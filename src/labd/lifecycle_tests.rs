@@ -2358,6 +2358,35 @@ async fn a_failed_online_snapshot_load_resumes_the_vm() {
     vm.stop(true).await.unwrap();
 }
 
+#[tokio::test]
+async fn a_failed_container_load_resumes_the_container() {
+    let dirs = Dirs::new();
+    let (ctr, hv) = container(
+        &dirs,
+        WORKLOAD,
+        Script {
+            capabilities: Capabilities {
+                snapshots: true,
+                ..Capabilities::default()
+            },
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events));
+
+    let error = ctr
+        .clone()
+        .restore(lab, "missing", true)
+        .await
+        .expect_err("no such snapshot");
+    assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+    assert!(!hv.paused(), "failed load left CPUs paused");
+    ctr.stop(true).await.expect("stop");
+}
+
 /// A container's online snapshot rides the same capability: absent, the
 /// refusal it always gave; present, an online capture it can restore.
 #[tokio::test]

@@ -47,7 +47,7 @@ depends on what a real guest or agent does, the finding says so.
 | F2 (fixed, card #385) | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
 | F3 (fixed, card #390) | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
 | F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
-| F5 | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
+| F5 (fixed, card #404) | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
 | F6 | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
 | F7 | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
 | F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
@@ -191,6 +191,10 @@ where the flag is given.
 
 ### F4. A re-seed never completes while the tree holds a path it skips
 
+**Fixed in #403.** Skipped paths and size refusals are reported as warnings
+while the re-seed completes for the rest of the tree. Apply failures and case
+collisions still hold the re-seed barrier.
+
 **Where.** `src/labd/workspace/reseed.rs:193-199` (`Reconverged::complete`),
 `reseed.rs:326`, `src/labd/workspace/syncer.rs:884-899`.
 
@@ -223,6 +227,10 @@ paths are reported.
 and the guest hash the whole tree every 5 s.
 
 ### F5. A halted workspace keeps every path the guest reports
+
+**Fixed in #404.** Both watch batch handlers validate relative paths before
+debouncing. A halted pass drops reported paths that are absent on both sides
+and keeps paths with an agreement or an observation still pending.
 
 **Where.** `src/labd/workspace/syncer.rs:1262-1270` (a `Batch` goes into the
 debounce set unchecked), `syncer.rs:2120-2126` (`owed` while halted),
@@ -289,6 +297,10 @@ drained 0 times.
 on the canonical copy for a time.
 
 ### F7. A guest delete across a prune-list reopen is undone
+
+**Fixed in #419.** The stat-walk after an immediate prune-list reopen
+recovers guest deletions. A failed reopen keeps the unwitnessed-absence
+policy on retry.
 
 **Where.** `src/labd/workspace/syncer.rs:1152-1161` and `syncer.rs:966-975`
 (`unwitnessed = rescan` on every open), `src/labd/workspace/plan.rs:716-735`.

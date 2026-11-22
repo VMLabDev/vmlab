@@ -9,6 +9,9 @@ mod e2e '.just/e2e'
 # Release artefacts built in the vmlab-build container (binary, guest bundle, BPF objects)
 mod buildbox '.just/buildbox'
 
+# A release built on this host in the build container, and its upload (`just release::local`)
+mod release '.just/release'
+
 [default, private]
 main:
 	@just --list
@@ -18,9 +21,9 @@ main:
 build:
 	cargo build
 
-# Build release artifacts
+# Build the release profile (a version for publishing is `just release::local`)
 [group('build')]
-release:
+build-release:
 	cargo build --release
 
 # Run the test suite
@@ -127,17 +130,17 @@ fastpath-bench:
 
 # Bring a lab up (a VNC viewer opens per VM when the lab sets `gui = true`)
 [group('lab')]
-lab-up dir='examples/mixed-lab': release
+lab-up dir='examples/mixed-lab': build-release
 	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab up
 
 # Stop a running lab gracefully (clones retained)
 [group('lab')]
-lab-down dir='examples/mixed-lab': release
+lab-down dir='examples/mixed-lab': build-release
 	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab down
 
 # Tear a lab down completely: stop + delete clones and lab-local state
 [group('lab')]
-lab-destroy dir='examples/mixed-lab': release
+lab-destroy dir='examples/mixed-lab': build-release
 	cd {{dir}} && {{justfile_directory()}}/target/release/vmlab destroy
 
 # Launch the winsrv-desktop example (opens the WS2025 guest window)

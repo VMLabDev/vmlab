@@ -32,8 +32,8 @@ def build(steps):
     return tmp, repo
 
 
-def calc(repo, source=None):
-    run = subprocess.run(["bash", str(SCRIPT)], cwd=repo, capture_output=True,
+def calc(repo, source=None, args=()):
+    run = subprocess.run(["bash", str(SCRIPT), *args], cwd=repo, capture_output=True,
                          text=True, env=GIT_ENV)
     if run.returncode != 0:
         raise AssertionError(f"exit {run.returncode}: {run.stderr}")
@@ -47,10 +47,10 @@ def calc(repo, source=None):
 
 
 class ReleaseVersionTest(unittest.TestCase):
-    def check(self, steps, source=None, **expected):
+    def check(self, steps, source=None, args=(), **expected):
         tmp, repo = build(steps)
         self.addCleanup(tmp.cleanup)
-        got = calc(repo, source)
+        got = calc(repo, source, args)
         for key, value in expected.items():
             self.assertEqual(got.get(key), value, f"{key} in {got}")
 
@@ -127,6 +127,39 @@ class ReleaseVersionTest(unittest.TestCase):
         tmp, repo = build([("chore: init", None, "v0.45.0"), ("fix: a", None, None)])
         self.addCleanup(tmp.cleanup)
         self.assertNotIn("version", calc(repo))
+
+    def test_command_line_gives_kind_and_bump_without_trailers(self):
+        steps = [("chore: init", None, "v0.48.0-alpha"), ("fix: a", None, None)]
+        for args, version, bump in [
+            (["--pre-release", "--bump", "patch"], "0.48.1-alpha", "patch"),
+            (["--pre-release", "--bump=minor"], "0.49.0-alpha", "minor"),
+            (["--pre-release", "--bump", "major"], "0.49.0-alpha", "major"),
+            (["--release"], "0.48.0", "promote"),
+        ]:
+            with self.subTest(args=args):
+                self.check(steps, args=args, do_release="true", version=version, bump=bump,
+                           last_tag="v0.48.0-alpha")
+        self.check(steps, args=["--pre-release", "--bump", "patch"], source="command line")
+        self.check(steps, args=["--pre-release"], source="commit subjects",
+                   version="0.48.1-alpha")
+
+    def test_command_line_wins_over_trailers(self):
+        self.check(
+            [("chore: init", None, "v1.2.3"),
+             ("fix: a", ["release: true", "bump: major"], None)],
+            args=["--pre-release", "--bump", "patch"],
+            version="1.2.4-alpha", prerelease="true", bump="patch")
+
+    def test_bad_command_line_is_refused(self):
+        tmp, repo = build([("fix: a", None, None)])
+        self.addCleanup(tmp.cleanup)
+        for args in (["--bump", "patch"], ["--pre-release", "--bump", "huge"],
+                     ["--pre-release", "--release"], ["--nonsense"]):
+            with self.subTest(args=args):
+                run = subprocess.run(["bash", str(SCRIPT), *args], cwd=repo,
+                                     capture_output=True, text=True, env=GIT_ENV)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertEqual(run.stdout, "")
 
 
 if __name__ == "__main__":

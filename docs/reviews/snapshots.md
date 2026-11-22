@@ -19,10 +19,10 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 | F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot (fixed in #387) |
 | F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back |
 | F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails (fixed in #389) |
-| F5 | wrong result | A container whose online restore fails stays paused |
-| F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on |
+| F5 | wrong result | A container whose online restore fails stays paused (fixed in #405) |
+| F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on (fixed in #406) |
 | F7 | wrong result | A capture that failed leaves a pending entry that a running vmlab-hv machine, or any container, cannot clear |
-| F8 | wrong result | A failed vmlab-hv save leaves the snapshot on the earlier disks and the vmstate clusters in the image |
+| F8 | wrong result | A failed vmlab-hv save leaves the snapshot on the earlier disks and the vmstate clusters in the image (fixed in #407) |
 | F9 | wrong result | A vmlab-hv process killed during a load leaves its rollback checkpoint on every disk for good |
 | F10 | wrong result | An offline snapshot does not hold the UEFI variables or the TPM state |
 | F11 | wrong result | The micro-VM's ACPI PM1a block is in no snapshot section |
@@ -143,6 +143,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F5. A failed online restore leaves a container paused (wrong result)
 
+- Fixed in #405. A failed load attempts to resume the container and returns
+  the load error with the resume outcome.
 - Where: `src/labd/container.rs:1145-1149`.
 - Why it is a fault: `restore_online` pauses the micro-VM and then calls
   `snapshots.load(...)` with `?`. On an error it returns without a resume.
@@ -154,10 +156,13 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
   running VM").
 - Proof: lifecycle test with the fake adapter (`src/labd/hypervisor/fake.rs`),
   `a_failed_container_load_resumes_the_container`: make `load` fail, call
-  restore, and assert that the last control call is `resume`.
+  restore, and assert that the fake hypervisor reports the CPUs are unpaused.
 
 ### F6. virtio-net restores the position of a stream that has moved (wrong result)
 
+- Fixed in #406. Restore keeps the live stream's partial reads and writes
+  and ignores saved stream cursors in older snapshots. Complete pending
+  receive frames and virtqueue state still restore from the snapshot.
 - Where: `hv/crates/vmlab-hv-devices/src/virtio/net.rs:2021-2033` (save) and
   `:2160-2163` (restore).
 - Why it is a fault: in stream mode the device talks to the lab switch over a
@@ -214,6 +219,9 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F8. A failed vmlab-hv save cleans nothing (wrong result)
 
+- Fixed in #407. Save checks for duplicate names before capture. Failed
+  capture deletes the snapshots it created and releases any active vmstate
+  clusters written by the attempt. Cleanup errors identify the affected disk.
 - Where: `hv/crates/vmlab-hv-vmm/src/snapshot.rs:313-352` (`save`) and
   `:377-405` (`capture_and_write`).
 - Why it is a fault: `capture_and_write` first streams the whole vmstate into

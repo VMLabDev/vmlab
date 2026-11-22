@@ -281,6 +281,19 @@ Not read:
   Today the sum is 32 x 2000.
 - Confidence: high for the mechanism. The effect depends on the memory limit
   of the process.
+- Fixed in card #400. A directory handle holds no entries: it holds one
+  directory descriptor, opened by the first `READDIR`, and the cookie the
+  stream stands at. Each request reads bounded batches with `getdents64`
+  (at most 64 KiB per call) and serves the host's `d_off` as the cookie, so
+  a request costs what it serves and a listing is linear. A request at
+  another cookie seeks. Offset 0 still rewinds. A handle counts against the
+  session limit as before, so the descriptors are bounded by it. The test
+  `directory_caches_are_bounded_across_handles` fails before the fix
+  (`32 handles hold 64096 directory entries`) and passes after it.
+  - Changed for the guest: a cookie is now the host's `d_off` and not an
+    index. After a snapshot restore a handle resumes by seeking to the
+    cookie the guest sends.
+  - Not fixed here: F13 (fixed in card #417).
 
 ### F8. virtio-net: one frame larger than the guest's buffers stalls receive forever without mergeable buffers
 
@@ -341,6 +354,14 @@ Not read:
   does.
 - Confidence: high that the limit is missing. Medium that it grows to an
   out-of-memory state in practice.
+- Fixed in card #415. A queue holds at most its own size of chains, vblank
+  waits and fences counted together. A surplus vblank wait is answered at
+  once with `ERR_OUT_OF_MEMORY`, and a surplus fenced chain is answered at
+  once without waiting for its fence. The tests
+  `held_vblank_waits_are_bounded_by_the_queue_size` and
+  `held_fences_are_bounded_by_the_queue_size` prove it. The fence test calls
+  `State::hold_fence`, because a fenced chain needs a renderer to reach
+  `queue_notify`.
 
 ### F10. virtio-gpu: guest backing entries have no total cap in 3D mode
 
@@ -361,6 +382,15 @@ Not read:
   succeeds. The test needs a render node, so it does not run in
   `just ci::check`.
 - Confidence: high.
+- Fixed in card #415. Attach-backing and blob create refuse entries above a
+  total over all resources. The total is `MAX_TOTAL_ENTRIES`, 16 times
+  `MAX_ENTRIES` (262144 entries, about 12 MiB of host memory), not the
+  `MAX_ENTRIES` of the 2D path: a 3D guest backs every texture, and a total
+  of 16384 would refuse real guests. So the proof test fills 16 resources,
+  not one. `backing_entries_stop_at_the_room_left_over_all_resources` runs in
+  `just ci::check` and proves the count, also for an entry that crosses a
+  memory region. `renderer_backing_entries_are_bounded_across_resources`
+  needs a render node.
 
 ### F11. virtio-fs: a device reset does not end the FUSE session
 
@@ -378,6 +408,8 @@ Not read:
   Call `f.fs.reset()`, activate again as `Fixture::over` does, send `INIT`,
   then `LOOKUP` a new file and expect `error == 0`. Today it is `-ENFILE`.
 - Confidence: high.
+- Fixed in card #402. Device reset ends the FUSE session, releases its inodes
+  and handles, and keeps the pinned share root for the next guest session.
 
 ### F12. vhost-user-fs: a completion interrupt can be lost across a snapshot
 
@@ -401,6 +433,14 @@ Not read:
   recorded before `save_state` returns.
 - Confidence: medium. Both code facts are confirmed. Where the VMM saves the
   transport's interrupt state relative to this section was not read.
+- Fixed in card #416. `save_state` delivers the calls that are readable
+  after `GET_VRING_BASE` before it re-arms the rings, and a restore of an
+  active section notifies every armed queue (also when the section is applied
+  by the next `activate`). The two proof tests and
+  `restored_state_applied_at_activation_notifies_every_queue` fail before
+  the fix and pass after it. The save test checks the order (the interrupt
+  comes before the re-arm), because the restarted worker would otherwise
+  deliver the call a moment after `save_state` returns.
 
 ### F13. virtio-fs: `READDIRPLUS` leaks a lookup reference and hides entries when the inode table is full
 
@@ -421,6 +461,20 @@ Not read:
   `readdirplus_reports_a_full_inode_table`: create 40 files and assert that
   the call returns `ENFILE` or lists all 40.
 - Confidence: high.
+- Fixed in card #417. An entry that `add_entry` does not take (`Ok(0)` or an
+  error) gives its lookup back at once, and a request that fails gives back
+  the lookups of every entry it had already placed, because the guest gets
+  the error alone. A full inode table is no longer skipped: a request that
+  has placed entries ends there, and the next one, which can place none,
+  returns `ENFILE`. The tests
+  `readdirplus_does_not_leak_the_entry_that_did_not_fit`,
+  `readdirplus_takes_back_its_lookups_when_the_request_fails` and
+  `readdirplus_reports_a_full_inode_table` fail before the fix (the refused
+  entry stays in `by_path`, 4 inodes where 2 are due, 31 of 40 files listed
+  with no error) and pass after it.
+  - Not fixed here: every other error of `resolve` still skips the entry,
+    which is right for a file that raced away and hides one for a host
+    error such as `EMFILE`.
 
 ### F14. virtio-net on a TAP: one failed packet write or read latches `tap_error` for the life of the process
 

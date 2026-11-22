@@ -385,6 +385,11 @@ throughout the code and commit messages.
   with /dev/kvm (`e2e/README.md`). It sits outside the merge bar.
   `--hypervisor vmlab` runs it on vmlab-hv, skipping each feature past the
   phase vmlab-hv has delivered (its tag in `features.py`).
+- `just release::local` builds one version on the build host (helios) into a
+  release directory — the four assets, `SHA256SUMS`, `provenance.json` and the
+  signature of `scripts/release-sign.sh` — and `just release::publish` uploads
+  it with `gh release create`. GitHub Actions builds and publishes no version
+  (`docs/agents/release-gate.md`).
 - `just buildbox::dist` builds every release artefact (binary, strict guest
   bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
   (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the
