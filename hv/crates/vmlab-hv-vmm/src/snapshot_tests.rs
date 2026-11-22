@@ -481,7 +481,9 @@ fn a_failed_save_leaves_no_snapshot_and_no_vmstate() {
         control::{Command, Outcome},
     };
 
-    for duplicate in [true, false] {
+    // Exercise preflight, rollback after snapshot creation, and discard
+    // before the vmstate disk has received its snapshot.
+    for (duplicate, vmstate_first) in [(true, true), (false, true), (false, false)] {
         let Some(m) = machine_with_setup(&[0xeb, 0xfe], 8, true, |_, _| {}) else {
             assert!(
                 std::env::var_os("VMLAB_REQUIRE_KVM").is_none(),
@@ -497,24 +499,30 @@ fn a_failed_save_leaves_no_snapshot_and_no_vmstate() {
         if duplicate {
             vmlab_disk::ops::snapshot_create(&second, "s").unwrap();
         }
-        let second_image = vmlab_disk::open(&second, vmlab_disk::Format::Qcow2, !duplicate).unwrap();
-        let second_before = second_image.snapshots().unwrap();
+        let second_image = Arc::new(PlMutex::new(
+            vmlab_disk::open(&second, vmlab_disk::Format::Qcow2, !duplicate).unwrap(),
+        ));
+        let second_before = second_image.lock().snapshots().unwrap();
+        let mut disks = vec![
+            DiskNode {
+                id: "scratch".into(),
+                writable: true,
+                vmstate: true,
+                image: image.clone(),
+            },
+            DiskNode {
+                id: "second".into(),
+                writable: true,
+                vmstate: false,
+                image: second_image.clone(),
+            },
+        ];
+        if !vmstate_first {
+            disks.swap(0, 1);
+        }
         shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
             digest: original.digest,
-            disks: vec![
-                DiskNode {
-                    id: "scratch".into(),
-                    writable: true,
-                    vmstate: true,
-                    image: image.clone(),
-                },
-                DiskNode {
-                    id: "second".into(),
-                    writable: true,
-                    vmstate: false,
-                    image: Arc::new(PlMutex::new(second_image)),
-                },
-            ],
+            disks,
             nodes: vec![DeviceNode::Plain(shared.serials.lock()[0].clone())],
         }));
         let before = std::fs::metadata(&m.disk_path).unwrap().len();
@@ -532,11 +540,7 @@ fn a_failed_save_leaves_no_snapshot_and_no_vmstate() {
         let mut vmstate = [0xff; 512];
         image.lock().read_vmstate(0, &mut vmstate).unwrap();
         assert_eq!(vmstate, [0; 512]);
-        let second_after = shared.snapshot_registry().unwrap().disks[1]
-            .image
-            .lock()
-            .snapshots()
-            .unwrap();
+        let second_after = second_image.lock().snapshots().unwrap();
         assert_eq!(second_after.len(), second_before.len());
         if duplicate {
             assert_eq!(second_after[0].name, "s");
