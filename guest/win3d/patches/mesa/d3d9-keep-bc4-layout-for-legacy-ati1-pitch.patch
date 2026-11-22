@@ -1,0 +1,23 @@
+Subject: [PATCH] d3d9: keep the BC4 layout for legacy ATI1 pitches
+
+The runtime can describe an ATI1 system-memory surface with a pitch
+smaller than a BC4 block row. Keep the format-derived layout in that
+case so the initial upload receives complete blocks. Continue to use
+the supplied pitches for other borrowed textures, including packed L8.
+
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Resource.cpp
+@@ -2632,5 +2632,11 @@ D3D9CopyInitialData(const D3DDDIARG_CREATERESOURCE *data,
+    if (!D3D9PoolNeedsReadback(data->Pool)) {
+-      if (!data->Flags.VertexBuffer && !data->Flags.IndexBuffer) {
++      /* A legacy ATI1 pitch below a full BC4 row does not describe the
++       * block storage. Keep the row and slice layout computed at creation. */
++      const bool legacy_ati1_pitch =
++         data->Format == D3D9_FMT_ATI1 && src->SysMemPitch &&
++         src->SysMemPitch < dst->pitch;
++      if (!data->Flags.VertexBuffer && !data->Flags.IndexBuffer &&
++          !legacy_ati1_pitch) {
+          /* This storage belongs to the caller and has no driver padding. */
+          const UINT rows = D3D9FormatRowCount(data->Format, src->Height);
+          dst->pitch = src->SysMemPitch ? src->SysMemPitch :
