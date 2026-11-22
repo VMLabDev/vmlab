@@ -918,6 +918,48 @@ template "base" {
         assert_eq!(t.provisions.len(), 1);
     }
 
+    /// Review F15: the artefact cache names its files by this value, so it
+    /// must be a digest and nothing else.
+    #[test]
+    fn a_url_source_needs_a_64_digit_hex_sha256() {
+        let load = |sha256: &str| {
+            let src = format!(
+                r#"import <vmlab.wcl>
+lab "l" {{ vm "a" {{ template = "x86_64/base" }} }}
+template "base" {{
+  arch    = "x86_64"
+  version = "1.0"
+  profile = "linux-modern"
+  disk    = 20GiB
+  source "iso" {{ url = "https://example.com/x.iso" sha256 = "{sha256}" }}
+}}
+"#
+            );
+            load_lab_source(&src, "<test>", Path::new("/tmp"))
+        };
+        for bad in ["../x", "abc123", &"g".repeat(64), &"a".repeat(65)] {
+            let err = match load(bad) {
+                Ok(_) => panic!("`{bad}` must not validate"),
+                Err(e) => e,
+            };
+            assert!(
+                err.issues
+                    .iter()
+                    .any(|i| i.message.contains("64 hex digits")),
+                "{bad}: {:?}",
+                err.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+        }
+        // Either case is a digest. The model holds it in lower case.
+        let lf = load(&"AB".repeat(32)).unwrap();
+        match &lf.templates[0].source {
+            TemplateSource::Iso(ArtefactSource::Url { sha256, .. }) => {
+                assert_eq!(sha256, &"ab".repeat(32));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Every shipped example template's `vmlab.wcl` must parse (keeps the
     /// examples/templates/ definitions honest, like the wscript script test).
     #[test]

@@ -16,6 +16,16 @@ pub fn cache_dir() -> PathBuf {
 /// Resolve an artefact source to a local file path, downloading + verifying
 /// URL sources. Reports progress via `log`.
 pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<PathBuf> {
+    resolve_in(&cache_dir(), source, log, DOWNLOAD_LIMITS).await
+}
+
+/// [`resolve`] against a cache directory and limits the caller names.
+async fn resolve_in(
+    dir: &Path,
+    source: &ArtefactSource,
+    log: impl Fn(String),
+    limits: DownloadLimits,
+) -> Result<PathBuf> {
     match source {
         ArtefactSource::Path { path, .. } => {
             if !path.is_file() {
@@ -24,8 +34,7 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
             Ok(path.clone())
         }
         ArtefactSource::Url { url, sha256, .. } => {
-            let dir = cache_dir();
-            std::fs::create_dir_all(&dir)?;
+            std::fs::create_dir_all(dir)?;
             // Cache key = the expected digest, so a re-download is skipped
             // when the verified artefact is already present.
             let cached = dir.join(format!("{sha256}.artefact"));
@@ -39,7 +48,7 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                         return Ok(cached);
                     }
                     log(format!("downloading {url}"));
-                    download(url, &cached, DOWNLOAD_LIMITS).await?;
+                    download(url, &cached, limits).await?;
                     verify_file(&cached, sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
@@ -57,7 +66,7 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                     }
                     let dl = dir.join(format!("{sha256}.download"));
                     log(format!("downloading {url}"));
-                    download(url, &dl, DOWNLOAD_LIMITS).await?;
+                    download(url, &dl, limits).await?;
                     verify_file(&dl, sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
@@ -223,6 +232,164 @@ mod tests {
         .await
         .expect("the download must give up by itself");
         assert!(done.is_err(), "a silent mirror is an error");
+    }
+
+    /// What the loopback mirror below holds back, and for whom.
+    struct Mirror {
+        addr: std::net::SocketAddr,
+        /// Sent to release the second half of the first connection's body.
+        release_first: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    /// A loopback HTTP mirror that serves `body` to every connection. The
+    /// first connection gets the head and the first half of the body, and the
+    /// rest only when `release_first` fires. Later connections get it all.
+    async fn mirror(body: Vec<u8>) -> Mirror {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_first, gate) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut gate = Some(gate);
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let gate = gate.take();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let (first, second) = body.split_at(body.len() / 2);
+                    sock.write_all(head.as_bytes()).await.ok();
+                    sock.write_all(first).await.ok();
+                    sock.flush().await.ok();
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    sock.write_all(second).await.ok();
+                    sock.shutdown().await.ok();
+                });
+            }
+        });
+        Mirror {
+            addr,
+            release_first: Some(release_first),
+        }
+    }
+
+    fn url_source(url: String, sha256: &str) -> ArtefactSource {
+        ArtefactSource::Url {
+            url,
+            sha256: sha256.to_string(),
+            span: (0, 0),
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Every entry of `dir`, by file name.
+    fn entries(dir: &Path) -> Vec<String> {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = read
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review F15, part 1: two builds that use one URL at the same time each
+    /// download it. Neither may write into, or rename away, the file the
+    /// other is still downloading.
+    #[tokio::test]
+    async fn two_resolves_of_one_url_both_succeed() {
+        let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let half = (body.len() / 2) as u64;
+        let mut mirror = mirror(body.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artefacts");
+        let source = url_source(format!("http://{}/x.iso", mirror.addr), &sha256_hex(&body));
+
+        // The first resolve stops half way through its body.
+        let first = {
+            let (dir, source) = (dir.clone(), source.clone());
+            tokio::spawn(async move { resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS).await })
+        };
+        // Let it put that half on disk. The bound is not a pass condition:
+        // when it runs out the test goes on, and only proves less.
+        for _ in 0..3000 {
+            let written = std::fs::read_dir(&dir).into_iter().flatten().any(|e| {
+                let e = e.unwrap();
+                e.file_name().to_string_lossy().ends_with(".part")
+                    && e.metadata().map(|m| m.len() >= half).unwrap_or(false)
+            });
+            if written {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The second runs from start to end while the first is held.
+        let second = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let first = first.await.unwrap();
+
+        let second = second.expect("the second resolve");
+        let first = first.expect("the first resolve");
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), body);
+        assert_eq!(
+            entries(&dir),
+            vec![format!("{}.artefact", sha256_hex(&body))],
+            "the cache holds the artefact and no leftover"
+        );
+    }
+
+    /// Review F15, part 2: a download is checked before it gets its
+    /// digest-named place, so a failed check leaves nothing behind.
+    #[tokio::test]
+    async fn a_download_that_fails_its_hash_leaves_no_cache_entry() {
+        let mut mirror = mirror(b"not what the definition names".to_vec()).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artefacts");
+        for name in ["x.iso", "x.qcow2.gz"] {
+            let source = url_source(format!("http://{}/{name}", mirror.addr), &"0".repeat(64));
+            let err = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS)
+                .await
+                .expect_err("a wrong hash is an error");
+            assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
+            assert_eq!(entries(&dir), Vec::<String>::new(), "after {name}");
+        }
+    }
+
+    /// Review F15, part 3: the cache names its files by the digest, so a
+    /// `sha256` that is not one is refused before anything is fetched.
+    #[tokio::test]
+    async fn a_sha256_that_is_not_a_digest_writes_nothing() {
+        let mut mirror = mirror(b"body".to_vec()).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cache").join("artefacts");
+        let source = url_source(format!("http://{}/x.iso", mirror.addr), "../x");
+        let err = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS)
+            .await
+            .expect_err("`../x` is not a digest");
+        assert!(format!("{err:#}").contains("64 hex digits"), "{err:#}");
+        assert_eq!(entries(&tmp.path().join("cache")), Vec::<String>::new());
     }
 
     #[tokio::test]
