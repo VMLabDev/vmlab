@@ -5,7 +5,7 @@
 # ADAPTER_HOST_LOAD      busy host processes meanwhile (16; see 120_latency.sh)
 
 check_audio() {
-    local lab node rec log offset ppid rpid i rc linked=0
+    local lab node rec log offset ppid rpid i rc linked=0 sink=
     local load=${ADAPTER_HOST_LOAD:-16} secs=${ADAPTER_AUDIO_SECONDS:-60}
     note "audio"
     command -v pw-record >/dev/null && command -v pw-link >/dev/null ||
@@ -15,6 +15,14 @@ check_audio() {
     # The host node of the VM's sound card. It exists while the guest plays.
     node="vmlab.$lab.$VM"
     rec="vmlab-adapter-audio-$$"
+    # A stream plays only when it is linked to a sink. A PipeWire without
+    # one (an account with no sound card and no pipewire-pulse) gets a null
+    # sink for the length of the check.
+    if ! pw-link -i 2>/dev/null | grep -q ':playback_FL$'; then
+        sink="vmlab-adapter-sink-$$"
+        pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$sink media.class=Audio/Sink object.linger=true audio.position=[FL FR] }" >/dev/null 2>&1
+        note "  no sink in this PipeWire: made the null sink $sink"
+    fi
     log=$(hv_log)
     offset=$(stat -c %s "$log" 2>/dev/null || echo 0)
     # Record the VM's own node, linked by hand: the sink it plays into may
@@ -41,6 +49,7 @@ check_audio() {
     kill -INT "$rpid" 2>/dev/null
     wait "$rpid" 2>/dev/null
     host_load_stop
+    [ -n "$sink" ] && pw-cli destroy "$sink" >/dev/null 2>&1
     printf '{"host_load": %s, "host_cpus": %s, "node": "%s", "linked": %s, "seconds": %s}\n' \
         "$load" "$(nproc)" "$node" "$linked" "$secs" >"$EV/tone.host.json"
     python3 "$A/audio.py" "$STAGE/tone.wav" "$EV/tone.capture.json" --hv-log "$log" --hv-log-offset "$offset" \
