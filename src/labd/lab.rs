@@ -3960,20 +3960,27 @@ impl crate::labd::machine::LabServices for LabRuntime {
         self.arc().ensure_smb(&quiet).await;
     }
 
-    async fn attach_nic(
+    async fn attach_nics(
         &self,
-        segment: &str,
-        sock: &std::path::Path,
-        mac: crate::config::model::MacAddr,
-        isolated: bool,
-        tap_ok: bool,
-        framing: crate::net::framing::FramingMode,
-    ) -> Result<crate::net::fastpath::NicAttachment> {
-        let mut net = self.network.lock().await;
-        let seg = net
-            .segment_mut(segment)
-            .ok_or_else(|| anyhow!("unknown segment \"{segment}\""))?;
-        seg.attach_nic(sock, mac, isolated, tap_ok, framing).await
+        machine: &dyn Machine,
+    ) -> Result<Vec<crate::net::fastpath::NicAttachment>> {
+        let nics = machine.nics();
+        let macs = machine.macs();
+        if macs.len() < nics.len() {
+            let i = macs.len();
+            bail!("{}: no persisted MAC for nic {i}", machine.name());
+        }
+        self.network
+            .lock()
+            .await
+            .attach_nics(
+                nics,
+                &macs[..nics.len()],
+                |i| machine.nic_sock(i),
+                machine.takes_tap_fds(),
+                machine.net_framing(),
+            )
+            .await
     }
 
     async fn before_resume(&self, machine: &str) -> Result<()> {
