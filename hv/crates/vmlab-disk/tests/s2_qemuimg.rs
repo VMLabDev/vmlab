@@ -1051,6 +1051,62 @@ fn s2_subcluster_discard_preserves_neighboring_metadata() {
     qemu_check(&path);
 }
 
+/// Review vmlab-disk F1 (#542). QEMU zeroes an allocated cluster in place:
+/// the L2 entry keeps its host offset and gets the zero flag. A write to
+/// such a cluster must clear the flag, and the old bytes of the host cluster
+/// must not come back around a partial write.
+#[test]
+fn a_write_to_a_cluster_qemu_zeroed_in_place_reads_back() {
+    require_qemu_img!();
+    let temp = tmpdir("zero-in-place");
+    let path = temp.path().join("z.qcow2");
+    let raw = temp.path().join("z.raw");
+    let cluster = 64 * 1024;
+    qemu_img(&["create", "-f", "qcow2", path.to_str().unwrap(), "1M"]);
+    qemu_io(&[
+        "-f",
+        "qcow2",
+        "-c",
+        "write -P 0x11 0 128k",
+        "-c",
+        "write -z 0 128k",
+        path.to_str().unwrap(),
+    ]);
+    {
+        let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+        // A partial write to the first cluster, a whole-cluster write to
+        // the second.
+        image.write_at(512, &[0xaa; 512]).unwrap();
+        image.write_at(cluster as u64, &vec![0xbb; cluster]).unwrap();
+        image.flush().unwrap();
+    }
+    let mut expected = vec![0u8; 1 << 20];
+    expected[512..1024].fill(0xaa);
+    expected[cluster..2 * cluster].fill(0xbb);
+    let actual = read_all(&path, Format::Qcow2);
+    assert!(
+        actual == expected,
+        "the crate reads back something else: {:02x?} at 512, {:02x?} at 64k, {:02x?} at 0",
+        &actual[512..520],
+        &actual[cluster..cluster + 8],
+        &actual[..8],
+    );
+    qemu_img(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        path.to_str().unwrap(),
+        raw.to_str().unwrap(),
+    ]);
+    assert!(
+        std::fs::read(&raw).unwrap() == expected,
+        "qemu-img reads back something else than the crate"
+    );
+    qemu_check(&path);
+}
+
 #[test]
 fn s2_discard_and_zero_semantics() {
     require_qemu_img!();
