@@ -75,14 +75,16 @@ just ci::check
 
 ## Release version
 
-- `scripts/release-version.sh` currently derives the bump from conventional
-  commits, not the `bump:` trailer. Do not rely on that trailer to select a
-  version. Until trailer support lands, the lead must check the script's
-  calculated version against the intended version before publishing.
+- The version of a release comes from the command line of
+  `just release::local` (`--pre-release | --release`, `--bump`). Print it
+  first with `just release::version ...` and check it against the intended
+  version before building.
 
 ## Release gate
 
-- `scripts/release-version.sh` honors HEAD's `bump: major|minor|patch`
+- `scripts/release-version.sh` takes the kind and the bump on the command
+  line (`--pre-release | --release`, `--bump major|minor|patch`). Without a
+  kind it honors HEAD's `bump: major|minor|patch`
   trailer, falling back to commit subjects without it. A 0.x major bumps
   minor. The `release: true` promotion of an alpha keeps its version,
   regardless of a bump trailer.
@@ -96,4 +98,7 @@ just ci::check
   `docs/agents/release-gate.md`. All heavy runs start with `terrarium run`
   through `/var/build/cache/vmlab/bin/heavy`.
 - Follow the exact-tree evidence checklist in `docs/agents/release-gate.md`
-  before merging. Signing and GitHub publication remain main-only.
+  before merging.
+- GitHub builds and publishes no version. Build with `just release::local`
+  on helios, then publish with `just release::publish`: see "Build and
+  publish a version" and the signing decision in `docs/agents/release-gate.md`.

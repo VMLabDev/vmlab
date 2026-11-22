@@ -1,32 +1,65 @@
 #!/usr/bin/env bash
-# Calculate the release version of HEAD for the "Calculate version" job in
-# .github/workflows/ci.yml (VML-104). Run it in a full checkout (fetch-depth 0)
-# with the tags fetched.
+# Calculate the release version of HEAD, for `just release::local` and
+# `just release::version` (VML-104, card 423). Run it in a full checkout with
+# the tags fetched.
+#
+# Usage: release-version.sh [--pre-release | --release] [--bump major|minor|patch]
+#
+# With --pre-release or --release the kind and the bump come from the command
+# line, and the trailers of HEAD are not read. Without either, the trailers
+# `pre-release: true`, `release: true` and `bump:` of HEAD decide, as before.
 #
 # Standard output: one key=value line each for do_release, version, prerelease,
 # bump and last_tag. Nothing else goes to standard output. Diagnostics go to
 # standard error.
 #
 # Rules:
-#   - Neither trailer on HEAD: do_release=false, and nothing else is printed.
-#   - release: true on HEAD (not pre-release) and the last v* tag has a suffix
+#   - No kind on the command line and neither trailer on HEAD:
+#     do_release=false, and nothing else is printed.
+#   - A release (not a pre-release) and the last v* tag has a suffix
 #     (vX.Y.Z-alpha): promote it. The version is X.Y.Z, with no bump.
 #   - Otherwise bump from the last v* tag with its suffix stripped. The bump
-#     level comes from HEAD's bump trailer, or otherwise the conventional-commit
-#     subjects since that tag. In 0.x a
+#     level comes from --bump or HEAD's bump trailer, or otherwise the
+#     conventional-commit subjects since that tag. In 0.x a
 #     major bump is a minor bump.
-#   - pre-release: true appends -alpha to the version.
+#   - A pre-release appends -alpha to the version.
 set -eu
 
 trailer() {
   git log -1 --format="%(trailers:key=$1,valueonly)"
 }
 
-IS_RELEASE=$(trailer release)
-IS_PRERELEASE=$(trailer pre-release)
+KIND=""
+ARG_BUMP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pre-release|--release)
+      [ -z "$KIND" ] || { echo "release-version: give --pre-release or --release, not both" >&2; exit 2; }
+      KIND="${1#--}"; shift ;;
+    --bump)
+      [ $# -ge 2 ] || { echo "release-version: --bump needs major, minor or patch" >&2; exit 2; }
+      ARG_BUMP="$2"; shift 2 ;;
+    --bump=*) ARG_BUMP="${1#--bump=}"; shift ;;
+    *) echo "release-version: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+case "$ARG_BUMP" in
+  ""|major|minor|patch) ;;
+  *) echo "release-version: --bump is major, minor or patch, not '$ARG_BUMP'" >&2; exit 2 ;;
+esac
+if [ -z "$KIND" ] && [ -n "$ARG_BUMP" ]; then
+  echo "release-version: --bump needs --pre-release or --release" >&2
+  exit 2
+fi
+
+case "$KIND" in
+  pre-release) IS_RELEASE=""; IS_PRERELEASE=true ;;
+  release) IS_RELEASE=true; IS_PRERELEASE="" ;;
+  *) IS_RELEASE=$(trailer release); IS_PRERELEASE=$(trailer pre-release) ;;
+esac
 
 if [ "$IS_RELEASE" != "true" ] && [ "$IS_PRERELEASE" != "true" ]; then
-  echo "No release/pre-release trailer on HEAD: tests only." >&2
+  echo "No release/pre-release trailer on HEAD and no kind on the command line: no release." >&2
   echo "do_release=false"
   exit 0
 fi
@@ -50,9 +83,10 @@ if [ "$IS_RELEASE" = "true" ] && [ "$IS_PRERELEASE" != "true" ] \
   SOURCE="pre-release promotion"
   MAJOR=$PREV_MAJOR; MINOR=$PREV_MINOR; PATCH=$PREV_PATCH
 else
-  BUMP=$(trailer bump)
+  if [ -n "$KIND" ]; then BUMP=$ARG_BUMP; BUMP_SOURCE="command line"
+  else BUMP=$(trailer bump); BUMP_SOURCE="HEAD bump trailer"; fi
   case "$BUMP" in
-    major|minor|patch) SOURCE="HEAD bump trailer" ;;
+    major|minor|patch) SOURCE=$BUMP_SOURCE ;;
     *) BUMP="none"; SOURCE="commit subjects" ;;
   esac
   if [ "$BUMP" = "none" ]; then
