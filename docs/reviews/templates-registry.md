@@ -36,7 +36,7 @@ much as a Makefile is.
 | F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
 | F10 | wrong result | The registry HTTP client has no timeout (fixed, #505) |
 | F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest (fixed, #504) |
-| F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" |
+| F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" (fixed, #522) |
 | F13 | wrong result | A cancelled pull removes the work directory under the install that is still running |
 | F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept |
 | F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked |
@@ -520,6 +520,20 @@ much as a Makefile is.
   `src/oci/client.rs`: a fake transport whose `get_blob` waits on a barrier
   for two callers, two `ensure_registry_template` calls joined. Expect both
   `Ok` with the same version. Today one is `Err`.
+- Fixed in card #522. The store's refusal is a typed error,
+  `AlreadyInstalled`, with the same text. `pull_with_progress` runs one more
+  pass when a pull without `overwrite` gets it and the store now holds the
+  version. That pass takes the path of a version already held: it refuses a
+  version another repository installed, compares the disk digest, and
+  fetches only the variants that the store still lacks. The base is not
+  downloaded a second time.
+  - The proof test drives `pull_with_progress` with the barrier on the chunk
+    download, not `ensure_registry_template`: that function builds its own
+    HTTP transport and takes no fake. Without the fix it fails with
+    "the second pull: template x86_64/alpine@3.20 already exists in the
+    store".
+  - Not fixed here: both pulls still download the whole base. One download
+    for two pulls needs a lock or a shared operation per version.
 
 ### F13. A cancelled pull removes the work directory under a running install (wrong result)
 
