@@ -521,7 +521,7 @@ impl PciRoot {
         for bar in &func.bars {
             dev.set_bar_address(
                 bar.info.index,
-                (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                bar_placement(self.firmware, func.command, bar),
             );
         }
         if let Some(start) =
@@ -761,12 +761,26 @@ impl PciRoot {
             for bar in &func.bars {
                 dev.set_bar_address(
                     bar.info.index,
-                    (bar.addr != 0 && !bar.sizing).then_some(bar.addr),
+                    bar_placement(self.firmware, func.command, bar),
                 );
             }
         }
         Ok(())
     }
+}
+
+/// The address a function is told its BAR is at, or `None` while the root
+/// does not decode it: unprogrammed, mid-sizing, or, on a root that firmware
+/// programs, with the BAR's decode bit of the command register clear. A
+/// function registers kernel-side decoding from this (queue doorbells, direct
+/// mappings), so it must not outlive what `decode_mmio` and `find_bar` decode.
+fn bar_placement(firmware: bool, command: u16, bar: &BarState) -> Option<u64> {
+    let enable = if matches!(bar.info.kind, BarKind::Io) {
+        1
+    } else {
+        2
+    };
+    (bar.addr != 0 && !bar.sizing && (!firmware || command & enable != 0)).then_some(bar.addr)
 }
 
 fn bar_low_read(bar: &BarState) -> u32 {
@@ -1165,6 +1179,50 @@ mod tests {
         // A restore tells the function where its BARs are, as a config
         // write does: a function with kernel registrations moves them.
         assert!(device.lock().placements.contains(&(0, Some(0xc200_0000))));
+    }
+
+    #[test]
+    fn doorbells_follow_the_memory_enable_bit() {
+        // A function registers its queue doorbells in the kernel from the
+        // address `set_bar_address` gives it. On a q35 root that address
+        // must go away with memory decoding, as the userspace dispatch does.
+        let device = FakePci::new(test_bars());
+        let mut root = PciRoot::q35(1 << 32);
+        root.add_device_at(3, 0, device.clone()).unwrap();
+        let last = |device: &Arc<Mutex<FakePci>>| {
+            let device = device.lock();
+            device
+                .placements
+                .iter()
+                .rev()
+                .find(|(bar, _)| *bar == 0)
+                .map(|(_, address)| *address)
+        };
+        root.config_write(0, 3, 0, 16, &0xc200_0000u32.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert_eq!(last(&device), Some(Some(0xc200_0000)));
+        let saved = root.save_bar_states();
+        root.config_write(0, 3, 0, 4, &0u16.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+        assert!(!root.dispatch_mmio_write(0xc200_0040, &[1]));
+        // A restore follows the bit the function holds, as a config write.
+        root.restore_bar_states(&saved).unwrap();
+        assert_eq!(last(&device), Some(None));
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert_eq!(last(&device), Some(Some(0xc200_0000)));
+        // The I/O enable bit does not place a memory BAR.
+        root.config_write(0, 3, 0, 4, &1u16.to_le_bytes());
+        assert_eq!(last(&device), Some(None));
+    }
+
+    #[test]
+    fn a_root_without_firmware_places_bars_whatever_the_command_register() {
+        let (root, device) = root_with_fake();
+        root.lock().config_write(0, 1, 0, 4, &0u16.to_le_bytes());
+        let device = device.lock();
+        let (_, address) = device.placements.iter().rev().find(|p| p.0 == 0).unwrap();
+        assert!(address.is_some());
     }
 
     #[test]
