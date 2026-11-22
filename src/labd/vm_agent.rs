@@ -3091,7 +3091,8 @@ mod tests {
                                     // and never exits: twice the collect
                                     // ceiling, so the mock itself is bounded.
                                     if argv.first().is_some_and(|s| s == "mock:flood") {
-                                        let mut flood = (INITIAL_WINDOW, 2 * EXEC_OUTPUT_LIMIT as u64);
+                                        let mut flood =
+                                            (INITIAL_WINDOW, 2 * EXEC_OUTPUT_LIMIT as u64);
                                         pump_flood(&tx, id, &mut flood).await;
                                         floods.insert(id, flood);
                                         continue;
