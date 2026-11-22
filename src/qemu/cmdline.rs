@@ -2008,6 +2008,19 @@ mod tests {
         assert!(!format!("{p:?}").contains(&",".repeat(64)));
     }
 
+    /// `/proc/<pid>/cmdline` is readable by every local user, so the key is
+    /// in no argv element (docs/reviews/config.md F3).
+    #[test]
+    fn the_osk_is_not_an_argv_element() {
+        let vm = resolved("macos", "x86_64");
+        let mut p = paths();
+        p.tsc_hz = Some(3_000_000_000);
+        let key = p.apple_smc_osk.as_ref().unwrap().expose().to_string();
+        let args = build_args("l", &vm, &p, Accel::Kvm).unwrap();
+        let holding: Vec<&String> = args.iter().filter(|a| a.contains(&key)).collect();
+        assert!(holding.is_empty(), "the key is in the argv: {holding:?}");
+    }
+
     /// `tsc = "host"` needs the frequency the lab daemon reads; under TCG,
     /// where there is no KVM to read it from, it is left off and said.
     #[test]
