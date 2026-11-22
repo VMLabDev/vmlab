@@ -310,7 +310,7 @@ impl VirtioPciDevice {
         }
         match (offset, data.len()) {
             (4, 4) if !self.activated => {
-                self.driver_features = u32::from_le_bytes(data.try_into().unwrap()) as u64;
+                self.set_driver_features(u32::from_le_bytes(data.try_into().unwrap()) as u64);
                 self.transitional.as_mut().unwrap().active = true;
             }
             (8, 4) if !self.activated => {
