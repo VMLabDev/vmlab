@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -260,6 +261,17 @@ long proc_read(struct plat_proc *p, int which, void *buf, long cap)
     else
         p->out_fd = -1;
     return -1;
+}
+
+long proc_output_pending(struct plat_proc *p, int which)
+{
+    int fd = which ? p->err_fd : p->out_fd;
+    int bytes = 0;
+    int rc;
+    do {
+        rc = ioctl(fd, FIONREAD, &bytes);
+    } while (rc < 0 && errno == EINTR);
+    return rc == 0 ? bytes : 0;
 }
 
 static void flush_in(struct plat_proc *p)

@@ -889,7 +889,19 @@ pub trait Platform: Sync {
 /// Standard guest→host output pump: read chunks from `src`, respect the
 /// session's credit window, forward as `kind` frames. Returns when the
 /// source ends or the session closes.
-pub fn pump_out(mux: &Mux, id: u32, kind: FrameKind, credit: &Credit, mut src: impl std::io::Read) {
+pub fn pump_out(mux: &Mux, id: u32, kind: FrameKind, credit: &Credit, src: impl std::io::Read) {
+    pump_out_with(credit, src, |bytes| {
+        mux.send_data(kind, id, bytes);
+        true
+    });
+}
+
+/// Like `pump_out`, but the caller can stop forwarding at a frame boundary.
+pub fn pump_out_with(
+    credit: &Credit,
+    mut src: impl std::io::Read,
+    mut send: impl FnMut(&[u8]) -> bool,
+) {
     let mut buf = [0u8; 32 * 1024];
     loop {
         match src.read(&mut buf) {
@@ -898,10 +910,9 @@ pub fn pump_out(mux: &Mux, id: u32, kind: FrameKind, credit: &Credit, mut src: i
                 let mut off = 0;
                 while off < n {
                     let take = credit.take(n - off);
-                    if take == 0 {
+                    if take == 0 || !send(&buf[off..off + take]) {
                         return; // session closed under us
                     }
-                    mux.send_data(kind, id, &buf[off..off + take]);
                     off += take;
                 }
             }
