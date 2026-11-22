@@ -3196,7 +3196,13 @@ mod tests {
         /// moving, which the watchdog must never mistake for one that
         /// stopped.
         slow: bool,
+        /// Bytes served so far from a file named `claims-everything`.
+        endless_served: u64,
     }
+
+    /// Where the mock ends a file named `claims-everything` by an error.
+    const ENDLESS_STOP: u64 = 16 * 1024 * 1024;
+    const ENDLESS_STOPPED: &str = "the mock stopped an endless file";
 
     /// The marker reply [`MockFiles::op`] hands back for a request the
     /// stalled peer never answers; `serve` drops it on the floor.
@@ -3227,6 +3233,7 @@ mod tests {
                     .map(|l| format!("as:{}:{}", l.user, l.elevated))
                     .unwrap_or_else(|| "as:agent".into()),
                 slow: false,
+                endless_served: 0,
             }
         }
 
@@ -3327,6 +3334,27 @@ mod tests {
                     offset,
                     len,
                 } => {
+                    // A file named `claims-everything` never ends: every
+                    // read is a full one, at any offset. The mock stops it
+                    // by an error of its own after `ENDLESS_STOP` bytes, so
+                    // a host that believes it cannot fill the test host.
+                    if self
+                        .handles
+                        .get(&handle)
+                        .is_some_and(|p| p.contains("claims-everything"))
+                    {
+                        self.endless_served += len as u64;
+                        if self.endless_served > ENDLESS_STOP {
+                            return (
+                                Reply::Error {
+                                    code: ErrorCode::Failure,
+                                    msg: ENDLESS_STOPPED.into(),
+                                },
+                                Vec::new(),
+                            );
+                        }
+                        return (Reply::Data, vec![9; len as usize]);
+                    }
                     let store = self.fs.store.lock().unwrap();
                     let Some(file) = self.handles.get(&handle).and_then(|p| store.get(p)) else {
                         return (
@@ -3451,7 +3479,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("growing-hostile") {
+                                    size: if path.contains("claims-everything") {
+                                        u64::MAX
+                                    } else if path.contains("growing-hostile") {
                                         0
                                     } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
@@ -4059,6 +4089,37 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("stat size"));
         assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+    }
+
+    /// The guest answers `stat` with the largest size there is and every
+    /// read with a full chunk. The size is the guest's word, so it bounds
+    /// nothing: the bound is the room the host measured on its own disk, and
+    /// a size past it is refused before a byte is written (guest-agents F7).
+    #[tokio::test]
+    async fn a_guest_cannot_choose_how_much_a_pull_writes() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, b"seed").unwrap();
+        ops.push(&source, "/claims-everything", None).await.unwrap();
+
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/claims-everything", &dest).await.unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!said.contains(ENDLESS_STOPPED), "{said}");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+
+        let dest = work.path().join("dest-file");
+        let err = agent
+            .pull_file("/claims-everything", &dest)
+            .await
+            .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!dest.exists());
     }
 
     /// A directory arrives whole, however many slices the guest streams it
