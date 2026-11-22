@@ -4,14 +4,22 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import shutil
 import tempfile
 import tarfile
 import unittest
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+INSTALL = ROOT / 'install.sh'
+PUBLIC_KEY = ROOT / 'build/release-signing.pub'
+COMMIT = 'a' * 40
+# A throwaway public key: the tests stub cosign, so only its text matters.
+KEY = '''-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfixturefixturefixturefixturefixture
+fixturefixturefixturefixturefixturefixturefixturefixture==
+-----END PUBLIC KEY-----'''
 SPEC = importlib.util.spec_from_file_location('release_assets', ROOT / 'scripts/release-assets.py')
 ASSETS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ASSETS)
@@ -32,15 +40,14 @@ class ReleaseDryRun(unittest.TestCase):
         (self.dist / self.helper).write_text('#!/bin/sh\nexit 2\n')
         for name in ['vmlab-guest-1.2.3.tar.gz', 'vmlab-hv-1.2.3-linux-x86_64.tar.gz']:
             (self.dist / name).write_bytes(b'fixture')
-        self.env = dict(os.environ, GITHUB_SHA='a' * 40, GITHUB_RUN_ID='123',
+        self.env = dict(os.environ,
                         PATH=str(self.bin) + ':' + os.environ['PATH'],
                         FIXTURES=str(self.dist), MARKER=str(self.root / 'executed'),
                         VMLAB_RELEASE_BASE_URL='https://fixture.invalid',
                         VMLAB_INSTALL_DIR=str(self.root / 'installed'),
                         VMLAB_INSECURE_SKIP_SIGNATURE='0',
                         VMLAB_GUEST_DIR=str(self.root / 'guest'))
-        with patch.dict(os.environ, self.env):
-            ASSETS.prepare(self.dist, '1.2.3')
+        self.prepare()
         (self.dist / 'SHA256SUMS.bundle').write_text('offline-signature-stub')
         self.tool('curl', '''#!/bin/sh
 set -eu
@@ -51,21 +58,55 @@ cat "$FIXTURES/$name" > "$3"
         self.tool('cosign', '''#!/bin/sh
 set -eu
 [ "$1" = verify-blob ]
-[ "$2" = --bundle ]
-[ "$4" = --certificate-identity ]
-[ "$5" = https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main ]
-[ "$6" = --certificate-oidc-issuer ]
-[ "$7" = https://token.actions.githubusercontent.com ]
+case "$2" in
+  --bundle)
+    [ "${3##*/}" = SHA256SUMS.bundle ]
+    [ "$4" = --certificate-identity ]
+    [ "$5" = https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main ]
+    [ "$6" = --certificate-oidc-issuer ]
+    [ "$7" = https://token.actions.githubusercontent.com ]
+    [ "${8##*/}" = SHA256SUMS ] ;;
+  --key)
+    [ "$(cat "$3")" = "$EXPECT_KEY" ]
+    [ "$4" = --bundle ]
+    [ "${5##*/}" = SHA256SUMS.key.bundle ]
+    [ "$6" = --insecure-ignore-tlog=true ]
+    [ "${7##*/}" = SHA256SUMS ] ;;
+  *) exit 1 ;;
+esac
+printf '%s\\n' "$2" >> "$COSIGN_LOG"
 [ "${BAD_SIGNATURE:-0}" = 0 ]
 ''')
+        self.env['COSIGN_LOG'] = str(self.root / 'cosign.log')
+        self.env['EXPECT_KEY'] = KEY
+
+    def prepare(self):
+        ASSETS.prepare(self.dist, '1.2.3', COMMIT, 'helios', image='sha256:' + 'b' * 64)
+
+    def key_signed(self):
+        """Turn the fixture into a release that scripts/release-sign.sh signed with a key."""
+        (self.dist / 'SHA256SUMS.bundle').unlink()
+        (self.dist / 'SHA256SUMS.key.bundle').write_text('offline-key-signature-stub')
+
+    def verified_with(self):
+        log = self.root / 'cosign.log'
+        return log.read_text().split() if log.exists() else []
 
     def tool(self, name, body):
         path = self.bin / name
         path.write_text(body)
         path.chmod(0o755)
 
-    def install(self, *args):
-        return subprocess.run(['sh', str(ROOT / 'install.sh'), '--version', '1.2.3',
+    def installer_with_key(self):
+        """install.sh as it is after the operator commits the public half."""
+        text = INSTALL.read_text()
+        self.assertEqual(text.count("\nRELEASE_KEY=''\n"), 1)
+        script = self.root / 'install-with-key.sh'
+        script.write_text(text.replace("\nRELEASE_KEY=''\n", f"\nRELEASE_KEY='{KEY}'\n"))
+        return script
+
+    def install(self, *args, script=None):
+        return subprocess.run(['sh', str(script or INSTALL), '--version', '1.2.3',
                                '--no-fastpath', '--skip-checks', *args],
                               env=self.env, capture_output=True, text=True)
 
@@ -85,8 +126,7 @@ set -eu
         (agent / 'new').write_text('new agent')
         with tarfile.open(self.dist / 'vmlab-guest-1.2.3.tar.gz', 'w:gz') as bundle:
             bundle.add(agent, arcname='agent')
-        with patch.dict(os.environ, self.env):
-            ASSETS.prepare(self.dist, '1.2.3')
+        self.prepare()
 
     def test_guest_marker_allows_upgrade(self):
         self.guest_bundle()
@@ -312,6 +352,17 @@ esac
         data = json.loads((self.dist / 'provenance.json').read_text())
         self.assertEqual(len(data['subject']), 4)
         self.assertEqual(data['predicateType'], 'https://slsa.dev/provenance/v1')
+        # Built on a named host from a named commit, not by a GitHub workflow.
+        builder = data['predicate']['runDetails']['builder']['id']
+        self.assertIn('helios', builder)
+        self.assertIn(COMMIT, builder)
+        self.assertNotIn('.github/workflows', json.dumps(data))
+        definition = data['predicate']['buildDefinition']
+        self.assertEqual(definition['resolvedDependencies'][0]['digest'], {'gitCommit': COMMIT})
+        self.assertEqual(definition['internalParameters'], {'buildImage': 'sha256:' + 'b' * 64})
+        self.assertEqual(ASSETS.verify(self.dist),
+                         {'version': '1.2.3', 'commit': COMMIT, 'builder': builder,
+                          'prerelease': 'false'})
         for line in (self.dist / 'SHA256SUMS').read_text().splitlines():
             digest, name = line.split()
             self.assertEqual(digest, hashlib.sha256((self.dist / name).read_bytes()).hexdigest())
@@ -320,13 +371,178 @@ esac
         for name in [self.asset, self.helper]:
             (self.dist / name).rename(self.root / name)
             with self.assertRaises(ValueError):
-                ASSETS.prepare(self.dist, '1.2.3')
+                ASSETS.prepare(self.dist, '1.2.3', COMMIT, 'helios')
+            with self.assertRaises(ValueError):
+                ASSETS.verify(self.dist)
             (self.root / name).rename(self.dist / name)
+            ASSETS.verify(self.dist)
 
     def test_unsafe_inputs(self):
-        for directory, version in [('/', '1.2.3'), (self.dist, '../escape')]:
+        for directory, version, commit, builder in [
+                ('/', '1.2.3', COMMIT, 'helios'), (self.dist, '../escape', COMMIT, 'helios'),
+                (self.dist, '1.2.3', 'abc123', 'helios'), (self.dist, '1.2.3', COMMIT, 'bad host')]:
             with self.assertRaises(ValueError):
-                ASSETS.prepare(directory, version)
+                ASSETS.prepare(directory, version, commit, builder)
+
+    def test_check_refuses_what_the_manifest_does_not_describe(self):
+        ASSETS.verify(self.dist)
+        guest = self.dist / 'vmlab-guest-1.2.3.tar.gz'
+        guest.write_bytes(b'replaced after the manifest')
+        with self.assertRaisesRegex(ValueError, 'provenance.json does not describe'):
+            ASSETS.verify(self.dist)
+        self.prepare()
+        sums = self.dist / 'SHA256SUMS'
+        sums.write_text(sums.read_text() + '0' * 64 + '  extra-file\n')
+        with self.assertRaisesRegex(ValueError, 'SHA256SUMS does not match'):
+            ASSETS.verify(self.dist)
+        self.prepare()
+        guest.write_bytes(b'')
+        with self.assertRaisesRegex(ValueError, 'empty release asset'):
+            ASSETS.verify(self.dist)
+
+    # ── The two ways of a locally built release (scripts/release-sign.sh) ────
+
+    def test_key_signed_release_is_refused_while_the_switch_is_off(self):
+        self.assertIn("\nRELEASE_KEY=''\n", INSTALL.read_text())
+        self.key_signed()
+        result = self.install('--no-guest')
+        self.refused(result)
+        self.assertIn('has none to verify it with', result.stderr)
+        self.assertEqual(self.verified_with(), [])
+
+    def test_key_signed_release_installs_with_the_committed_key(self):
+        self.key_signed()
+        result = self.install('--no-guest', script=self.installer_with_key())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.verified_with(), ['--key'])
+        self.assertTrue((self.root / 'executed').exists())
+
+    def test_bad_key_signature_never_executes(self):
+        self.key_signed()
+        self.env['BAD_SIGNATURE'] = '1'
+        self.refused(self.install('--no-guest', script=self.installer_with_key()))
+
+    def test_another_key_than_the_committed_one_is_refused(self):
+        self.key_signed()
+        self.env['EXPECT_KEY'] = KEY.replace('MFkw', 'XXXX')
+        self.refused(self.install('--no-guest', script=self.installer_with_key()))
+
+    def test_keyless_releases_still_install_after_the_switch(self):
+        result = self.install('--no-guest', script=self.installer_with_key())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.verified_with(), ['--bundle'])
+
+    def test_release_key_option_verifies_a_test_build(self):
+        self.key_signed()
+        key = self.root / 'test.pub'
+        key.write_text(KEY + '\n')
+        for args in (['--release-key', str(key)], [f'--release-key={key}']):
+            result = self.install('--no-guest', *args)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('not the one of this installer', result.stderr)
+        self.env['VMLAB_RELEASE_KEY'] = str(key)
+        self.assertEqual(self.install('--no-guest').returncode, 0)
+        self.assertEqual(self.verified_with(), ['--key'] * 3)
+
+    def test_release_key_option_never_falls_back_to_keyless(self):
+        key = self.root / 'test.pub'
+        key.write_text(KEY + '\n')
+        result = self.install('--no-guest', '--release-key', str(key))
+        self.refused(result)
+        self.assertIn('no key signature', result.stderr)
+        self.refused(self.install('--no-guest', '--release-key', str(self.root / 'absent.pub')))
+
+    def test_unsigned_release_needs_the_insecure_flag(self):
+        (self.dist / 'SHA256SUMS.bundle').unlink()
+        result = self.install('--no-guest')
+        self.refused(result)
+        self.assertIn('--insecure-skip-signature', result.stderr)
+        result = self.install('--no-guest', '--insecure-skip-signature')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.verified_with(), [])
+
+    def test_installer_key_is_the_committed_public_half(self):
+        embedded = re.search(r"\nRELEASE_KEY='([^']*)'\n", INSTALL.read_text())[1]
+        if PUBLIC_KEY.exists():
+            self.assertEqual(embedded, PUBLIC_KEY.read_text().strip())
+            self.assertIn('BEGIN PUBLIC KEY', embedded)
+        else:
+            self.assertEqual(embedded, '')
+
+    def sign(self, *args, **env):
+        return subprocess.run(['bash', str(ROOT / 'scripts/release-sign.sh'), str(self.dist), *args],
+                              env=dict(self.env, **env), capture_output=True, text=True)
+
+    def signer(self):
+        """A cosign that signs and verifies by contract: the arguments release-sign.sh must give."""
+        self.tool('cosign', '''#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$COSIGN_LOG"
+case "$1" in
+  sign-blob)
+    [ "$2 $3 $4 $5" = "--yes --key env://VMLAB_RELEASE_COSIGN_KEY --tlog-upload=false" ]
+    [ "$6" = --bundle ]
+    [ -n "$VMLAB_RELEASE_COSIGN_KEY" ]
+    [ "${COSIGN_PASSWORD+set}" = set ]
+    printf 'signed %s\\n' "$(sha256sum < "$8")" > "$7" ;;
+  verify-blob)
+    [ "$2" = --key ]
+    [ "$4" = --bundle ]
+    [ "$6" = --insecure-ignore-tlog=true ]
+    [ "$(cat "$3")" = "$EXPECT_KEY" ]
+    [ "$(cat "$5")" = "signed $(sha256sum < "$7")" ] ;;
+  *) exit 1 ;;
+esac
+''')
+        key = self.root / 'release.pub'
+        key.write_text(KEY + '\n')
+        return {'VMLAB_RELEASE_PUBLIC_KEY': str(key), 'VMLAB_RELEASE_COSIGN_KEY': 'private half'}
+
+    def test_sign_none_leaves_the_manifest_alone(self):
+        (self.dist / 'SHA256SUMS.key.bundle').write_text('stale')
+        for args, env in ([['none'], {}], [[], {}], [[], {'VMLAB_RELEASE_SIGNING': 'none'}]):
+            result = self.sign(*args, **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('UNSIGNED', result.stderr)
+            self.assertFalse((self.dist / 'SHA256SUMS.key.bundle').exists())
+            self.assertFalse((self.dist / 'SHA256SUMS.bundle').exists())
+
+    def test_sign_with_a_key_signs_then_verifies(self):
+        env = self.signer()
+        for args, extra in ([['key'], {}], [[], {'VMLAB_RELEASE_SIGNING': 'key'}]):
+            result = self.sign(*args, **env, **extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((self.dist / 'SHA256SUMS.key.bundle').is_file())
+            self.assertFalse((self.dist / 'SHA256SUMS.bundle').exists())
+            self.assertNotIn('private half', result.stdout + result.stderr)
+        commands = [line.split()[0] for line in (self.root / 'cosign.log').read_text().splitlines()]
+        self.assertEqual(commands, ['sign-blob', 'verify-blob'] * 2)
+        # What it wrote is what install.sh takes.
+        result = self.install('--no-guest', script=self.installer_with_key())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_sign_with_a_key_refuses_without_its_halves(self):
+        env = self.signer()
+        for missing in env:
+            result = self.sign('key', **dict(env, **{missing: ''}))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((self.dist / 'SHA256SUMS.key.bundle').exists())
+        # No public half is committed until the operator turns the way on.
+        if not PUBLIC_KEY.exists():
+            result = self.sign('key', VMLAB_RELEASE_COSIGN_KEY='private half')
+            self.assertIn('no public half', result.stderr)
+
+    def test_sign_removes_a_signature_that_the_public_half_rejects(self):
+        env = self.signer()
+        result = self.sign('key', **dict(env, EXPECT_KEY='another public half'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('halves differ', result.stderr)
+        self.assertFalse((self.dist / 'SHA256SUMS.key.bundle').exists())
+
+    def test_sign_refuses_an_unknown_way_and_a_missing_manifest(self):
+        self.assertNotEqual(self.sign('keyless').returncode, 0)
+        (self.dist / 'SHA256SUMS').unlink()
+        self.assertNotEqual(self.sign('none').returncode, 0)
 
 
 if __name__ == '__main__':
