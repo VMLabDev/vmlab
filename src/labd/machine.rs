@@ -56,6 +56,15 @@ use crate::sync::LockRecover;
 /// console; re-exported here because this is where machines produce it.
 pub use crate::status::{MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus};
 
+/// Whether a failed capture reached a backend that could have created artifacts.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotCaptureError {
+    #[error(transparent)]
+    Refused(#[from] anyhow::Error),
+    #[error(transparent)]
+    Attempted(anyhow::Error),
+}
+
 /// Boot reserves only the transition out of Stopped. Offline snapshot work
 /// reserves the power-state check and every disk operation together.
 pub(super) fn snapshot_guard(gate: &Arc<Mutex<()>>, name: &str) -> Result<OwnedMutexGuard<()>> {
@@ -636,7 +645,7 @@ pub trait Machine: Send + Sync + 'static {
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    async fn snapshot(&self, name: &str) -> Result<bool>;
+    async fn snapshot(&self, name: &str) -> Result<bool, SnapshotCaptureError>;
     async fn delete_snapshot(&self, name: &str) -> Result<()>;
 
     /// The artefact identity a snapshot of this machine is only valid

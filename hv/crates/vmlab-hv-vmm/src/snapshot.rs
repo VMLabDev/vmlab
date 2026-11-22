@@ -897,21 +897,24 @@ fn restore(
 // ---- delete ------------------------------------------------------------
 
 /// `snapshot_delete {name}`: remove the internal snapshot from every
-/// writable disk. Missing on any disk is an error naming it; the others are
-/// still cleaned.
+/// writable disk. Report missing entries only if every attempted deletion
+/// succeeded or found nothing, so a caller can safely accept that outcome.
 pub fn delete(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let reg = registry(handle)?;
     let mut first_err = None;
+    let mut missing = None;
     for disk in writable_disks(&reg) {
         let mut image = disk.image.lock();
         if let Err(e) = image.snapshot_delete(name) {
             let err = SnapshotError::from_disk("snapshot_delete", &disk.id, e);
-            if first_err.is_none() {
-                first_err = Some(err);
+            if err.is_not_found() {
+                missing.get_or_insert(err);
+            } else {
+                first_err.get_or_insert(err);
             }
         }
     }
-    match first_err {
+    match first_err.or(missing) {
         Some(err) => Err(err),
         None => Ok(()),
     }

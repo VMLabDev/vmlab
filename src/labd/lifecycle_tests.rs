@@ -2266,7 +2266,7 @@ async fn a_missing_capability_is_refused_as_not_running() {
         assert!(e.contains("dc01: not running"), "{e}");
     };
 
-    refused(m.snapshot("s1").await.expect_err("no snapshots"));
+    refused(m.snapshot("s1").await.expect_err("no snapshots").into());
     refused(
         m.clone()
             .restore(lab, "s1", true)
