@@ -36,8 +36,8 @@ Who the attacker is, per finding:
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
 | F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
-| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
+| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
