@@ -10,6 +10,12 @@
 //! identifier (54), and RFC 3442 classless static routes (121) when the
 //! segment declares `routes {}` — with the default route through the router
 //! appended, since a client given option 121 ignores option 3.
+//!
+//! A guest writes every byte of its frames, so the server takes a client's
+//! identity from the frame and not from the payload alone: a message whose
+//! `chaddr` is not its ethernet source is ignored, a DECLINE quarantines only
+//! the address its client holds and only for one lease time, and an OFFER
+//! holds its address for [`OFFER_HOLD`], the lease proper starting at the ACK.
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -105,6 +111,12 @@ impl DhcpConfig {
     }
 }
 
+/// How long an OFFER keeps its address for a client that has not sent the
+/// REQUEST yet. A DISCOVER costs the pool one address for this long and not
+/// for the whole lease, so addresses nobody confirmed come back by
+/// themselves.
+const OFFER_HOLD: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy)]
 struct Lease {
     ip: Ipv4Addr,
@@ -116,8 +128,11 @@ struct Lease {
 pub struct DhcpServer {
     config: DhcpConfig,
     leases: HashMap<MacAddr, Lease>,
-    /// Addresses quarantined by client DECLINEs (duplicate detection).
-    declined: HashSet<Ipv4Addr>,
+    /// Addresses quarantined by client DECLINEs (duplicate detection), each
+    /// with the time its quarantine ends. Only an address the declining
+    /// client held gets here, and an entry lasts one lease time, so the map
+    /// is no larger than the leases of one lease time.
+    declined: HashMap<Ipv4Addr, Instant>,
 }
 
 /// A parsed inbound BOOTP/DHCP request.
@@ -138,7 +153,7 @@ impl DhcpServer {
         Self {
             config,
             leases: HashMap::new(),
-            declined: HashSet::new(),
+            declined: HashMap::new(),
         }
     }
 
@@ -159,6 +174,18 @@ impl DhcpServer {
             return None;
         }
         let req = parse_bootp(udp.payload())?;
+        // A client speaks for its own NIC only. The segment has no relay
+        // agent, so a `chaddr` that is not the frame's source is one guest
+        // naming another machine: it could release, decline or re-select that
+        // machine's lease, and take one address per invented MAC.
+        if req.chaddr != eth.src_mac() {
+            debug!(
+                src = %eth.src_mac(),
+                chaddr = %req.chaddr,
+                "ignoring DHCP message whose chaddr is not its ethernet source"
+            );
+            return None;
+        }
         self.purge_expired();
         match req.msg_type {
             DHCP_DISCOVER => self.on_discover(&req),
@@ -238,7 +265,11 @@ impl DhcpServer {
             );
             return None;
         };
-        self.grant(req.chaddr, ip);
+        // The offer holds the address only until the REQUEST is due. A
+        // client that already has this address keeps the time it has.
+        if self.lease_of(req.chaddr) != Some(ip) {
+            self.hold(req.chaddr, ip, OFFER_HOLD);
+        }
         debug!(mac = %req.chaddr, %ip, "DHCP offer");
         self.build_reply(req, DHCP_OFFER, Some(ip))
     }
@@ -280,16 +311,26 @@ impl DhcpServer {
         }
     }
 
+    /// Quarantine the address a client declines, for one lease time. A
+    /// client declines only what it holds: a DECLINE with no lease, or one
+    /// that names another address, quarantines nothing.
     fn on_decline(&mut self, req: &BootpRequest) {
-        let declined = self
-            .leases
-            .remove(&req.chaddr)
-            .map(|l| l.ip)
-            .or(req.requested_ip);
-        if let Some(ip) = declined {
-            warn!(mac = %req.chaddr, %ip, "DHCP decline; address quarantined");
-            self.declined.insert(ip);
+        let Some(held) = self.lease_of(req.chaddr) else {
+            debug!(mac = %req.chaddr, "ignoring DHCP decline from a client with no lease");
+            return;
+        };
+        if req.requested_ip.is_some_and(|ip| ip != held) {
+            debug!(
+                mac = %req.chaddr,
+                %held,
+                "ignoring DHCP decline of an address the client does not hold"
+            );
+            return;
         }
+        self.leases.remove(&req.chaddr);
+        warn!(mac = %req.chaddr, ip = %held, "DHCP decline; address quarantined");
+        let until = Instant::now() + Duration::from_secs(u64::from(self.config.lease_secs));
+        self.declined.insert(held, until);
     }
 
     // -- allocation -------------------------------------------------------------
@@ -318,7 +359,7 @@ impl DhcpServer {
             .map(|l| l.ip)
             .chain(self.config.reservations.values().copied())
             .chain(std::iter::once(self.config.gateway))
-            .chain(self.declined.iter().copied())
+            .chain(self.declined.keys().copied())
             .collect();
         self.config.subnet.hosts().find(|h| !taken.contains(h))
     }
@@ -331,18 +372,28 @@ impl DhcpServer {
             && ip != self.config.subnet.broadcast()
             && ip != self.config.gateway
             && !self.config.reservations.values().any(|&r| r == ip)
-            && !self.declined.contains(&ip)
+            && !self.declined.contains_key(&ip)
             && !self.leases.values().any(|l| l.ip == ip && l.expiry > now)
     }
 
     fn grant(&mut self, mac: MacAddr, ip: Ipv4Addr) {
-        let expiry = Instant::now() + Duration::from_secs(u64::from(self.config.lease_secs));
+        self.hold(
+            mac,
+            ip,
+            Duration::from_secs(u64::from(self.config.lease_secs)),
+        );
+    }
+
+    /// Give `ip` to `mac` for `time`, replacing what it held.
+    fn hold(&mut self, mac: MacAddr, ip: Ipv4Addr, time: Duration) {
+        let expiry = Instant::now() + time;
         self.leases.insert(mac, Lease { ip, expiry });
     }
 
     fn purge_expired(&mut self) {
         let now = Instant::now();
         self.leases.retain(|_, l| l.expiry > now);
+        self.declined.retain(|_, until| *until > now);
     }
 
     // -- reply construction -------------------------------------------------------
@@ -853,6 +904,132 @@ mod tests {
         // The declined address is skipped from now on.
         let next = parse_reply(&s.handle(&discover(mac(2))).unwrap());
         assert_eq!(next.yiaddr, Ipv4Addr::new(10, 213, 1, 3));
+    }
+
+    #[test]
+    fn a_quarantine_ends_after_one_lease_time() {
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        let decline = client_frame(
+            mac(1),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &offer.yiaddr.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        s.handle(&decline);
+        let left = s.declined[&offer.yiaddr] - Instant::now();
+        assert!(left <= Duration::from_secs(3600), "quarantine is {left:?}");
+        // Once its time is over the address is offered again.
+        *s.declined.get_mut(&offer.yiaddr).unwrap() = Instant::now();
+        let next = parse_reply(&s.handle(&discover(mac(2))).unwrap());
+        assert_eq!(next.yiaddr, offer.yiaddr);
+    }
+
+    /// `frame` as another NIC would send it: the ethernet source replaced,
+    /// `chaddr` left as the sender wrote it.
+    fn sent_by(mut frame: Vec<u8>, src: MacAddr) -> Vec<u8> {
+        frame[6..12].copy_from_slice(&src.0);
+        frame
+    }
+
+    #[test]
+    fn a_decline_without_a_lease_quarantines_nothing() {
+        let mut s = DhcpServer::new(config());
+        let first = Ipv4Addr::new(10, 213, 1, 2);
+        let decline = client_frame(
+            mac(9),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &first.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&decline).is_none());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(offer.yiaddr, first);
+    }
+
+    #[test]
+    fn a_decline_of_an_address_the_client_does_not_hold_quarantines_nothing() {
+        let mut s = DhcpServer::new(config());
+        let held = parse_reply(&s.handle(&discover(mac(1))).unwrap()).yiaddr;
+        let other = Ipv4Addr::new(10, 213, 1, 3);
+        let decline = client_frame(
+            mac(1),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &other.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&decline).is_none());
+        assert_eq!(s.lease_of(mac(1)), Some(held));
+        let next = parse_reply(&s.handle(&discover(mac(2))).unwrap());
+        assert_eq!(next.yiaddr, other);
+    }
+
+    #[test]
+    fn a_message_that_speaks_for_another_mac_is_ignored() {
+        let mut s = DhcpServer::new(config());
+        let held = parse_reply(&s.handle(&discover(mac(1))).unwrap()).yiaddr;
+        s.handle(&request(mac(1), held)).unwrap();
+
+        // RELEASE, DECLINE and a REQUEST that selects another server, each
+        // with the victim's MAC in `chaddr` and the attacker's on the frame.
+        let release = client_frame(mac(1), DHCP_RELEASE, &[], held, false);
+        assert!(s.handle(&sent_by(release, mac(2))).is_none());
+        let decline = client_frame(
+            mac(1),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &held.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&sent_by(decline, mac(2))).is_none());
+        let elsewhere = client_frame(
+            mac(1),
+            DHCP_REQUEST,
+            &[
+                (OPT_REQUESTED_IP, &held.octets()),
+                (OPT_SERVER_ID, &[192, 168, 0, 1]),
+            ],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&sent_by(elsewhere, mac(2))).is_none());
+        assert_eq!(s.leases(), vec![(mac(1), held)]);
+
+        // Nor does a DISCOVER take an address for a MAC that did not send it.
+        assert!(s.handle(&sent_by(discover(mac(3)), mac(2))).is_none());
+        assert_eq!(s.leases(), vec![(mac(1), held)]);
+        // The address is still usable: nothing was quarantined.
+        let again = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(again.yiaddr, held);
+    }
+
+    #[test]
+    fn an_offer_holds_its_address_briefly_until_the_request() {
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        let hold = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(
+            hold <= Duration::from_secs(60),
+            "an unanswered offer holds its address for {hold:?}"
+        );
+        // The client is still told the full lease time, and gets it on ACK.
+        assert_eq!(offer.opts[&OPT_LEASE_TIME], 3600u32.to_be_bytes().to_vec());
+        s.handle(&request(mac(1), offer.yiaddr)).unwrap();
+        let held = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(held > Duration::from_secs(3500), "lease is {held:?}");
+    }
+
+    #[test]
+    fn a_rediscover_does_not_shorten_a_confirmed_lease() {
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        s.handle(&request(mac(1), offer.yiaddr)).unwrap();
+        s.handle(&discover(mac(1))).unwrap();
+        let held = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(held > Duration::from_secs(3500), "lease is {held:?}");
     }
 
     #[test]
