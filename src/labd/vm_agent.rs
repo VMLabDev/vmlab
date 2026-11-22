@@ -915,6 +915,8 @@ impl AgentHandle {
     }
 
     /// Run to completion, collecting output. `128 + signal` codes on Unix.
+    /// Stdout and stderr together stop at [`EXEC_OUTPUT_LIMIT`]: past it the
+    /// command is ended and the exec is an error.
     pub async fn exec(
         &self,
         argv: Vec<String>,
@@ -937,6 +939,17 @@ impl AgentHandle {
             let ev = tokio::time::timeout_at(deadline, session.recv())
                 .await
                 .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?;
+            if let Some(SessionEvent::Data(b) | SessionEvent::Stderr(b)) = &ev
+                && out.len() + err.len() + b.len() > EXEC_OUTPUT_LIMIT
+            {
+                // Returning drops the session, which closes the channel and
+                // so ends the command in the guest.
+                bail!(
+                    "exec `{display}` wrote more than {} MiB of output, the most a collected \
+                     exec holds; send the output to a file in the guest and copy that",
+                    EXEC_OUTPUT_LIMIT / (1024 * 1024)
+                );
+            }
             match ev {
                 Some(SessionEvent::Data(b)) => out.extend(b),
                 Some(SessionEvent::Stderr(b)) => err.extend(b),
