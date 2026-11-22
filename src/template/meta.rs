@@ -60,6 +60,12 @@ pub struct TemplateMeta {
     pub origin: Option<String>,
     /// Full OCI repository this template publishes to (host/owner/[group/]name).
     pub registry: Option<String>,
+    /// The repository (`host/owner/[group/]name`, no tag) a pull installed
+    /// this version from. `None` for a build or an import. A pull writes it
+    /// from the reference it was given and never from the config blob, so it
+    /// is the one record of who published the entry: `origin` holds a
+    /// build's source too, and `registry` is the publisher's own statement.
+    pub pulled_from: Option<String>,
     /// Hex SHA-256 digest of `disk.qcow2`.
     pub sha256: Option<String>,
     /// Embedded wscript script (full source text) run the first time a VM is
@@ -143,6 +149,20 @@ pub fn variant_disk_rel(name: &str) -> std::path::PathBuf {
 pub const VARIANTS_DIR: &str = "variants";
 
 impl TemplateMeta {
+    /// The repository this version was pulled from, when that is not
+    /// `source` (`host/owner/[group/]name`). `None` for a pull from `source`
+    /// and for a version no pull installed: a build or an import is the
+    /// user's own, and stands for any reference that names it.
+    ///
+    /// The store keys a version by the name and version its config blob
+    /// states, which the publishing repository chooses freely. A registry
+    /// reference is therefore resolved to a version only where this is
+    /// `None`: otherwise one repository could fill the slot another
+    /// reference resolves to.
+    pub fn pulled_from_other(&self, source: &str) -> Option<&str> {
+        self.pulled_from.as_deref().filter(|from| *from != source)
+    }
+
     /// The variant named `name`, if the metadata records one.
     pub fn variant(&self, name: &str) -> Option<&VariantMeta> {
         self.variants.iter().find(|v| v.name == name)
@@ -394,6 +414,9 @@ impl TemplateMeta {
         if let Some(r) = &self.registry {
             let _ = writeln!(out, "  registry = {}", quote(r));
         }
+        if let Some(r) = &self.pulled_from {
+            let _ = writeln!(out, "  pulled_from = {}", quote(r));
+        }
         if let Some(s) = &self.sha256 {
             let _ = writeln!(out, "  sha256 = {}", quote(s));
         }
@@ -631,6 +654,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         .and_then(|s| crate::config::model::AccelMode::parse(&s));
     let origin = r.string("origin").unspan();
     let registry = r.string("registry").unspan();
+    let pulled_from = r.string("pulled_from").unspan();
     let sha256 = r.string("sha256").unspan();
     let first_boot_script = r.string("first_boot_script").unspan();
     let agent_version = r.string("agent_version").unspan();
@@ -667,6 +691,7 @@ fn extract(b: &Block, issues: &mut IssueList) -> Option<TemplateMeta> {
         accel,
         origin,
         registry,
+        pulled_from,
         sha256,
         first_boot_script,
         agent_version,
@@ -925,6 +950,7 @@ login "dev" { user = "dev" }
             created: "2026-06-12T10:20:30.123456Z".parse().unwrap(),
             origin: Some("https://example.com/win11.iso".into()),
             registry: Some("ghcr.io/vmlabdev/vmlab-templates/win11".into()),
+            pulled_from: None,
             sha256: Some("ab".repeat(32)),
             first_boot_script: Some(
                 "use vmlab\nfn main(lab) {\n    let vm = lab.this_vm()\n}\n".into(),
@@ -960,6 +986,7 @@ login "dev" { user = "dev" }
             created: "2026-01-02T03:04:05Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -1350,6 +1377,27 @@ login "dev" { user = "dev" }
         assert_eq!(plain.secure_boot, Some(true));
         assert_eq!(plain.first_boot_script, base.first_boot_script);
         assert!(plain.variants.is_empty());
+    }
+
+    /// `pulled_from` writes only when set and reads back, and only a pull
+    /// from another repository makes a version someone else's.
+    #[test]
+    fn round_trip_pulled_from() {
+        let mut meta = with_variants(Vec::new());
+        assert!(!meta.to_wcl().contains("pulled_from"));
+        assert_eq!(meta.pulled_from_other("ghcr.io/owner/win11"), None);
+        meta.pulled_from = Some("ghcr.io/owner/win11".into());
+        let text = meta.to_wcl();
+        assert!(
+            text.contains("  pulled_from = \"ghcr.io/owner/win11\"\n"),
+            "{text}"
+        );
+        assert_eq!(TemplateMeta::from_wcl(&text, "meta").unwrap(), meta);
+        assert_eq!(meta.pulled_from_other("ghcr.io/owner/win11"), None);
+        assert_eq!(
+            meta.pulled_from_other("ghcr.io/other/win11"),
+            Some("ghcr.io/owner/win11")
+        );
     }
 
     /// `variants_expected` writes only when set and reads back; a file

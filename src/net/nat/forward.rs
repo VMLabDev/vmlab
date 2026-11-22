@@ -69,14 +69,16 @@ impl PortForwarder {
         guest_port: u16,
     ) {
         info!(addr = ?listener.local_addr().ok(), %guest_ip, guest_port, "tcp forward up");
+        let mut errors = crate::net::accept::AcceptErrors::default();
         loop {
             let (mut sock, peer) = match listener.accept().await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!(error = %e, "tcp forward: accept failed");
+                    errors.failed("tcp forward", &e).await;
                     continue;
                 }
             };
+            errors.accepted();
             let engine = engine.clone();
             tokio::spawn(async move {
                 match engine.open_tcp_to_guest(guest_ip, guest_port).await {

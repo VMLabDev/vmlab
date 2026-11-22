@@ -514,8 +514,12 @@ SRC
     tag pulls `latest`. A multi-architecture index with no `--arch` is
     refused, because the store keys templates by architecture. A version the
     store already holds is used as it stands when its disk is the published
-    image, and refused without `--overwrite` when it differs. `--overwrite`
-    is itself refused, before anything is downloaded, while a clone in a
+    image, and refused without `--overwrite` when it differs. A version that
+    was pulled from another repository is refused in both cases, naming that
+    repository: the name and version come from the published metadata, so
+    two repositories can state the same ones, and a registry reference is
+    only ever resolved to a version its own repository installed.
+    `--overwrite` is itself refused, before anything is downloaded, while a clone in a
     registered lab is backed by a disk of that version: the refusal names
     the machines. `vmlab up` and
     `vmlab pull` pull a machine's template on demand, so this verb is for

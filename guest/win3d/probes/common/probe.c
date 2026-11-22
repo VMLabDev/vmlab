@@ -30,6 +30,8 @@ static fact g_facts[128];
 static int g_nfacts;
 static char *g_errors[64];
 static int g_nerrors;
+static char *g_warnings[64];
+static int g_nwarnings;
 static int g_rb_got[PROBE_MARKERS];
 static uint8_t g_rb[PROBE_MARKERS][3];
 
@@ -155,6 +157,18 @@ void probe_error(probe_ctx *ctx, const char *fmt, ...)
     va_end(ap);
     if (g_nerrors < (int)(sizeof g_errors / sizeof g_errors[0]))
         g_errors[g_nerrors++] = _strdup(buf);
+}
+
+void probe_warning(probe_ctx *ctx, const char *fmt, ...)
+{
+    (void)ctx;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (g_nwarnings < (int)(sizeof g_warnings / sizeof g_warnings[0]))
+        g_warnings[g_nwarnings++] = _strdup(buf);
 }
 
 int probe_hr(probe_ctx *ctx, HRESULT hr, const char *what)
@@ -599,6 +613,17 @@ static void write_section(FILE *f, probe_section s)
     fputs(first ? "}" : "\n  }", f);
 }
 
+static void write_strings(FILE *f, char *const *items, int n)
+{
+    fputc('[', f);
+    for (int i = 0; i < n; i++) {
+        char *e = json_escape(items[i]);
+        fprintf(f, "%s\n    %s", i ? "," : "", e);
+        free(e);
+    }
+    fputs(n ? "\n  ]" : "]", f);
+}
+
 static void os_version(char *buf, size_t n)
 {
     typedef LONG(WINAPI * rtl_fn)(OSVERSIONINFOW *);
@@ -686,13 +711,11 @@ int probe_finish(probe_ctx *ctx)
             fputs("\"actual\": null, \"match\": false}", f);
         }
     }
-    fputs("\n    ]\n  },\n  \"errors\": [", f);
-    for (int i = 0; i < g_nerrors; i++) {
-        char *e = json_escape(g_errors[i]);
-        fprintf(f, "%s\n    %s", i ? "," : "", e);
-        free(e);
-    }
-    fputs(g_nerrors ? "\n  ]\n}\n" : "]\n}\n", f);
+    fputs("\n    ]\n  },\n  \"errors\": ", f);
+    write_strings(f, g_errors, g_nerrors);
+    fputs(",\n  \"warnings\": ", f);
+    write_strings(f, g_warnings, g_nwarnings);
+    fputs("\n}\n", f);
     fclose(f);
     free(exe);
     return code;
