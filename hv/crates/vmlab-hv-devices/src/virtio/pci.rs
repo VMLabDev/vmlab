@@ -564,6 +564,15 @@ impl VirtioPciDevice {
         }
     }
 
+    /// Take the driver's feature set. Once a set is accepted (FEATURES_OK,
+    /// or DRIVER_OK from a legacy driver) it is fixed until the next reset,
+    /// and a later write is ignored: the queues and the device run on it.
+    fn set_driver_features(&mut self, features: u64) {
+        if self.negotiated.is_none() {
+            self.driver_features = features;
+        }
+    }
+
     /// Handle a write to `device_status` (VIRTIO 1.2 §2.3-2.4.1).
     fn status_write(&mut self, new: u8) {
         if new == 0 {
@@ -587,19 +596,26 @@ impl VirtioPciDevice {
         if new & device_status::DRIVER_OK != 0 {
             status |= device_status::DRIVER_OK;
         }
-        if new & device_status::FEATURES_OK != 0
-            && self.driver_features & !self.offered_features() == 0
-        {
-            status |= device_status::FEATURES_OK;
-            let negotiated = self.driver_features;
-            self.negotiated = Some(negotiated);
-            self.device.ack_features(negotiated);
+        if new & device_status::FEATURES_OK != 0 {
+            if self.negotiated.is_some() {
+                // The set is fixed until the next reset (VIRTIO 1.2
+                // §3.1.1): the device is not told again.
+                status |= device_status::FEATURES_OK;
+            } else if self.driver_features & !self.offered_features() == 0 {
+                status |= device_status::FEATURES_OK;
+                let negotiated = self.driver_features;
+                self.negotiated = Some(negotiated);
+                self.device.ack_features(negotiated);
+            }
         }
         // An unacceptable feature set leaves FEATURES_OK clear so the
         // driver retries with a subset.
         let activating = status & device_status::DRIVER_OK != 0
             && self.driver_status & device_status::DRIVER_OK == 0;
-        if activating && self.transitional.as_ref().is_some_and(|s| s.active) {
+        if activating
+            && self.negotiated.is_none()
+            && self.transitional.as_ref().is_some_and(|s| s.active)
+        {
             if self.driver_features & !self.offered_features() != 0 {
                 status |= device_status::FAILED;
                 status &= !device_status::DRIVER_OK;
@@ -722,11 +738,11 @@ impl VirtioPciDevice {
         }
         if touches(common::GUEST_FEATURE as usize, 4) && self.guest_feature_select < 2 {
             let half = val32(common::GUEST_FEATURE as usize) as u64;
-            self.driver_features = if self.guest_feature_select == 0 {
+            self.set_driver_features(if self.guest_feature_select == 0 {
                 (self.driver_features & 0xFFFF_FFFF_0000_0000) | half
             } else {
                 (self.driver_features & 0x0000_0000_FFFF_FFFF) | (half << 32)
-            };
+            });
         }
         if touches(common::MSIX_CONFIG as usize, 2) {
             let vector = val16(common::MSIX_CONFIG as usize);
@@ -1989,6 +2005,49 @@ mod tests {
         // The read-only table-size field still reads through (two vectors
         // for one queue plus config, encoded as entries - 1).
         assert_eq!(control(&mut g) & 0x03FF, 1);
+    }
+
+    /// Review F20: a feature write after FEATURES_OK, and the status
+    /// written again, must not give a live device another feature set.
+    #[test]
+    fn features_are_fixed_after_features_ok() {
+        let mut g = Guest::new();
+        g.setup_msix();
+        g.negotiate_and_activate(0);
+        // Bytes 5..13 of the block state are its acknowledged features.
+        let acked = |g: &Guest| g.pci.device().save_state().unwrap()[5..13].to_vec();
+        let first = acked(&g);
+        assert_ne!(first, [0u8; 8]);
+        let status = g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS);
+        assert_eq!(status, 0x0F);
+
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, status);
+
+        assert_eq!(acked(&g), first);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x0F);
+        // The driver reads back the set that is in force.
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        let read_back = g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE);
+        assert_eq!(read_back.to_le_bytes(), first[..4]);
+
+        // Dropping FEATURES_OK without a reset does not reopen negotiation.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F);
+        assert_eq!(acked(&g), first);
+
+        // A reset does: one of the first set's bits alone is accepted.
+        let low = u32::from_le_bytes(first[..4].try_into().unwrap());
+        let one = 1u32 << low.trailing_zeros();
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, one);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 1);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1); // VERSION_1
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(acked(&g), (one as u64).to_le_bytes());
     }
 
     #[test]

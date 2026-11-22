@@ -94,7 +94,7 @@ use super::halt::{self, Halt};
 use super::ignore::{TEMP_PREFIX, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
-use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
+use super::plan::{Inputs, Oversize, State, Volume, Winner, has_moved, reconcile};
 use super::scan::{Skip, guest_locks, guest_walk, host_scan, join_guest, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
 use super::windows::{GuestRun, Learned, Preconditions, prepare_root, set_line_endings};
@@ -830,20 +830,22 @@ async fn run(
     // this process.
     let mut rescan = true;
     // Whether the walk that is owed follows a **break**: nothing was watching
-    // the guest, and it may not even be the same boot. Every (re)open of the
-    // watch is one. An overflow is not — the watch stayed open and the guest
-    // stayed up — so its walk reads a missing path as the deletion it is.
+    // the guest, and it may not even be the same boot. An overflow or an
+    // immediate prune-list reopen still gets a walk, but the guest stayed up
+    // and the walk can carry its deletions.
     // Cleared by a completed pass, like the barrier.
     let mut unwitnessed = true;
     // The watch is being reopened by the syncer itself, on a guest it was
-    // talking to a moment ago — see [`Pending::bears_out`].
-    let mut same_guest = false;
-    let mut bears_out = true;
+    // talking to a moment ago.
+    let mut prune_reopen = false;
     let mut due = true;
     // Guest-side lock files seen and not yet observed gone. The watcher names
     // a path once, at the moment it appears, so a lock held across several
     // passes has to be re-asked about rather than re-reported.
     let mut lock_candidates: BTreeSet<String> = BTreeSet::new();
+    // What the passes have seen at each moved path, so a change no event has
+    // named yet waits out a quiet period exactly once.
+    let mut sighted = Sighted::default();
     // What the marker file at the guest's workspace root currently says, so it
     // is written when the halt changes and not once a pass.
     let mut marker: Option<String> = None;
@@ -978,11 +980,13 @@ async fn run(
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
                     rescan = !std::mem::take(&mut seeded);
-                    unwitnessed = rescan;
-                    bears_out = !std::mem::take(&mut same_guest);
+                    let changed_prune = std::mem::take(&mut prune_reopen);
+                    unwitnessed = rescan && !changed_prune;
                     due = true;
                 }
                 Err(e) => {
+                    // A failed reopen breaks continuity with the old watch.
+                    prune_reopen = false;
                     events.emit(
                         "workspace.deferred",
                         json!({
@@ -1092,9 +1096,9 @@ async fn run(
                         .collect(),
                     rescan,
                     unwitnessed: rescan && unwitnessed,
-                    bears_out: rescan && unwitnessed && bears_out,
                     flush,
                     lock_candidates: &lock_candidates,
+                    sighted: &sighted,
                     resolved: &resolutions,
                     previous_halt: syncer.report().halt,
                     marker: marker.clone(),
@@ -1125,6 +1129,18 @@ async fn run(
                     owed.extend(done.deferred);
                     host_dirty = done.host_deferred;
                     lock_candidates = done.locks;
+                    sighted = done.sighted;
+                    // Found moved with no event behind them: their quiet
+                    // period starts here, and an event that does arrive
+                    // starts it again. The guest's are in flight from now on,
+                    // so they are listed as unsynced below.
+                    let now = Instant::now();
+                    for path in done.found_host {
+                        host_debounce.touch(path, now);
+                    }
+                    for path in done.found_guest {
+                        guest_debounce.touch(path, now);
+                    }
                     look_again = if !done.report.deferred.is_empty() {
                         Some(Instant::now() + LOCK_RETRY)
                     } else {
@@ -1160,12 +1176,10 @@ async fn run(
                     let _ = syncer.served.send(serving);
                     if done.prune != prune {
                         // The rules changed under the syncer, so the guest is
-                        // watching the wrong shape of tree. Reopening is a
-                        // discontinuity, which is what re-establishes
-                        // agreement.
+                        // watching the wrong shape of tree. The new watch
+                        // needs a walk to recover changes across the reopen.
                         prune = done.prune;
-                        guest_watch = None;
-                        same_guest = true;
+                        prune_reopen = guest_watch.take().is_some();
                         continue;
                     }
                 }
@@ -1581,21 +1595,16 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
-    /// The walk follows a **break in the watch** — a new syncer or a reopened
-    /// channel, not an overflow — so an agreed path the guest does not hold is
-    /// an absence nothing saw, never a deletion to carry onto the host
-    /// ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
+    /// The walk follows startup or a channel failure. Agreements it finds
+    /// present are confirmed, and missing paths get the unwitnessed-absence
+    /// policy ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
     unwitnessed: bool,
-    /// That walk may also **bear agreements out**
-    /// ([`Ledger::unconfirmed`]): the guest may have been away and come back,
-    /// so a path it still holds was durably there. Not so where the syncer
-    /// itself reopened the watch for a changed prune list — the same guest,
-    /// seconds later, proves nothing about what a hard stop would keep.
-    bears_out: bool,
     /// A verb is waiting: a walk cannot establish a guest path's quiet period.
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
     lock_candidates: &'a BTreeSet<String>,
+    /// What earlier passes saw at each path that had moved, and since when.
+    sighted: &'a Sighted,
     /// Who wins where, as the developer has already said.
     resolved: &'a BTreeMap<String, Winner>,
     /// Conflicts a deferred comparison cannot clear.
@@ -1603,6 +1612,110 @@ struct Pending<'a> {
     /// What the guest's halt marker currently says, so an unchanged halt does
     /// not rewrite it once a pass.
     marker: Option<String>,
+}
+
+/// What a pass saw at one path that had moved against the ledger, and when it
+/// first saw exactly that.
+#[derive(Debug, Clone)]
+struct Sighting {
+    /// `None` where the side no longer holds the path.
+    state: Option<State>,
+    since: Instant,
+}
+
+/// Each side's moved paths as the passes have seen them.
+///
+/// **The debounce's rule, for a change no event has named yet.** A steady
+/// pass stats every agreed path, so it finds a file that moved whether or not
+/// the watch has reported it — and the report may simply not have arrived:
+/// the loop reads one event a turn, and a pass another path asked for can run
+/// while the event for this one waits in the channel. Deciding such a path at
+/// once would read a file in the middle of being written. So a moved path
+/// with no settled event behind it is decided only once a pass has seen it in
+/// the same state a quiet period earlier, and until then it is deferred and
+/// handed to the debounce like a reported one.
+///
+/// The record is what keeps that from repeating. A path that differs from
+/// the ledger for good and that no action clears — a file the size guard
+/// refuses, say — would otherwise be found afresh by every pass and never
+/// read as still.
+#[derive(Debug, Clone, Default)]
+struct Sighted {
+    host: BTreeMap<String, Sighting>,
+    guest: BTreeMap<String, Sighting>,
+}
+
+/// One side's moved paths this pass, and which of them moved with nothing to
+/// say they have stopped.
+struct Unsettled {
+    /// Every moved path, for the next pass to compare against.
+    sighted: BTreeMap<String, Sighting>,
+    /// The ones to defer: no settled event, not already in flight, and not
+    /// seen in this state a quiet period ago.
+    found: BTreeSet<String>,
+    /// Deferred without a quiet period of their own: gone from under a
+    /// directory that is itself still in one, and decided with it.
+    riding: BTreeSet<String>,
+}
+
+/// Work out one side's [`Unsettled`].
+///
+/// `reported` is what the watch named and the debounce let settle, `waiting`
+/// what is in a quiet period already, and `decided` the paths whose state an
+/// earlier pass has put in front of the developer — a halted path, or one a
+/// resolution names — which a second quiet period would only keep halted for
+/// one pass more.
+///
+/// **A directory's report speaks for what went with it.** A delete expands
+/// through the ledger rather than through the event stream, because the
+/// platforms disagree about whether a removed tree is reported entry by entry.
+/// So a path this side no longer holds, under a directory the watch named, is
+/// reported when that directory is, and waits exactly as long as it does.
+fn unsettled(
+    tree: &BTreeMap<String, State>,
+    ledger: &Ledger,
+    before: &BTreeMap<String, Sighting>,
+    reported: &BTreeSet<String>,
+    waiting: &BTreeSet<String>,
+    decided: &dyn Fn(&str) -> bool,
+    now: Instant,
+) -> Unsettled {
+    let mut out = Unsettled {
+        sighted: BTreeMap::new(),
+        found: BTreeSet::new(),
+        riding: BTreeSet::new(),
+    };
+    let under = |path: &str, dirs: &BTreeSet<String>| {
+        path.match_indices('/')
+            .any(|(end, _)| dirs.contains(&path[..end]))
+    };
+    let paths: BTreeSet<&String> = tree.keys().chain(ledger.entries.keys()).collect();
+    for path in paths {
+        let state = tree.get(path);
+        if !has_moved(state, ledger.entries.get(path)) {
+            continue;
+        }
+        let since = before
+            .get(path)
+            .filter(|seen| seen.state.as_ref() == state)
+            .map(|seen| seen.since);
+        let still = since.is_some_and(|since| now.duration_since(since) >= QUIET);
+        if !still && !reported.contains(path) && !waiting.contains(path) && !decided(path) {
+            if state.is_none() && under(path, waiting) {
+                out.riding.insert(path.clone());
+            } else if !(state.is_none() && under(path, reported)) {
+                out.found.insert(path.clone());
+            }
+        }
+        out.sighted.insert(
+            path.clone(),
+            Sighting {
+                state: state.cloned(),
+                since: since.unwrap_or(now),
+            },
+        );
+    }
+    out
 }
 
 /// What a completed pass tells the loop.
@@ -1618,6 +1731,13 @@ struct Passed {
     host_deferred: BTreeSet<String>,
     /// Guest-side locks still held, to re-ask about next pass.
     locks: BTreeSet<String>,
+    /// Each side's moved paths as this pass saw them.
+    sighted: Sighted,
+    /// Host paths that moved with no settled event: their quiet period starts
+    /// now.
+    found_host: BTreeSet<String>,
+    /// The same on the guest's side.
+    found_guest: BTreeSet<String>,
     /// Resolutions to hand back: their apply failed, so the developer's answer
     /// has not been carried out yet.
     unresolved: BTreeMap<String, Winner>,
@@ -1755,9 +1875,90 @@ async fn pass(
         rehash.extend(skips.iter().map(|skip| skip.path.clone()));
     }
 
+    // The ignore rules live in the tree and change under the syncer. A ledger
+    // path the developer has just ignored is not a delete on either side: it
+    // leaves the ledger and both copies stay where they are.
+    let guest_owned: BTreeSet<String> = ledger
+        .entries
+        .iter()
+        .filter(|(path, agreed)| {
+            ignores
+                .verdict(path, agreed.kind == Kind::Dir)
+                .is_guest_owned()
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+
     // Everything neither side can be read for, plus everything still being
     // written: deferred, never guessed at.
     let mut undecided = pending.in_flight.clone();
+
+    // A path that moved with no settled event behind it is still being
+    // written for all this pass can tell ([`Sighted`]). The walk is left out:
+    // it runs where the events were lost, so there is no report to wait for,
+    // and a flush over one already holds every changed guest path back.
+    let mut sighted = pending.sighted.clone();
+    let (mut found_host, mut found_guest) = (BTreeSet::new(), BTreeSet::new());
+    if !pending.rescan {
+        let now = Instant::now();
+        let unread: BTreeSet<&str> = scan
+            .skipped
+            .iter()
+            .chain(probe.skipped.iter())
+            .map(|skip| skip.path.as_str())
+            .collect();
+        let decided = |path: &str| {
+            pending.resolved.contains_key(path)
+                || ledger.halted.iter().any(|halted| halted == path)
+                || guest_owned.contains(path)
+                || unread.contains(path)
+        };
+        let host = unsettled(
+            &scan.tree,
+            ledger,
+            &pending.sighted.host,
+            pending.host_dirty,
+            &pending.in_flight,
+            &decided,
+            now,
+        );
+        let guest = unsettled(
+            &probe.tree,
+            ledger,
+            &pending.sighted.guest,
+            pending.guest_dirty,
+            &pending.in_flight,
+            &decided,
+            now,
+        );
+        undecided.extend(host.riding);
+        undecided.extend(guest.riding);
+        (found_host, found_guest) = (host.found, guest.found);
+        sighted = Sighted {
+            host: host.sighted,
+            guest: guest.sighted,
+        };
+        let found = found_host.len() + found_guest.len();
+        if found > 0 {
+            events.emit(
+                "workspace.deferred",
+                json!({
+                    "machine": workspace.machine,
+                    "reason": format!(
+                        "{found} path(s) changed with no report from the watch yet, so they wait \
+                         out a quiet period rather than being read while they may still be \
+                         written"
+                    ),
+                    "paths": found_host
+                        .iter()
+                        .chain(found_guest.iter())
+                        .take(REPORTED)
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            undecided.extend(found_host.iter().chain(found_guest.iter()).cloned());
+        }
+    }
     if pending.rescan && pending.flush {
         // An overflow loses the named events that would have kept these
         // paths in the debounce set. A walk finds their current contents,
@@ -1829,6 +2030,11 @@ async fn pass(
         // inside its debounce window counts too: the debounce exists to stop
         // the syncer *reading* a file mid-write, and a lock is never read, only
         // noticed.
+        //
+        // And a lock whose own event has not been drained yet is asked for by
+        // name wherever the mutable set moved, on either side: the pass would
+        // otherwise carry `index` and `HEAD` out from under a commit because
+        // the report of `index.lock` was one turn of the loop behind them.
         let candidates: BTreeSet<String> = pending
             .lock_candidates
             .iter()
@@ -1840,6 +2046,9 @@ async fn pass(
                     .filter(|path| locks::is_lock(path)),
             )
             .cloned()
+            .chain(locks::candidates(
+                sighted.host.keys().chain(sighted.guest.keys()),
+            ))
             .collect();
         held.extend(guest_locks(guest.as_ref(), &workspace.guest_root, &candidates).await);
     }
@@ -1862,26 +2071,12 @@ async fn pass(
         undecided.extend(deferred.iter().cloned());
     }
 
-    // The ignore rules live in the tree and change under the syncer. A ledger
-    // path the developer has just ignored is not a delete on either side: it
-    // leaves the ledger and both copies stay where they are.
-    let guest_owned: BTreeSet<String> = ledger
-        .entries
-        .iter()
-        .filter(|(path, agreed)| {
-            ignores
-                .verdict(path, agreed.kind == Kind::Dir)
-                .is_guest_owned()
-        })
-        .map(|(path, _)| path.clone())
-        .collect();
-
     // The walk after a break is the one look at the guest that can bear an
     // agreement out: a path still there once the watch, or the machine, has
     // been away and come back was durably there. What it finds missing keeps
     // its mark, which is what tells the plan to copy it again (#190).
     let mut bookkeeping = false;
-    if pending.bears_out {
+    if pending.unwitnessed {
         let before = ledger.unconfirmed.len();
         ledger
             .unconfirmed
@@ -2063,7 +2258,18 @@ async fn pass(
     // next pass, which is the sentence a developer who just edited
     // `.vmlabignore` needs most.
     let prune = ignores.prune_list(&scan.pruned);
-    let record_rules = if halt.is_some() {
+    //
+    // So does a pass that left a path the ledger has never held waiting out
+    // its quiet period. A path the new rules bring into scope is exactly
+    // that, it may be the conflict they cause, and it has not been compared
+    // yet — the next pass has to be able to say why it halts.
+    let uncompared = pending
+        .in_flight
+        .iter()
+        .chain(found_host.iter())
+        .chain(found_guest.iter())
+        .any(|path| !ledger.entries.contains_key(path));
+    let record_rules = if halt.is_some() || (rules_changed && uncompared) {
         ledger.ignore_digest.clone()
     } else {
         rules
@@ -2196,6 +2402,9 @@ async fn pass(
         },
         deferred: owed,
         locks: held,
+        sighted,
+        found_host,
+        found_guest,
         unresolved,
         marker: wanted,
         report: Report {
@@ -2429,6 +2638,7 @@ mod tests {
     struct OneFake {
         guest: Arc<FakeGuest>,
         watcher: Arc<FakeWatcher>,
+        before_watch: fn(&FakeGuest, &[String]),
         /// The prune list of every watch that has been opened, in order.
         opens: std::sync::Mutex<Vec<Vec<String>>>,
         /// How many guest writes had already happened when each watch opened.
@@ -2448,6 +2658,7 @@ mod tests {
             Arc::new(OneFake {
                 guest,
                 watcher,
+                before_watch: |_, _| {},
                 opens: std::sync::Mutex::new(Vec::new()),
                 opened_after: std::sync::Mutex::new(Vec::new()),
                 claims: std::sync::Mutex::new(Vec::new()),
@@ -2479,6 +2690,7 @@ mod tests {
             if !matches!(self.guest.get(root), Some(Node::Dir)) {
                 anyhow::bail!("watch root {root}: No such file or directory (os error 2)");
             }
+            (self.before_watch)(&self.guest, &prune);
             self.opens.lock().expect("opens").push(prune);
             self.opened_after
                 .lock()
@@ -2560,9 +2772,9 @@ mod tests {
                 in_flight: BTreeSet::new(),
                 rescan: true,
                 unwitnessed: false,
-                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
                 marker: None,
@@ -2886,9 +3098,9 @@ mod tests {
                 in_flight: BTreeSet::new(),
                 rescan,
                 unwitnessed: false,
-                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
                 marker: None,
@@ -3274,9 +3486,9 @@ mod tests {
             in_flight: BTreeSet::new(),
             rescan: true,
             unwitnessed: false,
-            bears_out: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
+            sighted: &Sighted::default(),
             resolved: &BTreeMap::new(),
             previous_halt: None,
             marker: None,
@@ -3631,6 +3843,43 @@ mod tests {
             sessions.opens()
         );
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn a_guest_delete_across_a_prune_reopen_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let source = dir.path().join("old.rs");
+        std::fs::write(&source, "agreed").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, prune| {
+            if prune.iter().any(|prefix| prefix == "build") {
+                guest.unlink("/src/old.rs");
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(workspace(dir.path(), state.path()), sessions, events)
+            .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans == 1).await,
+            "the initial walk did not finish"
+        );
+        assert_eq!(guest.text("/src/old.rs").as_deref(), Some("agreed"));
+
+        std::fs::write(dir.path().join(".vmlabignore"), "build/\n").unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans >= 2).await,
+            "the walk after the prune reopen did not finish"
+        );
+        syncers.stop("dev01").await;
+        assert!(syncer.report().halt.is_none());
+        assert!(!source.exists(), "the guest deletion must reach the host");
+        assert!(guest.get("/src/old.rs").is_none());
     }
 
     /// The ledger is written where `destroy` will wipe it, and it survives a
@@ -4416,6 +4665,118 @@ mod tests {
             let guest = guest.clone();
             eventually(move || {
                 guest.text("/src/.git/index").as_deref() == Some("a host-side fetch wrote this")
+            })
+            .await
+        };
+        assert!(flowed, "the deferral never cleared");
+        syncers.stop("dev01").await;
+    }
+
+    /// **A path is only reconciled once it has stopped moving**, and that holds
+    /// for a change the watch has not reported yet. A steady pass stats every
+    /// agreed path, so a pass another path asked for finds a guest file that
+    /// is in the middle of being written — its event is still on its way. It
+    /// must not carry that file: the copy would be a torn one, on the
+    /// canonical side. The file waits out a quiet period like a reported one,
+    /// and is carried after it.
+    #[tokio::test]
+    async fn a_guest_change_found_by_the_probe_waits_out_a_quiet_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "whole").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "one").unwrap();
+        let (syncers, guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        let before = events_of(state.path()).len();
+
+        // The guest is writing main.rs, and no event for it has reached the
+        // host: no quiet period has started for it.
+        guest.file("/src/main.rs", "written in the guest", 70);
+        // An unrelated host edit asks for a pass.
+        std::fs::write(dir.path().join("other.rs"), "two").unwrap();
+
+        let landed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || {
+                std::fs::read_to_string(dir.join("main.rs")).unwrap_or_default()
+                    == "written in the guest"
+            })
+            .await
+        };
+        assert!(landed, "the guest's change never reached the host");
+        syncers.stop("dev01").await;
+
+        // The pass the host edit asked for carried the host edit and nothing
+        // else: the guest's file crossed in a later pass, a quiet period on.
+        let synced: Vec<serde_json::Value> = events_of(state.path())
+            .into_iter()
+            .skip(before)
+            .filter(|(name, _)| name == "workspace.synced")
+            .map(|(_, data)| data)
+            .collect();
+        let asked = synced
+            .iter()
+            .find(|data| data["guest_placed"] == 1)
+            .unwrap_or_else(|| panic!("the host edit was never carried: {synced:?}"));
+        assert_eq!(
+            asked["host_placed"], 0,
+            "a guest file with no settled event was carried in the pass another path asked \
+             for: {synced:?}"
+        );
+        assert!(
+            synced.iter().any(|data| data["host_placed"] == 1),
+            "{synced:?}"
+        );
+    }
+
+    /// The same gap, for `.git`: a guest-side lock is known from the watch
+    /// having named it, and a pass can run before that name is drained. The
+    /// pass asks for the lock by name wherever the mutable set moved, so
+    /// `index` does not cross while guest git still holds `index.lock`.
+    #[tokio::test]
+    async fn a_git_lock_found_by_the_probe_defers_the_mutable_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dir.path().join(".git/index"), "agreed").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "code").unwrap();
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/.git/index").await;
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        syncer.pass_now().await.unwrap();
+
+        // Guest-side git takes the lock and rewrites the index. The index's
+        // own event arrives; the lock's has not been drained.
+        guest.file("/src/.git/index.lock", "pid", 600);
+        guest.file("/src/.git/index", "half of a commit", 601);
+        sessions.watcher.mark(".git/index");
+
+        let deferred = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().deferred.iter().any(|p| p == ".git/index")).await
+        };
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/index")).unwrap(),
+            "agreed",
+            "the mutable set crossed while the guest held the lock"
+        );
+        assert!(
+            deferred,
+            "the mutable set was not deferred: {:?}",
+            syncer.report()
+        );
+        assert!(syncer.report().halt.is_none(), "{:?}", syncer.report());
+
+        // git lets go, and what it wrote crosses with no developer in it.
+        guest.unlink("/src/.git/index.lock");
+        let flowed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || {
+                std::fs::read_to_string(dir.join(".git/index")).unwrap_or_default()
+                    == "half of a commit"
             })
             .await
         };
