@@ -1710,11 +1710,24 @@ impl VmInstance {
         *self.qemu.lock().await = None;
     }
 
+    /// What this machine's stop plan is made from, read now.
+    async fn stop_facts(&self, force: bool) -> super::stop_plan::StopFacts {
+        let t = self.template();
+        super::stop_plan::StopFacts {
+            force,
+            agent_channel: t.resolved.agent_transport.has_channel(),
+            agent_answered: self.agent_up_flag().await,
+            agent_sealed: t.agent_version.is_some(),
+            acpi_shutdown: t.resolved.acpi_shutdown,
+            ready_timeout: super::machine::Machine::ready_timeout(self),
+        }
+    }
+
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
     /// powerdown → emulator quit → hard kill, each with a timeout. Which
     /// rungs, and how long each waits, is [`super::stop_plan`]'s.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
-        use super::stop_plan::{Rung, StopFacts, plan_stop};
+        use super::stop_plan::{Rung, plan_stop};
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
             return Ok(()); // already stopped
@@ -1724,15 +1737,7 @@ impl VmInstance {
         if !force && let Err(e) = self.wake(WakeCause::Stop).await {
             tracing::warn!("{e:#}");
         }
-        let t = self.template();
-        let plan = plan_stop(&StopFacts {
-            force,
-            agent_channel: t.resolved.agent_transport.has_channel(),
-            agent_answered: self.agent_up_flag().await,
-            agent_sealed: t.agent_version.is_some(),
-            acpi_shutdown: t.resolved.acpi_shutdown,
-            ready_timeout: super::machine::Machine::ready_timeout(self),
-        });
+        let plan = plan_stop(&self.stop_facts(force).await);
         *self.stop_requested.write().await = true;
         *self.state.write().await = PowerState::Stopping;
         let began = std::time::Instant::now();
@@ -2057,6 +2062,14 @@ impl super::display::DisplayHost for VmInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
+    async fn stop_wait(&self) -> Duration {
+        if self.qemu.lock().await.is_none() {
+            return Duration::ZERO;
+        }
+        use super::stop_plan::{plan_stop, plan_wait};
+        plan_wait(&plan_stop(&self.stop_facts(false).await))
+    }
+
     async fn debug_available(&self) -> bool {
         self.control
             .lock()

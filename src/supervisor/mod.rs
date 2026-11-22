@@ -43,10 +43,31 @@ pub struct Supervisor {
     keepers: keepawake::Keepers,
 }
 
-/// How long a release waits for a lab daemon's teardown before killing it
+/// The least a release waits for a lab daemon's teardown before killing it
 /// and everything it owns. Teardown stops any machine still running, which is
-/// a guest shutdown per machine.
-const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+/// a guest shutdown per machine, so the daemon's `shutdown` reply names how
+/// long its machines' stop ladders may take and [`release_deadline`] waits
+/// that long when it is longer. This floor covers the longest ladder of one
+/// guest that acts on ACPI, for a daemon whose reply names none.
+const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// What a release adds to the stop wait a lab daemon reports: the rest of its
+/// teardown (the workspace syncers, smbd, the global segments, five seconds
+/// for its tasks) and the settle after each kill rung.
+const RELEASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a release waits for the lab daemon that answered `shutdown` with
+/// `reply`: its reported stop wait plus [`RELEASE_MARGIN`], never less than
+/// [`RELEASE_DEADLINE`]. A kill before then is a power cut in the middle of a
+/// guest's shutdown.
+fn release_deadline(reply: Option<&serde_json::Value>) -> std::time::Duration {
+    let reported = reply
+        .and_then(|v| v.get("stop_within_secs"))
+        .and_then(serde_json::Value::as_u64)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_default();
+    RELEASE_DEADLINE.max(reported.saturating_add(RELEASE_MARGIN))
+}
 
 /// How often an adopted lab daemon's process is checked. It is not this
 /// supervisor's child, so there is no exit to wait on.
@@ -620,15 +641,16 @@ impl Supervisor {
         // reaper watching it, so remove the entry here — otherwise it would be
         // stuck in Stopping forever.
         if let Ok(client) = LabClient::connect(&sock).await {
-            let _ = client.send(LabRequest::Shutdown {}).await;
+            let reply = client.send(LabRequest::Shutdown {}).await.ok();
+            let deadline = release_deadline(reply.as_ref());
             // The release is not done until the daemon is: `Shutdown` answers
             // before its teardown runs, and a daemon still tearing down holds
             // the clone disks, the QMP socket and the smbd port that the
             // next `up` of this lab needs.
-            if !self.wait_daemon_gone(name, pid, RELEASE_DEADLINE).await {
+            if !self.wait_daemon_gone(name, pid, deadline).await {
                 tracing::warn!(
                     "lab daemon for {name} did not stop within {}s; killing it",
-                    RELEASE_DEADLINE.as_secs()
+                    deadline.as_secs()
                 );
                 // Only the daemon itself: its pid may name another process
                 // by now.
@@ -919,6 +941,29 @@ mod tests {
             longest.as_secs(),
             super::RELEASE_DEADLINE.as_secs()
         );
+    }
+
+    /// A lab daemon's machines can need longer than the floor: a guest that
+    /// ignores ACPI waits its whole readiness budget for its agent, and the
+    /// waves of a `down` stop one after the other. The release then waits
+    /// what the daemon reports, plus the rest of its teardown. A reply that
+    /// names nothing gets the floor.
+    #[test]
+    fn a_release_waits_out_the_stop_wait_its_daemon_reports() {
+        use super::{RELEASE_DEADLINE, RELEASE_MARGIN, release_deadline};
+        use std::time::Duration;
+        let long = serde_json::json!({ "stop_within_secs": 750 });
+        assert_eq!(
+            release_deadline(Some(&long)),
+            Duration::from_secs(750) + RELEASE_MARGIN
+        );
+        let short = serde_json::json!({ "stop_within_secs": 10 });
+        assert_eq!(release_deadline(Some(&short)), RELEASE_DEADLINE);
+        assert_eq!(
+            release_deadline(Some(&serde_json::json!(true))),
+            RELEASE_DEADLINE
+        );
+        assert_eq!(release_deadline(None), RELEASE_DEADLINE);
     }
 
     /// A pid is reused once its process is gone; the start time is what
