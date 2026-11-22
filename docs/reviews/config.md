@@ -37,8 +37,8 @@ The findings are ranked against these three facts, which the code states:
 | F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments |
 | F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read. **Fixed by card #544.** |
 | F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file |
-| F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file |
-| F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear |
+| F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545) |
+| F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
 | F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address |
 | F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites |
@@ -216,6 +216,17 @@ is refused at launch, because the file format has no escape for one.
   with `var "token" { value = "hunter2-var" secret = true }`. Format the error
   as the CLI does (`format!("{:?}", miette::Report::new(err))`) and assert
   that neither string is in it. Today both are.
+- Fixed in card #545. The source a lab or template file's diagnostic renders
+  from is no longer the file's text. `diagnostic_source` in
+  `src/config/mod.rs` stars out the value of every `password` field and of
+  every `value` beside a `secret` that is not plainly `false`, found by field
+  span in the parsed document. Byte offsets and line breaks are kept, so each
+  label points where it did. A file that does not parse is blanked whole, as
+  the host config is. `load_lab_source`, `load_template_source` and
+  `vmlab validate`'s own error use it. Not covered: a secret that the field
+  refers to and does not hold (a value bound elsewhere in the file), and the diagnostics of
+  profile files and template metadata (`IssueError::diagnostic` in
+  `src/config/block.rs`), which still render from the file's text.
 
 ### F6. `HostConfig`'s `Debug` output holds the PSK (security)
 
@@ -230,6 +241,10 @@ is refused at launch, because the file format has no escape for one.
   (`src/config/host.rs:468`), or add `the_psk_is_hidden_from_debug`:
   parse `host { psk = "sekrit-psk" }` and assert
   `!format!("{host:?}").contains("sekrit-psk")`. Today the assertion fails.
+- Fixed in card #545. `HostConfig::psk` is a `TrunkPsk`, a wrapper whose
+  `Debug` prints `[REDACTED]`, like `AppleSmcOsk`. The supervisor reads the
+  key with `expose()` where it starts the trunk listener and the global
+  segments.
 
 ### F7. `host.subnet_pool` is never read (wrong result)
 

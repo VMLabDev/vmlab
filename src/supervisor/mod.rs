@@ -153,7 +153,8 @@ async fn run_async() -> Result<()> {
     // `host:port` in their segment `connect {}` blocks.
     if let Some(psk) = &host_cfg.psk {
         let bind: std::net::SocketAddr = ([0, 0, 0, 0], host_cfg.trunk_port).into();
-        match global::bind_peer_listener(supervisor.globals.clone(), bind, psk.clone()).await {
+        let psk = psk.expose().to_string();
+        match global::bind_peer_listener(supervisor.globals.clone(), bind, psk).await {
             Ok((_addr, _task)) => {}
             Err(e) => tracing::error!("{e:#}"),
         }
