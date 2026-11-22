@@ -1716,6 +1716,57 @@ mod tests {
         });
     }
 
+    /// CPU time the worker thread has used so far.
+    fn worker_cpu_time(dev: &Console) -> Duration {
+        use std::os::unix::thread::JoinHandleExt;
+        let thread = dev.worker.as_ref().unwrap().as_pthread_t();
+        let mut clock: libc::clockid_t = 0;
+        // SAFETY: the worker is joined only in `Drop`, so the pthread id is
+        // live; `clock` and `ts` are valid out-pointers.
+        let rc = unsafe { libc::pthread_getcpuclockid(thread, &mut clock) };
+        assert_eq!(rc, 0, "pthread_getcpuclockid");
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: as above.
+        let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime");
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    #[test]
+    fn second_client_in_the_backlog_does_not_spin_the_worker() {
+        let mut f = Fixture::new();
+        f.device_ready(8, 4);
+        f.post_ctrl_rx(8);
+        let first = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("PORT_OPEN(2,1)", || {
+            f.ctrl_delivered()
+                .last()
+                .is_some_and(|m| *m == (2, EV_PORT_OPEN, 1, Vec::new()))
+        });
+        // The port is busy, so this one waits in the listener's backlog.
+        let second = UnixStream::connect(&f.agent_sock).unwrap();
+        let before = worker_cpu_time(&f.dev);
+        thread::sleep(Duration::from_millis(300));
+        let used = worker_cpu_time(&f.dev) - before;
+        assert!(
+            used < Duration::from_millis(50),
+            "the worker used {used:?} of CPU in 300 ms with a client in the backlog"
+        );
+
+        // The waiting client is served once the first one leaves.
+        drop(first);
+        f.post_ctrl_rx(9);
+        f.post_ctrl_rx(10);
+        wait_for("PORT_OPEN(2,1) for the second client", || {
+            let got = f.ctrl_delivered();
+            got.len() == 7 && got[6] == (2, EV_PORT_OPEN, 1, Vec::new())
+        });
+        drop(second);
+    }
+
     #[test]
     fn large_scatter_gather_output_survives_partial_socket_writes() {
         let mut f = Fixture::new();
