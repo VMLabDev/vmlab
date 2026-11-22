@@ -37,7 +37,17 @@ pub(crate) fn scripts(meta: &TemplateMeta, trusted: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether `host/repository` is in the trust list: an entry names one
+/// repository exactly, or a namespace when it ends in `/`.
+///
+/// The match is on text, so it holds only for a repository that reaches the
+/// registry as written. One with a `..` segment, or another spelling the
+/// request path would not keep, is trusted by no entry
+/// ([`crate::oci::reference::repository_is_plain`]).
 pub(crate) fn repository_trusted(allowed: &[String], host: &str, repository: &str) -> bool {
+    if !crate::oci::reference::repository_is_plain(repository) {
+        return false;
+    }
     let actual = format!("{host}/{repository}");
     allowed
         .iter()

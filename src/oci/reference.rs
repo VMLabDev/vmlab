@@ -66,6 +66,13 @@ impl Reference {
         if tag.is_empty() {
             bail!("reference `{reference}` has an empty tag");
         }
+        if !repository_is_plain(&repository) {
+            bail!(
+                "reference `{reference}` has an invalid repository `{repository}`: each \
+                 `/`-separated segment is letters, digits, `.`, `_` and `-`, and is not `.` \
+                 or `..`"
+            );
+        }
 
         Ok(Reference {
             host,
@@ -90,6 +97,27 @@ impl Reference {
 /// exactly `localhost`.
 fn looks_like_registry_host(segment: &str) -> bool {
     segment == "localhost" || segment.contains('.') || segment.contains(':')
+}
+
+/// Whether `repository` reaches a registry as the path it is written as.
+///
+/// The repository goes into the request path as text
+/// (`/v2/<repository>/manifests/<tag>`), and the URL parser removes `.` and
+/// `..` segments, their percent-encoded spellings too, reads `\` as `/` and
+/// ends the path at `?` or `#`. With any of those the repository that answers
+/// is not the one the text names, and the text is what the trust list
+/// (`host.trusted_template_repositories`) is matched against. So every
+/// segment is non-empty, holds only ASCII letters, digits, `.`, `_` and `-`,
+/// and is not a dot segment.
+pub(crate) fn repository_is_plain(repository: &str) -> bool {
+    repository.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
 }
 
 /// Render `reference` with `version` as its tag (`host/repository:version`),
