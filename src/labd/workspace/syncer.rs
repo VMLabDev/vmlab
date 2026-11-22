@@ -830,15 +830,14 @@ async fn run(
     // this process.
     let mut rescan = true;
     // Whether the walk that is owed follows a **break**: nothing was watching
-    // the guest, and it may not even be the same boot. Every (re)open of the
-    // watch is one. An overflow is not — the watch stayed open and the guest
-    // stayed up — so its walk reads a missing path as the deletion it is.
+    // the guest, and it may not even be the same boot. An overflow or an
+    // immediate prune-list reopen still gets a walk, but the guest stayed up
+    // and the walk can carry its deletions.
     // Cleared by a completed pass, like the barrier.
     let mut unwitnessed = true;
     // The watch is being reopened by the syncer itself, on a guest it was
-    // talking to a moment ago — see [`Pending::bears_out`].
-    let mut same_guest = false;
-    let mut bears_out = true;
+    // talking to a moment ago.
+    let mut prune_reopen = false;
     let mut due = true;
     // Guest-side lock files seen and not yet observed gone. The watcher names
     // a path once, at the moment it appears, so a lock held across several
@@ -978,11 +977,13 @@ async fn run(
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
                     rescan = !std::mem::take(&mut seeded);
-                    unwitnessed = rescan;
-                    bears_out = !std::mem::take(&mut same_guest);
+                    let changed_prune = std::mem::take(&mut prune_reopen);
+                    unwitnessed = rescan && !changed_prune;
                     due = true;
                 }
                 Err(e) => {
+                    // A failed reopen breaks continuity with the old watch.
+                    prune_reopen = false;
                     events.emit(
                         "workspace.deferred",
                         json!({
@@ -1092,7 +1093,6 @@ async fn run(
                         .collect(),
                     rescan,
                     unwitnessed: rescan && unwitnessed,
-                    bears_out: rescan && unwitnessed && bears_out,
                     flush,
                     lock_candidates: &lock_candidates,
                     resolved: &resolutions,
@@ -1160,12 +1160,10 @@ async fn run(
                     let _ = syncer.served.send(serving);
                     if done.prune != prune {
                         // The rules changed under the syncer, so the guest is
-                        // watching the wrong shape of tree. Reopening is a
-                        // discontinuity, which is what re-establishes
-                        // agreement.
+                        // watching the wrong shape of tree. The new watch
+                        // needs a walk to recover changes across the reopen.
                         prune = done.prune;
-                        guest_watch = None;
-                        same_guest = true;
+                        prune_reopen = guest_watch.take().is_some();
                         continue;
                     }
                 }
@@ -1581,17 +1579,10 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
-    /// The walk follows a **break in the watch** — a new syncer or a reopened
-    /// channel, not an overflow — so an agreed path the guest does not hold is
-    /// an absence nothing saw, never a deletion to carry onto the host
-    /// ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
+    /// The walk follows startup or a channel failure. Agreements it finds
+    /// present are confirmed, and missing paths get the unwitnessed-absence
+    /// policy ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
     unwitnessed: bool,
-    /// That walk may also **bear agreements out**
-    /// ([`Ledger::unconfirmed`]): the guest may have been away and come back,
-    /// so a path it still holds was durably there. Not so where the syncer
-    /// itself reopened the watch for a changed prune list — the same guest,
-    /// seconds later, proves nothing about what a hard stop would keep.
-    bears_out: bool,
     /// A verb is waiting: a walk cannot establish a guest path's quiet period.
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
@@ -1881,7 +1872,7 @@ async fn pass(
     // been away and come back was durably there. What it finds missing keeps
     // its mark, which is what tells the plan to copy it again (#190).
     let mut bookkeeping = false;
-    if pending.bears_out {
+    if pending.unwitnessed {
         let before = ledger.unconfirmed.len();
         ledger
             .unconfirmed
@@ -2429,6 +2420,7 @@ mod tests {
     struct OneFake {
         guest: Arc<FakeGuest>,
         watcher: Arc<FakeWatcher>,
+        before_watch: fn(&FakeGuest, &[String]),
         /// The prune list of every watch that has been opened, in order.
         opens: std::sync::Mutex<Vec<Vec<String>>>,
         /// How many guest writes had already happened when each watch opened.
@@ -2448,6 +2440,7 @@ mod tests {
             Arc::new(OneFake {
                 guest,
                 watcher,
+                before_watch: |_, _| {},
                 opens: std::sync::Mutex::new(Vec::new()),
                 opened_after: std::sync::Mutex::new(Vec::new()),
                 claims: std::sync::Mutex::new(Vec::new()),
@@ -2479,6 +2472,7 @@ mod tests {
             if !matches!(self.guest.get(root), Some(Node::Dir)) {
                 anyhow::bail!("watch root {root}: No such file or directory (os error 2)");
             }
+            (self.before_watch)(&self.guest, &prune);
             self.opens.lock().expect("opens").push(prune);
             self.opened_after
                 .lock()
@@ -2560,7 +2554,6 @@ mod tests {
                 in_flight: BTreeSet::new(),
                 rescan: true,
                 unwitnessed: false,
-                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
@@ -2886,7 +2879,6 @@ mod tests {
                 in_flight: BTreeSet::new(),
                 rescan,
                 unwitnessed: false,
-                bears_out: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
                 resolved: &BTreeMap::new(),
@@ -3274,7 +3266,6 @@ mod tests {
             in_flight: BTreeSet::new(),
             rescan: true,
             unwitnessed: false,
-            bears_out: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
@@ -3631,6 +3622,43 @@ mod tests {
             sessions.opens()
         );
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn a_guest_delete_across_a_prune_reopen_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let source = dir.path().join("old.rs");
+        std::fs::write(&source, "agreed").unwrap();
+
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, prune| {
+            if prune.iter().any(|prefix| prefix == "build") {
+                guest.unlink("/src/old.rs");
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(workspace(dir.path(), state.path()), sessions, events)
+            .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans == 1).await,
+            "the initial walk did not finish"
+        );
+        assert_eq!(guest.text("/src/old.rs").as_deref(), Some("agreed"));
+
+        std::fs::write(dir.path().join(".vmlabignore"), "build/\n").unwrap();
+        assert!(
+            eventually(|| syncer.report().rescans >= 2).await,
+            "the walk after the prune reopen did not finish"
+        );
+        syncers.stop("dev01").await;
+        assert!(syncer.report().halt.is_none());
+        assert!(!source.exists(), "the guest deletion must reach the host");
+        assert!(guest.get("/src/old.rs").is_none());
     }
 
     /// The ledger is written where `destroy` will wipe it, and it survives a
