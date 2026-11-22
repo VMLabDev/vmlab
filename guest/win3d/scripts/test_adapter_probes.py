@@ -63,6 +63,12 @@ class Analyse(unittest.TestCase):
         r = audio.analyse(sine(3, skips=((48000, 768),)), RATE, 997)
         self.assertEqual((r['discontinuities'], r['displaced'], r['shifts'], r['gaps']), (1, 0, 1, 0))
         self.assertAlmostEqual(r['first_shifts'][0]['jump_samples'], 768 % (RATE / 997) - RATE / 997, delta=0.3)
+        self.assertEqual((r['period_shifts'], r['quantum_shifts'], r['other_shifts']), (0, 1, 0))
+        # Two late periods in a row: the phase jumps by 960 frames and stays.
+        r = audio.analyse(sine(3, skips=((48000, -960),)), RATE, 997)
+        self.assertEqual((r['shifts'], r['period_shifts'], r['quantum_shifts'], r['other_shifts']), (1, 1, 0, 0))
+        r = audio.analyse(sine(3, skips=((48000, 100),)), RATE, 997)
+        self.assertEqual((r['shifts'], r['period_shifts'], r['quantum_shifts'], r['other_shifts']), (1, 0, 0, 1))
 
     def test_a_silent_capture_is_an_error(self):
         self.assertEqual(audio.analyse([0] * RATE, RATE, 997)['error'], 'the capture is silent')

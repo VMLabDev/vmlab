@@ -27,8 +27,13 @@ Each discontinuity gets the jump of the sine's phase across it, in samples
              half of the path.
   gaps       silence put in by the host half: vmlab-hv's queue ran empty, or
              the sound server had no buffer from it in time.
-  shifts     the rest: the phase jumps and stays. Frames were lost or
-             repeated on the way, in the sound server or in the capture.
+  shifts     the rest: the phase jumps and stays. A jump that is a whole
+             number of guest periods (10 ms) is counted in `period_shifts`:
+             a stretch of late periods, one next to the other. A jump that is
+             a whole number of host quanta (256 frames) is counted in
+             `quantum_shifts`: frames lost or repeated in the sound server or
+             in the capture. Up to four of either are tried; a jump that is
+             neither is in `other_shifts`.
 
 With --hv-log it also sums the underruns vmlab-hv wrote to the VM's log after
 the byte offset: the pulls of the host's sound server that the VM could not
@@ -49,6 +54,10 @@ import math
 import re
 import sys
 import wave
+
+
+GUEST_PERIOD_MS = 10       # the period of the Windows audio engine
+HOST_QUANTUM_FRAMES = 256  # what vmlab-hv asks the sound server for
 
 
 def analyse(samples, rate, hz):
@@ -135,7 +144,27 @@ def classify(signal, places, gaps, w, rate):
     lengths = {}
     for d in displaced:
         lengths[d['frames']] = lengths.get(d['frames'], 0) + 1
-    return {'displaced': len(displaced), 'shifts': len(shifts),
+    cycle = 2 * math.pi / w
+
+    def whole(jump, frames):
+        """Is the jump what `frames` lost or repeated, one to four times, would make?"""
+        for k in range(1, 5):
+            for sign in (1, -1):
+                miss = (jump - sign * k * frames + cycle / 2) % cycle - cycle / 2
+                if abs(miss) < 0.2:
+                    return True
+        return False
+
+    kinds = {'period_shifts': 0, 'quantum_shifts': 0, 'other_shifts': 0}
+    for shift in shifts:
+        jump = shift['jump_samples']
+        if jump is not None and whole(jump, rate * GUEST_PERIOD_MS // 1000):
+            kinds['period_shifts'] += 1
+        elif jump is not None and whole(jump, HOST_QUANTUM_FRAMES):
+            kinds['quantum_shifts'] += 1
+        else:
+            kinds['other_shifts'] += 1
+    return {'displaced': len(displaced), 'shifts': len(shifts), **kinds,
             'displaced_frames': dict(sorted(lengths.items(), key=lambda kv: -kv[1])[:6]),
             'first_shifts': shifts[:10]}
 
@@ -197,7 +226,8 @@ def main():
     with open(a.out, 'w') as f:
         json.dump(res, f, indent=2)
     print(f"audio: {res.get('signal_seconds', 0)} s of signal, {res.get('discontinuities', '?')} discontinuities "
-          f"({res.get('displaced', '?')} displaced stretches, {res.get('shifts', '?')} shifts), "
+          f"({res.get('displaced', '?')} displaced stretches, {res.get('period_shifts', '?')} period shifts, "
+          f"{res.get('quantum_shifts', '?')} quantum shifts, {res.get('other_shifts', '?')} other), "
           f"{res.get('gaps', '?')} gaps" + (f"; vmlab-hv underruns: {res['hv'].get('underruns')}" if a.hv_log else '')
           + (f"; error: {res['error']}" if res['error'] else ''))
     return 1 if res['error'] else 0

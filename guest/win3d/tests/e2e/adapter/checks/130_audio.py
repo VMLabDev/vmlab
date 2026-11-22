@@ -19,9 +19,10 @@ def judge(report):
     whole = g['signal_seconds'] >= 0.9 * seconds
     ok = whole and g['discontinuities'] == 0 and g['gaps'] == 0
     report.row('audio', 'S1', what, 'pass' if ok else 'fail',
-        f"{g['discontinuities']} discontinuities ({g.get('displaced', '?')} displaced stretches as of a period the "
-        f"guest refilled late, {g.get('shifts', '?')} shifts as of frames lost on the way) and {g['gaps']} silent "
-        f"gaps ({g['gap_seconds'] * 1000:.0f} ms) in "
+        f"{g['discontinuities']} discontinuities and {g['gaps']} silent gaps ({g['gap_seconds'] * 1000:.0f} ms): "
+        f"{g.get('displaced', '?')} stretches and {g.get('period_shifts', '?')} shifts of whole guest periods "
+        f"(the guest refilled late), {g.get('quantum_shifts', '?')} shifts of whole host quanta (frames lost in the "
+        f"sound server or the capture), {g.get('other_shifts', '?')} other; in "
         f"{g['signal_seconds']:.1f} s of a {g['hz']:.0f} Hz sine captured from the VM's host node, of {seconds} s "
         f"played (limits: none, and 90 percent of the tone captured); vmlab-hv logged {hv.get('underruns', '?')} "
         f"underruns with {hv.get('silence_frames', '?')} frames of silence and {hv.get('late_callbacks', '?')} late "
