@@ -37,7 +37,7 @@ Who the attacker is, per finding:
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
 | F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
-| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error |
+| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again |
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
@@ -449,6 +449,25 @@ Who the attacker is, per finding:
   (`getrusage`). Assert it is under 100 ms and that a connection made after
   the first batch timed out still gets the `VMLABTRUNK2` greeting. Today the
   accept loop uses the whole second.
+- Fixed in card #479. `bind_peer_listener` counts the connections that have
+  not finished the handshake in `PreAuth` (`src/supervisor/global.rs`): at
+  most 32 in total and 8 from one address. A connection past a limit is
+  closed at once, with no task and no greeting, and a slot comes back when
+  the handshake ends either way. A refused peer dials again after its redial
+  delay. After a failed `accept` the loop waits 100 ms and logs the first
+  failure of a run only (`AcceptErrors`, `src/net/accept.rs`), and the port
+  forward listener in `src/net/nat/forward.rs` does the same. Tests in
+  `src/supervisor/global.rs`:
+  `silent_connections_do_not_take_the_process_to_its_descriptor_limit` (the
+  proof above, with the 80 connections made by the parent, because they
+  would count against the child's own limit),
+  `a_listener_at_the_descriptor_limit_waits` (a child with three free
+  descriptors, which reaches `EMFILE` under the new limits too),
+  `a_silent_address_holds_only_its_share_of_the_listener`,
+  `silent_connections_are_limited_in_total` and
+  `an_authenticated_connection_gives_its_slot_back`. Not changed: the limits
+  are per address, so an attacker with five addresses still holds all 32
+  slots for as long as it keeps opening connections.
 
 ### F12. A dialed bridge outlives its segment (wrong result)
 
