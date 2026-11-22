@@ -37,7 +37,17 @@ pub(crate) fn scripts(meta: &TemplateMeta, trusted: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether `host/repository` is in the trust list: an entry names one
+/// repository exactly, or a namespace when it ends in `/`.
+///
+/// The match is on text, so it holds only for a repository that reaches the
+/// registry as written. One with a `..` segment, or another spelling the
+/// request path would not keep, is trusted by no entry
+/// ([`crate::oci::reference::repository_is_plain`]).
 pub(crate) fn repository_trusted(allowed: &[String], host: &str, repository: &str) -> bool {
+    if !crate::oci::reference::repository_is_plain(repository) {
+        return false;
+    }
     let actual = format!("{host}/{repository}");
     allowed
         .iter()
@@ -97,6 +107,37 @@ mod tests {
             &defaults,
             "evil.ghcr.io",
             "vmlabdev/vmlab-templates/windows-11"
+        ));
+    }
+
+    /// A namespace entry trusts the repositories under it by name. A `..`
+    /// segment is removed from the request path, so the text under the
+    /// namespace is not the repository that answers (config review F2).
+    #[test]
+    fn a_dot_segment_does_not_inherit_a_namespace_trust() {
+        let allowed = vec!["ghcr.io/vmlabdev/vmlab-templates/".to_string()];
+        for repo in [
+            "vmlabdev/vmlab-templates/../../other/tpl",
+            "vmlabdev/vmlab-templates/./tpl",
+            "vmlabdev/vmlab-templates//tpl",
+            "vmlabdev/vmlab-templates/%2e%2e/%2e%2e/other/tpl",
+            "vmlabdev/vmlab-templates/..\\..\\other\\tpl",
+            "vmlabdev/vmlab-templates/tpl?x",
+            "vmlabdev/vmlab-templates/tpl#x",
+        ] {
+            assert!(!repository_trusted(&allowed, "ghcr.io", repo), "{repo}");
+        }
+        assert!(repository_trusted(
+            &allowed,
+            "ghcr.io",
+            "vmlabdev/vmlab-templates/tpl"
+        ));
+        // An exact entry does not trust an unnormalised spelling of itself.
+        let exact = vec!["ghcr.io/org/../org/template".to_string()];
+        assert!(!repository_trusted(
+            &exact,
+            "ghcr.io",
+            "org/../org/template"
         ));
     }
 
