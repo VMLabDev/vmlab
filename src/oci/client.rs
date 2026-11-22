@@ -2280,6 +2280,8 @@ mod tests {
         manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
         /// Every blob digest PUT, in order — what a push uploaded.
         puts: Mutex<Vec<String>>,
+        /// Every blob digest asked for with GET, in order.
+        gets: Mutex<Vec<String>>,
     }
 
     fn key(repo: &str, id: &str) -> String {
@@ -2292,6 +2294,7 @@ mod tests {
             Ok(self.blobs.lock().unwrap().contains_key(&key(repo, digest)))
         }
         async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+            self.gets.lock().unwrap().push(digest.to_string());
             self.blobs
                 .lock()
                 .unwrap()
@@ -3122,6 +3125,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("mismatch"), "{err}");
+    }
+
+    /// F5 of `docs/reviews/templates-registry.md`: a registry cannot make a
+    /// pull write more than its manifest declares. The manifest says the disk
+    /// is 1 MiB and lists one chunk of 1 MiB of zeros 64 times. In the first
+    /// case each layer states its true size, so the layers sum to 64 MiB and
+    /// the pull stops before it fetches a chunk. In the second each layer
+    /// states 16 KiB, so the sum fits and the pull stops at the first chunk
+    /// that decompresses past what it states.
+    #[tokio::test]
+    async fn a_pull_refuses_more_data_than_its_manifest_declares() {
+        const DECLARED: u64 = 1024 * 1024;
+        const COPIES: usize = 64;
+        for honest_layers in [true, false] {
+            let fake = std::sync::Arc::new(FakeRegistry::default());
+            let work = tempfile::tempdir().unwrap();
+            let tdir = work.path().join("t");
+            make_template(&tdir, &meta("x86_64"), &vec![0u8; DECLARED as usize]);
+            registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .push(
+                    &tdir,
+                    DECLARED,
+                    "x86_64",
+                    &work.path().join("p"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut hostile = arch_manifest(&fake, "3.20").await;
+            assert_eq!(hostile.layers.len(), 1);
+            let chunk = hostile.layers[0].clone();
+            hostile.layers = (0..COPIES)
+                .map(|i| {
+                    let mut layer = chunk.clone();
+                    let ann = layer.annotations.as_mut().unwrap();
+                    ann.insert(annotations::CHUNK_INDEX.to_string(), i.to_string());
+                    if !honest_layers {
+                        ann.insert(
+                            annotations::CHUNK_UNCOMPRESSED_SIZE.to_string(),
+                            (DECLARED / COPIES as u64).to_string(),
+                        );
+                    }
+                    layer
+                })
+                .collect();
+            let ann = hostile.annotations.as_mut().unwrap();
+            assert_eq!(ann[annotations::TOTAL_SIZE], DECLARED.to_string());
+            ann.insert(annotations::CHUNK_COUNT.to_string(), COPIES.to_string());
+            fake.put_manifest(
+                "owner/alpine",
+                "3.20",
+                media_types::OCI_MANIFEST,
+                serde_json::to_vec(&hostile).unwrap(),
+            )
+            .await
+            .unwrap();
+            fake.gets.lock().unwrap().clear();
+
+            let store = TemplateStore::new(work.path().join("store"));
+            let pull_dir = work.path().join("pull");
+            let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .pull(Some("x86_64"), &store, &pull_dir, false)
+                .await
+                .unwrap_err();
+            assert!(store.list().unwrap().is_empty(), "{err:#}");
+
+            let fetched = fake
+                .gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|d| **d == chunk.digest)
+                .count();
+            if honest_layers {
+                assert_eq!(fetched, 0, "chunks fetched before the refusal: {err:#}");
+            }
+            assert!(
+                fetched as u64 * chunk.size <= DECLARED,
+                "{fetched} chunks fetched: {err:#}"
+            );
+            let written = std::fs::metadata(pull_dir.join("staging").join(DISK_FILE))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert!(
+                written <= DECLARED,
+                "{written} bytes assembled for a disk declared as {DECLARED}: {err:#}"
+            );
+        }
     }
 
     #[test]
