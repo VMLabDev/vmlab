@@ -1076,6 +1076,36 @@ mod tests {
         assert!(lab_orphans(&table, &LabIdentity::new("some-other-lab", None)).is_empty());
     }
 
+    /// F5: the lab name is unique only inside one environment. A QEMU of a
+    /// lab of the same name in another vmlab environment (another
+    /// `XDG_RUNTIME_DIR`) has its QMP and serial sockets under that
+    /// environment's runtime directory, and is not this lab's orphan.
+    #[test]
+    fn a_qemu_of_another_runtime_directory_is_not_an_orphan() {
+        let other = crate::paths::lab_runtime_dir_in(Path::new("/run/user/elsewhere/vmlab"), "demo");
+        let other = other.display();
+        let table = vec![
+            (
+                400,
+                format!(
+                    "qemu-system-x86_64\0-name\0vmlab:demo/a\0-machine\0q35\0\
+                     -qmp\0unix:{other}/vms/a/qmp.sock,server=on,wait=off\0\
+                     -chardev\0socket,id=vagent0,path={other}/vms/a/agent.sock,server=on,wait=off\0"
+                )
+                .into_bytes(),
+            ),
+            (
+                401,
+                format!(
+                    "/opt/gpu/bin/qemu-nv\0-name\0vmlab:demo/a\0-machine\0q35\0\
+                     -qmp\0unix:{other}/vms/a/qmp.sock,server=on,wait=off\0"
+                )
+                .into_bytes(),
+            ),
+        ];
+        assert!(lab_orphans(&table, &LabIdentity::new("demo", None)).is_empty());
+    }
+
     /// `lab move` only refuses, so it still counts a process that mentions
     /// the lab's paths.
     #[test]
