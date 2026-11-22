@@ -833,6 +833,21 @@ impl Qcow2Image {
                     // The copied bit is a hint; the refcount is the truth.
                     self.get_refcount(host / self.cluster_size)? == 1
                 };
+                if owned && zero_flag {
+                    // QEMU zeroes an allocated cluster in place: it sets the
+                    // zero flag and keeps the host cluster, whose old bytes
+                    // stay. The write fills the whole host cluster first,
+                    // zeros around the new bytes, and then clears the flag:
+                    // until the entry changes the cluster still reads as
+                    // zeros.
+                    let mut cluster = vec![0u8; self.cluster_size as usize];
+                    cluster[in_off as usize..in_off as usize + take]
+                        .copy_from_slice(&buf[done..done + take]);
+                    self.write_file(host, &cluster)?;
+                    self.set_l2_entry(l2_host, l2_index, host | COPIED_BIT)?;
+                    done += take;
+                    continue;
+                }
                 if owned {
                     if entry & COPIED_BIT == 0 {
                         self.set_l2_entry(l2_host, l2_index, entry | COPIED_BIT)?;
