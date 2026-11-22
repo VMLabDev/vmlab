@@ -547,7 +547,7 @@ impl GlobalSegments {
             crate::paths::runtime_dir().join("global"),
             host.dns_suffix.clone(),
             host.upstream_resolver(),
-            host.psk.clone(),
+            host.psk.as_ref().map(|psk| psk.expose().to_string()),
             events,
         )
     }
