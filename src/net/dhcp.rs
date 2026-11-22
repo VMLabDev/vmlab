@@ -254,6 +254,18 @@ impl DhcpServer {
             .map(|l| l.ip)
     }
 
+    /// Whether `ip` is under a valid lease and `mac` does not hold it: the
+    /// address then has an owner, and it is not `mac`. The gateway checks a
+    /// frame's source against this (review F9). An honest frame costs one
+    /// lookup; only a mismatch scans the table.
+    pub fn leased_to_another(&self, ip: Ipv4Addr, mac: MacAddr) -> bool {
+        if self.lease_of(mac) == Some(ip) {
+            return false;
+        }
+        let now = Instant::now();
+        self.leases.values().any(|l| l.ip == ip && l.expiry > now)
+    }
+
     // -- message handling -----------------------------------------------------
 
     fn on_discover(&mut self, req: &BootpRequest) -> Option<Vec<u8>> {
