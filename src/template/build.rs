@@ -4384,7 +4384,9 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let host_file = tmp.path().join("host-file.qcow2");
         qimg::create_blank(&host_file, 16 << 20).await.unwrap();
         let source = tmp.path().join("source.qcow2");
-        qimg::create_linked_clone(&host_file, &source).await.unwrap();
+        qimg::create_linked_clone(&host_file, &source)
+            .await
+            .unwrap();
         let working = tmp.path().join("disk0.qcow2");
 
         let err = super::seed_working_disk(&source, true, &working)
