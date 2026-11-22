@@ -702,13 +702,14 @@ impl LabRuntime {
     /// Abort the download `machine` is waiting on; false when it isn't
     /// downloading (queued but not started, already finished, or never
     /// declared). The ledger keeps the job pending, so a later `up`/`pull`
-    /// retries from scratch — chunks already fetched live in the store's
-    /// `.oci-pull` work dir and are cleaned up by the next successful pull.
+    /// retries from scratch — chunks already fetched live in the pull's own
+    /// work dir under the store's `.oci-pull`, which goes with the pull.
     ///
     /// Cancelling only interrupts the download, and takes down every machine
     /// sharing it. The final assemble+install runs on a blocking thread that
-    /// cannot be interrupted, so a cancel that lands during install still
-    /// leaves a fully verified template behind.
+    /// cannot be interrupted and that holds the work dir until it ends, so a
+    /// cancel that lands during install still leaves a fully verified
+    /// template behind.
     pub fn cancel_pull(&self, machine: &str) -> bool {
         let ledger = self.pulls.lock_recover();
         match ledger.cancel(machine) {
