@@ -480,6 +480,14 @@ Not read:
 - Test: in `guest/agent/src/unix/mod.rs`, next to the path resolver test at
   line 1453: open a file session on `container_platform`, send
   `Op::Realpath { path: "/srv/link" }`, and assert `/etc/sentinel`.
+- Fixed in card #525. `realpath` in a session whose paths are resolved inside
+  a root answers the resolved path without that root in front
+  (`seen_from` in `guest/agent/src/fileops.rs`), so the answer is good for a
+  later request. The test is
+  `realpath_in_a_container_answers_a_container_path` in
+  `guest/agent/src/unix/mod.rs`. It fails before the fix (the answer was
+  `<tempdir>/rootfs/etc/sentinel`) and passes after it. Not fixed here: the
+  failure messages of the file operations still name the micro-VM path.
 
 ### F14. A tail or event-log stream damages a UTF-8 character that crosses two frames
 

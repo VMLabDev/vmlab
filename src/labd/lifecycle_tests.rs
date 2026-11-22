@@ -162,18 +162,15 @@ impl LabServices for TestLab {
 
     async fn ensure_shares(&self) {}
 
-    async fn attach_nic(
+    async fn attach_nics(
         &self,
-        _segment: &str,
-        sock: &std::path::Path,
-        _mac: crate::config::model::MacAddr,
-        _isolated: bool,
-        _tap_ok: bool,
-        _framing: crate::net::framing::FramingMode,
-    ) -> anyhow::Result<crate::net::fastpath::NicAttachment> {
-        Ok(crate::net::fastpath::NicAttachment::Stream {
-            sock: sock.to_path_buf(),
-        })
+        machine: &dyn Machine,
+    ) -> anyhow::Result<Vec<crate::net::fastpath::NicAttachment>> {
+        Ok((0..machine.nics().len())
+            .map(|i| crate::net::fastpath::NicAttachment::Stream {
+                sock: machine.nic_sock(i),
+            })
+            .collect())
     }
 
     async fn before_resume(&self, machine: &str) -> anyhow::Result<()> {
