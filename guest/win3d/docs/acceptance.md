@@ -866,6 +866,8 @@ Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: N
 post-fix baseline and the remaining follow-ups.
 [C412](acceptance/C412.md) records the ATI1 texture creation fix of its
 draft A1 and the counts of both programs that crashed there.
+[C413](acceptance/C413.md) traces the window styles of its draft A3 to
+the Windows runtime and repeats them without Win3D.
 
 Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
 Windows 11 tables above. Counts below are failed assertions, including
