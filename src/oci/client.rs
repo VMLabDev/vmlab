@@ -3064,7 +3064,10 @@ mod tests {
             )
             .await
             .expect_err("a config blob naming another digest is refused");
-        assert!(format!("{err:#}").contains("config blob records"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("config blob records"),
+            "{err:#}"
+        );
         assert_eq!(downloads, 0, "refused before a chunk is fetched");
         assert!(store.list().unwrap().is_empty());
     }
