@@ -23,8 +23,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 | F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on (fixed in #406) |
 | F7 | wrong result | A capture that failed leaves a pending entry that a running vmlab-hv machine, or any container, cannot clear |
 | F8 | wrong result | A failed vmlab-hv save leaves the snapshot on the earlier disks and the vmstate clusters in the image (fixed in #407) |
-| F9 | wrong result | A vmlab-hv process killed during a load leaves its rollback checkpoint on every disk for good |
-| F10 | wrong result | An offline snapshot does not hold the UEFI variables or the TPM state |
+| F9 | wrong result | A vmlab-hv process killed during a load leaves its rollback checkpoint on every disk for good (fixed in #421) |
+| F10 | wrong result | An offline snapshot does not hold the UEFI variables or the TPM state (fixed in #437) |
 | F11 | wrong result | The micro-VM's ACPI PM1a block is in no snapshot section |
 
 ### F1. Offline snapshot operations do not exclude a start (data loss)
@@ -254,6 +254,9 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F9. A rollback checkpoint outlives a killed load (wrong result)
 
+- Fixed in #421. Startup removes rollback checkpoints from each writable disk
+  before starting the guest. New checkpoints use a reserved name prefix.
+  Older checkpoints share the user snapshot namespace and are left in place.
 - Where: `hv/crates/vmlab-hv-vmm/src/snapshot.rs:627-664`
   (`load_checkpoint_name`) and `:684-718`.
 - Why it is a fault: every load first saves the running machine as
@@ -273,6 +276,11 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F10. An offline snapshot holds the disks only (wrong result)
 
+- Fixed in #437. An offline capture copies `OVMF_VARS.fd` and `tpm-state/`
+  into `snapshot-state/snap-<name>/` in the VM's directory, an offline restore
+  puts them back after the disks, and a delete removes the copy. A snapshot
+  taken before the fix has no copy, and a restore of it leaves both alone.
+  PRD §7.3 now says what an offline snapshot holds.
 - Where: `src/labd/vm.rs:1826-1828` and `:2641-2668`
   (`snapshot_offline_disks`), `:1889-1891`, and the files the capture leaves
   out: `ovmf_vars()` (`:857`, `:1315-1317`) and `tpm_state()` (`:244`).

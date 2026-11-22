@@ -62,8 +62,7 @@ const PROBE_WINDOW: usize = 32;
 /// content).
 type Content = (String, Option<String>);
 
-/// A path neither direction may touch, and why. Always reported: this is the
-/// one thing a syncer must never do quietly.
+/// A reported path the syncer declined to process, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skip {
     pub path: String,
@@ -89,6 +88,9 @@ pub struct HostScan {
     /// a rule matching at a depth its own text does not name.
     pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
+    /// Names outside the UTF-8 path space. Their escaped labels are for
+    /// reporting only and can coincide with valid UTF-8 paths.
+    pub unrepresentable: Vec<Skip>,
     /// Rule files whose rules were refused — a `.gitignore` or `.vmlabignore`
     /// that is a symlink. Reported like a skip, and apart from
     /// [`skipped`](HostScan::skipped) because the path itself is still an
@@ -132,8 +134,15 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
             .with_context(|| format!("reading directory {}", here.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("reading directory {}", here.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = join_rel(&dir, &name);
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                scan.unrepresentable.push(Skip {
+                    path: format!("{:?}", Path::new(&dir).join(&name)),
+                    why: "host: name is not UTF-8".into(),
+                });
+                continue;
+            };
+            let rel = join_rel(&dir, name);
             let path = entry.path();
             // Never followed, so a link is an entry to record rather than a
             // directory to descend.
@@ -761,6 +770,35 @@ mod tests {
         assert_eq!(scan.skipped[0].path, "build.sock");
         assert!(scan.skipped[0].to_string().contains("build.sock"));
         assert!(scan.tree.contains_key("src/main.rs"));
+    }
+
+    /// A directory or a FIFO named like a rule file holds no rules, and it
+    /// must not stop the scan: a guest makes one with `mkdir`, it syncs to the
+    /// host, and a scan that failed on it would fail every pass from then on
+    /// (review labd-sync F9). The name is a named skip, the directory still
+    /// syncs as a directory, and the regular rule file beside it applies.
+    #[test]
+    fn a_rule_file_that_is_not_a_file_is_a_named_skip() {
+        let dir = workspace(&[
+            (".gitignore/inner.txt", "x"),
+            (".vmlabignore", "target/\n"),
+            ("target/out", "o"),
+            ("src/main.rs", "y"),
+        ]);
+        let fifo = dir.path().join("src/.vmlabignore");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (scan, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+
+        assert_eq!(scan.tree[".gitignore"].kind, Kind::Dir);
+        assert!(scan.tree.contains_key(".gitignore/inner.txt"));
+        assert!(scan.tree.contains_key("src/main.rs"));
+        assert!(!scan.tree.contains_key("target/out"));
+        assert_eq!(ignores.prune_list(&[]), vec!["target".to_string()]);
+        let refused: Vec<&str> = scan.refused_rules.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(refused, vec![".gitignore", "src/.vmlabignore"]);
+        assert!(scan.refused_rules[0].why.contains("directory"));
+        assert!(scan.refused_rules[1].why.contains("not a regular file"));
     }
 
     /// The pre-filter's whole job: a path whose own recorded pair still

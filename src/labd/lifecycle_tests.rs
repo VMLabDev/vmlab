@@ -2223,6 +2223,66 @@ async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
     }
 }
 
+/// An offline snapshot is the whole powered-off machine: the disks, the UEFI
+/// variable store and the TPM's permanent state. A restore that rewound the
+/// disks alone would leave boot entries, enrolled keys and whatever the guest
+/// sealed to the TPM at the present, against a disk from the past.
+#[tokio::test]
+async fn an_offline_restore_returns_the_firmware_variables() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (vm, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    qimg::create_blank(&vm.dirs.primary_disk(), 1 << 20)
+        .await
+        .unwrap();
+    let vars = vm.dirs.ovmf_vars();
+    let tpm = vm.dirs.tpm_state();
+    let permall = tpm.join("tpm2-00.permall");
+    std::fs::write(&vars, b"vars at capture").unwrap();
+    std::fs::create_dir_all(&tpm).unwrap();
+    std::fs::write(&permall, b"tpm at capture").unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let machine: Arc<dyn Machine> = vm.clone();
+    assert!(!machine.snapshot("cold").await.expect("offline capture"));
+
+    // What a boot after the capture does: the guest rewrites a variable,
+    // re-seals to the TPM, and leaves a file the capture never saw.
+    std::fs::write(&vars, b"vars after capture").unwrap();
+    std::fs::write(&permall, b"tpm after capture").unwrap();
+    std::fs::write(tpm.join("later"), b"made after capture").unwrap();
+
+    machine
+        .clone()
+        .restore(lab.clone(), "cold", false)
+        .await
+        .expect("offline restore");
+    assert_eq!(std::fs::read(&vars).unwrap(), b"vars at capture");
+    assert_eq!(std::fs::read(&permall).unwrap(), b"tpm at capture");
+    assert!(
+        !tpm.join("later").exists(),
+        "the TPM state is replaced whole"
+    );
+
+    // A second restore gives the same answer: the capture is not consumed.
+    std::fs::write(&vars, b"vars after restore").unwrap();
+    machine
+        .clone()
+        .restore(lab, "cold", false)
+        .await
+        .expect("second offline restore");
+    assert_eq!(std::fs::read(&vars).unwrap(), b"vars at capture");
+
+    machine.delete_snapshot("cold").await.expect("delete");
+    assert!(
+        !vm.dirs.snapshot_state().join("snap-cold").exists(),
+        "deleting the snapshot deletes what it held beside the disks"
+    );
+}
+
 /// A machine whose hypervisor reports no snapshots capability — the fake's
 /// default — reports exactly what a stopped one does rather than inventing a
 /// result: the honest failure that keeps what a snapshot does to a guest

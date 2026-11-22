@@ -51,9 +51,9 @@ depends on what a real guest or agent does, the finding says so.
 | F6 (fixed, card #418) | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
 | F7 | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
 | F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
-| F9 | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
+| F9 (fixed, card #434) | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
 | F10 | A host file name that is not UTF-8 is trouble on every pass, and refuses every capture | Wrong result |
-| F11 | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
+| F11 (fixed, card #435) | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
 
 ### F1. A failed guest `readdir` during a walk deletes host files
 
@@ -360,6 +360,17 @@ and the ledger no longer has it.
 
 ### F9. A directory named like a rule file fails every pass
 
+**Fixed in #434.** `read_rule_file` reads a regular file only. A rule-file name
+that is a directory, a FIFO, a socket or a device is refused by name, like the
+symlink of F2: its rules do not apply, the pass names it in the skipped list
+and in a `workspace.skipped` event, and the scan goes on. A directory still
+syncs as a directory. The open does not block and the opened handle is checked
+again, so a FIFO that replaces the file is not waited on. A regular rule file
+that cannot be read is still an error. The tests are
+`a_rule_file_that_is_not_a_file_is_a_named_skip` (scan) and
+`a_directory_named_like_a_rule_file_is_refused_by_name` (ignore rules). The
+text below describes the code before the fix.
+
 **Where.** `src/labd/workspace/ignore.rs:169-173`,
 `src/labd/workspace/scan.rs:115`.
 
@@ -381,6 +392,9 @@ hand.
 
 ### F10. A host file name that is not UTF-8 is trouble on every pass
 
+**Fixed in #436.** The host scan reports the escaped filename as a
+skip and leaves the entry out of reconciliation.
+
 **Where.** `src/labd/workspace/scan.rs:125`.
 
 **Why it is a fault.** The scan turns each name into a `String` with
@@ -400,6 +414,14 @@ a row report `1 workspace actions failed: caf�.txt: No such file or directory`
 **How bad.** Wrong result.
 
 ### F11. A directory left standing comes back on the side that deleted it
+
+**Fixed in #435.** The ledger records each directory a removal left standing,
+with the side that kept it (`left_standing`). Reconciliation does not read such
+a directory as created: it makes it again only when a synced path has to land
+under it. The record ends when the keeping side drops the directory too, or
+when both sides hold it. A steady-state pass asks the guest about each recorded
+path by name, so a guest that kept the directory is seen without a walk. A
+re-seed starts from a new ledger and so drops the records.
 
 **Where.** `src/labd/workspace/apply.rs:278-281`.
 

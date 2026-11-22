@@ -35,9 +35,11 @@ rutabaga reports the capset ID.
 
 The process inherits the launcher's environment unchanged. This includes
 Vulkan ICD/loader settings and the PCI filter layer supplied by vmlab. The
-hypervisor does not translate `qemu_env` or choose a replacement ICD. The
-vmlab launcher must apply the selected host GPU's environment itself, including
-`RENDER_SERVER_EXEC_PATH` when a patched virglrenderer render server is needed.
+hypervisor does not translate `qemu_env` or choose a replacement ICD. vmlab
+does not pass a host GPU's `qemu_env` either (card #447): the patched
+virglrenderer render server is the bundle's, which the bundle's launcher names
+in `RENDER_SERVER_EXEC_PATH` unless the inherited environment already does.
+vmlab warns when a Venus VM would start any other render server.
 
 ## Host dependencies
 

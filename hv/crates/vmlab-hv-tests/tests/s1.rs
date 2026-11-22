@@ -222,6 +222,138 @@ fn snapshot_disk_integrity() {
     snapshot_roundtrip(false, true);
 }
 
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn a_new_process_removes_a_stale_rollback_checkpoint() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::time::Instant;
+    use vmlab_disk::ops::snapshot_list;
+    use vmlab_hv_proto::client::Client;
+    use vmlab_hv_tests::process::ManagedChild;
+
+    let assets = probe_assets();
+    if let Some(reason) = assets.skip_reason() {
+        assert!(
+            std::env::var_os("VMLAB_REQUIRE_KVM").is_none(),
+            "cannot run killed-load proof: {reason}"
+        );
+        eprintln!("skipping S1: {reason}");
+        return;
+    }
+    let mut spec = MachineSpec::idle("s1-killed-load");
+    spec.paused = true;
+    let mut guest = vmlab_hv_tests::launch(&spec, &assets);
+    let disk = guest.dir().join("scratch.qcow2");
+    let control = guest.dir().join("control.sock");
+    assert!(matches!(
+        guest
+            .control
+            .call(Ctrl::SnapshotSave {
+                name: "saved".into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    // A name of the checkpoint format before #421: a user may hold it.
+    const LEGACY: &str = "vmlab-hv-rollback-1-0";
+    assert!(matches!(
+        guest
+            .control
+            .call(Ctrl::SnapshotSave {
+                name: LEGACY.into()
+            })
+            .unwrap(),
+        Outcome::Ok { .. }
+    ));
+    assert!(
+        !matches!(
+            guest
+                .control
+                .call(Ctrl::SnapshotSave {
+                    name: "vmlab-hv-rollback-:1-0".into()
+                })
+                .unwrap(),
+            Outcome::Ok { .. }
+        ),
+        "a save under the reserved checkpoint prefix must be refused"
+    );
+    let is_checkpoint = |name: &str| name.starts_with("vmlab-hv-rollback-") && name != LEGACY;
+    let mut loader = Client::connect(control).unwrap();
+    let load = std::thread::spawn(move || {
+        loader.call(Ctrl::SnapshotLoad {
+            name: "saved".into(),
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if snapshot_list(&disk)
+            .is_ok_and(|entries| entries.iter().any(|entry| is_checkpoint(&entry.name)))
+        {
+            guest.child.kill().unwrap();
+            break;
+        }
+        assert!(
+            !load.is_finished(),
+            "load ended before the checkpoint was observed"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "rollback checkpoint never appeared"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(guest.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert!(load.join().unwrap().is_err(), "load replied before SIGKILL");
+    assert!(
+        snapshot_list(&disk)
+            .unwrap()
+            .iter()
+            .any(|entry| is_checkpoint(&entry.name)),
+        "the killed process left no rollback checkpoint"
+    );
+
+    std::fs::remove_file(&guest.ctl_sock).unwrap();
+    std::fs::remove_file(&guest.agent_sock).unwrap();
+    let control = guest.dir().join("restart.sock");
+    // The original Guest still holds its VM permit and temporary directory.
+    let mut restarted = ManagedChild::helper(
+        Command::new(vmlab_hv_tests::hv_binary())
+            .arg("--machine")
+            .arg(guest.dir().join("machine.json"))
+            .arg("--control")
+            .arg(&control)
+            .arg("--paused"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut client = loop {
+        if let Ok(client) = Client::connect(&control) {
+            break client;
+        }
+        assert!(
+            restarted.try_wait().unwrap().is_none(),
+            "restart exited before serving control"
+        );
+        assert!(Instant::now() < deadline, "restart never served control");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(matches!(
+        client.call(Ctrl::Quit).unwrap(),
+        Outcome::Ok { .. }
+    ));
+    assert!(restarted.wait().unwrap().success());
+    let entries = snapshot_list(&disk).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["saved", LEGACY],
+        "restart must remove the rollback checkpoint and keep both user snapshots"
+    );
+}
+
 fn guest_seconds(agent: &mut AgentClient) -> i64 {
     let out = agent
         .exec(&[BUSYBOX, "date", "+%s"], Duration::from_secs(15))

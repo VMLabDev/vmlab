@@ -230,7 +230,8 @@ staying ignored. The floor covers the syncer's own scratch names and
 `.vmlabignore` that is a symlink is never read as rules, wherever it points:
 the link syncs as a link, its rules do not apply, and `vmlab dev sync status`
 names it among the skipped paths. Make it a regular file to have its rules
-apply.
+apply. A directory with one of those names is named the same way: it syncs as
+a directory and holds no rules.
 DOC
 
   p <<'DOC'

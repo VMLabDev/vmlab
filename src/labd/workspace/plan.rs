@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ledger::{Agreed, Kind, Ledger, Side};
+use super::ledger::{Agreed, Keeper, Kind, Ledger, Side};
 
 /// What one side holds at one path right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -658,7 +658,11 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
         .keys()
         .chain(inputs.guest.keys())
         .chain(inputs.ledger.entries.keys())
+        .chain(inputs.ledger.left_standing.keys())
         .collect();
+    // Directories left standing that this pass found still standing, and the
+    // action that would make each again on the side that deleted it.
+    let mut standing: Vec<Action> = Vec::new();
 
     // Before anything is decided about them: a guest that folds case cannot
     // hold `Foo.cs` and `foo.cs` apart, and the second write would land on the
@@ -697,10 +701,34 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
         // Neither side has anything left: the agreement has nothing to be
         // about any more.
         if host.is_none() && guest.is_none() {
-            if was.is_some() {
+            if was.is_some() || inputs.ledger.left_standing.contains_key(path) {
                 plan.forget.push(path.clone());
             }
             continue;
+        }
+
+        // A directory one side deleted and the other could not drop, still
+        // exactly so: it is not a creation on the side that kept it. It is
+        // made again only where something synced has to land under it, which
+        // is decided once every path has been.
+        if was.is_none()
+            && !inputs.resolved.contains_key(path)
+            && let Some(keeper) = inputs.ledger.left_standing.get(path)
+        {
+            let (kept, dropped, direction) = match keeper {
+                Keeper::Host => (host, guest, Direction::ToGuest),
+                Keeper::Guest => (guest, host, Direction::ToHost),
+            };
+            if let (Some(state), None) = (kept, dropped)
+                && state.kind == Kind::Dir
+            {
+                standing.push(Action::MakeDir {
+                    direction,
+                    path: path.clone(),
+                    side: state.side(),
+                });
+                continue;
+            }
         }
 
         // Both moved. A resolution the developer has already given makes this
@@ -790,6 +818,21 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
                     Err(refusal) => plan.oversize.push(refusal),
                 }
             }
+        }
+    }
+
+    // A directory left standing comes back with the first synced path that
+    // needs it as a parent, and not before. Deepest first, so one left
+    // standing inside another brings the outer one with it.
+    standing.sort_by(|a, b| b.path().cmp(a.path()));
+    for action in standing {
+        let needed = creations.iter().any(|creation| {
+            creation.direction() == action.direction()
+                && creation.path() != action.path()
+                && at_or_below(creation.path(), action.path())
+        });
+        if needed {
+            creations.push(action);
         }
     }
 
@@ -1300,6 +1343,70 @@ mod tests {
             plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
             vec!["src", "src/Foo.cs", "src/foo.cs"],
         );
+    }
+
+    /// A directory left standing is not a creation on the side that kept it
+    /// (review #380 F11): the side that deleted it is left without it.
+    #[test]
+    fn a_directory_left_standing_is_made_on_neither_side() {
+        let kept = tree(&[("crate", dir(1))]);
+        let none = BTreeMap::new();
+        let mut l = ledger(&[]);
+
+        l.left_standing.insert("crate".into(), Keeper::Host);
+        assert!(run(&kept, &none, &l).nothing_to_record());
+
+        l.left_standing.insert("crate".into(), Keeper::Guest);
+        assert!(run(&none, &kept, &l).nothing_to_record());
+    }
+
+    /// The first synced path under a directory left standing needs it as a
+    /// parent, so it is made then, ahead of that path.
+    #[test]
+    fn a_directory_left_standing_comes_back_with_synced_content() {
+        let host = tree(&[
+            ("crate", dir(1)),
+            ("crate/sub", dir(1)),
+            ("crate/sub/b.rs", file(Some("bb"), 1, 1)),
+        ]);
+        let mut l = ledger(&[]);
+        l.left_standing.insert("crate".into(), Keeper::Host);
+        l.left_standing.insert("crate/sub".into(), Keeper::Host);
+        let plan = run(&host, &BTreeMap::new(), &l);
+        assert_eq!(
+            plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
+            vec!["crate", "crate/sub", "crate/sub/b.rs"],
+        );
+    }
+
+    /// The record is about one state only. Gone from both sides it is
+    /// dropped, and a directory on the side that deleted it is an ordinary
+    /// creation again.
+    #[test]
+    fn a_left_standing_record_ends_when_the_directory_moves() {
+        let kept = tree(&[("crate", dir(1))]);
+        let none = BTreeMap::new();
+        let mut l = ledger(&[]);
+        l.left_standing.insert("crate".into(), Keeper::Host);
+
+        let plan = run(&none, &none, &l);
+        assert_eq!(plan.forget, vec!["crate".to_string()]);
+        assert!(plan.actions.is_empty());
+
+        let plan = run(&none, &kept, &l);
+        assert!(
+            matches!(
+                plan.actions.as_slice(),
+                [Action::MakeDir {
+                    direction: Direction::ToHost,
+                    ..
+                }]
+            ),
+            "{plan:?}"
+        );
+
+        let plan = run(&kept, &kept, &l);
+        assert_eq!(plan.adopt.len(), 1, "{plan:?}");
     }
 
     /// Windows picks the object at creation and cannot infer it from a target

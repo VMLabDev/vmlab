@@ -22,7 +22,8 @@ page guide_snapshots {
 
   p <<DOC
     An **offline** snapshot, taken while the machine is powered off,
-    captures disk state only. An **online** snapshot, taken while it runs,
+    captures disk state, together with the VM's UEFI variable store and TPM
+    state, and no RAM. An **online** snapshot, taken while it runs,
     captures disk, RAM and device state, and pauses the guest only for as
     long as the save takes. Every snapshot records the machine's power state
     at capture, and a restore does the right thing with it: restoring an

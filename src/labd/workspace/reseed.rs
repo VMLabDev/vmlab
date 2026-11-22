@@ -209,7 +209,7 @@ pub struct Reconverged {
     pub oversize: Vec<Oversize>,
     /// Host paths a case-folding guest cannot hold apart.
     pub collisions: Vec<Collision>,
-    /// Paths neither side could be read for.
+    /// Paths the scan or probe declined to process.
     pub skipped: Vec<Skip>,
     /// Rule files whose rules were refused (a symlink). Reported, and no part
     /// of [`complete`](Reconverged::complete): the path itself converges.
@@ -339,7 +339,7 @@ pub async fn reconverge(
         adopted: applied.adopted,
         oversize: plan.oversize,
         collisions: plan.collisions,
-        skipped,
+        skipped: skipped.into_iter().chain(scan.unrepresentable).collect(),
         refused_rules: scan.refused_rules,
         failures: applied
             .failures

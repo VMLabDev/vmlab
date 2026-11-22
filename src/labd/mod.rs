@@ -39,6 +39,7 @@ pub mod pull_ledger;
 pub mod record;
 pub mod reload_plan;
 pub mod share_plan;
+mod snapshot_state;
 pub mod state;
 pub mod stop_plan;
 pub mod usb;
