@@ -523,9 +523,10 @@ impl FileSystem for PassthroughFs {
         self.refuse_writes()?;
         let session = self.inner.lock();
         let state = live_inode(&session, inode)?;
-        if let Some(handle) = handle {
-            session.file_handle(inode, handle)?;
-        }
+        let open = match handle {
+            Some(handle) => Some(session.file_handle(inode, handle)?),
+            None => None,
+        };
         if valid.contains(SetattrValid::SIZE)
             && kind_of(fstat(state.fd.as_raw_fd())?.st_mode) != FileKind::File
         {
@@ -538,7 +539,14 @@ impl FileSystem for PassthroughFs {
             fchownat(&state.fd, valid, &attr)?;
         }
         if valid.contains(SetattrValid::SIZE) {
-            truncateat(&state.fd, attr.st_size)?;
+            // ftruncate(2) asks for a writable descriptor, not for a
+            // writable file: a handle the guest opened for writing carries
+            // the truncation whatever the mode of the file is now. Without
+            // one the reopen applies the mode, as truncate(2) does.
+            match open.as_ref().filter(|file| opened_for_writing(file)) {
+                Some(file) => ftruncate(file, attr.st_size)?,
+                None => truncateat(&state.fd, attr.st_size)?,
+            }
         }
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
             utimensat(&state.fd, valid, &attr)?;
@@ -1725,12 +1733,22 @@ fn truncateat(fd: &OwnedFd, size: i64) -> io::Result<()> {
     if kind_of(fstat(fd.as_raw_fd())?.st_mode) != FileKind::File {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let file = reopen(fd, libc::O_WRONLY)?;
-    // SAFETY: the fd is owned.
+    ftruncate(&reopen(fd, libc::O_WRONLY)?, size)
+}
+
+fn ftruncate(file: &File, size: i64) -> io::Result<()> {
+    // SAFETY: the fd is owned for the call.
     if unsafe { libc::ftruncate(file.as_raw_fd(), size) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether the descriptor itself allows writing, as the host sees it.
+fn opened_for_writing(file: &File) -> bool {
+    // SAFETY: F_GETFL reads the flags of an owned descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    flags >= 0 && matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
 }
 
 fn utimensat(fd: &OwnedFd, valid: SetattrValid, attr: &stat64) -> io::Result<()> {
