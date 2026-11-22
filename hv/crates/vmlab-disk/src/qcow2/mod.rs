@@ -894,7 +894,8 @@ impl Qcow2Image {
         let host_offset = entry & ((1u64 << x) - 1);
         let sector_bits = 62 - x;
         let additional_sectors = (entry >> x) & ((1u64 << sector_bits) - 1);
-        let end = host_offset + (additional_sectors + 1) * 512;
+        // The data ends at the end of its last sector, as on the read path.
+        let end = (host_offset / 512 + additional_sectors + 1) * 512;
         let first = host_offset / self.cluster_size;
         let last = end.div_ceil(self.cluster_size) - 1;
         for cluster_idx in first..=last {
@@ -1641,6 +1642,22 @@ mod tests {
         img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
         img.file.write_all_at(&u32::MAX.to_be_bytes(), 56).unwrap();
         assert!(Qcow2Image::open(&img.path, true).is_err());
+    }
+
+    #[test]
+    fn compressed_refcounts_end_at_the_last_sector() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let cluster = img.cluster_size;
+        assert_eq!(cluster, 0x10000);
+        // Offset 0x1ff37 with no further sector, moved past the metadata:
+        // the data ends on the boundary of cluster 11.
+        let offset = 10 * cluster + 0xff37;
+        img.set_cluster_refcount(10, 5).unwrap();
+        img.set_cluster_refcount(11, 5).unwrap();
+        img.adjust_compressed_refcounts(COMPRESSED_BIT | offset, 1)
+            .unwrap();
+        assert_eq!(img.get_refcount(10).unwrap(), 6);
+        assert_eq!(img.get_refcount(11).unwrap(), 5);
     }
 
     #[test]

@@ -316,6 +316,9 @@ Module map under `src/`:
   sockets;
   `boot_clock.rs` is the guest-clock check every fresh agent handshake runs
   under `clock = "host"` (§7.3, #186): `get_time`, and `set_time` past 2 s;
+  `start_gate.rs` keeps a start from running behind a stop or a destroy: a
+  `down` makes the starts asked for before it stale, a destroy holds the
+  machine until its disks are gone, and a lab that is going away takes none;
   `boot_id.rs` is the per-family boot identity read over the agent's `exec`
   and the loop `wait_rebooted` waits on it with (§10.3);
   `usb.rs` is USB passthrough's lab-wide half (§5.2.1) — selector resolution

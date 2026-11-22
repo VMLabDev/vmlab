@@ -140,7 +140,9 @@ impl Qcow2Image {
                     let shift = 62 - (self.cluster_bits - 8);
                     let offset = entry & ((1u64 << shift) - 1);
                     let sectors = ((entry >> shift) & ((1u64 << (62 - shift)) - 1)) + 1;
-                    self.count_range(counts, offset, sectors * 512)?;
+                    // The data ends at the end of its last sector.
+                    let end = (offset / 512 + sectors) * 512;
+                    self.count_range(counts, offset, end - offset)?;
                 } else if entry & OFFSET_MASK != 0 {
                     self.count_range(counts, entry & OFFSET_MASK, self.cluster_size)?;
                 }

@@ -32,9 +32,9 @@ Two facts are used by several findings:
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one (fixed, card #546) |
-| F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned |
+| F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547) |
 | F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name |
-| F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine |
+| F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
 | F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host |
 | F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down |
 | F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon |
@@ -127,6 +127,28 @@ Two facts are used by several findings:
   channel. Start `up`, run `down(&[], false)` to its end, then release the
   channel and await `up`. Assert that the fake launched nothing after `down`
   returned and that every machine is `Stopped`. Today `b` launches.
+- Fixed in card #547. `src/labd/start_gate.rs` is a gate that every start,
+  `down` and destroy of the lab runtime goes through. A start carries a
+  ticket from the moment it was asked for, and `up` takes one ticket for all
+  its waves. A `down` refuses every older ticket for the machines it stops,
+  so an `up` under way starts nothing after it. A start holds its machine's
+  lock until the machine has started, and a stop takes that lock first, so a
+  stop no longer passes over a machine that has no emulator yet. `teardown`
+  calls `LabRuntime::stop_for_exit`, which closes the lab to every start
+  before it stops the machines, and stops each machine by force when `down`
+  fails. `destroy` closes the lab the same way.
+  - The proof as written above does not reproduce: a machine that is stopped
+    while `up` waits for its readiness fails that wait
+    (`wait_until` in `src/labd/machine.rs`), so `b` never launches. The fault
+    is real one step earlier, while the start of `a` is under way. The test
+    is `a_down_leaves_no_machine_running_behind_an_up_under_way` in
+    `src/labd/lab.rs`, where the lab runtime's doubles are, with a double
+    that waits inside `start`. It fails before the fix (`a` and `b` run after
+    `down` returned) and passes after it.
+    `a_lab_stopped_for_exit_takes_no_start` covers the teardown.
+  - Not fixed here: `vm stop` and `vm restart` do not make an earlier start
+    stale, and the server still accepts requests during the teardown (they
+    are refused only where they start a machine).
 
 ### F3. No supervisor is read as no registration (data loss)
 
@@ -171,6 +193,20 @@ Two facts are used by several findings:
   release the channel. The start must be refused or must wait, and after
   both return either the machine is stopped with no directory or it runs
   with its disks present. Today it runs and its directory is gone.
+- Fixed in card #547, with the gate of F2. `destroy_machine` makes every
+  earlier start of the machine stale and holds the machine's start lock from
+  before its stop until the directory and the state entry are gone. A start
+  under way finishes first and is stopped, and a later start waits for the
+  removal and then builds the machine again. Lab `destroy` closes the lab to
+  every start before `down`, and opens it again only when the destroy fails.
+  An online restore, which boots a stopped machine, takes the same lock.
+  Tests in `src/labd/lab.rs`:
+  `a_machine_destroy_excludes_a_concurrent_start` (the proof above),
+  `a_machine_destroy_stops_a_start_under_way_before_it_removes_the_disks` and
+  `a_lab_destroy_refuses_a_start`. Each fails before the fix and passes after
+  it.
+  - Not fixed here: `wait_settled` still gives up after `SETTLE_TIMEOUT` and
+    the removal goes ahead.
 
 ### F5. The orphan reaper crosses environments (crash)
 

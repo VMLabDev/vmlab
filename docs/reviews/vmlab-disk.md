@@ -22,7 +22,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 |------|----------|-------------------|
 | F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros (fixed, #542) |
 | F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
-| F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster |
+| F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster (fixed, card #549) |
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
@@ -145,6 +145,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   fails. Unit test beside it: for a descriptor with offset `0x1ff37` and 0
   further sectors in a 64 KiB image, `adjust_compressed_refcounts(entry, 1)`
   must change cluster 1 only. Today it changes clusters 1 and 2.
+- Fixed in card #549. `adjust_compressed_refcounts` and `count_view` end the
+  range at the end of the last sector, as the read path does. The unit test is
+  `compressed_refcounts_end_at_the_last_sector` in
+  `hv/crates/vmlab-disk/src/qcow2/mod.rs` (the descriptor moved to clusters
+  10 and 11, past the metadata). The S2 test also runs the convert with
+  `compat=0.10`. Before the fix the unit test failed with the next cluster
+  changed and the S2 test with `refcount underflow at cluster 81`.
 
 ### F4. A snapshot entry without extra data comes back with disk size 0 (data loss)
 
