@@ -39,9 +39,16 @@ impl SnapshotEntry {
         }
     }
 
+    /// Extra data written for this entry: the large vmstate size, then the
+    /// disk size and icount. An entry that records no disk size (old QEMU)
+    /// keeps it absent, because a recorded 0 would shrink the disk on apply.
+    fn extra_len(&self) -> usize {
+        if self.disk_size.is_some() { 24 } else { 8 }
+    }
+
     /// Serialized size, padded to a multiple of 8 as the format requires.
     fn padded_size(&self) -> usize {
-        (40 + 24 + self.id.len() + self.name.len()).div_ceil(8) * 8
+        (40 + self.extra_len() + self.id.len() + self.name.len()).div_ceil(8) * 8
     }
 
     fn serialize(&self, out: &mut Vec<u8>) {
@@ -54,10 +61,12 @@ impl SnapshotEntry {
         out.extend_from_slice(&self.date_nsec.to_be_bytes());
         out.extend_from_slice(&self.vm_clock_nsec.to_be_bytes());
         out.extend_from_slice(&self.vm_state_size.to_be_bytes());
-        out.extend_from_slice(&24u32.to_be_bytes()); // extra data size
+        out.extend_from_slice(&(self.extra_len() as u32).to_be_bytes());
         out.extend_from_slice(&self.effective_vm_state_size().to_be_bytes());
-        out.extend_from_slice(&self.disk_size.unwrap_or(0).to_be_bytes());
-        out.extend_from_slice(&0u64.to_be_bytes()); // icount: disabled
+        if let Some(disk_size) = self.disk_size {
+            out.extend_from_slice(&disk_size.to_be_bytes());
+            out.extend_from_slice(&0u64.to_be_bytes()); // icount: disabled
+        }
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(self.name.as_bytes());
         while !(out.len() - start).is_multiple_of(8) {
