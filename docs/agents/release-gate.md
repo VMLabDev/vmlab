@@ -102,8 +102,9 @@ exists. It uploads nothing. Start it like every heavy run on helios.
 The command rebuilds the `vmlab-build` image first, so the image has the
 toolchains that the commit pins. `--image-as-is` skips that for a test build.
 A change of `scripts/guest-toolchains.sh` rebuilds every layer of the image
-(about 10 GiB). The build needs about 25 GiB free on the disk of the checkout
-and of docker.
+(about 10 GiB). A cold build of all assets took 14 minutes on helios and
+about 3 GiB of docker volumes, beside the caches in the checkout. Do not
+start it with less than 15 GiB free: the disk is shared with the e2e runs.
 
 B2. Publish. After R1 to R3 and A1 to A3, with the release commit on GitHub
 `main`, the factory runs this with its GitHub login:
@@ -152,10 +153,11 @@ SignTool (the former `vdisplay-sign` job on a GitHub Windows runner).
   The bundle has no catalog and no certificate. It proves the build, and it is
   never a release.
 
-Left open by card 423: `--display rebuild` was not run on helios. Helios has
-the Windows 11 template. Its disk was full (6 GiB free), and no config-weave
-Windows binary was found there. A real version needs one green
-`--display rebuild`, or a signed package staged by hand, before B1.
+Left open by card 423: `--display rebuild` was not run on helios. The proof
+of the card built `0.0.0-dry-run` with `--display unsigned`. Helios has the
+Windows 11 template, and no config-weave Windows binary was found in the
+account vmlab. A real version needs one green `--display rebuild`, or a
+signed package staged by hand, before B1.
 
 ## Signing: two ways, and the decision of the operator
 
