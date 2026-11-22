@@ -4479,7 +4479,12 @@ mod tests {
         }
 
         /// A container double with a disk, held at one of its two points.
-        fn held(name: &str, shared: &Shared, start: Option<&Hold>, settle: Option<&Hold>) -> Arc<Self> {
+        fn held(
+            name: &str,
+            shared: &Shared,
+            start: Option<&Hold>,
+            settle: Option<&Hold>,
+        ) -> Arc<Self> {
             let mut m = Arc::into_inner(Self::new(name, MachineKind::Container, shared))
                 .expect("sole owner");
             m.hold_start = start.cloned();
@@ -6155,8 +6160,16 @@ lab "t" {
         down.await.unwrap().expect("down");
         let up = up.await.unwrap();
 
-        assert_eq!(a.state().await, PowerState::Stopped, "\"a\" outlived the down");
-        assert_eq!(b.state().await, PowerState::Stopped, "\"b\" outlived the down");
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "\"a\" outlived the down"
+        );
+        assert_eq!(
+            b.state().await,
+            PowerState::Stopped,
+            "\"b\" outlived the down"
+        );
         assert_eq!(
             b.starts.load(Ordering::SeqCst),
             0,

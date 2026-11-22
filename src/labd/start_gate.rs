@@ -83,9 +83,10 @@ impl StartGate {
     pub(super) fn ticket(&self) -> Result<Ticket> {
         let inner = self.inner.lock_recover();
         if let Some(why) = inner.closed {
-            return Err(
-                CommandError::conflict(format!("the lab is {why}: nothing can be started")).into(),
-            );
+            return Err(CommandError::conflict(format!(
+                "the lab is {why}: nothing can be started"
+            ))
+            .into());
         }
         Ok(Ticket(inner.clock))
     }
@@ -164,8 +165,14 @@ mod tests {
         let after = gate.ticket().unwrap();
 
         let refused = gate.admit("a", before).await.unwrap_err();
-        assert!(refused.to_string().contains("\"a\" was stopped"), "{refused}");
-        assert!(gate.admit("b", before).await.is_ok(), "\"b\" was not stopped");
+        assert!(
+            refused.to_string().contains("\"a\" was stopped"),
+            "{refused}"
+        );
+        assert!(
+            gate.admit("b", before).await.is_ok(),
+            "\"b\" was not stopped"
+        );
         assert!(gate.admit("a", after).await.is_ok(), "a later start");
     }
 
