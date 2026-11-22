@@ -307,6 +307,44 @@ fn exec_streams_stdio_and_exit_code() {
 }
 
 #[test]
+fn stdin_after_the_child_closed_it_is_still_credited() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 4,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec 0<&-; printf ready; exec sleep 15".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    cap.data_until(4, b"ready");
+    // Send 600 KiB, replenishing the window after each 150 KiB batch.
+    for _ in 0..4 {
+        for _ in 0..3 {
+            mux.route_input(4, Input::Bytes(vec![0; 50 * 1024]));
+        }
+        assert_eq!(
+            cap.ctrl(),
+            AgentMsg::WindowAdjust {
+                id: 4,
+                bytes: 150 * 1024,
+            }
+        );
+    }
+    open(&mux, &p, HostMsg::Close { id: 4 });
+}
+
+#[test]
 fn exec_missing_binary_reports_error() {
     let (mux, mut cap) = capture_mux();
     let p = platform();
