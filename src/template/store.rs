@@ -906,6 +906,75 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&name).into_owned()))
 }
 
+/// The incompatible-feature bit that says a qcow2 image keeps the guest's
+/// clusters in a second host file.
+const QCOW2_INCOMPAT_DATA_FILE: u64 = 1 << 2;
+/// The header extension that names that second file.
+const QCOW2_EXT_DATA_FILE: u32 = 0x4441_5441;
+/// The largest qcow2 cluster, which bounds where header extensions can lie.
+const QCOW2_MAX_CLUSTER: u64 = 2 << 20;
+
+/// Refuse a qcow2 image that keeps its data in an external file. QEMU and
+/// `qemu-img` open the host file such an image names when they open the
+/// image, so a pulled or imported disk could hand the guest any file its
+/// user can read. Refused on the feature bit and on the extension alone,
+/// whichever image tool is selected. A file that is not qcow2 passes.
+pub fn refuse_qcow2_data_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    regular_file(path)?;
+    let f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut head = Vec::new();
+    f.take(QCOW2_MAX_CLUSTER)
+        .read_to_end(&mut head)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let be32 = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?))
+    };
+    let be64 = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(head.get(at..at + 8)?.try_into().ok()?))
+    };
+    if head.get(..4) != Some(b"QFI\xfb".as_slice()) {
+        return Ok(());
+    }
+    let refused = || {
+        anyhow!(
+            "{} is a qcow2 image with an external data file, which a template disk must not have",
+            path.display()
+        )
+    };
+    // Version 2 has neither feature bits nor a header length. Its
+    // extensions start right after its 72-byte header.
+    let mut at = 72;
+    if be32(4).is_some_and(|version| version >= 3) {
+        if be64(72).is_some_and(|bits| bits & QCOW2_INCOMPAT_DATA_FILE != 0) {
+            return Err(refused());
+        }
+        at = be32(100).map_or(104, |len| (len as usize).max(104));
+    }
+    // Extensions end at the backing file name when there is one.
+    let end = match be64(8) {
+        Some(backing) if backing != 0 => head.len().min(backing as usize),
+        _ => head.len(),
+    };
+    while let (Some(kind), Some(len)) = (be32(at), be32(at + 4)) {
+        if kind == 0 || at + 8 > end {
+            break;
+        }
+        if kind == QCOW2_EXT_DATA_FILE {
+            return Err(refused());
+        }
+        // Each extension's data is padded to eight bytes.
+        let Some(next) = (len as usize)
+            .checked_next_multiple_of(8)
+            .and_then(|padded| at.checked_add(8)?.checked_add(padded))
+        else {
+            break;
+        };
+        at = next;
+    }
+    Ok(())
+}
+
 fn regular_file(path: &Path) -> Result<()> {
     ensure!(
         fs::symlink_metadata(path)?.file_type().is_file(),
@@ -926,6 +995,7 @@ pub(crate) fn verify_base(path: &Path) -> Result<()> {
             qcow2_backing_file(path)?.is_none(),
             "template base disk must not have a backing file"
         );
+        refuse_qcow2_data_file(path)?;
     }
     Ok(())
 }
@@ -1048,6 +1118,8 @@ fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -
             v.name,
             backing.as_deref().unwrap_or("nothing")
         );
+        refuse_qcow2_data_file(&overlay)
+            .with_context(|| format!("variant `{}` of {reference}", v.name))?;
     }
     Ok(())
 }
@@ -2766,6 +2838,80 @@ mod tests {
             sha256_file(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// A version-3 qcow2 header, with the external-data-file feature bit
+    /// when `bit`, the data-file extension naming `/etc/hostname` when
+    /// `extension`, and `backing` as its backing file name.
+    fn qcow2_header(bit: bool, extension: bool, backing: Option<&str>) -> Vec<u8> {
+        let mut bytes = vec![0; 104];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&16u32.to_be_bytes());
+        if bit {
+            bytes[72..80].copy_from_slice(&(1u64 << 2).to_be_bytes());
+        }
+        bytes[100..104].copy_from_slice(&104u32.to_be_bytes());
+        if extension {
+            let name = b"/etc/hostname";
+            bytes.extend_from_slice(&0x4441_5441u32.to_be_bytes());
+            bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+        }
+        // The end-of-extensions marker.
+        bytes.extend_from_slice(&[0; 8]);
+        if let Some(backing) = backing {
+            let offset = bytes.len() as u64;
+            bytes[8..16].copy_from_slice(&offset.to_be_bytes());
+            bytes[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(backing.as_bytes());
+        }
+        bytes.resize(512, 0);
+        bytes
+    }
+
+    // Review templates-registry F7.
+    #[test]
+    fn a_base_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join(DISK_FILE);
+        fs::write(&disk, qcow2_header(false, false, None)).unwrap();
+        verify_base(&disk).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            fs::write(&disk, qcow2_header(bit, extension, None)).unwrap();
+            let err = verify_base(&disk).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
+    }
+
+    // Review templates-registry F7: the same for a variant overlay whose
+    // backing name is the correct one.
+    #[test]
+    fn a_variant_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(DISK_FILE), qcow2_header(false, false, None)).unwrap();
+        let base_sha = sha256_file(&dir.path().join(DISK_FILE)).unwrap();
+        let overlay = dir.path().join(variant_disk_rel("standard"));
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        let staged = |bit: bool, extension: bool| {
+            fs::write(
+                &overlay,
+                qcow2_header(bit, extension, Some(VARIANT_BACKING)),
+            )
+            .unwrap();
+            let mut variant = variant_meta("standard", true, &base_sha);
+            variant.sha256 = sha256_file(&overlay).unwrap();
+            let mut m = meta("x86_64", "win", "1");
+            m.variants = vec![variant];
+            verify_variants(dir.path(), &m, Some(&base_sha))
+        };
+        staged(false, false).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            let err =
+                staged(bit, extension).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
     }
 
     #[test]
