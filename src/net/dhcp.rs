@@ -48,6 +48,12 @@ const BOOTREPLY: u8 = 2;
 const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 /// BOOTP fixed header (236 bytes) plus the magic cookie (4 bytes).
 const BOOTP_MIN_LEN: usize = 240;
+
+/// How many declined addresses stay quarantined (review F6). A client can
+/// take a lease and decline it without end, so past this a new decline
+/// replaces the quarantine that ends first, and that address can be offered
+/// again.
+const MAX_DECLINED: usize = 1024;
 /// The broadcast bit in the BOOTP `flags` field.
 const FLAG_BROADCAST: u16 = 0x8000;
 
@@ -130,8 +136,9 @@ pub struct DhcpServer {
     leases: HashMap<MacAddr, Lease>,
     /// Addresses quarantined by client DECLINEs (duplicate detection), each
     /// with the time its quarantine ends. Only an address the declining
-    /// client held gets here, and an entry lasts one lease time, so the map
-    /// is no larger than the leases of one lease time.
+    /// client held gets here, and an entry lasts one lease time. A client
+    /// can take a new lease and decline it again, so the map holds
+    /// [`MAX_DECLINED`] (review F6).
     declined: HashMap<Ipv4Addr, Instant>,
 }
 
@@ -341,7 +348,21 @@ impl DhcpServer {
         }
         self.leases.remove(&req.chaddr);
         warn!(mac = %req.chaddr, ip = %held, "DHCP decline; address quarantined");
-        let until = Instant::now() + Duration::from_secs(u64::from(self.config.lease_secs));
+        let now = Instant::now();
+        // A full set gives up the quarantine that ends first (review F6).
+        if !self.declined.contains_key(&held) && self.declined.len() >= MAX_DECLINED {
+            self.declined.retain(|_, until| *until > now);
+            if self.declined.len() >= MAX_DECLINED
+                && let Some(first) = self
+                    .declined
+                    .iter()
+                    .min_by_key(|(_, until)| **until)
+                    .map(|(ip, _)| *ip)
+            {
+                self.declined.remove(&first);
+            }
+        }
+        let until = now + Duration::from_secs(u64::from(self.config.lease_secs));
         self.declined.insert(held, until);
     }
 
@@ -376,13 +397,18 @@ impl DhcpServer {
         self.config.subnet.hosts().find(|h| !taken.contains(h))
     }
 
-    /// May a client with no reservation and no lease claim `ip`?
-    fn requestable(&self, ip: Ipv4Addr) -> bool {
-        let now = Instant::now();
+    /// Whether `ip` is an address of the subnet a client can hold.
+    fn in_pool(&self, ip: Ipv4Addr) -> bool {
         self.config.subnet.contains(&ip)
             && ip != self.config.subnet.network()
             && ip != self.config.subnet.broadcast()
             && ip != self.config.gateway
+    }
+
+    /// May a client with no reservation and no lease claim `ip`?
+    fn requestable(&self, ip: Ipv4Addr) -> bool {
+        let now = Instant::now();
+        self.in_pool(ip)
             && !self.config.reservations.values().any(|&r| r == ip)
             && !self.declined.contains_key(&ip)
             && !self.leases.values().any(|l| l.ip == ip && l.expiry > now)
@@ -1198,5 +1224,50 @@ mod tests {
                 assert!(EthView::parse(&reply).is_some());
             }
         }
+    }
+
+    /// Review F6: a client that takes and declines 5 000 addresses in turn
+    /// quarantines no more than [`MAX_DECLINED`], and a decline of an
+    /// address it does not hold takes no slot.
+    #[test]
+    fn the_declined_set_is_bounded() {
+        let decline = |ip: Ipv4Addr| {
+            client_frame(
+                mac(1),
+                DHCP_DECLINE,
+                &[(OPT_REQUESTED_IP, &ip.octets())],
+                Ipv4Addr::UNSPECIFIED,
+                false,
+            )
+        };
+        // A /8, so that the pool is larger than the limit.
+        let cfg = DhcpConfig::new(net("10.0.0.0/8"), Ipv4Addr::new(10, 0, 0, 1), GW_MAC);
+        let mut s = DhcpServer::new(cfg);
+        let mut last = Ipv4Addr::UNSPECIFIED;
+        for _ in 0..5_000u32 {
+            last = parse_reply(&s.handle(&discover(mac(1))).unwrap()).yiaddr;
+            s.handle(&decline(last));
+        }
+        assert!(
+            s.declined.len() <= MAX_DECLINED,
+            "{} addresses are quarantined, over the limit of {MAX_DECLINED}",
+            s.declined.len()
+        );
+        assert_eq!(
+            s.declined.len(),
+            MAX_DECLINED,
+            "a decline still quarantines"
+        );
+        assert!(
+            s.declined.contains_key(&last),
+            "the newest decline is quarantined"
+        );
+
+        // An address the client does not hold takes no slot.
+        let mut s = DhcpServer::new(config());
+        for i in 0..1_000u32 {
+            s.handle(&decline(Ipv4Addr::from(0xC612_0000 + i)));
+        }
+        assert_eq!(s.declined.len(), 0);
     }
 }

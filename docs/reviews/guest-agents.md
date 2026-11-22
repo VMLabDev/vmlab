@@ -354,6 +354,16 @@ Not read:
   `guest/agent/src/sessions_test.rs`. Make a FIFO with `mkfifo`, send
   `Op::Digest` and `Op::Open` for it, and assert an error reply within one
   second for each.
+- Fixed in card #508. On Unix every open the file session makes for a path
+  (`Op::Open`, `Op::Digest`, and the open of a size or time `Op::Setstat`)
+  refuses a FIFO, a character device and a socket with "not a regular
+  file". It checks the path first, opens with `O_NONBLOCK`, and checks the
+  open handle again. A block device is finite and stays allowed, so
+  `vmlab cp file vm:/dev/null` is now refused and a push to a disk device is
+  not. The test also asks for `/dev/zero` and for more requests than the
+  session has workers. It failed before the fix (the digest of the FIFO got
+  no reply in 10 s) and passes after it. Not fixed here: Windows device
+  names, which stay unchecked.
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 
@@ -376,6 +386,8 @@ Not read:
 
 ### F10. An exec with stdin can deadlock, and the timeout does not cover it
 
+- Status: fixed in card #509. Collected exec drains output while sending
+  stdin under the same deadline, and the agent credits discarded input.
 - Where: `src/labd/vm_agent.rs:811-815` and
   `guest/agent/src/exec.rs:66-78`.
 - Fault: two faults on one path.
@@ -392,11 +404,12 @@ Not read:
   caller in the tree passes stdin today except the conformance check with
   six bytes, so the fault is not reached yet.
 - Confidence: high for both readings.
-- Test: `a_large_stdin_through_cat_comes_back_whole`: `exec` of `cat` with
-  1 MiB of stdin and a 30 s timeout against a real agent (the conformance
-  suite), assert 1 MiB of stdout. `stdin_after_the_child_closed_it_is_still_credited`
-  in `sessions_test.rs`: exec `true`, send 600 KiB on the channel, assert
-  that `window_adjust` grants cover all of it.
+- Test: `a_large_stdin_through_cat_comes_back_whole` runs against a real
+  agent with 1 MiB of stdin and a 30 s timeout. The command fills its output
+  window on stderr before running `cat`. The test checks both streams.
+  `stdin_after_the_child_closed_it_is_still_credited` keeps the child alive
+  after it closes stdin, sends 600 KiB, and checks that `window_adjust`
+  grants cover all of it.
 
 ### F11. The ctl reader ends for good on one line that is too long or not UTF-8
 
@@ -417,6 +430,14 @@ Not read:
   `src/labd/container_ctl.rs`. The mock writes `b"\xff\n"`, then a `started`
   event. Assert that `wait_started` succeeds. The same with a line of
   70 000 bytes before the event.
+- Fixed in card #510. `read_ctl_line` no longer returns an error for a bad
+  line. It reports the line as skipped, and the reader task warns and reads
+  on, as it does for a line that is not JSON. A line past the 64 KiB cap is
+  dropped through its newline without being held in memory. Only EOF and a
+  socket error end the reader. The tests
+  `a_line_that_is_not_utf8_is_skipped` and
+  `a_line_that_is_too_long_is_skipped` failed before the fix ("ctl channel
+  closed before the container started") and pass after it.
 
 ### F12. File names that are not UTF-8 are changed in a directory listing
 
