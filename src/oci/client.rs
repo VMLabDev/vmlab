@@ -1747,8 +1747,7 @@ impl HttpTransport {
             }
             let (resp, redirected) = match self.send_request(req.build()?, false).await {
                 Ok(r) => r,
-                Err(e) if attempt < MAX_RETRIES && worth_another_try(&e) =>
-                {
+                Err(e) if attempt < MAX_RETRIES && worth_another_try(&e) => {
                     backoff(attempt).await;
                     continue;
                 }
@@ -3703,7 +3702,10 @@ mod tests {
         assert_eq!(limits.connect, Duration::from_secs(30));
         assert_eq!(limits.answer, Duration::from_secs(60));
         assert_eq!(limits.idle, Duration::from_secs(60));
-        assert!(limits.upload > Duration::from_secs(600), "past GHCR's session");
+        assert!(
+            limits.upload > Duration::from_secs(600),
+            "past GHCR's session"
+        );
     }
 
     /// A registry that answers `head` to every request and then goes quiet
