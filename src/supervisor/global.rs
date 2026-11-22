@@ -1046,6 +1046,58 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::{Duration, sleep, timeout};
 
+    fn globals_without_psk(sock_dir: PathBuf) -> Arc<GlobalSegments> {
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        GlobalSegments::new_at(sock_dir, "test.internal".into(), None, None, events)
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        globals.attach("wan", None, None, None).await.unwrap();
+        let lab = joining("refused", None, vec![member("vm", 1, None)]);
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), Some(lab))
+                .await
+                .is_err()
+        );
+        globals.detach("wan", None).await;
+        assert!(globals.list().await.is_empty(), "refused attach added a reference");
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_new_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("global");
+        let globals = globals_without_psk(sock_dir.clone());
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), None)
+                .await
+                .is_err()
+        );
+        assert!(!sock_dir.join("wan.sock").exists(), "refused attach left a socket");
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_when_socket_setup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("wan.sock");
+        std::fs::create_dir(&socket).unwrap();
+        let globals = globals_without_psk(dir.path().to_path_buf());
+        assert!(globals.attach("wan", None, None, None).await.is_err());
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+
+        std::fs::remove_dir(socket).unwrap();
+        globals.attach("wan", None, None, None).await.unwrap();
+        globals.detach("wan", None).await;
+    }
+
     struct Instance {
         globals: Arc<GlobalSegments>,
         addr: SocketAddr,
