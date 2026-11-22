@@ -4451,6 +4451,118 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// **A path is only reconciled once it has stopped moving**, and that holds
+    /// for a change the watch has not reported yet. A steady pass stats every
+    /// agreed path, so a pass another path asked for finds a guest file that
+    /// is in the middle of being written — its event is still on its way. It
+    /// must not carry that file: the copy would be a torn one, on the
+    /// canonical side. The file waits out a quiet period like a reported one,
+    /// and is carried after it.
+    #[tokio::test]
+    async fn a_guest_change_found_by_the_probe_waits_out_a_quiet_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "whole").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "one").unwrap();
+        let (syncers, guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        let before = events_of(state.path()).len();
+
+        // The guest is writing main.rs, and no event for it has reached the
+        // host: no quiet period has started for it.
+        guest.file("/src/main.rs", "written in the guest", 70);
+        // An unrelated host edit asks for a pass.
+        std::fs::write(dir.path().join("other.rs"), "two").unwrap();
+
+        let landed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || {
+                std::fs::read_to_string(dir.join("main.rs")).unwrap_or_default()
+                    == "written in the guest"
+            })
+            .await
+        };
+        assert!(landed, "the guest's change never reached the host");
+        syncers.stop("dev01").await;
+
+        // The pass the host edit asked for carried the host edit and nothing
+        // else: the guest's file crossed in a later pass, a quiet period on.
+        let synced: Vec<serde_json::Value> = events_of(state.path())
+            .into_iter()
+            .skip(before)
+            .filter(|(name, _)| name == "workspace.synced")
+            .map(|(_, data)| data)
+            .collect();
+        let asked = synced
+            .iter()
+            .find(|data| data["guest_placed"] == 1)
+            .unwrap_or_else(|| panic!("the host edit was never carried: {synced:?}"));
+        assert_eq!(
+            asked["host_placed"], 0,
+            "a guest file with no settled event was carried in the pass another path asked \
+             for: {synced:?}"
+        );
+        assert!(
+            synced.iter().any(|data| data["host_placed"] == 1),
+            "{synced:?}"
+        );
+    }
+
+    /// The same gap, for `.git`: a guest-side lock is known from the watch
+    /// having named it, and a pass can run before that name is drained. The
+    /// pass asks for the lock by name wherever the mutable set moved, so
+    /// `index` does not cross while guest git still holds `index.lock`.
+    #[tokio::test]
+    async fn a_git_lock_found_by_the_probe_defers_the_mutable_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dir.path().join(".git/index"), "agreed").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "code").unwrap();
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/.git/index").await;
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        syncer.pass_now().await.unwrap();
+
+        // Guest-side git takes the lock and rewrites the index. The index's
+        // own event arrives; the lock's has not been drained.
+        guest.file("/src/.git/index.lock", "pid", 600);
+        guest.file("/src/.git/index", "half of a commit", 601);
+        sessions.watcher.mark(".git/index");
+
+        let deferred = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().deferred.iter().any(|p| p == ".git/index")).await
+        };
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/index")).unwrap(),
+            "agreed",
+            "the mutable set crossed while the guest held the lock"
+        );
+        assert!(
+            deferred,
+            "the mutable set was not deferred: {:?}",
+            syncer.report()
+        );
+        assert!(syncer.report().halt.is_none(), "{:?}", syncer.report());
+
+        // git lets go, and what it wrote crosses with no developer in it.
+        guest.unlink("/src/.git/index.lock");
+        let flowed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || {
+                std::fs::read_to_string(dir.join(".git/index")).unwrap_or_default()
+                    == "half of a commit"
+            })
+            .await
+        };
+        assert!(flowed, "the deferral never cleared");
+        syncers.stop("dev01").await;
+    }
+
     /// A resolution is carried out **while the workspace is still halted on
     /// other paths**, or per-path `--host`/`--guest` would be a flag that does
     /// nothing until the last one — and it lands even where the directory it
