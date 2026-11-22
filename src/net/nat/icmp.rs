@@ -31,12 +31,18 @@ use async_trait::async_trait;
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{self, IPPROTO_ICMP};
 
 use super::NatEngine;
 
 /// Reachability results are reused for this long.
 const CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// How many results the cache holds (review F6). A guest names the
+/// destination, so past this a new result replaces the oldest, and an echo
+/// to that destination is probed again.
+pub(super) const MAX_CACHED: usize = 1024;
 
 /// How many probes run at once (review F3): each is one `ping` process. An
 /// echo request that would need one more is dropped (the guest retransmits).
@@ -92,7 +98,7 @@ impl Pinger for SubprocessPinger {
 
 /// Per-engine probe cache + in-flight dedup.
 pub(super) struct IcmpState {
-    cache: StdMutex<HashMap<Ipv4Addr, (bool, Instant)>>,
+    cache: StdMutex<BoundedMap<Ipv4Addr, (bool, Instant)>>,
     /// Destinations with a probe in flight, and the guest each runs for.
     pending: StdMutex<HashMap<Ipv4Addr, Ipv4Addr>>,
 }
@@ -100,7 +106,7 @@ pub(super) struct IcmpState {
 impl IcmpState {
     pub fn new() -> Self {
         Self {
-            cache: StdMutex::new(HashMap::new()),
+            cache: StdMutex::new(BoundedMap::new(MAX_CACHED)),
             pending: StdMutex::new(HashMap::new()),
         }
     }
@@ -111,6 +117,12 @@ impl IcmpState {
             Some((ok, at)) if at.elapsed() < CACHE_TTL => Some(*ok),
             _ => None,
         }
+    }
+
+    /// How many results the cache holds.
+    #[cfg(test)]
+    pub(super) fn cached_len(&self) -> usize {
+        self.cache.lock_recover().len()
     }
 
     /// Try to claim the probe for `dst` on behalf of `guest`; `false` means
