@@ -557,6 +557,22 @@ impl PciRoot {
                 bar_placement(self.firmware, func.command, bar),
             );
         }
+        if log::log_enabled!(target: "vmlab_hv_vmm::pci::bars", log::Level::Debug) {
+            let bars: Vec<String> = func
+                .bars
+                .iter()
+                .map(|bar| {
+                    format!(
+                        "{}:{:#x}+{:#x}{}",
+                        bar.info.index,
+                        bar.addr,
+                        bar.info.size,
+                        if bar.sizing { "?" } else { "" }
+                    )
+                })
+                .collect();
+            log::debug!(target: "vmlab_hv_vmm::pci::bars", "PCI 00:{slot:02x}.{function} command={:#06x} bars=[{}] rom={:#x?}", func.command, bars.join(" "), func.rom.as_ref().map(|rom| rom.value));
+        }
         if let Some(start) =
             start.filter(|start| start.elapsed() > std::time::Duration::from_millis(1))
         {
