@@ -448,9 +448,17 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::Realpath { path } => {
-                let path = self.path(&path, Last::Follow)?;
+                let resolved = self.path(&path, Last::Follow)?;
+                // Where the session's paths are resolved inside a root (a
+                // container), the answer is a path of that root: the client
+                // sends it back in a later request, and the root goes in
+                // front of it again there (guest-agent review F13).
+                let root = self.path("/", Last::Keep)?;
                 ok(Reply::Name {
-                    path: realpath(&path),
+                    path: match seen_from(&root, &resolved) {
+                        Some(seen) => seen,
+                        None => realpath(&resolved),
+                    },
                 })
             }
             Op::Symlink { target, link, kind } => {
@@ -790,6 +798,28 @@ fn symlink(target: &str, link: &str, kind: LinkKind) -> std::io::Result<()> {
         LinkKind::File => std::os::windows::fs::symlink_file(target, link),
         LinkKind::Dir => std::os::windows::fs::symlink_dir(target, link),
     }
+}
+
+/// `resolved` as a client of a session rooted at `root` names it, or `None`
+/// where the session has no root of its own (`/` resolves to itself) and the
+/// path is the guest's as it stands.
+///
+/// The resolver has already followed every link inside the root and stopped
+/// `..` at it, so the answer is `resolved` without the root in front. It is
+/// not canonicalised: that would follow links in the root's own path, which
+/// the client never named.
+fn seen_from(root: &str, resolved: &str) -> Option<String> {
+    let root = std::path::Path::new(root);
+    if root.parent().is_none() {
+        return None;
+    }
+    let inside = std::path::Path::new(resolved).strip_prefix(root).ok()?;
+    Some(
+        std::path::Path::new("/")
+            .join(inside)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// Canonicalise where the path exists, and fall back to what the client can
