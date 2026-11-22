@@ -1807,10 +1807,14 @@ async fn pass(
         // What the drain reported joins the host's own set and the ledger's.
         // The obvious exclusions go before the round trip; the rest is
         // decided below, once the kind is known.
+        // A directory left standing has no agreement, and the guest may be
+        // the side that kept it: it is asked about by name, or its record
+        // would read as a directory gone from both sides.
         let paths: BTreeSet<String> = scan
             .tree
             .keys()
             .chain(ledger.entries.keys())
+            .chain(ledger.left_standing.keys())
             .cloned()
             .chain(
                 pending
@@ -1980,13 +1984,7 @@ async fn pass(
         .chain(probe.skipped.iter())
         .cloned()
         .collect();
-    for skip in &skipped {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
-        );
-        undecided.insert(skip.path.clone());
-    }
+    undecided.extend(skipped.iter().map(|skip| skip.path.clone()));
     if !probe.unlisted_dirs.is_empty() {
         // The listing says nothing about paths below a skipped directory.
         // Defer existing agreements, host-only paths and reported guest
@@ -2003,19 +2001,19 @@ async fn pass(
                 .cloned(),
         );
     }
-    // A refused rule file is said like a skip and decided like any other
-    // path: the link is still a sync object, and only its reading as rules
-    // was declined. Left out of `undecided`, so it never holds a pass open.
-    for refusal in &scan.refused_rules {
-        events.emit(
-            "workspace.skipped",
-            json!({"machine": workspace.machine, "path": refusal.path, "reason": refusal.why}),
-        );
-    }
+    // Escaped host names are diagnostic labels only. Refused rule files are
+    // still sync objects: only their reading as rules was declined.
     let skipped: Vec<Skip> = skipped
         .into_iter()
+        .chain(scan.unrepresentable.iter().cloned())
         .chain(scan.refused_rules.iter().cloned())
         .collect();
+    for skip in &skipped {
+        events.emit(
+            "workspace.skipped",
+            json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
 
     // `.git`'s mutable set, while either side holds a lock on it. **Timing,
     // not a conflict**: the paths are left exactly as they are on both sides
@@ -3698,6 +3696,71 @@ mod tests {
         assert!(
             dir.path().join("keep.rs").exists(),
             "it took the wrong tree"
+        );
+        syncers.stop("dev01").await;
+    }
+
+    /// A directory the guest deleted, that the host cannot drop because it
+    /// still holds ignored content there, stays deleted in the guest (review
+    /// #380 F11). No later pass and no walk makes it again, until a synced
+    /// file has to land under it.
+    #[tokio::test]
+    async fn a_directory_left_standing_is_not_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("crate/target")).unwrap();
+        std::fs::write(dir.path().join("crate/target/host.o"), "host build").unwrap();
+        std::fs::write(dir.path().join("crate/a.rs"), "a").unwrap();
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/crate/a.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        guest.unlink("/src/crate/a.rs");
+        guest.unlink("/src/crate");
+        sessions.watcher.mark("crate/a.rs");
+        sessions.watcher.mark("crate");
+        let removed = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || !dir.join("crate/a.rs").exists()).await
+        };
+        assert!(removed, "the guest delete never reached the host");
+
+        // Past the quiet period a path with no agreement waits out, more
+        // than once, and then through a walk of both trees.
+        for _ in 0..3 {
+            tokio::time::sleep(QUIET * 2).await;
+            syncer.pass_now().await.unwrap();
+        }
+        assert!(
+            guest.get("/src/crate").is_none(),
+            "the directory the guest deleted is back: {:?}",
+            guest.paths()
+        );
+        sessions.watcher.overflow();
+        tokio::time::sleep(QUIET * 2).await;
+        let report = syncer.pass_now().await.unwrap();
+        assert!(
+            guest.get("/src/crate").is_none(),
+            "a walk made the directory the guest deleted again: {:?}",
+            guest.paths()
+        );
+        assert!(dir.path().join("crate/target/host.o").exists());
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+
+        // A synced file under it is work for the guest, and brings the
+        // directory with it.
+        std::fs::write(dir.path().join("crate/b.rs"), "b").unwrap();
+        let landed = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/crate/b.rs").as_deref() == Some("b")).await
+        };
+        assert!(
+            landed,
+            "a new file under it never landed: {:?}",
+            guest.paths()
         );
         syncers.stop("dev01").await;
     }
@@ -5631,6 +5694,37 @@ mod tests {
             .before_restore("dev01", false, Some(&ws))
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_name_that_is_not_utf8_is_a_named_skip() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let (syncers, guest, _) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let invalid = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        std::fs::write(&invalid, "local only").unwrap();
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        let first = syncer.pass_now().await.unwrap();
+        let second = syncer.pass_now().await.unwrap();
+        for report in [first, second] {
+            assert!(report.trouble.is_none(), "{:?}", report.trouble);
+            assert!(
+                report.skipped.iter().any(|skip| {
+                    skip.path.contains(r"caf\xE9.txt") && skip.why.contains("UTF-8")
+                }),
+                "{:?}",
+                report.skipped
+            );
+        }
+        assert!(guest.get("/src/caf�.txt").is_none());
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(invalid).unwrap(), "local only");
+        syncers.stop("dev01").await;
     }
 
     /// A rule file is read by the host, and a symlink syncs guest to host

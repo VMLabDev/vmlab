@@ -305,12 +305,41 @@ fn writable_disks(reg: &SnapshotRegistry) -> impl Iterator<Item = &DiskNode> {
     reg.disks.iter().filter(|d| d.writable)
 }
 
+// The colon keeps this namespace outside the lab's snapshot name grammar.
+// Older, unmarked checkpoint names could also be user snapshots.
+const ROLLBACK_PREFIX: &str = "vmlab-hv-rollback-:";
+
+/// Reclaim interrupted loads before the guest can write to its disks.
+/// Each disk is independent because a process can die midway through capture
+/// or deletion of the checkpoint.
+pub(crate) fn remove_stale_checkpoints(disks: &[DiskNode]) -> Result<(), SnapshotError> {
+    for disk in disks.iter().filter(|disk| disk.writable) {
+        let mut image = disk.image.lock();
+        let snapshots = image
+            .snapshots()
+            .map_err(|err| SnapshotError::from_disk("snapshots", &disk.id, err))?;
+        for snapshot in snapshots {
+            if snapshot.name.starts_with(ROLLBACK_PREFIX) {
+                image
+                    .snapshot_delete(&snapshot.name)
+                    .map_err(|err| SnapshotError::from_disk("snapshot_delete", &disk.id, err))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- save --------------------------------------------------------------
 
 /// `snapshot_save {name}`: quiesce, capture, stream into the vmstate disk,
 /// write the internal snapshot on every writable disk, and leave the machine
 /// in the run state it had.
 pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
+    if name.starts_with(ROLLBACK_PREFIX) {
+        return Err(SnapshotError::Unsupported(
+            "snapshot name is reserved for internal rollback checkpoints".into(),
+        ));
+    }
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
@@ -700,7 +729,7 @@ fn load_checkpoint_name(reg: &SnapshotRegistry, name: &str) -> Result<String, Sn
     }
     loop {
         let checkpoint = format!(
-            "vmlab-hv-rollback-{}-{}",
+            "{ROLLBACK_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
