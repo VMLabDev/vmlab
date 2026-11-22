@@ -1492,3 +1492,235 @@ async fn nat_refuses_every_loopback_address_and_protocol_without_isolation() {
     );
     assert_eq!(pinger.calls.load(Ordering::SeqCst), 0, "no probe ran");
 }
+
+// ---------------------------------------------------------------------------
+// Limits on what guests can make the engine hold (networking review F3)
+// ---------------------------------------------------------------------------
+
+/// The address of the `n`th flooding guest.
+fn guest_n(n: u16) -> Ipv4Addr {
+    Ipv4Addr::new(10, 213, 1 + (n >> 8) as u8, n as u8)
+}
+
+async fn udp_from(engine: &Arc<NatEngine>, guest: Ipv4Addr, sport: u16, dst: (Ipv4Addr, u16)) {
+    let seg = frame::udp_build(guest, dst.0, sport, dst.1, b"x").unwrap();
+    let pkt = frame::ipv4_build(guest, dst.0, IPPROTO_UDP, 64, &seg, 8).unwrap();
+    let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
+    engine.handle_frame(Bytes::from(f)).await;
+    // The gateway task awaits its queue between two frames.
+    tokio::task::yield_now().await;
+}
+
+async fn syn_from(engine: &Arc<NatEngine>, guest: Ipv4Addr, sport: u16, dst: (Ipv4Addr, u16)) {
+    let seg = frame::tcp_build(
+        guest,
+        dst.0,
+        TcpFields {
+            src_port: sport,
+            dst_port: dst.1,
+            seq: 1000,
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            options: &[],
+        },
+        &[],
+    )
+    .unwrap();
+    let pkt = frame::ipv4_build(guest, dst.0, IPPROTO_TCP, 64, &seg, 7).unwrap();
+    let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
+    engine.handle_frame(Bytes::from(f)).await;
+}
+
+async fn echo_from(engine: &Arc<NatEngine>, guest: Ipv4Addr, dst: Ipv4Addr) {
+    let m = frame::icmp_build(ICMP_ECHO_REQUEST, 0, [0, 1, 0, 1], b"x");
+    let pkt = frame::ipv4_build(guest, dst, IPPROTO_ICMP, 64, &m, 9).unwrap();
+    let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
+    engine.handle_frame(Bytes::from(f)).await;
+}
+
+fn udp_key(guest: Ipv4Addr, sport: u16, dst: (Ipv4Addr, u16)) -> super::FlowKey {
+    super::FlowKey {
+        guest_ip: guest,
+        guest_port: sport,
+        dst_ip: dst.0,
+        dst_port: dst.1,
+    }
+}
+
+/// One guest that sends 5 000 datagrams on 5 000 flows holds no more host
+/// sockets than its share, the newest flow replaces the oldest, and no
+/// number of guests takes the table past its size.
+#[tokio::test]
+async fn udp_flows_are_bounded() {
+    use super::udp::{MAX_UDP_FLOWS, MAX_UDP_FLOWS_PER_GUEST};
+    use crate::sync::LockRecover;
+
+    let (engine, _rx) = engine();
+    // A sink that never answers: every flow stays up for its idle time.
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = (
+        Ipv4Addr::new(127, 0, 0, 1),
+        sink.local_addr().unwrap().port(),
+    );
+
+    const FLOOD: u16 = 5_000;
+    for i in 0..FLOOD {
+        udp_from(&engine, GUEST_IP, 10_000 + i, dst).await;
+    }
+    {
+        let table = engine.udp_flows.lock_recover();
+        assert!(
+            table.len() <= MAX_UDP_FLOWS_PER_GUEST,
+            "one guest holds {} UDP flows, over its limit of {MAX_UDP_FLOWS_PER_GUEST}",
+            table.len()
+        );
+        assert!(
+            table.contains_key(&udp_key(GUEST_IP, 10_000 + FLOOD - 1, dst)),
+            "the newest flow is served"
+        );
+        assert!(
+            !table.contains_key(&udp_key(GUEST_IP, 10_000, dst)),
+            "the oldest flow made room for it"
+        );
+    }
+
+    // A second guest gets flows of its own beside the first one's.
+    let other = guest_n(1);
+    udp_from(&engine, other, 10_000, dst).await;
+    assert!(
+        engine
+            .udp_flows
+            .lock_recover()
+            .contains_key(&udp_key(other, 10_000, dst))
+    );
+
+    // Forty guests, each inside its own share, do not pass the table's size.
+    for n in 2..42 {
+        for i in 0..125 {
+            udp_from(&engine, guest_n(n), 10_000 + i, dst).await;
+        }
+    }
+    let held = engine.udp_flows.lock_recover().len();
+    assert!(
+        held <= MAX_UDP_FLOWS,
+        "the engine holds {held} UDP flows, over its limit of {MAX_UDP_FLOWS}"
+    );
+}
+
+/// The same with SYNs: one guest holds no more connecting flows than its
+/// share, all guests together no more than the table's size, and a flow
+/// that ends gives its slot back.
+#[tokio::test]
+async fn tcp_flows_are_bounded() {
+    use super::{MAX_TCP_FLOWS, MAX_TCP_FLOWS_PER_GUEST};
+    use crate::sync::LockRecover;
+
+    let (engine, mut rx) = engine();
+    // Each failed connect answers its guest with a RST: read them away.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    // A loopback port nothing listens on.
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let dst = (Ipv4Addr::new(127, 0, 0, 1), port);
+
+    let mut peak = 0;
+    for i in 0..5_000 {
+        syn_from(&engine, GUEST_IP, 10_000 + i, dst).await;
+        peak = peak.max(engine.tcp_flows.lock_recover().len());
+    }
+    assert!(
+        peak <= MAX_TCP_FLOWS_PER_GUEST,
+        "one guest held {peak} TCP flows, over its limit of {MAX_TCP_FLOWS_PER_GUEST}"
+    );
+
+    let mut peak = 0;
+    for n in 1..41 {
+        for i in 0..125 {
+            syn_from(&engine, guest_n(n), 10_000 + i, dst).await;
+            peak = peak.max(engine.tcp_flows.lock_recover().len());
+        }
+    }
+    assert!(
+        peak <= MAX_TCP_FLOWS,
+        "the engine held {peak} TCP flows, over its limit of {MAX_TCP_FLOWS}"
+    );
+
+    // Every connect is refused, so every flow ends and frees its slot.
+    timeout(WAIT, async {
+        while !engine.tcp_flows.lock_recover().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refused flows end");
+    syn_from(&engine, GUEST_IP, 9_000, dst).await;
+    assert_eq!(
+        engine.tcp_flows.lock_recover().len(),
+        1,
+        "a guest that was at its limit opens a flow again"
+    );
+}
+
+/// A pinger that never answers and records how many probes ran at once.
+#[derive(Default)]
+struct HoldingPinger {
+    running: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl Pinger for HoldingPinger {
+    async fn ping(&self, _dst: Ipv4Addr) -> bool {
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Echo requests to 5 000 addresses start no more `ping` calls at once than
+/// the guest's share, and all guests together no more than the limit.
+#[tokio::test]
+async fn ping_probes_are_bounded() {
+    use super::icmp::{MAX_PROBES, MAX_PROBES_PER_GUEST};
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let pinger = Arc::new(HoldingPinger::default());
+    let (engine, _rx) = engine_with_pinger(pinger.clone());
+
+    for i in 0..5_000u16 {
+        let dst = Ipv4Addr::new(198, 18, (i >> 8) as u8, i as u8);
+        echo_from(&engine, GUEST_IP, dst).await;
+    }
+    settle().await;
+    let peak = pinger.peak.load(Ordering::SeqCst);
+    assert!(peak > 0, "a probe ran");
+    assert!(
+        peak <= MAX_PROBES_PER_GUEST,
+        "one guest ran {peak} probes at once, over its limit of {MAX_PROBES_PER_GUEST}"
+    );
+
+    for n in 1..41 {
+        for i in 0..100u16 {
+            let dst = Ipv4Addr::new(198, 19, n as u8, i as u8);
+            echo_from(&engine, guest_n(n), dst).await;
+        }
+    }
+    settle().await;
+    let peak = pinger.peak.load(Ordering::SeqCst);
+    assert!(
+        peak <= MAX_PROBES,
+        "the engine ran {peak} probes at once, over its limit of {MAX_PROBES}"
+    );
+    assert!(
+        peak > MAX_PROBES_PER_GUEST,
+        "a second guest probes while the first is at its limit"
+    );
+}

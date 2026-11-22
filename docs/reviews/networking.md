@@ -29,7 +29,7 @@ Who the attacker is, per finding:
 |------|----------|-------------------|
 | F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
-| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses |
+| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476) |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
@@ -166,6 +166,27 @@ Who the attacker is, per finding:
   limit). The same shape with SYNs (`tcp_flows`), and with a counting
   `Pinger` stub and 5 000 echo destinations (assert a limit on concurrent
   `ping` calls).
+- Fixed in card #476. Each table has a limit per guest address and a limit
+  per engine, so one guest cannot take every slot of its segment. Guest-opened
+  TCP flows: 128 per guest and 256 in all (`MAX_TCP_FLOWS` in
+  `src/net/nat/mod.rs`). A SYN past the limit is dropped, and the guest's
+  retransmission retries it. Flows the engine opens toward a guest (port
+  forwards) are not counted. UDP flows: 128 per guest and 256 in all
+  (`MAX_UDP_FLOWS` in `src/net/nat/udp.rs`). A new flow past the limit
+  replaces the flow idle the longest, of that guest or of the table, so a
+  table full of abandoned flows does not refuse a live one. `ping` probes in
+  flight: 8 per guest and 32 in all (`MAX_PROBES` in `src/net/nat/icmp.rs`).
+  An echo request past the limit is dropped. Forwarded DNS queries in flight:
+  64 per gateway (`MAX_DNS_FORWARDS` in `src/net/gateway.rs`), with no share
+  per guest. A query past the limit is dropped. The proof tests
+  `udp_flows_are_bounded`, `tcp_flows_are_bounded` and
+  `ping_probes_are_bounded` in `src/net/nat/tests.rs` and
+  `forwarded_dns_queries_are_bounded` in `src/net/gateway.rs` failed before
+  the fix (1 833 UDP flows where the descriptor limit stopped the test, 5 000
+  TCP flows, 3 050 probes at once, 200 forwards) and pass after it. Not
+  changed: the limits count per segment, the lab daemon still does not raise
+  `RLIMIT_NOFILE`, and a guest that sends from many source addresses (F9)
+  has the engine's limit and not one guest's.
 
 ### F4. One stalled TCP flow blocks the whole gateway (security, guest)
 

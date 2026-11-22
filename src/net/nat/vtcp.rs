@@ -224,15 +224,19 @@ impl AsyncWrite for GuestStream {
 // ---------------------------------------------------------------------------
 
 /// Spawn the flow task answering a guest SYN (already inserted in the flow
-/// table by the caller).
+/// table by the caller). The task holds `slot`, the flow's place under the
+/// engine's limit, until it ends.
 pub(super) fn spawn_passive(
     engine: Arc<NatEngine>,
     key: FlowKey,
     guest_mac: MacAddr,
     syn: Segment,
     rx: mpsc::Receiver<Segment>,
+    slot: super::PassiveSlot,
 ) {
     tokio::spawn(async move {
+        // Given back when the task ends, however it ends.
+        let _slot = slot;
         let dst = (key.dst_ip, key.dst_port);
         match timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
             Ok(Ok(stream)) => {
