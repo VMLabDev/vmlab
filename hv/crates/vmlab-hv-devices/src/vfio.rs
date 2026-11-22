@@ -72,7 +72,7 @@ fn hide_extended_capabilities(config: &mut [u8], host_config: &mut [bool]) {
         return;
     }
     let mut chain = Vec::new();
-    let mut offset = 0x100;
+    let mut offset: usize = 0x100;
     while (0x100..=0xffc).contains(&offset)
         && offset.is_multiple_of(4)
         && !chain.iter().any(|&(seen, _)| seen == offset)
