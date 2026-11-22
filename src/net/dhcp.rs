@@ -855,6 +855,112 @@ mod tests {
         assert_eq!(next.yiaddr, Ipv4Addr::new(10, 213, 1, 3));
     }
 
+    /// `frame` as another NIC would send it: the ethernet source replaced,
+    /// `chaddr` left as the sender wrote it.
+    fn sent_by(mut frame: Vec<u8>, src: MacAddr) -> Vec<u8> {
+        frame[6..12].copy_from_slice(&src.0);
+        frame
+    }
+
+    #[test]
+    fn a_decline_without_a_lease_quarantines_nothing() {
+        let mut s = DhcpServer::new(config());
+        let first = Ipv4Addr::new(10, 213, 1, 2);
+        let decline = client_frame(
+            mac(9),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &first.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&decline).is_none());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(offer.yiaddr, first);
+    }
+
+    #[test]
+    fn a_decline_of_an_address_the_client_does_not_hold_quarantines_nothing() {
+        let mut s = DhcpServer::new(config());
+        let held = parse_reply(&s.handle(&discover(mac(1))).unwrap()).yiaddr;
+        let other = Ipv4Addr::new(10, 213, 1, 3);
+        let decline = client_frame(
+            mac(1),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &other.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&decline).is_none());
+        assert_eq!(s.lease_of(mac(1)), Some(held));
+        let next = parse_reply(&s.handle(&discover(mac(2))).unwrap());
+        assert_eq!(next.yiaddr, other);
+    }
+
+    #[test]
+    fn a_message_that_speaks_for_another_mac_is_ignored() {
+        let mut s = DhcpServer::new(config());
+        let held = parse_reply(&s.handle(&discover(mac(1))).unwrap()).yiaddr;
+        s.handle(&request(mac(1), held)).unwrap();
+
+        // RELEASE, DECLINE and a REQUEST that selects another server, each
+        // with the victim's MAC in `chaddr` and the attacker's on the frame.
+        let release = client_frame(mac(1), DHCP_RELEASE, &[], held, false);
+        assert!(s.handle(&sent_by(release, mac(2))).is_none());
+        let decline = client_frame(
+            mac(1),
+            DHCP_DECLINE,
+            &[(OPT_REQUESTED_IP, &held.octets())],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&sent_by(decline, mac(2))).is_none());
+        let elsewhere = client_frame(
+            mac(1),
+            DHCP_REQUEST,
+            &[
+                (OPT_REQUESTED_IP, &held.octets()),
+                (OPT_SERVER_ID, &[192, 168, 0, 1]),
+            ],
+            Ipv4Addr::UNSPECIFIED,
+            false,
+        );
+        assert!(s.handle(&sent_by(elsewhere, mac(2))).is_none());
+        assert_eq!(s.leases(), vec![(mac(1), held)]);
+
+        // Nor does a DISCOVER take an address for a MAC that did not send it.
+        assert!(s.handle(&sent_by(discover(mac(3)), mac(2))).is_none());
+        assert_eq!(s.leases(), vec![(mac(1), held)]);
+        // The address is still usable: nothing was quarantined.
+        let again = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        assert_eq!(again.yiaddr, held);
+    }
+
+    #[test]
+    fn an_offer_holds_its_address_briefly_until_the_request() {
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        let hold = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(
+            hold <= Duration::from_secs(60),
+            "an unanswered offer holds its address for {hold:?}"
+        );
+        // The client is still told the full lease time, and gets it on ACK.
+        assert_eq!(offer.opts[&OPT_LEASE_TIME], 3600u32.to_be_bytes().to_vec());
+        s.handle(&request(mac(1), offer.yiaddr)).unwrap();
+        let held = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(held > Duration::from_secs(3500), "lease is {held:?}");
+    }
+
+    #[test]
+    fn a_rediscover_does_not_shorten_a_confirmed_lease() {
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle(&discover(mac(1))).unwrap());
+        s.handle(&request(mac(1), offer.yiaddr)).unwrap();
+        s.handle(&discover(mac(1))).unwrap();
+        let held = s.leases[&mac(1)].expiry - Instant::now();
+        assert!(held > Duration::from_secs(3500), "lease is {held:?}");
+    }
+
     #[test]
     fn same_mac_rediscover_keeps_its_address() {
         let mut s = DhcpServer::new(config());
