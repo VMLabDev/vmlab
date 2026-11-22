@@ -969,49 +969,17 @@ impl FileSystem for PassthroughFs {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let mut session = self.inner.lock();
-        let live = live_inode(&session, inode)?;
-        let dir_path = live.path.clone();
-        let dir_fd = live.fd.try_clone()?;
-        // Cookies are the host's own, as in `readdir`. A READDIRPLUS record
-        // is several times its getdents64 record, so read a smaller batch:
-        // what does not fit is read again by the next request.
-        let mut used = 0usize;
-        let mut position = offset;
-        while used <= size as usize {
-            let Some((entries, next)) =
-                session.dir_batch(inode, handle, position, size as usize / 4)?
-            else {
-                break;
-            };
-            position = next;
-            for cached in &entries {
-                if used > size as usize {
-                    return Ok(());
-                }
-                let path = dir_path.join(OsStr::from_bytes(&cached.name));
-                // Resolve (or create) the session inode so the Entry carries
-                // the server's own ino and a lookup count the kernel will
-                // FORGET.
-                let entry = match session.resolve(&path, &dir_fd, &cached.name) {
-                    Ok(entry) => entry,
-                    Err(_) => continue, // raced away; the guest re-lookups
-                };
-                match add_entry(
-                    DirEntry {
-                        ino: entry.inode,
-                        offset: cached.cookie,
-                        type_: cached.d_type as u32,
-                        name: &cached.name,
-                    },
-                    entry,
-                ) {
-                    Ok(0) => return Ok(()),
-                    Ok(len) => used += len,
-                    Err(e) => return Err(e),
-                }
+        // Every entry handed to `add_entry` carries one lookup the guest
+        // answers with FORGET. A request that fails is answered with the
+        // error alone, so the guest sees none of them: take them back.
+        let mut served = Vec::new();
+        let result = session.readdirplus(inode, handle, size, offset, &mut served, add_entry);
+        if result.is_err() {
+            for ino in served {
+                session.forget_one(ino, 1);
             }
         }
-        Ok(())
+        result
     }
 
     fn fsyncdir(&self, _ctx: &Context, inode: u64, datasync: bool, _handle: u64) -> io::Result<()> {
@@ -1295,6 +1263,83 @@ impl Session {
             HandleKind::File { file: None, .. } => Err(io::Error::from_raw_os_error(libc::ESTALE)),
             HandleKind::Dir { .. } => Err(io::Error::from_raw_os_error(libc::EISDIR)),
         }
+    }
+
+    /// READDIRPLUS under the session lock. `served` takes the inode of each
+    /// entry `add_entry` accepted, in order: the caller undoes their lookups
+    /// when the request fails.
+    fn readdirplus(
+        &mut self,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        served: &mut Vec<u64>,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let live = live_inode(self, inode)?;
+        let dir_path = live.path.clone();
+        let dir_fd = live.fd.try_clone()?;
+        // Cookies are the host's own, as in `readdir`. A READDIRPLUS record
+        // is several times its getdents64 record, so read a smaller batch:
+        // what does not fit is read again by the next request.
+        let mut used = 0usize;
+        let mut position = offset;
+        while used <= size as usize {
+            let Some((entries, next)) =
+                self.dir_batch(inode, handle, position, size as usize / 4)?
+            else {
+                break;
+            };
+            position = next;
+            for cached in &entries {
+                if used > size as usize {
+                    return Ok(());
+                }
+                let path = dir_path.join(OsStr::from_bytes(&cached.name));
+                // Resolve (or create) the session inode so the Entry carries
+                // the server's own ino and a lookup count the kernel will
+                // FORGET.
+                let entry = match self.resolve(&path, &dir_fd, &cached.name) {
+                    Ok(entry) => entry,
+                    // The inode table is full. Skipping the entry would
+                    // hide a file that exists, so say it: end a reply that
+                    // already holds entries here (the guest asks again at
+                    // the last cookie it took), and fail one that holds
+                    // none.
+                    Err(e) if e.raw_os_error() == Some(libc::ENFILE) => {
+                        return if served.is_empty() { Err(e) } else { Ok(()) };
+                    }
+                    Err(_) => continue, // raced away; the guest re-lookups
+                };
+                let ino = entry.inode;
+                match add_entry(
+                    DirEntry {
+                        ino,
+                        offset: cached.cookie,
+                        type_: cached.d_type as u32,
+                        name: &cached.name,
+                    },
+                    entry,
+                ) {
+                    // The entry did not fit and the guest never sees it, so
+                    // no FORGET comes for it: drop its lookup here.
+                    Ok(0) => {
+                        self.forget_one(ino, 1);
+                        return Ok(());
+                    }
+                    Ok(len) => {
+                        served.push(ino);
+                        used += len;
+                    }
+                    Err(e) => {
+                        self.forget_one(ino, 1);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One bounded batch of the entries of `handle` after the cookie
@@ -2388,6 +2433,111 @@ mod tests {
             vec![b"hello.txt".to_vec(), b"link".to_vec(), b"sub".to_vec()]
         );
         FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
+    }
+
+    #[test]
+    fn readdirplus_does_not_leak_the_entry_that_did_not_fit() {
+        let (_dir, fs) = scratch();
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply buffer takes one entry and refuses the second.
+        let mut offered: Vec<(Vec<u8>, u64)> = Vec::new();
+        FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |d, e| {
+            offered.push((d.name.to_vec(), e.inode));
+            Ok(if offered.len() == 1 { 160 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(offered.len(), 2, "one entry served, one refused");
+        let session = fs.inner.lock();
+        let (taken, taken_ino) = &offered[0];
+        let (refused, refused_ino) = &offered[1];
+        // The served entry keeps the lookup the guest will FORGET.
+        assert_eq!(
+            session.by_path.get(Path::new(OsStr::from_bytes(taken))),
+            Some(taken_ino)
+        );
+        assert_eq!(session.inodes[taken_ino].lookups, 1);
+        // The guest never saw the refused one and sends no FORGET for it.
+        assert!(
+            !session
+                .by_path
+                .contains_key(Path::new(OsStr::from_bytes(refused))),
+            "the entry that did not fit is still in the inode table"
+        );
+        assert!(!session.inodes.contains_key(refused_ino));
+        assert_eq!(session.inodes.len(), 2, "the root and the served entry");
+    }
+
+    #[test]
+    fn readdirplus_takes_back_its_lookups_when_the_request_fails() {
+        let (_dir, fs) = scratch();
+        let known = lookup(&fs, b"hello.txt").unwrap().inode;
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply is the error alone: the guest sees no entry of it.
+        let mut offered = 0;
+        let err = FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |_, _| {
+            offered += 1;
+            if offered == 3 {
+                Err(io::Error::from_raw_os_error(libc::EOVERFLOW))
+            } else {
+                Ok(160)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EOVERFLOW));
+        let session = fs.inner.lock();
+        // Only what the guest looked up before the request stays.
+        assert_eq!(session.inodes.len(), 2);
+        assert_eq!(session.inodes[&known].lookups, 1);
+    }
+
+    #[test]
+    fn readdirplus_reports_a_full_inode_table() {
+        const FILES: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{n:02}")), []).unwrap();
+        }
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // List to the end the way the guest does, and never FORGET: either
+        // every file is listed or the guest is told the table is full.
+        let mut names = Vec::new();
+        let mut offset = 0;
+        let mut error = None;
+        for _ in 0..=FILES {
+            let mut last = None;
+            let result =
+                FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, offset, &mut |d, _| {
+                    names.push(d.name.to_vec());
+                    last = Some(d.offset);
+                    Ok(d.name.len() + 152)
+                });
+            if let Err(e) = result {
+                // A failed request served nothing.
+                assert_eq!(last, None);
+                error = Some(e.raw_os_error());
+                break;
+            }
+            match last {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        if error.is_none() {
+            assert_eq!(
+                names.len(),
+                FILES,
+                "a listing with no error leaves files out"
+            );
+        } else {
+            assert_eq!(error, Some(Some(libc::ENFILE)));
+            // What was listed is what the table holds beside the root.
+            assert_eq!(names.len(), SESSION_LIMIT - 1);
+            assert_eq!(fs.inner.lock().inodes.len(), SESSION_LIMIT);
+        }
     }
 
     /// List one directory handle to its end through the cookies, the way
