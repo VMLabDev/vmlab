@@ -763,6 +763,9 @@ impl Registry {
         // template pushed from this store and referenced back by registry
         // lands here rather than in an offline cache hit.
         let local = if overwrite {
+            // Refused here rather than at the install alone, so a pull that
+            // cannot replace the version downloads nothing first.
+            dest_store.check_replace(&meta.arch, &meta.name, &meta.version)?;
             None
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
@@ -2553,6 +2556,67 @@ mod tests {
             .resolve_version("x86_64", "alpine", Some("3.20"))
             .unwrap();
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
+    }
+
+    /// A pull with `overwrite` hands the version it would replace to the
+    /// store's replace guard, and a refusal — a clone is backed by the
+    /// version — leaves the held disk as it was (review templates-registry
+    /// F2).
+    #[tokio::test]
+    async fn an_overwriting_pull_is_refused_while_a_clone_is_backed_by_the_version() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let m = meta("x86_64");
+        let push = |disk: &'static [u8], n: u32| {
+            let tdir = work.path().join(format!("tmpl{n}"));
+            let push_work = work.path().join(format!("push{n}"));
+            let (fake, m) = (fake.clone(), m.clone());
+            async move {
+                make_template(&tdir, &m, disk);
+                registry_with_fake(reference, fake)
+                    .push(&tdir, 1024, "x86_64", &push_work, None, None)
+                    .await
+                    .unwrap();
+            }
+        };
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let reg = registry_with_fake(reference, fake.clone());
+
+        push(b"first disk", 1).await;
+        reg.pull(Some("x86_64"), &store, &store_root.join(".p1"), false)
+            .await
+            .unwrap();
+        let held = store.resolve_version(&m.arch, &m.name, None).unwrap();
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"first disk");
+
+        // The tag now carries another disk, and a clone leans on the held one.
+        push(b"second disk", 2).await;
+        let guarded = store.clone().refusing_replace({
+            let disk = held.disk_path.clone();
+            move |doomed| {
+                doomed
+                    .contains(&disk)
+                    .then(|| "the clone of machine corp/dc01 is backed by it".to_string())
+            }
+        });
+        let err = reg
+            .pull(Some("x86_64"), &guarded, &store_root.join(".p2"), true)
+            .await
+            .expect_err("the clone of corp/dc01 is backed by the version");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("corp/dc01"), "{text}");
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"first disk");
+
+        // With no clone backed by it, the same pull replaces the version.
+        let free = store.clone().refusing_replace(|_| None);
+        reg.pull(Some("x86_64"), &free, &store_root.join(".p3"), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"second disk");
     }
 
     /// A template carrying a pre-enrolled VARS file (§5.2) pushes it in the
