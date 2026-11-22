@@ -39,15 +39,45 @@ struct Function {
 }
 
 struct OptionRom {
-    bytes: Arc<[u8]>,
+    image: Arc<RomImage>,
     value: u32,
     sizing: bool,
+}
+
+/// The bytes behind a ROM BAR. A ROM the device itself carries is read on
+/// the guest's first access, not at construction: a passed-through card's
+/// flash takes seconds to read, and nothing may hold the control socket back
+/// that long. The bytes are kept for the life of the machine.
+struct RomImage {
+    size: usize,
+    bytes: std::sync::OnceLock<Box<[u8]>>,
+    device: Option<Arc<Mutex<dyn PciDevice>>>,
+}
+
+impl RomImage {
+    fn loaded(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            size: bytes.len(),
+            bytes: std::sync::OnceLock::from(bytes.into_boxed_slice()),
+            device: None,
+        })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        self.bytes.get_or_init(|| {
+            let mut bytes = vec![0xff; self.size];
+            if let Some(device) = &self.device {
+                device.lock().bar_read(6, 0, &mut bytes);
+            }
+            bytes.into_boxed_slice()
+        })
+    }
 }
 
 impl OptionRom {
     fn read_config(&self) -> u32 {
         if self.sizing {
-            !((self.bytes.len() - 1) as u32) & 0xffff_f800
+            !((self.image.size - 1) as u32) & 0xffff_f800
         } else {
             self.value
         }
@@ -171,7 +201,7 @@ enum MmioTarget {
         offset: u64,
     },
     Rom {
-        bytes: Arc<[u8]>,
+        image: Arc<RomImage>,
         offset: usize,
     },
 }
@@ -192,7 +222,8 @@ impl MmioTarget {
             Self::Bar {
                 dev, bar, offset, ..
             } => dev.lock().bar_read(bar, offset, data),
-            Self::Rom { bytes, offset } => {
+            Self::Rom { image, offset } => {
+                let bytes = image.bytes();
                 for (i, byte) in data.iter_mut().enumerate() {
                     *byte = bytes.get(offset + i).copied().unwrap_or(0xff);
                 }
@@ -331,10 +362,12 @@ impl PciRoot {
                 if !info.size.is_power_of_two() || info.size < 2048 || info.size > 16 << 20 {
                     return Err("invalid expansion ROM size".into());
                 }
-                let mut bytes = vec![0xff; info.size as usize];
-                dev.lock().bar_read(6, 0, &mut bytes);
                 rom = Some(OptionRom {
-                    bytes: bytes.into(),
+                    image: Arc::new(RomImage {
+                        size: info.size as usize,
+                        bytes: std::sync::OnceLock::new(),
+                        device: Some(dev.clone()),
+                    }),
                     value: 0,
                     sizing: false,
                 });
@@ -407,7 +440,7 @@ impl PciRoot {
         let mut bytes = vec![0xff; image.len().max(2048).next_power_of_two()];
         bytes[..image.len()].copy_from_slice(image);
         func.rom = Some(OptionRom {
-            bytes: bytes.into(),
+            image: RomImage::loaded(bytes),
             value: 0,
             sizing: false,
         });
@@ -491,7 +524,7 @@ impl PciRoot {
                 let value = u32::from_le_bytes(value);
                 rom.sizing = value & 0xffff_f800 == 0xffff_f800;
                 if !rom.sizing {
-                    rom.value = value & (!((rom.bytes.len() - 1) as u32) | 1);
+                    rom.value = value & (!((rom.image.size - 1) as u32) | 1);
                 }
                 offset += n;
                 data = &data[n..];
@@ -523,6 +556,22 @@ impl PciRoot {
                 bar.info.index,
                 bar_placement(self.firmware, func.command, bar),
             );
+        }
+        if log::log_enabled!(target: "vmlab_hv_vmm::pci::bars", log::Level::Debug) {
+            let bars: Vec<String> = func
+                .bars
+                .iter()
+                .map(|bar| {
+                    format!(
+                        "{}:{:#x}+{:#x}{}",
+                        bar.info.index,
+                        bar.addr,
+                        bar.info.size,
+                        if bar.sizing { "?" } else { "" }
+                    )
+                })
+                .collect();
+            log::debug!(target: "vmlab_hv_vmm::pci::bars", "PCI 00:{slot:02x}.{function} command={:#06x} bars=[{}] rom={:#x?}", func.command, bars.join(" "), func.rom.as_ref().map(|rom| rom.value));
         }
         if let Some(start) =
             start.filter(|start| start.elapsed() > std::time::Duration::from_millis(1))
@@ -616,10 +665,10 @@ impl PciRoot {
                 && !rom.sizing
                 && func.command & 2 != 0
                 && addr >= base
-                && addr - base < rom.bytes.len() as u64
+                && addr - base < rom.image.size as u64
             {
                 return Some(MmioTarget::Rom {
-                    bytes: rom.bytes.clone(),
+                    image: rom.image.clone(),
                     offset: (addr - base) as usize,
                 });
             }
@@ -1245,6 +1294,35 @@ mod tests {
         root.config_write(0, 3, 0, 0x30, &0xc200_0000u32.to_le_bytes());
         assert!(root.dispatch_mmio_read(0xc200_0000, &mut bytes));
         assert_eq!(bytes, [0xaa; 2]);
+    }
+
+    #[test]
+    fn a_device_rom_is_sized_at_once_and_read_on_the_first_guest_access() {
+        let mut bars = test_bars();
+        bars.push(BarInfo {
+            index: 6,
+            size: 0x1_0000,
+            kind: BarKind::Mmio32,
+        });
+        let device = FakePci::new(bars);
+        let mut root = PciRoot::q35(1 << 32);
+        root.add_device_at(3, 0, device.clone()).unwrap();
+        // Sizing and placement need no byte of the ROM: a passed-through
+        // card's flash takes seconds to read.
+        root.config_write(0, 3, 0, 0x30, &0xffff_f800u32.to_le_bytes());
+        assert_eq!(root.config_read(0, 3, 0, 12), 0xffff_0000);
+        root.config_write(0, 3, 0, 0x30, &0xc300_0001u32.to_le_bytes());
+        root.config_write(0, 3, 0, 4, &2u16.to_le_bytes());
+        assert!(device.lock().bar_log.lock().is_empty());
+        let mut bytes = [0; 2];
+        assert!(root.dispatch_mmio_read(0xc300_0000, &mut bytes));
+        assert_eq!(bytes, [0xaa; 2]);
+        assert!(root.dispatch_mmio_read(0xc300_fffe, &mut bytes));
+        assert_eq!(bytes, [0xaa; 2]);
+        // One read of the whole ROM serves every later access.
+        let log = device.lock().bar_log.lock().clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].0, log[0].1, log[0].2.len()), (6, 0, 0x1_0000));
     }
 
     #[test]
