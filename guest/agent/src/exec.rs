@@ -59,7 +59,8 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
     };
     mux.send_ctrl(&AgentMsg::Opened { id });
 
-    // stdin pump: host bytes → child stdin; credit granted once written.
+    // stdin pump: grant credit for bytes written or discarded after the
+    // child closes its pipe.
     {
         let mux = mux.clone();
         thread::spawn(move || {
@@ -67,8 +68,9 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
             for chunk in host_input {
                 match chunk {
                     Input::Bytes(b) => {
-                        let Some(s) = stdin.as_mut() else { continue };
-                        if s.write_all(&b).is_err() {
+                        if let Some(s) = stdin.as_mut()
+                            && s.write_all(&b).is_err()
+                        {
                             stdin = None; // child closed its end; keep draining
                         }
                         if let Some(grant) = window.recv(b.len()) {
