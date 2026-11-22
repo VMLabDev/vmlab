@@ -239,9 +239,10 @@ impl Playback {
     fn pull(&mut self, ring: &SpscRing, out: &mut [u8], stride: usize) -> usize {
         let available = ring.used_bytes();
         if !self.primed && available != 0 {
-            // Begin with two quanta of PCM so timer/callback phase does not
+            // Begin with two callbacks of PCM so timer/callback phase does not
             // consume the jitter reserve. Short one-shot sounds still drain.
-            self.primed = available >= QUEUE_FRAMES * stride || self.startup_pulls == 2;
+            let reserve = (QUEUE_FRAMES * stride).max(2 * out.len());
+            self.primed = available >= reserve || self.startup_pulls == 2;
             if !self.primed {
                 self.startup_pulls += 1;
             }
@@ -647,6 +648,23 @@ mod tests {
         );
         // A report empties the counters, and a clean interval says nothing.
         assert_eq!(health_report(&health, 10, 768), None);
+    }
+
+    /// A host whose callback asks for more than 256 frames gets two of its
+    /// own callbacks as the reserve, not two of ours.
+    #[test]
+    fn playback_prefill_follows_a_larger_host_quantum() {
+        let stride = 4;
+        let ring = SpscRing::with_capacity_bytes(4096 * stride);
+        let mut playback = Playback::default();
+        let mut out = vec![9; 1024 * stride];
+        ring.push_drop_oldest(&vec![1; 512 * stride]);
+        assert_eq!(playback.pull(&ring, &mut out, stride), 0);
+        for _ in 0..3 {
+            ring.push_drop_oldest(&vec![1; 512 * stride]);
+        }
+        assert_eq!(playback.pull(&ring, &mut out, stride), 1024 * stride);
+        assert_eq!(ring.used_bytes(), 1024 * stride);
     }
 
     #[test]
