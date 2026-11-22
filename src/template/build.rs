@@ -463,6 +463,7 @@ async fn build_variant(
     })?;
     let build_vm = "build";
     let hw = EffectiveHardware::for_variant(v, &base.meta).locate_vars(Some(&base.dir));
+    hw.ensure_known_display()?;
     let spec = BuildSpec::variant(def, v, base.meta.disk);
     check_spec_hardware(def, &spec, &hw, build_vm, root, profiles)?;
 
@@ -1033,6 +1034,7 @@ async fn run_build(
         .unwrap_or_default();
     let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta))
         .locate_vars(layered.as_ref().map(|r| r.dir.as_path()));
+    hw.ensure_known_display()?;
 
     // That hardware decides how the build VM boots, so resolve it before the
     // first expensive step: the resolver refuses combinations that cannot work
@@ -1570,6 +1572,23 @@ struct EffectiveHardware {
 impl EffectiveHardware {
     /// Merge the template block over `source` — the recorded metadata of the
     /// template a layered build layers on, `None` for every other source kind.
+    /// The build records `display` in the template's metadata, which takes
+    /// a display device by name only; refuse another string before the
+    /// build, not at the first VM cloned from its result. The build reads
+    /// its file without the lab validator, which says the same.
+    fn ensure_known_display(&self) -> Result<()> {
+        let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+        if let Some(d) = &self.display
+            && !known.contains(&d.as_str())
+        {
+            bail!(
+                "display = \"{d}\" is not a display device a template can record; use one of {}",
+                known.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     fn resolve(def: &TemplateDef, source: Option<&TemplateMeta>) -> Self {
         Self::declared(def).over(source)
     }
@@ -1735,6 +1754,8 @@ fn resolve_layered_source(
             crate::template::store::Purpose::Build,
         )
         .context("resolving layered build source")?;
+    // The build VM boots the display its source recorded, as a `-device`.
+    resolved.meta.ensure_known_display()?;
     // `#base` seeds from the unsealed base of a template with variants, which
     // was never generalized: there is nothing for a first-boot script to
     // specialize, and on such a template the base carries none anyway. A

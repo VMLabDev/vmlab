@@ -468,6 +468,30 @@ impl TemplateMeta {
         Ok(meta)
     }
 
+    /// Refuse a `display`, the base's or a variant's, outside
+    /// [`TEMPLATE_DISPLAYS`](crate::qemu::resolve::TEMPLATE_DISPLAYS). The
+    /// string becomes a QEMU `-device` value on the host that clones the
+    /// template, and the metadata is whatever a registry or an archive said.
+    pub(crate) fn ensure_known_display(&self) -> Result<()> {
+        let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+        let named = std::iter::once((None, &self.display))
+            .chain(self.variants.iter().map(|v| (Some(&v.name), &v.display)));
+        for (variant, display) in named {
+            let Some(display) = display else { continue };
+            if !known.contains(&display.as_str()) {
+                let variant = variant.map(|v| format!("#{v}")).unwrap_or_default();
+                bail!(
+                    "template `{}/{}@{}{variant}` records display = {display:?}, which is not a display device vmlab knows ({}); refusing to pass it to QEMU",
+                    self.arch,
+                    self.name,
+                    self.version,
+                    known.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Logins use surface 6 even where the template embeds no script.
     pub(crate) fn ensure_login_surface(&self) -> Result<()> {
         if !self.logins.is_empty() {

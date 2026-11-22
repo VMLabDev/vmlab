@@ -33,7 +33,7 @@ The findings are ranked against these three facts, which the code states:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry |
+| F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry (fixed, card #540) |
 | F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments |
 | F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read |
 | F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file |
@@ -91,6 +91,17 @@ The findings are ranked against these three facts, which the code states:
      holds `-device loader,file=...`.
 - I did not check which QEMU devices other than `loader` give a guest host
   data without a second argument.
+- Fixed in card #540. A template's `display`, the base's or a variant's, is
+  one of a closed list of names (`TEMPLATE_DISPLAYS` in
+  `src/qemu/resolve.rs`): vmlab's five names and QEMU's display devices by
+  name, with no properties. `TemplateConfig::into_meta` refuses any other
+  string at the pull, `resolve_vm` refuses it for metadata that is in the
+  store already or came from an archive, and a layered build refuses it in
+  its source. A `template {}` block that declares another string is a
+  validation error, because the build would record it. The lab file's own
+  `display` is unchanged. Both proof tests failed before the fix (the
+  resolver returned the `loader` string, `into_meta` returned the metadata)
+  and pass after it. Proof 3 was not run by hand.
 
 ### F2. The trust list is a text prefix on an unnormalised repository (security)
 
