@@ -453,12 +453,11 @@ impl TemplateStore {
         // An install interrupted mid-swap left the old version beside `dest`.
         recover_swap(&dest)?;
         if dest.exists() && !overwrite {
-            bail!(
-                "template {}/{}@{} already exists in the store (pass overwrite to replace)",
-                meta.arch,
-                meta.name,
-                meta.version
-            );
+            return Err(anyhow::Error::new(AlreadyInstalled {
+                arch: meta.arch.clone(),
+                name: meta.name.clone(),
+                version: meta.version.clone(),
+            }));
         }
         if dest.exists() {
             self.check_replace(&meta.arch, &meta.name, &meta.version)?;
@@ -887,6 +886,29 @@ impl TemplateStore {
             .map_err(|(_, errno)| anyhow!("cannot lock template store: {errno}"))
     }
 }
+
+/// An install without `overwrite` found the version in the store. A typed
+/// error, so a pull that lost the race against another pull of the same
+/// version can tell this refusal from every other and use what the winner
+/// installed.
+#[derive(Debug)]
+pub struct AlreadyInstalled {
+    pub arch: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl std::fmt::Display for AlreadyInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "template {}/{}@{} already exists in the store (pass overwrite to replace)",
+            self.arch, self.name, self.version
+        )
+    }
+}
+
+impl std::error::Error for AlreadyInstalled {}
 
 /// A version directory's metadata with the variants it can actually serve:
 /// a variant block whose overlay is missing does not count (§6.6).
