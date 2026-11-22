@@ -54,6 +54,14 @@ page cmd_exec {
     exit status, so a script can test the guest command's result directly.
   DOC
 
+  p <<DOC
+    The daemon collects the output and hands it over when the command exits.
+    It holds at most 64 MiB, standard output and standard error together. A
+    command that writes more is ended and the exec fails naming that limit.
+    For more output, redirect it to a file in the guest and fetch the file
+    with `vmlab cp`.
+  DOC
+
   code sh { source = <<'SRC'
 vmlab exec dc01 -- powershell -NoProfile -Command "Get-Service ntds | Select Status"
 vmlab exec --user admin dc01 -- cmd /c whoami

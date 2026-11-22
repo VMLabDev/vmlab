@@ -161,6 +161,12 @@ const SESSION_QUEUE: usize = 2048;
 /// the consumer stuck and closing that session (never the whole port).
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most output, stdout and stderr together, a collected
+/// [`AgentHandle::exec`] holds. The guest decides how much a command writes,
+/// so without a ceiling one endless stream grows the lab daemon until the
+/// timeout. A caller that needs more streams it over [`AgentHandle::open_exec`].
+pub const EXEC_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+
 /// How long an `open_*` waits for the agent's `opened`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -909,6 +915,8 @@ impl AgentHandle {
     }
 
     /// Run to completion, collecting output. `128 + signal` codes on Unix.
+    /// Stdout and stderr together stop at [`EXEC_OUTPUT_LIMIT`]: past it the
+    /// command is ended and the exec is an error.
     pub async fn exec(
         &self,
         argv: Vec<String>,
@@ -931,6 +939,17 @@ impl AgentHandle {
             let ev = tokio::time::timeout_at(deadline, session.recv())
                 .await
                 .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?;
+            if let Some(SessionEvent::Data(b) | SessionEvent::Stderr(b)) = &ev
+                && out.len() + err.len() + b.len() > EXEC_OUTPUT_LIMIT
+            {
+                // Returning drops the session, which closes the channel and
+                // so ends the command in the guest.
+                bail!(
+                    "exec `{display}` wrote more than {} MiB of output, the most a collected \
+                     exec holds; send the output to a file in the guest and copy that",
+                    EXEC_OUTPUT_LIMIT / (1024 * 1024)
+                );
+            }
             match ev {
                 Some(SessionEvent::Data(b)) => out.extend(b),
                 Some(SessionEvent::Stderr(b)) => err.extend(b),
@@ -2918,6 +2937,23 @@ mod tests {
         .await
     }
 
+    /// Send what a `mock:flood` exec may: full frames while both the host's
+    /// credit and the flood's remaining bytes cover one.
+    async fn pump_flood(
+        tx: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        id: u32,
+        (credit, left): &mut (u64, u64),
+    ) {
+        let frame = encode_frame(FrameKind::Data, id, &[b'x'; MAX_PAYLOAD]);
+        while *credit >= MAX_PAYLOAD as u64 && *left >= MAX_PAYLOAD as u64 {
+            if tx.lock().await.write_all(&frame).await.is_err() {
+                return;
+            }
+            *credit -= MAX_PAYLOAD as u64;
+            *left -= MAX_PAYLOAD as u64;
+        }
+    }
+
     /// The same agent, advertising exactly `features` — for the callers that
     /// have to see an agent *without* one.
     async fn mock_agent_with(
@@ -2952,6 +2988,9 @@ mod tests {
             let mut buf = [0u8; 8192];
             // Channel kinds the mock tracks.
             let mut terminals: Vec<u32> = Vec::new();
+            // `mock:flood` execs: channel -> (send credit, bytes still to
+            // send). The flood spends only the credit the host granted.
+            let mut floods: HashMap<u32, (u64, u64)> = HashMap::new();
             // File sessions: channel -> the in-memory filesystem it serves,
             // its record decoder and its handle table.
             let mut files: HashMap<u32, MockFiles> = HashMap::new();
@@ -3048,6 +3087,16 @@ mod tests {
                                         tokio::time::sleep(Duration::from_secs(20)).await;
                                     }
                                     send(AgentMsg::Opened { id }).await;
+                                    // A command that never stops writing
+                                    // and never exits: twice the collect
+                                    // ceiling, so the mock itself is bounded.
+                                    if argv.first().is_some_and(|s| s == "mock:flood") {
+                                        let mut flood =
+                                            (INITIAL_WINDOW, 2 * EXEC_OUTPUT_LIMIT as u64);
+                                        pump_flood(&tx, id, &mut flood).await;
+                                        floods.insert(id, flood);
+                                        continue;
+                                    }
                                     // Echo who the open said to run as, so a
                                     // test can assert the identity actually
                                     // reached the wire (PRD §19.2).
@@ -3092,7 +3141,14 @@ mod tests {
                                         send_data(id, encode_record(&WatchRecord::Dirty)).await;
                                     }
                                 }
+                                HostMsg::WindowAdjust { id, bytes } => {
+                                    if let Some(flood) = floods.get_mut(&id) {
+                                        flood.0 += bytes;
+                                        pump_flood(&tx, id, flood).await;
+                                    }
+                                }
                                 HostMsg::Close { id } => {
+                                    floods.remove(&id);
                                     terminals.retain(|&channel| channel != id);
                                     files.remove(&id);
                                     watches.remove(&id);
@@ -4082,6 +4138,41 @@ mod tests {
         assert_eq!(out.exit_code, 42);
         assert_eq!(out.stdout, b"ran:echo hi");
         assert_eq!(out.stderr, b"warning-line");
+    }
+
+    /// A command that writes without end (`cat /dev/zero`, or a guest that
+    /// turned hostile answering a probe) must not grow the lab daemon until
+    /// the timeout: the collect stops at its ceiling and says so.
+    #[tokio::test]
+    async fn a_collected_exec_refuses_output_past_its_ceiling() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let timeout = Duration::from_secs(20);
+        let before = tokio::time::Instant::now();
+        let err = agent
+            .exec(vec!["mock:flood".into()], vec![], None, None, timeout, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("more than 64 MiB of output"),
+            "the error names the limit: {err}"
+        );
+        assert!(before.elapsed() < timeout, "it must not run to the timeout");
+        // The channel was closed, so the connection still serves the next
+        // exec.
+        let out = agent
+            .exec(
+                vec!["echo".into()],
+                vec![],
+                None,
+                None,
+                Duration::from_secs(5),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, b"ran:echo");
     }
 
     #[tokio::test]
