@@ -141,11 +141,71 @@ impl TemplateVersion {
 #[derive(Debug, Clone)]
 pub struct TemplateStore {
     root: PathBuf,
+    /// Asked before an overwriting install replaces a version (see
+    /// [`Self::refusing_replace`]). `None` replaces unasked.
+    replace_guard: Option<ReplaceGuard>,
+}
+
+/// The in-use check of an overwriting install: handed the disks the
+/// replacement would delete, it says why they cannot go.
+#[derive(Clone)]
+struct ReplaceGuard(std::sync::Arc<dyn Fn(&[PathBuf]) -> Option<String> + Send + Sync>);
+
+impl std::fmt::Debug for ReplaceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplaceGuard")
+    }
 }
 
 impl TemplateStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            replace_guard: None,
+        }
+    }
+
+    /// This store, with every overwriting install — an import or a pull with
+    /// `overwrite` — first handing `in_use` the disks of the version it would
+    /// replace: the base and every variant overlay on disk. A `Some(reason)`
+    /// (clones backed by one of them, PRD §7.1) refuses the install and
+    /// leaves the version as it is, the way [`Self::remove`] refuses.
+    pub fn refusing_replace(
+        mut self,
+        in_use: impl Fn(&[PathBuf]) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.replace_guard = Some(ReplaceGuard(std::sync::Arc::new(in_use)));
+        self
+    }
+
+    /// Refuse when an overwriting install of `<arch>/<name>@<version>` would
+    /// delete a disk the store's replace guard reports in use. Passes when
+    /// the store has no guard or holds no such version. An install runs this
+    /// itself; a pull calls it before it downloads anything.
+    pub fn check_replace(&self, arch: &str, name: &str, version: &str) -> Result<()> {
+        let Some(guard) = &self.replace_guard else {
+            return Ok(());
+        };
+        let dir = self.version_dir(arch, name, version);
+        // Read from the directory rather than `template.wcl`: an overlay
+        // whose block is gone is deleted with the version all the same.
+        let mut doomed = vec![dir.join(DISK_FILE)];
+        doomed.extend(
+            fs::read_dir(dir.join(VARIANTS_DIR))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path().join(DISK_FILE)),
+        );
+        doomed.retain(|disk| disk.is_file());
+        if let Some(reason) = (guard.0)(&doomed) {
+            bail!(
+                "refusing to replace template {arch}/{name}@{version}: {reason} — replacing its \
+                 disks would corrupt every clone backed by them (remove those machines' disks \
+                 first, or install the template under another version)"
+            );
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -396,6 +456,9 @@ impl TemplateStore {
                 meta.name,
                 meta.version
             );
+        }
+        if dest.exists() {
+            self.check_replace(&meta.arch, &meta.name, &meta.version)?;
         }
         (ops.write_meta)(meta, &staging.join(META_FILE))?;
         let parent = dest.parent().expect("version dir always has a parent");
@@ -2038,6 +2101,49 @@ mod tests {
     }
 
     // ---- remove ---------------------------------------------------------------
+
+    /// An overwriting install asks the store's replace guard about every
+    /// disk of the version it would delete, and a refusal leaves the version
+    /// untouched (review templates-registry F2).
+    #[test]
+    fn an_overwrite_asks_the_replace_guard_and_a_refusal_keeps_the_version() {
+        let (_tmp, store, _) = store_with_old_version();
+        let before = version_files(&store);
+        let dir = store.version_dir("x86_64", "t", "1");
+        fs::create_dir_all(dir.join("variants/extra")).unwrap();
+        fs::write(dir.join("variants/extra/disk.qcow2"), b"overlay").unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let guarded = store.clone().refusing_replace({
+            let asked = asked.clone();
+            move |doomed| {
+                asked.lock().unwrap().extend(doomed.to_vec());
+                Some("the clone of machine lab/vm is backed by it".into())
+            }
+        });
+
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        fs::write(staging.path().join(DISK_FILE), b"new disk").unwrap();
+        let err = guarded
+            .install(staging.path(), &new_meta(), true)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("lab/vm"), "{text}");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                dir.join(DISK_FILE),
+                dir.join("variants/extra").join(DISK_FILE)
+            ]
+        );
+        assert_eq!(version_files(&store), before);
+        assert_eq!(version_entries(&store), ["1"]);
+
+        // A guard that finds no clone lets the replacement through.
+        let free = store.clone().refusing_replace(|_| None);
+        free.install(&staging.keep(), &new_meta(), true).unwrap();
+        assert_ne!(version_files(&store), before);
+    }
 
     #[test]
     fn remove_respects_in_use_and_force() {
