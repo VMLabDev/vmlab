@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use super::cache::{CONFIG_FILE, ImageCache, MANIFEST_FILE, ROOTFS_FILE};
-use super::flatten::flatten_to_squashfs;
+use super::flatten::{CancelOnDrop, flatten_to_squashfs};
 use super::model::{ImageConfig, oci_arch};
 use super::reference::{ImageReference, Selector, parse_image_reference};
 use crate::oci::auth;
@@ -253,14 +253,19 @@ pub(crate) async fn pull_with_transport(
     }
 
     // 5. Flatten to a squashfs, verifying diff_ids (blocking work). The
-    // blobs stay in the cache on failure so a retry resumes.
+    // blobs stay in the cache on failure so a retry resumes. Aborting this
+    // task does not stop a blocking thread: the guard, dropped with this
+    // future, sets the flag the flatten stops at.
     let rootfs_tmp = staging.path().join(ROOTFS_FILE);
     {
         let layer_files = layer_files.clone();
         let diff_ids = config.rootfs.diff_ids.clone();
         let dest = rootfs_tmp.clone();
-        tokio::task::spawn_blocking(move || flatten_to_squashfs(&layer_files, &diff_ids, &dest))
-            .await
+        let (_cancel_on_drop, cancel) = CancelOnDrop::pair();
+        tokio::task::spawn_blocking(move || {
+            flatten_to_squashfs(&layer_files, &diff_ids, &dest, &cancel)
+        })
+        .await
             .context("flatten task panicked")?
             .with_context(|| format!("flattening {reference}"))?;
     }

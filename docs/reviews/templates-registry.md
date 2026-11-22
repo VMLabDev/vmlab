@@ -30,7 +30,7 @@ much as a Makefile is.
 | F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed, #480) |
 | F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481) |
 | F5 | security | A template pull bounds each chunk but not the number of chunks or the total size (fixed, #482) |
-| F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop |
+| F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop (fixed, #503) |
 | F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
 | F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
 | F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
@@ -313,6 +313,35 @@ much as a Makefile is.
   under ten seconds. Today it performs about 2 × 10^10 closure calls. A
   second test, `a_layer_with_too_many_entries_is_refused`, states the limit
   that the fix picks.
+- Fixed in card #503. The survey keeps the surviving paths as a tree of
+  path components (`Survivors` in `src/oci/image/flatten.rs`). A whiteout,
+  an opaque marker and a file over a directory write one number on the root
+  of the subtree they erase, and visit nothing beneath it. Folding one entry
+  in, and asking which layer won a path, costs the length of that path.
+  One image is held to `Limits::IMAGE`: 4,000,000 tar entries over all
+  layers and as many distinct paths, 256 MiB of path names, and 64 GiB of
+  decompressed layer bytes. Past any of them the pull is refused. The pull
+  holds a `CancelOnDrop` across the `spawn_blocking` await
+  (`src/oci/image/pull.rs`). Aborting the pull task drops it, which sets the
+  flag that both passes test at each entry and each read, and `sqfstar` is
+  killed when the stream to it fails.
+  Tests in `src/oci/image/flatten.rs`:
+  `the_survey_of_a_large_layer_is_linear` failed before the fix (the survey
+  of 200,000 files took 135 s on helios) and passes after it.
+  `a_layer_with_too_many_entries_is_refused`,
+  `a_layer_whose_names_take_too_much_memory_is_refused`,
+  `layers_that_unpack_to_too_much_are_refused` and
+  `a_cancelled_flatten_stops` call what the fix added.
+  `the_survivor_tree_agrees_with_a_scan_of_every_path` compares the tree
+  with the old map on 2,000 generated layer stacks.
+  - Not fixed here: the number of layers in a manifest has no limit of its
+    own. The 8 MiB manifest limit bounds it, the three limits above are over
+    the whole image, and every layer is still downloaded before the flatten
+    refuses anything.
+  - Not fixed here: the 64 GiB are not compared with the free space of the
+    cache's filesystem.
+  - Changed behaviour: an image past one of the limits, which flattened
+    before (slowly), is now refused.
 
 ### F7. The store accepts a qcow2 with an external data file (security)
 
