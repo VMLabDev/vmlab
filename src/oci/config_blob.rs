@@ -267,6 +267,7 @@ impl TemplateConfig {
             variants: Vec::new(),
         };
         meta.ensure_login_surface()?;
+        meta.ensure_known_display()?;
         Ok(meta)
     }
 
@@ -354,7 +355,7 @@ mod tests {
             tpm: Some(true),
             secure_boot: Some(true),
             secure_boot_keys: Some(crate::config::model::SecureBootKeys::Vars),
-            display: Some("vnc".into()),
+            display: Some("qxl".into()),
             cpu_model: Some("pentium3".into()),
             hyperv: Some(true),
             apple_smc: Some(true),

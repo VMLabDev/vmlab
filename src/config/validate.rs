@@ -827,6 +827,30 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 check_virtual_display_family(gpu, family, &mut issues);
             }
         }
+        // What a template block says here is recorded in its metadata, and a
+        // VM cloned from the template takes it from there, where only a
+        // display device by name is accepted (`TEMPLATE_DISPLAYS`). Say so at
+        // the block, not after the build.
+        let displays = std::iter::once((t.span, String::new(), &t.display)).chain(
+            t.variants
+                .iter()
+                .map(|v| (v.span, format!(" variant \"{}\"", v.name), &v.display)),
+        );
+        for (span, variant, display) in displays {
+            let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+            if let Some(d) = display
+                && !known.contains(&d.as_str())
+            {
+                issues.push(Issue::at(
+                    span,
+                    format!(
+                        "template \"{}\"{variant}: display = \"{d}\" is not a display device a template can record; use one of {}",
+                        t.name,
+                        known.join(", ")
+                    ),
+                ));
+            }
+        }
         check_logins("template", &t.name, &t.logins, base_family, &mut issues);
         let variant_playbooks = t.variants.iter().flat_map(|v| {
             let family = match &v.profile {
@@ -2718,6 +2742,26 @@ template "t" { arch = "x86" version = "1" disk = 1GiB cpu_model = ""
 lab "l" { vm "a" { template = "x86_64/t" cpu_model = "Westmere,+aes" } }"#,
         );
         assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
+    }
+
+    /// A template block's `display` ends up in template metadata, which
+    /// carries a display device by name only (docs/reviews/config.md F1).
+    #[test]
+    fn a_template_block_display_is_a_known_device() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "bochs-display,vgamem=8M"
+  source "scratch" { } }"#,
+            "template \"t\": display = \"bochs-display,vgamem=8M\" is not a display device",
+        );
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "cirrus-vga"
+  source "scratch" { } }"#,
+        );
+        assert!(es.iter().all(|m| !m.contains("display")), "{es:#?}");
     }
 
     fn assert_nested_cpu_model_conflict(ctx: &Hardware, src: &str, needle: &str) {

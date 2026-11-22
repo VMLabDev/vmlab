@@ -72,7 +72,7 @@ SRC
       | "`cpus`" | "i64" | "from profile" | "vCPU count for the build VM. Inherited by clones." |
       | "`memory`" | "ByteSize" | "from profile" | "RAM for the build VM, for example `8GiB`. Inherited by clones." |
       | "`disk`" | "ByteSize" | "from source" | "Working disk size for the build, for example `64GiB`. Required for a `scratch` source." |
-      | "`display`" | "utf8" | "from profile" | "QEMU display device string for the build VM." |
+      | "`display`" | "utf8" | "from profile" | "Display device for the build VM, recorded in the template: `std`, `qxl`, `virtio-vga`, `virtio-gpu`, `vmware`, or a QEMU display device by name with no properties (`VGA`, `cirrus-vga`, `qxl-vga`, `virtio-gpu-pci`, `vmware-svga`, `bochs-display`, `ramfb`, `ati-vga`). Any other string is refused." |
       | "`cpu_model`" | "utf8" | "from profile" | "QEMU `-cpu` model for the build VM, for example `pentium3`, replacing the accelerator default. Inherited by clones. Cannot be combined with `nested = true`." |
       | "`hyperv`" | "bool" | "from profile" | "Hyper-V enlightenments for the build VM under KVM; the build VM resolves it like any VM, so a template on a shipped Windows profile builds with them. Recorded in the metadata and inherited by clones. Not applied under TCG or with a `cpu_model`." |
       | "`apple_smc`" | "bool" | "from profile" | "The Apple SMC and an SMBIOS type 2 table for the build VM, which a macOS installer needs. Recorded in the metadata and inherited by clones. x86 only." |
@@ -250,7 +250,7 @@ SRC
       | "`profile`" | "utf8" | "the base's" | "Guest OS profile for this variant." |
       | "`cpus`" | "i64" | "the base's" | "vCPU count." |
       | "`memory`" | "ByteSize" | "the base's" | "RAM, for example `8GiB`." |
-      | "`display`" | "utf8" | "the base's" | "QEMU display device string." |
+      | "`display`" | "utf8" | "the base's" | "Display device, from the same list as the template's `display`." |
       | "`cpu_model`" | "utf8" | "the base's" | "QEMU `-cpu` model." |
       | "`hyperv`" | "bool" | "the base's" | "Hyper-V enlightenments under KVM." |
       | "`apple_smc`" | "bool" | "the base's" | "The Apple SMC device." |

@@ -472,6 +472,28 @@ fn meta_firmware(s: &str) -> Option<FirmwareKind> {
     Firmware::parse(s).map(firmware_kind)
 }
 
+/// The `display` values a template's metadata may carry: vmlab's own names
+/// and QEMU's display devices by name, with no properties. Template metadata
+/// comes from any registry, and whatever passes here becomes the whole value
+/// of a `-device` argument, so this is a closed list and not a syntax check —
+/// `loader,file=…` is a device too. A lab file's `display` is not held to it:
+/// a lab file already has `qemu_args`.
+pub const TEMPLATE_DISPLAYS: &[&str] = &[
+    "std",
+    "qxl",
+    "virtio-vga",
+    "virtio-gpu",
+    "vmware",
+    "VGA",
+    "cirrus-vga",
+    "qxl-vga",
+    "virtio-gpu-pci",
+    "vmware-svga",
+    "bochs-display",
+    "ramfb",
+    "ati-vga",
+];
+
 fn display_device_name(d: &str, arch: &str) -> String {
     let x86 = arch == "x86_64" || arch == "x86";
     match d {
@@ -504,6 +526,11 @@ pub fn resolve_vm(
     template: Option<&TemplateMeta>,
     profiles: &ProfileSet,
 ) -> anyhow::Result<ResolvedVm> {
+    // Refused whether or not this VM restates `display`: the string would be
+    // the device of the next VM that does not.
+    if let Some(t) = template {
+        t.ensure_known_display()?;
+    }
     let profile_name = effective_profile_name(lab_vm, template);
     let default_profile = default_profile();
     let profile = match &profile_name {
