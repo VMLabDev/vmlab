@@ -34,6 +34,9 @@ async fn resolve_in(
             Ok(path.clone())
         }
         ArtefactSource::Url { url, sha256, .. } => {
+            // The digest names the cache files, so it is checked here too,
+            // for a source that did not come through the lab file.
+            let sha256 = &digest_name(sha256)?;
             std::fs::create_dir_all(dir)?;
             // Cache key = the expected digest, so a re-download is skipped
             // when the verified artefact is already present.
@@ -48,10 +51,12 @@ async fn resolve_in(
                         return Ok(cached);
                     }
                     log(format!("downloading {url}"));
-                    download(url, &cached, limits).await?;
-                    verify_file(&cached, sha256)
+                    let dl = Scratch::new(dir, sha256);
+                    download(url, dl.path(), limits).await?;
+                    verify_file(dl.path(), sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
+                    dl.publish(&cached)?;
                     log(format!("verified sha256 {sha256}"));
                 }
                 // Compressed: sha256 verifies the *download*, then we
@@ -64,23 +69,76 @@ async fn resolve_in(
                         log(format!("using cached artefact {sha256}"));
                         return Ok(cached);
                     }
-                    let dl = dir.join(format!("{sha256}.download"));
                     log(format!("downloading {url}"));
-                    download(url, &dl, limits).await?;
-                    verify_file(&dl, sha256)
+                    let dl = Scratch::new(dir, sha256);
+                    download(url, dl.path(), limits).await?;
+                    verify_file(dl.path(), sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
                     log(format!(
                         "verified sha256 {sha256}; decompressing ({})",
                         c.name()
                     ));
-                    c.decompress(&dl, &cached).await?;
-                    std::fs::remove_file(&dl).ok();
+                    let image = Scratch::new(dir, sha256);
+                    c.decompress(dl.path(), image.path()).await?;
+                    image.publish(&cached)?;
                     std::fs::write(&marker, [])?;
                 }
             }
             Ok(cached)
         }
+    }
+}
+
+/// A `sha256` as the cache names files by it: 64 hex digits, in lower case.
+/// Anything else is refused, because the value becomes a file name.
+pub fn digest_name(sha256: &str) -> Result<String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("`sha256` must be 64 hex digits, got `{sha256}`");
+    }
+    Ok(sha256.to_ascii_lowercase())
+}
+
+/// A file of the cache directory that one resolve writes and no other
+/// resolve names: a download, or an image being decompressed. It gets its
+/// digest-named place with [`Scratch::publish`], after it is verified, and
+/// is removed when it does not get there.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new(dir: &Path, sha256: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The process id and a counter separate the resolves of this host.
+        // The clock separates this process from an earlier one with its id.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        Scratch {
+            path: dir.join(format!(".{sha256}.{pid}-{n}-{nanos:09}.part")),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rename the file to `dest`. A rename replaces whole files, so a
+    /// concurrent resolve that publishes the same artefact does no harm.
+    fn publish(self, dest: &Path) -> Result<()> {
+        std::fs::rename(&self.path, dest)
+            .with_context(|| format!("moving the artefact to {}", dest.display()))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // After `publish` the name is gone and this is a no-op.
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -113,14 +171,14 @@ impl Compression {
         }
     }
 
+    /// Decompress `src` into `dest`, which the caller owns and publishes.
     async fn decompress(self, src: &Path, dest: &Path) -> Result<()> {
         let (prog, args): (&str, &[&str]) = match self {
             Compression::Xz => ("xz", &["--decompress", "--stdout"]),
             Compression::Gzip => ("gzip", &["--decompress", "--stdout"]),
         };
-        let tmp = dest.with_extension("decomp");
         let out =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
         let status = tokio::process::Command::new(prog)
             .args(args)
             .arg(src)
@@ -131,7 +189,6 @@ impl Compression {
         if !status.success() {
             bail!("`{prog}` failed to decompress {}", src.display());
         }
-        tokio::fs::rename(&tmp, dest).await?;
         Ok(())
     }
 }
@@ -150,11 +207,12 @@ const DOWNLOAD_LIMITS: DownloadLimits = DownloadLimits {
     read: std::time::Duration::from_secs(60),
 };
 
+/// Download `url` into `dest`. The caller verifies the file before it gives
+/// it a name that another resolve reads.
 async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let tmp = dest.with_extension("part");
     // A User-Agent is required: some CDNs (e.g. Fastly fronting
     // cloud.centos.org) answer 403 to requests with an empty UA.
     let client = reqwest::Client::builder()
@@ -171,15 +229,13 @@ async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> 
     if !resp.status().is_success() {
         bail!("GET {url} returned {}", resp.status());
     }
-    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, dest).await?;
     Ok(())
 }
 

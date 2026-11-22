@@ -900,7 +900,7 @@ template "base" {
   version = "1.0"
   profile = "linux-modern"
   disk    = 20GiB
-  source "iso" { url = "https://example.com/x.iso" sha256 = "abc123" }
+  source "iso" { url = "https://example.com/x.iso" sha256 = "00000000000000000000000000000000000000000000000000000000000000ab" }
   media { kind = "iso" from = "./unattend/" }
   provision "scripts/install.ws" { }
 }

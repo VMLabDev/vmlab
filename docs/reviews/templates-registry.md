@@ -39,7 +39,7 @@ much as a Makefile is.
 | F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" |
 | F13 | wrong result | A cancelled pull removes the work directory under the install that is still running |
 | F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept |
-| F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked |
+| F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked (fixed, #523) |
 | F16 | wrong result | A push onto a tag that holds a plain manifest drops that manifest's architecture |
 | F17 | wrong result | The flatten drops PAX extended attributes, so file capabilities are lost |
 | F18 | wrong result | A 404 on a later page of a tag list returns an empty list |
@@ -597,6 +597,22 @@ much as a Makefile is.
   `a_download_that_fails_its_hash_leaves_no_cache_entry`.
   `a_url_source_needs_a_64_digit_hex_sha256` in the config tests: a
   definition with `sha256 = "../x"` is a validation error.
+- Fixed in card #523. Each resolve downloads into a file of its own in the
+  cache directory (`.<sha256>.<pid>-<n>-<nanos>.part`), verifies it there,
+  and only then renames it to `<sha256>.artefact`. A compressed artefact is
+  decompressed into a second file of that kind, so the shared `.download` and
+  `.decomp` names are gone too. A file that does not reach its place is
+  removed. `digest_name` accepts 64 hex digits and nothing else. The lab file
+  extraction reports another value as a validation error and holds the digest
+  in lower case, and `resolve` asks it again before it builds a path. The
+  three proof tests and `a_sha256_that_is_not_a_digest_writes_nothing` failed
+  before the fix (the first resolve failed at its rename with "No such file
+  or directory", the failed download stayed as `<sha256>.artefact`,
+  `sha256 = "../x"` validated and was downloaded) and pass after it.
+  - Not fixed here: two resolves of one URL at the same time each download
+    it. Both succeed, the second rename replaces an identical file.
+  - Not fixed here: a file left by a process that was killed during a
+    download stays until someone removes it (F14).
 
 ### F16. A push onto a tag that holds a plain manifest drops its architecture (wrong result)
 
