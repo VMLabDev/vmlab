@@ -256,6 +256,38 @@ impl PullSink for FileSink {
     }
 }
 
+/// The part-written file of a pull, removed when the pull ends. After the
+/// rename that completes a pull there is nothing at this path to remove.
+struct PullTemp(PathBuf);
+
+impl Drop for PullTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A new file beside `target`, on its filesystem, for a pull to fill and
+/// rename over it. Never an existing file: the name is taken exclusively.
+async fn create_pull_temp(target: &Path) -> std::io::Result<(tokio::fs::File, PullTemp)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp =
+            target.with_file_name(format!(".{name}.vmlab-pull.{}.{n}", std::process::id()));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+        {
+            Ok(file) => return Ok((file, PullTemp(temp))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Into memory, for a caller that wants the bytes. The ceiling is checked
 /// chunk by chunk, so an oversized file is refused mid-flight rather than
 /// buffered whole and then rejected.
@@ -926,14 +958,48 @@ impl AgentHandle {
         {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let file = tokio::fs::File::create(local)
-            .await
-            .with_context(|| format!("creating {}", local.display()))?;
+        // The guest is asked before the host is touched: an agent that
+        // cannot serve the transfer costs the destination nothing.
         let ops = self
             .open_fileops(logon)
             .await
             .with_context(|| format!("pull {remote}"))?;
-        ops.pull(remote, &mut FileSink(file)).await
+        // A destination that is already a file is written through whatever
+        // symlink names it, and keeps its mode.
+        let (target, existing) = match tokio::fs::metadata(local).await {
+            Ok(meta) => (
+                tokio::fs::canonicalize(local)
+                    .await
+                    .unwrap_or_else(|_| local.to_path_buf()),
+                Some(meta),
+            ),
+            Err(_) => (local.to_path_buf(), None),
+        };
+        if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
+            // A device, a FIFO or a directory: nothing a failed pull could
+            // lose, and nothing a rename may replace. A directory fails here.
+            let file = tokio::fs::File::create(&target)
+                .await
+                .with_context(|| format!("creating {}", local.display()))?;
+            return ops.pull(remote, &mut FileSink(file)).await;
+        }
+        // The bytes land beside the destination and replace it only once the
+        // digest has matched, so every failure — a guest path that is not
+        // there, a dropped connection, a mismatch — leaves the host file as
+        // it was.
+        let (file, temp) = create_pull_temp(&target)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        let pulled = ops.pull(remote, &mut FileSink(file)).await?;
+        if let Some(meta) = existing {
+            tokio::fs::set_permissions(&temp.0, meta.permissions())
+                .await
+                .with_context(|| format!("creating {}", local.display()))?;
+        }
+        tokio::fs::rename(&temp.0, &target)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        Ok(pulled)
     }
 
     /// Pull a guest file into memory, for a caller that wants the bytes rather
