@@ -367,10 +367,13 @@ pub fn validate_current() -> Result<crate::config::LabFile> {
 /// against that file.
 fn validation_error(root: &Path, issues: config::IssueList) -> ConfigErrors {
     let path = root.join(crate::paths::LAB_FILE);
+    let name = path.display().to_string();
     let source = std::fs::read_to_string(&path).unwrap_or_default();
+    // The excerpts a report prints hold no password and no secret value.
+    let shown = config::diagnostic_source(&source, &name, root);
     ConfigErrors {
-        name: path.display().to_string(),
-        src: NamedSource::new(path.display().to_string(), source),
+        src: NamedSource::new(&name, shown),
+        name,
         issues,
     }
 }
