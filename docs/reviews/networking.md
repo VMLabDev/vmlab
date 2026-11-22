@@ -27,7 +27,7 @@ Who the attacker is, per finding:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user |
+| F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
 | F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment |
@@ -75,6 +75,11 @@ Who the attacker is, per finding:
   "../victim", "k")`. Read the 3-byte answer. Assert that the answer is not
   `OK\n` and that `<tempdir>/victim.sock` is still a regular file. Today the
   answer is `OK\n` and the file is a socket.
+- Fixed in card #466: `check_segment_name` in `src/supervisor/global.rs`
+  refuses a name that is not one file name (empty, over 128 bytes, `.`, `..`,
+  or holding `/` or a control character). The trunk listener answers `NO\n`
+  to such a name, and `attach` refuses it for every caller. The proof test
+  failed before the fix and passes after it.
 
 ### F2. A fast-path tap outlives its XDP filter (security, guest and local user)
 

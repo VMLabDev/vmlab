@@ -546,6 +546,7 @@ impl GlobalSegments {
         peer: Option<String>,
         lab: Option<Joining>,
     ) -> Result<(PathBuf, Vec<String>)> {
+        check_segment_name(name)?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
             seg.refcount += 1;
@@ -853,6 +854,24 @@ fn spawn_tcp_peer_dialer(
     })
 }
 
+/// Refuse a global segment name that is not one file name. The name becomes
+/// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
+/// sends its own: a separator, `..` or an absolute path would aim that at
+/// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
+/// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
+/// refused here.
+fn check_segment_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| c == '/' || c.is_control());
+    if !ok {
+        bail!("invalid global segment name {name:?}");
+    }
+    Ok(())
+}
+
 /// A global segment's name as a DNS domain label. A worktree lab's global
 /// segment is named `<segment>@<worktree>` (PRD §21.4), and a worktree is
 /// named by its directory: `@`, and anything else a segment name never
@@ -915,6 +934,12 @@ pub async fn bind_peer_listener(
                 else {
                     return;
                 };
+                // The peer chose this name, and it names a socket file.
+                if let Err(e) = check_segment_name(&segment) {
+                    tracing::warn!("refusing a peer trunk: {e:#}");
+                    let _ = stream.write_all(b"NO\n").await;
+                    return;
+                }
                 // Single-slot rule: refuse up front when a trunk to/from this
                 // host already exists (mutual connect, duplicate dial). The
                 // atomic reserve inside accept_peer catches the race window.
@@ -1022,6 +1047,76 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
         }
         panic!("segment {name} never reached peer_connected={want}");
+    }
+
+    /// A segment name from a trunk peer names a socket file under `sock_dir`:
+    /// one that leaves the directory is refused before anything is unlinked
+    /// (docs/reviews/networking.md F1).
+    #[tokio::test]
+    async fn a_peer_cannot_name_a_segment_outside_the_socket_directory() {
+        use tokio::io::AsyncReadExt;
+        let i = instance("k").await;
+        let victim = i._dir.path().join("victim.sock");
+        let absolute = i._dir.path().join("absolute.sock");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::write(&absolute, b"victim").unwrap();
+        let absolute_name = absolute.with_extension("");
+        for name in ["../victim", absolute_name.to_str().unwrap(), "..", "a/b"] {
+            // The handshake carries at most 128 bytes: a long TMPDIR drops
+            // the absolute case, and the others still prove the fault.
+            if name.len() > 128 {
+                continue;
+            }
+            let mut s = tokio::net::TcpStream::connect(i.addr).await.unwrap();
+            crate::supervisor::trunk_auth::client(&mut s, name, "k")
+                .await
+                .unwrap();
+            let mut answer = [0u8; 3];
+            timeout(Duration::from_secs(10), s.read_exact(&mut answer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(&answer, b"OK\n", "the peer's name {name:?} was accepted");
+            assert!(
+                i.globals.attach(name, None, None, None).await.is_err(),
+                "attach took {name:?}"
+            );
+        }
+        // An accepted trunk is attached after the answer: give a wrong one
+        // the time to reach the file.
+        sleep(Duration::from_millis(200)).await;
+        for file in [&victim, &absolute] {
+            assert!(
+                std::fs::symlink_metadata(file)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{} was replaced",
+                file.display()
+            );
+        }
+        assert!(i.globals.list().await.is_empty());
+    }
+
+    #[test]
+    fn a_segment_name_is_one_file_name() {
+        for ok in ["wan", "wan@feat-x", "wan@my tree", "a.b_c", "wan@..x"] {
+            assert!(check_segment_name(ok).is_ok(), "{ok:?}");
+        }
+        let long = "a".repeat(129);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../vmlabd",
+            "/run/x",
+            "a/b",
+            "a\0b",
+            "a\nb",
+            &long,
+        ] {
+            assert!(check_segment_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]
