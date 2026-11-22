@@ -20,8 +20,8 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros |
-| F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk |
+| F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros (fixed, #542) |
+| F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster |
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
@@ -65,6 +65,10 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   `Qcow2Image`, then read the whole cluster with `qemu-io` and with
   `read_at`. Expected: zeros, then 512 bytes of `0xaa` at offset 512, then
   zeros. Today: all zeros.
+- Fixed in card #542. A write to an owned cluster with the zero flag fills the
+  whole host cluster, zeros around the new bytes, and then rewrites the entry
+  without the flag. The test also writes a whole cluster, and it failed with
+  all zeros before the fix.
 
 ### F2. A build source with a host file as backing is read into the disk (security)
 
@@ -99,6 +103,11 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   working disk. Expected: an error that names the backing file, and no working
   disk. Today: the working disk holds the backing file's content. Run it on
   both image tools (`on_both_tools!`).
+- Fixed by card #541: `seed_working_disk` in `src/template/build.rs` calls
+  `refuse_backed_source` before the convert for a `TemplateSource::Qcow2`
+  source. A layered source (a store disk, which may be a variant overlay on
+  its base) is not checked. The proof test failed on both tools before the
+  fix and passes after it.
 
 ### F3. Compressed clusters get a refcount range that is too long (data loss)
 

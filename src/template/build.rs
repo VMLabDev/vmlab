@@ -463,6 +463,7 @@ async fn build_variant(
     })?;
     let build_vm = "build";
     let hw = EffectiveHardware::for_variant(v, &base.meta).locate_vars(Some(&base.dir));
+    hw.ensure_known_display()?;
     let spec = BuildSpec::variant(def, v, base.meta.disk);
     check_spec_hardware(def, &spec, &hw, build_vm, root, profiles)?;
 
@@ -1033,6 +1034,7 @@ async fn run_build(
         .unwrap_or_default();
     let hw = EffectiveHardware::resolve(def, layered.as_ref().map(|r| &r.meta))
         .locate_vars(layered.as_ref().map(|r| r.dir.as_path()));
+    hw.ensure_known_display()?;
 
     // That hardware decides how the build VM boots, so resolve it before the
     // first expensive step: the resolver refuses combinations that cannot work
@@ -1053,7 +1055,7 @@ async fn run_build(
         }
         TemplateSource::Qcow2(src) => {
             let img = cancelable(&run.control.cancel, resolve_artefact(src, root, log)).await?;
-            (None, SeedDisk::CopyFrom(img))
+            (None, SeedDisk::Image(img))
         }
         TemplateSource::Template { .. } => {
             let resolved = layered
@@ -1216,13 +1218,14 @@ async fn run_build(
             )
             .await?;
         }
-        SeedDisk::CopyFrom(src) => {
+        SeedDisk::Image(src) | SeedDisk::CopyFrom(src) => {
             log(format!("seeding working disk from {}\n", src.display()));
+            let standalone = matches!(seed_disk, SeedDisk::Image(_));
             // Flatten/copy into a standalone working qcow2 (resized up to the
             // requested disk size if larger).
             cancelable(
                 &run.control.cancel,
-                super::qimg::convert_to_qcow2(src, &disk0),
+                seed_working_disk(src, standalone, &disk0),
             )
             .await?;
             if def.disk.is_some() {
@@ -1444,7 +1447,48 @@ fn base_first_boot(def: &TemplateDef) -> Option<&PathBuf> {
 
 enum SeedDisk {
     Blank(u64),
+    /// A `qcow2` source's own image, which must stand alone.
+    Image(PathBuf),
+    /// A store disk, which may be a variant overlay on its base.
     CopyFrom(PathBuf),
+}
+
+/// Copy a source image into the working disk, flattening its chain. A
+/// `standalone` source is the image a template definition names itself, and
+/// it is refused when it has a backing file.
+async fn seed_working_disk(src: &Path, standalone: bool, dest: &Path) -> Result<()> {
+    if standalone {
+        refuse_backed_source(src)?;
+    }
+    super::qimg::convert_to_qcow2(src, dest).await?;
+    Ok(())
+}
+
+/// Refuse a `qcow2` build source that names a backing file. Both image tools
+/// open the backing file when they convert the image, and they open a host
+/// file that is not qcow2 as raw. The convert would copy that file into the
+/// working disk, where the guest of the same image reads it. The store has the
+/// same rule for a pulled or imported base (`verify_base`). A source that is
+/// not qcow2 passes.
+fn refuse_backed_source(src: &Path) -> Result<()> {
+    use std::io::Read;
+    // The header reader refuses a symlink, and a local source may be one.
+    let image = std::fs::canonicalize(src)
+        .with_context(|| format!("cannot open the build source {}", src.display()))?;
+    let mut magic = [0; 4];
+    let n = std::fs::File::open(&image)
+        .and_then(|mut f| f.read(&mut magic))
+        .with_context(|| format!("cannot read the build source {}", src.display()))?;
+    if n < 4 || magic != *b"QFI\xfb" {
+        return Ok(());
+    }
+    if let Some(backing) = super::store::qcow2_backing_file(&image)? {
+        bail!(
+            "the build source {} names the backing file {backing:?}, and a qcow2 source must not have a backing file: flatten it first (qemu-img convert -O qcow2)",
+            src.display()
+        );
+    }
+    Ok(())
 }
 
 struct BuildRun<'a> {
@@ -1528,6 +1572,23 @@ struct EffectiveHardware {
 impl EffectiveHardware {
     /// Merge the template block over `source` — the recorded metadata of the
     /// template a layered build layers on, `None` for every other source kind.
+    /// The build records `display` in the template's metadata, which takes
+    /// a display device by name only; refuse another string before the
+    /// build, not at the first VM cloned from its result. The build reads
+    /// its file without the lab validator, which says the same.
+    fn ensure_known_display(&self) -> Result<()> {
+        let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+        if let Some(d) = &self.display
+            && !known.contains(&d.as_str())
+        {
+            bail!(
+                "display = \"{d}\" is not a display device a template can record; use one of {}",
+                known.join(", ")
+            );
+        }
+        Ok(())
+    }
+
     fn resolve(def: &TemplateDef, source: Option<&TemplateMeta>) -> Self {
         Self::declared(def).over(source)
     }
@@ -1693,6 +1754,8 @@ fn resolve_layered_source(
             crate::template::store::Purpose::Build,
         )
         .context("resolving layered build source")?;
+    // The build VM boots the display its source recorded, as a `-device`.
+    resolved.meta.ensure_known_display()?;
     // `#base` seeds from the unsealed base of a template with variants, which
     // was never generalized: there is nothing for a first-boot script to
     // specialize, and on such a template the base carries none anyway. A
@@ -4331,6 +4394,37 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         );
         assert!(super::resolve_layered_source(&layered_from("x86_64/win11#extra"), &store).is_ok());
         assert!(super::resolve_layered_source(&layered_from("x86_64/win11#base"), &store).is_ok());
+    }
+
+    on_both_tools!(async a_qcow2_source_with_a_backing_file_is_refused);
+    /// A `qcow2` source is somebody else's image. One that names a backing
+    /// file would have that host file flattened into the working disk, where
+    /// the image's own guest reads it (docs/reviews/vmlab-disk.md, F2).
+    async fn a_qcow2_source_with_a_backing_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_file = tmp.path().join("host-file.qcow2");
+        qimg::create_blank(&host_file, 16 << 20).await.unwrap();
+        let source = tmp.path().join("source.qcow2");
+        qimg::create_linked_clone(&host_file, &source)
+            .await
+            .unwrap();
+        let working = tmp.path().join("disk0.qcow2");
+
+        let err = super::seed_working_disk(&source, true, &working)
+            .await
+            .expect_err("a source with a backing file must not seed a working disk");
+        assert!(
+            err.to_string().contains(host_file.to_str().unwrap()),
+            "{err}"
+        );
+        assert!(!working.exists(), "no working disk may be written");
+
+        // A store disk's chain is vmlab's own, and still flattens.
+        super::seed_working_disk(&source, false, &working)
+            .await
+            .unwrap();
+        let info = qimg::image_info(&working).await.unwrap();
+        assert!(info.backing_file.is_none(), "{info:?}");
     }
 
     on_both_tools!(async seeding_from_a_variant_flattens_the_chain);
