@@ -17,24 +17,34 @@ static D3DCOLOR to_d3dcolor(const float c[4])
     return D3DCOLOR_COLORVALUE(c[0], c[1], c[2], c[3]);
 }
 
-static bool check_wrap_draw(probe_ctx *ctx, IDirect3DDevice9 *dev,
-                            IDirect3DSurface9 *target, IDirect3DSurface9 *readback,
-                            unsigned set, DWORD mask)
+/* How the coordinate-wrap self-check ended. A mismatch is a rendering
+ * difference of the driver; the probe records it and renders on. */
+enum wrap_result {
+    WRAP_OK,
+    WRAP_MISMATCH,    /* a draw gave the wrong value */
+    WRAP_API_FAILURE, /* a call failed; recorded by probe_hr */
+};
+
+static wrap_result check_wrap_draw(probe_ctx *ctx, IDirect3DDevice9 *dev,
+                                   IDirect3DSurface9 *target, IDirect3DSurface9 *readback,
+                                   unsigned set, DWORD mask, bool win3d)
 {
     static const float vertices[][6] = {
         {-1,  1, .85f, .85f, .85f, .85f}, {1,  1, .15f, .15f, .15f, .15f},
         {-1, -1, .85f, .85f, .85f, .85f}, {1, -1, .15f, .15f, .15f, .15f},
     };
-    if (probe_hr(ctx, dev->BeginScene(), "WRAP BeginScene") ||
-        probe_hr(ctx, dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices,
-                                           sizeof vertices[0]), "WRAP DrawPrimitiveUP") ||
-        probe_hr(ctx, dev->EndScene(), "WRAP EndScene") ||
+    if (probe_hr(ctx, dev->BeginScene(), "WRAP BeginScene"))
+        return WRAP_API_FAILURE;
+    const HRESULT draw = dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof vertices[0]);
+    /* Always close the scene, or the frame loop's BeginScene fails too. */
+    const HRESULT end = dev->EndScene();
+    if (probe_hr(ctx, draw, "WRAP DrawPrimitiveUP") || probe_hr(ctx, end, "WRAP EndScene") ||
         probe_hr(ctx, dev->GetRenderTargetData(target, readback), "WRAP GetRenderTargetData"))
-        return false;
+        return WRAP_API_FAILURE;
 
     D3DLOCKED_RECT pixels;
     if (probe_hr(ctx, readback->LockRect(&pixels, NULL, D3DLOCK_READONLY), "WRAP LockRect"))
-        return false;
+        return WRAP_API_FAILURE;
     const DWORD *row = (const DWORD *)((const char *)pixels.pBits + 16 * pixels.Pitch);
     const DWORD samples[] = {row[8], row[24]};
     readback->UnlockRect();
@@ -45,16 +55,84 @@ static bool check_wrap_draw(probe_ctx *ctx, IDirect3DDevice9 *dev,
         for (unsigned x = 0; x < 2; ++x) {
             const int actual = (samples[x] >> shifts[c]) & 0xff;
             if (abs(actual - expected[x]) > 5) {
-                probe_error(ctx, "WRAP%u mask %#lx component %u sample %u was %d, expected %d",
-                            set, (unsigned long)mask, c, x, actual, expected[x]);
-                return false;
+                /* The win3d adapter must wrap, so there it is an error. On
+                 * another vendor's driver it is a difference to report. */
+                (win3d ? probe_error : probe_warning)(
+                    ctx, "WRAP%u mask %#lx component %u sample %u was %d, expected %d",
+                    set, (unsigned long)mask, c, x, actual, expected[x]);
+                return WRAP_MISMATCH;
             }
         }
     }
-    return true;
+    return WRAP_OK;
 }
 
-static bool check_coordinate_wrap(probe_ctx *ctx, IDirect3DDevice9 *dev)
+/* Checks one WRAP state: no flag, then each flag alone, restored by Apply.
+ * Stops at the first mismatch of this state. */
+static wrap_result check_wrap_set(probe_ctx *ctx, IDirect3DDevice9 *dev,
+                                  IDirect3DSurface9 *target, IDirect3DSurface9 *readback,
+                                  unsigned set, bool win3d)
+{
+    const auto state = (D3DRENDERSTATETYPE)(set < 8 ? D3DRS_WRAP0 + set
+                                                   : D3DRS_WRAP8 + set - 8);
+    char source[384];
+    snprintf(source, sizeof source,
+             "struct V { float4 pos : POSITION; float4 uv : TEXCOORD%u; };"
+             "V vs(float2 p : POSITION, float4 uv : TEXCOORD0)"
+             "{ V o; o.pos = float4(p, 0, 1); o.uv = uv; return o; }"
+             "float4 ps(float4 uv : TEXCOORD%u) : COLOR { return uv; }", set, set);
+    size_t size;
+    void *vs_code = probe_compile_hlsl(ctx, source, "vs", "vs_3_0", &size);
+    void *ps_code = probe_compile_hlsl(ctx, source, "ps", "ps_3_0", &size);
+    IDirect3DVertexShader9 *vs = NULL;
+    IDirect3DPixelShader9 *ps = NULL;
+    const bool ready = vs_code && ps_code &&
+        !probe_hr(ctx, dev->CreateVertexShader((const DWORD *)vs_code, &vs), "WRAP CreateVertexShader") &&
+        !probe_hr(ctx, dev->CreatePixelShader((const DWORD *)ps_code, &ps), "WRAP CreatePixelShader") &&
+        !probe_hr(ctx, dev->SetVertexShader(vs), "WRAP SetVertexShader") &&
+        !probe_hr(ctx, dev->SetPixelShader(ps), "WRAP SetPixelShader");
+    free(vs_code);
+    free(ps_code);
+
+    wrap_result result = ready ? check_wrap_draw(ctx, dev, target, readback, set, 0, win3d)
+                               : WRAP_API_FAILURE;
+    for (unsigned c = 0; c < 4 && result == WRAP_OK; ++c) {
+        const DWORD mask = 1u << c;
+        IDirect3DStateBlock9 *block = NULL;
+        if (probe_hr(ctx, dev->BeginStateBlock(), "WRAP BeginStateBlock")) {
+            result = WRAP_API_FAILURE;
+            break;
+        }
+        const HRESULT record = dev->SetRenderState(state, mask);
+        /* Always end the recording, or every later call is recorded too. */
+        if (probe_hr(ctx, dev->EndStateBlock(&block), "WRAP EndStateBlock") ||
+            probe_hr(ctx, record, "WRAP record state") ||
+            probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP clear before Apply") ||
+            probe_hr(ctx, block->Apply(), "WRAP Apply"))
+            result = WRAP_API_FAILURE;
+        else
+            result = check_wrap_draw(ctx, dev, target, readback, set, mask, win3d);
+        if (block)
+            block->Release();
+    }
+    /* Leave the state off whatever happened; the frame loop draws next. */
+    if (probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP disable") && result == WRAP_OK)
+        result = WRAP_API_FAILURE;
+    dev->SetVertexShader(NULL);
+    dev->SetPixelShader(NULL);
+    if (vs)
+        vs->Release();
+    if (ps)
+        ps->Release();
+    return result;
+}
+
+/* The self-check of D3DRS_WRAP0..15 (docs/acceptance/C344.md). It runs every
+ * state it covers even after one fails, and always puts the render target
+ * back. Sets *usable to false only when the back buffer could not be
+ * restored, which is the one case the frame loop cannot follow. */
+static wrap_result check_coordinate_wrap(probe_ctx *ctx, IDirect3DDevice9 *dev, bool win3d,
+                                         bool *usable)
 {
     static const D3DVERTEXELEMENT9 elements[] = {
         {0, 0, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
@@ -63,67 +141,44 @@ static bool check_coordinate_wrap(probe_ctx *ctx, IDirect3DDevice9 *dev)
     };
     IDirect3DVertexDeclaration9 *decl = NULL;
     IDirect3DSurface9 *original = NULL, *target = NULL, *readback = NULL;
-    if (probe_hr(ctx, dev->GetRenderTarget(0, &original), "WRAP GetRenderTarget") ||
-        probe_hr(ctx, dev->CreateRenderTarget(32, 32, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE,
+    wrap_result result = WRAP_OK;
+    *usable = true;
+    if (probe_hr(ctx, dev->GetRenderTarget(0, &original), "WRAP GetRenderTarget"))
+        return WRAP_API_FAILURE; /* the render target was not touched */
+    if (probe_hr(ctx, dev->CreateRenderTarget(32, 32, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE,
                                              0, FALSE, &target, NULL), "WRAP CreateRenderTarget") ||
         probe_hr(ctx, dev->CreateOffscreenPlainSurface(32, 32, D3DFMT_A8R8G8B8,
              D3DPOOL_SYSTEMMEM, &readback, NULL), "WRAP CreateOffscreenPlainSurface") ||
         probe_hr(ctx, dev->CreateVertexDeclaration(elements, &decl), "WRAP CreateVertexDeclaration") ||
         probe_hr(ctx, dev->SetRenderTarget(0, target), "WRAP SetRenderTarget") ||
-        probe_hr(ctx, dev->SetVertexDeclaration(decl), "WRAP SetVertexDeclaration"))
-        return false;
-
-    /* Cover the legacy range, the start of the second range, and WRAP15. */
-    const unsigned sets[] = {0, 8, 15};
-    for (unsigned set : sets) {
-        const auto state = (D3DRENDERSTATETYPE)(set < 8 ? D3DRS_WRAP0 + set
-                                                       : D3DRS_WRAP8 + set - 8);
-        char source[384];
-        snprintf(source, sizeof source,
-                 "struct V { float4 pos : POSITION; float4 uv : TEXCOORD%u; };"
-                 "V vs(float2 p : POSITION, float4 uv : TEXCOORD0)"
-                 "{ V o; o.pos = float4(p, 0, 1); o.uv = uv; return o; }"
-                 "float4 ps(float4 uv : TEXCOORD%u) : COLOR { return uv; }", set, set);
-        size_t size;
-        void *vs_code = probe_compile_hlsl(ctx, source, "vs", "vs_3_0", &size);
-        void *ps_code = probe_compile_hlsl(ctx, source, "ps", "ps_3_0", &size);
-        IDirect3DVertexShader9 *vs = NULL;
-        IDirect3DPixelShader9 *ps = NULL;
-        if (!vs_code || !ps_code ||
-            probe_hr(ctx, dev->CreateVertexShader((const DWORD *)vs_code, &vs), "WRAP CreateVertexShader") ||
-            probe_hr(ctx, dev->CreatePixelShader((const DWORD *)ps_code, &ps), "WRAP CreatePixelShader") ||
-            probe_hr(ctx, dev->SetVertexShader(vs), "WRAP SetVertexShader") ||
-            probe_hr(ctx, dev->SetPixelShader(ps), "WRAP SetPixelShader"))
-            return false;
-        free(vs_code);
-        free(ps_code);
-        vs->Release();
-        ps->Release();
-
-        if (!check_wrap_draw(ctx, dev, target, readback, set, 0))
-            return false;
-        for (unsigned c = 0; c < 4; ++c) {
-            const DWORD mask = 1u << c;
-            IDirect3DStateBlock9 *block = NULL;
-            if (probe_hr(ctx, dev->BeginStateBlock(), "WRAP BeginStateBlock") ||
-                probe_hr(ctx, dev->SetRenderState(state, mask), "WRAP record state") ||
-                probe_hr(ctx, dev->EndStateBlock(&block), "WRAP EndStateBlock") ||
-                probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP clear before Apply") ||
-                probe_hr(ctx, block->Apply(), "WRAP Apply"))
-                return false;
-            block->Release();
-            if (!check_wrap_draw(ctx, dev, target, readback, set, mask) ||
-                probe_hr(ctx, dev->SetRenderState(state, 0), "WRAP disable"))
-                return false;
+        probe_hr(ctx, dev->SetVertexDeclaration(decl), "WRAP SetVertexDeclaration")) {
+        result = WRAP_API_FAILURE;
+    } else {
+        /* Cover the legacy range, the start of the second range, and WRAP15. */
+        const unsigned sets[] = {0, 8, 15};
+        for (unsigned set : sets) {
+            const wrap_result one = check_wrap_set(ctx, dev, target, readback, set, win3d);
+            if (one == WRAP_API_FAILURE) {
+                result = one;
+                break;
+            }
+            if (one == WRAP_MISMATCH)
+                result = one;
         }
     }
 
-    const bool restored = !probe_hr(ctx, dev->SetRenderTarget(0, original), "WRAP restore render target");
+    if (probe_hr(ctx, dev->SetRenderTarget(0, original), "WRAP restore render target")) {
+        *usable = false;
+        result = WRAP_API_FAILURE;
+    }
     original->Release();
-    target->Release();
-    readback->Release();
-    decl->Release();
-    return restored;
+    if (target)
+        target->Release();
+    if (readback)
+        readback->Release();
+    if (decl)
+        decl->Release();
+    return result;
 }
 
 static int run(probe_ctx *ctx)
@@ -148,6 +203,9 @@ static int run(probe_ctx *ctx)
     }
     probe_int(ctx, PROBE_API, "adapter_count", d3d->GetAdapterCount());
 
+    /* The win3d adapter is the virtio-gpu device; any other one runs a
+     * vendor's own Direct3D 9 driver. */
+    bool win3d = false;
     D3DADAPTER_IDENTIFIER9 id = {};
     if (!probe_hr(ctx, d3d->GetAdapterIdentifier(D3DADAPTER_DEFAULT, 0, &id),
                   "GetAdapterIdentifier")) {
@@ -160,6 +218,7 @@ static int run(probe_ctx *ctx)
         probe_str(ctx, PROBE_ADAPTER, "driver_version",
                   probe_version4((unsigned long long)id.DriverVersion.QuadPart));
         probe_classify(ctx, id.Description, (long)id.VendorId, 0, NULL);
+        win3d = id.VendorId == 0x1af4;
         char sub[160];
         snprintf(sub, sizeof sub, "%s - %s", ctx->arch, id.Description);
         probe_set_subtitle(ctx, sub);
@@ -248,9 +307,13 @@ static int run(probe_ctx *ctx)
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
-    if (!check_coordinate_wrap(ctx, dev))
+    /* A failed self-check is recorded and the probe renders on: one
+     * difference of a driver must not hide the frames and the readback. */
+    bool usable;
+    const wrap_result wrap = check_coordinate_wrap(ctx, dev, win3d, &usable);
+    probe_bool(ctx, PROBE_API, "coordinate_wrap_state_block", wrap == WRAP_OK);
+    if (!usable)
         return 1;
-    probe_bool(ctx, PROBE_API, "coordinate_wrap_state_block", true);
 
     probe_vertex *verts = (probe_vertex *)malloc(vb_bytes);
     for (;;) {
