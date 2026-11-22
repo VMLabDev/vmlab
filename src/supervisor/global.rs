@@ -1078,10 +1078,7 @@ mod tests {
                 .unwrap();
             assert_ne!(&answer, b"OK\n", "the peer's name {name:?} was accepted");
             assert!(
-                i.globals
-                    .attach(name, None, None, None)
-                    .await
-                    .is_err(),
+                i.globals.attach(name, None, None, None).await.is_err(),
                 "attach took {name:?}"
             );
         }
@@ -1090,7 +1087,10 @@ mod tests {
         sleep(Duration::from_millis(200)).await;
         for file in [&victim, &absolute] {
             assert!(
-                std::fs::symlink_metadata(file).unwrap().file_type().is_file(),
+                std::fs::symlink_metadata(file)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
                 "{} was replaced",
                 file.display()
             );
@@ -1104,7 +1104,17 @@ mod tests {
             assert!(check_segment_name(ok).is_ok(), "{ok:?}");
         }
         let long = "a".repeat(129);
-        for bad in ["", ".", "..", "../vmlabd", "/run/x", "a/b", "a\0b", "a\nb", &long] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../vmlabd",
+            "/run/x",
+            "a/b",
+            "a\0b",
+            "a\nb",
+            &long,
+        ] {
             assert!(check_segment_name(bad).is_err(), "{bad:?}");
         }
     }
