@@ -575,7 +575,9 @@ mod tests {
             creds.insert(user.to_string(), pass.to_string());
 
             let first = (round == 0).then_some(held_port);
-            let ports = first.into_iter().chain(std::iter::repeat_with(free_high_port));
+            let ports = first
+                .into_iter()
+                .chain(std::iter::repeat_with(free_high_port));
             let server = match spawn_on_a_free_port(ports, config_for, &creds) {
                 Ok(s) => s,
                 Err(e) => {
