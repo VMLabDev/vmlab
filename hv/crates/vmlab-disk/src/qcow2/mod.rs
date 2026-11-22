@@ -894,7 +894,8 @@ impl Qcow2Image {
         let host_offset = entry & ((1u64 << x) - 1);
         let sector_bits = 62 - x;
         let additional_sectors = (entry >> x) & ((1u64 << sector_bits) - 1);
-        let end = host_offset + (additional_sectors + 1) * 512;
+        // The data ends at the end of its last sector, as on the read path.
+        let end = (host_offset / 512 + additional_sectors + 1) * 512;
         let first = host_offset / self.cluster_size;
         let last = end.div_ceil(self.cluster_size) - 1;
         for cluster_idx in first..=last {
