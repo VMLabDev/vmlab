@@ -2153,6 +2153,89 @@ async fn a_fin_behind_a_stalled_flow_reaches_the_host_after_the_data() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Tables a guest's frames fill (review F6)
+// ---------------------------------------------------------------------------
+
+/// Frames from 100 000 source addresses leave no more than
+/// [`MAX_GUEST_MACS`](super::MAX_GUEST_MACS) entries in the IP → MAC table,
+/// and the newest address is one of them.
+#[tokio::test]
+async fn guest_macs_are_bounded() {
+    use super::MAX_GUEST_MACS;
+    use crate::sync::LockRecover;
+
+    let (engine, _rx) = engine();
+    // A binding of the lab daemon is not one of the limited entries.
+    let bound_ip = Ipv4Addr::new(10, 200, 0, 9);
+    let bound_mac = MacAddr([0x02, 0xEE, 0, 0, 0, 0x09]);
+    engine.learn_mac(bound_ip, bound_mac);
+    const SOURCES: u32 = 100_000;
+    for i in 0..SOURCES {
+        let src = Ipv4Addr::from(0x0A00_0000 + i);
+        // GRE: a protocol the engine drops, so the frame only teaches.
+        let pkt = frame::ipv4_build(src, Ipv4Addr::new(192, 0, 2, 1), 47, 64, b"x", 9).unwrap();
+        let f = frame::eth_build(GW_MAC, GUEST_MAC, ETHERTYPE_IPV4, &pkt);
+        engine.handle_frame(Bytes::from(f)).await;
+    }
+    let held = engine.macs.lock_recover().seen.len();
+    assert!(
+        held <= MAX_GUEST_MACS,
+        "the engine holds {held} guest MACs, over its limit of {MAX_GUEST_MACS}"
+    );
+    assert_eq!(
+        engine.guest_mac(Ipv4Addr::from(0x0A00_0000 + SOURCES - 1)),
+        GUEST_MAC
+    );
+    assert_eq!(
+        engine.guest_mac(bound_ip),
+        bound_mac,
+        "the flood does not drop a bound address"
+    );
+}
+
+/// A pinger that answers at once.
+struct PromptPinger;
+
+#[async_trait]
+impl Pinger for PromptPinger {
+    async fn ping(&self, _dst: Ipv4Addr) -> bool {
+        true
+    }
+}
+
+/// Echo requests to 5 000 destinations leave no more than
+/// [`MAX_CACHED`](super::icmp::MAX_CACHED) results in the probe cache.
+#[tokio::test]
+async fn the_ping_cache_is_bounded() {
+    use super::icmp::MAX_CACHED;
+
+    let (engine, mut rx) = engine_with_pinger(Arc::new(PromptPinger));
+    let replies = tokio::spawn(async move {
+        let mut n = 0usize;
+        while rx.recv().await.is_some() {
+            n += 1;
+        }
+        n
+    });
+    for i in 0..5_000u16 {
+        let dst = Ipv4Addr::new(198, 18, (i >> 8) as u8, i as u8);
+        echo_from(&engine, GUEST_IP, dst).await;
+        // Each echo is answered by a task of its own.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let held = engine.icmp.cached_len();
+    assert!(held > 0, "a probe was cached");
+    assert!(
+        held <= MAX_CACHED,
+        "the cache holds {held} results, over its limit of {MAX_CACHED}"
+    );
+    drop(engine);
+    replies.abort();
+}
+
 /// Review F9: a forward goes to the MAC the lab daemon bound the address to,
 /// whatever MAC a later frame carries that address from.
 #[tokio::test]

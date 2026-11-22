@@ -87,6 +87,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{
     self, ETHERTYPE_IPV4, EthView, ICMP_ECHO_REQUEST, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP,
     IcmpView, Ipv4View, MAC_BROADCAST, TcpView, UdpView,
@@ -138,8 +139,8 @@ pub struct NatEngine {
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
     /// (guest_ip, guest_port, gw_port); the value receives guest payloads.
     guest_udp: StdMutex<HashMap<GuestUdpKey, mpsc::Sender<Vec<u8>>>>,
-    /// Guest IP → MAC mappings, bound or seen ([`GuestMac`]).
-    macs: StdMutex<HashMap<Ipv4Addr, GuestMac>>,
+    /// Guest IP → MAC mappings, bound or seen ([`GuestMacs`]).
+    macs: StdMutex<GuestMacs>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
     /// What of the host a new flow may not reach: the segment's guard, or
@@ -154,14 +155,15 @@ pub struct NatEngine {
 }
 
 /// Where the engine sends what it originates toward a guest address.
-#[derive(Clone, Copy)]
-enum GuestMac {
+struct GuestMacs {
     /// Told by the lab daemon ([`NatEngine::learn_mac`]), which knows the
-    /// NIC that holds the lease. Only another binding replaces it.
-    Bound(MacAddr),
-    /// The source MAC of the last frame from this address. Any frame
-    /// replaces it.
-    Seen(MacAddr),
+    /// NIC that holds the lease. Only another binding replaces an entry,
+    /// and no guest frame adds or removes one (review F9).
+    bound: HashMap<Ipv4Addr, MacAddr>,
+    /// The source MAC of the last frame from each address without a
+    /// binding. Any frame replaces it. A guest writes the source address
+    /// freely, so this table holds [`MAX_GUEST_MACS`] (review F6).
+    seen: BoundedMap<Ipv4Addr, MacAddr>,
 }
 
 /// How many guest-opened vTCP flows the engine holds at once (review F3):
@@ -192,6 +194,13 @@ impl Drop for PassiveSlot {
     }
 }
 
+/// How many guest addresses the engine keeps a seen MAC for (review F6).
+/// Past this a new one replaces the oldest. A flow a guest opens carries the
+/// MAC of its own frames. Only a flow the engine opens toward a guest (a
+/// port forward) reads this table, and it broadcasts when the address has
+/// neither a binding nor an entry here.
+pub(super) const MAX_GUEST_MACS: usize = 1024;
+
 /// The ephemeral range 49152..=65535.
 const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_PORTS: u32 = 16384;
@@ -215,7 +224,10 @@ impl NatEngine {
             tcp_passive: StdMutex::new(HashMap::new()),
             udp_flows: StdMutex::new(HashMap::new()),
             guest_udp: StdMutex::new(HashMap::new()),
-            macs: StdMutex::new(HashMap::new()),
+            macs: StdMutex::new(GuestMacs {
+                bound: HashMap::new(),
+                seen: BoundedMap::new(MAX_GUEST_MACS),
+            }),
             icmp: icmp::IcmpState::new(),
             pinger,
             guard: std::sync::OnceLock::new(),
@@ -251,14 +263,14 @@ impl NatEngine {
     /// daemon, which knows the NIC that holds the lease. A later call
     /// replaces the binding.
     pub fn learn_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
-        self.macs.lock_recover().insert(ip, GuestMac::Bound(mac));
+        self.macs.lock_recover().bound.insert(ip, mac);
     }
 
     /// Note the MAC a frame from `ip` came from, unless `ip` is bound.
     fn see_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
         let mut macs = self.macs.lock_recover();
-        if !matches!(macs.get(&ip), Some(GuestMac::Bound(_))) {
-            macs.insert(ip, GuestMac::Seen(mac));
+        if !macs.bound.contains_key(&ip) {
+            macs.seen.insert(ip, mac);
         }
     }
 
@@ -474,10 +486,12 @@ impl NatEngine {
     // -- internals shared with submodules -------------------------------------
 
     fn guest_mac(&self, ip: Ipv4Addr) -> MacAddr {
-        match self.macs.lock_recover().get(&ip) {
-            Some(GuestMac::Bound(mac) | GuestMac::Seen(mac)) => *mac,
-            None => MAC_BROADCAST,
-        }
+        let macs = self.macs.lock_recover();
+        macs.bound
+            .get(&ip)
+            .or_else(|| macs.seen.get(&ip))
+            .copied()
+            .unwrap_or(MAC_BROADCAST)
     }
 
     fn next_ip_id(&self) -> u16 {

@@ -32,8 +32,8 @@ Who the attacker is, per finding:
 | F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476) |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477) |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
-| F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
-| F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
+| F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache (fixed in card #485) |
+| F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet (fixed in card #485) |
 | F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501) |
 | F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards (fixed in card #502) |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
@@ -296,6 +296,39 @@ Who the attacker is, per finding:
   `inner.macs.len()` is at most a stated limit. Today it is 100 000. The same
   shape for the gateway (100 000 ARP requests, `neighbours.table.len()`), for
   `NatEngine::macs`, and for `DhcpServer::declined` (see F8).
+- Fixed in card #485. Each of the five tables has a limit, and a new entry
+  past it replaces the oldest one. The switch remembers 256 source MACs per
+  guest port and 4 096 per service port, which a trunk is
+  (`MAX_MACS_PER_GUEST_PORT` and `MAX_MACS_PER_SERVICE_PORT` in
+  `src/net/switch.rs`). The limit is per port, so a guest drops only MACs
+  learned on its own port. A dropped MAC also leaves the sockmap tier's
+  kernel map (`SegmentOffload::forget`), and a frame for it is flooded like
+  any unknown destination. A frame from a port that is gone teaches nothing
+  now. The gateway remembers 1 024 neighbours (`MAX_NEIGHBOURS` in
+  `src/net/gateway.rs`) and asks again with ARP for one it dropped. The NAT
+  engine keeps the MAC it saw for 1 024 guest addresses (`MAX_GUEST_MACS`
+  in `src/net/nat/mod.rs`). The addresses the lab daemon binds (F9) are held
+  apart from those and are not counted, so a flood of source addresses
+  cannot drop a binding. Only a flow the engine opens toward a guest reads
+  either table, and it broadcasts when the address is in neither. The probe cache
+  holds 1 024 results (`MAX_CACHED` in `src/net/nat/icmp.rs`). DHCP
+  quarantines 1 024 declined addresses (`MAX_DECLINED` in
+  `src/net/dhcp.rs`). Since F8 a client declines only the address it holds,
+  but it can take a new lease and decline that one too, so the limit is
+  still needed. A decline past it replaces the quarantine that ends first.
+  The gateway, NAT and probe tables share one type, `BoundedMap` in
+  `src/net/bounded.rs`. The proof tests failed before the
+  fix and pass after it: `the_mac_table_is_bounded` in `src/net/switch.rs`
+  (100 001 MACs before), `the_neighbour_table_is_bounded` in
+  `src/net/gateway.rs` (100 000), `guest_macs_are_bounded` and
+  `the_ping_cache_is_bounded` in `src/net/nat/tests.rs` (100 000 and
+  5 000), and `the_declined_set_is_bounded` in `src/net/dhcp.rs` (100 000 before
+  F8 was fixed, and 5 000 on the code of F8 without the limit, where one
+  client takes and declines 5 000 addresses in turn).
+  Not changed: the address tables have no share per guest, so a guest
+  that floods one pushes out the entries of the others, which each owner
+  puts back with its next frame. A /24 has 253 addresses a client can hold,
+  so only a larger subnet reaches the DHCP limit of 1 024.
 
 ### F7. The redirect connection table: no limit, full scan per packet (security, guest)
 
@@ -320,6 +353,22 @@ Who the attacker is, per finding:
   that 1 000 further `eval` calls of a packet that matches no rule finish
   within a fixed time. Today `conn_count()` is 200 000 and each call scans
   all of them.
+- Fixed in card #485. The table holds 4 096 entries, and one guest address
+  1 024 of them (`MAX_CONNS` and `MAX_CONNS_PER_GUEST` in
+  `src/net/rules.rs`). A new connection of a guest at its limit replaces
+  that guest's entry idle the longest, and in a full table the entry idle
+  the longest of all. `eval` drops idle entries at most once a second
+  (`CONN_SWEEP`), where it walked the table for every packet. A reply was
+  never rewritten by an idle entry, so the later sweep changes no verdict.
+  The proof test failed before the fix at the 1 025th entry and passes
+  after it. Its count is checked after every packet, because without a
+  limit the 200 000 calls take minutes, so the before run did not reach the
+  timing part. A second test, `a_guest_at_its_limit_does_not_push_out_another_guest`,
+  held 2 049 entries before the fix. Not changed: a new connection still
+  walks the table once to count its guest's entries, and a second time when
+  it has to replace one. Both walks are over at most 4 096 entries. A guest
+  that sends from many source addresses (F9) has the table's limit and not
+  one guest's.
 
 ### F8. DHCP trusts `chaddr` (security, guest)
 

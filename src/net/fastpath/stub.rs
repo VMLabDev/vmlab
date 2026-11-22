@@ -38,6 +38,10 @@ impl SegmentOffload {
         match self.never {}
     }
 
+    pub fn forget(&self, _mac: MacAddr) {
+        match self.never {}
+    }
+
     pub fn remove_port(&self, _id: PortId, _purged: &[MacAddr]) {
         match self.never {}
     }
