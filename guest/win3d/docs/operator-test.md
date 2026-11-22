@@ -124,7 +124,7 @@ same lab. The kernel log had no Xid before or after any run.
 | windows-11 `#win3d` | AMD1 | **12 of 12** | 59 / 57, 56 / 56, 53 / 51, 53 / 57, 58 / 58 | 23 pass, 4 fail, 0 not-run |
 | windows-11 `#win3d` | Nvidia2 | **12 of 12** | 57 / 55, 55 / 55, 46 / 43, 54 / 55, 56 / 57 | 23 pass, 4 fail, 0 not-run |
 | windows-10 `#win3d` | AMD1 | **12 of 12** | 57 / 58, 59 / 59, 44 / 56, 57 / 58, 58 / 58 | 23 pass, 4 fail, 0 not-run |
-| windows-10 `#win3d` | Nvidia2 | **12 of 12** | 56 / 57, 58 / 58, 41 / 43, 56 / 58, 56 / 57 | 22 pass, 4 fail, 1 not-run |
+| windows-10 `#win3d` | Nvidia2 | **12 of 12** | 56 / 57, 58 / 58, 41 / 43, 56 / 58, 56 / 57 | 22 pass, 4 fail, 1 not-run (the not-run check passes in a second run, below) |
 
 The display runs at 60 Hz. Each probe drew on "Yttrium VirtIO GPU 3D
 controller" or the Venus device, read its picture back correctly and showed
@@ -155,7 +155,7 @@ What the suite measured, the same in all four runs unless said:
 | `tear-flip`, `tear-blt` | pass | 0 torn of about 1,260 console frames in each of the eight runs |
 | `duplication`, `shared-texture` | pass | Desktop Duplication gives 8 lit frames, and a shared render target reads whole in all 4 cases |
 | `d2d`, `d2d-tir`, `draws` | pass | Direct2D fills have no hole against WARP |
-| `svb-chrome`, `svb-edge` | pass, but `svb-chrome` not-run on windows-10 Nvidia2 | WebGL draws `255,0,0,255` on the adapter in Chrome 158 and Edge 158. NOTRUN-TEXT |
+| `svb-chrome`, `svb-edge` | pass; `svb-chrome` not-run once | WebGL draws `255,0,0,255` on the adapter in Chrome 158 and Edge 158. On windows-10 on Nvidia2 the first start of Chrome did not report in time, so `svb-chrome` was not-run there (`venc-chrome` right after it passed). The four browser checks were run again on a new clone of windows-10 on Nvidia2: all four pass, and the e2e before them was again 12 of 12 (`ev/windows-10-nvidia2-rerun/`) |
 | `venc-chrome`, `venc-edge`, `chromium` | pass | WebGL stays on the adapter in 5 of 5 tries, no crash dump, and the GPU process loads Microsoft's `d3d12.dll` |
 | `wine-d3d10_1_d3d10_1`, `wine-d3d10core_d3d10core`, `wine-d3d10_device`, `wine-d3d10_effect`, `wine-d3d9_stateblock` | pass | 0 failures |
 | `wine-d3d11_d3d11` | **fail** | 2 failures of 5,561,777 checks, the count of [acceptance/C374.md](acceptance/C374.md) |
