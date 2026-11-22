@@ -121,7 +121,18 @@ page guide_networking {
     Because the NAT terminates flows on the host, anything a guest addresses
     off-segment reaches the host's own address space. That is how a guest
     reaches a host-side service such as a package mirror or a licence
-    server.
+    server: by an address on one of the host's interfaces.
+  DOC
+
+  p <<DOC
+    The host's loopback is the exception. The NAT refuses every new flow to
+    `127.0.0.0/8` and `0.0.0.0/8`, so a service the host binds to loopback
+    stays reachable from the host only. A refused TCP connect gets a reset;
+    UDP and ICMP are dropped silently. To give guests a loopback service,
+    declare a `redirect {}` onto it, for example
+    `redirect { from = "10.0.0.1:8080" to = "127.0.0.1:8080" }`: the NAT
+    admits the address, protocol and port a redirect of the segment names,
+    and the lab's own smbd port for [shared folders](guide_shares).
   DOC
 
   p <<DOC

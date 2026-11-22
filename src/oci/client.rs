@@ -165,6 +165,9 @@ pub trait Transport: Send + Sync {
 pub struct Registry {
     reference: Reference,
     transport: Box<dyn Transport>,
+    /// Asked before a pull replaces a variant overlay the store holds
+    /// ([`Self::guarding`]). Without one, no held overlay is replaced.
+    in_use: Option<crate::template::build::InUse>,
 }
 
 impl Registry {
@@ -177,7 +180,18 @@ impl Registry {
         Ok(Self {
             reference,
             transport: Box::new(transport),
+            in_use: None,
         })
+    }
+
+    /// Give a pull the in-use check it asks before it replaces a variant
+    /// overlay the store already holds under the same name (§6.6): `in_use`
+    /// says why the overlay cannot go — the clones backed by it — or `None`.
+    /// A client without one cannot tell, so its pulls replace no held
+    /// overlay.
+    pub fn guarding(mut self, in_use: crate::template::build::InUse) -> Self {
+        self.in_use = Some(in_use);
+        self
     }
 
     /// Build a client over an explicit transport (used by tests).
@@ -186,6 +200,7 @@ impl Registry {
         Self {
             reference,
             transport,
+            in_use: None,
         }
     }
 
@@ -703,6 +718,14 @@ impl Registry {
     /// holds is not downloaded again, nor is a variant it holds with the same
     /// digest; what arrives is merged into the version, keeping the variants
     /// already there.
+    ///
+    /// A variant the store holds with *another* digest was rebuilt and pushed
+    /// again. Its overlay is replaced only when the in-use check
+    /// ([`Self::guarding`]) finds no clone backed by the held one: a clone is
+    /// a delta against that overlay, and would be corrupt on the new one.
+    /// Otherwise the held overlay stays where the pull only brought the
+    /// default along, and the pull is refused where `want` asked for that
+    /// variant.
     pub async fn pull_with_progress(
         &self,
         arch: Option<&str>,
@@ -787,10 +810,34 @@ impl Registry {
                 entry.name,
                 layout.base_digest
             );
-            if let Some(held) = local.as_ref().and_then(|l| l.meta.variant(&entry.name))
-                && digest_eq(&held.sha256, &layout.overlay_digest)
+            if let Some(local) = &local
+                && let Some(held) = local.meta.variant(&entry.name)
             {
-                continue;
+                if digest_eq(&held.sha256, &layout.overlay_digest) {
+                    continue;
+                }
+                let why = match &self.in_use {
+                    Some(in_use) => in_use(vec![local.variant_disk(&entry.name)]).await,
+                    None => Some("a clone may be backed by it".to_string()),
+                };
+                if let Some(why) = why {
+                    ensure!(
+                        !want.asks_for(&entry.name),
+                        "{reference}#{} is in the store with a different overlay than {} \
+                         publishes, and {why} — replacing the overlay a clone is a delta \
+                         against would corrupt it; destroy those machines, then pull \
+                         again",
+                        entry.name,
+                        self.reference.canonical()
+                    );
+                    tracing::warn!(
+                        variant = %entry.name,
+                        "keeping {reference}#{}: {} publishes a different overlay, and {why}",
+                        entry.name,
+                        self.reference.canonical()
+                    );
+                    continue;
+                }
             }
             let config_bytes = self
                 .transport
@@ -859,6 +906,10 @@ impl Registry {
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("cannot create {}", staging.display()))?;
         let store = dest_store.clone();
+        // The store asks again under its lock, at the moment it replaces an
+        // overlay: a clone can have been made since the check above.
+        let in_use = self.in_use.clone();
+        let runtime = tokio::runtime::Handle::current();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
             let mut variants = Vec::new();
             for (variant, paths, digest) in overlays {
@@ -871,6 +922,8 @@ impl Registry {
                         == Some(crate::template::store::VARIANT_BACKING),
                     "untrusted variant backing file"
                 );
+                crate::template::store::refuse_qcow2_data_file(&disk)
+                    .with_context(|| format!("variant `{}`", variant.name))?;
                 variants.push(variant);
             }
             match local {
@@ -880,6 +933,10 @@ impl Registry {
                     &held.meta.version,
                     &staging,
                     &variants,
+                    &|doomed| match &in_use {
+                        Some(in_use) => runtime.block_on(in_use(doomed.to_vec())),
+                        None => Some("a clone may be backed by it".to_string()),
+                    },
                 ),
                 None => {
                     let disk = staging.join(DISK_FILE);
@@ -999,6 +1056,12 @@ impl VariantWant {
         if let Some(crate::config::model::VariantRef::Named(n)) = variant {
             self.names.insert(n.clone());
         }
+    }
+
+    /// Whether this asks for `variant` itself, rather than a pull bringing it
+    /// along as the default.
+    fn asks_for(&self, variant: &str) -> bool {
+        self.all || self.names.contains(variant)
     }
 
     /// Whether a store version already holds everything this asks for, as
@@ -1162,6 +1225,7 @@ pub async fn ensure_registry_template(
     arch: &str,
     store: &TemplateStore,
     want: &VariantWant,
+    in_use: crate::template::build::InUse,
     progress: &mut (dyn FnMut(PullProgress) + Send),
 ) -> Result<crate::template::store::TemplateVersion> {
     // Tag is a concrete, already-cached version holding every variant asked
@@ -1205,6 +1269,7 @@ pub async fn ensure_registry_template(
         &crate::paths::template_store_dir().join(".oci-pull"),
     )?;
     let meta = registry
+        .guarding(in_use)
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
@@ -3737,6 +3802,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chunks, 0);
+    }
+
+    /// Rebuild `standard` in the pushed template directory with other data
+    /// and push it again onto the same version tag, as `template build
+    /// --variant` followed by a push does. Returns the new overlay's digest.
+    async fn push_rebuilt_standard(fake: &std::sync::Arc<FakeRegistry>, work: &Path) -> String {
+        let tdir = work.join("tmpl");
+        let overlay = tdir.join(variant_disk_rel("standard"));
+        run(
+            overlay.parent().unwrap(),
+            "qemu-io",
+            &["-c", "write -q -P 0x33 2M 128k", DISK_FILE],
+        );
+        let rebuilt = sha256_file(&overlay).unwrap();
+        let mut m = TemplateMeta::read_from(&tdir.join(META_FILE)).unwrap();
+        m.variants
+            .iter_mut()
+            .find(|v| v.name == "standard")
+            .unwrap()
+            .sha256 = rebuilt.clone();
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.join("push-again"),
+                None,
+                Some("latest"),
+            )
+            .await
+            .unwrap();
+        rebuilt
+    }
+
+    /// Review templates-registry F1: a pull into a version the store holds
+    /// brings the default variant along, and the registry's default was
+    /// rebuilt since. The held overlay has a clone on it, so it stays as it
+    /// is — the clone is a delta against it — and the variant asked for
+    /// still arrives.
+    #[tokio::test]
+    async fn a_pull_does_not_replace_a_variant_a_clone_is_backed_by() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let store = store_in(work.path(), "store");
+        pull_want(&fake, reference, &store, &VariantWant::default())
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_a = sha256_file(&held).unwrap();
+
+        // Lab A's clone of the default variant.
+        let clone = work.path().join("clone.qcow2");
+        run(
+            work.path(),
+            "qemu-img",
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                held.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+        assert_ne!(digest_a, digest_b);
+
+        // Lab B asks for a variant the store lacks.
+        let (meta, _) = pull_want(
+            &fake,
+            reference,
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sha256_file(&held).unwrap(),
+            digest_a,
+            "the overlay under the clone was replaced"
+        );
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_a);
+        assert!(meta.variant("extra").is_some(), "the variant asked for");
+        assert_eq!(
+            crate::template::store::qcow2_backing_file(&clone)
+                .unwrap()
+                .as_deref(),
+            held.to_str()
+        );
+    }
+
+    fn in_use_saying(why: Option<&'static str>) -> crate::template::build::InUse {
+        std::sync::Arc::new(move |_| Box::pin(async move { why.map(str::to_string) }))
+    }
+
+    async fn pull_guarded(
+        fake: &std::sync::Arc<FakeRegistry>,
+        store: &TemplateStore,
+        want: &VariantWant,
+        in_use: crate::template::build::InUse,
+    ) -> Result<TemplateMeta> {
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .guarding(in_use)
+            .pull_with_progress(
+                Some("x86_64"),
+                store,
+                &store
+                    .root()
+                    .join(".oci-pull")
+                    .join(rand::random::<u32>().to_string()),
+                false,
+                want,
+                &mut |_| {},
+            )
+            .await
+    }
+
+    /// The other two answers to a rebuilt variant (F1): a pull that asks for
+    /// the variant itself is refused while a clone is backed by the held
+    /// overlay, naming the clone and leaving the store as it was; and once
+    /// the in-use check finds none, the pull replaces the overlay.
+    #[tokio::test]
+    async fn a_pull_replaces_a_rebuilt_variant_only_when_no_clone_is_backed_by_it() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let store = store_in(work.path(), "store");
+        let free = in_use_saying(None);
+        pull_guarded(&fake, &store, &VariantWant::default(), free.clone())
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_a = sha256_file(&held).unwrap();
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+
+        let busy = in_use_saying(Some("the clone of machine a/web is backed by it"));
+        let asked = VariantWant::of(Some(&VariantRefNamed("standard")));
+        let err = pull_guarded(&fake, &store, &asked, busy.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x86_64/alpine@3.20#standard") && err.contains("a/web"),
+            "{err}"
+        );
+        assert_eq!(sha256_file(&held).unwrap(), digest_a);
+
+        // Brought along as the default only: kept, and the pull goes on.
+        let meta = pull_guarded(&fake, &store, &VariantWant::default(), busy)
+            .await
+            .unwrap();
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_a);
+        assert_eq!(sha256_file(&held).unwrap(), digest_a);
+
+        let meta = pull_guarded(&fake, &store, &asked, free).await.unwrap();
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_b);
+        assert_eq!(sha256_file(&held).unwrap(), digest_b);
     }
 
     /// A corrupt overlay chunk fails the pull on its digest, and nothing of
