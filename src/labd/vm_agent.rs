@@ -913,6 +913,23 @@ impl AgentHandle {
         ops.push(local, remote, mode).await
     }
 
+    /// Push bytes held in memory into a guest file, as a declared account
+    /// (§19.2), returning the verified digest+size — the inline form on the
+    /// wire. The bytes never pass through a file on this host.
+    pub async fn push_bytes_as(
+        &self,
+        bytes: &[u8],
+        remote: &str,
+        mode: Option<u32>,
+        logon: Option<Logon>,
+    ) -> Result<(String, u64)> {
+        let ops = self
+            .open_fileops(logon)
+            .await
+            .with_context(|| format!("push {remote}"))?;
+        ops.push_bytes_making_parents(bytes, remote, mode).await
+    }
+
     /// Push a host file or directory tree into the guest, returning
     /// `(files, bytes)`. Guest paths join with `/` (works on Windows too).
     ///
@@ -1490,21 +1507,7 @@ impl FileOps {
         let mut file = tokio::fs::File::open(local)
             .await
             .with_context(|| format!("opening {}", local.display()))?;
-        let handle = match self.open_for_push(remote, mode).await {
-            Ok(h) => h,
-            // The one recoverable open failure: the guest has no directory to
-            // put it in yet. Making the parents costs a round trip only where
-            // it is actually needed.
-            Err(e) if e.code == ErrorCode::NoSuchFile => {
-                if let Some(parent) = guest_parent(remote) {
-                    self.mkdir_p(&parent).await?;
-                }
-                self.open_for_push(remote, mode)
-                    .await
-                    .with_context(|| format!("push {remote}"))?
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("push {remote}"))),
-        };
+        let handle = self.open_for_push_making_parents(remote, mode).await?;
 
         let mut hasher = Sha256::new();
         let mut offset = 0u64;
@@ -1579,11 +1582,30 @@ impl FileOps {
     /// memory and must not pass through a host file — a playbook's variables
     /// file, whose secrets would otherwise sit on the host disk too.
     pub async fn push_bytes(&self, bytes: &[u8], remote: &str, mode: Option<u32>) -> Result<()> {
-        use sha2::{Digest, Sha256};
         let handle = self
             .open_for_push(remote, mode)
             .await
             .with_context(|| format!("push {remote}"))?;
+        self.write_bytes(handle, bytes, remote).await.map(|_| ())
+    }
+
+    /// The same for the inline form of a push, which a person invoked: the
+    /// guest directories are made where they are missing, as [`Self::push`]
+    /// makes them, and the verified digest and size come back.
+    pub async fn push_bytes_making_parents(
+        &self,
+        bytes: &[u8],
+        remote: &str,
+        mode: Option<u32>,
+    ) -> Result<(String, u64)> {
+        let handle = self.open_for_push_making_parents(remote, mode).await?;
+        self.write_bytes(handle, bytes, remote).await
+    }
+
+    /// Write `bytes` through an open push handle, close it, and verify the
+    /// guest's digest of the file against them.
+    async fn write_bytes(&self, handle: u64, bytes: &[u8], remote: &str) -> Result<(String, u64)> {
+        use sha2::{Digest, Sha256};
         let mut written = Ok(());
         for (i, chunk) in bytes.chunks(TRANSFER_CHUNK).enumerate() {
             let offset = (i * TRANSFER_CHUNK) as u64;
@@ -1599,14 +1621,32 @@ impl FileOps {
         let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
         written.with_context(|| format!("push {remote}"))?;
         closed.with_context(|| format!("push {remote}"))?;
-        let (sha256, _) = self
+        let (sha256, len) = self
             .digest_of_len(remote, bytes.len() as u64)
             .await
             .with_context(|| format!("push {remote}"))?;
         if sha256 != hex::encode(Sha256::digest(bytes)) {
             bail!("push {remote}: digest mismatch after transfer");
         }
-        Ok(())
+        Ok((sha256, len))
+    }
+
+    /// Open `remote` for a push. The one recoverable open failure is that the
+    /// guest has no directory to put the file in yet: making the parents
+    /// costs a round trip only where it is actually needed.
+    async fn open_for_push_making_parents(&self, remote: &str, mode: Option<u32>) -> Result<u64> {
+        match self.open_for_push(remote, mode).await {
+            Ok(h) => Ok(h),
+            Err(e) if e.code == ErrorCode::NoSuchFile => {
+                if let Some(parent) = guest_parent(remote) {
+                    self.mkdir_p(&parent).await?;
+                }
+                self.open_for_push(remote, mode)
+                    .await
+                    .with_context(|| format!("push {remote}"))
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!("push {remote}"))),
+        }
     }
 
     async fn open_for_push(&self, remote: &str, mode: Option<u32>) -> Result<u64, FileOpsError> {
@@ -4404,15 +4444,21 @@ mod tests {
         // `slow` in the name makes the mock sit on each reply of the first
         // push, the open included.
         let (a, b) = tokio::join!(
-            super::super::push_inline(&agent, "f2-pair", &first, "/slow-first", None, None),
-            super::super::push_inline(&agent, "f2-pair", &second, "/second", None, None),
+            super::super::push_inline(&agent, &first, "/slow-first", None, None),
+            super::super::push_inline(&agent, &second, "/second", None, None),
         );
         let (sha, len) = a.expect("the first push");
         assert_eq!(len, first.len() as u64);
-        assert_eq!(sha, hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&first)));
+        assert_eq!(
+            sha,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&first))
+        );
         let (sha, len) = b.expect("the second push");
         assert_eq!(len, second.len() as u64);
-        assert_eq!(sha, hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&second)));
+        assert_eq!(
+            sha,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&second))
+        );
         let limit = crate::proto::INLINE_FILE_LIMIT;
         let (_, held) = agent.pull_bytes("/slow-first", limit).await.unwrap();
         assert!(held == first, "the first guest path holds other bytes");
@@ -4431,16 +4477,15 @@ mod tests {
         let victim = work.path().join("victim");
         std::fs::write(&victim, b"keep me").unwrap();
         // The name the daemon used for a machine called `f2-symlink`.
-        let planted = std::env::temp_dir().join(format!(
-            "vmlab-cp-{}-f2-symlink",
-            std::process::id()
-        ));
+        let planted =
+            std::env::temp_dir().join(format!("vmlab-cp-{}-f2-symlink", std::process::id()));
         let _ = std::fs::remove_file(&planted);
         std::os::unix::fs::symlink(&victim, &planted).unwrap();
 
         let (_dir, path) = mock_agent(true).await;
         let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
-        let pushed = super::super::push_inline(&agent, "f2-symlink", b"pushed bytes", "/pushed", None, None).await;
+        let pushed =
+            super::super::push_inline(&agent, b"pushed bytes", "/pushed", None, None).await;
         let link_left = std::fs::symlink_metadata(&planted).is_ok();
         let _ = std::fs::remove_file(&planted);
 

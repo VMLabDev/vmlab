@@ -429,20 +429,17 @@ fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, Command
 }
 
 /// The inline form of `machine.push_file`: the caller sent the bytes, not a
-/// host path.
+/// host path. They go from memory to the guest. They used to pass through
+/// `<temp_dir>/vmlab-cp-<pid>-<machine>`, a name two pushes to one machine
+/// shared and any local user could plant a symlink at or read.
 async fn push_inline(
     agent: &vm_agent::AgentHandle,
-    machine: &str,
     bytes: &[u8],
     to: &str,
     mode: Option<u32>,
     logon: Option<vm_agent::Logon>,
 ) -> anyhow::Result<(String, u64)> {
-    let tmp = std::env::temp_dir().join(format!("vmlab-cp-{}-{machine}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    let res = agent.push_file_as(&tmp, to, mode, logon).await;
-    let _ = std::fs::remove_file(&tmp);
-    res
+    agent.push_bytes_as(bytes, to, mode, logon).await
 }
 
 /// A clipboard request that failed, under the machine's name: the agent's
@@ -977,7 +974,7 @@ impl Handler<LabRequest> for LabdHandler {
                                 crate::proto::INLINE_FILE_LIMIT,
                             ));
                         }
-                        let res = push_inline(&agent, &machine, &bytes, &to, mode, logon).await;
+                        let res = push_inline(&agent, &bytes, &to, mode, logon).await;
                         on_machine(&machine, Ok(res?))?
                     }
                     None => {

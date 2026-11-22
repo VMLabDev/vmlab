@@ -143,6 +143,16 @@ Not read:
   own bytes. Second test: create a symlink at the temp name that points to a
   file with known content, run one inline push, and assert that the target
   file did not change.
+- Fixed in card #469. An inline push no longer writes a host file: the
+  daemon sends the decoded bytes from memory over the file session
+  (`AgentHandle::push_bytes_as`), makes missing guest directories as a push
+  from a file does, and verifies the guest's digest against the bytes. The
+  handler's inline branch is the function `push_inline` in `src/labd/mod.rs`,
+  and the two tests in `src/labd/vm_agent.rs` call it against the mock
+  agent: `inline_pushes_to_one_machine_do_not_share_a_temp_file` and
+  `an_inline_push_does_not_write_through_a_planted_symlink`. Both failed
+  before the fix (the first push sent the bytes of the second, and the
+  symlink target held the pushed bytes) and pass after it.
 
 ### F3. A collected exec holds all guest output in host memory without a limit
 
