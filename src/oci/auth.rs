@@ -472,4 +472,64 @@ mod tests {
             Credential::Basic { .. }
         ));
     }
+
+    /// F8 of the templates review: a config that does not parse is the
+    /// user's, with other registries' credentials in it. It is refused, not
+    /// replaced by an empty one.
+    #[test]
+    fn a_malformed_config_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let before = r#"{"auths":{"a.example":{"auth":"eDp5"}},}"#;
+        std::fs::write(&path, before).unwrap();
+        let error = store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+        assert!(format!("{error:#}").contains("config.json"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let before = r#"["not", "an", "object"]"#;
+        std::fs::write(&path, before).unwrap();
+        store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_non_object_auths_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for before in [r#"{"auths":"x"}"#, r#"{"auths":[1]}"#, r#"{"auths":7}"#] {
+            std::fs::write(&path, before).unwrap();
+            let error = store_login_at(&path, "ghcr.io", "carol", "tok").unwrap_err();
+            assert!(format!("{error:#}").contains("auths"), "{error:#}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    /// The smaller half of F8: the password is never in a file other local
+    /// users can read, and the other keys of the config survive.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_keeps_the_other_keys_and_writes_a_private_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"auths":{"a.example":{"auth":"eDp5"}},"credHelpers":{"b.example":"pass"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store_login_at(&path, "ghcr.io", "carol", "tok").unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["auths"]["a.example"]["auth"], "eDp5");
+        assert_eq!(root["credHelpers"]["b.example"], "pass");
+        assert!(root["auths"]["ghcr.io"]["auth"].is_string());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("config.json")]);
+    }
 }
