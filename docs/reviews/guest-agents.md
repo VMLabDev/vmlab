@@ -250,8 +250,9 @@ Not read:
   loses nothing: every consumer reads a channel as a byte stream. An event
   that cannot join (stdout and stderr in turn past the depth, for example)
   closes that one channel at once, and its consumer reads an error that
-  names the queue after what was queued. The event that ends a session is
-  always taken. The `close` frame the reader sends for a channel it ended is
+  names the queue after what was queued. One `Eof` and the event that ends
+  a session are always taken, so a command that ends while its consumer is
+  behind keeps its exit code. The `close` frame the reader sends for a channel it ended is
   written by a task of its own with a 10 s limit on the writer lock and the
   write, so a guest that does not read cannot hold the reader there. A write
   cut off inside the frame marks the connection as over, as a ping does. The

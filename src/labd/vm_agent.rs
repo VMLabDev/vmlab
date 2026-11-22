@@ -236,23 +236,28 @@ impl SessionQueue {
     /// Queue one event without waiting. Below [`SESSION_QUEUE`] events each
     /// frame is its own event. At the depth, payload joins the last event
     /// when that is the same stream (every consumer reads a channel as a
-    /// byte stream, and the receive window bounds the bytes), a repeated
-    /// `Eof` is dropped, and the event that ends the session is always
-    /// taken, as only one can arrive. `false` is an event the full queue
-    /// cannot take: the guest sent more frames than a consumer this far
-    /// behind can be kept for.
+    /// byte stream, and the receive window bounds the bytes). One `Eof` is
+    /// taken past the depth and a repeated one is dropped: an exec ends with
+    /// `Eof` and then its exit, and no payload can join behind an `Eof`, so
+    /// the queue grows by that one event. The event that ends the session
+    /// is always taken, as only one can arrive. `false` is an event the
+    /// full queue cannot take: the guest sent more frames than a consumer
+    /// this far behind can be kept for.
     fn push(&self, ev: SessionEvent) -> bool {
         let mut st = self.state.lock_recover();
         let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
         if st.events.len() < SESSION_QUEUE || terminal {
             st.events.push_back(ev);
+        } else if matches!(ev, SessionEvent::Eof) {
+            if !matches!(st.events.back(), Some(SessionEvent::Eof)) {
+                st.events.push_back(ev);
+            }
         } else {
             match (st.events.back_mut(), ev) {
                 (Some(SessionEvent::Data(tail)), SessionEvent::Data(more))
                 | (Some(SessionEvent::Stderr(tail)), SessionEvent::Stderr(more)) => {
                     tail.extend_from_slice(&more)
                 }
-                (Some(SessionEvent::Eof), SessionEvent::Eof) => {}
                 // An empty frame carries nothing a consumer acts on.
                 (_, SessionEvent::Data(more) | SessionEvent::Stderr(more)) if more.is_empty() => {}
                 _ => return false,
@@ -3153,7 +3158,8 @@ mod tests {
     }
 
     /// What `mock:small-frames` and `mock:mixed-frames` send: more frames
-    /// than one session queue holds, of one byte each.
+    /// than one session queue holds, of one byte each. The first then ends
+    /// with `Eof` and an exit code of 3.
     const SMALL_FRAMES: usize = SESSION_QUEUE + 500;
 
     /// One channel holds more frames than its queue while nobody reads it.
@@ -3202,6 +3208,22 @@ mod tests {
             }
         }
         assert_eq!(got, SMALL_FRAMES);
+        // The command ended behind a full queue: its end is there too.
+        let mut end = Vec::new();
+        for _ in 0..2 {
+            end.push(
+                tokio::time::timeout(Duration::from_secs(5), full.recv())
+                    .await
+                    .expect("the first channel lost the end of its command"),
+            );
+        }
+        assert!(
+            matches!(
+                end[..],
+                [Some(SessionEvent::Eof), Some(SessionEvent::Exited(3))]
+            ),
+            "{end:?}"
+        );
     }
 
     /// Frames the queue cannot merge (stdout and stderr in turn) pass its
@@ -3441,6 +3463,13 @@ mod tests {
                                             };
                                             let _ =
                                                 w.write_all(&encode_frame(kind, id, b"s")).await;
+                                        }
+                                        drop(w);
+                                        // The all-stdout command ends as
+                                        // the agent's exec does.
+                                        if !mixed {
+                                            send(AgentMsg::Eof { id }).await;
+                                            send(AgentMsg::Exited { id, code: 3 }).await;
                                         }
                                         continue;
                                     }
