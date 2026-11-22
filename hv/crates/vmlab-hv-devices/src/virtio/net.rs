@@ -45,7 +45,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
+use virtio_queue::{DescriptorChain, Queue, QueueOwnedT, QueueState, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, VolatileSlice};
 use vmm_sys_util::eventfd::EventFd;
@@ -998,6 +998,40 @@ fn receive_merged_header(
     Ok(Receive::Delivered)
 }
 
+fn receive_single(
+    mem: &GuestMemory,
+    q: &mut Queue,
+    chain: DescriptorChain<&GuestMemory>,
+    header: &[u8],
+    frame: &[u8],
+    guest_csum: bool,
+) -> Result<Receive, ()> {
+    let head = chain.head_index();
+    let need = header.len() + frame.len();
+    let (written, result) = match ReceiveWriter::new(mem, chain) {
+        Ok(mut writer) if writer.available_bytes() >= need => {
+            let mut checksum = guest_csum.then(|| CopyChecksum::receive(frame)).flatten();
+            if writer.write_all(header).is_ok()
+                && writer.write_frame(frame, checksum.as_mut()).is_ok()
+                && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
+                    || writer.set_flags(HDR_F_DATA_VALID).is_ok())
+            {
+                (need as u32, Receive::Delivered)
+            } else {
+                (0, Receive::Retry)
+            }
+        }
+        Ok(writer) if writer.available_bytes() >= header.len() => {
+            // A valid receive buffer cannot hold the frame. Return the
+            // buffer empty and drop the frame so the next one can proceed.
+            (0, Receive::Delivered)
+        }
+        _ => (0, Receive::Retry),
+    };
+    q.add_used(mem, head, written).map_err(|_| ())?;
+    Ok(result)
+}
+
 fn receive_offload_supported(header: Header, frame: &[u8], features: u64) -> bool {
     if header.flags & NEEDS_CSUM != 0 && features & F_GUEST_CSUM == 0 {
         return false;
@@ -1094,33 +1128,18 @@ fn place_vnet_rx_frames(
             match q.iter(mem).ok().and_then(|mut iter| iter.next()) {
                 None => Ok(Receive::Wait(q.next_avail())),
                 Some(chain) => {
-                    let head = chain.head_index();
                     let mut header = metadata.encode();
                     if hdr_len == 12 {
                         header[10..].copy_from_slice(&1u16.to_le_bytes());
                     }
-                    let need = hdr_len + frame.len();
-                    let mut checksum = (guest_csum && metadata.flags == 0)
-                        .then(|| CopyChecksum::receive(frame))
-                        .flatten();
-                    let written = if let Ok(mut writer) = ReceiveWriter::new(mem, chain)
-                        && writer.available_bytes() >= need
-                        && writer.write_all(&header[..hdr_len]).is_ok()
-                        && writer.write_frame(frame, checksum.as_mut()).is_ok()
-                        && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
-                            || writer.set_flags(HDR_F_DATA_VALID).is_ok())
-                    {
-                        need as u32
-                    } else {
-                        0
-                    };
-                    q.add_used(mem, head, written).map_err(|_| ()).map(|()| {
-                        if written == 0 {
-                            Receive::Retry
-                        } else {
-                            Receive::Delivered
-                        }
-                    })
+                    receive_single(
+                        mem,
+                        q,
+                        chain,
+                        &header[..hdr_len],
+                        frame,
+                        guest_csum && metadata.flags == 0,
+                    )
                 }
             }
         };
@@ -1373,28 +1392,20 @@ fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool,
                     }
                 };
                 let Some(chain) = chain else { break };
-                let head = chain.head_index();
-                let need = hdr.len() + frame.len();
-                let mut written = 0;
-                let mut checksum = guest_csum.then(|| CopyChecksum::receive(frame)).flatten();
-                if let Ok(mut writer) = ReceiveWriter::new(mem, chain)
-                    && writer.available_bytes() >= need
-                    && writer.write_all(&hdr).is_ok()
-                    && writer.write_frame(frame, checksum.as_mut()).is_ok()
-                    && (!checksum.as_ref().is_some_and(CopyChecksum::valid)
-                        || writer.set_flags(HDR_F_DATA_VALID).is_ok())
-                {
-                    written = need as u32;
+                match receive_single(mem, q, chain, &hdr, frame, guest_csum) {
+                    Ok(Receive::Delivered) => {
+                        used_any = true;
+                        sh.rx_pending.pop_front();
+                    }
+                    Ok(Receive::Retry | Receive::Wait(_)) => {
+                        used_any = true;
+                        break;
+                    }
+                    Err(()) => {
+                        invalid = true;
+                        break;
+                    }
                 }
-                if q.add_used(mem, head, written).is_err() {
-                    invalid = true;
-                    break;
-                }
-                used_any = true;
-                if written == 0 {
-                    break;
-                }
-                sh.rx_pending.pop_front();
             }
             // Socket input drives RX while buffers are available. If a frame
             // is waiting, arm the refill kick and check for a raced refill.
@@ -3812,6 +3823,51 @@ mod tests {
         assert_eq!(f.vqs[0].used_idx(&f.mem), 2);
         assert_eq!(f.vqs[0].used_entry(&f.mem, 0).1, 0);
         assert_eq!(f.vqs[0].used_entry(&f.mem, 1).1, 12 + frame.len() as u32);
+        assert!(lock(&f.dev.shared).rx_pending.is_empty());
+    }
+
+    #[test]
+    fn oversized_frame_without_mergeable_buffers_is_dropped() {
+        check_oversized_frame_is_dropped(None);
+    }
+
+    #[test]
+    fn oversized_vnet_frame_without_mergeable_buffers_is_dropped() {
+        check_oversized_frame_is_dropped(Some(2));
+    }
+
+    fn check_oversized_frame_is_dropped(pairs: Option<u16>) {
+        let mut f = Fixture::new_mode(pairs);
+        let _switch = f.take_switch_side();
+        f.dev.quiesce();
+        let oversized = [0x11; 1000];
+        let frame = [0x22; 60];
+        {
+            let mut state = lock(&f.dev.shared);
+            state.snapshot_paused = false;
+            for packet in [oversized.as_slice(), frame.as_slice()] {
+                state.rx_pending.push_back(if pairs.is_some() {
+                    vnet_body(Header::default(), packet)
+                } else {
+                    packet.to_vec()
+                });
+            }
+        }
+        for index in 0..2 {
+            let addr = f.data(index);
+            f.vqs[0].add_chain(&f.mem, &[(addr, 256, true)]);
+        }
+
+        place_rx_frames(&f.dev.shared, 12, false, false);
+
+        assert_eq!(f.vqs[0].used_idx(&f.mem), 2);
+        assert_eq!(f.vqs[0].used_entry(&f.mem, 0).1, 0);
+        assert_eq!(f.vqs[0].used_entry(&f.mem, 1).1, 72);
+        let mut received = [0; 60];
+        f.mem
+            .read_slice(&mut received, GuestAddress(f.data(1) + 12))
+            .unwrap();
+        assert_eq!(received, frame);
         assert!(lock(&f.dev.shared).rx_pending.is_empty());
     }
 
