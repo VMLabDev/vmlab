@@ -204,9 +204,6 @@ impl Registry {
         }
     }
 
-    pub fn repository(&self) -> &str {
-        &self.reference.repository
-    }
     pub fn tag(&self) -> &str {
         &self.reference.tag
     }
@@ -774,6 +771,20 @@ impl Registry {
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
         };
+        // A version another repository put there is not this reference's,
+        // whatever its disk: its metadata and its variants are that
+        // repository's. It is refused rather than used or merged into.
+        if let Some(other) = local
+            .as_ref()
+            .and_then(|l| l.meta.pulled_from_other(&self.reference.source()))
+        {
+            bail!(
+                "template {reference} is already in the store, pulled from {other}, and {} \
+                 states the same name and version — remove it first, or pull with overwrite \
+                 to replace it",
+                self.reference.canonical()
+            );
+        }
         if let Some(local) = &local {
             let held = local.clone();
             let whole = whole.clone();
@@ -1199,18 +1210,42 @@ pub fn cached_registry_template(
     arch: &str,
     store: &TemplateStore,
 ) -> Result<Option<crate::template::store::TemplateVersion>> {
-    let registry = Registry::new(reference)?;
-    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
-    // the last repository path component.
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    Ok(store
-        .resolve_version(arch, &store_name, Some(registry.tag()))
-        .ok())
+    let reference = Reference::parse(reference)?;
+    Ok(held_for(&reference, arch, store, &reference.tag))
+}
+
+/// The store version the registry `reference` stands for at version `pin`,
+/// offline. Templates live at `host/owner/[group/]name:VERSION`; the store
+/// name is the last repository path component.
+///
+/// A version pulled from another repository is never the answer
+/// ([`TemplateMeta::pulled_from_other`]): its config blob chose the name and
+/// version it sits under. Where such a version is the newest match of the
+/// pin, the newest one this reference can stand for is taken instead, so the
+/// other repository cannot hide it either.
+fn held_for(
+    reference: &Reference,
+    arch: &str,
+    store: &TemplateStore,
+    pin: &str,
+) -> Option<crate::template::store::TemplateVersion> {
+    let name = reference.repository.rsplit('/').next().unwrap_or_default();
+    let source = reference.source();
+    let newest = store.resolve_version(arch, name, Some(pin)).ok()?;
+    if newest.meta.pulled_from_other(&source).is_none() {
+        return Some(newest);
+    }
+    let mut held = Vec::new();
+    for version in store.versions_of(arch, name).unwrap_or_default() {
+        if let Ok(Some(v)) = store.installed(arch, name, &version)
+            && v.meta.pulled_from_other(&source).is_none()
+        {
+            held.push(v);
+        }
+    }
+    let versions: Vec<String> = held.iter().map(|v| v.meta.version.clone()).collect();
+    let version = crate::template::store::resolve_version_pin(&versions, pin)?;
+    held.into_iter().find(|v| v.meta.version == version)
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -1240,12 +1275,6 @@ pub async fn ensure_registry_template(
         return Ok(r);
     }
     let registry = Registry::new(reference)?;
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
     // Not cached. Resolve the requested tag against the registry's published
     // tags first: a version pin (e.g. 26100.1742, or 24.04) resolves to the
     // version `latest` names when it falls under the pin, else to the newest
@@ -1262,7 +1291,7 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real))
+    if let Some(r) = held_for(&registry.reference, arch, store, &real)
         && want.held_by(&r.meta)
     {
         return Ok(r);
@@ -1277,7 +1306,19 @@ pub async fn ensure_registry_template(
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
+    // Exactly the version the pull installed or found held. A pin
+    // resolution here would prefer a `<version>.<N>` sub-build, which another
+    // repository may have put in the store.
+    store
+        .installed(&meta.arch, &meta.name, &meta.version)?
+        .ok_or_else(|| {
+            anyhow!(
+                "template {}/{}@{} is not in the store after its pull",
+                meta.arch,
+                meta.name,
+                meta.version
+            )
+        })
 }
 
 /// `sha256:<hex>` of a byte slice.
