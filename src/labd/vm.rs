@@ -244,6 +244,11 @@ impl VmDirs {
     pub fn tpm_state(&self) -> PathBuf {
         self.local.join("tpm-state")
     }
+    /// What each offline snapshot holds beside the disks (§7.3): one
+    /// directory per snapshot, see [`super::snapshot_state`].
+    pub fn snapshot_state(&self) -> PathBuf {
+        self.local.join("snapshot-state")
+    }
     /// The TSC frequency a `tsc = "host"` VM was pinned at, at its first KVM
     /// start (§5.2) — kept beside its disk, because an online snapshot only
     /// loads into a VM started at the frequency it was taken at
