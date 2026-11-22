@@ -53,7 +53,7 @@ depends on what a real guest or agent does, the finding says so.
 | F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
 | F9 | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
 | F10 | A host file name that is not UTF-8 is trouble on every pass, and refuses every capture | Wrong result |
-| F11 | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
+| F11 (fixed, card #435) | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
 
 ### F1. A failed guest `readdir` during a walk deletes host files
 
@@ -400,6 +400,14 @@ a row report `1 workspace actions failed: caf�.txt: No such file or directory`
 **How bad.** Wrong result.
 
 ### F11. A directory left standing comes back on the side that deleted it
+
+**Fixed in #435.** The ledger records each directory a removal left standing,
+with the side that kept it (`left_standing`). Reconciliation does not read such
+a directory as created: it makes it again only when a synced path has to land
+under it. The record ends when the keeping side drops the directory too, or
+when both sides hold it. A steady-state pass asks the guest about each recorded
+path by name, so a guest that kept the directory is seen without a walk. A
+re-seed starts from a new ledger and so drops the records.
 
 **Where.** `src/labd/workspace/apply.rs:278-281`.
 

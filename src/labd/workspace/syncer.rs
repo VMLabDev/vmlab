@@ -1807,10 +1807,14 @@ async fn pass(
         // What the drain reported joins the host's own set and the ledger's.
         // The obvious exclusions go before the round trip; the rest is
         // decided below, once the kind is known.
+        // A directory left standing has no agreement, and the guest may be
+        // the side that kept it: it is asked about by name, or its record
+        // would read as a directory gone from both sides.
         let paths: BTreeSet<String> = scan
             .tree
             .keys()
             .chain(ledger.entries.keys())
+            .chain(ledger.left_standing.keys())
             .cloned()
             .chain(
                 pending
