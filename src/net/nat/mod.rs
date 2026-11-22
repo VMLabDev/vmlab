@@ -140,6 +140,15 @@ pub struct NatEngine {
     eph_span: AtomicU32,
 }
 
+/// How many guest-opened vTCP flows the engine holds at once (review F3):
+/// each is a host socket and a task, and a lab daemon that runs out of
+/// descriptors can open no QMP socket, agent socket or disk. A SYN past the
+/// limit is dropped, so the guest's own retransmission retries it.
+pub(super) const MAX_TCP_FLOWS: usize = 256;
+/// How many of [`MAX_TCP_FLOWS`] one guest address may hold, so that one
+/// guest cannot take every slot of its segment.
+pub(super) const MAX_TCP_FLOWS_PER_GUEST: usize = 128;
+
 /// The ephemeral range 49152..=65535.
 const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_PORTS: u32 = 16384;

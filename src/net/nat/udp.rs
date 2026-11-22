@@ -19,6 +19,15 @@ use super::{FlowKey, NatEngine};
 /// Flows idle longer than this are torn down.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
+/// How many outbound UDP flows the engine holds at once (review F3): each
+/// is a host socket, a task and a 64 KiB buffer. A new flow past the limit
+/// replaces the one idle the longest, so a table full of abandoned flows
+/// never refuses a live one.
+pub(super) const MAX_UDP_FLOWS: usize = 256;
+/// How many of [`MAX_UDP_FLOWS`] one guest address may hold. Past it a new
+/// flow replaces that guest's own oldest, not another guest's.
+pub(super) const MAX_UDP_FLOWS_PER_GUEST: usize = 128;
+
 /// A live outbound UDP flow.
 #[derive(Clone)]
 pub(super) struct UdpFlow {

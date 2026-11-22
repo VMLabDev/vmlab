@@ -35,6 +35,12 @@ use super::NatEngine;
 /// Reachability results are reused for this long.
 const CACHE_TTL: Duration = Duration::from_secs(10);
 
+/// How many probes run at once (review F3): each is one `ping` process. An
+/// echo request that would need one more is dropped (the guest retransmits).
+pub(super) const MAX_PROBES: usize = 32;
+/// How many of [`MAX_PROBES`] one guest address may have in flight.
+pub(super) const MAX_PROBES_PER_GUEST: usize = 8;
+
 /// Reachability probe. The default implementation shells out to `ping`;
 /// tests substitute a stub.
 #[async_trait]
