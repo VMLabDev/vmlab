@@ -60,3 +60,4 @@ d3d9-register-ati2-scratch-pixel-size.patch
 d3d9-blit-yuy2-surfaces.patch
 d3d9-report-yuy2-format-conversion.patch
 d3d10umd-back-nv12-with-two-texture-planes.patch
+d3d9-keep-bc4-layout-for-legacy-ati1-pitch.patch

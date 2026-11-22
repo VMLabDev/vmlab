@@ -278,3 +278,44 @@ async fn tcp_override_bridges_vnc_on_both_hypervisors() {
         assert!(!native.with_file_name("native.args").exists());
     }
 }
+
+/// The address line is the signal a script waits for before it uses the
+/// bridge, so an interrupt may follow it at once. The bridge must already
+/// handle SIGINT then, and stop with success instead of dying of the signal.
+#[tokio::test]
+async fn an_interrupt_right_after_the_address_line_stops_the_bridge_cleanly() {
+    let fixture = Fixture::new("vmlab", false).await;
+    let _listener = tokio::net::UnixListener::bind(fixture.vnc_socket()).unwrap();
+    for round in 0..40 {
+        let mut child = fixture
+            .command(&["console", "--tcp", "console-test/vm"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
+        let mut stdout = child.stdout.take().unwrap();
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !seen.contains(&b'\n') {
+                let mut byte = [0; 1];
+                stdout.read_exact(&mut byte).await.unwrap();
+                seen.push(byte[0]);
+            }
+        })
+        .await
+        .unwrap();
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+        assert!(seen.starts_with(b"VNC for console-test/vm on "));
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "round {round}: {:?}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
