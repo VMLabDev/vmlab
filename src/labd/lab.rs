@@ -55,6 +55,10 @@ pub struct LabRuntime {
     /// every start across looking its machine up and starting it (PRD §7.1):
     /// a start never boots an instance a reload has just replaced.
     rebuild_gate: tokio::sync::RwLock<()>,
+    /// What keeps a start from running behind a stop or a destroy: a `down`
+    /// makes the starts before it stale, a destroy holds the machine until
+    /// its disks are gone, and a lab that is going away takes no start.
+    starts: super::start_gate::StartGate,
     /// What the running SMB server exports, as [`reload::smb_exports`]
     /// renders it, so a reload can tell whether the file changed them.
     smb_served: std::sync::Mutex<String>,
@@ -562,6 +566,7 @@ impl LabRuntime {
             #[cfg(test)]
             doubles: std::sync::Mutex::new(None),
             rebuild_gate: tokio::sync::RwLock::new(()),
+            starts: Default::default(),
             smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(state),
@@ -636,6 +641,7 @@ impl LabRuntime {
             machines: std::sync::RwLock::new(set),
             doubles: std::sync::Mutex::new(None),
             rebuild_gate: tokio::sync::RwLock::new(()),
+            starts: Default::default(),
             smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(LabState::load(&lab_local).unwrap_or_default()),
@@ -1336,12 +1342,37 @@ impl LabRuntime {
         name: &str,
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
-        self.settle_pending(name).await?;
-        self.prepare_disk_dir(name, None)?;
-        self.clone_from_freeze(name).await?;
+        let ticket = self.starts.ticket()?;
+        self.start_machine_at(name, output, ticket).await
+    }
+
+    /// [`start_machine_with_output`](Self::start_machine_with_output) for a
+    /// start that was asked for at `ticket`: refused when the lab is closed
+    /// to starts, or when a `down` or a destroy of `name` came after the
+    /// ticket. `up` takes one ticket for all its waves, so a `down` that
+    /// crosses it stops the later waves too.
+    async fn start_machine_at(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+        ticket: super::start_gate::Ticket,
+    ) -> Result<()> {
+        {
+            // What makes disks is held against a destroy of this machine,
+            // which removes them.
+            let _admitted = self.starts.admit(name, ticket).await?;
+            self.settle_pending(name).await?;
+            self.prepare_disk_dir(name, None)?;
+            self.clone_from_freeze(name).await?;
+        }
         // A download is the one long wait a start can make: outside the
-        // gate, so a reload is not held up behind it (§7.1).
+        // gate, so a reload is not held up behind it (§7.1), and outside the
+        // machine's start lock, so a stop is not either. A stop that comes
+        // meanwhile makes the ticket stale.
         self.ensure_pulled(&[name.to_string()], None).await?;
+        // Held until the machine has started: a stop that arrives now waits
+        // and then has an emulator to stop.
+        let _admitted = self.starts.admit(name, ticket).await?;
         let _gate = self.rebuild_gate.read().await;
         self.machine(name)?.start(self.services(), output).await
     }
@@ -1505,6 +1536,14 @@ impl LabRuntime {
     /// rest of the lab running. It stays in the lab config, so a later
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
     pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.machine(name)?;
+        // No start of this machine from here to the removal of its disks: a
+        // start under way finishes first and is stopped below, one asked for
+        // earlier is refused, and a later one waits for the removal.
+        self.starts.stop_requested([name]);
+        let _no_start = self.starts.hold(name).await;
+        // The instance as it is now: a start that was under way may have
+        // rebuilt it (§7.1).
         let m = self.machine(name)?;
         self.stop_mounting(name);
         self.workspaces.stop(name).await;
@@ -1628,6 +1667,20 @@ impl LabRuntime {
         name: &str,
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
+        let ticket = self.starts.ticket()?;
+        self.start_with_deferred_refresh_at(name, output, ticket)
+            .await
+    }
+
+    /// [`start_with_deferred_refresh`](Self::start_with_deferred_refresh)
+    /// for a start asked for at `ticket`
+    /// ([`start_machine_at`](Self::start_machine_at)).
+    async fn start_with_deferred_refresh_at(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+        ticket: super::start_gate::Ticket,
+    ) -> Result<()> {
         self.settle_pending(name).await?;
         let name = name.to_string();
         if self.refresh_could_be_owed(self.machine(&name)?.as_ref()) {
@@ -1635,7 +1688,7 @@ impl LabRuntime {
                 .lock_recover()
                 .insert(name.clone(), OwedRefresh::AtHandshake);
         }
-        self.start_machine_with_output(&name, output).await?;
+        self.start_machine_at(&name, output, ticket).await?;
         let m = &self.machine(&name)?;
         // Already running and ready, so no handshake is coming: a machine
         // other callers are already using is refreshed beside them, in the
@@ -2033,6 +2086,9 @@ impl LabRuntime {
         wait_ready: bool,
         output: crate::scripting::OutputSink,
     ) -> Result<()> {
+        // One ticket for every wave: a `down` or a destroy that crosses this
+        // `up` refuses the starts it has not made yet.
+        let ticket = self.starts.ticket()?;
         // Decide the whole schedule before touching anything: which
         // machines a subset drags in, which wave each lands in, and which
         // configuration steps are in scope (see `labd::plan`).
@@ -2110,11 +2166,13 @@ impl LabRuntime {
         // Before any disk exists to miss it: NOCOW reaches only files made
         // after it is set (PRD §7.1).
         for name in &targets {
+            let _admitted = self.starts.admit(name, ticket).await?;
             self.prepare_disk_dir(name, Some(&output))?;
         }
         // Before anything downloads or boots, so the waves below see each
         // clone's first-boot marker and the pull its image pin.
         for name in &targets {
+            let _admitted = self.starts.admit(name, ticket).await?;
             self.clone_from_freeze(name).await?;
         }
 
@@ -2208,9 +2266,10 @@ impl LabRuntime {
                         if !first_boot {
                             hold = me.hold_for_inline_refresh(m.as_ref());
                         }
-                        me.start_machine_with_output(&n, Some(&out)).await?;
+                        me.start_machine_at(&n, Some(&out), ticket).await?;
                     } else {
-                        me.start_with_deferred_refresh(&n, Some(&out)).await?;
+                        me.start_with_deferred_refresh_at(&n, Some(&out), ticket)
+                            .await?;
                     }
                     // The instance that booted: a reload may have rebuilt the
                     // one looked up above while it was still stopped (§7.1).
@@ -2860,10 +2919,20 @@ impl LabRuntime {
         for skip in &plan.skipped {
             tracing::info!("{}: {}", skip.what, skip.why);
         }
+        // Every start asked for before this point is stale for the machines
+        // this stops: an `up` under way boots none of them afterwards.
+        if subset.is_empty() {
+            self.starts.lab_stop_requested();
+        } else {
+            self.starts
+                .stop_requested(plan.machines().chain(&dropped).map(String::as_str));
+        }
         for name in &dropped {
             self.stop_mounting(name);
             self.workspaces.stop(name).await;
             self.record_finalise_machine(name, "machine stopped").await;
+            // A start under way finishes first, so there is something to stop.
+            drop(self.starts.hold(name).await);
             self.machine(name)?.stop(force).await?;
         }
 
@@ -2881,8 +2950,20 @@ impl LabRuntime {
             for name in wave {
                 // A machine the config declares but this runtime never built
                 // is nothing to stop.
-                let Ok(m) = self.machine(name) else { continue };
-                handles.push(tokio::spawn(async move { m.stop(force).await }));
+                if self.machine(name).is_err() {
+                    continue;
+                }
+                let me = self.clone();
+                let name = name.clone();
+                handles.push(tokio::spawn(async move {
+                    // A start under way finishes first: before it has an
+                    // emulator a stop finds nothing to stop, and the machine
+                    // would boot behind this `down`.
+                    drop(me.starts.hold(&name).await);
+                    // The instance that start made: it may have rebuilt the
+                    // machine (§7.1).
+                    me.machine(&name)?.stop(force).await
+                }));
             }
             for h in handles {
                 h.await.map_err(|e| anyhow!("join: {e}"))??;
@@ -2900,6 +2981,24 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Stop the lab because its daemon is about to exit, and take no start
+    /// from here on: a machine that booted after this would outlive the
+    /// daemon, with nothing left to manage it. A `down` that fails is
+    /// followed by a forced stop of every machine, for the same reason.
+    pub async fn stop_for_exit(self: &Arc<Self>) {
+        self.starts.close("shutting down");
+        let Err(e) = self.down(&[], false).await else {
+            return;
+        };
+        tracing::warn!("stopping the lab: {e:#}; stopping every machine by force");
+        for m in self.machines() {
+            drop(self.starts.hold(m.name()).await);
+            if let Err(e) = m.stop(true).await {
+                tracing::warn!("{}: {e:#}", m.name());
+            }
+        }
+    }
+
     /// Stop everything and delete clones, lab-local state, and dynamic net
     /// config (PRD §12).
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
@@ -2907,6 +3006,19 @@ impl LabRuntime {
         // With none depending, the freeze goes with the rest of `.vmlab/`.
         self.refuse_while_depended_on("cannot destroy the main lab")
             .await?;
+        // Nothing starts between the stop below and the removal: every start
+        // is refused from here on. A destroy that fails leaves a lab, which
+        // takes starts again.
+        self.starts.close("being destroyed");
+        let destroyed = self.destroy_closed().await;
+        if destroyed.is_err() {
+            self.starts.reopen();
+        }
+        destroyed
+    }
+
+    /// [`destroy`](Self::destroy), once the lab is closed to starts.
+    async fn destroy_closed(self: &Arc<Self>) -> Result<()> {
         self.workspaces.stop_all().await;
         self.record_finalise_all("lab destroyed").await;
         self.down(&[], true).await?;
@@ -3577,9 +3689,20 @@ impl LabRuntime {
             Ok(()) => match record.freeze_point {
                 Some(generation) => self.restore_freeze_point(&m, snap, generation).await,
                 None => {
-                    Arc::clone(&m)
-                        .restore(self.services(), snap, record.online)
-                        .await
+                    // An online restore boots a stopped machine, so it is a
+                    // start: refused in a lab that is going away, and held
+                    // against a destroy of this machine.
+                    match self.starts.ticket() {
+                        Ok(ticket) => match self.starts.admit(m.name(), ticket).await {
+                            Ok(_admitted) => {
+                                Arc::clone(&m)
+                                    .restore(self.services(), snap, record.online)
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    }
                 }
             },
             Err(e) => Err(e),
@@ -6144,6 +6267,31 @@ lab "t" {
         assert!(started.is_err(), "a start was accepted during the destroy");
         assert_eq!(a.starts.load(Ordering::SeqCst), 0);
         assert_eq!(a.state().await, PowerState::Stopped);
+    }
+
+    /// F2's teardown: a daemon that stops its lab to exit takes no start
+    /// afterwards, from `up`, from a single start or from a handler.
+    #[tokio::test]
+    async fn a_lab_stopped_for_exit_takes_no_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let a = FakeMachine::new("a", MachineKind::Container, &sh);
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b.clone()]);
+        lab.start_machine("a").await.expect("start");
+
+        lab.stop_for_exit().await;
+
+        assert_eq!(a.state().await, PowerState::Stopped);
+        let refused = lab.start_machine("a").await.unwrap_err();
+        assert!(
+            refused.to_string().contains("shutting down"),
+            "the refusal names the reason: {refused}"
+        );
+        assert!(lab.up(&[], quiet()).await.is_err());
+        assert!(lab.restart_machine("b", true, &quiet()).await.is_err());
+        assert_eq!(a.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(b.starts.load(Ordering::SeqCst), 0);
     }
 
     /// Teardown iterates machines once: both kinds are stopped, and neither
