@@ -3763,7 +3763,11 @@ mod tests {
             let guest = guest.clone();
             eventually(move || guest.text("/src/crate/b.rs").as_deref() == Some("b")).await
         };
-        assert!(landed, "a new file under it never landed: {:?}", guest.paths());
+        assert!(
+            landed,
+            "a new file under it never landed: {:?}",
+            guest.paths()
+        );
         syncers.stop("dev01").await;
     }
 
