@@ -8,8 +8,8 @@
 //! to disk (slow, permission-fraught) the layers are streamed twice:
 //!
 //! 1. **Survey** — walk every layer's entries recording, per path, the
-//!    winning layer and the whiteout effects, while hashing each layer's
-//!    decompressed bytes to verify its manifest `diff_id`.
+//!    winning entry, hard-link origins, and whiteout effects, while hashing
+//!    each layer's decompressed bytes to verify its manifest `diff_id`.
 //! 2. **Emit** — re-stream the layers lowest→highest, appending only the
 //!    surviving entries to a merged tar piped straight into `sqfstar`,
 //!    which builds the squashfs without the tree ever touching disk.
@@ -52,7 +52,7 @@ const OPAQUE_MARKER: &str = ".wh..wh..opq";
 struct Limits {
     /// Tar entries over all layers, and distinct paths the survey remembers.
     entries: u64,
-    /// Bytes of path the survey remembers.
+    /// Bytes of paths and recorded hard-link names the survey remembers.
     name_bytes: u64,
     /// Decompressed bytes over all layers.
     unpacked_bytes: u64,
@@ -153,7 +153,28 @@ fn survey_layers(
                 let Some(name) = normalise(&entry.path()?) else {
                     continue;
                 };
-                winners.apply(i, &name, entry.header().entry_type())?;
+                let kind = entry.header().entry_type();
+                let origin = if kind == EntryType::Link {
+                    entry
+                        .link_name()?
+                        .and_then(|target| normalise(&target))
+                        .and_then(|target| winners.entry(&target))
+                        .and_then(|target| target.origin)
+                } else if kind == EntryType::Directory {
+                    None
+                } else {
+                    Some(entries)
+                };
+                let record = LayerEntry {
+                    layer: i,
+                    ordinal: entries,
+                    origin,
+                };
+                if winners.apply(record, &name, kind)? && kind == EntryType::Link && origin.is_some()
+                {
+                    winners.count_name_bytes(name.len())?;
+                    winners.links.push((name, record));
+                }
             }
         }
         // The tar reader stops at the end-of-archive marker; drain to EOF so
@@ -184,15 +205,24 @@ fn survey_layers(
 /// who won a path.
 struct Survivors {
     nodes: Vec<Node>,
+    links: Vec<(String, LayerEntry)>,
     name_bytes: u64,
     max_nodes: u64,
     max_name_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+struct LayerEntry {
+    layer: usize,
+    ordinal: u64,
+    /// The original non-link entry for this inode, if known.
+    origin: Option<u64>,
+}
+
 #[derive(Default)]
 struct Node {
-    /// The layer whose entry at this path is the newest not erased here.
-    entry: Option<usize>,
+    /// The newest entry at this path, unless erased by an ancestor.
+    entry: Option<LayerEntry>,
     /// Entries strictly beneath this path from a layer below `cut` are
     /// erased. Layers are folded in lowest first, so a later entry is never
     /// from a layer below a cut that is already recorded.
@@ -204,6 +234,7 @@ impl Survivors {
     fn new(limits: &Limits) -> Self {
         Self {
             nodes: vec![Node::default()],
+            links: Vec::new(),
             name_bytes: 0,
             max_nodes: limits.entries,
             max_name_bytes: limits.name_bytes,
@@ -222,8 +253,10 @@ impl Survivors {
     /// Fold one tar entry from `layer` into the tree. Whiteouts and opaque
     /// markers only erase *lower* layers — entries this layer already
     /// recorded are kept (a layer can legitimately whiteout a path and
-    /// recreate it, in either order).
-    fn apply(&mut self, layer: usize, name: &str, kind: EntryType) -> Result<()> {
+    /// recreate it, in either order). Returns whether this is a filesystem
+    /// entry rather than a whiteout.
+    fn apply(&mut self, entry: LayerEntry, name: &str, kind: EntryType) -> Result<bool> {
+        let layer = entry.layer;
         let (dir, base) = match name.rsplit_once('/') {
             Some((dir, base)) => (dir, base),
             None => ("", name),
@@ -232,20 +265,20 @@ impl Survivors {
             let at = self.node(dir)?;
             let node = &mut self.nodes[at];
             node.cut = node.cut.max(layer);
-            return Ok(());
+            return Ok(false);
         }
         if let Some(target_base) = base.strip_prefix(WHITEOUT_PREFIX) {
             if target_base.is_empty() {
-                return Ok(()); // `.wh.` names no target
+                return Ok(false); // `.wh.` names no target
             }
             let at = self.node(dir)?;
             let at = self.node_under(at, target_base)?;
             let node = &mut self.nodes[at];
-            if node.entry.is_some_and(|l| l < layer) {
+            if node.entry.is_some_and(|e| e.layer < layer) {
                 node.entry = None;
             }
             node.cut = node.cut.max(layer);
-            return Ok(());
+            return Ok(false);
         }
         let at = self.node(name)?;
         let node = &mut self.nodes[at];
@@ -253,8 +286,8 @@ impl Survivors {
             // A non-directory shadows any lower directory tree at the same path.
             node.cut = node.cut.max(layer);
         }
-        node.entry = Some(layer);
-        Ok(())
+        node.entry = Some(entry);
+        Ok(true)
     }
 
     /// The node of the one component `comp` beneath node `at`, made if absent.
@@ -262,32 +295,51 @@ impl Survivors {
         if let Some(&child) = self.nodes[at].children.get(comp) {
             return Ok(child);
         }
-        self.name_bytes += comp.len() as u64;
         ensure!(
             self.nodes.len() as u64 <= self.max_nodes,
             "the image has more than {} paths in its layers — refused",
             self.max_nodes
         );
-        ensure!(
-            self.name_bytes <= self.max_name_bytes,
-            "the paths in the image's layers take more than {} bytes — refused",
-            self.max_name_bytes
-        );
+        self.count_name_bytes(comp.len())?;
         let child = self.nodes.len();
         self.nodes.push(Node::default());
         self.nodes[at].children.insert(comp.into(), child);
         Ok(child)
     }
 
-    /// The layer that wins `name`, or `None` when no layer's entry survives.
-    fn winner(&self, name: &str) -> Option<usize> {
+    fn count_name_bytes(&mut self, len: usize) -> Result<()> {
+        self.name_bytes += len as u64;
+        ensure!(
+            self.name_bytes <= self.max_name_bytes,
+            "the paths in the image's layers take more than {} bytes — refused",
+            self.max_name_bytes
+        );
+        Ok(())
+    }
+
+    /// The winning entry for `name`, accounting for cuts above it.
+    fn entry(&self, name: &str) -> Option<LayerEntry> {
         let mut at = 0;
         let mut cut = 0;
         for comp in name.split('/').filter(|c| !c.is_empty()) {
             cut = cut.max(self.nodes[at].cut);
             at = *self.nodes[at].children.get(comp)?;
         }
-        self.nodes[at].entry.filter(|layer| *layer >= cut)
+        self.nodes[at].entry.filter(|entry| entry.layer >= cut)
+    }
+
+    /// Group surviving aliases by the archive entry that supplies their data.
+    fn surviving_links(&self, cancel: &AtomicBool) -> Result<HashMap<u64, Vec<&str>>> {
+        let mut links = HashMap::<_, Vec<_>>::new();
+        for (name, link) in &self.links {
+            ensure_running(cancel)?;
+            if self.entry(name).is_some_and(|entry| entry.ordinal == link.ordinal) {
+                links.entry(link.origin.expect("recorded link has an origin"))
+                    .or_default()
+                    .push(name.as_str());
+            }
+        }
+        Ok(links)
     }
 }
 
@@ -344,8 +396,8 @@ fn write_squashfs(
     streamed
 }
 
-/// Re-stream the layers lowest→highest, appending each entry whose path this
-/// layer won (headers preserved: mode, uid/gid, mtime, link targets).
+/// Re-stream the layers lowest→highest, writing each surviving inode under
+/// its original name or a surviving alias, followed by its other hard links.
 fn stream_survivors(
     layers: &[(PathBuf, String)],
     winners: &Survivors,
@@ -353,6 +405,8 @@ fn stream_survivors(
     cancel: &AtomicBool,
 ) -> Result<()> {
     let mut builder = tar::Builder::new(stdin);
+    let links = winners.surviving_links(cancel)?;
+    let mut ordinal = 0;
     for (i, (path, media_type)) in layers.iter().enumerate() {
         let reader = LayerStream::verified(layer_reader(path, media_type)?, cancel);
         let mut archive = tar::Archive::new(reader);
@@ -363,6 +417,7 @@ fn stream_survivors(
             ensure_running(cancel)?;
             let mut entry =
                 entry.with_context(|| format!("cannot re-read layer {i} ({})", path.display()))?;
+            ordinal += 1;
             let Some(name) = normalise(&entry.path()?) else {
                 continue;
             };
@@ -370,9 +425,21 @@ fn stream_survivors(
             if base.starts_with(WHITEOUT_PREFIX) {
                 continue; // whiteouts/opaque markers never reach the output
             }
-            if winners.winner(&name) != Some(i) {
-                continue; // shadowed by a higher layer (or whiteout-erased)
-            }
+            let aliases = links.get(&ordinal).map_or(&[][..], Vec::as_slice);
+            let (name, aliases) = match winners.entry(&name) {
+                Some(winner) if winner.ordinal == ordinal => {
+                    if winner.origin.is_some_and(|origin| origin != ordinal) {
+                        continue; // emitted with the entry that supplies its data
+                    }
+                    (name.as_str(), aliases)
+                }
+                // The old name was erased or replaced. Emit the data under
+                // the first surviving alias and link the others to it.
+                _ => match aliases.split_first() {
+                    Some((&first, rest)) => (first, rest),
+                    None => continue,
+                },
+            };
             // Preserve the original header; append via `append_data`/
             // `append_link` (rather than raw `append`) purely so paths and
             // link targets longer than the ustar fields survive — the crate
@@ -386,14 +453,27 @@ fn stream_survivors(
                         .ok_or_else(|| anyhow!("layer {i}: link entry `{name}` has no target"))?
                         .into_owned();
                     builder
-                        .append_link(&mut header, &name, &target)
+                        .append_link(&mut header, name, &target)
                         .with_context(|| format!("cannot append link `{name}`"))?;
                 }
                 _ => {
                     builder
-                        .append_data(&mut header, &name, &mut entry)
+                        .append_data(&mut header, name, &mut entry)
                         .with_context(|| format!("cannot append `{name}`"))?;
                 }
+            }
+            for alias in aliases {
+                ensure_running(cancel)?;
+                let mut link = tar::Header::new_gnu();
+                link.set_entry_type(EntryType::Link);
+                link.set_size(0);
+                link.set_mode(0o644);
+                link.set_uid(0);
+                link.set_gid(0);
+                link.set_mtime(0);
+                builder
+                    .append_link(&mut link, alias, name)
+                    .with_context(|| format!("cannot append hard link `{alias}`"))?;
             }
         }
     }
@@ -705,7 +785,9 @@ mod tests {
             Layer::new().file("b", 0o644, 0, b"two")
         } else {
             Layer::new().whiteout("b")
-        };
+        }
+        .dir("nested", 0o750)
+        .hardlink("nested/c", "a");
         let (l1, m1, d1) = upper.build(tmp.path(), "upper.tar", false);
         let dest = tmp.path().join("rootfs.sqfs");
         flatten_to_squashfs(
@@ -718,14 +800,23 @@ mod tests {
 
         let image = dest.to_str().unwrap();
         assert_eq!(unsquashfs(&["-cat", image, "a"]), "one");
+        assert_eq!(unsquashfs(&["-cat", image, "nested/c"]), "one");
         let listing = unsquashfs(&["-lln", image]);
         let alias = listing.lines().find(|line| line.ends_with("/a")).unwrap();
         assert!(alias.contains("rw-------"), "{alias}");
         assert!(alias.contains("1000/1000"), "{alias}");
+        let dir = listing
+            .lines()
+            .find(|line| line.ends_with("/nested"))
+            .unwrap();
+        assert!(dir.contains("rwxr-x---"), "{dir}");
         if replace {
             assert_eq!(unsquashfs(&["-cat", image, "b"]), "two");
         } else {
-            assert!(!listing.lines().any(|line| line.ends_with("/b")), "{listing}");
+            assert!(
+                !listing.lines().any(|line| line.ends_with("/b")),
+                "{listing}"
+            );
         }
     }
 
@@ -822,7 +913,7 @@ mod tests {
         let started = std::time::Instant::now();
         let cancel = AtomicBool::new(false);
         let winners = survey_layers(&[(path, media)], &[diff_id], &Limits::IMAGE, &cancel).unwrap();
-        assert_eq!(winners.winner("d/f199999"), Some(0));
+        assert_eq!(winners.entry("d/f199999").map(|entry| entry.layer), Some(0));
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_secs(10),
@@ -1044,13 +1135,18 @@ mod tests {
                         _ => (path.clone(), EntryType::Regular),
                     };
                     scan(&mut map, layer, &name, kind);
-                    tree.apply(layer, &name, kind).unwrap();
+                    let entry = LayerEntry {
+                        layer,
+                        ordinal: script.len() as u64 + 1,
+                        origin: None,
+                    };
+                    tree.apply(entry, &name, kind).unwrap();
                     script.push((layer, name, kind));
                 }
             }
             for path in &paths {
                 assert_eq!(
-                    tree.winner(path),
+                    tree.entry(path).map(|entry| entry.layer),
                     map.get(path).copied(),
                     "round {round}, path `{path}`, after {script:?}"
                 );
@@ -1062,8 +1158,15 @@ mod tests {
     fn survey_records_winners_and_whiteouts() {
         // Pure pass-1 logic, no sqfstar required.
         let mut winners = Survivors::new(&ROOMY);
+        let mut ordinal = 0;
         let mut apply_entry = |layer: usize, name: &str, kind: EntryType| {
-            winners.apply(layer, name, kind).unwrap();
+            ordinal += 1;
+            let entry = LayerEntry {
+                layer,
+                ordinal,
+                origin: None,
+            };
+            winners.apply(entry, name, kind).unwrap();
         };
         // layer 0
         apply_entry(0, "etc", EntryType::Directory);
@@ -1078,20 +1181,21 @@ mod tests {
         apply_entry(1, "opq/upper", EntryType::Regular);
         apply_entry(1, "tree", EntryType::Regular);
 
-        assert_eq!(winners.winner("etc"), Some(0), "merged dir stays");
-        assert_eq!(winners.winner("etc/version"), Some(1), "last writer wins");
-        assert_eq!(winners.winner("gone"), None, "whiteout deletes");
-        assert_eq!(winners.winner("opq/lower"), None, "opaque drops lower");
+        let winner = |name| winners.entry(name).map(|entry| entry.layer);
+        assert_eq!(winner("etc"), Some(0), "merged dir stays");
+        assert_eq!(winner("etc/version"), Some(1), "last writer wins");
+        assert_eq!(winner("gone"), None, "whiteout deletes");
+        assert_eq!(winner("opq/lower"), None, "opaque drops lower");
         assert_eq!(
-            winners.winner("opq/upper"),
+            winner("opq/upper"),
             Some(1),
             "opaque keeps same layer"
         );
         assert_eq!(
-            winners.winner("tree/child"),
+            winner("tree/child"),
             None,
             "file shadows lower dir tree"
         );
-        assert_eq!(winners.winner("tree"), Some(1));
+        assert_eq!(winner("tree"), Some(1));
     }
 }
