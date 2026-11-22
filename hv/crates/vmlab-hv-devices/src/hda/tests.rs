@@ -687,6 +687,47 @@ impl PlaybackSink for GraphSink {
     }
 }
 
+struct LimitHost(Arc<AtomicUsize>, Option<usize>);
+struct LimitSink(GraphSink, Option<usize>);
+impl HostAudio for LimitHost {
+    fn name(&self) -> &'static str {
+        "limit-test"
+    }
+    fn open_playback(&self, _: AudioFormat) -> Result<Box<dyn PlaybackSink>, DeviceError> {
+        Ok(Box::new(LimitSink(GraphSink(self.0.clone()), self.1)))
+    }
+    fn open_capture(&self, _: AudioFormat) -> Result<Box<dyn CaptureSource>, DeviceError> {
+        Err(DeviceError::Other("no capture".into()))
+    }
+}
+impl PlaybackSink for LimitSink {
+    fn write_period(&mut self, pcm: &[u8]) {
+        self.0.write_period(pcm);
+    }
+    fn queued_bytes(&self) -> usize {
+        self.0.queued_bytes()
+    }
+    fn latency_bytes(&self) -> usize {
+        self.0.latency_bytes()
+    }
+    fn queue_limit_bytes(&self) -> Option<usize> {
+        self.1
+    }
+}
+
+/// The host queue is two periods deep, and deeper when the sink asks for it
+/// (after underruns, card #447). A sink cannot ask for less than two periods.
+#[test]
+fn playback_queue_follows_the_sinks_limit() {
+    for (wish, frames) in [(None, 512), (Some(1024 * 4), 1024), (Some(64 * 4), 512)] {
+        let queued = Arc::new(AtomicUsize::new(0));
+        let (mut hda, mem, _) = fixture(Arc::new(LimitHost(queued.clone(), wish)), false);
+        setup_stream(&mut hda, &mem, false, 480 * 4);
+        hda.advance(Duration::from_millis(100)).unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), frames * 4, "{wish:?}");
+    }
+}
+
 #[test]
 fn playback_ioc_reports_dma_completion_before_host_consumption() {
     let queued = Arc::new(AtomicUsize::new(0));
