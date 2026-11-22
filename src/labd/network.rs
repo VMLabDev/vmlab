@@ -759,6 +759,25 @@ lab "framing" { segment "lan" { mtu = 1500 } }"#))
         }
     }
 
+    #[tokio::test]
+    async fn a_second_attach_replaces_the_first_listener() {
+        let mut network = LabNetwork::build(&lab(r#"import <vmlab.wcl>
+lab "restart" { segment "lan" {} }"#))
+        .unwrap();
+        let segment = network.segment_mut("lan").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nic.sock");
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        for _ in 0..2 {
+            segment
+                .attach_nic(&socket, mac, false, false, FramingMode::Raw)
+                .await
+                .unwrap();
+        }
+        assert_eq!(segment.listeners.len(), 1);
+        tokio::net::UnixStream::connect(&socket).await.unwrap();
+    }
+
     #[test]
     fn declared_and_auto_subnets() {
         let l = lab(r#"import <vmlab.wcl>
