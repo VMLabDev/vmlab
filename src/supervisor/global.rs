@@ -546,6 +546,7 @@ impl GlobalSegments {
         peer: Option<String>,
         lab: Option<Joining>,
     ) -> Result<(PathBuf, Vec<String>)> {
+        check_segment_name(name)?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
             seg.refcount += 1;
@@ -853,6 +854,24 @@ fn spawn_tcp_peer_dialer(
     })
 }
 
+/// Refuse a global segment name that is not one file name. The name becomes
+/// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
+/// sends its own: a separator, `..` or an absolute path would aim that at
+/// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
+/// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
+/// refused here.
+fn check_segment_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| c == '/' || c.is_control());
+    if !ok {
+        bail!("invalid global segment name {name:?}");
+    }
+    Ok(())
+}
+
 /// A global segment's name as a DNS domain label. A worktree lab's global
 /// segment is named `<segment>@<worktree>` (PRD §21.4), and a worktree is
 /// named by its directory: `@`, and anything else a segment name never
@@ -915,6 +934,12 @@ pub async fn bind_peer_listener(
                 else {
                     return;
                 };
+                // The peer chose this name, and it names a socket file.
+                if let Err(e) = check_segment_name(&segment) {
+                    tracing::warn!("refusing a peer trunk: {e:#}");
+                    let _ = stream.write_all(b"NO\n").await;
+                    return;
+                }
                 // Single-slot rule: refuse up front when a trunk to/from this
                 // host already exists (mutual connect, duplicate dial). The
                 // atomic reserve inside accept_peer catches the race window.
@@ -1037,6 +1062,11 @@ mod tests {
         std::fs::write(&absolute, b"victim").unwrap();
         let absolute_name = absolute.with_extension("");
         for name in ["../victim", absolute_name.to_str().unwrap(), "..", "a/b"] {
+            // The handshake carries at most 128 bytes: a long TMPDIR drops
+            // the absolute case, and the others still prove the fault.
+            if name.len() > 128 {
+                continue;
+            }
             let mut s = tokio::net::TcpStream::connect(i.addr).await.unwrap();
             crate::supervisor::trunk_auth::client(&mut s, name, "k")
                 .await
@@ -1066,6 +1096,17 @@ mod tests {
             );
         }
         assert!(i.globals.list().await.is_empty());
+    }
+
+    #[test]
+    fn a_segment_name_is_one_file_name() {
+        for ok in ["wan", "wan@feat-x", "wan@my tree", "a.b_c", "wan@..x"] {
+            assert!(check_segment_name(ok).is_ok(), "{ok:?}");
+        }
+        let long = "a".repeat(129);
+        for bad in ["", ".", "..", "../vmlabd", "/run/x", "a/b", "a\0b", "a\nb", &long] {
+            assert!(check_segment_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]
