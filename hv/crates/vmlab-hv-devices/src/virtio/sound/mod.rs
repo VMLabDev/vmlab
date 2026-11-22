@@ -142,6 +142,17 @@ struct PcmParams {
 }
 
 impl PcmParams {
+    /// Whether a buffer and a period are sizes a stream can run on: a whole,
+    /// non-zero number of frames per period and of periods per buffer. The
+    /// clock divides by the period in frames, so `SET_PARAMS` and a restored
+    /// snapshot both pass through here.
+    fn sizes_ok(buffer_bytes: u32, period_bytes: u32, format: &AudioFormat) -> bool {
+        buffer_bytes != 0
+            && period_bytes != 0
+            && buffer_bytes.is_multiple_of(period_bytes)
+            && period_bytes.is_multiple_of(format.frame_bytes() as u32)
+    }
+
     /// Whole frames in one hardware period.
     fn period_frames(&self) -> usize {
         self.period_bytes as usize / self.format.frame_bytes()
@@ -367,11 +378,7 @@ impl VirtioSnd {
             channels,
             rate: rate_hz,
         };
-        if buffer_bytes == 0
-            || period_bytes == 0
-            || buffer_bytes % period_bytes != 0
-            || period_bytes % format.frame_bytes() as u32 != 0
-        {
+        if !PcmParams::sizes_ok(buffer_bytes, period_bytes, &format) {
             return bad_msg();
         }
         // New parameters restart the lifecycle: any host stream opened for
@@ -1155,15 +1162,25 @@ impl Snapshot for VirtioSnd {
                     PCM_RATE_96000 => 96000,
                     _ => return Err(invalid("bad sound state")),
                 };
+                let buffer_bytes = u32::from_le_bytes(b[1..5].try_into().unwrap());
+                let period_bytes = u32::from_le_bytes(b[5..9].try_into().unwrap());
+                let format = AudioFormat {
+                    sample_format,
+                    channels: b[13],
+                    rate,
+                };
+                // The same bounds `SET_PARAMS` holds a live guest to: the
+                // clock divides by the period in frames.
+                if !(1..=2).contains(&format.channels)
+                    || !PcmParams::sizes_ok(buffer_bytes, period_bytes, &format)
+                {
+                    return Err(invalid("bad sound state"));
+                }
                 Some(PcmParams {
-                    buffer_bytes: u32::from_le_bytes(b[1..5].try_into().unwrap()),
-                    period_bytes: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+                    buffer_bytes,
+                    period_bytes,
                     features: u32::from_le_bytes(b[9..13].try_into().unwrap()),
-                    format: AudioFormat {
-                        sample_format,
-                        channels: b[13],
-                        rate,
-                    },
+                    format,
                     rate_code: b[15],
                 })
             } else {
