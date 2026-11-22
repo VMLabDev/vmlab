@@ -44,7 +44,7 @@ Who the attacker is, per finding:
 | F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind |
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
-| F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network |
+| F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
 | F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length |
 | F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended |
 
@@ -722,6 +722,14 @@ Who the attacker is, per finding:
   `src/net/nat/tests.rs`: send a guest SYN to `gw_ip:22` with no flow.
   Assert a RST arrives on the output channel within 100 ms. Today nothing
   arrives until the host connect fails or times out.
+- Fixed in card #520. `NatEngine::handle_tcp` opens no flow for a SYN whose
+  destination is the gateway's own address: it answers with a RST in the
+  same call, and no host socket is made. TCP that the gateway does serve is
+  not affected: the replies of a port forward belong to a flow the engine
+  opened, and a `redirect` on the gateway address is rewritten to its target
+  before the frame reaches the engine. The proof test does not use a time
+  limit. It asserts that the flow table is empty and that the RST is on the
+  output channel when `handle_frame` returns.
 
 ### F19. A DHCP option longer than 255 bytes (wrong result)
 
