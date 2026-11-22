@@ -17,26 +17,23 @@ check_audio() {
     rec="vmlab-adapter-audio-$$"
     log=$(hv_log)
     offset=$(stat -c %s "$log" 2>/dev/null || echo 0)
-    host_load_start "$load"
-    probe tone "$secs" tone_probe.exe &
-    ppid=$!
-    for i in $(seq 1 600); do
-        pw-link -o 2>/dev/null | grep -qxF "$node:output_FL" && break
-        kill -0 "$ppid" 2>/dev/null || break
-        sleep 0.5
-    done
     # Record the VM's own node, linked by hand: the sink it plays into may
-    # carry other sound.
+    # carry other sound. The recorder waits for the node, which appears when
+    # the guest starts to play.
     pw-record --target 0 --rate 48000 --channels 2 --format s16 \
         -P "{ node.name = \"$rec\" node.autoconnect = false }" "$STAGE/tone.wav" >"$STAGE/tone.record.out" 2>&1 &
     rpid=$!
-    for i in $(seq 1 40); do
-        if pw-link -i 2>/dev/null | grep -qxF "$rec:input_FL"; then
+    host_load_start "$load"
+    probe tone "$secs" tone_probe.exe &
+    ppid=$!
+    for i in $(seq 1 1200); do
+        if pw-link -o 2>/dev/null | grep -qxF "$node:output_FL"; then
             pw-link "$node:output_FL" "$rec:input_FL" 2>>"$STAGE/tone.record.out" &&
                 pw-link "$node:output_FR" "$rec:input_FR" 2>>"$STAGE/tone.record.out" && linked=1
             break
         fi
-        sleep 0.25
+        kill -0 "$ppid" 2>/dev/null || break
+        sleep 0.2
     done
     wait "$ppid"
     rc=$?
