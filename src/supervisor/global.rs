@@ -975,6 +975,9 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::{Duration, sleep, timeout};
 
+    const PREAUTH_MAX: usize = 32;
+    const PREAUTH_MAX_PER_ADDR: usize = 8;
+
     struct Instance {
         globals: Arc<GlobalSegments>,
         addr: SocketAddr,
@@ -1612,6 +1615,221 @@ mod tests {
         assert_eq!(
             lookup(&g, "wan", "example.com").await,
             crate::net::dns::DnsAnswer::Forward
+        );
+    }
+
+    // ---- the listener before authentication (docs/reviews/networking.md F11) ----
+
+    /// A TCP connection to the trunk listener from a chosen loopback address,
+    /// so one test can be several peers.
+    async fn connect_from(from: [u8; 4], to: SocketAddr) -> tokio::net::TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((Ipv4Addr::from(from), 0).into()).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// Whether the listener started a handshake on this connection: it sends
+    /// its greeting first. A connection it refused is closed without one.
+    async fn greeted(stream: &mut tokio::net::TcpStream, wait: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut magic = [0u8; 12];
+        matches!(
+            timeout(wait, stream.read_exact(&mut magic)).await,
+            Ok(Ok(_)) if &magic == crate::supervisor::trunk_auth::MAGIC
+        )
+    }
+
+    /// One address that opens connections and says nothing holds its own
+    /// share of the listener and no more: the next one from it is closed at
+    /// once, and another address is still served.
+    #[tokio::test]
+    async fn a_silent_address_holds_only_its_share_of_the_listener() {
+        let i = instance("k").await;
+        let mut held = Vec::new();
+        for n in 0..PREAUTH_MAX_PER_ADDR {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            assert!(
+                greeted(&mut s, Duration::from_secs(2)).await,
+                "connection {n} is inside the share"
+            );
+            held.push(s);
+        }
+        let mut over = connect_from([127, 0, 0, 1], i.addr).await;
+        assert!(
+            !greeted(&mut over, Duration::from_secs(2)).await,
+            "a connection past the address's share is held"
+        );
+        let mut other = connect_from([127, 0, 0, 2], i.addr).await;
+        assert!(
+            greeted(&mut other, Duration::from_secs(2)).await,
+            "one silent address shut another address out"
+        );
+        // A slot comes back when its connection ends.
+        held.pop();
+        let mut again = false;
+        for _ in 0..80 {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            if greeted(&mut s, Duration::from_millis(200)).await {
+                again = true;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(again, "a closed connection never gave its slot back");
+    }
+
+    /// Many addresses together hold a limited number of connections that
+    /// have proved nothing.
+    #[tokio::test]
+    async fn silent_connections_are_limited_in_total() {
+        let i = instance("k").await;
+        let mut held = Vec::new();
+        for n in 0..PREAUTH_MAX {
+            let from = [127, 0, 1, 1 + (n / PREAUTH_MAX_PER_ADDR) as u8];
+            let mut s = connect_from(from, i.addr).await;
+            assert!(
+                greeted(&mut s, Duration::from_secs(2)).await,
+                "connection {n} is inside the limit"
+            );
+            held.push(s);
+        }
+        let mut over = connect_from([127, 0, 2, 1], i.addr).await;
+        assert!(
+            !greeted(&mut over, Duration::from_secs(2)).await,
+            "a connection past the total limit is held"
+        );
+    }
+
+    /// A handshake that finished no longer counts: more trunks than the
+    /// per-address share authenticate one after another from one address.
+    #[tokio::test]
+    async fn an_authenticated_connection_gives_its_slot_back() {
+        use tokio::io::AsyncReadExt;
+        let i = instance("k").await;
+        let mut kept = Vec::new();
+        for n in 0..PREAUTH_MAX_PER_ADDR + 2 {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            // A name the listener refuses after authentication, so that no
+            // segment is made: the answer is `NO`, and it is an answer.
+            crate::supervisor::trunk_auth::client(&mut s, "a/b", "k")
+                .await
+                .unwrap_or_else(|e| panic!("handshake {n}: {e:#}"));
+            let mut answer = [0u8; 3];
+            s.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"NO\n");
+            kept.push(s);
+        }
+    }
+
+    const LISTENER_CHILD: &str = "VMLAB_TEST_TRUNK_LISTENER_CHILD";
+
+    /// The other half of the two descriptor-limit tests: a process whose
+    /// descriptor limit the parent set, serving the trunk listener. It prints
+    /// the address and stays.
+    #[tokio::test]
+    async fn trunk_listener_child() {
+        let Ok(mode) = std::env::var(LISTENER_CHILD) else {
+            return;
+        };
+        let i = instance("k").await;
+        // "full": leave three free descriptors, so the listener itself meets
+        // the limit however few connections it holds.
+        let mut filler = Vec::new();
+        if mode == "full" {
+            while let Ok(f) = std::fs::File::open("/dev/null") {
+                filler.push(f);
+            }
+            filler.truncate(filler.len().saturating_sub(3));
+        }
+        println!("TRUNK-LISTENER {}", i.addr);
+        sleep(Duration::from_secs(60)).await;
+    }
+
+    /// Start [`trunk_listener_child`] with a descriptor limit of 64, open 80
+    /// connections to it that send nothing, and give back the child, its
+    /// address, the connections, and its CPU use over one second as a percent
+    /// of one core.
+    async fn besiege_listener_child(
+        mode: &str,
+    ) -> (
+        tokio::process::Child,
+        SocketAddr,
+        Vec<tokio::net::TcpStream>,
+        f64,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", r#"ulimit -n 64 && exec "$0" "$@""#])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::global::tests::trunk_listener_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LISTENER_CHILD, mode)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let addr: SocketAddr = timeout(Duration::from_secs(30), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the child ended before it listened");
+                if let Some(addr) = line.strip_prefix("TRUNK-LISTENER ") {
+                    return addr.parse().unwrap();
+                }
+            }
+        })
+        .await
+        .expect("the child never listened");
+        let mut silent = Vec::new();
+        for _ in 0..80 {
+            silent.push(connect_from([127, 0, 0, 1], addr).await);
+        }
+        sleep(Duration::from_millis(300)).await;
+        let cpu = crate::labd::host_cpu::sample(child.id().unwrap())
+            .await
+            .expect("the child is there to measure");
+        (child, addr, silent, cpu)
+    }
+
+    /// 80 silent connections against a process that may hold 64 descriptors:
+    /// the listener stays under the limit, idle, and serves another address
+    /// while the 80 are still open.
+    #[tokio::test]
+    async fn silent_connections_do_not_take_the_process_to_its_descriptor_limit() {
+        let (_child, addr, _silent, cpu) = besiege_listener_child("limit").await;
+        assert!(
+            cpu < 10.0,
+            "the listener used {cpu:.0}% of a core for one second"
+        );
+        let mut other = connect_from([127, 0, 0, 2], addr).await;
+        assert!(
+            greeted(&mut other, Duration::from_secs(3)).await,
+            "silent connections shut another address out"
+        );
+    }
+
+    /// A process that is at its descriptor limit for another reason: `accept`
+    /// fails at once and the listener waits instead of spinning, and it
+    /// serves again when descriptors come back.
+    #[tokio::test]
+    async fn a_listener_at_the_descriptor_limit_waits() {
+        let (_child, addr, silent, cpu) = besiege_listener_child("full").await;
+        assert!(
+            cpu < 10.0,
+            "the listener used {cpu:.0}% of a core for one second"
+        );
+        drop(silent);
+        let mut later = connect_from([127, 0, 0, 2], addr).await;
+        assert!(
+            greeted(&mut later, Duration::from_secs(20)).await,
+            "the listener never served again"
         );
     }
 }
