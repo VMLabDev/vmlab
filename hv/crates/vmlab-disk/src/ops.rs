@@ -503,4 +503,79 @@ mod tests {
         assert_eq!(i.snapshots.len(), 1);
         assert_eq!(i.snapshots[0].name, "one");
     }
+
+    fn patterned(path: &Path, byte: u8) {
+        create_qcow2(path, 1 << 20, None, None).unwrap();
+        let mut img = Qcow2Image::open(path, false).unwrap();
+        img.write_at(0, &[byte; 4096]).unwrap();
+        img.flush().unwrap();
+    }
+
+    fn first_bytes(path: &Path) -> Vec<u8> {
+        let mut img = Qcow2Image::open(path, true).unwrap();
+        let mut buf = vec![0u8; 4096];
+        img.read_at(0, &mut buf).unwrap();
+        buf
+    }
+
+    /// Review vmlab-disk F11: `convert` removes an existing destination, so
+    /// a destination that is the source must be refused before the removal.
+    #[test]
+    fn convert_onto_the_source_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let same = dir.path().join("same.qcow2");
+        patterned(&same, 0xa5);
+        assert!(convert(&same, &same, None, None, None).is_err());
+        assert!(same.exists(), "the source was deleted");
+        assert_eq!(first_bytes(&same), vec![0xa5; 4096]);
+    }
+
+    /// The same for a destination that is a second name of the source.
+    #[cfg(unix)]
+    #[test]
+    fn convert_onto_a_second_name_of_the_source_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.qcow2");
+        patterned(&src, 0x5a);
+        let hard = dir.path().join("hard.qcow2");
+        std::fs::hard_link(&src, &hard).unwrap();
+        let soft = dir.path().join("soft.qcow2");
+        std::os::unix::fs::symlink(&src, &soft).unwrap();
+        for dest in [&hard, &soft] {
+            assert!(convert(&src, dest, None, None, None).is_err());
+            assert!(dest.symlink_metadata().is_ok(), "{dest:?} was removed");
+            assert_eq!(first_bytes(&src), vec![0x5a; 4096]);
+        }
+    }
+
+    /// The same for a destination that is a backing file the convert reads:
+    /// the source's own, or the one given as `backing`.
+    #[test]
+    fn convert_onto_a_backing_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        patterned(&base, 0x3c);
+        let top = dir.path().join("top.qcow2");
+        create_linked_clone(&base, &top).unwrap();
+        assert!(convert(&top, &base, None, None, None).is_err());
+        assert_eq!(first_bytes(&top), vec![0x3c; 4096]);
+
+        let other = dir.path().join("other.qcow2");
+        patterned(&other, 0x11);
+        assert!(convert(&other, &base, None, Some(&base), Some("qcow2")).is_err());
+        assert_eq!(first_bytes(&base), vec![0x3c; 4096]);
+    }
+
+    /// An existing destination that the convert does not read is replaced,
+    /// as before.
+    #[test]
+    fn convert_replaces_an_unrelated_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.qcow2");
+        patterned(&src, 0x77);
+        let dest = dir.path().join("dest.qcow2");
+        patterned(&dest, 0x01);
+        convert(&src, &dest, None, None, None).unwrap();
+        assert_eq!(first_bytes(&dest), vec![0x77; 4096]);
+    }
 }
