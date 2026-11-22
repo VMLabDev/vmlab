@@ -2393,7 +2393,7 @@ mod tests {
             err.contains("x86_64/win@1#standard") && err.contains("a/web"),
             "{err}"
         );
-        assert_eq!(*asked.borrow(), [held.clone()]);
+        assert_eq!(*asked.borrow(), std::slice::from_ref(&held));
         assert_eq!(fs::metadata(&held).unwrap().ino(), inode, "left in place");
         assert!(staging.path().join(variant_disk_rel("standard")).is_file());
 
