@@ -147,14 +147,54 @@ impl SendCredit {
     }
 }
 
+/// Host-granted credit for guest→host payload on one channel: what the
+/// guest may still send. The reader takes from it as frames arrive and the
+/// consumer adds each `window_adjust` it sends, so the bytes queued for one
+/// channel never pass [`INITIAL_WINDOW`].
+struct RecvCredit {
+    avail: std::sync::Mutex<u64>,
+    /// Why the reader ended the channel, for the consumer to read once the
+    /// queue is drained (the queue can be full when the reader finds out).
+    overrun: std::sync::Mutex<Option<String>>,
+}
+
+impl RecvCredit {
+    fn new() -> Self {
+        Self {
+            avail: std::sync::Mutex::new(INITIAL_WINDOW),
+            overrun: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Account for `bytes` of arrived payload. `false` when the guest sent
+    /// more than it was granted.
+    fn take(&self, bytes: usize) -> bool {
+        let mut g = self.avail.lock_recover();
+        match g.checked_sub(bytes as u64) {
+            Some(left) => {
+                *g = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn grant(&self, bytes: u64) {
+        let mut g = self.avail.lock_recover();
+        *g = g.saturating_add(bytes);
+    }
+}
+
 struct SessionEntry {
     tx: mpsc::Sender<SessionEvent>,
     credit: Arc<SendCredit>,
+    recv_credit: Arc<RecvCredit>,
 }
 
-/// Per-session event queue depth. Flow control caps un-granted bytes, but a
-/// window's worth of tiny frames can outnumber a byte-sized bound — this is
-/// the safety valve; see the reader's stall policy.
+/// Per-session event queue depth. The reader enforces the receive window
+/// ([`RecvCredit`]), which caps the queued bytes, but a window's worth of
+/// tiny frames can outnumber a byte-sized bound — this is the safety valve;
+/// see the reader's stall policy.
 const SESSION_QUEUE: usize = 2048;
 
 /// How long the reader waits on one session's full queue before declaring
@@ -690,11 +730,13 @@ impl AgentHandle {
         // queue only ever carries post-open traffic.
         let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
         let credit = Arc::new(SendCredit::new());
+        let recv_credit = Arc::new(RecvCredit::new());
         self.inner.sessions.lock().await.insert(
             id,
             SessionEntry {
                 tx,
                 credit: credit.clone(),
+                recv_credit: recv_credit.clone(),
             },
         );
         // Stash the oneshot where the reader finds it.
@@ -709,6 +751,7 @@ impl AgentHandle {
             id,
             rx,
             credit,
+            recv_credit,
             window: RecvWindow::default(),
             closed: false,
         };
@@ -1343,6 +1386,7 @@ pub struct AgentSession {
     pub id: u32,
     rx: mpsc::Receiver<SessionEvent>,
     credit: Arc<SendCredit>,
+    recv_credit: Arc<RecvCredit>,
     window: RecvWindow,
     closed: bool,
 }
@@ -1351,10 +1395,19 @@ impl AgentSession {
     /// Next event; grants receive window back as data is consumed. `None`
     /// once the channel (or connection) is gone.
     pub async fn recv(&mut self) -> Option<SessionEvent> {
-        let ev = self.rx.recv().await?;
+        let Some(ev) = self.rx.recv().await else {
+            // The reader ended the channel because the guest sent past its
+            // window: say so, once, after what was queued.
+            let msg = self.recv_credit.overrun.lock_recover().take()?;
+            self.closed = true; // the reader already sent the close
+            return Some(SessionEvent::Error(msg));
+        };
         if let SessionEvent::Data(b) | SessionEvent::Stderr(b) = &ev
             && let Some(grant) = self.window.recv(b.len())
         {
+            // Counted before it is sent: the guest may use the grant as
+            // soon as it reads it.
+            self.recv_credit.grant(grant);
             let _ = self
                 .handle
                 .send_msg(&HostMsg::WindowAdjust {
@@ -2710,22 +2763,34 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
 /// session closed (the rest of the mux keeps flowing).
 async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
     let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
-    let tx = {
+    let entry = {
         let sessions = inner.sessions.lock().await;
-        sessions.get(&id).map(|e| e.tx.clone())
+        sessions
+            .get(&id)
+            .map(|e| (e.tx.clone(), e.recv_credit.clone()))
     };
-    let Some(tx) = tx else { return }; // late frames after close: normal
+    let Some((tx, recv_credit)) = entry else {
+        return; // late frames after close: normal
+    };
+    // The receive window: a guest that sends more than it was granted loses
+    // that channel, and the frame is dropped rather than queued.
+    if let SessionEvent::Data(b) | SessionEvent::Stderr(b) = &ev
+        && !recv_credit.take(b.len())
+    {
+        tracing::warn!("agent session {id}: the guest sent past its receive window, closing it");
+        *recv_credit.overrun.lock_recover() = Some(format!(
+            "the guest agent sent more than the receive window of {INITIAL_WINDOW} bytes \
+             it was granted on this channel, so the host closed the channel"
+        ));
+        close_session(inner, id).await;
+        return;
+    }
     if tokio::time::timeout(STALL_TIMEOUT, tx.send(ev))
         .await
         .is_err()
     {
         tracing::warn!("agent session {id}: consumer stalled >10s, closing that session");
-        if let Some(entry) = inner.sessions.lock().await.remove(&id) {
-            entry.credit.close();
-        }
-        let mut w = inner.writer.lock().await;
-        let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
-        let _ = w.write_all(&frame).await;
+        close_session(inner, id).await;
         return;
     }
     if terminal {
@@ -2735,6 +2800,17 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
             entry.credit.close();
         }
     }
+}
+
+/// The reader ends one session: its queue closes behind what it holds, and
+/// the agent is told to drop its side.
+async fn close_session(inner: &Arc<Inner>, id: u32) {
+    if let Some(entry) = inner.sessions.lock().await.remove(&id) {
+        entry.credit.close();
+    }
+    let mut w = inner.writer.lock().await;
+    let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
+    let _ = w.write_all(&frame).await;
 }
 
 /// Re-expose one terminal session as a raw-byte unix socket at `sock_path`:
@@ -2984,15 +3060,15 @@ mod tests {
                     let _ = tx.lock().await.write_all(&encode_ctrl(&msg).unwrap()).await;
                 }
             };
+            // Data goes out under the host's credit, like the agent's own
+            // pumps: the host closes a channel that sends past its window.
+            let out = Arc::new(MockOut {
+                tx: tx.clone(),
+                channels: std::sync::Mutex::new(HashMap::new()),
+            });
             let send_data = |id: u32, payload: Vec<u8>| {
-                let tx = tx.clone();
-                async move {
-                    let _ = tx
-                        .lock()
-                        .await
-                        .write_all(&encode_frame(FrameKind::Data, id, &payload))
-                        .await;
-                }
+                let out = out.clone();
+                async move { out.data(id, payload).await }
             };
 
             let mut dec = FrameDecoder::new();
@@ -3290,6 +3366,7 @@ mod tests {
                                         .await
                                     }
                                 },
+                                HostMsg::WindowAdjust { id, bytes } => out.grant(id, bytes).await,
                                 _ => {}
                             }
                         }
@@ -3363,6 +3440,67 @@ mod tests {
             }
         });
         (dir, path)
+    }
+
+    /// The mock's guest→host data path: each channel starts with one window
+    /// of credit, and a frame with no credit left waits, in order, for the
+    /// host's `window_adjust`.
+    struct MockOut {
+        tx: Arc<Mutex<OwnedWriteHalf>>,
+        channels: std::sync::Mutex<HashMap<u32, MockChannel>>,
+    }
+
+    struct MockChannel {
+        credit: u64,
+        waiting: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl MockOut {
+        async fn data(&self, id: u32, payload: Vec<u8>) {
+            let ready = {
+                let mut channels = self.channels.lock().unwrap();
+                let ch = channels.entry(id).or_insert_with(|| MockChannel {
+                    credit: INITIAL_WINDOW,
+                    waiting: Default::default(),
+                });
+                if ch.waiting.is_empty() && ch.credit >= payload.len() as u64 {
+                    ch.credit -= payload.len() as u64;
+                    Some(payload)
+                } else {
+                    ch.waiting.push_back(payload);
+                    None
+                }
+            };
+            if let Some(payload) = ready {
+                self.write(id, &payload).await;
+            }
+        }
+
+        async fn grant(&self, id: u32, bytes: u64) {
+            let ready: Vec<Vec<u8>> = {
+                let mut channels = self.channels.lock().unwrap();
+                let Some(ch) = channels.get_mut(&id) else {
+                    return;
+                };
+                ch.credit += bytes;
+                let mut ready = Vec::new();
+                while let Some(len) = ch.waiting.front().map(|p| p.len() as u64)
+                    && ch.credit >= len
+                {
+                    ch.credit -= len;
+                    ready.extend(ch.waiting.pop_front());
+                }
+                ready
+            };
+            for payload in ready {
+                self.write(id, &payload).await;
+            }
+        }
+
+        async fn write(&self, id: u32, payload: &[u8]) {
+            let frame = encode_frame(FrameKind::Data, id, payload);
+            let _ = self.tx.lock().await.write_all(&frame).await;
+        }
     }
 
     /// An in-memory guest filesystem behind one `fileops` channel: enough of
