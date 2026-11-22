@@ -3314,6 +3314,132 @@ mod tests {
         );
     }
 
+    /// A registry whose chunk downloads meet: the first two GETs of a chunk
+    /// both wait until the other has arrived. A pull asks the store whether
+    /// it holds the version before it fetches a chunk, so two pulls that
+    /// meet here have both found it absent.
+    #[derive(Clone)]
+    struct ChunksMeet {
+        inner: std::sync::Arc<FakeRegistry>,
+        chunks: std::sync::Arc<std::collections::HashSet<String>>,
+        meeting: std::sync::Arc<tokio::sync::Barrier>,
+        to_meet: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for ChunksMeet {
+        async fn blob_exists(&self, r: &str, d: &str) -> Result<bool> {
+            self.inner.blob_exists(r, d).await
+        }
+        async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+            let meets = self.chunks.contains(d)
+                && self
+                    .to_meet
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+            if meets {
+                self.meeting.wait().await;
+            }
+            self.inner.get_blob(r, d).await
+        }
+        async fn put_blob(&self, r: &str, d: &str, data: Vec<u8>) -> Result<()> {
+            self.inner.put_blob(r, d, data).await
+        }
+        async fn put_blob_file(&self, r: &str, d: &str, p: &Path) -> Result<()> {
+            self.inner.put_blob_file(r, d, p).await
+        }
+        async fn get_manifest(&self, r: &str, rf: &str) -> Result<Option<Fetched>> {
+            self.inner.get_manifest(r, rf).await
+        }
+        async fn put_manifest(&self, r: &str, rf: &str, mt: &str, b: Vec<u8>) -> Result<String> {
+            self.inner.put_manifest(r, rf, mt, b).await
+        }
+        async fn list_tags(&self, r: &str) -> Result<Vec<String>> {
+            self.inner.list_tags(r).await
+        }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            self.inner.list_catalog().await
+        }
+    }
+
+    /// F12 of docs/reviews/templates-registry.md. Two lab daemons that start
+    /// a lab with the same registry reference both find the version absent
+    /// and both download it. The store lock orders their installs, and the
+    /// second must use what the first installed, not fail on "already
+    /// exists". The pulls go through `pull_with_progress`, which is what
+    /// `ensure_registry_template` calls: that function builds its own HTTP
+    /// transport and takes no fake.
+    #[tokio::test]
+    async fn two_pulls_of_one_reference_both_succeed() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let reference = "ghcr.io/owner/alpine:3.20";
+        push_stating(&fake, reference, "alpine", "3.20", b"one disk").await;
+        // The disk's chunks are the zstd frames among the pushed blobs.
+        let chunks: std::collections::HashSet<String> = fake
+            .blobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, data)| data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+            .filter_map(|(key, _)| key.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+            .collect();
+        assert_eq!(chunks.len(), 1, "a disk of one chunk");
+        let meeting = ChunksMeet {
+            inner: fake.clone(),
+            chunks: std::sync::Arc::new(chunks),
+            meeting: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            to_meet: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+        };
+        fake.gets.lock().unwrap().clear();
+
+        let pull = |work_dir: &str| {
+            let registry = Registry::with_transport(
+                Reference::parse(reference).unwrap(),
+                Box::new(meeting.clone()),
+            );
+            // Its own work directory each, as `ensure_registry_template`
+            // gives every pull.
+            let work_dir = store.root().join(".oci-pull").join(work_dir);
+            let store = &store;
+            async move {
+                registry
+                    .pull_with_progress(
+                        Some("x86_64"),
+                        store,
+                        &work_dir,
+                        false,
+                        &VariantWant::default(),
+                        &mut |_| {},
+                    )
+                    .await
+            }
+        };
+        let (first, second) = tokio::join!(pull("a"), pull("b"));
+
+        // Both downloaded the chunk: neither was served from the store.
+        let chunk_gets = fake
+            .gets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| meeting.chunks.contains(*d))
+            .count();
+        assert_eq!(chunk_gets, 2, "both pulls downloaded the disk");
+        let first = first.expect("the first pull");
+        let second = second.expect("the second pull");
+        assert_eq!(first.version, "3.20");
+        assert_eq!(second.version, first.version);
+        assert_eq!(second.sha256, first.sha256);
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .expect("the version is in the store");
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"one disk");
+    }
+
     #[tokio::test]
     async fn pull_reports_progress() {
         let fake = std::sync::Arc::new(FakeRegistry::default());
