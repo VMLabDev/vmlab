@@ -34,7 +34,7 @@ Who the attacker is, per finding:
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache |
 | F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet |
-| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease |
+| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501) |
 | F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards |
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
@@ -352,6 +352,21 @@ Who the attacker is, per finding:
   source MAC in the `handle` call, so it is a gateway test in
   `src/net/gateway.rs`: lease as MAC A, send a RELEASE with `chaddr` A in a
   frame whose ethernet source is B, assert `dhcp_leases()` still holds A.
+- Fixed in card #501, in `src/net/dhcp.rs`. `handle` ignores a message whose
+  `chaddr` is not the ethernet source of its frame, so a guest speaks for its
+  own NIC only (the segments have no relay agent). A DECLINE quarantines only
+  the address its client holds: one with no lease, or one that names another
+  address, changes nothing. A quarantine ends after one lease time, so the
+  set is no larger than the leases of one lease time. An OFFER holds its
+  address for 60 seconds (`OFFER_HOLD`) and the full lease starts at the ACK.
+  The client is still told the full lease time in the OFFER. Five proof tests
+  failed before the fix and pass after it: the two named above,
+  `a_decline_of_an_address_the_client_does_not_hold_quarantines_nothing`,
+  `a_message_that_speaks_for_another_mac_is_ignored` and
+  `an_offer_holds_its_address_briefly_until_the_request`.
+  - Not fixed here: a guest that also forges the ethernet source of its
+    frames still speaks for that MAC, and can still take one address per
+    forged MAC with a DISCOVER and a REQUEST. Binding a port to its MAC is F9.
 
 ### F9. No port is bound to its MAC or IP (security, guest)
 

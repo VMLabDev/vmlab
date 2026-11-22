@@ -204,6 +204,18 @@ Not read:
   answers an open and sends 300 KiB on that channel while the test does not
   call `recv`. Assert that the session ends with an error that names the
   window, and that no more than `INITIAL_WINDOW` bytes sit in the queue.
+- Fixed in card #484. The host now counts the credit it granted on each
+  channel (`RecvCredit` in `src/labd/vm_agent.rs`): the reader takes from it
+  for every data frame, and the consumer adds each `window_adjust` before it
+  sends it. A frame past the credit is dropped, the reader closes that one
+  channel and tells the agent, and the consumer reads an error that names
+  the window after what was queued. The connection and the other channels
+  stay. The queue of one channel therefore holds at most `INITIAL_WINDOW`
+  bytes. The test `a_guest_that_ignores_its_credit_loses_the_channel` failed
+  before the fix (the host kept the channel) and passes after it. The mock
+  agent of the tests in that file now sends its data under the credit too.
+  Not fixed here: the 10 s wait of F5, and a queue of 2048 small frames
+  inside the window.
 
 ### F5. One channel with a slow consumer stops the host reader for 10 seconds
 
