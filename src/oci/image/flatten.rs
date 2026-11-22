@@ -873,7 +873,13 @@ mod tests {
         let (p0, m0, d0) = layer("l0.tar.gz");
         let (p1, m1, d1) = layer("l1.tar.gz");
 
-        survey_layers(&[(p0.clone(), m0.clone())], &[d0.clone()], &limits, &cancel).unwrap();
+        survey_layers(
+            &[(p0.clone(), m0.clone())],
+            std::slice::from_ref(&d0),
+            &limits,
+            &cancel,
+        )
+        .unwrap();
         // The limit is over the image, not over each layer.
         let err = survey_layers(&[(p0, m0), (p1, m1)], &[d0, d1], &limits, &cancel)
             .err()
