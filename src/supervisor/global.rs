@@ -32,7 +32,7 @@ use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::framing::{read_frame, write_frame};
 use crate::net::gateway::{Gateway, GatewayConfig, GatewayHandle, gateway_mac};
-use crate::net::switch::{ChannelPort, PortClass, Switch};
+use crate::net::switch::{ChannelPort, PortClass, PortId, Switch};
 use crate::proto::Event;
 use crate::proto::vocab::GlobalMember;
 
@@ -118,8 +118,8 @@ enum TrunkState {
         direction: &'static str, // "dial" | "accept"
         addr: SocketAddr,
         since: chrono::DateTime<chrono::Utc>,
-        /// Abort handle for an inbound bridge (dial bridges are owned by the
-        /// dialer loop, which aborts with the dialer task itself).
+        /// Abort handle for an inbound bridge. Outbound bridges run in the
+        /// dialer task and are dropped when that task is aborted.
         task: Option<tokio::task::AbortHandle>,
     },
 }
@@ -761,7 +761,7 @@ impl GlobalSegments {
             (seg.switch.clone(), seg.trunks.clone())
         };
         tune_trunk_socket(&stream);
-        let bridge = bridge_tcp_to_switch(switch, stream);
+        let bridge = tokio::spawn(bridge_tcp_to_switch(switch, stream));
         if !trunks.try_reserve_accept(remote, bridge.abort_handle()) {
             bridge.abort();
             self.detach(name, None).await;
@@ -780,38 +780,46 @@ impl GlobalSegments {
     }
 }
 
-/// Bridge a TCP stream (cross-host trunk) onto a switch via a channel port:
-/// frames from the switch are written to TCP; frames from TCP are injected.
-/// The returned handle completes when the trunk dies (read EOF/error), after
-/// the port has been removed from the switch.
+struct TrunkPort {
+    switch: Arc<Switch>,
+    id: PortId,
+}
+
+impl Drop for TrunkPort {
+    fn drop(&mut self) {
+        self.switch.remove_port(self.id);
+    }
+}
+
+/// Bridge a TCP stream onto a switch. Both directions and the port belong to
+/// the returned future, so dropping it closes the trunk and removes the port.
 fn bridge_tcp_to_switch(
     switch: Arc<Switch>,
-    stream: tokio::net::TcpStream,
-) -> tokio::task::JoinHandle<()> {
+    mut stream: tokio::net::TcpStream,
+) -> impl Future<Output = ()> {
     let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Service);
-    let (read_half, write_half) = stream.into_split();
+    let port = TrunkPort { switch, id };
 
-    // Switch → TCP.
-    let mut write_half = write_half;
-    tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if write_frame(&mut write_half, &frame).await.is_err() {
-                break;
-            }
+    async move {
+        let _port = port;
+        let (mut read_half, mut write_half) = stream.split();
+        tokio::select! {
+            () = async {
+                while let Some(frame) = rx.recv().await {
+                    if write_frame(&mut write_half, &frame).await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+            () = async {
+                while let Ok(Some(frame)) = read_frame(&mut read_half).await {
+                    if tx.try_send(frame).is_err() {
+                        tracing::debug!("global trunk ingress queue full");
+                    }
+                }
+            } => {}
         }
-    });
-
-    // TCP → switch; owns the trunk lifetime.
-    let sw = switch.clone();
-    tokio::spawn(async move {
-        let mut read_half = read_half;
-        while let Ok(Some(frame)) = read_frame(&mut read_half).await {
-            if tx.try_send(frame).is_err() {
-                tracing::debug!("global trunk ingress queue full");
-            }
-        }
-        sw.remove_port(id);
-    })
+    }
 }
 
 /// Keepalive-tune a trunk socket so a silently dead peer surfaces as a read
@@ -892,7 +900,7 @@ fn spawn_tcp_peer_dialer(
                     let bridge = bridge_tcp_to_switch(switch.clone(), stream);
                     trunks.activate_dial(addr);
                     // Wait for the bridge to die, then loop around to redial.
-                    let _ = bridge.await;
+                    bridge.await;
                     trunks.clear(addr.ip());
                 }
                 Err(e) => {
@@ -1252,6 +1260,60 @@ mod tests {
         wait_event(&mut a.events, "segment.peer.up").await;
         wait_connected(&a.globals, "wan", true).await;
         wait_connected(&b.globals, "wan", true).await;
+    }
+
+    #[tokio::test]
+    async fn a_trunk_forms_again_after_the_dialer_detaches() {
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        let target = b.addr.to_string();
+        b.globals.attach("wan", None, None, None).await.unwrap();
+        a.globals
+            .attach("wan", None, Some(target.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        let (old_switch, dialer, gateway_sender) = {
+            let segs = a.globals.segs.lock().await;
+            let seg = &segs["wan"];
+            (
+                seg.switch.clone(),
+                seg.dialer.as_ref().unwrap().abort_handle(),
+                seg.gateway.sender(),
+            )
+        };
+        assert_eq!(old_switch.stats().ports, 2);
+        a.globals.detach("wan", None).await;
+        while !dialer.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        // Keep the gateway port registered so the count isolates the TCP port.
+        assert_eq!(
+            old_switch.stats().ports,
+            1,
+            "dialed trunk port survived detach"
+        );
+        drop(gateway_sender);
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.down");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.down");
+
+        let (a_sock, _) = a
+            .globals
+            .attach("wan", None, Some(target), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        // Register B's test port before sending so the frame cannot pass it by.
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        let mut b_port = b_switch.add_channel_port(PortClass::Service);
+        let mut a_client = trunk_client(&a_sock).await;
+        let frame = bcast(b"after reattach");
+        write_frame(&mut a_client, &frame).await.unwrap();
+        assert_eq!(b_port.rx.recv().await.unwrap(), frame);
     }
 
     #[tokio::test]
