@@ -2321,7 +2321,7 @@ impl super::machine::Machine for VmInstance {
         ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
-        let attachments = super::machine::attach_all_nics(&*self, &*lab).await?;
+        let attachments = lab.attach_nics(&*self).await?;
         self.set_nic_attachments(attachments).await;
 
         let events_exit = events.clone();

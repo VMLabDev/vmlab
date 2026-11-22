@@ -4,13 +4,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use ipnet::Ipv4Net;
 
-use crate::config::model::{Lab, MacAddr, Segment};
+use crate::config::model::{Lab, MacAddr, Nic, Segment};
 use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::fastpath::{self, FastpathTier, NicAttachment, SegmentXdp};
@@ -61,7 +61,7 @@ pub struct SegmentNet {
     pub gateway: Option<crate::net::gateway::GatewayHandle>,
     /// NAT + L3 rule services (PRD §9.6–§9.9), wired alongside the gateway.
     pub services: Option<Arc<super::netservices::SegmentServices>>,
-    listeners: Vec<tokio::task::JoinHandle<()>>,
+    listeners: HashMap<PathBuf, tokio::task::JoinHandle<()>>,
     /// The afxdp-tier datapath (host tap + XDP program), created lazily on
     /// the first tap NIC when that tier is active.
     xdp: Option<Arc<SegmentXdp>>,
@@ -86,7 +86,7 @@ impl SegmentNet {
     }
 
     /// Listen on a unix socket for one VM NIC; QEMU connects to it.
-    pub async fn listen_nic(
+    async fn listen_nic(
         &mut self,
         sock: &Path,
         isolated: bool,
@@ -104,8 +104,16 @@ impl SegmentNet {
             )
             .await
             .with_context(|| format!("listening on {}", sock.display()))?;
-        self.listeners.push(handle);
+        self.listeners.insert(sock.to_path_buf(), handle);
         Ok(())
+    }
+
+    async fn detach_nic(&mut self, sock: &Path) {
+        if let Some(listener) = self.listeners.remove(sock) {
+            listener.abort();
+            let _ = std::fs::remove_file(sock);
+            let _ = listener.await;
+        }
     }
 
     /// Attach one NIC: a tap on the afxdp fast path when that tier is active
@@ -123,9 +131,13 @@ impl SegmentNet {
         tap_ok: bool,
         framing: FramingMode,
     ) -> Result<NicAttachment> {
+        self.detach_nic(sock).await;
         if tap_ok && fastpath::tier() == FastpathTier::AfXdp {
             match self.attach_tap(mac, isolated, framing) {
-                Ok(att) => return Ok(att),
+                Ok(att) => {
+                    let _ = std::fs::remove_file(sock);
+                    return Ok(att);
+                }
                 Err(error) => tracing::warn!(
                     segment = %self.name,
                     "tap fast path failed ({error:#}); nic falls back to a stream socket"
@@ -158,6 +170,14 @@ impl SegmentNet {
             isolated,
             framing,
         )?))
+    }
+}
+
+impl Drop for SegmentNet {
+    fn drop(&mut self) {
+        for listener in self.listeners.values() {
+            listener.abort();
+        }
     }
 }
 
@@ -230,7 +250,7 @@ impl LabNetwork {
                     global_warnings: Vec::new(),
                     gateway: None,
                     services: None,
-                    listeners: Vec::new(),
+                    listeners: HashMap::new(),
                     xdp: None,
                 },
             );
@@ -264,7 +284,7 @@ impl LabNetwork {
                     global_warnings: Vec::new(),
                     gateway: None,
                     services: None,
-                    listeners: Vec::new(),
+                    listeners: HashMap::new(),
                     xdp: None,
                 },
             );
@@ -301,6 +321,46 @@ impl LabNetwork {
 
     pub fn segment_mut(&mut self, name: &str) -> Option<&mut SegmentNet> {
         self.segments.get_mut(name)
+    }
+
+    /// Attach a machine's NICs in order. Keep the network lock across the
+    /// batch so rollback cannot detach a listener from another start.
+    pub(super) async fn attach_nics(
+        &mut self,
+        nics: &[Nic],
+        macs: &[MacAddr],
+        socket: impl Fn(usize) -> PathBuf,
+        tap_ok: bool,
+        framing: FramingMode,
+    ) -> Result<Vec<NicAttachment>> {
+        let mut attachments = Vec::with_capacity(nics.len());
+        for (i, (nic, &mac)) in nics.iter().zip(macs).enumerate() {
+            let name = nic_segment_name(nic);
+            let attachment = match self.segment_mut(name) {
+                Some(segment) => {
+                    segment
+                        .attach_nic(&socket(i), mac, nic.isolated, tap_ok, framing)
+                        .await
+                }
+                None => Err(anyhow::anyhow!("unknown segment \"{name}\"")),
+            };
+            match attachment {
+                Ok(attachment) => attachments.push(attachment),
+                Err(error) => {
+                    for (nic, attachment) in nics.iter().zip(&attachments) {
+                        if let NicAttachment::Stream { sock } = attachment {
+                            self.segments
+                                .get_mut(nic_segment_name(nic))
+                                .expect("segment of an attached NIC")
+                                .detach_nic(sock)
+                                .await;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(attachments)
     }
 
     /// Bridge each global segment to the supervisor's global switch (PRD
@@ -754,9 +814,6 @@ lab "framing" { segment "lan" { mtu = 1500 } }"#))
         .unwrap();
         assert_eq!(reply.frame, packet.frame);
         assert!(reply.queue < 3);
-        for listener in segment.listeners.drain(..) {
-            listener.abort();
-        }
     }
 
     #[tokio::test]
@@ -768,6 +825,7 @@ lab "restart" { segment "lan" {} }"#))
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nic.sock");
         let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let switch_refs = Arc::strong_count(&segment.switch);
         for _ in 0..2 {
             segment
                 .attach_nic(&socket, mac, false, false, FramingMode::Raw)
@@ -775,7 +833,34 @@ lab "restart" { segment "lan" {} }"#))
                 .unwrap();
         }
         assert_eq!(segment.listeners.len(), 1);
+        assert_eq!(Arc::strong_count(&segment.switch), switch_refs + 1);
         tokio::net::UnixStream::connect(&socket).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_attach_rolls_back_earlier_listeners() {
+        let config = lab(r#"import <vmlab.wcl>
+lab "rollback" {
+  segment "lan" {}
+  vm "a" {
+    template = "x86_64/t"
+    nic { segment = "lan" }
+    nic { segment = "lan" }
+  }
+}"#);
+        let mut network = LabNetwork::build(&config).unwrap();
+        let nics = config.machines().next().unwrap().nics();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = |i| dir.path().join(format!("nic{i}.sock"));
+        std::fs::create_dir(socket(1)).unwrap();
+        let macs = [MacAddr([2, 0, 0, 0, 0, 1]), MacAddr([2, 0, 0, 0, 0, 2])];
+        let result = network
+            .attach_nics(nics, &macs, socket, false, FramingMode::Raw)
+            .await;
+        assert!(result.is_err());
+        assert!(network.segments["lan"].listeners.is_empty());
+        assert_eq!(Arc::strong_count(&network.segments["lan"].switch), 1);
+        assert!(!socket(0).exists());
     }
 
     #[test]
