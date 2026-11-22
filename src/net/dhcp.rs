@@ -377,7 +377,11 @@ impl DhcpServer {
     }
 
     fn grant(&mut self, mac: MacAddr, ip: Ipv4Addr) {
-        self.hold(mac, ip, Duration::from_secs(u64::from(self.config.lease_secs)));
+        self.hold(
+            mac,
+            ip,
+            Duration::from_secs(u64::from(self.config.lease_secs)),
+        );
     }
 
     /// Give `ip` to `mac` for `time`, replacing what it held.
