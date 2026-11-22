@@ -657,8 +657,8 @@ impl GlobalSegments {
         let dns_sync = spawn_dns_sync(&gateway, directory.clone());
 
         let trunks = TrunkTable::new(name, self.events.clone());
-        let dialer =
-            peer.map(|(peer, psk)| spawn_tcp_peer_dialer(switch.clone(), peer, psk, trunks.clone()));
+        let dialer = peer
+            .map(|(peer, psk)| spawn_tcp_peer_dialer(switch.clone(), peer, psk, trunks.clone()));
 
         let seg = GlobalSeg {
             switch,
