@@ -1922,6 +1922,11 @@ impl VirtioDevice for Net {
                 tap_error,
                 ..
             } = &mut *sh;
+            // A backend error belongs to the negotiation that ends here: a
+            // packet the kernel refused, a read that failed. The next
+            // activation configures the backend again from nothing, and a
+            // backend that is still broken reports it again there.
+            *tap_error = None;
             if let Some(tap) = tap
                 && let Err(error) = tap.pause(queues)
             {

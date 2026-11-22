@@ -500,6 +500,15 @@ Not read:
   `tap_integration_tests.rs` with a real TAP: transmit one frame with
   `hdr_len = 0xFFFF` and `gso_type = 0`.
 - Confidence: high that the error latches. Medium for the guest trigger.
+- Fixed in card #431. `reset` clears `tap_error` before it pauses the
+  backend, so the error ends with the negotiation it happened in and a
+  guest reboot recovers the link and the snapshot. A pause that fails in
+  that reset still sets it. Test
+  `a_failed_tap_write_does_not_outlive_a_device_reset` fails before the fix
+  (the link stays down after the reset) and passes after it.
+  - Not fixed here: until the reset, one failed write still takes the link
+    down and refuses a snapshot. The guest trigger with `hdr_len` was not
+    run on a real TAP.
 
 ### F15. virtio-console: an in-place restore does not tell the guest the live host connection state
 
