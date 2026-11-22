@@ -35,8 +35,10 @@ struct session {
     struct plat_proc *proc;
     unsigned long credit;        /* guest->host bytes we may still send */
     unsigned long recv_consumed; /* host->guest bytes since the last grant */
-    int out_closed;
-    int err_closed;
+    long out_remaining; /* -1 until EOF, or a fixed byte count after exit */
+    long err_remaining;
+    int exited;
+    long code;
 };
 
 static struct session sessions[MAX_SESSIONS];
@@ -433,6 +435,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     s->id = id;
     s->proc = proc;
     s->credit = WIRE_INITIAL_WINDOW;
+    s->out_remaining = s->err_remaining = -1;
     send_simple("opened", (long)id);
 }
 
@@ -545,21 +548,25 @@ static void handle_data(unsigned long channel, const unsigned char *payload,
 
 /* Move what a pipe holds onto the wire, within credit. Returns 1 when
  * anything moved. */
-static int pump(struct session *s, int which, int *closed, int kind)
+static int pump(struct session *s, int which, long *remaining, int kind)
 {
     long want, n;
-    if (*closed || s->credit == 0)
+    if (*remaining == 0 || s->credit == 0)
         return 0;
     want = (long)sizeof chunk;
     if ((unsigned long)want > s->credit)
         want = (long)s->credit;
+    if (*remaining > 0 && want > *remaining)
+        want = *remaining;
     n = proc_read(s->proc, which, chunk, want);
     if (n < 0) {
-        *closed = 1;
+        *remaining = 0;
         return 0;
     }
     if (n == 0)
         return 0;
+    if (*remaining > 0)
+        *remaining -= n;
     s->credit -= (unsigned long)n;
     send_frame(kind, s->id, chunk, (unsigned long)n);
     return 1;
@@ -571,11 +578,19 @@ static int service_sessions(void)
     for (i = 0; i < MAX_SESSIONS; i++) {
         struct session *s = &sessions[i];
         unsigned long consumed;
-        long code;
         if (!s->used)
             continue;
-        active |= pump(s, 0, &s->out_closed, WIRE_KIND_DATA);
-        active |= pump(s, 1, &s->err_closed, WIRE_KIND_DATA_ERR);
+        if (!s->exited && proc_exited(s->proc, &s->code)) {
+            /* Snapshot the backlog once. A descendant may never close its
+             * pipes or stop writing, and the serial line may drain slowly. */
+            s->exited = 1;
+            if (s->out_remaining != 0)
+                s->out_remaining = proc_output_pending(s->proc, 0);
+            if (s->err_remaining != 0)
+                s->err_remaining = proc_output_pending(s->proc, 1);
+        }
+        active |= pump(s, 0, &s->out_remaining, WIRE_KIND_DATA);
+        active |= pump(s, 1, &s->err_remaining, WIRE_KIND_DATA_ERR);
 
         consumed = proc_consumed(s->proc);
         if (consumed) {
@@ -587,10 +602,9 @@ static int service_sessions(void)
             active = 1;
         }
 
-        if (s->out_closed && s->err_closed && proc_exited(s->proc, &code)) {
-            /* Both pipes drained: the channel's bytes are complete. */
+        if (s->exited && s->out_remaining == 0 && s->err_remaining == 0) {
             send_simple("eof", (long)s->id);
-            send_exited(s->id, code);
+            send_exited(s->id, s->code);
             proc_free(s->proc);
             memset(s, 0, sizeof *s);
             active = 1;

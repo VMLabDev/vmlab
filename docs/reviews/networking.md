@@ -42,7 +42,7 @@ Who the attacker is, per finding:
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
 | F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
-| F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind |
+| F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
 | F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length |
@@ -663,6 +663,10 @@ Who the attacker is, per finding:
   `<sock_dir>/wan.sock` does not exist. Today it exists.
 
 ### F16. Every machine start leaves a NIC listener behind (wrong result)
+
+Fixed in card #527. A replacement closes the old listener before binding the
+same path, and a failed NIC attachment rolls back the listeners already
+created for that start.
 
 - Where: `src/labd/network.rs:89-109` (`listen_nic` pushes the task handle
   into `listeners`), `:64` (the field), `src/net/switch.rs:384-411`

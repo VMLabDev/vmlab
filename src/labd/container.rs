@@ -1478,7 +1478,7 @@ impl super::machine::Machine for ContainerInstance {
         std::fs::create_dir_all(&self.dirs.run)?;
         // The micro-VM connects to the sockets itself, so the attachments are
         // the lab's to hold, not this machine's.
-        super::machine::attach_all_nics(&*self, &*lab).await?;
+        lab.attach_nics(&*self).await?;
 
         let events_exit = events.clone();
         let events_health = events.clone();
