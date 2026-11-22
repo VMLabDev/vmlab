@@ -2262,7 +2262,10 @@ async fn an_offline_restore_returns_the_firmware_variables() {
         .expect("offline restore");
     assert_eq!(std::fs::read(&vars).unwrap(), b"vars at capture");
     assert_eq!(std::fs::read(&permall).unwrap(), b"tpm at capture");
-    assert!(!tpm.join("later").exists(), "the TPM state is replaced whole");
+    assert!(
+        !tpm.join("later").exists(),
+        "the TPM state is replaced whole"
+    );
 
     // A second restore gives the same answer: the capture is not consumed.
     std::fs::write(&vars, b"vars after restore").unwrap();

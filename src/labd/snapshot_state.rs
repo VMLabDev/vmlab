@@ -137,9 +137,7 @@ impl FirmwareState {
         };
         if let Err(error) = copy(&mut staged) {
             self.discard_restore(staged);
-            return Err(error.context(format!(
-                "reading the firmware state of snapshot {name:?}"
-            )));
+            return Err(error.context(format!("reading the firmware state of snapshot {name:?}")));
         }
         Ok(Some(staged))
     }
@@ -342,7 +340,10 @@ mod tests {
         std::fs::write(&vm.vars, b"then").unwrap();
         let dead = vm.state.stage_capture().unwrap();
         let staged = vm.state.stage_capture().unwrap();
-        assert!(!dead.exists(), "the next capture sweeps a dead staging directory");
+        assert!(
+            !dead.exists(),
+            "the next capture sweeps a dead staging directory"
+        );
         vm.state.discard_capture(&staged);
         assert_eq!(std::fs::read_dir(&vm.state.root).unwrap().count(), 0);
         vm.state.delete("never").unwrap();
