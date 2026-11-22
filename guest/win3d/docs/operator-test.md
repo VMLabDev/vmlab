@@ -35,8 +35,9 @@ account vmlab only.
 | Path | What it is |
 | --- | --- |
 | `env.sh` | The environment of the test build: its `vmlab`, its vmlab-hv bundle, its own supervisor and state, and a host config that declares only `AMD1` and `Nvidia2` |
-| `win3d-test/labs/windows-11/`, `win3d-test/labs/windows-10/` | One lab for each variant |
+| `windows-11/` and `windows-10/` in the directory `labs` | One lab for each variant, with a sound card (`audio = true`) |
 | `desktop.sh` | Prepares a logged-on desktop in a lab (below) |
+| `sound.sh` | Checks the guest's sound card and plays a test sound (below) |
 | `report.sh` | Collects what a bug report needs (below) |
 | `pkg/` | The package zip, its `SHA256SUMS` and release notes, and the pin change for vmlab-templates as a patch file |
 | `tpl/` | A clone of vmlab-templates on the local branch `card-409` with the pin change committed (not pushed) |
@@ -83,6 +84,52 @@ vmlab console win --tcp                            # prints the VNC address for 
 - End with `vmlab down`, or `vmlab destroy` to delete the clone. Then leave
   the shell, which frees the GPU lock.
 
+### Sound
+
+The lab files have `audio = true`. The guest then gets an Intel HDA sound
+card, which Windows drives with its own driver, and vmlab-hv plays the
+guest's sound into the PipeWire whose socket is `pipewire-0` under its
+`XDG_RUNTIME_DIR`. The host node is named `vmlab.<lab>.win`, for example
+`vmlab.win3d-test-windows-11.win`. It exists only while the guest plays.
+
+On helios the VM runs as the account vmlab, and your sound devices belong
+to your own session. The PipeWire of the account vmlab has only a "Dummy
+Output". To hear the guest, let the account vmlab reach your PipeWire. Run
+this once as yourself, in your own session, before `. env.sh` and
+`vmlab up`:
+
+```sh
+setfacl -m u:vmlab:x /run/user/1000
+```
+
+`env.sh` then links your socket `/run/user/1000/pipewire-0`. Without that
+command it links the PipeWire of the account vmlab, and the check below
+still works but nobody hears it. The permission is gone when you log out.
+A VM picks its PipeWire when it starts: after a change run `vmlab down` and
+`vmlab up`.
+
+```sh
+../../sound.sh           # in the lab directory, after desktop.sh
+```
+
+`sound.sh` lists the guest's sound devices, plays `C:\Windows\Media\tada.wav`
+three times in the session of the user `win3d`, and reports whether the
+host node appeared and how loud the default output was meanwhile. With your
+PipeWire linked, `wpctl status` in your own session shows the node under
+Streams while the sound plays, and `wpctl set-volume <id> 0.5` or
+pavucontrol sets its volume.
+
+Checked on 2026-11-22 against the PipeWire of the account vmlab: in the
+windows-11 lab on `Nvidia2` and the windows-10 lab on `AMD1` the guest
+showed "High Definition Audio Device" with status OK and the Speakers
+endpoint, and played the sound. In the windows-11 lab the host node
+`vmlab.win3d-test-windows-11.win` (Stream/Output/Audio) appeared while the
+guest played, and a capture of the default sink had a peak of 0.077 of full
+scale, against 0.000 with the guest silent. Not checked: the route into the
+operator's session with `setfacl`, because no agent may act as the
+operator. If the node does not appear in your session, check
+`readlink ~/src/stc/win3d-test/r/pipewire-0` as the account vmlab.
+
 If the kernel log shows an Xid (`journalctl -k | grep 'NVRM: Xid'`), stop
 and do not try to bring the GPU back.
 
@@ -112,6 +159,7 @@ the console address was `127.0.0.1:5900`, and the capture, the recording
 | T7 | The pointer: move it over text (I-beam), window edges (resize arrows) and a video that hides it | The pointer follows the mouse without lag and changes shape at once. The I-beam is black with a white outline (a known difference). It is at the same place in a screenshot and in the viewer |
 | T8 | A Direct3D 9, 11 and 12 program: `d3d9_probe.exe`, `d3d11_probe.exe`, `d3d12_probe.exe` (also `opengl_probe.exe` and `vulkan_probe.exe`), each `--seconds 30`, x64 and x86. Then real programs of your own | Each window shows a turning pinwheel, the name of the API and the adapter line "Yttrium VirtIO GPU 3D controller" (OpenGL and Vulkan: "Virtio-GPU Venus (…)"), with a red, a blue and a green square in three corners. The frame rates of the automatic runs are in the table below |
 | T9 | Restart the guest twice and repeat T1 | The same after each boot. No dwm crash, no black console |
+| T10 | Sound ("Sound" above): Device Manager, "Sound, video and game controllers", then `../../sound.sh`, or in the guest Settings, System, Sound, Speakers, "Test" | Device Manager shows "High Definition Audio Device" without a warning sign, and "High Definition Audio Controller" under System devices. Windows has the output "Speakers (High Definition Audio Device)". While the guest plays, the host has the node `vmlab.<lab>.win` (`wpctl status`, under Streams), and you hear the sound when the VM plays into your session |
 
 ## Results of the automatic checks
 
@@ -241,7 +289,7 @@ Copy the directory `/home/vmlab/src/stc/win3d-test/zeus/` of helios to
 | `windows-10-19045.2006.10-win3d-test409.tar.zst` | 7,454,798,559 | The same for windows-10 19045.2006.10 |
 | `vmlab-3161c859-linux-x86_64` | 45,054,192 | The `vmlab` binary of this build |
 | `vmlab-hv-3161c859-linux-x86_64.tar.gz` | 6,824,673 | The vmlab-hv bundle of this build, with the patched render server |
-| `win3d-test-tools.tar.gz` | 4,592,878 | `env.sh`, a host config example, a lab file, `desktop.sh`, `report.sh`, the probes and the guest test scripts |
+| `win3d-test-tools.tar.gz` | 4,594,505 | `env.sh`, a host config example, a lab file, `desktop.sh`, `sound.sh`, `report.sh`, the probes and the guest test scripts |
 | `0001-test-windows-pin-the-vmlab-win3d-0.1.3-test409-test-.patch` | 2,166 | The pin change for vmlab-templates |
 
 ### Set up
@@ -324,7 +372,9 @@ Then run `vmlab down` and `vmlab up`. Two things show that it is on:
    boots.
 4. The bar of card #149 is 0 dashes in both boots with the setting on.
 
-Also run T1, T3 and T8 of the list above with the setting on. Send back
+Also run T1, T3 and T8 of the list above with the setting on. For sound
+(T10) run `../sound.sh` in the lab directory: on zeus the VM runs as
+yourself, `env.sh` links your session's PipeWire, and you hear the guest. Send back
 the four pictures, the dash counts, and `report.sh`'s file of an "off" boot
 and of an "on" boot. Two answers are open until this is measured: whether
 the rule ends #136, and whether it should be on for every NVIDIA host or
