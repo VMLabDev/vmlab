@@ -554,6 +554,25 @@ mod tests {
         assert_eq!(normalise(Path::new("./")), None);
     }
 
+    /// Review F6: every non-directory entry scanned the whole survivor map,
+    /// so a layer of `n` files cost `n²/2` visits.
+    #[test]
+    fn the_survey_of_a_large_layer_is_linear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut layer = Layer::new().dir("d", 0o755);
+        for i in 0..200_000 {
+            layer = layer.file(&format!("d/f{i}"), 0o644, 0, b"");
+        }
+        let (path, media, diff_id) = layer.build(tmp.path(), "big.tar", false);
+        let started = std::time::Instant::now();
+        survey_layers(&[(path, media)], &[diff_id]).unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "the survey of 200,000 files took {took:?}"
+        );
+    }
+
     #[test]
     fn survey_records_winners_and_whiteouts() {
         // Pure pass-1 logic, no sqfstar required.
