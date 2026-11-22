@@ -1025,6 +1025,27 @@ impl VmInstance {
         for warning in &plan.warnings {
             tracing::warn!("{}: {warning}", self.cfg.name);
         }
+        // The Venus render server this start gets, when it is not the one
+        // of vmlab-hv's bundle (card #447): this process's environment is
+        // the one the launcher inherits.
+        let venus = t
+            .resolved
+            .gpu
+            .as_ref()
+            .is_some_and(|g| g.mode == crate::config::model::GpuMode::Vulkan);
+        if venus && self.hypervisor() == HypervisorKind::Vmlab {
+            let binary = host
+                .vmlab_hv
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(super::hypervisor::vmlab_hv::BINARY));
+            let inherited = std::env::var(qemu::hostgpu::RENDER_SERVER_VAR).ok();
+            if let Some(warning) =
+                qemu::hostgpu::find_binary(&binary, std::env::var_os("PATH").as_deref())
+                    .and_then(|b| qemu::hostgpu::render_server_warning(&b, inherited.as_deref()))
+            {
+                tracing::warn!("{}: {warning}", self.cfg.name);
+            }
+        }
         *self.host_gpu.lock_recover() = plan.name.clone();
         *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
         *self.qemu_env.lock_recover() = plan.env.set.clone();

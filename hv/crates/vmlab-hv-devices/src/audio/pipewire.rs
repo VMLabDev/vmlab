@@ -1,7 +1,7 @@
 //! Native PipeWire streams, owned by one mainloop thread per direction.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,10 +14,110 @@ use crate::DeviceError;
 
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 const LOOP_TIMEOUT: Duration = Duration::from_millis(5);
+/// One host callback's worth of frames at the latency this backend asks for.
+const QUANTUM_FRAMES: usize = 256;
+/// The playback queue a stream starts with: two quanta, 10.7 ms at 48 kHz.
+const QUEUE_FRAMES: usize = 2 * QUANTUM_FRAMES;
+/// The deepest the playback queue grows after underruns: 42.7 ms at 48 kHz.
+const MAX_QUEUE_FRAMES: usize = 8 * QUANTUM_FRAMES;
+/// Silence this long after a short pull means the guest stopped playing, so
+/// the short pull was the end of a sound and not an underrun.
+const STREAM_GAP: Duration = Duration::from_millis(250);
+/// How often the worker writes the underruns it counted to the log.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
+
+/// What the playback callback counts and the worker reports (card #447).
+#[derive(Default)]
+struct Health {
+    /// Pulls inside a running stream that got less PCM than they asked for.
+    underruns: AtomicU64,
+    /// Frames of silence those pulls were padded with.
+    silence_frames: AtomicU64,
+    /// Callbacks that came more than two quanta after the one before.
+    late_callbacks: AtomicU64,
+    longest_gap_us: AtomicU64,
+}
+
+/// Tells an underrun from the end of a sound. A pull that gets less PCM than
+/// it asked for is held as pending. It counts once PCM arrives again within
+/// [`STREAM_GAP`], and is forgotten when the guest stays silent longer.
+#[derive(Default)]
+struct Gaps {
+    pending: u64,
+    pending_frames: u64,
+    first_short: Option<Instant>,
+    last_pull: Option<Instant>,
+}
+
+impl Gaps {
+    /// Record one pull after priming. Returns true when it confirmed an
+    /// underrun, which is when the queue should grow.
+    fn pull(
+        &mut self,
+        now: Instant,
+        requested: usize,
+        delivered: usize,
+        rate: u32,
+        health: &Health,
+    ) -> bool {
+        if let Some(last) = self.last_pull.replace(now) {
+            let gap = now.saturating_duration_since(last);
+            let quantum = Duration::from_secs_f64(requested as f64 / f64::from(rate.max(1)));
+            // Counted only while PCM flows: an idle stream's callbacks stop.
+            if delivered != 0 && requested != 0 && gap > 2 * quantum {
+                health.late_callbacks.fetch_add(1, Ordering::Relaxed);
+                health
+                    .longest_gap_us
+                    .fetch_max(gap.as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let mut confirmed = false;
+        if delivered != 0 && self.pending != 0 {
+            let recent = self
+                .first_short
+                .is_some_and(|at| now.saturating_duration_since(at) <= STREAM_GAP);
+            if recent {
+                health.underruns.fetch_add(self.pending, Ordering::Relaxed);
+                health
+                    .silence_frames
+                    .fetch_add(self.pending_frames, Ordering::Relaxed);
+                confirmed = true;
+            }
+            self.pending = 0;
+            self.pending_frames = 0;
+            self.first_short = None;
+        }
+        if delivered < requested {
+            self.pending += 1;
+            self.pending_frames += (requested - delivered) as u64;
+            self.first_short.get_or_insert(now);
+        }
+        confirmed
+    }
+}
+
+/// The report line for one interval, or `None` when nothing went wrong in it.
+fn health_report(health: &Health, seconds: u64, queue_frames: usize) -> Option<String> {
+    let underruns = health.underruns.swap(0, Ordering::Relaxed);
+    let silence = health.silence_frames.swap(0, Ordering::Relaxed);
+    let late = health.late_callbacks.swap(0, Ordering::Relaxed);
+    let gap = health.longest_gap_us.swap(0, Ordering::Relaxed);
+    (underruns != 0 || late != 0).then(|| {
+        format!(
+            "PipeWire playback underrun: underruns={underruns} silence_frames={silence} \
+             late_callbacks={late} longest_gap_ms={:.1} interval_s={seconds} \
+             queue_frames={queue_frames}",
+            gap as f64 / 1000.0
+        )
+    })
+}
 
 pub struct PipeWireHost {
     node_name: String,
     node_description: String,
+    /// The playback queue depth in frames. It outlives a stream, so a host
+    /// that needed a deeper queue once does not relearn it on every sound.
+    queue_frames: Arc<AtomicUsize>,
 }
 
 impl PipeWireHost {
@@ -35,6 +135,7 @@ impl PipeWireHost {
         Ok(Self {
             node_name: node_name.into(),
             node_description: node_description.into(),
+            queue_frames: Arc::new(AtomicUsize::new(QUEUE_FRAMES)),
         })
     }
 
@@ -43,7 +144,10 @@ impl PipeWireHost {
             return Err(error("invalid PCM format"));
         }
         let shared = Arc::new(Shared {
-            ring: SpscRing::with_capacity_bytes(4 * 256 * format.frame_bytes()),
+            ring: SpscRing::with_capacity_bytes(2 * MAX_QUEUE_FRAMES * format.frame_bytes()),
+            stride: format.frame_bytes(),
+            queue_frames: self.queue_frames.clone(),
+            health: Health::default(),
             stop: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             host_latency: AtomicUsize::new(0),
@@ -94,6 +198,9 @@ fn error(e: impl std::fmt::Display) -> DeviceError {
 
 struct Shared {
     ring: SpscRing,
+    stride: usize,
+    queue_frames: Arc<AtomicUsize>,
+    health: Health,
     stop: AtomicBool,
     alive: AtomicBool,
     host_latency: AtomicUsize,
@@ -110,15 +217,17 @@ struct Endpoint {
 struct Playback {
     primed: bool,
     startup_pulls: u8,
+    gaps: Gaps,
 }
 
 impl Playback {
     fn pull(&mut self, ring: &SpscRing, out: &mut [u8], stride: usize) -> usize {
         let available = ring.used_bytes();
         if !self.primed && available != 0 {
-            // Begin with two quanta of PCM so timer/callback phase does not
+            // Begin with two callbacks of PCM so timer/callback phase does not
             // consume the jitter reserve. Short one-shot sounds still drain.
-            self.primed = available >= 2 * 256 * stride || self.startup_pulls == 2;
+            let reserve = (QUEUE_FRAMES * stride).max(2 * out.len());
+            self.primed = available >= reserve || self.startup_pulls == 2;
             if !self.primed {
                 self.startup_pulls += 1;
             }
@@ -227,6 +336,10 @@ impl PlaybackSink for Endpoint {
             .used_bytes()
             .saturating_add(self.shared.host_latency.load(Ordering::Relaxed))
     }
+
+    fn queue_limit_bytes(&self) -> Option<usize> {
+        Some(self.shared.queue_frames.load(Ordering::Relaxed) * self.shared.stride)
+    }
 }
 
 impl CaptureSource for Endpoint {
@@ -292,7 +405,7 @@ fn run(
                 if let Some(bytes) = data.data() {
                     let offset = offset.min(bytes.len());
                     let size = size.min(bytes.len() - offset) / stride * stride;
-                    for period in bytes[offset..offset + size].chunks(256 * stride) {
+                    for period in bytes[offset..offset + size].chunks(QUANTUM_FRAMES * stride) {
                         shared.ring.push_drop_oldest(period);
                     }
                     shared.transferred.fetch_add(size, Ordering::Relaxed);
@@ -301,7 +414,7 @@ fn run(
                 let size = if let Some(bytes) = data.data() {
                     let frames = bytes.len() / stride;
                     let frames = if requested == 0 {
-                        frames.min(256)
+                        frames.min(QUANTUM_FRAMES)
                     } else {
                         frames.min(requested)
                     };
@@ -309,6 +422,24 @@ fn run(
                     let available = shared.ring.used_bytes();
                     let n = playback.pull(&shared.ring, &mut bytes[..size], stride);
                     let offset = shared.transferred.fetch_add(n, Ordering::Relaxed);
+                    // The queue holds two host callbacks at least, and one
+                    // quantum more after each underrun, up to its maximum.
+                    let mut queue = (2 * frames).min(MAX_QUEUE_FRAMES);
+                    if playback.primed
+                        && playback.gaps.pull(
+                            Instant::now(),
+                            frames,
+                            n / stride,
+                            format.rate,
+                            &shared.health,
+                        )
+                    {
+                        queue = queue.max(
+                            (shared.queue_frames.load(Ordering::Relaxed) + QUANTUM_FRAMES)
+                                .min(MAX_QUEUE_FRAMES),
+                        );
+                    }
+                    shared.queue_frames.fetch_max(queue, Ordering::Relaxed);
                     log::debug!(target: "vmlab_hv_devices::audio::pipewire::pull",
                         "PipeWire pull requested_frames={frames} available_frames={} delivered_frames={} pcm_offset={offset} dma_submitted={} queued_bytes={} silence_frames={} priming={}",
                         available / stride,
@@ -386,7 +517,16 @@ fn run(
         .map_err(error)?;
     let deadline = Instant::now() + START_TIMEOUT;
     let mut started = false;
+    let mut reported = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
+        if !capture && reported.elapsed() >= REPORT_EVERY {
+            let seconds = reported.elapsed().as_secs();
+            reported = Instant::now();
+            let queue = shared.queue_frames.load(Ordering::Relaxed);
+            if let Some(line) = health_report(&shared.health, seconds, queue) {
+                log::warn!("{line}");
+            }
+        }
         if mainloop
             .loop_()
             .iterate(pw::loop_::Timeout::Finite(LOOP_TIMEOUT))
@@ -411,6 +551,12 @@ fn run(
         }
     }
     stream.disconnect().map_err(error)?;
+    if !capture {
+        let queue = shared.queue_frames.load(Ordering::Relaxed);
+        if let Some(line) = health_report(&shared.health, reported.elapsed().as_secs(), queue) {
+            log::warn!("{line}");
+        }
+    }
     Ok(())
 }
 
@@ -442,6 +588,65 @@ mod tests {
         }
     }
 
+    /// A short pull counts as an underrun only when PCM follows it: the last
+    /// pull of a sound is short too, and is not one.
+    #[test]
+    fn an_underrun_is_a_short_pull_inside_a_running_stream() {
+        let health = Health::default();
+        let mut gaps = Gaps::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert!(!gaps.pull(at(0), 256, 256, 48000, &health));
+        // The producer is late: one pull is 100 frames short, the next empty.
+        assert!(!gaps.pull(at(5), 256, 156, 48000, &health));
+        assert!(!gaps.pull(at(10), 256, 0, 48000, &health));
+        assert_eq!(health.underruns.load(Ordering::Relaxed), 0);
+        // PCM is back: both short pulls were an underrun.
+        assert!(gaps.pull(at(16), 256, 256, 48000, &health));
+        assert_eq!(health.underruns.load(Ordering::Relaxed), 2);
+        assert_eq!(health.silence_frames.load(Ordering::Relaxed), 100 + 256);
+        assert_eq!(health.late_callbacks.load(Ordering::Relaxed), 0);
+        // The sound ends on a partial pull, and the next one starts a second
+        // later: no underrun.
+        assert!(!gaps.pull(at(21), 256, 96, 48000, &health));
+        for step in 0..215 {
+            assert!(!gaps.pull(at(26 + step * 5), 256, 0, 48000, &health));
+        }
+        assert!(!gaps.pull(at(1100), 256, 256, 48000, &health));
+        assert_eq!(health.late_callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(health.underruns.load(Ordering::Relaxed), 2);
+        // A callback 30 ms after the one before is late, while PCM flows.
+        assert!(!gaps.pull(at(1130), 256, 256, 48000, &health));
+        assert_eq!(health.late_callbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(health.longest_gap_us.load(Ordering::Relaxed), 30_000);
+
+        let line = health_report(&health, 10, 768).unwrap();
+        assert_eq!(
+            line,
+            "PipeWire playback underrun: underruns=2 silence_frames=356 late_callbacks=1 \
+             longest_gap_ms=30.0 interval_s=10 queue_frames=768"
+        );
+        // A report empties the counters, and a clean interval says nothing.
+        assert_eq!(health_report(&health, 10, 768), None);
+    }
+
+    /// A host whose callback asks for more than 256 frames gets two of its
+    /// own callbacks as the reserve, not two of ours.
+    #[test]
+    fn playback_prefill_follows_a_larger_host_quantum() {
+        let stride = 4;
+        let ring = SpscRing::with_capacity_bytes(4096 * stride);
+        let mut playback = Playback::default();
+        let mut out = vec![9; 1024 * stride];
+        ring.push_drop_oldest(&vec![1; 512 * stride]);
+        assert_eq!(playback.pull(&ring, &mut out, stride), 0);
+        for _ in 0..3 {
+            ring.push_drop_oldest(&vec![1; 512 * stride]);
+        }
+        assert_eq!(playback.pull(&ring, &mut out, stride), 1024 * stride);
+        assert_eq!(ring.used_bytes(), 1024 * stride);
+    }
+
     #[test]
     fn playback_prefill_drains_short_sounds_after_two_pulls() {
         let ring = SpscRing::with_capacity_bytes(4096);
@@ -469,6 +674,9 @@ mod tests {
         let mut sink = Endpoint {
             shared: Arc::new(Shared {
                 ring: SpscRing::with_capacity_bytes(4096),
+                stride: 4,
+                queue_frames: Arc::new(AtomicUsize::new(QUEUE_FRAMES)),
+                health: Health::default(),
                 stop: AtomicBool::new(false),
                 alive: AtomicBool::new(true),
                 host_latency: AtomicUsize::new(8192),
@@ -478,6 +686,7 @@ mod tests {
             join: None,
         };
         assert_eq!(sink.queued_bytes(), 0);
+        assert_eq!(sink.queue_limit_bytes(), Some(QUEUE_FRAMES * 4));
         assert_eq!(PlaybackSink::latency_bytes(&sink), 8192);
         sink.write_period(&[1; 1024]);
         assert_eq!(sink.queued_bytes(), 1024);

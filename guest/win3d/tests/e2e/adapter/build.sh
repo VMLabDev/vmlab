@@ -29,7 +29,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$repo:/src" -w /src/tests/e2e/ada
     x86_64-w64-mingw32-clang++ -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
       -std=c++17 -fno-exceptions -fno-rtti -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 \
       -mwindows -static -s -Wl,--no-insert-timestamp \
-      -o "$exe" "$src" -ld3d11 -ldxgi -ld2d1 -ldwmapi -lgdi32 -luser32
+      -o "$exe" "$src" -ld3d11 -ldxgi -ld2d1 -ldwmapi -lgdi32 -luser32 -lole32
   done'
 
 [ -n "$tarball" ] || exit 0

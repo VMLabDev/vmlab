@@ -2005,6 +2005,20 @@ fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> 
         .kind
 }
 
+/// The hypervisor each VM of `lab` runs on, selected the way validation
+/// selects it.
+pub fn vm_hypervisors(lab: &Lab, ctx: &dyn ValidationContext) -> Vec<(String, HypervisorKind)> {
+    lab.vms
+        .iter()
+        .map(|vm| {
+            (
+                vm.name.clone(),
+                selected_hypervisor(MachineCfg::Vm(vm), ctx),
+            )
+        })
+        .collect()
+}
+
 /// Every x86 machine of `lab` that runs on QEMU, by name, with the removal
 /// warning it earns ([`super::hypervisor::qemu_removal`]) — what `validate`
 /// prints, selected the way validation selects. The daemon says the same of
