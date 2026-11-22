@@ -134,7 +134,7 @@ impl SocketGuard {
             }
         };
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return Err(in_use(""));
+            return Err(in_use(" that still accepts connections"));
         }
         lock.set_len(0)?;
         lock.rewind()?;
