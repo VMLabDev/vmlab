@@ -23,6 +23,9 @@
 #   --signing key|none        default: $VMLAB_RELEASE_SIGNING, then none
 #   --builder NAME            the host name in the provenance
 #                             (default: $VMLAB_RELEASE_BUILDER, then hostname)
+#   --image-as-is             do not rebuild the vmlab-build image first: use the
+#                             tag as it is (a test build on a host that has
+#                             the image; a real version rebuilds it)
 #   --display staged|rebuild|unsigned
 #       staged    (default) use the signed package that is staged already, in
 #                 $VMLAB_VDISPLAY_PACKAGE_DIR or
@@ -49,12 +52,13 @@ die() {
   exit 1
 }
 
-kind="" bump="" version="" out="" display=staged
+kind="" bump="" version="" out="" display=staged image_as_is=0
 signing="${VMLAB_RELEASE_SIGNING:-none}"
 builder="${VMLAB_RELEASE_BUILDER:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --pre-release|--release) kind="$1"; shift ;;
+    --image-as-is) image_as_is=1; shift ;;
     --bump|--version|--out|--signing|--builder|--display)
       [ $# -ge 2 ] || die "$1 needs a value"
       case "$1" in
@@ -66,7 +70,7 @@ while [ $# -gt 0 ]; do
         --display) display="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -91,7 +95,10 @@ fi
 out="${out:-$ROOT/target/release-local/v$version}"
 log "version $version at $commit, built on $builder, into $out"
 
-# ── 2. Windows display driver ────────────────────────────────────────────────
+# ── 2. Build image and Windows display driver ────────────────────────────────
+# The image first: the display driver compiles in it too. build/run.sh builds
+# a missing image, and never rebuilds one that exists.
+[ "$image_as_is" -eq 1 ] || just buildbox::image
 container_env=()
 case "$display" in
   unsigned)
@@ -120,7 +127,6 @@ guest/vdisplay-windows/README.md), or point VMLAB_VDISPLAY_PACKAGE_DIR at one."
 fi
 
 # ── 3. Build in the container ────────────────────────────────────────────────
-just buildbox::image
 image="$(docker image inspect -f '{{.Id}}' "${VMLAB_BUILD_IMAGE:-vmlab-build}")"
 ./build/run.sh "${container_env[@]}" ./build/dist.sh "$version"
 

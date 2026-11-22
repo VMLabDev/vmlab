@@ -99,6 +99,12 @@ version. `just release::verify <dir>` runs the check again. The command refuses
 a checkout with uncommitted changes to tracked files, and a version whose tag
 exists. It uploads nothing. Start it like every heavy run on helios.
 
+The command rebuilds the `vmlab-build` image first, so the image has the
+toolchains that the commit pins. `--image-as-is` skips that for a test build.
+A change of `scripts/guest-toolchains.sh` rebuilds every layer of the image
+(about 10 GiB). The build needs about 25 GiB free on the disk of the checkout
+and of docker.
+
 B2. Publish. After R1 to R3 and A1 to A3, with the release commit on GitHub
 `main`, the factory runs this with its GitHub login:
 
