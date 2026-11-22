@@ -2390,6 +2390,111 @@ mod tests {
         FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
     }
 
+    #[test]
+    fn readdirplus_does_not_leak_the_entry_that_did_not_fit() {
+        let (_dir, fs) = scratch();
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply buffer takes one entry and refuses the second.
+        let mut offered: Vec<(Vec<u8>, u64)> = Vec::new();
+        FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |d, e| {
+            offered.push((d.name.to_vec(), e.inode));
+            Ok(if offered.len() == 1 { 160 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(offered.len(), 2, "one entry served, one refused");
+        let session = fs.inner.lock();
+        let (taken, taken_ino) = &offered[0];
+        let (refused, refused_ino) = &offered[1];
+        // The served entry keeps the lookup the guest will FORGET.
+        assert_eq!(
+            session.by_path.get(Path::new(OsStr::from_bytes(taken))),
+            Some(taken_ino)
+        );
+        assert_eq!(session.inodes[taken_ino].lookups, 1);
+        // The guest never saw the refused one and sends no FORGET for it.
+        assert!(
+            !session
+                .by_path
+                .contains_key(Path::new(OsStr::from_bytes(refused))),
+            "the entry that did not fit is still in the inode table"
+        );
+        assert!(!session.inodes.contains_key(refused_ino));
+        assert_eq!(session.inodes.len(), 2, "the root and the served entry");
+    }
+
+    #[test]
+    fn readdirplus_takes_back_its_lookups_when_the_request_fails() {
+        let (_dir, fs) = scratch();
+        let known = lookup(&fs, b"hello.txt").unwrap().inode;
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply is the error alone: the guest sees no entry of it.
+        let mut offered = 0;
+        let err = FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |_, _| {
+            offered += 1;
+            if offered == 3 {
+                Err(io::Error::from_raw_os_error(libc::EOVERFLOW))
+            } else {
+                Ok(160)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EOVERFLOW));
+        let session = fs.inner.lock();
+        // Only what the guest looked up before the request stays.
+        assert_eq!(session.inodes.len(), 2);
+        assert_eq!(session.inodes[&known].lookups, 1);
+    }
+
+    #[test]
+    fn readdirplus_reports_a_full_inode_table() {
+        const FILES: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{n:02}")), []).unwrap();
+        }
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // List to the end the way the guest does, and never FORGET: either
+        // every file is listed or the guest is told the table is full.
+        let mut names = Vec::new();
+        let mut offset = 0;
+        let mut error = None;
+        for _ in 0..=FILES {
+            let mut last = None;
+            let result =
+                FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, offset, &mut |d, _| {
+                    names.push(d.name.to_vec());
+                    last = Some(d.offset);
+                    Ok(d.name.len() + 152)
+                });
+            if let Err(e) = result {
+                // A failed request served nothing.
+                assert_eq!(last, None);
+                error = Some(e.raw_os_error());
+                break;
+            }
+            match last {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        if error.is_none() {
+            assert_eq!(
+                names.len(),
+                FILES,
+                "a listing with no error leaves files out"
+            );
+        } else {
+            assert_eq!(error, Some(Some(libc::ENFILE)));
+            // What was listed is what the table holds beside the root.
+            assert_eq!(names.len(), SESSION_LIMIT - 1);
+            assert_eq!(fs.inner.lock().inodes.len(), SESSION_LIMIT);
+        }
+    }
+
     /// List one directory handle to its end through the cookies, the way
     /// the guest does: each request resumes at the last entry it took.
     fn list_all(fs: &PassthroughFs, handle: u64, size: u32) -> Vec<Vec<u8>> {
