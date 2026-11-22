@@ -140,7 +140,7 @@ fn not_a_file(kind: std::fs::FileType) -> Option<&'static str> {
     } else if kind.is_dir() {
         Some("host: a directory named like a rule file holds no rules, so none apply from it")
     } else {
-        Some("host: a rule file that is not a regular file is never read, so its rules do not apply")
+        Some("host: a rule file that is not a regular file is never read, so no rules apply")
     }
 }
 
