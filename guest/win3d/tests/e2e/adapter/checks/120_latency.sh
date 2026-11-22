@@ -28,7 +28,7 @@ check_latency() {
     sock=$(vnc_sock)
     [ -n "$sock" ] || { skip latency "found no vnc.sock for this lab's VM in the vmlab runtime directory"; return; }
     host_load_start "$load"
-    python3 "$A/latency.py" "$sock" "$EV/latency.grab.json" --moves "$moves" --stop "$STAGE/latency.stop" \
+    python3 "$A/latency.py" "$sock" "$EV/latency.grab.json" --moves "$moves" --wait 900 --stop "$STAGE/latency.stop" \
         >"$STAGE/latency.grab.out" 2>&1 &
     gpid=$!
     # A move takes a quarter of a second and its answer; the window must outlast them.
