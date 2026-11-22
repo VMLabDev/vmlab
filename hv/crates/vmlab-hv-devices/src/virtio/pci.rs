@@ -2029,10 +2029,8 @@ mod tests {
         assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x0F);
         // The driver reads back the set that is in force.
         g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
-        assert_eq!(
-            g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE).to_le_bytes(),
-            first[..4]
-        );
+        let read_back = g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE);
+        assert_eq!(read_back.to_le_bytes(), first[..4]);
 
         // Dropping FEATURES_OK without a reset does not reopen negotiation.
         g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03);
