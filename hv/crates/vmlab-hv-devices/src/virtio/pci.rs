@@ -2040,7 +2040,7 @@ mod tests {
 
         // A reset does: one of the first set's bits alone is accepted.
         let low = u32::from_le_bytes(first[..4].try_into().unwrap());
-        let one = low & low.wrapping_neg();
+        let one = 1u32 << low.trailing_zeros();
         g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
         g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
         g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, one);
