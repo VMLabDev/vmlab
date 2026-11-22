@@ -858,6 +858,8 @@ Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: N
 
 [C376](acceptance/C376.md) records the four Wine D3D9 programs on the
 post-fix baseline and the remaining follow-ups.
+[C412](acceptance/C412.md) records the ATI1 texture creation fix of its
+draft A1 and the counts of both programs that crashed there.
 
 Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
 Windows 11 tables above. Counts below are failed assertions, including
