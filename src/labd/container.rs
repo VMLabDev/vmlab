@@ -1758,7 +1758,11 @@ mod tests {
     // ---- the Machine interface ---------------------------------------------
 
     fn instance(name: &str) -> Arc<ContainerInstance> {
-        let dirs = ContainerDirs::new(Path::new("/tmp/vmlab-test"), "lab", name);
+        instance_in(Path::new("/tmp/vmlab-test"), name)
+    }
+
+    fn instance_in(root: &Path, name: &str) -> Arc<ContainerInstance> {
+        let dirs = ContainerDirs::new(root, "lab", name);
         let cfg = container(name);
         let resolved = crate::qemu::resolve_container(
             &cfg,
@@ -1820,6 +1824,18 @@ mod tests {
         let c = instance("web");
         // No image bound yet (deferred pull) — nothing to pin.
         assert_eq!(c.snapshot_pin(), None);
+    }
+
+    #[tokio::test]
+    async fn drop_snapshot_accepts_absent_scratch_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = instance_in(dir.path(), "web");
+        let scratch = c.dirs.scratch_disk();
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        crate::template::qimg::create_blank(&scratch, 1024 * 1024)
+            .await
+            .unwrap();
+        c.drop_snapshot("missing").await.unwrap();
     }
 
     // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------

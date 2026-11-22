@@ -4131,6 +4131,7 @@ mod tests {
         online_snapshots: bool,
         snapshot_failure: bool,
         snapshot_cleanup_failure: bool,
+        snapshot_missing: bool,
         clock: crate::config::model::Clock,
         /// What `boot_id` answers, in turn; the last answer repeats. Empty is
         /// a machine with no boot identity to read.
@@ -4217,6 +4218,7 @@ mod tests {
                 online_snapshots: false,
                 snapshot_failure: false,
                 snapshot_cleanup_failure: false,
+                snapshot_missing: false,
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
@@ -4526,6 +4528,7 @@ mod tests {
             next.map(String::from).map_err(|e| anyhow!(e))
         }
         async fn snapshot(&self, name: &str) -> Result<bool> {
+            super::super::vm::validate_snapshot_name(name)?;
             self.note(&format!("snapshot:{name}")).await;
             if self.snapshot_failure {
                 bail!("injected snapshot failure");
@@ -4578,6 +4581,9 @@ mod tests {
         }
         async fn delete_snapshot(&self, name: &str) -> Result<()> {
             self.note(&format!("delete_snapshot:{name}")).await;
+            if self.snapshot_missing {
+                return Err(missing_snapshot(&self.name, name).into());
+            }
             if self.snapshot_cleanup_failure {
                 bail!("injected snapshot cleanup failure");
             }
@@ -4742,6 +4748,42 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
                 .pending_snapshots
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_capture_leaves_no_pending_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("a", "invalid/name").await.unwrap_err();
+        assert!(lab.snapshots("a").await.unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_entry_is_cleared_when_no_disk_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.snapshot_missing = true;
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        {
+            let mut state = lab.state.lock().await;
+            state.machine_mut("a").pending_snapshots.insert("interrupted".into());
+            state.save(&lab.lab_local).unwrap();
+        }
+        lab.delete_snapshot("a", "interrupted").await.unwrap();
+        assert!(lab.snapshots("a").await.unwrap().as_array().unwrap().is_empty());
+        assert!(lab.snapshot("a", "interrupted").await.is_ok());
     }
 
     fn quiet() -> crate::scripting::OutputSink {
