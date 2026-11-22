@@ -764,7 +764,55 @@ impl Registry {
     /// Otherwise the held overlay stays where the pull only brought the
     /// default along, and the pull is refused where `want` asked for that
     /// variant.
+    ///
+    /// Two pulls of one version at the same time both find it absent and both
+    /// download it. The store lock orders their installs, and the second is
+    /// refused because the version is there. That pull runs once more: it
+    /// now finds the version held, checks it as any held version is checked
+    /// (same repository, same disk), and fetches only the variants it still
+    /// lacks.
     pub async fn pull_with_progress(
+        &self,
+        arch: Option<&str>,
+        dest_store: &TemplateStore,
+        work_dir: &Path,
+        overwrite: bool,
+        want: &VariantWant,
+        progress: &mut (dyn FnMut(PullProgress) + Send),
+    ) -> Result<TemplateMeta> {
+        let first = self
+            .pull_once(arch, dest_store, work_dir, overwrite, want, &mut *progress)
+            .await;
+        let lost_race = |e: &anyhow::Error| {
+            e.downcast_ref::<crate::template::store::AlreadyInstalled>()
+                .is_some_and(|held| {
+                    // A directory with no metadata is not a version another
+                    // pull installed, and a second pass would end the same way.
+                    matches!(
+                        dest_store.installed(&held.arch, &held.name, &held.version),
+                        Ok(Some(_))
+                    )
+                })
+        };
+        match first {
+            Err(e) if !overwrite && lost_race(&e) => {
+                tracing::info!(
+                    reference = %self.reference.canonical(),
+                    "another pull installed this version first; using it"
+                );
+                // What the first pass staged is not needed again.
+                for dir in ["chunks", "staging"] {
+                    let _ = std::fs::remove_dir_all(work_dir.join(dir));
+                }
+                self.pull_once(arch, dest_store, work_dir, overwrite, want, progress)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// One pass of [`Self::pull_with_progress`].
+    async fn pull_once(
         &self,
         arch: Option<&str>,
         dest_store: &TemplateStore,
@@ -3323,7 +3371,7 @@ mod tests {
         inner: std::sync::Arc<FakeRegistry>,
         chunks: std::sync::Arc<std::collections::HashSet<String>>,
         meeting: std::sync::Arc<tokio::sync::Barrier>,
-        to_meet: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        arrived: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -3333,11 +3381,8 @@ mod tests {
         }
         async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
             use std::sync::atomic::Ordering;
-            let meets = self.chunks.contains(d)
-                && self
-                    .to_meet
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok();
+            let meets =
+                self.chunks.contains(d) && self.arrived.fetch_add(1, Ordering::SeqCst) < 2;
             if meets {
                 self.meeting.wait().await;
             }
@@ -3391,7 +3436,7 @@ mod tests {
             inner: fake.clone(),
             chunks: std::sync::Arc::new(chunks),
             meeting: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
-            to_meet: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+            arrived: std::sync::Arc::default(),
         };
         fake.gets.lock().unwrap().clear();
 
