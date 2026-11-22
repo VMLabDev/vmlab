@@ -183,6 +183,8 @@ pub struct Registry {
     /// Asked before a pull replaces a variant overlay the store holds
     /// ([`Self::guarding`]). Without one, no held overlay is replaced.
     in_use: Option<crate::template::build::InUse>,
+    /// The owner of a pull's work directory ([`Self::holding`]).
+    work: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 impl Registry {
@@ -196,6 +198,7 @@ impl Registry {
             reference,
             transport: Box::new(transport),
             in_use: None,
+            work: None,
         })
     }
 
@@ -209,6 +212,16 @@ impl Registry {
         self
     }
 
+    /// Give a pull the owner of its work directory, so the directory lives
+    /// as long as the pull uses it. The install runs on a blocking thread
+    /// that an abort of the pull's task does not stop: it keeps this owner
+    /// until it ends, so a cancel cannot remove the staged disks under it
+    /// (review templates-registry F13).
+    pub fn holding(mut self, work: std::sync::Arc<tempfile::TempDir>) -> Self {
+        self.work = Some(work);
+        self
+    }
+
     /// Build a client over an explicit transport (used by tests).
     #[allow(dead_code)]
     pub fn with_transport(reference: Reference, transport: Box<dyn Transport>) -> Self {
@@ -216,6 +229,7 @@ impl Registry {
             reference,
             transport,
             in_use: None,
+            work: None,
         }
     }
 
@@ -4829,6 +4843,82 @@ mod tests {
 
         let meta = pull_guarded(&fake, &store, &asked, free).await.unwrap();
         assert_eq!(meta.variant("standard").unwrap().sha256, digest_b);
+        assert_eq!(sha256_file(&held).unwrap(), digest_b);
+    }
+
+    /// Review templates-registry F13: a pull is aborted while its install
+    /// runs on the blocking thread. The work directory must stay until that
+    /// install ends, and the install must complete.
+    #[tokio::test]
+    async fn a_cancelled_pull_keeps_its_work_directory_until_the_install_ends() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let store = store_in(work.path(), "store");
+        pull_guarded(&fake, &store, &VariantWant::default(), in_use_saying(None))
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+
+        // The in-use check runs on the install thread, after the overlay is
+        // staged and before it moves into the store. It says where it is
+        // and waits there.
+        let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let in_use: crate::template::build::InUse = std::sync::Arc::new(move |_| {
+            let reached_tx = reached_tx.clone();
+            let mut released = released.clone();
+            Box::pin(async move {
+                let _ = reached_tx.send(());
+                let _ = released.wait_for(|go| *go).await;
+                None
+            })
+        });
+
+        let op = std::sync::Arc::new(
+            crate::template::oci_bridge::fresh_work_dir(&store.root().join(".oci-pull")).unwrap(),
+        );
+        let op_dir = op.path().to_path_buf();
+        let registry = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .guarding(in_use)
+            .holding(op);
+        let (task_store, task_dir) = (store.clone(), op_dir.clone());
+        let task = tokio::spawn(async move {
+            let asked = VariantWant::of(Some(&VariantRefNamed("standard")));
+            registry
+                .pull_with_progress(
+                    Some("x86_64"),
+                    &task_store,
+                    &task_dir,
+                    false,
+                    &asked,
+                    &mut |_| {},
+                )
+                .await
+        });
+        reached.recv().await.expect("the install asks the in-use check");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let staged = op_dir.join("staging").join(variant_disk_rel("standard"));
+        assert!(
+            staged.is_file(),
+            "the cancel removed {} under the running install",
+            staged.display()
+        );
+
+        // The install goes on, and the directory goes when it has ended.
+        release.send(true).unwrap();
+        while op_dir.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(sha256_file(&held).unwrap(), digest_b);
     }
 

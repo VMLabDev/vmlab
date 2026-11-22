@@ -2056,6 +2056,75 @@ mod tests {
         assert_eq!(version_entries(&store), ["1"]);
     }
 
+    // ---- staged files that go away during the install (F13) ----------------
+
+    /// Review templates-registry F13: the staged disk is removed after
+    /// `install_with` checked it and before the rename. Nothing is installed.
+    #[test]
+    fn a_staged_disk_removed_before_the_rename_installs_nothing() {
+        let (_tmp, store) = new_store();
+        fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"one").unwrap();
+        let err = store
+            .install_with(
+                &staging,
+                &meta("x86_64", "t", "1"),
+                false,
+                &InstallOps {
+                    write_meta: |meta, path| {
+                        fs::remove_file(path.with_file_name(DISK_FILE)).unwrap();
+                        meta.write_to(path)
+                    },
+                    ..InstallOps::REAL
+                },
+            )
+            .expect_err("a version with no disk was installed");
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+        assert!(store.installed("x86_64", "t", "1").unwrap().is_none());
+        assert!(!store.version_dir("x86_64", "t", "1").exists());
+    }
+
+    /// The same during an overwrite: the old version stays.
+    #[test]
+    fn a_staged_disk_removed_before_the_swap_keeps_the_old_version() {
+        let err = overwrite_fails_and_keeps_old(&InstallOps {
+            write_meta: |meta, path| {
+                fs::remove_file(path.with_file_name(DISK_FILE)).unwrap();
+                meta.write_to(path)
+            },
+            ..InstallOps::REAL
+        });
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+    }
+
+    /// The disk goes in the last moment, with the rename itself: the version
+    /// that arrived without it is taken out again.
+    #[test]
+    fn a_staged_disk_removed_at_the_rename_installs_nothing() {
+        let (_tmp, store) = new_store();
+        fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"one").unwrap();
+        let err = store
+            .install_with(
+                &staging,
+                &meta("x86_64", "t", "1"),
+                false,
+                &InstallOps {
+                    rename: |from, to| {
+                        fs::remove_file(from.join(DISK_FILE))?;
+                        fs::rename(from, to)
+                    },
+                    ..InstallOps::REAL
+                },
+            )
+            .expect_err("a version with no disk was installed");
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+        assert!(store.installed("x86_64", "t", "1").unwrap().is_none());
+        assert!(!store.version_dir("x86_64", "t", "1").exists());
+    }
+
     /// The state a crash between setting `x86_64/t@1` aside and the final
     /// rename leaves: no version dir, the old one at `.old-1`, and a
     /// half-staged replacement at `.next-1`.
