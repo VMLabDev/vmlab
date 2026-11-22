@@ -1180,9 +1180,15 @@ fn restore_rejects_a_zero_period() {
     let cases = [
         ("a zero period", damaged(5, &0u32.to_le_bytes())),
         ("a period below one frame", damaged(5, &3u32.to_le_bytes())),
-        ("a period of part frames", damaged(5, &1026u32.to_le_bytes())),
+        (
+            "a period of part frames",
+            damaged(5, &1026u32.to_le_bytes()),
+        ),
         ("a zero buffer", damaged(1, &0u32.to_le_bytes())),
-        ("a buffer of part periods", damaged(1, &4097u32.to_le_bytes())),
+        (
+            "a buffer of part periods",
+            damaged(1, &4097u32.to_le_bytes()),
+        ),
         ("three channels", damaged(13, &[3])),
     ];
     for (what, state) in cases {
