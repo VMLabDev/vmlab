@@ -805,8 +805,17 @@ impl LabRuntime {
                     },
                 );
             };
-            crate::oci::ensure_registry_template(&ref_s, &arch_s, &store, &want, &mut progress)
-                .await
+            // A pull that brings a rebuilt variant asks every registered lab
+            // whether a clone is backed by the overlay it would replace.
+            crate::oci::ensure_registry_template(
+                &ref_s,
+                &arch_s,
+                &store,
+                &want,
+                crate::supervisor::store::in_use_check(),
+                &mut progress,
+            )
+            .await
         });
         match self.join_pull(batch, task).await {
             Ok(resolved) => match self.bind_template(batch, &resolved) {

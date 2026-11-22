@@ -738,6 +738,12 @@ impl TemplateStore {
     /// moves first and the block is written after, so a failure between the
     /// two leaves an overlay with no block — which does not count — never a
     /// block naming a disk that is not there.
+    ///
+    /// An incoming variant whose name the version already holds replaces that
+    /// overlay. `in_use` is handed the overlays that would go and says why
+    /// they cannot — the clones backed by them, each a delta against the
+    /// overlay it was made from — or `None`. It is asked under the store
+    /// lock, before anything moves, and a reason refuses the whole call.
     pub fn add_variants(
         &self,
         arch: &str,
@@ -745,6 +751,7 @@ impl TemplateStore {
         version: &str,
         staging_dir: &Path,
         variants: &[super::meta::VariantMeta],
+        in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
@@ -753,6 +760,23 @@ impl TemplateStore {
         let mut incoming = found.meta.clone();
         incoming.variants = variants.to_vec();
         verify_variants(staging_dir, &incoming, found.meta.sha256.as_deref())?;
+
+        let replaced: Vec<&str> = variants
+            .iter()
+            .map(|v| v.name.as_str())
+            .filter(|n| found.variant_disk(n).exists())
+            .collect();
+        let doomed: Vec<PathBuf> = replaced.iter().map(|n| found.variant_disk(n)).collect();
+        if !doomed.is_empty()
+            && let Some(reason) = in_use(&doomed)
+        {
+            bail!(
+                "refusing to replace {arch}/{name}@{version}#{}: {reason} — replacing the \
+                 overlay a clone is a delta against would corrupt it; destroy those machines \
+                 first",
+                replaced.join(", #")
+            );
+        }
 
         let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
         for v in variants {
@@ -2064,8 +2088,9 @@ mod tests {
         let adding = store.clone();
         let staging = tempfile::tempdir_in(store.root()).unwrap();
         let staging_path = staging.path().to_path_buf();
-        let added =
-            returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
+        let added = returns_within_10s(move || {
+            adding.add_variants("x86_64", "t", "1", &staging_path, &[], &|_| None)
+        });
         assert!(added.is_ok(), "{added:?}");
         assert_eq!(version_entries(&store), ["1"]);
         assert_eq!(version_files(&store).0, before.0);
@@ -2392,6 +2417,83 @@ mod tests {
 
     fn named(n: &str) -> VariantRef {
         VariantRef::Named(n.into())
+    }
+
+    on_both_tools!(adding_a_variant_that_replaces_one_asks_whether_it_is_in_use);
+    /// Review templates-registry F1: `add_variants` with a variant the
+    /// version already holds replaces that overlay, so it asks first. It
+    /// hands the check the overlay that would go, a reason refuses the call
+    /// with nothing moved, and a variant of a new name is not asked about.
+    fn adding_a_variant_that_replaces_one_asks_whether_it_is_in_use() {
+        use std::os::unix::fs::MetadataExt;
+        let (_tmp, store) = variant_store();
+        let found = store.resolve_version("x86_64", "win", Some("1")).unwrap();
+        let base_sha = found.meta.sha256.clone().unwrap();
+        let held = found.variant_disk("standard");
+        let inode = fs::metadata(&held).unwrap().ino();
+
+        // A staged `standard` and a staged `fresh`, each on a copy of the base.
+        let stage = |name: &str| {
+            let staging = tempfile::tempdir_in(store.root()).unwrap();
+            fs::copy(&found.disk_path, staging.path().join(DISK_FILE)).unwrap();
+            let vdir = staging.path().join(VARIANTS_DIR).join(name);
+            fs::create_dir_all(&vdir).unwrap();
+            variant_overlay(&vdir);
+            let mut v = variant_meta(name, name == "standard", &base_sha);
+            v.sha256 = sha256_file(&vdir.join(DISK_FILE)).unwrap();
+            (staging, v)
+        };
+
+        let (staging, v) = stage("standard");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let busy = |doomed: &[PathBuf]| {
+            asked.borrow_mut().extend_from_slice(doomed);
+            Some("the clone of machine a/web is backed by it".to_string())
+        };
+        let err = store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &busy,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x86_64/win@1#standard") && err.contains("a/web"),
+            "{err}"
+        );
+        assert_eq!(*asked.borrow(), std::slice::from_ref(&held));
+        assert_eq!(fs::metadata(&held).unwrap().ino(), inode, "left in place");
+        assert!(staging.path().join(variant_disk_rel("standard")).is_file());
+
+        // Nothing leans on it: replaced.
+        store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &|_| None,
+            )
+            .unwrap();
+        assert_ne!(fs::metadata(&held).unwrap().ino(), inode);
+
+        // A new name replaces nothing, so the check is not asked.
+        let (staging, v) = stage("fresh");
+        store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &|_| panic!("asked about a variant that replaces none"),
+            )
+            .unwrap();
     }
 
     on_both_tools!(a_marked_base_without_its_variants_is_refused);
