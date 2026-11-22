@@ -44,8 +44,11 @@ ls -l "/dev/vfio/$(basename "$GROUP")"
 The driver link must end in `vfio-pci`. Grant the test account access to the
 group's VFIO node through the host's device-permission policy. The VMM refuses
 other bindings and never unbinds, rebinds, or changes IOMMU groups.
-Set the account's locked-memory limit to at least the guest RAM size. This
-test needs 4 GiB. Check the limit in KiB with `ulimit -l`.
+Passthrough pins all guest RAM, and the kernel charges it to the account's
+locked-memory limit (RLIMIT_MEMLOCK). The VMM raises its soft limit to the hard
+limit by itself. When the hard limit is below the guest RAM it refuses to start
+and names the limit. Check the hard limit in KiB with `ulimit -Hl`. This test
+needs 4 GiB.
 
 ## Run the S1 acceptance test
 
@@ -94,12 +97,32 @@ address spaces. Sparse mmap areas are respected. MSI-X table and PBA pages
 remain trapped; other registers on those pages use VFIO region access.
 Guest BAR and ROM addresses never reach host config space.
 
+The expansion ROM is read on the guest's first access to it and kept for the
+life of the machine. The kernel checks the ROM signature through the device on
+every read, so the VMM turns memory decoding on for the length of the read.
+A graphics card's flash is slow: the first read of an RTX 5090's 512 KiB ROM
+takes about 14 seconds, once for each start.
+
+Three extended capabilities are unlinked from the chain the guest sees, and
+read as zeros: SR-IOV, ARI and Resizable BAR. The kernel presents SR-IOV's VF
+BARs read-only, and EDK2 adds them to its resource plan. On an RTX 5090 that
+asks the host bridge for a range it rejects, after which OVMF gives no device
+a BAR and the guest finds no disk and no display. ARI names a next function
+the guest does not have, and Resizable BAR would change a BAR size the VMM has
+fixed.
+
+PCI0's 64-bit window in the ACPI tables grows by the sum of the assigned
+64-bit BARs, rounded up to 1 GiB, above its 32 GiB default. Firmware places
+the largest BAR first, so a 32 GiB BAR would otherwise push every other
+device's 64-bit BAR outside the declared window.
+
 MSI advertises one maskable vector when hardware supports masking. MSI-X
 preserves the hardware vector count. Both use eventfds and KVM MSI routing;
 masked vectors retain pending events. INTx uses KVM irqfd resampling at the
 q35 IOAPIC PIRQ GSI. Legacy PIC-only INTx delivery is not implemented.
 Other capability accesses pass through the kernel VFIO config-space filters.
-No vendor-specific GPU reset or NVIDIA workarounds are included.
+No vendor-specific GPU reset or NVIDIA workarounds are included. An RTX 5090
+runs a Windows 11 guest with the NVIDIA driver without them (card 453).
 
 Online snapshot save and load are refused while any VFIO function is assigned.
 Disk-only image operations remain independent of assignment.

@@ -147,10 +147,66 @@ struct Domain {
     mapped: Mutex<bool>,
 }
 
+/// What the locked-memory limit allows for a guest that needs `need` bytes
+/// pinned: nothing to do, a soft limit to raise, or a refusal in plain words.
+/// The type1 IOMMU backend charges every pinned guest page to RLIMIT_MEMLOCK
+/// and answers ENOMEM past it, which names neither the limit nor the cure.
+fn memlock_plan(need: u64, soft: u64, hard: u64, privileged: bool) -> Result<Option<u64>, String> {
+    if privileged || soft >= need {
+        return Ok(None);
+    }
+    if hard >= need {
+        return Ok(Some(hard));
+    }
+    Err(format!(
+        "PCI passthrough pins all guest RAM ({} MiB), but this process may lock only {} MiB \
+         (RLIMIT_MEMLOCK). Raise the locked-memory limit of the account that runs vmlab to at \
+         least the guest RAM (`ulimit -l unlimited`, a `memlock` line in \
+         /etc/security/limits.conf, or LimitMEMLOCK=infinity on the service), then restart \
+         the vmlab daemons (`vmlab daemon stop`) and start the machine again",
+        need.div_ceil(1 << 20),
+        hard >> 20
+    ))
+}
+
+/// Apply [`memlock_plan`] to this process before the first DMA map.
+fn ensure_memlock(need: u64) -> Result<(), String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a valid rlimit for the kernel to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return Ok(());
+    }
+    // CAP_IPC_LOCK (bit 14) exempts the process from the limit.
+    let privileged = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find_map(|l| l.strip_prefix("CapEff:"))?;
+            u64::from_str_radix(line.trim(), 16).ok()
+        })
+        .is_some_and(|caps| caps & (1 << 14) != 0);
+    if let Some(soft) = memlock_plan(need, limit.rlim_cur, limit.rlim_max, privileged)? {
+        limit.rlim_cur = soft;
+        // SAFETY: limit is a valid rlimit; raising the soft limit to the hard
+        // limit needs no privilege.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) } != 0 {
+            return Err(format!(
+                "raising RLIMIT_MEMLOCK for PCI passthrough: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Domain {
     fn map(&self) -> Result<(), String> {
         let mut mapped = self.mapped.lock();
         if !*mapped {
+            use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+            ensure_memlock(self.memory.iter().map(|region| region.len()).sum())?;
             // SAFETY: Domain retains RAM until every device has closed and DMA
             // mappings have been removed in Drop.
             unsafe { self.container.vfio_map_guest_memory(&self.memory) }
@@ -260,7 +316,30 @@ fn event_pending(
 
 impl Backend for Host {
     fn read(&self, region: u8, offset: u64, data: &mut [u8]) {
+        if u32::from(region) != VFIO_PCI_ROM_REGION_INDEX {
+            self.device.region_read(u32::from(region), data, offset);
+            return;
+        }
+        // The kernel maps the expansion ROM for each read and checks its
+        // 0xaa55 signature through the device. With memory decoding off, as
+        // it is before the guest enables it, the device answers all-ones and
+        // the read fails with ENOMEM. Decode memory for the length of the read.
+        let mut command = [0; 2];
+        self.device
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, &mut command, 4);
+        let decoding = command[0] & 2 != 0;
+        if !decoding {
+            self.device.region_write(
+                VFIO_PCI_CONFIG_REGION_INDEX,
+                &[command[0] | 2, command[1]],
+                4,
+            );
+        }
         self.device.region_read(u32::from(region), data, offset);
+        if !decoding {
+            self.device
+                .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &command, 4);
+        }
     }
     fn write(&self, region: u8, offset: u64, data: &[u8]) {
         self.device.region_write(u32::from(region), data, offset);
@@ -360,12 +439,16 @@ impl Backend for Host {
                     return Err("VFIO BAR overlaps RAM or platform MMIO".into());
                 }
             }
-            self.register_mapping(m, None)?;
-            if let Err(error) = self.register_mapping(m, base) {
-                let _ = self.register_mapping(m, None);
-                return Err(error);
+            // KVM answers EINVAL to the removal of a slot that does not exist,
+            // so only a mapping the guest can see now is taken away first.
+            if m.base.is_some() {
+                self.register_mapping(m, None)?;
+                self.mappings[i].base = None;
             }
-            self.mappings[i].base = base;
+            if base.is_some() {
+                self.register_mapping(&self.mappings[i], base)?;
+                self.mappings[i].base = base;
+            }
         }
         Ok(())
     }
@@ -472,7 +555,7 @@ impl Drop for Host {
         let _ = self.stop_interrupts();
         self.device.reset();
         for mapping in &self.mappings {
-            if self.register_mapping(mapping, None).is_ok() {
+            if mapping.base.is_none() || self.register_mapping(mapping, None).is_ok() {
                 // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
                 unsafe {
                     libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize);
@@ -482,6 +565,19 @@ impl Drop for Host {
         }
         // Domain outlives all device fds and removes DMA mappings before RAM drops.
     }
+}
+
+/// Length of the 64-bit PCI window PCI0._CRS must declare for these assigned
+/// BARs. Firmware packs 64-bit BARs largest first from the window base, so
+/// the assigned ones can push every other device's past the default 32 GiB:
+/// a 32 GiB BAR alone fills it. A guest OS that finds a BAR outside the
+/// window treats the firmware's placement as a conflict.
+pub(crate) fn pci64_window(bars: impl Iterator<Item = BarInfo>) -> u64 {
+    let assigned: u64 = bars
+        .filter(|bar| matches!(bar.kind, BarKind::Mmio64 { .. }))
+        .map(|bar| bar.size)
+        .sum();
+    vmlab_hv_firmware::acpi::PCI64_SIZE + assigned.div_ceil(1 << 30) * (1 << 30)
 }
 
 pub(crate) fn build(
@@ -694,6 +790,40 @@ mod tests {
         assert_eq!(*maps.lock().last().unwrap(), Some(2 << 32));
         root.config_write(0, 6, 0, 4, &0u16.to_le_bytes());
         assert_eq!(*maps.lock().last().unwrap(), None);
+    }
+
+    #[test]
+    fn a_short_locked_memory_limit_is_raised_or_refused_in_plain_words() {
+        let gib = 1u64 << 30;
+        assert_eq!(memlock_plan(16 * gib, u64::MAX, u64::MAX, false), Ok(None));
+        assert_eq!(memlock_plan(16 * gib, 16 * gib, 16 * gib, false), Ok(None));
+        assert_eq!(memlock_plan(16 * gib, 8 << 20, 8 << 20, true), Ok(None));
+        assert_eq!(
+            memlock_plan(16 * gib, 8 << 20, u64::MAX, false),
+            Ok(Some(u64::MAX))
+        );
+        let error = memlock_plan(16 * gib, 8 << 20, 8 << 20, false).unwrap_err();
+        assert!(error.contains("16384 MiB"), "{error}");
+        assert!(error.contains("only 8 MiB"), "{error}");
+        assert!(error.contains("RLIMIT_MEMLOCK"), "{error}");
+        assert!(error.contains("ulimit -l unlimited"), "{error}");
+    }
+
+    #[test]
+    fn the_64_bit_pci_window_grows_by_the_assigned_64_bit_bars() {
+        let bar = |index, size, kind| BarInfo { index, size, kind };
+        let wide = BarKind::Mmio64 { prefetchable: true };
+        assert_eq!(pci64_window(std::iter::empty()), 32 << 30);
+        // An RTX 5090: 64 MiB of registers, 32 GiB and 32 MiB prefetchable,
+        // an I/O BAR and the ROM.
+        let gpu = [
+            bar(0, 64 << 20, BarKind::Mmio32),
+            bar(1, 32 << 30, wide),
+            bar(3, 32 << 20, wide),
+            bar(5, 0x80, BarKind::Io),
+            bar(6, 512 << 10, BarKind::Mmio32),
+        ];
+        assert_eq!(pci64_window(gpu.into_iter()), 65 << 30);
     }
 
     #[test]

@@ -36,6 +36,7 @@ fn macos_platform() -> Platform {
         .collect(),
         ecam_base: 0xe0000000,
         pci64_base: Some(32 << 30),
+        pci64_size: 32 << 30,
         tpm: false,
         smm: false,
     }
@@ -456,6 +457,47 @@ fn ovmf_smm_cpu_eject_namespace_and_loader_order_match_the_capture() {
     let records = generated.loader.as_chunks::<128>().0;
     assert_eq!(name(&records[1][4..60]), "etc/tpm/log");
     assert_eq!(name(&records[2][4..60]), "etc/acpi/tables");
+}
+
+#[test]
+fn a_larger_64_bit_pci_window_changes_only_its_end_and_length() {
+    let mut p = captured_platform();
+    p.pci64_base = Some(0x380000000000);
+    let default = generate(&p).unwrap().tables;
+    p.pci64_size = 96 << 30;
+    let wide = generate(&p).unwrap().tables;
+    assert_eq!(default.len(), wide.len());
+    let find = |tables: &[u8], value: u64| {
+        tables
+            .windows(8)
+            .filter(|window| *window == value.to_le_bytes())
+            .count()
+    };
+    // QWordMemory: minimum, maximum, translation, length.
+    let descriptor = [
+        0x380000000000u64,
+        0x380000000000 + (96 << 30) - 1,
+        0,
+        96 << 30,
+    ]
+    .iter()
+    .flat_map(|value| value.to_le_bytes())
+    .collect::<Vec<u8>>();
+    assert_eq!(
+        wide.windows(descriptor.len())
+            .filter(|window| *window == descriptor)
+            .count(),
+        1
+    );
+    assert_eq!(find(&default, 0x380000000000 + (32 << 30) - 1), 1);
+    assert_eq!(find(&wide, 0x380000000000 + (32 << 30) - 1), 0);
+    // Only the two fields and the DSDT checksum differ.
+    let changed = default.iter().zip(&wide).filter(|(a, b)| a != b).count();
+    assert!(changed <= 5, "{changed} bytes differ");
+    for size in [16 << 30, (32 << 30) + 1, !((1u64 << 30) - 1)] {
+        p.pci64_size = size;
+        assert!(generate(&p).is_err(), "{size:#x}");
+    }
 }
 
 #[test]
