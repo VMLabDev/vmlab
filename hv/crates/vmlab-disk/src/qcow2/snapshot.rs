@@ -547,3 +547,46 @@ fn next_snapshot_id(entries: &[SnapshotEntry], name: &str) -> Result<String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testsupport;
+    use crate::DiskImage;
+
+    /// Review F4: an entry of an old image records no disk size. A rewrite of
+    /// the table must keep it absent, not record a disk size of 0.
+    #[test]
+    fn a_snapshot_without_a_recorded_disk_size_keeps_the_size_through_a_rewrite() {
+        let size = 8 << 20;
+        let (_dir, mut img) = testsupport::blank(size);
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.snapshot_create("a", 0, 0).unwrap();
+        img.write_at(0, &[0x22; 512]).unwrap();
+
+        // Write entry `a` again as old QEMU does: no extra data.
+        let entry = img.parse_table().unwrap().remove(0);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&entry.l1_table_offset.to_be_bytes());
+        raw.extend_from_slice(&entry.l1_size.to_be_bytes());
+        raw.extend_from_slice(&(entry.id.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&entry.date_sec.to_be_bytes());
+        raw.extend_from_slice(&entry.date_nsec.to_be_bytes());
+        raw.extend_from_slice(&entry.vm_clock_nsec.to_be_bytes());
+        raw.extend_from_slice(&entry.vm_state_size.to_be_bytes());
+        raw.extend_from_slice(&0u32.to_be_bytes()); // extra data size
+        raw.extend_from_slice(entry.id.as_bytes());
+        raw.extend_from_slice(entry.name.as_bytes());
+        raw.resize(raw.len().div_ceil(8) * 8, 0);
+        let table = img.snapshots_offset;
+        img.write_file(table, &raw).unwrap();
+        assert_eq!(img.parse_table().unwrap()[0].disk_size, None);
+
+        img.snapshot_create("b", 0, 0).unwrap();
+        img.snapshot_apply("a").unwrap();
+        assert_eq!(img.size(), size);
+        let mut first = [0u8; 512];
+        img.read_at(0, &mut first).unwrap();
+        assert_eq!(first, [0x11; 512]);
+    }
+}
