@@ -494,7 +494,7 @@ fn a_larger_64_bit_pci_window_changes_only_its_end_and_length() {
     // Only the two fields and the DSDT checksum differ.
     let changed = default.iter().zip(&wide).filter(|(a, b)| a != b).count();
     assert!(changed <= 5, "{changed} bytes differ");
-    for size in [16 << 30, (32 << 30) + 1, u64::MAX & !((1 << 30) - 1)] {
+    for size in [16 << 30, (32 << 30) + 1, !((1u64 << 30) - 1)] {
         p.pci64_size = size;
         assert!(generate(&p).is_err(), "{size:#x}");
     }
