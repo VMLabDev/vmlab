@@ -75,8 +75,10 @@ reads back and presents. On the win3d adapter (PCI vendor `0x1af4`) the
 record is an error, so the run exits 1 with its frames and readback in the
 result. On any other adapter it is a warning. The Direct3D 9 header
 defines `WRAP8` to `WRAP15` for `vs_3_0` attributes with
-`D3DDECLUSAGE_TEXCOORD`, yet the native NVIDIA driver 32.0.16.1088 does not
-wrap `TEXCOORD8` (card #486).
+`D3DDECLUSAGE_TEXCOORD`, yet the native NVIDIA driver 32.0.16.1088 wraps
+neither `TEXCOORD8` nor `TEXCOORD15`. On an RTX 5090 passed through to a
+Windows 11 guest the probe passes with those two warnings, in x64 and x86
+(card #486).
 
 ## JSON result
 
