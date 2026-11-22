@@ -5633,6 +5633,37 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_name_that_is_not_utf8_is_a_named_skip() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let (syncers, guest, _) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let invalid = dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        std::fs::write(&invalid, "local only").unwrap();
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        let first = syncer.pass_now().await.unwrap();
+        let second = syncer.pass_now().await.unwrap();
+        for report in [first, second] {
+            assert!(report.trouble.is_none(), "{:?}", report.trouble);
+            assert!(
+                report.skipped.iter().any(|skip| {
+                    skip.path.contains(r"caf\xE9.txt") && skip.why.contains("UTF-8")
+                }),
+                "{:?}",
+                report.skipped
+            );
+        }
+        assert!(guest.get("/src/caf�.txt").is_none());
+        syncers.before_capture("dev01", None).await.unwrap();
+        assert_eq!(std::fs::read_to_string(invalid).unwrap(), "local only");
+        syncers.stop("dev01").await;
+    }
+
     /// A rule file is read by the host, and a symlink syncs guest to host
     /// verbatim — so a guest that plants `.vmlabignore` as a link to a host
     /// file must never get that file's lines back as a prune list (review
