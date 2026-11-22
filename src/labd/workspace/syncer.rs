@@ -72,8 +72,8 @@
 //!
 //! While halted the loop keeps its watch open and keeps draining the guest's
 //! dirty set into its own pending set, so the guest's set stays small and a
-//! long halt costs no rescan; every drained path stays owed, because nothing
-//! was agreed about any of it. The only work a halted pass still does is work
+//! long halt costs no rescan. A path with work to reconcile stays owed across
+//! the halt. The only work a halted pass still does is work
 //! that moves nothing the developer did not ask for: adopting two sides that
 //! already match, and carrying out a resolution.
 
@@ -91,7 +91,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use super::apply::{Target, apply};
 use super::guest::{GuestFs, GuestWatch};
 use super::halt::{self, Halt};
-use super::ignore::{TEMP_PREFIX, is_syncer_own};
+use super::ignore::{TEMP_PREFIX, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
 use super::plan::{Inputs, Oversize, Volume, Winner, reconcile};
@@ -1046,6 +1046,7 @@ async fn run(
                             &mut guest_debounce,
                             &mut rescan,
                             syncer.settle,
+                            workspace.preconditions.windows,
                         )
                         .await
                         {
@@ -1269,12 +1270,11 @@ async fn run(
                     // skip comes from.
                     WatchReport::Batch(entries) => {
                         draining = draining.saturating_sub(1);
-                        let now = Instant::now();
-                        // vmlab's own writes — the marker above all, written
-                        // *because* of a halt — are never the guest's work.
-                        for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
-                            guest_debounce.touch(entry.path, now);
-                        }
+                        record_guest_paths(
+                            &mut guest_debounce,
+                            entries.into_iter().map(|entry| entry.path),
+                            workspace.preconditions.windows,
+                        );
                     }
                     // Overflow. It **warns and never halts** — a build burst
                     // is wanted work that happens to be large, and halting
@@ -1368,6 +1368,20 @@ fn drop_watch(
     });
 }
 
+/// Only workspace-relative paths can enter the guest debounce set.
+fn record_guest_paths(debounce: &mut Debounce, paths: impl Iterator<Item = String>, windows: bool) {
+    let now = Instant::now();
+    for path in paths {
+        if path
+            .split('/')
+            .all(|component| validate_entry_name(component, windows).is_ok())
+            && !is_syncer_own(&path)
+        {
+            debounce.touch(path, now);
+        }
+    }
+}
+
 /// Ask the guest for its dirty set and wait for that answer, so a verb's pass
 /// sees every guest-side write the agent had noticed when the verb arrived.
 ///
@@ -1384,6 +1398,7 @@ async fn settle_guest(
     debounce: &mut Debounce,
     rescan: &mut bool,
     bound: Duration,
+    windows: bool,
 ) -> Result<bool> {
     watch.drain().await?;
     *draining += 1;
@@ -1396,10 +1411,11 @@ async fn settle_guest(
                 }
                 Some(WatchReport::Batch(entries)) => {
                     *draining -= 1;
-                    let now = Instant::now();
-                    for entry in entries.into_iter().filter(|e| !is_syncer_own(&e.path)) {
-                        debounce.touch(entry.path, now);
-                    }
+                    record_guest_paths(
+                        debounce,
+                        entries.into_iter().map(|entry| entry.path),
+                        windows,
+                    );
                 }
                 Some(WatchReport::Rescan) => {
                     *draining -= 1;
@@ -1772,11 +1788,13 @@ async fn pass(
     }
     if !probe.unlisted_dirs.is_empty() {
         // The listing says nothing about paths below a skipped directory.
-        // Defer existing agreements and host-only paths under it.
+        // Defer existing agreements, host-only paths and reported guest
+        // paths under it until their presence can be checked.
         undecided.extend(
             scan.tree
                 .keys()
                 .chain(ledger.entries.keys())
+                .chain(rehash_guest.iter())
                 .filter(|path| {
                     path.match_indices('/')
                         .any(|(end, _)| probe.unlisted_dirs.contains(&path[..end]))
@@ -2153,7 +2171,17 @@ async fn pass(
         )
     });
     let mut owed = match halt {
-        Some(_) => rehash_guest.clone(),
+        // Keep guest work and known deletions across the halt. An untracked
+        // path absent on both sides has nothing left to reconcile.
+        Some(_) => rehash_guest
+            .into_iter()
+            .filter(|path| {
+                scan.tree.contains_key(path)
+                    || probe.tree.contains_key(path)
+                    || ledger.entries.contains_key(path)
+                    || undecided.contains(path)
+            })
+            .collect::<BTreeSet<_>>(),
         None => rehash_guest.intersection(&undecided).cloned().collect(),
     };
     // A full walk can discover a new guest file without a dirty notification.
@@ -2166,11 +2194,6 @@ async fn pass(
             Some(_) => rehash_host.clone(),
             None => rehash_host.intersection(&undecided).cloned().collect(),
         },
-        // **While halted, everything drained stays owed.** Nothing was agreed
-        // about any of it, so a path dropped here would be a guest-side edit
-        // waiting for a discontinuity to be noticed at all — and the host
-        // keeping the pending set is exactly what stops a long halt costing a
-        // rescan.
         deferred: owed,
         locks: held,
         unresolved,
@@ -4083,6 +4106,61 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn guest_watch_drops_invalid_paths_on_receipt() {
+        let guest = Arc::new(FakeGuest::new());
+        let sessions = OneFake::new(guest);
+        for path in [
+            "",
+            "/absolute",
+            "../outside",
+            "nested/./file",
+            "nested//file",
+            "valid.rs",
+        ] {
+            sessions.watcher.mark(path);
+        }
+        let mut watch = sessions.watcher.session();
+        let mut debounce = Debounce::default();
+        assert!(
+            settle_guest(
+                watch.as_mut(),
+                &mut 0,
+                &mut debounce,
+                &mut false,
+                SETTLE,
+                false
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(debounce.in_flight(), BTreeSet::from(["valid.rs".into()]));
+    }
+
+    #[tokio::test]
+    async fn guest_watch_drops_absent_paths_during_a_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        guest.file("/src/new.rs", "guest work", 501);
+        sessions.watcher.mark("new.rs");
+        for n in 0..3_000 {
+            sessions.watcher.mark(&format!("absent-{n}"));
+        }
+
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        for _ in 0..2 {
+            let report = syncer.pass_now().await.expect("no pass");
+            assert!(report.halt.is_some());
+            assert_eq!(report.unsynced.len(), 2);
+            assert!(report.unsynced.iter().any(|path| path == "main.rs"));
+            assert!(report.unsynced.iter().any(|path| path == "new.rs"));
+        }
+        syncers.stop("dev01").await;
+    }
+
     /// **A free third route needing no verb**: make the two sides identical by
     /// hand and the next pass adopts them as agreed. Which is also why
     /// ledger-only work survives a halt at all.
@@ -4721,6 +4799,59 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn a_re_seed_completes_beside_a_socket_and_an_oversize_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let mut ws = workspace(dir.path(), state.path());
+        ws.max_file_bytes = 64;
+        let opens = sessions.opens().len();
+        syncers.stop("dev01").await;
+        syncers.mark_rewound(&ws).await.unwrap();
+        rewind(&guest);
+        let _socket =
+            std::os::unix::net::UnixListener::bind(dir.path().join("monitor.sock")).unwrap();
+        std::fs::write(dir.path().join("big.bin"), [0; 128]).unwrap();
+        guest.dir("/src/big.bin");
+        guest.file("/src/big.bin/child", "keep this", 1);
+        guest.file("/src/large.tmp", &"x".repeat(128), 1);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        assert!(eventually(|| syncer.report().passes > 0).await);
+        let report = syncer.report();
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(report.reseed.is_none(), "the re-seed barrier never lifted");
+        assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        assert!(eventually(|| sessions.opens().len() > opens).await);
+        assert_eq!(
+            guest.text("/src/big.bin/child").as_deref(),
+            Some("keep this")
+        );
+        assert!(guest.get("/src/large.tmp").is_some());
+        assert!(!dir.path().join("large.tmp").exists());
+        syncers.stop("dev01").await;
+        let events = events_of(state.path());
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.skipped" && data["path"] == "monitor.sock"
+            })
+        );
+        for path in ["big.bin", "large.tmp"] {
+            assert!(
+                events
+                    .iter()
+                    .any(|(name, data)| { name == "workspace.refused" && data["path"] == path })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn an_incomplete_reseed_keeps_the_loop_and_restart_behind_the_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -4730,7 +4861,8 @@ mod tests {
         let opens = sessions.opens().len();
         restore_bracket(&syncers, &ws, || {
             rewind(&guest);
-            guest.unreadable("/src/experiment.rs");
+            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
+            guest.refuse_symlinks();
         })
         .await;
         for restart in [false, true] {
