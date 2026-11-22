@@ -28,6 +28,38 @@ an event arrives. This does not guarantee real-time scheduling or the 20 ms
 guest-to-speaker target. Measuring that target requires the A4 guest loopback
 harness and a tuned host.
 
+## Playback underruns and queue depth
+
+HDA keeps at most the sink's queue limit of PCM ahead of the host callback
+(`PlaybackSink::queue_limit_bytes`, two 256-frame periods when a sink has no
+opinion). The PipeWire sink starts at 512 frames, 10.7 ms at 48 kHz. It holds
+at least two host callbacks, so a host whose quantum is larger than 256 frames
+gets a deeper queue and a matching prefill. After each confirmed underrun the
+limit grows by 256 frames, up to 2048 frames (42.7 ms). The limit belongs to
+the machine's `PipeWireHost` and outlives a stream, so a loaded host is learned
+once and not again for every sound. `VMLAB_HV_AUDIO_QUEUE_MAX=<frames>` replaces
+the maximum for a measurement; `512` is the fixed queue of earlier builds.
+
+An underrun is a pull, after priming, that got less PCM than the host asked
+for while the guest was playing. The last pull of a sound is short too, so a
+short pull is held as pending and counts only when PCM arrives again within
+250 ms. A late callback is one that came more than two quanta after the one
+before while PCM flowed: then the callback thread was late, PipeWire had no
+buffer for at least one cycle, and the queue did not run empty. The two
+counters separate a late producer (the HDA timer service, or a vCPU holding
+the device) from a late consumer.
+
+Every 10 seconds, and when the stream ends, the worker writes one warning for
+an interval that had either:
+
+```text
+PipeWire playback underrun: underruns=2 silence_frames=356 late_callbacks=1 longest_gap_ms=30.0 interval_s=10 queue_frames=768
+```
+
+A clean interval writes nothing. The counters do not see a break made in the
+guest: a period the guest refilled too late leaves the device on time, with
+stale PCM in it.
+
 PulseAudio uses a nonblocking mainloop iteration followed by a 1 ms worker
 sleep. Playback writes are limited to the server's writable space. Capture
 handles both data and holes, then discards the server fragment. Work per
