@@ -4391,6 +4391,69 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
+    /// Two inline pushes to one machine at the same time each land their own
+    /// bytes. Before, both wrote `<temp_dir>/vmlab-cp-<pid>-<machine>` first
+    /// and pushed that file second, so the later write replaced the bytes of
+    /// the earlier push, or removed the file under it.
+    #[tokio::test]
+    async fn inline_pushes_to_one_machine_do_not_share_a_temp_file() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let first = vec![1u8; TRANSFER_CHUNK + 17];
+        let second = vec![2u8; 300];
+        // `slow` in the name makes the mock sit on each reply of the first
+        // push, the open included.
+        let (a, b) = tokio::join!(
+            super::super::push_inline(&agent, "f2-pair", &first, "/slow-first", None, None),
+            super::super::push_inline(&agent, "f2-pair", &second, "/second", None, None),
+        );
+        let (sha, len) = a.expect("the first push");
+        assert_eq!(len, first.len() as u64);
+        assert_eq!(sha, hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&first)));
+        let (sha, len) = b.expect("the second push");
+        assert_eq!(len, second.len() as u64);
+        assert_eq!(sha, hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&second)));
+        let limit = crate::proto::INLINE_FILE_LIMIT;
+        let (_, held) = agent.pull_bytes("/slow-first", limit).await.unwrap();
+        assert!(held == first, "the first guest path holds other bytes");
+        let (_, held) = agent.pull_bytes("/second", limit).await.unwrap();
+        assert!(held == second, "the second guest path holds other bytes");
+    }
+
+    /// An inline push writes nothing on the host: its bytes go from memory to
+    /// the guest. Before, they passed through a file with a name any local
+    /// user could predict, written through a symlink planted there, so the
+    /// push overwrote the file the link pointed to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inline_push_does_not_write_through_a_planted_symlink() {
+        let work = tempfile::tempdir().unwrap();
+        let victim = work.path().join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        // The name the daemon used for a machine called `f2-symlink`.
+        let planted = std::env::temp_dir().join(format!(
+            "vmlab-cp-{}-f2-symlink",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&planted);
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let pushed = super::super::push_inline(&agent, "f2-symlink", b"pushed bytes", "/pushed", None, None).await;
+        let link_left = std::fs::symlink_metadata(&planted).is_ok();
+        let _ = std::fs::remove_file(&planted);
+
+        pushed.expect("the push");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(link_left, "the push removed a file it did not make");
+        let (_, held) = agent
+            .pull_bytes("/pushed", crate::proto::INLINE_FILE_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(held, b"pushed bytes");
+    }
+
     /// A pull that succeeds replaces the destination's content in one step,
     /// keeps the mode the file had, and writes through a symlink to the file
     /// it names rather than replacing the link.

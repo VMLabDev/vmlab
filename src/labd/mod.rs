@@ -428,6 +428,23 @@ fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, Command
     r.map_err(|e| e.prefixed(machine))
 }
 
+/// The inline form of `machine.push_file`: the caller sent the bytes, not a
+/// host path.
+async fn push_inline(
+    agent: &vm_agent::AgentHandle,
+    machine: &str,
+    bytes: &[u8],
+    to: &str,
+    mode: Option<u32>,
+    logon: Option<vm_agent::Logon>,
+) -> anyhow::Result<(String, u64)> {
+    let tmp = std::env::temp_dir().join(format!("vmlab-cp-{}-{machine}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    let res = agent.push_file_as(&tmp, to, mode, logon).await;
+    let _ = std::fs::remove_file(&tmp);
+    res
+}
+
 /// A clipboard request that failed, under the machine's name: the agent's
 /// own refusal ([`vm_agent::ClipboardRefused`] — nobody is logged on to a
 /// Windows guest's desktop) knows why but not where, so the host says which
@@ -960,12 +977,7 @@ impl Handler<LabRequest> for LabdHandler {
                                 crate::proto::INLINE_FILE_LIMIT,
                             ));
                         }
-                        let tmp = std::env::temp_dir()
-                            .join(format!("vmlab-cp-{}-{machine}", std::process::id()));
-                        std::fs::write(&tmp, &bytes)
-                            .map_err(|e| CommandError::failed(e.to_string()))?;
-                        let res = agent.push_file_as(&tmp, &to, mode, logon).await;
-                        let _ = std::fs::remove_file(&tmp);
+                        let res = push_inline(&agent, &machine, &bytes, &to, mode, logon).await;
                         on_machine(&machine, Ok(res?))?
                     }
                     None => {
