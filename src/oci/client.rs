@@ -1082,7 +1082,7 @@ struct Chunks {
     sizes: Vec<u64>,
 }
 
-fn sum_sizes(sizes: impl Iterator<Item = u64>) -> Result<u64> {
+fn sum_sizes(mut sizes: impl Iterator<Item = u64>) -> Result<u64> {
     sizes
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(|| anyhow!("the manifest's sizes overflow"))

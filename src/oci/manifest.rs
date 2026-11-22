@@ -734,7 +734,9 @@ mod tests {
         empty.chunk_count = 1;
         let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
         assert_eq!(
-            build_manifest(&empty, config).declared_base_chunks().unwrap(),
+            build_manifest(&empty, config)
+                .declared_base_chunks()
+                .unwrap(),
             vec![0]
         );
 
@@ -747,7 +749,10 @@ mod tests {
         );
         set(&mut variant, annotations::VARIANT_SIZE, "1535");
         let err = variant.variant_layout().unwrap_err().to_string();
-        assert!(err.contains("states 1535 bytes for variant `extra`"), "{err}");
+        assert!(
+            err.contains("states 1535 bytes for variant `extra`"),
+            "{err}"
+        );
     }
 
     #[test]
