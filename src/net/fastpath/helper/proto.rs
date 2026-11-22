@@ -100,7 +100,8 @@ pub(crate) enum Request {
     SockmapDebug {
         engine: u32,
     },
-    /// Drop an engine and everything it holds.
+    /// Drop an engine and everything it holds. Its program stays attached
+    /// to each tap it filtered until that tap is destroyed.
     Unload {
         engine: u32,
     },
