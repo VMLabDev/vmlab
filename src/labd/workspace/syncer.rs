@@ -4083,6 +4083,54 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    #[tokio::test]
+    async fn guest_watch_drops_invalid_paths_on_receipt() {
+        let guest = Arc::new(FakeGuest::new());
+        let sessions = OneFake::new(guest);
+        for path in [
+            "",
+            "/absolute",
+            "../outside",
+            "nested/./file",
+            "nested//file",
+            "valid.rs",
+        ] {
+            sessions.watcher.mark(path);
+        }
+        let mut watch = sessions.watcher.session();
+        let mut debounce = Debounce::default();
+        assert!(
+            settle_guest(watch.as_mut(), &mut 0, &mut debounce, &mut false, SETTLE)
+                .await
+                .unwrap()
+        );
+        assert_eq!(debounce.in_flight(), BTreeSet::from(["valid.rs".into()]));
+    }
+
+    #[tokio::test]
+    async fn guest_watch_drops_absent_paths_during_a_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions) = halted_lab(dir.path(), state.path()).await;
+        diverge(dir.path(), &guest, &sessions);
+        halt_of(&syncers, "dev01").await.expect("nothing halted");
+        guest.file("/src/new.rs", "guest work", 501);
+        sessions.watcher.mark("new.rs");
+        for n in 0..3_000 {
+            sessions.watcher.mark(&format!("absent-{n}"));
+        }
+
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        for _ in 0..2 {
+            let report = syncer.pass_now().await.expect("no pass");
+            assert!(report.halt.is_some());
+            assert_eq!(report.unsynced.len(), 2);
+            assert!(report.unsynced.iter().any(|path| path == "main.rs"));
+            assert!(report.unsynced.iter().any(|path| path == "new.rs"));
+        }
+        syncers.stop("dev01").await;
+    }
+
     /// **A free third route needing no verb**: make the two sides identical by
     /// hand and the next pass adopts them as agreed. Which is also why
     /// ledger-only work survives a halt at all.
