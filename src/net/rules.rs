@@ -884,6 +884,93 @@ mod tests {
         assert_eq!(rs.eval(&p), Verdict::Pass);
     }
 
+    // --- fragments ---
+
+    /// Split a full IPv4 packet (20-byte header) into fragments of at most
+    /// `chunk` payload bytes each (a multiple of 8), as a sender would.
+    fn fragments(pkt: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        assert_eq!(chunk % 8, 0);
+        let ip = Ipv4View::parse(pkt).unwrap();
+        let payload = ip.payload();
+        let count = payload.len().div_ceil(chunk);
+        payload
+            .chunks(chunk)
+            .enumerate()
+            .map(|(i, part)| {
+                let mut f = ipv4_build(ip.src(), ip.dst(), ip.proto(), 64, part, ip.id()).unwrap();
+                let more = if i + 1 < count { 0x2000 } else { 0 };
+                let field = more | (i * chunk / 8) as u16;
+                f[6..8].copy_from_slice(&field.to_be_bytes());
+                f[10..12].copy_from_slice(&[0, 0]);
+                let c = frame::internet_checksum(&f[..20]);
+                f[10..12].copy_from_slice(&c.to_be_bytes());
+                f
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fragment_does_not_evade_a_port_block() {
+        let mut rs = RuleSet::new();
+        rs.add_block(block("10.0.1.0/24", Some(L4Proto::Udp), Some(53)));
+        let dst = Ipv4Addr::new(10, 0, 1, 5);
+        let whole = udp_pkt(GUEST, dst, 5000, 53, &[0xAB; 2000]);
+        let frags = fragments(&whole, 1480);
+        assert_eq!(frags.len(), 2);
+        let first = Ipv4View::parse(&frags[0]).unwrap();
+        assert!(first.more_fragments() && first.checksum_valid());
+        assert_eq!(Ipv4View::parse(&frags[1]).unwrap().frag_offset(), 185);
+        for f in &frags {
+            assert_eq!(rs.eval(f), Verdict::Drop { reply: None });
+        }
+    }
+
+    #[test]
+    fn a_fragment_does_not_evade_a_port_redirect() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, Some(53), TARGET, Some(5353), None));
+        // A TCP first fragment too short to hold the header, and its tail.
+        let whole = tcp_pkt(GUEST, DST_A, 5000, 53, frame::TCP_SYN);
+        for f in &fragments(&whole, 8) {
+            assert_eq!(rs.eval(f), Verdict::Drop { reply: None });
+        }
+        assert_eq!(rs.conn_count(), 0);
+    }
+
+    #[test]
+    fn a_fragment_passes_where_no_port_rule_covers_it() {
+        let mut rs = RuleSet::new();
+        rs.add_block(block("192.0.2.1/32", Some(L4Proto::Tcp), Some(445)));
+        rs.add_redirect(redirect(DST_B, Some(53), TARGET, None, Some(L4Proto::Udp)));
+        // Another protocol than the rule names.
+        let udp = udp_pkt(GUEST, DST_A, 5000, 445, &[0; 2000]);
+        // Another address than any rule names.
+        let other = udp_pkt(GUEST, Ipv4Addr::new(192, 0, 2, 9), 5000, 53, &[0; 2000]);
+        // ICMP has no ports, so a port rule never covered it.
+        let icmp = ipv4_build(GUEST, DST_A, IPPROTO_ICMP, 64, &[0; 2000], 45).unwrap();
+        for whole in [udp, other, icmp] {
+            for f in &fragments(&whole, 1480) {
+                assert_eq!(rs.eval(f), Verdict::Pass);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fragment_is_never_tracked_or_rewritten_on_return() {
+        let mut rs = RuleSet::new();
+        rs.add_redirect(redirect(DST_A, Some(53), TARGET, Some(5353), None));
+        let q = udp_pkt(GUEST, DST_A, 5000, 53, b"q");
+        assert!(matches!(rs.eval(&q), Verdict::Rewrite(_)));
+        // A whole reply is rewritten, the same reply in fragments is not:
+        // only its first fragment has the ports, and a fragment's checksum
+        // cannot be redone.
+        let reply = udp_pkt(TARGET, GUEST, 5353, 5000, &[0; 64]);
+        assert!(matches!(rs.eval_return(&reply), Verdict::Rewrite(_)));
+        for f in &fragments(&reply, 32) {
+            assert_eq!(rs.eval_return(f), Verdict::Pass);
+        }
+    }
+
     // --- DNAT rewrite correctness ---
 
     #[test]
