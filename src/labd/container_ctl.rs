@@ -320,6 +320,38 @@ mod tests {
         ctl.wait_started(LONG).await.unwrap();
     }
 
+    /// Review F11: one byte that is not UTF-8 costs that line, not the
+    /// channel.
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_is_skipped() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            stream.write_all(b"\xff\n").await.unwrap();
+            write_line(&mut stream, &CtlEvent::Started { pid: 1 }).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+
+        let ctl = CtlHandle::connect(&path).await.unwrap();
+        ctl.wait_started(LONG).await.unwrap();
+    }
+
+    /// Review F11: a line past the cap is dropped up to its newline, and the
+    /// event after it is still seen.
+    #[tokio::test]
+    async fn a_line_that_is_too_long_is_skipped() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            let mut long = vec![b'x'; 70_000];
+            long.push(b'\n');
+            stream.write_all(&long).await.unwrap();
+            write_line(&mut stream, &CtlEvent::Started { pid: 1 }).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+
+        let ctl = CtlHandle::connect(&path).await.unwrap();
+        ctl.wait_started(LONG).await.unwrap();
+    }
+
     #[tokio::test]
     async fn eof_closes_waiters_gracefully() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
