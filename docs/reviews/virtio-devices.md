@@ -321,6 +321,13 @@ Not read:
   buffer. Assert that the 60-byte frame arrives. Today each buffer comes
   back with used length 0 and nothing arrives.
 - Confidence: high.
+- Fixed in card #401. Both paths place a frame through `receive_single`.
+  A chain that holds the header but not the frame is returned with length 0
+  and the frame is dropped, as the mergeable path does. The tests
+  `oversized_frame_without_mergeable_buffers_is_dropped` and
+  `oversized_vnet_frame_without_mergeable_buffers_is_dropped` fail before
+  the fix (the second buffer came back with length 0, not 72) and pass
+  after it.
 
 ### F9. virtio-gpu: chains held for a vblank or a fence have no upper limit
 
@@ -493,6 +500,15 @@ Not read:
   `tap_integration_tests.rs` with a real TAP: transmit one frame with
   `hdr_len = 0xFFFF` and `gso_type = 0`.
 - Confidence: high that the error latches. Medium for the guest trigger.
+- Fixed in card #431. `reset` clears `tap_error` before it pauses the
+  backend, so the error ends with the negotiation it happened in and a
+  guest reboot recovers the link and the snapshot. A pause that fails in
+  that reset still sets it. Test
+  `a_failed_tap_write_does_not_outlive_a_device_reset` fails before the fix
+  (the link stays down after the reset) and passes after it.
+  - Not fixed here: until the reset, one failed write still takes the link
+    down and refuses a snapshot. The guest trigger with `hdr_len` was not
+    run on a real TAP.
 
 ### F15. virtio-console: an in-place restore does not tell the guest the live host connection state
 
@@ -526,6 +542,11 @@ Not read:
   `host_open`, read the worker thread's CPU clock (`pthread_getcpuclockid`)
   across a 300 ms sleep, and assert less than 50 ms.
 - Confidence: high.
+- Fixed in card #432. The worker polls a port's listener only while the port
+  has no client, so a connection in the backlog wakes it only when the port
+  is free again. The proof test fails before the fix (the worker used 299 ms
+  of CPU in 300 ms) and passes after it. It also checks that the waiting
+  client is accepted once the first one leaves.
 
 ### F17. virtio-sound: restored stream parameters are not validated, and `advance` then divides by zero
 
@@ -541,6 +562,11 @@ Not read:
   `restore_state` must return `Err`. Today it returns `Ok` and
   `guest.advance(period_time())` panics.
 - Confidence: high.
+- Fixed in card #430. `restore_state` holds the stored buffer size, period
+  size and channel count to the bounds of `SET_PARAMS`, through one shared
+  check, and answers `Err` otherwise. The proof test also covers a period
+  below one frame, a period of part frames, a zero buffer, a buffer of part
+  periods and three channels.
 
 ### F18. virtio-console: control traffic stalls or is lost when `pending` is full
 
@@ -574,6 +600,11 @@ Not read:
   then `fs.setattr(ino, attr { st_size: 0 }, Some(handle), SetattrValid::SIZE)`
   must be `Ok`. Skip the test when it runs as root.
 - Confidence: high.
+- Fixed in card #433. A `SETATTR` with a size truncates through the supplied
+  handle when that descriptor is open for writing, and through the
+  `O_WRONLY` reopen otherwise (no handle, or a read-only one), where the
+  mode of the file decides as it does for `truncate(2)`. The proof test
+  fails before the fix (`EACCES`) and passes after it.
 
 ### F20. virtio-pci: the driver can change the feature set of a live device
 
@@ -597,6 +628,12 @@ Not read:
   `save_state()` bytes 5..13, the acknowledged features, are unchanged).
   Today they change.
 - Confidence: high.
+- Fixed in card #428. The set accepted at `FEATURES_OK` (or at `DRIVER_OK`
+  from a legacy driver) is fixed until the next reset: a later
+  `GUEST_FEATURE` write, modern or legacy, is ignored, and a status write
+  does not call `ack_features` again. The driver reads back the set in
+  force. The proof test fails before the fix (the block device's
+  acknowledged features become 0) and passes after it.
 
 ### F21. PCI root: a queue doorbell stays registered while memory decoding is off
 
@@ -616,6 +653,17 @@ Not read:
   Program BAR 0, set command bit 1, then clear it. Assert that the last
   entry of `placements` for the BAR is `None`. Today it is `Some(addr)`.
 - Confidence: high.
+- Fixed in card #429. On a q35 root the address given to `set_bar_address`
+  is `None` while the BAR's decode bit of the command register is clear
+  (bit 1 for a memory BAR, bit 0 for an I/O BAR), on a config write and on a
+  restore of the BAR state, as `decode_mmio` and `find_bar` already decide.
+  The root of a container machine, which does not check the command
+  register on dispatch, is unchanged. `doorbells_follow_the_memory_enable_bit`
+  fails before the fix (`Some(0xc2000000)` after BAR 0 is programmed with
+  memory decoding off) and passes after it.
+  - Not fixed here: the kernel path matches only `base + 4 * queue` (the
+    harmless difference above), and a command register that the device
+    changes by itself, without a config write, moves no placement.
 
 ### F22. virtio-gpu: a fenced release after the loss of the host GPU is answered with an error
 

@@ -1025,6 +1025,27 @@ impl VmInstance {
         for warning in &plan.warnings {
             tracing::warn!("{}: {warning}", self.cfg.name);
         }
+        // The Venus render server this start gets, when it is not the one
+        // of vmlab-hv's bundle (card #447): this process's environment is
+        // the one the launcher inherits.
+        let venus = t
+            .resolved
+            .gpu
+            .as_ref()
+            .is_some_and(|g| g.mode == crate::config::model::GpuMode::Vulkan);
+        if venus && self.hypervisor() == HypervisorKind::Vmlab {
+            let binary = host
+                .vmlab_hv
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(super::hypervisor::vmlab_hv::BINARY));
+            let inherited = std::env::var(qemu::hostgpu::RENDER_SERVER_VAR).ok();
+            if let Some(warning) =
+                qemu::hostgpu::find_binary(&binary, std::env::var_os("PATH").as_deref())
+                    .and_then(|b| qemu::hostgpu::render_server_warning(&b, inherited.as_deref()))
+            {
+                tracing::warn!("{}: {warning}", self.cfg.name);
+            }
+        }
         *self.host_gpu.lock_recover() = plan.name.clone();
         *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
         *self.qemu_env.lock_recover() = plan.env.set.clone();
@@ -1808,24 +1829,34 @@ impl VmInstance {
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    async fn take_snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<bool, super::machine::SnapshotCaptureError> {
+        use super::machine::SnapshotCaptureError::Attempted;
+
         validate_snapshot_name(name)?;
         let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
                 drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
-                    bail!("{why}");
+                    return Err(anyhow!("{why}").into());
                 }
                 // See `usb::snapshot_refusal` for why, and PRD §5.2.1.
                 let attached = self.usb.lock().await.clone();
                 if !attached.is_empty() {
-                    bail!(crate::usb::snapshot_refusal(&self.cfg.name, &attached));
+                    return Err(
+                        anyhow!(crate::usb::snapshot_refusal(&self.cfg.name, &attached)).into(),
+                    );
                 }
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                snapshots.save(name, "disk0", &refs).await?;
+                snapshots
+                    .save(name, "disk0", &refs)
+                    .await
+                    .map_err(Attempted)?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1834,12 +1865,15 @@ impl VmInstance {
                 super::machine::finish_offline_snapshot(guard, async move {
                     snapshot_offline_disks(&disks, &name).await
                 })
-                .await?;
+                .await
+                .map_err(Attempted)?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
-            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name)),
-            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name).into()),
+            other => {
+                Err(anyhow!("{} is {:?} — wait for it to settle", self.cfg.name, other).into())
+            }
         }
     }
 
@@ -1927,11 +1961,12 @@ impl VmInstance {
                     for disk in disks {
                         // Capture rollback may already have removed this disk's
                         // entry. Pending-intent cleanup is idempotent.
-                        if crate::template::qimg::image_info(&disk)
-                            .await?
-                            .snapshots
-                            .iter()
-                            .any(|snapshot| snapshot.name == name)
+                        if disk.try_exists()?
+                            && crate::template::qimg::image_info(&disk)
+                                .await?
+                                .snapshots
+                                .iter()
+                                .any(|snapshot| snapshot.name == name)
                         {
                             crate::template::qimg::snapshot_delete(&disk, &name).await?;
                         }
@@ -2443,7 +2478,7 @@ impl super::machine::Machine for VmInstance {
         self.agent.clear_failure().await;
     }
 
-    async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {
         self.take_snapshot(name).await
     }
 

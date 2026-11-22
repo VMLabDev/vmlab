@@ -84,6 +84,11 @@ pub trait PlaybackSink: Send {
     fn queued_bytes(&self) -> usize {
         self.latency_bytes()
     }
+    /// The most PCM this sink wants queued ahead of its host callback, when
+    /// it has an opinion. A sink that saw underruns asks for more.
+    fn queue_limit_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Where a device pulls capture periods from.

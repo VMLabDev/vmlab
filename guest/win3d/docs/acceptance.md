@@ -633,6 +633,8 @@ next to each probe's JSON.
 | P8, a driver for every API | `venc-chrome`, `venc-edge` | `tests/e2e/adapter/pages/venc.html`, the page of GitHub #238: a hardware video encoder query, which makes a Chromium GPU process load `d3d12.dll`, then WebGL every 4 s for 20 s. The browsers run with `--enable-features=D3D12VideoEncodeAccelerator,D3D12VideoDecoder`. | WebGL stays on the adapter in all five tries, and the profile has no crash dump. |
 | P8 | `chromium` | `tests/e2e/chromium.sh`, the check of the native `d3d12.dll` preload ([chromium.md](chromium.md)): the same page in both browsers while the GPU process's modules are recorded, the same again with the preload off, and the package's `d3d12_probe.exe`. It restarts the VM twice. Its evidence is in `chromium/`. | In both browsers WebGL stays on the adapter, there is no crash dump, one GPU process ran, and the `d3d12.dll` it loaded is the native copy. With the preload off the GPU process ends itself in both. The native probe still gets the bridge. |
 | P10 | `wine-<program>` | Wine's Direct3D 9, 10 and 11 tests, one row per test program. | The program reaches its summary line with 0 failures. |
+| U1, a desktop that answers in time | `latency` | `latency_probe.exe` fills its window with the colour of the column the pointer is in, with GDI, so the picture reaches the screen through DWM. `tests/e2e/adapter/latency.py` sends 120 pointer events on the console's RFB socket, each to another column, and after each asks for a few pixels of the window until they have the new colour. `ADAPTER_HOST_LOAD` busy host processes run meanwhile (none when it is not set). | Every move is answered within 2 s, the median time from the pointer event to the console frame is at most 100 ms, and the 90th percentile at most 150 ms. |
+| S1, sound without breaks | `audio` | `tone_probe.exe` plays a 997 Hz sine for 60 s (`ADAPTER_AUDIO_SECONDS`) through the default output, as a WASAPI shared-mode stream. `pw-record` captures the VM's own host node `vmlab.<lab>.<vm>`, linked with `pw-link`, and `tests/e2e/adapter/audio.py` counts the places where the curve bends more than that sine can, and the silent stretches of 1 ms or more. `ADAPTER_HOST_LOAD` busy host processes run meanwhile (16 when it is not set). The row also has the underruns vmlab-hv wrote to `vmlab-hv.log` during the tone. A PipeWire with no sink gets a null sink for the length of the check. Not run on a host without `pw-record` and `pw-link`, or in a lab without `audio = true`. | No discontinuity and no gap, and at least 90 percent of the tone captured. |
 
 Chrome is Chrome for Testing 158, pinned in `tests/e2e/PINS`. Edge is the
 one the template has. A page writes its result to the browser's console, and
@@ -652,6 +654,10 @@ kept as `adapter/wine-<program>.failures.txt`. The tests run last, because
 they change display modes and reset devices. When a program ends the VM, its
 row says so with the last line of `vmlab-hv.log`, and the suite starts the
 VM again for the next program, at most three times a run.
+
+U1 and S1 are not properties of that design. They are what a person at
+the console notices first (card #447 of the vmlab board): a desktop that
+answers late, and sound that crackles.
 
 Properties the suite does not check: P6 (it has no test of where a Blt
 present is copied), P9 (it needs an Intel CPU host with an NVIDIA GPU), P11
@@ -858,6 +864,8 @@ Host GPU: Nvidia2, /dev/dri/renderD129 0000:05:00.0 VGA compatible controller: N
 
 [C376](acceptance/C376.md) records the four Wine D3D9 programs on the
 post-fix baseline and the remaining follow-ups.
+[C412](acceptance/C412.md) records the ATI1 texture creation fix of its
+draft A1 and the counts of both programs that crashed there.
 
 Card #253 uses the `adapter/wine-<program>.failures.txt` logs for the
 Windows 11 tables above. Counts below are failed assertions, including

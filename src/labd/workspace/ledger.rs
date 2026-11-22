@@ -91,6 +91,15 @@ impl Side {
     }
 }
 
+/// Which side still holds a directory the other side deleted — see
+/// [`Ledger::left_standing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Keeper {
+    Host,
+    Guest,
+}
+
 /// One path's agreement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agreed {
@@ -180,6 +189,17 @@ pub struct Ledger {
     /// host's copy after all.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub withheld: BTreeSet<String>,
+    /// Directories one side deleted and the other could not: it still holds
+    /// content the rules leave to it alone (§19.6). The value is the side that
+    /// kept the directory.
+    ///
+    /// There is no agreement at such a path, and without this record the next
+    /// pass would read the directory as *created* on the side that kept it and
+    /// make it again on the side that deleted it. With it, the directory stays
+    /// where it is and is made nowhere, until something synced has to land
+    /// under it, the keeping side drops it too, or both sides hold it again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub left_standing: BTreeMap<String, Keeper>,
     /// Keyed by `/`-separated path relative to the workspace root.
     pub entries: BTreeMap<String, Agreed>,
 }
@@ -198,6 +218,7 @@ impl Ledger {
             halted: Vec::new(),
             unconfirmed: BTreeSet::new(),
             withheld: BTreeSet::new(),
+            left_standing: BTreeMap::new(),
             entries: BTreeMap::new(),
         }
     }
@@ -207,12 +228,21 @@ impl Ledger {
     pub fn agree(&mut self, path: &str, agreed: Agreed) {
         self.entries.insert(path.to_string(), agreed);
         self.unconfirmed.insert(path.to_string());
+        self.left_standing.remove(path);
     }
 
     /// Drop the agreement at `path`, and everything that was said about it.
     pub fn forget(&mut self, path: &str) {
         self.entries.remove(path);
         self.unconfirmed.remove(path);
+        self.left_standing.remove(path);
+    }
+
+    /// Record that a removal of the directory at `path` could not land on
+    /// `keeper`'s side, so there is no agreement there and none is owed.
+    pub fn leave_standing(&mut self, path: &str, keeper: Keeper) {
+        self.forget(path);
+        self.left_standing.insert(path.to_string(), keeper);
     }
 
     /// A ledger about no workspace at all — what a machine that declares none
