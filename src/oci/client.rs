@@ -801,8 +801,7 @@ impl Registry {
 
         // The variants to fetch: each one's manifest and config blob, which
         // say what its overlay assembles to and the block it stands for.
-        let mut parts: Vec<(crate::template::meta::VariantMeta, Vec<Descriptor>, String)> =
-            Vec::new();
+        let mut parts: Vec<(crate::template::meta::VariantMeta, Chunks, String)> = Vec::new();
         for entry in chosen {
             let vm = self.fetch_manifest(repo, &entry.manifest).await?;
             if !vm.is_vmlab_template() {
@@ -874,7 +873,14 @@ impl Registry {
                 "variant `{}`'s config blob disagrees with its manifest",
                 entry.name
             );
-            parts.push((variant, layout.overlay, layout.overlay_digest));
+            parts.push((
+                variant,
+                Chunks {
+                    layers: layout.overlay,
+                    sizes: layout.overlay_sizes,
+                },
+                layout.overlay_digest,
+            ));
         }
         if let Some(local) = &local
             && parts.is_empty()
@@ -885,27 +891,45 @@ impl Registry {
         // 4. Download chunks in order — the base's only when the store does
         // not already hold it — verifying each chunk's digest as it lands.
         let chunks_dir = work_dir.join("chunks");
-        let base_layers: Vec<Descriptor> = if local.is_none() {
-            manifest.layers_in_order().into_iter().cloned().collect()
+        //
+        // A manifest is hostile input, and its layer list may name one small
+        // chunk of zeros thousands of times. So what each part assembles to
+        // is taken from what the manifest declares, checked against its own
+        // totals before anything is fetched, and held to at every chunk; and
+        // the sum is refused where the filesystem has no room for it.
+        let base = if local.is_none() {
+            Chunks {
+                sizes: manifest.declared_base_chunks()?,
+                layers: manifest.layers_in_order().into_iter().cloned().collect(),
+            }
         } else {
-            Vec::new()
+            Chunks::default()
         };
-        let mut download = Download::new(
-            std::iter::once(&base_layers)
-                .chain(parts.iter().map(|(_, layers, _)| layers))
-                .flatten(),
-            progress,
-        );
+        let all = || std::iter::once(&base).chain(parts.iter().map(|(_, chunks, _)| chunks));
+        let assembled = sum_sizes(all().flat_map(|c| c.sizes.iter().copied()))?;
+        let compressed = sum_sizes(all().flat_map(|c| c.layers.iter().map(|d| d.size)))?;
+        // The chunks and the assembled disks both land under the work
+        // directory; the install renames them into the store, or copies them
+        // when the store is another filesystem.
+        ensure_room(
+            work_dir,
+            assembled
+                .checked_add(compressed)
+                .ok_or_else(|| anyhow!("the manifest's sizes overflow"))?,
+            &reference,
+        )?;
+        ensure_room(dest_store.root(), assembled, &reference)?;
+        let mut download = Download::new(all().flat_map(|c| c.layers.iter()), progress);
         let base_paths = self
-            .download_layers(repo, &base_layers, &chunks_dir.join("base"), &mut download)
+            .download_layers(repo, &base, &chunks_dir.join("base"), &mut download)
             .await?;
         let mut overlays = Vec::new();
-        for (variant, layers, digest) in parts {
+        for (variant, chunks, digest) in &parts {
             let dir = chunks_dir.join("variants").join(&variant.name);
             let paths = self
-                .download_layers(repo, layers.as_slice(), &dir, &mut download)
+                .download_layers(repo, chunks, &dir, &mut download)
                 .await?;
-            overlays.push((variant, paths, digest));
+            overlays.push((variant.clone(), paths, digest.clone()));
         }
 
         // 5 + 6. Decompress the chunks into the disk images, verify each
@@ -1006,24 +1030,32 @@ impl Registry {
         }
     }
 
-    /// Download `layers` in order into `dir`, verifying each compressed
-    /// chunk's digest, and return the chunk files in that order.
+    /// Download `chunks` in order into `dir`, verifying each compressed
+    /// chunk's size and digest, and return the chunk files in that order,
+    /// each with the decompressed size its manifest states.
     async fn download_layers(
         &self,
         repo: &str,
-        layers: &[Descriptor],
+        chunks: &Chunks,
         dir: &Path,
         download: &mut Download<'_>,
-    ) -> Result<Vec<std::path::PathBuf>> {
+    ) -> Result<Vec<(std::path::PathBuf, u64)>> {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        let mut paths = Vec::with_capacity(layers.len());
-        for (i, layer) in layers.iter().enumerate() {
+        let mut paths = Vec::with_capacity(chunks.layers.len());
+        for (i, (layer, size)) in chunks.layers.iter().zip(&chunks.sizes).enumerate() {
             let chunk = download.chunk;
             let bytes = self
                 .transport
                 .get_blob(repo, &layer.digest)
                 .await
                 .with_context(|| format!("downloading chunk {chunk}"))?;
+            // The room check counted the size the manifest states.
+            ensure!(
+                bytes.len() as u64 == layer.size,
+                "chunk {chunk} is {} bytes, its manifest states {}",
+                bytes.len(),
+                layer.size
+            );
             let got = digest_of(&bytes);
             if !got.eq_ignore_ascii_case(&layer.digest) {
                 bail!(
@@ -1034,11 +1066,51 @@ impl Registry {
             let path = dir.join(format!("chunk-{i:04}.zst"));
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("cannot write {}", path.display()))?;
-            paths.push(path);
+            paths.push((path, *size));
             download.done(layer.size);
         }
         Ok(paths)
     }
+}
+
+/// One part of a pull, the base or a variant's overlay: its chunk layers in
+/// order, and what each decompresses to as the manifest declares it
+/// ([`crate::oci::manifest::declared_chunk_sizes`]).
+#[derive(Debug, Clone, Default)]
+struct Chunks {
+    layers: Vec<Descriptor>,
+    sizes: Vec<u64>,
+}
+
+fn sum_sizes(sizes: impl Iterator<Item = u64>) -> Result<u64> {
+    sizes
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| anyhow!("the manifest's sizes overflow"))
+}
+
+/// Refuse a pull whose manifest declares more than the filesystem holding
+/// `dir` has free. The declared size is the registry's word, so without this
+/// a registry fills the store's filesystem by declaring a large disk, and a
+/// full store filesystem stops every VM whose overlay is on it. `dir` need
+/// not exist yet: its nearest existing ancestor is asked.
+fn ensure_room(dir: &Path, need: u64, reference: &str) -> Result<()> {
+    let Some(at) = dir.ancestors().find(|p| p.exists()) else {
+        return Ok(());
+    };
+    let stat = nix::sys::statvfs::statvfs(at)
+        .with_context(|| format!("cannot read the free space of {}", at.display()))?;
+    let free = (stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64);
+    refuse_without_room(need, free, at, reference)
+}
+
+fn refuse_without_room(need: u64, free: u64, at: &Path, reference: &str) -> Result<()> {
+    ensure!(
+        need <= free,
+        "template {reference} declares {need} bytes to download and assemble, and the \
+         filesystem of {} has {free} free — free space there, then pull again",
+        at.display()
+    );
+    Ok(())
 }
 
 /// Which variants a pull fetches beyond the default, which it always does
@@ -3218,6 +3290,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_is_refused_where_the_filesystem_has_no_room() {
+        let at = Path::new("/store");
+        refuse_without_room(10, 10, at, "x86_64/alpine@3.20").unwrap();
+        let err = refuse_without_room(11, 10, at, "x86_64/alpine@3.20")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares 11 bytes") && err.contains("/store has 10 free"),
+            "{err}"
+        );
+        // A directory that does not exist yet is measured at its ancestor.
+        let dir = tempfile::tempdir().unwrap();
+        ensure_room(&dir.path().join("a/b"), 1, "t").unwrap();
+        assert!(ensure_room(&dir.path().join("a/b"), u64::MAX, "t").is_err());
+    }
+
+    #[test]
     fn assemble_matches_chunking_helpers() {
         // sanity: client uses chunking helpers; ensure they are reachable
         let dir = tempfile::tempdir().unwrap();
@@ -4292,7 +4381,10 @@ mod tests {
         for (i, d) in base.layers_in_order().iter().enumerate() {
             let p = dir.join(format!("{i}.zst"));
             std::fs::write(&p, fake.get_blob("owner/alpine", &d.digest).await.unwrap()).unwrap();
-            paths.push(p);
+            let size = d.annotations.as_ref().unwrap()[annotations::CHUNK_UNCOMPRESSED_SIZE]
+                .parse()
+                .unwrap();
+            paths.push((p, size));
         }
         chunking::assemble(&paths, &dir.join(DISK_FILE)).unwrap();
         chunking::verify_whole(&dir.join(DISK_FILE), base.whole_digest().unwrap()).unwrap();

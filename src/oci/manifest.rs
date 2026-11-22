@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use super::chunking::ChunkSet;
+use super::chunking::{ChunkSet, MAX_CHUNK_SIZE};
 use super::media_types;
 
 /// vmlab annotation keys recorded on the manifest (the `vnd.vmlab.*`
@@ -147,6 +147,19 @@ impl Manifest {
             .map(String::as_str)
     }
 
+    /// What each of the base's chunks decompresses to, in layer order, as
+    /// the manifest declares it ([`declared_chunk_sizes`]). A pull checks
+    /// this before it fetches a chunk.
+    pub fn declared_base_chunks(&self) -> Result<Vec<u64>> {
+        let layers: Vec<Descriptor> = self.layers_in_order().into_iter().cloned().collect();
+        declared_chunk_sizes(
+            "the base",
+            &layers,
+            self.annotation(annotations::CHUNK_COUNT),
+            self.annotation(annotations::TOTAL_SIZE),
+        )
+    }
+
     /// Layer descriptors ordered by their recorded chunk index (falls back
     /// to manifest order when the annotation is absent).
     pub fn layers_in_order(&self) -> Vec<&Descriptor> {
@@ -160,6 +173,64 @@ impl Manifest {
         });
         layers
     }
+}
+
+/// What each chunk of `layers` decompresses to, in order, checked against
+/// the manifest's own totals. A manifest is hostile input: its layer list may
+/// name one small blob of zeros thousands of times. So the disk a pull
+/// writes is bounded by what the manifest states before a chunk is fetched:
+/// the chunk count is the layer count, every layer states its decompressed
+/// size, no chunk is above [`MAX_CHUNK_SIZE`], none is empty unless it is the
+/// only one (which bounds the count by the size), and the sizes sum to the
+/// declared total. `what` names the part in the error.
+pub fn declared_chunk_sizes(
+    what: &str,
+    layers: &[Descriptor],
+    count: Option<&str>,
+    total: Option<&str>,
+) -> Result<Vec<u64>> {
+    let count: usize = count
+        .ok_or_else(|| anyhow!("the manifest does not state {what}'s chunk count"))?
+        .parse()
+        .map_err(|_| anyhow!("the manifest's chunk count for {what} is malformed"))?;
+    let total: u64 = total
+        .ok_or_else(|| anyhow!("the manifest does not state {what}'s total size"))?
+        .parse()
+        .map_err(|_| anyhow!("the manifest's total size for {what} is malformed"))?;
+    if count != layers.len() {
+        bail!(
+            "the manifest states {count} chunks for {what} and lists {}",
+            layers.len()
+        );
+    }
+    let mut sizes = Vec::with_capacity(layers.len());
+    let mut sum: u64 = 0;
+    for (i, layer) in layers.iter().enumerate() {
+        let size: u64 = layer
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(annotations::CHUNK_UNCOMPRESSED_SIZE))
+            .ok_or_else(|| anyhow!("chunk {i} of {what} does not state its uncompressed size"))?
+            .parse()
+            .map_err(|_| anyhow!("chunk {i} of {what}: malformed uncompressed size"))?;
+        if size > MAX_CHUNK_SIZE {
+            bail!("chunk {i} of {what} states {size} bytes, above the {MAX_CHUNK_SIZE} limit");
+        }
+        if size == 0 && layers.len() > 1 {
+            bail!("chunk {i} of {what} is empty");
+        }
+        sum = sum
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("the chunk sizes of {what} overflow"))?;
+        sizes.push(size);
+    }
+    if sum != total {
+        bail!(
+            "the manifest states {total} bytes for {what} and its {count} chunks state {sum} — \
+             refusing to assemble more than the manifest declares"
+        );
+    }
+    Ok(sizes)
 }
 
 /// Build a template manifest from a [`ChunkSet`] and the already-pushed
@@ -307,6 +378,9 @@ pub struct VariantLayout {
     pub overlay: Vec<Descriptor>,
     /// `sha256:<hex>` of the assembled overlay.
     pub overlay_digest: String,
+    /// What each overlay chunk decompresses to, in order
+    /// ([`declared_chunk_sizes`]).
+    pub overlay_sizes: Vec<u64>,
 }
 
 impl Manifest {
@@ -404,7 +478,14 @@ impl Manifest {
                 "variant manifest `{name}`: its layers' parts disagree with its base layer count"
             );
         }
+        let overlay_sizes = declared_chunk_sizes(
+            &format!("variant `{name}`"),
+            overlay,
+            self.annotation(annotations::VARIANT_CHUNK_COUNT),
+            self.annotation(annotations::VARIANT_SIZE),
+        )?;
         Ok(VariantLayout {
+            overlay_sizes,
             base_digest: need(annotations::BASE_DIGEST)?,
             overlay_digest: need(annotations::VARIANT_DIGEST)?,
             base: base.to_vec(),
@@ -571,6 +652,102 @@ mod tests {
             chunk_size: 1024,
             chunk_count: 2,
         }
+    }
+
+    #[test]
+    fn the_declared_chunk_sizes_are_held_to_the_manifests_totals() {
+        let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
+        let good = build_manifest(&sample_set(), config);
+        assert_eq!(good.declared_base_chunks().unwrap(), vec![1024, 512]);
+
+        let refused = |change: &dyn Fn(&mut Manifest), want: &str| {
+            let mut m = good.clone();
+            change(&mut m);
+            let err = m.declared_base_chunks().unwrap_err().to_string();
+            assert!(err.contains(want), "{err}");
+        };
+        let set = |m: &mut Manifest, key: &str, value: &str| {
+            m.annotations
+                .as_mut()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+        };
+        let set_layer = |m: &mut Manifest, i: usize, value: &str| {
+            m.layers[i].annotations.as_mut().unwrap().insert(
+                annotations::CHUNK_UNCOMPRESSED_SIZE.to_string(),
+                value.to_string(),
+            );
+        };
+        // One more reference to a chunk than the manifest counts.
+        refused(
+            &|m| m.layers.push(m.layers[1].clone()),
+            "states 2 chunks for the base and lists 3",
+        );
+        // The count raised to match: the sizes no longer sum to the total.
+        refused(
+            &|m| {
+                m.layers.push(m.layers[1].clone());
+                set(m, annotations::CHUNK_COUNT, "3");
+            },
+            "states 1536 bytes for the base and its 3 chunks state 2048",
+        );
+        refused(
+            &|m| {
+                m.annotations
+                    .as_mut()
+                    .unwrap()
+                    .remove(annotations::TOTAL_SIZE);
+            },
+            "does not state the base's total size",
+        );
+        refused(
+            &|m| {
+                m.annotations
+                    .as_mut()
+                    .unwrap()
+                    .remove(annotations::CHUNK_COUNT);
+            },
+            "does not state the base's chunk count",
+        );
+        refused(
+            &|m| m.layers[0].annotations = None,
+            "chunk 0 of the base does not state its uncompressed size",
+        );
+        refused(&|m| set_layer(m, 1, "0"), "chunk 1 of the base is empty");
+        refused(
+            &|m| set_layer(m, 0, &(MAX_CHUNK_SIZE + 1).to_string()),
+            "above the",
+        );
+        refused(
+            &|m| {
+                set_layer(m, 0, &u64::MAX.to_string());
+                set_layer(m, 1, &u64::MAX.to_string());
+            },
+            "above the",
+        );
+
+        // An empty disk is one empty chunk.
+        let mut empty = sample_set();
+        empty.chunks.truncate(1);
+        empty.chunks[0].uncompressed_size = 0;
+        empty.total_size = 0;
+        empty.chunk_count = 1;
+        let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
+        assert_eq!(
+            build_manifest(&empty, config).declared_base_chunks().unwrap(),
+            vec![0]
+        );
+
+        // A variant's overlay is held to its own count and size.
+        let config = Descriptor::new(media_types::CONFIG_TEMPLATE_JSON, "sha256:cc", 42);
+        let mut variant = build_variant_manifest("extra", &sample_set(), &sample_set(), config);
+        assert_eq!(
+            variant.variant_layout().unwrap().overlay_sizes,
+            vec![1024, 512]
+        );
+        set(&mut variant, annotations::VARIANT_SIZE, "1535");
+        let err = variant.variant_layout().unwrap_err().to_string();
+        assert!(err.contains("states 1535 bytes for variant `extra`"), "{err}");
     }
 
     #[test]
