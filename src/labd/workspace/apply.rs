@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use super::guest::GuestFs;
 use super::ignore::TEMP_PREFIX;
-use super::ledger::{Agreed, Kind, Ledger, Side};
+use super::ledger::{Agreed, Keeper, Kind, Ledger, Side};
 use super::plan::{Action, Direction, Plan, State};
 use super::scan::{join_guest, mtime_ns};
 use crate::labd::vm_agent::{ErrorCode, FileOpsError, LinkKind};
@@ -274,9 +274,15 @@ pub async fn apply(
             // Neither direction touches guest-owned paths, so the directory
             // stays and the *agreement* about it goes: a removal that can
             // never succeed must not be retried on every pass for the life of
-            // the machine.
+            // the machine. The ledger keeps which side still holds it, so the
+            // next pass does not read it as created there and make it again
+            // on the side that deleted it.
             Ok(Landed::LeftStanding) => {
-                ledger.forget(path);
+                let keeper = match direction {
+                    Direction::ToGuest => Keeper::Guest,
+                    Direction::ToHost => Keeper::Host,
+                };
+                ledger.leave_standing(path, keeper);
                 done.left_standing.push(path.to_string());
             }
             Ok(Landed::Placed { kind, digest, side }) => {
@@ -995,6 +1001,7 @@ mod tests {
             .tree
             .keys()
             .chain(ledger.entries.keys())
+            .chain(ledger.left_standing.keys())
             .cloned()
             .chain(dirty.iter().map(|p| (*p).to_string()))
             .collect();
@@ -1562,6 +1569,13 @@ mod tests {
         // And it is not retried, pass after pass, forever.
         let again = pass(dir.path(), &guest, &mut ledger).await;
         assert_eq!(again, Applied::default());
+
+        // Nor is the directory the host deleted made again there, where the
+        // guest's watch names it (review #380 F11).
+        assert_eq!(ledger.left_standing.get("pkg"), Some(&Keeper::Guest));
+        let named = pass_with(dir.path(), &guest, &mut ledger, &["pkg"]).await;
+        assert_eq!(named, Applied::default());
+        assert!(!dir.path().join("pkg").exists());
     }
 
     /// The size guard refuses the one file, before transfer, and the rest of
@@ -1918,19 +1932,20 @@ mod tests {
         assert!(dir.path().join("pkg/target/out").exists());
         assert!(!ledger.entries.contains_key("pkg"));
 
-        // The removal is not retried. The host does still hold the directory,
-        // so the ordinary one-side-changed rule puts it back in the guest —
-        // and then both sides agree and nothing moves again.
-        let again = pass(dir.path(), &guest, &mut ledger).await;
-        assert_eq!(
-            again.to_host.removed, 0,
-            "the impossible removal was retried"
-        );
-        assert_eq!(again.to_guest.placed, 1);
+        assert_eq!(ledger.left_standing.get("pkg"), Some(&Keeper::Host));
+
+        // The removal is not retried, and the directory the guest deleted is
+        // not made again there (review #380 F11): nothing moves.
         assert_eq!(
             pass(dir.path(), &guest, &mut ledger).await,
             Applied::default()
         );
+        assert!(guest.get("/src/pkg").is_none());
+
+        // The host drops it too: the record has nothing left to be about.
+        std::fs::remove_dir_all(dir.path().join("pkg")).unwrap();
+        pass(dir.path(), &guest, &mut ledger).await;
+        assert!(ledger.left_standing.is_empty());
     }
 
     /// The temp lives in the target's own directory, so the rename is atomic
