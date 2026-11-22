@@ -2,9 +2,9 @@ Subject: [PATCH] d3d9: draw nothing for an indexed draw without an index buffer
 
 The runtime calls DrawIndexedPrimitive while no index buffer is set, for
 example after SetIndices(NULL). The draw then failed the index size check
-with E_INVALIDARG, and the runtime returned E_FAIL from the next indexed
-draw of the application. Return success without drawing, as there are no
-indices to fetch.
+with E_INVALIDARG, and the application got E_FAIL where Windows expects
+success. Return success without drawing, as there are no indices to
+fetch.
 
 diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
 --- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
