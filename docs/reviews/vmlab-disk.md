@@ -21,7 +21,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros (fixed, #542) |
-| F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk |
+| F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster |
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
@@ -103,6 +103,11 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   working disk. Expected: an error that names the backing file, and no working
   disk. Today: the working disk holds the backing file's content. Run it on
   both image tools (`on_both_tools!`).
+- Fixed by card #541: `seed_working_disk` in `src/template/build.rs` calls
+  `refuse_backed_source` before the convert for a `TemplateSource::Qcow2`
+  source. A layered source (a store disk, which may be a variant overlay on
+  its base) is not checked. The proof test failed on both tools before the
+  fix and passes after it.
 
 ### F3. Compressed clusters get a refcount range that is too long (data loss)
 
@@ -344,6 +349,16 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 - Proof: unit test in `ops.rs`, `convert_onto_the_source_is_refused`: after
   the call the source still exists and reads the same data. Today the file is
   gone.
+- Fixed in card #543. `convert` refuses, before it removes anything, a
+  destination that is the same file (device and inode, so under any name) as
+  the source, as the `backing` argument, or as a file of either backing
+  chain. The proof test failed before the fix (`the source was deleted`) and
+  passes after it, with `convert_onto_a_second_name_of_the_source_is_refused`
+  and `convert_onto_a_backing_file_is_refused` beside it. A hard link or a
+  symlink to the source is refused too, although replacing that name alone
+  loses no data.
+  - Not fixed here: `convert` still writes the image in place, so an
+    interrupted convert leaves a part of an image at the destination path.
 
 ## Notes
 
