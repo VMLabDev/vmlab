@@ -561,14 +561,20 @@ mod tests {
 
     /// A minimal DHCP DISCOVER broadcast frame from `mac`.
     fn discover_frame(mac: MacAddr) -> Vec<u8> {
+        dhcp_frame(mac, mac, 1)
+    }
+
+    /// A minimal DHCP broadcast frame of `msg_type` that names `chaddr` as
+    /// its client and leaves the NIC with the MAC `eth_src`.
+    fn dhcp_frame(eth_src: MacAddr, chaddr: MacAddr, msg_type: u8) -> Vec<u8> {
         let mut b = vec![0u8; 240];
         b[0] = 1; // BOOTREQUEST
         b[1] = 1;
         b[2] = 6;
         b[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-        b[28..34].copy_from_slice(&mac.0);
+        b[28..34].copy_from_slice(&chaddr.0);
         b[236..240].copy_from_slice(&[99, 130, 83, 99]);
-        b.extend_from_slice(&[53, 1, 1]); // DISCOVER
+        b.extend_from_slice(&[53, 1, msg_type]);
         b.push(255);
         let udp = udp_build(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, &b).unwrap();
         let ip = ipv4_build(
@@ -580,7 +586,7 @@ mod tests {
             1,
         )
         .unwrap();
-        crate::net::frame::eth_build(MAC_BROADCAST, mac, ETHERTYPE_IPV4, &ip)
+        crate::net::frame::eth_build(MAC_BROADCAST, eth_src, ETHERTYPE_IPV4, &ip)
     }
 
     #[test]
@@ -637,6 +643,52 @@ mod tests {
         assert_eq!(opts[&3], gw.gw_ip().octets().to_vec()); // router
         // The lease shows up in status.
         assert_eq!(gw.dhcp_leases(), vec![(GUEST_MAC, yiaddr)]);
+    }
+
+    /// Networking review F8: a guest cannot release another machine's lease
+    /// by writing that machine's MAC into `chaddr`.
+    #[tokio::test]
+    async fn a_release_from_another_port_keeps_the_lease() {
+        const OTHER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x0B]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut attacker = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        victim
+            .tx
+            .send(Bytes::from(discover_frame(GUEST_MAC)))
+            .await
+            .unwrap();
+        recv(&mut victim.rx).await;
+        let leased = gw.dhcp_leases();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].0, GUEST_MAC);
+
+        // RELEASE (7) for the victim's MAC, sent from the attacker's NIC.
+        attacker
+            .tx
+            .send(Bytes::from(dhcp_frame(OTHER_MAC, GUEST_MAC, 7)))
+            .await
+            .unwrap();
+        // A RELEASE has no answer: the attacker's own DISCOVER is handled
+        // after it, so its offer says the RELEASE was processed.
+        attacker
+            .tx
+            .send(Bytes::from(discover_frame(OTHER_MAC)))
+            .await
+            .unwrap();
+        loop {
+            let frame = recv(&mut attacker.rx).await;
+            if EthView::parse(&frame).unwrap().dst_mac() == OTHER_MAC {
+                break;
+            }
+        }
+        assert!(
+            gw.dhcp_leases().contains(&leased[0]),
+            "the victim's lease is gone: {:?}",
+            gw.dhcp_leases()
+        );
     }
 
     #[tokio::test]
