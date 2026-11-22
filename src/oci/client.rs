@@ -1049,13 +1049,6 @@ impl Registry {
                 .get_blob(repo, &layer.digest)
                 .await
                 .with_context(|| format!("downloading chunk {chunk}"))?;
-            // The room check counted the size the manifest states.
-            ensure!(
-                bytes.len() as u64 == layer.size,
-                "chunk {chunk} is {} bytes, its manifest states {}",
-                bytes.len(),
-                layer.size
-            );
             let got = digest_of(&bytes);
             if !got.eq_ignore_ascii_case(&layer.digest) {
                 bail!(
@@ -1063,6 +1056,13 @@ impl Registry {
                     layer.digest
                 );
             }
+            // The room check counted the size the manifest states.
+            ensure!(
+                bytes.len() as u64 == layer.size,
+                "chunk {chunk} is {} bytes, its manifest states {}",
+                bytes.len(),
+                layer.size
+            );
             let path = dir.join(format!("chunk-{i:04}.zst"));
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("cannot write {}", path.display()))?;

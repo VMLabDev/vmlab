@@ -710,7 +710,13 @@ mod tests {
             "does not state the base's chunk count",
         );
         refused(
-            &|m| m.layers[0].annotations = None,
+            &|m| {
+                m.layers[0]
+                    .annotations
+                    .as_mut()
+                    .unwrap()
+                    .remove(annotations::CHUNK_UNCOMPRESSED_SIZE);
+            },
             "chunk 0 of the base does not state its uncompressed size",
         );
         refused(&|m| set_layer(m, 1, "0"), "chunk 1 of the base is empty");
