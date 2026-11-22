@@ -56,6 +56,8 @@ impl<K: Copy + Eq + Hash, V> BoundedMap<K, V> {
         self.map.keys()
     }
 
+    /// Read by the tests that hold a table to its limit.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
