@@ -150,17 +150,21 @@ async fn run_main(
     let run = run.unwrap_or_else(|| runtime.recordings.new_run());
     let finalise_on = runtime.clone();
     let token = disconnect.or_else(|| owner.as_ref().and_then(|o| o.cancel.clone()));
-    let result = run_blocking(finalise_on.script_shutdown.child_token(), token, move || {
-        let lab = LabHandle {
-            runtime,
-            rt,
-            output,
-            ref_base,
-            owner,
-            run,
-        };
-        execute(&source, &name, "main", (lab,))
-    })
+    let result = run_blocking(
+        finalise_on.script_shutdown.child_token(),
+        token,
+        move || {
+            let lab = LabHandle {
+                runtime,
+                rt,
+                output,
+                ref_base,
+                owner,
+                run,
+            };
+            execute(&source, &name, "main", (lab,))
+        },
+    )
     .await;
     // Whatever the script recorded and did not stop is finalised here, on
     // success and on failure alike (D7).
