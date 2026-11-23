@@ -307,6 +307,12 @@ impl Fixture {
         for feature in &features {
             match feature.as_str() {
                 "exec" => {
+                    if handle.info().os == "dos" {
+                        report.check(
+                            "exec refuses a missing cwd",
+                            dos_exec_refuses_missing_cwd(&handle).await,
+                        );
+                    }
                     check!("exec", exec_case(&handle, &root));
                     if tier == "full" {
                         check!(
@@ -934,6 +940,33 @@ async fn exec_preserves_exit_when_stdin_is_unread(handle: &AgentHandle) -> Resul
         out.exit_code == 7 && out.stdout == b"done",
         "lost output or exit code when the child exited without reading stdin",
     )
+}
+
+async fn dos_exec_refuses_missing_cwd(handle: &AgentHandle) -> Result<()> {
+    let cwd = r"C:\VML721NO";
+    match handle
+        .open_exec(vec!["CD".into()], vec![], Some(cwd.into()), None)
+        .await
+    {
+        Err(error) => ensure(error.to_string().contains(cwd), &error.to_string()),
+        Ok(mut session) => {
+            let mut output = Vec::new();
+            while let Some(event) = session.recv().await {
+                match event {
+                    SessionEvent::Data(bytes) | SessionEvent::Stderr(bytes) => output.extend(bytes),
+                    SessionEvent::Exited(code) => {
+                        let output = String::from_utf8_lossy(&output);
+                        return ensure(
+                            code != 0 && output.contains(cwd),
+                            &format!("CD with missing cwd {cwd} exited {code}, output: {output:?}"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            bail!("CD with missing cwd {cwd} closed without an exit status")
+        }
+    }
 }
 
 async fn exec_case(handle: &AgentHandle, root: &str) -> Result<()> {
