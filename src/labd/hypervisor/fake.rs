@@ -252,7 +252,6 @@ impl FakeHypervisor {
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
             journal: Journal::default(),
-            ignores_detach: false,
         })
     }
 
@@ -504,6 +503,7 @@ impl FakeProc {
             snapshots: Default::default(),
             plugged: Default::default(),
             journal: Journal::default(),
+            ignores_detach: false,
         }
     }
 
