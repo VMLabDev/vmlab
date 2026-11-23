@@ -84,13 +84,30 @@ fn caller_refusal(gained: bool, caller: u32, owner: Option<u32>) -> Option<Strin
     }
 }
 
-/// [`caller_refusal`] for this process. `AT_SECURE` is how the kernel says
-/// that the exec gained privilege from the file (capabilities or a set-id
-/// bit). The owner is read through `/proc/self/exe`, which is the file that
-/// was executed, whatever its path is now.
+/// Whether the kernel marked this exec as one that gained privilege from its
+/// file (capabilities or a set-id bit): the `AT_SECURE` entry of the
+/// auxiliary vector, given as the bytes of `/proc/self/auxv`. `None` when
+/// the vector has no such entry.
+fn at_secure(auxv: &[u8]) -> Option<bool> {
+    const AT_SECURE: usize = 23;
+    const WORD: usize = std::mem::size_of::<usize>();
+    let word = |bytes: &[u8]| <[u8; WORD]>::try_from(bytes).ok().map(usize::from_ne_bytes);
+    auxv.chunks_exact(2 * WORD).find_map(|entry| {
+        let (key, value) = entry.split_at(WORD);
+        (word(key)? == AT_SECURE).then_some(word(value)? != 0)
+    })
+}
+
+/// [`caller_refusal`] for this process. A vector that cannot be read counts
+/// as a gain, so the check fails closed. The owner is read through
+/// `/proc/self/exe`, which is the file that was executed, whatever its path
+/// is now.
 fn caller_refusal_now() -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let gained = rustix::param::linux_secure();
+    let gained = std::fs::read("/proc/self/auxv")
+        .ok()
+        .and_then(|auxv| at_secure(&auxv))
+        .unwrap_or(true);
     let caller = nix::unistd::getuid().as_raw();
     let owner = std::fs::metadata("/proc/self/exe")
         .ok()
@@ -100,7 +117,7 @@ fn caller_refusal_now() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::caller_refusal;
+    use super::{at_secure, caller_refusal};
 
     /// Review `install-release.md` F2 (card 608): a helper with file
     /// capabilities served any account that could execute it.
@@ -130,5 +147,28 @@ mod tests {
     fn a_helper_that_gained_nothing_serves_every_caller() {
         assert_eq!(caller_refusal(false, 1001, Some(1000)), None);
         assert_eq!(caller_refusal(false, 1001, None), None);
+    }
+
+    fn auxv(entries: &[(usize, usize)]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|(key, value)| [key.to_ne_bytes(), value.to_ne_bytes()].concat())
+            .collect()
+    }
+
+    #[test]
+    fn at_secure_is_read_from_the_auxiliary_vector() {
+        assert_eq!(at_secure(&auxv(&[(6, 4096), (23, 1), (0, 0)])), Some(true));
+        assert_eq!(at_secure(&auxv(&[(6, 4096), (23, 0), (0, 0)])), Some(false));
+        assert_eq!(at_secure(&auxv(&[(6, 4096), (0, 0)])), None);
+        assert_eq!(at_secure(&[]), None);
+    }
+
+    /// The test binary gained nothing from its file, and the kernel says so.
+    #[test]
+    fn this_process_has_a_readable_auxiliary_vector() {
+        let auxv = std::fs::read("/proc/self/auxv").expect("/proc/self/auxv");
+        assert_eq!(at_secure(&auxv), Some(false));
+        assert_eq!(super::caller_refusal_now(), None);
     }
 }
