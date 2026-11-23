@@ -203,7 +203,7 @@ be dropped.
   1. `smb1 unix extensions = no` is written for every lab, so no SMB1 client
      is offered the extensions and the symlink call fails.
   2. NT1 is refused on every share that did not ask for it: such a share
-     gets a `preexec` that fails unless `%R` (the dialect of the session) is
+     gets a `preexec` (a `/bin/sh -c` line) that fails unless `%R` (the dialect of the session) is
      SMB2 or newer, with `preexec close = yes`. `ntlm auth` is
      `ntlmv2-only` in `smb.conf`. The NTLMv1 and LM acceptance moved to
      `smb.NT1.conf` beside it, read through `include = .../smb.%R.conf`:

@@ -349,9 +349,9 @@ impl SmbConfig {
             if self.any_smb1 && !s.smb1 {
                 // The floor above is NT1 for the whole server. A share that
                 // did not ask for `smb1` refuses the tree connect of any
-                // session that is not SMB2 or newer: smbd runs this in a
-                // shell with `%R` as the session's dialect, and closes the
-                // connection when it fails.
+                // session that is not SMB2 or newer: smbd runs this with
+                // `%R` as the session's dialect, and closes the connection
+                // when it fails.
                 out.push_str(&format!("    preexec = {MODERN_ONLY}\n"));
                 out.push_str("    preexec close = yes\n");
             }
@@ -369,7 +369,9 @@ const NT1: &str = "NT1";
 /// The `preexec` of a share that did not ask for `smb1`, in a lab where
 /// another did: succeed for a session on SMB2 or newer (`%R` is `SMB2_02`,
 /// `SMB2_10`, `SMB3_00`, `SMB3_02` or `SMB3_11`), fail for anything else.
-const MODERN_ONLY: &str = "case %R in SMB2*|SMB3*) exit 0 ;; esac ; exit 1";
+/// The shell is named: smbd does not take a line with `;` in it as one shell
+/// command (tried on Samba 4.25.1, where the bare `case` exits 2).
+const MODERN_ONLY: &str = r#"/bin/sh -c "case %R in SMB[23]_*) exit 0;; esac; exit 1""#;
 
 /// A share [`SmbConfig::render_conf`] will not write, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -754,7 +756,10 @@ mod tests {
         // The modern share turns an SMB1 session away, the smb1 share not.
         let modern = section(&conf, "data");
         assert!(modern.contains("preexec close = yes\n"), "{modern}");
-        assert!(modern.contains("preexec = case %R in"), "{modern}");
+        assert!(
+            modern.contains("preexec = /bin/sh -c \"case %R in SMB[23]_*) exit 0;; esac; exit 1\"\n"),
+            "{modern}"
+        );
         assert!(!section(&conf, "src").contains("preexec"), "{conf}");
     }
 
