@@ -130,6 +130,16 @@ interfaces rewritten to vendor-specific so guest drivers leave them
 alone. Streams and isochronous OUT are not supported, matching the lift
 source.
 
+usbdevfs has no asynchronous form of SETCONFIGURATION, SETINTERFACE,
+CLEAR_HALT or the interface claim, and each waits for the device or for a
+host driver. A guest request that needs one hands it to a thread of its
+own and is `Nak`ed until that thread is done; meanwhile the backend makes
+no usbdevfs call at all (the kernel serialises them per device), so every
+other transfer of the device is `Nak`ed too and no caller waits. The
+active configuration is read at the open and followed from there, never
+asked of the device on a guest request. `HostUsbDevice::open` and the drop
+of a backend do block: call both with no controller lock held.
+
 Detach paths differ from crosvm deliberately: releasing an interface
 claim leaves the host driverless, because only USBDEVFS_CONNECT rebinds,
 so `device_del`, host unplug and claim failure all release and reconnect

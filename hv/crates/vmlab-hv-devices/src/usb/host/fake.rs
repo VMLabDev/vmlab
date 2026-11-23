@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::raw::c_int;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use parking_lot::Mutex;
 
@@ -30,6 +30,8 @@ pub struct FakeCalls {
     pub set_interfaces: Vec<(u8, u8)>,
     pub set_configurations: Vec<u8>,
     pub cleared_halts: Vec<u8>,
+    /// Synchronous control transfers (`UsbFs::control`).
+    pub controls: usize,
 }
 
 /// Device descriptor blob the fake serves from the usbdevfs file: one
@@ -83,6 +85,8 @@ struct Shared {
     completed: VecDeque<usize>,
     lost: bool,
     claim_fails: Vec<u8>,
+    /// The descriptor blob served instead of [`FAKE_DESCRIPTORS`].
+    descriptors: Option<Vec<u8>>,
 }
 
 /// The fake usbdevfs. Cloning shares the same fake device, so a test can
@@ -98,6 +102,9 @@ struct Inner {
     in_flight: Mutex<Vec<Submitted>>,
     done: Mutex<Vec<Submitted>>,
     next_tag: std::sync::atomic::AtomicUsize,
+    /// Set by `block_set_interface`: the next `set_interface` reports that
+    /// it was entered and waits to be released.
+    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 // SAFETY: the raw pointers in `Submitted` are only dereferenced between
@@ -116,8 +123,25 @@ impl FakeUsbFs {
                 in_flight: Mutex::new(Vec::new()),
                 done: Mutex::new(Vec::new()),
                 next_tag: std::sync::atomic::AtomicUsize::new(1),
+                gate: Mutex::new(None),
             }),
         }
+    }
+
+    /// A fake whose device has two configurations: [`FAKE_DESCRIPTORS`]
+    /// with its configuration repeated under bConfigurationValue 2. Such a
+    /// device cannot be asked for its active configuration from the
+    /// descriptors alone.
+    pub fn with_two_configurations() -> Self {
+        const DEVICE_LENGTH: usize = 18;
+        let mut descriptors = FAKE_DESCRIPTORS.to_vec();
+        descriptors[DEVICE_LENGTH - 1] = 2; // bNumConfigurations
+        let mut second = FAKE_DESCRIPTORS[DEVICE_LENGTH..].to_vec();
+        second[5] = 2; // bConfigurationValue
+        descriptors.extend(second);
+        let fake = Self::new();
+        fake.shared().lock().descriptors = Some(descriptors);
+        fake
     }
 
     fn shared(&self) -> &Mutex<Shared> {
@@ -127,6 +151,16 @@ impl FakeUsbFs {
     /// Make `claim_interface(interface)` fail with EBUSY.
     pub fn fail_claim(&self, interface: u8) {
         self.shared().lock().claim_fails.push(interface);
+    }
+
+    /// Make the next `set_interface` block inside the "kernel", as a device
+    /// that does not answer does. The receiver yields once the call is
+    /// entered; a send on the sender lets the call return.
+    pub fn block_set_interface(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self.inner.gate.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     /// Queue the completion the next URB `run_irq` services receives.
@@ -238,7 +272,12 @@ impl Default for FakeUsbFs {
 
 impl UsbFs for FakeUsbFs {
     fn read_descriptors(&self) -> io::Result<Vec<u8>> {
-        Ok(FAKE_DESCRIPTORS.to_vec())
+        Ok(self
+            .shared()
+            .lock()
+            .descriptors
+            .clone()
+            .unwrap_or_else(|| FAKE_DESCRIPTORS.to_vec()))
     }
 
     fn submit_urb(&self, urb: *mut sys::usbdevfs_urb) -> io::Result<()> {
@@ -312,7 +351,8 @@ impl UsbFs for FakeUsbFs {
     }
 
     fn control(&self, transfer: &sys::usbdevfs_ctrltransfer) -> io::Result<c_int> {
-        let shared = self.shared().lock();
+        let mut shared = self.shared().lock();
+        shared.calls.controls += 1;
         if shared.lost {
             return Err(Self::errno(libc::ENODEV));
         }
@@ -350,6 +390,11 @@ impl UsbFs for FakeUsbFs {
     }
 
     fn set_interface(&self, interface: u8, alt_setting: u8) -> io::Result<()> {
+        let gate = self.inner.gate.lock().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         self.shared()
             .lock()
             .calls
