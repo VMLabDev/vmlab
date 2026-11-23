@@ -334,9 +334,7 @@ impl HostUsbDevice {
                     result = self
                         .device
                         .get_config_descriptor(config)
-                        .and_then(|descriptor| {
-                            self.endpoint_table(&descriptor, &self.alt_settings)
-                        })
+                        .and_then(|descriptor| self.endpoint_table(&descriptor, &self.alt_settings))
                         .map(|endpoints| self.endpoints = endpoints);
                 }
                 format!("set config {config}")
@@ -1090,7 +1088,11 @@ mod tests {
         assert_eq!(host.speed(), UsbSpeed::High);
         assert!(!host.is_lost());
         host.endpoint_dropped(0x81);
-        assert_eq!(fake.submitted_payloads().len(), before, "a URB was submitted");
+        assert_eq!(
+            fake.submitted_payloads().len(),
+            before,
+            "a URB was submitted"
+        );
         assert_eq!(host.deferred_discards.len(), 1, "the discard must wait");
         assert!(fake.calls().set_interfaces.is_empty());
 

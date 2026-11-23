@@ -362,24 +362,6 @@ impl Device {
             .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_IOCTL, e))
     }
 
-    /// Activate an alternate setting for an interface.
-    pub fn set_interface_alt_setting(
-        &self,
-        interface_number: u8,
-        alternative_setting: u8,
-    ) -> Result<()> {
-        self.fs
-            .set_interface(interface_number, alternative_setting)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_SETINTERFACE, e))
-    }
-
-    /// Set the active configuration.
-    pub fn set_active_configuration(&self, config: u8) -> Result<()> {
-        self.fs
-            .set_configuration(config)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_SETCONFIGURATION, e))
-    }
-
     /// Get the device descriptor of this device.
     pub fn get_device_descriptor(&self) -> super::types::DeviceDescriptor {
         *self.device_descriptor_tree
@@ -443,13 +425,6 @@ impl Device {
             .control(&ctrl_transfer)
             .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_CONTROL, e))?;
         Ok(active_config)
-    }
-
-    /// Clear the halt/stall condition for an endpoint.
-    pub fn clear_halt(&self, ep_addr: u8) -> Result<()> {
-        self.fs
-            .clear_halt(ep_addr)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_CLEAR_HALT, e))
     }
 
     /// Get the speed of this device.
