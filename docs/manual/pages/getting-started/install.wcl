@@ -78,6 +78,10 @@ page gs_install {
     on WSL 2, which cannot run the fast path, and it says so when the helper
     sits on a `nosuid` mount, where the kernel ignores file capabilities.
     Replacing the helper drops its capabilities, so every install asks again.
+    The helper is checked before `vmlab` is replaced, so a helper that fails
+    its checksum leaves the earlier install whole. When the installer cannot
+    download the helper of the release, it removes the helper of the earlier
+    install and says so: the fast path is off until an install brings one.
     Daemons already running keep the helpers they started: run `vmlab daemon
     stop` before `vmlab fastpath`.
   DOC

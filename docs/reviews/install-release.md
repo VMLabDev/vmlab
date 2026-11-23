@@ -186,6 +186,21 @@ helper is removed or reported. Observed: `getcap ~/.local/bin/vmlab-fastpath`
 still lists the capabilities, `vmlab --version` is B, and `vmlab fastpath`
 selects a kernel tier through A's helper.
 
+Fixed in card #636. `install.sh` downloads and verifies the helper before it
+replaces `vmlab`, so a helper that fails its checksum ends the install with
+the earlier `vmlab` and the earlier helper both in place, one release. When
+the helper download fails, the installer removes the `vmlab-fastpath` of the
+earlier install before it moves the new `vmlab` in, and its warning names the
+removed file. Removing the file removes its capabilities. When that removal
+fails, the install ends before `vmlab` is replaced. Proof:
+`test_old_helper_is_removed_when_the_release_gives_none` and
+`test_corrupt_helper_leaves_the_old_install_whole` in
+`scripts/test_release_assets.py`. Both failed before the fix: the old helper
+was still in the bin directory beside the new `vmlab`, and a corrupt helper
+left the new `vmlab` installed. The daemon and the helper still exchange no
+version. A helper process that a running daemon started before the install
+keeps running until `vmlab daemon stop`.
+
 ### F6. Replacing the binary is not atomic and can leave a broken one (wrong result)
 
 `install.sh:215` stages downloads in `mktemp -d`, under `$TMPDIR` or `/tmp`,
