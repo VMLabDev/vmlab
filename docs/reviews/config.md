@@ -361,6 +361,9 @@ is refused at launch, because the file format has no escape for one.
 
 ### F11. A malformed `dns_upstream` falls back without a word (wrong result)
 
+**Fixed by card #578.** Host config loading rejects an invalid `dns_upstream`
+at the field. The host resolver is used only when the field is omitted.
+
 - Where: `src/config/host.rs:243` (read as any string), `:389-404`
   (`upstream_resolver`: `parse_upstream` returning `None` leads to
   `host_resolver()`).
@@ -424,6 +427,9 @@ an absolute path for the guest's family that is not the file system root.
   on a Linux-profile VM must give two issues. Today `validate` returns none.
 
 ### F14. Port 0 and an ICMP rule with a port pass validation (wrong result)
+
+**Fixed by card #578.** Lab config loading rejects zero ports in forward and
+redirect addresses and requires TCP or UDP for a block rule with a port.
 
 - Where: `src/config/extract.rs:295` (`port_s.parse::<u16>()`),
   `src/config/model.rs:1546-1556` (`parse_host_port`),

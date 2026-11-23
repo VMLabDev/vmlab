@@ -1315,10 +1315,19 @@ lab "l" {
 }
 "#;
         match crate::config::load_lab_source(source, "<test>", std::path::Path::new("/tmp")) {
-            Err(err) => assert!(err.issues.iter().any(|issue| issue.message.contains("`proto`"))),
+            Err(err) => assert!(
+                err.issues
+                    .iter()
+                    .any(|issue| issue.message.contains("`proto`"))
+            ),
             Ok(file) => {
                 let mut rules = RuleSet::new();
-                for rule in file.lab.segments.into_iter().flat_map(|segment| segment.block_rules) {
+                for rule in file
+                    .lab
+                    .segments
+                    .into_iter()
+                    .flat_map(|segment| segment.block_rules)
+                {
                     rules.add_block(rule);
                 }
                 let packet = icmp_echo_pkt(GUEST, DST_A, 9, false);

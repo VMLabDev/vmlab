@@ -196,12 +196,17 @@ fn extract_segment(b: &Block, issues: &mut IssueList) -> Option<Segment> {
                 let mut c = Reader::new(&child, r.issues());
                 let cidr = c.required("cidr", |c, n| c.parse_as(n, "CIDR"));
                 let proto = c.keyword("proto", L4_PROTOS).unspan();
-                let port = c.port("port").unspan();
+                let port = c.port("port");
+                if let Some(port) = &port
+                    && !matches!(proto, Some(L4Proto::Tcp | L4Proto::Udp))
+                {
+                    c.issue_at(port.span, "`port` requires `proto` to be `tcp` or `udp`");
+                }
                 if let Some(cidr) = cidr {
                     seg.block_rules.push(BlockRule {
                         cidr: cidr.value,
                         proto,
-                        port,
+                        port: port.unspan(),
                         span: c.span(),
                     });
                 }
@@ -292,7 +297,7 @@ fn extract_forward(b: &Block, issues: &mut IssueList) -> Option<Forward> {
         );
         return None;
     };
-    let Ok(guest_port) = port_s.parse::<u16>() else {
+    let Ok(guest_port) = port_s.parse::<std::num::NonZeroU16>() else {
         r.issue_at(to.span, format!("malformed guest port in `{}`", to.value));
         return None;
     };
@@ -301,7 +306,7 @@ fn extract_forward(b: &Block, issues: &mut IssueList) -> Option<Forward> {
         host_port,
         bind,
         vm: vm.to_string(),
-        guest_port,
+        guest_port: guest_port.get(),
         proto,
         span,
     })
@@ -1225,9 +1230,18 @@ mod tests {
     fn ports_that_can_never_match_are_refused() {
         let cases = [
             (r#"forward { to = "web:0" }"#, "guest port"),
-            (r#"redirect { from = "10.0.0.1:0" to = "10.0.0.2:80" }"#, "port"),
-            (r#"redirect { from = "10.0.0.1:80" to = "10.0.0.2:0" }"#, "port"),
-            (r#"block { cidr = "192.0.2.0/24" proto = "icmp" port = 80 }"#, "`proto`"),
+            (
+                r#"redirect { from = "10.0.0.1:0" to = "10.0.0.2:80" }"#,
+                "port",
+            ),
+            (
+                r#"redirect { from = "10.0.0.1:80" to = "10.0.0.2:0" }"#,
+                "port",
+            ),
+            (
+                r#"block { cidr = "192.0.2.0/24" proto = "icmp" port = 80 }"#,
+                "`proto`",
+            ),
             (r#"block { cidr = "192.0.2.0/24" port = 80 }"#, "`proto`"),
         ];
         let mut accepted = Vec::new();
@@ -1237,7 +1251,10 @@ mod tests {
                 accepted.push((rule, issues));
             }
         }
-        assert!(accepted.is_empty(), "expected port diagnostics for {accepted:?}");
+        assert!(
+            accepted.is_empty(),
+            "expected port diagnostics for {accepted:?}"
+        );
     }
 
     /// Fields the schema declares required but does not itself check for
