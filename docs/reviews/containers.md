@@ -82,7 +82,7 @@ Not read:
 | F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614) |
 | F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine (fixed, card #642) |
 | F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image |
-| F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 |
+| F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 (fixed, card #643) |
 | F5 | wrong result | A start that fails on its second virtiofsd leaves the first one running |
 | F6 | wrong result | An image `StopSignal` of a real-time signal powers the micro-VM off before the workload starts |
 | F7 | wrong result | A FIFO at `/.vmlab/busybox` hangs PID 1 at boot |
@@ -246,6 +246,16 @@ Not read:
   second test `tail_file_reads_only_the_end` over a sparse file of 8 GiB with
   three lines at its end, asserting the result: it shows the whole-file read
   as an allocation failure or a very long run.
+- Fixed in card #643. `tail_file` reads the end of the file through
+  `logs::tail_with_len` (at most 4 MiB, bytes that are not UTF-8 replaced),
+  and `logs --follow` reads what the file gained by offset
+  (`read_log_since`, at most 1 MiB a poll) where it read the whole file every
+  half second. vmlab-hv writes the serial log through `CappedLog`
+  (`hv/crates/vmlab-hv/src/serial_log.rs`): past 64 MiB the file is cut to
+  its newest half. Both proving tests are in `src/labd/vm.rs`, the cap's in
+  `serial_log.rs`. Not covered: a container on QEMU (an aarch64 or riscv64
+  host), whose `-serial file:` has no size limit. Its reads are bounded, its
+  file is not.
 
 ### F5. A start that fails on its second virtiofsd leaves the first one running (wrong result)
 

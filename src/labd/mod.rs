@@ -1114,29 +1114,25 @@ impl Handler<LabRequest> for LabdHandler {
                 follow,
             } => {
                 let m = machine_of(lab, &machine)?;
-                let Some(tail) = m.console_log(lines) else {
-                    return Err(CommandError::unsupported(format!(
-                        "machine `{machine}` has no console log"
-                    )));
-                };
-                let tail = tail?;
+                let no_log =
+                    || CommandError::unsupported(format!("machine `{machine}` has no console log"));
                 if !follow {
-                    return Ok(json!(tail));
+                    return Ok(json!(m.console_log(lines).ok_or_else(no_log)??));
                 }
-                // Follow: stream the tail, then poll for growth until the
-                // client hangs up or the machine stops.
+                // Follow: stream the tail, then what the file gains after it,
+                // by offset, until the client hangs up or the machine stops.
+                // The guest writes this file: no poll reads it whole.
+                let path = m.console_log_file().ok_or_else(no_log)?;
+                let (tail, mut seen) = vm::tail_file_with_len(&path, lines)?;
                 stream.chunk(tail).await;
-                let mut seen = 0usize;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Some(Ok(all)) = m.console_log(usize::MAX) {
-                        let len = all.len();
-                        if len > seen {
-                            stream.chunk(all[seen..].to_string()).await;
-                            seen = len;
-                        }
+                    let stopped = m.state().await == vm::PowerState::Stopped;
+                    let gained = vm::read_log_since(&path, &mut seen);
+                    if !gained.is_empty() {
+                        stream.chunk(gained).await;
                     }
-                    if m.state().await == vm::PowerState::Stopped {
+                    if stopped {
                         break;
                     }
                 }

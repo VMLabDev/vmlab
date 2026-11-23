@@ -1595,6 +1595,10 @@ impl super::machine::Machine for ContainerInstance {
         Some(self.tail_console(lines))
     }
 
+    fn console_log_file(&self) -> Option<PathBuf> {
+        Some(self.dirs.console_log())
+    }
+
     async fn health(&self) -> Option<bool> {
         self.health_verdict().await
     }

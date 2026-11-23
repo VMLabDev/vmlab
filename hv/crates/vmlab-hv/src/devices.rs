@@ -3,7 +3,6 @@
 //! the placement.
 
 use parking_lot::Mutex;
-use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,6 +17,8 @@ use vmlab_hv_devices::{GuestMemory, IrqLine, VirtioDevice};
 use vmlab_hv_proto::machine::{Disk, FsBacking, FsShare, Nic, NicAttachment, SerialPort};
 use vmlab_hv_vmm::DeviceUnavailable;
 use vmlab_hv_vmm::factory::{BuiltBlk, BuiltPci, BuiltSerial, SharedDisk};
+
+use crate::serial_log::{CappedLog, SERIAL_LOG_CAP};
 
 /// The device set the binary ships.
 #[derive(Debug, Default)]
@@ -74,16 +75,13 @@ impl vmlab_hv_vmm::DeviceFactory for DeviceSet {
         log_path: &Path,
         irq: Arc<dyn IrqLine>,
     ) -> Result<BuiltSerial, DeviceUnavailable> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| {
-                DeviceUnavailable::new(
-                    "serial-16550a",
-                    format!("cannot open serial log {}: {e}", log_path.display()),
-                )
-            })?;
+        // The guest decides how much lands here, so the file has a cap.
+        let file = CappedLog::open(log_path, SERIAL_LOG_CAP).map_err(|e| {
+            DeviceUnavailable::new(
+                "serial-16550a",
+                format!("cannot open serial log {}: {e}", log_path.display()),
+            )
+        })?;
         let dev = Arc::new(Mutex::new(Serial::new(
             "serial0",
             SerialOut::new(Box::new(file)),

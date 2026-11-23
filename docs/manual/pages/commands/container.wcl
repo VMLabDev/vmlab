@@ -186,6 +186,10 @@ page cmd_container {
     half second and streams what was appended, until you press Ctrl-C or the
     container stops. An empty log prints nothing. The log is read from the
     host, so it works while the container is stopped and needs no agent.
+    The history is read from the last 4 MiB of the file, and a byte that is
+    not UTF-8 prints as the Unicode replacement character. vmlab-hv keeps
+    the file under 64 MiB: at that size it drops the older half and leaves a
+    line that says so.
   DOC
 
   h2 "vmlab container ip"
