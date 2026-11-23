@@ -19,8 +19,7 @@ use vmlab_hv_proto::machine::{
     Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat,
     Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV,
     Machine, MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, PitTicks, SerialPort,
-    SerialTransport, Tpm,
-    VfioDevice, VirtualDisplay,
+    SerialTransport, Tpm, VfioDevice, VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
