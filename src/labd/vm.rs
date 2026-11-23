@@ -2563,19 +2563,26 @@ impl super::machine::Machine for VmInstance {
     /// And for a macOS guest on QEMU (§5.2), what the host lacks for it:
     /// KVM's `ignore_msrs`, without which the guest faults on the Intel MSRs
     /// it reads, and a pinned TSC, which TCG cannot give it.
+    ///
+    /// And, whatever the accelerator, a secure boot whose key store the
+    /// guest's own kernel can rewrite (every arch but x86_64).
     fn launch_warnings(&self) -> Vec<String> {
         let t = self.template();
+        let mut warnings: Vec<String> = qemu::secure_boot_store_unprotected(&t.resolved)
+            .into_iter()
+            .collect();
         let kvm = qemu::kvm_usable(&t.resolved.arch);
         let Ok(plan) = qemu::plan_accel(&t.resolved, kvm) else {
-            return Vec::new();
+            return warnings;
         };
-        let mut warnings: Vec<String> = [
-            qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()),
-            qemu::tsc_not_applied(&t.resolved, plan.accel()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        warnings.extend(
+            [
+                qemu::hyperv_not_applied(self.cfg.hyperv, &t.resolved, plan.accel()),
+                qemu::tsc_not_applied(&t.resolved, plan.accel()),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
         // vmlab-hv answers the MSRs macOS touches itself (its `macos`
         // policy); only QEMU needs the host's kvm.ignore_msrs.
