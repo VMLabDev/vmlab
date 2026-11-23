@@ -6568,8 +6568,12 @@ lab "t" {
 }"#,
             vec![vm.clone(), ct.clone()],
         );
-        lab.destroy_machine("dc01", false).await.expect("destroy dc01");
-        lab.destroy_machine("web", false).await.expect("destroy web");
+        lab.destroy_machine("dc01", false)
+            .await
+            .expect("destroy dc01");
+        lab.destroy_machine("web", false)
+            .await
+            .expect("destroy web");
         assert_eq!(vm.stops.load(Ordering::SeqCst), 1);
         assert_eq!(ct.stops.load(Ordering::SeqCst), 1);
     }
@@ -8426,7 +8430,9 @@ lab "t" {
             "the stop took no last pass"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("src/new.rs")).ok().as_deref(),
+            std::fs::read_to_string(dir.path().join("src/new.rs"))
+                .ok()
+                .as_deref(),
             Some("new")
         );
         // In step at the stop, so nothing stands in a restore's way.
@@ -8488,7 +8494,9 @@ lab "t" {
         assert!(said.contains("--discard-guest-changes"), "{said}");
         assert!(ws.ledger_path.exists(), "a refused destroy removes nothing");
 
-        lab.destroy_machine("dev01", true).await.expect("discarding");
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
         assert!(!ws.ledger_path.exists());
     }
 
@@ -8513,7 +8521,9 @@ lab "t" {
             "a refused destroy stops nothing"
         );
 
-        lab.destroy_machine("dev01", true).await.expect("discarding");
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
         assert!(lab.workspaces.get("dev01").await.is_none());
         assert!(!ws.ledger_path.exists());
     }

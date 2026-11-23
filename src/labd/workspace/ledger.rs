@@ -146,7 +146,11 @@ pub fn stopped_work(lab_local: &Path) -> Vec<StoppedWork> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            let machine = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
+            let machine = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_string();
             let ledger: Ledger = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
             // A rewound tree is carried back from the host, so it holds
             // nothing the host lacks.

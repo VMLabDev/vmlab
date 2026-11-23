@@ -614,7 +614,11 @@ mod tests {
         };
         let left = left_at_stop("dev01", &owed).expect("work is owed");
         assert_eq!(left.paths, ["new.rs"]);
-        assert!(left.why.contains("the agent channel dropped"), "{}", left.why);
+        assert!(
+            left.why.contains("the agent channel dropped"),
+            "{}",
+            left.why
+        );
 
         // A restore of the stopped machine says it, and names a verb that can
         // answer for a machine that is down.

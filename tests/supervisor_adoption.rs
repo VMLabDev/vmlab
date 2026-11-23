@@ -309,7 +309,9 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_destroy_and_crash(
     let lab = Client::<LabRequest>::connect(&host.lab_socket("destroyed"))
         .await
         .unwrap();
-    lab.send(LabRequest::Destroy { discard: false }).await.unwrap();
+    lab.send(LabRequest::Destroy { discard: false })
+        .await
+        .unwrap();
     host.wait_entry("destroyed", "a destroyed lab keeps no entry", |e| {
         e.is_none()
     })

@@ -788,9 +788,7 @@ impl WorkspaceSyncers {
             &workspace.guest_root,
             left,
         ) {
-            tracing::warn!(
-                "{machine}: noting on the sync ledger what the stop left owed: {e:#}"
-            );
+            tracing::warn!("{machine}: noting on the sync ledger what the stop left owed: {e:#}");
         }
     }
 
