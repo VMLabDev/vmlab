@@ -5,7 +5,7 @@
 //!
 //! - [`load_screen`] / [`save_png`] — read QMP `screendump` output (PPM) or
 //!   PNG reference images, write PNG screenshots.
-//! - [`find_template`] — normalised cross-correlation template matching,
+//! - [`find_template`] — full-resolution RGB template matching,
 //!   returning a [`Match`] (location + score) that can anchor a relative
 //!   mouse click.
 //! - [`ocr`] — Tesseract-backed text extraction (`vm.wait_for_text` applies
