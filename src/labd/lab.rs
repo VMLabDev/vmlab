@@ -8183,4 +8183,82 @@ lab "t" {
         let none = lab.script_forward_target("c", "two").await.unwrap_err();
         assert!(none.contains("no NIC on segment \"c\""), "{none}");
     }
+
+    // ---- card 672 review probes: each PASSES while its fault is present ----
+
+    const REVIEW672_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    #[tokio::test]
+    async fn review672_p8_a_restore_with_the_host_workspace_away_skips_the_halt_and_the_note() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            REVIEW672_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("dev01", "s").await.unwrap();
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+        // Control: with the directory there, the halt on the ledger refuses.
+        let control = lab.restore("dev01", "s", false).await;
+
+        std::fs::rename(dir.path().join("src"), dir.path().join("src.away")).unwrap();
+        let restored = lab.restore("dev01", "s", false).await;
+        std::fs::rename(dir.path().join("src.away"), dir.path().join("src")).unwrap();
+        let after = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+
+        assert!(control.is_err(), "control: the halt refuses");
+        assert!(restored.is_ok(), "{restored:?}");
+        assert!(!after.reseed_owed, "no re-seed is owed after the rewind");
+        assert_eq!(after.halted, ["main.rs"], "the halt still stands");
+    }
+
+    #[tokio::test]
+    async fn review672_p9_a_dev_machine_started_outside_up_has_no_syncer_and_both_brackets_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            REVIEW672_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.start_machine("dev01").await.unwrap();
+        let running = lab.machine("dev01").unwrap().state().await == PowerState::Running;
+        let syncing = lab.workspaces.get("dev01").await.is_some();
+        let captured = lab.snapshot("dev01", "s").await;
+        let restored = lab.restore("dev01", "s", false).await;
+        assert!(running);
+        assert!(!syncing, "nothing started a syncer");
+        assert!(captured.is_ok(), "{captured:?}");
+        assert!(restored.is_ok(), "{restored:?}");
+    }
+
+    #[tokio::test]
+    async fn review672_p10_a_destroy_does_not_ask_about_a_halted_workspace() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            REVIEW672_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+        let destroyed = lab.destroy_machine("dev01").await;
+        assert!(destroyed.is_ok(), "{destroyed:?}");
+        assert!(!ws.ledger_path.exists(), "the halt went with the ledger");
+    }
 }

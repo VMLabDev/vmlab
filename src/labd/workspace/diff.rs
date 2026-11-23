@@ -379,4 +379,110 @@ mod tests {
         assert_eq!(copy.size, 4);
         assert!(!copy.digest.is_empty(), "still comparable");
     }
+
+    // ---- card 672 review probes: each PASSES while its fault is present ----
+
+    struct Lying(Arc<FakeGuest>);
+
+    #[async_trait::async_trait]
+    impl GuestFs for Lying {
+        async fn lstat(&self, path: &str) -> Result<Option<crate::labd::vm_agent::Attrs>> {
+            Ok(GuestFs::lstat(&self.0, path).await?.map(|mut attrs| {
+                attrs.size = 1;
+                attrs
+            }))
+        }
+        async fn pull(&self, _: &str, local: &Path) -> Result<()> {
+            std::fs::write(local, vec![b'a'; INLINE as usize + 1])?;
+            Ok(())
+        }
+        async fn readdir(&self, _: &str) -> Result<Vec<crate::labd::vm_agent::DirEntry>> {
+            unimplemented!()
+        }
+        async fn readlink(&self, _: &str) -> Result<String> {
+            unimplemented!()
+        }
+        async fn digest(&self, _: &str) -> Result<String> {
+            unimplemented!()
+        }
+        async fn mkdir(&self, _: &str, _: bool) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mkdir_root(&self, _: &str, _: bool) -> Result<()> {
+            unimplemented!()
+        }
+        async fn push(&self, _: &Path, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn symlink(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::labd::vm_agent::LinkKind,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn rename(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn remove(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn rmdir(&self, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn review672_p4_the_inline_cap_trusts_the_size_the_guest_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/big.log", "x", 1);
+        let sides = one(
+            &Lying(guest),
+            &workspace(dir.path()),
+            "big.log",
+            &scratch.path().join("0"),
+        )
+        .await;
+        let copy = sides.guest.unwrap();
+        assert_eq!(copy.size, INLINE + 1, "read whole into memory");
+        assert_eq!(copy.text.map(|t| t.len() as u64), Some(INLINE + 1));
+        assert!(copy.omitted.is_none());
+    }
+
+    #[tokio::test]
+    async fn review672_p5_a_link_and_a_file_with_the_same_bytes_read_as_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("x")).unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/x", "target", 1);
+        let sides = one(
+            &guest,
+            &workspace(dir.path()),
+            "x",
+            &scratch.path().join("0"),
+        )
+        .await;
+        assert!(sides.identical);
+    }
+
+    #[tokio::test]
+    async fn review672_p6_terminal_escapes_in_a_guest_file_count_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/a.txt", "\u{1b}[2J\u{1b}]52;c;ZXZpbA==\u{7}gone\n", 1);
+        let sides = one(
+            &guest,
+            &workspace(dir.path()),
+            "a.txt",
+            &scratch.path().join("0"),
+        )
+        .await;
+        let text = sides.guest.unwrap().text.expect("taken as text");
+        assert!(text.contains('\u{1b}'));
+    }
 }
