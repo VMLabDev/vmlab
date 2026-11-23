@@ -2538,7 +2538,10 @@ mod tests {
             .err()
             .expect("both builds claimed the same runtime directory");
         let error = err.to_string();
-        assert!(error.contains("build lab `build-x86_64-t` is in use"), "{error}");
+        assert!(
+            error.contains("build lab `build-x86_64-t` is in use"),
+            "{error}"
+        );
         assert!(!second_work.exists());
         drop(first_claim);
         assert!(super::claim_build_workdir(&second, &second_work, &runtime).is_ok());
