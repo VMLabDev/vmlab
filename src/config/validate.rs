@@ -3331,16 +3331,16 @@ lab "l" {
         let container = r#"container "dev01" { image = "sdk:9.0" }"#;
         for (dev, machine) in [
             (r#"workspace_guest = "/""#, linux),
-            (r#"workspace_guest = "C:\""#, windows),
+            (r#"workspace_guest = "C:\\""#, windows),
             (r#"workspace_guest = "/src""#, windows),
-            (r#"workspace_guest = "C:\src""#, container),
+            (r#"workspace_guest = "C:\\src""#, container),
         ] {
             let es = dev_errs(dev, machine);
             assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
         }
         for (dev, machine) in [
             (r#"workspace = ".", workspace_guest = "/src""#, linux),
-            (r#"workspace_guest = "C:\src""#, windows),
+            (r#"workspace_guest = "C:\\src""#, windows),
             (r#"workspace_guest = "/home/dev/src""#, container),
         ] {
             let es = dev_errs(dev, machine);
