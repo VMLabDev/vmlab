@@ -121,3 +121,220 @@ async fn legacy_agent_full_argv_and_no_inherited_descriptors() -> Result<()> {
 fn sh(script: &str) -> Vec<String> {
     vec!["sh".into(), "-c".into(), script.into()]
 }
+
+/// The NT build under Wine, on a COM1 that is a pty: the one way this host
+/// can run `plat_win32.c`. `None` when the host has no mingw or no Wine.
+struct WineAgent {
+    dir: tempfile::TempDir,
+    socket: PathBuf,
+    child: std::process::Child,
+}
+
+/// Not a limit a step must meet: the client API wants a budget, and a first
+/// Wine start builds a whole prefix. It only ends a run that hangs.
+const WINE_HANG_GUARD: Duration = Duration::from_secs(1800);
+
+fn found(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()))
+}
+
+impl WineAgent {
+    fn wine(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env("WINEPREFIX", self.dir.path().join("prefix"))
+            .env("WINEDEBUG", "-all")
+            .env("WINEDLLOVERRIDES", "mscoree=;mshtml=;winemenubuilder.exe=")
+            // The C locale gives the guest the Western code page (1252).
+            .env("LC_ALL", "C")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn start() -> Result<Option<Self>> {
+        const CC: &str = "i686-w64-mingw32-gcc";
+        if !found(CC) || !found("wine") || !found("wineserver") {
+            eprintln!("skipped: the Win32 legacy agent needs {CC}, wine and wineserver");
+            return Ok(None);
+        }
+        let dir = tempfile::tempdir()?;
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("guest/agent-legacy/src");
+        let exe = dir.path().join("agent.exe");
+        let status = Command::new(CC)
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+            .args(["-Wno-cast-function-type", "-Os", "-static"])
+            .arg("-DAGENT_VERSION=\"agent-legacy=test\"")
+            .arg("-o")
+            .arg(&exe)
+            .args(
+                ["json.c", "wire.c", "agent.c", "plat_win32.c"]
+                    .iter()
+                    .map(|f| src.join(f)),
+            )
+            .args(["-ladvapi32", "-luser32"])
+            .status()?;
+        ensure!(status.success(), "the Win32 legacy agent did not compile");
+
+        // COM1 is a pty. The slave stays open here so the master never
+        // reports a hang-up between two opens on the Wine side.
+        let master = rustix::pty::openpt(
+            rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY,
+        )?;
+        rustix::pty::grantpt(&master)?;
+        rustix::pty::unlockpt(&master)?;
+        let pts = rustix::pty::ptsname(&master, Vec::new())?;
+        let pts = pts.to_str()?.to_string();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pts)?;
+        let mut term = rustix::termios::tcgetattr(&slave)?;
+        term.make_raw();
+        rustix::termios::tcsetattr(&slave, rustix::termios::OptionalActions::Now, &term)?;
+
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let master = std::fs::File::from(master);
+        std::thread::spawn(move || {
+            let _slave = slave;
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let (Ok(mut to_guest), Ok(mut from_host)) = (master.try_clone(), stream.try_clone())
+            else {
+                return;
+            };
+            std::thread::spawn(move || std::io::copy(&mut from_host, &mut to_guest));
+            let (mut from_guest, mut to_host) = (master, stream);
+            let _ = std::io::copy(&mut from_guest, &mut to_host);
+        });
+
+        let mut agent = Self {
+            dir,
+            socket,
+            child: Command::new("true").spawn()?,
+        };
+        // Wine reads its port map when the prefix starts, so the prefix is
+        // made, told, and let stop before the agent starts it again.
+        let status = agent
+            .wine("wine")
+            .args(["reg", "add", r"HKLM\Software\Wine\Ports", "/v", "COM1"])
+            .args(["/t", "REG_SZ", "/d", &pts, "/f"])
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        ensure!(status.success(), "wine reg add failed: {status}");
+        ensure!(agent.wine("wineserver").arg("-w").status()?.success());
+        agent.child.wait()?;
+        agent.child = agent
+            .wine("wine")
+            .arg(&exe)
+            .args(["--console", "--port", "COM1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        Ok(Some(agent))
+    }
+
+    /// A host path as the guest names it: Wine's `Z:` is the host's `/`.
+    fn guest_path(path: &Path) -> String {
+        format!("Z:{}", path.to_str().unwrap().replace('/', "\\"))
+    }
+}
+
+impl Drop for WineAgent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Everything else the prefix started (services, the server itself).
+        let _ = self.wine("wineserver").arg("-k").status();
+        let _ = self.wine("wineserver").arg("-w").status();
+    }
+}
+
+/// Review `legacy-agents.md` F1. A character the guest's code page lacks
+/// used to reach the command as `?`, which `del` reads as a wildcard: the
+/// two-character name the host sent deleted another two-character file.
+/// The exec is refused instead, by naming what did not convert, for an
+/// argument, an environment entry and the `cwd` alike.
+#[tokio::test]
+async fn legacy_win32_exec_refuses_text_outside_the_code_page() -> Result<()> {
+    let Some(agent) = WineAgent::start()? else {
+        return Ok(());
+    };
+    let handle = AgentHandle::connect_serial(
+        &agent.socket,
+        WINE_HANG_GUARD,
+        super::vm_agent::Greeting::GuestFirst { fallback: false },
+    )
+    .await?;
+    let exec = |argv: &[&str], env: &[(&str, &str)], cwd: Option<&str>| {
+        let argv = argv.iter().map(|a| a.to_string()).collect();
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let handle = handle.clone();
+        let cwd = cwd.map(str::to_string);
+        async move {
+            handle
+                .exec(argv, env, cwd, None, WINE_HANG_GUARD, None)
+                .await
+        }
+    };
+    let refused = |what: &str, result: Result<super::vm_agent::ExecOutput>, wants: &[&str]| {
+        let text = match result {
+            Ok(out) => format!("it ran and exited {}", out.exit_code),
+            Err(e) => format!("{e:#}"),
+        };
+        ensure!(
+            wants.iter().all(|want| text.contains(want)),
+            "{what}: expected a refusal with {wants:?}, got: {text}"
+        );
+        Ok(())
+    };
+
+    let victims = agent.dir.path().join("t");
+    std::fs::create_dir(&victims)?;
+    let victim = victims.join("ab.txt");
+    std::fs::write(&victim, "kept")?;
+    let dir = WineAgent::guest_path(&victims);
+
+    // The control: the guest runs commands, and text the code page holds
+    // passes (U+00E9 is in 1252).
+    let out = exec(&["cmd", "/c", "echo", "caf\u{e9}"], &[], Some(&dir)).await?;
+    ensure!(
+        out.exit_code == 0 && out.stdout.starts_with(b"caf"),
+        "control: exit {} stdout {:?}",
+        out.exit_code,
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let name = format!("{dir}\\\u{65e5}\u{672c}.txt");
+    let result = exec(&["cmd", "/c", "del", &name], &[], None).await;
+    ensure!(
+        victim.exists(),
+        "`del` of a name outside the code page deleted {}",
+        victim.display()
+    );
+    refused("argument", result, &["argument 3", "U+65E5", "code page"])?;
+
+    // A best-fit look-alike is as wrong as `?`: a full-width quote must not
+    // arrive as the ASCII one.
+    let result = exec(&["cmd", "/c", "echo", "\u{ff02}"], &[], None).await;
+    refused("best fit", result, &["argument 3", "U+FF02"])?;
+
+    let result = exec(
+        &["cmd", "/c", "echo"],
+        &[("A", "plain"), ("B", "\u{65e5}")],
+        None,
+    )
+    .await;
+    refused("env", result, &["env entry 1", "U+65E5"])?;
+
+    let missing = format!("{dir}\\\u{672c}");
+    let result = exec(&["cmd", "/c", "echo"], &[], Some(&missing)).await;
+    refused("cwd", result, &["cwd", "U+672C"])?;
+    Ok(())
+}
