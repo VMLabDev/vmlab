@@ -714,6 +714,12 @@ pub trait Machine: Send + Sync + 'static {
         None
     }
 
+    /// The file [`Machine::console_log`] reads, for a follower that reads it
+    /// by offset.
+    fn console_log_file(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// The latest healthcheck verdict, when the machine declares one.
     /// `None` means "no check, or no report yet" — a machine with no
     /// healthcheck is healthy once it is ready.
