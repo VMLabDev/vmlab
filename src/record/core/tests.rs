@@ -678,13 +678,6 @@ fn a_whole_screen_repaint_that_changes_a_caret_is_idle() {
     assert_eq!(core.cuts().len(), 1);
 }
 
-/// How many frames a batch holds in memory.
-fn held(frames: &[Frame]) -> usize {
-    frames.len()
-}
-
-const QUEUE_LIMIT: usize = 120;
-
 /// A clock that comes back late owes many intervals. They show one picture,
 /// so the batch must not hold one copy for each (review record-vision F2,
 /// part 1).
@@ -696,11 +689,12 @@ fn a_late_tick_does_not_return_an_unbounded_batch() {
     core.rect(secs(0.0), 0, 0, 16, 16, &solid(16, 16, RED));
     let frames = core.tick(secs(600.0));
     assert!(
-        held(&frames) <= QUEUE_LIMIT,
+        frames.held() <= core.queue_limit(),
         "the batch holds {} frames",
-        held(&frames)
+        frames.held()
     );
-    assert_eq!(core.video_duration(), secs(600.0), "no output time is lost");
+    assert_eq!(frames.len(), 18_000, "no output time is lost");
+    assert_eq!(core.dropped_frames(), 0, "one picture, nothing to drop");
 }
 
 /// Display events advance the clock too. With nobody taking the frames, a
@@ -724,11 +718,17 @@ fn events_do_not_pile_frames_while_nobody_ticks() {
     }
     let frames = core.tick(secs(600.0));
     assert!(
-        held(&frames) <= QUEUE_LIMIT,
+        frames.held() <= core.queue_limit(),
         "the queue holds {} frames",
-        held(&frames)
+        frames.held()
     );
-    assert_eq!(core.video_duration(), secs(600.0), "no output time is lost");
+    assert_eq!(frames.len(), 18_000, "no output time is lost");
+    assert_eq!(
+        core.dropped_frames(),
+        18_000 - core.queue_limit() as u64,
+        "what did not fit repeats the newest queued picture"
+    );
+    assert_eq!(core.tick(secs(600.0)).len(), 0, "the queue was taken");
 }
 
 /// An idle run that ends below the threshold is written out whole. It is one
@@ -747,10 +747,11 @@ fn a_long_idle_run_below_the_threshold_is_not_cloned() {
     );
     let frames = core.tick(secs(599.1));
     assert!(
-        held(&frames) <= QUEUE_LIMIT,
+        frames.held() <= core.queue_limit(),
         "the batch holds {} frames",
-        held(&frames)
+        frames.held()
     );
     assert!(core.cuts().is_empty(), "the run is below the threshold");
-    assert_eq!(core.video_duration(), secs(599.1), "no output time is lost");
+    assert_eq!(frames.len(), 17_971, "no output time is lost");
+    assert_eq!(core.dropped_frames(), 0, "one picture, nothing to drop");
 }

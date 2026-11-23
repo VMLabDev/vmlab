@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::{mpsc, watch};
 
-use super::core::{Core, CursorShape};
+use super::core::{Core, CursorShape, Frames};
 use super::encoder::{Encoder, EncoderPlan};
 use super::input::TimedInput;
 use super::{Settings, timeline_path};
@@ -202,8 +202,10 @@ async fn run(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .tick(started.elapsed());
-            for f in &frames {
-                encoder.write_frame(&f.rgb).await?;
+            for run in frames.runs() {
+                for _ in 0..run.count {
+                    encoder.write_frame(&run.frame.rgb).await?;
+                }
             }
             if let Some(max) = settings.max_duration {
                 let video = core
@@ -233,8 +235,15 @@ async fn run(
         let frames = if outcome.is_ok() {
             c.finish(started.elapsed())
         } else {
-            Vec::new()
+            Frames::default()
         };
+        if c.dropped_frames() > 0 {
+            tracing::warn!(
+                "recorder: {}: the encoder fell behind; {} frames repeat the picture before them",
+                output.display(),
+                c.dropped_frames()
+            );
+        }
         (
             frames,
             c.video_duration(),
@@ -245,10 +254,12 @@ async fn run(
     };
     let mut write_err = outcome.err();
     if write_err.is_none() {
-        for f in &frames {
-            if let Err(e) = encoder.write_frame(&f.rgb).await {
-                write_err = Some(e);
-                break;
+        'flush: for run in frames.runs() {
+            for _ in 0..run.count {
+                if let Err(e) = encoder.write_frame(&run.frame.rgb).await {
+                    write_err = Some(e);
+                    break 'flush;
+                }
             }
         }
     }
