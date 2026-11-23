@@ -150,6 +150,10 @@ pub struct LabRuntime {
     /// a developer's source tree must not stop syncing because a terminal
     /// closed.
     pub workspaces: crate::labd::workspace::WorkspaceSyncers,
+    /// The machines an `up` is bringing up now, counted per `up`. That `up`
+    /// starts their syncers itself, after provisioning (§19.6), so a start
+    /// made inside it — a provision's `m.start()` — starts none.
+    ups: std::sync::Mutex<HashMap<String, usize>>,
     /// The console recordings this lab owns, one per machine (§11.1).
     pub recordings: super::record::Recordings,
     /// Worktree isolation (§21.4), decided once when the daemon starts:
@@ -596,6 +600,7 @@ impl LabRuntime {
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            ups: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
             isolation,
@@ -676,6 +681,7 @@ impl LabRuntime {
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            ups: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb,
             isolation,
@@ -1377,7 +1383,9 @@ impl LabRuntime {
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         let ticket = self.starts.ticket()?;
-        self.start_machine_at(name, output, ticket).await
+        self.start_machine_at(name, output, ticket).await?;
+        self.ensure_workspace(name, output).await;
+        Ok(())
     }
 
     /// [`start_machine_with_output`](Self::start_machine_with_output) for a
@@ -1703,7 +1711,9 @@ impl LabRuntime {
     ) -> Result<()> {
         let ticket = self.starts.ticket()?;
         self.start_with_deferred_refresh_at(name, output, ticket)
-            .await
+            .await?;
+        self.ensure_workspace(name, output).await;
+        Ok(())
     }
 
     /// [`start_with_deferred_refresh`](Self::start_with_deferred_refresh)
@@ -2252,6 +2262,9 @@ impl LabRuntime {
             output(format!("warning: {warning}\n"));
         }
         let targets: Vec<String> = plan.machines().cloned().collect();
+        // Until this `up` ends, a start of one of its machines leaves the
+        // syncer to it: it starts them after provisioning.
+        let _syncers_are_ours = UpInFlight::over(&self.ups, &targets);
 
         // `nested = true` asks for VMX/SVM the host may not have to give
         // (§5.2): the machine still boots, so this is said, not refused.
@@ -3195,6 +3208,39 @@ impl LabRuntime {
             .and_then(|name| self.profiles.get(&name).cloned())
     }
 
+    /// Start `name`'s workspace syncer when the machine runs and has none
+    /// (docs/reviews/dev-machines.md F3): what every start outside `up`
+    /// calls, because only `up` used to start one, and a dev machine booted
+    /// by `vm start`, `vm restart`, a wscript `start()` or a restore then ran
+    /// with a workspace that did not sync and nothing that said so.
+    ///
+    /// A syncer that is already there is kept: it outlives a `vm stop`, and
+    /// replacing it would lose what its last pass knew. A machine an `up` is
+    /// bringing up now is left to that `up`, which starts the syncer after
+    /// provisioning has made the login it writes as. Outside `up` nothing
+    /// says whether provisioning ever ran, and a syncer whose login is not
+    /// there fails its passes and says so, which the brackets refuse on.
+    async fn ensure_workspace(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) {
+        let in_an_up = self.ups.lock_recover().contains_key(name);
+        if in_an_up || self.workspaces.get(name).await.is_some() {
+            return;
+        }
+        let Ok(machine) = self.machine(name) else {
+            return;
+        };
+        if machine.state().await == PowerState::Stopped {
+            return;
+        }
+        let logged: crate::scripting::OutputSink =
+            Arc::new(|line: String| tracing::warn!("{}", line.trim_end()));
+        self.start_workspaces(&[name.to_string()], output.unwrap_or(&logged))
+            .await;
+    }
+
     /// Start the workspace syncer for every `@dev` machine in `scope` that
     /// declares one (§19.6). An empty `scope` means the whole lab.
     ///
@@ -3589,8 +3635,9 @@ impl LabRuntime {
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
+        let running = m.state().await != PowerState::Stopped;
         self.workspaces
-            .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
+            .before_capture(vm_name, self.workspace_of(vm_name).as_ref(), running)
             .await?;
         let _active = {
             let mut state = self.state.lock().await;
@@ -3815,8 +3862,13 @@ impl LabRuntime {
         // Put back on **both** paths. A workspace whose syncer quietly never
         // came back looks exactly like a machine with nothing to sync, which
         // is the silent-divergence failure ADR-0014 exists to rule out.
-        if let Some(bracket) = bracket {
-            self.workspaces.resume(bracket).await;
+        match bracket {
+            Some(bracket) => self.workspaces.resume(bracket).await,
+            // None was taken off, and the machine may run now all the same:
+            // an online restore boots a stopped one, and a discard restore
+            // goes ahead on one that ran with no syncer. Either way the
+            // syncer starts here, owing the re-seed noted above.
+            None => self.ensure_workspace(name, None).await,
         }
         if let (Err(e), Some(workspace)) = (&restored, &workspace) {
             // Said rather than silently undone, for the reason above: the
@@ -3910,8 +3962,9 @@ impl LabRuntime {
             }
         }
         // Flush after any deferred pull, before the caller suspends sync.
+        let running = m.state().await != PowerState::Stopped;
         self.workspaces
-            .before_restore(name, discard, workspace)
+            .before_restore(name, discard, workspace, running)
             .await?;
         Ok(record)
     }
@@ -4305,6 +4358,40 @@ async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, 
             })
             .collect(),
     )
+}
+
+/// The machines one `up` is bringing up, held in [`LabRuntime::ups`] until
+/// that `up` ends, however it ends.
+struct UpInFlight<'a> {
+    ups: &'a std::sync::Mutex<HashMap<String, usize>>,
+    machines: Vec<String>,
+}
+
+impl<'a> UpInFlight<'a> {
+    fn over(ups: &'a std::sync::Mutex<HashMap<String, usize>>, machines: &[String]) -> Self {
+        let mut held = ups.lock_recover();
+        for machine in machines {
+            *held.entry(machine.clone()).or_default() += 1;
+        }
+        Self {
+            ups,
+            machines: machines.to_vec(),
+        }
+    }
+}
+
+impl Drop for UpInFlight<'_> {
+    fn drop(&mut self) {
+        let mut held = self.ups.lock_recover();
+        for machine in &self.machines {
+            if let Some(count) = held.get_mut(machine) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(machine);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -67,7 +67,7 @@ says "read, not run".
 |---|---|---|
 | F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690) | Security against a hostile guest |
 | F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note | Data loss (canonical copy) |
-| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush | Data loss (guest work) |
+| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush (fixed, card #694) | Data loss (guest work) |
 | F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag | Data loss (guest work) |
 | F5 | `destroy` does not ask about a halted or unsynced workspace | Data loss (guest work) |
 | F6 | One machine's pass holds a host-wide lock across its guest I/O | Security against a hostile guest or peer, and wrong result |
@@ -225,6 +225,24 @@ exists, `snapshot` returns `Ok`, and `restore` without the flag returns `Ok`.
 
 **How bad.** Data loss (guest work that never reached the host), and a
 workspace that does not sync with no word about it.
+
+**Fixed by card #694.** Two changes. Every start outside `up` now starts the
+syncer when the machine runs and has none (`ensure_workspace`,
+`src/labd/lab.rs`): `vm start`, `vm restart`, a wscript `start()`, and a
+restore that leaves the machine running. A syncer that is already there is
+kept. A start made inside an `up` for one of that `up`'s machines starts none,
+because the `up` starts it after provisioning. The second change covers what
+is left, an `up` whose provisioning failed: `before_capture` and
+`before_restore` (`src/labd/workspace/syncer.rs`) take whether the machine
+runs, and a running machine with a declared workspace and no syncer is refused
+(`NoSyncer`, `bracket.rs`). Capture has no flag, restore passes with
+`--discard-guest-changes`, and both refusals name `vmlab up <machine>`. The
+`dev sync` verbs name the same case in their refusal. Both tests named above
+are in `src/labd/lab.rs`. Before the fix both failed on helios: the start left
+no syncer, and the capture returned `Ok`. Not changed: a start outside `up`
+cannot tell whether provisioning ever ran, so on a machine that was never
+provisioned the syncer starts, fails its passes until its login exists, and
+the brackets refuse on that.
 
 ### F4. A stop takes no last pass and records nothing about owed work
 

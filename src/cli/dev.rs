@@ -168,7 +168,8 @@ async fn sync_status(client: &LabClient, machine: &str) -> Result<WorkspaceSyncS
         .and_then(|dev| dev.sync.clone())
         .ok_or_else(|| {
             anyhow!(
-                "\"{machine}\" has no workspace syncer running: it is not up, or it declares no \
+                "\"{machine}\" has no workspace syncer running: it is not up, its syncer has not \
+                 started (`vmlab up {machine}` starts it), or it declares no \
                  `@dev(workspace = …)`"
             )
         })
