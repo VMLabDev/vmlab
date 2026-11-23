@@ -35,7 +35,9 @@ pub trait UsbFs: Send + Sync {
     /// Synchronous control transfer with a timeout in milliseconds. The
     /// returned value is the number of bytes transferred.
     fn control(&self, transfer: &usbdevfs_ctrltransfer) -> io::Result<c_int>;
-    /// Claim `interface`, detaching whatever host kernel driver owns it.
+    /// Claim `interface`, detaching whatever host kernel driver owns it. A
+    /// claim another usbdevfs user holds (another VM, a libusb program) is
+    /// not such a driver: it stays, and the call fails with EBUSY.
     fn claim_interface(&self, interface: u8) -> io::Result<()>;
     /// Release an interface previously claimed with `claim_interface`.
     fn release_interface(&self, interface: u8) -> io::Result<()>;
@@ -104,6 +106,27 @@ impl Usbdevfs {
     }
 }
 
+/// The name of the kernel driver that stands for a claim made through
+/// usbdevfs (`usbfs_driver` in `drivers/usb/core/devio.c`).
+const USBFS_DRIVER: &[u8] = b"usbfs";
+
+/// The USBDEVFS_DISCONNECT_CLAIM argument for `interface`. The kernel
+/// unbinds whatever driver holds the interface before it claims, and a
+/// claim another process made through usbdevfs is the driver `usbfs`. With
+/// no flag the call would take the interface from that process (another
+/// VM's vmlab-hv in the middle of its transfers). `EXCEPT_DRIVER` with the
+/// name `usbfs` makes the kernel answer EBUSY instead and leave that claim
+/// alone; every other host driver is still detached.
+fn disconnect_claim_request(interface: u8) -> usbdevfs_disconnect_claim {
+    let mut driver = [0u8; sys::USBDEVFS_MAXDRIVERNAME + 1];
+    driver[..USBFS_DRIVER.len()].copy_from_slice(USBFS_DRIVER);
+    usbdevfs_disconnect_claim {
+        interface: c_uint::from(interface),
+        flags: sys::USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER,
+        driver,
+    }
+}
+
 impl UsbFs for Usbdevfs {
     fn read_descriptors(&self) -> io::Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
@@ -135,11 +158,7 @@ impl UsbFs for Usbdevfs {
     }
 
     fn claim_interface(&self, interface: u8) -> io::Result<()> {
-        let disconnect_claim = usbdevfs_disconnect_claim {
-            interface: c_uint::from(interface),
-            flags: 0,
-            driver: [0u8; sys::USBDEVFS_MAXDRIVERNAME + 1],
-        };
+        let disconnect_claim = disconnect_claim_request(interface);
         self.ioctl_with_ref(sys::USBDEVFS_DISCONNECT_CLAIM, &disconnect_claim)
             .map(|_| ())
     }
@@ -183,5 +202,27 @@ impl UsbFs for Usbdevfs {
 
     fn get_speed(&self) -> io::Result<c_int> {
         self.ioctl(sys::USBDEVFS_GET_SPEED)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review usb.md F1: the claim must not take the interface from another
+    /// usbdevfs user. The kernel compares `driver` with `strncmp` over the
+    /// whole field, so the name must be NUL-terminated inside it.
+    #[test]
+    fn a_claim_leaves_the_claim_of_another_usbfs_user_alone() {
+        let request = disconnect_claim_request(3);
+        assert_eq!(request.interface, 3);
+        assert_eq!(
+            request.flags,
+            sys::USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER,
+            "without EXCEPT_DRIVER the kernel releases any driver on the interface, \
+             another process's usbfs claim included"
+        );
+        let end = request.driver.iter().position(|b| *b == 0);
+        assert_eq!(end.map(|end| &request.driver[..end]), Some(&b"usbfs"[..]));
     }
 }

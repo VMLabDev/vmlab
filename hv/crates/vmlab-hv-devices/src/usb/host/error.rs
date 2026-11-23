@@ -21,6 +21,11 @@ pub enum Error {
     InvalidIsochronousParameters,
     #[error("USB ioctl 0x{0:x} failed: {1}")]
     IoctlFailed(u32, io::Error),
+    #[error(
+        "the interface is held by another program through usbfs (another VM, or a libusb \
+         program on the host); detach it there first"
+    )]
+    InterfaceHeld,
     #[error("device has been removed")]
     NoDevice,
     #[error("requested descriptor not found")]
