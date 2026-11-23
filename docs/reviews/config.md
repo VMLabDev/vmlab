@@ -42,7 +42,7 @@ The findings are ranked against these three facts, which the code states:
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
 | F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
 | F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites (fixed, card #569) |
-| F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name |
+| F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name (fixed, card #577) |
 | F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
 | F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header (fixed, card #570) |
 | F13 | wrong result | `@dev` arguments are not validated: a relative `workspace_guest`, a missing `workspace` (fixed, card #570) |
@@ -340,7 +340,7 @@ is refused at launch, because the file format has no escape for one.
   before the fix and passes after. The container argv
   (`src/qemu/container.rs`) is not part of this fix.
 
-### F10. Names that differ only in case share one DNS name (wrong result)
+### F10. Names that differ only in case share one DNS name (wrong result, fixed by #577)
 
 - Where: `src/config/validate.rs:247-262` and `:391-400` (a case-sensitive
   `HashSet`), `:111-119` (segments), `:2090-2105` (`check_dns_label` accepts
@@ -358,6 +358,8 @@ is refused at launch, because the file format has no escape for one.
   2. Unit test in `src/net/dns.rs`: `register("Web", a)` then
      `register("web", b)` (`:160`), and resolve `web.<zone>`. It gives `b`,
      and no name gives `a`.
+- Fix: validation compares machine and segment names using ASCII lowercase
+  keys, preserving the declared spelling in diagnostics and references.
 
 ### F11. A malformed `dns_upstream` falls back without a word (wrong result)
 

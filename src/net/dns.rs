@@ -737,6 +737,16 @@ mod tests {
     }
 
     #[test]
+    fn registrations_that_differ_only_in_case_share_one_record() {
+        let mut z = DnsZone::new("vmlab.internal");
+        z.register("Web", ip(10));
+        assert_eq!(z.lookup("web.vmlab.internal"), DnsAnswer::A(ip(10)));
+        z.register("web", ip(11));
+        assert_eq!(z.lookup("web.vmlab.internal"), DnsAnswer::A(ip(11)));
+        assert_eq!(z.lookup("Web.vmlab.internal"), DnsAnswer::A(ip(11)));
+    }
+
+    #[test]
     fn lookup_precedence_matrix() {
         let mut z = DnsZone::new("vmlab.internal");
         z.upstream = Some(upstream());
