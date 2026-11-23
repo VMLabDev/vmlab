@@ -479,6 +479,7 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
         );
     }
     control(&mut client, Control::Resume);
+    let resumed = Instant::now();
     let timeout = Duration::from_secs(
         std::env::var("VMLAB_HV_TEMPLATE_TIMEOUT")
             .ok()
@@ -500,6 +501,10 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     assert_eq!(
         exec(&mut guest, "printf macos-agent-ready"),
         "macos-agent-ready"
+    );
+    eprintln!(
+        "macOS P1 agent answered {:.1} s after resume",
+        resumed.elapsed().as_secs_f64()
     );
     // This boot drew a slide that fits; without the quirk the next one may not.
     assert_eq!(
