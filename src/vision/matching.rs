@@ -118,7 +118,6 @@ fn squared_error(actual: &[u8], expected: &[u8]) -> u32 {
         .sum()
 }
 
-
 /// Find the smallest sum of squared RGB channel differences in budget.
 fn search_best(
     screen: &RgbImage,
