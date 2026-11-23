@@ -81,8 +81,8 @@ SH
   p <<'DOC'
 An attach checks, in order: the VM is running and has the controller; the
 selector names one device; no other VM, in any lab, holds it; the device is
-not a keyboard or mouse; and vmlab can open its device node. Two of these
-need a word.
+not a keyboard or mouse; the host has no filesystem mounted from it; and
+vmlab can open its device node. Three of these need a word.
 DOC
 
   p <<'DOC'
@@ -91,6 +91,14 @@ is refused unless you pass `--force`, because the host is probably using it
 and loses it while the VM has it. A wireless receiver often carries both
 interfaces and is named a keyboard. Do not attach the host's only keyboard:
 with it gone there is nothing left to type the detach with.
+DOC
+
+  p <<'DOC'
+**Mounted disks.** A USB disk the host has a filesystem mounted from is
+refused too, with the block device and the mount point named: `sdb1 at
+/run/media/you/STICK`. An attach takes the disk from the host at once, so
+whatever the host had not written to it yet is lost. Unmount it on the host
+first. `--force` attaches it anyway.
 DOC
 
   p <<'DOC'

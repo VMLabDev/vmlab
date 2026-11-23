@@ -1252,7 +1252,8 @@ pub fn lab_module() -> Module {
         // Host USB passthrough (§5.2.1). `force` is its own verb, as
         // `restore_discarding_workspace` is: wscript has no optional
         // arguments, and `usb_attach(sel, true)` would not say what the
-        // `true` overrides — taking the host's keyboard or mouse away.
+        // `true` overrides — taking the host's keyboard, mouse or mounted
+        // disk away.
         .method(
             "usb_attach",
             |h: &MachineHandle, selector: &str| -> Result<ScriptUsbDevice, String> {

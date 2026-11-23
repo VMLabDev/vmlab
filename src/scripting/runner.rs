@@ -348,18 +348,13 @@ impl SegmentHandle {
             u16::try_from(host_port).map_err(|_| "host_port out of range".to_string())?;
         let guest_port =
             u16::try_from(guest_port).map_err(|_| "guest_port out of range".to_string())?;
-        // Resolve the target VM's leased IP on this segment.
-        let guest_ip = super::cancel::block_on(&self.rt, async {
-            self.runtime
-                .machine(vm)
-                .map_err(|e| format!("{e:#}"))?
-                .guest_ip(None)
-                .await
-                .map_err(|e| format!("{e:#}"))
-        })?;
-        let guest_ip: std::net::Ipv4Addr = guest_ip
-            .parse()
-            .map_err(|_| format!("vm {vm} has no IPv4 lease yet"))?;
+        // The address the segment's DHCP server leased to the VM's NIC on
+        // this segment, not the one its guest reports
+        // (docs/reviews/wscript.md F1).
+        let (guest_ip, guest_mac) = super::cancel::block_on(
+            &self.rt,
+            self.runtime.script_forward_target(&self.segment, vm),
+        )?;
         use crate::config::model::Proto;
         use crate::freeze::ports;
         // Under worktree isolation a forward binds loopback only (§21.4),
@@ -390,8 +385,15 @@ impl SegmentHandle {
         let port = family.as_ref().map_or(host_port, |(_, _, port)| *port);
         let host_addr = std::net::SocketAddr::from((bind, port));
         let id = self.with_services(|s| {
-            s.add_forward(host_addr, guest_ip, guest_port, Proto::Tcp)
-                .map(|(id, _)| id as i64)
+            let id = s
+                .add_forward(host_addr, guest_ip, guest_port, Proto::Tcp)
+                .map(|(id, _)| id as i64)?;
+            // As a declared forward does: the engine frames what it sends to
+            // this address to the NIC that holds it.
+            if let Some(mac) = guest_mac {
+                s.learn_mac(guest_ip, mac);
+            }
+            Ok(id)
         })?;
         if let Some((locked, record, _)) = family {
             locked.save(&record).map_err(|e| format!("{e:#}"))?;
