@@ -919,6 +919,107 @@ mod tests {
         assert!(!daemon_running(pid, None));
     }
 
+    const LIVE_DAEMON_HELPER: &str = "VMLAB_TEST_LIVE_DAEMON_ROOT";
+
+    /// Review F7 (card #561): a daemon whose socket does not answer can
+    /// still run — starting, or with its socket file gone. A release must
+    /// stop it or keep its entry, never forget it while it runs.
+    #[test]
+    fn a_release_does_not_forget_a_live_daemon() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::live_daemon_release_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LIVE_DAEMON_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths: a supervisor with one `running` entry whose pid and
+    /// start time name a live helper process, and no socket at the lab's
+    /// path.
+    #[test]
+    #[ignore = "subprocess helper for a_release_does_not_forget_a_live_daemon"]
+    fn live_daemon_release_helper() {
+        use std::sync::Arc;
+
+        let Some(root) = std::env::var_os(LIVE_DAEMON_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let name = "f7-silent";
+            assert!(!crate::paths::lab_socket(name).exists());
+            let mut helper = tokio::process::Command::new("sleep")
+                .arg("1000")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = helper.id().unwrap();
+            // Reap the helper the moment it exits, as the supervisor's
+            // reaper reaps a daemon it spawned.
+            let reaper = tokio::spawn(async move {
+                let _ = helper.wait().await;
+            });
+
+            let host = crate::config::host::HostConfig::default();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: name.into(),
+                    root: root.clone(),
+                    pid,
+                    started: process_start_time(pid),
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+
+            supervisor.release_lab(name).await.unwrap();
+
+            let registered = supervisor.registry.lock().await.get(name).is_some();
+            let running = process_start_time(pid).is_some();
+            if running {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = reaper.await;
+            assert!(
+                !running || registered,
+                "the release forgot daemon {pid}, which still runs"
+            );
+        });
+    }
+
     const BUILD_INSPECTION_HELPER: &str = "VMLAB_TEST_BUILD_INSPECTION_ROOT";
 
     #[test]
