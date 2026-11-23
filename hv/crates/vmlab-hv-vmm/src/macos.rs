@@ -357,7 +357,11 @@ mod tests {
 
     #[test]
     fn macos_table_is_sorted_and_answers_only_its_own_indices() {
-        assert!(MACOS_MSRS.windows(2).all(|pair| pair[0].index < pair[1].index));
+        assert!(
+            MACOS_MSRS
+                .windows(2)
+                .all(|pair| pair[0].index < pair[1].index)
+        );
         for entry in MACOS_MSRS {
             assert_eq!(
                 msr_action(MsrPolicy::Macos, entry.index, MsrExitReason::Unknown, false),
@@ -470,7 +474,13 @@ mod tests {
             (None, None)
         );
         assert_eq!(
-            answer(MsrPolicy::Macos, &mut seen, 0xe8, MsrExitReason::Inval, false),
+            answer(
+                MsrPolicy::Macos,
+                &mut seen,
+                0xe8,
+                MsrExitReason::Inval,
+                false
+            ),
             (None, None)
         );
         assert_eq!(
