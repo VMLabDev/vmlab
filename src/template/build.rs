@@ -511,6 +511,11 @@ async fn build_variant(
     runtime
         .agent_updates
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // A build's guest runs an installer, and Windows 9x Setup reads a host
+    // hello on COM1 as a serial mouse: the host stays silent there (#678).
+    runtime
+        .fallback_hello
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // The base boots an installed OS whose agent answers promptly, as a
     // layered source does: verify it before the variant's first step.
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
@@ -1137,6 +1142,11 @@ async fn run_build(
     runtime
         .agent_updates
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // A build's guest runs an installer, and Windows 9x Setup reads a host
+    // hello on COM1 as a serial mouse: the host stays silent there (#678).
+    runtime
+        .fallback_hello
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     let agent_version: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
     let verify_concurrent = matches!(
@@ -1331,6 +1341,9 @@ async fn run_build(
             crate::labd::lab::LabRuntime::build(labfile, event_log, profiles),
         )
         .await?;
+        runtime2
+            .fallback_hello
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let vm2 = runtime2.vm(build_vm)?;
         let _inspection =
             Inspection::open(&runtime2, &vm2, run.control.inspectable.clone(), log).await?;
