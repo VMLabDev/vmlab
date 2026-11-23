@@ -83,6 +83,7 @@ host {
 | `viewer` | utf8 | none (auto-detected) | VNC viewer command; `{}` is replaced by the target. |
 | `waypipe` | utf8 | `waypipe` on `PATH` | Path to the host's waypipe client for shared apps from Linux guests (cli-machine.md, `vmlab app`). Read by the CLI itself, so no restart; not checked until `app run` starts it. |
 | `freerdp` | utf8 | `xfreerdp3`, then `xfreerdp`, on `PATH` | Path to the FreeRDP 3 client for shared apps from Windows guests (cli-machine.md, `vmlab app`). Read by the CLI itself, so no restart; not checked until `app run` starts it. |
+| `app_x11_fallback` | bool | `false` | Let `vmlab app run` fall back from waypipe to X11 when the guest reports no waypipe. The guest answers that question and X11 gives the guest program access to the host's X server, so `false` refuses and names `--via x11` (cli-machine.md, `vmlab app`). Read by the CLI itself, so no restart. |
 | `ffmpeg` | utf8 | `ffmpeg` on `PATH` | Path to the ffmpeg that encodes console recordings (cli-machine.md, `vmlab record`); needs `libx264` for `.mp4`, `libvpx-vp9` for `.webm`. Read by the lab daemon when a recording starts and checked then (`-encoders`); never looked for at `up` without `--record`. |
 | `fastpath` | utf8 | `auto` | Network fast path: `auto` probes, `off` forces userspace, `sockmap` and `afxdp` force a kernel tier. |
 | `oci_chunk_size` | ByteSize | `512MiB` | OCI layer chunk size for `vmlab template push` (see templates.md). |

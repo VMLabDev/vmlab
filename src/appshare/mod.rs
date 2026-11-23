@@ -114,6 +114,9 @@ pub struct HostEnv {
     pub waypipe: Option<PathBuf>,
     /// The FreeRDP client, from host config or `PATH`.
     pub freerdp: Option<PathBuf>,
+    /// The host config's `app_x11_fallback`: a guest without waypipe may be
+    /// shared over X11 without `--via x11` (PRD §20.1).
+    pub x11_fallback: bool,
 }
 
 impl HostEnv {
@@ -131,6 +134,7 @@ impl HostEnv {
                 .freerdp
                 .or_else(|| on_path("xfreerdp3"))
                 .or_else(|| on_path("xfreerdp")),
+            x11_fallback: cfg.app_x11_fallback,
         }
     }
 }
@@ -239,15 +243,46 @@ const NO_HOST_WAYPIPE: &str = "this host has no `waypipe` on PATH (or `waypipe` 
 /// Whether a refusal from the lab daemon falls back to X11, and the notice
 /// that says so (PRD §20.1): the daemon answers `unsupported` when the guest
 /// has no waypipe for the login, and the CLI falls back when it chose waypipe
-/// itself and the host has `DISPLAY` set.
+/// itself, the host has `DISPLAY` set, and the host config allows it with
+/// `app_x11_fallback = true`.
+///
+/// The guest answers the daemon's waypipe probe, so without that setting a
+/// fallback would let the guest choose the one transport that opens the
+/// host's X server to it (PRD §1.2). The X11 transport is the user's to opt
+/// into.
 pub fn daemon_fallback(
     mode: Mode,
     via: Option<Mode>,
     host: &HostEnv,
     refusal: &CommandError,
 ) -> Option<String> {
-    (mode == Mode::Waypipe && via.is_none() && host.x11 && refusal.code == ErrorCode::Unsupported)
+    (guest_lacks_waypipe(mode, via, refusal) && host.x11 && host.x11_fallback)
         .then(|| format!("{}; falling back to X11 through Xwayland", refusal.message))
+}
+
+/// The refusal [`run`] reports when [`daemon_fallback`] gave none: the
+/// daemon's own, with the two ways to X11 named when only the user's consent
+/// is missing.
+fn without_fallback(
+    mode: Mode,
+    via: Option<Mode>,
+    host: &HostEnv,
+    mut refusal: CommandError,
+) -> CommandError {
+    if guest_lacks_waypipe(mode, via, &refusal) && host.x11 && !host.x11_fallback {
+        refusal.message.push_str(NO_X11_CONSENT);
+    }
+    refusal
+}
+
+const NO_X11_CONSENT: &str = "; X11 gives the guest program access to this desktop's X server, \
+     so vmlab does not fall back to it on the guest's word: pass `--via x11`, or set \
+     `app_x11_fallback = true` in config.wcl";
+
+/// The one refusal a fallback can follow: the CLI chose waypipe itself and
+/// the daemon says the guest has none.
+fn guest_lacks_waypipe(mode: Mode, via: Option<Mode>, refusal: &CommandError) -> bool {
+    mode == Mode::Waypipe && via.is_none() && refusal.code == ErrorCode::Unsupported
 }
 
 /// One `app run`, as the command line spelled it.
@@ -271,7 +306,7 @@ pub struct Request {
 ///
 /// `selected` is [`select_mode`]'s answer. A waypipe session the daemon
 /// refuses because the guest has no waypipe is reopened as X11 when
-/// [`daemon_fallback`] says so.
+/// [`daemon_fallback`] says so, which takes the host config's consent.
 pub async fn run(
     client: &LabClient,
     req: &Request,
@@ -289,7 +324,7 @@ pub async fn run(
                     Attempt::Refused(refusal) => Err(refusal.into()),
                 }
             }
-            None => Err(refusal.into()),
+            None => Err(without_fallback(selected, via, host, refusal).into()),
         },
     }
 }
@@ -549,6 +584,15 @@ mod tests {
             x11,
             waypipe: waypipe.then(|| PathBuf::from("/usr/bin/waypipe")),
             freerdp: freerdp.then(|| PathBuf::from("/usr/bin/xfreerdp3")),
+            x11_fallback: false,
+        }
+    }
+
+    /// `host` with `app_x11_fallback = true` in the host config.
+    fn consenting(host: HostEnv) -> HostEnv {
+        HostEnv {
+            x11_fallback: true,
+            ..host
         }
     }
 
@@ -684,15 +728,15 @@ mod tests {
     }
 
     /// The daemon's `unsupported` for a guest without waypipe falls back to
-    /// X11 only when the CLI chose waypipe itself and `DISPLAY` is set, and
-    /// the notice carries the daemon's reason.
+    /// X11 only when the host config allows it, the CLI chose waypipe itself
+    /// and `DISPLAY` is set, and the notice carries the daemon's reason.
     #[test]
     fn a_guest_without_waypipe_falls_back_only_when_waypipe_was_not_forced() {
         let refusal = CommandError::new(
             ErrorCode::Unsupported,
             "`web` has no `waypipe` on PATH for `dev`",
         );
-        let both = host(true, true, true, false);
+        let both = consenting(host(true, true, true, false));
         assert_eq!(
             daemon_fallback(Mode::Waypipe, None, &both, &refusal).as_deref(),
             Some("`web` has no `waypipe` on PATH for `dev`; falling back to X11 through Xwayland")
@@ -705,13 +749,67 @@ mod tests {
             daemon_fallback(
                 Mode::Waypipe,
                 None,
-                &host(true, false, true, false),
+                &consenting(host(true, false, true, false)),
                 &refusal
             ),
             None
         );
         let other = CommandError::new(ErrorCode::NotFound, "no machine `web`");
         assert_eq!(daemon_fallback(Mode::Waypipe, None, &both, &other), None);
+    }
+
+    /// The guest answers the waypipe probe, so its refusal alone never picks
+    /// X11 (review appshare-media F2): the fallback needs the host config's
+    /// `app_x11_fallback`.
+    #[test]
+    fn a_guest_refusal_does_not_select_x11_unasked() {
+        let unsupported = CommandError::new(
+            ErrorCode::Unsupported,
+            "`web` has no `waypipe` on PATH for `dev`",
+        );
+        let unasked = host(true, true, true, true);
+        assert_eq!(
+            daemon_fallback(Mode::Waypipe, None, &unasked, &unsupported),
+            None
+        );
+        assert!(daemon_fallback(Mode::Waypipe, None, &consenting(unasked), &unsupported).is_some());
+    }
+
+    /// The refusal that takes the fallback's place names both ways to X11,
+    /// and only where consent is all that is missing.
+    #[test]
+    fn a_refused_fallback_names_the_two_ways_to_x11() {
+        let unsupported = || {
+            CommandError::new(
+                ErrorCode::Unsupported,
+                "`web` has no `waypipe` on PATH for `dev`",
+            )
+        };
+        let unasked = host(true, true, true, true);
+        let told = without_fallback(Mode::Waypipe, None, &unasked, unsupported());
+        assert_eq!(told.code, ErrorCode::Unsupported);
+        assert_eq!(
+            told.message,
+            "`web` has no `waypipe` on PATH for `dev`; X11 gives the guest program access to \
+             this desktop's X server, so vmlab does not fall back to it on the guest's word: \
+             pass `--via x11`, or set `app_x11_fallback = true` in config.wcl"
+        );
+        // `--via waypipe` asked for no fallback, and with no `DISPLAY` there
+        // is no X11 to name.
+        for (via, host) in [
+            (Some(Mode::Waypipe), unasked.clone()),
+            (None, host(true, false, true, true)),
+        ] {
+            assert_eq!(
+                without_fallback(Mode::Waypipe, via, &host, unsupported()).message,
+                "`web` has no `waypipe` on PATH for `dev`"
+            );
+        }
+        let other = CommandError::new(ErrorCode::NotFound, "no machine `web`");
+        assert_eq!(
+            without_fallback(Mode::Waypipe, None, &unasked, other).message,
+            "no machine `web`"
+        );
     }
 
     /// The guest family follows the profile name, the way `labd::guest_os`
