@@ -118,6 +118,108 @@ pub struct Closure {
     pub captures: Vec<Rc<RefCell<Value>>>,
 }
 
+// Freeing a value must not recurse once per nesting level: a script can
+// link a struct to an `Option` of itself to any depth in a loop, and a
+// recursive drop of that chain overflows the native stack, which ends the
+// process instead of faulting the script. Every type a value can nest
+// through without limit is nominal (a struct or an enum), a closure or a
+// `dyn` object, so each of these four hands the values it holds to
+// `release` rather than dropping them in its own frame. What is left to
+// plain recursion (lists, maps and cells directly inside one another) is
+// bounded by the static type of the value.
+
+struct Pending {
+    /// A `release` further up this thread's stack is emptying `queue`.
+    draining: bool,
+    queue: Vec<Value>,
+}
+
+thread_local! {
+    static PENDING: RefCell<Pending> = const {
+        RefCell::new(Pending {
+            draining: false,
+            queue: Vec::new(),
+        })
+    };
+}
+
+/// Free `values` in constant native stack depth. The outermost call on a
+/// thread drops them one at a time from a queue; a call made from inside one
+/// of those drops only adds to the queue and returns.
+fn release(mut values: Vec<Value>) {
+    // A value that holds no other value is dropped here, in place.
+    values.retain(Value::holds_values);
+    if values.is_empty() {
+        return;
+    }
+    let outermost = PENDING.try_with(|p| {
+        // No borrow of `PENDING` is ever held across the drop of a value.
+        let mut p = p.borrow_mut();
+        let outermost = !p.draining;
+        p.draining = true;
+        p.queue.append(&mut values);
+        outermost
+    });
+    match outermost {
+        Ok(true) => {}
+        Ok(false) => return,
+        // The thread is ending and its queue is gone: `values` still holds
+        // everything, and drops the old way as this function returns.
+        Err(_) => return,
+    }
+
+    struct Drained;
+    impl Drop for Drained {
+        fn drop(&mut self) {
+            let _ = PENDING.try_with(|p| {
+                let mut p = p.borrow_mut();
+                p.draining = false;
+                if p.queue.capacity() > 4096 {
+                    p.queue.shrink_to(4096);
+                }
+            });
+        }
+    }
+    // Also on a panic out of a host value's own `Drop`, so the next
+    // `release` on this thread drains again.
+    let _drained = Drained;
+    loop {
+        let next = PENDING.with(|p| p.borrow_mut().queue.pop());
+        match next {
+            Some(value) => drop(value),
+            None => break,
+        }
+    }
+}
+
+impl Drop for StructInstance {
+    fn drop(&mut self) {
+        release(std::mem::take(self.fields.get_mut()));
+    }
+}
+
+impl Drop for EnumInstance {
+    fn drop(&mut self) {
+        release(std::mem::take(self.fields.get_mut()));
+    }
+}
+
+impl Drop for Closure {
+    fn drop(&mut self) {
+        if !self.captures.is_empty() {
+            release(self.captures.drain(..).map(Value::Cell).collect());
+        }
+    }
+}
+
+impl Drop for DynObj {
+    fn drop(&mut self) {
+        if self.inner.holds_values() {
+            release(vec![std::mem::replace(&mut self.inner, Value::Unit)]);
+        }
+    }
+}
+
 /// A live host value held by handle. Borrow conflicts at the host boundary
 /// surface as `Err`, never panics (PRD §6.5) — hence `try_borrow` at every
 /// access site.
@@ -165,6 +267,20 @@ impl WeakValue {
 }
 
 impl Value {
+    /// Whether dropping this value can drop another value.
+    fn holds_values(&self) -> bool {
+        matches!(
+            self,
+            Value::List(_)
+                | Value::Map(_)
+                | Value::Struct(_)
+                | Value::Enum(_)
+                | Value::Closure(_)
+                | Value::Dyn(_)
+                | Value::Cell(_)
+        )
+    }
+
     pub fn from_const(c: &Const) -> Value {
         match c {
             Const::Unit => Value::Unit,

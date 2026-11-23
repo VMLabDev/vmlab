@@ -50,7 +50,7 @@ test does not reproduce is wrong and should be dropped.
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
-| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon |
+| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666) |
 | F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped |
 | F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it |
 | F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
@@ -137,6 +137,14 @@ test does not reproduce is wrong and should be dropped.
 
   Expected: the run returns, with or without a fault. Today: the child dies
   on SIGABRT.
+- Fixed in card #666. `Value` is defined in the vendored `wscript-core`
+  (`vendor/wscript-core/src/value.rs`). A struct, an enum, a closure and a
+  `dyn` object now hand the values they hold to `release`, which frees them
+  from a queue, one at a time, instead of by recursion. A value can nest
+  without limit only through one of these four, so the native stack a drop
+  uses no longer grows with the depth of the value. The test builds 300,000
+  nodes, not 3,000,000: that is far past the overflow on a 2 MiB stack and
+  takes a tenth of the memory. Before the fix the child died on SIGABRT.
 
 ### F3. A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (wrong result)
 
