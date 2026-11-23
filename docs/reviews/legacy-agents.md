@@ -122,7 +122,7 @@ Not read:
   runs it under Wine with COM1 on a pty, and it is skipped on a host that
   has neither. Not run on a real Windows guest.
 
-### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory
+### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory (fixed, card #721)
 
 - Where: `guest/agent-legacy/src/plat_dos.c:211-215`. The results of
   `_dos_setdrive` and `chdir` are not looked at.
@@ -135,13 +135,15 @@ Not read:
   from arithmetic on the character.
 - Severity: data loss. Wire only today: no host caller sends a `cwd`.
 - Confidence: high for the ignored results.
-- Test: a check `exec refuses a missing cwd` in
-  `src/labd/agent_conformance.rs`: `open_exec` of `CD` (DOS) or `pwd` with
-  a `cwd` that does not exist, assert an error reply or an exit code that
-  is not 0 with text that names the directory. Run it against the agent
-  socket of a FreeDOS guest (the external-socket mode of the fixture).
-  Today the DOS agent prints its own directory and exits 0. The same check
-  on the POSIX build in CI covers F13.
+- Test: `dos_exec_refuses_missing_cwd` in `src/labd/agent_conformance.rs`
+  opens `CD` with a missing directory on a FreeDOS guest through the
+  fixture's external socket. It requires an error reply or nonzero exit,
+  with a diagnostic naming the directory. Before the fix, the agent
+  printed its current directory and exited 0.
+- Fixed by card #721. The DOS adapter validates the drive letter, verifies
+  the selected drive and checks `chdir` before launching a child. It restores
+  the original directory and returns an exec error naming the requested path
+  when the directory change fails.
 
 ### F3. The NT install puts a SYSTEM service binary in a directory with inherited permissions
 
