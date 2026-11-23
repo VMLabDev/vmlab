@@ -51,6 +51,12 @@ block overrides the ICD choice when the driver name is not enough. A
 `host_gpu` the host does not declare makes `vmlab validate` warn and fall
 back to the default GPU.
 
+In GPU passthrough mode on x86, a `win3d` template variant uses standard
+VGA in place of an inherited VirtIO display for its boot console. The
+Win3D driver requires 3D support, and standard VGA has a PCI identity
+that the Win3D driver does not match. An explicit VM `display` still
+selects the console.
+
 A lab for the package:
 
 ```wcl

@@ -11,7 +11,8 @@
 use std::path::PathBuf;
 
 use crate::config::model::{
-    AccelMode, Container, Firmware, Gpu, InputDevices, SecureBootKeys, TemplateRef, TscMode, Vm,
+    AccelMode, Container, Firmware, Gpu, GpuMode, InputDevices, SecureBootKeys, TemplateRef,
+    TscMode, Vm,
 };
 use crate::profiles::{
     AgentTransport, DiskBus, FirmwareKind, InputTransport, Machine, Profile, ProfileSet,
@@ -526,6 +527,20 @@ pub fn resolve_vm(
     template: Option<&TemplateMeta>,
     profiles: &ProfileSet,
 ) -> anyhow::Result<ResolvedVm> {
+    resolve_vm_for_variant(
+        lab_vm,
+        template,
+        lab_vm.template.variant().map(|variant| variant.as_str()),
+        profiles,
+    )
+}
+
+pub(crate) fn resolve_vm_for_variant(
+    lab_vm: &Vm,
+    template: Option<&TemplateMeta>,
+    variant: Option<&str>,
+    profiles: &ProfileSet,
+) -> anyhow::Result<ResolvedVm> {
     // Refused whether or not this VM restates `display`: the string would be
     // the device of the next VM that does not.
     if let Some(t) = template {
@@ -657,12 +672,26 @@ pub fn resolve_vm(
         }
     }
 
+    let inherited_display = template
+        .and_then(|t| t.display.as_deref())
+        .or(profile.display.as_deref());
+    // The Win3D INF also matches plain virtio GPUs, but its driver needs
+    // the 3D feature. Standard VGA gives passthrough guests a boot console
+    // with a separate PCI identity.
+    let inherited_display = if variant == Some("win3d")
+        && qemu_arch(&arch) == "x86_64"
+        && lab_vm.gpu.as_ref().is_some_and(|g| g.mode == GpuMode::Passthrough)
+        && matches!(inherited_display, Some("virtio-vga" | "virtio-gpu" | "virtio-gpu-pci"))
+    {
+        Some("std")
+    } else {
+        inherited_display
+    };
     let display_device = lab_vm
         .display
-        .clone()
-        .or_else(|| template.and_then(|t| t.display.clone()))
-        .or_else(|| profile.display.clone())
-        .map(|d| display_device_name(&d, &arch));
+        .as_deref()
+        .or(inherited_display)
+        .map(|d| display_device_name(d, &arch));
 
     Ok(ResolvedVm {
         name: lab_vm.name.clone(),
@@ -934,6 +963,28 @@ mod tests {
         m.display = None;
         let r = resolve_vm(&own, Some(&m), &profiles).unwrap();
         assert_eq!(r.display_device.as_deref(), Some("bochs-display,vgamem=8M"));
+    }
+
+    #[test]
+    fn win3d_passthrough_uses_standard_vga_for_the_inherited_console() {
+        let profiles = ProfileSet::shipped().unwrap();
+        let mut v = vm(
+            r#"vm "a" { template = "x86_64/win" gpu { mode = "passthrough" } }"#,
+        );
+        let mut m = meta();
+        m.display = Some("virtio-vga".into());
+        let display = |vm, variant| {
+            resolve_vm_for_variant(vm, Some(&m), variant, &profiles)
+                .unwrap()
+                .display_device
+        };
+        assert_eq!(display(&v, Some("win3d")).as_deref(), Some("VGA"));
+        assert_eq!(display(&v, Some("standard")).as_deref(), Some("virtio-vga"));
+        v.display = Some("virtio-vga".into());
+        assert_eq!(display(&v, Some("win3d")).as_deref(), Some("virtio-vga"));
+        v.display = None;
+        v.gpu.as_mut().unwrap().mode = GpuMode::Vulkan;
+        assert_eq!(display(&v, Some("win3d")).as_deref(), Some("virtio-vga"));
     }
 
     /// Shipped profiles plus one user profile, `period`, that pins a CPU

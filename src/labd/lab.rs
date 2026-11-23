@@ -877,8 +877,12 @@ impl LabRuntime {
             let resolved = version
                 .select(vm_cfg.template.variant(), Purpose::Lab)
                 .with_context(|| format!("vm \"{vm_name}\""))?;
-            let resolved_vm =
-                crate::qemu::resolve_vm(vm_cfg, Some(&resolved.meta), &self.profiles)?;
+            let resolved_vm = crate::qemu::resolve::resolve_vm_for_variant(
+                vm_cfg,
+                Some(&resolved.meta),
+                resolved.variant.as_deref(),
+                &self.profiles,
+            )?;
             // kind-aware: binding a downloaded template needs the concrete
             // type that holds one. Not a decision — this path only ever runs
             // for a machine whose artefact is a template.
