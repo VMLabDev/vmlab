@@ -270,6 +270,11 @@ Not read:
 - Severity: security against a peer (another user of the host). PRD §1.2
   says vmlab serves one trusted host user, which lowers this.
 - Confidence: high.
+- Status: fixed by card #733. The helper's command line holds
+  `--password-stdin` in place of the password, and `vmlab app run --detach`
+  writes the password to the helper's stdin, a pipe it then closes. The
+  proof test `the_detached_helper_argv_holds_no_password` failed before the
+  fix and passes after it.
 
 ### F9. The X11 proxy sends the host's real cookie to whoever holds the abstract socket name
 

@@ -43,9 +43,15 @@ pub struct RunArgs {
     pub cmd: Vec<String>,
 }
 
+/// The flag that tells the hidden helper its password is on stdin.
+const PASSWORD_STDIN: &str = "--password-stdin";
+
 impl RunArgs {
     /// The arguments the detached helper is re-executed with: these, less
-    /// `--detach`.
+    /// `--detach`, and less the password. A command line is readable by
+    /// every local user for as long as the helper lives, so the password
+    /// travels on the helper's stdin ([`RunArgs::helper_stdin`]) and the
+    /// argv only says that it is there.
     fn helper_args(&self) -> Vec<String> {
         let mut out = vec![HELPER_VERB.to_string(), self.machine.clone()];
         if let Some(via) = self.via {
@@ -60,13 +66,52 @@ impl RunArgs {
         if let Some(user) = &self.run_as.user {
             out.extend(["--user".into(), user.clone()]);
         }
-        if let Some(password) = &self.run_as.password {
-            out.extend(["--password".into(), password.clone()]);
+        if self.run_as.password.is_some() {
+            out.push(PASSWORD_STDIN.into());
         }
         out.push("--".into());
         out.extend(self.cmd.iter().cloned());
         out
     }
+
+    /// What the detached helper is handed on stdin: the password, exactly,
+    /// when there is one.
+    fn helper_stdin(&self) -> Option<&str> {
+        self.run_as.password.as_deref()
+    }
+}
+
+/// The hidden helper's arguments: `vmlab app run`'s, with the password on
+/// stdin instead of the command line.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+pub struct HelperArgs {
+    #[command(flatten)]
+    pub run: RunArgs,
+    /// The password is the whole of stdin
+    #[arg(long, requires = "user", conflicts_with = "password")]
+    pub password_stdin: bool,
+}
+
+impl HelperArgs {
+    /// The request the helper runs: its arguments, with the password read
+    /// from `stdin` (to its end, byte for byte) when the argv says so.
+    fn resolve(self, mut stdin: impl std::io::Read) -> Result<RunArgs> {
+        let mut run = self.run;
+        if self.password_stdin {
+            let mut password = String::new();
+            stdin
+                .read_to_string(&mut password)
+                .context("reading the password from stdin")?;
+            run.run_as.password = Some(password);
+        }
+        Ok(run)
+    }
+}
+
+/// The hidden helper verb: `vmlab app run` with the password taken off
+/// stdin.
+pub fn cmd_app_session(args: HelperArgs) -> Result<()> {
+    cmd_app_run(args.resolve(std::io::stdin().lock())?)
 }
 
 /// `vmlab app run` — show a guest program's windows on this desktop, and exit
@@ -150,12 +195,29 @@ fn spawn_helper(args: &RunArgs) -> Result<()> {
         }
         None => Command::new(&exe),
     };
-    cmd.args(args.helper_args())
-        .stdin(Stdio::null())
+    // The password goes down a pipe the helper reads to its end; with none,
+    // stdin is null as it always was.
+    let secret = args.helper_stdin();
+    let mut child = cmd
+        .args(args.helper_args())
+        .stdin(if secret.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("spawning the background app session")?;
+    if let Some(secret) = secret {
+        use std::io::Write;
+        // Dropping the handle closes the pipe, which is the helper's end of
+        // input.
+        let mut stdin = child.stdin.take().context("the helper's stdin pipe")?;
+        stdin
+            .write_all(secret.as_bytes())
+            .context("handing the password to the background app session")?;
+    }
     Ok(())
 }
 
@@ -180,14 +242,11 @@ mod tests {
     #[derive(clap::Subcommand)]
     enum Verb {
         #[command(name = "__appsession")]
-        Session(RunArgs),
+        Session(HelperArgs),
     }
 
-    /// The detached helper is re-executed with everything the user typed but
-    /// `--detach`, and parses back to the same request.
-    #[test]
-    fn the_detached_helper_gets_the_same_arguments_less_detach() {
-        let typed = RunArgs {
+    fn typed(password: Option<&str>) -> RunArgs {
+        RunArgs {
             machine: "lab/web".into(),
             via: Some(Mode::X11),
             detach: true,
@@ -195,19 +254,36 @@ mod tests {
             cwd: Some("/srv".into()),
             run_as: As {
                 user: Some("dev".into()),
-                password: Some("pw".into()),
+                password: password.map(str::to_string),
             },
             cmd: vec!["foot".into(), "--hold".into(), "-e".into(), "top".into()],
-        };
+        }
+    }
+
+    fn reparsed(typed: &RunArgs) -> RunArgs {
         let argv = std::iter::once("vmlab".to_string()).chain(typed.helper_args());
         let Verb::Session(parsed) = Helper::parse_from(argv).verb;
-        assert_eq!(
-            parsed,
-            RunArgs {
-                detach: false,
-                ..typed
-            }
-        );
+        parsed
+            .resolve(typed.helper_stdin().unwrap_or("").as_bytes())
+            .unwrap()
+    }
+
+    /// The detached helper is re-executed with everything the user typed but
+    /// `--detach`, and — with what it reads from stdin — comes back to the
+    /// same request.
+    #[test]
+    fn the_detached_helper_gets_the_same_arguments_less_detach() {
+        // A password that a line-based or trimming reader would damage.
+        for password in [Some("pw"), Some(" p w\n"), Some(""), None] {
+            let typed = typed(password);
+            assert_eq!(
+                reparsed(&typed),
+                RunArgs {
+                    detach: false,
+                    ..typed
+                }
+            );
+        }
     }
 
     /// Review appshare-media F8: every local user can read the helper's
@@ -215,22 +291,21 @@ mod tests {
     /// must not be in it.
     #[test]
     fn the_detached_helper_argv_holds_no_password() {
-        let typed = RunArgs {
-            machine: "lab/web".into(),
-            via: None,
-            detach: true,
-            verbose: false,
-            cwd: None,
-            run_as: As {
-                user: Some("dev".into()),
-                password: Some("s3cret-pw".into()),
-            },
-            cmd: vec!["foot".into()],
-        };
+        let typed = typed(Some("s3cret-pw"));
         let argv = typed.helper_args();
         assert!(
             !argv.iter().any(|a| a.contains("s3cret-pw")),
             "the helper argv holds the password: {argv:?}"
         );
+        assert!(!argv.iter().any(|a| a == "--password"), "{argv:?}");
+        assert_eq!(typed.helper_stdin(), Some("s3cret-pw"));
+    }
+
+    /// With no password the helper is told of none and handed none.
+    #[test]
+    fn a_helper_without_a_password_reads_no_stdin() {
+        let typed = typed(None);
+        assert!(!typed.helper_args().iter().any(|a| a == PASSWORD_STDIN));
+        assert_eq!(typed.helper_stdin(), None);
     }
 }
