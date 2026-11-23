@@ -84,7 +84,7 @@ Not read:
 | F4 | wrong result | Two captures of one machine share one scratch file |
 | F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match |
 | F6 | wrong result | The match score ignores colour, brightness and contrast |
-| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory |
+| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720) |
 | F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind |
 | F9 | crash of a request | A large duration panics `Settings::resolve` |
 | F10 | wrong result | The match threshold is not checked |
@@ -351,6 +351,13 @@ Not read:
   names, run `ocr`, assert that the victim file is unchanged. Today it
   holds a PNG.
 - Confidence: high.
+- Fixed by card #720. `ocr` makes a directory with a random name and mode
+  0700 under the temp directory, and in it the PNG as a file created
+  exclusively with mode 0600. Both are removed when the run ends. Both
+  proof tests are in `src/vision/ocr.rs`. They reach the code through
+  `ocr_with`, which takes the scratch root and the command, so they change
+  neither `PATH` nor `TMPDIR` of the test process. The lab's runtime
+  directory is still not used: `ocr` gets no lab.
 
 ### F8. A cancelled or timed-out OCR leaves tesseract running and its file behind
 

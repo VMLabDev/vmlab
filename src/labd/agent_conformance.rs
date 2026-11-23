@@ -1684,3 +1684,39 @@ async fn external_agent() -> Result<()> {
         )
         .await
 }
+
+#[tokio::test]
+#[ignore = "requires a FreeDOS agent socket in VMLAB_CONFORMANCE_SOCKET"]
+async fn dos_exec_refuses_missing_cwd() -> Result<()> {
+    let socket = std::env::var_os("VMLAB_CONFORMANCE_SOCKET")
+        .map(PathBuf::from)
+        .context("set VMLAB_CONFORMANCE_SOCKET to a FreeDOS agent socket")?;
+    let fixture = Fixture::start(None, "listen", vec![], Some(&socket)).await?;
+    let handle = AgentHandle::connect_serial(fixture.socket(), BUDGET, greeting("legacy")).await?;
+    ensure(handle.info().os == "dos", "expected a DOS agent")?;
+
+    let cwd = r"C:\VML721NO";
+    match handle
+        .open_exec(vec!["CD".into()], vec![], Some(cwd.into()), None)
+        .await
+    {
+        Err(error) => ensure(error.to_string().contains(cwd), &error.to_string()),
+        Ok(mut session) => {
+            let mut output = Vec::new();
+            while let Some(event) = session.recv().await {
+                match event {
+                    SessionEvent::Data(bytes) | SessionEvent::Stderr(bytes) => output.extend(bytes),
+                    SessionEvent::Exited(code) => {
+                        let output = String::from_utf8_lossy(&output);
+                        return ensure(
+                            code != 0 && output.contains(cwd),
+                            &format!("CD with missing cwd {cwd} exited {code}, output: {output:?}"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            bail!("CD with missing cwd {cwd} closed without an exit status")
+        }
+    }
+}
