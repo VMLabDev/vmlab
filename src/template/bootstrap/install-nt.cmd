@@ -10,10 +10,14 @@ if not exist %VMLAB_DIR% mkdir %VMLAB_DIR%
 rem The service runs as LocalSystem, and a directory under the root of C:
 rem inherits that root's permissions (full control for Everyone on NT4 and
 rem 2000). Give it to Administrators and SYSTEM alone before the binary
-rem lands in it; the copy below inherits that. On FAT it warns and goes on.
+rem lands in it. On FAT it warns and goes on.
 "%~dp0legacy\nt\vmlab-agent-legacy.exe" --secure-dir %VMLAB_DIR%
 if errorlevel 1 exit /b 1
 copy /y "%~dp0legacy\nt\vmlab-agent-legacy.exe" %VMLAB_DIR%\vmlab-agent-legacy.exe
+if errorlevel 1 exit /b 1
+rem Again, so the copied binary carries the permissions itself and does not
+rem rest on what it inherited.
+"%~dp0legacy\nt\vmlab-agent-legacy.exe" --secure-dir %VMLAB_DIR%
 if errorlevel 1 exit /b 1
 %VMLAB_DIR%\vmlab-agent-legacy.exe --install
 exit /b %errorlevel%

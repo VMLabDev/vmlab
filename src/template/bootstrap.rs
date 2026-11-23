@@ -230,7 +230,8 @@ mod tests {
     /// directory it runs from must not keep the ACL it inherits from the root
     /// of `C:` (full control for Everyone on NT4 and Windows 2000). The script
     /// has the binary on the ISO take the directory for Administrators and
-    /// SYSTEM before anything is copied into it, and stops when that fails
+    /// SYSTEM before anything is copied into it and again after the copy, and
+    /// stops when either fails
     /// (docs/reviews/legacy-agents.md F3).
     #[test]
     fn the_nt_install_secures_its_directory_before_the_service_binary_lands() {
@@ -252,11 +253,19 @@ mod tests {
             mkdir < secure && secure < copy && copy < install,
             "order is mkdir, --secure-dir, copy, --install: {lines:#?}"
         );
-        assert_eq!(
-            lines[secure + 1],
-            "if errorlevel 1 exit /b 1",
-            "a directory that could not be secured stops the install"
-        );
+        // Once more after the copy, so the binary's own ACL is explicit.
+        let again = lines[copy..install]
+            .iter()
+            .position(|l| *l == lines[secure])
+            .map(|at| copy + at)
+            .expect("install-nt.cmd secures the directory again after the copy");
+        for at in [secure, again] {
+            assert_eq!(
+                lines[at + 1],
+                "if errorlevel 1 exit /b 1",
+                "a directory that could not be secured stops the install"
+            );
+        }
     }
 
     /// The legacy flavours ride along for an x86 guest at their 8.3-safe

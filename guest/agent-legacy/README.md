@@ -75,7 +75,7 @@ project's `ow-snapshot.tar.xz` there).
 
 `install-nt.cmd` on the bootstrap ISO makes `C:\vmlab`, runs
 `vmlab-agent-legacy.exe --secure-dir C:\vmlab` from the ISO, copies the
-binary in and registers it with `--install`. The service runs as SYSTEM, so
+binary in, runs `--secure-dir` again and registers it with `--install`. The service runs as SYSTEM, so
 `--secure-dir` makes Administrators the owner of the directory and of what
 is in it, and leaves full control for Administrators and SYSTEM and no entry
 for anyone else. Without it the directory keeps what the root of `C:` hands
