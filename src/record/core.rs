@@ -123,9 +123,10 @@ impl Frames {
     /// picture is the same. Returns `false`, and adds nothing, when that
     /// would hold more than `limit` pictures.
     fn push(&mut self, frame: Frame, count: u64, limit: usize) -> bool {
+        let full = self.runs.len() >= limit;
         match self.runs.last_mut() {
             Some(last) if last.frame == frame => last.count += count,
-            _ if self.runs.len() >= limit => return false,
+            _ if full => return false,
             _ => self.runs.push(Run { frame, count }),
         }
         true
