@@ -1,7 +1,8 @@
 //! OCR via the `tesseract` CLI.
 //!
 //! Tesseract is driven as a subprocess: the frame is cropped, turned to
-//! greyscale and upscaled with a Lanczos3 filter, written to a temporary PNG,
+//! greyscale and upscaled with a Lanczos3 filter, written to a temporary PNG
+//! (mode 0600, in a directory of its own with mode 0700),
 //! then `tesseract <png> stdout --psm <n>` is run with stderr discarded.
 //!
 //! The upscale is what makes console fonts readable. Tesseract's model is
@@ -15,9 +16,8 @@
 //! Every decision — the crop, the output size, the page segmentation mode —
 //! is made by [`plan`] as a value before any pixel is touched (ADR-0003).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
@@ -206,22 +206,41 @@ async fn ocr_with(
     let plan = plan(img.width(), img.height(), region, opts)?;
     let prepared = prepare(img, &plan);
 
-    let png_path = temp_png_path(scratch_root);
-    write_png(&prepared, &png_path)
-        .with_context(|| format!("failed to write OCR scratch PNG {}", png_path.display()))?;
+    // The picture shows the guest's screen, and `scratch_root` is usually
+    // the temp directory every local user shares. So it goes into a
+    // directory of its own, mode 0700 under a random name, as a file made
+    // exclusively with mode 0600: no other user can read it, and a name
+    // made ahead of time is refused instead of written through.
+    let dir = tempfile::Builder::new()
+        .prefix("vmlab-ocr-")
+        .tempdir_in(scratch_root)
+        .with_context(|| {
+            format!(
+                "failed to create the OCR scratch directory under {}",
+                scratch_root.display()
+            )
+        })?;
+    let png = tempfile::Builder::new()
+        .prefix("frame-")
+        .suffix(".png")
+        .tempfile_in(dir.path())
+        .context("failed to create the OCR scratch PNG")?;
+    write_png(&prepared, png.as_file())
+        .with_context(|| format!("failed to write OCR scratch PNG {}", png.path().display()))?;
 
-    let result = run_tesseract(tesseract, &png_path, plan.psm).await;
-    let _ = std::fs::remove_file(&png_path); // best effort
-    result
+    // Dropping `png` and then `dir` removes both, best effort.
+    run_tesseract(tesseract, png.path(), plan.psm).await
 }
 
 /// Write the scratch PNG with fast compression: it lives for one tesseract
 /// run, and the default level spends longer encoding a 9 MP frame than
 /// tesseract spends reading it.
-fn write_png(img: &GrayImage, path: &Path) -> Result<()> {
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let encoder = PngEncoder::new_with_quality(file, CompressionType::Fast, PngFilter::NoFilter);
+fn write_png(img: &GrayImage, file: &std::fs::File) -> Result<()> {
+    let mut file = std::io::BufWriter::new(file);
+    let encoder =
+        PngEncoder::new_with_quality(&mut file, CompressionType::Fast, PngFilter::NoFilter);
     img.write_with_encoder(encoder)?;
+    std::io::Write::flush(&mut file)?;
     Ok(())
 }
 
@@ -250,14 +269,6 @@ async fn run_tesseract(
         bail!("tesseract failed with {}", output.status);
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Unique scratch path in the system temp dir (no tempfile crate at
-/// runtime; uniqueness via pid + monotonic counter).
-fn temp_png_path(root: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    root.join(format!("vmlab-ocr-{}-{n}.png", std::process::id()))
 }
 
 #[cfg(test)]
