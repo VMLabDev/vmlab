@@ -911,6 +911,45 @@ mod tests {
         );
     }
 
+    /// F9 of docs/reviews/usb.md: a transfer in flight when the guest sets
+    /// a configuration belongs to the old one, and must not answer the
+    /// first transfer on the new configuration's endpoint.
+    #[test]
+    fn set_config_forgets_in_flight_work() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(
+            host.control(set_config(1), &[]),
+            UsbTransfer::Ack(Vec::new())
+        );
+        fake.run_irq();
+        // A fresh submission, not the old URB's result.
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        fake.complete_with(Completion::Data(b"fresh".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer(0x81, &[], 64),
+            UsbTransfer::Ack(b"fresh".to_vec())
+        );
+        assert!(host.discarded.is_empty());
+    }
+
+    /// F9: the same for a device reset, with a completion nobody collected
+    /// on a second endpoint.
+    #[test]
+    fn reset_forgets_in_flight_and_uncollected_work() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x02, b"old", 64), UsbTransfer::Nak);
+        fake.run_irq();
+        host.reap();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        host.reset();
+        fake.run_irq();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(host.transfer(0x02, b"new", 64), UsbTransfer::Nak);
+        assert!(host.discarded.is_empty());
+    }
+
     #[test]
     fn snapshots_are_refused() {
         let (mut host, _fake) = device();
