@@ -1211,7 +1211,10 @@ mod tests {
         let globals = globals_without_psk(dir.path().join("global"));
         let held: Ipv4Net = "10.214.0.0/24".parse().unwrap();
         let a = joining("a", None, Vec::new());
-        globals.attach("corp", Some(held), None, Some(a)).await.unwrap();
+        globals
+            .attach("corp", Some(held), None, Some(a))
+            .await
+            .unwrap();
         let b = joining("b", None, Vec::new());
         globals.attach("lan", None, None, Some(b)).await.unwrap();
         let list = globals.list().await;

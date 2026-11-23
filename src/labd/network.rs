@@ -384,7 +384,11 @@ impl LabNetwork {
             .await
     }
 
-    pub(crate) async fn attach_globals_via(&mut self, supervisor: &Path, lab: &str) -> anyhow::Result<()> {
+    pub(crate) async fn attach_globals_via(
+        &mut self,
+        supervisor: &Path,
+        lab: &str,
+    ) -> anyhow::Result<()> {
         for seg in self.segments.values_mut() {
             if !seg.global {
                 continue;
@@ -425,7 +429,11 @@ impl LabNetwork {
 
     /// Detach this lab's global segments from the supervisor (on shutdown).
     pub async fn detach_globals(&self, lab: &str) {
-        for keeper in self.segments.values().filter_map(|s| s.global_keeper.as_ref()) {
+        for keeper in self
+            .segments
+            .values()
+            .filter_map(|s| s.global_keeper.as_ref())
+        {
             keeper.abort();
         }
         let names: Vec<String> = self
@@ -751,7 +759,9 @@ fn keep_global(
                         tracing::info!("global segment \"{}\" attached again", join.name);
                         break trunk.closed;
                     }
-                    Err(e) => tracing::debug!("re-attaching global segment \"{}\": {e:#}", join.name),
+                    Err(e) => {
+                        tracing::debug!("re-attaching global segment \"{}\": {e:#}", join.name)
+                    }
                 }
             };
         }
