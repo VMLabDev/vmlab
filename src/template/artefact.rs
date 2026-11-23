@@ -200,11 +200,13 @@ impl Compression {
 struct DownloadLimits {
     connect: std::time::Duration,
     read: std::time::Duration,
+    max_bytes: u64,
 }
 
 const DOWNLOAD_LIMITS: DownloadLimits = DownloadLimits {
     connect: std::time::Duration::from_secs(30),
     read: std::time::Duration::from_secs(60),
+    max_bytes: 32 << 30,
 };
 
 /// Download `url` into `dest`. The caller verifies the file before it gives
@@ -276,6 +278,7 @@ mod tests {
         let limits = DownloadLimits {
             connect: std::time::Duration::from_secs(5),
             read: std::time::Duration::from_millis(300),
+            ..DOWNLOAD_LIMITS
         };
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -341,6 +344,100 @@ mod tests {
             addr,
             release_first: Some(release_first),
         }
+    }
+
+    /// A loopback HTTP mirror for review F2. It answers every connection
+    /// with a head that declares `declared` bytes, or no length at all, and
+    /// then sends 64 KiB blocks until the client closes or `sent_at_most`
+    /// bytes are out. The bound keeps a client with no limit from filling
+    /// the disk of the test.
+    async fn flood_mirror(declared: Option<u64>, sent_at_most: u64) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let length = declared
+                        .map(|n| format!("Content-Length: {n}\r\n"))
+                        .unwrap_or_default();
+                    let head = format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let block = [0x5au8; 64 * 1024];
+                    let mut sent = 0u64;
+                    while sent < sent_at_most {
+                        if sock.write_all(&block).await.is_err() {
+                            return;
+                        }
+                        sent += block.len() as u64;
+                    }
+                    sock.shutdown().await.ok();
+                });
+            }
+        });
+        addr
+    }
+
+    /// Review template-build F2: a mirror that sends data without end must
+    /// not fill the filesystem of the cache. The download stops at its
+    /// limit, and the cache keeps nothing of it.
+    #[tokio::test]
+    async fn a_download_that_never_ends_is_stopped_at_a_limit() {
+        const LIMIT: u64 = 2 << 20;
+        let limits = DownloadLimits {
+            max_bytes: LIMIT,
+            ..DOWNLOAD_LIMITS
+        };
+        let addr = flood_mirror(None, 16 * LIMIT).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let part = tmp.path().join("x.part");
+        let err = download(&format!("http://{addr}/x.iso"), &part, limits)
+            .await
+            .expect_err("a body past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        let written = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        assert!(written <= LIMIT, "{written} bytes written, limit {LIMIT}");
+
+        let dir = tmp.path().join("artefacts");
+        let source = url_source(format!("http://{addr}/x.iso"), &"0".repeat(64));
+        let err = resolve_in(&dir, &source, |_| {}, limits)
+            .await
+            .expect_err("a body past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        assert_eq!(entries(&dir), Vec::<String>::new());
+    }
+
+    /// Review template-build F2: a declared length past the limit is
+    /// refused from the head, before a byte of the body is written.
+    #[tokio::test]
+    async fn a_declared_length_past_the_limit_writes_nothing() {
+        const LIMIT: u64 = 2 << 20;
+        let limits = DownloadLimits {
+            max_bytes: LIMIT,
+            ..DOWNLOAD_LIMITS
+        };
+        let addr = flood_mirror(Some(LIMIT + 1), LIMIT + 1).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("x.part");
+        let err = download(&format!("http://{addr}/x.iso"), &part, limits)
+            .await
+            .expect_err("a declared length past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        let written = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(written, 0);
     }
 
     fn url_source(url: String, sha256: &str) -> ArtefactSource {
