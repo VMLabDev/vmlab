@@ -3261,11 +3261,24 @@ async fn a_guest_reset_on_vmlab_hv_happens_in_place_as_one_run() {
     );
     // ...and returns with the rebooted guest's agent.
     m.wait_ready(SETTLE).await.expect("ready again");
-    let after = m.agent().await.expect("agent").info();
+    let agent = m.agent().await.expect("agent");
+    let after = agent.info();
     assert_ne!(
         after.instance, before.instance,
         "the new agent was handshaken"
     );
+    let output = agent
+        .exec(
+            vec!["echo".into(), "rebooted".into()],
+            vec![],
+            None,
+            None,
+            SETTLE,
+            None,
+        )
+        .await
+        .expect("exec as soon as ready");
+    assert_eq!(output.exit_code, 0);
     assert_eq!(hv.starts(), 1, "the reset happened in place");
     assert_eq!(observed.ready_count(), 1, "one run, announced once");
     assert!(
