@@ -35,7 +35,7 @@ be dropped.
 | F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606) |
 | F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares (fixed, card #609) |
 | F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run |
-| F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path |
+| F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path (fixed, card #610) |
 | F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609) |
 | F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory |
 | F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops |
@@ -217,6 +217,33 @@ be dropped.
      one modern share. Assert that the modern share cannot be mapped with
      NT1. This cannot pass with one `smbd`, which is the fault.
      `conf_protocol_floor_toggles_on_smb1` (`:504`) shows the global switch.
+- Fixed by card #610, with one `smbd` and one remainder.
+  1. `smb1 unix extensions = no` is written for every server, so no SMB1 client
+     is offered the extensions and the symlink call fails.
+  2. NT1 is refused on every share that did not ask for it: such a share
+     gets a `preexec` (a `/bin/sh -c` line) that fails unless `%R` (the dialect of the session) is
+     SMB2 or newer, with `preexec close = yes`. `ntlm auth` is
+     `ntlmv2-only` in `smb.conf`. The NTLMv1 and LM acceptance moved to
+     `smb.NT1.conf` beside it, read through `include = .../smb.%R.conf`:
+     `smbd` reads its configuration again after the dialect is chosen, so
+     only an NT1 session gets it. Proof 2 was written as "cannot pass with
+     one `smbd`". It does pass: the three directives were tried on helios
+     (Samba 4.25.1) before the fix was written.
+  3. Remainder: `server signing = auto` still holds for every session of a
+     server with an `smb1` share. Since card #609 that is the server of one
+     machine, not of the lab. `smbd` fixes signing before the dialect is
+     negotiated, so the include cannot restore `mandatory` for SMB2 and
+     newer (tried: the NT1 client with signing off was refused under
+     `mandatory` plus the include). A modern share of such a machine is
+     therefore reached with NTLMv2 only and never over NT1, but a client
+     that does not ask for signing is not made to sign. This now concerns
+     only the modern shares of a machine that also declares an `smb1`
+     share. Closing it needs proof that XP-era clients sign reliably under
+     `mandatory`.
+  The tests: `an_smb1_client_cannot_create_a_symlink` and
+  `an_smb1_share_does_not_relax_the_share_beside_it` in `src/smb/server.rs`
+  (real `smbd`), `an_smb1_share_relaxes_only_itself` and
+  `conf_never_offers_the_smb1_unix_extensions` in `src/smb/config.rs`.
 
 ### F5. Any guest can change the lab's SMB password (security)
 

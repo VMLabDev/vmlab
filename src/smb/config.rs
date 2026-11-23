@@ -16,10 +16,21 @@
 //!   (that proxy is the network layer's job, not this module's).
 //!
 //! One `smbd` serves one machine ([`super::LabSmb`]). Auth baseline is NTLMv2 +
-//! mandatory SMB signing. `smb1 = true` on any share of that machine
-//! relaxes its whole server to the NT1 dialect with NTLMv1/LM acceptance for
-//! XP/2003-era guests that never send NTLMv2 (PRD §7.5 — irrelevant as a
-//! security concern on an isolated lab segment).
+//! mandatory SMB signing. `smb1 = true` relaxes **that share**: it alone is
+//! reachable over the NT1 dialect, and only an NT1 session logs on with
+//! NTLMv1/LM, for XP/2003-era guests that never send NTLMv2 (PRD §7.5). One
+//! `smbd` has one protocol floor, so the dialect is on offer to the whole
+//! machine as soon as one of its shares asks for it; what keeps the
+//! relaxation to the share is in [`SmbConfig::render_conf`] — every other
+//! share turns an NT1 session away, and the NTLMv1/LM acceptance sits in a
+//! file `smbd` reads for NT1 sessions only ([`SmbConfig::nt1_conf_path`]).
+//! Signing is the one setting that cannot follow the session: `smbd` fixes
+//! it before a dialect is chosen, so the server of a machine with an `smb1`
+//! share offers signing to every session and demands it of none.
+//!
+//! No SMB1 client is offered the CIFS Unix extensions: with them a guest
+//! creates a symlink to any host path inside a writable share
+//! (docs/reviews/smb.md F4).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -144,9 +155,10 @@ pub struct SmbConfig {
     /// bytes, so these must not grow with the lab's own path.
     pub run_dir: PathBuf,
     pub shares: Vec<ShareDef>,
-    /// True if any share opted into smb1 — toggles the global protocol floor,
-    /// signing, and NTLM auth relaxation for the whole instance (a single
-    /// `smbd` can only have one protocol floor).
+    /// True if any share opted into smb1 — lowers the protocol floor and
+    /// the signing demand of the whole instance (a single `smbd` has one of
+    /// each). Every share that did not opt in then refuses an NT1 session,
+    /// and NTLMv1/LM is accepted from NT1 sessions only.
     pub any_smb1: bool,
 }
 
@@ -165,6 +177,26 @@ impl SmbConfig {
     }
     pub fn ncalrpc_dir(&self) -> PathBuf {
         self.run_dir.join("ncalrpc")
+    }
+    /// The settings `smbd` adds for a session that negotiated NT1 and for no
+    /// other: `smb.conf` includes `smb.%R.conf`, and `%R` is the dialect of
+    /// the session. Written beside `smb.conf` when a share asks for `smb1`.
+    pub fn nt1_conf_path(&self) -> PathBuf {
+        self.lab_dir.join(format!("smb.{NT1}.conf"))
+    }
+
+    /// The text of [`Self::nt1_conf_path`]: what an XP/2003-era client needs
+    /// to log on, since it sends NTLMv1 or LM and never NTLMv2. `None` when
+    /// no share asks for `smb1`.
+    pub fn render_nt1_conf(&self) -> Option<String> {
+        self.any_smb1.then(|| {
+            [
+                "    ntlm auth = ntlmv1-permitted\n",
+                "    lanman auth = yes\n",
+                "    client lanman auth = yes\n",
+            ]
+            .concat()
+        })
     }
 
     /// Render the `smb.conf`. Every directive is annotated below; the key
@@ -222,6 +254,8 @@ impl SmbConfig {
         // Signing: mandatory is the PRD baseline. SMB1/NTLMv1 clients cannot
         // satisfy mandatory signing reliably, so relax to `auto` when smb1 is
         // in play (still negotiates signing where the client supports it).
+        // smbd fixes this before a dialect is negotiated, so unlike the NTLM
+        // level below it cannot be kept to NT1 sessions.
         let signing = if self.any_smb1 { "auto" } else { "mandatory" };
 
         let mut out = String::new();
@@ -266,13 +300,21 @@ impl SmbConfig {
         out.push_str("    rpc start on demand helpers = no\n");
         out.push_str(&format!("    server min protocol = {min_proto}\n"));
         out.push_str(&format!("    server signing = {signing}\n"));
+        out.push_str("    ntlm auth = ntlmv2-only\n");
+        // Samba's SMB1 server offers the CIFS Unix extensions by default,
+        // and with them a client creates a symlink with any target in a
+        // writable share: a file on the host that every host program reading
+        // the directory follows (docs/reviews/smb.md F4). No guest vmlab
+        // mounts for asks for them.
+        out.push_str("    smb1 unix extensions = no\n");
         if self.any_smb1 {
-            // XP/2003 send NTLMv1/LM only; permit it for this instance.
-            out.push_str("    ntlm auth = ntlmv1-permitted\n");
-            out.push_str("    lanman auth = yes\n");
-            out.push_str("    client lanman auth = yes\n");
-        } else {
-            out.push_str("    ntlm auth = ntlmv2-only\n");
+            // XP/2003 send NTLMv1/LM only. smbd reads its configuration
+            // again once a session has negotiated its dialect, with `%R` as
+            // that dialect, so the acceptance in `smb.NT1.conf` holds for
+            // NT1 sessions and no other; the file a newer dialect names does
+            // not exist, which smbd passes over. After `ntlm auth` above:
+            // the later line wins.
+            out.push_str(&format!("    include = {dir}/smb.%R.conf\n"));
         }
         // Quieter logging straight to our log file; no syslog, no rotation.
         out.push_str(&format!("    log file = {dir}/smbd.log\n"));
@@ -312,12 +354,32 @@ impl SmbConfig {
             // Granting execute on open changes nothing a guest can write; it
             // could copy the file off the share and run it anyway.
             out.push_str("    acl allow execute always = yes\n");
+            if self.any_smb1 && !s.smb1 {
+                // The floor above is NT1 for the whole server. A share that
+                // did not ask for `smb1` refuses the tree connect of any
+                // session that is not SMB2 or newer: smbd runs this with
+                // `%R` as the session's dialect, and closes the connection
+                // when it fails.
+                out.push_str(&format!("    preexec = {MODERN_ONLY}\n"));
+                out.push_str("    preexec close = yes\n");
+            }
             out.push('\n');
         }
 
         Ok(out)
     }
 }
+
+/// Samba's name for the SMB1 dialect, as `server min protocol` takes it and
+/// as `%R` gives it.
+const NT1: &str = "NT1";
+
+/// The `preexec` of a share that did not ask for `smb1`, on a server where
+/// another did: succeed for a session on SMB2 or newer (`%R` is `SMB2_02`,
+/// `SMB2_10`, `SMB3_00`, `SMB3_02` or `SMB3_11`), fail for anything else.
+/// The shell is named: smbd does not take a line with `;` in it as one shell
+/// command (tried on Samba 4.25.1, where the bare `case` exits 2).
+const MODERN_ONLY: &str = r#"/bin/sh -c "case %R in SMB[23]_*) exit 0;; esac; exit 1""#;
 
 /// A share [`SmbConfig::render_conf`] will not write, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -641,12 +703,84 @@ mod tests {
         assert!(modern.contains("ntlm auth = ntlmv2-only"));
         assert!(!modern.contains("ntlmv1-permitted"));
 
+        assert!(!modern.contains("include ="));
+        assert!(!modern.contains("preexec"));
+        assert_eq!(cfg(false).render_nt1_conf(), None);
+
         let legacy = cfg(true).render_conf().unwrap();
         assert!(legacy.contains("server min protocol = NT1"));
         // signing relaxed for smb1
         assert!(legacy.contains("server signing = auto"));
-        assert!(legacy.contains("ntlm auth = ntlmv1-permitted"));
-        assert!(legacy.contains("lanman auth = yes"));
+        // NTLMv1 and LM for NT1 sessions only, from the file smbd reads for
+        // them; every share here is smb1, so none turns NT1 away.
+        assert!(legacy.contains("ntlm auth = ntlmv2-only"));
+        assert!(legacy.contains("include = /labroot/.vmlab/smb/smb.%R.conf\n"));
+        assert!(!legacy.contains("preexec"));
+        assert_eq!(
+            cfg(true).nt1_conf_path(),
+            PathBuf::from("/labroot/.vmlab/smb/smb.NT1.conf")
+        );
+        let nt1 = cfg(true).render_nt1_conf().unwrap();
+        assert!(nt1.contains("ntlm auth = ntlmv1-permitted"));
+        assert!(nt1.contains("lanman auth = yes"));
+    }
+
+    /// The text of one share's section in a rendered `smb.conf`.
+    fn section<'a>(conf: &'a str, name: &str) -> &'a str {
+        let rest = conf
+            .split_once(&format!("[{name}]\n"))
+            .unwrap_or_else(|| panic!("no [{name}] section in:\n{conf}"))
+            .1;
+        rest.split("\n[").next().unwrap_or(rest)
+    }
+
+    /// One `smb1` share and one modern share, as two machines of one lab
+    /// declare them.
+    fn mixed() -> SmbConfig {
+        let mut c = cfg(false);
+        c.any_smb1 = true;
+        c.shares[0].smb1 = true;
+        c
+    }
+
+    /// docs/reviews/smb.md F4, point 1: the relaxation `smb1 = true` asks for
+    /// belongs to that share. The server-wide settings stay at the baseline
+    /// for every session newer than SMB1, and the modern share refuses an
+    /// SMB1 session. (`an_smb1_share_does_not_relax_the_share_beside_it` in
+    /// `server.rs` asks a real smbd the same.)
+    #[test]
+    fn an_smb1_share_relaxes_only_itself() {
+        let conf = mixed().render_conf().unwrap();
+        let global = conf.split("\n[").next().unwrap();
+        // The baseline, with the dialect on offer: smbd has one floor.
+        assert!(global.contains("server min protocol = NT1\n"), "{global}");
+        assert!(global.contains("ntlm auth = ntlmv2-only\n"), "{global}");
+        for relaxed in ["ntlmv1-permitted", "lanman auth = yes"] {
+            assert!(
+                !global.contains(relaxed),
+                "`{relaxed}` for every session:\n{global}"
+            );
+        }
+        // The modern share turns an SMB1 session away, the smb1 share not.
+        let modern = section(&conf, "data");
+        assert!(modern.contains("preexec close = yes\n"), "{modern}");
+        let gate = "preexec = /bin/sh -c \"case %R in SMB[23]_*) exit 0;; esac; exit 1\"\n";
+        assert!(modern.contains(gate), "{modern}");
+        assert!(!section(&conf, "src").contains("preexec"), "{conf}");
+    }
+
+    /// docs/reviews/smb.md F4, point 2: no SMB1 client is offered the CIFS
+    /// Unix extensions, whatever the lab's shares ask for.
+    #[test]
+    fn conf_never_offers_the_smb1_unix_extensions() {
+        for conf in [cfg(false), cfg(true), mixed()] {
+            let conf = conf.render_conf().unwrap();
+            let global = conf.split("\n[").next().unwrap();
+            assert!(
+                global.contains("smb1 unix extensions = no\n"),
+                "the SMB1 Unix extensions are on offer:\n{global}"
+            );
+        }
     }
 
     #[test]

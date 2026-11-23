@@ -504,21 +504,27 @@ fn i440fx_pam_offsets_shadow_each_bank_and_restore_state_without_q35_aliases() {
     assert!(bridge.error.is_none());
 }
 
+/// QEMU's i440fx keeps every write to 0x72. The 82441FX does not once D_LCK
+/// is set, and vmlab-hv follows the chip (card #611).
 #[test]
-fn i440fx_smram_uses_72h_and_preserves_qemu_register_writes() {
+fn i440fx_smram_uses_72h_and_locks_until_reset() {
     let pam = Arc::new(Mutex::new(Pam::new(&[0; 0x40000], None, 0).unwrap()));
     let mut bridge = Mch::i440fx(pam, 512 << 20);
+    let reset = bridge.save_state().unwrap();
     assert_eq!(pci_byte(&mut bridge, 0x72), 2);
     pci_write(&mut bridge, 0x72, &[0x4a]);
     assert_eq!(pci_byte(&mut bridge, 0x72), 0x4a);
     pci_write(&mut bridge, 0x72, &[0x5a]);
-    assert_eq!(pci_byte(&mut bridge, 0x72), 0x5a);
+    assert_eq!(pci_byte(&mut bridge, 0x72), 0x1a);
     pci_write(&mut bridge, 0x72, &[0x4a]);
-    assert_eq!(pci_byte(&mut bridge, 0x72), 0x4a);
+    assert_eq!(pci_byte(&mut bridge, 0x72), 0x1a);
     let state = bridge.save_state().unwrap();
     bridge.restore_state(&state).unwrap();
     pci_write(&mut bridge, 0x72, &[2]);
-    assert_eq!(pci_byte(&mut bridge, 0x72), 2);
+    assert_eq!(pci_byte(&mut bridge, 0x72), 0x1a);
+    bridge.restore_state(&reset).unwrap();
+    pci_write(&mut bridge, 0x72, &[0x4a]);
+    assert_eq!(pci_byte(&mut bridge, 0x72), 0x4a);
     assert!(bridge.error.is_none());
 }
 
