@@ -400,9 +400,9 @@ pub async fn spawn_swtpm(
 ///   live (`swtpm --ctrl type=unixio,path=…/swtpm.sock`, `virtiofsd
 ///   --socket-path …/virtiofs0.sock`) and vmlab-hv's machine file and control
 ///   socket (`--machine …/machine.json --control …/control.sock`, PRD §22),
-/// - `smb`: the lab's SMB state directory, which is how `smbd -s
-///   <…>/smb/smb.conf` is recognised. It carries no runtime-dir path, and it
-///   needs the lab's `root`.
+/// - `smb`: the lab's SMB state directory, which is how each machine's
+///   `smbd -s <…>/smb/machines/<machine>/smb.conf` is recognised. It carries
+///   no runtime-dir path, and it needs the lab's `root`.
 struct LabIdentity {
     name: String,
     runtime: String,
@@ -1028,7 +1028,7 @@ mod tests {
                 "smbd",
                 format!(
                     "smbd\0-F\0--no-process-group\0-s\0{0}/smb.conf\0-l\0{0}\0",
-                    smb.display()
+                    smb.join("machines/web").display()
                 ),
             ),
         ]

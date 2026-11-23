@@ -65,7 +65,12 @@ page gs_install {
     capability. Installed as an ordinary user from a terminal, the installer
     asks whether to grant the helper those two capabilities, and on yes runs
     `sudo setcap cap_bpf,cap_net_admin+ep` on it. Any program running as you
-    can then start the helper and make those requests. `--fastpath` grants
+    can then start the helper and make those requests. No other user can:
+    the installer leaves the helper executable by its owner alone (mode
+    0700), and a helper that holds file capabilities refuses a caller who
+    is neither the owner of its file nor root. A helper that root owns
+    serves every user, because only the administrator can have granted
+    it. `--fastpath` grants
     them without asking, `--no-fastpath` never offers, and
     `VMLAB_FASTPATH_CAPS=yes|no|ask` sets the same choice. With no terminal to
     ask on, the installer prints the `setcap` command instead. It offers

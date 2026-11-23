@@ -230,6 +230,23 @@ esac
         self.assertTrue(helper.is_file())
         self.assertTrue(os.access(helper, os.X_OK))
 
+    def test_helper_is_executable_by_its_owner_only(self):
+        # File capabilities go to whoever executes the file (review F2, card
+        # 608): no other account may be able to start the helper.
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(oct(helper.stat().st_mode & 0o777), oct(0o700))
+
+    def test_helper_keeps_owner_only_mode_through_the_grant(self):
+        self.fastpath_tools(swap_in=None)
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(oct(helper.stat().st_mode & 0o777), oct(0o700))
+        self.assertIn('Any program running as you', result.stderr)
+        self.assertIn('serves no other user', result.stderr)
+
     def fastpath_tools(self, *, swap_in):
         """Stubs for a grant. `swap_in` names the tool that, when the installer
         starts it, first renames another program onto the helper's path: what
