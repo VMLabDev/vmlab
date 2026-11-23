@@ -2350,6 +2350,11 @@ impl super::machine::Machine for VmInstance {
             events.clone(),
         ));
 
+        // The host speaks first on COM1 only to an agent sealed before
+        // guest-first, so only where the template records an agent.
+        self.agent
+            .arm_fallback_hello(lab.fallback_hello() && self.template().agent_version.is_some());
+
         std::fs::create_dir_all(&self.dirs.run)?;
         let attachments = lab.attach_nics(&*self).await?;
         self.set_nic_attachments(attachments).await;

@@ -50,7 +50,7 @@ test does not reproduce is wrong and should be dropped.
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
-| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon |
+| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666) |
 | F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped |
 | F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it |
 | F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
@@ -137,6 +137,14 @@ test does not reproduce is wrong and should be dropped.
 
   Expected: the run returns, with or without a fault. Today: the child dies
   on SIGABRT.
+- Fixed in card #666. `Value` is defined in the vendored `wscript-core`
+  (`vendor/wscript-core/src/value.rs`). A struct, an enum, a closure and a
+  `dyn` object now hand the values they hold to `release`, which frees them
+  from a queue, one at a time, instead of by recursion. A value can nest
+  without limit only through one of these four, so the native stack a drop
+  uses no longer grows with the depth of the value. The test builds 300,000
+  nodes, not 3,000,000: that is far past the overflow on a 2 MiB stack and
+  takes a tenth of the memory. Before the fix the child died on SIGABRT.
 
 ### F3. A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (wrong result)
 
@@ -254,6 +262,17 @@ test does not reproduce is wrong and should be dropped.
   paused clock. Expected: an error that names a limit, with
   `state.buf.len()` under that limit. Today: the buffer holds everything
   that was sent, and the call ends only at the timeout.
+- Fixed by card #667. `pump` ends the session when the buffer would pass
+  `TERM_BUFFER_LIMIT`, 16 MiB, closes the channel, and the waiting `expect`
+  fails with an error that names the limit. `expect` scans a buffer once:
+  it scans again only after new output arrived, and it borrows the buffer
+  instead of copying it while the output is valid UTF-8. One correction to
+  the text above: `pump` returns at the end of its window (500 ms), so the
+  scan ran once per window, not once per chunk. The work of one `expect` is
+  now at most one scan of 16 MiB per window that brought new output. The
+  proof test needs no clock: its flood is twice the limit and then stops.
+  Before the fix it failed with "the buffer holds 33554432 bytes, past the
+  limit of 16777216".
 
 ### F7. A very large timeout panics the script thread, or sleeps for ever (crash of the script run)
 
