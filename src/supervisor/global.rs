@@ -453,13 +453,52 @@ struct GlobalSeg {
     /// Keeps the zone following the leases.
     dns_sync: tokio::task::JoinHandle<()>,
     subnet: Ipv4Net,
-    refcount: usize,
+    /// Who holds the segment (docs/reviews/lab-lifecycle.md F8). A lab is
+    /// one reference however often it attaches, and only a lab that holds
+    /// one can give it back.
+    holders: Holders,
     sock: PathBuf,
     listener: tokio::task::JoinHandle<()>,
     /// Outbound dialer loop (present once some attach declared `connect`).
     dialer: Option<tokio::task::JoinHandle<()>>,
     /// Cross-host trunk slots (dialer + inbound accepts + list()).
     trunks: Arc<TrunkTable>,
+}
+
+/// The references a global segment counts: each attached lab by name, and
+/// the anonymous ones (inbound cross-host trunks, a caller naming no lab).
+#[derive(Default)]
+struct Holders {
+    labs: std::collections::BTreeSet<String>,
+    anonymous: usize,
+}
+
+impl Holders {
+    fn take(&mut self, lab: Option<&str>) {
+        match lab {
+            Some(lab) => {
+                self.labs.insert(lab.to_string());
+            }
+            None => self.anonymous += 1,
+        }
+    }
+
+    /// Give back `lab`'s reference, or one anonymous one. Returns false
+    /// when `lab` holds none, and nothing changes.
+    fn give_back(&mut self, lab: Option<&str>) -> bool {
+        match lab {
+            Some(lab) => self.labs.remove(lab),
+            None if self.anonymous > 0 => {
+                self.anonymous -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.labs.len() + self.anonymous
+    }
 }
 
 impl GlobalSeg {
@@ -552,7 +591,7 @@ impl GlobalSegments {
         )
     }
 
-    fn new_at(
+    pub(crate) fn new_at(
         sock_dir: PathBuf,
         dns_suffix: String,
         upstream_dns: Option<SocketAddr>,
@@ -571,8 +610,9 @@ impl GlobalSegments {
     }
 
     /// Attach to (creating if needed) the global segment `name`. Returns the
-    /// unix socket the caller's lab daemon connects its trunk to, and the
-    /// warnings that lab should show (see [`Directory::admit`]).
+    /// unix socket the caller's lab daemon connects its trunk to, the
+    /// warnings that lab should show (see [`Directory::admit`]) and the
+    /// segment's subnet, which the lab names again when it re-attaches (F9).
     ///
     /// `lab` is the attaching lab and the NICs it puts on the segment; their
     /// names join the segment's DNS, and their static addresses its DHCP
@@ -584,14 +624,14 @@ impl GlobalSegments {
         subnet: Option<Ipv4Net>,
         peer: Option<String>,
         lab: Option<Joining>,
-    ) -> Result<(PathBuf, Vec<String>)> {
+    ) -> Result<(PathBuf, Vec<String>, Ipv4Net)> {
         check_segment_name(name)?;
         let peer = peer
             .map(|peer| self.require_psk().map(|psk| (peer, psk)))
             .transpose()?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
-            seg.refcount += 1;
+            seg.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
             let warnings = seg.join(name, lab);
             // A later lab may be the one declaring `connect` — start the
             // dialer on an already-existing segment too.
@@ -605,11 +645,15 @@ impl GlobalSegments {
                     seg.trunks.clone(),
                 ));
             }
-            return Ok((seg.sock.clone(), warnings));
+            return Ok((seg.sock.clone(), warnings, seg.subnet));
         }
 
         let mut next_index = self.next_index.lock().await;
         let automatic_subnet = subnet.is_none();
+        // A subnet named explicitly may be one this pool handed out before:
+        // an adopted lab re-attaching after a supervisor restart (F9) names
+        // the subnet its guests hold leases in. Allocate past it.
+        let pool_index = subnet.and_then(pool_index);
         let subnet = match subnet {
             Some(subnet) => subnet,
             None => {
@@ -631,6 +675,8 @@ impl GlobalSegments {
         // Commit the allocation only after the last fallible setup step.
         if automatic_subnet {
             *next_index += 1;
+        } else if let Some(index) = pool_index {
+            *next_index = (*next_index).max(index + 1);
         }
 
         let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
@@ -666,7 +712,11 @@ impl GlobalSegments {
             directory,
             dns_sync,
             subnet,
-            refcount: 1,
+            holders: {
+                let mut holders = Holders::default();
+                holders.take(lab.as_ref().map(|j| j.lab.as_str()));
+                holders
+            },
             sock: sock.clone(),
             listener,
             dialer,
@@ -675,7 +725,7 @@ impl GlobalSegments {
         let warnings = seg.join(name, lab);
         segs.insert(name.to_string(), seg);
         tracing::info!("global segment \"{name}\" created on {subnet}");
-        Ok((sock, warnings))
+        Ok((sock, warnings, subnet))
     }
 
     fn require_psk(&self) -> Result<String> {
@@ -684,14 +734,21 @@ impl GlobalSegments {
             .ok_or_else(|| anyhow::anyhow!("cross-host segment needs a `psk` in host config"))
     }
 
-    /// Detach; destroys the segment when the last lab leaves. `lab`'s names
-    /// leave the segment's DNS with it.
+    /// Detach; destroys the segment when the last reference goes. `lab`'s
+    /// names leave the segment's DNS with it. A lab that holds no reference
+    /// changes nothing: it cannot take the segment from the labs on it.
     pub async fn detach(self: &Arc<Self>, name: &str, lab: Option<&str>) {
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
+            if !seg.holders.give_back(lab) {
+                tracing::debug!(
+                    "global segment \"{name}\": {} holds no reference to give back",
+                    lab.unwrap_or("an anonymous caller")
+                );
+                return;
+            }
             seg.leave(lab);
-            seg.refcount = seg.refcount.saturating_sub(1);
-            if seg.refcount == 0
+            if seg.holders.count() == 0
                 && let Some(seg) = segs.remove(name)
             {
                 seg.listener.abort();
@@ -706,7 +763,8 @@ impl GlobalSegments {
         }
     }
 
-    /// Segment inventory for `global.list`: name, subnet, refcount, and the
+    /// Segment inventory for `global.list`: name, subnet, refcount, the
+    /// labs attached, and the
     /// live cross-host trunk state (drives the web UI's peer LED).
     pub async fn list(&self) -> Vec<serde_json::Value> {
         self.segs
@@ -717,7 +775,8 @@ impl GlobalSegments {
                 json!({
                     "name": n,
                     "subnet": s.subnet.to_string(),
-                    "refcount": s.refcount,
+                    "refcount": s.holders.count(),
+                    "labs": s.holders.labs.iter().collect::<Vec<_>>(),
                     "mtu": s.directory.lock().expect("global directory").mtu(),
                     "peer_connected": s.trunks.connected(),
                     "peers": s.trunks.peers_json(),
@@ -917,6 +976,13 @@ fn spawn_tcp_peer_dialer(
 /// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
 /// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
 /// refused here.
+/// Where `subnet` sits among the automatic pool's /24s, if it is one.
+fn pool_index(subnet: Ipv4Net) -> Option<u32> {
+    let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
+    (subnet.prefix_len() == 24 && pool.contains(&subnet))
+        .then(|| (u32::from(subnet.network()) - u32::from(pool.network())) >> 8)
+}
+
 fn check_segment_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -1105,6 +1171,61 @@ mod tests {
         std::fs::remove_dir(socket).unwrap();
         globals.attach("wan", None, None, None).await.unwrap();
         globals.detach("wan", None).await;
+    }
+
+    /// F8 (docs/reviews/lab-lifecycle.md): a lab that never attached gives
+    /// back nothing, so the segment stays for the lab that is on it.
+    #[tokio::test]
+    async fn a_lab_that_never_attached_cannot_destroy_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let b = joining("b", None, vec![member("vm", 1, None)]);
+        globals.attach("corp", None, None, Some(b)).await.unwrap();
+        globals.detach("corp", Some("a")).await;
+        let list = globals.list().await;
+        assert_eq!(list.len(), 1, "lab a destroyed lab b's segment");
+        assert_eq!(list[0]["name"], "corp");
+        assert_eq!(list[0]["refcount"], 1);
+        assert_eq!(list[0]["labs"], json!(["b"]));
+    }
+
+    /// F8: a lab that attaches again (a restarted lab daemon, an adopted lab
+    /// re-attaching) still holds one reference, and its one detach frees it.
+    #[tokio::test]
+    async fn a_second_attach_by_one_lab_is_one_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        for _ in 0..2 {
+            let a = joining("a", None, vec![member("vm", 1, None)]);
+            globals.attach("corp", None, None, Some(a)).await.unwrap();
+        }
+        globals.detach("corp", Some("a")).await;
+        assert!(globals.list().await.is_empty(), "the segment leaked");
+    }
+
+    /// F9: a lab re-attaching with the subnet it was given keeps it, and the
+    /// next automatic allocation does not hand that subnet out again.
+    #[tokio::test]
+    async fn a_reattached_pool_subnet_is_not_allocated_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let held: Ipv4Net = "10.214.0.0/24".parse().unwrap();
+        let a = joining("a", None, Vec::new());
+        globals
+            .attach("corp", Some(held), None, Some(a))
+            .await
+            .unwrap();
+        let b = joining("b", None, Vec::new());
+        globals.attach("lan", None, None, Some(b)).await.unwrap();
+        let list = globals.list().await;
+        let subnet = |name: &str| {
+            list.iter()
+                .find(|s| s["name"] == name)
+                .map(|s| s["subnet"].clone())
+                .unwrap()
+        };
+        assert_eq!(subnet("corp"), "10.214.0.0/24");
+        assert_eq!(subnet("lan"), "10.214.1.0/24");
     }
 
     struct Instance {
@@ -1352,7 +1473,7 @@ mod tests {
         assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.down");
         assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.down");
 
-        let (a_sock, _) = a
+        let (a_sock, _, _) = a
             .globals
             .attach("wan", None, Some(target), None)
             .await
@@ -1623,7 +1744,7 @@ mod tests {
         let (tx, _events) = tokio::sync::broadcast::channel(8);
         let g = GlobalSegments::new_at(dir.path().into(), "test.internal".into(), None, None, tx);
         let subnet = Some("10.82.9.0/24".parse().unwrap());
-        let (_, warnings) = g
+        let (_, warnings, _) = g
             .attach(
                 "wan",
                 subnet,
@@ -1640,7 +1761,7 @@ mod tests {
             .await
             .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        let (_, warnings) = g
+        let (_, warnings, _) = g
             .attach(
                 "wan",
                 subnet,

@@ -34,10 +34,12 @@ pub struct Supervisor {
     ensure_locks: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// In-flight template builds/pushes (web Templates page, PRD §6).
     template_ops: templates::TemplateOps,
-    /// Set once `shutdown` is accepted. From then on every request is
-    /// refused: a lab daemon spawned during teardown would outlive this
-    /// process, carrying its environment, and be adopted by the next
-    /// supervisor as if it were current.
+    /// Set once a teardown begins, by the `shutdown` request or by a
+    /// termination signal ([`teardown`]). From then on every request is
+    /// refused, and a `lab.ensure` accepted earlier spawns nothing: a lab
+    /// daemon spawned during teardown would outlive this process, carrying
+    /// its environment, and be adopted by the next supervisor as if it were
+    /// current.
     shutting_down: std::sync::atomic::AtomicBool,
     /// The helpers holding host GPUs out of runtime suspend (ADR-0018).
     keepers: keepawake::Keepers,
@@ -232,14 +234,28 @@ async fn run_async() -> Result<()> {
 /// Stop every template operation (a build stops its own build VM), release
 /// every lab daemon (each stops its own machines), then the GPUs held awake
 /// for them, and join the supervisor's background tasks.
+///
+/// It closes the supervisor to requests first, whoever started it: the server
+/// keeps serving while this runs.
 async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
+    sup.shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     // Builds run in this process, and their VMs are its children: an exit
     // with a build in flight leaves vmlab-hv/QEMU and swtpm running unowned.
     templates::stop_all(&sup.template_ops, templates::STOP_DEADLINE).await;
-    let names: Vec<String> = {
+    // The registered labs, then every name a `lab.ensure` has locked. One
+    // that passed the closed check holds its name's lock and registers its
+    // daemon only later; it took that lock before the flag was set, so the
+    // name is here, and the release waits on the lock for the daemon.
+    let mut names: Vec<String> = {
         let reg = sup.registry.lock().await;
         reg.labs().iter().map(|l| l.name.clone()).collect()
     };
+    for name in sup.ensure_locks.lock().await.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
     for name in names {
         let _ = sup.release_lab(&name).await;
     }
@@ -449,6 +465,12 @@ impl Supervisor {
         name: &str,
         root: PathBuf,
     ) -> Result<PathBuf, CommandError> {
+        // Checked under the name's lock, which the teardown takes for every
+        // name locked before it closed the supervisor: a request that passes
+        // here is waited for, and one that arrives later spawns nothing.
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CommandError::conflict("vmlabd is shutting down"));
+        }
         let sock = crate::paths::lab_socket(name);
         // A daemon still stopping holds the lab's disks, sockets and smbd
         // port; a successor started beside it dies at `vm.starting`. Wait
@@ -836,8 +858,9 @@ impl Handler<SupRequest> for SupervisorHandler {
                 mtu,
             } => {
                 let joining = lab.map(|lab| global::Joining { lab, members, mtu });
-                let (sock, warnings) = sup.globals.attach(&name, subnet, peer, joining).await?;
-                Ok(json!({"socket": sock, "warnings": warnings}))
+                let (sock, warnings, subnet) =
+                    sup.globals.attach(&name, subnet, peer, joining).await?;
+                Ok(json!({"socket": sock, "warnings": warnings, "subnet": subnet.to_string()}))
             }
             SupRequest::GlobalDetach { name, lab } => {
                 sup.globals.detach(&name, lab.as_deref()).await;
@@ -1430,6 +1453,214 @@ mod tests {
         });
     }
 
+    const SIGNALLED_TEARDOWN_HELPER: &str = "VMLAB_TEST_SIGNALLED_TEARDOWN_ROOT";
+
+    /// Review F11 (card #572): the teardown a termination signal runs must
+    /// close the supervisor to requests, as the `shutdown` request does. A
+    /// lab daemon spawned or registered once the teardown has read its list
+    /// of labs outlives the supervisor.
+    #[test]
+    fn a_signalled_teardown_refuses_requests() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::signalled_teardown_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SIGNALLED_TEARDOWN_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths. This process serves the control socket of the lab
+    /// `f11-held`, whose registry entry names a helper process: the teardown
+    /// sends it `Shutdown` and then waits for that process, so the arrival of
+    /// `Shutdown` proves the teardown has read its list of labs and is inside
+    /// a release. Two things then happen that no teardown may let through: a
+    /// `lab.ensure` for another name arrives, and a `lab.ensure` that was
+    /// accepted before the teardown began registers its daemon.
+    #[test]
+    #[ignore = "subprocess helper for a_signalled_teardown_refuses_requests"]
+    fn signalled_teardown_helper() {
+        use std::sync::Arc;
+
+        use crate::proto::client::SupClient;
+        use crate::proto::server::{Handler, Server, Streamer};
+        use crate::proto::{CommandError, ErrorCode, LabRequest, ProtoError, SupRequest};
+
+        /// Answers every request and reports each `Shutdown` it is sent.
+        struct Held(tokio::sync::mpsc::UnboundedSender<()>);
+
+        #[async_trait::async_trait]
+        impl Handler<LabRequest> for Held {
+            async fn handle(
+                &self,
+                req: LabRequest,
+                _s: &Streamer,
+            ) -> Result<serde_json::Value, CommandError> {
+                if matches!(req, LabRequest::Shutdown {}) {
+                    let _ = self.0.send(());
+                }
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let Some(root) = std::env::var_os(SIGNALLED_TEARDOWN_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (held, late, inflight) = ("f11-held", "f11-late", "f11-inflight");
+            crate::paths::ensure_dir(&crate::paths::state_dir()).unwrap();
+            let root = super::registry::canonical_root(&root).unwrap();
+
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _daemon = Server::<LabRequest>::bind(
+                &crate::paths::lab_socket(held),
+                Arc::new(Held(shutdown_tx)),
+            )
+            .await
+            .unwrap();
+            // The process the held lab's entry names. The release waits for
+            // it, so the teardown stays inside that release until it is
+            // killed below.
+            let mut helper = tokio::process::Command::new("sleep")
+                .arg("1000")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let held_pid = helper.id().unwrap();
+            let reaper = tokio::spawn(async move {
+                let _ = helper.wait().await;
+            });
+            // A pid no process has: the daemon the in-flight `lab.ensure`
+            // registers. Its release needs no process to wait for.
+            let mut gone = std::process::Command::new("true").spawn().unwrap();
+            let gone_pid = gone.id();
+            gone.wait().unwrap();
+
+            let host = crate::config::host::HostConfig::default();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: held.into(),
+                    root: root.join(held),
+                    pid: held_pid,
+                    started: process_start_time(held_pid),
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
+            let handler = Arc::new(super::SupervisorHandler {
+                sup: supervisor.clone(),
+                tasks: tasks.clone(),
+            });
+            let _server = Server::<SupRequest>::bind(&crate::paths::supervisor_socket(), handler)
+                .await
+                .unwrap();
+            let client = SupClient::connect(&crate::paths::supervisor_socket())
+                .await
+                .unwrap();
+
+            // A `lab.ensure` accepted before the teardown: it holds the
+            // name's lock, as `ensure_lab` does until its daemon answers.
+            let inflight_lock = supervisor.ensure_lock(inflight).await;
+            let inflight_guard = inflight_lock.lock().await;
+
+            // What `run_async` does once `termination_signal` returns.
+            let teardown = tokio::spawn({
+                let (supervisor, tasks) = (supervisor.clone(), tasks.clone());
+                async move { super::teardown(&supervisor, &tasks).await }
+            });
+            shutdown_rx.recv().await.expect("the held lab is released");
+
+            let ensured = client
+                .send(SupRequest::LabEnsure {
+                    name: late.into(),
+                    root: root.clone(),
+                })
+                .await;
+            // Before the fix the unwanted `__labd` child is this test
+            // executable, which rejects that argument, and `lab.ensure`
+            // answers only once its reaper has marked the entry failed.
+            let late_log = crate::paths::state_dir().join(format!("labd-{late}.log"));
+            let late_registered = supervisor.registry.lock().await.get(late).is_some();
+
+            // The in-flight `lab.ensure` registers its daemon and returns.
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: inflight.into(),
+                    root: root.join(inflight),
+                    pid: gone_pid,
+                    started: None,
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            drop(inflight_guard);
+
+            // End the held daemon, so its release and the teardown finish.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(held_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = reaper.await;
+            teardown.await.unwrap();
+
+            let left: Vec<String> = {
+                let registry = supervisor.registry.lock().await;
+                registry.labs().iter().map(|l| l.name.clone()).collect()
+            };
+            let mut faults = Vec::new();
+            match &ensured {
+                Err(ProtoError::Remote(e))
+                    if e.code == ErrorCode::Conflict && e.message.contains("shutting down") => {}
+                other => faults.push(format!(
+                    "lab.ensure during the teardown was not refused as shutting down: {other:?}"
+                )),
+            }
+            if late_log.exists() || late_registered {
+                faults.push(format!(
+                    "lab.ensure during the teardown spawned a lab daemon (log: {}, entry: \
+                     {late_registered})",
+                    late_log.exists()
+                ));
+            }
+            if !left.is_empty() {
+                faults.push(format!("the teardown left lab(s) registered: {left:?}"));
+            }
+            assert!(faults.is_empty(), "{}", faults.join("\n"));
+        });
+    }
+
     #[test]
     fn an_exited_child_is_not_running_before_it_is_reaped() {
         assert!(process_running(std::process::id()));
@@ -1444,5 +1675,146 @@ mod tests {
         assert!(!process_running(pid));
         child.wait().unwrap();
         assert!(!process_running(pid));
+    }
+
+    /// Answers `global.attach` with a trunk socket the test holds, as a
+    /// supervisor that is about to be killed would.
+    struct DoomedSupervisor {
+        trunk: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proto::server::Handler<crate::proto::SupRequest> for DoomedSupervisor {
+        async fn handle(
+            &self,
+            req: crate::proto::SupRequest,
+            _stream: &crate::proto::server::Streamer,
+        ) -> Result<serde_json::Value, crate::proto::CommandError> {
+            match req {
+                crate::proto::SupRequest::GlobalAttach { .. } => Ok(serde_json::json!({
+                    "socket": self.trunk,
+                    "warnings": [],
+                    "subnet": "10.214.3.0/24",
+                })),
+                _ => Err(crate::proto::CommandError::internal("not served here")),
+            }
+        }
+    }
+
+    /// F9 (docs/reviews/lab-lifecycle.md): two labs share the global
+    /// segment `corp`. The supervisor they attached to dies, and its
+    /// segments with it. The supervisor that replaces it must hold `corp`
+    /// again with both labs as members, on the subnet their guests have
+    /// leases in, and a frame from one lab must reach the other.
+    #[tokio::test]
+    async fn adopted_labs_attach_their_global_segments_again() {
+        use crate::net::frame::{MAC_BROADCAST, eth_build};
+        use crate::net::switch::PortClass;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup_sock = dir.path().join("vmlabd.sock");
+        let trunk = dir.path().join("doomed-corp.sock");
+        let network = |lab: &str| {
+            let src = format!(
+                "import <vmlab.wcl>\nlab \"{lab}\" {{ segment \"corp\" {{ global = true }} }}"
+            );
+            let lab = crate::config::load_lab_source(&src, "<t>", std::path::Path::new("/tmp"))
+                .unwrap()
+                .lab;
+            crate::labd::network::LabNetwork::build(&lab).unwrap()
+        };
+        let (mut a, mut b) = (network("a"), network("b"));
+
+        // The first supervisor: both labs attach and bridge their trunks.
+        let doomed = crate::proto::server::Server::<crate::proto::SupRequest>::bind(
+            &sup_sock,
+            Arc::new(DoomedSupervisor {
+                trunk: trunk.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let trunks = tokio::net::UnixListener::bind(&trunk).unwrap();
+        a.attach_globals_via(&sup_sock, "a").await.unwrap();
+        b.attach_globals_via(&sup_sock, "b").await.unwrap();
+        let held = [
+            trunks.accept().await.unwrap().0,
+            trunks.accept().await.unwrap().0,
+        ];
+
+        // It dies: its socket, its trunk listener and both trunks go.
+        drop(doomed);
+        drop(trunks);
+        drop(held);
+
+        // Its successor starts with no segments, as a new vmlabd does.
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        let globals = super::GlobalSegments::new_at(
+            dir.path().join("global"),
+            "test.internal".into(),
+            None,
+            None,
+            events.clone(),
+        );
+        let supervisor = Arc::new(super::Supervisor {
+            registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+            events,
+            globals: globals.clone(),
+            ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            template_ops: super::templates::TemplateOps::default(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            keepers: super::keepawake::Keepers::default(),
+        });
+        let _successor = crate::proto::server::Server::<crate::proto::SupRequest>::bind(
+            &sup_sock,
+            Arc::new(super::SupervisorHandler {
+                sup: supervisor,
+                tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // A frame from lab a's side of `corp` reaches lab b's side once both
+        // have attached again; resend until it does.
+        let from_a = a
+            .segment_mut("corp")
+            .unwrap()
+            .switch
+            .add_channel_port(PortClass::Service);
+        let mut at_b = b
+            .segment_mut("corp")
+            .unwrap()
+            .switch
+            .add_channel_port(PortClass::Service);
+        let frame = bytes::Bytes::from(eth_build(
+            MAC_BROADCAST,
+            crate::config::model::MacAddr([0x02, 0, 0, 0, 0, 0x0a]),
+            0x88b5,
+            b"from lab a",
+        ));
+        'delivered: loop {
+            from_a.tx.send(frame.clone()).await.unwrap();
+            let resend = tokio::time::sleep(std::time::Duration::from_millis(50));
+            tokio::pin!(resend);
+            loop {
+                tokio::select! {
+                    got = at_b.rx.recv() => {
+                        if got.unwrap() == frame {
+                            break 'delivered;
+                        }
+                    }
+                    () = &mut resend => break,
+                }
+            }
+        }
+
+        let list = globals.list().await;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0]["name"], "corp");
+        assert_eq!(list[0]["labs"], serde_json::json!(["a", "b"]));
+        assert_eq!(list[0]["refcount"], 2);
+        assert_eq!(list[0]["subnet"], "10.214.3.0/24");
     }
 }
