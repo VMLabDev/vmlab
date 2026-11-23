@@ -2582,6 +2582,83 @@ mod tests {
         tf.templates.into_iter().next().unwrap()
     }
 
+    /// The arguments of a build that is expected to be refused before it
+    /// fetches or boots anything: an empty store and no controls.
+    async fn refused_build(
+        d: &crate::config::model::TemplateDef,
+        version: Option<&str>,
+    ) -> String {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = TemplateStore::new(store_dir.path().to_path_buf());
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let err = super::build_template(
+            d,
+            Path::new("/root"),
+            &store,
+            &profiles,
+            std::sync::Arc::new(|_| {}),
+            super::BuildTarget {
+                version,
+                variants: None,
+            },
+            super::BuildControl::default(),
+        )
+        .await
+        .expect_err("the build must be refused");
+        format!("{err:#}")
+    }
+
+    /// The working directory is `<arch>-<name>-<version>` under the builds
+    /// directory, and claiming it deletes whatever is there. A version with
+    /// `/` and `..` moved that delete out of the cache, so the build refuses
+    /// the name before it forms the path (template-build review F1).
+    #[tokio::test]
+    async fn a_build_working_directory_stays_inside_the_builds_directory() {
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1/../../card-691-proof"
+                 profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(
+            err.contains("version") && err.contains("1/../../card-691-proof"),
+            "{err}"
+        );
+        assert!(!err.contains("card-691.iso"), "{err}");
+
+        // A pinned version is the one the store is given, so it is held to
+        // the same rule.
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, Some("../card-691-proof")).await;
+        assert!(
+            err.contains("version") && err.contains("../card-691-proof"),
+            "{err}"
+        );
+    }
+
+    /// The store's name rule used to be applied by the install, the last
+    /// step: a definition with `version = "24H2"` fetched its source,
+    /// installed the guest and sealed the disk before it was refused. The
+    /// source here does not exist, so an error about the source means the
+    /// fetch ran first (template-build review F1).
+    #[tokio::test]
+    async fn a_name_the_store_refuses_is_refused_before_the_build() {
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "24H2" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(err.contains("version") && err.contains("24H2"), "{err}");
+        assert!(!err.contains("card-691.iso"), "{err}");
+
+        let d = def(r#"import <vmlab.wcl>
+               template "Windows-11" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(err.contains("name") && err.contains("Windows-11"), "{err}");
+        assert!(!err.contains("card-691.iso"), "{err}");
+    }
+
     /// The build render, with the VMLAB bootstrap ISO folder attached or not.
     fn install(guest_iso: Option<&Path>) -> BuildBoot<'_> {
         BuildBoot::Install {
