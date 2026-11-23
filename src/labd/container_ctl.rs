@@ -421,6 +421,60 @@ mod tests {
         ctl.wait_started(LONG).await.unwrap();
     }
 
+    /// Review F2: a peer that floods `boot` and never reads fills the socket
+    /// buffer under the watcher's answers. The blocked answer must not hold
+    /// the writer for ever, or a stop behind it never reaches its next rung.
+    /// The clock is paused, so it moves only when every task is blocked: the
+    /// test has no wall-clock limit of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_ctl_peer_that_never_reads_does_not_block_a_stop() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            write_line(&mut stream, &CtlEvent::Boot { proto_version: 1 }).await;
+            // Keep the socket open and never read it.
+            std::future::pending::<()>().await;
+        })
+        .await;
+        let ctl = CtlHandle::connect(&path).await.unwrap();
+
+        // The watcher's answer to every `boot`: the whole spec.
+        let spec: vmlab_cinit_proto::ContainerSpec = serde_json::from_value(serde_json::json!({
+            "hostname": "silent",
+            "env": [["PAD", "x".repeat(16 * 1024)]],
+        }))
+        .unwrap();
+        let answer = CtlCommand::Spec {
+            spec: Box::new(spec),
+        };
+        let watcher = {
+            let ctl = ctl.clone();
+            tokio::spawn(async move {
+                let mut sent = 0u32;
+                while ctl.send(&answer).await.is_ok() {
+                    sent += 1;
+                }
+                sent
+            })
+        };
+
+        // Paused time passes only once the watcher is stuck in a write.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!watcher.is_finished(), "the watcher is blocked in its write");
+
+        let stop = {
+            let ctl = ctl.clone();
+            tokio::spawn(async move { ctl.send(&CtlCommand::Stop { grace_secs: 3 }).await })
+        };
+        let err = stop.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("ctl"), "{err:#}");
+
+        // The watcher's own write gave up too, after some answers went out.
+        assert!(watcher.await.unwrap() > 0);
+        // A write that was cut short leaves half a line on the wire, so the
+        // channel takes no further command.
+        let err = ctl.send(&CtlCommand::Resync).await.unwrap_err();
+        assert!(format!("{err:#}").contains("no longer usable"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn eof_closes_waiters_gracefully() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
