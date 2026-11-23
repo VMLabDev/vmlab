@@ -40,7 +40,7 @@ The findings are ranked against these three facts, which the code states:
 | F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545) |
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
-| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address |
+| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
 | F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites |
 | F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name |
 | F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
@@ -288,7 +288,7 @@ is refused at launch, because the file format has no escape for one.
   2. By hand: set `subnet_pool = "10.99.0.0/16"`, run `vmlab up` on such a
      lab, and read the segment's subnet in `vmlab status`. It is `10.213.x.0/24`.
 
-### F8. Any subnet prefix is accepted, and `gateway_ip` overflows (crash, wrong result)
+### F8. Any subnet prefix is accepted, and `gateway_ip` overflows (crash, wrong result, fixed in #564)
 
 - Where: `src/config/extract.rs:133` (`subnet` is any CIDR),
   `src/config/validate.rs:112-134` (only the overlap check),
