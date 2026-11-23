@@ -169,6 +169,22 @@ static int build_tail(char **argv, int argc, char *out, size_t cap)
     return 0;
 }
 
+static int set_exec_cwd(const char *cwd)
+{
+    if (cwd[0] && cwd[1] == ':') {
+        int letter = toupper((unsigned char)cwd[0]);
+        unsigned drive, drives, current;
+        if (letter < 'A' || letter > 'Z')
+            return -1;
+        drive = (unsigned)(letter - 'A' + 1);
+        _dos_setdrive(drive, &drives);
+        _dos_getdrive(&current);
+        if (current != drive)
+            return -1;
+    }
+    return chdir(cwd);
+}
+
 struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
 {
     static char tail[1024];
@@ -181,6 +197,11 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         fmt(err, (size_t)errcap, "exec: DOS runs one command at a time");
         return NULL;
     }
+    if (!getcwd(save_cwd, sizeof save_cwd)) {
+        fmt(err, (size_t)errcap, "exec: cannot save current directory");
+        return NULL;
+    }
+    _dos_getdrive(&save_drive);
     p = calloc(1, sizeof *p);
     if (!p) {
         fmt(err, (size_t)errcap, "exec: out of memory");
@@ -204,15 +225,20 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         return NULL;
     }
 
+    if (spec->cwd && set_exec_cwd(spec->cwd) != 0) {
+        _dos_setdrive(save_drive, &drives);
+        chdir(save_cwd);
+        close(in);
+        close(out);
+        close(errf);
+        unlink(p->out_path);
+        unlink(p->err_path);
+        free(p);
+        fmt(err, (size_t)errcap, "exec: cannot use directory %s", spec->cwd);
+        return NULL;
+    }
     for (i = 0; i < spec->nenv; i++)
         putenv(spec->env[i]);
-    getcwd(save_cwd, sizeof save_cwd);
-    _dos_getdrive(&save_drive);
-    if (spec->cwd) {
-        if (strlen(spec->cwd) >= 2 && spec->cwd[1] == ':')
-            _dos_setdrive((unsigned)(toupper(spec->cwd[0]) - 'A' + 1), &drives);
-        chdir(spec->cwd);
-    }
 
     save0 = dup(0);
     save1 = dup(1);
