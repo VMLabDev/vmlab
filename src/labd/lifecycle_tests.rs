@@ -325,28 +325,16 @@ fn automatic_hypervisor_selection_follows_a_deferred_templates_hardware() {
     let mut parts = (*machine.template()).clone();
     parts.resolved.display_device = Some("qxl-vga".into());
     machine.set_template(parts);
-    assert_eq!(machine.hypervisor(), HypervisorKind::Qemu);
-    assert!(machine.takes_tap_fds());
-    assert_eq!(machine.net_framing(), FramingMode::Raw);
-    // vmlab-hv presents no QXL, so the template's display sends it to QEMU.
-    let why = machine.hypervisor_fallback().unwrap();
-    assert!(why.contains("qxl-vga"), "{why}");
-}
-
-/// A VM the lab builder left on QEMU reports the removal warning in its
-/// status, by the rung that chose QEMU; one nothing selected reports none.
-#[tokio::test]
-async fn a_qemu_vm_reports_the_removal_warning_in_its_status() {
-    use crate::config::hypervisor::{QemuReason, SelectionSource};
-    let dirs = Dirs::new();
-    let (mut machine, _) = vm(&dirs, LINUX_VM, Script::healthy());
-    machine.set_host_facts(kvm_host());
-    assert_eq!(machine.qemu_removal(), None);
-    let machine = machine.with_selection_source(SelectionSource::Existing);
-    let removal = machine.qemu_removal().expect("an x86 VM on QEMU");
-    assert_eq!(removal.reason, QemuReason::Existing);
-    let machine: Arc<dyn Machine> = machine;
-    assert_eq!(machine.status().await.qemu_removal, Some(removal));
+    // vmlab-hv presents no QXL, and QEMU runs no x86 guest: the VM stays on
+    // vmlab-hv, and its start refuses the display.
+    assert_eq!(machine.hypervisor(), HypervisorKind::Vmlab);
+    assert_eq!(machine.hypervisor_fallback(), None);
+    let why = crate::config::hypervisor::vmlab_refusals(
+        crate::config::model::MachineCfg::Vm(&machine.cfg),
+        &kvm_host(),
+        Some(&machine.template().resolved),
+    );
+    assert!(why.iter().any(|w| w.contains("qxl-vga")), "{why:?}");
 }
 
 #[tokio::test]
@@ -1792,6 +1780,9 @@ async fn a_booting_guest_that_ignores_acpi_is_stopped_through_its_agent() {
         },
     );
     assert!(!vm.template().resolved.acpi_shutdown);
+    // The profile pins the TSC; a pin from an earlier start spares the probe,
+    // which only vmlab-hv has now (§22.4).
+    crate::qemu::tsc::write_pin(&vm.dirs.tsc_pin(), 3_000_000_000).expect("pin");
     let (cbs, mut observed) = callbacks();
     start_vm(&vm, cbs).await.expect("start");
 

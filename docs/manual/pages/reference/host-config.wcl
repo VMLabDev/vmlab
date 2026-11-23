@@ -207,7 +207,8 @@ SRC
   list {
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
     li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
-    li "Explicit `vmlab` settings are validated against the refusal list. A new machine without a hypervisor setting selects vmlab-hv if supported or QEMU with a reason."
+    li "Explicit `vmlab` settings are validated against the refusal list. A new x86 machine without a hypervisor setting selects vmlab-hv and is validated the same way; a new machine of another architecture selects QEMU with a reason."
+    li "QEMU runs no x86 guest: `vm = \"qemu\"` or `container = \"qemu\"` is a validation error for every x86 machine it reaches, naming the fix. It stays valid for aarch64 and riscv64 machines."
     li "With neither setting, an existing x86 QEMU identity selects vmlab-hv. A hardware refusal fails the start and keeps the old identity. After the checks pass, vmlab saves the switch before boot and `up` reports it once."
     li "Other existing identities survive stops and daemon restarts until destroy or an explicit setting. For older disks, the newest snapshot supplies the identity where recorded. Otherwise vmlab infers QEMU."
     li "Changing an explicit default can move an existing VM. Online snapshots still require the hypervisor that captured them; offline snapshots restore under either."
@@ -219,9 +220,8 @@ SRC
     including the selected vmlab-hv before a migration has been saved.
     Ordinary status also prints fallback reasons, and `status --json` carries
     `hypervisor` and optional `hypervisor_fallback`. `up` prints an info line
-    for each fallback. An x86 machine on QEMU gets the QEMU removal warning
-    instead, at `up`, `vm start`, `validate` and `status`, with
-    `qemu_removal` in `status --json`. See [Host configuration and WSL 2](guide_host) and
+    for each fallback, which only a machine that is not x86 has. See
+    [Host configuration and WSL 2](guide_host) and
     [Snapshots](guide_snapshots).
   DOC
   h2 "gpu \"<name>\" {}"

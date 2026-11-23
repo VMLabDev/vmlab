@@ -67,12 +67,9 @@ each floppy on drive A:. It tests the raw `floppy` attachment and
 folder-built `media` separately, using the FreeDOS template from the legacy
 gate.
 
-Two core and admin features remain skipped by default on vmlab-hv.
-
-| Feature | Scenario and QEMU lab | Skip reason |
-| --- | --- | --- |
-| `vm.hw.qemu_args` | core, core-lab/vm01 | QEMU-only command-line arguments |
-| `arch.emulated` | admin, admin-lab/arm01 | Phase 3 aarch64 TCG emulation |
+No core or admin feature is skipped by default. `vm.hw.qemu_args` was removed
+with QEMU's x86 support (PRD §22.4), and `arch.emulated` runs `admin-lab`'s
+aarch64 `arm01` on QEMU on every run.
 
 Phase tags are unchanged. `lab.validate`, `lab.validate.reject`, and
 `daemon.lifecycle` are host features that already ran on both hypervisors.

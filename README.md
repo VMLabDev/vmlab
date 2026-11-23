@@ -11,9 +11,11 @@ state, snapshots, keystrokes and mouse input, screenshot capture with image
 matching and OCR, and command execution and file transfer over vmlab's own
 in-guest agent.
 
-vmlab runs VMs on vmlab-hv or QEMU/KVM, without libvirt.
+vmlab runs VMs on vmlab-hv or QEMU, without libvirt. x86 and x86_64 guests
+run on vmlab-hv under KVM only, so a host for them needs a usable `/dev/kvm`;
+aarch64 and riscv64 guests run on QEMU, under KVM on a host of their own
+architecture and emulated (TCG) elsewhere.
 Hosts are Linux, with **WSL2 supported as a first-class host environment**.
-Guests can be x86_64, aarch64 or riscv64, natively accelerated or emulated.
 
 See [`docs/vmlab-prd.md`](docs/vmlab-prd.md) for the full product
 requirements; it is the source of truth for design and scope.
@@ -60,7 +62,7 @@ Two-tier daemon system (PRD §3):
 - **Supervisor (`vmlabd`)** — one per user, auto-started by the CLI. Owns lab
   lifecycle, the lab registry, global segments, template-store writes,
   host-level watchdogs, and an aggregated event stream.
-- **Lab daemon** — one per running lab, owning that lab's QEMU processes,
+- **Lab daemon** — one per running lab, owning that lab's hypervisor processes,
   QMP/agent channels, network fabric (a complete userspace switching / DHCP /
   DNS / NAT / routing / filtering stack), snapshots, state, and the wscript
   runtime.
@@ -237,7 +239,8 @@ needs a one-time `just ebpf-tools`. It also checks hypervisor formatting,
 clippy and tests with KVM and host-asset acceptance tests marked ignored.
 The guest-booting `just ci::hv-gate` runs locally once per orchestrator batch.
 
-Runtime tools expected on the host: `qemu-system-<arch>`, `qemu-img`, `swtpm`,
+Runtime tools expected on the host: `vmlab-hv` and `/dev/kvm` for x86 guests,
+`qemu-system-<arch>` for aarch64 and riscv64 guests, `qemu-img`, `swtpm`,
 `tesseract` (OCR), an ISO tool (`xorriso`/`genisoimage`), `mtools` +
 `mkfs.vfat` (floppy building), `sqfstar` from `squashfs-tools` (required for
 containers), and a VNC viewer (`remote-viewer` preferred) for `vmlab console`.

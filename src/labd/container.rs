@@ -1421,20 +1421,6 @@ impl super::machine::Machine for ContainerInstance {
         self.hypervisor_fallback.clone()
     }
 
-    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
-        let source = self.selection_source?;
-        crate::config::hypervisor::qemu_removal(
-            model::MachineCfg::Container(&self.cfg),
-            &crate::config::hypervisor::HypervisorSelection {
-                kind: self.hypervisor,
-                source,
-                fallback_reason: self.hypervisor_fallback.clone(),
-            },
-            &(self.host_facts)(),
-            None,
-        )
-    }
-
     async fn state(&self) -> PowerState {
         self.power_state().await
     }
