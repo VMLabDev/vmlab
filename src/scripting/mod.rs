@@ -3,7 +3,8 @@
 //! runs. Scripts are daemon-unaware; the wscript VM is synchronous, so scripts
 //! execute on blocking threads and host methods bridge into the lab
 //! daemon's tokio runtime via `Handle::block_on` (through [`cancel`], so a
-//! provision `up` abandons stops at its next host call).
+//! provision `up` abandons stops at a host cancellation check or when its
+//! bytecode budget is exhausted).
 
 mod cancel;
 mod ocr;
