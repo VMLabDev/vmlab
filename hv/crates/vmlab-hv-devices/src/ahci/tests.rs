@@ -1,6 +1,6 @@
 use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
+    Condvar, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -95,7 +95,14 @@ impl Driver {
         let hba = Ahci::new("ahci-00:1f.2", memory.clone(), irq.clone(), irq.clone());
         Self { hba, memory, irq }
     }
+    /// A register write, then every command it started, as the tests that
+    /// read a result on the next line expect.
     fn write(&mut self, offset: usize, value: u32) {
+        self.write_only(offset, value);
+        self.hba.wait_idle();
+    }
+    /// A register write alone, as a vCPU performs it.
+    fn write_only(&mut self, offset: usize, value: u32) {
         self.hba.bar_write(5, offset as u64, &value.to_le_bytes());
     }
     fn read(&mut self, offset: usize) -> u32 {
@@ -436,11 +443,15 @@ fn hba_reset_six_ports_and_indexed_io() {
 fn system_reset_clears_pci_and_hba_state_and_keeps_attached_drives() {
     let mut d = Driver::new();
     d.hba.attach_cdrom(2, None).unwrap();
-    let Some(Drive::Cdrom(optical)) = &mut d.hba.drives[2] else {
-        panic!("CD-ROM missing")
+    let optical_mode = {
+        let mut core = d.hba.idle();
+        let Some(Drive::Cdrom(optical)) = &mut core.drives[2] else {
+            panic!("CD-ROM missing")
+        };
+        let optical_mode = optical.transfer_mode;
+        optical.transfer_mode = 0x20;
+        optical_mode
     };
-    let optical_mode = optical.transfer_mode;
-    optical.transfer_mode = 0x20;
     d.hba
         .attach_disk(5, image(vec![0x42; 4096], false))
         .unwrap();
@@ -451,13 +462,14 @@ fn system_reset_clears_pci_and_hba_state_and_keeps_attached_drives() {
     assert_eq!(d.read(4), 1 << 31);
     assert_eq!(d.read(port_base(5) + 0x18), 6);
     assert_eq!(d.read(port_base(5) + 0x24), 0x101);
-    let Some(Drive::Disk(disk)) = &mut d.hba.drives[5] else {
+    let mut core = d.hba.idle();
+    let Some(Drive::Disk(disk)) = &mut core.drives[5] else {
         panic!("drive detached")
     };
     let mut sector = [0; 512];
     disk.image.read_at(0, &mut sector).unwrap();
     assert_eq!(sector, [0x42; 512]);
-    let Some(Drive::Cdrom(optical)) = &d.hba.drives[2] else {
+    let Some(Drive::Cdrom(optical)) = &core.drives[2] else {
         panic!("CD-ROM detached")
     };
     assert_eq!(optical.transfer_mode, optical_mode);
@@ -844,7 +856,10 @@ fn dma_above_four_gib_and_fis_address_validation() {
     d.write(0x138, 1);
     assert_ne!(d.read(0x110) & HBFS, 0);
     let mut disk = [0; 512];
-    d.hba.disk_mut(0).unwrap().read_at(0, &mut disk).unwrap();
+    d.hba
+        .with_disk(0, |image| image.read_at(0, &mut disk))
+        .unwrap()
+        .unwrap();
     assert_eq!(disk, [0xa5; 512]);
 }
 
@@ -1058,24 +1073,30 @@ fn p4_qcow2_disk_and_controller_snapshot_transaction() {
     assert_eq!(d.command(0x35, 3, 1, true), 0x50);
     let state = d.hba.save_state().unwrap();
     let ram = d.bytes(0, 0x20000);
-    let disk = d.hba.disk_mut(0).unwrap();
-    disk.write_vmstate(0, &state).unwrap();
-    disk.snapshot_create("before", state.len() as u64, 0)
+    d.hba
+        .with_disk(0, |disk| {
+            disk.write_vmstate(0, &state).unwrap();
+            disk.snapshot_create("before", state.len() as u64, 0)
+                .unwrap();
+        })
         .unwrap();
     d.put(0x4000, &[0xa2; 512]);
     assert_eq!(d.command(0x35, 3, 1, true), 0x50);
     assert_eq!(d.command(0x25, 3, 1, false), 0x50);
     assert_eq!(d.bytes(0x4000, 512), vec![0xa2; 512]);
     d.write(4, 1);
-    let disk = d.hba.disk_mut(0).unwrap();
-    disk.snapshot_apply("before").unwrap();
     let mut restored = vec![0; state.len()];
-    disk.read_vmstate(0, &mut restored).unwrap();
+    d.hba
+        .with_disk(0, |disk| {
+            disk.snapshot_apply("before").unwrap();
+            disk.read_vmstate(0, &mut restored).unwrap();
+        })
+        .unwrap();
     d.put(0, &ram);
     d.hba.restore_state(&restored).unwrap();
     assert_eq!(d.command(0x25, 3, 1, false), 0x50);
     assert_eq!(d.bytes(0x4000, 512), vec![0x51; 512]);
-    d.hba.disk_mut(0).unwrap().flush().unwrap();
+    d.hba.with_disk(0, |disk| disk.flush()).unwrap().unwrap();
     if let Ok(output) = std::process::Command::new("qemu-img")
         .arg("check")
         .arg(&path)
@@ -1182,7 +1203,7 @@ fn measure_issue_block_time() {
             d.ack(0);
             d.prepare(command, flags, round * 64, 64, None, &[(0x4000, 0x8000, true)]);
             let started = std::time::Instant::now();
-            d.hba.bar_write(5, 0x138, &1u32.to_le_bytes());
+            d.write_only(0x138, 1);
             issue.push((command, started.elapsed()));
             while d.read(0x138) != 0 {
                 std::thread::yield_now();
@@ -1208,4 +1229,250 @@ fn measure_issue_block_time() {
             );
         }
     }
+}
+
+/// Holds every write and flush of a disk until the test opens it, and counts
+/// the calls that have arrived.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+    arrived: AtomicUsize,
+}
+impl Gate {
+    fn pass(&self) {
+        self.arrived.fetch_add(1, Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+    }
+    fn set(&self, open: bool) {
+        *self.open.lock().unwrap() = open;
+        self.opened.notify_all();
+    }
+    /// Wait until the worker is inside the disk with `count` calls.
+    fn wait_arrived(&self, count: usize) {
+        while self.arrived.load(Ordering::SeqCst) < count {
+            std::thread::yield_now();
+        }
+    }
+}
+
+struct GatedDisk {
+    disk: MemoryDisk,
+    gate: Arc<Gate>,
+}
+impl DiskImage for GatedDisk {
+    fn size(&self) -> u64 {
+        self.disk.size()
+    }
+    fn read_only(&self) -> bool {
+        self.disk.read_only()
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> vmlab_disk::Result<()> {
+        self.disk.read_at(offset, buf)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> vmlab_disk::Result<()> {
+        self.gate.pass();
+        self.disk.write_at(offset, buf)
+    }
+    fn flush(&mut self) -> vmlab_disk::Result<()> {
+        self.gate.pass();
+        self.disk.flush()
+    }
+    fn discard(&mut self, offset: u64, len: u64) -> vmlab_disk::Result<()> {
+        self.disk.discard(offset, len)
+    }
+    fn snapshots(&self) -> vmlab_disk::Result<Vec<vmlab_disk::SnapshotInfo>> {
+        self.disk.snapshots()
+    }
+    fn snapshot_create(&mut self, name: &str, size: u64, clock: u64) -> vmlab_disk::Result<()> {
+        self.disk.snapshot_create(name, size, clock)
+    }
+    fn snapshot_apply(&mut self, name: &str) -> vmlab_disk::Result<vmlab_disk::SnapshotInfo> {
+        self.disk.snapshot_apply(name)
+    }
+    fn snapshot_delete(&mut self, name: &str) -> vmlab_disk::Result<()> {
+        self.disk.snapshot_delete(name)
+    }
+    fn write_vmstate(&mut self, offset: u64, buf: &[u8]) -> vmlab_disk::Result<()> {
+        self.disk.write_vmstate(offset, buf)
+    }
+    fn read_vmstate(&mut self, offset: u64, buf: &mut [u8]) -> vmlab_disk::Result<()> {
+        self.disk.read_vmstate(offset, buf)
+    }
+}
+
+/// A started controller with a gated disk on port 0 and a CD-ROM on port 1.
+fn gated() -> (Driver, Arc<Gate>) {
+    let gate = Arc::new(Gate::default());
+    let mut d = Driver::new();
+    d.hba
+        .attach_disk(
+            0,
+            Box::new(GatedDisk {
+                disk: MemoryDisk {
+                    data: vec![0x11; 64 * 512],
+                    readonly: false,
+                    flushes: Arc::default(),
+                },
+                gate: gate.clone(),
+            }),
+        )
+        .unwrap();
+    d.hba
+        .attach_cdrom(1, Some(image(vec![0; 64 * 2048], true)))
+        .unwrap();
+    d.start(0);
+    // Port 1 by hand: `start` resets the whole HBA.
+    let base = port_base(1);
+    d.write(base, 0x1000);
+    d.write(base + 8, 0x2000);
+    d.write(base + 0x14, u32::MAX);
+    d.write(base + 0x18, 0x10);
+    d.write(base + 0x18, 0x11);
+    d.ack(1);
+    (d, gate)
+}
+
+#[test]
+fn a_flush_in_the_disk_does_not_hold_the_register_write() {
+    let (mut d, gate) = gated();
+    d.prepare(0xe7, 0, 0, 0, None, &[]);
+    // The write returns while the flush is still inside the disk: this is
+    // the vCPU going back to the guest, where it can answer an IPI.
+    d.write_only(0x138, 1);
+    gate.wait_arrived(1);
+    assert_eq!(d.read(0x138), 1);
+    assert_eq!(d.read(0x110), 0);
+    assert!(!d.irq.level.load(Ordering::SeqCst));
+    // Registers answer and another port completes a command meanwhile.
+    d.prepare(0xa1, 0, 0, 0, None, &[(0x4000, 512, false)]);
+    d.write_only(port_base(1) + 0x38, 1);
+    assert_eq!(d.read(port_base(1) + 0x38), 0);
+    assert_eq!(d.read(port_base(1) + 0x20), 0x50);
+    assert_eq!(d.read(0x138), 1);
+    d.write_only(port_base(1) + 0x10, u32::MAX);
+    d.write_only(8, 2);
+    assert!(!d.irq.level.load(Ordering::SeqCst));
+    // The flush ends: the command completes with an interrupt.
+    gate.set(true);
+    d.hba.wait_idle();
+    assert_eq!(d.read(0x138), 0);
+    assert_eq!(d.read(0x120), 0x50);
+    assert_ne!(d.read(0x110) & DHRS, 0);
+    assert_eq!(d.read(8), 1);
+    assert!(d.irq.level.load(Ordering::SeqCst));
+}
+
+#[test]
+fn slots_issued_together_run_in_order_behind_a_blocked_write() {
+    let (mut d, gate) = gated();
+    // Slot 1 reads the sector slot 0 writes.
+    d.prepare(0x25, 0, 3, 1, None, &[(0x6000, 512, true)]);
+    let mut header = d.bytes(0x1000, 32);
+    header[8..16].copy_from_slice(&0x5000u64.to_le_bytes());
+    d.put(0x1020, &header);
+    d.put(0x5000, &d.bytes(0x3000, 0x90));
+    d.put(0x4000, &[0x77; 512]);
+    d.prepare(0x35, 0x40, 3, 1, None, &[(0x4000, 512, true)]);
+    d.write_only(0x138, 3);
+    gate.wait_arrived(1);
+    assert_eq!(d.read(0x138), 3);
+    assert_eq!(d.bytes(0x6000, 512), vec![0; 512]);
+    gate.set(true);
+    d.hba.wait_idle();
+    assert_eq!(d.read(0x138), 0);
+    assert_eq!(d.bytes(0x6000, 512), vec![0x77; 512]);
+    assert_eq!(le32(&d.bytes(0x1004, 4)), 512);
+    assert_eq!(le32(&d.bytes(0x1024, 4)), 512);
+}
+
+#[test]
+fn a_snapshot_waits_for_the_command_in_flight_and_saves_it_completed() {
+    let (mut d, gate) = gated();
+    d.put(0x4000, &[0x5a; 512]);
+    d.prepare(0x35, 0x40, 7, 1, None, &[(0x4000, 512, true)]);
+    d.write_only(0x138, 1);
+    gate.wait_arrived(1);
+    let saved = AtomicBool::new(false);
+    let state = std::thread::scope(|scope| {
+        let snapshot = scope.spawn(|| {
+            PciSnapshot::quiesce(&mut d.hba);
+            let state = d.hba.save_function_state().unwrap();
+            saved.store(true, Ordering::SeqCst);
+            state
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!saved.load(Ordering::SeqCst));
+        gate.set(true);
+        snapshot.join().unwrap()
+    });
+    // The saved state holds the finished command, and the disk its data.
+    let mut sector = [0; 512];
+    d.hba
+        .with_disk(0, |disk| disk.read_at(7 * 512, &mut sector))
+        .unwrap()
+        .unwrap();
+    assert_eq!(sector, [0x5a; 512]);
+    let (mut restored, _gate) = gated();
+    restored.put(0, &d.bytes(0, 0x20000));
+    restored.hba.restore_function_state(&state).unwrap();
+    assert_eq!(restored.read(0x138), 0);
+    assert_eq!(restored.read(0x120), 0x50);
+    assert_ne!(restored.read(0x110) & DHRS, 0);
+    assert!(restored.irq.level.load(Ordering::SeqCst));
+    assert_eq!(restored.hba.save_function_state().unwrap(), state);
+}
+
+#[test]
+fn stopping_a_port_discards_the_command_in_flight_after_its_io_ends() {
+    let (mut d, gate) = gated();
+    d.put(0x4000, &[0x3c; 512]);
+    d.prepare(0x35, 0x40, 2, 1, None, &[(0x4000, 512, true)]);
+    d.write_only(0x138, 1);
+    gate.wait_arrived(1);
+    let stopped = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let stop = scope.spawn(|| {
+            // Clearing PxCMD.ST returns only when the write has left the disk.
+            d.write_only(0x118, 0x10);
+            stopped.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!stopped.load(Ordering::SeqCst));
+        gate.set(true);
+        stop.join().unwrap();
+    });
+    assert_eq!(d.read(0x138), 0);
+    assert_eq!(d.read(0x110), 0);
+    assert_eq!(le32(&d.bytes(0x1004, 4)), 0);
+    assert!(!d.irq.level.load(Ordering::SeqCst));
+    // The port takes commands again once it is restarted.
+    d.write(0x118, 0x11);
+    assert_eq!(d.command(0x25, 2, 1, false), 0x50);
+    assert_eq!(d.bytes(0x4000, 512), vec![0x3c; 512]);
+}
+
+#[test]
+fn a_machine_reset_waits_for_the_command_in_flight() {
+    let (mut d, gate) = gated();
+    d.prepare(0xe7, 0, 0, 0, None, &[]);
+    d.write_only(0x138, 1);
+    gate.wait_arrived(1);
+    let reset = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let thread = scope.spawn(|| {
+            crate::Resettable::reset(&mut d.hba).unwrap();
+            reset.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!reset.load(Ordering::SeqCst));
+        gate.set(true);
+        thread.join().unwrap();
+    });
+    assert_eq!(d.read(0x138), 0);
+    assert_eq!(d.read(0x118), 6);
+    assert!(!d.irq.level.load(Ordering::SeqCst));
 }
