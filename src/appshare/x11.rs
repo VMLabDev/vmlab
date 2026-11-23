@@ -29,7 +29,8 @@ const FAMILY_WILD: u16 = 65535;
 /// Where the host X server listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Endpoint {
-    /// A unix socket: the abstract name first when there is one, then the path.
+    /// A unix socket: the path first, then the abstract name when there is
+    /// one, which only a server of this user or of root is believed at.
     Local {
         abstract_name: Option<String>,
         path: PathBuf,
@@ -414,15 +415,23 @@ async fn connect(endpoint: &Endpoint) -> Result<HostStream> {
             abstract_name,
             path,
         } => {
+            // The path first: a directory owns it. An abstract name has no
+            // owner and no mode, so any local user may hold one the server
+            // left free, and the setup written next carries the real cookie.
+            let refused = match UnixStream::connect(path).await {
+                Ok(stream) => return Ok(HostStream::Unix(stream)),
+                Err(e) => e,
+            };
             if let Some(name) = abstract_name
                 && let Ok(stream) = connect_abstract(name)
+                && let Ok(peer) = stream.peer_cred()
+                && trusted_peer(peer.uid(), nix::unistd::getuid().as_raw())
             {
                 return Ok(HostStream::Unix(stream));
             }
-            let stream = UnixStream::connect(path).await.with_context(|| {
+            Err(refused).with_context(|| {
                 format!("connecting to the host X server at {}", path.display())
-            })?;
-            Ok(HostStream::Unix(stream))
+            })
         }
         Endpoint::Tcp { host, port } => {
             let stream = tokio::net::TcpStream::connect((host.as_str(), *port))
@@ -432,6 +441,12 @@ async fn connect(endpoint: &Endpoint) -> Result<HostStream> {
             Ok(HostStream::Tcp(stream))
         }
     }
+}
+
+/// Whether the listener of an abstract socket may be handed the host cookie:
+/// the user's own X server, or root's. Anyone else merely holds the name.
+fn trusted_peer(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid || peer_uid == 0
 }
 
 /// Connect to the abstract socket `\0<name>`. A local connect does not block
@@ -894,6 +909,14 @@ mod tests {
         let mut setup = vec![0u8; expected.len()];
         host.read_exact(&mut setup).await.unwrap();
         assert_eq!(setup, expected);
+    }
+
+    /// The abstract name is believed only when this user or root listens.
+    #[test]
+    fn an_abstract_socket_of_another_user_is_not_trusted() {
+        assert!(trusted_peer(1000, 1000));
+        assert!(trusted_peer(0, 1000));
+        assert!(!trusted_peer(1001, 1000));
     }
 
     /// Send a setup through `proxy` to `display` and return the server's

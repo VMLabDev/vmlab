@@ -291,6 +291,9 @@ Not read:
   of the host. PRD §1.2 lowers this as it does F8.
 - Confidence: high for the code, medium for how many hosts leave the
   abstract name free.
+- Fixed in card #732. The proxy connects to the path socket first. It takes
+  the abstract name only when the path socket refuses, and only when
+  `SO_PEERCRED` says that this user or root listens on it.
 
 ### F10. The host cookie is not found for two common Xauthority shapes
 
