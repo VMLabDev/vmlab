@@ -107,10 +107,11 @@ SRC
     nothing extra, a Linux guest needs only `cifs-utils`, and an
     XP-era guest can be served too: `smb1 = true` on a share enables the
     SMB1 dialect and the NTLMv1 authentication those guests require, for
-    that share alone: the lab's other shares refuse an SMB1 session, and
-    only an SMB1 session logs on with NTLMv1. It is off unless asked for.
-    One thing it does change for the whole lab: while any share has
-    `smb1 = true`, the server offers SMB signing to every session and
+    that share alone: the machine's other shares refuse an SMB1 session,
+    and only an SMB1 session logs on with NTLMv1. It is off unless asked
+    for. One thing it does change for the whole machine: while one of its
+    shares has `smb1 = true`, its server offers SMB signing to every
+    session and
     demands it of none. SMB
     carries no device state at all, so a restored VM's sessions are stale
     TCP that the guest's SMB client re-establishes transparently.
@@ -159,12 +160,23 @@ SRC
   DOC
 
   p <<DOC
-    vmlab mints per-lab SMB credentials automatically, and a share is
-    mappable only with its owning VM's credential. That scopes shares to
-    the VM that declared them even on a shared segment. Authenticated NTLMv2
-    with SMB signing is the baseline, because current Windows hardening
-    rejects unauthenticated shares. None of this is visible to you: the
-    credentials are plumbed by vmlab.
+    vmlab mints an SMB credential for each machine automatically, and a
+    share is mappable only with its owning machine's credential. That scopes
+    shares to the machine that declared them even on a shared segment.
+    Authenticated NTLMv2 with SMB signing is the baseline, because current
+    Windows hardening rejects unauthenticated shares. None of this is
+    visible to you: the credentials are plumbed by vmlab.
+  DOC
+
+  p <<DOC
+    An unprivileged Samba holds one account, the host user's, so vmlab runs
+    one `smbd` for each machine that shares over SMB. Each has its own
+    password, kept in `.vmlab/smb/machines/<machine>/creds`, its own host
+    port, and that machine's shares alone. The gateway sends a machine's
+    connections to port 445 to its own server, told by its NIC address.
+    The user name is the same for every machine. The servers answer no RPC
+    pipe, so a guest cannot change the password, and `net view` against the
+    gateway lists nothing: a share is reached by its name.
   DOC
 
   p <<DOC

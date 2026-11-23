@@ -15,17 +15,18 @@
 //! - the switch then proxies the segment gateway's port 445 to this high port
 //!   (that proxy is the network layer's job, not this module's).
 //!
-//! Auth baseline is NTLMv2 + mandatory SMB signing. `smb1 = true` relaxes
-//! **that share**: it alone is reachable over the NT1 dialect, and only an
-//! NT1 session logs on with NTLMv1/LM, for XP/2003-era guests that never send
-//! NTLMv2 (PRD §7.5). One `smbd` has one protocol floor, so the dialect is on
-//! offer to the whole lab as soon as one share asks for it; what keeps the
+//! One `smbd` serves one machine ([`super::LabSmb`]). Auth baseline is NTLMv2 +
+//! mandatory SMB signing. `smb1 = true` relaxes **that share**: it alone is
+//! reachable over the NT1 dialect, and only an NT1 session logs on with
+//! NTLMv1/LM, for XP/2003-era guests that never send NTLMv2 (PRD §7.5). One
+//! `smbd` has one protocol floor, so the dialect is on offer to the whole
+//! machine as soon as one of its shares asks for it; what keeps the
 //! relaxation to the share is in [`SmbConfig::render_conf`] — every other
 //! share turns an NT1 session away, and the NTLMv1/LM acceptance sits in a
 //! file `smbd` reads for NT1 sessions only ([`SmbConfig::nt1_conf_path`]).
 //! Signing is the one setting that cannot follow the session: `smbd` fixes
-//! it before a dialect is chosen, so a lab with an `smb1` share offers
-//! signing to every session and demands it of none.
+//! it before a dialect is chosen, so the server of a machine with an `smb1`
+//! share offers signing to every session and demands it of none.
 //!
 //! No SMB1 client is offered the CIFS Unix extensions: with them a guest
 //! creates a symlink to any host path inside a writable share
@@ -36,10 +37,11 @@ use std::process::Command;
 
 use rand::RngExt;
 
-/// Per-VM SMB credential. vmlab generates these automatically and plumbs them
-/// into the guest mount. Persisted per lab under `.vmlab/smb/creds` (0600)
-/// so remembered guest mappings survive daemon restarts, and so a human can
-/// map the share inside an interactive guest session (PRD §7.5 access model).
+/// One machine's SMB credential. vmlab generates these automatically and
+/// plumbs them into the guest mount. Persisted per machine under
+/// `.vmlab/smb/machines/<machine>/creds` (0600) so remembered guest mappings
+/// survive daemon restarts, and so a human can map the share inside an
+/// interactive guest session (PRD §7.5 access model).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmbCredentials {
     pub username: String,
@@ -47,7 +49,7 @@ pub struct SmbCredentials {
 }
 
 impl SmbCredentials {
-    /// Generate the credential for a lab.
+    /// Generate the credential for one machine.
     ///
     /// ## Unprivileged-passdb constraint (important)
     ///
@@ -56,35 +58,30 @@ impl SmbCredentials {
     /// entry). Creating arbitrary per-VM Unix accounts (`vmlab-<vm>`) needs
     /// root, which this backend deliberately avoids (PRD §7.5 strategy 2 runs
     /// `smbd` unprivileged). So the SMB **username is the invoking Unix user**
-    /// (the same identity `force user` exports the host tree as) and there is
-    /// **one credential per lab**, with a strong random password.
+    /// (the same identity `force user` exports the host tree as) for every
+    /// machine, and one passdb holds one account.
     ///
-    /// The `vm` argument is retained for API shape and so a future privileged /
-    /// embedded-server backend (strategy 1) can mint genuinely per-VM accounts
-    /// without changing callers; today it does not affect the username.
-    ///
-    /// ⚠ Deviation from PRD §7.5 "a share is mappable only with its owning VM's
-    /// credential": with one unprivileged passdb account, all of a lab's shares
-    /// authenticate with the same credential. Per-VM credential scoping needs
-    /// either root (to create per-VM Unix users) or the embedded SMB2 server of
-    /// strategy 1. `valid users` still gates each share to this single lab
-    /// account, so shares remain authenticated (never anonymous).
-    pub fn generate(lab: &str, vm: &str) -> SmbCredentials {
-        let _ = (lab, vm); // see doc: one credential per lab, mapped to the unix user.
+    /// PRD §7.5 "a share is mappable only with its owning VM's credential" is
+    /// therefore met with **one `smbd` per machine** ([`super::LabSmb`]): each
+    /// has a passdb of its own, holding this account under a strong random
+    /// password no other machine is given, and exports that machine's shares
+    /// alone.
+    pub fn generate() -> SmbCredentials {
         SmbCredentials {
             username: current_unix_user(),
             password: random_password(),
         }
     }
 
-    /// Load the lab's persisted credential, or mint and persist one.
+    /// Load the persisted credential of the machine whose SMB state
+    /// directory is `smb_dir`, or mint and persist one.
     ///
     /// Stability matters: guests remember mappings (`/persistent:yes`,
     /// fstab, credential manager). A password that rotated on every
     /// daemon start turned each remembered mapping into "user name or
-    /// password is incorrect" on the next `up`. The file lives in
+    /// password is incorrect" on the next `up`. The file lives under
     /// `.vmlab/smb/` so `destroy` wipes it together with the clones.
-    pub fn load_or_create(lab: &str, smb_dir: &std::path::Path) -> SmbCredentials {
+    pub fn load_or_create(smb_dir: &std::path::Path) -> SmbCredentials {
         let path = smb_dir.join("creds");
         if let Ok(s) = std::fs::read_to_string(&path)
             && let Some((u, p)) = s.trim().split_once(':')
@@ -96,7 +93,7 @@ impl SmbCredentials {
                 password: p.to_string(),
             };
         }
-        let c = Self::generate(lab, "");
+        let c = Self::generate();
         let _ = std::fs::create_dir_all(smb_dir);
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -136,19 +133,20 @@ pub struct ShareDef {
     pub readonly: bool,
     /// Whether this share requires the SMB1/NT1 dialect (XP-era guests).
     pub smb1: bool,
-    /// The single account permitted to map this share — its owning VM's
-    /// credential (PRD §7.5: "a share is mappable only with its owning VM's
-    /// credential"). Becomes `valid users = <allowed_user>`.
+    /// The single account permitted to map this share: the one account of
+    /// its owning machine's `smbd` (PRD §7.5: "a share is mappable only with
+    /// its owning VM's credential"). Becomes `valid users = <allowed_user>`.
     pub allowed_user: String,
 }
 
-/// A complete `smb.conf` description for one lab's `smbd` instance.
+/// A complete `smb.conf` description for one `smbd` instance: the one that
+/// serves one machine's shares.
 #[derive(Debug, Clone)]
 pub struct SmbConfig {
     /// Localhost high port `smbd` listens on (`smb ports =`).
     pub listen_port: u16,
-    /// The lab's `.vmlab/smb` directory; holds the conf, passdb, log and the
-    /// state/cache directories so `smbd` needs no root.
+    /// This server's directory under the lab's `.vmlab/smb`; holds the conf,
+    /// passdb, log and the state/cache directories so `smbd` needs no root.
     pub lab_dir: PathBuf,
     /// The directories `smbd` binds unix sockets in — `private dir`
     /// (`msg.sock/<pid>`), `ncalrpc dir` (`np/<pipe>`) — with the volatile
@@ -291,6 +289,15 @@ impl SmbConfig {
         out.push_str("    security = user\n");
         out.push_str("    map to guest = never\n");
         out.push_str("    restrict anonymous = 2\n");
+        // No RPC pipe at all. An unprivileged smbd runs every session with
+        // the uid it started with, which Samba's RPC servers take for root:
+        // any guest could set the password of the account over SAMR, or
+        // remove it (docs/reviews/smb.md F5). smbd serves a pipe only through
+        // samba-dcerpcd, which this keeps it from starting; mounting a share
+        // needs none. With it goes the share list (`net view`), which no
+        // guest mount reads. Samba before 4.16 has no such switch and
+        // ignores the line.
+        out.push_str("    rpc start on demand helpers = no\n");
         out.push_str(&format!("    server min protocol = {min_proto}\n"));
         out.push_str(&format!("    server signing = {signing}\n"));
         out.push_str("    ntlm auth = ntlmv2-only\n");
@@ -367,7 +374,7 @@ impl SmbConfig {
 /// as `%R` gives it.
 const NT1: &str = "NT1";
 
-/// The `preexec` of a share that did not ask for `smb1`, in a lab where
+/// The `preexec` of a share that did not ask for `smb1`, on a server where
 /// another did: succeed for a session on SMB2 or newer (`%R` is `SMB2_02`,
 /// `SMB2_10`, `SMB3_00`, `SMB3_02` or `SMB3_11`), fail for anything else.
 /// The shell is named: smbd does not take a line with `;` in it as one shell
@@ -783,12 +790,25 @@ mod tests {
         assert!(conf.contains("security = user"));
     }
 
+    /// No RPC pipe is served, with or without SMB1: over SAMR a guest sets
+    /// the password of the account (docs/reviews/smb.md F5).
+    #[test]
+    fn conf_serves_no_rpc_pipe() {
+        for smb1 in [false, true] {
+            let conf = cfg(smb1).render_conf().unwrap();
+            assert!(
+                conf.contains("    rpc start on demand helpers = no\n"),
+                "{conf}"
+            );
+        }
+    }
+
     #[test]
     fn credentials_username_is_unix_user_and_password_strong() {
         // Unprivileged passdb constraint: the SMB username must be a real Unix
         // account, so it is the invoking user (same for every VM in a lab).
-        let a = SmbCredentials::generate("lab", "web");
-        let b = SmbCredentials::generate("lab", "db");
+        let a = SmbCredentials::generate();
+        let b = SmbCredentials::generate();
         assert_eq!(a.username, current_unix_user());
         assert_eq!(a.username, b.username);
         assert!(!a.username.is_empty());
@@ -808,7 +828,7 @@ mod tests {
     fn persisted_credentials_are_private_and_stable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let first = SmbCredentials::load_or_create("lab", dir.path());
+        let first = SmbCredentials::load_or_create(dir.path());
         assert_eq!(
             std::fs::metadata(dir.path().join("creds"))
                 .unwrap()
@@ -817,7 +837,7 @@ mod tests {
                 & 0o777,
             0o600
         );
-        assert_eq!(SmbCredentials::load_or_create("lab", dir.path()), first);
+        assert_eq!(SmbCredentials::load_or_create(dir.path()), first);
     }
 
     #[cfg(unix)]
@@ -827,7 +847,7 @@ mod tests {
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "do not overwrite").unwrap();
         std::os::unix::fs::symlink(&victim, dir.path().join("creds")).unwrap();
-        SmbCredentials::load_or_create("lab", dir.path());
+        SmbCredentials::load_or_create(dir.path());
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
     }
 }

@@ -101,3 +101,13 @@ Before each boot, the scenario waits until fewer than two project VMs run on
 the host, excluding `qemu-system-* -avd` Android emulators. Containers need
 `--pid=host` for that count. On a shared development host, run the VM-owning
 processes inside `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`.
+
+The `macos` scenario boots `x86_64/macos-tahoe` on the run's hypervisor
+(`vm.macos`): `validate`, the hypervisor `status -v` names, agent readiness,
+`sw_vers` over `exec`, a PNG screenshot and `vm stop`. It needs the Apple SMC
+key from your own Mac in `VMLAB_E2E_APPLE_SMC_OSK` and skips without it. The
+scenario writes the key into the run's host config, mode 600, and restores the
+config afterwards. `just e2e::run` passes the variable by name, so the key is
+never on a command line. A missing template is copied from
+`VMLAB_E2E_MACOS_STORE`, mounted read-only at `/macos-store` like the legacy
+store, and the scenario skips when neither has it.

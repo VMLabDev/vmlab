@@ -53,7 +53,9 @@
 # from a terminal, the installer asks with a default of no; non-interactive
 # installs grant nothing unless --fastpath is explicit. The vmlab binary itself
 # never gets a capability. Replacing the helper drops them, so every install
-# requires consent again.
+# requires consent again. File capabilities go to whoever executes the file,
+# so the helper is installed mode 0700, and it refuses a caller that is not
+# the owner of its file.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -295,7 +297,10 @@ if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
   verify_asset "$helper_asset" "$helper_tmp"
   HELPER_SHA="$want"
   [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
-  chmod +x "$helper_tmp"
+  # File capabilities go to whoever executes the file, so no other account
+  # may execute it. The helper checks the caller too: this mode is the half
+  # that holds for a helper older than that check.
+  chmod 0700 "$helper_tmp"
   mv "$helper_tmp" "$BIN_DIR/vmlab-fastpath"
   HELPER="$BIN_DIR/vmlab-fastpath"
 else
@@ -323,7 +328,7 @@ fastpath_hint() {
 }
 
 fastpath_warning() {
-  printf '%s\n' 'NOTE: only the vmlab-fastpath helper gets CAP_BPF and CAP_NET_ADMIN, not vmlab. Any program running as you can start it and ask it to create tap devices and load and update vmlab'"'"'s own XDP and sockmap programs on them; it refuses every other request.'
+  printf '%s\n' 'NOTE: only the vmlab-fastpath helper gets CAP_BPF and CAP_NET_ADMIN, not vmlab. Any program running as you can start it and ask it to create tap devices and load and update vmlab'"'"'s own XDP and sockmap programs on them; it refuses every other request. It is installed for you alone (mode 0700) and serves no other user.'
 }
 
 # Ask on the terminal: under `curl | sh` the script itself is stdin.
@@ -375,7 +380,8 @@ got=$(sha256sum ./vmlab-fastpath | cut -d" " -f1)
 [ "$got" = "$want" ] || exit 3
 # chown drops file capabilities, so it comes before setcap.
 chown "$(stat -c %u:%g ..)" ./vmlab-fastpath
-chmod 755 ./vmlab-fastpath
+# Owner only: file capabilities go to whoever executes the file (F2).
+chmod 700 ./vmlab-fastpath
 setcap "$caps" ./vmlab-fastpath
 mv -fT ./vmlab-fastpath ../vmlab-fastpath
 '
