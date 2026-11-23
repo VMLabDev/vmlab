@@ -501,6 +501,105 @@ mod tests {
         assert!(steps[4].args.join(" ").contains("/v vmlab-shares"));
     }
 
+    /// PRD §7.5: "a share is mappable only with its owning VM's credential".
+    /// The user name is the host user's for every machine, because an
+    /// unprivileged passdb takes no other, so the password is what differs
+    /// (docs/reviews/smb.md F2).
+    #[test]
+    fn each_machine_has_its_own_credential() {
+        let lab = sample();
+        let web = lab.credentials("web").unwrap();
+        let xp = lab.credentials("xp").unwrap();
+        assert_ne!(
+            web.password, xp.password,
+            "one password opens the shares of both machines"
+        );
+    }
+
+    fn which(bin: &str) -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
+    }
+
+    /// `smbclient ... -c ls` on `share` at `port`, stdout and stderr.
+    fn smbclient_ls(port: u16, share: &str, creds: &SmbCredentials) -> String {
+        let out = std::process::Command::new("smbclient")
+            .arg(format!("//127.0.0.1/{share}"))
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-U")
+            .arg(format!("{}%{}", creds.username, creds.password))
+            .arg("-c")
+            .arg("ls")
+            .output()
+            .expect("run smbclient");
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    }
+
+    fn free_ports(n: usize) -> Vec<u16> {
+        let held: Vec<_> = (0..n)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        held.iter().map(|l| l.local_addr().unwrap().port()).collect()
+    }
+
+    /// Two machines, a real `smbd`: what `web` was given does not list the
+    /// share of `db`, wherever `web` connects (docs/reviews/smb.md F2).
+    #[test]
+    fn one_machines_credential_does_not_open_anothers_share() {
+        if !which("smbd") || !which("smbclient") {
+            eprintln!("SKIP: smbd or smbclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = |name: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.txt")), b"x").unwrap();
+            dir
+        };
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        let mut of_web = share("websrc", "/mnt/src", true, false);
+        of_web.host = host_dir("websrc");
+        let mut of_db = share("dbdata", "/mnt/data", false, false);
+        of_db.host = host_dir("dbdata");
+        let vms = vec![
+            ("web".to_string(), gateway, vec![of_web]),
+            ("db".to_string(), gateway, vec![of_db]),
+        ];
+        let vmlab_dir = tmp.path().join("lab/.vmlab");
+        let mut started = None;
+        for _ in 0..5 {
+            let port = free_ports(1)[0];
+            let mut lab = LabSmb::plan("l", &vmlab_dir, port, &vms);
+            let config = lab.build_config();
+            match lab.spawn(config) {
+                Ok(_) => {
+                    started = Some(lab);
+                    break;
+                }
+                Err(e) => eprintln!("smbd on {port}: {e}"),
+            }
+        }
+        let Some(mut lab) = started else {
+            eprintln!("SKIP: could not spawn smbd");
+            return;
+        };
+        let web = lab.credentials("web").unwrap().clone();
+        let db = lab.credentials("db").unwrap().clone();
+        let port = lab.listen_port();
+        let own = smbclient_ls(port, "websrc", &web);
+        let theirs = smbclient_ls(port, "dbdata", &web);
+        let owner = smbclient_ls(port, "dbdata", &db);
+        lab.stop();
+        assert!(own.contains("websrc.txt"), "web lists its own share:\n{own}");
+        assert!(owner.contains("dbdata.txt"), "db lists its own share:\n{owner}");
+        assert!(
+            !theirs.contains("dbdata.txt"),
+            "web's credential listed db's share:\n{theirs}"
+        );
+    }
+
     #[test]
     fn unknown_vm_yields_empty_plan() {
         let lab = sample();

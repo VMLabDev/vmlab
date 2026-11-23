@@ -785,6 +785,89 @@ mod tests {
         assert_eq!(last_reason("smbd version 4.24.6 started.\n"), None);
     }
 
+    /// A guest logs in with an ordinary Samba account, and Samba lets an
+    /// account set its password over the SAMR pipe: by the change call, and
+    /// by the administrator's set call too, because an unprivileged smbd
+    /// takes every session for root. After either, the password vmlab hands
+    /// out must still open the share (docs/reviews/smb.md F5).
+    #[test]
+    fn a_guest_cannot_change_the_lab_password() {
+        if which("smbd").is_none() || which("smbclient").is_none() || which("rpcclient").is_none()
+        {
+            eprintln!("SKIP: smbd, smbclient or rpcclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let smb_dir = tmp.path().join("lab/.vmlab/smb");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("hello.txt"), b"hi").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: false,
+            shares: vec![ShareDef {
+                name: "ro".to_string(),
+                host_path: shared.clone(),
+                readonly: true,
+                smb1: false,
+                allowed_user: user.to_string(),
+            }],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.to_string(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return;
+            }
+        };
+        let port = server.listen_port();
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("run {program}: {e}"));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        let port_arg = port.to_string();
+        let login = format!("{user}%{pass}");
+        let ls = || {
+            run(
+                "smbclient",
+                &["//127.0.0.1/ro", "-p", &port_arg, "-U", &login, "-c", "ls"],
+            )
+        };
+        let before = ls();
+        let rpc = |command: String| {
+            run(
+                "rpcclient",
+                &["-p", &port_arg, "-U", &login, "127.0.0.1", "-c", &command],
+            )
+        };
+        let changed = rpc(format!("chgpasswd3 {user} {pass} NewPass456def"));
+        let after_change = ls();
+        let set = rpc(format!("setuserinfo2 {user} 23 OtherPass789ghi"));
+        let after_set = ls();
+        drop(server);
+        assert!(before.contains("hello.txt"), "the share lists at all:\n{before}");
+        assert!(
+            after_change.contains("hello.txt"),
+            "a guest changed the password of the account.\nchgpasswd3:\n{changed}\nls:\n{after_change}"
+        );
+        assert!(
+            after_set.contains("hello.txt"),
+            "a guest set the password of the account.\nsetuserinfo2:\n{set}\nls:\n{after_set}"
+        );
+    }
+
     fn which(bin: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         for dir in std::env::split_paths(&path) {
