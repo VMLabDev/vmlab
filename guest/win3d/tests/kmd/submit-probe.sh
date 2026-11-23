@@ -8,11 +8,13 @@
 # Build the probe first: build/probes/build.sh submit. A driver without the
 # fix can bugcheck the guest on the case "wrap": the script then waits for
 # the guest to come back and records the bugcheck. Use a disposable lab.
+# After two bugchecks in a row Windows stops at its recovery screen and
+# waits for a key there.
 # Exit status: 0 when every case passed, 1 otherwise, 2 on usage.
 # check-shell-paths: no-errexit a case that fails or bugchecks is recorded and the next one runs (VML-88).
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-[ $# -ge 4 ] || { sed -n '2,12p' "$0" >&2; exit 2; }
+[ $# -ge 4 ] || { sed -n '2,14p' "$0" >&2; exit 2; }
 LABDIR=$(cd "$1" && pwd); VM=$2; EV=$3; shift 3
 PROBE=$REPO/out/probes-extra/x64/submit_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE: run build/probes/build.sh submit" >&2; exit 2; }
@@ -59,6 +61,7 @@ bugchecks >"$EV/bugchecks-before.txt" 2>/dev/null
 failed=0
 for c in "$@"; do
     note "case $c"
+    rm -f "$EV/$c.json" "$EV/$c.stdout.json" "$EV/$c.stderr.txt" "$EV/$c.rc" "$EV/$c.status-v.txt" "$EV/$c.screen.png"
     in_lab vmlab exec --user "$USER_NAME" --password "$USER_PASS" --timeout 120 "$VM" -- \
         'C:\c752\submit_probe.exe' --case "$c" --out "C:\\c752\\out\\$c.json" >"$EV/$c.stdout.json" 2>"$EV/$c.stderr.txt"
     rc=$?
