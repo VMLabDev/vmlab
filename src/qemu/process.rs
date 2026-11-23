@@ -439,9 +439,16 @@ impl LabExecutable {
 
 impl LabIdentity {
     fn new(lab: &str, root: Option<&Path>) -> Self {
+        Self::in_runtime(lab, root, &crate::paths::runtime_dir())
+    }
+
+    fn in_runtime(lab: &str, root: Option<&Path>, runtime: &Path) -> Self {
         Self {
             name: format!("vmlab:{lab}/"),
-            runtime: format!("{}/", crate::paths::lab_runtime_dir(lab).display()),
+            runtime: format!(
+                "{}/",
+                crate::paths::lab_runtime_dir_in(runtime, lab).display()
+            ),
             smb: root.map(|root| {
                 format!(
                     "{}/",
@@ -577,14 +584,29 @@ fn cmdline_mentions(cmdline: &[u8], markers: &[String]) -> bool {
 /// the lab's `smbd` is covered too — an orphaned smbd holds its port against
 /// the next `up`.
 pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
-    let pids = lab_orphans(&process_table(), &LabIdentity::new(lab, root));
+    signal_lab_orphans(LabIdentity::new(lab, root)).0
+}
+
+/// Reap a build in the runtime where it started. A failed signal leaves the
+/// workdir available for another cleanup attempt.
+pub(crate) fn kill_build_orphans(lab: &str, runtime: &Path) -> bool {
+    signal_lab_orphans(LabIdentity::in_runtime(lab, None, runtime)).1
+}
+
+fn signal_lab_orphans(identity: LabIdentity) -> (usize, bool) {
+    let pids = lab_orphans(&process_table(), &identity);
+    let mut all_signalled = true;
     for pid in &pids {
-        let _ = nix::sys::signal::kill(
+        if let Err(error) = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(*pid),
             nix::sys::signal::Signal::SIGKILL,
-        );
+        ) && error != nix::errno::Errno::ESRCH
+        {
+            tracing::warn!("could not kill orphaned process {pid}: {error}");
+            all_signalled = false;
+        }
     }
-    pids.len()
+    (pids.len(), all_signalled)
 }
 
 /// The pids in `table` that vmlab started for the lab `identity` names.
