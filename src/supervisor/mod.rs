@@ -34,10 +34,12 @@ pub struct Supervisor {
     ensure_locks: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// In-flight template builds/pushes (web Templates page, PRD §6).
     template_ops: templates::TemplateOps,
-    /// Set once `shutdown` is accepted. From then on every request is
-    /// refused: a lab daemon spawned during teardown would outlive this
-    /// process, carrying its environment, and be adopted by the next
-    /// supervisor as if it were current.
+    /// Set once a teardown begins, by the `shutdown` request or by a
+    /// termination signal ([`teardown`]). From then on every request is
+    /// refused, and a `lab.ensure` accepted earlier spawns nothing: a lab
+    /// daemon spawned during teardown would outlive this process, carrying
+    /// its environment, and be adopted by the next supervisor as if it were
+    /// current.
     shutting_down: std::sync::atomic::AtomicBool,
     /// The helpers holding host GPUs out of runtime suspend (ADR-0018).
     keepers: keepawake::Keepers,
@@ -232,14 +234,28 @@ async fn run_async() -> Result<()> {
 /// Stop every template operation (a build stops its own build VM), release
 /// every lab daemon (each stops its own machines), then the GPUs held awake
 /// for them, and join the supervisor's background tasks.
+///
+/// It closes the supervisor to requests first, whoever started it: the server
+/// keeps serving while this runs.
 async fn teardown(sup: &Arc<Supervisor>, tasks: &crate::lifecycle::TaskGroup) {
+    sup.shutting_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     // Builds run in this process, and their VMs are its children: an exit
     // with a build in flight leaves vmlab-hv/QEMU and swtpm running unowned.
     templates::stop_all(&sup.template_ops, templates::STOP_DEADLINE).await;
-    let names: Vec<String> = {
+    // The registered labs, then every name a `lab.ensure` has locked. One
+    // that passed the closed check holds its name's lock and registers its
+    // daemon only later; it took that lock before the flag was set, so the
+    // name is here, and the release waits on the lock for the daemon.
+    let mut names: Vec<String> = {
         let reg = sup.registry.lock().await;
         reg.labs().iter().map(|l| l.name.clone()).collect()
     };
+    for name in sup.ensure_locks.lock().await.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
     for name in names {
         let _ = sup.release_lab(&name).await;
     }
@@ -449,6 +465,15 @@ impl Supervisor {
         name: &str,
         root: PathBuf,
     ) -> Result<PathBuf, CommandError> {
+        // Checked under the name's lock, which the teardown takes for every
+        // name locked before it closed the supervisor: a request that passes
+        // here is waited for, and one that arrives later spawns nothing.
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(CommandError::conflict("vmlabd is shutting down"));
+        }
         let sock = crate::paths::lab_socket(name);
         // A daemon still stopping holds the lab's disks, sockets and smbd
         // port; a successor started beside it dies at `vm.starting`. Wait
