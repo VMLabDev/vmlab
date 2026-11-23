@@ -246,6 +246,101 @@ fn event_data_td_completes_without_requesting_a_usb_report() {
     assert_eq!(d.report()[2], 4);
 }
 
+/// The firmware's USB stack (EDK2 XhciDxe, UsbBusDxe and UsbKbDxe, which
+/// OpenCore's picker reads through): it resets the controller, enables no
+/// interrupt, enumerates a root port only when the port reports a change,
+/// selects the boot protocol and reads the event ring on a timer.
+#[test]
+fn boot_protocol_report_reaches_a_polling_driver_after_controller_reset() {
+    let mut d = Driver::new();
+    d.hc.detach(5).unwrap();
+    d.hc.attach(5, Box::new(super::Keyboard::new("test-keyboard")))
+        .unwrap();
+    d.hc.config_write(1, 0, &6u16.to_le_bytes());
+    d.write(0x40, 2);
+    d.mem64(0x2000, 0x3000);
+    d.mem32(0x2008, 256);
+    d.write(0x1028, 1);
+    d.write(0x1030, 0x2000);
+    d.write(0x1038, 0x3000);
+    d.write(0x58, 0x1001);
+    d.write(0x70, 0x4000);
+    d.write(0x78, 64);
+    d.write(0x40, 1);
+    let port = d.read(0x480);
+    assert_eq!(port & 1, 1, "the keyboard is connected");
+    assert_ne!(
+        port & (1 << 17),
+        0,
+        "a reset controller reports its connected device as a connect change"
+    );
+    // Clear the change, reset the port, and clear the reset change.
+    d.write(0x480, (port & 0x0e00_c3e0) | (1 << 17));
+    assert_eq!(d.read(0x480) & (1 << 17), 0);
+    d.write(0x480, (port & 0x0e00_c3e0) | 0x10);
+    let port = d.read(0x480);
+    assert_eq!(port & 0x20_0003, 0x20_0003, "the port reset enabled the port");
+    d.write(0x480, (port & 0x0e00_c3e0) | (1 << 21));
+    assert_eq!(d.event(34).parameter, 5 << 24);
+    let t = d.command(9, 0, 0);
+    assert_eq!(t.status >> 24, 1);
+    d.slot = t.control >> 24;
+    d.mem64(0x4000 + u64::from(d.slot) * 8, 0x5000);
+    d.mem32(0x6004, 3);
+    d.mem32(0x6020, (3 << 20) | (1 << 27));
+    d.mem32(0x6024, 5 << 16);
+    d.mem32(0x6044, (4 << 3) | (64 << 16));
+    d.mem64(0x6048, 0x7001);
+    assert_eq!(d.command(11, 0x6000, d.slot << 24).status >> 24, 1);
+    // Interface descriptor: a boot-interface keyboard.
+    d.control([0x80, 6, 0, 2, 0, 0, 34, 0], 34);
+    let mut config = [0; 34];
+    d.mem.read_slice(&mut config, GuestAddress(0x9000)).unwrap();
+    assert_eq!(&config[14..17], &[3, 1, 1]);
+    d.configure();
+    // GET_PROTOCOL reports the report protocol; SET_PROTOCOL selects boot.
+    d.control([0xa1, 3, 0, 0, 0, 0, 1, 0], 1);
+    let mut protocol = [0xff; 1];
+    d.mem
+        .read_slice(&mut protocol, GuestAddress(0x9000))
+        .unwrap();
+    assert_eq!(protocol, [1]);
+    assert_eq!(d.control([0x21, 11, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24, 1);
+    d.control([0xa1, 3, 0, 0, 0, 0, 1, 0], 1);
+    d.mem
+        .read_slice(&mut protocol, GuestAddress(0x9000))
+        .unwrap();
+    assert_eq!(protocol, [0]);
+    // SET_IDLE(0), then the keyboard LEDs.
+    assert_eq!(d.control([0x21, 10, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24, 1);
+    d.mem.write_slice(&[0], GuestAddress(0x9000)).unwrap();
+    assert_eq!(d.control([0x21, 9, 0, 2, 0, 0, 1, 0], 1)[0].status >> 24, 1);
+    // The asynchronous interrupt transfer the driver leaves queued.
+    d.trb(0x8000, 0xa000, 8, (1 << 10) | 32 | 4);
+    d.write(0x2000 + u64::from(d.slot) * 4, 3);
+    assert_eq!(Trb::read(&d.mem, d.event).unwrap().control, 0);
+    d.hc.inject_key("down", true).unwrap();
+    let event = d.event(32);
+    assert_eq!(event.parameter, 0x8000);
+    assert_eq!(event.status, 1 << 24);
+    let mut report = [0xff; 8];
+    d.mem.read_slice(&mut report, GuestAddress(0xa000)).unwrap();
+    assert_eq!(report, [0, 0, 81, 0, 0, 0, 0, 0]);
+    d.hc.inject_key("down", false).unwrap();
+    d.trb(0x8010, 0xa000, 8, (1 << 10) | 32 | 4);
+    d.write(0x2000 + u64::from(d.slot) * 4, 3);
+    assert_eq!(d.event(32).parameter, 0x8010);
+    d.mem.read_slice(&mut report, GuestAddress(0xa000)).unwrap();
+    assert_eq!(report, [0; 8]);
+    assert!(
+        d.irq.0.lock().unwrap().is_empty(),
+        "the polling driver enabled no interrupt"
+    );
+    // A machine reset leaves the same connect change for the next boot.
+    crate::Resettable::reset(&mut d.hc).unwrap();
+    assert_eq!(d.read(0x480) & 0x2_0001, 0x2_0001);
+}
+
 #[test]
 fn interrupt_keyboard_reports_wait_for_the_endpoint_service_interval() {
     let mut d = Driver::new();
