@@ -980,7 +980,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
 | `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
-| `vmlab app run [--via waypipe\|x11\|rdp] [--detach] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
+| `vmlab app run [--via waypipe\|x11\|rdp] [--detach] [--clipboard] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
 | `vmlab osinfo <vm>` | Guest OS identification as JSON |
 | `vmlab script <script.ws> [--record vm=path]` | Ad-hoc script against the current lab; `--record` records a VM for exactly the run (§11.1) |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
@@ -2440,6 +2440,10 @@ connection (`guest/agent-proto/src/app.rs`):
   leaves them changed. The CLI listens on a private unix socket and starts
   `xfreerdp` with `/v:<that socket>`, `/app:program:<argv0>,cmd:<rest>`, and
   the login's credentials passed through `/args-from:stdin`, never argv. It
+  passes `-clipboard`, because FreeRDP otherwise redirects the clipboard, and a
+  redirected clipboard lets the guest read what is copied on the host without
+  a paste, and set it. `app run --clipboard` passes `+clipboard` and shares it
+  both ways for that session. It
   starts FreeRDP only once the agent says the session is ready, which waits for
   the guest's RDP listener to accept: the first session on a machine turns
   Remote Desktop on, and TermService takes about 40 seconds to listen. Each

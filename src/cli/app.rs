@@ -33,6 +33,11 @@ pub struct RunArgs {
     /// Show the window protocol clients' diagnostic output
     #[arg(long)]
     pub verbose: bool,
+    /// Share this desktop's clipboard with the guest, both ways, for an RDP
+    /// session; without it the guest neither reads nor sets it. The other
+    /// protocols ignore it
+    #[arg(long)]
+    pub clipboard: bool,
     /// Guest working directory for the program
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
@@ -59,6 +64,9 @@ impl RunArgs {
         }
         if self.verbose {
             out.push("--verbose".into());
+        }
+        if self.clipboard {
+            out.push("--clipboard".into());
         }
         if let Some(cwd) = &self.cwd {
             out.extend(["--cwd".into(), cwd.clone()]);
@@ -144,6 +152,7 @@ pub fn cmd_app_run(args: RunArgs) -> Result<()> {
         user: args.run_as.user,
         password: args.run_as.password,
         verbose: args.verbose,
+        clipboard: args.clipboard,
     };
     let code = rt.block_on(async {
         let (_name, client) = lab_client_for(lab).await?;
@@ -251,6 +260,7 @@ mod tests {
             via: Some(Mode::X11),
             detach: true,
             verbose: true,
+            clipboard: true,
             cwd: Some("/srv".into()),
             run_as: As {
                 user: Some("dev".into()),

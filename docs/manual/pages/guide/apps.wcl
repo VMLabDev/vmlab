@@ -144,7 +144,9 @@ A failed session
 prints the retained log's path and up to 20 trailing lines, excluding
 backtraces. Normal disconnect and user logoff are successful endings and
 print no failure report. Waypipe's own logs are hidden on both ends.
-Add `--verbose` to show protocol diagnostics while troubleshooting.
+Add `--verbose` to show protocol diagnostics while troubleshooting. An RDP session
+does not share the clipboard unless the command has `--clipboard`, which
+shares it both ways and lets the guest read what is copied on the host.
 Older guest agents still return mixed waypipe and application output;
 repair the agent to get the separate diagnostic channel.
 DOC

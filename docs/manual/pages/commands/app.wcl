@@ -29,6 +29,7 @@ page cmd_app {
       | "`--via <VIA>`" | "The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session." |
       | "`--detach`" | "Hand the session to a background helper and return at once." |
       | "`--verbose`" | "Show FreeRDP and waypipe diagnostics. Application output is always shown." |
+      | "`--clipboard`" | "Share this desktop's clipboard with the guest, both ways, for an RDP session. Without it the guest neither reads nor sets it. The other protocols ignore it." |
       | "`--cwd <DIR>`" | "Guest working directory for the program." |
       | "`--user <LOGIN>`" | "Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity." |
       | "`--password <PASSWORD>`" | "Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`." |
@@ -102,6 +103,16 @@ page cmd_app {
     `--verbose` shows protocol diagnostics in the foreground. A detached
     helper retains the option but has no terminal. Older guest agents keep their previous mixed output until
     repaired.
+  DOC
+
+  p <<DOC
+    An RDP session does not share the clipboard: FreeRDP is started with
+    `-clipboard`, so the guest is not told of what is copied on this desktop,
+    cannot read it and cannot set it. `--clipboard` shares it both ways for
+    that session. While it is shared, the guest can read each thing copied on
+    the host without a paste, so do not copy a secret for another program
+    during such a session. `--clipboard` changes nothing for waypipe and X11,
+    which carry the selection as part of the window protocol.
   DOC
 
   p <<DOC
