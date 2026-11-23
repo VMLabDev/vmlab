@@ -534,8 +534,24 @@ impl WorkspaceSyncers {
     /// every down dev machine unsnapshottable would be a bigger obstruction
     /// than the incoherence it guards against, and the halt is the part a
     /// developer can actually answer.
-    pub async fn before_capture(&self, machine: &str, declared: Option<&Workspace>) -> Result<()> {
+    ///
+    /// `running` is whether the machine is anything but stopped. A machine
+    /// that runs with a declared workspace and no syncer is **not** down: its
+    /// guest may hold work and no flush can look, so this refuses
+    /// (docs/reviews/dev-machines.md F3).
+    pub async fn before_capture(
+        &self,
+        machine: &str,
+        declared: Option<&Workspace>,
+        running: bool,
+    ) -> Result<()> {
         let Some(syncer) = self.get(machine).await else {
+            if running && declared.is_some() {
+                return refuse(Some(super::bracket::NoSyncer {
+                    machine: machine.to_string(),
+                    restore: false,
+                }));
+            }
             let ledger = recorded(declared).unwrap_or_else(Ledger::about_nothing);
             return refuse(super::bracket::Outstanding::when_stopped(
                 machine,
@@ -556,11 +572,16 @@ impl WorkspaceSyncers {
     /// workspace, because a restore does not need a running machine and the
     /// halt is exactly the state a developer must not lose by having stopped
     /// one.
+    ///
+    /// A machine that is `running` with a declared workspace and no syncer is
+    /// refused as [`before_capture`](Self::before_capture) refuses it, with
+    /// the discard flag as the way through.
     pub async fn before_restore(
         &self,
         machine: &str,
         discard: bool,
         declared: Option<&Workspace>,
+        running: bool,
     ) -> Result<()> {
         if discard {
             return Ok(());
@@ -576,6 +597,10 @@ impl WorkspaceSyncers {
                         .map(super::bracket::RestoreOutstanding),
                 )
             }
+            None if running && declared.is_some() => refuse(Some(super::bracket::NoSyncer {
+                machine: machine.to_string(),
+                restore: true,
+            })),
             // A restore is not refused for owing a re-seed: it is about to
             // ask for another one, and the second answers the first.
             None => {
@@ -729,8 +754,9 @@ impl WorkspaceSyncers {
     pub async fn expect(&self, machine: &str) -> Result<Arc<Syncer>> {
         self.get(machine).await.ok_or_else(|| {
             anyhow::anyhow!(
-                "\"{machine}\" has no workspace syncer running: it is not up, or it is not a dev \
-                 machine declaring `@dev(workspace = …)`"
+                "\"{machine}\" has no workspace syncer running: it is not up, its syncer has not \
+                 started (`vmlab up {machine}` starts it), or it is not a dev machine declaring \
+                 `@dev(workspace = …)`"
             )
         })
     }
@@ -3294,7 +3320,7 @@ mod tests {
         assert!(eventually(|| syncer.report().trouble.is_some()).await);
         assert!(syncer.report().unsynced.contains(&"new.rs".into()));
         guest.fail_pull("/src/new.rs");
-        assert!(syncers.before_capture("dev01", None).await.is_err());
+        assert!(syncers.before_capture("dev01", None, false).await.is_err());
         tokio::time::timeout(RETRY + Duration::from_secs(3), async {
             loop {
                 if std::fs::read_to_string(dir.path().join("new.rs"))
@@ -3391,7 +3417,7 @@ mod tests {
         // capture is waiting, rather than on an earlier background pass.
         sessions.watcher.mute();
         let drains = sessions.watcher.drains();
-        let capture = syncers.before_capture("dev01", None);
+        let capture = syncers.before_capture("dev01", None, false);
         let overflow = async {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while sessions.watcher.drains() == drains {
@@ -3422,7 +3448,7 @@ mod tests {
         // The deferred path is retained and a later flush can carry it once
         // the writer has stopped, without needing a new named event.
         syncer.pass_now().await.unwrap();
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("busy.txt")).unwrap(),
             guest.text("/src/busy.txt").unwrap(),
@@ -3445,14 +3471,14 @@ mod tests {
             seeded_lab_settling(dir.path(), state.path(), "/src/main.rs", Some(settle)).await;
         let syncer = syncers.get("dev01").await.unwrap();
         syncer.pass_now().await.unwrap();
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
 
         sessions.watcher.mute();
         guest.file("/src/late.txt", "written in the guest", 42);
         sessions.watcher.mark("late.txt");
         let started = Instant::now();
         let refused = syncers
-            .before_capture("dev01", None)
+            .before_capture("dev01", None, false)
             .await
             .expect_err("a capture must refuse while the guest's watch does not answer");
         let said = format!("{refused:#}");
@@ -3492,7 +3518,7 @@ mod tests {
             .await,
             "the late answer was not carried"
         );
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
         assert!(syncer.report().unanswered.is_none());
         let flush = syncer.pass_now().await.unwrap().project();
         let status = syncer.report().project();
@@ -5591,7 +5617,7 @@ mod tests {
 
         // Refused while the halt stands…
         let refused = syncers
-            .before_restore("dev01", false, None)
+            .before_restore("dev01", false, None, false)
             .await
             .expect_err("a halted workspace refuses an unasked restore");
         assert!(
@@ -5601,7 +5627,10 @@ mod tests {
             "{refused:#}"
         );
         // …and allowed once it is asked for by name.
-        syncers.before_restore("dev01", true, None).await.unwrap();
+        syncers
+            .before_restore("dev01", true, None, false)
+            .await
+            .unwrap();
 
         let ws = workspace(dir.path(), state.path());
         restore_bracket(&syncers, &ws, || {}).await;
@@ -5633,14 +5662,14 @@ mod tests {
 
         // In step: the pre-flight flush is the whole of the check, and it
         // passes.
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
 
         // A guest-side save that has not drained yet. The flush carries it,
         // which is the other half of the bracket: flushing before capture is
         // what makes the snapshot coherent with the host tree.
         guest.file("/src/main.rs", "typed just now", 900);
         sessions.watcher.mark("main.rs");
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "typed just now",
@@ -5652,7 +5681,7 @@ mod tests {
         diverge(dir.path(), &guest, &sessions);
         halt_of(&syncers, "dev01").await.expect("nothing halted");
         let refused = syncers
-            .before_capture("dev01", None)
+            .before_capture("dev01", None, false)
             .await
             .expect_err("a halted workspace is not a coherent capture");
         let said = format!("{refused:#}");
@@ -5673,11 +5702,14 @@ mod tests {
             Some(Duration::from_millis(300)),
         )
         .await;
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
 
         guest.file("/src/main.rs", "typed just now", 900);
         sessions.watcher.mark("main.rs");
-        syncers.before_restore("dev01", false, None).await.unwrap();
+        syncers
+            .before_restore("dev01", false, None, false)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "typed just now",
@@ -5688,7 +5720,7 @@ mod tests {
         guest.file("/src/late.txt", "written in the guest", 901);
         sessions.watcher.mark("late.txt");
         let refused = syncers
-            .before_restore("dev01", false, None)
+            .before_restore("dev01", false, None, false)
             .await
             .expect_err("restore must refuse while the guest's watch does not answer");
         let said = format!("{refused:#}");
@@ -5700,7 +5732,10 @@ mod tests {
             Some("written in the guest"),
         );
         assert!(!dir.path().join("late.txt").exists());
-        syncers.before_restore("dev01", true, None).await.unwrap();
+        syncers
+            .before_restore("dev01", true, None, false)
+            .await
+            .unwrap();
         syncers.stop("dev01").await;
     }
 
@@ -5709,9 +5744,12 @@ mod tests {
     #[tokio::test]
     async fn a_machine_with_no_workspace_brackets_nothing() {
         let syncers = WorkspaceSyncers::default();
-        syncers.before_capture("plain-vm", None).await.unwrap();
         syncers
-            .before_restore("plain-vm", false, None)
+            .before_capture("plain-vm", None, false)
+            .await
+            .unwrap();
+        syncers
+            .before_restore("plain-vm", false, None, false)
             .await
             .unwrap();
         assert!(syncers.suspend("plain-vm").await.is_none());
@@ -5786,7 +5824,7 @@ mod tests {
 
         let ws = workspace(dir.path(), state.path());
         let refused = syncers
-            .before_restore("dev01", false, Some(&ws))
+            .before_restore("dev01", false, Some(&ws), false)
             .await
             .expect_err("a halt outlives the machine that was holding it");
         let said = format!("{refused:#}");
@@ -5796,12 +5834,15 @@ mod tests {
         // it cannot flush one, but it can still decline to freeze a
         // disagreement.
         assert!(
-            syncers.before_capture("dev01", Some(&ws)).await.is_err(),
+            syncers
+                .before_capture("dev01", Some(&ws), false)
+                .await
+                .is_err(),
             "a stopped, halted workspace is not a coherent capture",
         );
         // …and the flag answers it, as it does for a running one.
         syncers
-            .before_restore("dev01", true, Some(&ws))
+            .before_restore("dev01", true, Some(&ws), false)
             .await
             .unwrap();
     }
@@ -5819,9 +5860,12 @@ mod tests {
         syncers.stop("dev01").await;
 
         let ws = workspace(dir.path(), state.path());
-        syncers.before_capture("dev01", Some(&ws)).await.unwrap();
         syncers
-            .before_restore("dev01", false, Some(&ws))
+            .before_capture("dev01", Some(&ws), false)
+            .await
+            .unwrap();
+        syncers
+            .before_restore("dev01", false, Some(&ws), false)
             .await
             .unwrap();
     }
@@ -5881,7 +5925,7 @@ mod tests {
         syncers.mark_rewound(&ws).await.unwrap();
 
         let refused = syncers
-            .before_capture("dev01", Some(&ws))
+            .before_capture("dev01", Some(&ws), false)
             .await
             .expect_err("a tree that has not re-converged is not a coherent capture");
         let said = format!("{refused:#}");
@@ -5891,7 +5935,7 @@ mod tests {
         // …and a *restore* is not refused for it: it is about to ask for
         // another re-seed, and the second answers the first.
         syncers
-            .before_restore("dev01", false, Some(&ws))
+            .before_restore("dev01", false, Some(&ws), false)
             .await
             .unwrap();
     }
@@ -5922,7 +5966,7 @@ mod tests {
             );
         }
         assert!(guest.get("/src/caf�.txt").is_none());
-        syncers.before_capture("dev01", None).await.unwrap();
+        syncers.before_capture("dev01", None, false).await.unwrap();
         assert_eq!(std::fs::read_to_string(invalid).unwrap(), "local only");
         syncers.stop("dev01").await;
     }
