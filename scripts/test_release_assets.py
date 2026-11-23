@@ -336,9 +336,160 @@ esac
         self.assertIn('checksum mismatch', result.stderr)
         self.assertFalse((self.root / 'installed/vmlab-fastpath').exists())
 
+    def old_install(self):
+        """The previous release in the bin directory: its vmlab and its helper,
+        which holds the file capabilities of an earlier grant."""
+        installed = self.root / 'installed'
+        installed.mkdir()
+        (installed / 'vmlab').write_text('#!/bin/sh\necho old vmlab\n')
+        (installed / 'vmlab-fastpath').write_text('#!/bin/sh\necho old helper\n')
+        for name in ('vmlab', 'vmlab-fastpath'):
+            (installed / name).chmod(0o700)
+        return installed
+
+    def test_old_helper_is_removed_when_the_release_gives_none(self):
+        # Review install-release F5, card 636: a helper download that fails
+        # must not leave the previous, capable helper beside the new vmlab.
+        installed = self.old_install()
+        self.env['FAIL_DOWNLOAD'] = self.helper
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('old vmlab', (installed / 'vmlab').read_text())
+        self.assertFalse((installed / 'vmlab-fastpath').exists())
+        self.assertIn('fast path stays off', result.stderr)
+        self.assertIn('Removed the vmlab-fastpath of the earlier install', result.stderr)
+
+    def test_corrupt_helper_leaves_the_old_install_whole(self):
+        # F5's second path: the helper is verified before vmlab is replaced,
+        # so a refused helper never ends with a new vmlab beside the old one.
+        installed = self.old_install()
+        (self.dist / self.helper).write_text('tampered')
+        result = self.install('--no-guest')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertIn('old vmlab', (installed / 'vmlab').read_text())
+        self.assertIn('old helper', (installed / 'vmlab-fastpath').read_text())
+        self.assertFalse((self.root / 'executed').exists())
+
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
         self.refused(self.install('--no-guest'))
+
+    # ── vmlab-hv, which the manual installs by hand (review F4) ──────────────
+
+    HV = 'vmlab-hv-1.2.3-linux-x86_64'
+
+    def hv_bundle(self, word):
+        """A bundle whose icon installer writes `word` when it is run."""
+        tree = self.root / 'hv-tree' / word / self.HV
+        tree.mkdir(parents=True)
+        script = tree / 'install-viewer-icons.sh'
+        script.write_text(f'#!/bin/sh\nprintf {word} > "$MARKER.hv"\n')
+        script.chmod(0o755)
+        path = self.dist / f'{self.HV}.tar.gz'
+        with tarfile.open(path, 'w:gz') as tar:
+            tar.add(tree, arcname=self.HV)
+        # The sidecar of release-publish.sh. No signature covers it, so
+        # whoever replaces the bundle writes a matching one.
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        (self.dist / f'{path.name}.sha256').write_text(f'{digest}  {path.name}\n')
+
+    def manual_hv_install(self):
+        """Run the commands of the manual's section "Install vmlab-hv" as they are."""
+        page = (ROOT / 'docs/manual/pages/getting-started/install.wcl').read_text()
+        section = page.split('h3 "Install vmlab-hv"', 1)[1]
+        commands = re.search(r"code sh \{ source = <<'SRC'\n(.*?)\nSRC\n", section, re.S)[1]
+        commands, pinned = re.subn(r'(?m)^VERSION=.*$', 'VERSION=1.2.3', commands)
+        self.assertEqual(pinned, 1)
+        # curl as the manual and install.sh call it, served from the fixture
+        # release. https://vmlab.io/install.sh is the installer of this tree.
+        self.tool('curl', '''#!/bin/sh
+set -eu
+out=""; here=0; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -fLO) here=1; shift ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+name="${url##*/}"
+if [ "$name" = install.sh ]; then cat "$INSTALL_SH"; exit 0; fi
+[ -f "$FIXTURES/$name" ] || exit 22
+if [ -n "$out" ]; then cat "$FIXTURES/$name" > "$out"
+elif [ "$here" = 1 ]; then cat "$FIXTURES/$name" > "./$name"
+else cat "$FIXTURES/$name"
+fi
+''')
+        home = self.root / 'home'
+        work = self.root / 'downloads'
+        home.mkdir()
+        work.mkdir()
+        script = self.root / 'manual-hv-install.sh'
+        script.write_text(commands + '\n')
+        env = dict(self.env, HOME=str(home), INSTALL_SH=str(INSTALL))
+        result = subprocess.run(['sh', str(script)], cwd=work, env=env,
+                                capture_output=True, text=True)
+        return result, home / '.local/opt' / self.HV, self.root / 'executed.hv'
+
+    def test_manual_hv_install_unpacks_a_genuine_bundle(self):
+        self.hv_bundle('genuine')
+        self.prepare()
+        result, unpacked, marker = self.manual_hv_install()
+        self.assertTrue(unpacked.is_dir(), result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), 'genuine')
+        self.assertEqual(self.verified_with(), ['--bundle'])
+        self.assertFalse((self.root / 'installed/vmlab').exists())
+
+    def test_manual_hv_install_refuses_a_replaced_bundle_with_its_sidecar(self):
+        self.hv_bundle('genuine')
+        self.prepare()
+        # The asset host swaps the bundle and regenerates the unsigned sidecar.
+        # It cannot make a new signed SHA256SUMS.
+        self.hv_bundle('tampered')
+        result, unpacked, marker = self.manual_hv_install()
+        self.assertFalse(marker.exists(), 'the replaced bundle was unpacked and run:\n'
+                         + result.stdout + result.stderr)
+        self.assertFalse(unpacked.exists())
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertFalse((self.root / 'downloads' / f'{self.HV}.tar.gz').exists())
+
+    def fetch(self, name, *args):
+        work = self.root / 'fetched'
+        work.mkdir(exist_ok=True)
+        result = subprocess.run(['sh', str(INSTALL), '--version', '1.2.3', '--fetch', name, *args],
+                                cwd=work, env=self.env, capture_output=True, text=True)
+        return result, work
+
+    def test_fetch_downloads_one_verified_asset_and_installs_nothing(self):
+        result, work = self.fetch(f'{self.HV}.tar.gz')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((work / f'{self.HV}.tar.gz').read_bytes(), b'fixture')
+        self.assertEqual(self.verified_with(), ['--bundle'])
+        self.assertFalse((self.root / 'installed').exists())
+        self.assertFalse((self.root / 'guest').exists())
+
+    def test_fetch_refuses_without_a_good_signature(self):
+        self.env['BAD_SIGNATURE'] = '1'
+        result, work = self.fetch(f'{self.HV}.tar.gz')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(work.iterdir()), [])
+
+    def test_fetch_refuses_what_the_signed_manifest_does_not_name(self):
+        sidecar = f'{self.HV}.tar.gz.sha256'
+        (self.dist / sidecar).write_text('0' * 64 + f'  {self.HV}.tar.gz\n')
+        result, work = self.fetch(sidecar)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing or duplicate checksum', result.stderr)
+        self.assertEqual(list(work.iterdir()), [])
+
+    def test_fetch_takes_a_file_name_and_never_a_path(self):
+        for name in ['../SHA256SUMS', '/tmp/x', 'a/b', '.hidden', '-x', '']:
+            result, work = self.fetch(name)
+            self.assertNotEqual(result.returncode, 0, name)
+            self.assertEqual(list(work.iterdir()), [])
+            self.assertEqual(self.verified_with(), [])
 
     def restricted_path(self, *, cosign=True, sha256sum=True):
         # Do not accidentally find a host-installed cosign or sha256sum.

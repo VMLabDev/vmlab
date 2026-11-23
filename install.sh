@@ -28,6 +28,10 @@
 #                     key, not the one in this script; or VMLAB_RELEASE_KEY.
 #                     For testing a local build: whoever picks the key picks
 #                     whom the installer trusts.
+#   --fetch <asset>   install nothing: download the named asset of the release
+#                     into the current directory, after the same signature
+#                     check and against the signed SHA256SUMS. For the
+#                     vmlab-hv bundle, which this script does not install.
 #   --help            show this help
 #
 #   VMLAB_RELEASE_BASE_URL  where releases are downloaded from, as
@@ -88,6 +92,7 @@ SKIP_CHECKS=0
 INSECURE_SKIP_SIGNATURE="${VMLAB_INSECURE_SKIP_SIGNATURE:-0}"
 RELEASE_KEY_FILE="${VMLAB_RELEASE_KEY:-}"
 NO_GUEST=0
+FETCH=""
 FASTPATH="${VMLAB_FASTPATH_CAPS:-ask}"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -104,6 +109,7 @@ usage() {
     '  --skip-checks       skip runtime tool checks' \
     '  --insecure-skip-signature  unsafe: skip cosign, still check SHA256SUMS' \
     '  --release-key FILE  cosign public key for a key-signed release (testing)' \
+    '  --fetch ASSET       only download ASSET, verified, into this directory' \
     '  --help              show this help'
   exit "${1:-0}"
 }
@@ -125,11 +131,19 @@ while [ $# -gt 0 ]; do
     --insecure-skip-signature) INSECURE_SKIP_SIGNATURE=1; shift ;;
     --release-key) [ $# -ge 2 ] || err "--release-key needs an argument"; RELEASE_KEY_FILE="$2"; shift 2 ;;
     --release-key=*) RELEASE_KEY_FILE="${1#--release-key=}"; shift ;;
+    --fetch) [ $# -ge 2 ] && [ -n "$2" ] || err "--fetch needs an argument"; FETCH="$2"; shift 2 ;;
+    --fetch=*) FETCH="${1#--fetch=}"; [ -n "$FETCH" ] || err "--fetch needs an argument"; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
   esac
 done
+
+# A fetched asset is written under its own name into the current directory:
+# one plain file name, never a path.
+case "$FETCH" in
+  [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) err "--fetch takes the file name of one release asset, not '$FETCH'" ;;
+esac
 
 case "$FASTPATH" in
   ask|yes|no) ;;
@@ -214,7 +228,7 @@ BASE_URL="${BASE_URL%/}"
 url="$BASE_URL/$tag/$asset"
 
 # ── Download + install ──────────────────────────────────────────────────────
-printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
+[ -n "$FETCH" ] || printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
 
 verify_dir="$(mktemp -d)"
 [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || err "unsafe verification directory"
@@ -271,24 +285,33 @@ verify_asset() {
   [ "$want" = "$got" ] || err "checksum mismatch for $1"
 }
 
+# ── Fetch one asset ─────────────────────────────────────────────────────────
+# --fetch: the asset reaches the current directory only after its bytes match
+# the line of the authenticated SHA256SUMS. The .sha256 file a release has
+# beside an asset is covered by no signature and is never read here.
+if [ -n "$FETCH" ]; then
+  fetch_tmp="$verify_dir/$FETCH"
+  download_file "$BASE_URL/$tag/$FETCH" "$fetch_tmp" || err "download failed: $BASE_URL/$tag/$FETCH"
+  verify_asset "$FETCH" "$fetch_tmp"
+  [ -n "$fetch_tmp" ] && [ "$fetch_tmp" != / ] || err "fetch_tmp is empty or /"
+  mv "$fetch_tmp" "./$FETCH"
+  printf 'Fetched: %s (verified against SHA256SUMS of vmlab %s)\n' "$FETCH" "$ver"
+  exit 0
+fi
+
 tmp="$verify_dir/$asset"
 download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 verify_asset "$asset" "$tmp"
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-chmod +x "$tmp"
-mkdir -p "$BIN_DIR"
-[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-mv "$tmp" "$BIN_DIR/vmlab"
-
-printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
-
 # ── Fast-path helper ────────────────────────────────────────────────────────
 # vmlab-fastpath, the only binary the fast path's capabilities go to. The
 # daemons look for it beside vmlab. A release without it costs only the fast
 # path: the userspace fabric carries every lab without it.
+#
+# It is downloaded and verified before vmlab is replaced: the daemons and the
+# helper exchange no version, so a helper this script refuses must not end
+# with the new vmlab beside the helper of the earlier install.
 helper_asset="vmlab-fastpath-${ver}-${suffix}"
 helper_tmp="$verify_dir/$helper_asset"
 HELPER=""
@@ -296,16 +319,42 @@ HELPER_SHA=""
 if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
   verify_asset "$helper_asset" "$helper_tmp"
   HELPER_SHA="$want"
+  HELPER="$BIN_DIR/vmlab-fastpath"
+fi
+
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
+chmod +x "$tmp"
+mkdir -p "$BIN_DIR"
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
+
+# No helper from this release: the helper of an earlier install, which may
+# still hold file capabilities, goes away before the new vmlab arrives. Its
+# daemons would start it otherwise, an older privileged binary than the user
+# was told about. Removing the file removes its capabilities with it.
+if [ -z "$HELPER" ]; then
+  old_helper="$BIN_DIR/vmlab-fastpath"
+  if [ -e "$old_helper" ] || [ -L "$old_helper" ]; then
+    rm -f -- "$old_helper" \
+      || err "this release gave no $helper_asset, and the vmlab-fastpath of the earlier install at $old_helper cannot be removed. Nothing was installed. Remove it and install again."
+    warn "this release gave no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege. Removed the vmlab-fastpath of the earlier install ($old_helper) and its capabilities with it: it is not the helper of this vmlab."
+  else
+    warn "this release has no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege."
+  fi
+fi
+
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
+mv "$tmp" "$BIN_DIR/vmlab"
+
+if [ -n "$HELPER" ]; then
   [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
   # File capabilities go to whoever executes the file, so no other account
   # may execute it. The helper checks the caller too: this mode is the half
   # that holds for a helper older than that check.
   chmod 0700 "$helper_tmp"
-  mv "$helper_tmp" "$BIN_DIR/vmlab-fastpath"
-  HELPER="$BIN_DIR/vmlab-fastpath"
-else
-  warn "this release has no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege."
+  mv "$helper_tmp" "$HELPER"
 fi
+
+printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
 
 # ── PATH hint ───────────────────────────────────────────────────────────────
 case ":$PATH:" in

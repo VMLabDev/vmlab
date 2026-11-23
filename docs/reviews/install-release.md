@@ -142,6 +142,24 @@ Expected: the build is unaffected. Observed (by reading): it fails with
 `tampered`, which shows the edit reached the release build; an edit that
 compiles would pass silently.
 
+Fixed in card #634. `build/run.sh` takes the prefix of its named volumes from
+`VMLAB_BUILD_VOLUMES` (default `vmlab-build`, so other builds are as before).
+`scripts/release-local.sh` sets it to `vmlab-release-<16 random hex digits>`
+for every container of the release (the display driver build and
+`build/dist.sh`), refuses to start when a volume of that name exists, and
+removes the volumes when it ends. A release so starts from an empty cargo
+home, where cargo downloads each crate and checks it against `Cargo.lock`,
+and from empty target dirs. Every release build is now a cold build. Proof:
+`test_a_release_build_takes_nothing_from_the_volumes_of_another_build` in
+`scripts/test_release_workflow.py`, with a stub `docker` that keeps each
+volume as a directory and writes a file into every volume a container mounts.
+Before the fix the release mounted `vmlab-build-cargo` and the target volumes
+of the earlier build at the same path, each with that file in it. The docker
+test above was not run: the merge bar has no docker. Not covered: the caches
+inside the checkout (`guest/.cache/`, `.ci-cache/`, `guest/dist/`), which
+belong to the release checkout, and code that runs outside a container as the
+build account, which can reach docker itself.
+
 ### F4. The documented vmlab-hv install checks the bundle against an unsigned sidecar (security)
 
 `docs/manual/pages/getting-started/install.wcl:89-98` tells the user to
@@ -159,6 +177,23 @@ Test: serve a release directory locally, replace the hv tarball with any
 tarball and regenerate its `.sha256`. Follow the manual's commands against
 that server: `sha256sum -c` prints `OK`. Verifying against the signed
 `SHA256SUMS` instead reports a mismatch.
+
+Fixed in card #635. `install.sh` has a new option, `--fetch <asset>`: it
+installs nothing, authenticates `SHA256SUMS` with the same cosign check as an
+install, downloads the named asset, checks it against its line in
+`SHA256SUMS`, and only then moves it into the current directory. It takes one
+plain file name, and refuses an asset that `SHA256SUMS` does not name, which
+includes the `.sha256` sidecars. The manual's "Install vmlab-hv" commands
+call it and unpack the bundle only when it succeeds. They read no sidecar,
+and the text says why. The check follows the installer's trust root, so it
+covers a key-signed release once `RELEASE_KEY` is set, and an unsigned
+release needs `--insecure-skip-signature` here as it does for the CLI.
+Proof: `test_manual_hv_install_refuses_a_replaced_bundle_with_its_sidecar`
+in `scripts/test_release_assets.py` takes the commands out of the manual page
+and runs them against a fixture release whose bundle and sidecar were
+replaced. Before the fix it failed: `sha256sum -c` passed, the bundle was
+unpacked and its `install-viewer-icons.sh` ran. The sidecars are still
+uploaded (`scripts/release-publish.sh`), and the sentence of F11 is unchanged.
 
 ### F5. An old helper keeps its capabilities beside a new vmlab (wrong result, security)
 
@@ -185,6 +220,21 @@ B from a server that returns 404 for B's helper asset. Expected: the old
 helper is removed or reported. Observed: `getcap ~/.local/bin/vmlab-fastpath`
 still lists the capabilities, `vmlab --version` is B, and `vmlab fastpath`
 selects a kernel tier through A's helper.
+
+Fixed in card #636. `install.sh` downloads and verifies the helper before it
+replaces `vmlab`, so a helper that fails its checksum ends the install with
+the earlier `vmlab` and the earlier helper both in place, one release. When
+the helper download fails, the installer removes the `vmlab-fastpath` of the
+earlier install before it moves the new `vmlab` in, and its warning names the
+removed file. Removing the file removes its capabilities. When that removal
+fails, the install ends before `vmlab` is replaced. Proof:
+`test_old_helper_is_removed_when_the_release_gives_none` and
+`test_corrupt_helper_leaves_the_old_install_whole` in
+`scripts/test_release_assets.py`. Both failed before the fix: the old helper
+was still in the bin directory beside the new `vmlab`, and a corrupt helper
+left the new `vmlab` installed. The daemon and the helper still exchange no
+version. A helper process that a running daemon started before the install
+keeps running until `vmlab daemon stop`.
 
 ### F6. Replacing the binary is not atomic and can leave a broken one (wrong result)
 

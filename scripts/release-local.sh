@@ -8,6 +8,10 @@
 #   2. The Windows display driver package (--display, below).
 #   3. `build/run.sh build/dist.sh <version>`: the CLI, the fast-path helper,
 #      the strict guest bundle, the hypervisor bundle and the BPF objects.
+#      Every container of a release gets docker volumes of this run alone (the
+#      cargo home and the target dirs), new and empty, and removed at the end:
+#      an earlier build on this host cannot leave crate sources or build
+#      outputs for a release to compile in.
 #   4. The four assets and the two bundle .sha256 files go to the release
 #      directory. scripts/release-assets.py writes provenance.json (the
 #      builder id names this host and the commit) and SHA256SUMS.
@@ -70,7 +74,7 @@ while [ $# -gt 0 ]; do
         --display) display="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -94,6 +98,28 @@ fi
 [ -n "$builder" ] || builder="$(hostname -s 2>/dev/null || uname -n)"
 out="${out:-$ROOT/target/release-local/v$version}"
 log "version $version at $commit, built on $builder, into $out"
+
+# ── Volumes of this release alone ────────────────────────────────────────────
+# build/run.sh keeps the cargo home in one volume that every container build
+# on the host shares, and the target dirs in volumes named after the path of
+# the checkout. Code of an earlier build (a build.rs or a test of a card
+# branch) can write to both: a crate source that cargo does not check again,
+# or an output that cargo takes as fresh. A release takes neither. Its volumes
+# have a random name, must not exist yet, and go away when this script ends.
+release_volumes="vmlab-release-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+[[ "$release_volumes" =~ ^vmlab-release-[0-9a-f]{16}$ ]] || die "no random volume name: '$release_volumes'"
+own_volumes() { docker volume ls -q | grep "^$release_volumes-" || true; }
+[ -z "$(own_volumes)" ] || die "the docker volumes $release_volumes-* exist already: run again"
+export VMLAB_BUILD_VOLUMES="$release_volumes"
+remove_volumes() {
+  local names
+  names="$(own_volumes)"
+  [ -z "$names" ] && return 0
+  # shellcheck disable=SC2086  # one volume name per word
+  docker volume rm $names >/dev/null \
+    || log "warning: could not remove the docker volumes $release_volumes-*: remove them by hand"
+}
+trap remove_volumes EXIT
 
 # ── 2. Build image and Windows display driver ────────────────────────────────
 # The image first: the display driver compiles in it too. build/run.sh builds

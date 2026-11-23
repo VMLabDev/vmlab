@@ -87,7 +87,10 @@ host config, and lift the refusal.
   is actually running (`KVM_GET_TSC_KHZ`), the same value the TSC pin carries.
   EBX is the local APIC bus rate in kHz that KVM emulates, 1,000,000 as the
   capture shows, not the TSC rate.
-- **Unknown MSRs (D2).** KVM's userspace MSR exits handle MSRs that KVM
+- **Unknown MSRs (D2).** Superseded by vmlab card #618: the policy is named
+  `macos` and answers a fixed table (`hv/docs/macos-msrs.md`); every other
+  unknown MSR faults. The original decision follows.
+  KVM's userspace MSR exits handle MSRs that KVM
   rejects (`KVM_CAP_X86_USER_SPACE_MSR` with the unknown-MSR reason). Reads
   return 0 and writes are dropped, and each MSR index is logged once per
   machine. This applies only where the machine's MSR policy says `ignore`, so
