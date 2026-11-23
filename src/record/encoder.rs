@@ -6,15 +6,22 @@
 //! in, a path or a refusal comes out. Only [`probe`] and [`Encoder`] touch
 //! the host.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::AsyncWriteExt;
+use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::task::JoinSet;
 
 use super::{Format, Settings};
+
+const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+// MP4 faststart can rewrite the entire recording after stdin closes.
+const TRAILER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// What a recording start knows about the host's ffmpeg.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -184,6 +191,7 @@ impl EncoderPlan {
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
+    stderr: JoinSet<Vec<u8>>,
     output: PathBuf,
 }
 
@@ -205,54 +213,106 @@ impl Encoder {
             .spawn()
             .with_context(|| format!("starting {}", plan.program.display()))?;
         let stdin = child.stdin.take();
+        // Drain during both frame writes and trailer generation. JoinSet
+        // aborts the reader if a timeout drops the encoder.
+        let mut stderr = JoinSet::new();
+        let mut pipe = child.stderr.take().expect("ffmpeg stderr is piped");
+        stderr.spawn(async move {
+            const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+            let mut diagnostic = VecDeque::<u8>::new();
+            let mut chunk = [0; 4096];
+            while let Ok(n) = pipe.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let excess = (diagnostic.len() + n).saturating_sub(DIAGNOSTIC_LIMIT);
+                diagnostic.drain(..excess);
+                diagnostic.extend(&chunk[..n]);
+            }
+            diagnostic.into()
+        });
         Ok(Self {
             child,
             stdin,
+            stderr,
             output: output.to_path_buf(),
         })
     }
 
-    /// Feed one frame. An error here means ffmpeg went away; the recording
-    /// is over.
-    pub async fn write_frame(&mut self, rgb: &[u8]) -> Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("ffmpeg stdin already closed"))?;
-        stdin
-            .write_all(rgb)
-            .await
-            .map_err(|e| anyhow!("writing a frame to ffmpeg: {e}"))
+    /// Feed one frame while ffmpeg continues to accept bytes.
+    pub async fn write_frame(&mut self, rgb: &[u8]) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ffmpeg stdin already closed")
+        })?;
+        write_frame_with_progress(stdin, rgb).await
     }
 
     /// Close stdin so ffmpeg writes its trailer, and wait for it.
     pub async fn finish(mut self) -> Result<PathBuf> {
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = stdin.shutdown().await;
-            drop(stdin);
-        }
-        let stderr = self.child.stderr.take();
-        let status = self.child.wait().await.context("waiting for ffmpeg")?;
-        let mut err = String::new();
-        if let Some(mut s) = stderr {
-            use tokio::io::AsyncReadExt;
-            let _ = s.read_to_string(&mut err).await;
-        }
-        if !status.success() {
-            bail!(
-                "ffmpeg exited with {status} while writing {}: {}",
-                self.output.display(),
-                err.trim()
-            );
-        }
+        drop(self.stdin.take());
+        tokio::time::timeout(TRAILER_TIMEOUT, async {
+            let status = self.child.wait().await.context("waiting for ffmpeg")?;
+            if !status.success() {
+                let stderr = self
+                    .stderr
+                    .join_next()
+                    .await
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                bail!(
+                    "ffmpeg exited with {status} while writing {}: {}",
+                    self.output.display(),
+                    String::from_utf8_lossy(&stderr).trim()
+                );
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("ffmpeg timed out finalising {}", self.output.display()))??;
         Ok(self.output)
     }
+}
+
+async fn write_frame_with_progress(
+    stdin: &mut (impl AsyncWrite + Unpin),
+    mut rgb: &[u8],
+) -> io::Result<()> {
+    while !rgb.is_empty() {
+        let n = tokio::time::timeout(WRITE_IDLE_TIMEOUT, stdin.write(rgb))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "encoder made no progress"))??;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        rgb = &rgb[n..];
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::record::{RecordOptions, Size};
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_frame_write_can_finish_while_making_progress() {
+        let (mut stdin, mut reader) = tokio::io::duplex(1);
+        let started = tokio::time::Instant::now();
+        let read = async {
+            let mut frame = [0; 3];
+            for byte in &mut frame {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                *byte = reader.read_u8().await.unwrap();
+            }
+            frame
+        };
+        let write = async {
+            write_frame_with_progress(&mut stdin, b"rgb").await.unwrap();
+            assert!(started.elapsed() > WRITE_IDLE_TIMEOUT);
+        };
+        let ((), read) = tokio::join!(write, read);
+        assert_eq!(&read, b"rgb");
+    }
 
     const LISTING: &str = "Encoders:
  V..... = Video
