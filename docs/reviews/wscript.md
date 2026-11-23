@@ -254,6 +254,17 @@ test does not reproduce is wrong and should be dropped.
   paused clock. Expected: an error that names a limit, with
   `state.buf.len()` under that limit. Today: the buffer holds everything
   that was sent, and the call ends only at the timeout.
+- Fixed by card #667. `pump` ends the session when the buffer would pass
+  `TERM_BUFFER_LIMIT`, 16 MiB, closes the channel, and the waiting `expect`
+  fails with an error that names the limit. `expect` scans a buffer once:
+  it scans again only after new output arrived, and it borrows the buffer
+  instead of copying it while the output is valid UTF-8. One correction to
+  the text above: `pump` returns at the end of its window (500 ms), so the
+  scan ran once per window, not once per chunk. The work of one `expect` is
+  now at most one scan of 16 MiB per window that brought new output. The
+  proof test needs no clock: its flood is twice the limit and then stops.
+  Before the fix it failed with "the buffer holds 33554432 bytes, past the
+  limit of 16777216".
 
 ### F7. A very large timeout panics the script thread, or sleeps for ever (crash of the script run)
 
