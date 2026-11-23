@@ -15,7 +15,9 @@
 #
 # A driver without the fix bugchecks the guest on some cases. The script
 # then waits for the guest to come back and records the bugcheck event.
-# Use a disposable VM.
+# Use a disposable VM: the script also turns off the recovery screen that
+# Windows shows after two bugchecks (bcdedit bootstatuspolicy and
+# recoveryenabled), which nothing would answer.
 #
 # <out-dir> gets driver.txt (the installed viogpu3d.sys), <case>.json (the
 # probe's result; "requesting" when the guest died in the escape),
@@ -90,6 +92,8 @@ gps '$f = Get-Item C:\Windows\System32\drivers\viogpu3d.sys -ErrorAction Silentl
     "sha256: {0}" -f (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()' 120 >"$OUT/driver.txt"
 note "$(tr '\n' ' ' <"$OUT/driver.txt")"
 
+gps 'bcdedit /set "{current}" bootstatuspolicy IgnoreAllFailures | Out-Null; bcdedit /set "{current}" recoveryenabled No | Out-Null' 60
+
 bad=0
 : >"$OUT/summary.txt"
 for c in $CASES; do
@@ -99,15 +103,21 @@ for c in $CASES; do
     in_lab "$VMLAB" exec --user "$ACCOUNT" --password "$PASSWORD" --timeout 90 "$VM" -- \
         "$GUEST\\capset_probe.exe" --case "$c" --out "$GUEST\\out\\$c.json" >"$OUT/$c.stdout.txt" 2>&1 || rc=$?
     sleep 5
-    died=no
     if ! in_lab "$VMLAB" exec --user SYSTEM --timeout 20 "$VM" -- cmd.exe /c ver >/dev/null 2>&1; then
-        died=yes
         note "$c: the guest went away; waiting for it to come back"
         sleep 30; wait_agent || { echo "$c: exit=$rc guest did not come back" >>"$OUT/summary.txt"; exit 1; }
-        sleep 60   # Windows writes the bugcheck event some time after the boot
     fi
     gps "Get-Content '$GUEST\\out\\$c.json' -Raw -ErrorAction SilentlyContinue" 60 >"$OUT/$c.json"
+    # The probe leaves "requesting" on disk before the escape. It is still there when the guest died in it.
+    died=no; [ "$(field "$OUT/$c.json" result)" = completed ] || died=yes
     after=$(last_bugcheck); after=${after:-0}
+    if [ "$died" = yes ]; then
+        # Windows writes the bugcheck event some time after the boot.
+        for _ in $(seq 1 24); do
+            [ "$after" != "$before" ] && break
+            sleep 10; after=$(last_bugcheck); after=${after:-0}
+        done
+    fi
     bug=none
     if [ "$after" != "$before" ]; then
         gps '$e = Get-WinEvent -FilterHashtable @{LogName="System"; ProviderName="Microsoft-Windows-WER-SystemErrorReporting"; Id=1001} -MaxEvents 1; "record {0} at {1}" -f $e.RecordId, $e.TimeCreated.ToUniversalTime().ToString("o"); $e.Message' 60 >"$OUT/$c.bugcheck.txt"
