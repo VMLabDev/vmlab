@@ -119,6 +119,7 @@ pub async fn build_template(
     // The declaration is checked before anything is fetched or booted: a
     // base that builds for an hour and then has no default to install its
     // variants under helps nobody.
+    check_build_names(def, version_override)?;
     let order = plan_variants(def, only_variants)?;
     if only_variants.is_some() {
         return build_onto_installed(
@@ -137,6 +138,9 @@ pub async fn build_template(
         Some(v) => v.to_string(),
         None => cancelable(&control.cancel, next_version(def, store, &log)).await?,
     };
+    // The counter is appended to the declared version, which can take a
+    // version at the length limit past it.
+    check_store_name(def, "version", &version)?;
     log(format!("building {}/{}@{}\n", def.arch, def.name, version));
 
     if store.exists(&def.arch, &def.name, Some(&version)) {
@@ -186,6 +190,41 @@ pub async fn build_template(
         .installed(&meta.arch, &meta.name, &meta.version)?
         .map(|v| v.meta)
         .unwrap_or(meta))
+}
+
+/// Refuse a name or a version the store would refuse, before the build does
+/// anything.
+///
+/// The store's rule ([`super::trust::component`]) is applied by the install,
+/// the last step of a build. Two things need it at the first step. The
+/// working directory is named from the architecture, the name and the
+/// declared version, and claiming it deletes what is there: a `/` or a `..`
+/// in one of them moves that delete out of the builds directory. And a
+/// definition the store refuses for its spelling alone (`version = "24H2"`)
+/// would otherwise fetch, install and seal before it is told.
+///
+/// The declared version is checked with a pinned one beside it: the first
+/// names the working directory, the second is what the store is given.
+fn check_build_names(def: &TemplateDef, pinned: Option<&str>) -> Result<()> {
+    check_store_name(def, "architecture", &def.arch)?;
+    check_store_name(def, "name", &def.name)?;
+    check_store_name(def, "version", &def.version)?;
+    if let Some(version) = pinned {
+        check_store_name(def, "version", version)?;
+    }
+    Ok(())
+}
+
+/// One name of [`check_build_names`], with the error saying which it is.
+fn check_store_name(def: &TemplateDef, what: &str, value: &str) -> Result<()> {
+    super::trust::component(value).map_err(|_| {
+        anyhow::anyhow!(
+            "template \"{}\" cannot be built: its {what} `{value}` is not a name the template \
+             store takes — lowercase letters, digits, `.`, `_` and `-`, starting with a letter \
+             or a digit, at most 128 bytes, without `..`",
+            def.name
+        )
+    })
 }
 
 /// The variants a build builds, in the order it builds them (§6.6), after
