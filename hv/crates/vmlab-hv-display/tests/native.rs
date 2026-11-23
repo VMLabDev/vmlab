@@ -706,7 +706,10 @@ fn an_unreleased_dma_frame_cannot_hold_its_lease_for_ever() {
     }
     *source.0.lock().unwrap() = make(3);
     server.publish().unwrap();
-    assert!(!leases[0].try_retire(), "the client still holds buffer zero");
+    assert!(
+        !leases[0].try_retire(),
+        "the client still holds buffer zero"
+    );
 
     // The GPU device retires a buffer before the guest command that writes
     // to it, and in a reset. That call has to come back.
