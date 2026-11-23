@@ -527,8 +527,8 @@ mod tests {
     const SESSION: [u8; 16] = [0x5a; 16];
     const HOST: [u8; 16] = [0xc3; 16];
 
-    /// `:N` and `:N.S` name the local server, reached at its abstract socket
-    /// and then its path socket; the screen does not change the connection.
+    /// `:N` and `:N.S` name the local server, reached at its path socket
+    /// and then its abstract socket; the screen does not change the connection.
     #[test]
     fn a_bare_display_number_is_the_local_server() {
         let local = |n: u32| Display {
@@ -813,6 +813,87 @@ mod tests {
             err.to_string().contains("wrong MIT-MAGIC-COOKIE-1"),
             "{err}"
         );
+    }
+
+    /// A listener on the abstract socket `\0<name>`.
+    #[cfg(target_os = "linux")]
+    fn abstract_listener(name: &str) -> tokio::net::UnixListener {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        tokio::net::UnixListener::from_std(listener).unwrap()
+    }
+
+    /// Run `proxy` towards a local display whose abstract name is its path,
+    /// as `:N` makes it, presenting the session cookie; the display's real
+    /// cookie is sixteen 0x7e bytes.
+    #[cfg(target_os = "linux")]
+    fn proxy_to_local(path: &Path) -> (UnixStream, tokio::task::JoinHandle<Result<()>>) {
+        let display = HostDisplay {
+            endpoint: Endpoint::Local {
+                abstract_name: Some(path.to_str().unwrap().to_string()),
+                path: path.to_path_buf(),
+            },
+            cookie: Some(vec![0x7e; 16]),
+        };
+        let (guest, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(async move { proxy(guest, &display, &"5a".repeat(16)).await });
+        (client, task)
+    }
+
+    /// Whoever binds the abstract name a server left free must not be the
+    /// one the real cookie is written to: with both sockets listening, the
+    /// connection — and the cookie in its setup — goes to the path socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_real_cookie_goes_to_the_path_socket_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("X0");
+        let server = tokio::net::UnixListener::bind(&path).unwrap();
+        let squatter = abstract_listener(path.to_str().unwrap());
+        let (mut client, _task) = proxy_to_local(&path);
+        client
+            .write_all(&client_setup(ByteOrder::Lsb, MIT_MAGIC_COOKIE, &[0x5a; 16]))
+            .await
+            .unwrap();
+        let mut host = tokio::select! {
+            accepted = server.accept() => accepted.unwrap().0,
+            _ = squatter.accept() => {
+                panic!("the proxy connected to the abstract socket, which gets the real cookie")
+            }
+        };
+        let expected = client_setup(ByteOrder::Lsb, MIT_MAGIC_COOKIE, &[0x7e; 16]);
+        let mut setup = vec![0u8; expected.len()];
+        host.read_exact(&mut setup).await.unwrap();
+        assert_eq!(setup, expected);
+        // The proxy has made its one connection; none is queued elsewhere.
+        let pending = squatter.into_std().unwrap().accept();
+        assert_eq!(
+            pending.unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the abstract socket was connected to as well"
+        );
+    }
+
+    /// A server that listens on the abstract name alone is still reached
+    /// when it is this user's own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_abstract_socket_of_this_user_serves_when_the_path_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("X0");
+        let server = abstract_listener(path.to_str().unwrap());
+        let (mut client, _task) = proxy_to_local(&path);
+        client
+            .write_all(&client_setup(ByteOrder::Lsb, MIT_MAGIC_COOKIE, &[0x5a; 16]))
+            .await
+            .unwrap();
+        let (mut host, _) = server.accept().await.unwrap();
+        let expected = client_setup(ByteOrder::Lsb, MIT_MAGIC_COOKIE, &[0x7e; 16]);
+        let mut setup = vec![0u8; expected.len()];
+        host.read_exact(&mut setup).await.unwrap();
+        assert_eq!(setup, expected);
     }
 
     /// Send a setup through `proxy` to `display` and return the server's
