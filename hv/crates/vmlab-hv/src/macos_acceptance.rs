@@ -28,6 +28,29 @@ fn exec(guest: &mut AgentClient, script: &str) -> String {
     String::from_utf8(result.stdout).unwrap().trim().into()
 }
 
+/// OpenCore's `Booter > Quirks > ProvideCustomSlide` in the booted template,
+/// read from the EFI system partition: `true`, `false`, or what went wrong.
+///
+/// vmlab#200: boot.efi draws a random KASLR slide and loads the kernel at
+/// 1 MiB + slide x 2 MiB. OVMF keeps its firmware volumes at 8 to 23.5 MiB,
+/// so the 12 lowest of the 256 slides have no free memory, and boot.efi then
+/// shows the prohibited sign and waits for ever: one boot in 21. This quirk
+/// is what keeps boot.efi to the slides that fit.
+fn provide_custom_slide(guest: &mut AgentClient) -> String {
+    let script = "d=/tmp/vmlab-esp; mkdir -p $d && \
+        diskutil mount readOnly -mountPoint $d disk0s1 >/dev/null && \
+        plutil -extract Booter.Quirks.ProvideCustomSlide raw $d/EFI/OC/config.plist; \
+        diskutil unmount $d >/dev/null";
+    match guest.exec(&["/bin/sh", "-c", script], Duration::from_secs(60)) {
+        Ok(result) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout).trim(),
+            String::from_utf8_lossy(&result.stderr).trim()
+        ),
+        Err(error) => error,
+    }
+}
+
 fn control(client: &mut Client, command: Control) {
     let result = client.call(command).unwrap();
     assert!(matches!(result, Outcome::Ok { .. }), "{result:?}");
@@ -269,54 +292,28 @@ fn password_glyph_detector_matches_the_captured_five_key_exercise() {
     assert_eq!(password_bullets(&output.stdout), 5);
 }
 
-#[test]
-#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
-fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
-    // The live macOS boot is intermittent (OpenCore and early-boot stalls) and is
-    // parked under https://github.com/VMLabDev/vmlab/issues/200, so it runs only on
-    // request until that issue is picked up.
-    if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
-        eprintln!(
-            "skipping macOS P1: opt-in while parked under vmlab#200; set VMLAB_HV_MACOS_ACCEPTANCE=1"
-        );
-        return;
+/// A macOS VM launched as the P1 test boots the template: a fresh overlay
+/// of `template`, its own VARS copy, the test switch, and the description
+/// (with `key` as the Apple SMC key) passed through an anonymous memfd so
+/// the key never becomes an artifact. Returns once control answers.
+struct Launched {
+    process: ManagedChild,
+    client: Client,
+    agent: PathBuf,
+    stderr: PathBuf,
+    _machine: File,
+    _switch: vmlab_hv_tests::switch::MiniSwitch,
+}
+
+impl Launched {
+    fn diagnostics(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
     }
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping macOS P1: /dev/kvm unavailable");
-        return;
-    }
-    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
-        eprintln!("skipping macOS P1: macos-tahoe template absent; set VMLAB_HV_MACOS_DISK");
-        return;
-    };
-    let Some(key) = vmlab_hv_tests::host_key::load_host_osk()
-        .expect("loading host key failed; contents suppressed")
-    else {
-        eprintln!(
-            "skipping macOS P1: host.apple_smc_osk absent; alternatively set VMLAB_HV_TEST_APPLE_SMC_OSK"
-        );
-        return;
-    };
-    let firmware = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".local/share/vmlab/guest/firmware/x86_64")
-        });
-    for file in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"] {
-        assert!(firmware.join(file).is_file(), "missing firmware {file}");
-    }
-    let mut directory = tempfile::Builder::new()
-        .prefix("hv-macos-")
-        .tempdir()
-        .unwrap();
-    if std::env::var_os("VMLAB_HV_ACCEPTANCE_KEEP").is_some() {
-        directory.disable_cleanup(true);
-        eprintln!("macOS P1 artifacts: {}", directory.path().display());
-    }
-    let path = directory.path().to_path_buf();
+}
+
+fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Launched {
     let disk = path.join("disk.qcow2");
-    vmlab_disk::ops::create_linked_clone(&template, &disk).unwrap();
+    vmlab_disk::ops::create_linked_clone(template, &disk).unwrap();
     let vars = path.join("vars.fd");
     std::fs::copy(firmware.join("OVMF_VARS_4M.fd"), &vars).unwrap();
     let socket = path.join("control.sock");
@@ -391,7 +388,7 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     .unwrap();
     let diagnostics = || std::fs::read_to_string(&stderr).unwrap_or_default();
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut client = loop {
+    let client = loop {
         if let Ok(client) = Client::connect(&socket) {
             break client;
         }
@@ -407,6 +404,73 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
+    Launched {
+        process,
+        client,
+        agent,
+        stderr,
+        _machine: machine,
+        _switch,
+    }
+}
+
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
+    // Opt-in: the intermittent stall of
+    // https://github.com/VMLabDev/vmlab/issues/200 is the template's (see
+    // `provide_custom_slide`), and the template in the store has it until it
+    // is rebuilt. This test passed ten times in a row on a fixed overlay
+    // (hv/docs/macos-verification.md).
+    if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
+        eprintln!(
+            "skipping macOS P1: opt-in until the template is rebuilt (vmlab#200); set VMLAB_HV_MACOS_ACCEPTANCE=1"
+        );
+        return;
+    }
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping macOS P1: /dev/kvm unavailable");
+        return;
+    }
+    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
+        eprintln!("skipping macOS P1: macos-tahoe template absent; set VMLAB_HV_MACOS_DISK");
+        return;
+    };
+    let Some(key) = vmlab_hv_tests::host_key::load_host_osk()
+        .expect("loading host key failed; contents suppressed")
+    else {
+        eprintln!(
+            "skipping macOS P1: host.apple_smc_osk absent; alternatively set VMLAB_HV_TEST_APPLE_SMC_OSK"
+        );
+        return;
+    };
+    let firmware = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".local/share/vmlab/guest/firmware/x86_64")
+        });
+    for file in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"] {
+        assert!(firmware.join(file).is_file(), "missing firmware {file}");
+    }
+    let mut directory = tempfile::Builder::new()
+        .prefix("hv-macos-")
+        .tempdir()
+        .unwrap();
+    if std::env::var_os("VMLAB_HV_ACCEPTANCE_KEEP").is_some() {
+        directory.disable_cleanup(true);
+        eprintln!("macOS P1 artifacts: {}", directory.path().display());
+    }
+    let path = directory.path().to_path_buf();
+    let Launched {
+        mut process,
+        mut client,
+        agent,
+        stderr,
+        _machine,
+        _switch,
+    } = launch_macos(&path, &template, &firmware, &key);
+    let diagnostics = || std::fs::read_to_string(&stderr).unwrap_or_default();
     let host_ignore_before =
         std::fs::read_to_string("/sys/module/kvm/parameters/ignore_msrs").unwrap();
     if std::env::var_os("VMLAB_HV_TEST_REQUIRE_MSR_EXITS").is_some() {
@@ -417,6 +481,7 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
         );
     }
     control(&mut client, Control::Resume);
+    let resumed = Instant::now();
     let timeout = Duration::from_secs(
         std::env::var("VMLAB_HV_TEMPLATE_TIMEOUT")
             .ok()
@@ -438,6 +503,17 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     assert_eq!(
         exec(&mut guest, "printf macos-agent-ready"),
         "macos-agent-ready"
+    );
+    eprintln!(
+        "macOS P1 agent answered {:.1} s after resume",
+        resumed.elapsed().as_secs_f64()
+    );
+    // This boot drew a slide that fits; without the quirk the next one may not.
+    assert_eq!(
+        provide_custom_slide(&mut guest),
+        "true",
+        "the macos-tahoe template boots with OpenCore's ProvideCustomSlide off, so one boot in 21 \
+         stops at the prohibited sign (vmlab#200): rebuild it with the quirk on"
     );
     let tsc = exec(&mut guest, "sysctl -n machdep.tsc.frequency");
     eprintln!("macOS P1 agent-ready; TSC Hz={tsc}");
@@ -569,4 +645,339 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
             "macOS P1 independent checks passed; unknown-MSR independence remains unverified until the owner sets ignore_msrs=N"
         );
     }
+}
+
+/// Where a vCPU is: XNU runs in the kernel's high half; anything below it
+/// during boot is OVMF, OpenCore or boot.efi.
+const XNU_BASE: u64 = 0xffff_ff80_0000_0000;
+
+fn debug(
+    client: &mut Client,
+    request: vmlab_hv_proto::debug::DebugRequest,
+) -> vmlab_hv_proto::debug::DebugResponse {
+    match client.call(Control::Debug { request }).unwrap() {
+        Outcome::Debug { response } => response,
+        other => panic!("debug request answered {other:?}"),
+    }
+}
+
+/// Every vCPU's RIP, read with the guest paused for the instant it takes.
+fn sample_rips(client: &mut Client, vcpus: u8) -> Vec<u64> {
+    use vmlab_hv_proto::debug::{DebugRequest, DebugResponse};
+    debug(client, DebugRequest::Pause);
+    let rips = (0..vcpus)
+        .map(
+            |vcpu| match debug(client, DebugRequest::ReadRegisters { vcpu }) {
+                // GENERAL_REGISTERS order: rip is index 16.
+                DebugResponse::Registers { registers, .. } => registers.general[16],
+                other => panic!("read registers answered {other:?}"),
+            },
+        )
+        .collect();
+    debug(client, DebugRequest::Continue);
+    rips
+}
+
+/// Where the vCPUs spend their time: `samples` looks 200 ms apart at every
+/// vCPU's RIP and interrupt flag, then the code around the commonest RIP.
+/// `VMLAB_HV_MACOS_STALL_PROBE=<samples>` runs it at the end of a census run.
+fn probe_idle(client: &mut Client, samples: usize) {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    let mut seen = std::collections::BTreeMap::<(u64, bool), usize>::new();
+    for _ in 0..samples {
+        std::thread::sleep(Duration::from_millis(200));
+        debug(client, DebugRequest::Pause);
+        for vcpu in 0..4 {
+            if let DebugResponse::Registers { registers, .. } =
+                debug(client, DebugRequest::ReadRegisters { vcpu })
+            {
+                let key = (registers.general[16], registers.general[17] & 0x200 != 0);
+                *seen.entry(key).or_default() += 1;
+            }
+        }
+        debug(client, DebugRequest::Continue);
+    }
+    let mut ranked: Vec<_> = seen.into_iter().collect();
+    ranked.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    ranked.truncate(6);
+    eprintln!("census probe: (rip, IF) by samples {ranked:x?}");
+    debug(client, DebugRequest::Pause);
+    for ((rip, _), _) in ranked.iter().take(2) {
+        let code = client.call(Control::Debug {
+            request: DebugRequest::ReadMemory {
+                space: AddressSpace::Virtual { vcpu: 0 },
+                address: rip - 32,
+                length: 64,
+            },
+        });
+        eprintln!("census probe: code at {rip:x}-32: {code:x?}");
+    }
+    debug(client, DebugRequest::Continue);
+}
+
+/// The KASLR slide boot.efi chose, in its 2 MiB steps: the first step above
+/// XNU's unslid base where a vCPU running XNU maps a 64-bit Mach-O header.
+fn kernel_slide(client: &mut Client) -> Option<u16> {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    debug(client, DebugRequest::Pause);
+    let vcpu = (0..4u8).find(|vcpu| {
+        matches!(
+            debug(client, DebugRequest::ReadRegisters { vcpu: *vcpu }),
+            DebugResponse::Registers { registers, .. } if registers.general[16] >= XNU_BASE
+        )
+    });
+    let slide = vcpu.and_then(|vcpu| {
+        (0..=255u16).find(|slide| {
+            let header = client.call(Control::Debug {
+                request: DebugRequest::ReadMemory {
+                    space: AddressSpace::Virtual { vcpu },
+                    address: 0xffff_ff80_0020_0000 + u64::from(*slide) * 0x20_0000,
+                    length: 4,
+                },
+            });
+            matches!(
+                header,
+                Ok(Outcome::Debug { response: DebugResponse::Memory { data } })
+                    if data == [0xcf, 0xfa, 0xed, 0xfe]
+            )
+        })
+    });
+    debug(client, DebugRequest::Continue);
+    slide
+}
+
+/// The top 256 MiB below 2 GiB, where OVMF, OpenCore and boot.efi keep
+/// their pools and logs, then the first 36 MiB: what a boot stuck before XNU
+/// last said, and what lay under the kernel's lowest slides. A boot
+/// with the census's fake key puts no secret there.
+fn dump_firmware_ram(client: &mut Client, destination: &Path) {
+    use vmlab_hv_proto::debug::{AddressSpace, DebugRequest, DebugResponse};
+    const CHUNK: usize = 64 * 1024;
+    let mut out = File::create(destination).unwrap();
+    debug(client, DebugRequest::Pause);
+    // The first 36 MiB too: where OVMF's own volumes sit under the kernel's
+    // lowest KASLR slides. The file is the two ranges end to end.
+    for address in (0x7000_0000u64..0x8000_0000)
+        .chain(0..0x240_0000)
+        .step_by(CHUNK)
+    {
+        let chunk = client.call(Control::Debug {
+            request: DebugRequest::ReadMemory {
+                space: AddressSpace::Physical,
+                address,
+                length: CHUNK,
+            },
+        });
+        match chunk {
+            Ok(Outcome::Debug {
+                response: DebugResponse::Memory { data },
+            }) => out.write_all(&data).unwrap(),
+            _ => out.write_all(&[0; CHUNK]).unwrap(),
+        }
+    }
+    debug(client, DebugRequest::Continue);
+}
+
+/// vmlab#200 census: how often the macOS boot stalls before XNU.
+///
+/// The stall #200 records (the agent never answering with the vCPUs in
+/// firmware or OpenCore, and the prohibited sign on the screen) comes before
+/// macOS reads the Apple SMC, so this boots with an obviously fake key: no
+/// owner secret is involved. On helios it measured 15 stalls in 460 boots
+/// of `macos-tahoe@26.7.0`, never a slide below 17 in the boots that
+/// worked, and no stall in 180 boots once `ProvideCustomSlide` was on: see
+/// `hv/docs/macos-verification.md`. Each run
+/// boots a fresh overlay and samples every vCPU's RIP through the debug
+/// protocol until one reaches XNU or `VMLAB_HV_MACOS_STALL_TIMEOUT` (240 s)
+/// passes, and reports the time or the stall with its RIPs and a screenshot.
+/// `VMLAB_HV_MACOS_STALL_AGENT=<seconds>` then waits that long for the agent,
+/// which the fake key does not stop, and counts the resets on the way.
+/// Opt-in: `VMLAB_HV_MACOS_STALL_RUNS=<n>`. It measures; it asserts no rate.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn macos_boot_stall_census() {
+    let Some(runs) = std::env::var("VMLAB_HV_MACOS_STALL_RUNS").ok().map(|n| {
+        n.parse::<usize>()
+            .expect("VMLAB_HV_MACOS_STALL_RUNS must be a count")
+    }) else {
+        eprintln!("skipping macOS stall census: set VMLAB_HV_MACOS_STALL_RUNS=<n>");
+        return;
+    };
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping macOS stall census: /dev/kvm unavailable");
+        return;
+    }
+    let Some(template) = super::acceptance::template("macos-tahoe", "VMLAB_HV_MACOS_DISK") else {
+        eprintln!("skipping macOS stall census: macos-tahoe template absent");
+        return;
+    };
+    let firmware = PathBuf::from(
+        std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
+            .expect("set VMLAB_HV_FIRMWARE_DIR to vmlab's built OVMF"),
+    );
+    let timeout = Duration::from_secs(
+        std::env::var("VMLAB_HV_MACOS_STALL_TIMEOUT")
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(240),
+    );
+    let agent_wait = std::env::var("VMLAB_HV_MACOS_STALL_AGENT")
+        .ok()
+        .map(|s| Duration::from_secs(s.parse().unwrap()));
+    let mut agent_times = Vec::new();
+    let mut slides = Vec::new();
+    let probe = std::env::var("VMLAB_HV_MACOS_STALL_PROBE")
+        .ok()
+        .map(|s| s.parse::<usize>().unwrap());
+    let interval = Duration::from_millis(
+        std::env::var("VMLAB_HV_MACOS_STALL_INTERVAL_MS")
+            .ok()
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(3000),
+    );
+    let fake_key = "FAKE".repeat(16);
+    let mut stalls = Vec::new();
+    let mut times = Vec::new();
+    for run in 1..=runs {
+        let mut directory = tempfile::Builder::new()
+            .prefix("hv-macos-census-")
+            .tempdir()
+            .unwrap();
+        let path = directory.path().to_path_buf();
+        let mut vm = launch_macos(&path, &template, &firmware, &fake_key);
+        control(&mut vm.client, Control::Resume);
+        let started = Instant::now();
+        let mut last = Vec::new();
+        let mut reached = None;
+        while started.elapsed() < timeout {
+            std::thread::sleep(interval);
+            if vm.process.try_wait().unwrap().is_some() {
+                break;
+            }
+            last = sample_rips(&mut vm.client, 4);
+            if last.iter().any(|rip| *rip >= XNU_BASE) {
+                reached = Some(started.elapsed());
+                break;
+            }
+        }
+        if reached.is_some() {
+            slides.push(kernel_slide(&mut vm.client));
+        }
+        // Past XNU the agent is a plain launchd daemon, which a fake key does
+        // not stop: `VMLAB_HV_MACOS_STALL_AGENT=<seconds>` waits for it too.
+        let mut agent_failed = None;
+        if let (Some(_), Some(wait)) = (reached, agent_wait) {
+            match AgentClient::connect(&vm.agent, wait) {
+                Ok(mut guest) => {
+                    agent_times.push(started.elapsed().as_secs_f64());
+                    if run == 1 {
+                        eprintln!(
+                            "census: the template's ProvideCustomSlide is {}",
+                            provide_custom_slide(&mut guest)
+                        );
+                    }
+                    // `VMLAB_HV_MACOS_STALL_EXEC=<sh script>` runs it in the
+                    // guest, powers the guest down and keeps the overlay: a
+                    // changed disk a later census boots as its template
+                    // (`VMLAB_HV_MACOS_DISK`).
+                    if let Ok(script) = std::env::var("VMLAB_HV_MACOS_STALL_EXEC") {
+                        let result = guest
+                            .exec(&["/bin/sh", "-c", &script], Duration::from_secs(120))
+                            .unwrap();
+                        eprintln!(
+                            "census exec: exit {} stdout {:?} stderr {:?}",
+                            result.exit_code,
+                            String::from_utf8_lossy(&result.stdout),
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                        guest
+                            .shutdown("powerdown", Duration::from_secs(10))
+                            .unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(120);
+                        while vm.process.try_wait().unwrap().is_none() && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        directory.disable_cleanup(true);
+                        eprintln!(
+                            "census exec: stopped {}, overlay {}",
+                            vm.process.try_wait().unwrap().is_some(),
+                            path.join("disk.qcow2").display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    last = sample_rips(&mut vm.client, 4);
+                    agent_failed = Some(error);
+                }
+            }
+        }
+        let resets = vm
+            .client
+            .take_events()
+            .into_iter()
+            .filter(|event| matches!(event, vmlab_hv_proto::control::Event::Reset))
+            .count();
+        match reached.filter(|_| agent_failed.is_none()) {
+            Some(elapsed) => {
+                eprintln!(
+                    "census run {run}/{runs}: XNU after {:.1} s, agent {:?} s, resets {resets}",
+                    elapsed.as_secs_f64(),
+                    agent_wait.and(agent_times.last())
+                );
+                times.push(elapsed.as_secs_f64());
+            }
+            None => {
+                // Keep the stall's evidence: no secret is in it.
+                directory.disable_cleanup(true);
+                let kept = directory.path().to_path_buf();
+                super::display_acceptance::diagnostic_screenshot(
+                    &kept.join("display.sock"),
+                    &kept.join("stall.ppm"),
+                );
+                if agent_failed.is_none() && vm.process.try_wait().unwrap().is_none() {
+                    dump_firmware_ram(&mut vm.client, &kept.join("stall-ram.bin"));
+                }
+                eprintln!(
+                    "census run {run}/{runs}: STALL {} after {:.0} s, resets {resets}, rips {:x?}, exited {}, artifacts {}",
+                    match &agent_failed {
+                        Some(error) => format!("before the agent ({error})"),
+                        None => "before XNU".into(),
+                    },
+                    started.elapsed().as_secs_f64(),
+                    last,
+                    vm.process.try_wait().unwrap().is_some(),
+                    kept.display()
+                );
+                let diagnostics = vm.diagnostics();
+                let tail: String = diagnostics
+                    .chars()
+                    .rev()
+                    .take(2000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                eprintln!("census run {run} diagnostics tail: {tail}");
+                stalls.push(run);
+            }
+        }
+        if let Some(samples) = probe.filter(|_| vm.process.try_wait().unwrap().is_none()) {
+            probe_idle(&mut vm.client, samples);
+        }
+        if vm.process.try_wait().unwrap().is_none() {
+            let _ = vm.client.call(Control::Quit);
+        }
+        let _ = vm.process.wait();
+    }
+    slides.sort();
+    eprintln!("census: KASLR slides of the boots that reached XNU {slides:?}");
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "census: {} of {runs} runs stalled {stalls:?}; time to the agent {agent_times:.0?}; time to XNU min {:.1} median {:.1} max {:.1} s",
+        stalls.len(),
+        times.first().copied().unwrap_or(f64::NAN),
+        times.get(times.len() / 2).copied().unwrap_or(f64::NAN),
+        times.last().copied().unwrap_or(f64::NAN)
+    );
 }

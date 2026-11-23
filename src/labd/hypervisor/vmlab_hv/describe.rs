@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat, Display,
-    DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV, Machine, Nic,
-    NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm, VfioDevice,
-    VirtualDisplay,
+    Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat,
+    Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV,
+    Machine, MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm,
+    VfioDevice, VirtualDisplay,
 };
 
 use crate::config::model::GpuMode as VmGpuMode;
@@ -27,6 +27,10 @@ use crate::config::model::GpuMode as VmGpuMode;
 use crate::profiles::AgentTransport;
 use crate::qemu::container::{ContainerVmPaths, kernel_cmdline};
 use crate::qemu::{NicBackend, ResolvedContainer, ResolvedVm, VmPaths};
+
+/// vmlab-hv's name for the macos profile's CPU: `Skylake-Client-v4` with
+/// that profile's edits (-hle, -rtm, vendor, kvm), from the captured CPUID.
+const MACOS_HV_CPU_MODEL: &str = "Skylake-Client-v4";
 
 /// The disk whose snapshot carries RAM and device state: the scratch disk,
 /// the container's only writable one, as under QEMU.
@@ -347,10 +351,15 @@ pub(crate) fn vm(
         );
     }
     let ovmf = resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf);
+    // A macOS guest (HV macOS phase): VMware SVGA, a USB keyboard, the
+    // pinned Skylake model with VMware's frequency leaf, unknown MSRs read as
+    // 0, an SMBIOS baseboard and the Apple SMC serving the host's key.
+    let macos = crate::config::hypervisor::is_macos(resolved);
     let display_device = match resolved.display_device.as_deref() {
         // QEMU's q35 adds a std VGA of its own where nothing names one.
         None | Some("VGA") => DisplayDevice::StdVga,
         Some("virtio-vga") => DisplayDevice::VirtioVga,
+        Some("vmware-svga") if macos => DisplayDevice::VmwareSvga,
         Some("cirrus-vga") if pc => DisplayDevice::CirrusVga,
         Some(other) => {
             bail!(
@@ -551,11 +560,15 @@ pub(crate) fn vm(
             other => bail!("vm \"{name}\": vmlab-hv cannot describe NIC model `{other}`"),
         };
         let attachment = match &nic.backend {
-            // An emulated pc NIC has one queue and no virtio-net header, so
-            // it takes the plain stream; virtio-net takes the vnet stream.
-            NicBackend::Stream { sock } if model != NicModel::Virtio => NicAttachment::Stream {
-                socket: sock.clone(),
-            },
+            // An emulated pc NIC has one queue and no virtio-net header, and
+            // macOS's AppleVirtIO drives a transitional, single-queue
+            // virtio-net, so both take the plain stream (vm.rs agrees);
+            // any other virtio-net takes the vnet stream.
+            NicBackend::Stream { sock } if macos || model != NicModel::Virtio => {
+                NicAttachment::Stream {
+                    socket: sock.clone(),
+                }
+            }
             NicBackend::Stream { sock } => NicAttachment::StreamVnet {
                 socket: sock.clone(),
                 queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
@@ -563,6 +576,11 @@ pub(crate) fn vm(
             NicBackend::TapQueues { .. } | NicBackend::Tap { .. } if model != NicModel::Virtio => {
                 bail!(
                     "vm \"{name}\": vmlab-hv attaches an emulated pc NIC by stream socket only, not a TAP"
+                )
+            }
+            NicBackend::TapQueues { .. } | NicBackend::Tap { .. } if macos => {
+                bail!(
+                    "vm \"{name}\": vmlab-hv attaches a macOS guest's NIC by stream socket only, not a TAP"
                 )
             }
             NicBackend::TapQueues { tap_fds, vhost_fds } => {
@@ -640,11 +658,8 @@ pub(crate) fn vm(
         DisplayDevice::StdVga => roms.vgabios_std.clone(),
         DisplayDevice::VirtioVga => roms.vgabios_virtio.clone(),
         DisplayDevice::CirrusVga => roms.vgabios_cirrus.clone(),
-        DisplayDevice::VmwareSvga => {
-            bail!(
-                "vm \"{name}\": vmlab-hv adapter supports std VGA, virtio VGA and Cirrus (pc) only"
-            )
-        }
+        // OVMF drives it through its GOP; no legacy VGA BIOS.
+        DisplayDevice::VmwareSvga => None,
     };
     // The tablet's xHCI (HV phase-2 D6) takes the slot after the display,
     // where QEMU's `-usb` puts its ICH9 UHCI/EHCI at 1d.x instead. Under
@@ -714,14 +729,34 @@ pub(crate) fn vm(
         // sockets and every connection to them stay (PRD §22).
         exit_on_reset: false,
         machine: if pc { Machine::Pc } else { Machine::Q35 },
-        cpu_model: resolved.cpu_model.clone(),
+        // vmlab-hv names the macos profile's QEMU CPU string by its base
+        // model; every other declared model passes as written.
+        cpu_model: if macos {
+            Some(MACOS_HV_CPU_MODEL.to_string())
+        } else {
+            resolved.cpu_model.clone()
+        },
         invtsc: tsc_khz.is_some(),
         tsc_khz,
-        vmware_cpuid_freq: false,
-        msr_policy: Default::default(),
-        applesmc: None,
-        usb_keyboard: false,
-        smbios_type2: false,
+        vmware_cpuid_freq: macos,
+        msr_policy: if macos {
+            MsrPolicy::Ignore
+        } else {
+            MsrPolicy::Fault
+        },
+        applesmc: if resolved.apple_smc {
+            let key = paths
+                .apple_smc_osk
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(crate::config::host::APPLE_SMC_OSK_REQUIRED))?;
+            Some(AppleSmc {
+                osk: key.expose().to_string(),
+            })
+        } else {
+            None
+        },
+        usb_keyboard: macos && resolved.input == crate::config::model::InputDevices::Usb,
+        smbios_type2: resolved.apple_smc,
         cpu: if resolved.nested {
             CpuPolicy::Nested
         } else {
@@ -983,6 +1018,7 @@ mod tests {
             "templeos",
             "windows-10",
             "windows-11",
+            "macos",
         ]
         .iter()
         .map(|n| {
@@ -1395,6 +1431,63 @@ mod tests {
             (at(1), at(2), at(3), at(5))
         );
         assert_eq!(d.display.unwrap().pci, at(4).unwrap());
+    }
+
+    /// The macos profile is described as vmlab-hv's macOS P1 acceptance test
+    /// describes the template: console 00:01.0, virtio-net 00:02.0 (plain,
+    /// single queue), VMware SVGA 00:03.0 without a VGA BIOS, the tablet's
+    /// xHCI 00:04.0 with a USB keyboard, AHCI disks, the pinned Skylake model
+    /// with VMware's frequency leaf, the `ignore` MSR policy, SMBIOS type 2
+    /// and the Apple SMC serving the host's key.
+    #[test]
+    fn macos_is_described_as_the_hypervisors_acceptance_test_boots_it() {
+        let r = declared(r#"profile = "macos""#, None);
+        let mut paths = ovmf_paths(false);
+        paths.tsc_hz = Some(2_995_200_000);
+        let key = "FAKE".repeat(16);
+        paths.apple_smc_osk = Some(crate::config::host::AppleSmcOsk::parse(key.clone()).unwrap());
+        let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        assert_eq!(d.cpu_model.as_deref(), Some("Skylake-Client-v4"));
+        assert!(d.vmware_cpuid_freq && d.invtsc && d.usb_keyboard && d.smbios_type2);
+        assert_eq!(d.tsc_khz, Some(2_995_200));
+        assert_eq!(d.msr_policy, MsrPolicy::Ignore);
+        assert_eq!(
+            d.applesmc.as_ref().map(|s| s.osk.as_str()),
+            Some(key.as_str())
+        );
+        assert!(
+            !format!("{d:?}").contains(&key),
+            "Debug never shows the key"
+        );
+        assert!(
+            !serde_json::to_string(&d.redacted()).unwrap().contains(&key),
+            "the redacted dump never holds the key"
+        );
+        let display = d.display.as_ref().unwrap();
+        assert_eq!(display.device, DisplayDevice::VmwareSvga);
+        assert_eq!(display.rom, None);
+        assert_eq!(
+            (d.console_pci, d.nics[0].pci, Some(display.pci), d.tablet),
+            (at(1), at(2), at(3), at(4))
+        );
+        assert_eq!(
+            d.nics[0].attachment,
+            NicAttachment::Stream {
+                socket: "/run/l/v/nic0.sock".into()
+            }
+        );
+        assert_eq!(d.disks[0].bus, DiskBus::Ahci);
+        assert!(d.hyperv.is_empty());
+
+        // Without the host key the description is refused, as validation
+        // refuses the machine before it gets here.
+        paths.apple_smc_osk = None;
+        let error = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap_err();
+        assert!(error.to_string().contains("apple_smc_osk"), "{error}");
+        // Another guest gets none of it.
+        let linux = vm("l", &seabios_modern(), &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+        assert!(linux.cpu_model.is_none() && linux.applesmc.is_none() && !linux.usb_keyboard);
+        assert_eq!(linux.msr_policy, MsrPolicy::Fault);
     }
 
     #[test]

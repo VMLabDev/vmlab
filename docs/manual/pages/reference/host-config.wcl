@@ -175,7 +175,9 @@ SRC
     host configuration and launch paths also redact it. The key is never
     recorded in templates or OCI metadata. A key that holds a double quote is
     refused at launch, because QEMU's configuration file cannot carry one.
-    vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
+    vmlab-hv receives the key through a private pipe at its machine
+    description's path, replaced by the redacted description once read, so
+    under vmlab-hv the key is in no process argument and no file.
   DOC
 
   h2 "hypervisor {}"
