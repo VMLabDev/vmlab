@@ -1989,8 +1989,27 @@ impl LabRuntime {
     /// the lease, not simply the first: priming the NAT engine with a
     /// multi-NIC machine's NIC-0 address for an address leased on NIC 1 would
     /// point the engine at the wrong port.
+    ///
+    /// Which NIC is asked of the guest; which address that NIC holds is not.
+    /// The guest writes its agent's report, so on a segment with a DHCP
+    /// server the address is the server's lease for that NIC
+    /// ([`DhcpServer::vouched`](crate::net::dhcp::DhcpServer::vouched)): a
+    /// guest that claims another machine's address gets no forward aimed at
+    /// it and no NAT binding for it (docs/reviews/containers.md F1). A global
+    /// segment's DHCP server is the supervisor's, so there the report stands.
     async fn forward_observations(&self, scope: &[String]) -> forward_plan::Observed {
         let mut observed = forward_plan::Observed::default();
+        // Taken before any guest is asked: an agent may take seconds to
+        // answer, and the network is not held for that.
+        let dhcp: HashMap<String, _> = {
+            let net = self.network.lock().await;
+            net.segments
+                .iter()
+                .filter_map(|(name, seg)| {
+                    Some((name.clone(), seg.gateway.as_ref()?.dhcp_server()?))
+                })
+                .collect()
+        };
         for m in self.machines() {
             let name = m.name().to_string();
             if !scope.is_empty() && !scope.contains(&name) {
@@ -2007,8 +2026,26 @@ impl LabRuntime {
             let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
-            if let Some(mac) = m.macs().get(nic) {
-                observed.macs.insert(name.clone(), *mac);
+            let mac = m.macs().get(nic).copied();
+            let server = m
+                .nics()
+                .get(nic)
+                .and_then(|n| dhcp.get(nic_segment_name(n)));
+            let ip = match (mac, server) {
+                (Some(mac), Some(server)) => {
+                    let Some(held) = server.lock_recover().vouched(mac, ip) else {
+                        tracing::warn!(
+                            "\"{name}\": its guest reports {ip} on {mac}, an address that NIC \
+                             does not hold; no forward follows it"
+                        );
+                        continue;
+                    };
+                    held
+                }
+                _ => ip,
+            };
+            if let Some(mac) = mac {
+                observed.macs.insert(name.clone(), mac);
             }
             observed.leases.insert(name, ip);
         }

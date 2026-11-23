@@ -79,7 +79,7 @@ Not read:
 
 | # | Severity | Finding |
 |---|----------|---------|
-| F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards |
+| F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614) |
 | F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine |
 | F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image |
 | F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 |
@@ -136,6 +136,20 @@ Not read:
 - Open question for the fix: whether a claimed address equal to the
   segment's service address makes the engine originate toward its own
   redirect rules (the SMB DNAT to the host's loopback). Not followed.
+- Fixed in card #614. `forward_observations` asks the segment's DHCP server
+  (`DhcpServer::vouched`, `src/net/dhcp.rs`) which address the NIC holds. A
+  NIC with a valid lease is recorded with the leased address, whatever its
+  guest reports. A NIC with no lease (a static address, or a lease table lost
+  with a restarted lab daemon) is recorded with the reported address, unless
+  that address is leased or reserved to another NIC or is the segment's
+  service address: then nothing is recorded, a warning names the machine, and
+  its forwards are skipped with "no lease". The open question is closed that
+  way: a claim of the service address is refused. Proof:
+  `a_forward_targets_the_dhcp_lease_not_the_guest_claim` in `src/labd/lab.rs`
+  and `a_claim_never_outranks_a_lease` in `src/net/dhcp.rs`. Not covered: a
+  global segment, whose DHCP server is the supervisor's, and an address
+  nobody holds a lease or a reservation for, which is believed as a frame
+  from it is (`Gateway::may_claim`).
 
 ### F2. A ctl write has no timeout, so a silent micro-VM hangs its stop (crash)
 
