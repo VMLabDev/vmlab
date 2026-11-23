@@ -789,6 +789,43 @@ fn restore_with_rollback(
     (final_run_code, result)
 }
 
+/// Bytes of device and vCPU sections a vmstate stream may carry beside RAM.
+/// The largest section today is a display's video memory.
+const VMSTATE_SECTION_ALLOWANCE: u64 = 1 << 30;
+
+/// The largest vmstate stream a machine with `ram_bytes` of RAM can have
+/// saved: every page as data, the worst case of one 9-byte record header for
+/// each page (18 bytes for a zero page and a data page in turn), and the
+/// section allowance.
+fn vmstate_size_limit(ram_bytes: u64) -> u64 {
+    ram_bytes
+        .saturating_add((ram_bytes / format::PAGE_SIZE).saturating_mul(9))
+        .saturating_add(VMSTATE_SECTION_ALLOWANCE)
+}
+
+/// The zeroed buffer a load reads the vmstate into. `vmstate_size` is the
+/// snapshot table's word. A size over the machine's limit, or one the
+/// allocator refuses, is an error and not an abort.
+fn vmstate_buffer(name: &str, vmstate_size: u64, ram_bytes: u64) -> Result<Vec<u8>, SnapshotError> {
+    let limit = vmstate_size_limit(ram_bytes);
+    if vmstate_size > limit {
+        return Err(SnapshotError::Incompatible(format!(
+            "snapshot {name:?} records {vmstate_size} bytes of machine state, more than the \
+             {limit} bytes this machine can have saved"
+        )));
+    }
+    let size = usize::try_from(vmstate_size)
+        .map_err(|_| SnapshotError::Internal("vmstate size exceeds usize".into()))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|e| {
+        SnapshotError::Internal(format!(
+            "allocating {size} bytes for snapshot {name:?}: {e}"
+        ))
+    })?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
 /// The stopped part of a load: revert the disks, validate the stream,
 /// restore everything. Returns the recorded run state on success.
 fn restore(
@@ -818,8 +855,14 @@ fn restore(
         )));
     }
 
+    // The size comes from the disk's snapshot table. Bound it by what this
+    // machine can have saved before it sizes the buffer.
+    let ram = shared
+        .ram()
+        .ok_or_else(|| SnapshotError::Internal("machine has no RAM".into()))?;
+    let ram_bytes: u64 = ram_regions(&ram).iter().map(|&(_, len)| len).sum();
+    let mut bytes = vmstate_buffer(name, vmstate_size, ram_bytes)?;
     let mut image = vmstate_disk.image.lock();
-    let mut bytes = vec![0u8; vmstate_size as usize];
     image
         .read_vmstate(0, &mut bytes)
         .map_err(|e| SnapshotError::from_disk("read_vmstate", &vmstate_disk.id, e))?;
@@ -839,9 +882,6 @@ fn restore(
         sections.insert(id, body);
     }
     validate_cpu_frequencies(shared, &sections)?;
-    let ram = shared
-        .ram()
-        .ok_or_else(|| SnapshotError::Internal("machine has no RAM".into()))?;
 
     // Validate the region list and complete stream before replacing memory.
     // Legacy snapshots contain only the original boot layout.
@@ -1067,10 +1107,21 @@ fn encode_msrs(fd: &VcpuFd, indices: &[u32], required: &[u32]) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Bytes of one saved MSR: a `u32` index and a `u64` value.
+const MSR_ENTRY_BYTES: usize = 12;
+
 fn decode_msrs(bytes: &[u8]) -> Result<Vec<kvm_msr_entry>, SnapshotError> {
     let bad = || SnapshotError::Internal("bad msr state".into());
     let mut r = format::Reader::new(bytes);
     let count = r.u32().map_err(|_| bad())? as usize;
+    // The count comes from the file: it must be what the section holds.
+    if r.remaining().len() / MSR_ENTRY_BYTES != count || r.remaining().len() % MSR_ENTRY_BYTES != 0
+    {
+        return Err(SnapshotError::Internal(format!(
+            "bad msr state: {count} entries in {} bytes",
+            r.remaining().len()
+        )));
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         entries.push(kvm_msr_entry {
@@ -1289,5 +1340,18 @@ mod tests {
         let entries = decode_msrs(&bytes).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!((entries[1].index, entries[1].data), (0xc000_0080, 0x501));
+    }
+
+    #[test]
+    fn load_rejects_a_vmstate_size_no_machine_of_this_size_can_have_saved() {
+        // Card #612: the snapshot table's size sized the read buffer.
+        let ram = 64 << 20;
+        for size in [u64::MAX, 1 << 40, vmstate_size_limit(ram) + 1] {
+            let error = vmstate_buffer("crafted", size, ram).unwrap_err();
+            assert!(matches!(error, SnapshotError::Incompatible(_)), "{error}");
+        }
+        assert_eq!(vmstate_buffer("small", 4096, ram).unwrap(), vec![0u8; 4096]);
+        // Every page as data behind its own record still fits.
+        assert!(vmstate_size_limit(ram) >= ram + (ram / format::PAGE_SIZE) * 9);
     }
 }

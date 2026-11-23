@@ -51,12 +51,36 @@ fn restore_rejects_execution_inconsistent_with_opcode() {
         ("floppy", "Read", vec![0x0a, 0], Vec::new(), 0),
         // A format with a sector in the PIO buffer: the FIFO read that
         // empties it reads command byte 6 of 6.
-        ("floppy", "Format", vec![0x4d, 0, 2, 18, 0x1b, 0xf6], sector.clone(), SECTOR - 1),
-        ("floppy", "ReadId", vec![0x4a, 0], sector.clone(), SECTOR - 1),
+        (
+            "floppy",
+            "Format",
+            vec![0x4d, 0, 2, 18, 0x1b, 0xf6],
+            sector.clone(),
+            SECTOR - 1,
+        ),
+        (
+            "floppy",
+            "ReadId",
+            vec![0x4a, 0],
+            sector.clone(),
+            SECTOR - 1,
+        ),
         // A transfer in the PIO buffer of a drive that holds no medium.
-        ("empty", "Read", vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff], sector.clone(), SECTOR - 1),
+        (
+            "empty",
+            "Read",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            sector.clone(),
+            SECTOR - 1,
+        ),
         // The operation of another transfer opcode.
-        ("floppy", "Write", vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff], Vec::new(), 0),
+        (
+            "floppy",
+            "Write",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            Vec::new(),
+            0,
+        ),
     ];
     for (configuration, operation, command, pio, pio_position) in cases {
         let mut m = Machine::new(configuration);
@@ -81,10 +105,22 @@ fn restore_keeps_a_command_that_matches_its_opcode() {
     // The check must not refuse what a save can produce: a read waiting for
     // DMA, a READ ID in its delay, and a PIO sector half read.
     let cases = [
-        ("Read", vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff], Vec::new(), 0, 0u64),
+        (
+            "Read",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            Vec::new(),
+            0,
+            0u64,
+        ),
         ("ReadId", vec![0x4a, 0], Vec::new(), 0, 1),
         ("Format", vec![0x4d, 0, 2, 18, 0x1b, 0xf6], Vec::new(), 0, 0),
-        ("Verify", vec![0x56, 0, 0, 0, 1, 2, 18, 0x1b, 0xff], vec![0u8; SECTOR], 100, 0),
+        (
+            "Verify",
+            vec![0x56, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            vec![0u8; SECTOR],
+            100,
+            0,
+        ),
     ];
     for (operation, command, pio, pio_position, remaining_ns) in cases {
         let mut m = Machine::new("floppy");

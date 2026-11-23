@@ -313,6 +313,9 @@ pub fn encode_ram_regions<'a>(
     Ok(out)
 }
 
+/// Bytes of one `(base, len)` entry of the RAM region list.
+const RAM_REGION_ENTRY: usize = 16;
+
 /// Decode the RAM region and stream pages back out through `write_pages`
 /// (guest physical base of the run, then the run's bytes).
 pub fn decode_ram_regions<'a>(
@@ -320,6 +323,13 @@ pub fn decode_ram_regions<'a>(
     mut write_pages: impl FnMut(u64, &[u8]) -> Result<(), String>,
 ) -> Result<Vec<(u64, u64)>, FormatError> {
     let count = reader.u32()? as usize;
+    // The count comes from the file. Every entry is 16 bytes of the stream,
+    // so a count the stream cannot hold is refused before it sizes anything.
+    if count > reader.remaining().len() / RAM_REGION_ENTRY {
+        return Err(FormatError::Corrupt(format!(
+            "RAM region count {count} exceeds the stream"
+        )));
+    }
     let mut regions = Vec::with_capacity(count);
     for _ in 0..count {
         let base = reader.u64()?;
@@ -329,18 +339,36 @@ pub fn decode_ram_regions<'a>(
                 "RAM region {base:#x}+{len:#x} is not page aligned"
             )));
         }
+        if base.checked_add(len).is_none() {
+            return Err(FormatError::Corrupt(format!(
+                "RAM region {base:#x}+{len:#x} overflows the address space"
+            )));
+        }
         regions.push((base, len));
     }
     for (base, len) in &regions {
+        let overrun = || FormatError::Corrupt(format!("RAM region {base:#x} overruns its length"));
         let mut covered = 0u64;
         while covered < *len {
+            // A run is refused when it passes the end of its region, so
+            // `covered` stays at most `len` and `base + covered` cannot
+            // overflow.
+            let left = *len - covered;
             match reader.u8()? {
-                0 => covered += reader.u64()? * PAGE_SIZE,
-                1 => {
-                    let pages = reader.u64()?;
-                    let bytes = pages
+                0 => {
+                    let bytes = reader
+                        .u64()?
                         .checked_mul(PAGE_SIZE)
-                        .ok_or_else(|| FormatError::Corrupt("run overflows".into()))?;
+                        .filter(|bytes| *bytes <= left)
+                        .ok_or_else(overrun)?;
+                    covered += bytes;
+                }
+                1 => {
+                    let bytes = reader
+                        .u64()?
+                        .checked_mul(PAGE_SIZE)
+                        .filter(|bytes| *bytes <= left)
+                        .ok_or_else(overrun)?;
                     let run = reader.take(bytes as usize)?;
                     write_pages(base + covered, run).map_err(FormatError::Corrupt)?;
                     covered += bytes;
@@ -351,11 +379,6 @@ pub fn decode_ram_regions<'a>(
                     )));
                 }
             }
-        }
-        if covered > *len {
-            return Err(FormatError::Corrupt(format!(
-                "RAM region {base:#x} overruns its length"
-            )));
         }
     }
     Ok(regions)

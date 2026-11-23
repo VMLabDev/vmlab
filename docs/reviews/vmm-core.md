@@ -86,6 +86,22 @@ and the IDE, AHCI and USB devices on the same buses.
 - Confidence: high for the code. Whether the allocation aborts or is
   granted lazily depends on the host's overcommit setting. The overflow and
   the `decode_msrs` path do not.
+- Fixed by card #612. `decode_ram_regions` refuses a region count that the
+  rest of the stream cannot hold, a region that ends past the address space,
+  and a run that overflows or passes the end of its region. It refuses the
+  run before it writes the pages. `decode_msrs` refuses a count that is not
+  the section's length in 12-byte entries. `restore` bounds the snapshot
+  table's vmstate size by what the machine can have saved (its RAM, nine
+  bytes of record header for each page, and 1 GiB for the sections) and
+  returns an error when the allocator refuses the buffer
+  (`vmstate_buffer`). On the build host the 64 GiB request was granted
+  lazily, so before the fix the count tests failed on the error text and
+  not by an abort. The overflow test panicked. Tests:
+  `decode_ram_regions_rejects_a_huge_region_count`,
+  `decode_ram_regions_rejects_a_run_that_overflows`,
+  `decode_ram_regions_refuses_an_overrunning_data_run_before_it_writes`,
+  `decode_msrs_rejects_a_huge_entry_count` and
+  `load_rejects_a_vmstate_size_no_machine_of_this_size_can_have_saved`.
 
 ### F2. Floppy: a restored command whose operation does not match its opcode panics the host
 
@@ -110,6 +126,13 @@ and the IDE, AHCI and USB devices on the same buses.
   Assert `restore_state` returns `Err`. Today it returns `Ok`, and the next
   `dma_ready()` or `io_read(5)` panics.
 - Confidence: high.
+- Fixed by card #612. `data_operation` is the one table from an opcode to
+  its operation. `execute` starts a command by it, and `restore_state`
+  refuses a saved command whose operation is not the one its opcode starts.
+  A sector in the PIO buffer is accepted only for a read, a write or a
+  verify on a drive that holds a medium. Tests:
+  `restore_rejects_execution_inconsistent_with_opcode` and
+  `restore_keeps_a_command_that_matches_its_opcode`.
 
 ### F3. Cirrus: a restored waiting BitBLT has unchecked geometry
 
