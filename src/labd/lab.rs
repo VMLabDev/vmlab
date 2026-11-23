@@ -5642,6 +5642,74 @@ lab "t" {
         );
     }
 
+    const DEV_WORKSPACE_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    /// A restore brackets the workspace from the **ledger**, which does not
+    /// live in the host directory (docs/reviews/dev-machines.md F2). With that
+    /// directory away — another branch, an unmounted volume — the halt the
+    /// ledger records still refuses, and a restore that goes ahead still
+    /// leaves the note that a re-seed is owed, where the syncer that starts
+    /// once the directory is back reads it.
+    #[tokio::test]
+    async fn a_restore_with_the_host_workspace_away_still_refuses_and_still_notes_the_re_seed() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("dev01", "s").await.unwrap();
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+
+        std::fs::rename(dir.path().join("src"), dir.path().join("src.away")).unwrap();
+        let refused = lab.restore("dev01", "s", false).await;
+        let before = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+        let discarded = lab.restore("dev01", "s", true).await;
+        std::fs::rename(dir.path().join("src.away"), dir.path().join("src")).unwrap();
+        let after = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+
+        let refusal = format!("{:#}", refused.expect_err("the recorded halt refuses"));
+        assert!(refusal.contains("main.rs"), "{refusal}");
+        assert!(!before.reseed_owed, "a refused restore rewinds nothing");
+        discarded.expect("the discard flag lets the restore through");
+        assert!(after.reseed_owed, "the re-seed is owed after the rewind");
+        assert_eq!(after.halted, ["main.rs"], "the note keeps the ledger");
+    }
+
+    /// The same with no ledger on disk yet: the note is written about the
+    /// directory as it resolves once it is back.
+    #[tokio::test]
+    async fn a_restore_with_the_host_workspace_away_and_no_ledger_notes_the_re_seed() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("dev01", "s").await.unwrap();
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+
+        std::fs::rename(dir.path().join("src"), dir.path().join("src.away")).unwrap();
+        let restored = lab.restore("dev01", "s", false).await;
+        std::fs::rename(dir.path().join("src.away"), dir.path().join("src")).unwrap();
+        let after = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+
+        restored.expect("nothing is recorded to refuse on");
+        assert!(after.reseed_owed, "the re-seed is owed after the rewind");
+    }
+
     /// Who `up`'s agent refresh asks at all (§19.4), through the real `up`:
     /// a VM double seals an agent but has none answering, so a refresh that
     /// is attempted ends in a warning — and one that is not says nothing.
