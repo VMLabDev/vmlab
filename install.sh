@@ -47,11 +47,15 @@
 # installed beside vmlab. The daemons start it and ask it, over a closed
 # request protocol, to create taps and to load, attach and update vmlab's own
 # BPF programs; it refuses anything else. An install as an ordinary user can
-# give the helper those capabilities as file capabilities (`sudo setcap`). Run
+# give the helper those capabilities as file capabilities (`sudo setcap`). The
+# grant goes to a copy root holds and has checked against the signed checksum,
+# never to whatever is at the helper's path at that moment. Run
 # from a terminal, the installer asks with a default of no; non-interactive
 # installs grant nothing unless --fastpath is explicit. The vmlab binary itself
 # never gets a capability. Replacing the helper drops them, so every install
-# requires consent again.
+# requires consent again. File capabilities go to whoever executes the file,
+# so the helper is installed mode 0700, and it refuses a caller that is not
+# the owner of its file.
 #
 # vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
 # Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
@@ -288,10 +292,15 @@ printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN
 helper_asset="vmlab-fastpath-${ver}-${suffix}"
 helper_tmp="$verify_dir/$helper_asset"
 HELPER=""
+HELPER_SHA=""
 if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
   verify_asset "$helper_asset" "$helper_tmp"
+  HELPER_SHA="$want"
   [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
-  chmod +x "$helper_tmp"
+  # File capabilities go to whoever executes the file, so no other account
+  # may execute it. The helper checks the caller too: this mode is the half
+  # that holds for a helper older than that check.
+  chmod 0700 "$helper_tmp"
   mv "$helper_tmp" "$BIN_DIR/vmlab-fastpath"
   HELPER="$BIN_DIR/vmlab-fastpath"
 else
@@ -319,14 +328,14 @@ fastpath_hint() {
 }
 
 fastpath_warning() {
-  printf '%s\n' 'NOTE: only the vmlab-fastpath helper gets CAP_BPF and CAP_NET_ADMIN, not vmlab. Any program running as you can start it and ask it to create tap devices and load and update vmlab'"'"'s own XDP and sockmap programs on them; it refuses every other request.'
+  printf '%s\n' 'NOTE: only the vmlab-fastpath helper gets CAP_BPF and CAP_NET_ADMIN, not vmlab. Any program running as you can start it and ask it to create tap devices and load and update vmlab'"'"'s own XDP and sockmap programs on them; it refuses every other request. It is installed for you alone (mode 0700) and serves no other user.'
 }
 
 # Ask on the terminal: under `curl | sh` the script itself is stdin.
 fastpath_ask() {
   fastpath_warning >/dev/tty
   printf '\nGrant the vmlab-fastpath helper CAP_BPF and CAP_NET_ADMIN for the eBPF network fast path?\n' >/dev/tty
-  printf 'This runs: sudo setcap %s %s\n' "$CAPS" "$HELPER" >/dev/tty
+  printf 'This runs, under sudo: setcap %s on a copy of %s that root checked against the release checksum.\n' "$CAPS" "$HELPER" >/dev/tty
   printf '[y/N] ' >/dev/tty
   read -r answer </dev/tty || answer=""
   case "$answer" in
@@ -334,6 +343,48 @@ fastpath_ask() {
     *) return 1 ;;
   esac
 }
+
+# What root runs for the grant: $1 the capabilities, $2 the bin directory, $3
+# the SHA-256 the signed SHA256SUMS names for the helper, stdin the helper.
+# The bin directory is the user's, so any program running as the user can
+# rename another file onto the helper's path while the installer waits at its
+# prompt or sudo at its password. Root therefore never grants a path there. It
+# copies stdin into a directory only root can enter, checks the digest of that
+# copy, grants the copy, and renames it onto the helper's path: the rename
+# keeps the capabilities, and the staging directory is in the bin directory so
+# that it is one filesystem. Exit 3: the bytes are not the helper. Exit 4: the
+# staging directory is not the one made here.
+FASTPATH_GRANT='
+set -eu
+umask 077
+caps=$1 want=$3
+cd -- "$2"
+bin=$(pwd -P)
+stage=$(mktemp -d "$bin/.vmlab-fastpath.XXXXXX")
+cd -- "$stage"
+# The name was looked up in the user'"'"'s directory a second time: prove that
+# this is a fresh directory of ours, directly in the bin directory. A user
+# cannot move a directory they may not write to another parent, so ".." is
+# the bin directory from here on.
+here=$(pwd -P)
+case "$here" in
+  "$bin"/.vmlab-fastpath.??????) ;;
+  *) exit 4 ;;
+esac
+[ -O . ] && [ "$(stat -c %a .)" = 700 ] && [ -z "$(ls -A .)" ] || exit 4
+name=${here##*/}
+[ -n "$name" ] || exit 4
+trap '"'"'rm -f ./vmlab-fastpath; cd .. && rmdir "./$name"'"'"' EXIT
+cat > ./vmlab-fastpath
+got=$(sha256sum ./vmlab-fastpath | cut -d" " -f1)
+[ "$got" = "$want" ] || exit 3
+# chown drops file capabilities, so it comes before setcap.
+chown "$(stat -c %u:%g ..)" ./vmlab-fastpath
+# Owner only: file capabilities go to whoever executes the file (F2).
+chmod 700 ./vmlab-fastpath
+setcap "$caps" ./vmlab-fastpath
+mv -fT ./vmlab-fastpath ../vmlab-fastpath
+'
 
 fastpath_caps() {
   # root's daemons hold every capability already.
@@ -374,14 +425,22 @@ fastpath_caps() {
     return 0
   fi
   # sudo asks for its password on the terminal, not on stdin.
-  if sudo setcap "$CAPS" "$HELPER"; then
-    printf 'Granted: %s\n' "$(getcap "$HELPER" 2>/dev/null || echo "$CAPS")"
-    printf 'Daemons already running keep their old privileges: run `vmlab daemon stop`,\n'
-    printf 'then `vmlab fastpath` shows the tier the next daemon selects.\n'
-  else
-    warn "setcap failed; the helper is installed without the fast path's capabilities."
-    fastpath_hint
-  fi
+  # The helper is opened here, as the user, and root reads only that stream.
+  grant=0
+  sudo sh -c "$FASTPATH_GRANT" sh "$CAPS" "$BIN_DIR" "$HELPER_SHA" < "$HELPER" || grant=$?
+  case "$grant" in
+    0)
+      printf 'Granted: %s\n' "$(getcap "$HELPER" 2>/dev/null || echo "$CAPS")"
+      printf 'Daemons already running keep their old privileges: run `vmlab daemon stop`,\n'
+      printf 'then `vmlab fastpath` shows the tier the next daemon selects.\n' ;;
+    3)
+      warn "no capabilities granted: the file at $HELPER is not the helper of this release (its SHA-256 differs from the signed checksum). Something replaced it after it was installed. Find out what before you install again." ;;
+    4)
+      warn "no capabilities granted: something changed $BIN_DIR while the grant ran. Find out what before you install again." ;;
+    *)
+      warn "setcap failed; the helper is installed without the fast path's capabilities."
+      fastpath_hint ;;
+  esac
 }
 
 fastpath_caps

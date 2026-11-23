@@ -119,7 +119,8 @@ GPU driver for x86, and the screen is OpenCore's 1280×800. The CPU is
 `Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on`,
 an Intel model macOS supports, with the TSX flags it lacks turned off and the
 VMware CPUID leaf it reads its clock frequencies from. `hyperv` is off by
-name. The host needs KVM's `ignore_msrs` on; see
+name. vmlab-hv runs it, and a new macOS VM selects vmlab-hv like any
+other supported VM. On QEMU the host needs KVM's `ignore_msrs` on; see
 [Host configuration and WSL 2](guide_host).
 DOC
 

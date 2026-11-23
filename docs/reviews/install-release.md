@@ -63,6 +63,23 @@ Answer `y`. Then `getcap ~/.local/bin/vmlab-fastpath` shows the capabilities
 on busybox, and `sha256sum` of the file differs from the helper's line in
 `SHA256SUMS`. The expected result is a refusal.
 
+Fixed in card #607. `fastpath_caps` no longer grants a path in the bin
+directory. It opens the helper as the user and gives the stream to one
+`sudo sh -c` script (`FASTPATH_GRANT`), which copies it into a mode 0700
+staging directory of root's inside the bin directory, checks the SHA-256 of
+that copy against the line of the signed `SHA256SUMS`, runs `setcap` on the
+copy, and renames it onto `vmlab-fastpath`. A file swapped in before sudo
+starts fails the digest and gets nothing (a refusal, with a warning and no
+`sudo setcap` advice). A file swapped in later is replaced by the verified,
+granted copy. Root makes a new file, so a hard link cannot receive the grant,
+and `setcap` works in a directory no other user can change, which covers N5.
+Proof: `test_fastpath_refuses_a_file_swapped_in_before_the_grant` and
+`test_fastpath_grants_only_verified_bytes_when_swapped_under_sudo` in
+`scripts/test_release_assets.py`, with stubs for `sudo` and `setcap`. Both
+failed before the fix: the stub `setcap` was run on the swapped-in file. The
+manual `sudo setcap` command that the installer prints when it grants nothing
+itself is unchanged, and whoever runs it grants whatever is at the path.
+
 ### F2. Every local user who can reach the helper gets its capabilities (security)
 
 The helper is installed mode 0755 (`install.sh:294`, after the download into
@@ -84,6 +101,19 @@ second account, run a small program that makes a `SOCK_SEQPACKET` pair,
 starts `~first/.local/bin/vmlab-fastpath` with one end as stdin, and sends
 `XdpLoad` then `XdpTap`. Expected: a refusal. Observed (by reading): a tap
 `vmfp0` appears in `ip link`, up, with the XDP program attached.
+
+Fixed by card #608, in two halves. `install.sh` installs the helper mode
+0700, so no other account can execute it
+(`scripts/test_release_assets.py`: `test_helper_is_executable_by_its_owner_only`,
+`test_helper_keeps_owner_only_mode_through_the_grant`). The helper itself
+refuses a start that gained privilege from its file (`AT_SECURE`) when the
+caller is neither the owner of the file nor root
+(`src/net/fastpath/helper/mod.rs`, `caller_refusal` and its tests), which
+also covers a helper whose mode was changed and one granted by hand. A
+helper that root owns still serves every user: only the administrator can
+have granted it. The limits on engines and taps are per connection as
+before. The two-account test above was not run: the merge bar has one
+account and no way to grant file capabilities.
 
 ### F3. A release is built from caches that any build on the host can write (security)
 

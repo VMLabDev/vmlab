@@ -311,6 +311,16 @@ fn vm_hardware_refusals(
     why
 }
 
+/// The macos profile's QEMU CPU string: vmlab-hv's `Skylake-Client-v4` is
+/// this model with these edits, pinned from a capture (HV macOS phase).
+pub const MACOS_CPU_MODEL: &str =
+    "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on";
+
+/// Whether `h` is a macOS guest: the macos profile, or an Apple SMC.
+pub fn is_macos(h: &ResolvedVm) -> bool {
+    h.profile.as_deref() == Some("macos") || h.apple_smc
+}
+
 /// What the resolved hardware asks for that vmlab-hv cannot present yet.
 fn hardware_refusals(
     name: &str,
@@ -320,14 +330,16 @@ fn hardware_refusals(
     why: &mut Vec<String>,
 ) {
     use crate::profiles::AgentTransport;
-    // macOS has a separate gate for its complete hardware configuration.
-    if h.profile.as_deref() == Some("macos") || h.apple_smc {
-        why.push(phase(
-            name,
-            "a macOS guest",
-            "macOS (its own phase, after 2)",
+    // A macOS guest brings the hardware vmlab-hv's macOS phase delivered:
+    // VMware SVGA, a USB keyboard and the one CPU model it pins. The rest of
+    // the list below still applies to it.
+    let macos = is_macos(h);
+    if macos && h.cpu_model.as_deref() != Some(MACOS_CPU_MODEL) {
+        why.push(format!(
+            "vm \"{name}\": a macOS guest runs on vmlab-hv with the macos profile's cpu_model only, \
+             not `{}` (PRD §22); remove `cpu_model`",
+            h.cpu_model.as_deref().unwrap_or("the host CPU")
         ));
-        return;
     }
     let pc = legacy_pc(&h.machine);
     if pc {
@@ -352,6 +364,7 @@ fn hardware_refusals(
     }
     match h.display_device.as_deref() {
         None | Some("VGA") | Some("virtio-vga") => {}
+        Some("vmware-svga") if macos => {}
         Some("cirrus-vga") if pc => {
             if !delivered.cirrus {
                 why.push(phase(name, "the Cirrus VGA display", "4d (Cirrus)"));
@@ -396,10 +409,10 @@ fn hardware_refusals(
              (PRD §22); use the pc machine, or agent_transport = \"virtio-serial\""
         ));
     }
-    if h.input == crate::config::model::InputDevices::Usb {
+    if h.input == crate::config::model::InputDevices::Usb && !macos {
         why.push(phase(name, "input = \"usb\" (a USB keyboard)", "after 2b"));
     }
-    if let Some(model) = &h.cpu_model {
+    if let Some(model) = h.cpu_model.as_ref().filter(|_| !macos) {
         if pc && !delivered.machine_core {
             why.push(phase(
                 name,
@@ -697,28 +710,20 @@ mod tests {
     #[test]
     fn automatic_selection_of_an_x86_guest_never_falls_back_to_qemu() {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        for setting in [
-            r#"profile = "macos""#,
-            r#"profile = "linux-modern" accel = "tcg""#,
-        ] {
-            let file = lab(&format!(
-                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }} }}"#
-            ));
-            let vm = &file.lab.vms[0];
-            let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
-            let picked = HypervisorDefaults::default().select(
-                MachineCfg::Vm(vm),
-                &kvm_host(),
-                Some(&hw),
-                None,
-            );
-            assert_eq!(picked.kind, HypervisorKind::Vmlab, "{setting}");
-            assert_eq!(picked.fallback_reason, None, "{setting}");
-            assert!(
-                !vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).is_empty(),
-                "{setting}"
-            );
-        }
+        let setting = r#"profile = "linux-modern" accel = "tcg""#;
+        let file = lab(&format!(
+            r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }} }}"#
+        ));
+        let vm = &file.lab.vms[0];
+        let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
+        let picked =
+            HypervisorDefaults::default().select(MachineCfg::Vm(vm), &kvm_host(), Some(&hw), None);
+        assert_eq!(picked.kind, HypervisorKind::Vmlab, "{setting}");
+        assert_eq!(picked.fallback_reason, None, "{setting}");
+        assert!(
+            !vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).is_empty(),
+            "{setting}"
+        );
     }
 
     #[test]
@@ -895,10 +900,7 @@ mod tests {
     #[test]
     fn what_a_later_phase_brings_is_refused_naming_that_phase() {
         let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
-        let cases = [
-            (r#"profile = "macos""#, "phase macOS"),
-            (r#"profile = "linux-modern" accel = "tcg""#, "phase 3"),
-        ];
+        let cases = [(r#"profile = "linux-modern" accel = "tcg""#, "phase 3")];
         for (body, phase) in cases {
             let why = refused(&format!("{base} {body}"));
             assert!(
@@ -907,8 +909,30 @@ mod tests {
                 "{body}: expected {phase} in {why:?}"
             );
         }
-        // macOS retains its separate hardware gate.
-        assert_eq!(refused(&format!(r#"{base} profile = "macos""#)).len(), 1);
+    }
+
+    /// The macOS phase is delivered: the macos profile's hardware, its SVGA,
+    /// USB keyboard and pinned CPU model included, runs on vmlab-hv. Another
+    /// CPU model for it, or those devices on any other guest, still do not.
+    #[test]
+    fn a_macos_guest_is_admitted_with_its_own_hardware_only() {
+        let base = r#"template = "scratch" arch = "x86_64" disk = 10GiB"#;
+        let why = refused(&format!(r#"{base} profile = "macos""#));
+        assert!(why.is_empty(), "{why:?}");
+        let why = refused(&format!(
+            r#"{base} profile = "macos" cpu_model = "Haswell""#
+        ));
+        assert!(
+            why.len() == 1 && why[0].contains("macos profile's cpu_model only"),
+            "{why:?}"
+        );
+        for other in [
+            r#"profile = "linux-modern" display = "vmware""#,
+            r#"profile = "linux-modern" input = "usb""#,
+            r#"profile = "linux-modern" cpu_model = "Skylake-Client-v4""#,
+        ] {
+            assert_eq!(refused(&format!("{base} {other}")).len(), 1, "{other}");
+        }
     }
 
     #[test]

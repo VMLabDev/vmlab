@@ -126,9 +126,12 @@ at the first KVM start, keeps `tsc-hz`, and passes `invtsc` and `tsc_khz`
 in the machine description. N6-N8 networking supplies offloaded multiqueue
 virtio-net streams and passed TAP/vhost-net descriptors; the e2e `fastpath`
 scenario follows the selected hypervisor. Kernel tiers still require host
-capabilities. Everything else — macOS, `accel = "tcg"`, `qemu_args`, hosts
-without KVM — is refused from one list naming the phase that brings it, and
-for an x86 guest that refusal means it does not run. Snapshots
+capabilities. A macOS guest runs too, with the `macos` profile's VMware SVGA, USB
+keyboard, Skylake model, ignored MSRs and an Apple SMC whose key reaches
+vmlab-hv through a mode-600 pipe, never a file or an argv. Everything else —
+`accel = "tcg"`, `qemu_args`, hosts without KVM — is refused from one list
+naming the phase that brings it, and for an x86 guest that refusal means it
+does not run. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the

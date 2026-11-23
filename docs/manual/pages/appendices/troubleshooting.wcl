@@ -915,9 +915,10 @@ MSG
     Intel model-specific registers that KVM does not emulate, and unless the
     `kvm` module's `ignore_msrs` parameter is on, KVM answers each read with a
     general-protection fault. On an AMD host that happens on every boot.
-    `vmlab up` prints the warning above for any VM it starts under KVM whose
+    `vmlab up` prints the warning above for any VM it starts on QEMU under KVM whose
     profile name starts with `macos` or whose `apple_smc` resolves on, but it
-    still starts the VM.
+    still starts the VM. vmlab-hv reads those MSRs as 0 for a macOS guest,
+    so a VM on vmlab-hv gets no warning and needs no module parameter.
   DOC
   p <<DOC
     Run both commands from the warning: the first makes the setting permanent
