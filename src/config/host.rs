@@ -886,7 +886,8 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
             ("2001:db8::1", "[2001:db8::1]:53"),
             ("[2001:db8::1]:5353", "[2001:db8::1]:5353"),
         ] {
-            let source = format!("import <vmlab-host.wcl>\nhost {{ dns_upstream = \"{upstream}\" }}");
+            let source =
+                format!("import <vmlab-host.wcl>\nhost {{ dns_upstream = \"{upstream}\" }}");
             let host = HostConfig::parse(&source, "config.wcl").unwrap();
             assert_eq!(host.upstream_resolver(), Some(address.parse().unwrap()));
         }
