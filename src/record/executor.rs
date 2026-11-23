@@ -377,6 +377,34 @@ mod tests {
     use crate::record::{Format, RecordOptions, Size};
     use crate::vnc::fake::{self, pattern, raw_rect, update};
 
+    #[tokio::test(start_paused = true)]
+    async fn stop_returns_when_the_encoder_stops_reading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = fake::spawn(16, 16, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg = dir.path().join("ffmpeg");
+        std::fs::write(&ffmpeg, "#!/bin/sh\nset -eu\nexec sleep infinity\n").unwrap();
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = dir.path().join("stalled.mp4");
+        let settings = Settings::resolve(&output, &RecordOptions::default()).unwrap();
+        let (_tx, inputs) = mpsc::unbounded_channel();
+        let rec = Recorder::start(RecorderSpec {
+            source: StreamSource::Vnc(server.path.clone()),
+            output,
+            settings,
+            ffmpeg,
+            inputs,
+        })
+        .await
+        .unwrap();
+
+        // Even before the first tick, finalization owes at least one frame.
+        // The default frame is larger than the pipe and the child never reads.
+        let result = tokio::time::timeout(Duration::from_secs(60), rec.stop()).await;
+        assert!(result.is_ok(), "record stop hung on the encoder");
+    }
+
     /// Against the fake server: the recorder starts only once connected,
     /// survives the socket vanishing and coming back, takes inputs, and
     /// finalises to a file with a timeline beside it.
