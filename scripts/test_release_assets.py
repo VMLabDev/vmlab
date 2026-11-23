@@ -336,6 +336,41 @@ esac
         self.assertIn('checksum mismatch', result.stderr)
         self.assertFalse((self.root / 'installed/vmlab-fastpath').exists())
 
+    def old_install(self):
+        """The previous release in the bin directory: its vmlab and its helper,
+        which holds the file capabilities of an earlier grant."""
+        installed = self.root / 'installed'
+        installed.mkdir()
+        (installed / 'vmlab').write_text('#!/bin/sh\necho old vmlab\n')
+        (installed / 'vmlab-fastpath').write_text('#!/bin/sh\necho old helper\n')
+        for name in ('vmlab', 'vmlab-fastpath'):
+            (installed / name).chmod(0o700)
+        return installed
+
+    def test_old_helper_is_removed_when_the_release_gives_none(self):
+        # Review install-release F5, card 636: a helper download that fails
+        # must not leave the previous, capable helper beside the new vmlab.
+        installed = self.old_install()
+        self.env['FAIL_DOWNLOAD'] = self.helper
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('old vmlab', (installed / 'vmlab').read_text())
+        self.assertFalse((installed / 'vmlab-fastpath').exists())
+        self.assertIn('fast path stays off', result.stderr)
+        self.assertIn('Removed the vmlab-fastpath of the earlier install', result.stderr)
+
+    def test_corrupt_helper_leaves_the_old_install_whole(self):
+        # F5's second path: the helper is verified before vmlab is replaced,
+        # so a refused helper never ends with a new vmlab beside the old one.
+        installed = self.old_install()
+        (self.dist / self.helper).write_text('tampered')
+        result = self.install('--no-guest')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('checksum mismatch', result.stderr)
+        self.assertIn('old vmlab', (installed / 'vmlab').read_text())
+        self.assertIn('old helper', (installed / 'vmlab-fastpath').read_text())
+        self.assertFalse((self.root / 'executed').exists())
+
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
         self.refused(self.install('--no-guest'))
