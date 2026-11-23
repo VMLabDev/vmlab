@@ -500,7 +500,10 @@ mod tests {
 
         // Paused time passes only once the watcher is stuck in a write.
         tokio::time::sleep(Duration::from_millis(1)).await;
-        assert!(!watcher.is_finished(), "the watcher is blocked in its write");
+        assert!(
+            !watcher.is_finished(),
+            "the watcher is blocked in its write"
+        );
 
         let stop = {
             let ctl = ctl.clone();
