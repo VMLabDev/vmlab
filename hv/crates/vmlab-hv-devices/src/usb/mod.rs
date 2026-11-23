@@ -90,9 +90,12 @@ pub trait UsbDevice: Snapshot {
         let _ = packet_size;
         self.transfer(endpoint, data, max_length)
     }
-    /// The guest dropped this endpoint's transfer state (Stop Endpoint,
-    /// Set TR Dequeue Pointer, Reset Device). Backends with in-flight work
-    /// discard it, so a stale completion is never attributed to a new TD.
+    /// The guest dropped this endpoint's transfer state: Stop Endpoint,
+    /// Reset Endpoint, Set TR Dequeue Pointer, Reset Device, Disable Slot,
+    /// a Configure Endpoint that drops, replaces or deconfigures it, a port
+    /// reset, a controller reset or a machine reset. Backends with
+    /// in-flight work discard it, so a stale completion is never
+    /// attributed to a new TD.
     fn endpoint_dropped(&mut self, endpoint: u8) {
         let _ = endpoint;
     }

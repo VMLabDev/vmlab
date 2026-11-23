@@ -502,6 +502,16 @@ impl HostUsbDevice {
         Ok(endpoints)
     }
 
+    /// Forget every transfer of the endpoints `keep` selects: an in-flight
+    /// URB is discarded and its cancelled completion dropped at the reap,
+    /// and a completion that was never collected is thrown away.
+    fn drop_transfers(&mut self, keep: impl Fn(u8) -> bool) {
+        let endpoints: Vec<u8> = self.pending.keys().copied().filter(|e| keep(*e)).collect();
+        for endpoint in endpoints {
+            self.endpoint_dropped(endpoint);
+        }
+    }
+
     /// SET_CONFIGURATION: everything that can be refused from the
     /// descriptors is refused here, the rest is a job.
     fn set_config(&mut self, config: u8) -> Result<UsbTransfer> {
@@ -515,6 +525,12 @@ impl HostUsbDevice {
         // reset the device for nothing.
         let set = self.initialized || self.active_config != Some(config);
         self.initialized = true;
+        // The old configuration's endpoints end here. Their URBs are
+        // discarded before the job releases the interfaces; left alone, the
+        // release cancels them and the reap files each as a stall on the
+        // new configuration's endpoint. The control endpoint carries this
+        // very request and stays.
+        self.drop_transfers(|endpoint| endpoint != 0);
         Ok(self.start_job(Job::SetConfig {
             config,
             release: self.claimed_interfaces.clone(),
@@ -677,7 +693,9 @@ impl UsbDevice for HostUsbDevice {
     fn reset(&mut self) {
         // The lift source skips USBDEVFS_RESET (it would also drop the
         // configuration and the claims); the xHCI re-initializes slot and
-        // endpoint state itself.
+        // endpoint state itself. Nothing in flight belongs to the guest
+        // after a reset, so none of it may complete a later transfer.
+        self.drop_transfers(|_| true);
         self.device.reset();
     }
 
@@ -1290,6 +1308,45 @@ mod tests {
             host.transfer(0x81, &[], 64),
             UsbTransfer::Ack(b"fresh".to_vec())
         );
+    }
+
+    /// F9 of docs/reviews/usb.md: a transfer in flight when the guest sets
+    /// a configuration belongs to the old one, and must not answer the
+    /// first transfer on the new configuration's endpoint.
+    #[test]
+    fn set_config_forgets_in_flight_work() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(
+            control(&mut host, set_config(1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        fake.run_irq();
+        // A fresh submission, not the old URB's result.
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        fake.complete_with(Completion::Data(b"fresh".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer(0x81, &[], 64),
+            UsbTransfer::Ack(b"fresh".to_vec())
+        );
+        assert!(host.discarded.is_empty());
+    }
+
+    /// F9: the same for a device reset, with a completion nobody collected
+    /// on a second endpoint.
+    #[test]
+    fn reset_forgets_in_flight_and_uncollected_work() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x02, b"old", 64), UsbTransfer::Nak);
+        fake.run_irq();
+        host.reap();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        host.reset();
+        fake.run_irq();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(host.transfer(0x02, b"new", 64), UsbTransfer::Nak);
+        assert!(host.discarded.is_empty());
     }
 
     #[test]
