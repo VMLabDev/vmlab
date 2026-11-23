@@ -71,7 +71,7 @@ says "read, not run".
 | F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag | Data loss (guest work) |
 | F5 | `destroy` does not ask about a halted or unsynced workspace | Data loss (guest work) |
 | F6 | One machine's pass holds a host-wide lock across its guest I/O | Security against a hostile guest or peer, and wrong result |
-| F7 | `dev sync diff` reads a guest file of any size into the lab daemon's memory | Security against a hostile guest, and crash |
+| F7 | `dev sync diff` reads a guest file of any size into the lab daemon's memory (fixed, card #696) | Security against a hostile guest, and crash |
 | F8 | Guest file names and guest file text reach the developer's terminal with their escape sequences | Security against a hostile guest |
 | F9 | `dev sync diff` calls a symlink and a file identical | Wrong result |
 | F10 | The refusal for a stopped machine names two verbs that cannot answer for a stopped machine | Cosmetic |
@@ -360,6 +360,18 @@ was read.
 
 **How bad.** Security against a hostile guest (host memory and scratch space),
 and a crash of the lab daemon.
+
+**Fixed by card #696.** `guest_side` no longer pulls the file to a scratch
+file and reads that back. It calls the new `GuestFs::read_capped`
+(`FileOps::pull_capped`), which reads into memory through the sink that
+refuses the chunk that would pass `INLINE`. The cap is on the bytes as they
+arrive, so the size the guest reported bounds nothing. A file over the cap is
+answered as too large, with the reported size named as the guest's word. The
+diff uses no scratch directory any more. The test
+`the_inline_cap_holds_whatever_size_the_guest_reported` is in
+`src/labd/workspace/diff.rs`, and
+`pull_capped_answers_none_for_a_file_over_the_limit` in
+`src/labd/vm_agent.rs` covers the real session.
 
 ### F8. Guest names and guest text reach the terminal with their escapes
 

@@ -386,6 +386,9 @@ mod tests {
         async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
             self.guest.pull(remote, local).await
         }
+        async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+            self.guest.read_capped(path, limit).await
+        }
         async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
             self.guest.mkdir(path, case_sensitive).await
         }
