@@ -52,7 +52,7 @@ async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
     )?;
     let bin = build(dir.path())?;
     let fixture = Fixture::process(&bin, "listen", vec![]).await?;
-    let handle = AgentHandle::connect(fixture.socket(), Duration::MAX).await?;
+    let handle = AgentHandle::connect(fixture.socket(), BUDGET).await?;
     let mut reader = handle
         .open_exec(
             vec!["cat".into(), fifo.to_str().unwrap().into()],
