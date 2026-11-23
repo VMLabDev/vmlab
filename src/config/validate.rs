@@ -2175,7 +2175,10 @@ fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: 
         return;
     };
     if let Some(problem) = guest_path_problem(guest, family) {
-        issues.push(Issue::at(dev.span, format!("@dev workspace_guest {problem}")));
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace_guest {problem}"),
+        ));
     } else if is_guest_root(guest) {
         issues.push(Issue::at(
             dev.span,
@@ -3363,7 +3366,10 @@ lab "l" {{
         };
         for bad in ["global", "Homes", "IPC$", "a]b", "a\\nb"] {
             let es = share_errs(bad);
-            assert!(es.iter().any(|m| m.contains("share name")), "{bad} → {es:#?}");
+            assert!(
+                es.iter().any(|m| m.contains("share name")),
+                "{bad} → {es:#?}"
+            );
         }
         for good in ["src", "Data-2", "my.share"] {
             let es = share_errs(good);

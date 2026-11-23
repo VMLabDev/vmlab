@@ -108,9 +108,11 @@ impl SmbServer {
 
         // 2. Write smb.conf.
         let conf_path = config.conf_path();
-        std::fs::write(&conf_path, config.render_conf()?).map_err(|source| SmbError::WriteConf {
-            path: conf_path.clone(),
-            source,
+        std::fs::write(&conf_path, config.render_conf()?).map_err(|source| {
+            SmbError::WriteConf {
+                path: conf_path.clone(),
+                source,
+            }
         })?;
 
         // 3. Create passdb users (unprivileged: tdbsam under lab_dir).
