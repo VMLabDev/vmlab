@@ -189,6 +189,7 @@ fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, 
         "VFIO reset at VM exit",
         "removing VFIO BAR KVM slot",
         "unmapping VFIO BAR",
+        "unmapping VFIO guest DMA",
     ] {
         assert!(!log.contains(error), "VFIO teardown: {error}\n{log}");
     }

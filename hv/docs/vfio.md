@@ -52,10 +52,12 @@ needs 4 GiB.
 
 ## Run the S1 acceptance test
 
-Install SeaBIOS at `/usr/share/qemu/bios-256k.bin`. Provide the Ubuntu 26.04
-template under `~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
-`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test creates an overlay and
-does not write the template.
+Install matching 4 MiB OVMF CODE and VARS files in the system firmware
+directory or set `VMLAB_HV_FIRMWARE_DIR` to the directory containing them.
+Provide the Ubuntu 26.04 template under
+`~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
+`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test writes to a disk overlay
+and makes a private copy of the VARS file for each VM start.
 
 ```sh
 systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
@@ -63,14 +65,17 @@ systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
 ```
 
 The test boots the designated function at guest `00:06.0`, checks `lspci -n`
-against its host vendor and device IDs, refuses snapshot save and load through
-the control socket, and quits. Without the device variable, it prints a skip
-reason before accessing hardware. Missing KVM, firmware, or template assets
-also produce a named skip.
+against its host vendor and device IDs, and checks that the control socket
+refuses snapshot save and load. It reboots the guest, checks the reset event,
+the new boot ID, and the PCI identity, then powers off from the guest. A second
+VM process starts with the same device and disk overlay, checks the PCI
+identity again, and quits through the control socket. Both exits must be
+successful and free of VFIO teardown errors. Without the device variable, it
+prints a skip reason before accessing hardware. With a device specified,
+missing KVM, firmware, or template assets fail the test.
 
 For hardware acceptance, also exercise the function with its normal guest
-driver and repeat the test after guest shutdown and reset. Enumeration alone
-does not prove GPU rendering, DMA throughput, or every interrupt mode.
+driver. That step covers rendering, DMA, and interrupts used by the workload.
 
 After every VM has exited, restore the original host driver if appropriate:
 
