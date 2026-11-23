@@ -211,6 +211,9 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
     async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
         (**self).pull(remote, local).await
     }
+    async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        (**self).read_capped(path, limit).await
+    }
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
         (**self).mkdir(path, case_sensitive).await
     }
