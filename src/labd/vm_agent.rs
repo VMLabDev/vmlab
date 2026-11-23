@@ -15,8 +15,9 @@
 //! error.
 //! On ISA serial only, the guest announces itself first so the host cannot
 //! leave a hello in COM1 for Windows serial mouse detection to consume;
-//! agents older than the announcement get a rate-limited fallback hello
-//! ([`Greeting`]).
+//! agents older than the announcement get a fallback hello, only where an
+//! agent is expected and a limited number of times after a boot
+//! ([`Greeting`], `FallbackHello` in `machine.rs`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -329,6 +330,9 @@ struct Inner {
     /// the pong was only late.
     last_rx: std::sync::Mutex<std::time::Instant>,
     received: watch::Sender<bool>,
+    /// Whether this connection's hello went out to a guest that had not
+    /// spoken ([`Greeting::GuestFirst`]'s fallback).
+    fallback_hello: AtomicBool,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
     /// Waiters for `opened`/error replies to an `open_*` message, keyed by
     /// channel id (std mutex: never held across await).
@@ -577,6 +581,7 @@ impl AgentHandle {
             closed: watch::Sender::new(false),
             last_rx: std::sync::Mutex::new(std::time::Instant::now()),
             received: watch::Sender::new(false),
+            fallback_hello: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             open_waiters: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
@@ -620,7 +625,10 @@ impl AgentHandle {
                 // nobody answer, dropping the connection drops whatever of
                 // the hello the guest had not read (both hypervisors discard
                 // unread input on hangup).
-                Err(_) if fallback => deadline = tokio::time::Instant::now() + handshake_timeout,
+                Err(_) if fallback => {
+                    inner.fallback_hello.store(true, Ordering::Relaxed);
+                    deadline = tokio::time::Instant::now() + handshake_timeout;
+                }
                 Err(_) => bail!("no vmlab-agent answered on the agent channel"),
             }
         }
@@ -649,6 +657,12 @@ impl AgentHandle {
     }
 
     /// The handshake info (always present after a successful `connect`).
+    /// Whether the agent on this connection answered a hello it had not
+    /// announced itself for: an agent older than guest-first on ISA serial.
+    pub(super) fn answered_fallback_hello(&self) -> bool {
+        self.inner.fallback_hello.load(Ordering::Relaxed)
+    }
+
     pub fn info(&self) -> AgentInfo {
         self.inner
             .hello
@@ -4531,6 +4545,55 @@ mod tests {
         assert!(agent.ping(HANDSHAKE).await);
         agent.shutdown().await;
         guest.await.unwrap();
+    }
+
+    /// The whole path on a socket (#678): a silent guest on ISA serial reads
+    /// no byte from an unarmed slot's connect or probe, and an old agent
+    /// that never speaks first is found by a slot armed for an expected
+    /// agent once the boot delay has passed.
+    #[tokio::test]
+    async fn a_silent_serial_guest_reads_nothing_until_an_agent_is_expected() {
+        use super::super::machine::{AgentSlot, LEGACY_HELLO_BOOT_DELAY, LEGACY_HELLO_TRIES};
+        use crate::profiles::AgentTransport;
+        let (_mock_dir, mock_path) = mock_agent(true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("serial.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // The guest's COM1: counts what the host sends, and from the first
+        // host byte on is an old agent, silent until the host's hello.
+        let (seen_tx, seen) = tokio::sync::watch::channel(0usize);
+        tokio::spawn(async move {
+            loop {
+                let (mut port, _) = listener.accept().await.unwrap();
+                let mut first = [0];
+                if port.read_exact(&mut first).await.is_err() {
+                    continue; // the host hung up having sent nothing
+                }
+                seen_tx.send_modify(|n| *n += 1);
+                let mut agent = UnixStream::connect(&mock_path).await.unwrap();
+                agent.write_all(&first).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut port, &mut agent).await;
+            }
+        });
+
+        let slot = AgentSlot::for_transport(AgentTransport::IsaSerial);
+        assert!(!slot.probe(&sock).await);
+        slot.arm_fallback_hello(false);
+        assert!(!slot.probe(&sock).await);
+        assert!(slot.connect("m1", &sock, "hint").await.is_err());
+        // Armed for an expected agent, but the boot is too young.
+        slot.arm_fallback_hello(true);
+        assert!(!slot.probe(&sock).await);
+        assert_eq!(*seen.borrow(), 0, "the host wrote into a silent COM1");
+
+        slot.arm_fallback_hello_since(std::time::Instant::now() - LEGACY_HELLO_BOOT_DELAY);
+        assert!(slot.probe(&sock).await, "the old agent got no hello");
+        assert_eq!(*seen.borrow(), 1);
+        assert_eq!(
+            slot.fallback_hellos_left(),
+            LEGACY_HELLO_TRIES,
+            "an agent that answered the hello gets a fresh budget"
+        );
     }
 
     #[tokio::test]
