@@ -267,7 +267,16 @@ impl HostConfig {
             if let Some(v) = r.string("dns_suffix").unspan() {
                 cfg.dns_suffix = v;
             }
-            cfg.dns_upstream = r.string("dns_upstream").unspan();
+            if let Some(upstream) = r.string("dns_upstream") {
+                if parse_upstream(&upstream.value).is_some() {
+                    cfg.dns_upstream = Some(upstream.value);
+                } else {
+                    r.issue_at(
+                        upstream.span,
+                        "`dns_upstream` must be an IP address, optionally with a port",
+                    );
+                }
+            }
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
                 cfg.disk_low_percent = v;
             }
@@ -415,10 +424,10 @@ impl HostConfig {
     /// `dns_upstream` when set, else the host's own resolver. `None` leaves
     /// unmatched names NXDOMAIN.
     pub fn upstream_resolver(&self) -> Option<std::net::SocketAddr> {
-        self.dns_upstream
-            .as_deref()
-            .and_then(parse_upstream)
-            .or_else(host_resolver)
+        match self.dns_upstream.as_deref() {
+            Some(upstream) => parse_upstream(upstream),
+            None => host_resolver(),
+        }
     }
 }
 
@@ -888,6 +897,31 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
         let source = format!("import <vmlab-host.wcl>\n{body}");
         let err = HostConfig::parse(&source, "config.wcl").expect_err("should be rejected");
         format!("{err:#}")
+    }
+
+    #[test]
+    fn a_malformed_dns_upstream_is_refused() {
+        for upstream in ["dns.corp", "10.0.0.1:"] {
+            assert!(
+                host_err(&format!("host {{ dns_upstream = \"{upstream}\" }}\n"))
+                    .contains("config.wcl:2:8: `dns_upstream`")
+            );
+        }
+    }
+
+    #[test]
+    fn a_dns_upstream_ip_accepts_an_optional_port() {
+        for (upstream, address) in [
+            ("192.0.2.1", "192.0.2.1:53"),
+            ("192.0.2.1:5353", "192.0.2.1:5353"),
+            ("2001:db8::1", "[2001:db8::1]:53"),
+            ("[2001:db8::1]:5353", "[2001:db8::1]:5353"),
+        ] {
+            let source =
+                format!("import <vmlab-host.wcl>\nhost {{ dns_upstream = \"{upstream}\" }}");
+            let host = HostConfig::parse(&source, "config.wcl").unwrap();
+            assert_eq!(host.upstream_resolver(), Some(address.parse().unwrap()));
+        }
     }
 
     #[test]
