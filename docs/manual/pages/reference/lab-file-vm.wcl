@@ -356,6 +356,12 @@ SRC
       | "`label`" | "utf8" | "none" | "Volume label for the image." |
   }
   p "Validation requires `from` to be a directory under the lab root."
+  p <<DOC
+    An ISO is attached read-only. A floppy is writable, so each machine
+    attaches its own copy of the built image, kept beside its disks. The
+    copy keeps what the guest writes until the machine is destroyed or the
+    folder changes, and no other machine sees it.
+  DOC
 
   h2 "gpu {}"
   p <<DOC

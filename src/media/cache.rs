@@ -3,6 +3,13 @@
 //! Images are keyed by a digest over the source folder's contents plus the
 //! media kind and label, so unchanged folders never rebuild. The lab daemon
 //! points this at `<lab>/.vmlab/media`.
+//!
+//! An entry is shared: every machine of every instance of the lab with that
+//! folder gets the same file. An ISO is attached read-only. A floppy is not,
+//! so no machine attaches a floppy entry itself — each takes its own copy
+//! ([`private_floppy`]) — and a floppy entry carries a **seal**, the digest of
+//! the image as built, that a hit is checked against. An entry that fails the
+//! check, or has no seal, is built again.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -43,7 +50,8 @@ impl MediaCache {
     ) -> Result<PathBuf> {
         let digest = folder_digest(src_folder)?;
         let dest = self.cache_dir.join(entry_name(kind, label, &digest));
-        if dest.is_file() {
+        let sealed = matches!(kind, MediaKind::Floppy);
+        if dest.is_file() && (!sealed || seal_holds(&dest)) {
             return Ok(dest);
         }
 
@@ -66,8 +74,18 @@ impl MediaCache {
             return Err(err);
         }
 
+        // The seal follows the image: a crash between the two leaves an entry
+        // that fails the check and is built again.
+        let seal = if sealed {
+            Some(image_digest(&tmp)?)
+        } else {
+            None
+        };
         fs::rename(&tmp, &dest)
             .with_context(|| format!("installing media cache entry {}", dest.display()))?;
+        if let Some(seal) = seal {
+            write_seal(&dest, &seal)?;
+        }
         Ok(dest)
     }
 
@@ -91,13 +109,105 @@ impl MediaCache {
             let item =
                 item.with_context(|| format!("reading media cache {}", self.cache_dir.display()))?;
             let path = item.path();
-            if path.is_file() && !keep_names.contains(&item.file_name()) {
+            // A kept entry keeps its seal.
+            let name = item.file_name();
+            let entry = match name.to_str().and_then(|n| n.strip_suffix(SEAL_SUFFIX)) {
+                Some(entry) => OsString::from(entry),
+                None => name,
+            };
+            if path.is_file() && !keep_names.contains(&entry) {
                 fs::remove_file(&path)
                     .with_context(|| format!("removing stale cache entry {}", path.display()))?;
             }
         }
         Ok(())
     }
+}
+
+/// What a seal's file name adds to its entry's.
+const SEAL_SUFFIX: &str = ".sha256";
+
+/// Where the seal of the entry at `entry` is kept.
+fn seal_path(entry: &Path) -> PathBuf {
+    let mut name = entry.as_os_str().to_owned();
+    name.push(SEAL_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// The hex SHA-256 of the image at `path`.
+fn image_digest(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// Whether the entry at `entry` is the image its seal was written for. An
+/// entry with no seal, or one that cannot be read, is not.
+fn seal_holds(entry: &Path) -> bool {
+    let Ok(seal) = fs::read_to_string(seal_path(entry)) else {
+        return false;
+    };
+    image_digest(entry).is_ok_and(|digest| digest == seal.trim())
+}
+
+/// Writes the seal of `entry` through a temporary name, so a seal is whole
+/// or absent.
+fn write_seal(entry: &Path, digest: &str) -> Result<()> {
+    let seal = seal_path(entry);
+    let dir = entry.parent().expect("a cache entry has a directory");
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("writing {}", seal.display()))?;
+    std::io::Write::write_all(&mut tmp, digest.as_bytes())
+        .with_context(|| format!("writing {}", seal.display()))?;
+    tmp.persist(&seal)
+        .with_context(|| format!("writing {}", seal.display()))?;
+    Ok(())
+}
+
+/// The name prefix of a machine's own copy of a built floppy.
+const PRIVATE_FLOPPY_PREFIX: &str = "floppy-";
+
+/// The image a machine puts in drive A for the built floppy at `entry`: its
+/// own copy under `dir`, the machine's directory, made on first use.
+///
+/// Drive A is writable and the entry is shared, so the entry itself is never
+/// attached. The copy is named after the entry, which is named after the
+/// folder's contents: it lasts as long as the machine's disks do, guest
+/// writes included, and a changed folder gives a new copy. Copies of earlier
+/// builds are removed. Call it only while the machine is stopped.
+pub fn private_floppy(entry: &Path, dir: &Path) -> Result<PathBuf> {
+    let name = entry
+        .file_name()
+        .with_context(|| format!("floppy image {} has no file name", entry.display()))?;
+    let mut own = OsString::from(PRIVATE_FLOPPY_PREFIX);
+    own.push(name);
+    let dest = dir.join(&own);
+    if !dest.is_file() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let tmp = tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("copying floppy image to {}", dest.display()))?;
+        fs::copy(entry, tmp.path()).with_context(|| {
+            format!(
+                "copying floppy image {} to {}",
+                entry.display(),
+                dest.display()
+            )
+        })?;
+        tmp.persist(&dest)
+            .with_context(|| format!("copying floppy image to {}", dest.display()))?;
+    }
+    for item in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let item = item.with_context(|| format!("reading {}", dir.display()))?;
+        let stale = item.file_name() != own
+            && item
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(PRIVATE_FLOPPY_PREFIX) && n.ends_with(".img"));
+        if stale {
+            fs::remove_file(item.path())
+                .with_context(|| format!("removing {}", item.path().display()))?;
+        }
+    }
+    Ok(dest)
 }
 
 /// Cache entry file name: 16 hex characters of a digest over kind, label,
@@ -232,6 +342,77 @@ mod tests {
             last_sector(&second) == last_sector(&fresh),
             "the cache handed back the sector its reader wrote"
         );
+    }
+
+    #[test]
+    fn an_unsealed_floppy_entry_is_built_again() {
+        let src = unattend_folder();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let entry = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+
+        // An entry from before seals existed: a guest may have written it.
+        fs::remove_file(seal_path(&entry)).unwrap();
+        fs::write(&entry, b"left by a guest").unwrap();
+
+        let again = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+        assert_eq!(entry, again);
+        assert_eq!(fs::metadata(&again).unwrap().len(), 2880 * 512);
+        assert!(seal_holds(&again));
+    }
+
+    #[test]
+    fn a_machine_gets_its_own_copy_of_a_built_floppy() {
+        let cache = tempfile::tempdir().unwrap();
+        let entry = cache.path().join("0123456789abcdef.img");
+        fs::write(&entry, b"as built").unwrap();
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+        let in_a = private_floppy(&entry, a.path()).unwrap();
+        let in_b = private_floppy(&entry, b.path()).unwrap();
+        assert_ne!(in_a, in_b);
+        assert_ne!(in_a, entry);
+        assert!(in_a.starts_with(a.path()));
+
+        // The copy outlives a restart, with what the guest wrote to it.
+        fs::write(&in_a, b"written by a guest").unwrap();
+        assert_eq!(private_floppy(&entry, a.path()).unwrap(), in_a);
+        assert_eq!(fs::read(&in_a).unwrap(), b"written by a guest");
+        assert_eq!(fs::read(&in_b).unwrap(), b"as built");
+        assert_eq!(fs::read(&entry).unwrap(), b"as built");
+    }
+
+    #[test]
+    fn a_changed_folder_replaces_the_machines_copy() {
+        let cache = tempfile::tempdir().unwrap();
+        let (old, new) = (cache.path().join("aaaa.img"), cache.path().join("bbbb.img"));
+        fs::write(&old, b"old build").unwrap();
+        fs::write(&new, b"new build").unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        fs::write(machine.path().join("disk0.qcow2"), b"").unwrap();
+
+        let first = private_floppy(&old, machine.path()).unwrap();
+        let second = private_floppy(&new, machine.path()).unwrap();
+
+        assert_eq!(fs::read(&second).unwrap(), b"new build");
+        assert!(!first.exists(), "the copy of the earlier build is removed");
+        assert!(machine.path().join("disk0.qcow2").exists());
+    }
+
+    #[test]
+    fn gc_keeps_the_seal_of_a_kept_entry() {
+        let src = unattend_folder();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+
+        let kept = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+        fs::write(src.path().join("extra.txt"), b"more").unwrap();
+        let dropped = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+
+        cache.gc(std::slice::from_ref(&kept)).unwrap();
+        assert!(seal_holds(&kept));
+        assert!(!dropped.exists());
+        assert!(!seal_path(&dropped).exists());
     }
 
     #[test]

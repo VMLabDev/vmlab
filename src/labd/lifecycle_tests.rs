@@ -35,7 +35,7 @@ use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
 use super::hypervisor::fake::{Capabilities, FakeHypervisor, Run, Script};
 use super::machine::{LabServices, Machine};
-use super::vm::{PowerState, StopReason, TemplateParts, VmDirs, VmInstance};
+use super::vm::{Floppy, PowerState, StopReason, TemplateParts, VmDirs, VmInstance};
 use crate::oci::image::model::{ImageConfig, RuntimeDefaults};
 use crate::oci::image::pull::PulledImage;
 use crate::profiles::ProfileSet;
@@ -246,7 +246,7 @@ fn vm_with_floppy(
     dirs: &Dirs,
     decl: &str,
     script: Script,
-    floppy: Option<PathBuf>,
+    floppy: Option<Floppy>,
 ) -> (Arc<VmInstance>, Arc<FakeHypervisor>) {
     let cfg = testing::vm(decl);
     let resolved = crate::qemu::resolve_vm(
@@ -836,7 +836,12 @@ async fn two_machines_do_not_share_a_writable_floppy() {
     let mut launched = Vec::new();
     for _ in 0..2 {
         let dirs = Dirs::new();
-        let (vm, hv) = vm_with_floppy(&dirs, LINUX_VM, Script::healthy(), Some(entry.clone()));
+        let (vm, hv) = vm_with_floppy(
+            &dirs,
+            LINUX_VM,
+            Script::healthy(),
+            Some(Floppy::Built(entry.clone())),
+        );
         let (cbs, _observed) = callbacks();
         start_vm(&vm, cbs).await.expect("start");
         let floppy = hv
@@ -855,6 +860,8 @@ async fn two_machines_do_not_share_a_writable_floppy() {
         launched.push((dirs, floppy));
     }
 
+    assert_ne!(launched[0].1, entry, "a machine launched with the cache entry");
+    assert_ne!(launched[1].1, entry, "a machine launched with the cache entry");
     assert_ne!(
         launched[0].1, launched[1].1,
         "two machines launched with one writable floppy image"
