@@ -4,7 +4,7 @@ On Zeus's RTX 4060 Laptop GPU, every client that drives Venus through the
 Vulkan API hung on its first fence: the Vulkan probes, D3D12 through
 vkd3d-proton, and OpenGL through Zink. The acceptance run passed 7 of 12
 ([`zeus.md`](zeus.md#nvidia-rtx-4060)). This page gives the cause, the
-two guest fixes `patches/mesa/0065` and `0066`, the evidence, and what
+two guest fixes `patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch` and `0066`, the evidence, and what
 remains. Evidence is in [docs/evidence/nvfb/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/nvfb/). Investigated on 2026-10-19.
 
 ## Result
@@ -13,7 +13,7 @@ remains. Evidence is in [docs/evidence/nvfb/](https://github.com/VMLabDev/vmlab-
 | --- | --- |
 | Cause | In the guest, the host GPU's writes to NVIDIA memory type 2 (`HOST_VISIBLE` and `HOST_COHERENT`, uncached system memory) are not visible to the guest CPU. The guest reads a stale line from the CPU cache, and the GPU's write never invalidates that line. Venus put its feedback buffer (fence, semaphore, event and query status) in that type. The host itself sees the same writes |
 | Owner | The guest Venus driver chose the memory type. The underlying behaviour belongs to the host platform, an Intel CPU host with this NVIDIA GPU. On helios (an AMD CPU) a guest on an RTX 5090 sees every GPU write in type 2 (`helios/nv1-fbguest-0b26b36/`), so 0067 changes nothing there |
-| Fix | `patches/mesa/0065`: Venus feedback buffers use a `HOST_COHERENT` and `HOST_CACHED` type (NVIDIA type 3), where the GPU's writes reach the guest. `patches/mesa/0066`: at device creation Venus checks that one fence feedback write lands, and disables feedback for that device if it does not. `patches/mesa/0067`: the same check tests the uncached type, and where the GPU's writes do not arrive, Venus backs that type with the cached one for every application (this also fixes the black OpenGL readback) |
+| Fix | `patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch`: Venus feedback buffers use a `HOST_COHERENT` and `HOST_CACHED` type (NVIDIA type 3), where the GPU's writes reach the guest. `patches/mesa/venus-disable-feedback-when-writes-do-not-arrive.patch`: at device creation Venus checks that one fence feedback write lands, and disables feedback for that device if it does not. `patches/mesa/venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive.patch`: the same check tests the uncached type, and where the GPU's writes do not arrive, Venus backs that type with the cached one for every application (this also fixes the black OpenGL readback) |
 | Zeus Nvidia1, `tests/e2e/run.sh --template windows-11`, package defaults | With 0065 and 0066 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)): runs 1 and 3 **12 of 12**, run 2 **11 of 12**, a black OpenGL readback. With 0067 as well and `main` merged: [0b26b36](https://github.com/VMLabDev/vmlab-win3d/commit/0b26b364b393f940e9a8be2cb41c3723140bcff8) 12 of 12, and the committed [bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf) **12 of 12 twice**. helios: AMD1 12 of 12 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)), RTX 5090 on Nvidia2 12 of 12 ([bf4d948](https://github.com/VMLabDev/vmlab-win3d/commit/bf4d9485d00a434b6215b9521e275ca321ef7ccf)), Zeus Intel1 12 of 12 ([6dabb22](https://github.com/VMLabDev/vmlab-win3d/commit/6dabb22a8ef9d73284e1f37ad6c74c46095f742e)) |
 | Regressions | See [Proof](#proof) |
 
@@ -82,7 +82,7 @@ so Intel1 passes too.
 
 ## The fixes
 
-`patches/mesa/0065-venus-feedback-buffers-in-host-cached-memory.patch`
+`patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch`
 (`vn_feedback_buffer_create`, `src/virtio/vulkan/vn_feedback.c`): the
 feedback buffer takes the first memory type with `HOST_COHERENT` and
 `HOST_CACHED`, and otherwise the first `HOST_COHERENT` type as before. On
@@ -90,7 +90,7 @@ NVIDIA that is type 3, on RADV the cached GTT type, and on ANV the cached
 device-local type. Polling cached memory is also cheaper than polling uncached
 memory. Query feedback buffers go through the same function.
 
-`patches/mesa/0066-venus-disable-feedback-when-writes-do-not-arrive.patch`
+`patches/mesa/venus-disable-feedback-when-writes-do-not-arrive.patch`
 (`vn_feedback_self_test`) protects hosts where even that type fails. After
 `vkCreateDevice` it allocates a fence feedback slot, sets it to
 `VK_NOT_READY`, and submits the fence feedback command (`vkCmdFillBuffer` of
@@ -111,7 +111,7 @@ Venus context died: vulkaninfo crashed and 6 of 12 checks passed
 `vkQueueWaitIdle resulted in CS error`). The patch waits on a fence
 instead.
 
-`patches/mesa/0067` extends the check to the uncached memory type and backs
+`patches/mesa/venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive.patch` extends the check to the uncached memory type and backs
 it with the cached type where the GPU's writes do not arrive; see
 [the black OpenGL readback](#the-black-opengl-readback).
 
@@ -198,7 +198,7 @@ type 2 with type 3 removes the fault (0 black readbacks in 24 runs, against
 5 of 6 without 0067, `zeus/44-no67/`). Why `ZINK_DEBUG=sync` made the
 fault happen every time is not established.
 
-**The fix.** `patches/mesa/0067` extends 0066's check to every uncached
+**The fix.** `patches/mesa/venus-back-uncached-host-memory-with-cached-when-gpu-writes-do-not-arrive.patch` extends 0066's check to every uncached
 `HOST_COHERENT` type that has a cached counterpart: same heap, and a
 superset of the flags plus `HOST_CACHED` (NVIDIA type 2, counterpart type
 3). The check puts a 4 KiB buffer in that type, writes and reads its first
@@ -257,7 +257,12 @@ timing on helios could not be isolated: with ten VMs on the host,
   not established. KVM or the host's virglrenderer could fix it for every
   guest driver; the package cannot change either (decision D3).
 - Yttrium's D3D9/D3D10/D3D11 driver has its own Venus transport and is not
-  covered by 0067. It passed every check on Zeus Nvidia1.
+  covered by 0067. It passed every check on Zeus Nvidia1. On a second Intel
+  and NVIDIA laptop its images arrived with 64-byte holes. vmlab can hide the
+  uncached type from every guest driver on the host side: the host GPU
+  setting `hide_uncached_memory = true` (vmlab manual, host configuration).
+  It is off by default, and it is not yet measured on such a host through
+  vmlab.
 
 ## Files
 

@@ -197,84 +197,117 @@ async fn ensure_current_daemon(
     targets: &[String],
 ) -> Result<CurrentDaemon> {
     let targeted = |machine: &str| targets.is_empty() || targets.iter().any(|t| t == machine);
-    let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
-        // A daemon started now reads the file now.
-        return Ok(CurrentDaemon {
-            client: daemon::ensure_lab_daemon(name, root).await?,
-            pending: Vec::new(),
-            reloaded: false,
-        });
-    };
     // The daemon was handed the canonical root (the supervisor registers it
     // so), and the digest covers it, so load from the same path.
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let digest = crate::config::digest(&load_lab_at(&root)?);
-    let status = lab_status(&client).await?;
-    match daemon_freshness(name, &status, &digest) {
-        DaemonFreshness::Current => Ok(CurrentDaemon {
-            pending: status
-                .pending
-                .into_iter()
-                .filter(|p| targeted(&p.machine))
-                .collect(),
-            client,
-            reloaded: false,
-        }),
-        DaemonFreshness::Refuse(why) => bail!(why),
-        DaemonFreshness::Reload => {
-            println!("lab \"{name}\": vmlab.wcl changed — reloading it into the running lab");
-            let reply = client.send(LabRequest::Reload {}).await.map_err(remote)?;
-            let report: crate::status::ReloadReport = serde_json::from_value(reply)
-                .context("the lab daemon sent a reload report vmlab cannot read")?;
-            for line in reload_lines(&report) {
-                println!("{line}");
-            }
-            Ok(CurrentDaemon {
-                pending: report
-                    .machines
-                    .into_iter()
-                    .filter_map(|m| match m {
-                        crate::status::MachineReload::Pending(p) if targeted(&p.machine) => Some(p),
-                        _ => None,
-                    })
-                    .collect(),
-                client,
-                reloaded: true,
-            })
-        }
-        DaemonFreshness::Restart => {
-            if status.config_digest != digest {
-                println!(
-                    "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
-                );
-            } else {
-                println!(
-                    "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
-                     — restarting the lab daemon to plan its clones again"
-                );
-            }
-            let reply = daemon::ensure_supervisor()
-                .await?
-                .send(SupRequest::LabRestart {
-                    name: name.to_string(),
-                    root,
-                })
-                .await
-                .map_err(remote)?;
-            // The old daemon's socket path is reused, but follow the reply
-            // rather than assume it.
-            let socket = std::path::PathBuf::from(
-                reply["socket"]
-                    .as_str()
-                    .context("malformed lab.restart response")?,
-            );
-            Ok(CurrentDaemon {
-                client: LabClient::connect(&socket).await?,
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // A restart that found another command's successor in place of the
+    // daemon it named replaced nothing, so that successor is checked like
+    // any daemon found here. Once: a second one means the lab's daemon is
+    // being replaced again and again under this command.
+    let mut superseded = false;
+    loop {
+        let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
+            // A daemon started now reads the file now.
+            return Ok(CurrentDaemon {
+                client: daemon::ensure_lab_daemon(name, root).await?,
                 pending: Vec::new(),
                 reloaded: false,
-            })
+            });
+        };
+        let digest = crate::config::digest(&load_lab_at(&canonical)?);
+        let status = lab_status(&client).await?;
+        match daemon_freshness(name, &status, &digest) {
+            DaemonFreshness::Current => {
+                return Ok(CurrentDaemon {
+                    pending: status
+                        .pending
+                        .into_iter()
+                        .filter(|p| targeted(&p.machine))
+                        .collect(),
+                    client,
+                    reloaded: false,
+                });
+            }
+            DaemonFreshness::Refuse(why) => bail!(why),
+            DaemonFreshness::Reload => {
+                println!("lab \"{name}\": vmlab.wcl changed — reloading it into the running lab");
+                let reply = client.send(LabRequest::Reload {}).await.map_err(remote)?;
+                let report: crate::status::ReloadReport = serde_json::from_value(reply)
+                    .context("the lab daemon sent a reload report vmlab cannot read")?;
+                for line in reload_lines(&report) {
+                    println!("{line}");
+                }
+                return Ok(CurrentDaemon {
+                    pending: report
+                        .machines
+                        .into_iter()
+                        .filter_map(|m| match m {
+                            crate::status::MachineReload::Pending(p) if targeted(&p.machine) => {
+                                Some(p)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    client,
+                    reloaded: true,
+                });
+            }
+            DaemonFreshness::Restart => {
+                if status.config_digest != digest {
+                    println!(
+                        "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
+                    );
+                } else {
+                    println!(
+                        "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
+                         — restarting the lab daemon to plan its clones again"
+                    );
+                }
+                let reply = daemon::ensure_supervisor()
+                    .await?
+                    .send(SupRequest::LabRestart {
+                        name: name.to_string(),
+                        root: canonical.clone(),
+                        daemon: named_daemon(&status),
+                    })
+                    .await
+                    .map_err(remote)?;
+                if reply["replaced"] == false {
+                    if superseded {
+                        bail!(
+                            "lab \"{name}\": other commands keep replacing the lab daemon — \
+                             run this command again once they have finished"
+                        );
+                    }
+                    superseded = true;
+                    println!(
+                        "lab \"{name}\": another command restarted the lab daemon first — \
+                         using that daemon"
+                    );
+                    continue;
+                }
+                // The old daemon's socket path is reused, but follow the reply
+                // rather than assume it.
+                let socket = std::path::PathBuf::from(
+                    reply["socket"]
+                        .as_str()
+                        .context("malformed lab.restart response")?,
+                );
+                return Ok(CurrentDaemon {
+                    client: LabClient::connect(&socket).await?,
+                    pending: Vec::new(),
+                    reloaded: false,
+                });
+            }
         }
     }
+}
+
+/// The daemon a restart decided from `status` replaces: the one that
+/// answered it. `None` for a daemon that predates the field, which is
+/// replaced whatever its pid.
+fn named_daemon(status: &LabStatus) -> Option<u32> {
+    (status.daemon_pid != 0).then_some(status.daemon_pid)
 }
 
 /// What a reload did, one line per machine rebuilt, added, dropped or left
@@ -499,6 +532,15 @@ pub fn cmd_destroy() -> Result<()> {
             }
             None if lab_local.exists() => {
                 refuse_destroy_under_freeze(&root).await?;
+                // A daemon that does not answer may still be starting, or
+                // have lost its socket file, and it holds the lab's state
+                // open. The release waits for a start and stops such a
+                // daemon before the directory goes.
+                if let Ok(sup) = daemon::ensure_supervisor().await {
+                    let _ = sup
+                        .send(SupRequest::LabRelease { name: name.clone() })
+                        .await;
+                }
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
                 crate::freeze::ports::release_worktree(&root)?;
@@ -544,16 +586,10 @@ pub fn cmd_status(verbose: bool, json: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
         let Some(client) = daemon::try_own_lab_daemon(&name, &root).await? else {
-            // No daemon to ask, so the lab file and the lab's state answer:
-            // which x86 machines would run on QEMU, and their snapshots.
-            let report = super::validate::QemuRemovalReport::of_current_lab();
             if json {
-                return super::print_json(&not_running_status(&name, &report));
+                return super::print_json(&not_running_status(&name));
             }
             println!("lab \"{name}\": not running");
-            for warning in report.lines() {
-                println!("  warning: {warning}");
-            }
             return Ok(());
         };
         let payload = client.send(LabRequest::Status {}).await.map_err(remote)?;
@@ -572,27 +608,8 @@ pub fn cmd_status(verbose: bool, json: bool) -> Result<()> {
 /// What `status --json` prints for a lab with no daemon: the name and that
 /// nothing runs, so a script reads one shape from both answers rather than
 /// parsing a sentence.
-///
-/// `qemu_removal` is there when an x86 machine would run on QEMU: one entry
-/// each, with the machine's name beside what the running status carries.
-fn not_running_status(name: &str, report: &super::validate::QemuRemovalReport) -> Value {
-    let mut status = serde_json::json!({ "lab": name, "running": false });
-    if !report.machines.is_empty() {
-        let machines: Vec<Value> = report
-            .machines
-            .iter()
-            .map(|(machine, removal)| {
-                let mut entry = serde_json::json!(removal);
-                entry["machine"] = Value::from(machine.as_str());
-                entry
-            })
-            .collect();
-        status["qemu_removal"] = Value::from(machines);
-    }
-    if !report.host.is_empty() {
-        status["host_warnings"] = serde_json::json!(report.host);
-    }
-    status
+fn not_running_status(name: &str) -> Value {
+    serde_json::json!({ "lab": name, "running": false })
 }
 
 /// Ask a lab daemon for its status projection (ADR-0004).
@@ -681,26 +698,9 @@ fn render_status(status: &LabStatus, verbose: bool) -> String {
             if verbose {
                 let _ = writeln!(out, "      {}", machine_detail(m));
             }
-            // An x86 machine on QEMU says its reason in the removal warning.
-            match &m.qemu_removal {
-                Some(removal) => {
-                    for line in removal.lines(&m.name) {
-                        let _ = writeln!(out, "      warning: {line}");
-                    }
-                }
-                None => {
-                    if let Some(reason) = &m.hypervisor_fallback {
-                        let _ =
-                            writeln!(out, "      hypervisor={} fallback: {reason}", m.hypervisor);
-                    }
-                }
+            if let Some(reason) = &m.hypervisor_fallback {
+                let _ = writeln!(out, "      hypervisor={} fallback: {reason}", m.hypervisor);
             }
-        }
-    }
-    if !status.host_warnings.is_empty() {
-        let _ = writeln!(out);
-        for warning in &status.host_warnings {
-            let _ = writeln!(out, "  warning: {warning}");
         }
     }
 
@@ -1272,20 +1272,28 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
         // is exactly what restart exists to recover from, and blocking there
         // would make the verb useless when it is needed most (the console's
         // reload button reasons the same way).
+        //
+        // The daemon that answered is the one this restart replaces. The
+        // request names it, so a daemon another command started in between,
+        // which nothing here checked, is left running.
+        let mut checked = None;
         if let Some(client) = daemon::try_lab_daemon(name).await?
             && let Ok(status) = lab_status(&client).await
-            && !status.all_stopped()
         {
-            bail!(
-                "lab \"{name}\" still has machines running — stop them first; \
-                 a restarted daemon cannot re-adopt them"
-            );
+            if !status.all_stopped() {
+                bail!(
+                    "lab \"{name}\" still has machines running — stop them first; \
+                     a restarted daemon cannot re-adopt them"
+                );
+            }
+            checked = named_daemon(&status);
         }
         let supervisor = daemon::ensure_supervisor().await?;
         let reply = supervisor
             .send(SupRequest::LabRestart {
                 name: name.to_string(),
                 root,
+                daemon: checked,
             })
             .await
             .map_err(remote)?;
@@ -1301,8 +1309,15 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
             .send(LabRequest::Ping {})
             .await
             .map_err(remote)?;
-        super::emit(json, &reply, |_| {
-            format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
+        super::emit(json, &reply, |reply| {
+            if reply["replaced"] == false {
+                format!(
+                    "lab \"{name}\" daemon was already restarted by another command, at {}\n",
+                    socket.display()
+                )
+            } else {
+                format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
+            }
         })
     })
 }
@@ -3115,10 +3130,9 @@ mod tests {
     /// answers.
     #[test]
     fn a_lab_that_is_not_running_has_a_json_answer() {
-        let v = not_running_status("ad-lab", &Default::default());
+        let v = not_running_status("ad-lab");
         assert_eq!(v["lab"], "ad-lab");
         assert_eq!(v["running"], false);
-        assert!(v.get("qemu_removal").is_none(), "{v}");
     }
 
     /// A machine a repair verb changed in place says so wherever its state is
@@ -3439,71 +3453,5 @@ mod tests {
         );
         assert!(root_for(&labs, "gamma").is_none());
         assert!(root_for(&[], "alpha").is_none());
-    }
-
-    fn qemu_removal(snapshots: &[&str]) -> crate::config::hypervisor::QemuRemoval {
-        crate::config::hypervisor::QemuRemoval {
-            reason: crate::config::hypervisor::QemuReason::Existing,
-            warning: "vm \"old\" runs on QEMU because its disks were made under QEMU".into(),
-            online_snapshots: snapshots.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    /// An x86 machine on QEMU is warned under its row, with the snapshots
-    /// the removal costs, and `--json` carries the same as fields.
-    #[test]
-    fn status_warns_of_the_qemu_removal_and_lists_the_snapshots() {
-        let mut old = crate::status::fixtures::machine("old", PowerState::Stopped, false, vm());
-        old.hypervisor_fallback = Some("old: keeping existing QEMU machine".into());
-        old.qemu_removal = Some(qemu_removal(&["warm"]));
-        let mut status = lab(vec![old]);
-        status.host_warnings = vec!["/dev/kvm is not usable on this host".into()];
-        let text = render_status(&status, false);
-        assert!(
-            text.contains("      warning: vm \"old\" runs on QEMU because"),
-            "{text}"
-        );
-        assert!(text.contains("online snapshot(s) \"warm\""), "{text}");
-        assert!(text.contains("  warning: /dev/kvm is not usable"), "{text}");
-        // The warning carries the reason, so the fallback line is not repeated.
-        assert!(!text.contains("fallback:"), "{text}");
-        let json = serde_json::to_value(&status).unwrap();
-        let removal = &json["machines"][0]["qemu_removal"];
-        assert_eq!(removal["reason"], "existing");
-        assert_eq!(removal["online_snapshots"][0], "warm");
-        assert_eq!(
-            json["host_warnings"][0],
-            "/dev/kvm is not usable on this host"
-        );
-        // A machine that earns no warning carries no field.
-        let quiet = lab(vec![crate::status::fixtures::machine(
-            "new",
-            PowerState::Stopped,
-            false,
-            vm(),
-        )]);
-        let json = serde_json::to_value(&quiet).unwrap();
-        assert!(json["machines"][0].get("qemu_removal").is_none(), "{json}");
-        assert!(json.get("host_warnings").is_none(), "{json}");
-    }
-
-    /// The listing answers with no daemon too, naming each machine.
-    #[test]
-    fn a_lab_that_is_not_running_still_lists_its_qemu_machines() {
-        let report = crate::cli::validate::QemuRemovalReport {
-            machines: vec![("old".into(), qemu_removal(&["warm"]))],
-            host: Vec::new(),
-        };
-        let v = not_running_status("ad-lab", &report);
-        assert_eq!(v["running"], false);
-        assert_eq!(v["qemu_removal"][0]["machine"], "old");
-        assert_eq!(v["qemu_removal"][0]["reason"], "existing");
-        assert_eq!(v["qemu_removal"][0]["online_snapshots"][0], "warm");
-        assert!(v.get("host_warnings").is_none(), "{v}");
-        assert_eq!(
-            report.lines(),
-            qemu_removal(&["warm"]).lines("old"),
-            "status prints what the listing names"
-        );
     }
 }

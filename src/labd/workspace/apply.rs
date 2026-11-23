@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use super::guest::GuestFs;
 use super::ignore::TEMP_PREFIX;
-use super::ledger::{Agreed, Kind, Ledger, Side};
+use super::ledger::{Agreed, Keeper, Kind, Ledger, Side};
 use super::plan::{Action, Direction, Plan, State};
 use super::scan::{join_guest, mtime_ns};
 use crate::labd::vm_agent::{ErrorCode, FileOpsError, LinkKind};
@@ -225,11 +225,11 @@ pub async fn apply(
             });
             continue;
         }
-        ledger.entries.insert(path.clone(), agreed.clone());
+        ledger.agree(path, agreed.clone());
         done.adopted += 1;
     }
     for path in &plan.forget {
-        ledger.entries.remove(path);
+        ledger.forget(path);
     }
 
     for action in &plan.actions {
@@ -265,7 +265,7 @@ pub async fn apply(
         match landed {
             Ok(Landed::Removed) => {
                 expected.insert(path.into(), None);
-                ledger.entries.remove(path);
+                ledger.forget(path);
                 done.counts(direction).removed += 1;
             }
             // The other side still holds content of its own in there — a
@@ -274,9 +274,15 @@ pub async fn apply(
             // Neither direction touches guest-owned paths, so the directory
             // stays and the *agreement* about it goes: a removal that can
             // never succeed must not be retried on every pass for the life of
-            // the machine.
+            // the machine. The ledger keeps which side still holds it, so the
+            // next pass does not read it as created there and make it again
+            // on the side that deleted it.
             Ok(Landed::LeftStanding) => {
-                ledger.entries.remove(path);
+                let keeper = match direction {
+                    Direction::ToGuest => Keeper::Guest,
+                    Direction::ToHost => Keeper::Host,
+                };
+                ledger.leave_standing(path, keeper);
                 done.left_standing.push(path.to_string());
             }
             Ok(Landed::Placed { kind, digest, side }) => {
@@ -291,8 +297,8 @@ pub async fn apply(
                         } else {
                             (other, side)
                         };
-                        ledger.entries.insert(
-                            path.to_string(),
+                        ledger.agree(
+                            path,
                             Agreed {
                                 kind,
                                 digest,
@@ -306,7 +312,7 @@ pub async fn apply(
                     // the safe direction — the next pass hashes both sides
                     // and adopts them if they match.
                     Err(e) => {
-                        ledger.entries.remove(path);
+                        ledger.forget(path);
                         done.failures.push(Failure {
                             path: path.to_string(),
                             why: format!("{e:#}"),
@@ -945,7 +951,7 @@ mod tests {
 
     /// One whole pass: scan the host, probe the guest, reconcile, apply.
     async fn pass(root: &Path, guest: &FakeGuest, ledger: &mut Ledger) -> Applied {
-        run_pass(root, guest, ledger, target(root), false, &[]).await
+        run_pass(root, guest, ledger, target(root), false, false, &[]).await
     }
 
     /// The same, with `dirty` standing in for what the guest's own watcher
@@ -957,7 +963,7 @@ mod tests {
         ledger: &mut Ledger,
         dirty: &[&str],
     ) -> Applied {
-        run_pass(root, guest, ledger, target(root), false, dirty).await
+        run_pass(root, guest, ledger, target(root), false, false, dirty).await
     }
 
     /// The same, against a guest with §19.6's Windows semantics: the flag the
@@ -969,7 +975,7 @@ mod tests {
         target: Target,
         case_folding: bool,
     ) -> Applied {
-        run_pass(root, guest, ledger, target, case_folding, &[]).await
+        run_pass(root, guest, ledger, target, case_folding, false, &[]).await
     }
 
     async fn run_pass(
@@ -978,6 +984,7 @@ mod tests {
         ledger: &mut Ledger,
         mut target: Target,
         case_folding: bool,
+        unwitnessed: bool,
         dirty: &[&str],
     ) -> Applied {
         // As the syncer does: the root, and what the guest will really take,
@@ -994,6 +1001,7 @@ mod tests {
             .tree
             .keys()
             .chain(ledger.entries.keys())
+            .chain(ledger.left_standing.keys())
             .cloned()
             .chain(dirty.iter().map(|p| (*p).to_string()))
             .collect();
@@ -1019,8 +1027,15 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding,
+            unwitnessed,
         });
         apply(guest, &target, &plan, ledger).await
+    }
+
+    /// The first pass of a syncer that has just come back: the guest was read
+    /// with nothing having watched it in the meantime.
+    async fn pass_after_a_break(root: &Path, guest: &FakeGuest, ledger: &mut Ledger) -> Applied {
+        run_pass(root, guest, ledger, target(root), false, true, &[]).await
     }
 
     fn ledger_for(root: &Path) -> Ledger {
@@ -1092,6 +1107,7 @@ mod tests {
                 resolved: &BTreeMap::new(),
                 max_file_bytes: CAP,
                 case_folding: false,
+                unwitnessed: false,
             });
             assert!(matches!(plan.actions.as_slice(), [Action::Remove { .. }]));
             if to_host {
@@ -1262,6 +1278,83 @@ mod tests {
         assert!(ledger.entries.contains_key("a.txt"));
     }
 
+    /// **An interrupted pass never costs the host a file** (#190). The machine
+    /// stops part way through the seed: one transfer fails outright, and one
+    /// the guest had already answered for is not there when it comes back —
+    /// a guest stopped hard loses what it had not written out. The ledger
+    /// still agrees about that path, and reading its absence as a guest-side
+    /// delete is what removed a source file from the canonical copy. Both are
+    /// copied again, and nothing is removed.
+    #[tokio::test]
+    async fn an_interrupted_pass_resumes_the_copy_and_deletes_nothing_on_the_host() {
+        let dir = workspace(&[
+            ("answered.rs", "kept on the host"),
+            ("failed.rs", "also kept"),
+        ]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        guest.fail_push(&temp_beside("/src/failed.rs", false));
+
+        let first = pass(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(first.to_guest.placed, 1);
+        assert_eq!(first.failures.len(), 1, "{:?}", first.failures);
+        assert!(ledger.entries.contains_key("answered.rs"));
+        assert!(
+            ledger.unconfirmed.contains("answered.rs"),
+            "a fresh agreement is not yet borne out"
+        );
+        assert!(!ledger.entries.contains_key("failed.rs"));
+
+        // The machine stops, and comes back without the write it answered for.
+        guest.unlink("/src/answered.rs");
+
+        let second = pass_after_a_break(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(second.failures, vec![]);
+        assert_eq!(second.to_host.removed, 0, "the host copy was deleted");
+        assert_eq!(second.to_guest.placed, 2);
+        for (path, body) in [
+            ("answered.rs", "kept on the host"),
+            ("failed.rs", "also kept"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(path)).unwrap(),
+                body,
+                "{path} did not survive on the host"
+            );
+            assert_eq!(
+                guest.text(&format!("/src/{path}")).as_deref(),
+                Some(body),
+                "{path} was not copied again"
+            );
+            assert!(ledger.entries.contains_key(path));
+        }
+    }
+
+    /// The same absence with the copy that fails **again**: the agreement is
+    /// already gone, so the pass after it — an ordinary one, the break long
+    /// over — still sees a host file the guest lacks rather than a guest-side
+    /// delete.
+    #[tokio::test]
+    async fn a_lost_copy_that_fails_again_is_still_not_a_delete_on_the_next_pass() {
+        let dir = workspace(&[("a.rs", "kept")]);
+        let guest = FakeGuest::new();
+        let mut ledger = ledger_for(dir.path());
+        pass(dir.path(), &guest, &mut ledger).await;
+        guest.unlink("/src/a.rs");
+        guest.fail_push(&temp_beside("/src/a.rs", false));
+
+        let broken = pass_after_a_break(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(broken.failures.len(), 1, "{:?}", broken.failures);
+        assert_eq!(broken.to_host.removed, 0);
+        assert!(!ledger.entries.contains_key("a.rs"), "the agreement stood");
+
+        let resumed = pass(dir.path(), &guest, &mut ledger).await;
+        assert_eq!(resumed.to_host.removed, 0);
+        assert_eq!(resumed.to_guest.placed, 1);
+        assert!(dir.path().join("a.rs").exists());
+        assert_eq!(guest.text("/src/a.rs").as_deref(), Some("kept"));
+    }
+
     /// Each side's own size and mtime, recorded from that side. The guest's
     /// come from the guest after the rename; the host's from the host scan.
     #[tokio::test]
@@ -1347,6 +1440,7 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
+            unwitnessed: false,
         });
         let done = apply(&guest, &target(dir.path()), &plan, &mut ledger).await;
 
@@ -1475,6 +1569,13 @@ mod tests {
         // And it is not retried, pass after pass, forever.
         let again = pass(dir.path(), &guest, &mut ledger).await;
         assert_eq!(again, Applied::default());
+
+        // Nor is the directory the host deleted made again there, where the
+        // guest's watch names it (review #380 F11).
+        assert_eq!(ledger.left_standing.get("pkg"), Some(&Keeper::Guest));
+        let named = pass_with(dir.path(), &guest, &mut ledger, &["pkg"]).await;
+        assert_eq!(named, Applied::default());
+        assert!(!dir.path().join("pkg").exists());
     }
 
     /// The size guard refuses the one file, before transfer, and the rest of
@@ -1495,6 +1596,7 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: 4,
             case_folding: false,
+            unwitnessed: false,
         });
         apply(&guest, &target(dir.path()), &plan, &mut ledger).await;
 
@@ -1830,19 +1932,20 @@ mod tests {
         assert!(dir.path().join("pkg/target/out").exists());
         assert!(!ledger.entries.contains_key("pkg"));
 
-        // The removal is not retried. The host does still hold the directory,
-        // so the ordinary one-side-changed rule puts it back in the guest —
-        // and then both sides agree and nothing moves again.
-        let again = pass(dir.path(), &guest, &mut ledger).await;
-        assert_eq!(
-            again.to_host.removed, 0,
-            "the impossible removal was retried"
-        );
-        assert_eq!(again.to_guest.placed, 1);
+        assert_eq!(ledger.left_standing.get("pkg"), Some(&Keeper::Host));
+
+        // The removal is not retried, and the directory the guest deleted is
+        // not made again there (review #380 F11): nothing moves.
         assert_eq!(
             pass(dir.path(), &guest, &mut ledger).await,
             Applied::default()
         );
+        assert!(guest.get("/src/pkg").is_none());
+
+        // The host drops it too: the record has nothing left to be about.
+        std::fs::remove_dir_all(dir.path().join("pkg")).unwrap();
+        pass(dir.path(), &guest, &mut ledger).await;
+        assert!(ledger.left_standing.is_empty());
     }
 
     /// The temp lives in the target's own directory, so the rename is atomic

@@ -165,13 +165,14 @@ $exitCode = $null
 $taskResult = $null
 try {
     Start-ScheduledTask -TaskName $taskName
-    # Find the process the task started. A task stays Queued until the user's
-    # logon has finished, so allow for that.
+    # Find the process the task started in the interactive session. A Raw
+    # PowerShell probe can have the same executable as this session 0 runner.
+    # A task can stay queued until the user's logon has finished.
     $deadline = $started.AddSeconds(180)
     $escaped = $Path.Replace('\', '\\').Replace("'", "\'")
     while (-not $proc -and (Get-Date) -lt $deadline) {
         $cim = Get-CimInstance Win32_Process -Filter "ExecutablePath='$escaped'" |
-            Where-Object { $_.CreationDate -ge $started.AddSeconds(-2) } | Select-Object -First 1
+            Where-Object { $_.SessionId -ne 0 -and $_.CreationDate -ge $started.AddSeconds(-2) } | Select-Object -First 1
         if ($cim) {
             try {
                 $proc = [Diagnostics.Process]::GetProcessById([int]$cim.ProcessId)

@@ -305,12 +305,41 @@ fn writable_disks(reg: &SnapshotRegistry) -> impl Iterator<Item = &DiskNode> {
     reg.disks.iter().filter(|d| d.writable)
 }
 
+// The colon keeps this namespace outside the lab's snapshot name grammar.
+// Older, unmarked checkpoint names could also be user snapshots.
+const ROLLBACK_PREFIX: &str = "vmlab-hv-rollback-:";
+
+/// Reclaim interrupted loads before the guest can write to its disks.
+/// Each disk is independent because a process can die midway through capture
+/// or deletion of the checkpoint.
+pub(crate) fn remove_stale_checkpoints(disks: &[DiskNode]) -> Result<(), SnapshotError> {
+    for disk in disks.iter().filter(|disk| disk.writable) {
+        let mut image = disk.image.lock();
+        let snapshots = image
+            .snapshots()
+            .map_err(|err| SnapshotError::from_disk("snapshots", &disk.id, err))?;
+        for snapshot in snapshots {
+            if snapshot.name.starts_with(ROLLBACK_PREFIX) {
+                image
+                    .snapshot_delete(&snapshot.name)
+                    .map_err(|err| SnapshotError::from_disk("snapshot_delete", &disk.id, err))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- save --------------------------------------------------------------
 
 /// `snapshot_save {name}`: quiesce, capture, stream into the vmstate disk,
 /// write the internal snapshot on every writable disk, and leave the machine
 /// in the run state it had.
 pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
+    if name.starts_with(ROLLBACK_PREFIX) {
+        return Err(SnapshotError::Unsupported(
+            "snapshot name is reserved for internal rollback checkpoints".into(),
+        ));
+    }
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
@@ -339,6 +368,24 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     // Refuse what cannot work before touching the run state.
     let reg = registry(handle)?;
     let vmstate_disk = vmstate_disk(&reg)?;
+    if name.is_empty() || name.len() > 1023 {
+        return Err(SnapshotError::Unsupported(
+            "snapshot name must be 1..=1023 bytes".into(),
+        ));
+    }
+    for disk in writable_disks(&reg) {
+        let snapshots = disk
+            .image
+            .lock()
+            .snapshots()
+            .map_err(|e| SnapshotError::from_disk("snapshots", &disk.id, e))?;
+        if snapshots.iter().any(|snapshot| snapshot.name == name) {
+            return Err(SnapshotError::Unsupported(format!(
+                "disk `{}`: snapshot {name:?} already exists",
+                disk.id
+            )));
+        }
+    }
     let was = shared
         .stop_for_snapshot(QUIESCE_TIMEOUT)
         .map_err(SnapshotError::Internal)?;
@@ -374,35 +421,64 @@ fn capture_and_write(
         &sections,
     );
 
-    // Stream into the vmstate area, RAM last and run-length coded.
-    let mut offset: u64 = 0;
-    let mut total: u64 = 0;
-    {
-        let mut image = vmstate_disk.image.lock();
-        let mut write = |bytes: &[u8]| -> Result<(), SnapshotError> {
-            image
-                .write_vmstate(offset, bytes)
-                .map_err(|e| SnapshotError::from_disk("write_vmstate", &vmstate_disk.id, e))?;
-            offset += bytes.len() as u64;
-            total += bytes.len() as u64;
-            Ok(())
-        };
-        write(&head)?;
-        let ram = shared
-            .ram()
-            .ok_or_else(|| SnapshotError::Internal("machine has no RAM".into()))?;
-        stream_ram_out(&ram, &mut write)?;
-    }
+    let ram = shared
+        .ram()
+        .ok_or_else(|| SnapshotError::Internal("machine has no RAM".into()))?;
+    let mut active_vmstate = 0;
+    let mut created = Vec::new();
+    let result = (|| {
+        // Stream into the vmstate area, RAM last and run-length coded.
+        {
+            let mut image = vmstate_disk.image.lock();
+            let mut write = |bytes: &[u8]| -> Result<(), SnapshotError> {
+                let offset = active_vmstate;
+                // A failing write can still have mapped part of this range.
+                active_vmstate += bytes.len() as u64;
+                image
+                    .write_vmstate(offset, bytes)
+                    .map_err(|e| SnapshotError::from_disk("write_vmstate", &vmstate_disk.id, e))
+            };
+            write(&head)?;
+            stream_ram_out(&ram, &mut write)?;
+        }
 
-    // The internal snapshot on every writable disk, under the same name.
-    for disk in writable_disks(reg) {
-        let mut image = disk.image.lock();
-        let size = if disk.vmstate { total } else { 0 };
-        image
-            .snapshot_create(name, size, 0)
-            .map_err(|e| SnapshotError::from_disk("snapshot_create", &disk.id, e))?;
+        for disk in writable_disks(reg) {
+            let size = if disk.vmstate { active_vmstate } else { 0 };
+            disk.image
+                .lock()
+                .snapshot_create(name, size, 0)
+                .map_err(|e| SnapshotError::from_disk("snapshot_create", &disk.id, e))?;
+            created.push(disk);
+            if disk.vmstate {
+                active_vmstate = 0;
+            }
+        }
+        Ok(())
+    })();
+    let Err(error) = result else {
+        return Ok(());
+    };
+
+    let mut cleanup = Vec::new();
+    for disk in created.into_iter().rev() {
+        if let Err(err) = disk.image.lock().snapshot_delete(name) {
+            cleanup.push(SnapshotError::from_disk("snapshot_delete", &disk.id, err).to_string());
+        }
     }
-    Ok(())
+    if active_vmstate != 0
+        && let Err(err) = vmstate_disk.image.lock().discard_vmstate(active_vmstate)
+    {
+        cleanup
+            .push(SnapshotError::from_disk("discard_vmstate", &vmstate_disk.id, err).to_string());
+    }
+    if cleanup.is_empty() {
+        Err(error)
+    } else {
+        Err(SnapshotError::Internal(format!(
+            "{error}; cleanup of snapshot {name:?} failed: {}",
+            cleanup.join("; ")
+        )))
+    }
 }
 
 fn ram_regions(ram: &crate::memory::GuestRam) -> Vec<(u64, u64)> {
@@ -636,7 +712,7 @@ fn load_checkpoint_name(reg: &SnapshotRegistry, name: &str) -> Result<String, Sn
             .map_err(|e| SnapshotError::from_disk("snapshots", &disk.id, e))?;
         let target = snapshots
             .iter()
-            .find(|snapshot| snapshot.name == name || snapshot.id == name)
+            .find(|snapshot| snapshot.name == name)
             .ok_or_else(|| {
                 SnapshotError::NotFound(format!("disk `{}` has no snapshot {name:?}", disk.id))
             })?;
@@ -653,7 +729,7 @@ fn load_checkpoint_name(reg: &SnapshotRegistry, name: &str) -> Result<String, Sn
     }
     loop {
         let checkpoint = format!(
-            "vmlab-hv-rollback-{}-{}",
+            "{ROLLBACK_PREFIX}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
@@ -690,11 +766,7 @@ fn restore_with_rollback(
     was: vmlab_hv_proto::control::RunState,
 ) -> (u8, Result<(), SnapshotError>) {
     if let Err(error) = capture_and_write(shared, reg, vmstate_disk, checkpoint, was) {
-        let result = match delete_checkpoint(reg, checkpoint) {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(SnapshotError::Internal(format!("{error}; {cleanup}"))),
-        };
-        return (run_code(was), result);
+        return (run_code(was), Err(error));
     }
     let restored = restore(shared, reg, vmstate_disk, name);
     if let Err(error) = &restored
@@ -854,21 +926,24 @@ fn restore(
 // ---- delete ------------------------------------------------------------
 
 /// `snapshot_delete {name}`: remove the internal snapshot from every
-/// writable disk. Missing on any disk is an error naming it; the others are
-/// still cleaned.
+/// writable disk. Report missing entries only if every attempted deletion
+/// succeeded or found nothing, so a caller can safely accept that outcome.
 pub fn delete(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let reg = registry(handle)?;
     let mut first_err = None;
+    let mut missing = None;
     for disk in writable_disks(&reg) {
         let mut image = disk.image.lock();
         if let Err(e) = image.snapshot_delete(name) {
             let err = SnapshotError::from_disk("snapshot_delete", &disk.id, e);
-            if first_err.is_none() {
-                first_err = Some(err);
+            if err.is_not_found() {
+                missing.get_or_insert(err);
+            } else {
+                first_err.get_or_insert(err);
             }
         }
     }
-    match first_err {
+    match first_err.or(missing) {
         Some(err) => Err(err),
         None => Ok(()),
     }

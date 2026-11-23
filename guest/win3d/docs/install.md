@@ -163,10 +163,10 @@ powershell -ExecutionPolicy Bypass -File C:\ProgramData\vmlab-win3d\vmlab-win3d.
 | Driver | Lifts this device's pin (below), removes older builds of this package from the driver store (`pnputil /delete-driver oemNN.inf /uninstall /force`), then runs `pnputil /add-driver viogpu3d.inf /install`. If the device still uses another driver (`DEVPKEY_Device_DriverInfPath`), installs this package on it with `UpdateDriverForPlugAndPlayDevices` and `INSTALLFLAG_FORCE`. The INF copies the UMDs and the Venus ICD into System32 and SysWOW64 and registers them (below). | — |
 | Pin | Lists the device instance under the device installation policy `DenyInstanceIDs` (`HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`), so neither Windows Update nor `pnputil` can put another driver, such as a newer `viogpudo`, on it ([installer.md](installer.md)). | — |
 | Vulkan loader | Installs `vulkan-1.dll` and `vulkaninfo.exe` into System32 (x64) and SysWOW64 (x86) when the existing `vulkan-1.dll` is absent or has an older file version (the binary version resource is compared). Otherwise it keeps the existing loader and installs `vulkaninfo.exe` only where none exists. The template's loader is 1.3.300; the package's is 1.4.363. | — |
-| D3D12 bridge | For System32 and SysWOW64: copies the machine's own `d3d12.dll` to `vmlab-win3d\d3d12-native.dll`, copies `vkd3dcore.dll` and `dxgi-vulkan.dll` there, takes ownership of `d3d12.dll` (`takeown /A`, `icacls /grant`), replaces it with the bridge, and puts back the original owner (TrustedInstaller) and ACL. | — |
+| D3D12 bridge | For System32 and SysWOW64: copies the machine's own `d3d12.dll` to `vmlab-win3d\d3d12-native.dll` and to `vmlab-win3d\native\d3d12.dll` (the copy a Chromium GPU process loads, [chromium.md](chromium.md)), copies `vkd3dcore.dll` and `dxgi-vulkan.dll` to `vmlab-win3d\`, takes ownership of `d3d12.dll` (`takeown /A`, `icacls /grant`), replaces it with the bridge, and puts back the original owner (TrustedInstaller) and ACL. | — |
 | Repair task | Registers `vmlab-win3d-repair`, a SYSTEM startup task. At each boot it also puts the device back on this package, and the pin back, if either went. | — |
 | Final reboot | Registers `vmlab-win3d-resume` and restarts, unless nothing changed. | Yes |
-| Verify | After the restart: the device uses this package with problem code 0 and is pinned, `UserModeDriverName` and `OpenGLDriverName` are set, both bridges and `d3d12-native.dll` are in place, and both Vulkan ICDs are registered. Sets `state.json` to `Installed` and removes the resume task. | — |
+| Verify | After the restart: the device uses this package with problem code 0 and is pinned, `UserModeDriverName` and `OpenGLDriverName` are set, both bridges, `d3d12-native.dll` and its copy `native\d3d12.dll` are in place, and both Vulkan ICDs are registered. Sets `state.json` to `Installed` and removes the resume task. | — |
 
 A first install from the template takes two restarts. Once test signing is
 active, an upgrade takes one, and a rerun of the same bundle takes none.
@@ -221,8 +221,10 @@ bundle's `Install.cmd` upgrades in place and keeps the original baseline.
 
 A cumulative update can put Microsoft's `d3d12.dll` back. At every boot,
 `vmlab-win3d-repair` checks both `d3d12.dll` files. A file that is not the
-bridge is treated as the new native DLL: it becomes `d3d12-native.dll` and
-the newest backup, and the bridge goes back in place. The journal records it.
+bridge is treated as the new native DLL: it becomes `d3d12-native.dll`,
+`native\d3d12.dll` and the newest backup, and the bridge goes back in place.
+The journal records it. Until that boot a Chromium GPU process loads
+Microsoft's new `d3d12.dll` from System32 by itself, so it keeps running.
 
 ## Troubleshooting
 

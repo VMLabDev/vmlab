@@ -84,6 +84,10 @@ type HostGpu {
   @schemaless qemu_env: QemuEnv?
   @doc("Hold the GPU out of runtime suspend from the first virgl/vulkan VM on it until the supervisor stops: `auto` (default; an NVIDIA GPU that can runtime-suspend), `on`, or `off`")
   keepawake: utf8?
+  @doc("Hide an uncached host-visible memory type from a `vulkan` guest when the same heap has a cached one (default false); for a host whose CPU and GPU do not see that memory alike")
+  hide_uncached_memory: bool?
+  @doc("The card's other PCI functions (its HDMI/DP audio) a `passthrough` guest on vmlab-hv gets with it, each bound to `vfio-pci`; left out, every function of the slot already bound to `vfio-pci` goes")
+  passthrough_functions: list<utf8>?
 }
 
 // `qemu_env`'s shape: a record of strings, keyed by variable name. WCL has

@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import harness
-from features import HOST, PHASES
+from features import HOST, NO_X86_ON_QEMU, PHASES, out_of_scope
 from run import scenario_features
 from scenarios.fastpath import nic_attachments
 
@@ -27,7 +27,7 @@ class ScenarioScopeTests(unittest.TestCase):
         self.addCleanup(h.log.close)
         return h
 
-    def test_all_34_delivered_core_and_admin_features_follow_vmlab(self):
+    def test_all_38_delivered_core_and_admin_features_follow_vmlab(self):
         h = self.new_harness("vmlab")
         delivered = set()
         for name in ("core", "admin"):
@@ -42,44 +42,48 @@ class ScenarioScopeTests(unittest.TestCase):
                 h.ok(feature, True, "scope regression")
                 self.assertEqual(h.results[feature][0], "pass", feature)
         self.assertIn("vm.hw.tsc", delivered)
-        self.assertEqual(len(delivered), 34)
+        self.assertIn("lab.down.isolation", delivered)
+        self.assertIn("arch.emulated", delivered)
+        self.assertEqual(len(delivered), 38)
 
-    def test_host_config_exercises_automatic_containers_on_vmlab(self):
-        for hypervisor in ("qemu", "vmlab"):
-            h = self.new_harness(hypervisor)
-            for vms in (False, True):
-                config = h.host_config(vms)
-                if hypervisor == "qemu":
-                    self.assertIn('container = "qemu"', config)
-                else:
-                    self.assertNotIn('container =', config)
-                vm = hypervisor if vms else "qemu"
-                self.assertIn(f'vm = "{vm}"', config)
-
-    def test_unsupported_features_keep_their_reasons(self):
+    def test_default_vmlab_scope_reports_phase_4_results(self):
         h = self.new_harness("vmlab")
-        h.vms_here = True
-        for feature, reason in {
-            "vm.hw.qemu_args": "QEMU only:",
-            "vm.hw.floppy": "vmlab-hv phase 4",
-            "vm.media.floppy": "vmlab-hv phase 4",
-            "arch.emulated": "vmlab-hv phase 3",
-        }.items():
+        phase_4 = {feature for feature, phase in PHASES.items() if phase == "4"}
+        self.assertEqual(len(phase_4), 8)
+        for feature in phase_4:
             with self.subTest(feature=feature):
+                h.vms_here = h.vms_follow({feature})
                 h.ok(feature, True)
-                status, detail = h.results[feature]
-                self.assertEqual(status, "skip")
-                self.assertTrue(detail.startswith(reason), detail)
+                self.assertEqual(h.results[feature][0], "pass")
+                h.ok(feature, False)
+                self.assertEqual(h.results[feature][0], "fail")
+                self.assertEqual(out_of_scope(feature, "vmlab", "2f"), "vmlab-hv phase 4")
+        # The aarch64 guest is in scope whatever the cutoff: QEMU runs it.
+        self.assertIsNone(out_of_scope("arch.emulated", "vmlab", "2f"))
 
-    def test_qemu_keeps_every_core_and_admin_feature_in_scope(self):
+    def test_host_config_leaves_a_vmlab_run_to_automatic_selection(self):
+        for vms in (False, True):
+            # QEMU runs no x86 guest: a vmlab run names no hypervisor at all.
+            self.assertEqual(self.new_harness("vmlab").host_config(vms), "")
+            config = self.new_harness("qemu").host_config(vms)
+            self.assertIn('container = "qemu"', config)
+            self.assertIn('vm = "qemu"', config)
+
+    def test_qemu_runs_its_aarch64_guest_alone(self):
         h = self.new_harness("qemu")
         for name in ("core", "admin"):
             h.scenario = name
             for feature in scenario_features(name):
                 with self.subTest(feature=feature):
-                    self.assertIsNone(h.out_of_scope(feature))
                     h.ok(feature, True)
-                    self.assertEqual(h.results[feature][0], "pass")
+                    if feature == "arch.emulated":
+                        self.assertIsNone(h.out_of_scope(feature))
+                        self.assertEqual(h.results[feature][0], "pass")
+                    else:
+                        self.assertEqual(h.results[feature], ("skip", NO_X86_ON_QEMU))
+        # And on a vmlab run the aarch64 guest is in scope too: automatic
+        # selection puts it on QEMU.
+        self.assertIsNone(self.new_harness("vmlab").out_of_scope("arch.emulated"))
 
     def test_fastpath_follows_vmlab_and_cannot_overwrite_a_failure(self):
         h = self.new_harness("vmlab")

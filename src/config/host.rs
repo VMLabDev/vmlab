@@ -47,6 +47,27 @@ impl AppleSmcOsk {
     }
 }
 
+/// The pre-shared key that authenticates cross-host trunks (§9.2). Debug
+/// output must never expose its contents.
+#[derive(Clone)]
+pub struct TrunkPsk(String);
+
+impl std::fmt::Debug for TrunkPsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl TrunkPsk {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     /// Repository names or slash-terminated namespaces trusted for host scripts.
@@ -55,7 +76,7 @@ pub struct HostConfig {
     pub dns_suffix: String,
     pub dns_upstream: Option<String>,
     pub disk_low_percent: u8,
-    pub psk: Option<String>,
+    pub psk: Option<TrunkPsk>,
     pub apple_smc_osk: Option<AppleSmcOsk>,
     /// TCP listen port for inbound cross-host segment trunks (§9.2).
     pub trunk_port: u16,
@@ -126,6 +147,16 @@ pub struct HostGpu {
     /// Whether the supervisor holds this GPU out of runtime suspend while
     /// VMs render on it (ADR-0018).
     pub keepawake: KeepAwake,
+    /// Hide this GPU's uncached host-visible memory types from a `vulkan`
+    /// guest where the same heap has a cached one (PRD §5.2). Off unless
+    /// set: for a host whose CPU and GPU do not see that memory alike.
+    pub hide_uncached_memory: bool,
+    /// The card's other PCI functions `passthrough` hands a vmlab-hv guest
+    /// with it — its HDMI/DP audio (PRD §5.2). `None`, the key left out,
+    /// takes every function of the slot already bound to `vfio-pci`; a list
+    /// is exactly what goes, each entry refused at resolution
+    /// (`qemu::hostgpu::render_plan`) unless it is bound to `vfio-pci`.
+    pub passthrough_functions: Option<Vec<String>>,
 }
 
 /// A host GPU's `keepawake` (PRD §5.2, ADR-0018): whether the supervisor
@@ -236,11 +267,20 @@ impl HostConfig {
             if let Some(v) = r.string("dns_suffix").unspan() {
                 cfg.dns_suffix = v;
             }
-            cfg.dns_upstream = r.string("dns_upstream").unspan();
+            if let Some(upstream) = r.string("dns_upstream") {
+                if parse_upstream(&upstream.value).is_some() {
+                    cfg.dns_upstream = Some(upstream.value);
+                } else {
+                    r.issue_at(
+                        upstream.span,
+                        "`dns_upstream` must be an IP address, optionally with a port",
+                    );
+                }
+            }
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
                 cfg.disk_low_percent = v;
             }
-            cfg.psk = r.string("psk").unspan();
+            cfg.psk = r.string("psk").unspan().map(TrunkPsk::new);
             if let Some(v) = r.string("apple_smc_osk") {
                 match AppleSmcOsk::parse(v.value) {
                     Ok(key) => cfg.apple_smc_osk = Some(key),
@@ -329,6 +369,8 @@ impl HostConfig {
                     .keyword("keepawake", KeepAwake::NAMES)
                     .unspan()
                     .unwrap_or_default(),
+                hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
+                passthrough_functions: r.opt_string_list("passthrough_functions"),
             };
             if let Some(prev) = cfg
                 .gpus
@@ -382,10 +424,10 @@ impl HostConfig {
     /// `dns_upstream` when set, else the host's own resolver. `None` leaves
     /// unmatched names NXDOMAIN.
     pub fn upstream_resolver(&self) -> Option<std::net::SocketAddr> {
-        self.dns_upstream
-            .as_deref()
-            .and_then(parse_upstream)
-            .or_else(host_resolver)
+        match self.dns_upstream.as_deref() {
+            Some(upstream) => parse_upstream(upstream),
+            None => host_resolver(),
+        }
     }
 }
 
@@ -491,6 +533,18 @@ mod tests {
             );
             assert!(!format!("{error:?}").contains(&source));
         }
+    }
+
+    /// The trunk PSK is a secret like the OSK (config review F6).
+    #[test]
+    fn the_psk_is_hidden_from_debug() {
+        let host = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { psk = \"sekrit-psk\" }",
+            "<test>",
+        )
+        .unwrap();
+        assert!(host.psk.is_some());
+        assert!(!format!("{host:?}").contains("sekrit-psk"));
     }
 
     #[test]
@@ -600,7 +654,7 @@ host {
         assert_eq!(cfg.subnet_pool.to_string(), "10.99.0.0/16");
         assert_eq!(cfg.dns_suffix, "lab.local");
         assert_eq!(cfg.disk_low_percent, 5);
-        assert_eq!(cfg.psk.as_deref(), Some("sekrit"));
+        assert_eq!(cfg.psk.as_ref().map(TrunkPsk::expose), Some("sekrit"));
         assert_eq!(cfg.trunk_port, 13948);
         assert_eq!(cfg.oci_chunk_size, 128 << 20);
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
@@ -680,6 +734,46 @@ gpu "Nvidia1" {
         );
         let amd = cfg.gpu("AMD1").unwrap();
         assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
+    }
+
+    /// `hide_uncached_memory` is off unless a GPU block turns it on.
+    #[test]
+    fn parses_a_host_gpus_hide_uncached_memory() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  default = true }
+gpu "Nvidia1" { address = "0000:01:00.0"  hide_uncached_memory = true }
+gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let on: Vec<bool> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
+        assert_eq!(on, [false, true, false]);
+    }
+
+    /// `passthrough_functions` tells a key left out from an empty list:
+    /// the first takes what is bound to `vfio-pci`, the second nothing.
+    #[test]
+    fn parses_a_host_gpus_passthrough_functions() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  default = true }
+gpu "Nvidia1" { address = "0000:01:00.0"  passthrough_functions = [] }
+gpu "Nvidia2" { address = "0000:05:00.0"  passthrough_functions = ["0000:05:00.1"] }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let functions: Vec<_> = cfg
+            .gpus
+            .iter()
+            .map(|g| g.passthrough_functions.clone())
+            .collect();
+        assert_eq!(
+            functions,
+            [None, Some(vec![]), Some(vec!["0000:05:00.1".to_string()])]
+        );
     }
 
     /// `keepawake` reads `auto`, `on` or `off`, defaults to `auto`, and
@@ -803,6 +897,31 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
         let source = format!("import <vmlab-host.wcl>\n{body}");
         let err = HostConfig::parse(&source, "config.wcl").expect_err("should be rejected");
         format!("{err:#}")
+    }
+
+    #[test]
+    fn a_malformed_dns_upstream_is_refused() {
+        for upstream in ["dns.corp", "10.0.0.1:"] {
+            assert!(
+                host_err(&format!("host {{ dns_upstream = \"{upstream}\" }}\n"))
+                    .contains("config.wcl:2:8: `dns_upstream`")
+            );
+        }
+    }
+
+    #[test]
+    fn a_dns_upstream_ip_accepts_an_optional_port() {
+        for (upstream, address) in [
+            ("192.0.2.1", "192.0.2.1:53"),
+            ("192.0.2.1:5353", "192.0.2.1:5353"),
+            ("2001:db8::1", "[2001:db8::1]:53"),
+            ("[2001:db8::1]:5353", "[2001:db8::1]:5353"),
+        ] {
+            let source =
+                format!("import <vmlab-host.wcl>\nhost {{ dns_upstream = \"{upstream}\" }}");
+            let host = HostConfig::parse(&source, "config.wcl").unwrap();
+            assert_eq!(host.upstream_resolver(), Some(address.parse().unwrap()));
+        }
     }
 
     #[test]

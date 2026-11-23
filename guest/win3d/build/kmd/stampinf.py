@@ -2,8 +2,9 @@
 """Turn viogpu3d_x64_wow64.inx into INF files, as the upstream MSBuild does.
 
 Upstream runs three steps on Windows:
-  1. tools/prepare_package_inx.ps1 drops the Lavapipe and yttrium12 entries
-     when those payloads are absent (they are, here);
+  1. tools/prepare_package_inx.ps1 drops the Lavapipe, yttrium12 and
+     d3d11on12 entries when those payloads are absent (they are, here: no
+     source for yttrium12.dll or its patched d3d11on12.dll is published);
   2. stampinf.exe replaces $ARCH$ and writes DriverVer;
   3. Driver.Common.targets substitutes the INX_* vendor strings.
 
@@ -32,9 +33,12 @@ SUBSTITUTIONS = {
     "_INX_SUBSYS_VENDOR_ID": "1AF4",
 }
 
-# prepare_package_inx.ps1 with no Lavapipe and no yttrium12 payload.
+# prepare_package_inx.ps1 with no Lavapipe, no yttrium12 and no On12 payload.
+# A line that holds one of these tokens is removed: the file entries, and the
+# driver-store section VioGpu3D_Files.Yttrium12 with its DestinationDirs line.
 ABSENT_PAYLOAD = ["vulkan_lvp_x64.dll", "lvp_icd.x86_64.json",
-                  "vulkan_lvp_x86.dll", "lvp_icd.x86.json", "yttrium12_x64.dll"]
+                  "vulkan_lvp_x86.dll", "lvp_icd.x86.json",
+                  "yttrium12.dll", "VioGpu3D_Files.Yttrium12", "d3d11on12.dll"]
 
 # Everything the Mesa build provides. The kernel-only INF drops these files,
 # their CopyFiles sections and the registry values that point at them.
@@ -52,8 +56,9 @@ def common(lines, version, date):
     out = []
     for line in lines:
         # prepare_package_inx.ps1: drop the DX12 slot, keep DX9/10/11.
-        line = re.sub(r",%11%\\yttrium12\.dll\s*$", "", line)
+        line = re.sub(r",%13%\\x64\\yttrium12\.dll\s*$", "", line)
         line = re.sub(r",yttrium12\s*$", "", line)
+        line = line.replace(", VioGpu3D_Files.Yttrium12", "")
         if any(tok in line for tok in ABSENT_PAYLOAD):
             continue
         # stampinf -a $(InfArch). viogpu3d.vcxproj sets InfArch to

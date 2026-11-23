@@ -353,6 +353,7 @@ pub struct ContainerInstance {
     snapshot_refusal: std::sync::Mutex<Option<String>>,
 
     state: RwLock<PowerState>,
+    snapshot_gate: Arc<Mutex<()>>,
     /// The bundled vmlab-agent answers its handshake.
     agent_up: RwLock<bool>,
     /// cinit reported the container process running (ctl `started`).
@@ -422,6 +423,7 @@ impl ContainerInstance {
             virtiofs_active: AtomicBool::new(false),
             snapshot_refusal: std::sync::Mutex::new(None),
             state: RwLock::new(PowerState::Stopped),
+            snapshot_gate: Arc::default(),
             agent_up: RwLock::new(false),
             started: RwLock::new(false),
             ready: RwLock::new(false),
@@ -736,6 +738,7 @@ impl ContainerInstance {
         on_health: impl Fn(bool) + Send + Sync + 'static,
     ) -> Result<()> {
         {
+            let _snapshot = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
             let mut st = self.state.write().await;
             if *st != PowerState::Stopped {
                 bail!("{} is {:?}", self.cfg.name, *st);
@@ -1112,29 +1115,48 @@ impl ContainerInstance {
     /// state outside snapshot scope, §7.5 semantics). Online captures RAM +
     /// device state into the same qcow2, exactly like a VM; returns whether
     /// the capture was online.
-    async fn take_snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<bool, super::machine::SnapshotCaptureError> {
+        use super::machine::SnapshotCaptureError::Attempted;
+
         super::vm::validate_snapshot_name(name)?;
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
-                    bail!("{why}");
+                    return Err(anyhow!("{why}").into());
                 }
                 let snapshots = self.capability(|c| c.snapshots()).await?;
-                snapshots.save(name, "scratch", &["scratch"]).await?;
+                snapshots
+                    .save(name, "scratch", &["scratch"])
+                    .await
+                    .map_err(Attempted)?;
                 Ok(true)
             }
             PowerState::Stopped => {
                 let scratch = self.dirs.scratch_disk();
                 if !scratch.exists() {
-                    bail!(
+                    return Err(anyhow!(
                         "{}: no scratch disk yet — the container has never started",
                         self.cfg.name
-                    );
+                    )
+                    .into());
                 }
-                crate::template::qimg::snapshot_create(&scratch, name).await?;
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    crate::template::qimg::snapshot_create(&scratch, &name).await?;
+                    Ok(())
+                })
+                .await
+                .map_err(Attempted)?;
                 Ok(false)
             }
-            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+            other => {
+                Err(anyhow!("{} is {:?} — wait for it to settle", self.cfg.name, other).into())
+            }
         }
     }
 
@@ -1146,7 +1168,10 @@ impl ContainerInstance {
         let snapshots = self.capability(|c| c.snapshots()).await?;
         let control = self.running_control().await?;
         control.pause().await?;
-        snapshots.load(name, "scratch", &["scratch"]).await?;
+        if let Err(error) = snapshots.load(name, "scratch", &["scratch"]).await {
+            let resume = control.resume().await;
+            return Err(error.context(format!("snapshot load failed, resume: {resume:?}")));
+        }
         // Drop the agent connection BEFORE resuming: the rewound guest
         // replays virtio-serial response bytes the host already consumed.
         // With no client attached, QEMU discards the replayed bytes; the
@@ -1187,23 +1212,46 @@ impl ContainerInstance {
     /// disk, stay off (PRD §7.3 restore semantics). The stop sets
     /// `stop_requested`, so the exit is classified as requested.
     async fn restore_offline(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         if self.power_state().await != PowerState::Stopped {
             self.stop_ladder(false).await?;
             self.settle_stopped(Duration::from_secs(60)).await?;
         }
-        crate::template::qimg::snapshot_apply(&self.dirs.scratch_disk(), name).await?;
-        Ok(())
+        let scratch = self.dirs.scratch_disk();
+        let name = name.to_owned();
+        super::machine::finish_offline_snapshot(guard, async move {
+            crate::template::qimg::snapshot_apply(&scratch, &name).await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 snapshots.delete(name, &["scratch"]).await?;
             }
-            _ => {
-                crate::template::qimg::snapshot_delete(&self.dirs.scratch_disk(), name).await?;
+            PowerState::Stopped => {
+                let scratch = self.dirs.scratch_disk();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    if scratch.try_exists()?
+                        && crate::template::qimg::image_info(&scratch)
+                            .await?
+                            .snapshots
+                            .iter()
+                            .any(|snapshot| snapshot.name == name)
+                    {
+                        crate::template::qimg::snapshot_delete(&scratch, &name).await?;
+                    }
+                    Ok(())
+                })
+                .await?;
             }
+            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
         }
         Ok(())
     }
@@ -1217,6 +1265,19 @@ impl ContainerInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for ContainerInstance {
+    /// [`Self::stop_ladder`]'s waits: the ctl rung's grace and margin, the
+    /// agent's connect, answer and exit, then the kill's exit and settle.
+    async fn stop_wait(&self) -> Duration {
+        if self.qemu.lock().await.is_none() {
+            return Duration::ZERO;
+        }
+        let grace = self
+            .image_parts()
+            .map(|p| p.spec.stop_grace_secs)
+            .unwrap_or(10);
+        Duration::from_secs(grace + 15 + 2 + 5 + 15 + 10 + 10)
+    }
+
     async fn debug_available(&self) -> bool {
         self.control
             .lock()
@@ -1360,20 +1421,6 @@ impl super::machine::Machine for ContainerInstance {
         self.hypervisor_fallback.clone()
     }
 
-    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
-        let source = self.selection_source?;
-        crate::config::hypervisor::qemu_removal(
-            model::MachineCfg::Container(&self.cfg),
-            &crate::config::hypervisor::HypervisorSelection {
-                kind: self.hypervisor,
-                source,
-                fallback_reason: self.hypervisor_fallback.clone(),
-            },
-            &(self.host_facts)(),
-            None,
-        )
-    }
-
     async fn state(&self) -> PowerState {
         self.power_state().await
     }
@@ -1430,7 +1477,7 @@ impl super::machine::Machine for ContainerInstance {
         std::fs::create_dir_all(&self.dirs.run)?;
         // The micro-VM connects to the sockets itself, so the attachments are
         // the lab's to hold, not this machine's.
-        super::machine::attach_all_nics(&*self, &*lab).await?;
+        lab.attach_nics(&*self).await?;
 
         let events_exit = events.clone();
         let events_health = events.clone();
@@ -1532,7 +1579,7 @@ impl super::machine::Machine for ContainerInstance {
         super::machine::AgentOrigin::HostAsset
     }
 
-    async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {
         self.take_snapshot(name).await
     }
 
@@ -1730,7 +1777,11 @@ mod tests {
     // ---- the Machine interface ---------------------------------------------
 
     fn instance(name: &str) -> Arc<ContainerInstance> {
-        let dirs = ContainerDirs::new(Path::new("/tmp/vmlab-test"), "lab", name);
+        instance_in(Path::new("/tmp/vmlab-test"), name)
+    }
+
+    fn instance_in(root: &Path, name: &str) -> Arc<ContainerInstance> {
+        let dirs = ContainerDirs::new(root, "lab", name);
         let cfg = container(name);
         let resolved = crate::qemu::resolve_container(
             &cfg,
@@ -1792,6 +1843,20 @@ mod tests {
         let c = instance("web");
         // No image bound yet (deferred pull) — nothing to pin.
         assert_eq!(c.snapshot_pin(), None);
+    }
+
+    #[tokio::test]
+    async fn drop_snapshot_accepts_absent_scratch_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = instance_in(dir.path(), "web");
+        let scratch = c.dirs.scratch_disk();
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        crate::template::qimg::create_blank(&scratch, 1024 * 1024)
+            .await
+            .unwrap();
+        c.drop_snapshot("missing").await.unwrap();
+        std::fs::remove_file(&scratch).unwrap();
+        c.drop_snapshot("missing").await.unwrap();
     }
 
     // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------

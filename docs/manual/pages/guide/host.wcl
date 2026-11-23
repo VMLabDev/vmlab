@@ -182,6 +182,39 @@ To turn the layer off for one host GPU, set
 every card that matches the driver filter.
 DOC
 
+  p <<'DOC'
+On some hosts, so far an Intel CPU with an NVIDIA laptop GPU, a `vulkan`
+guest's images show dark dashes 16 pixels long, most visible in a still image
+such as the wallpaper. The guest wrote them into a kind of GPU memory that
+the host's CPU and GPU do not see alike. Add `hide_uncached_memory = true` to
+that host GPU's block and start the VM again:
+DOC
+
+  code wcl { source = <<'SRC'
+gpu "Nvidia1" {
+  address              = "0000:01:00.0"
+  hide_uncached_memory = true
+}
+SRC
+  }
+
+  p <<'DOC'
+vmlab's layer then hides that kind of memory from the guest wherever the GPU
+offers a cached kind in its place. `qemu.log` gains
+`VMLAB_VK_HIDE_UNCACHED=1` on its `vmlab: env:` line and one line that says
+what was hidden:
+DOC
+
+  code text {
+    source = <<'SRC'
+vmlab-hide-uncached: memory type 2 (uncached) is hidden, guests use type 3 (cached)
+SRC
+  }
+
+  p <<'DOC'
+The setting is off by default.
+DOC
+
   h3 "The viewer"
 
   p <<'DOC'
@@ -431,7 +464,7 @@ is `/dev/kvm`. Four things are specific to WSL 2.
 DOC
 
   list {
-    li "**Nested virtualisation must be enabled** in `.wslconfig` for `/dev/kvm` to exist inside the distribution. Without it every VM runs under TCG."
+    li "**Nested virtualisation must be enabled** in `.wslconfig` for `/dev/kvm` to exist inside the distribution. Without it no x86 guest runs, and an aarch64 or riscv64 guest runs under TCG."
     li "**`XDG_RUNTIME_DIR` may be missing.** Some WSL setups do not set it; vmlab falls back to `/tmp/vmlab-<uid>`, created private and refused if owned by anyone else."
     li "**The viewer lives on the Windows side.** Run `vmlab console --tcp` to get a localhost address and point a Windows VNC client at it; WSL's localhost forwarding carries it across. Host access to guest services works the same way, through [port forwards](guide_networking) and localhost forwarding."
     li "**The disk-space watchdog matters more.** WSL 2's ext4 VHDX grows and does not shrink, and linked clones grow with use, so `disk_low_percent` and the `host.disk_low` event are worth handling."
@@ -440,13 +473,14 @@ DOC
   h2 "KVM or TCG"
 
   p <<'DOC'
-For each machine vmlab picks the accelerator once: KVM when `/dev/kvm` can be
+An x86 or x86_64 guest runs on vmlab-hv under KVM only: on a host whose
+`/dev/kvm` cannot be opened it fails with an error saying KVM is required.
+QEMU picks the accelerator for the guests it runs: KVM when `/dev/kvm` can be
 opened and the guest architecture is the host's, TCG otherwise. TCG is full
 emulation, slow but functional, and vmlab warns loudly when it falls back,
-naming the machine and the architecture. Two cases hit it on purpose: a
-foreign-architecture guest such as an aarch64 or riscv64 template on an x86_64
-host, which can only ever be emulated, and a host with no `/dev/kvm`. Give an
-emulated guest a couple of minutes to boot. Nested virtualisation inside a
+naming the machine and the architecture. An aarch64 or riscv64 template on an
+x86_64 host can only ever be emulated. Give an emulated guest a couple of
+minutes to boot. Nested virtualisation inside a
 guest is separate: a KVM guest on x86 sees VMX or SVM only when its VM sets
 `nested = true`, and only when the host's own `kvm_intel` or `kvm_amd` module
 has nested virtualisation on. `vmlab up` warns with the fix when it is off.
@@ -469,47 +503,41 @@ the old identity is kept. When the checks pass, vmlab saves the new identity
 before boot and `vmlab up` announces the switch once.
 DOC
 
-  h3 "Getting ready for the removal"
+  h3 "QEMU runs no x86 guest"
 
   p <<'DOC'
-`vmlab up`, `vmlab vm start`, `vmlab validate` and `vmlab status` still
-warn about x86 machines selected for QEMU through explicit settings or
-automatic fallback. Each warning names the machine and the reason:
+vmlab-hv is the only hypervisor for x86 and x86_64 guests. QEMU runs aarch64
+and riscv64 guests. Each way an x86 machine used to reach QEMU is now an
+error, from `vmlab validate` and again from `vmlab up` and `vmlab vm start`,
+naming the machine and the fix:
 DOC
 
   table {
     rows:
-      | "Reason (`reason` in JSON)" | "Why the machine is on QEMU" | "Fix" |
-      | "`explicit`" | "It sets `hypervisor = \"qemu\"`." | "Set `hypervisor = \"vmlab\"` or remove the setting to allow migration when there is no host override." |
-      | "`host_default`" | "The host config sets `hypervisor { vm = \"qemu\" }` or `container = \"qemu\"`." | "Remove the default to allow migration, or set `hypervisor = \"vmlab\"` on the machine." |
-      | "`qemu_args`" | "It declares `qemu_args`, which only QEMU takes." | "Remove `qemu_args`." |
-      | "`refused`" | "vmlab-hv cannot run it as declared, so automatic selection fell back." | "Change what the warning names. After the removal `hypervisor = \"qemu\"` is no longer a way out for an x86 guest." |
+      | "What puts the machine on QEMU" | "Fix" |
+      | "It sets `hypervisor = \"qemu\"`." | "Set `hypervisor = \"vmlab\"`, or remove the line." |
+      | "The host config sets `hypervisor { vm = \"qemu\" }` or `container = \"qemu\"`." | "Remove that default, or set it to `vmlab`." |
+      | "It declares `qemu_args`, which only QEMU takes." | "Remove `qemu_args` and declare the hardware with the vm block's own keys or a profile." |
+      | "vmlab-hv cannot run it as declared." | "Change what the error names. There is no fallback to QEMU." |
+      | "`/dev/kvm` is not usable, or the host is not x86_64." | "KVM is required: enable virtualization in the firmware, load the kvm module and give your user read/write access to `/dev/kvm`." |
   }
 
   p <<'DOC'
-Where vmlab-hv would refuse the machine after the fix, the warning adds what
-it refuses, so one pass finds everything. On a host where `/dev/kvm` is not
-usable the lab gets one more warning: x86 guests run under QEMU's emulation
-(TCG) today and will need KVM. Enable virtualization in the firmware, load
-the kvm module and give your user access to `/dev/kvm`.
+A guest vmlab-hv does not run yet, such as macOS or a VM with
+`accel = "tcg"`, does not run on this release.
 
 An online snapshot taken under QEMU holds RAM and device state in QEMU's own
-format. Those snapshots stay on disk. Once vmlab-hv is selected,
-`vmlab snapshot list` marks them unrestorable by name. To convert one to
-offline, use a release that can restore it under QEMU, shut down the guest,
-and take an offline snapshot before upgrading. Offline snapshots restore
-under either hypervisor. The warning lists each affected machine's online QEMU snapshots, and
-`vmlab status --json` carries the same listing: every x86 machine on QEMU has
-a `qemu_removal` object with `reason`, `warning` and `online_snapshots`, and
-the lab a `host_warnings` list when KVM is missing. A lab that is not running
-answers too, with a top-level `qemu_removal` list whose entries add `machine`.
+format. Those snapshots stay on disk. `vmlab snapshot list` marks them
+unrestorable by name, and a restore of one is refused. To keep one, use an
+earlier release that can restore it under QEMU, shut down the guest, and take
+an offline snapshot. Offline snapshots restore under either hypervisor.
 DOC
 
   p <<'DOC'
-Supported new x86_64 KVM VMs default to vmlab-hv. Other new VMs fall back
-to QEMU, with the reason in `status`, `status --json`, and an info line at `up`.
-Supported new containers also default to vmlab-hv. Unsupported hosts select QEMU
-with a reason, but containers require KVM and never fall back to TCG.
+Every new x86 VM and every container on an x86_64 host selects vmlab-hv. A
+VM of another architecture falls back to QEMU, with the reason in `status`,
+`status --json`, and an info line at `up`. Containers require KVM and never
+fall back to TCG.
 vmlab-hv is vmlab's own
 hypervisor, built a phase at a time, on an x86_64 host with a usable
 `/dev/kvm`; it has no TCG fallback. It runs container micro-VMs, and modern
@@ -541,11 +569,19 @@ guests.
 A `virgl` or `vulkan` GPU renders on the render node of the host GPU your host
 config picks, exactly as under QEMU, with the same Vulkan filter and
 keep-awake; with no declared GPU it renders on the host's first render node,
-and `up` says which. A host GPU's `qemu_env` also applies to vmlab-hv,
-including `RENDER_SERVER_EXEC_PATH` for the Venus render server.
-`qemu_binary` is ignored with a warning. `passthrough` needs the
+and `up` says which. A host GPU's `qemu_binary` and `qemu_env`
+are QEMU's and do not apply to vmlab-hv: `validate` and `up` warn about each
+and name the ignored variables. A vmlab-hv VM runs the Venus render server of
+its vmlab-hv bundle, and `validate` and `up` warn when it would start another
+one, from `RENDER_SERVER_EXEC_PATH` in your environment or because `vmlab_hv`
+is not a bundle's `bin/vmlab-hv`. `passthrough` needs the
 GPU already bound to `vfio-pci`, which you do yourself; vmlab-hv refuses one
-that is not, and neither it nor vmlab ever rebinds a device. Shares are
+that is not, and neither it nor vmlab ever rebinds a device. The card's other
+functions that are bound to `vfio-pci`, its HDMI/DP audio above all, go to the
+guest with it as one multi-function device. One bound to another driver stays
+with the host. To choose them yourself, list them in the host GPU's
+`passthrough_functions`: a listed function that is not bound to `vfio-pci` is
+then refused by name, and `[]` sends the card alone. Shares are
 served by vmlab-hv itself from the host directory, so no virtiofsd runs for a
 VM, and `auto` shares follow the same rules as on QEMU. A VM with a GPU takes
 no online snapshot on vmlab-hv; stop it and take an offline one.

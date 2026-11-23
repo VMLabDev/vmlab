@@ -470,14 +470,16 @@ impl Snapshots for HvSnapshots {
     }
 
     async fn delete(&self, name: &str, _devices: &[&str]) -> Result<()> {
-        call(
-            &self.0,
-            Command::SnapshotDelete {
-                name: name.to_string(),
-            },
-        )
-        .await
-        .map(drop)
+        let command = Command::SnapshotDelete {
+            name: name.to_string(),
+        };
+        match send(&self.0, command).await? {
+            Outcome::Error {
+                code: ErrorCode::SnapshotNotFound,
+                message,
+            } => Err(crate::proto::CommandError::not_found(message).into()),
+            outcome => refused("snapshot_delete", outcome).map(drop),
+        }
     }
 }
 

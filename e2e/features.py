@@ -45,6 +45,7 @@ FEATURES: dict[str, str] = {
     "lab.info": "`vmlab lab info`",
     "lab.stop": "`vmlab lab stop`",
     "lab.down.release": "a full `vmlab down` releases the lab name, so another checkout declaring it can `up`",
+    "lab.down.isolation": "a full `vmlab down` leaves a guest in another lab running",
     "lab.move": "`vmlab lab move` hands a stopped lab's clones to another checkout declaring its name, and refuses while it runs",
     "lab.status.conflict": "`vmlab status` (and `down`) in a checkout whose lab name is registered from another root exit 5 naming it",
     "lab.restart": "`vmlab lab restart` (and its refusal while running)",
@@ -66,7 +67,6 @@ FEATURES: dict[str, str] = {
     "vm.hw.tpm": "`tpm = true` (swtpm)",
     "vm.hw.firmware": "`firmware` selection (OVMF)",
     "vm.hw.secure_boot": "`secure_boot = true`",
-    "vm.hw.qemu_args": "`qemu_args` passthrough",
     "vm.hw.nested": "`nested = true`",
     "vm.hw.tsc": "`tsc = \"host\"` pins an invariant TSC through the selected hypervisor",
     "vm.hw.gpu": "`gpu {}` passthrough / virgl",
@@ -147,7 +147,6 @@ FEATURES: dict[str, str] = {
     "share.readonly": "`share { readonly = true }`",
     "share.smb1": "SMB1 shares for legacy guests",
     "share.unmountable": "`vmlab up` warns, before saying the lab is up, about a share that will not mount",
-    "share.virtiofs.old-virtiofsd": "a virtiofs share on a virtiofsd without `--migration-mode` (Ubuntu 24.04's 1.10.0)",
     # -- containers --------------------------------------------------------
     "container.up": "an OCI container runs as a micro-VM",
     "container.idle": "`mode = :idle`",
@@ -168,7 +167,6 @@ FEATURES: dict[str, str] = {
     "snapshot.clock.set": "an online restore sets the guest clock to the host's time (VM and container)",
     "snapshot.clock.kept": "`clock = \"snapshot\"` keeps the time a restored guest was captured at",
     "snapshot.clock.fixed": "a fixed `clock` starts the guest at the declared date",
-    "snapshot.virtiofs.old-virtiofsd": "online snapshots refused, offline ones taken, on a virtiofsd too old to migrate",
     # -- worktree labs (§21) -----------------------------------------------
     "worktree.isolation.status": "`vmlab status` (and `--json`) in a frozen family says the main and the worktree lab run under worktree isolation",
     "worktree.isolation.forward": "under worktree isolation a forward binds 127.0.0.1: reachable on loopback, not on the host's address",
@@ -236,11 +234,11 @@ FEATURES: dict[str, str] = {
 
 HOST = "host"
 
-# Every phase in the order vmlab-hv delivers them.
+# Phase order for the historical coverage cutoff.
 PHASE_ORDER: tuple[str, ...] = (HOST, "1", "2a", "2b", "2c", "2d", "2e", "2f", "3", "4")
 
-# The phases vmlab-hv has delivered; `run.py --vmlab-phase` overrides it.
-VMLAB_DELIVERED = "2f"
+# Phase 4 is delivered independently of TCG in phase 3.
+VMLAB_DELIVERED = "4"
 
 _GROUPS: dict[str, list[str]] = {
     HOST: [
@@ -284,7 +282,7 @@ _GROUPS: dict[str, list[str]] = {
         "lab.up.partial", "lab.depends_on", "lab.depends_on_provision", "lab.provision.parallel",
         "lab.status", "lab.down", "lab.up.reload", "lab.reload.stopped", "lab.reload.network",
         "lab.up.template-changed", "lab.destroy", "lab.list", "lab.info", "lab.stop", "lab.down.release",
-        "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named", "vm.start", "vm.stop",
+        "lab.down.isolation", "lab.move", "lab.status.conflict", "lab.restart", "lab.destroy.named", "vm.start", "vm.stop",
         "vm.restart", "vm.destroy", "vm.ip", "vm.sleep", "vm.prevent_sleep", "vm.hw.cpus-memory",
         "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.tpm", "vm.hw.firmware", "vm.hw.secure_boot",
         "vm.hw.nested", "vm.scratch", "vm.media.iso", "agent.eventlog", "login.elevated", "console.viewer",
@@ -299,26 +297,21 @@ _GROUPS: dict[str, list[str]] = {
     "2e": ["share.virtiofs", "share.readonly", "share.unmountable", "vm.hw.audio"],
     # macOS is a phase of its own after 2 (PRD §22), delivered with 2f.
     "2f": ["usb.controller", "usb.refusals", "usb.attach", "vm.hw.tsc", "vm.macos"],
-    # TCG emulation.
-    "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
     "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1",
           "vm.legacy.freedos", "vm.legacy.windows98", "vm.legacy.windows7", "vm.legacy.templeos",
           "vm.legacy.server2016"],
 }
 
-# Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why.
-# Their host and container features still count;
-# a VM feature they report is skipped with the reason, never passed, since a
-# pass on QEMU says nothing about vmlab-hv (`Harness._record`).
-QEMU_SCENARIOS: dict[str, str] = {}
-
-# Features only QEMU can ever run, and why; skipped on every other hypervisor.
+# Features of the guests QEMU still runs, and why (PRD §22): automatic
+# selection puts a guest that is not x86 on QEMU, so these are in scope on
+# every run. QEMU runs no x86 guest, so on a QEMU run nothing else is.
 QEMU_ONLY: dict[str, str] = {
-    "vm.hw.qemu_args": "`qemu_args` is QEMU's command line; vmlab-hv refuses it",
-    "share.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
-    "snapshot.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
+    "arch.emulated": "an aarch64 guest, which QEMU runs under TCG",
 }
+
+# Why a QEMU run skips every other feature.
+NO_X86_ON_QEMU = "QEMU runs no x86 guest (PRD §22)"
 
 PHASES: dict[str, str] = {fid: phase for phase, ids in _GROUPS.items() for fid in ids}
 
@@ -334,11 +327,12 @@ assert not _untagged and not _unknown and not _twice, (
 def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED) -> str | None:
     """Why `feature` does not apply on `hypervisor` with phases through
     `delivered` landed, or None when it does."""
-    if hypervisor == "qemu":
-        return None
     if feature in QEMU_ONLY:
-        return f"QEMU only: {QEMU_ONLY[feature]}"
+        return None
+    if hypervisor == "qemu":
+        return NO_X86_ON_QEMU
     phase = PHASES[feature]
-    if PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered):
+    if (phase == "3" and delivered != "3"
+            or PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered)):
         return f"vmlab-hv phase {phase}"
     return None

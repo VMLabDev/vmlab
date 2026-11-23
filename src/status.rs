@@ -483,12 +483,6 @@ pub struct MachineStatus {
     pub hypervisor: crate::config::hypervisor::HypervisorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hypervisor_fallback: Option<String>,
-    /// Set on an x86 machine that runs on QEMU, which a later release stops
-    /// running: the reason, the warning with its fix, and the machine's
-    /// online QEMU snapshots, which cannot be restored after the removal.
-    /// The snapshots are lab-level, like `agent_diverged`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qemu_removal: Option<crate::config::hypervisor::QemuRemoval>,
     #[serde(flatten)]
     pub detail: MachineDetail,
 }
@@ -745,16 +739,17 @@ pub struct LabStatus {
     /// replaces it, as it does a daemon whose `config_digest` is stale.
     #[serde(default)]
     pub freeze_stale: bool,
+    /// The pid of the daemon that answered. A restart names it, so that the
+    /// supervisor replaces the daemon this status came from and no other
+    /// (`lab.restart`). Zero from a daemon that predates the field.
+    #[serde(default)]
+    pub daemon_pid: u32,
     /// Machines not on the declaration `config_digest` names (PRD §7.1): a
     /// reload found each changed or removed while it could not be rebuilt,
     /// and says why. Every other machine runs the file as loaded. Empty from
     /// a daemon that predates the field.
     #[serde(default)]
     pub pending: Vec<PendingMachine>,
-    /// What the host itself owes before QEMU stops running x86 guests: no
-    /// usable KVM while an x86 machine of this lab runs on QEMU.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub host_warnings: Vec<String>,
 }
 
 /// One machine a reload could not rebuild yet (PRD §7.1).
@@ -918,7 +913,6 @@ pub(crate) mod fixtures {
             recording: None,
             hypervisor: Default::default(),
             hypervisor_fallback: None,
-            qemu_removal: None,
             detail,
         }
     }
@@ -990,7 +984,7 @@ pub(crate) mod fixtures {
             forwards: Vec::new(),
             isolation: None,
             freeze_stale: false,
-            host_warnings: Vec::new(),
+            daemon_pid: 0,
             pending: Vec::new(),
         }
     }

@@ -30,14 +30,14 @@ mkdir -p "$SRC"
 [ -n "$SRC" ] && [ "$SRC" != / ] || { echo "VML-88: SRC is empty or /" >&2; exit 1; }
 cp -a /src/VirtIO /src/viogpu /src/build "$SRC/"
 chmod -R u+w "$SRC"
-for p in /patches/*.patch; do
-    echo "== patch $(basename "$p")"
-    patch -d "$SRC" -p1 --no-backup-if-mismatch -s <"$p"
-done
+while IFS= read -r p; do
+    echo "== patch $p"
+    patch -d "$SRC" -p1 --no-backup-if-mismatch -s <"/patches/$p"
+done </patches/series
 
 # Upstream's commit date, for a reproducible DriverVer.
-DRIVER_DATE=09/27/2026
-export SOURCE_DATE_EPOCH=$(date -u -d 2026-09-27T00:00:00Z +%s)
+DRIVER_DATE=11/02/2026
+export SOURCE_DATE_EPOCH=$(date -u -d 2026-11-02T00:00:00Z +%s)
 
 OUT=/out/x64 /build/compile-kmd.sh
 OUT=/out/x64 /build/compile-helpers.sh

@@ -12,7 +12,7 @@ rasterizer and left five areas out. This page covers them:
 - a Windows 10 run of the whole fixed-function suite.
 
 The new probe found one fault, in the bump-map formats. It was fixed in
-`patches/mesa/0043`. A second change, `0044`, corrects a capability the
+`patches/mesa/d3d9-bump-luminance-formats.patch`. A second change, `0044`, corrects a capability the
 driver reported too low. Mixed devices, blending, cube and volume texgen and
 Windows 10 already matched the reference. The work was done on 2026-10-19
 on helios: NVIDIA 610.57.04 on `Nvidia2` and RADV (Mesa 26.2.2) on `AMD1`,
@@ -144,11 +144,11 @@ The runtime turns fixed-function state into a vs_2_0 and a ps_2_0 shader
 - **Cube and volume coordinates.** The runtime's vertex shader generates and
   transforms them. The UMD only samples.
 - **Mixed devices.** Software-mode draws reach the UMD as the runtime's
-  processed vertices, exactly as on a software device (`patches/mesa/0040`),
+  processed vertices, exactly as on a software device (`patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch`),
   and hardware-mode draws as on a hardware device. Nothing in the UMD
   depends on the device type.
 
-## Bump-map formats: `patches/mesa/0043`
+## Bump-map formats: `patches/mesa/d3d9-bump-luminance-formats.patch`
 
 Vulkan has no format with signed U and V and unsigned luminance, so the UMD
 had left out `L6V5U5` (61) and `X8L8V8U8` (62). The fix:
@@ -171,7 +171,7 @@ A lock that maps such a texture directly on the GPU still sees the
 converted layout. That happens only for dynamic textures in
 `D3DPOOL_DEFAULT`. No probe case uses one.
 
-## Matrix palette: `patches/mesa/0044`
+## Matrix palette: `patches/mesa/d3d9-indexed-vertex-blend-palette.patch`
 
 `MaxVertexBlendMatrixIndex` was 0. The reference reports 255, and its own
 vertex processing supports that. The runtime's shader on this UMD supports

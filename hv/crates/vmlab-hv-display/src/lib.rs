@@ -8,6 +8,7 @@ mod input;
 mod lease;
 pub mod protocol;
 pub mod rfb;
+pub mod trace;
 mod transport;
 
 pub use client::Client;

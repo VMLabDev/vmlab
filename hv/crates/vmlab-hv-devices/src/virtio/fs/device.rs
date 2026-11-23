@@ -21,6 +21,7 @@ use virtio_queue::{Queue, QueueState, QueueT};
 use vm_memory::GuestMemoryMmap;
 
 use super::fuse::Server;
+use super::fuse::filesystem::FileSystem;
 use super::fuse::transport::{Reader, Writer};
 use super::passthrough::PassthroughFs;
 use super::vhost_user::{CONFIG_LEN, FS_DEVICE_TYPE, NUM_QUEUES, QUEUE_MAX_SIZE};
@@ -135,6 +136,11 @@ impl InProcessFs {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&inner.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = inner
                 .queues
                 .get_mut(index)
@@ -288,6 +294,8 @@ impl VirtioDevice for InProcessFs {
         inner.queues.clear();
         inner.pending_queues = None;
         inner.active = false;
+        self.fs.destroy();
+        self.server = Arc::new(Server::new(self.fs.clone()));
     }
 }
 
@@ -463,26 +471,7 @@ mod tests {
                 },
             )
             .unwrap();
-            fs.ack_features(fs.features());
-            let mut hiprio = Queue::new(QUEUE_MAX_SIZE).unwrap();
-            hiprio.set_size(16);
-            hiprio.set_desc_table_address(Some(0x1000), Some(0));
-            hiprio.set_avail_ring_address(Some(0x2000), Some(0));
-            hiprio.set_used_ring_address(Some(0x3000), Some(0));
-            hiprio.set_ready(true);
-            let mut requests = Queue::new(QUEUE_MAX_SIZE).unwrap();
-            requests.set_size(16);
-            requests.set_desc_table_address(Some(0x5000), Some(0));
-            requests.set_avail_ring_address(Some(0x6000), Some(0));
-            requests.set_used_ring_address(Some(0x7000), Some(0));
-            requests.set_ready(true);
-            assert!(hiprio.is_valid(&mem) && requests.is_valid(&mem));
-            fs.activate(
-                mem.clone(),
-                interrupt.clone() as Arc<dyn crate::VirtioInterrupt>,
-                vec![hiprio, requests],
-            )
-            .unwrap();
+            Self::activate(&mut fs, &mem, &interrupt);
             Self {
                 fs,
                 mem,
@@ -496,6 +485,29 @@ mod tests {
                 dir: dir.path().to_path_buf(),
                 _kept: Some(dir),
             }
+        }
+
+        fn activate(fs: &mut InProcessFs, mem: &GuestMemory, interrupt: &Arc<RecInterrupt>) {
+            fs.ack_features(fs.features());
+            let mut hiprio = Queue::new(QUEUE_MAX_SIZE).unwrap();
+            hiprio.set_size(16);
+            hiprio.set_desc_table_address(Some(0x1000), Some(0));
+            hiprio.set_avail_ring_address(Some(0x2000), Some(0));
+            hiprio.set_used_ring_address(Some(0x3000), Some(0));
+            hiprio.set_ready(true);
+            let mut requests = Queue::new(QUEUE_MAX_SIZE).unwrap();
+            requests.set_size(16);
+            requests.set_desc_table_address(Some(0x5000), Some(0));
+            requests.set_avail_ring_address(Some(0x6000), Some(0));
+            requests.set_used_ring_address(Some(0x7000), Some(0));
+            requests.set_ready(true);
+            assert!(hiprio.is_valid(mem) && requests.is_valid(mem));
+            fs.activate(
+                mem.clone(),
+                interrupt.clone() as Arc<dyn crate::VirtioInterrupt>,
+                vec![hiprio, requests],
+            )
+            .unwrap();
         }
 
         /// Compose one FUSE request: header + `body` at the request buffer.
@@ -550,9 +562,10 @@ mod tests {
         }
 
         fn submit(&mut self) {
+            let slot = u64::from(self.submitted % 16);
             self.submitted += 1;
             self.mem
-                .write_obj(Le16::from(0u16), GuestAddress(self.avail + 4))
+                .write_obj(Le16::from(0u16), GuestAddress(self.avail + 4 + slot * 2))
                 .unwrap();
             self.mem
                 .write_obj(Le16::from(self.submitted), GuestAddress(self.avail + 2))
@@ -605,6 +618,18 @@ mod tests {
     unsafe impl ByteValued for Desc {}
 
     #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let f = Fixture::new(false);
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut fs = f.fs;
+        let returned = crate::virtio::testing::returns_in_time(move || fs.queue_notify(1));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(), 0);
+    }
+
+    #[test]
     fn hostile_oversized_chains_are_discarded() {
         for writable in [false, true] {
             let mut f = Fixture::new(false);
@@ -629,9 +654,7 @@ mod tests {
         assert_eq!(f.out_header().error, -libc::ENOTTY);
     }
 
-    #[test]
-    fn init_negotiates_capabilities() {
-        let mut f = Fixture::new(false);
+    fn submit_init(f: &mut Fixture) {
         let init = InitIn {
             major: 7,
             minor: 33,
@@ -652,6 +675,13 @@ mod tests {
             512,
         );
         f.submit();
+        assert_eq!(f.out_header().error, 0, "INIT must succeed");
+    }
+
+    #[test]
+    fn init_negotiates_capabilities() {
+        let mut f = Fixture::new(false);
+        submit_init(&mut f);
         let (idx, id, len) = f.used_slot(0);
         assert_eq!((idx, id), (1, 0));
         assert!(len > 16, "the reply carries an InitOut");
@@ -660,12 +690,46 @@ mod tests {
             "INIT reply: len={} error={} unique={}",
             out.len, out.error, out.unique
         );
-        assert_eq!(out.error, 0, "INIT must succeed");
         let bytes = f.reply_bytes(len as usize);
         // Entry point of the stack: the server decoded the request through
         // the transport and wrote a reply into the writable descriptors.
         assert_eq!(out.len as usize, bytes.len().min(out.len as usize));
         assert_eq!(*f.interrupt.notifies.lock(), vec![1]);
+    }
+
+    #[test]
+    fn reset_and_reinit_start_a_fresh_session() {
+        let mut f = Fixture::new(false);
+        submit_init(&mut f);
+        for index in 0..31 {
+            let name = format!("file-{index}");
+            std::fs::write(f.dir.join(&name), b"").unwrap();
+            let name = std::ffi::CString::new(name).unwrap();
+            let body = name.as_bytes_with_nul();
+            f.request(Opcode::Lookup, 1, body);
+            f.chain(
+                std::mem::size_of::<InHeader>() as u32 + body.len() as u32,
+                256,
+            );
+            f.submit();
+            assert_eq!(f.out_header().error, 0);
+        }
+
+        f.fs.reset();
+        f.mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
+        f.submitted = 0;
+        Fixture::activate(&mut f.fs, &f.mem, &f.interrupt);
+        submit_init(&mut f);
+
+        let name = b"hello.txt\0";
+        f.request(Opcode::Lookup, 1, name);
+        f.chain(
+            std::mem::size_of::<InHeader>() as u32 + name.len() as u32,
+            256,
+        );
+        f.submit();
+        assert_eq!(f.used_slot(1).0, 2);
+        assert_eq!(f.out_header().error, 0, "lookup after reset and INIT");
     }
 
     #[test]

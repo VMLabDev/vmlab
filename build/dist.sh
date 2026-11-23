@@ -18,7 +18,7 @@
 #
 # Tracked files are left exactly as they were. A version other than
 # Cargo.toml's is stamped into Cargo.toml (and so Cargo.lock) for the binary
-# build only, as CI's build job does, and put back afterwards. The BPF rebuild
+# build only, and put back afterwards. The BPF rebuild
 # writes over the committed objects, so the working copies are saved first and
 # restored after; a rebuilt object that differs from the committed one is
 # reported, and fails the build (`just ci::ebpf-verify` would reject it too).

@@ -195,9 +195,6 @@ pub fn cmd_validate() -> Result<()> {
     for warning in gpu_warnings(&file, |_| true) {
         eprintln!("WARNING: {warning}");
     }
-    for warning in QemuRemovalReport::of(&file).lines() {
-        eprintln!("WARNING: {warning}");
-    }
     for line in nocow_notes(&file) {
         println!("{line}");
     }
@@ -209,70 +206,6 @@ pub fn cmd_validate() -> Result<()> {
         file.lab.segments.len()
     );
     Ok(())
-}
-
-/// The QEMU removal warnings of a lab read from its file and its persisted
-/// state, with no daemon: every x86 machine that would run on QEMU, the
-/// online snapshots QEMU took of it, and what the host owes. `validate`
-/// prints it, and so does `status` on a lab that is not running.
-#[derive(Debug, Default)]
-pub struct QemuRemovalReport {
-    pub machines: Vec<(String, crate::config::hypervisor::QemuRemoval)>,
-    pub host: Vec<String>,
-}
-
-impl QemuRemovalReport {
-    /// Of a loaded lab. A lab whose state or profiles cannot be read
-    /// reports nothing here; validation already said why.
-    pub fn of(file: &crate::config::LabFile) -> Self {
-        match HostContext::at(&file.root) {
-            Ok(ctx) => Self::with(file, &ctx, &ctx.state),
-            Err(_) => Self::default(),
-        }
-    }
-
-    /// Of the lab in the current directory, or nothing where there is none
-    /// that loads.
-    pub fn of_current_lab() -> Self {
-        let Ok(cwd) = std::env::current_dir() else {
-            return Self::default();
-        };
-        crate::paths::find_lab_root(&cwd)
-            .ok()
-            .and_then(|root| config::load_lab_root(&root).ok())
-            .map(|file| Self::of(&file))
-            .unwrap_or_default()
-    }
-
-    fn with(
-        file: &crate::config::LabFile,
-        ctx: &dyn ValidationContext,
-        state: &crate::labd::state::LabState,
-    ) -> Self {
-        let mut machines = config::validate::qemu_removals(&file.lab, ctx);
-        for (name, removal) in &mut machines {
-            removal.online_snapshots = state
-                .machines
-                .get(name)
-                .map(|m| m.qemu_online_snapshots())
-                .unwrap_or_default();
-        }
-        let host = (!machines.is_empty())
-            .then(|| crate::config::hypervisor::kvm_removal_warning(&ctx.host_facts()))
-            .flatten()
-            .into_iter()
-            .collect();
-        Self { machines, host }
-    }
-
-    /// One line per warning, as a surface prints them.
-    pub fn lines(&self) -> Vec<String> {
-        self.machines
-            .iter()
-            .flat_map(|(name, removal)| removal.lines(name))
-            .chain(self.host.iter().cloned())
-            .collect()
-    }
 }
 
 /// What `up` will do to each machine's disk directory on btrfs (PRD §7.1,
@@ -319,7 +252,32 @@ pub fn gpu_warnings(
         .iter()
         .filter(|vm| chosen(vm))
         .filter_map(|vm| Some((vm.name.as_str(), vm.gpu.as_ref()?)));
-    crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host())
+    let mut out = crate::qemu::hostgpu::warnings(gpus, &host, &crate::qemu::hostgpu::Sysfs::host());
+    // What a vmlab-hv VM's `gpu {}` earns besides (card #447): the host
+    // GPU's `qemu_env` it ignores, and a render server that is not its
+    // bundle's, judged by this process's `RENDER_SERVER_EXEC_PATH`. The lab
+    // daemon judges its own environment again at the start and logs it.
+    if let Ok(ctx) = HostContext::at(&file.root) {
+        let on_vmlab: Vec<String> = config::validate::vm_hypervisors(&file.lab, &ctx)
+            .into_iter()
+            .filter(|(_, kind)| *kind == crate::config::hypervisor::HypervisorKind::Vmlab)
+            .map(|(name, _)| name)
+            .collect();
+        let gpus = file
+            .lab
+            .vms
+            .iter()
+            .filter(|vm| chosen(vm) && on_vmlab.contains(&vm.name))
+            .filter_map(|vm| vm.gpu.as_ref());
+        let inherited = std::env::var(crate::qemu::hostgpu::RENDER_SERVER_VAR).ok();
+        out.extend(crate::qemu::hostgpu::vmlab_hv_warnings(
+            gpus,
+            &host,
+            std::env::var_os("PATH").as_deref(),
+            inherited.as_deref(),
+        ));
+    }
+    out
 }
 
 /// Full validation of the cwd's lab; every side-effecting verb runs this
@@ -335,16 +293,95 @@ pub fn validate_current() -> Result<crate::config::LabFile> {
         crate::instance::apply(&mut file, &root)?;
         return Ok(file);
     }
+    Err(miette_to_anyhow(validation_error(&root, issues)))
+}
+
+/// The issues validation raised about the lab file under `root`, renderable
+/// against that file.
+fn validation_error(root: &Path, issues: config::IssueList) -> ConfigErrors {
     let path = root.join(crate::paths::LAB_FILE);
+    let name = path.display().to_string();
     let source = std::fs::read_to_string(&path).unwrap_or_default();
-    let err = ConfigErrors {
-        name: path.display().to_string(),
-        src: NamedSource::new(path.display().to_string(), source),
+    // The excerpts a report prints hold no password and no secret value.
+    let shown = config::diagnostic_source(&source, &name, root);
+    ConfigErrors {
+        src: NamedSource::new(&name, shown),
+        name,
         issues,
-    };
-    Err(miette_to_anyhow(err))
+    }
 }
 
 fn miette_to_anyhow(e: ConfigErrors) -> anyhow::Error {
     anyhow::anyhow!("{:?}", miette::Report::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host that knows no profile and no template.
+    struct KnowsNothing;
+
+    impl ValidationContext for KnowsNothing {
+        fn template_meta(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Option<crate::template::TemplateMeta> {
+            None
+        }
+        fn profile(&self, _: &str) -> Option<crate::profiles::Profile> {
+            None
+        }
+        fn check_container_hardware(
+            &self,
+            _: &crate::config::model::Container,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn check_script(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// An issue labelled with a whole `vm` block prints every line of it
+    /// (config review F5). The login's password and a `secret = true`
+    /// variable's value are in those lines and must not be in the report.
+    #[test]
+    fn a_diagnostic_does_not_show_a_secret_value() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(crate::paths::LAB_FILE),
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    profile = "no-such-profile"
+    login "dev" { user = "dev" password = "hunter2-login" }
+    playbook "pb" {
+      play = "base"
+      var "token" { value = "hunter2-var" secret = true }
+      var "domain" { value = "plain-var" }
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        let file = config::load_lab_root(root.path()).expect("the lab file loads");
+        let issues = config::validate(&file, &KnowsNothing);
+        assert!(
+            issues.iter().any(|i| i.message.contains("unknown profile")),
+            "{issues:?}"
+        );
+        let err = validation_error(root.path(), issues);
+        let shown = format!("{:?}", miette::Report::new(err));
+        assert!(shown.contains("unknown profile"), "{shown}");
+        // The excerpt is still there, with what is not a secret in it.
+        assert!(shown.contains("plain-var"), "{shown}");
+        assert!(shown.contains("password"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+        assert!(!shown.contains("hunter2-var"), "{shown}");
+    }
 }

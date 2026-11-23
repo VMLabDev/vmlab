@@ -187,7 +187,7 @@ type BlockRule {
   cidr: utf8
   @doc("Protocol to scope the rule: `tcp` | `udp` | `icmp`")
   @options(["tcp", "udp", "icmp"]) proto: utf8?
-  @doc("Port to scope the rule (1–65535); requires `proto`")
+  @doc("Port to scope the rule (1–65535); requires `proto` to be `tcp` or `udp`")
   @range(1, 65535) port: i64?
 }
 

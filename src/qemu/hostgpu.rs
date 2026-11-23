@@ -145,6 +145,27 @@ impl Sysfs {
         Ok(())
     }
 
+    /// The other functions of the PCI slot `address` sits in, each with the
+    /// driver it is bound to (`None`: no driver), in function order — a
+    /// graphics card's HDMI/DP audio function above all. Empty when
+    /// `address` is not a PCI address.
+    pub fn sibling_functions(&self, address: &str) -> Vec<(String, Option<String>)> {
+        let Some((slot, own)) = address.rsplit_once('.') else {
+            return Vec::new();
+        };
+        (0..8)
+            .map(|function| format!("{slot}.{function}"))
+            .filter(|sibling| sibling.rsplit_once('.').is_some_and(|(_, f)| f != own))
+            .filter_map(|sibling| {
+                let dev = self.devices().join(&sibling);
+                dev.exists().then(|| {
+                    let driver = driver(&dev);
+                    (sibling, driver)
+                })
+            })
+            .collect()
+    }
+
     /// Resolve a PCI address to its render node and driver. An address with
     /// no device, a device with no render node, or one in a failed power
     /// state is an error naming it.
@@ -248,7 +269,7 @@ fn driver(dev: &Path) -> Option<String> {
 /// into a guest's renderer. `MESA_VK_DEVICE_SELECT` is in the list but never
 /// set: Mesa's device-select layer breaks Venus
 /// (`vkr: venus driver is required to call vkEnumeratePhysicalDevices first`).
-pub const VULKAN_ENV_VARS: [&str; 7] = [
+pub const VULKAN_ENV_VARS: [&str; 8] = [
     "VK_DRIVER_FILES",
     "VK_ICD_FILENAMES",
     "VK_LOADER_DRIVERS_SELECT",
@@ -256,6 +277,7 @@ pub const VULKAN_ENV_VARS: [&str; 7] = [
     vk_layer::PATH_VAR,
     vk_layer::ADDRESS_VAR,
     vk_layer::DISABLE_VAR,
+    vk_layer::HIDE_UNCACHED_VAR,
 ];
 
 /// The emulator's environment for a VM (§5.2): the Vulkan loader
@@ -394,6 +416,9 @@ pub struct RenderPlan {
     pub name: Option<String>,
     /// The PCI address `passthrough` hands the guest (`vfio-pci,host=`).
     pub passthrough: Option<String>,
+    /// The other functions of that card vmlab-hv hands over with it, in
+    /// function order ([`passthrough_functions`]). QEMU is handed none.
+    pub passthrough_functions: Vec<String>,
     /// The GPU a `virgl`/`vulkan` guest renders on.
     pub gpu: Option<RenderGpu>,
     /// The host GPU's `qemu_binary`, checked: run in place of
@@ -498,18 +523,88 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
     }
 }
 
+/// The functions of a passed-through card that go to the guest with it, in
+/// function order (PRD §5.2). A graphics card is more than one PCI function —
+/// its HDMI/DP audio is function 1 — and a guest has sound from the card only
+/// when that function arrives too.
+///
+/// With no `passthrough_functions` on the host GPU it is every other
+/// function of the slot that is bound to `vfio-pci` already; one on another
+/// driver stays with the host and is not an error, since nobody asked for it.
+/// A declared list is exactly what goes, and each entry must be a function of
+/// the same slot bound to `vfio-pci`: vmlab changes no binding, so an entry
+/// that cannot go is refused by name. Either way the card itself must be
+/// function 0, the only place a guest looks for a multi-function device.
+fn passthrough_functions(decl: &HostGpu, sysfs: &Sysfs) -> Result<Vec<String>> {
+    let primary_is_zero = decl.address.ends_with(".0");
+    let siblings = sysfs.sibling_functions(&decl.address);
+    let Some(asked) = &decl.passthrough_functions else {
+        if !primary_is_zero {
+            return Ok(Vec::new());
+        }
+        return Ok(siblings
+            .into_iter()
+            .filter(|(_, driver)| driver.as_deref() == Some("vfio-pci"))
+            .map(|(address, _)| address)
+            .collect());
+    };
+    let name = &decl.name;
+    if !asked.is_empty() && !primary_is_zero {
+        bail!(
+            "host GPU `{name}`: `passthrough_functions` needs the GPU's `address` to be \
+             function 0 of its card, and {} is not",
+            decl.address
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    for address in asked {
+        if *address == decl.address {
+            bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, the GPU's own \
+                 `address` — list only the card's other functions"
+            );
+        }
+        if out.contains(address) {
+            bail!("host GPU `{name}`: `passthrough_functions` names {address} twice");
+        }
+        match siblings.iter().find(|(sibling, _)| sibling == address) {
+            Some((_, Some(driver))) if driver == "vfio-pci" => out.push(address.clone()),
+            Some((_, Some(driver))) => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is bound \
+                 to the host driver `{driver}`, not `vfio-pci` — vmlab never changes a driver \
+                 binding: bind it to `vfio-pci`, or take it off the list"
+            ),
+            Some((_, None)) => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is bound \
+                 to no driver, not `vfio-pci` — vmlab never changes a driver binding: bind \
+                 it to `vfio-pci`, or take it off the list"
+            ),
+            None => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is not \
+                 another function of the card at {} on this host",
+                decl.address
+            ),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Decide a VM's [`RenderPlan`] before the emulator spawns (ADR-0003): pick
 /// the host GPU, then ask sysfs about its address — a PCI device for
 /// `passthrough`, a render node for `virgl`/`vulkan` — and name the GPU in
 /// any refusal. Its `vulkan_icd` must exist; its `qemu_binary`, in every
 /// mode, must run and suit `arch` (the VM's arch, when known); its
 /// `qemu_env` goes on last. A `vulkan` GPU's PCI-filter layer is planned
-/// under `data` ([`vk_layer::dir`]), not written.
+/// under `data` ([`vk_layer::dir`]), not written, and its
+/// `hide_uncached_memory` turns the layer's memory rule on.
 ///
 /// On vmlab-hv (`hypervisor`, PRD §22, HV phase-2 D10) the render node, the
 /// Vulkan environment, the filter layer and keep-awake are planned the same
-/// way. `qemu_env` also applies to its shared virglrenderer runtime, while
-/// `qemu_binary` is ignored with a warning. vmlab-hv renders on a
+/// way. `qemu_binary` and `qemu_env` are QEMU's and are ignored with a
+/// warning each ([`qemu_env_ignored_warning`]): an entry written for QEMU,
+/// `RENDER_SERVER_EXEC_PATH` above all, would otherwise replace the render
+/// server of vmlab-hv's own bundle (card #447). vmlab-hv renders on a
 /// node it is named, never one it finds, so a paravirtual GPU no declared
 /// GPU resolves for renders on this host's first render node, and says so.
 pub fn render_plan(
@@ -542,6 +637,19 @@ pub fn render_plan(
         let decl = decl.expect("pick refuses passthrough with no host GPU");
         sysfs.device(&decl.address).with_context(context)?;
         plan.passthrough = Some(decl.address.clone());
+        if vmlab {
+            plan.passthrough_functions = passthrough_functions(decl, sysfs)?;
+        } else if decl
+            .passthrough_functions
+            .as_ref()
+            .is_some_and(|f| !f.is_empty())
+        {
+            plan.warnings.push(format!(
+                "host GPU `{}`: `passthrough_functions` is ignored on QEMU, which is handed \
+                 {} alone — it applies with hypervisor = \"vmlab\"",
+                decl.name, decl.address
+            ));
+        }
         plan.env = emulator_env(false, None, None, None);
     } else {
         plan.gpu = decl
@@ -580,11 +688,17 @@ pub fn render_plan(
             plan.keepawake = keepawake_wanted(d.keepawake, g, &sysfs.power(&g.address));
         }
         plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
+        // The memory rule is the layer's, so it goes only where the layer does.
+        if plan.vk_layer.is_some() && decl.is_some_and(|g| g.hide_uncached_memory) {
+            plan.env
+                .set
+                .push((vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()));
+        }
     }
     if let Some(decl) = decl
         && vmlab
     {
-        // The executable override is specific to QEMU.
+        // The executable and environment overrides are specific to QEMU.
         if let Some(binary) = &decl.qemu_binary {
             plan.warnings.push(format!(
                 "host GPU `{}`: qemu_binary {} is QEMU's and does not apply on vmlab-hv; \
@@ -593,16 +707,136 @@ pub fn render_plan(
                 binary.display()
             ));
         }
-    } else if let Some(decl) = decl
-        && let Some(binary) = &decl.qemu_binary
-    {
-        check_qemu_binary(&decl.name, binary, arch)?;
-        plan.qemu_binary = Some(binary.clone());
-    }
-    if let Some(decl) = decl {
+        plan.warnings.extend(qemu_env_ignored_warning(decl));
+    } else if let Some(decl) = decl {
+        if let Some(binary) = &decl.qemu_binary {
+            check_qemu_binary(&decl.name, binary, arch)?;
+            plan.qemu_binary = Some(binary.clone());
+        }
         apply_qemu_env(&decl.name, &mut plan.env, &decl.qemu_env)?;
     }
     Ok(plan)
+}
+
+/// The variable virglrenderer reads for the Venus render server to start in
+/// place of its build-time path. vmlab-hv's bundle launcher sets it to the
+/// bundle's own server unless the process already carries one.
+pub const RENDER_SERVER_VAR: &str = "RENDER_SERVER_EXEC_PATH";
+
+/// The warning a host GPU's `qemu_env` earns on vmlab-hv, where it does not
+/// apply: the keys it names, and for [`RENDER_SERVER_VAR`] that the VM runs
+/// its bundle's render server instead. `None` for an empty `qemu_env`.
+pub fn qemu_env_ignored_warning(decl: &HostGpu) -> Option<String> {
+    if decl.qemu_env.is_empty() {
+        return None;
+    }
+    let keys: Vec<&str> = decl.qemu_env.iter().map(|(k, _)| k.as_str()).collect();
+    let server = if keys.contains(&RENDER_SERVER_VAR) {
+        "; the VM runs the render server of its vmlab-hv bundle"
+    } else {
+        ""
+    };
+    Some(format!(
+        "host GPU `{}`: qemu_env ({}) is QEMU's and does not apply on vmlab-hv; ignored{server}",
+        decl.name,
+        keys.join(", ")
+    ))
+}
+
+/// `binary` as a spawn finds it: a path with a `/` as it is, a bare name
+/// through `path` (the `PATH` value).
+pub fn find_binary(binary: &Path, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if binary.components().count() > 1 {
+        return Some(binary.to_path_buf());
+    }
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The warning a `vulkan` VM on vmlab-hv earns when the Venus render server
+/// it will start is not the one of its vmlab-hv bundle (card #325, card
+/// #447: on NVIDIA an unpatched server presents at about 40 frames a
+/// second). `binary` is the vmlab-hv a spawn runs ([`find_binary`]) and
+/// `inherited` the [`RENDER_SERVER_VAR`] of the process that spawns it, which
+/// the bundle's launcher keeps. A bundle is `bin/vmlab-hv`, a launcher
+/// script, beside `libexec/virgl_render_server`. Three cases warn: an
+/// inherited server that is not the bundle's, a vmlab-hv that is no bundle
+/// launcher (virglrenderer then starts its build-time server), and an
+/// inherited server with no bundle to compare it with.
+pub fn render_server_warning(binary: &Path, inherited: Option<&str>) -> Option<String> {
+    let real = binary.canonicalize().ok()?;
+    let root = real.parent().and_then(Path::parent)?;
+    let bundled = root.join("libexec/virgl_render_server");
+    let launcher = real.parent().is_some_and(|dir| dir.ends_with("bin"))
+        && root.join("libexec/vmlab-hv").is_file()
+        && bundled.is_file();
+    let same = |other: &str| {
+        Path::new(other)
+            .canonicalize()
+            .is_ok_and(|other| bundled.canonicalize().is_ok_and(|b| b == other))
+    };
+    match (launcher, inherited.filter(|value| !value.is_empty())) {
+        (true, None) => None,
+        (true, Some(other)) if same(other) => None,
+        (true, Some(other)) => Some(format!(
+            "vmlab-hv starts the Venus render server {other} from {RENDER_SERVER_VAR} in the \
+             environment, not its bundle's {}; an older or unpatched render server costs frame \
+             rate (about 40 frames a second on NVIDIA) — unset {RENDER_SERVER_VAR} unless you \
+             mean to test another server",
+            bundled.display()
+        )),
+        (false, Some(other)) => Some(format!(
+            "vmlab-hv at {} is not a bundle launcher, and starts the Venus render server \
+             {other} from {RENDER_SERVER_VAR} in the environment; no bundle render server is \
+             beside it to compare with",
+            real.display()
+        )),
+        (false, None) => Some(format!(
+            "vmlab-hv at {} is not a bundle launcher (bin/vmlab-hv beside \
+             libexec/virgl_render_server), so virglrenderer starts its build-time Venus render \
+             server, which may lack the bundle's patches — set host {{ vmlab_hv = … }} to a \
+             bundle's bin/vmlab-hv",
+            real.display()
+        )),
+    }
+}
+
+/// What these `vulkan`/`virgl` VMs on vmlab-hv earn short of an error, once
+/// each: the `qemu_env` of the host GPU each picks, ignored
+/// ([`qemu_env_ignored_warning`]), and for a `vulkan` one the render server
+/// that is not its bundle's ([`render_server_warning`]). `validate` and `up`
+/// print them; the start logs the same from its plan.
+pub fn vmlab_hv_warnings<'a>(
+    gpus: impl IntoIterator<Item = &'a Gpu>,
+    host: &HostConfig,
+    path: Option<&std::ffi::OsStr>,
+    inherited: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut venus = false;
+    for gpu in gpus {
+        if gpu.mode == GpuMode::Passthrough {
+            continue;
+        }
+        venus |= gpu.mode == GpuMode::Vulkan;
+        if let Ok(picked) = pick(gpu, host)
+            && let Some(w) = picked.gpu.and_then(qemu_env_ignored_warning)
+            && !out.contains(&w)
+        {
+            out.push(w);
+        }
+    }
+    if venus {
+        let binary = host
+            .vmlab_hv
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("vmlab-hv"));
+        out.extend(
+            find_binary(&binary, path).and_then(|found| render_server_warning(&found, inherited)),
+        );
+    }
+    out
 }
 
 /// Whether any of these `gpu {}` blocks renders on a host GPU nothing
@@ -785,7 +1019,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::fake_host;
+    use super::testing::{fake_gpu, fake_host};
     use super::*;
 
     fn set(env: &ChildEnv) -> Vec<(&str, &str)> {
@@ -931,6 +1165,8 @@ mod tests {
             qemu_binary: None,
             qemu_env: Vec::new(),
             keepawake: KeepAwake::Auto,
+            hide_uncached_memory: false,
+            passthrough_functions: None,
         }
     }
 
@@ -1029,6 +1265,127 @@ mod tests {
         assert!(
             e.starts_with("passthrough needs a host GPU: declare `gpu \"<name>\""),
             "{e}"
+        );
+    }
+
+    /// On vmlab-hv a passed-through card takes its other functions with it
+    /// (card #590): every one already bound to `vfio-pci`, in function
+    /// order, and none on another driver, which nobody asked for. QEMU is
+    /// handed the one address.
+    #[test]
+    fn passthrough_takes_the_cards_vfio_bound_functions_on_vmlab_hv() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
+        // Another slot's function is not this card's.
+        fake_gpu(sys.path(), "0000:03:01.1", None, "vfio-pci");
+        let mut h = host();
+        h.gpus.push(decl("Vfio1", "0000:03:00.0", false));
+        let pass = gpu(GpuMode::Passthrough, Some("Vfio1"));
+        let on = |h: &HostConfig, hypervisor| {
+            super::render_plan(
+                Some(&pass),
+                Some("x86_64"),
+                h,
+                &sysfs,
+                Path::new(DATA),
+                hypervisor,
+            )
+        };
+        let plan = on(&h, HypervisorKind::Vmlab).unwrap();
+        assert_eq!(plan.passthrough.as_deref(), Some("0000:03:00.0"));
+        assert_eq!(plan.passthrough_functions, ["0000:03:00.1", "0000:03:00.2"]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        let qemu = on(&h, HypervisorKind::Qemu).unwrap();
+        assert!(qemu.passthrough_functions.is_empty() && qemu.warnings.is_empty());
+
+        // A card declared by a function other than 0 goes alone.
+        h.gpus.last_mut().unwrap().address = "0000:03:00.1".into();
+        let plan = on(&h, HypervisorKind::Vmlab).unwrap();
+        assert!(plan.passthrough_functions.is_empty());
+    }
+
+    /// `passthrough_functions` is exactly what goes: an empty list sends the
+    /// card alone, and an entry that cannot go — on a host driver, on none,
+    /// in another slot, absent, the card itself, or named twice — is refused
+    /// by name, because the user asked for it. On QEMU the list is ignored
+    /// with a warning.
+    #[test]
+    fn declared_passthrough_functions_go_or_are_refused_by_name() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
+        std::fs::create_dir_all(sys.path().join("bus/pci/devices/0000:03:00.4")).unwrap();
+        fake_gpu(sys.path(), "0000:03:01.0", None, "vfio-pci");
+        let pass = gpu(GpuMode::Passthrough, Some("Vfio1"));
+        let on = |functions: &[&str], address: &str, hypervisor| {
+            let mut h = host();
+            h.gpus.push(HostGpu {
+                passthrough_functions: Some(functions.iter().map(|f| f.to_string()).collect()),
+                ..decl("Vfio1", address, false)
+            });
+            super::render_plan(
+                Some(&pass),
+                Some("x86_64"),
+                &h,
+                &sysfs,
+                Path::new(DATA),
+                hypervisor,
+            )
+        };
+        let hv = |functions: &[&str]| on(functions, "0000:03:00.0", HypervisorKind::Vmlab);
+        assert!(hv(&[]).unwrap().passthrough_functions.is_empty());
+        assert_eq!(
+            hv(&["0000:03:00.2"]).unwrap().passthrough_functions,
+            ["0000:03:00.2"]
+        );
+        assert_eq!(
+            hv(&["0000:03:00.2", "0000:03:00.1"])
+                .unwrap()
+                .passthrough_functions,
+            ["0000:03:00.1", "0000:03:00.2"]
+        );
+        let refused = |functions: &[&str]| format!("{:#}", hv(functions).unwrap_err());
+        let e = refused(&["0000:03:00.3"]);
+        assert!(
+            e.starts_with("host GPU `Vfio1`: `passthrough_functions` names 0000:03:00.3")
+                && e.contains("bound to the host driver `xhci_hcd`, not `vfio-pci`")
+                && e.contains("never changes a driver binding"),
+            "{e}"
+        );
+        let e = refused(&["0000:03:00.4"]);
+        assert!(
+            e.contains("0000:03:00.4, which is bound to no driver"),
+            "{e}"
+        );
+        for other in ["0000:03:01.0", "0000:03:00.7", "03:00.1"] {
+            let e = refused(&[other]);
+            assert!(
+                e.contains("is not another function of the card at 0000:03:00.0"),
+                "{e}"
+            );
+        }
+        let e = refused(&["0000:03:00.0"]);
+        assert!(e.contains("the GPU's own `address`"), "{e}");
+        let e = refused(&["0000:03:00.1", "0000:03:00.1"]);
+        assert!(e.contains("names 0000:03:00.1 twice"), "{e}");
+        let e = format!(
+            "{:#}",
+            on(&["0000:03:00.0"], "0000:03:00.1", HypervisorKind::Vmlab).unwrap_err()
+        );
+        assert!(e.contains("to be function 0 of its card"), "{e}");
+
+        let qemu = on(&["0000:03:00.3"], "0000:03:00.0", HypervisorKind::Qemu).unwrap();
+        assert!(qemu.passthrough_functions.is_empty());
+        assert_eq!(qemu.warnings.len(), 1, "{:?}", qemu.warnings);
+        assert!(
+            qemu.warnings[0].contains("`passthrough_functions` is ignored on QEMU"),
+            "{:?}",
+            qemu.warnings
         );
     }
 
@@ -1289,14 +1646,22 @@ mod tests {
         );
     }
 
-    /// vmlab-hv shares virglrenderer with QEMU, including its render-server
-    /// environment. The QEMU binary override still does not apply.
+    /// vmlab-hv takes the derived Vulkan environment and nothing of the host
+    /// GPU's QEMU-only keys: `qemu_binary` and `qemu_env` are ignored, each
+    /// with a warning, so an entry written for QEMU cannot replace the
+    /// bundle's render server (card #447). QEMU still gets both.
     #[test]
-    fn on_vmlab_hv_gpu_environment_is_applied_and_a_render_node_is_always_named() {
+    fn on_vmlab_hv_qemu_env_is_ignored_and_a_render_node_is_always_named() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
         let gone = sys.path().join("nope/qemu-system-x86_64");
-        let h = host_with_qemu(&gone, &[("RENDER_SERVER_EXEC_PATH", "/x")]);
+        let h = host_with_qemu(
+            &gone,
+            &[
+                ("RENDER_SERVER_EXEC_PATH", "/x"),
+                ("VK_LOADER_DRIVERS_SELECT", "*custom*"),
+            ],
+        );
         let on = |gpu: &Gpu, h: &HostConfig| {
             super::render_plan(
                 Some(gpu),
@@ -1313,28 +1678,29 @@ mod tests {
             plan.env
                 .set
                 .iter()
-                .any(|(k, v)| k == "RENDER_SERVER_EXEC_PATH" && v == "/x")
+                .all(|(k, v)| k != "RENDER_SERVER_EXEC_PATH" && v != "*custom*"),
+            "{:?}",
+            plan.env
         );
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         assert!(plan.warnings[0].contains("qemu_binary") && plan.warnings[0].contains("ignored"));
-        let override_env = host_with_qemu(&gone, &[("VK_LOADER_DRIVERS_SELECT", "*custom*")]);
-        let override_plan = on(&gpu(GpuMode::Vulkan, None), &override_env).unwrap();
         assert_eq!(
-            override_plan
+            plan.warnings[1],
+            "host GPU `Nvidia1`: qemu_env (RENDER_SERVER_EXEC_PATH, VK_LOADER_DRIVERS_SELECT) is \
+             QEMU's and does not apply on vmlab-hv; ignored; the VM runs the render server of \
+             its vmlab-hv bundle"
+        );
+        // The same host GPU on QEMU keeps its environment.
+        let exe = fake_qemu(&sys.path().join("q"), "qemu-system-x86_64");
+        let qemu_host = host_with_qemu(&exe, &[("RENDER_SERVER_EXEC_PATH", "/x")]);
+        let on_qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &qemu_host, &sysfs).unwrap();
+        assert!(
+            on_qemu
                 .env
                 .set
-                .iter()
-                .filter(|(k, _)| k == "VK_LOADER_DRIVERS_SELECT")
-                .collect::<Vec<_>>(),
-            vec![&("VK_LOADER_DRIVERS_SELECT".into(), "*custom*".into())]
+                .contains(&("RENDER_SERVER_EXEC_PATH".into(), "/x".into()))
         );
-        let invalid = host_with_qemu(&gone, &[("A=B", "x")]);
-        assert!(
-            on(&gpu(GpuMode::Vulkan, None), &invalid)
-                .unwrap_err()
-                .to_string()
-                .contains("variable name containing `=`")
-        );
+        assert!(on_qemu.warnings.is_empty(), "{:?}", on_qemu.warnings);
         let qemu = render_plan(Some(&gpu(GpuMode::Vulkan, None)), &host(), &sysfs).unwrap();
         let vmlab = on(&gpu(GpuMode::Vulkan, None), &host()).unwrap();
         assert_eq!(
@@ -1351,6 +1717,98 @@ mod tests {
             "{:?}",
             plan.warnings
         );
+    }
+
+    /// A bundle as `build/hv.py` stages it: the launcher, the binary and the
+    /// render server.
+    fn bundle(root: &Path) -> PathBuf {
+        fake_qemu(&root.join("libexec"), "vmlab-hv");
+        fake_qemu(&root.join("libexec"), "virgl_render_server");
+        fake_qemu(&root.join("bin"), "vmlab-hv")
+    }
+
+    /// The render server a vmlab-hv VM starts is its bundle's, or the start
+    /// says which one it is instead.
+    #[test]
+    fn a_render_server_that_is_not_the_bundles_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = bundle(&dir.path().join("bundle"));
+        let bundled = dir.path().join("bundle/libexec/virgl_render_server");
+        assert_eq!(render_server_warning(&launcher, None), None);
+        assert_eq!(render_server_warning(&launcher, Some("")), None);
+        assert_eq!(
+            render_server_warning(&launcher, Some(bundled.to_str().unwrap())),
+            None
+        );
+        // A symlink to the launcher, as an install puts on PATH, is the bundle.
+        let link = dir.path().join("vmlab-hv");
+        std::os::unix::fs::symlink(&launcher, &link).unwrap();
+        assert_eq!(render_server_warning(&link, None), None);
+
+        let old = fake_qemu(&dir.path().join("old/libexec"), "virgl_render_server");
+        let w = render_server_warning(&launcher, Some(old.to_str().unwrap())).unwrap();
+        assert!(
+            w.contains(old.to_str().unwrap())
+                && w.contains("not its bundle's")
+                && w.contains(bundled.canonicalize().unwrap().to_str().unwrap()),
+            "{w}"
+        );
+
+        // The binary without its launcher: virglrenderer's build-time server.
+        let bare = dir.path().join("bundle/libexec/vmlab-hv");
+        let w = render_server_warning(&bare, None).unwrap();
+        assert!(
+            w.contains("build-time") && w.contains("not a bundle launcher"),
+            "{w}"
+        );
+        let cargo = fake_qemu(&dir.path().join("target/release"), "vmlab-hv");
+        assert!(
+            render_server_warning(&cargo, None)
+                .unwrap()
+                .contains("build-time")
+        );
+        let w = render_server_warning(&cargo, Some("/opt/virgl_render_server")).unwrap();
+        assert!(w.contains("/opt/virgl_render_server"), "{w}");
+        // A vmlab-hv that is not there is the start's refusal, not a warning.
+        assert_eq!(render_server_warning(&dir.path().join("nope"), None), None);
+    }
+
+    /// `validate` and `up` say both things of a vmlab-hv VM before it
+    /// starts: the ignored `qemu_env` of the GPU it picks, once, and a
+    /// render server that is not the bundle's for a `vulkan` one only.
+    #[test]
+    fn vmlab_hv_warnings_name_the_ignored_qemu_env_and_the_render_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = bundle(&dir.path().join("bundle"));
+        let mut h = host_with_qemu(Path::new("/q"), &[("RENDER_SERVER_EXEC_PATH", "/old")]);
+        h.vmlab_hv = Some(launcher.clone());
+        let vulkan = gpu(GpuMode::Vulkan, Some("Nvidia1"));
+        let virgl = gpu(GpuMode::Virgl, Some("Nvidia1"));
+        let amd = gpu(GpuMode::Vulkan, Some("AMD1"));
+        let pass = gpu(GpuMode::Passthrough, Some("Nvidia1"));
+
+        let w = vmlab_hv_warnings([&vulkan, &virgl], &h, None, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("qemu_env (RENDER_SERVER_EXEC_PATH)"), "{w:?}");
+        assert!(vmlab_hv_warnings([&amd, &pass], &h, None, None).is_empty());
+
+        let w = vmlab_hv_warnings([&amd], &h, None, Some("/old"));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("/old") && w[0].contains("not its bundle's"),
+            "{w:?}"
+        );
+        // `virgl` starts no render server.
+        let w = vmlab_hv_warnings([&gpu(GpuMode::Virgl, Some("AMD1"))], &h, None, Some("/old"));
+        assert!(w.is_empty(), "{w:?}");
+
+        // No `vmlab_hv` in the host config: the one on PATH.
+        h.vmlab_hv = None;
+        let path = std::env::join_paths([dir.path().join("bundle/libexec")]).unwrap();
+        let w = vmlab_hv_warnings([&amd], &h, Some(&path), None);
+        assert!(w[0].contains("build-time"), "{w:?}");
+        let path = std::env::join_paths([dir.path().join("bundle/bin")]).unwrap();
+        assert!(vmlab_hv_warnings([&amd], &h, Some(&path), None).is_empty());
     }
 
     /// A `qemu_binary` that is missing, or is there but cannot run, is
@@ -1552,6 +2010,40 @@ mod tests {
         }
     }
 
+    /// A host GPU's `hide_uncached_memory` turns the layer's memory rule on
+    /// for a `vulkan` guest on that GPU and on no other; the GPU's
+    /// `qemu_env` still has the last word. `virgl` on the same GPU loads no
+    /// layer and so gets no switch.
+    #[test]
+    fn hide_uncached_memory_sets_the_layers_switch_for_that_gpu_only() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        let mut h = host();
+        let nvidia2 = h.gpus.iter().position(|g| g.name == "Nvidia2").unwrap();
+        h.gpus[nvidia2].hide_uncached_memory = true;
+        let switch = (vk_layer::HIDE_UNCACHED_VAR.to_string(), "1".to_string());
+        let plan = |mode, name| render_plan(Some(&gpu(mode, Some(name))), &h, &sysfs).unwrap();
+        let on = plan(GpuMode::Vulkan, "Nvidia2");
+        assert_eq!(owned(&on.env).last(), Some(&switch));
+        for other in [
+            plan(GpuMode::Vulkan, "Nvidia1"),
+            plan(GpuMode::Vulkan, "AMD1"),
+        ] {
+            assert!(!owned(&other.env).contains(&switch));
+        }
+        assert!(plan(GpuMode::Virgl, "Nvidia2").env.set.is_empty());
+        h.gpus[nvidia2].qemu_env = vec![(vk_layer::HIDE_UNCACHED_VAR.into(), "0".into())];
+        let off = render_plan(Some(&gpu(GpuMode::Vulkan, Some("Nvidia2"))), &h, &sysfs).unwrap();
+        let set: Vec<_> = owned(&off.env)
+            .into_iter()
+            .filter(|(k, _)| k == vk_layer::HIDE_UNCACHED_VAR)
+            .collect();
+        assert_eq!(
+            set,
+            [(vk_layer::HIDE_UNCACHED_VAR.to_string(), "0".to_string())]
+        );
+    }
+
     /// `virgl`, `passthrough`, no `gpu {}` and a `vulkan` guest with no host
     /// GPU resolved get no layer, though its variables are still stripped
     /// from what the emulator inherits.
@@ -1579,6 +2071,7 @@ mod tests {
                 vk_layer::PATH_VAR,
                 vk_layer::ADDRESS_VAR,
                 vk_layer::DISABLE_VAR,
+                vk_layer::HIDE_UNCACHED_VAR,
             ] {
                 assert!(
                     plan.env.remove.iter().any(|r| r == var),

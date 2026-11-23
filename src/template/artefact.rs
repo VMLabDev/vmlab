@@ -16,6 +16,16 @@ pub fn cache_dir() -> PathBuf {
 /// Resolve an artefact source to a local file path, downloading + verifying
 /// URL sources. Reports progress via `log`.
 pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<PathBuf> {
+    resolve_in(&cache_dir(), source, log, DOWNLOAD_LIMITS).await
+}
+
+/// [`resolve`] against a cache directory and limits the caller names.
+async fn resolve_in(
+    dir: &Path,
+    source: &ArtefactSource,
+    log: impl Fn(String),
+    limits: DownloadLimits,
+) -> Result<PathBuf> {
     match source {
         ArtefactSource::Path { path, .. } => {
             if !path.is_file() {
@@ -24,8 +34,10 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
             Ok(path.clone())
         }
         ArtefactSource::Url { url, sha256, .. } => {
-            let dir = cache_dir();
-            std::fs::create_dir_all(&dir)?;
+            // The digest names the cache files, so it is checked here too,
+            // for a source that did not come through the lab file.
+            let sha256 = &digest_name(sha256)?;
+            std::fs::create_dir_all(dir)?;
             // Cache key = the expected digest, so a re-download is skipped
             // when the verified artefact is already present.
             let cached = dir.join(format!("{sha256}.artefact"));
@@ -39,10 +51,12 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                         return Ok(cached);
                     }
                     log(format!("downloading {url}"));
-                    download(url, &cached).await?;
-                    verify_file(&cached, sha256)
+                    let dl = Scratch::new(dir, sha256);
+                    download(url, dl.path(), limits).await?;
+                    verify_file(dl.path(), sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
+                    dl.publish(&cached)?;
                     log(format!("verified sha256 {sha256}"));
                 }
                 // Compressed: sha256 verifies the *download*, then we
@@ -55,23 +69,76 @@ pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<Pa
                         log(format!("using cached artefact {sha256}"));
                         return Ok(cached);
                     }
-                    let dl = dir.join(format!("{sha256}.download"));
                     log(format!("downloading {url}"));
-                    download(url, &dl).await?;
-                    verify_file(&dl, sha256)
+                    let dl = Scratch::new(dir, sha256);
+                    download(url, dl.path(), limits).await?;
+                    verify_file(dl.path(), sha256)
                         .await
                         .with_context(|| format!("hash mismatch for {url}"))?;
                     log(format!(
                         "verified sha256 {sha256}; decompressing ({})",
                         c.name()
                     ));
-                    c.decompress(&dl, &cached).await?;
-                    std::fs::remove_file(&dl).ok();
+                    let image = Scratch::new(dir, sha256);
+                    c.decompress(dl.path(), image.path()).await?;
+                    image.publish(&cached)?;
                     std::fs::write(&marker, [])?;
                 }
             }
             Ok(cached)
         }
+    }
+}
+
+/// A `sha256` as the cache names files by it: 64 hex digits, in lower case.
+/// Anything else is refused, because the value becomes a file name.
+pub fn digest_name(sha256: &str) -> Result<String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("`sha256` must be 64 hex digits, got `{sha256}`");
+    }
+    Ok(sha256.to_ascii_lowercase())
+}
+
+/// A file of the cache directory that one resolve writes and no other
+/// resolve names: a download, or an image being decompressed. It gets its
+/// digest-named place with [`Scratch::publish`], after it is verified, and
+/// is removed when it does not get there.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new(dir: &Path, sha256: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The process id and a counter separate the resolves of this host.
+        // The clock separates this process from an earlier one with its id.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        Scratch {
+            path: dir.join(format!(".{sha256}.{pid}-{n}-{nanos:09}.part")),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rename the file to `dest`. A rename replaces whole files, so a
+    /// concurrent resolve that publishes the same artefact does no harm.
+    fn publish(self, dest: &Path) -> Result<()> {
+        std::fs::rename(&self.path, dest)
+            .with_context(|| format!("moving the artefact to {}", dest.display()))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // After `publish` the name is gone and this is a no-op.
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -104,14 +171,14 @@ impl Compression {
         }
     }
 
+    /// Decompress `src` into `dest`, which the caller owns and publishes.
     async fn decompress(self, src: &Path, dest: &Path) -> Result<()> {
         let (prog, args): (&str, &[&str]) = match self {
             Compression::Xz => ("xz", &["--decompress", "--stdout"]),
             Compression::Gzip => ("gzip", &["--decompress", "--stdout"]),
         };
-        let tmp = dest.with_extension("decomp");
         let out =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
         let status = tokio::process::Command::new(prog)
             .args(args)
             .arg(src)
@@ -122,20 +189,36 @@ impl Compression {
         if !status.success() {
             bail!("`{prog}` failed to decompress {}", src.display());
         }
-        tokio::fs::rename(&tmp, dest).await?;
         Ok(())
     }
 }
 
-async fn download(url: &str, dest: &Path) -> Result<()> {
+/// How long an artefact download waits on a server that has stopped
+/// talking: to connect, and then for the response head and between two
+/// reads of the body. Neither bounds the whole download.
+#[derive(Clone, Copy)]
+struct DownloadLimits {
+    connect: std::time::Duration,
+    read: std::time::Duration,
+}
+
+const DOWNLOAD_LIMITS: DownloadLimits = DownloadLimits {
+    connect: std::time::Duration::from_secs(30),
+    read: std::time::Duration::from_secs(60),
+};
+
+/// Download `url` into `dest`. The caller verifies the file before it gives
+/// it a name that another resolve reads.
+async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
 
-    let tmp = dest.with_extension("part");
     // A User-Agent is required: some CDNs (e.g. Fastly fronting
     // cloud.centos.org) answer 403 to requests with an empty UA.
     let client = reqwest::Client::builder()
         .user_agent(concat!("vmlab/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(limits.connect)
+        .read_timeout(limits.read)
         .build()
         .context("building HTTP client")?;
     let resp = client
@@ -146,15 +229,13 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
     if !resp.status().is_success() {
         bail!("GET {url} returned {}", resp.status());
     }
-    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, dest).await?;
     Ok(())
 }
 
@@ -177,6 +258,195 @@ async fn verify_file(path: &Path, expected_hex: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review F10: a mirror that accepts the connection and sends nothing
+    /// must fail the download, not hold it for ever.
+    #[tokio::test]
+    async fn a_mirror_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                held.push(sock);
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = DownloadLimits {
+            connect: std::time::Duration::from_secs(5),
+            read: std::time::Duration::from_millis(300),
+        };
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download(
+                &format!("http://{addr}/x.iso"),
+                &tmp.path().join("x.iso"),
+                limits,
+            ),
+        )
+        .await
+        .expect("the download must give up by itself");
+        assert!(done.is_err(), "a silent mirror is an error");
+    }
+
+    /// What the loopback mirror below holds back, and for whom.
+    struct Mirror {
+        addr: std::net::SocketAddr,
+        /// Sent to release the second half of the first connection's body.
+        release_first: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    /// A loopback HTTP mirror that serves `body` to every connection. The
+    /// first connection gets the head and the first half of the body, and the
+    /// rest only when `release_first` fires. Later connections get it all.
+    async fn mirror(body: Vec<u8>) -> Mirror {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_first, gate) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut gate = Some(gate);
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let gate = gate.take();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let (first, second) = body.split_at(body.len() / 2);
+                    sock.write_all(head.as_bytes()).await.ok();
+                    sock.write_all(first).await.ok();
+                    sock.flush().await.ok();
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    sock.write_all(second).await.ok();
+                    sock.shutdown().await.ok();
+                });
+            }
+        });
+        Mirror {
+            addr,
+            release_first: Some(release_first),
+        }
+    }
+
+    fn url_source(url: String, sha256: &str) -> ArtefactSource {
+        ArtefactSource::Url {
+            url,
+            sha256: sha256.to_string(),
+            span: (0, 0),
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// Every entry of `dir`, by file name.
+    fn entries(dir: &Path) -> Vec<String> {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = read
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review F15, part 1: two builds that use one URL at the same time each
+    /// download it. Neither may write into, or rename away, the file the
+    /// other is still downloading.
+    #[tokio::test]
+    async fn two_resolves_of_one_url_both_succeed() {
+        let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let half = (body.len() / 2) as u64;
+        let mut mirror = mirror(body.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artefacts");
+        let source = url_source(format!("http://{}/x.iso", mirror.addr), &sha256_hex(&body));
+
+        // The first resolve stops half way through its body.
+        let first = {
+            let (dir, source) = (dir.clone(), source.clone());
+            tokio::spawn(async move { resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS).await })
+        };
+        // Let it put that half on disk. The bound is not a pass condition:
+        // when it runs out the test goes on, and only proves less.
+        for _ in 0..3000 {
+            let written = std::fs::read_dir(&dir).into_iter().flatten().any(|e| {
+                let e = e.unwrap();
+                e.file_name().to_string_lossy().ends_with(".part")
+                    && e.metadata().map(|m| m.len() >= half).unwrap_or(false)
+            });
+            if written {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The second runs from start to end while the first is held.
+        let second = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let first = first.await.unwrap();
+
+        let second = second.expect("the second resolve");
+        let first = first.expect("the first resolve");
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), body);
+        assert_eq!(
+            entries(&dir),
+            vec![format!("{}.artefact", sha256_hex(&body))],
+            "the cache holds the artefact and no leftover"
+        );
+    }
+
+    /// Review F15, part 2: a download is checked before it gets its
+    /// digest-named place, so a failed check leaves nothing behind.
+    #[tokio::test]
+    async fn a_download_that_fails_its_hash_leaves_no_cache_entry() {
+        let mut mirror = mirror(b"not what the definition names".to_vec()).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artefacts");
+        for name in ["x.iso", "x.qcow2.gz"] {
+            let source = url_source(format!("http://{}/{name}", mirror.addr), &"0".repeat(64));
+            let err = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS)
+                .await
+                .expect_err("a wrong hash is an error");
+            assert!(format!("{err:#}").contains("hash mismatch"), "{err:#}");
+            assert_eq!(entries(&dir), Vec::<String>::new(), "after {name}");
+        }
+    }
+
+    /// Review F15, part 3: the cache names its files by the digest, so a
+    /// `sha256` that is not one is refused before anything is fetched.
+    #[tokio::test]
+    async fn a_sha256_that_is_not_a_digest_writes_nothing() {
+        let mut mirror = mirror(b"body".to_vec()).await;
+        mirror.release_first.take().unwrap().send(()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("cache").join("artefacts");
+        let source = url_source(format!("http://{}/x.iso", mirror.addr), "../x");
+        let err = resolve_in(&dir, &source, |_| {}, DOWNLOAD_LIMITS)
+            .await
+            .expect_err("`../x` is not a digest");
+        assert!(format!("{err:#}").contains("64 hex digits"), "{err:#}");
+        assert_eq!(entries(&tmp.path().join("cache")), Vec::<String>::new());
+    }
 
     #[tokio::test]
     async fn local_path_passthrough() {

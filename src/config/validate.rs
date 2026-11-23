@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use super::hypervisor::{
-    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, vmlab_refusals,
+    HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, qemu_x86_refusals, vmlab_refusals,
 };
 use super::model::*;
 use super::{Issue, IssueList};
@@ -108,15 +108,28 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     check_dns_label(&lab.name, lab.span, "lab name", &mut issues);
 
     // -- segments -------------------------------------------------------
-    let mut seg_names: HashMap<&str, Span> = HashMap::new();
+    let mut seg_names = HashSet::new();
     for seg in &lab.segments {
-        if seg_names.insert(&seg.name, seg.span).is_some() {
+        if !seg_names.insert(seg.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 seg.span,
                 format!("duplicate segment \"{}\"", seg.name),
             ));
         }
         check_dns_label(&seg.name, seg.span, "segment name", &mut issues);
+        // A /0 covers the entire auto-subnet pool. At the other end, a
+        // segment needs at least two usable addresses for a gateway and guest.
+        if let Some(subnet) = seg.subnet
+            && !(1..=30).contains(&subnet.prefix_len())
+        {
+            issues.push(Issue::at(
+                seg.span,
+                format!(
+                    "segment \"{}\" subnet {subnet} must have a prefix length from /1 to /30",
+                    seg.name
+                ),
+            ));
+        }
         for other in &lab.segments {
             if !std::ptr::eq(seg, other)
                 && let (Some(a), Some(b)) = (seg.subnet, other.subnet)
@@ -242,15 +255,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     // -- VMs --------------------------------------------------------------
-    // VMs and containers share one name namespace (they share DNS, forwards,
-    // and dependency waves).
-    let mut machine_names: HashSet<&str> = HashSet::new();
+    // VMs and containers share one name namespace, and DNS folds ASCII case.
+    let mut machine_names = HashSet::new();
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
     for vm in &lab.vms {
         let vm_hypervisor = selected_hypervisor(MachineCfg::Vm(vm), ctx);
-        if !machine_names.insert(&vm.name) {
+        if !machine_names.insert(vm.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 vm.span,
                 format!(
@@ -321,6 +333,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         share.guest
                     ),
                 ));
+            } else if let Some(problem) = crate::smb::config::share_name_problem(&share.name) {
+                // A derived name is already `[a-z0-9_]`; an explicit one is
+                // taken as written and becomes an `smb.conf` section header.
+                issues.push(Issue::at(
+                    share.span,
+                    format!("share name \"{}\": {problem}", share.name.escape_debug()),
+                ));
+            }
+            if let Some(problem) = crate::smb::config::share_host_problem(&share.host) {
+                issues.push(Issue::at(share.span, format!("share {problem}")));
             }
             // vmlab-hv serves its VMs' shares itself (§22, phase 2e): the
             // host's virtiofsd is not asked.
@@ -341,12 +363,23 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref()),
             &mut issues,
         );
+        if let Some(dev) = &vm.dev {
+            check_dev_arguments(
+                dev,
+                &file.root,
+                login_family(
+                    effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref(),
+                ),
+                &mut issues,
+            );
+        }
         for m in &vm.media {
             check_media(&file.root, m, &mut issues);
         }
         for d in &vm.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(&format!("vm \"{}\"", vm.name), &vm.extra_disks, &mut issues);
         if let Some(gpu) = &vm.gpu {
             check_virtual_display_family(
                 gpu,
@@ -388,7 +421,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     // -- containers ---------------------------------------------------------
     for c in &lab.containers {
-        if !machine_names.insert(&c.name) {
+        if !machine_names.insert(c.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 c.span,
                 format!(
@@ -480,6 +513,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             LoginFamily::Linux,
             &mut issues,
         );
+        if let Some(dev) = &c.dev {
+            check_dev_arguments(dev, &file.root, LoginFamily::Linux, &mut issues);
+        }
 
         for v in &c.volumes {
             if let VolumeSource::Host(host) = &v.source {
@@ -782,6 +818,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(
+            &format!("template \"{}\"", t.name),
+            &t.extra_disks,
+            &mut issues,
+        );
         // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
         // that builds: the same check, including `passthrough`, which a
         // build may ask for on the same terms a lab VM may.
@@ -825,6 +866,30 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     .as_deref()
                     .map_or(base_family, |p| login_family(Some(p)));
                 check_virtual_display_family(gpu, family, &mut issues);
+            }
+        }
+        // What a template block says here is recorded in its metadata, and a
+        // VM cloned from the template takes it from there, where only a
+        // display device by name is accepted (`TEMPLATE_DISPLAYS`). Say so at
+        // the block, not after the build.
+        let displays = std::iter::once((t.span, String::new(), &t.display)).chain(
+            t.variants
+                .iter()
+                .map(|v| (v.span, format!(" variant \"{}\"", v.name), &v.display)),
+        );
+        for (span, variant, display) in displays {
+            let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+            if let Some(d) = display
+                && !known.contains(&d.as_str())
+            {
+                issues.push(Issue::at(
+                    span,
+                    format!(
+                        "template \"{}\"{variant}: display = \"{d}\" is not a display device a template can record; use one of {}",
+                        t.name,
+                        known.join(", ")
+                    ),
+                ));
             }
         }
         check_logins("template", &t.name, &t.logins, base_family, &mut issues);
@@ -1770,9 +1835,11 @@ fn check_nics(
 
 /// The daemon claims the first usable address of every segment as its
 /// gateway (DHCP/DNS/NAT/share endpoint).
+/// Saturate at the final IPv4 address so NIC validation can report issues
+/// even when a segment declares an invalid prefix.
 pub fn gateway_ip(net: ipnet::Ipv4Net) -> Ipv4Addr {
     let base = u32::from(net.network());
-    Ipv4Addr::from(base + 1)
+    Ipv4Addr::from(base.saturating_add(1))
 }
 
 /// One ordering key's graph (§7.2) is acyclic. `key` names it in the issue;
@@ -1917,6 +1984,25 @@ fn check_media(root: &Path, m: &Media, issues: &mut IssueList) {
     }
 }
 
+/// A `disk` block's image is `disk-<name>.qcow2` in the machine's directory,
+/// so two blocks with one name would be two drives on one image file. QEMU's
+/// image lock refuses the second; vmlab-hv takes no lock, and writes through
+/// both corrupt the image. `who` is the block they sit in (`vm "a"`).
+fn check_disk_names(who: &str, disks: &[DiskBlock], issues: &mut IssueList) {
+    for (i, d) in disks.iter().enumerate() {
+        if disks[..i].iter().any(|e| e.name == d.name) {
+            issues.push(Issue::at(
+                d.span,
+                format!(
+                    "{who}: disk \"{}\" is declared twice; each `disk` block needs its own name, \
+                     because the name is its image file",
+                    d.name
+                ),
+            ));
+        }
+    }
+}
+
 fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
     match (&d.size, &d.from) {
         (None, None) => issues.push(Issue::at(
@@ -1944,7 +2030,8 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 /// (`<vm>.<lab>.<suffix>`, §9.5).
 /// A lab has at most one default dev machine (§19.1).
 ///
-/// This is the *only* `@dev` rule §5.1 owns. The decorator's own errors — an
+/// This is the only `@dev` rule that spans machines; each machine's own
+/// arguments are [`check_dev_arguments`]'s. The decorator's own errors — an
 /// undeclared `@dve`, a wrong-typed or unknown argument, `@dev` on a `nic {}`,
 /// a repeated `@dev @dev` — come from WCL, which validates an instance
 /// decorator against its declaration. What WCL cannot see is this one, because
@@ -1971,7 +2058,23 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
                 ),
             ));
         }
-        if selected_hypervisor(m, ctx) != HypervisorKind::Vmlab {
+        let host = host.get_or_insert_with(|| ctx.host_facts());
+        let hardware = match m {
+            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
+            MachineCfg::Container(_) => None,
+        };
+        let selection = ctx.hypervisor_defaults().select(
+            m,
+            host,
+            hardware.as_ref(),
+            ctx.existing_hypervisor(m.name()),
+        );
+        // QEMU runs no x86 guest: a setting that puts one there is an error,
+        // and on vmlab-hv what it refuses is one too.
+        for why in qemu_x86_refusals(m, &selection, host, hardware.as_ref()) {
+            issues.push(Issue::at(m.span(), why));
+        }
+        if selection.kind != HypervisorKind::Vmlab {
             if let MachineCfg::Vm(vm) = m {
                 for why in qemu_refusals(vm) {
                     issues.push(Issue::at(vm.span, why));
@@ -1979,11 +2082,6 @@ fn check_hypervisors(lab: &Lab, ctx: &dyn ValidationContext, issues: &mut IssueL
             }
             continue;
         }
-        let host = host.get_or_insert_with(|| ctx.host_facts());
-        let hardware = match m {
-            MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-            MachineCfg::Container(_) => None,
-        };
         for why in vmlab_refusals(m, host, hardware.as_ref()) {
             issues.push(Issue::at(m.span(), why));
         }
@@ -2005,29 +2103,16 @@ fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> 
         .kind
 }
 
-/// Every x86 machine of `lab` that runs on QEMU, by name, with the removal
-/// warning it earns ([`super::hypervisor::qemu_removal`]) — what `validate`
-/// prints, selected the way validation selects. The daemon says the same of
-/// the machines it built, with the hardware of a template pulled since.
-pub fn qemu_removals(
-    lab: &Lab,
-    ctx: &dyn ValidationContext,
-) -> Vec<(String, super::hypervisor::QemuRemoval)> {
-    let host = ctx.host_facts();
-    lab.machines()
-        .filter_map(|m| {
-            let hardware = match m {
-                MachineCfg::Vm(vm) => vm_hardware(vm, ctx),
-                MachineCfg::Container(_) => None,
-            };
-            let selection = ctx.hypervisor_defaults().select(
-                m,
-                &host,
-                hardware.as_ref(),
-                ctx.existing_hypervisor(m.name()),
-            );
-            super::hypervisor::qemu_removal(m, &selection, &host, hardware.as_ref())
-                .map(|removal| (m.name().to_string(), removal))
+/// The hypervisor each VM of `lab` runs on, selected the way validation
+/// selects it.
+pub fn vm_hypervisors(lab: &Lab, ctx: &dyn ValidationContext) -> Vec<(String, HypervisorKind)> {
+    lab.vms
+        .iter()
+        .map(|vm| {
+            (
+                vm.name.clone(),
+                selected_hypervisor(MachineCfg::Vm(vm), ctx),
+            )
         })
         .collect()
 }
@@ -2053,6 +2138,48 @@ fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::Reso
         None => crate::profiles::ProfileSet::of([]),
     };
     crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
+}
+
+/// One machine's `@dev` arguments (§19.1, §19.6), held to what a share is held
+/// to: the host `workspace` must be a directory now, not at `up`, where a
+/// missing one only stops the syncer; and `workspace_guest` must be an absolute
+/// path for the guest's family, and not the root of its file system, which
+/// would make the whole guest the workspace.
+fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: &mut IssueList) {
+    if let Some(workspace) = &dev.workspace
+        && !root.join(workspace).is_dir()
+    {
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace {} is not a directory", workspace.display()),
+        ));
+    }
+    let Some(guest) = &dev.workspace_guest else {
+        return;
+    };
+    if let Some(problem) = guest_path_problem(guest, family) {
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace_guest {problem}"),
+        ));
+    } else if is_guest_root(guest) {
+        issues.push(Issue::at(
+            dev.span,
+            format!(
+                "@dev workspace_guest \"{guest}\" is the root of the guest's file system — the \
+                 workspace syncer would own the whole guest; name a directory below it"
+            ),
+        ));
+    }
+}
+
+/// `/`, `C:\` and the like: an absolute guest path with nothing below the root.
+fn is_guest_root(path: &str) -> bool {
+    let rest = match path.as_bytes() {
+        [d, b':', rest @ ..] if d.is_ascii_alphabetic() => rest,
+        rest => rest,
+    };
+    rest.iter().all(|&b| b == b'/' || b == b'\\')
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -2120,6 +2247,7 @@ pub(crate) mod tests {
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2700,9 +2828,29 @@ template "t" { arch = "x86" version = "1" disk = 1GiB cpu_model = ""
         // Any non-empty name is QEMU's to judge, not vmlab's.
         let es = errs(
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" cpu_model = "Westmere,+aes" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" cpu_model = "Westmere,+aes" } }"#,
         );
         assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
+    }
+
+    /// A template block's `display` ends up in template metadata, which
+    /// carries a display device by name only (docs/reviews/config.md F1).
+    #[test]
+    fn a_template_block_display_is_a_known_device() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "bochs-display,vgamem=8M"
+  source "scratch" { } }"#,
+            "template \"t\": display = \"bochs-display,vgamem=8M\" is not a display device",
+        );
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "cirrus-vga"
+  source "scratch" { } }"#,
+        );
+        assert!(es.iter().all(|m| !m.contains("display")), "{es:#?}");
     }
 
     fn assert_nested_cpu_model_conflict(ctx: &Hardware, src: &str, needle: &str) {
@@ -2763,7 +2911,7 @@ template "w98" { arch = "x86" version = "1" disk = 1GiB nested = true cpu_model 
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" nested = true } }"#,
             r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" cpu_model = "pentium3" } }"#,
+lab "l" { vm "a" { template = "aarch64/t" cpu_model = "pentium3" } }"#,
         ] {
             let es = hw_errs(&Hardware::blank(), src);
             assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
@@ -2786,7 +2934,7 @@ template "t" { arch = "x86" version = "1" disk = 1GiB accel = "whpx"
         }
         for ok in ["kvm", "tcg"] {
             let es = errs(&format!(
-                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"x86_64/t\" accel = \"{ok}\" }} }}"
+                "import <vmlab.wcl>\nlab \"l\" {{ vm \"a\" {{ template = \"aarch64/t\" accel = \"{ok}\" }} }}"
             ));
             assert!(es.iter().all(|m| !m.contains("accel")), "{es:#?}");
         }
@@ -2992,11 +3140,68 @@ template "t" {
         );
     }
 
+    /// F4 (docs/reviews/config.md): two `disk` blocks with one name would
+    /// give the VM two writable drives on one image file.
+    #[test]
+    fn two_disks_with_one_name_are_refused() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "data" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("vm \"a\"") && m.contains("disk \"data\" is declared twice")),
+            "expected the duplicate disk name to be refused, got: {es:#?}"
+        );
+        let distinct = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "logs" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            !distinct.iter().any(|m| m.contains("declared twice")),
+            "two names are two images: {distinct:#?}"
+        );
+    }
+
     #[test]
     fn undeclared_segment() {
         assert_err(
             "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" nic { segment = \"nope\" } } }",
             "undeclared segment",
+        );
+    }
+
+    #[test]
+    fn a_subnet_too_small_for_a_gateway_and_a_guest_is_refused() {
+        for subnet in ["255.255.255.255/32", "10.1.1.0/31", "0.0.0.0/0"] {
+            assert_err(
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ segment \"s\" {{ subnet = \"{subnet}\" }} }}"
+                ),
+                &format!("segment \"s\" subnet {subnet} must have a prefix length from /1 to /30"),
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_ip_does_not_overflow() {
+        let last = Ipv4Addr::new(255, 255, 255, 255);
+        assert_eq!(gateway_ip("255.255.255.255/32".parse().unwrap()), last);
+        assert_eq!(
+            gateway_ip("255.255.255.252/30".parse().unwrap()),
+            Ipv4Addr::new(255, 255, 255, 253)
         );
     }
 
@@ -3088,6 +3293,73 @@ lab "l" {
         }
     }
 
+    /// Review F13 (config): `@dev`'s arguments are checked as a share's are.
+    /// A missing host `workspace` and a relative `workspace_guest` are each an
+    /// issue, and so is a guest root, which would make the whole guest the
+    /// workspace. The guest path is judged by the machine's family.
+    #[test]
+    fn dev_arguments_are_checked_like_a_share() {
+        let dev_errs = |dev: &str, machine: &str| {
+            errs(&format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n@dev({dev}) {machine}\n}}"
+            ))
+        };
+        let linux = r#"vm "dev01" { template = "x86_64/t" profile = "linux" }"#;
+        let es = dev_errs(r#"workspace = "./nope", workspace_guest = "src""#, linux);
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("./nope")), "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("\"src\"")), "{es:#?}");
+
+        let windows = r#"vm "dev01" { template = "x86_64/t" profile = "windows-11" }"#;
+        let container = r#"container "dev01" { image = "sdk:9.0" }"#;
+        for (dev, machine) in [
+            (r#"workspace_guest = "/""#, linux),
+            (r#"workspace_guest = "C:\\""#, windows),
+            (r#"workspace_guest = "/src""#, windows),
+            (r#"workspace_guest = "C:\\src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
+        }
+        for (dev, machine) in [
+            (r#"workspace = ".", workspace_guest = "/src""#, linux),
+            (r#"workspace_guest = "C:\\src""#, windows),
+            (r#"workspace_guest = "/home/dev/src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert!(es.is_empty(), "{dev} on {machine} → {es:#?}");
+        }
+    }
+
+    /// Review F12 (config): an explicit share name becomes an `smb.conf`
+    /// section header, so it is held to a plain share name. `global` would
+    /// rewrite the server's settings, and `]` or a line break writes a
+    /// directive of its own.
+    #[test]
+    fn an_explicit_share_name_is_a_plain_share_name() {
+        let share_errs = |name: &str| {
+            errs(&format!(
+                r#"import <vmlab.wcl>
+lab "l" {{
+  segment "s" {{ }}
+  vm "a" {{ template = "x86_64/t" nic {{ segment = "s" }}
+    share {{ host = "." guest = "/mnt/x" name = "{name}" }} }}
+}}"#
+            ))
+        };
+        for bad in ["global", "Homes", "IPC$", "a]b", "a\\nb"] {
+            let es = share_errs(bad);
+            assert!(
+                es.iter().any(|m| m.contains("share name")),
+                "{bad} → {es:#?}"
+            );
+        }
+        for good in ["src", "Data-2", "my.share"] {
+            let es = share_errs(good);
+            assert!(es.is_empty(), "{good} → {es:#?}");
+        }
+    }
+
     /// Everything else about `@dev` is legal: any number of dev machines,
     /// none or one declaring the default, and a bare `@dev` on either kind.
     #[test]
@@ -3096,7 +3368,7 @@ lab "l" {
             r#"@dev vm "dev01" { template = "x86_64/t" }"#,
             r#"@dev vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
-            r#"@dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+            r#"@dev(default = true, workspace = ".") vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
         ] {
             let es = errs(&format!("import <vmlab.wcl>\nlab \"l\" {{\n{lab_src}\n}}"));
@@ -3372,7 +3644,7 @@ lab "l" {
         let f = lab(r#"import <vmlab.wcl>
 lab "l" {
   segment "s" { }
-  vm "a" { template = "x86_64/t" hypervisor = "qemu" nic { segment = "s" }
+  vm "a" { template = "aarch64/t" hypervisor = "qemu" nic { segment = "s" }
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" }
     share { host = "." guest = "/mnt/a" name = "a" }
     share { host = "." guest = "/mnt/s" name = "s" transport = "smb" } }
@@ -3624,9 +3896,9 @@ template "t" {{
     fn a_host_gpus_qemu_binary_is_checked_against_the_vms_arch() {
         use std::os::unix::fs::PermissionsExt;
         let sys = crate::qemu::hostgpu::testing::fake_host();
-        let arm = sys.path().join("qemu-system-aarch64");
-        std::fs::write(&arm, "").unwrap();
-        std::fs::set_permissions(&arm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let x86 = sys.path().join("qemu-system-x86_64");
+        std::fs::write(&x86, "").unwrap();
+        std::fs::set_permissions(&x86, std::fs::Permissions::from_mode(0o755)).unwrap();
         let errs = |binary: &Path| -> Vec<String> {
             let host = crate::config::host::HostConfig::parse(
                 &format!(
@@ -3637,7 +3909,7 @@ template "t" {{
             )
             .unwrap();
             let f = lab(r#"import <vmlab.wcl>
-lab "l" { vm "a" { template = "x86_64/t" hypervisor = "qemu" gpu { mode = "vulkan" } } }"#);
+lab "l" { vm "a" { template = "aarch64/t" hypervisor = "qemu" gpu { mode = "vulkan" } } }"#);
             validate(
                 &f,
                 &FakeGpus(crate::qemu::hostgpu::Sysfs::new(sys.path()), host),
@@ -3646,14 +3918,14 @@ lab "l" { vm "a" { template = "x86_64/t" hypervisor = "qemu" gpu { mode = "vulka
             .map(|i| i.message)
             .collect()
         };
-        let es = errs(&arm);
+        let es = errs(&x86);
         assert!(
             es.len() == 1
                 && es[0].starts_with("vm \"a\": host GPU `Nvidia1`")
-                && es[0].contains("emulates aarch64, but this VM is x86_64"),
+                && es[0].contains("emulates x86_64, but this VM is aarch64"),
             "{es:#?}"
         );
-        let es = errs(&sys.path().join("gone/qemu-system-x86_64"));
+        let es = errs(&sys.path().join("gone/qemu-system-aarch64"));
         assert!(es.len() == 1 && es[0].contains("does not exist"), "{es:#?}");
     }
 
@@ -3914,6 +4186,30 @@ lab "l" {
   container "a" { image = "nginx:1.27" }
 }"#,
             "share one namespace",
+        );
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "Web" { template = "x86_64/t" }
+  container "web" { image = "nginx:1.27" }
+}"#,
+            "duplicate name \"web\"",
+        );
+    }
+
+    #[test]
+    fn segment_names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "Web" {}
+  segment "web" {}
+}"#,
+            "duplicate segment \"web\"",
         );
     }
 
@@ -4657,24 +4953,37 @@ lab "l" {
             .collect()
     }
 
-    /// `validate` warns of the QEMU removal for the machines its own
-    /// selection puts on QEMU: the explicit one here, not its neighbours.
+    /// QEMU runs no x86 guest: an x86 machine a setting puts there is an
+    /// error naming the replacement, an x86 machine without KVM is an error
+    /// saying KVM is required, and another architecture validates on QEMU.
     #[test]
-    fn validation_lists_the_x86_machines_the_qemu_removal_touches() {
-        let src = r#"import <vmlab.wcl>
-lab "l" {
-  vm "q" { template = "x86_64/t" hypervisor = "qemu" }
-  vm "arm" { template = "aarch64/t" }
-  container "c" { image = "alpine" }
-}"#;
-        let found = qemu_removals(&lab(src).lab, &HvHost::kvm());
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, "q");
-        assert_eq!(
-            found[0].1.reason,
-            crate::config::hypervisor::QemuReason::Explicit
+    fn validation_refuses_every_x86_machine_on_qemu() {
+        let body = r#"vm "q" { template = "x86_64/t" hypervisor = "qemu" }
+  vm "args" { template = "x86_64/t" qemu_args = ["-no-hpet"] }
+  vm "arm" { template = "aarch64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }
+  container "c" { image = "alpine" }"#;
+        let es = hv_errs(&HvHost::kvm(), body);
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(
+            es.iter()
+                .any(|e| e.contains("vm \"q\"") && e.contains("set hypervisor = \"vmlab\"")),
+            "{es:#?}"
         );
-        // Without KVM the container falls back too, and is named.
+        assert!(
+            es.iter()
+                .any(|e| e.contains("vm \"args\"") && e.contains("`qemu_args`")),
+            "{es:#?}"
+        );
+        let by_host = HvHost {
+            defaults: HypervisorDefaults {
+                vm: Some(HypervisorKind::Qemu),
+                container: None,
+            },
+            facts: HvHost::kvm().facts,
+        };
+        let es = hv_errs(&by_host, r#"vm "plain" { template = "x86_64/t" }"#);
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("remove that default"), "{es:#?}");
         let no_kvm = HvHost {
             defaults: HypervisorDefaults::default(),
             facts: HostFacts {
@@ -4682,11 +4991,13 @@ lab "l" {
                 kvm: false,
             },
         };
-        let names: Vec<String> = qemu_removals(&lab(src).lab, &no_kvm)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names, ["q", "c"]);
+        let es = hv_errs(
+            &no_kvm,
+            r#"vm "v" { template = "x86_64/t" }
+  container "c" { image = "alpine" }"#,
+        );
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(es.iter().all(|e| e.contains("KVM is required")), "{es:#?}");
     }
 
     #[test]
@@ -4723,7 +5034,7 @@ lab "l" {
     fn audio_needs_vmlab_hv_and_a_microphone_needs_audio() {
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "q" { template = "x86_64/t" hypervisor = "qemu" audio = true microphone = true }"#,
+            r#"vm "q" { template = "aarch64/t" hypervisor = "qemu" audio = true microphone = true }"#,
         );
         assert_eq!(es.len(), 2, "{es:#?}");
         assert!(
@@ -4765,7 +5076,7 @@ lab "l" {
 lab "l" {
   vm "hv" { template = "x86_64/t" hypervisor = "vmlab"
     share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" } }
-  vm "q" { template = "x86_64/t" hypervisor = "qemu"
+  vm "q" { template = "aarch64/t" hypervisor = "qemu"
     share { host = "." guest = "/mnt/w" name = "w" transport = "virtiofs" } }
 }"#);
         let es: Vec<String> = validate(&f, &NoVirtiofsd)
@@ -4786,19 +5097,27 @@ lab "l" {
                 .any(|m| m.contains("`qemu_args`") && m.contains("vm \"v\"")),
             "{es:#?}"
         );
-        // The same declaration on QEMU is the escape hatch it always was.
+        // On QEMU it stays the escape hatch for the guests QEMU still runs.
         let es = hv_errs(
             &HvHost::kvm(),
-            r#"vm "v" { template = "x86_64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
+            r#"vm "v" { template = "aarch64/t" hypervisor = "qemu" qemu_args = ["-no-hpet"] }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
     }
 
     #[test]
-    fn automatic_fallback_validates_while_an_explicit_vmlab_still_refuses() {
+    fn automatic_x86_selection_refuses_what_vmlab_hv_cannot_run() {
         for setting in [
             r#"profile = "linux-modern" qemu_args = ["-no-hpet"]"#,
             r#"profile = "linux-modern" accel = "tcg""#,
+        ] {
+            let body = format!(
+                r#"vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }}"#
+            );
+            let errors = hv_errs(&HvHost::kvm(), &body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:?}");
+        }
+        for setting in [
             r#"profile = "windows-legacy""#,
             r#"profile = "linux-modern" tsc = "host""#,
         ] {
@@ -4840,9 +5159,11 @@ lab "l" {
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("/dev/kvm"), "{es:#?}");
-        // On QEMU it falls back to TCG, as it always has.
+        // Automatic selection refuses it the same way: QEMU runs no x86
+        // guest, so there is no fallback.
         let es = hv_errs(&host, r#"container "c" { image = "alpine" }"#);
-        assert!(es.is_empty(), "{es:#?}");
+        assert_eq!(es.len(), 1, "{es:#?}");
+        assert!(es[0].contains("KVM is required"), "{es:#?}");
     }
 
     #[test]
@@ -4877,7 +5198,7 @@ lab "l" {
             &host,
             r#"container "c" { image = "alpine" }
 vm "v" { template = "x86_64/t" accel = "tcg" }
-vm "q" { template = "x86_64/t" hypervisor = "qemu" accel = "tcg" }"#,
+vm "q" { template = "aarch64/t" hypervisor = "qemu" accel = "tcg" }"#,
         );
         assert_eq!(es.len(), 1, "{es:#?}");
         assert!(es[0].contains("vm \"v\""), "{es:#?}");

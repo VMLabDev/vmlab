@@ -44,7 +44,10 @@ can get; resolution is host-side necessarily, through `vmlab dev sync
 status/flush/diff/resolve`, with `--host`/`--guest`/`--all` and a free third
 route — make the two sides identical by hand — that needs no verb. With it the
 **guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
-stay unguarded), the **volume warning** that names a subtree and never halts,
+stay unguarded), the **unwitnessed-absence rule** (#190: after a break in the
+watch a path the guest lacks is never deleted on the host — an unconfirmed
+agreement is copied again, a confirmed one halts on that path), the
+**volume warning** that names a subtree and never halts,
 and the `.git` **lock deferral** that clears itself. So is **snapshot
 bracketing** (#97): vmlab performs a
 restore, so it brackets it — capture **pre-flight flushes and refuses with no
@@ -84,9 +87,14 @@ and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
 "vmlab"` on a machine, else an explicit host default, else the VM's persisted
-identity, selects its hypervisor. New supported x86_64 KVM VMs default to
-vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
-Supported new containers also default to vmlab-hv and require KVM.
+identity, selects its hypervisor. **QEMU runs no x86 guest** (§22.4, HV-D29):
+every x86 and x86_64 VM, and every container on an x86_64 host, runs on
+vmlab-hv under KVM only. `hypervisor = "qemu"`, a host default of `qemu` that
+reaches an x86 machine, and `qemu_args` on one are validation errors naming the
+replacement; what vmlab-hv refuses is an error with no fallback; a host
+without usable `/dev/kvm` fails with `KVM is required`. QEMU keeps aarch64 and
+riscv64 on the `virt` machine (`src/qemu/cmdline.rs` composes no q35 or pc
+argv), which still fall back to it automatically with a reason.
 **Existing x86 QEMU identities migrate at the next start** (§22.3), including
 identities inferred from old disks and inherited by clones from frozen worktree
 generations. Explicit machine and host settings still take precedence. Machine
@@ -95,17 +103,20 @@ reports any vmlab-hv refusal and keeps the old identity on refusal. After
 the checks pass, `up` saves the identity before boot and announces the switch
 once. Offline snapshots carry over. `snapshot list` names unrestorable online
 QEMU snapshots, and restore refuses them with offline conversion instructions.
-The removal warning (§22.2) remains for x86 machines selected for QEMU
-through explicit settings or automatic fallback. Phase 1 runs container micro-VMs; phases 2a to 2f a
+The removal warning of §22.2 is gone with the removal it announced, and
+`docs/agents/qemu-removal-remaining.md` lists what still uses QEMU. Phase 1
+runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
 a guest reset happens in place, readiness dropping until the rebooted
 guest's agent answers), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
 `vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
-host GPU pick resolves, with the host GPU's `qemu_env` applied and
-`qemu_binary` ignored with a warning;
-passthrough as a vfio device vmlab-hv takes only pre-bound), virtio-fs shares
+host GPU pick resolves, with the host GPU's `qemu_binary` and `qemu_env` ignored with a warning
+each, and a second warning when the Venus render server is not the bundle's;
+passthrough as a vfio device vmlab-hv takes only pre-bound, with the card's
+other `vfio-pci` functions at the same guest slot — `passthrough_functions`
+on the host GPU names them instead), virtio-fs shares
 it serves in process (no virtiofsd; the share plan asks each machine what
 serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
 `device_del`, waiting on `device_deleted`), and **guest audio** — `audio` and
@@ -118,8 +129,9 @@ scenario follows the selected hypervisor. Kernel tiers still require host
 capabilities. A macOS guest runs too, with the `macos` profile's VMware SVGA, USB
 keyboard, Skylake model, ignored MSRs and an Apple SMC whose key reaches
 vmlab-hv through a mode-600 pipe, never a file or an argv. Everything else —
-i440fx, `qemu_args`, hosts without
-KVM — is refused from one list naming the phase that brings it. Snapshots
+`accel = "tcg"`, `qemu_args`, hosts without KVM — is refused from one list
+naming the phase that brings it, and for an x86 guest that refusal means it
+does not run. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
@@ -163,6 +175,10 @@ Module map under `src/`:
   explicit settings, persisted VM identity, then automatic selection — and
   `vmlab_refusals`, the one list of what vmlab-hv cannot run yet, read by
   validation and again by the lab daemon.
+- `fuzzing.rs` — the bodies of the cargo-fuzz targets under `fuzz/` that
+  reach private modules (guest frames, registry documents), compiled under
+  `--cfg fuzzing` only; `docs/reviews/fuzz-coverage.md` lists every parser of
+  hostile input and its target.
 - `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the
   effective name `<declared>-<instance>` a directory runs its lab under, from
   `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
@@ -312,6 +328,9 @@ Module map under `src/`:
   sockets;
   `boot_clock.rs` is the guest-clock check every fresh agent handshake runs
   under `clock = "host"` (§7.3, #186): `get_time`, and `set_time` past 2 s;
+  `start_gate.rs` keeps a start from running behind a stop or a destroy: a
+  `down` makes the starts asked for before it stale, a destroy holds the
+  machine until its disks are gone, and a lab that is going away takes none;
   `boot_id.rs` is the per-family boot identity read over the agent's `exec`
   and the loop `wait_rebooted` waits on it with (§10.3);
   `usb.rs` is USB passthrough's lab-wide half (§5.2.1) — selector resolution
@@ -379,8 +398,15 @@ throughout the code and commit messages.
 - `just e2e::run` is the end-to-end suite: every feature in
   `e2e/features.py`, driven through the CLI inside a privileged container
   with /dev/kvm (`e2e/README.md`). It sits outside the merge bar.
-  `--hypervisor vmlab` runs it on vmlab-hv, skipping each feature past the
-  phase vmlab-hv has delivered (its tag in `features.py`).
+  `--hypervisor vmlab`, the default, runs it on vmlab-hv, skipping each
+  feature past the phase vmlab-hv has delivered (its tag in `features.py`);
+  automatic selection puts `arch.emulated`'s aarch64 guest on QEMU. QEMU runs
+  no x86 guest, so `--hypervisor qemu` runs `arch.emulated` alone.
+- `just release::local` builds one version on the build host (helios) into a
+  release directory — the four assets, `SHA256SUMS`, `provenance.json` and the
+  signature of `scripts/release-sign.sh` — and `just release::publish` uploads
+  it with `gh release create`. GitHub Actions builds and publishes no version
+  (`docs/agents/release-gate.md`).
 - `just buildbox::dist` builds every release artefact (binary, strict guest
   bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
   (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the

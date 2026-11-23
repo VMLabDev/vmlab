@@ -22,7 +22,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
-from features import FEATURES, HOST, PHASE_ORDER, PHASES, QEMU_SCENARIOS, VMLAB_DELIVERED, out_of_scope
+from features import FEATURES, VMLAB_DELIVERED, out_of_scope
 
 E2E = pathlib.Path(__file__).resolve().parent
 WORK = pathlib.Path(os.environ.get("E2E_WORK", "/work"))
@@ -245,25 +245,21 @@ class Harness:
         From 2c it is the UEFI one, as on QEMU."""
         return self.hypervisor != "qemu" and self.delivered in ("2a", "2b")
 
-    def vms_follow(self, features, scenario: str = "") -> bool:
-        """Whether a scenario's VMs run on vmlab-hv: it covers a VM feature of
-        a delivered phase (2a onwards). A scenario whose VM features are all
-        later keeps its VMs on QEMU, where a lab declaring OVMF or a TPM still
-        validates, and its features are skipped by phase."""
-        if self.hypervisor == "qemu" or scenario in QEMU_SCENARIOS:
-            return False
-        lo, hi = PHASE_ORDER.index("2a"), PHASE_ORDER.index(self.delivered)
-        return any(
-            f in PHASES and lo <= PHASE_ORDER.index(PHASES[f]) <= hi and not self.out_of_scope(f)
-            for f in features
-        )
+    def vms_follow(self, features=(), scenario: str = "") -> bool:
+        """Whether a scenario's x86 VMs run on vmlab-hv: on every vmlab run,
+        since QEMU runs no x86 guest (PRD §22). A feature of a later phase is
+        skipped by `out_of_scope`, not moved to QEMU."""
+        return self.hypervisor != "qemu"
 
     def host_config(self, vms: bool = False) -> str:
-        """The `host {}` lines that put this run's machines on its hypervisor:
-        containers automatically on vmlab, VMs where `vms` says (`vms_follow`)."""
-        vm = self.hypervisor if vms else "qemu"
-        container = 'container = "qemu" ' if self.hypervisor == "qemu" else ""
-        return f'  hypervisor {{ {container}vm = "{vm}" }}\n'
+        """The `host {}` lines that put this run's machines on its hypervisor.
+        A vmlab run leaves both kinds to automatic selection, which puts every
+        x86 machine on vmlab-hv and a guest of another architecture on QEMU; a
+        QEMU run pins both kinds to QEMU, which then runs its aarch64 guest
+        alone."""
+        if self.hypervisor == "qemu":
+            return '  hypervisor { container = "qemu" vm = "qemu" }\n'
+        return ""
 
     # -- recording -----------------------------------------------------------
 
@@ -274,10 +270,6 @@ class Harness:
         if why:
             # The scenario ran it, but not on the hypervisor under test.
             status, detail = "skip", why
-        elif (self.hypervisor != "qemu" and not self.vms_here
-              and PHASES.get(feature, HOST) not in (HOST, "1")):
-            # A VM feature from a scenario whose VMs ran on QEMU.
-            status, detail = "skip", f"not on vmlab-hv yet: {QEMU_SCENARIOS.get(self.scenario, 'VMs on QEMU')}"
         prior = self.results.get(feature)
         # A failure is never overwritten by a later pass of the same feature,
         # nor a pass by a skip from a scenario that could not run it.
@@ -325,6 +317,10 @@ class Harness:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
             if r["status"] != "pass":
                 print(f"{r['status'].upper():8} {r['feature']:<{width}}  {r['detail'][:160]}")
-        scope = f"vmlab-hv through phase {self.delivered}" if self.hypervisor == "vmlab" else self.hypervisor
+        scope = self.hypervisor
+        if self.hypervisor == "vmlab":
+            scope = f"vmlab-hv through phase {self.delivered}"
+            if self.delivered == "4":
+                scope += " excluding phase 3"
         print("\n" + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) + f" (of {len(rows)}) on {scope}")
         return 1 if failed else 0

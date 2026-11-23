@@ -39,6 +39,25 @@ async fn legacy_agent_conformance() -> Result<()> {
     fixture.run("legacy", None).await
 }
 
+#[tokio::test]
+async fn legacy_exec_reports_exit_with_inherited_output_pipes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let handle = AgentHandle::connect(fixture.socket(), BUDGET).await?;
+    let keep_running = tempfile::tempdir()?;
+    let mut argv = sh("(while [ -d \"$1\" ]; do sleep 1; done) & \
+                       printf stdout; printf stderr >&2; exit 3");
+    argv.push("sh".into());
+    argv.push(keep_running.path().to_str().unwrap().into());
+
+    let output = handle.exec(argv, vec![], None, None, BUDGET, None).await?;
+    assert_eq!(output.exit_code, 3);
+    assert_eq!(output.stdout, b"stdout");
+    assert_eq!(output.stderr, b"stderr");
+    Ok(())
+}
+
 /// F49: a full argv (the agent's MAX_ARGV, 64) still reaches execvp with its
 /// NULL terminator. F52: a child inherits none of the agent's descriptors —
 /// not the channel, not the listener, not another exec's pipe ends.

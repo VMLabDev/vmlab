@@ -115,6 +115,21 @@ pub trait Transport: Send + Sync {
     async fn blob_exists(&self, repository: &str, digest: &str) -> Result<bool>;
     /// GET a blob's bytes.
     async fn get_blob(&self, repository: &str, digest: &str) -> Result<Vec<u8>>;
+    /// GET a blob that is refused past `limit` bytes. The default
+    /// implementation checks what [`get_blob`](Self::get_blob) returned;
+    /// [`HttpTransport`] overrides it to stop reading at the limit.
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let bytes = self.get_blob(repository, digest).await?;
+        if bytes.len() > limit {
+            bail!("registry response exceeds {limit} bytes");
+        }
+        Ok(bytes)
+    }
     /// GET a blob into a file on disk, verifying its digest and reporting
     /// cumulative bytes to `progress`. Returns the byte count. The default
     /// implementation buffers through [`get_blob`](Self::get_blob);
@@ -165,6 +180,11 @@ pub trait Transport: Send + Sync {
 pub struct Registry {
     reference: Reference,
     transport: Box<dyn Transport>,
+    /// Asked before a pull replaces a variant overlay the store holds
+    /// ([`Self::guarding`]). Without one, no held overlay is replaced.
+    in_use: Option<crate::template::build::InUse>,
+    /// The owner of a pull's work directory ([`Self::holding`]).
+    work: Option<std::sync::Arc<tempfile::TempDir>>,
 }
 
 impl Registry {
@@ -177,7 +197,29 @@ impl Registry {
         Ok(Self {
             reference,
             transport: Box::new(transport),
+            in_use: None,
+            work: None,
         })
+    }
+
+    /// Give a pull the in-use check it asks before it replaces a variant
+    /// overlay the store already holds under the same name (§6.6): `in_use`
+    /// says why the overlay cannot go — the clones backed by it — or `None`.
+    /// A client without one cannot tell, so its pulls replace no held
+    /// overlay.
+    pub fn guarding(mut self, in_use: crate::template::build::InUse) -> Self {
+        self.in_use = Some(in_use);
+        self
+    }
+
+    /// Give a pull the owner of its work directory, so the directory lives
+    /// as long as the pull uses it. The install runs on a blocking thread
+    /// that an abort of the pull's task does not stop: it keeps this owner
+    /// until it ends, so a cancel cannot remove the staged disks under it
+    /// (review templates-registry F13).
+    pub fn holding(mut self, work: std::sync::Arc<tempfile::TempDir>) -> Self {
+        self.work = Some(work);
+        self
     }
 
     /// Build a client over an explicit transport (used by tests).
@@ -186,12 +228,11 @@ impl Registry {
         Self {
             reference,
             transport,
+            in_use: None,
+            work: None,
         }
     }
 
-    pub fn repository(&self) -> &str {
-        &self.reference.repository
-    }
     pub fn tag(&self) -> &str {
         &self.reference.tag
     }
@@ -224,11 +265,7 @@ impl Registry {
                 .collect()),
             ManifestOrIndex::Manifest(m) => {
                 // Plain single-arch manifest: read its config blob for the arch.
-                let config_bytes = self
-                    .transport
-                    .get_blob(repo, &m.config.digest)
-                    .await
-                    .context("downloading config blob")?;
+                let config_bytes = self.config_blob(repo, &m.config).await?;
                 Ok(vec![TemplateConfig::from_json(&config_bytes)?.arch])
             }
         }
@@ -275,11 +312,7 @@ impl Registry {
         if !manifest.is_vmlab_template() {
             bail!("{repo}:{tag} is not a vmlab template");
         }
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let arches = if arches.is_empty() {
             vec![config.arch]
@@ -390,6 +423,13 @@ impl Registry {
 
         // 1 + 2. Chunk, compress and upload the base.
         let set = chunking::chunk_and_compress(&disk, chunk_size, &work_dir.join("chunks"))?;
+        // The disk is published under the digest it has now, and the config
+        // blob carries the one the store recorded: a consumer verifies the
+        // first and records the second, so they must be the same.
+        let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        if let Some(recorded) = &meta.sha256 {
+            ensure_recorded(&reference, recorded, &set.whole_digest)?;
+        }
         report.base = self.upload_chunks(&repo, &set).await?;
 
         // 3. The variants, each a manifest of its own.
@@ -410,6 +450,11 @@ impl Registry {
                 &overlay,
                 chunk_size,
                 &work_dir.join("variants").join(&v.name),
+            )?;
+            ensure_recorded(
+                &format!("{reference}#{}", v.name),
+                &v.sha256,
+                &vset.whole_digest,
             )?;
             let uploaded = self.upload_chunks(&repo, &vset).await?;
             let config = self
@@ -506,9 +551,31 @@ impl Registry {
         Ok(count)
     }
 
+    /// A template's config blob, refused past [`MAX_CONFIG_BLOB`]: by the size
+    /// its descriptor declares before any request, and by the bytes that
+    /// arrive whatever it declares.
+    async fn config_blob(&self, repo: &str, config: &Descriptor) -> Result<Vec<u8>> {
+        ensure!(
+            config.size <= MAX_CONFIG_BLOB as u64,
+            "config blob {} of {} bytes exceeds the {MAX_CONFIG_BLOB} a template's may have",
+            config.digest,
+            config.size
+        );
+        self.transport
+            .get_blob_bounded(repo, &config.digest, MAX_CONFIG_BLOB)
+            .await
+            .context("downloading config blob")
+    }
+
     /// Upload a config blob unless present, returning its descriptor.
     async fn put_config(&self, repo: &str, config: &TemplateConfig) -> Result<Descriptor> {
         let bytes = config.to_json()?;
+        // What no pull would read back is not published.
+        ensure!(
+            bytes.len() <= MAX_CONFIG_BLOB,
+            "the template's config blob is {} bytes, over the {MAX_CONFIG_BLOB} a pull accepts",
+            bytes.len()
+        );
         let digest = digest_of(&bytes);
         if !self.transport.blob_exists(repo, &digest).await? {
             self.transport
@@ -628,14 +695,14 @@ impl Registry {
         }
 
         // 3. Download config → TemplateMeta.
-        let config_bytes = self
-            .transport
-            .get_blob(repo, &manifest.config.digest)
-            .await
-            .context("downloading config blob")?;
+        let config_bytes = self.config_blob(repo, &manifest.config).await?;
         let config = TemplateConfig::from_json(&config_bytes)?;
         let vars = config.vars()?;
-        let meta = config.into_meta(Some(self.reference.canonical()))?;
+        let mut meta = config.into_meta(Some(self.reference.canonical()))?;
+        // Who published it, from the reference and never from the blob: the
+        // blob chooses the store name and version, so this is what keeps the
+        // entry from standing for another repository's reference.
+        meta.pulled_from = Some(self.reference.source());
         crate::template::trust::names(&meta)?;
         let trusted = crate::template::trust::repository_trusted(
             &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
@@ -703,7 +770,63 @@ impl Registry {
     /// holds is not downloaded again, nor is a variant it holds with the same
     /// digest; what arrives is merged into the version, keeping the variants
     /// already there.
+    ///
+    /// A variant the store holds with *another* digest was rebuilt and pushed
+    /// again. Its overlay is replaced only when the in-use check
+    /// ([`Self::guarding`]) finds no clone backed by the held one: a clone is
+    /// a delta against that overlay, and would be corrupt on the new one.
+    /// Otherwise the held overlay stays where the pull only brought the
+    /// default along, and the pull is refused where `want` asked for that
+    /// variant.
+    ///
+    /// Two pulls of one version at the same time both find it absent and both
+    /// download it. The store lock orders their installs, and the second is
+    /// refused because the version is there. That pull runs once more: it
+    /// now finds the version held, checks it as any held version is checked
+    /// (same repository, same disk), and fetches only the variants it still
+    /// lacks.
     pub async fn pull_with_progress(
+        &self,
+        arch: Option<&str>,
+        dest_store: &TemplateStore,
+        work_dir: &Path,
+        overwrite: bool,
+        want: &VariantWant,
+        progress: &mut (dyn FnMut(PullProgress) + Send),
+    ) -> Result<TemplateMeta> {
+        let first = self
+            .pull_once(arch, dest_store, work_dir, overwrite, want, &mut *progress)
+            .await;
+        let lost_race = |e: &anyhow::Error| {
+            e.downcast_ref::<crate::template::store::AlreadyInstalled>()
+                .is_some_and(|held| {
+                    // A directory with no metadata is not a version another
+                    // pull installed, and a second pass would end the same way.
+                    matches!(
+                        dest_store.installed(&held.arch, &held.name, &held.version),
+                        Ok(Some(_))
+                    )
+                })
+        };
+        match first {
+            Err(e) if !overwrite && lost_race(&e) => {
+                tracing::info!(
+                    reference = %self.reference.canonical(),
+                    "another pull installed this version first; using it"
+                );
+                // What the first pass staged is not needed again.
+                for dir in ["chunks", "staging"] {
+                    let _ = std::fs::remove_dir_all(work_dir.join(dir));
+                }
+                self.pull_once(arch, dest_store, work_dir, overwrite, want, progress)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// One pass of [`Self::pull_with_progress`].
+    async fn pull_once(
         &self,
         arch: Option<&str>,
         dest_store: &TemplateStore,
@@ -728,6 +851,18 @@ impl Registry {
             .ok_or_else(|| anyhow!("manifest is missing the whole-image digest annotation"))?
             .to_string();
         let reference = format!("{}/{}@{}", meta.arch, meta.name, meta.version);
+        // The manifest's digest is what the disk is verified against, and the
+        // config blob's is what the store would record: one that differs
+        // would leave a version whose metadata names a digest its disk does
+        // not have.
+        if let Some(recorded) = &meta.sha256 {
+            ensure!(
+                digest_eq(recorded, &whole),
+                "{}'s config blob records the disk digest {recorded} but its manifest names \
+                 {whole} — the template was pushed inconsistently; refusing to pull",
+                self.reference.canonical()
+            );
+        }
         let (listed, default) = manifest.variants()?;
         for entry in &listed {
             crate::template::trust::component(&entry.name)?;
@@ -740,10 +875,27 @@ impl Registry {
         // template pushed from this store and referenced back by registry
         // lands here rather than in an offline cache hit.
         let local = if overwrite {
+            // Refused here rather than at the install alone, so a pull that
+            // cannot replace the version downloads nothing first.
+            dest_store.check_replace(&meta.arch, &meta.name, &meta.version)?;
             None
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
         };
+        // A version another repository put there is not this reference's,
+        // whatever its disk: its metadata and its variants are that
+        // repository's. It is refused rather than used or merged into.
+        if let Some(other) = local
+            .as_ref()
+            .and_then(|l| l.meta.pulled_from_other(&self.reference.source()))
+        {
+            bail!(
+                "template {reference} is already in the store, pulled from {other}, and {} \
+                 states the same name and version — remove it first, or pull with overwrite \
+                 to replace it",
+                self.reference.canonical()
+            );
+        }
         if let Some(local) = &local {
             let held = local.clone();
             let whole = whole.clone();
@@ -760,8 +912,7 @@ impl Registry {
 
         // The variants to fetch: each one's manifest and config blob, which
         // say what its overlay assembles to and the block it stands for.
-        let mut parts: Vec<(crate::template::meta::VariantMeta, Vec<Descriptor>, String)> =
-            Vec::new();
+        let mut parts: Vec<(crate::template::meta::VariantMeta, Chunks, String)> = Vec::new();
         for entry in chosen {
             let vm = self.fetch_manifest(repo, &entry.manifest).await?;
             if !vm.is_vmlab_template() {
@@ -784,14 +935,37 @@ impl Registry {
                 entry.name,
                 layout.base_digest
             );
-            if let Some(held) = local.as_ref().and_then(|l| l.meta.variant(&entry.name))
-                && digest_eq(&held.sha256, &layout.overlay_digest)
+            if let Some(local) = &local
+                && let Some(held) = local.meta.variant(&entry.name)
             {
-                continue;
+                if digest_eq(&held.sha256, &layout.overlay_digest) {
+                    continue;
+                }
+                let why = match &self.in_use {
+                    Some(in_use) => in_use(vec![local.variant_disk(&entry.name)]).await,
+                    None => Some("a clone may be backed by it".to_string()),
+                };
+                if let Some(why) = why {
+                    ensure!(
+                        !want.asks_for(&entry.name),
+                        "{reference}#{} is in the store with a different overlay than {} \
+                         publishes, and {why} — replacing the overlay a clone is a delta \
+                         against would corrupt it; destroy those machines, then pull \
+                         again",
+                        entry.name,
+                        self.reference.canonical()
+                    );
+                    tracing::warn!(
+                        variant = %entry.name,
+                        "keeping {reference}#{}: {} publishes a different overlay, and {why}",
+                        entry.name,
+                        self.reference.canonical()
+                    );
+                    continue;
+                }
             }
             let config_bytes = self
-                .transport
-                .get_blob(repo, &vm.config.digest)
+                .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
             let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
@@ -809,7 +983,14 @@ impl Registry {
                 "variant `{}`'s config blob disagrees with its manifest",
                 entry.name
             );
-            parts.push((variant, layout.overlay, layout.overlay_digest));
+            parts.push((
+                variant,
+                Chunks {
+                    layers: layout.overlay,
+                    sizes: layout.overlay_sizes,
+                },
+                layout.overlay_digest,
+            ));
         }
         if let Some(local) = &local
             && parts.is_empty()
@@ -820,27 +1001,45 @@ impl Registry {
         // 4. Download chunks in order — the base's only when the store does
         // not already hold it — verifying each chunk's digest as it lands.
         let chunks_dir = work_dir.join("chunks");
-        let base_layers: Vec<Descriptor> = if local.is_none() {
-            manifest.layers_in_order().into_iter().cloned().collect()
+        //
+        // A manifest is hostile input, and its layer list may name one small
+        // chunk of zeros thousands of times. So what each part assembles to
+        // is taken from what the manifest declares, checked against its own
+        // totals before anything is fetched, and held to at every chunk; and
+        // the sum is refused where the filesystem has no room for it.
+        let base = if local.is_none() {
+            Chunks {
+                sizes: manifest.declared_base_chunks()?,
+                layers: manifest.layers_in_order().into_iter().cloned().collect(),
+            }
         } else {
-            Vec::new()
+            Chunks::default()
         };
-        let mut download = Download::new(
-            std::iter::once(&base_layers)
-                .chain(parts.iter().map(|(_, layers, _)| layers))
-                .flatten(),
-            progress,
-        );
+        let all = || std::iter::once(&base).chain(parts.iter().map(|(_, chunks, _)| chunks));
+        let assembled = sum_sizes(all().flat_map(|c| c.sizes.iter().copied()))?;
+        let compressed = sum_sizes(all().flat_map(|c| c.layers.iter().map(|d| d.size)))?;
+        // The chunks and the assembled disks both land under the work
+        // directory; the install renames them into the store, or copies them
+        // when the store is another filesystem.
+        ensure_room(
+            work_dir,
+            assembled
+                .checked_add(compressed)
+                .ok_or_else(|| anyhow!("the manifest's sizes overflow"))?,
+            &reference,
+        )?;
+        ensure_room(dest_store.root(), assembled, &reference)?;
+        let mut download = Download::new(all().flat_map(|c| c.layers.iter()), progress);
         let base_paths = self
-            .download_layers(repo, &base_layers, &chunks_dir.join("base"), &mut download)
+            .download_layers(repo, &base, &chunks_dir.join("base"), &mut download)
             .await?;
         let mut overlays = Vec::new();
-        for (variant, layers, digest) in parts {
+        for (variant, chunks, digest) in &parts {
             let dir = chunks_dir.join("variants").join(&variant.name);
             let paths = self
-                .download_layers(repo, layers.as_slice(), &dir, &mut download)
+                .download_layers(repo, chunks, &dir, &mut download)
                 .await?;
-            overlays.push((variant, paths, digest));
+            overlays.push((variant.clone(), paths, digest.clone()));
         }
 
         // 5 + 6. Decompress the chunks into the disk images, verify each
@@ -856,7 +1055,15 @@ impl Registry {
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("cannot create {}", staging.display()))?;
         let store = dest_store.clone();
+        // The store asks again under its lock, at the moment it replaces an
+        // overlay: a clone can have been made since the check above.
+        let in_use = self.in_use.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // An abort of this future does not stop the blocking thread, so the
+        // thread holds the work directory until it ends (F13).
+        let work = self.work.clone();
         let meta = tokio::task::spawn_blocking(move || -> Result<TemplateMeta> {
+            let _work = work;
             let mut variants = Vec::new();
             for (variant, paths, digest) in overlays {
                 let disk = staging.join(crate::template::meta::variant_disk_rel(&variant.name));
@@ -868,6 +1075,8 @@ impl Registry {
                         == Some(crate::template::store::VARIANT_BACKING),
                     "untrusted variant backing file"
                 );
+                crate::template::store::refuse_qcow2_data_file(&disk)
+                    .with_context(|| format!("variant `{}`", variant.name))?;
                 variants.push(variant);
             }
             match local {
@@ -877,6 +1086,10 @@ impl Registry {
                     &held.meta.version,
                     &staging,
                     &variants,
+                    &|doomed| match &in_use {
+                        Some(in_use) => runtime.block_on(in_use(doomed.to_vec())),
+                        None => Some("a clone may be backed by it".to_string()),
+                    },
                 ),
                 None => {
                     let disk = staging.join(DISK_FILE);
@@ -887,14 +1100,14 @@ impl Registry {
                     }
                     chunking::verify_whole(&disk, &whole)?;
                     let mut meta = meta;
-                    if meta.sha256.is_none() {
-                        meta.sha256 = Some(
-                            whole
-                                .strip_prefix("sha256:")
-                                .unwrap_or(&whole)
-                                .to_ascii_lowercase(),
-                        );
-                    }
+                    // What the disk was just verified against, whatever
+                    // spelling the config blob gave it.
+                    meta.sha256 = Some(
+                        whole
+                            .strip_prefix("sha256:")
+                            .unwrap_or(&whole)
+                            .to_ascii_lowercase(),
+                    );
                     meta.variants = variants;
                     store.install_with_variants(&staging, &meta, overwrite)?;
                     Ok(meta)
@@ -931,18 +1144,19 @@ impl Registry {
         }
     }
 
-    /// Download `layers` in order into `dir`, verifying each compressed
-    /// chunk's digest, and return the chunk files in that order.
+    /// Download `chunks` in order into `dir`, verifying each compressed
+    /// chunk's size and digest, and return the chunk files in that order,
+    /// each with the decompressed size its manifest states.
     async fn download_layers(
         &self,
         repo: &str,
-        layers: &[Descriptor],
+        chunks: &Chunks,
         dir: &Path,
         download: &mut Download<'_>,
-    ) -> Result<Vec<std::path::PathBuf>> {
+    ) -> Result<Vec<(std::path::PathBuf, u64)>> {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        let mut paths = Vec::with_capacity(layers.len());
-        for (i, layer) in layers.iter().enumerate() {
+        let mut paths = Vec::with_capacity(chunks.layers.len());
+        for (i, (layer, size)) in chunks.layers.iter().zip(&chunks.sizes).enumerate() {
             let chunk = download.chunk;
             let bytes = self
                 .transport
@@ -956,14 +1170,61 @@ impl Registry {
                     layer.digest
                 );
             }
+            // The room check counted the size the manifest states.
+            ensure!(
+                bytes.len() as u64 == layer.size,
+                "chunk {chunk} is {} bytes, its manifest states {}",
+                bytes.len(),
+                layer.size
+            );
             let path = dir.join(format!("chunk-{i:04}.zst"));
             std::fs::write(&path, &bytes)
                 .with_context(|| format!("cannot write {}", path.display()))?;
-            paths.push(path);
+            paths.push((path, *size));
             download.done(layer.size);
         }
         Ok(paths)
     }
+}
+
+/// One part of a pull, the base or a variant's overlay: its chunk layers in
+/// order, and what each decompresses to as the manifest declares it
+/// ([`crate::oci::manifest::declared_chunk_sizes`]).
+#[derive(Debug, Clone, Default)]
+struct Chunks {
+    layers: Vec<Descriptor>,
+    sizes: Vec<u64>,
+}
+
+fn sum_sizes(mut sizes: impl Iterator<Item = u64>) -> Result<u64> {
+    sizes
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| anyhow!("the manifest's sizes overflow"))
+}
+
+/// Refuse a pull whose manifest declares more than the filesystem holding
+/// `dir` has free. The declared size is the registry's word, so without this
+/// a registry fills the store's filesystem by declaring a large disk, and a
+/// full store filesystem stops every VM whose overlay is on it. `dir` need
+/// not exist yet: its nearest existing ancestor is asked.
+fn ensure_room(dir: &Path, need: u64, reference: &str) -> Result<()> {
+    let Some(at) = dir.ancestors().find(|p| p.exists()) else {
+        return Ok(());
+    };
+    let stat = nix::sys::statvfs::statvfs(at)
+        .with_context(|| format!("cannot read the free space of {}", at.display()))?;
+    let free = (stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64);
+    refuse_without_room(need, free, at, reference)
+}
+
+fn refuse_without_room(need: u64, free: u64, at: &Path, reference: &str) -> Result<()> {
+    ensure!(
+        need <= free,
+        "template {reference} declares {need} bytes to download and assemble, and the \
+         filesystem of {} has {free} free — free space there, then pull again",
+        at.display()
+    );
+    Ok(())
 }
 
 /// Which variants a pull fetches beyond the default, which it always does
@@ -996,6 +1257,12 @@ impl VariantWant {
         if let Some(crate::config::model::VariantRef::Named(n)) = variant {
             self.names.insert(n.clone());
         }
+    }
+
+    /// Whether this asks for `variant` itself, rather than a pull bringing it
+    /// along as the default.
+    fn asks_for(&self, variant: &str) -> bool {
+        self.all || self.names.contains(variant)
     }
 
     /// Whether a store version already holds everything this asks for, as
@@ -1092,6 +1359,18 @@ impl<'a> Download<'a> {
     }
 }
 
+/// Refuse to push `what` when its disk hashes to `actual` and the store's
+/// metadata records `recorded`: the stored file is not the one that was
+/// built or pulled.
+fn ensure_recorded(what: &str, recorded: &str, actual: &str) -> Result<()> {
+    ensure!(
+        digest_eq(recorded, actual),
+        "{what} records the digest {recorded} but its disk hashes to {actual} — the stored \
+         disk is damaged or was changed outside vmlab; rebuild or pull it again before pushing"
+    );
+    Ok(())
+}
+
 /// Two `sha256` digests, either maybe `sha256:`-prefixed, compared without
 /// case.
 fn digest_eq(a: &str, b: &str) -> bool {
@@ -1129,18 +1408,42 @@ pub fn cached_registry_template(
     arch: &str,
     store: &TemplateStore,
 ) -> Result<Option<crate::template::store::TemplateVersion>> {
-    let registry = Registry::new(reference)?;
-    // Templates live at `host/owner/[group/]name:VERSION`; the store name is
-    // the last repository path component.
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    Ok(store
-        .resolve_version(arch, &store_name, Some(registry.tag()))
-        .ok())
+    let reference = Reference::parse(reference)?;
+    Ok(held_for(&reference, arch, store, &reference.tag))
+}
+
+/// The store version the registry `reference` stands for at version `pin`,
+/// offline. Templates live at `host/owner/[group/]name:VERSION`; the store
+/// name is the last repository path component.
+///
+/// A version pulled from another repository is never the answer
+/// ([`TemplateMeta::pulled_from_other`]): its config blob chose the name and
+/// version it sits under. Where such a version is the newest match of the
+/// pin, the newest one this reference can stand for is taken instead, so the
+/// other repository cannot hide it either.
+fn held_for(
+    reference: &Reference,
+    arch: &str,
+    store: &TemplateStore,
+    pin: &str,
+) -> Option<crate::template::store::TemplateVersion> {
+    let name = reference.repository.rsplit('/').next().unwrap_or_default();
+    let source = reference.source();
+    let newest = store.resolve_version(arch, name, Some(pin)).ok()?;
+    if newest.meta.pulled_from_other(&source).is_none() {
+        return Some(newest);
+    }
+    let mut held = Vec::new();
+    for version in store.versions_of(arch, name).unwrap_or_default() {
+        if let Ok(Some(v)) = store.installed(arch, name, &version)
+            && v.meta.pulled_from_other(&source).is_none()
+        {
+            held.push(v);
+        }
+    }
+    let versions: Vec<String> = held.iter().map(|v| v.meta.version.clone()).collect();
+    let version = crate::template::store::resolve_version_pin(&versions, pin)?;
+    held.into_iter().find(|v| v.meta.version == version)
 }
 
 /// Resolve a `registry` template reference to a cached store entry, pulling it
@@ -1159,6 +1462,7 @@ pub async fn ensure_registry_template(
     arch: &str,
     store: &TemplateStore,
     want: &VariantWant,
+    in_use: crate::template::build::InUse,
     progress: &mut (dyn FnMut(PullProgress) + Send),
 ) -> Result<crate::template::store::TemplateVersion> {
     // Tag is a concrete, already-cached version holding every variant asked
@@ -1169,12 +1473,6 @@ pub async fn ensure_registry_template(
         return Ok(r);
     }
     let registry = Registry::new(reference)?;
-    let store_name = registry
-        .repository()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
     // Not cached. Resolve the requested tag against the registry's published
     // tags first: a version pin (e.g. 26100.1742, or 24.04) resolves to the
     // version `latest` names when it falls under the pin, else to the newest
@@ -1191,21 +1489,35 @@ pub async fn ensure_registry_template(
         .resolve_version(Some(arch))
         .await
         .with_context(|| format!("resolving {reference}"))?;
-    if let Ok(r) = store.resolve_version(arch, &store_name, Some(&real))
+    if let Some(r) = held_for(&registry.reference, arch, store, &real)
         && want.held_by(&r.meta)
     {
         return Ok(r);
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
     // at once must not share (and then delete) one.
-    let work = crate::template::oci_bridge::fresh_work_dir(
+    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(
         &crate::paths::template_store_dir().join(".oci-pull"),
-    )?;
+    )?);
     let meta = registry
+        .guarding(in_use)
+        .holding(work.clone())
         .pull_with_progress(Some(arch), store, work.path(), false, want, progress)
         .await
         .with_context(|| format!("pulling {reference}"))?;
-    store.resolve_version(&meta.arch, &meta.name, Some(&meta.version))
+    // Exactly the version the pull installed or found held. A pin
+    // resolution here would prefer a `<version>.<N>` sub-build, which another
+    // repository may have put in the store.
+    store
+        .installed(&meta.arch, &meta.name, &meta.version)?
+        .ok_or_else(|| {
+            anyhow!(
+                "template {}/{}@{} is not in the store after its pull",
+                meta.arch,
+                meta.name,
+                meta.version
+            )
+        })
 }
 
 /// `sha256:<hex>` of a byte slice.
@@ -1222,6 +1534,7 @@ pub struct HttpTransport {
     base: String,
     credential: Credential,
     client: reqwest::Client,
+    limits: Limits,
     /// Cached bearer token per scope string.
     tokens: tokio::sync::Mutex<BTreeMap<String, String>>,
 }
@@ -1229,18 +1542,89 @@ pub struct HttpTransport {
 const MAX_RETRIES: u32 = 3;
 pub(super) const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_BLOB_BODY: usize = 1024 * 1024 * 1024;
+/// A template's config blob: a JSON document, read whole on every resolve of
+/// a registry reference. Its one large field is the packed VARS file, which
+/// is tens of KiB for a real one.
+const MAX_CONFIG_BLOB: usize = MAX_JSON_BODY;
 const MAX_STREAMED_BLOB: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_LIST_PAGES: usize = 100;
 pub(super) const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 
+/// How long the transport waits on a registry, a token realm or a mirror
+/// that has stopped talking. None of these bounds a whole transfer: a disk
+/// chunk is hundreds of MiB and takes as long as the link needs. Each one
+/// bounds a wait in which nothing arrives.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Limits {
+    /// Opening the connection, TLS handshake included.
+    connect: Duration,
+    /// From sending a request without a body to its response head.
+    answer: Duration,
+    /// The same for a request that carries a body, where the wait includes
+    /// the upload itself. reqwest's own `read_timeout` runs through the
+    /// upload too, which is why the transport keeps these waits itself.
+    upload: Duration,
+    /// Between two reads of a response body.
+    idle: Duration,
+}
+
+impl Limits {
+    /// The limits every registry call runs under. `upload` is past the ten
+    /// minutes after which GHCR drops an upload session (PRD §6.4), so it
+    /// never cuts a PUT the registry would still have taken.
+    pub(super) const DEFAULT: Limits = Limits {
+        connect: Duration::from_secs(30),
+        answer: Duration::from_secs(60),
+        upload: Duration::from_secs(15 * 60),
+        idle: Duration::from_secs(60),
+    };
+}
+
+/// A wait of [`Limits`] ran out: the other end is connected and silent.
+#[derive(Debug)]
+pub(super) struct NoAnswer {
+    waited: Duration,
+    /// Whether the request carried a body. Such a wait is long and is not
+    /// repeated.
+    upload: bool,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the registry sent nothing for {:?}; giving up",
+            self.waited
+        )
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
 /// Check the stream as well as Content-Length: a registry can omit or lie
 /// about its length. Never collect an unbounded response in memory.
-pub(super) async fn bounded_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(super) async fn bounded_body(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    bounded_body_within(resp, limit, Limits::DEFAULT.idle).await
+}
+
+/// [`bounded_body`] with the wait between two reads given.
+async fn bounded_body_within(
+    mut resp: reqwest::Response,
+    limit: usize,
+    idle: Duration,
+) -> Result<Vec<u8>> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         bail!("registry response exceeds {limit} bytes");
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.context("reading registry response")? {
+    while let Some(chunk) = tokio::time::timeout(idle, resp.chunk())
+        .await
+        .map_err(|_| NoAnswer {
+            waited: idle,
+            upload: false,
+        })?
+        .context("reading registry response")?
+    {
         if chunk.len() > limit.saturating_sub(body.len()) {
             bail!("registry response exceeds {limit} bytes");
         }
@@ -1277,6 +1661,10 @@ struct TokenResponse {
 
 impl HttpTransport {
     pub fn new(host: String, credential: Credential) -> Result<Self> {
+        Self::with_limits(host, credential, Limits::DEFAULT)
+    }
+
+    fn with_limits(host: String, credential: Credential, limits: Limits) -> Result<Self> {
         let parsed = reqwest::Url::parse(&format!("https://{host}"))?;
         let scheme = if loopback_registry(&parsed) {
             "http"
@@ -1287,6 +1675,7 @@ impl HttpTransport {
         let client = reqwest::Client::builder()
             .user_agent("vmlab-oci/1")
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(limits.connect)
             .build()
             .context("cannot build HTTP client")?;
         Ok(Self {
@@ -1294,12 +1683,17 @@ impl HttpTransport {
             base,
             credential,
             client,
+            limits,
             tokens: tokio::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    async fn body(&self, resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+        bounded_body_within(resp, limit, self.limits.idle).await
     }
 
     /// Credentials go only to the exact registry origin, over HTTPS, or
@@ -1406,7 +1800,15 @@ impl HttpTransport {
             let saved = req
                 .try_clone()
                 .ok_or_else(|| anyhow!("request cannot be replayed"))?;
-            let resp = self.client.execute(req).await?;
+            let upload = req.body().is_some();
+            let waited = if upload {
+                self.limits.upload
+            } else {
+                self.limits.answer
+            };
+            let resp = tokio::time::timeout(waited, self.client.execute(req))
+                .await
+                .map_err(|_| NoAnswer { waited, upload })??;
             if !resp.status().is_redirection() {
                 return Ok((resp, hop != 0));
             }
@@ -1448,10 +1850,7 @@ impl HttpTransport {
             }
             let (resp, redirected) = match self.send_request(req.build()?, false).await {
                 Ok(r) => r,
-                Err(e)
-                    if attempt < MAX_RETRIES
-                        && e.downcast_ref::<reqwest::Error>().is_some_and(is_transient) =>
-                {
+                Err(e) if attempt < MAX_RETRIES && worth_another_try(&e) => {
                     backoff(attempt).await;
                     continue;
                 }
@@ -1527,7 +1926,7 @@ impl HttpTransport {
                 resp.status()
             );
         }
-        let body: TokenResponse = serde_json::from_slice(&bounded_body(resp, MAX_JSON_BODY).await?)
+        let body: TokenResponse = serde_json::from_slice(&self.body(resp, MAX_JSON_BODY).await?)
             .context("malformed token response")?;
         body.token
             .or(body.access_token)
@@ -1560,7 +1959,24 @@ impl Transport for HttpTransport {
         if !resp.status().is_success() {
             bail!("GET blob {digest} returned {}", resp.status());
         }
-        bounded_body(resp, MAX_BLOB_BODY).await
+        self.body(resp, MAX_BLOB_BODY).await
+    }
+
+    async fn get_blob_bounded(
+        &self,
+        repository: &str,
+        digest: &str,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let url = self.url(&format!("/v2/{repository}/blobs/{digest}"));
+        let scope = self.scope(repository, false);
+        let resp = self
+            .send_with_auth(&scope, || self.client.get(&url))
+            .await?;
+        if !resp.status().is_success() {
+            bail!("GET blob {digest} returned {}", resp.status());
+        }
+        self.body(resp, limit).await
     }
 
     async fn get_blob_to_file(
@@ -1587,7 +2003,14 @@ impl Transport for HttpTransport {
         let mut hasher = Sha256::new();
         let mut done: u64 = 0;
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        let idle = self.limits.idle;
+        while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+            .await
+            .map_err(|_| NoAnswer {
+                waited: idle,
+                upload: false,
+            })?
+        {
             let chunk = chunk.with_context(|| format!("reading blob {digest} stream"))?;
             if chunk.len() as u64 > MAX_STREAMED_BLOB.saturating_sub(done) {
                 bail!("registry blob exceeds {MAX_STREAMED_BLOB} bytes");
@@ -1675,7 +2098,7 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .unwrap_or(media_types::OCI_MANIFEST)
             .to_string();
-        let body = bounded_body(resp, MAX_JSON_BODY).await?;
+        let body = self.body(resp, MAX_JSON_BODY).await?;
         Ok(Some(Fetched { media_type, body }))
     }
 
@@ -1737,7 +2160,7 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            let body = self.body(resp, MAX_JSON_BODY).await?;
             bytes += body.len();
             anyhow::ensure!(
                 bytes <= MAX_LIST_BYTES,
@@ -1789,7 +2212,7 @@ impl Transport for HttpTransport {
                 .get(reqwest::header::LINK)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let body = bounded_body(resp, MAX_JSON_BODY).await?;
+            let body = self.body(resp, MAX_JSON_BODY).await?;
             bytes += body.len();
             anyhow::ensure!(
                 bytes <= MAX_LIST_BYTES,
@@ -1851,6 +2274,13 @@ impl HttpTransport {
 
 fn is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// A failed send that a second attempt can cure: a network error, or a
+/// silence on a request that had no body to send again.
+fn worth_another_try(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>().is_some_and(is_transient)
+        || e.downcast_ref::<NoAnswer>().is_some_and(|n| !n.upload)
 }
 
 /// How many times a blob PUT restarts its upload session before giving up.
@@ -2167,6 +2597,8 @@ mod tests {
         manifests: Mutex<HashMap<String, (String, Vec<u8>)>>,
         /// Every blob digest PUT, in order — what a push uploaded.
         puts: Mutex<Vec<String>>,
+        /// Every blob digest asked for with GET, in order.
+        gets: Mutex<Vec<String>>,
     }
 
     fn key(repo: &str, id: &str) -> String {
@@ -2179,6 +2611,7 @@ mod tests {
             Ok(self.blobs.lock().unwrap().contains_key(&key(repo, digest)))
         }
         async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+            self.gets.lock().unwrap().push(digest.to_string());
             self.blobs
                 .lock()
                 .unwrap()
@@ -2280,6 +2713,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2490,6 +2924,67 @@ mod tests {
         assert_eq!(std::fs::read(&resolved.disk_path).unwrap(), disk);
     }
 
+    /// A pull with `overwrite` hands the version it would replace to the
+    /// store's replace guard, and a refusal — a clone is backed by the
+    /// version — leaves the held disk as it was (review templates-registry
+    /// F2).
+    #[tokio::test]
+    async fn an_overwriting_pull_is_refused_while_a_clone_is_backed_by_the_version() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let m = meta("x86_64");
+        let push = |disk: &'static [u8], n: u32| {
+            let tdir = work.path().join(format!("tmpl{n}"));
+            let push_work = work.path().join(format!("push{n}"));
+            let (fake, m) = (fake.clone(), m.clone());
+            async move {
+                make_template(&tdir, &m, disk);
+                registry_with_fake(reference, fake)
+                    .push(&tdir, 1024, "x86_64", &push_work, None, None)
+                    .await
+                    .unwrap();
+            }
+        };
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let reg = registry_with_fake(reference, fake.clone());
+
+        push(b"first disk", 1).await;
+        reg.pull(Some("x86_64"), &store, &store_root.join(".p1"), false)
+            .await
+            .unwrap();
+        let held = store.resolve_version(&m.arch, &m.name, None).unwrap();
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"first disk");
+
+        // The tag now carries another disk, and a clone leans on the held one.
+        push(b"second disk", 2).await;
+        let guarded = store.clone().refusing_replace({
+            let disk = held.disk_path.clone();
+            move |doomed| {
+                doomed
+                    .contains(&disk)
+                    .then(|| "the clone of machine corp/dc01 is backed by it".to_string())
+            }
+        });
+        let err = reg
+            .pull(Some("x86_64"), &guarded, &store_root.join(".p2"), true)
+            .await
+            .expect_err("the clone of corp/dc01 is backed by the version");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("corp/dc01"), "{text}");
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"first disk");
+
+        // With no clone backed by it, the same pull replaces the version.
+        let free = store.clone().refusing_replace(|_| None);
+        reg.pull(Some("x86_64"), &free, &store_root.join(".p3"), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"second disk");
+    }
+
     /// A template carrying a pre-enrolled VARS file (§5.2) pushes it in the
     /// base's config blob and pulls it back beside the disk, so clones of
     /// the pulled copy start from the same enrolled keys.
@@ -2532,6 +3027,68 @@ mod tests {
             .unwrap();
         let held = crate::template::store::template_vars(&r.dir, &r.meta).unwrap();
         assert_eq!(std::fs::read(held).unwrap(), vars);
+    }
+
+    /// A template's config blob is a small JSON document, and it is read
+    /// whole on every resolve of a registry reference. One of 16 MiB is
+    /// refused by its size rather than held and parsed (review F4).
+    #[tokio::test]
+    async fn an_oversized_config_blob_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same template under the tag `big`, its config blob padded with
+        // JSON whitespace to 16 MiB: still a document that parses.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let mut config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        config.resize(16 * 1024 * 1024, b' ');
+        TemplateConfig::from_json(&config).expect("the padded blob still parses");
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "big",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let err = registry_with_fake("ghcr.io/owner/alpine:big", fake.clone())
+            .pull(Some("x86_64"), &store, &store_root.join(".oci-pull"), false)
+            .await
+            .expect_err("a 16 MiB config blob is refused");
+        assert!(format!("{err:#}").contains("config blob"), "{err:#}");
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
     }
 
     /// Pulling a version the store already holds uses the stored copy when it
@@ -2600,6 +3157,350 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("different disk"), "{err}");
+    }
+
+    /// F11 of docs/reviews/templates-registry.md. The manifest's whole-image
+    /// digest is what a pull verifies, the config blob's `sha256` what the
+    /// store records. A config blob that states another digest is refused
+    /// before a chunk is fetched, so the store never holds a version whose
+    /// metadata names a digest its disk does not have.
+    #[tokio::test]
+    async fn a_config_digest_that_disagrees_with_the_manifest_is_refused() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        make_template(&tdir, &meta("x86_64"), &[7u8; 64 * 1024]);
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The same correct manifest under the tag `forged`, its config blob
+        // stating a `sha256` of 64 zeros.
+        let repo = "owner/alpine";
+        let mut manifest = fake
+            .manifests
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|(_, body)| match parse_manifest_or_index(body) {
+                Ok(ManifestOrIndex::Manifest(m)) => Some(m),
+                _ => None,
+            })
+            .expect("the push left a template manifest");
+        let config = fake.get_blob(repo, &manifest.config.digest).await.unwrap();
+        let mut config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+        config["sha256"] = serde_json::Value::String("00".repeat(32));
+        let config = serde_json::to_vec(&config).unwrap();
+        manifest.config.digest = digest_of(&config);
+        manifest.config.size = config.len() as u64;
+        fake.put_blob(repo, &manifest.config.digest, config)
+            .await
+            .unwrap();
+        fake.put_manifest(
+            repo,
+            "forged",
+            &manifest.media_type,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let store_root = work.path().join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let store = TemplateStore::new(store_root.clone());
+        let mut downloads = 0;
+        let err = registry_with_fake("ghcr.io/owner/alpine:forged", fake.clone())
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store_root.join(".oci-pull"),
+                false,
+                &VariantWant::default(),
+                &mut |_| downloads += 1,
+            )
+            .await
+            .expect_err("a config blob naming another digest is refused");
+        assert!(
+            format!("{err:#}").contains("config blob records"),
+            "{err:#}"
+        );
+        assert_eq!(downloads, 0, "refused before a chunk is fetched");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// F11 of docs/reviews/templates-registry.md, the push half. A stored
+    /// disk that is no longer the one its metadata records (bit rot, a file
+    /// truncated by a crash) is not published: the damaged bytes would get a
+    /// correct manifest digest, and every consumer would verify them as good.
+    #[tokio::test]
+    async fn a_push_refuses_a_disk_that_is_not_the_recorded_one() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let mut disk = vec![7u8; 64 * 1024];
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.sha256 = Some(hex::encode(Sha256::digest(&disk)));
+        disk[1000] ^= 1;
+        make_template(&tdir, &m, &disk);
+        let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a disk that is not the recorded one is not pushed");
+        assert!(format!("{err:#}").contains("records the digest"), "{err:#}");
+        assert!(fake.puts.lock().unwrap().is_empty(), "nothing was uploaded");
+        assert!(fake.manifests.lock().unwrap().is_empty());
+    }
+
+    /// Push a template under `reference`, with the name and version its
+    /// config blob states chosen freely, as a repository can.
+    async fn push_stating(
+        fake: &std::sync::Arc<FakeRegistry>,
+        reference: &str,
+        name: &str,
+        version: &str,
+        disk: &[u8],
+    ) {
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.name = name.into();
+        m.version = version.into();
+        make_template(&tdir, &m, disk);
+        registry_with_fake(reference, fake.clone())
+            .push(&tdir, 1024, "x86_64", &work.path().join("push"), None, None)
+            .await
+            .unwrap();
+    }
+
+    /// F3 of docs/reviews/templates-registry.md. The store slot comes from
+    /// the config blob, so `evil/x` can state `ubuntu` at a version under the
+    /// pin `24.04`. The offline lookup of `good/ubuntu:24.04` must not take
+    /// it, and it must not hide what `good/ubuntu` itself put in the store.
+    #[tokio::test]
+    async fn a_cached_registry_reference_is_not_served_from_another_repository() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        let good = "localhost:5000/good/ubuntu:24.04";
+
+        push_stating(
+            &fake,
+            "localhost:5000/evil/x:1",
+            "ubuntu",
+            "24.04.9",
+            b"evil",
+        )
+        .await;
+        let (pulled, _) = pull_want(&fake, "localhost:5000/evil/x:1", &store, &want)
+            .await
+            .unwrap();
+        assert_eq!(
+            (pulled.name.as_str(), pulled.version.as_str()),
+            ("ubuntu", "24.04.9")
+        );
+        assert_eq!(pulled.pulled_from.as_deref(), Some("localhost:5000/evil/x"));
+
+        let served = cached_registry_template(good, "x86_64", &store).unwrap();
+        assert!(
+            served.is_none(),
+            "{good} resolved to the entry pulled from {:?}",
+            served.map(|v| v.meta.origin)
+        );
+
+        // What the named repository published is found under the entry that
+        // sorts above it.
+        push_stating(
+            &fake,
+            "localhost:5000/good/ubuntu:24.04.3",
+            "ubuntu",
+            "24.04.3",
+            b"good",
+        )
+        .await;
+        pull_want(&fake, "localhost:5000/good/ubuntu:24.04.3", &store, &want)
+            .await
+            .unwrap();
+        let served = cached_registry_template(good, "x86_64", &store)
+            .unwrap()
+            .expect("the version good/ubuntu published is in the store");
+        assert_eq!(served.meta.version, "24.04.3");
+        assert_eq!(
+            served.meta.pulled_from.as_deref(),
+            Some("localhost:5000/good/ubuntu")
+        );
+    }
+
+    /// F3, the pull side: a version another repository installed is not this
+    /// reference's even with the same disk, since its metadata and variants
+    /// are that repository's. The pull is refused and names the repository.
+    /// The same repository pulls onto its own version as before.
+    #[tokio::test]
+    async fn a_pull_does_not_use_a_version_another_repository_installed() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let want = VariantWant::default();
+        for reference in ["ghcr.io/evil/alpine:3.20", "ghcr.io/owner/alpine:3.20"] {
+            push_stating(&fake, reference, "alpine", "3.20", b"same disk").await;
+        }
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .unwrap();
+        pull_want(&fake, "ghcr.io/evil/alpine:3.20", &store, &want)
+            .await
+            .expect("a repository pulls onto its own version");
+
+        let err = pull_want(&fake, "ghcr.io/owner/alpine:3.20", &store, &want)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pulled from ghcr.io/evil/alpine"), "{err}");
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.meta.pulled_from.as_deref(),
+            Some("ghcr.io/evil/alpine")
+        );
+    }
+
+    /// A registry whose chunk downloads meet: the first two GETs of a chunk
+    /// both wait until the other has arrived. A pull asks the store whether
+    /// it holds the version before it fetches a chunk, so two pulls that
+    /// meet here have both found it absent.
+    #[derive(Clone)]
+    struct ChunksMeet {
+        inner: std::sync::Arc<FakeRegistry>,
+        chunks: std::sync::Arc<std::collections::HashSet<String>>,
+        meeting: std::sync::Arc<tokio::sync::Barrier>,
+        arrived: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for ChunksMeet {
+        async fn blob_exists(&self, r: &str, d: &str) -> Result<bool> {
+            self.inner.blob_exists(r, d).await
+        }
+        async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+            let meets = self.chunks.contains(d) && self.arrived.fetch_add(1, Ordering::SeqCst) < 2;
+            if meets {
+                self.meeting.wait().await;
+            }
+            self.inner.get_blob(r, d).await
+        }
+        async fn put_blob(&self, r: &str, d: &str, data: Vec<u8>) -> Result<()> {
+            self.inner.put_blob(r, d, data).await
+        }
+        async fn put_blob_file(&self, r: &str, d: &str, p: &Path) -> Result<()> {
+            self.inner.put_blob_file(r, d, p).await
+        }
+        async fn get_manifest(&self, r: &str, rf: &str) -> Result<Option<Fetched>> {
+            self.inner.get_manifest(r, rf).await
+        }
+        async fn put_manifest(&self, r: &str, rf: &str, mt: &str, b: Vec<u8>) -> Result<String> {
+            self.inner.put_manifest(r, rf, mt, b).await
+        }
+        async fn list_tags(&self, r: &str) -> Result<Vec<String>> {
+            self.inner.list_tags(r).await
+        }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            self.inner.list_catalog().await
+        }
+    }
+
+    /// F12 of docs/reviews/templates-registry.md. Two lab daemons that start
+    /// a lab with the same registry reference both find the version absent
+    /// and both download it. The store lock orders their installs, and the
+    /// second must use what the first installed, not fail on "already
+    /// exists". The pulls go through `pull_with_progress`, which is what
+    /// `ensure_registry_template` calls: that function builds its own HTTP
+    /// transport and takes no fake.
+    #[tokio::test]
+    async fn two_pulls_of_one_reference_both_succeed() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path(), "store");
+        let reference = "ghcr.io/owner/alpine:3.20";
+        push_stating(&fake, reference, "alpine", "3.20", b"one disk").await;
+        // The disk's chunks are the zstd frames among the pushed blobs.
+        let chunks: std::collections::HashSet<String> = fake
+            .blobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, data)| data.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]))
+            .filter_map(|(key, _)| key.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+            .collect();
+        assert_eq!(chunks.len(), 1, "a disk of one chunk");
+        let meeting = ChunksMeet {
+            inner: fake.clone(),
+            chunks: std::sync::Arc::new(chunks),
+            meeting: std::sync::Arc::new(tokio::sync::Barrier::new(2)),
+            arrived: std::sync::Arc::default(),
+        };
+        fake.gets.lock().unwrap().clear();
+
+        let pull = |work_dir: &str| {
+            let registry = Registry::with_transport(
+                Reference::parse(reference).unwrap(),
+                Box::new(meeting.clone()),
+            );
+            // Its own work directory each, as `ensure_registry_template`
+            // gives every pull.
+            let work_dir = store.root().join(".oci-pull").join(work_dir);
+            let store = &store;
+            async move {
+                registry
+                    .pull_with_progress(
+                        Some("x86_64"),
+                        store,
+                        &work_dir,
+                        false,
+                        &VariantWant::default(),
+                        &mut |_| {},
+                    )
+                    .await
+            }
+        };
+        let (first, second) = tokio::join!(pull("a"), pull("b"));
+
+        // Both downloaded the chunk: neither was served from the store.
+        let chunk_gets = fake
+            .gets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| meeting.chunks.contains(*d))
+            .count();
+        assert_eq!(chunk_gets, 2, "both pulls downloaded the disk");
+        let first = first.expect("the first pull");
+        let second = second.expect("the second pull");
+        assert_eq!(first.version, "3.20");
+        assert_eq!(second.version, first.version);
+        assert_eq!(second.sha256, first.sha256);
+        let held = store
+            .installed("x86_64", "alpine", "3.20")
+            .unwrap()
+            .expect("the version is in the store");
+        assert_eq!(std::fs::read(&held.disk_path).unwrap(), b"one disk");
     }
 
     #[tokio::test]
@@ -2834,6 +3735,113 @@ mod tests {
         assert!(err.to_string().contains("mismatch"), "{err}");
     }
 
+    /// F5 of `docs/reviews/templates-registry.md`: a registry cannot make a
+    /// pull write more than its manifest declares. The manifest says the disk
+    /// is 1 MiB and lists one chunk of 1 MiB of zeros 64 times. In the first
+    /// case each layer states its true size, so the layers sum to 64 MiB and
+    /// the pull stops before it fetches a chunk. In the second each layer
+    /// states 16 KiB, so the sum fits and the pull stops at the first chunk
+    /// that decompresses past what it states.
+    #[tokio::test]
+    async fn a_pull_refuses_more_data_than_its_manifest_declares() {
+        const DECLARED: u64 = 1024 * 1024;
+        const COPIES: usize = 64;
+        for honest_layers in [true, false] {
+            let fake = std::sync::Arc::new(FakeRegistry::default());
+            let work = tempfile::tempdir().unwrap();
+            let tdir = work.path().join("t");
+            make_template(&tdir, &meta("x86_64"), &vec![0u8; DECLARED as usize]);
+            registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .push(
+                    &tdir,
+                    DECLARED,
+                    "x86_64",
+                    &work.path().join("p"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mut hostile = arch_manifest(&fake, "3.20").await;
+            assert_eq!(hostile.layers.len(), 1);
+            let chunk = hostile.layers[0].clone();
+            hostile.layers = (0..COPIES)
+                .map(|i| {
+                    let mut layer = chunk.clone();
+                    let ann = layer.annotations.as_mut().unwrap();
+                    ann.insert(annotations::CHUNK_INDEX.to_string(), i.to_string());
+                    if !honest_layers {
+                        ann.insert(
+                            annotations::CHUNK_UNCOMPRESSED_SIZE.to_string(),
+                            (DECLARED / COPIES as u64).to_string(),
+                        );
+                    }
+                    layer
+                })
+                .collect();
+            let ann = hostile.annotations.as_mut().unwrap();
+            assert_eq!(ann[annotations::TOTAL_SIZE], DECLARED.to_string());
+            ann.insert(annotations::CHUNK_COUNT.to_string(), COPIES.to_string());
+            fake.put_manifest(
+                "owner/alpine",
+                "3.20",
+                media_types::OCI_MANIFEST,
+                serde_json::to_vec(&hostile).unwrap(),
+            )
+            .await
+            .unwrap();
+            fake.gets.lock().unwrap().clear();
+
+            let store = TemplateStore::new(work.path().join("store"));
+            let pull_dir = work.path().join("pull");
+            let err = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+                .pull(Some("x86_64"), &store, &pull_dir, false)
+                .await
+                .unwrap_err();
+            assert!(store.list().unwrap().is_empty(), "{err:#}");
+
+            let fetched = fake
+                .gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|d| **d == chunk.digest)
+                .count();
+            if honest_layers {
+                assert_eq!(fetched, 0, "chunks fetched before the refusal: {err:#}");
+            }
+            assert!(
+                fetched as u64 * chunk.size <= DECLARED,
+                "{fetched} chunks fetched: {err:#}"
+            );
+            let written = std::fs::metadata(pull_dir.join("staging").join(DISK_FILE))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert!(
+                written <= DECLARED,
+                "{written} bytes assembled for a disk declared as {DECLARED}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pull_is_refused_where_the_filesystem_has_no_room() {
+        let at = Path::new("/store");
+        refuse_without_room(10, 10, at, "x86_64/alpine@3.20").unwrap();
+        let err = refuse_without_room(11, 10, at, "x86_64/alpine@3.20")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares 11 bytes") && err.contains("/store has 10 free"),
+            "{err}"
+        );
+        // A directory that does not exist yet is measured at its ancestor.
+        let dir = tempfile::tempdir().unwrap();
+        ensure_room(&dir.path().join("a/b"), 1, "t").unwrap();
+        assert!(ensure_room(&dir.path().join("a/b"), u64::MAX, "t").is_err());
+    }
+
     #[test]
     fn assemble_matches_chunking_helpers() {
         // sanity: client uses chunking helpers; ensure they are reachable
@@ -2879,6 +3887,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2970,6 +3979,166 @@ mod tests {
             2,
             "the second attempt must open its own upload session"
         );
+    }
+
+    /// A registry that takes connections and holds them without a byte:
+    /// the stand-in for a silent registry, token realm or mirror.
+    async fn silent_registry() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                held.push(sock);
+            }
+        });
+        addr
+    }
+
+    /// Waits short enough for a test. `upload` is the long one, as in
+    /// [`Limits::DEFAULT`].
+    const QUICK: Limits = Limits {
+        connect: Duration::from_secs(5),
+        answer: Duration::from_millis(300),
+        upload: Duration::from_secs(20),
+        idle: Duration::from_millis(300),
+    };
+
+    /// Review F10: a registry that accepts the connection and then sends
+    /// nothing must fail the request, not hold it for ever. The outer
+    /// timeout is every attempt's wait plus a margin.
+    #[tokio::test]
+    async fn a_registry_that_never_answers_times_out() {
+        let addr = silent_registry().await;
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_manifest("acme/ubuntu", "1.0.0"),
+        )
+        .await
+        .expect("the transport must give up by itself");
+        let err = answer.expect_err("a silent registry is an error");
+        assert!(
+            err.downcast_ref::<NoAnswer>().is_some(),
+            "the error names the silence: {err:#}"
+        );
+    }
+
+    /// The limits `new` runs under are the documented ones, and all are set.
+    #[test]
+    fn the_default_limits_bound_every_wait() {
+        let transport = HttpTransport::new("127.0.0.1:1".into(), Credential::Anonymous).unwrap();
+        let limits = transport.limits;
+        assert_eq!(limits.connect, Duration::from_secs(30));
+        assert_eq!(limits.answer, Duration::from_secs(60));
+        assert_eq!(limits.idle, Duration::from_secs(60));
+        assert!(
+            limits.upload > Duration::from_secs(600),
+            "past GHCR's session"
+        );
+    }
+
+    /// A registry that answers `head` to every request and then goes quiet
+    /// with the connection open.
+    async fn registry_that_stalls_after(head: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    if sock.read(&mut buf).await.is_ok() {
+                        let _ = sock.write_all(head.as_bytes()).await;
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// F10's other half: a response head followed by silence. `bounded_body`
+    /// limits bytes, and the idle limit is what limits the time.
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_times_out() {
+        let addr = registry_that_stalls_after(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\n\
+             Content-Length: 4096\r\n\r\n{",
+        )
+        .await;
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+
+        let manifest = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_manifest("acme/ubuntu", "1.0.0"),
+        )
+        .await
+        .expect("a stalled manifest body must not hold the call");
+        let err = manifest.expect_err("half a manifest is an error");
+        assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.get_blob_to_file(
+                "acme/ubuntu",
+                &digest_of(b"never sent"),
+                &tmp.path().join("blob"),
+                &mut |_| {},
+            ),
+        )
+        .await
+        .expect("a stalled blob stream must not hold the call");
+        let err = blob.expect_err("half a blob is an error");
+        assert!(err.downcast_ref::<NoAnswer>().is_some(), "{err:#}");
+    }
+
+    /// The answer limit is for a request with nothing to send. A PUT whose
+    /// answer comes later than that is an upload in progress, not a silence.
+    #[tokio::test]
+    async fn an_upload_outlasts_the_answer_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let reply = if head.starts_with("POST") {
+                            "HTTP/1.1 202 Accepted\r\nLocation: /upload/1\r\nContent-Length: 0\r\n\r\n"
+                        } else {
+                            tokio::time::sleep(QUICK.answer * 3).await;
+                            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let transport =
+            HttpTransport::with_limits(addr.to_string(), Credential::Anonymous, QUICK).unwrap();
+        let data = b"blob bytes".to_vec();
+        transport
+            .put_blob("acme/ubuntu", &digest_of(&data), data)
+            .await
+            .expect("a slow PUT is not a silent registry");
     }
 
     /// A refusal the registry means is reported, not retried into silence.
@@ -3387,6 +4556,105 @@ mod tests {
         }
     }
 
+    /// The fake registry behind the path handling of the real transport:
+    /// the repository goes into a request URL, and the URL parser removes
+    /// dot segments from it, so the repository that answers is the
+    /// normalised one.
+    struct DotSegmentsRemoved(std::sync::Arc<FakeRegistry>);
+
+    impl DotSegmentsRemoved {
+        fn repo(r: &str) -> String {
+            let url = reqwest::Url::parse(&format!("https://registry.test/v2/{r}/end")).unwrap();
+            url.path()
+                .strip_prefix("/v2/")
+                .and_then(|p| p.strip_suffix("/end"))
+                .unwrap_or_else(|| panic!("`{r}` leaves the /v2/ path: {url}"))
+                .to_string()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for DotSegmentsRemoved {
+        async fn blob_exists(&self, r: &str, d: &str) -> Result<bool> {
+            self.0.blob_exists(&Self::repo(r), d).await
+        }
+        async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
+            self.0.get_blob(&Self::repo(r), d).await
+        }
+        async fn put_blob(&self, r: &str, d: &str, data: Vec<u8>) -> Result<()> {
+            self.0.put_blob(&Self::repo(r), d, data).await
+        }
+        async fn put_blob_file(&self, r: &str, d: &str, p: &Path) -> Result<()> {
+            self.0.put_blob_file(&Self::repo(r), d, p).await
+        }
+        async fn get_manifest(&self, r: &str, rf: &str) -> Result<Option<Fetched>> {
+            self.0.get_manifest(&Self::repo(r), rf).await
+        }
+        async fn put_manifest(&self, r: &str, rf: &str, mt: &str, b: Vec<u8>) -> Result<String> {
+            self.0.put_manifest(&Self::repo(r), rf, mt, b).await
+        }
+        async fn list_tags(&self, r: &str) -> Result<Vec<String>> {
+            self.0.list_tags(&Self::repo(r)).await
+        }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            self.0.list_catalog().await
+        }
+    }
+
+    /// Config review F2. `ghcr.io/other/tpl` is in no trust list and its
+    /// template has a `first_boot_script`. Named through `..` segments under
+    /// the default trusted namespace, its text starts with that namespace
+    /// and its requests reach `other/tpl`. The reference is built as a value
+    /// here, because `Reference::parse` refuses it: the trust check must
+    /// refuse the script without that.
+    #[tokio::test]
+    async fn a_dot_segment_reference_does_not_run_another_repositorys_script() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        let disk = b"raw disk".to_vec();
+        m.first_boot_script = Some("fn main(lab) {}".into());
+        m.sha256 = Some(hex::encode(sha2::Sha256::digest(&disk)));
+        make_template(&tdir, &m, &disk);
+        registry_with_fake("ghcr.io/other/tpl:1", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let trusted = crate::config::host::HostConfig::default().trusted_template_repositories;
+        assert!(trusted.contains(&"ghcr.io/vmlabdev/vmlab-templates/".to_string()));
+        let reference = Reference {
+            host: "ghcr.io".into(),
+            repository: "vmlabdev/vmlab-templates/../../other/tpl".into(),
+            tag: "1".into(),
+        };
+        let store = store_in(work.path(), "victim");
+        let err = Registry::with_transport(reference, Box::new(DotSegmentsRemoved(fake.clone())))
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store.root().join(".oci-pull").join("f2"),
+                false,
+                &VariantWant::default(),
+                &mut |_| {},
+            )
+            .await
+            .expect_err("the script of a repository outside the trust list is refused");
+        assert!(
+            format!("{err:#}").contains("first_boot_script refused"),
+            "{err:#}"
+        );
+        assert!(store.list().unwrap().is_empty());
+    }
+
     async fn pull_want(
         fake: &std::sync::Arc<FakeRegistry>,
         reference: &str,
@@ -3544,6 +4812,7 @@ mod tests {
             assert_eq!(pulled.effective(Some(got)), {
                 let mut e = m.effective(Some(v));
                 e.origin = pulled.origin.clone();
+                e.pulled_from = pulled.pulled_from.clone();
                 e
             });
             assert_eq!(got.description, v.description);
@@ -3675,6 +4944,263 @@ mod tests {
         assert_eq!(chunks, 0);
     }
 
+    /// Rebuild `standard` in the pushed template directory with other data
+    /// and push it again onto the same version tag, as `template build
+    /// --variant` followed by a push does. Returns the new overlay's digest.
+    async fn push_rebuilt_standard(fake: &std::sync::Arc<FakeRegistry>, work: &Path) -> String {
+        let tdir = work.join("tmpl");
+        let overlay = tdir.join(variant_disk_rel("standard"));
+        run(
+            overlay.parent().unwrap(),
+            "qemu-io",
+            &["-c", "write -q -P 0x33 2M 128k", DISK_FILE],
+        );
+        let rebuilt = sha256_file(&overlay).unwrap();
+        let mut m = TemplateMeta::read_from(&tdir.join(META_FILE)).unwrap();
+        m.variants
+            .iter_mut()
+            .find(|v| v.name == "standard")
+            .unwrap()
+            .sha256 = rebuilt.clone();
+        m.write_to(&tdir.join(META_FILE)).unwrap();
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.join("push-again"),
+                None,
+                Some("latest"),
+            )
+            .await
+            .unwrap();
+        rebuilt
+    }
+
+    /// Review templates-registry F1: a pull into a version the store holds
+    /// brings the default variant along, and the registry's default was
+    /// rebuilt since. The held overlay has a clone on it, so it stays as it
+    /// is — the clone is a delta against it — and the variant asked for
+    /// still arrives.
+    #[tokio::test]
+    async fn a_pull_does_not_replace_a_variant_a_clone_is_backed_by() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let reference = "ghcr.io/owner/alpine:3.20";
+        let store = store_in(work.path(), "store");
+        pull_want(&fake, reference, &store, &VariantWant::default())
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_a = sha256_file(&held).unwrap();
+
+        // Lab A's clone of the default variant.
+        let clone = work.path().join("clone.qcow2");
+        run(
+            work.path(),
+            "qemu-img",
+            &[
+                "create",
+                "-q",
+                "-f",
+                "qcow2",
+                "-b",
+                held.to_str().unwrap(),
+                "-F",
+                "qcow2",
+                clone.to_str().unwrap(),
+            ],
+        );
+
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+        assert_ne!(digest_a, digest_b);
+
+        // Lab B asks for a variant the store lacks.
+        let (meta, _) = pull_want(
+            &fake,
+            reference,
+            &store,
+            &VariantWant::of(Some(&VariantRefNamed("extra"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sha256_file(&held).unwrap(),
+            digest_a,
+            "the overlay under the clone was replaced"
+        );
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_a);
+        assert!(meta.variant("extra").is_some(), "the variant asked for");
+        assert_eq!(
+            crate::template::store::qcow2_backing_file(&clone)
+                .unwrap()
+                .as_deref(),
+            held.to_str()
+        );
+    }
+
+    fn in_use_saying(why: Option<&'static str>) -> crate::template::build::InUse {
+        std::sync::Arc::new(move |_| Box::pin(async move { why.map(str::to_string) }))
+    }
+
+    async fn pull_guarded(
+        fake: &std::sync::Arc<FakeRegistry>,
+        store: &TemplateStore,
+        want: &VariantWant,
+        in_use: crate::template::build::InUse,
+    ) -> Result<TemplateMeta> {
+        registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .guarding(in_use)
+            .pull_with_progress(
+                Some("x86_64"),
+                store,
+                &store
+                    .root()
+                    .join(".oci-pull")
+                    .join(rand::random::<u32>().to_string()),
+                false,
+                want,
+                &mut |_| {},
+            )
+            .await
+    }
+
+    /// The other two answers to a rebuilt variant (F1): a pull that asks for
+    /// the variant itself is refused while a clone is backed by the held
+    /// overlay, naming the clone and leaving the store as it was; and once
+    /// the in-use check finds none, the pull replaces the overlay.
+    #[tokio::test]
+    async fn a_pull_replaces_a_rebuilt_variant_only_when_no_clone_is_backed_by_it() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let store = store_in(work.path(), "store");
+        let free = in_use_saying(None);
+        pull_guarded(&fake, &store, &VariantWant::default(), free.clone())
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_a = sha256_file(&held).unwrap();
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+
+        let busy = in_use_saying(Some("the clone of machine a/web is backed by it"));
+        let asked = VariantWant::of(Some(&VariantRefNamed("standard")));
+        let err = pull_guarded(&fake, &store, &asked, busy.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x86_64/alpine@3.20#standard") && err.contains("a/web"),
+            "{err}"
+        );
+        assert_eq!(sha256_file(&held).unwrap(), digest_a);
+
+        // Brought along as the default only: kept, and the pull goes on.
+        let meta = pull_guarded(&fake, &store, &VariantWant::default(), busy)
+            .await
+            .unwrap();
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_a);
+        assert_eq!(sha256_file(&held).unwrap(), digest_a);
+
+        let meta = pull_guarded(&fake, &store, &asked, free).await.unwrap();
+        assert_eq!(meta.variant("standard").unwrap().sha256, digest_b);
+        assert_eq!(sha256_file(&held).unwrap(), digest_b);
+    }
+
+    /// Review templates-registry F13: a pull is aborted while its install
+    /// runs on the blocking thread. The work directory must stay until that
+    /// install ends, and the install must complete.
+    #[tokio::test]
+    async fn a_cancelled_pull_keeps_its_work_directory_until_the_install_ends() {
+        if !have_qemu_tools() {
+            return;
+        }
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        push_variants(&fake, work.path()).await;
+        let store = store_in(work.path(), "store");
+        pull_guarded(&fake, &store, &VariantWant::default(), in_use_saying(None))
+            .await
+            .unwrap();
+        let held = store
+            .resolve_version("x86_64", "alpine", Some("3.20"))
+            .unwrap()
+            .variant_disk("standard");
+        let digest_b = push_rebuilt_standard(&fake, work.path()).await;
+
+        let op = std::sync::Arc::new(
+            crate::template::oci_bridge::fresh_work_dir(&store.root().join(".oci-pull")).unwrap(),
+        );
+        let op_dir = op.path().to_path_buf();
+        let staged = op_dir.join("staging").join(variant_disk_rel("standard"));
+
+        // The pull asks the in-use check twice: before the download, and on
+        // the install thread once the overlay is staged, before it moves
+        // into the store. The second says where it is and waits there.
+        let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let seen = staged.clone();
+        let in_use: crate::template::build::InUse = std::sync::Arc::new(move |_| {
+            let reached_tx = reached_tx.clone();
+            let mut released = released.clone();
+            let installing = seen.is_file();
+            Box::pin(async move {
+                if installing {
+                    let _ = reached_tx.send(());
+                    let _ = released.wait_for(|go| *go).await;
+                }
+                None
+            })
+        });
+
+        let registry = registry_with_fake("ghcr.io/owner/alpine:3.20", fake.clone())
+            .guarding(in_use)
+            .holding(op);
+        let (task_store, task_dir) = (store.clone(), op_dir.clone());
+        let task = tokio::spawn(async move {
+            let asked = VariantWant::of(Some(&VariantRefNamed("standard")));
+            registry
+                .pull_with_progress(
+                    Some("x86_64"),
+                    &task_store,
+                    &task_dir,
+                    false,
+                    &asked,
+                    &mut |_| {},
+                )
+                .await
+        });
+        reached.recv().await.expect("the install asks the check");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(
+            staged.is_file(),
+            "the cancel removed {} under the running install",
+            staged.display()
+        );
+
+        // The install goes on, and the directory goes when it has ended.
+        release.send(true).unwrap();
+        while op_dir.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(sha256_file(&held).unwrap(), digest_b);
+    }
+
     /// A corrupt overlay chunk fails the pull on its digest, and nothing of
     /// the version is installed.
     #[tokio::test]
@@ -3731,7 +5257,10 @@ mod tests {
         for (i, d) in base.layers_in_order().iter().enumerate() {
             let p = dir.join(format!("{i}.zst"));
             std::fs::write(&p, fake.get_blob("owner/alpine", &d.digest).await.unwrap()).unwrap();
-            paths.push(p);
+            let size = d.annotations.as_ref().unwrap()[annotations::CHUNK_UNCOMPRESSED_SIZE]
+                .parse()
+                .unwrap();
+            paths.push((p, size));
         }
         chunking::assemble(&paths, &dir.join(DISK_FILE)).unwrap();
         chunking::verify_whole(&dir.join(DISK_FILE), base.whole_digest().unwrap()).unwrap();

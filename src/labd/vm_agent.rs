@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 use vmlab_agent_proto::fileops::{self, Request, Response};
 // The file vocabulary itself, re-exported so callers of this client never
@@ -147,19 +147,156 @@ impl SendCredit {
     }
 }
 
-struct SessionEntry {
-    tx: mpsc::Sender<SessionEvent>,
-    credit: Arc<SendCredit>,
+/// Host-granted credit for guest→host payload on one channel: what the
+/// guest may still send. The reader takes from it as frames arrive and the
+/// consumer adds each `window_adjust` it sends, so the bytes queued for one
+/// channel never pass [`INITIAL_WINDOW`].
+struct RecvCredit {
+    avail: std::sync::Mutex<u64>,
+    /// Why the reader ended the channel (the guest sent past its window, or
+    /// the queue overflowed), for the consumer to read once the queue is
+    /// drained (the queue can be full when the reader finds out).
+    overrun: std::sync::Mutex<Option<String>>,
 }
 
-/// Per-session event queue depth. Flow control caps un-granted bytes, but a
-/// window's worth of tiny frames can outnumber a byte-sized bound — this is
-/// the safety valve; see the reader's stall policy.
+impl RecvCredit {
+    fn new() -> Self {
+        Self {
+            avail: std::sync::Mutex::new(INITIAL_WINDOW),
+            overrun: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Account for `bytes` of arrived payload. `false` when the guest sent
+    /// more than it was granted.
+    fn take(&self, bytes: usize) -> bool {
+        let mut g = self.avail.lock_recover();
+        match g.checked_sub(bytes as u64) {
+            Some(left) => {
+                *g = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn grant(&self, bytes: u64) {
+        let mut g = self.avail.lock_recover();
+        *g = g.saturating_add(bytes);
+    }
+}
+
+struct SessionEntry {
+    queue: Arc<SessionQueue>,
+    credit: Arc<SendCredit>,
+    recv_credit: Arc<RecvCredit>,
+}
+
+impl Drop for SessionEntry {
+    /// The entry is the reader's end of the queue: once it is gone the
+    /// consumer reads what is queued and then end-of-stream.
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+/// Per-session event queue depth. The reader enforces the receive window
+/// ([`RecvCredit`]), which caps the queued bytes, but a window's worth of
+/// tiny frames can outnumber a byte-sized bound. This caps the count; see
+/// [`SessionQueue::push`] for what happens at it.
 const SESSION_QUEUE: usize = 2048;
 
-/// How long the reader waits on one session's full queue before declaring
-/// the consumer stuck and closing that session (never the whole port).
+/// How long the reader's `close` for one session may wait for the writer.
+/// The reader itself never waits (see [`close_session`]).
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The events of one session between the connection's one reader task and
+/// the session's consumer. The reader's side never waits: one consumer that
+/// stopped reading must not keep the reader from the frames of every other
+/// channel, nor from a `pong`, an `opened` or a `window_adjust`.
+struct SessionQueue {
+    state: std::sync::Mutex<SessionQueueState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct SessionQueueState {
+    events: std::collections::VecDeque<SessionEvent>,
+    closed: bool,
+}
+
+impl SessionQueue {
+    fn new() -> Self {
+        Self {
+            state: Default::default(),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Queue one event without waiting. Below [`SESSION_QUEUE`] events each
+    /// frame is its own event. At the depth, payload joins the last event
+    /// when that is the same stream (every consumer reads a channel as a
+    /// byte stream, and the receive window bounds the bytes). One `Eof` is
+    /// taken past the depth and a repeated one is dropped: an exec ends with
+    /// `Eof` and then its exit, and no payload can join behind an `Eof`, so
+    /// the queue grows by that one event. The event that ends the session
+    /// is always taken, as only one can arrive. `false` is an event the
+    /// full queue cannot take: the guest sent more frames than a consumer
+    /// this far behind can be kept for.
+    fn push(&self, ev: SessionEvent) -> bool {
+        let mut st = self.state.lock_recover();
+        let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
+        if st.events.len() < SESSION_QUEUE || terminal {
+            st.events.push_back(ev);
+        } else if matches!(ev, SessionEvent::Eof) {
+            if !matches!(st.events.back(), Some(SessionEvent::Eof)) {
+                st.events.push_back(ev);
+            }
+        } else {
+            match (st.events.back_mut(), ev) {
+                (Some(SessionEvent::Data(tail)), SessionEvent::Data(more))
+                | (Some(SessionEvent::Stderr(tail)), SessionEvent::Stderr(more)) => {
+                    tail.extend_from_slice(&more)
+                }
+                // An empty frame carries nothing a consumer acts on.
+                (_, SessionEvent::Data(more) | SessionEvent::Stderr(more)) if more.is_empty() => {}
+                _ => return false,
+            }
+        }
+        drop(st);
+        self.notify.notify_one();
+        true
+    }
+
+    /// No more events: the consumer reads what is queued, then `None`.
+    fn close(&self) {
+        self.state.lock_recover().closed = true;
+        self.notify.notify_one();
+    }
+
+    /// The next event, or `None` once the queue is closed and empty. One
+    /// consumer reads a queue, and nothing is lost when this is cancelled.
+    async fn recv(&self) -> Option<SessionEvent> {
+        loop {
+            {
+                let mut st = self.state.lock_recover();
+                if let Some(ev) = st.events.pop_front() {
+                    return Some(ev);
+                }
+                if st.closed {
+                    return None;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// The most output, stdout and stderr together, a collected
+/// [`AgentHandle::exec`] holds. The guest decides how much a command writes,
+/// so without a ceiling one endless stream grows the lab daemon until the
+/// timeout. A caller that needs more streams it over [`AgentHandle::open_exec`].
+pub const EXEC_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
 /// How long an `open_*` waits for the agent's `opened`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -242,17 +379,128 @@ trait PullSink {
     async fn finish(&mut self) -> Result<()> {
         Ok(())
     }
+    /// How many bytes the host lets this pull write, where the host has a
+    /// bound of its own. A size the guest reports past it is refused before
+    /// the first read.
+    fn room(&self) -> Option<u64> {
+        None
+    }
 }
 
-/// Straight to a host file: bounded by the disk, never held in memory.
-struct FileSink(tokio::fs::File);
+/// The share of a filesystem a pull leaves free: a twentieth of it, and no
+/// more than [`PULL_RESERVE_MAX`].
+const PULL_RESERVE_MAX: u64 = 1 << 30;
+
+/// How many bytes a pull writes before it measures the free space again.
+/// Other writers share the disk, so one measurement does not hold for long.
+const PULL_REMEASURE: u64 = 64 * 1024 * 1024;
+
+/// The bytes a pull may write into `file`: the free space of its filesystem
+/// less the reserve. `None` where the filesystem reports no size.
+fn pull_room(file: &tokio::fs::File) -> Option<u64> {
+    let stat = nix::sys::statvfs::fstatvfs(file).ok()?;
+    let unit = stat.fragment_size() as u64;
+    let total = (stat.blocks() as u64).saturating_mul(unit);
+    if total == 0 {
+        return None;
+    }
+    let free = (stat.blocks_available() as u64).saturating_mul(unit);
+    Some(free.saturating_sub((total / 20).min(PULL_RESERVE_MAX)))
+}
+
+fn no_room(wanted: u64, room: u64) -> anyhow::Error {
+    anyhow!(
+        "the guest sends {wanted} bytes and the host has room for {room} \
+         (free space less the reserve a pull leaves)"
+    )
+}
+
+/// Straight to a host file, never held in memory. The guest decides what it
+/// sends, so the bound is the host's: the free space of the destination's
+/// filesystem, measured here and never taken from the guest.
+struct FileSink {
+    file: tokio::fs::File,
+    /// Bytes this pull may still write. `None` for a destination that fills
+    /// no disk: a device, a FIFO, a filesystem without a size.
+    left: Option<u64>,
+    /// Bytes until `left` is measured again.
+    remeasure_in: u64,
+}
+
+impl FileSink {
+    /// A sink for a regular file, bounded by the room on its filesystem.
+    fn new(file: tokio::fs::File) -> FileSink {
+        FileSink {
+            left: pull_room(&file),
+            file,
+            remeasure_in: PULL_REMEASURE,
+        }
+    }
+
+    /// A sink for a destination that is not a regular file.
+    fn unbounded(file: tokio::fs::File) -> FileSink {
+        FileSink {
+            file,
+            left: None,
+            remeasure_in: PULL_REMEASURE,
+        }
+    }
+}
 
 impl PullSink for FileSink {
     async fn write(&mut self, chunk: &[u8]) -> Result<()> {
-        Ok(self.0.write_all(chunk).await?)
+        let len = chunk.len() as u64;
+        if self.left.is_some() {
+            if self.remeasure_in < len {
+                self.left = pull_room(&self.file);
+                self.remeasure_in = PULL_REMEASURE;
+            }
+            self.remeasure_in = self.remeasure_in.saturating_sub(len);
+        }
+        if let Some(left) = self.left {
+            if len > left {
+                return Err(no_room(len, left));
+            }
+            self.left = Some(left - len);
+        }
+        Ok(self.file.write_all(chunk).await?)
     }
     async fn finish(&mut self) -> Result<()> {
-        Ok(self.0.flush().await?)
+        Ok(self.file.flush().await?)
+    }
+    fn room(&self) -> Option<u64> {
+        self.left
+    }
+}
+
+/// The part-written file of a pull, removed when the pull ends. After the
+/// rename that completes a pull there is nothing at this path to remove.
+struct PullTemp(PathBuf);
+
+impl Drop for PullTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A new file beside `target`, on its filesystem, for a pull to fill and
+/// rename over it. Never an existing file: the name is taken exclusively.
+async fn create_pull_temp(target: &Path) -> std::io::Result<(tokio::fs::File, PullTemp)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = target.with_file_name(format!(".{name}.vmlab-pull.{}.{n}", std::process::id()));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+        {
+            Ok(file) => return Ok((file, PullTemp(temp))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -377,6 +625,10 @@ impl AgentHandle {
             }
         }
 
+        // Subscribe before sending: the reader can process the reply on
+        // another worker before the write returns, and watch::send drops it
+        // if no receiver is subscribed.
+        let mut rx = handle.inner.hello.subscribe();
         handle
             .send_msg(&HostMsg::Hello {
                 proto_version: PROTO_VERSION,
@@ -385,7 +637,6 @@ impl AgentHandle {
             .await
             .context("sending agent handshake")?;
 
-        let mut rx = handle.inner.hello.subscribe();
         loop {
             if rx.borrow().is_some() {
                 return Ok(handle);
@@ -571,16 +822,18 @@ impl AgentHandle {
     /// Open a channel and wait for the agent's `opened` (or error).
     async fn open(&self, build: impl FnOnce(u32) -> HostMsg) -> Result<AgentSession> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+        let queue = Arc::new(SessionQueue::new());
         // The opened/error reply arrives on a oneshot so the session's event
         // queue only ever carries post-open traffic.
         let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
         let credit = Arc::new(SendCredit::new());
+        let recv_credit = Arc::new(RecvCredit::new());
         self.inner.sessions.lock().await.insert(
             id,
             SessionEntry {
-                tx,
+                queue: queue.clone(),
                 credit: credit.clone(),
+                recv_credit: recv_credit.clone(),
             },
         );
         // Stash the oneshot where the reader finds it.
@@ -593,8 +846,9 @@ impl AgentHandle {
         let mut session = AgentSession {
             handle: self.clone(),
             id,
-            rx,
+            rx: queue,
             credit,
+            recv_credit,
             window: RecvWindow::default(),
             closed: false,
         };
@@ -795,6 +1049,10 @@ impl AgentHandle {
     }
 
     /// Run to completion, collecting output. `128 + signal` codes on Unix.
+    /// After the channel opens, one timeout covers sending stdin and
+    /// collecting output.
+    /// Stdout and stderr together stop at [`EXEC_OUTPUT_LIMIT`]: past it the
+    /// command is ended and the exec is an error.
     pub async fn exec(
         &self,
         argv: Vec<String>,
@@ -806,34 +1064,69 @@ impl AgentHandle {
     ) -> Result<ExecOutput> {
         let display = argv.join(" ");
         let mut session = self.open_exec(argv, env, cwd, logon).await?;
-        if let Some(stdin) = stdin {
-            session.send(&stdin).await?;
-        }
-        session.eof().await?;
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let ev = tokio::time::timeout_at(deadline, session.recv())
-                .await
-                .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?;
-            match ev {
-                Some(SessionEvent::Data(b)) => out.extend(b),
-                Some(SessionEvent::Stderr(b)) => err.extend(b),
-                Some(SessionEvent::Exited(code)) => {
-                    return Ok(ExecOutput {
-                        exit_code: code,
-                        stdout: out,
-                        stderr: err,
-                    });
+        let sender = session.sender();
+        // Let an in-flight frame finish if the exec ends during a write.
+        // Dropping the session closes its credit and wakes a blocked sender.
+        let send_input = tokio::spawn(async move {
+            let result = async {
+                if let Some(stdin) = stdin {
+                    sender.send(&stdin).await?;
                 }
-                Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
-                // `exited` is what completes a collected exec; the output
-                // EOF just before it tells this caller nothing new.
-                Some(SessionEvent::Eof) => {}
-                None => bail!("agent channel closed during exec `{display}`"),
+                sender.eof().await
             }
-        }
+            .await;
+            // The child can exit before reading stdin. The receive half
+            // owns the terminal event and reports the command's result.
+            if sender.credit.closed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                result
+            }
+        });
+        let mut collect_output = std::pin::pin!(async {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            loop {
+                let ev = session.recv().await;
+                if let Some(SessionEvent::Data(b) | SessionEvent::Stderr(b)) = &ev
+                    && out.len() + err.len() + b.len() > EXEC_OUTPUT_LIMIT
+                {
+                    // Dropping the session closes the channel and ends the
+                    // command in the guest.
+                    bail!(
+                        "exec `{display}` wrote more than {} MiB of output, the most a collected \
+                         exec holds; send the output to a file in the guest and copy that",
+                        EXEC_OUTPUT_LIMIT / (1024 * 1024)
+                    );
+                }
+                match ev {
+                    Some(SessionEvent::Data(b)) => out.extend(b),
+                    Some(SessionEvent::Stderr(b)) => err.extend(b),
+                    Some(SessionEvent::Exited(code)) => {
+                        return Ok(ExecOutput {
+                            exit_code: code,
+                            stdout: out,
+                            stderr: err,
+                        });
+                    }
+                    Some(SessionEvent::Error(msg)) => bail!("exec `{display}`: {msg}"),
+                    // The output EOF precedes the exit code.
+                    Some(SessionEvent::Eof) => {}
+                    None => bail!("agent channel closed during exec `{display}`"),
+                }
+            }
+        });
+        tokio::time::timeout(timeout, async {
+            tokio::select! {
+                result = &mut collect_output => result,
+                sent = send_input => {
+                    sent??;
+                    collect_output.await
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("exec `{display}` timed out after {timeout:?}"))?
     }
 
     /// Open a file **RPC session** on the guest (PRD §19.5): handle-based,
@@ -877,6 +1170,23 @@ impl AgentHandle {
             .await
             .with_context(|| format!("push {remote}"))?;
         ops.push(local, remote, mode).await
+    }
+
+    /// Push bytes held in memory into a guest file, as a declared account
+    /// (§19.2), returning the verified digest+size — the inline form on the
+    /// wire. The bytes never pass through a file on this host.
+    pub async fn push_bytes_as(
+        &self,
+        bytes: &[u8],
+        remote: &str,
+        mode: Option<u32>,
+        logon: Option<Logon>,
+    ) -> Result<(String, u64)> {
+        let ops = self
+            .open_fileops(logon)
+            .await
+            .with_context(|| format!("push {remote}"))?;
+        ops.push_bytes_making_parents(bytes, remote, mode).await
     }
 
     /// Push a host file or directory tree into the guest, returning
@@ -923,14 +1233,48 @@ impl AgentHandle {
         {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let file = tokio::fs::File::create(local)
-            .await
-            .with_context(|| format!("creating {}", local.display()))?;
+        // The guest is asked before the host is touched: an agent that
+        // cannot serve the transfer costs the destination nothing.
         let ops = self
             .open_fileops(logon)
             .await
             .with_context(|| format!("pull {remote}"))?;
-        ops.pull(remote, &mut FileSink(file)).await
+        // A destination that is already a file is written through whatever
+        // symlink names it, and keeps its mode.
+        let (target, existing) = match tokio::fs::metadata(local).await {
+            Ok(meta) => (
+                tokio::fs::canonicalize(local)
+                    .await
+                    .unwrap_or_else(|_| local.to_path_buf()),
+                Some(meta),
+            ),
+            Err(_) => (local.to_path_buf(), None),
+        };
+        if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
+            // A device, a FIFO or a directory: nothing a failed pull could
+            // lose, and nothing a rename may replace. A directory fails here.
+            let file = tokio::fs::File::create(&target)
+                .await
+                .with_context(|| format!("creating {}", local.display()))?;
+            return ops.pull(remote, &mut FileSink::unbounded(file)).await;
+        }
+        // The bytes land beside the destination and replace it only once the
+        // digest has matched, so every failure — a guest path that is not
+        // there, a dropped connection, a mismatch — leaves the host file as
+        // it was.
+        let (file, temp) = create_pull_temp(&target)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        let pulled = ops.pull(remote, &mut FileSink::new(file)).await?;
+        if let Some(meta) = existing {
+            tokio::fs::set_permissions(&temp.0, meta.permissions())
+                .await
+                .with_context(|| format!("creating {}", local.display()))?;
+        }
+        tokio::fs::rename(&temp.0, &target)
+            .await
+            .with_context(|| format!("creating {}", local.display()))?;
+        Ok(pulled)
     }
 
     /// Pull a guest file into memory, for a caller that wants the bytes rather
@@ -1176,8 +1520,9 @@ pub const NO_CLIPBOARD: &str = "the guest agent has no clipboard (it offers one 
 pub struct AgentSession {
     handle: AgentHandle,
     pub id: u32,
-    rx: mpsc::Receiver<SessionEvent>,
+    rx: Arc<SessionQueue>,
     credit: Arc<SendCredit>,
+    recv_credit: Arc<RecvCredit>,
     window: RecvWindow,
     closed: bool,
 }
@@ -1186,10 +1531,19 @@ impl AgentSession {
     /// Next event; grants receive window back as data is consumed. `None`
     /// once the channel (or connection) is gone.
     pub async fn recv(&mut self) -> Option<SessionEvent> {
-        let ev = self.rx.recv().await?;
+        let Some(ev) = self.rx.recv().await else {
+            // The reader ended the channel (the guest sent past its window,
+            // or the queue overflowed): say so, once, after what was queued.
+            let msg = self.recv_credit.overrun.lock_recover().take()?;
+            self.closed = true; // the reader already sent the close
+            return Some(SessionEvent::Error(msg));
+        };
         if let SessionEvent::Data(b) | SessionEvent::Stderr(b) = &ev
             && let Some(grant) = self.window.recv(b.len())
         {
+            // Counted before it is sent: the guest may use the grant as
+            // soon as it reads it.
+            self.recv_credit.grant(grant);
             let _ = self
                 .handle
                 .send_msg(&HostMsg::WindowAdjust {
@@ -1252,6 +1606,7 @@ impl AgentSession {
 
 impl Drop for AgentSession {
     fn drop(&mut self) {
+        self.credit.close();
         if self.closed {
             return;
         }
@@ -1422,21 +1777,7 @@ impl FileOps {
         let mut file = tokio::fs::File::open(local)
             .await
             .with_context(|| format!("opening {}", local.display()))?;
-        let handle = match self.open_for_push(remote, mode).await {
-            Ok(h) => h,
-            // The one recoverable open failure: the guest has no directory to
-            // put it in yet. Making the parents costs a round trip only where
-            // it is actually needed.
-            Err(e) if e.code == ErrorCode::NoSuchFile => {
-                if let Some(parent) = guest_parent(remote) {
-                    self.mkdir_p(&parent).await?;
-                }
-                self.open_for_push(remote, mode)
-                    .await
-                    .with_context(|| format!("push {remote}"))?
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("push {remote}"))),
-        };
+        let handle = self.open_for_push_making_parents(remote, mode).await?;
 
         let mut hasher = Sha256::new();
         let mut offset = 0u64;
@@ -1511,11 +1852,30 @@ impl FileOps {
     /// memory and must not pass through a host file — a playbook's variables
     /// file, whose secrets would otherwise sit on the host disk too.
     pub async fn push_bytes(&self, bytes: &[u8], remote: &str, mode: Option<u32>) -> Result<()> {
-        use sha2::{Digest, Sha256};
         let handle = self
             .open_for_push(remote, mode)
             .await
             .with_context(|| format!("push {remote}"))?;
+        self.write_bytes(handle, bytes, remote).await.map(|_| ())
+    }
+
+    /// The same for the inline form of a push, which a person invoked: the
+    /// guest directories are made where they are missing, as [`Self::push`]
+    /// makes them, and the verified digest and size come back.
+    pub async fn push_bytes_making_parents(
+        &self,
+        bytes: &[u8],
+        remote: &str,
+        mode: Option<u32>,
+    ) -> Result<(String, u64)> {
+        let handle = self.open_for_push_making_parents(remote, mode).await?;
+        self.write_bytes(handle, bytes, remote).await
+    }
+
+    /// Write `bytes` through an open push handle, close it, and verify the
+    /// guest's digest of the file against them.
+    async fn write_bytes(&self, handle: u64, bytes: &[u8], remote: &str) -> Result<(String, u64)> {
+        use sha2::{Digest, Sha256};
         let mut written = Ok(());
         for (i, chunk) in bytes.chunks(TRANSFER_CHUNK).enumerate() {
             let offset = (i * TRANSFER_CHUNK) as u64;
@@ -1531,14 +1891,32 @@ impl FileOps {
         let closed = self.inner.expect_ok(Op::Close { handle }, &[]).await;
         written.with_context(|| format!("push {remote}"))?;
         closed.with_context(|| format!("push {remote}"))?;
-        let (sha256, _) = self
+        let (sha256, len) = self
             .digest_of_len(remote, bytes.len() as u64)
             .await
             .with_context(|| format!("push {remote}"))?;
         if sha256 != hex::encode(Sha256::digest(bytes)) {
             bail!("push {remote}: digest mismatch after transfer");
         }
-        Ok(())
+        Ok((sha256, len))
+    }
+
+    /// Open `remote` for a push. The one recoverable open failure is that the
+    /// guest has no directory to put the file in yet: making the parents
+    /// costs a round trip only where it is actually needed.
+    async fn open_for_push_making_parents(&self, remote: &str, mode: Option<u32>) -> Result<u64> {
+        match self.open_for_push(remote, mode).await {
+            Ok(h) => Ok(h),
+            Err(e) if e.code == ErrorCode::NoSuchFile => {
+                if let Some(parent) = guest_parent(remote) {
+                    self.mkdir_p(&parent).await?;
+                }
+                self.open_for_push(remote, mode)
+                    .await
+                    .with_context(|| format!("push {remote}"))
+            }
+            Err(e) => Err(anyhow::Error::new(e).context(format!("push {remote}"))),
+        }
     }
 
     async fn open_for_push(&self, remote: &str, mode: Option<u32>) -> Result<u64, FileOpsError> {
@@ -1564,6 +1942,13 @@ impl FileOps {
         if attrs.kind == EntryKind::Dir {
             bail!("pull {remote}: is a directory");
         }
+        // The size is the guest's word. It bounds the pull only once the
+        // host has checked it against a bound of its own.
+        if let Some(room) = sink.room()
+            && attrs.size > room
+        {
+            return Err(no_room(attrs.size, room)).with_context(|| format!("pull {remote}"));
+        }
         let handle = self
             .inner
             .open_handle(Op::Open {
@@ -1577,7 +1962,8 @@ impl FileOps {
         let mut hasher = Sha256::new();
         let mut got = 0u64;
         // A changing or dishonest guest must not turn a finite pull into an
-        // endless disk write. Allow one chunk of growth after the stat.
+        // endless disk write. Allow one chunk of growth after the stat. The
+        // sink holds the host's own bound, which no stat can raise.
         let limit = attrs.size.saturating_add(TRANSFER_CHUNK as u64);
         let mut queued = 0u64;
         let mut window: std::collections::VecDeque<tokio::task::JoinHandle<Result<Vec<u8>>>> =
@@ -1654,7 +2040,7 @@ impl FileOps {
         let file = tokio::fs::File::create(local)
             .await
             .with_context(|| format!("creating {}", local.display()))?;
-        self.pull(remote, &mut FileSink(file)).await
+        self.pull(remote, &mut FileSink::new(file)).await
     }
 
     /// Every entry in `dir`, each described by its own attributes and never
@@ -2510,26 +2896,40 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
     }
 }
 
-/// Route a session event; a consumer stuck past [`STALL_TIMEOUT`] gets its
-/// session closed (the rest of the mux keeps flowing).
+/// Route a session event. This runs on the connection's one reader task and
+/// waits for no consumer: an event its session's queue cannot take closes
+/// that session (the rest of the mux keeps flowing).
 async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
     let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
-    let tx = {
+    let entry = {
         let sessions = inner.sessions.lock().await;
-        sessions.get(&id).map(|e| e.tx.clone())
+        sessions
+            .get(&id)
+            .map(|e| (e.queue.clone(), e.recv_credit.clone()))
     };
-    let Some(tx) = tx else { return }; // late frames after close: normal
-    if tokio::time::timeout(STALL_TIMEOUT, tx.send(ev))
-        .await
-        .is_err()
+    let Some((queue, recv_credit)) = entry else {
+        return; // late frames after close: normal
+    };
+    // The receive window: a guest that sends more than it was granted loses
+    // that channel, and the frame is dropped rather than queued.
+    if let SessionEvent::Data(b) | SessionEvent::Stderr(b) = &ev
+        && !recv_credit.take(b.len())
     {
-        tracing::warn!("agent session {id}: consumer stalled >10s, closing that session");
-        if let Some(entry) = inner.sessions.lock().await.remove(&id) {
-            entry.credit.close();
-        }
-        let mut w = inner.writer.lock().await;
-        let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
-        let _ = w.write_all(&frame).await;
+        tracing::warn!("agent session {id}: the guest sent past its receive window, closing it");
+        *recv_credit.overrun.lock_recover() = Some(format!(
+            "the guest agent sent more than the receive window of {INITIAL_WINDOW} bytes \
+             it was granted on this channel, so the host closed the channel"
+        ));
+        close_session(inner, id).await;
+        return;
+    }
+    if !queue.push(ev) {
+        tracing::warn!("agent session {id}: its queue overflowed, closing that session");
+        *recv_credit.overrun.lock_recover() = Some(format!(
+            "the consumer of this channel fell behind and its queue of {SESSION_QUEUE} events \
+             overflowed, so the host closed the channel"
+        ));
+        close_session(inner, id).await;
         return;
     }
     if terminal {
@@ -2539,6 +2939,37 @@ async fn deliver(inner: &Arc<Inner>, id: u32, ev: SessionEvent) {
             entry.credit.close();
         }
     }
+}
+
+/// The reader ends one session: its queue closes behind what it holds, and
+/// the agent is told to drop its side. The `close` is written by a task of
+/// its own, because the reader must not wait for the writer: a guest that
+/// does not read leaves the socket full and the writer lock held. That task
+/// waits [`STALL_TIMEOUT`] at most. When the `close` is never sent the
+/// agent keeps its side of the channel, and the host drops the late frames
+/// of a channel it no longer has. A write cut off in the middle of the
+/// frame tears the stream, so the connection then counts as over, as it
+/// does for a ping.
+async fn close_session(inner: &Arc<Inner>, id: u32) {
+    if let Some(entry) = inner.sessions.lock().await.remove(&id) {
+        entry.credit.close();
+    }
+    let inner = inner.clone();
+    inner.rt.clone().spawn(async move {
+        let deadline = tokio::time::Instant::now() + STALL_TIMEOUT;
+        let frame = encode_ctrl(&HostMsg::Close { id }).expect("close fits one control frame");
+        let Ok(mut w) = tokio::time::timeout_at(deadline, inner.writer.lock()).await else {
+            return;
+        };
+        let written = tokio::time::timeout_at(deadline, async {
+            w.write_all(&frame).await?;
+            w.flush().await
+        })
+        .await;
+        if written.is_err() {
+            inner.closed.send_replace(true);
+        }
+    });
 }
 
 /// Re-expose one terminal session as a raw-byte unix socket at `sock_path`:
@@ -2706,6 +3137,156 @@ mod tests {
         }
     }
 
+    /// What `mock:overrun` sends on its channel: more than the window.
+    const FLOOD_BYTES: usize = 300 * 1024;
+
+    /// The host granted one window on the channel and the guest sent past
+    /// it: the channel ends with an error that names the window, and what
+    /// the consumer is left to read is no more than the host granted
+    /// (review of the guest agents, F4).
+    #[tokio::test]
+    async fn a_guest_that_ignores_its_credit_loses_the_channel() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:overrun".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // Nothing is read here, so the host grants no credit past the
+        // first window.
+        let id = session.id;
+        let dropped = async {
+            while handle.inner.sessions.lock().await.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .expect("the host kept a channel whose guest sent past its window");
+
+        let mut queued = 0usize;
+        let error = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), session.recv())
+                .await
+                .expect("the session did not end");
+            match ev {
+                Some(SessionEvent::Data(b)) => queued += b.len(),
+                Some(SessionEvent::Error(msg)) => break msg,
+                other => panic!("the session ended without an error: {other:?}"),
+            }
+        };
+        assert!(error.contains("window"), "{error}");
+        assert!(
+            queued as u64 <= INITIAL_WINDOW,
+            "{queued} bytes sat in the queue of one channel"
+        );
+        // The connection outlives the channel.
+        assert!(handle.ping(Duration::from_secs(2)).await);
+    }
+
+    /// What `mock:small-frames` and `mock:mixed-frames` send: more frames
+    /// than one session queue holds, of one byte each. The first then ends
+    /// with `Eof` and an exit code of 3.
+    const SMALL_FRAMES: usize = SESSION_QUEUE + 500;
+
+    /// One channel holds more frames than its queue while nobody reads it.
+    /// The reader goes on to the frames behind them: a pong arrives inside
+    /// the ping's budget and a second channel opens and delivers. The first
+    /// channel is intact, since its frames fit the window (review of the
+    /// guest agents, F5).
+    #[tokio::test]
+    async fn a_full_session_queue_does_not_delay_a_pong() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut full = handle
+            .open_exec(vec!["mock:small-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // `full` is not read. The pong and the second channel's frames are
+        // behind its frames on the stream.
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        let mut other = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.open_terminal(80, 24, None, vec![], None),
+        )
+        .await
+        .expect("a second channel did not open while the first was full")
+        .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(2), other.recv())
+            .await
+            .expect("the second channel delivered nothing while the first was full");
+        assert!(matches!(ev, Some(SessionEvent::Data(_))), "{ev:?}");
+
+        // Every byte of the first channel is still there, in order.
+        let mut got = 0usize;
+        while got < SMALL_FRAMES {
+            let ev = tokio::time::timeout(Duration::from_secs(5), full.recv())
+                .await
+                .expect("the first channel lost what it had queued");
+            match ev {
+                Some(SessionEvent::Data(b)) => {
+                    assert!(b.iter().all(|&c| c == b's'));
+                    got += b.len();
+                }
+                other => panic!("the first channel ended early: {other:?}"),
+            }
+        }
+        assert_eq!(got, SMALL_FRAMES);
+        // The command ended behind a full queue: its end is there too.
+        let mut end = Vec::new();
+        for _ in 0..2 {
+            end.push(
+                tokio::time::timeout(Duration::from_secs(5), full.recv())
+                    .await
+                    .expect("the first channel lost the end of its command"),
+            );
+        }
+        assert!(
+            matches!(
+                end[..],
+                [Some(SessionEvent::Eof), Some(SessionEvent::Exited(3))]
+            ),
+            "{end:?}"
+        );
+    }
+
+    /// Frames the queue cannot merge (stdout and stderr in turn) pass its
+    /// depth while nobody reads: the reader closes that one channel at once,
+    /// with an error that says why, and the connection goes on (F5).
+    #[tokio::test]
+    async fn a_channel_that_overfills_its_queue_is_closed_without_a_wait() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:mixed-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        assert!(
+            handle.ping(Duration::from_secs(2)).await,
+            "the pong waited behind a channel nobody reads"
+        );
+        assert!(
+            !handle.inner.sessions.lock().await.contains_key(&session.id),
+            "the host kept a channel whose queue overflowed"
+        );
+        let mut events = 0usize;
+        let error = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), session.recv())
+                .await
+                .expect("the session did not end");
+            match ev {
+                Some(SessionEvent::Data(_) | SessionEvent::Stderr(_)) => events += 1,
+                Some(SessionEvent::Error(msg)) => break msg,
+                other => panic!("the session ended without an error: {other:?}"),
+            }
+        };
+        assert!(error.contains("queue"), "{error}");
+        assert!(events <= SESSION_QUEUE, "{events} events sat in one queue");
+    }
+
     /// A minimal in-process agent speaking the real frame protocol over a
     /// unix socket, mirroring what `guest/agent` does: echo terminals,
     /// canned exec output, in-memory file store.
@@ -2720,6 +3301,23 @@ mod tests {
             ],
         )
         .await
+    }
+
+    /// Send what a `mock:flood` exec may: full frames while both the host's
+    /// credit and the flood's remaining bytes cover one.
+    async fn pump_flood(
+        tx: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+        id: u32,
+        (credit, left): &mut (u64, u64),
+    ) {
+        let frame = encode_frame(FrameKind::Data, id, &[b'x'; MAX_PAYLOAD]);
+        while *credit >= MAX_PAYLOAD as u64 && *left >= MAX_PAYLOAD as u64 {
+            if tx.lock().await.write_all(&frame).await.is_err() {
+                return;
+            }
+            *credit -= MAX_PAYLOAD as u64;
+            *left -= MAX_PAYLOAD as u64;
+        }
     }
 
     /// The same agent, advertising exactly `features` — for the callers that
@@ -2741,21 +3339,24 @@ mod tests {
                     let _ = tx.lock().await.write_all(&encode_ctrl(&msg).unwrap()).await;
                 }
             };
+            // Data goes out under the host's credit, like the agent's own
+            // pumps: the host closes a channel that sends past its window.
+            let out = Arc::new(MockOut {
+                tx: tx.clone(),
+                channels: std::sync::Mutex::new(HashMap::new()),
+            });
             let send_data = |id: u32, payload: Vec<u8>| {
-                let tx = tx.clone();
-                async move {
-                    let _ = tx
-                        .lock()
-                        .await
-                        .write_all(&encode_frame(FrameKind::Data, id, &payload))
-                        .await;
-                }
+                let out = out.clone();
+                async move { out.data(id, payload).await }
             };
 
             let mut dec = FrameDecoder::new();
             let mut buf = [0u8; 8192];
             // Channel kinds the mock tracks.
             let mut terminals: Vec<u32> = Vec::new();
+            // `mock:flood` execs: channel -> (send credit, bytes still to
+            // send). The flood spends only the credit the host granted.
+            let mut floods: HashMap<u32, (u64, u64)> = HashMap::new();
             // File sessions: channel -> the in-memory filesystem it serves,
             // its record decoder and its handle table.
             let mut files: HashMap<u32, MockFiles> = HashMap::new();
@@ -2852,6 +3453,63 @@ mod tests {
                                         tokio::time::sleep(Duration::from_secs(20)).await;
                                     }
                                     send(AgentMsg::Opened { id }).await;
+                                    // `mock:overrun`: a guest that ignores its
+                                    // credit, sending past the window with
+                                    // no grant and never ending the exec.
+                                    if argv.first().is_some_and(|s| s == "mock:overrun") {
+                                        let chunk = vec![7u8; 4096];
+                                        let mut w = tx.lock().await;
+                                        for _ in 0..FLOOD_BYTES / chunk.len() {
+                                            let _ = w
+                                                .write_all(&encode_frame(
+                                                    FrameKind::Data,
+                                                    id,
+                                                    &chunk,
+                                                ))
+                                                .await;
+                                        }
+                                        continue;
+                                    }
+                                    // `mock:small-frames` and
+                                    // `mock:mixed-frames`: more frames than
+                                    // one session queue holds, one byte
+                                    // each, so far inside the window. The
+                                    // first is all stdout; the second
+                                    // alternates stdout and stderr.
+                                    if let Some(mixed) = match argv.first().map(String::as_str) {
+                                        Some("mock:small-frames") => Some(false),
+                                        Some("mock:mixed-frames") => Some(true),
+                                        _ => None,
+                                    } {
+                                        let mut w = tx.lock().await;
+                                        for n in 0..SMALL_FRAMES {
+                                            let kind = if mixed && n % 2 == 1 {
+                                                FrameKind::DataErr
+                                            } else {
+                                                FrameKind::Data
+                                            };
+                                            let _ =
+                                                w.write_all(&encode_frame(kind, id, b"s")).await;
+                                        }
+                                        drop(w);
+                                        // The all-stdout command ends as
+                                        // the agent's exec does.
+                                        if !mixed {
+                                            send(AgentMsg::Eof { id }).await;
+                                            send(AgentMsg::Exited { id, code: 3 }).await;
+                                        }
+                                        continue;
+                                    }
+                                    // A command that never stops writing
+                                    // and never exits: twice the collect
+                                    // ceiling, so the mock itself is bounded.
+                                    if argv.first().is_some_and(|s| s == "mock:flood") {
+                                        let mut flood =
+                                            (INITIAL_WINDOW, 2 * EXEC_OUTPUT_LIMIT as u64);
+                                        pump_flood(&tx, id, &mut flood).await;
+                                        floods.insert(id, flood);
+                                        continue;
+                                    }
                                     // Echo who the open said to run as, so a
                                     // test can assert the identity actually
                                     // reached the wire (PRD §19.2).
@@ -2896,7 +3554,16 @@ mod tests {
                                         send_data(id, encode_record(&WatchRecord::Dirty)).await;
                                     }
                                 }
+                                HostMsg::WindowAdjust { id, bytes } => {
+                                    if let Some(flood) = floods.get_mut(&id) {
+                                        flood.0 += bytes;
+                                        pump_flood(&tx, id, flood).await;
+                                    } else {
+                                        out.grant(id, bytes).await;
+                                    }
+                                }
                                 HostMsg::Close { id } => {
+                                    floods.remove(&id);
                                     terminals.retain(|&channel| channel != id);
                                     files.remove(&id);
                                     watches.remove(&id);
@@ -3105,6 +3772,67 @@ mod tests {
         (dir, path)
     }
 
+    /// The mock's guest→host data path: each channel starts with one window
+    /// of credit, and a frame with no credit left waits, in order, for the
+    /// host's `window_adjust`.
+    struct MockOut {
+        tx: Arc<Mutex<OwnedWriteHalf>>,
+        channels: std::sync::Mutex<HashMap<u32, MockChannel>>,
+    }
+
+    struct MockChannel {
+        credit: u64,
+        waiting: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl MockOut {
+        async fn data(&self, id: u32, payload: Vec<u8>) {
+            let ready = {
+                let mut channels = self.channels.lock().unwrap();
+                let ch = channels.entry(id).or_insert_with(|| MockChannel {
+                    credit: INITIAL_WINDOW,
+                    waiting: Default::default(),
+                });
+                if ch.waiting.is_empty() && ch.credit >= payload.len() as u64 {
+                    ch.credit -= payload.len() as u64;
+                    Some(payload)
+                } else {
+                    ch.waiting.push_back(payload);
+                    None
+                }
+            };
+            if let Some(payload) = ready {
+                self.write(id, &payload).await;
+            }
+        }
+
+        async fn grant(&self, id: u32, bytes: u64) {
+            let ready: Vec<Vec<u8>> = {
+                let mut channels = self.channels.lock().unwrap();
+                let Some(ch) = channels.get_mut(&id) else {
+                    return;
+                };
+                ch.credit += bytes;
+                let mut ready = Vec::new();
+                while let Some(len) = ch.waiting.front().map(|p| p.len() as u64)
+                    && ch.credit >= len
+                {
+                    ch.credit -= len;
+                    ready.extend(ch.waiting.pop_front());
+                }
+                ready
+            };
+            for payload in ready {
+                self.write(id, &payload).await;
+            }
+        }
+
+        async fn write(&self, id: u32, payload: &[u8]) {
+            let frame = encode_frame(FrameKind::Data, id, payload);
+            let _ = self.tx.lock().await.write_all(&frame).await;
+        }
+    }
+
     /// An in-memory guest filesystem behind one `fileops` channel: enough of
     /// the vocabulary for a transfer, and it answers a batch of requests in
     /// **reverse** order so a host that assumed replies come back in the
@@ -3128,7 +3856,13 @@ mod tests {
         /// moving, which the watchdog must never mistake for one that
         /// stopped.
         slow: bool,
+        /// Bytes served so far from a file named `claims-everything`.
+        endless_served: u64,
     }
+
+    /// Where the mock ends a file named `claims-everything` by an error.
+    const ENDLESS_STOP: u64 = 16 * 1024 * 1024;
+    const ENDLESS_STOPPED: &str = "the mock stopped an endless file";
 
     /// The marker reply [`MockFiles::op`] hands back for a request the
     /// stalled peer never answers; `serve` drops it on the floor.
@@ -3159,6 +3893,7 @@ mod tests {
                     .map(|l| format!("as:{}:{}", l.user, l.elevated))
                     .unwrap_or_else(|| "as:agent".into()),
                 slow: false,
+                endless_served: 0,
             }
         }
 
@@ -3259,6 +3994,27 @@ mod tests {
                     offset,
                     len,
                 } => {
+                    // A file named `claims-everything` never ends: every
+                    // read is a full one, at any offset. The mock stops it
+                    // by an error of its own after `ENDLESS_STOP` bytes, so
+                    // a host that believes it cannot fill the test host.
+                    if self
+                        .handles
+                        .get(&handle)
+                        .is_some_and(|p| p.contains("claims-everything"))
+                    {
+                        self.endless_served += len as u64;
+                        if self.endless_served > ENDLESS_STOP {
+                            return (
+                                Reply::Error {
+                                    code: ErrorCode::Failure,
+                                    msg: ENDLESS_STOPPED.into(),
+                                },
+                                Vec::new(),
+                            );
+                        }
+                        return (Reply::Data, vec![9; len as usize]);
+                    }
                     let store = self.fs.store.lock().unwrap();
                     let Some(file) = self.handles.get(&handle).and_then(|p| store.get(p)) else {
                         return (
@@ -3383,7 +4139,9 @@ mod tests {
                                     // the file does not have — what a file
                                     // truncated between the stat and the
                                     // reads looks like to a puller.
-                                    size: if path.contains("growing-hostile") {
+                                    size: if path.contains("claims-everything") {
+                                        u64::MAX
+                                    } else if path.contains("growing-hostile") {
                                         0
                                     } else if path.contains("shrinking") {
                                         file.len() as u64 + (1 << 20)
@@ -3858,6 +4616,41 @@ mod tests {
         assert_eq!(out.stderr, b"warning-line");
     }
 
+    /// A command that writes without end (`cat /dev/zero`, or a guest that
+    /// turned hostile answering a probe) must not grow the lab daemon until
+    /// the timeout: the collect stops at its ceiling and says so.
+    #[tokio::test]
+    async fn a_collected_exec_refuses_output_past_its_ceiling() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let timeout = Duration::from_secs(20);
+        let before = tokio::time::Instant::now();
+        let err = agent
+            .exec(vec!["mock:flood".into()], vec![], None, None, timeout, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("more than 64 MiB of output"),
+            "the error names the limit: {err}"
+        );
+        assert!(before.elapsed() < timeout, "it must not run to the timeout");
+        // The channel was closed, so the connection still serves the next
+        // exec.
+        let out = agent
+            .exec(
+                vec!["echo".into()],
+                vec![],
+                None,
+                None,
+                Duration::from_secs(5),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, b"ran:echo");
+    }
+
     #[tokio::test]
     async fn push_and_pull_verify_digests() {
         let (_dir, path) = mock_agent(true).await;
@@ -3991,6 +4784,61 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("stat size"));
         assert!(std::fs::metadata(&dest).unwrap().len() <= TRANSFER_CHUNK as u64);
+    }
+
+    /// The guest answers `stat` with the largest size there is and every
+    /// read with a full chunk. The size is the guest's word, so it bounds
+    /// nothing: the bound is the room the host measured on its own disk, and
+    /// a size past it is refused before a byte is written (guest-agents F7).
+    #[tokio::test]
+    async fn a_guest_cannot_choose_how_much_a_pull_writes() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, b"seed").unwrap();
+        ops.push(&source, "/claims-everything", None).await.unwrap();
+
+        let dest = work.path().join("dest");
+        let err = ops.pull_to("/claims-everything", &dest).await.unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!said.contains(ENDLESS_STOPPED), "{said}");
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+
+        let dest = work.path().join("dest-file");
+        let err = agent
+            .pull_file("/claims-everything", &dest)
+            .await
+            .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("the host has room for"), "{said}");
+        assert!(!dest.exists());
+    }
+
+    /// The room is spent as the bytes land, so a guest whose `stat` was
+    /// modest and whose reads are not is stopped by the sink as well.
+    #[tokio::test]
+    async fn a_file_sink_stops_at_the_room_it_was_given() {
+        let work = tempfile::tempdir().unwrap();
+        let file = tokio::fs::File::create(work.path().join("dest"))
+            .await
+            .unwrap();
+        let mut sink = FileSink {
+            file,
+            left: Some(TRANSFER_CHUNK as u64 + 1),
+            remeasure_in: u64::MAX,
+        };
+        let chunk = vec![1u8; TRANSFER_CHUNK];
+        sink.write(&chunk).await.unwrap();
+        let err = sink.write(&chunk).await.unwrap_err();
+        assert!(format!("{err:#}").contains("the host has room for"));
+        sink.finish().await.unwrap();
+        assert_eq!(
+            std::fs::metadata(work.path().join("dest")).unwrap().len(),
+            TRANSFER_CHUNK as u64
+        );
     }
 
     /// A directory arrives whole, however many slices the guest streams it
@@ -4269,6 +5117,151 @@ mod tests {
         let err = format!("{err:#}");
         assert!(err.contains("repair-agent"), "{err}");
         assert!(err.starts_with("push /guest/x.bin"), "{err}");
+    }
+
+    /// A pull that fails costs the host nothing: the destination a user named
+    /// still holds what it held, and nothing is left beside it. Before, the
+    /// destination was emptied first and the guest asked second, so a typo in
+    /// the guest path destroyed the host file it was aimed at.
+    #[tokio::test]
+    async fn a_failed_pull_leaves_the_host_file_as_it_was() {
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("notes.txt");
+        std::fs::write(&dest, b"keep me").unwrap();
+
+        // A guest path the agent does not hold.
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent.pull_file("/guest/typo", &dest).await.unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.starts_with("pull /guest/typo"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // A transfer that fails part-way, after bytes have arrived.
+        let source = work.path().join("source");
+        std::fs::write(&source, vec![7; TRANSFER_CHUNK * 4]).unwrap();
+        agent
+            .push_file(&source, "/growing-hostile", None)
+            .await
+            .unwrap();
+        let err = agent
+            .pull_file("/growing-hostile", &dest)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("stat size"), "{err:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // An agent that cannot serve the transfer at all.
+        let (_dir, path) = mock_agent_with(true, vec!["terminal".into()]).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let err = agent
+            .pull_file("/guest/some-file", &dest)
+            .await
+            .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("repair-agent"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        // No failure left a part-written file beside the destination.
+        let left: Vec<_> = std::fs::read_dir(work.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "notes.txt" && n != "source")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// Two inline pushes to one machine at the same time each land their own
+    /// bytes. Before, both wrote `<temp_dir>/vmlab-cp-<pid>-<machine>` first
+    /// and pushed that file second, so the later write replaced the bytes of
+    /// the earlier push, or removed the file under it.
+    #[tokio::test]
+    async fn inline_pushes_to_one_machine_do_not_share_a_temp_file() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let first = vec![1u8; TRANSFER_CHUNK + 17];
+        let second = vec![2u8; 300];
+        // `slow` in the name makes the mock sit on each reply of the first
+        // push, the open included.
+        let (a, b) = tokio::join!(
+            super::super::push_inline(&agent, &first, "/slow-first", None, None),
+            super::super::push_inline(&agent, &second, "/second", None, None),
+        );
+        let (sha, len) = a.expect("the first push");
+        assert_eq!(len, first.len() as u64);
+        assert_eq!(
+            sha,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&first))
+        );
+        let (sha, len) = b.expect("the second push");
+        assert_eq!(len, second.len() as u64);
+        assert_eq!(
+            sha,
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&second))
+        );
+        let limit = crate::proto::INLINE_FILE_LIMIT;
+        let (_, held) = agent.pull_bytes("/slow-first", limit).await.unwrap();
+        assert!(held == first, "the first guest path holds other bytes");
+        let (_, held) = agent.pull_bytes("/second", limit).await.unwrap();
+        assert!(held == second, "the second guest path holds other bytes");
+    }
+
+    /// An inline push writes nothing on the host: its bytes go from memory to
+    /// the guest. Before, they passed through a file with a name any local
+    /// user could predict, written through a symlink planted there, so the
+    /// push overwrote the file the link pointed to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inline_push_does_not_write_through_a_planted_symlink() {
+        let work = tempfile::tempdir().unwrap();
+        let victim = work.path().join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        // The name the daemon used for a machine called `f2-symlink`.
+        let planted =
+            std::env::temp_dir().join(format!("vmlab-cp-{}-f2-symlink", std::process::id()));
+        let _ = std::fs::remove_file(&planted);
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let pushed =
+            super::super::push_inline(&agent, b"pushed bytes", "/pushed", None, None).await;
+        let link_left = std::fs::symlink_metadata(&planted).is_ok();
+        let _ = std::fs::remove_file(&planted);
+
+        pushed.expect("the push");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(link_left, "the push removed a file it did not make");
+        let (_, held) = agent
+            .pull_bytes("/pushed", crate::proto::INLINE_FILE_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(held, b"pushed bytes");
+    }
+
+    /// A pull that succeeds replaces the destination's content in one step,
+    /// keeps the mode the file had, and writes through a symlink to the file
+    /// it names rather than replacing the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_an_existing_file_keeps_its_mode_and_its_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let real = work.path().join("real.bin");
+        std::fs::write(&real, b"old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = work.path().join("link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &link).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap().len(), 10_000);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
     }
 
     const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";

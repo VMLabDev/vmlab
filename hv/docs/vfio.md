@@ -44,15 +44,20 @@ ls -l "/dev/vfio/$(basename "$GROUP")"
 The driver link must end in `vfio-pci`. Grant the test account access to the
 group's VFIO node through the host's device-permission policy. The VMM refuses
 other bindings and never unbinds, rebinds, or changes IOMMU groups.
-Set the account's locked-memory limit to at least the guest RAM size. This
-test needs 4 GiB. Check the limit in KiB with `ulimit -l`.
+Passthrough pins all guest RAM, and the kernel charges it to the account's
+locked-memory limit (RLIMIT_MEMLOCK). The VMM raises its soft limit to the hard
+limit by itself. When the hard limit is below the guest RAM it refuses to start
+and names the limit. Check the hard limit in KiB with `ulimit -Hl`. This test
+needs 4 GiB.
 
 ## Run the S1 acceptance test
 
-Install SeaBIOS at `/usr/share/qemu/bios-256k.bin`. Provide the Ubuntu 26.04
-template under `~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
-`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test creates an overlay and
-does not write the template.
+Install matching 4 MiB OVMF CODE and VARS files in the system firmware
+directory or set `VMLAB_HV_FIRMWARE_DIR` to the directory containing them.
+Provide the Ubuntu 26.04 template under
+`~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
+`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test writes to a disk overlay
+and makes a private copy of the VARS file for each VM start.
 
 ```sh
 systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
@@ -60,14 +65,17 @@ systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
 ```
 
 The test boots the designated function at guest `00:06.0`, checks `lspci -n`
-against its host vendor and device IDs, refuses snapshot save and load through
-the control socket, and quits. Without the device variable, it prints a skip
-reason before accessing hardware. Missing KVM, firmware, or template assets
-also produce a named skip.
+against its host vendor and device IDs, and checks that the control socket
+refuses snapshot save and load. It reboots the guest, checks the reset event,
+the new boot ID, and the PCI identity, then powers off from the guest. A second
+VM process starts with the same device and disk overlay, checks the PCI
+identity again, and quits through the control socket. Both exits must be
+successful and free of VFIO teardown errors. Without the device variable, it
+prints a skip reason before accessing hardware. With a device specified,
+missing KVM, firmware, or template assets fail the test.
 
 For hardware acceptance, also exercise the function with its normal guest
-driver and repeat the test after guest shutdown and reset. Enumeration alone
-does not prove GPU rendering, DMA throughput, or every interrupt mode.
+driver. That step covers rendering, DMA, and interrupts used by the workload.
 
 After every VM has exited, restore the original host driver if appropriate:
 
@@ -87,19 +95,59 @@ lspci -nnk -s "$BDF"
 ]
 ```
 
+Several functions of one card are separate entries that share a guest slot.
+The card goes at function 0, and each other function keeps its host function
+number:
+
+```json
+"vfio": [
+  {"host": "0000:05:00.0", "pci": {"bus": 0, "device": 4, "function": 0}},
+  {"host": "0000:05:00.1", "pci": {"bus": 0, "device": 4, "function": 1}}
+]
+```
+
+The guest then reads the multi-function bit at function 0 and finds the
+card's HDMI/DP audio function beside it. vmlab writes these entries for a
+`gpu { mode = "passthrough" }` VM from the functions of the host slot that are
+bound to `vfio-pci`, or from the host GPU's `passthrough_functions`.
+
 Assignment requires q35 and an explicit, unoccupied bus-zero guest address.
-The VMM resets the function at start and VM exit, maps guest RAM through a
+The VMM resets the function at start and VM exit when the kernel can reset it
+by itself (`VFIO_DEVICE_FLAGS_RESET`). The audio function of a graphics card
+usually cannot be: it has no function-level reset and shares its bus with the
+GPU. Such a function is assigned without a reset and the log says so. The VMM
+still clears its command register and interrupts. It maps guest RAM through a
 VFIO type1 container, and directly maps mmap-capable BAR pages into both KVM
 address spaces. Sparse mmap areas are respected. MSI-X table and PBA pages
 remain trapped; other registers on those pages use VFIO region access.
 Guest BAR and ROM addresses never reach host config space.
+
+The expansion ROM is read on the guest's first access to it and kept for the
+life of the machine. The kernel checks the ROM signature through the device on
+every read, so the VMM turns memory decoding on for the length of the read.
+A graphics card's flash is slow: the first read of an RTX 5090's 512 KiB ROM
+takes about 14 seconds, once for each start.
+
+Three extended capabilities are unlinked from the chain the guest sees, and
+read as zeros: SR-IOV, ARI and Resizable BAR. The kernel presents SR-IOV's VF
+BARs read-only, and EDK2 adds them to its resource plan. On an RTX 5090 that
+asks the host bridge for a range it rejects, after which OVMF gives no device
+a BAR and the guest finds no disk and no display. ARI names a next function
+the guest does not have, and Resizable BAR would change a BAR size the VMM has
+fixed.
+
+PCI0's 64-bit window in the ACPI tables grows by the sum of the assigned
+64-bit BARs, rounded up to 1 GiB, above its 32 GiB default. Firmware places
+the largest BAR first, so a 32 GiB BAR would otherwise push every other
+device's 64-bit BAR outside the declared window.
 
 MSI advertises one maskable vector when hardware supports masking. MSI-X
 preserves the hardware vector count. Both use eventfds and KVM MSI routing;
 masked vectors retain pending events. INTx uses KVM irqfd resampling at the
 q35 IOAPIC PIRQ GSI. Legacy PIC-only INTx delivery is not implemented.
 Other capability accesses pass through the kernel VFIO config-space filters.
-No vendor-specific GPU reset or NVIDIA workarounds are included.
+No vendor-specific GPU reset or NVIDIA workarounds are included. An RTX 5090
+runs a Windows 11 guest with the NVIDIA driver without them (card 453).
 
 Online snapshot save and load are refused while any VFIO function is assigned.
 Disk-only image operations remain independent of assignment.

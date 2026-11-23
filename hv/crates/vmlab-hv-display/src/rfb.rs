@@ -261,6 +261,10 @@ impl DisplayServer {
                         }
                         Err(error) => return Err(error),
                     };
+                    crate::trace::write(
+                        "rfb_send",
+                        format_args!("ts={} seq={seq}", frame.timestamp_ns),
+                    );
                     rect(&mut out, x as u16, y as u16, w as u16, h as u16, RAW);
                     count += 1;
                     for row in y..y + h {

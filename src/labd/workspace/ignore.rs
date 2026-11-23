@@ -113,6 +113,89 @@ pub struct Ignores {
     /// What the rules say about *directory prefixes*, as opposed to about
     /// paths — the input to [`Ignores::prune_list`].
     prune: PruneCandidates,
+    /// Rule files that were not read, by root-relative path, and why.
+    refused: Vec<(String, String)>,
+}
+
+/// Why a symlinked rule file contributes no rules.
+const SYMLINK_REFUSED: &str =
+    "host: a rule file that is a symlink is never read, so its rules do not apply";
+
+/// What opening one rule file found.
+enum RuleFile {
+    Read(Vec<u8>),
+    Absent,
+    /// The name is a symlink. Its target was not opened.
+    Symlink,
+    /// The name is something that holds no rules: a directory, a FIFO, a
+    /// socket or a device. Nothing was read from it.
+    NotAFile(&'static str),
+}
+
+/// Why a rule-file name that is not a regular file contributes no rules, or
+/// `None` for a regular file.
+fn not_a_file(kind: std::fs::FileType) -> Option<&'static str> {
+    if kind.is_file() {
+        None
+    } else if kind.is_dir() {
+        Some("host: a directory named like a rule file holds no rules, so none apply from it")
+    } else {
+        Some("host: a rule file that is not a regular file is never read, so no rules apply")
+    }
+}
+
+/// Read one rule file without following a symlink at its own name.
+///
+/// The check and the open are one step where the platform has `O_NOFOLLOW`,
+/// so a link put there between the two is not followed either.
+///
+/// A name that is not a regular file is not read: a directory has no lines,
+/// and a FIFO or a device may never end. The open does not block and the
+/// opened handle is checked again, so a FIFO put there after the first check
+/// is not waited on either.
+fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
+    use std::io::Read;
+    match std::fs::symlink_metadata(file) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(RuleFile::Symlink),
+        Ok(meta) => {
+            if let Some(why) = not_a_file(meta.file_type()) {
+                return Ok(RuleFile::NotAFile(why));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RuleFile::Absent),
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        options.custom_flags(flags.bits() as i32);
+    }
+    let mut opened = match options.open(file) {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RuleFile::Absent),
+        Err(e) => {
+            // `O_NOFOLLOW` answers a symlink with `ELOOP`: the name became a
+            // link after the check above.
+            // A socket answers `ENXIO`, the same way: it replaced the file.
+            return match std::fs::symlink_metadata(file) {
+                Ok(meta) if meta.file_type().is_symlink() => Ok(RuleFile::Symlink),
+                Ok(meta) => match not_a_file(meta.file_type()) {
+                    Some(why) => Ok(RuleFile::NotAFile(why)),
+                    None => Err(e),
+                },
+                Err(_) => Err(e),
+            };
+        }
+    };
+    if let Some(why) = not_a_file(opened.metadata()?.file_type()) {
+        return Ok(RuleFile::NotAFile(why));
+    }
+    let mut bytes = Vec::new();
+    opened.read_to_end(&mut bytes)?;
+    Ok(RuleFile::Read(bytes))
 }
 
 /// The raw material of the prune list: which prefixes the rules exclude, and
@@ -144,7 +227,14 @@ impl Ignores {
             dirs: BTreeMap::new(),
             sources: Vec::new(),
             prune: PruneCandidates::default(),
+            refused: Vec::new(),
         }
+    }
+
+    /// The rule files [`read_dir_rules`](Ignores::read_dir_rules) declined to
+    /// read, as (root-relative path, reason), in the order they were met.
+    pub fn refused(&self) -> &[(String, String)] {
+        &self.refused
     }
 
     /// Read `dir`'s own ignore files, if it has any. Called on entering a
@@ -154,6 +244,21 @@ impl Ignores {
     /// the root. An unreadable rule file is an error rather than an empty
     /// rule set: silently syncing a `node_modules` because its rule file could
     /// not be opened is the failure this section keeps refusing.
+    ///
+    /// **A rule file that is a symlink is never read through**, wherever it
+    /// points. A symlink syncs guest to host verbatim, so the guest chooses
+    /// its target, and what the rules name goes back to the guest as the prune
+    /// list: following one would hand a guest the lines of any file the lab
+    /// daemon's user can read, and a link to `/dev/zero` would not return. A
+    /// link that stays inside the workspace is refused too, because its
+    /// target can be a guest-owned path the guest was never given (`.env`).
+    /// Its rules do not apply, and it is kept by name in
+    /// [`refused`](Ignores::refused) for the pass to report.
+    ///
+    /// **A rule-file name that is not a regular file** — a directory, a FIFO,
+    /// a socket — is the same named refusal and not an error. It holds no
+    /// rules to lose, and a guest makes one with `mkdir`: failing on it would
+    /// fail every pass before the guest is looked at (review labd-sync F9).
     pub fn read_dir_rules(&mut self, root: &Path, rel: &str) -> Result<()> {
         let dir = if rel.is_empty() {
             root.to_path_buf()
@@ -166,9 +271,18 @@ impl Ignores {
             (GIT_IGNORE, &mut rules.git),
         ] {
             let file = dir.join(name);
-            let source = match std::fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            let source = match read_rule_file(&file) {
+                Ok(RuleFile::Read(bytes)) => bytes,
+                Ok(RuleFile::Absent) => continue,
+                Ok(RuleFile::Symlink) => {
+                    self.refused
+                        .push((join_rel(rel, name), SYMLINK_REFUSED.to_string()));
+                    continue;
+                }
+                Ok(RuleFile::NotAFile(why)) => {
+                    self.refused.push((join_rel(rel, name), why.to_string()));
+                    continue;
+                }
                 Err(e) => return Err(e).context(format!("reading {}", file.display())),
             };
             let mut builder = GitignoreBuilder::new(&dir);
@@ -768,13 +882,88 @@ mod tests {
 
     /// An unreadable rule file fails loudly. Treating it as "no rules" would
     /// quietly pull a whole dependency tree across the seam.
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_rule_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tmp();
         let mut set = Ignores::new();
-        std::fs::create_dir(dir.path().join(GIT_IGNORE)).unwrap();
+        let file = dir.path().join(GIT_IGNORE);
+        std::fs::write(&file, "target/\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            // Root reads through the mode, so there is nothing unreadable here.
+            return;
+        }
         let err = set.read_dir_rules(dir.path(), "").unwrap_err();
         assert!(format!("{err:#}").contains(GIT_IGNORE), "{err:#}");
+    }
+
+    /// A directory named like a rule file is not an unreadable rule file: it
+    /// holds no rules, so it is refused by name and the walk goes on (review
+    /// labd-sync F9).
+    #[test]
+    fn a_directory_named_like_a_rule_file_is_refused_by_name() {
+        let dir = tmp();
+        std::fs::create_dir(dir.path().join(GIT_IGNORE)).unwrap();
+        std::fs::write(dir.path().join(VMLAB_IGNORE), "target/\n").unwrap();
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
+        assert_eq!(set.refused().len(), 1);
+        assert_eq!(set.refused()[0].0, GIT_IGNORE);
+        assert!(set.refused()[0].1.contains("directory"));
+    }
+
+    /// A rule file that is a symlink is never read through, wherever it
+    /// points: a symlink syncs guest to host verbatim, so its target is the
+    /// guest's choice, and the prune list goes back to the guest (review
+    /// labd-sync F2). The refusal is kept by name, and the rules of the
+    /// regular file beside it still apply.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_rule_file_is_refused_by_name_and_never_read() {
+        let dir = tmp();
+        let outside = tmp();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "hunter2-token\nsecond/line\n").unwrap();
+        std::fs::write(dir.path().join("inside"), "in-tree-line\n").unwrap();
+        std::fs::create_dir(dir.path().join("web")).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join(VMLAB_IGNORE)).unwrap();
+        std::os::unix::fs::symlink("../inside", dir.path().join("web").join(GIT_IGNORE)).unwrap();
+        std::fs::write(dir.path().join(GIT_IGNORE), "target/\n").unwrap();
+
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        set.read_dir_rules(dir.path(), "web").unwrap();
+
+        assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
+        assert_eq!(set.verdict("hunter2-token", true), Verdict::Synced);
+        assert_eq!(set.verdict("web/in-tree-line", true), Verdict::Synced);
+        let refused: Vec<&str> = set
+            .refused()
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(refused, vec![".vmlabignore", "web/.gitignore"]);
+        assert!(set.refused().iter().all(|(_, why)| why.contains("symlink")));
+
+        // The digest covers what was read and nothing of what was refused.
+        let plain = tmp();
+        let same = ignores(plain.path(), &[(".gitignore", "target/\n")]);
+        assert_eq!(set.digest(), same.digest());
+    }
+
+    /// A link to a file that never ends must not be opened at all: reading
+    /// `/dev/zero` as rules would allocate until the lab daemon is killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_rule_file_linked_to_an_endless_file_is_not_opened() {
+        let dir = tmp();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(GIT_IGNORE)).unwrap();
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        assert_eq!(set.refused().len(), 1);
     }
 
     #[test]

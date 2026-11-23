@@ -49,6 +49,7 @@ const MAGIC: u32 = 0x5346_5049;
 const SESSION_LIMIT: usize = 4096;
 #[cfg(test)]
 const SESSION_LIMIT: usize = 32;
+const INITIAL_REQUEST_LIMIT: usize = super::fuse::server::MAX_BUFFER_SIZE as usize + 4096;
 
 /// A passthrough filesystem serving `root` on the host. Clones share one
 /// session, so the device and its FUSE server observe the same inodes.
@@ -62,6 +63,7 @@ pub struct PassthroughFs {
 
 /// Everything the guest has made the server remember.
 struct Session {
+    writeback_cache: bool,
     /// `O_PATH` descriptors by inode; the root holds the share directory.
     inodes: HashMap<u64, Inode>,
     /// Live path → inode, so repeat lookups of one file share one guest
@@ -76,10 +78,10 @@ struct Session {
 }
 
 /// One guest-known file. `fd` is an `O_PATH` handle on the inode; `path` is
-/// its location under the root at lookup time (the snapshot form). The
-/// parent's `O_PATH` descriptor and the own name serve the `*at` syscalls,
-/// which `O_PATH` descriptors alone cannot express (fchmod, readlink,
-/// truncate...).
+/// its location under the root at lookup time, moved along by every guest
+/// rename (the snapshot form). The parent's `O_PATH` descriptor and the own
+/// name serve the `*at` syscalls, which `O_PATH` descriptors alone cannot
+/// express (fchmod, readlink, truncate...).
 struct Inode {
     fd: OwnedFd,
     parent: OwnedFd,
@@ -101,25 +103,37 @@ struct Handle {
 
 enum HandleKind {
     File {
-        file: File,
+        // A restored handle keeps its ID even when its file cannot be reopened.
+        file: Option<File>,
         flags: i32,
         /// Path under the root at open time, for the snapshot.
         path: PathBuf,
     },
     Dir {
-        /// Cached directory entries, rebuilt when the guest rewinds to
-        /// offset 0 (and after a restore).
-        entries: Option<Vec<CachedDirent>>,
+        /// The directory stream, opened by the first READDIR (and again
+        /// after a restore). The handle holds no entries: every request
+        /// reads its own from the host, so a handle costs one descriptor
+        /// whatever the size of the directory.
+        dir: Option<File>,
+        /// The cookie the stream stands at, when that is known. A request
+        /// at another offset seeks first.
+        position: Option<u64>,
     },
 }
 
 /// One directory entry as getdents64 served it.
-#[derive(Clone)]
-struct CachedDirent {
+struct HostDirent {
     name: Vec<u8>,
     host_ino: u64,
     d_type: u8,
+    /// The host's `d_off`: the cookie that resumes after this entry.
+    cookie: u64,
 }
+
+/// The most one getdents64 call reads for a request.
+const DIR_BATCH_MAX: usize = 64 << 10;
+/// The least: room for any one record (19 bytes and a 255-byte name).
+const DIR_BATCH_MIN: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileKind {
@@ -138,9 +152,10 @@ impl PassthroughFs {
             root: root.canonicalize().unwrap_or(root),
             read_only,
             request_limit: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
-                super::fuse::server::MAX_BUFFER_SIZE as usize + 4096,
+                INITIAL_REQUEST_LIMIT,
             )),
             inner: std::sync::Arc::new(Mutex::new(Session {
+                writeback_cache: false,
                 inodes: HashMap::from([(
                     ROOT_ID,
                     Inode {
@@ -187,7 +202,8 @@ impl PassthroughFs {
         let session = self.inner.lock();
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.push(1); // format version
+        out.push(2); // format version
+        out.push(u8::from(session.writeback_cache));
         out.extend_from_slice(&(session.inodes.len() as u32).to_le_bytes());
         let mut inodes: Vec<(&u64, &Inode)> = session.inodes.iter().collect();
         inodes.sort_by_key(|(ino, _)| **ino);
@@ -230,19 +246,28 @@ impl PassthroughFs {
     /// every inode is re-walked from the root, every file handle reopened at
     /// its recorded path (creation flags stripped), every directory handle
     /// reset to its start. A missing path becomes a dead inode; an open file
-    /// that vanished reopens on `/dev/null` and answers `ESTALE`.
+    /// that vanished keeps its handle ID and answers `ESTALE` on I/O.
     pub fn restore_state(&self, state: &[u8]) -> io::Result<()> {
         let err = || io::Error::new(io::ErrorKind::InvalidData, "bad passthrough state");
         if state.len() < 10 || u32::from_le_bytes(state[0..4].try_into().unwrap()) != MAGIC {
             return Err(err());
         }
-        if state[4] != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("passthrough state version {} is not 1", state[4]),
-            ));
-        }
-        let mut cur = 5usize;
+        let (writeback_cache, mut cur) = match state[4] {
+            // Version 1 did not record negotiated writeback. Preserve its
+            // host append behavior when restoring those sessions.
+            1 => (false, 5usize),
+            2 => match state[5] {
+                0 => (false, 6),
+                1 => (true, 6),
+                _ => return Err(err()),
+            },
+            version => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported passthrough state version {version}"),
+                ));
+            }
+        };
         let mut take = |len: usize| -> io::Result<&[u8]> {
             let end = cur.checked_add(len).ok_or_else(err)?;
             let slice = state.get(cur..end).ok_or_else(err)?;
@@ -346,18 +371,23 @@ impl PassthroughFs {
             };
             let kind = match take(1)?[0] {
                 0 => {
-                    let flags = host_open_flags(i32::from_le_bytes(take(4)?.try_into().unwrap()));
+                    let flags = host_open_flags(
+                        i32::from_le_bytes(take(4)?.try_into().unwrap()),
+                        writeback_cache,
+                    );
                     let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
                     let path = PathBuf::from(OsStr::from_bytes(take(len)?));
                     let file = if inode.dead {
-                        // Nothing to reopen; I/O on it must fail loudly.
-                        reopen_dead()?
+                        None
                     } else {
-                        reopen(&inode.fd, flags).unwrap_or_else(|_| reopen_dead().unwrap())
+                        reopen(&inode.fd, flags).ok()
                     };
                     HandleKind::File { file, flags, path }
                 }
-                1 => HandleKind::Dir { entries: None },
+                1 => HandleKind::Dir {
+                    dir: None,
+                    position: None,
+                },
                 _ => return Err(err()),
             };
             handles.insert(handle, Handle { ino, kind });
@@ -368,6 +398,7 @@ impl PassthroughFs {
             return Err(err());
         }
         let mut session = self.inner.lock();
+        session.writeback_cache = writeback_cache;
         session.inodes = inodes;
         session.by_path = by_path;
         session.handles_by_inode.clear();
@@ -409,6 +440,7 @@ impl FileSystem for PassthroughFs {
             want |= FsOptions::WRITEBACK_CACHE;
         }
         let enabled = want & capable;
+        self.inner.lock().writeback_cache = enabled.contains(FsOptions::WRITEBACK_CACHE);
         let payload = if enabled.intersects(FsOptions::BIG_WRITES | FsOptions::MAX_PAGES) {
             super::fuse::server::MAX_BUFFER_SIZE as usize
         } else {
@@ -419,7 +451,19 @@ impl FileSystem for PassthroughFs {
         Ok(enabled)
     }
 
-    fn destroy(&self) {}
+    fn destroy(&self) {
+        let mut session = self.inner.lock();
+        // Keep the pinned share root so reset also works after a host rename.
+        session.inodes.retain(|&ino, _| ino == ROOT_ID);
+        session.by_path.retain(|_, ino| *ino == ROOT_ID);
+        session.handles.clear();
+        session.handles_by_inode.clear();
+        session.next_ino = ROOT_ID + 1;
+        session.next_handle = 1;
+        session.writeback_cache = false;
+        self.request_limit
+            .store(INITIAL_REQUEST_LIMIT, std::sync::atomic::Ordering::Relaxed);
+    }
 
     fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
         let mut session = self.inner.lock();
@@ -457,7 +501,9 @@ impl FileSystem for PassthroughFs {
             && let Some(open) = session.handles.get(&handle)
             && let HandleKind::File { file, .. } = &open.kind
         {
-            file.as_raw_fd()
+            file.as_ref()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?
+                .as_raw_fd()
         } else {
             live_inode(&session, inode)?.fd.as_raw_fd()
         };
@@ -477,9 +523,10 @@ impl FileSystem for PassthroughFs {
         self.refuse_writes()?;
         let session = self.inner.lock();
         let state = live_inode(&session, inode)?;
-        if let Some(handle) = handle {
-            session.file_handle(inode, handle)?;
-        }
+        let open = match handle {
+            Some(handle) => Some(session.file_handle(inode, handle)?),
+            None => None,
+        };
         if valid.contains(SetattrValid::SIZE)
             && kind_of(fstat(state.fd.as_raw_fd())?.st_mode) != FileKind::File
         {
@@ -492,7 +539,14 @@ impl FileSystem for PassthroughFs {
             fchownat(&state.fd, valid, &attr)?;
         }
         if valid.contains(SetattrValid::SIZE) {
-            truncateat(&state.fd, attr.st_size)?;
+            // ftruncate(2) asks for a writable descriptor, not for a
+            // writable file: a handle the guest opened for writing carries
+            // the truncation whatever the mode of the file is now. Without
+            // one the reopen applies the mode, as truncate(2) does.
+            match open.as_ref().filter(|file| opened_for_writing(file)) {
+                Some(file) => ftruncate(file, attr.st_size)?,
+                None => truncateat(&state.fd, attr.st_size)?,
+            }
         }
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
             utimensat(&state.fd, valid, &attr)?;
@@ -624,19 +678,44 @@ impl FileSystem for PassthroughFs {
         flags: u32,
     ) -> io::Result<()> {
         self.refuse_writes()?;
-        let session = self.inner.lock();
+        let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
         let newparent = live_inode(&session, newparent)?;
         if parent.kind != FileKind::Dir || newparent.kind != FileKind::Dir {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
-        renameat2(
-            &parent.fd,
-            checked_name(name)?,
-            &newparent.fd,
-            checked_name(newname)?,
-            flags,
-        )
+        let name = checked_name(name)?;
+        let newname = checked_name(newname)?;
+        let from = parent.path.join(OsStr::from_bytes(name));
+        let to = newparent.path.join(OsStr::from_bytes(newname));
+        // Cloned before the rename: once the host has moved the file, the
+        // session must be able to follow it without a step that can fail.
+        let dir = parent.fd.try_clone()?;
+        let newdir = newparent.fd.try_clone()?;
+        // rename(2) does nothing, and succeeds, when both names are links
+        // of one file. Then neither name moved.
+        let same_file = flags & libc::RENAME_EXCHANGE == 0
+            && matches!(
+                (host_identity(&dir, name), host_identity(&newdir, newname)),
+                (Some(a), Some(b)) if a == b
+            );
+        renameat2(&dir, name, &newdir, newname, flags)?;
+        if from == to || same_file {
+            return Ok(());
+        }
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            let moved = session.take_subtree(&from);
+            let back = session.take_subtree(&to);
+            session.place_subtree(moved, &to, newdir, newname);
+            session.place_subtree(back, &from, dir, name);
+        } else {
+            // Whatever the destination name held is replaced: its inodes
+            // stay with the guest until FORGET, but no longer own the name.
+            session.take_subtree(&to);
+            let moved = session.take_subtree(&from);
+            session.place_subtree(moved, &to, newdir, newname);
+        }
+        Ok(())
     }
 
     fn link(
@@ -692,7 +771,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let bytes = checked_name(name)?;
-        let flags = host_open_flags(args.flags as i32);
+        let flags = host_open_flags(args.flags as i32, session.writeback_cache);
         // EXCL makes creation atomic. Existing names are vetted with
         // O_PATH|NOFOLLOW and opened through that fd, never by name again.
         let file = match createat(
@@ -831,7 +910,10 @@ impl FileSystem for PassthroughFs {
             handle,
             Handle {
                 ino: inode,
-                kind: HandleKind::Dir { entries: None },
+                kind: HandleKind::Dir {
+                    dir: None,
+                    position: None,
+                },
             },
         );
         *session.handles_by_inode.entry(inode).or_default() += 1;
@@ -848,29 +930,38 @@ impl FileSystem for PassthroughFs {
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let mut session = self.inner.lock();
-        let entries = session.dir_entries(inode, handle, offset)?.to_vec();
-        let live = live_inode(&session, inode)?;
-        let dir_path = live.path.clone();
-        // Cookie `i` resumes at entry `i`: entry `n` carries offset `n+1`.
+        let dir_path = live_inode(&session, inode)?.path.clone();
+        // The cookie of an entry is the host's own: it resumes after that
+        // entry. Each batch is bounded, so a request costs what it serves
+        // and not the size of the directory.
         let mut used = 0usize;
-        for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
-            if used > size as usize {
+        let mut position = offset;
+        while used <= size as usize {
+            let Some((entries, next)) =
+                session.dir_batch(inode, handle, position, size as usize)?
+            else {
                 break;
-            }
-            let ino = session
-                .by_path
-                .get(&dir_path.join(OsStr::from_bytes(&entry.name)))
-                .copied()
-                .unwrap_or(entry.host_ino);
-            match add_entry(DirEntry {
-                ino,
-                offset: (index + 1) as u64,
-                type_: entry.d_type as u32,
-                name: &entry.name,
-            }) {
-                Ok(0) => break,
-                Ok(len) => used += len,
-                Err(e) => return Err(e),
+            };
+            position = next;
+            for entry in &entries {
+                if used > size as usize {
+                    return Ok(());
+                }
+                let ino = session
+                    .by_path
+                    .get(&dir_path.join(OsStr::from_bytes(&entry.name)))
+                    .copied()
+                    .unwrap_or(entry.host_ino);
+                match add_entry(DirEntry {
+                    ino,
+                    offset: entry.cookie,
+                    type_: entry.d_type as u32,
+                    name: &entry.name,
+                }) {
+                    Ok(0) => return Ok(()),
+                    Ok(len) => used += len,
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
@@ -886,38 +977,17 @@ impl FileSystem for PassthroughFs {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let mut session = self.inner.lock();
-        let entries = session.dir_entries(inode, handle, offset)?.to_vec();
-        let live = live_inode(&session, inode)?;
-        let dir_path = live.path.clone();
-        let dir_fd = live.fd.try_clone()?;
-        // Cookie `i` resumes at entry `i`: entry `n` carries offset `n+1`.
-        let mut used = 0usize;
-        for (index, cached) in entries.iter().enumerate().skip(offset as usize) {
-            if used > size as usize {
-                break;
-            }
-            let path = dir_path.join(OsStr::from_bytes(&cached.name));
-            // Resolve (or create) the session inode so the Entry carries the
-            // server's own ino and a lookup count the kernel will FORGET.
-            let entry = match session.resolve(&path, &dir_fd, &cached.name) {
-                Ok(entry) => entry,
-                Err(_) => continue, // raced away; the guest re-lookups
-            };
-            match add_entry(
-                DirEntry {
-                    ino: entry.inode,
-                    offset: (index + 1) as u64,
-                    type_: cached.d_type as u32,
-                    name: &cached.name,
-                },
-                entry,
-            ) {
-                Ok(0) => break,
-                Ok(len) => used += len,
-                Err(e) => return Err(e),
+        // Every entry handed to `add_entry` carries one lookup the guest
+        // answers with FORGET. A request that fails is answered with the
+        // error alone, so the guest sees none of them: take them back.
+        let mut served = Vec::new();
+        let result = session.readdirplus(inode, handle, size, offset, &mut served, add_entry);
+        if result.is_err() {
+            for ino in served {
+                session.forget_one(ino, 1);
             }
         }
-        Ok(())
+        result
     }
 
     fn fsyncdir(&self, _ctx: &Context, inode: u64, datasync: bool, _handle: u64) -> io::Result<()> {
@@ -982,6 +1052,64 @@ impl Session {
             && self.by_path.get(&state.path) == Some(&inode)
         {
             self.by_path.remove(&state.path);
+        }
+    }
+
+    /// Take the inode at `root` and every inode below it out of `by_path`,
+    /// each with its path relative to `root`. The inodes themselves stay.
+    fn take_subtree(&mut self, root: &Path) -> Vec<(PathBuf, u64)> {
+        let paths: Vec<PathBuf> = self
+            .by_path
+            .keys()
+            .filter(|path| path.starts_with(root))
+            .cloned()
+            .collect();
+        paths
+            .into_iter()
+            .map(|path| {
+                let ino = self.by_path.remove(&path).expect("key just listed");
+                let below = path.strip_prefix(root).expect("filtered on the prefix");
+                (below.to_path_buf(), ino)
+            })
+            .collect()
+    }
+
+    /// Record a subtree from [`Self::take_subtree`] at `root`, the name
+    /// `name` under the directory `parent`: a rename moved it there. Only
+    /// the subtree's own top changes parent and name; everything below
+    /// keeps both and changes path.
+    fn place_subtree(
+        &mut self,
+        subtree: Vec<(PathBuf, u64)>,
+        root: &Path,
+        parent: OwnedFd,
+        name: &[u8],
+    ) {
+        let mut parent = Some(parent);
+        for (below, ino) in &subtree {
+            let top = below.as_os_str().is_empty();
+            let path = if top {
+                root.to_path_buf()
+            } else {
+                root.join(below)
+            };
+            if let Some(state) = self.inodes.get_mut(ino) {
+                if top && let Some(parent) = parent.take() {
+                    state.parent = parent;
+                    state.name = name.to_vec();
+                }
+                state.path = path.clone();
+            }
+            self.by_path.insert(path, *ino);
+        }
+        // An open handle records its path for the snapshot.
+        for open in self.handles.values_mut() {
+            if let HandleKind::File { path, .. } = &mut open.kind
+                && subtree.iter().any(|(_, ino)| *ino == open.ino)
+                && let Some(state) = self.inodes.get(&open.ino)
+            {
+                path.clone_from(&state.path);
+            }
         }
     }
 
@@ -1096,7 +1224,11 @@ impl Session {
             handle,
             Handle {
                 ino,
-                kind: HandleKind::File { file, flags, path },
+                kind: HandleKind::File {
+                    file: Some(file),
+                    flags,
+                    path,
+                },
             },
         );
         *self.handles_by_inode.entry(ino).or_default() += 1;
@@ -1112,12 +1244,13 @@ impl Session {
         {
             return Err(io::Error::from_raw_os_error(libc::EROFS));
         }
-        let file = reopen(&state.fd, host_open_flags(flags))?;
+        let host_flags = host_open_flags(flags, self.writeback_cache);
+        let file = reopen(&state.fd, host_flags)?;
         if flags & libc::O_TRUNC != 0 {
             file.set_len(0)?;
         }
         let path = state.path.clone();
-        self.insert_file_handle(inode, file, host_open_flags(flags), path)
+        self.insert_file_handle(inode, file, host_flags, path)
     }
 
     /// A clone of the open file behind `handle` for one I/O operation.
@@ -1130,42 +1263,166 @@ impl Session {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
         match &open.kind {
-            HandleKind::File { file, .. } => file
+            HandleKind::File {
+                file: Some(file), ..
+            } => file
                 .try_clone()
                 .map_err(|e| io::Error::new(e.kind(), format!("reopening for I/O: {e}"))),
+            HandleKind::File { file: None, .. } => Err(io::Error::from_raw_os_error(libc::ESTALE)),
             HandleKind::Dir { .. } => Err(io::Error::from_raw_os_error(libc::EISDIR)),
         }
     }
 
-    /// The cached entries for `handle`, rebuilt when the guest rewinds to
-    /// offset 0 or after a restore.
-    fn dir_entries(&mut self, inode: u64, handle: u64, offset: u64) -> io::Result<&[CachedDirent]> {
-        let dir = if offset == 0
-            || !matches!(
-                self.handles.get(&handle),
-                Some(Handle {
-                    kind: HandleKind::Dir { entries: Some(_) },
-                    ..
-                })
-            ) {
-            Some(live_inode(self, inode)?.fd.try_clone()?)
+    /// READDIRPLUS under the session lock. `served` takes the inode of each
+    /// entry `add_entry` accepted, in order: the caller undoes their lookups
+    /// when the request fails.
+    fn readdirplus(
+        &mut self,
+        inode: u64,
+        handle: u64,
+        size: u32,
+        offset: u64,
+        served: &mut Vec<u64>,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let live = live_inode(self, inode)?;
+        let dir_path = live.path.clone();
+        let dir_fd = live.fd.try_clone()?;
+        // Cookies are the host's own, as in `readdir`. A READDIRPLUS record
+        // is several times its getdents64 record, so read a smaller batch:
+        // what does not fit is read again by the next request.
+        let mut used = 0usize;
+        let mut position = offset;
+        while used <= size as usize {
+            let Some((entries, next)) =
+                self.dir_batch(inode, handle, position, size as usize / 4)?
+            else {
+                break;
+            };
+            position = next;
+            for cached in &entries {
+                if used > size as usize {
+                    return Ok(());
+                }
+                let path = dir_path.join(OsStr::from_bytes(&cached.name));
+                // Resolve (or create) the session inode so the Entry carries
+                // the server's own ino and a lookup count the kernel will
+                // FORGET.
+                let entry = match self.resolve(&path, &dir_fd, &cached.name) {
+                    Ok(entry) => entry,
+                    // The inode table is full. Skipping the entry would
+                    // hide a file that exists, so say it: end a reply that
+                    // already holds entries here (the guest asks again at
+                    // the last cookie it took), and fail one that holds
+                    // none.
+                    Err(e) if e.raw_os_error() == Some(libc::ENFILE) => {
+                        return if served.is_empty() { Err(e) } else { Ok(()) };
+                    }
+                    Err(_) => continue, // raced away; the guest re-lookups
+                };
+                let ino = entry.inode;
+                match add_entry(
+                    DirEntry {
+                        ino,
+                        offset: cached.cookie,
+                        type_: cached.d_type as u32,
+                        name: &cached.name,
+                    },
+                    entry,
+                ) {
+                    // The entry did not fit and the guest never sees it, so
+                    // no FORGET comes for it: drop its lookup here.
+                    Ok(0) => {
+                        self.forget_one(ino, 1);
+                        return Ok(());
+                    }
+                    Ok(len) => {
+                        served.push(ino);
+                        used += len;
+                    }
+                    Err(e) => {
+                        self.forget_one(ino, 1);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One bounded batch of the entries of `handle` after the cookie
+    /// `offset`, with the cookie the stream then stands at. `None` is the
+    /// end of the directory. A batch can be empty before the end (it held
+    /// only `.` and `..`). Offset 0 rewinds, so the guest sees the
+    /// directory as it is now.
+    fn dir_batch(
+        &mut self,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        budget: usize,
+    ) -> io::Result<Option<(Vec<HostDirent>, u64)>> {
+        let unopened = match self.handles.get(&handle) {
+            Some(open) if open.ino != inode => {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            Some(Handle {
+                kind: HandleKind::Dir { dir, .. },
+                ..
+            }) => dir.is_none(),
+            Some(_) => return Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+            None => return Err(io::Error::from_raw_os_error(libc::EBADF)),
+        };
+        let opened = if unopened {
+            let fd = &live_inode(self, inode)?.fd;
+            Some(reopen(fd, libc::O_RDONLY | libc::O_DIRECTORY)?)
         } else {
             None
         };
-        let open = self
-            .handles
-            .get_mut(&handle)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-        if open.ino != inode {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
-        let HandleKind::Dir { entries } = &mut open.kind else {
-            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        let Some(Handle {
+            kind: HandleKind::Dir { dir, position },
+            ..
+        }) = self.handles.get_mut(&handle)
+        else {
+            unreachable!("checked above, under the same lock");
         };
-        if let Some(dir) = dir {
-            *entries = Some(read_dir(&dir)?);
+        if let Some(opened) = opened {
+            *dir = Some(opened);
+            *position = None;
         }
-        Ok(entries.as_ref().expect("just built").as_slice())
+        let dir = dir.as_ref().expect("opened above");
+        // Forget the position first: a failed seek or read leaves the
+        // stream where nobody knows.
+        if position.take() != Some(offset) {
+            let target =
+                i64::try_from(offset).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            // SAFETY: lseek(2) on an owned fd; the return is the new offset.
+            if unsafe { libc::lseek64(dir.as_raw_fd(), target, libc::SEEK_SET) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let Some((entries, last)) = read_dir_batch(dir, budget)? else {
+            return Ok(None);
+        };
+        *position = Some(last);
+        Ok(Some((entries, last)))
+    }
+
+    /// Directory entries the session keeps in memory between requests,
+    /// over every open directory handle.
+    #[cfg(test)]
+    fn held_dirents(&self) -> usize {
+        self.handles
+            .values()
+            .map(|open| match &open.kind {
+                // A directory handle is a descriptor and a cookie.
+                HandleKind::Dir {
+                    dir: _,
+                    position: _,
+                } => 0,
+                HandleKind::File { .. } => 0,
+            })
+            .sum()
     }
 
     fn forget_handle(&mut self, inode: u64, handle: u64) {
@@ -1247,10 +1504,12 @@ fn open_path(path: &Path, flags: i32) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Reopen the file an `O_PATH` descriptor points at with real `flags`: the
-/// procfs fd link resolves to exactly that inode, so the guest opens what
-/// it looked up even if the host replaced the name meanwhile.
-fn host_open_flags(flags: i32) -> i32 {
+fn host_open_flags(mut flags: i32, writeback_cache: bool) -> i32 {
+    // With writeback, the guest owns the append offset. Linux positional
+    // writes on an O_APPEND descriptor would still append at host EOF.
+    if writeback_cache {
+        flags &= !libc::O_APPEND;
+    }
     (flags
         & (libc::O_ACCMODE
             | libc::O_DIRECT
@@ -1262,6 +1521,7 @@ fn host_open_flags(flags: i32) -> i32 {
         | libc::O_CLOEXEC
 }
 
+/// Reopen the inode held by an `O_PATH` descriptor through its procfs fd link.
 fn reopen(path_fd: &OwnedFd, flags: i32) -> io::Result<File> {
     // Inspect the held inode, not its saved name or kind. This also
     // protects restored handles when a regular file became a special file.
@@ -1275,21 +1535,6 @@ fn reopen(path_fd: &OwnedFd, flags: i32) -> io::Result<File> {
         .expect("proc path has no NUL");
     // SAFETY: `path` is NUL-terminated; the fd is owned from return.
     let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the fd is fresh and owned from the open above.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-/// A stand-in descriptor for an open file whose path died before a
-/// restore: reads and writes must fail, and nothing may share data with
-/// the guest.
-fn reopen_dead() -> io::Result<File> {
-    let path = b"/dev/null\0";
-    // SAFETY: `path` is a NUL-terminated literal; the fd is owned from
-    // return.
-    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1374,6 +1619,14 @@ fn unlinkat(dir: &OwnedFd, name: &[u8], directory: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Which host file `name` in `dir` is, as (device, inode); `None` when it
+/// cannot be told.
+fn host_identity(dir: &OwnedFd, name: &[u8]) -> Option<(u64, u64)> {
+    let fd = openat(dir, name, libc::O_PATH | libc::O_NOFOLLOW).ok()?;
+    let st = fstat(fd.as_raw_fd()).ok()?;
+    Some((st.st_dev, st.st_ino))
 }
 
 fn renameat2(
@@ -1480,12 +1733,22 @@ fn truncateat(fd: &OwnedFd, size: i64) -> io::Result<()> {
     if kind_of(fstat(fd.as_raw_fd())?.st_mode) != FileKind::File {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let file = reopen(fd, libc::O_WRONLY)?;
-    // SAFETY: the fd is owned.
+    ftruncate(&reopen(fd, libc::O_WRONLY)?, size)
+}
+
+fn ftruncate(file: &File, size: i64) -> io::Result<()> {
+    // SAFETY: the fd is owned for the call.
     if unsafe { libc::ftruncate(file.as_raw_fd(), size) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Whether the descriptor itself allows writing, as the host sees it.
+fn opened_for_writing(file: &File) -> bool {
+    // SAFETY: F_GETFL reads the flags of an owned descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    flags >= 0 && matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
 }
 
 fn utimensat(fd: &OwnedFd, valid: SetattrValid, attr: &stat64) -> io::Result<()> {
@@ -1544,70 +1807,60 @@ fn fsync(fd: RawFd, datasync: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Read one directory with getdents64, skipping `.` and `..` (the guest
-/// VFS synthesises them).
-fn read_dir(dir: &OwnedFd) -> io::Result<Vec<CachedDirent>> {
-    let path =
-        CString::new(format!("/proc/self/fd/{}", dir.as_raw_fd())).expect("proc path has no NUL");
-    // SAFETY: `path` is NUL-terminated; the fd is owned from return and
-    // closed by drop at the end of this function.
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+/// Read one batch of a directory stream with a single getdents64 of at
+/// most `budget` bytes (kept within `DIR_BATCH_MIN..=DIR_BATCH_MAX`),
+/// skipping `.` and `..` (the guest VFS synthesises them). Returns the
+/// entries and the cookie of the last record read, or `None` at the end.
+fn read_dir_batch(dir: &File, budget: usize) -> io::Result<Option<(Vec<HostDirent>, u64)>> {
+    let mut buffer = vec![0u8; budget.clamp(DIR_BATCH_MIN, DIR_BATCH_MAX)];
+    // SAFETY: `buffer` is writable for its length; the fd is owned.
+    let n = unsafe {
+        libc::syscall(
+            libc::SYS_getdents64,
+            dir.as_raw_fd(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
         )
     };
-    if fd < 0 {
+    if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the fd is fresh and owned from the open above.
-    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut entries = Vec::new();
-    let mut buffer = vec![0u8; 64 << 10];
-    loop {
-        // SAFETY: `buffer` is writable for its length; the fd is owned.
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                dir.as_raw_fd(),
-                buffer.as_mut_ptr(),
-                buffer.len(),
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            break;
-        }
-        let mut pos = 0usize;
-        while pos < n as usize {
-            if pos + DIRENT_FIXED > n as usize {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            // Parse bytes rather than forming an aligned reference into a u8 buffer.
-            let record = &buffer[pos..n as usize];
-            let ino = u64::from_ne_bytes(record[..8].try_into().unwrap());
-            let reclen = u16::from_ne_bytes(record[16..18].try_into().unwrap()) as usize;
-            if reclen < DIRENT_FIXED || pos + reclen > n as usize {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            let name = buffer[pos + DIRENT_FIXED..pos + reclen]
-                .iter()
-                .copied()
-                .take_while(|b| *b != 0)
-                .collect::<Vec<u8>>();
-            if name != b"." && name != b".." {
-                entries.push(CachedDirent {
-                    name,
-                    host_ino: ino,
-                    d_type: record[18],
-                });
-            }
-            pos += reclen;
-        }
+    if n == 0 {
+        return Ok(None);
     }
-    Ok(entries)
+    let mut entries = Vec::new();
+    let mut last = 0u64;
+    let mut pos = 0usize;
+    while pos < n as usize {
+        if pos + DIRENT_FIXED > n as usize {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        // Parse bytes rather than forming an aligned reference into a u8 buffer.
+        let record = &buffer[pos..n as usize];
+        let ino = u64::from_ne_bytes(record[..8].try_into().unwrap());
+        // `d_off` is signed on the host and never negative.
+        let cookie = u64::from_ne_bytes(record[8..16].try_into().unwrap());
+        let reclen = u16::from_ne_bytes(record[16..18].try_into().unwrap()) as usize;
+        if reclen < DIRENT_FIXED || pos + reclen > n as usize {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        let name = buffer[pos + DIRENT_FIXED..pos + reclen]
+            .iter()
+            .copied()
+            .take_while(|b| *b != 0)
+            .collect::<Vec<u8>>();
+        if name != b"." && name != b".." {
+            entries.push(HostDirent {
+                name,
+                host_ino: ino,
+                d_type: record[18],
+                cookie,
+            });
+        }
+        last = cookie;
+        pos += reclen;
+    }
+    Ok(Some((entries, last)))
 }
 
 /// offsetof(d_type) in `struct linux_dirent64`: 8 + 8 + 2 + 1.
@@ -1944,6 +2197,8 @@ mod tests {
     #[test]
     fn append_uses_host_eof_instead_of_stale_guest_offset() {
         let (dir, fs) = scratch();
+        fs.init(FsOptions::all() - FsOptions::WRITEBACK_CACHE)
+            .unwrap();
         let entry = lookup(&fs, b"hello.txt").unwrap();
         let guest_offset = entry.attr.st_size as u64;
         let (handle, _, _) = fs
@@ -1980,6 +2235,71 @@ mod tests {
             std::fs::read(dir.path().join("hello.txt")).unwrap(),
             b"hello share\nhost append\nguest append\n"
         );
+    }
+
+    #[test]
+    fn append_handle_under_writeback_honours_the_write_offset() {
+        let (dir, fs) = scratch();
+        assert!(
+            fs.init(FsOptions::all())
+                .unwrap()
+                .contains(FsOptions::WRITEBACK_CACHE)
+        );
+        let path = dir.path().join("append.txt");
+        std::fs::File::create(&path).unwrap();
+        let inode = lookup(&fs, b"append.txt").unwrap().inode;
+        let (handle, _, _) = fs
+            .open(&ctx(), inode, (libc::O_WRONLY | libc::O_APPEND) as u32, 0)
+            .unwrap();
+        let handle = handle.unwrap();
+
+        for data in [b"a\n".as_slice(), b"a\nb\n".as_slice()] {
+            let written = fs
+                .write(
+                    &ctx(),
+                    inode,
+                    handle,
+                    &mut SliceReader(data),
+                    data.len() as u32,
+                    0,
+                    None,
+                    true,
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(written, data.len());
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"a\nb\n");
+    }
+
+    #[test]
+    fn restored_writeback_session_creates_handles_without_host_append() {
+        let (dir, fs) = scratch();
+        fs.init(FsOptions::all()).unwrap();
+        let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        restored.restore_state(&fs.save_state()).unwrap();
+        let (entry, handle, _, _) = restored
+            .create(
+                &ctx(),
+                ROOT_ID,
+                &name(b"append.txt"),
+                CreateIn {
+                    flags: (libc::O_WRONLY | libc::O_APPEND) as u32,
+                    mode: 0o600,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let file = restored
+            .inner
+            .lock()
+            .file_handle(entry.inode, handle.unwrap())
+            .unwrap();
+        // SAFETY: F_GETFL takes no third argument and the fd is owned.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(flags & libc::O_APPEND, 0);
     }
 
     #[test]
@@ -2134,6 +2454,171 @@ mod tests {
     }
 
     #[test]
+    fn readdirplus_does_not_leak_the_entry_that_did_not_fit() {
+        let (_dir, fs) = scratch();
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply buffer takes one entry and refuses the second.
+        let mut offered: Vec<(Vec<u8>, u64)> = Vec::new();
+        FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |d, e| {
+            offered.push((d.name.to_vec(), e.inode));
+            Ok(if offered.len() == 1 { 160 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(offered.len(), 2, "one entry served, one refused");
+        let session = fs.inner.lock();
+        let (taken, taken_ino) = &offered[0];
+        let (refused, refused_ino) = &offered[1];
+        // The served entry keeps the lookup the guest will FORGET.
+        assert_eq!(
+            session.by_path.get(Path::new(OsStr::from_bytes(taken))),
+            Some(taken_ino)
+        );
+        assert_eq!(session.inodes[taken_ino].lookups, 1);
+        // The guest never saw the refused one and sends no FORGET for it.
+        assert!(
+            !session
+                .by_path
+                .contains_key(Path::new(OsStr::from_bytes(refused))),
+            "the entry that did not fit is still in the inode table"
+        );
+        assert!(!session.inodes.contains_key(refused_ino));
+        assert_eq!(session.inodes.len(), 2, "the root and the served entry");
+    }
+
+    #[test]
+    fn readdirplus_takes_back_its_lookups_when_the_request_fails() {
+        let (_dir, fs) = scratch();
+        let known = lookup(&fs, b"hello.txt").unwrap().inode;
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // The reply is the error alone: the guest sees no entry of it.
+        let mut offered = 0;
+        let err = FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |_, _| {
+            offered += 1;
+            if offered == 3 {
+                Err(io::Error::from_raw_os_error(libc::EOVERFLOW))
+            } else {
+                Ok(160)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EOVERFLOW));
+        let session = fs.inner.lock();
+        // Only what the guest looked up before the request stays.
+        assert_eq!(session.inodes.len(), 2);
+        assert_eq!(session.inodes[&known].lookups, 1);
+    }
+
+    #[test]
+    fn readdirplus_reports_a_full_inode_table() {
+        const FILES: usize = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{n:02}")), []).unwrap();
+        }
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        // List to the end the way the guest does, and never FORGET: either
+        // every file is listed or the guest is told the table is full.
+        let mut names = Vec::new();
+        let mut offset = 0;
+        let mut error = None;
+        for _ in 0..=FILES {
+            let mut last = None;
+            let result =
+                FileSystem::readdirplus(&fs, &ctx(), ROOT_ID, handle, 4096, offset, &mut |d, _| {
+                    names.push(d.name.to_vec());
+                    last = Some(d.offset);
+                    Ok(d.name.len() + 152)
+                });
+            if let Err(e) = result {
+                // A failed request served nothing.
+                assert_eq!(last, None);
+                error = Some(e.raw_os_error());
+                break;
+            }
+            match last {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        if error.is_none() {
+            assert_eq!(
+                names.len(),
+                FILES,
+                "a listing with no error leaves files out"
+            );
+        } else {
+            assert_eq!(error, Some(Some(libc::ENFILE)));
+            // What was listed is what the table holds beside the root.
+            assert_eq!(names.len(), SESSION_LIMIT - 1);
+            assert_eq!(fs.inner.lock().inodes.len(), SESSION_LIMIT);
+        }
+    }
+
+    /// List one directory handle to its end through the cookies, the way
+    /// the guest does: each request resumes at the last entry it took.
+    fn list_all(fs: &PassthroughFs, handle: u64, size: u32) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let mut last = None;
+            FileSystem::readdir(fs, &ctx(), ROOT_ID, handle, size, offset, &mut |d| {
+                names.push(d.name.to_vec());
+                last = Some(d.offset);
+                Ok(d.name.len() + 24)
+            })
+            .unwrap();
+            match last {
+                Some(next) => offset = next,
+                None => return names,
+            }
+        }
+    }
+
+    #[test]
+    fn directory_caches_are_bounded_across_handles() {
+        const FILES: usize = 2000;
+        let (dir, fs) = scratch();
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{n:04}")), []).unwrap();
+        }
+        // Every handle the share admits, each read one time from the start.
+        let mut handles = Vec::new();
+        for _ in 0..SESSION_LIMIT {
+            let (handle, _) =
+                FileSystem::opendir(&fs, &ctx(), ROOT_ID, libc::O_RDONLY as u32).unwrap();
+            let handle = handle.unwrap();
+            let mut served = 0;
+            FileSystem::readdir(&fs, &ctx(), ROOT_ID, handle, 4096, 0, &mut |d| {
+                served += 1;
+                Ok(d.name.len() + 24)
+            })
+            .unwrap();
+            assert!(served > 0);
+            handles.push(handle);
+        }
+        // The budget: what the session holds between requests must not grow
+        // with the number of handles. One listing's worth is the ceiling.
+        let held = fs.inner.lock().held_dirents();
+        assert!(
+            held <= FILES,
+            "{} handles hold {held} directory entries",
+            handles.len()
+        );
+        // A bounded server still lists the whole directory on every handle.
+        for handle in handles {
+            let mut names = list_all(&fs, handle, 4096);
+            names.sort();
+            names.dedup();
+            assert_eq!(names.len(), FILES + 3);
+            FileSystem::releasedir(&fs, &ctx(), ROOT_ID, 0, handle).unwrap();
+        }
+    }
+
+    #[test]
     fn readdir_handles_mixed_record_lengths() {
         let (dir, fs) = scratch();
         let expected = (1..=64).map(|n| "x".repeat(n)).collect::<Vec<_>>();
@@ -2263,6 +2748,64 @@ mod tests {
         );
     }
 
+    /// F19 of the virtio devices review: `ftruncate(2)` works on a writable
+    /// descriptor whatever the mode of the file, so a SETATTR that carries
+    /// the handle truncates through it.
+    #[test]
+    fn ftruncate_through_a_handle_ignores_the_file_mode() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root opens a 0400 file for writing, so the fault does not show.
+            return;
+        }
+        let (dir, fs) = scratch();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx(),
+                ROOT_ID,
+                c"readonly",
+                CreateIn {
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o400,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        {
+            use std::os::unix::fs::FileExt;
+            let file = fs.inner.lock().file_handle(entry.inode, handle).unwrap();
+            file.write_all_at(b"content", 0).unwrap();
+        }
+        let mut attr = entry.attr;
+        attr.st_size = 3;
+        let (st, _) = fs
+            .setattr(&ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        assert_eq!(st.st_size, 3);
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
+
+        // Without the handle the mode of the file decides, as truncate(2).
+        attr.st_size = 0;
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, None, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        // A handle that is not open for writing does not truncate either.
+        let (reader, _, _) = fs
+            .open(&ctx(), entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        assert_eq!(
+            fs.setattr(&ctx(), entry.inode, attr, reader, SetattrValid::SIZE)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(std::fs::read(dir.path().join("readonly")).unwrap(), b"con");
+    }
+
     #[test]
     fn statfs_reports_the_share() {
         let (_dir, fs) = scratch();
@@ -2332,6 +2875,59 @@ mod tests {
     }
 
     #[test]
+    fn restored_handle_on_a_vanished_file_fails_io() {
+        let (dir, fs) = scratch();
+        let entry = lookup(&fs, b"hello.txt").unwrap();
+        let (handle, _, _) =
+            FileSystem::open(&fs, &ctx(), entry.inode, libc::O_RDWR as u32, 0).unwrap();
+        let handle = handle.unwrap();
+        let state = fs.save_state();
+        std::fs::remove_file(dir.path().join("hello.txt")).unwrap();
+
+        let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        restored.restore_state(&state).unwrap();
+        let data = b"lost write";
+        let write = FileSystem::write(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SliceReader(data),
+            data.len() as u32,
+            0,
+            None,
+            false,
+            0,
+            0,
+        );
+        assert_eq!(
+            write.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
+        let mut served = Vec::new();
+        let read = FileSystem::read(
+            &restored,
+            &ctx(),
+            entry.inode,
+            handle,
+            &mut SinkWriter(&mut served),
+            1,
+            0,
+            None,
+            0,
+        );
+        assert_eq!(
+            read.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
+        let sync = FileSystem::fsync(&restored, &ctx(), entry.inode, false, handle);
+        assert_eq!(
+            sync.map_err(|err| err.raw_os_error()),
+            Err(Some(libc::ESTALE))
+        );
+    }
+
+    #[test]
     fn restore_refuses_tampered_state() {
         let (_dir, fs) = scratch();
         let state = fs.save_state();
@@ -2380,5 +2976,182 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    /// Read the whole of inode `ino` through a fresh read-only handle.
+    fn read_all(fs: &PassthroughFs, ino: u64) -> Vec<u8> {
+        let (handle, _, _) = FileSystem::open(fs, &ctx(), ino, libc::O_RDONLY as u32, 0).unwrap();
+        let mut served = Vec::new();
+        let mut writer = SinkWriter(&mut served);
+        let n = FileSystem::read(
+            fs,
+            &ctx(),
+            ino,
+            handle.unwrap(),
+            &mut writer,
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        served.truncate(n);
+        served
+    }
+
+    fn create_in() -> CreateIn {
+        CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o644,
+            fuse_flags: 0,
+            umask: 0o022,
+        }
+    }
+
+    #[test]
+    fn rename_then_create_at_old_name_keeps_the_renamed_inode() {
+        let (dir, fs) = scratch();
+        let moved = lookup(&fs, b"hello.txt").unwrap().inode;
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"moved"),
+            0,
+        )
+        .unwrap();
+
+        let (created, _, _, _) =
+            FileSystem::create(&fs, &ctx(), ROOT_ID, &name(b"hello.txt"), create_in()).unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"new").unwrap();
+
+        // Two files, two node ids: the one the guest held follows the file
+        // to its new name, and the old name is a new inode.
+        assert_ne!(created.inode, moved);
+        assert_eq!(read_all(&fs, moved), b"hello share\n");
+        assert_eq!(read_all(&fs, created.inode), b"new");
+        assert_eq!(lookup(&fs, b"moved").unwrap().inode, moved);
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, created.inode);
+    }
+
+    #[test]
+    fn rename_carries_a_directory_subtree_and_a_symlink() {
+        let (dir, fs) = scratch();
+        let sub = lookup(&fs, b"sub").unwrap().inode;
+        let nested = FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        let link = lookup(&fs, b"link").unwrap().inode;
+        for (old, new) in [(&b"sub"[..], &b"dir2"[..]), (b"link", b"link2")] {
+            FileSystem::rename(&fs, &ctx(), ROOT_ID, &name(old), ROOT_ID, &name(new), 0).unwrap();
+        }
+
+        // The old names are taken again by other files.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested.txt"), b"other\n").unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.path().join("link")).unwrap();
+        let sub2 = lookup(&fs, b"sub").unwrap().inode;
+        assert_ne!(sub2, sub);
+        let nested2 = FileSystem::lookup(&fs, &ctx(), sub2, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        assert_ne!(nested2, nested);
+        assert_ne!(lookup(&fs, b"link").unwrap().inode, link);
+
+        assert_eq!(lookup(&fs, b"dir2").unwrap().inode, sub);
+        assert_eq!(
+            FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+                .unwrap()
+                .inode,
+            nested
+        );
+        assert_eq!(read_all(&fs, nested), b"nested\n");
+        assert_eq!(read_all(&fs, nested2), b"other\n");
+        // readlink goes by the parent descriptor and the own name.
+        assert_eq!(
+            FileSystem::readlink(&fs, &ctx(), link).unwrap(),
+            b"hello.txt"
+        );
+
+        // The snapshot form follows the rename too.
+        let state = fs.save_state();
+        let fs2 = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
+        fs2.restore_state(&state).unwrap();
+        assert_eq!(read_all(&fs2, nested), b"nested\n");
+        assert_eq!(read_all(&fs2, nested2), b"other\n");
+    }
+
+    #[test]
+    fn rename_over_a_known_file_and_exchange_keep_node_ids_with_their_files() {
+        let (dir, fs) = scratch();
+        std::fs::write(dir.path().join("target"), b"target\n").unwrap();
+        let hello = lookup(&fs, b"hello.txt").unwrap().inode;
+        let target = lookup(&fs, b"target").unwrap().inode;
+        let sub = lookup(&fs, b"sub").unwrap().inode;
+        let nested = FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+
+        // Replace: the name now answers with the moved inode, and the
+        // replaced one is left to its FORGET without taking the name along.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"target"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, hello);
+        assert_eq!(read_all(&fs, hello), b"hello share\n");
+        FileSystem::forget(&fs, &ctx(), target, 1);
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, hello);
+
+        // Exchange a file with a directory: both subtrees swap.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"target"),
+            ROOT_ID,
+            &name(b"sub"),
+            libc::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(lookup(&fs, b"sub").unwrap().inode, hello);
+        assert_eq!(lookup(&fs, b"target").unwrap().inode, sub);
+        assert_eq!(
+            FileSystem::lookup(&fs, &ctx(), sub, &name(b"nested.txt"))
+                .unwrap()
+                .inode,
+            nested
+        );
+        assert_eq!(read_all(&fs, hello), b"hello share\n");
+    }
+
+    #[test]
+    fn rename_between_two_links_of_one_file_moves_nothing() {
+        let (dir, fs) = scratch();
+        std::fs::hard_link(dir.path().join("hello.txt"), dir.path().join("twin")).unwrap();
+        let hello = lookup(&fs, b"hello.txt").unwrap().inode;
+        let twin = lookup(&fs, b"twin").unwrap().inode;
+        // rename(2) does nothing when both names are one file.
+        FileSystem::rename(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"hello.txt"),
+            ROOT_ID,
+            &name(b"twin"),
+            0,
+        )
+        .unwrap();
+        assert!(dir.path().join("hello.txt").exists());
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, hello);
+        assert_eq!(lookup(&fs, b"twin").unwrap().inode, twin);
     }
 }

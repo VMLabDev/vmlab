@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
+use vmlab_hv_display::trace;
 use zerocopy::IntoBytes;
 
 pub const APERTURE_SIZE: u64 = 1 << 32;
@@ -28,6 +29,32 @@ pub trait BlobMapper: Send + Sync {
 pub enum GpuMode {
     Virgl,
     Venus,
+}
+
+/// Descriptors held per live host resource: virglrenderer keeps the blob's
+/// descriptor and rutabaga a duplicate, until the guest unreferences it.
+const RESOURCE_DESCRIPTORS: u64 = 2;
+/// Descriptors left for the rest of the process: disks, sockets, contexts,
+/// the control and display clients.
+const RESERVED_DESCRIPTORS: u64 = 256;
+
+/// How many host resources the process's descriptor limit can pay for. A guest
+/// that reaches it gets an error, where an exhausted table ends the VM.
+fn resource_budget(descriptor_limit: u64) -> usize {
+    (descriptor_limit.saturating_sub(RESERVED_DESCRIPTORS) / RESOURCE_DESCRIPTORS)
+        .min(MAX_RESOURCES as u64) as usize
+}
+
+fn descriptor_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only the supplied structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 1024;
+    }
+    limit.rlim_cur
 }
 
 type Task = Box<dyn FnOnce(&mut Backend) + Send>;
@@ -85,6 +112,13 @@ pub(super) struct Renderer {
     completed: Arc<Mutex<BTreeMap<Ring, u64>>>,
     mapper: Arc<dyn BlobMapper>,
     direct: Arc<Mutex<Vec<std::sync::Weak<vmlab_hv_display::BufferLease>>>>,
+    /// Set when the host GPU is lost (`lost.rs`). A call then fails at
+    /// once and does not reach the worker.
+    lost: super::lost::Flag,
+    /// The render node, canonical.
+    node: PathBuf,
+    /// The child processes the start made: the render server of Venus.
+    servers: Vec<u32>,
 }
 
 struct Worker {
@@ -129,6 +163,11 @@ struct HostResource {
     scanout_info: Option<Resource3DInfo>,
     exported: Option<Arc<std::os::fd::OwnedFd>>,
     export_info: Option<Resource3DInfo>,
+    /// The renderer's host mapping of a blob, address and length, while
+    /// the guest has it mapped.
+    host_map: Option<(usize, usize)>,
+    /// The host ranges of the guest backing, the iovecs the renderer holds.
+    backing: Vec<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -157,11 +196,15 @@ struct Backend {
     resources: BTreeMap<u32, HostResource>,
     contexts: BTreeSet<u32>,
     mapper: Arc<dyn BlobMapper>,
+    budget: usize,
+    budget_reported: bool,
     scanout: Option<(u32, Rect)>,
     mode: GpuMode,
     scanout_copy: Option<super::scanout::Scanout>,
     node: PathBuf,
     timeline: Arc<Mutex<Timeline>>,
+    /// The renderer's [`Renderer::lost`]: the waits below end with it.
+    lost: super::lost::Flag,
     direct_frames: u64,
     fallback_frames: u64,
     external_frames: u64,
@@ -170,6 +213,9 @@ struct Backend {
     damage: Vec<Rect>,
     pending_frame: bool,
     scanout_dirty: bool,
+    present_copies: u64,
+    /// Frames exported to the display, for the trace.
+    exports: u64,
 }
 
 impl Drop for Backend {
@@ -200,6 +246,21 @@ impl Renderer {
         node: PathBuf,
         mapper: Arc<dyn BlobMapper>,
     ) -> Result<Self, DeviceError> {
+        Self::with_budget(mode, node, mapper, resource_budget(descriptor_limit()))
+    }
+
+    fn with_budget(
+        mode: GpuMode,
+        node: PathBuf,
+        mapper: Arc<dyn BlobMapper>,
+        budget: usize,
+    ) -> Result<Self, DeviceError> {
+        if budget < MAX_RESOURCES {
+            log::warn!(
+                "the descriptor limit of {} allows {budget} GPU resources of {MAX_RESOURCES}",
+                descriptor_limit()
+            );
+        }
         // Validate explicitly: virglrenderer otherwise falls back to another GPU.
         let node = std::fs::canonicalize(node)?;
         if !node.starts_with("/dev/dri")
@@ -222,6 +283,9 @@ impl Renderer {
         let timeline = Arc::new(Mutex::new(Timeline::default()));
         let callbacks = timeline.clone();
         let worker_mapper = mapper.clone();
+        let lost = super::lost::Flag::default();
+        let worker_lost = lost.clone();
+        let worker_node = node.clone();
         let join = std::thread::Builder::new()
             .name("virtio-gpu-renderer".into())
             .spawn(move || {
@@ -249,6 +313,14 @@ impl Renderer {
                         .collect();
                     for id in ids {
                         let (guest, signal) = pending.pending.remove(&id).unwrap();
+                        if trace::on() {
+                            let (ctx, ring, guest_id) =
+                                guest.map_or((0, 0, 0), |g| (g.ctx_id, g.ring_idx, g.fence_id));
+                            trace::write(
+                                "fence_done",
+                                format_args!("host={id} ctx={ctx} ring={ring} guest={guest_id}"),
+                            );
+                        }
                         signal.store(true, std::sync::atomic::Ordering::SeqCst);
                         if let Some(guest) = guest {
                             let mut completed = done.lock();
@@ -259,6 +331,9 @@ impl Renderer {
                         }
                     }
                 });
+                // virglrenderer forks its render server while it starts.
+                let proc = std::path::Path::new("/proc");
+                let before = super::lost::children(proc, std::process::id());
                 let gpu = RutabagaBuilder::new(mask, handler)
                     .set_default_component(RutabagaComponentType::VirglRenderer)
                     .set_use_egl(true)
@@ -267,7 +342,7 @@ impl Renderer {
                     .set_use_external_blob(mode == GpuMode::Venus)
                     .set_use_render_server(mode == GpuMode::Venus)
                     .set_rutabaga_paths(Some(vec![RutabagaPath {
-                        path: node.clone(),
+                        path: worker_node.clone(),
                         path_type: RUTABAGA_PATH_TYPE_GPU,
                     }]))
                     .build();
@@ -293,17 +368,24 @@ impl Renderer {
                     let _ = ready.send(Err("virglrenderer returned no usable Venus capset".into()));
                     return;
                 }
-                let _ = ready.send(Ok(gpu.get_num_capsets()));
+                let servers: Vec<u32> = super::lost::children(proc, std::process::id())
+                    .into_iter()
+                    .filter(|pid| !before.contains(pid))
+                    .collect();
+                let _ = ready.send(Ok((gpu.get_num_capsets(), servers)));
                 let mut backend = Backend {
                     gpu,
                     resources: BTreeMap::new(),
                     contexts: BTreeSet::new(),
                     mapper: worker_mapper,
+                    budget,
+                    budget_reported: false,
                     scanout: None,
                     mode,
                     scanout_copy: None,
-                    node,
+                    node: worker_node,
                     timeline,
+                    lost: worker_lost,
                     direct_frames: 0,
                     fallback_frames: 0,
                     external_frames: 0,
@@ -312,6 +394,8 @@ impl Renderer {
                     damage: Vec::new(),
                     pending_frame: false,
                     scanout_dirty: true,
+                    present_copies: 0,
+                    exports: 0,
                 };
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(2)) {
@@ -326,7 +410,7 @@ impl Renderer {
                     backend.gpu.event_poll();
                 }
             })?;
-        let capsets = initialized
+        let (capsets, servers) = initialized
             .recv()
             .map_err(|e| DeviceError::Other(e.to_string()))?
             .map_err(|e| DeviceError::Other(format!("initializing virtio-gpu renderer: {e}")))?;
@@ -339,7 +423,20 @@ impl Renderer {
             completed,
             mapper,
             direct: Arc::new(Mutex::new(Vec::new())),
+            lost,
+            node,
+            servers,
         })
+    }
+
+    /// The flag that says the host GPU is lost.
+    pub fn lost(&self) -> super::lost::Flag {
+        self.lost.clone()
+    }
+
+    /// The probes that see this renderer's host GPU go (`lost.rs`).
+    pub fn watch(&self) -> super::lost::Watch {
+        super::lost::Watch::for_renderer(&self.node, &self.servers)
     }
 
     pub fn set_base(&self, base: Option<u64>) -> Result<(), DeviceError> {
@@ -350,6 +447,9 @@ impl Renderer {
         &self,
         f: impl FnOnce(&mut Backend) -> Result<T, u32> + Send + 'static,
     ) -> Result<T, u32> {
+        if self.lost.get() {
+            return Err(UNSPEC);
+        }
         self.worker.call(f)
     }
 
@@ -357,6 +457,17 @@ impl Renderer {
         let kind = request
             .get(..4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+        if self.lost.get() {
+            // The host GPU is gone. A release still runs, because it
+            // removes host mappings from guest memory, and it succeeds
+            // whatever the renderer answers (`lost.rs`).
+            if !kind.is_some_and(super::lost::releases) {
+                return Err(UNSPEC);
+            }
+            let (mem, request) = (mem.clone(), request.to_vec());
+            let _ = self.worker.call(move |b| b.command(&mem, &request));
+            return Ok((NODATA, Vec::new()));
+        }
         if matches!(
             kind,
             Some(0x102 | 0x105 | 0x107 | 0x201 | 0x203 | 0x205 | 0x207 | 0x209)
@@ -376,7 +487,33 @@ impl Renderer {
             let ctx = request
                 .get(16..20)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()));
+            let start = trace::now_ns();
             let result = b.command(&mem, &request);
+            if trace::on() {
+                let word = |at: usize| {
+                    request
+                        .get(at..at + 4)
+                        .map_or(0, |bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                };
+                let fence = request
+                    .get(8..16)
+                    .map_or(0, |bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                trace::write_at(
+                    start,
+                    "cmd",
+                    format_args!(
+                        "kind={:#x} ctx={} flags={} fence={fence} ring={} res={} len={} us={} ok={}",
+                        word(0),
+                        word(16),
+                        word(4),
+                        request.get(20).copied().unwrap_or_default(),
+                        word(24),
+                        request.len(),
+                        (trace::now_ns() - start) / 1000,
+                        result.is_ok() as u8
+                    ),
+                );
+            }
             if let Err(error) = &result {
                 log::warn!(
                     "GPU command failed: type={:#x} ctx={} live={} bytes={} response={error:#x}",
@@ -400,6 +537,46 @@ impl Renderer {
             }))
             .map(|_| ())
         })
+    }
+
+    /// The host wait of an ordered flip, [`Backend::order`].
+    pub fn order(&self) -> Result<(), u32> {
+        self.call(Backend::order)
+    }
+
+    /// [`Backend::present_copy`]. The renderer's display readers do not
+    /// read a Blt destination, so this does not wait for them.
+    pub fn present_copy(&self, request: super::copy::Request) -> Result<(), u32> {
+        let (src, dst) = (request.src, request.dst);
+        self.call(move |b| b.present_copy(&request))
+            .map(|bytes| {
+                log::trace!("present copy {src} -> {dst}: {bytes} bytes");
+            })
+            .inspect_err(|error| {
+                log::warn!("present copy {src} -> {dst} refused: {error:#x}");
+            })
+    }
+
+    /// Return when the renderer has run every task queued before this
+    /// call, among them the console's readback of a published frame.
+    pub fn settle(&self) -> Result<(), u32> {
+        self.call(|_| Ok(()))
+    }
+
+    /// Wait until the display has stopped reading every published frame
+    /// but the newest one, and lend those no more.
+    pub fn retire_previous(&self) {
+        let older: Vec<_> = {
+            let mut direct = self.direct.lock();
+            direct.retain(|lease| lease.strong_count() != 0);
+            let live: Vec<_> = direct.iter().filter_map(|lease| lease.upgrade()).collect();
+            live.split_last()
+                .map(|(_, older)| older.to_vec())
+                .unwrap_or_default()
+        };
+        for lease in older {
+            lease.retire();
+        }
     }
 
     pub fn complete(&self, flags: u32, id: u64, ctx: u32, index: u8) -> bool {
@@ -455,7 +632,7 @@ impl Renderer {
     }
 
     pub fn dma_frame(&self, cpu: bool) -> Result<Option<super::DmaFrame>, u32> {
-        let mut frame = self.call(move |b| {
+        let frame = self.call(move |b| {
             let Some((id, rect)) = b.scanout else {
                 return Ok(None);
             };
@@ -497,6 +674,7 @@ impl Renderer {
                     Some(Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }));
             }
             let fd = resource.exported.as_ref().unwrap().clone();
+            let fd_source = fd.clone();
             use std::os::fd::AsRawFd;
             if b.scanout_copy.is_none() {
                 b.scanout_copy = Some(super::scanout::Scanout::new(&b.node)?);
@@ -540,8 +718,30 @@ impl Renderer {
             b.damage.clear();
             b.scanout_dirty = false;
             b.log_stats();
-            Ok(Some(frame))
+            b.exports += 1;
+            if trace::on() {
+                trace::write(
+                    "export",
+                    format_args!(
+                        "seq={} res={id} direct={} modifier={:#x} writers={} readers={}",
+                        b.exports,
+                        frame.direct as u8,
+                        info.modifier,
+                        fence_state(frame.fd.as_raw_fd(), DMA_BUF_SYNC_READ),
+                        fence_state(frame.fd.as_raw_fd(), DMA_BUF_SYNC_WRITE)
+                    ),
+                );
+            }
+            // With the reread on, a copied frame's readback also reads its
+            // source, the guest's scanout, to compare it with the copy.
+            let source =
+                (trace::reread() && !frame.direct).then_some((fd_source, info, width, height));
+            Ok(Some((frame, id, b.exports, source)))
         })?;
+        let (mut frame, res, seq, source) = match frame {
+            Some((frame, res, seq, source)) => (Some(frame), res, seq, source),
+            None => (None, 0, 0, None),
+        };
         if let Some(frame) = frame.as_mut() {
             if frame.direct {
                 let mut direct = self.direct.lock();
@@ -560,18 +760,98 @@ impl Renderer {
             let capture = move |b: &mut Backend| {
                 use std::os::fd::AsRawFd;
                 b.readbacks += 1;
+                let start = trace::now_ns();
+                let writers = if trace::on() {
+                    fence_state(fd.as_raw_fd(), DMA_BUF_SYNC_READ)
+                } else {
+                    ""
+                };
+                let info = Resource3DInfo {
+                    drm_fourcc: fourcc,
+                    modifier,
+                    strides: [stride, 0, 0, 0],
+                    ..Default::default()
+                };
                 let pixels = readback(
                     b.scanout_copy.as_mut().ok_or(0x1200u32)?,
                     fd.as_raw_fd(),
-                    Resource3DInfo {
-                        drm_fourcc: fourcc,
-                        modifier,
-                        strides: [stride, 0, 0, 0],
-                        ..Default::default()
-                    },
+                    info,
                     width,
                     height,
                 )?;
+                if trace::on() {
+                    let end = trace::now_ns();
+                    // A second read of the same publication: rows that
+                    // differ were written while the display read them. For
+                    // a copied frame, read its source twice instead: rows in
+                    // which the copy differs from the source were written
+                    // after the copy, while the frame was published.
+                    let row = width as usize * 4;
+                    let rows = |found: Option<(usize, usize, usize)>| match found {
+                        None => "0".to_string(),
+                        Some((first, last, count)) => format!("{count}:{first}-{last}"),
+                    };
+                    let (mut reread, mut copy_vs_source) = ("-".to_string(), "-".to_string());
+                    if !trace::reread() {
+                        // One read only.
+                    } else if let Some((source_fd, source_info, source_width, source_height)) =
+                        &source
+                    {
+                        let read = |b: &mut Backend| {
+                            readback(
+                                b.scanout_copy.as_mut()?,
+                                source_fd.as_raw_fd(),
+                                *source_info,
+                                *source_width,
+                                *source_height,
+                            )
+                            .ok()
+                        };
+                        if let (Some(first), Some(second)) = (read(b), read(b)) {
+                            let source_stride = source_info.strides[0] as usize;
+                            reread = rows(trace::differing_rows(
+                                &first,
+                                source_stride,
+                                &second,
+                                source_stride,
+                                row,
+                            ));
+                            if (*source_width, *source_height) == (width, height) {
+                                copy_vs_source = rows(trace::differing_rows(
+                                    &pixels,
+                                    stride as usize,
+                                    &first,
+                                    source_stride,
+                                    row,
+                                ));
+                            }
+                        }
+                    } else if let Ok(second) = readback(
+                        b.scanout_copy.as_mut().ok_or(0x1200u32)?,
+                        fd.as_raw_fd(),
+                        info,
+                        width,
+                        height,
+                    ) {
+                        reread = rows(trace::differing_rows(
+                            &pixels,
+                            stride as usize,
+                            &second,
+                            stride as usize,
+                            row,
+                        ));
+                    }
+                    trace::write_at(
+                        start,
+                        "readback",
+                        format_args!(
+                            "seq={seq} res={res} us={} writers={writers} digest={:016x} reread={reread} copy_vs_source={copy_vs_source} reread_us={}",
+                            (end - start) / 1000,
+                            trace::digest(&pixels),
+                            (trace::now_ns() - end) / 1000
+                        ),
+                    );
+                }
                 b.log_stats();
                 Ok(pixels)
             };
@@ -613,29 +893,144 @@ impl Renderer {
         self.call(|b| Ok(b.pending_frame.then(|| (b.generation, b.damage.clone()))))
     }
 
+    /// The render server processes (Venus), whose children serve the
+    /// guest's contexts (`teardown.rs`).
+    pub fn servers(&self) -> &[u32] {
+        &self.servers
+    }
+
+    /// Free what the guest held, and wait until the renderer's own GPU
+    /// work has ended. A failure does not stop the teardown: everything
+    /// else is still freed, and the first error is returned. What failed
+    /// to go stays held, so that a later reset tries it again. The workers
+    /// of Venus contexts are waited for by the caller (`teardown.rs`).
     pub fn reset(&self) -> Result<(), u32> {
         let leases = std::mem::take(&mut *self.direct.lock());
         for lease in leases.into_iter().filter_map(|lease| lease.upgrade()) {
             lease.retire();
         }
-        self.call(|b| {
+        // After a loss the host GPU's answers do not count: the reset
+        // frees what the guest held and does not wait for the GPU.
+        let lost = self.lost.clone();
+        self.worker.call(move |b| {
             log::debug!("GPU renderer reset: contexts={:?}", b.contexts);
+            let mut first = None;
             let ids: Vec<_> = b.resources.keys().copied().collect();
             for id in ids {
-                b.unref(id)?;
+                if let Err(error) = b.unref(id) {
+                    if lost.get() {
+                        b.resources.remove(&id);
+                    } else {
+                        log::error!("GPU reset: resource {id} not freed: {error:#x}");
+                        first.get_or_insert(error);
+                    }
+                }
             }
             for id in std::mem::take(&mut b.contexts) {
-                host(b.gpu.destroy_context(id))?;
+                if let Err(error) = host(b.gpu.destroy_context(id))
+                    && !lost.get()
+                {
+                    log::error!("GPU reset: context {id} not destroyed: {error:#x}");
+                    b.contexts.insert(id);
+                    first.get_or_insert(error);
+                }
             }
             b.scanout = None;
             b.pending_frame = false;
             b.damage.clear();
+            // The fences of destroyed contexts never signal: the wait
+            // below is for a fence of its own.
             b.timeline.lock().pending.clear();
-            Ok(())
+            if !lost.get()
+                && let Err(error) = b.synchronize()
+                && !lost.get()
+            {
+                log::error!("GPU reset: the renderer's GPU work did not end: {error:#x}");
+                first.get_or_insert(error);
+            }
+            b.timeline.lock().pending.clear();
+            first.map_or(Ok(()), Err)
         })?;
         self.completed.lock().clear();
         Ok(())
     }
+}
+
+/// `struct dma_buf_export_sync_file` of Linux 6.0.
+#[repr(C)]
+struct ExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: `_IOWR('b', 2, struct dma_buf_export_sync_file)`.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+/// The fences a reader waits for: those of the writers.
+const DMA_BUF_SYNC_READ: u32 = 1;
+/// The fences a writer waits for: those of the readers and the writers.
+const DMA_BUF_SYNC_WRITE: u32 = 2;
+
+/// Wait at most `timeout` until the writers that the kernel tracks on the
+/// dma-buf `fd` have finished. False when the kernel gives no sync file, or
+/// the wait timed out. NVIDIA attaches no implicit fences, so there the
+/// sync file is already signalled.
+fn wait_writers(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    wait_fences(fd, DMA_BUF_SYNC_READ, timeout)
+}
+
+/// [`wait_writers`] for the fences of `flags`: [`DMA_BUF_SYNC_READ`] for
+/// the writers, [`DMA_BUF_SYNC_WRITE`] for every reader and writer.
+fn wait_fences(fd: std::os::fd::RawFd, flags: u32, timeout: Duration) -> bool {
+    use std::os::fd::FromRawFd;
+    let mut export = ExportSyncFile { flags, fd: -1 };
+    // SAFETY: the request takes a pointer to this struct, which outlives the call.
+    if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
+        || export.fd < 0
+    {
+        return false;
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let sync = unsafe { std::os::fd::OwnedFd::from_raw_fd(export.fd) };
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&sync),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd for the duration of the call.
+    unsafe { libc::poll(&mut poll, 1, millis) == 1 }
+}
+
+/// The state of the fences of `flags` that the kernel tracks on the
+/// dma-buf `fd`, for the trace: `busy` while one is pending, `idle` when all
+/// have signalled, `none` when the kernel gives no sync file.
+fn fence_state(fd: std::os::fd::RawFd, flags: u32) -> &'static str {
+    use std::os::fd::FromRawFd;
+    let mut export = ExportSyncFile { flags, fd: -1 };
+    // SAFETY: the request takes a pointer to this struct, which outlives the call.
+    if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &mut export) } != 0
+        || export.fd < 0
+    {
+        return "none";
+    }
+    // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+    let sync = unsafe { std::os::fd::OwnedFd::from_raw_fd(export.fd) };
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&sync),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call.
+    if unsafe { libc::poll(&mut poll, 1, 0) } == 1 {
+        "idle"
+    } else {
+        "busy"
+    }
+}
+
+/// The host ranges of renderer iovecs.
+fn segments(vecs: &[RutabagaIovec]) -> Vec<(usize, usize)> {
+    vecs.iter().map(|v| (v.base as usize, v.len)).collect()
 }
 
 fn host<T>(result: RutabagaResult<T>) -> Result<T, u32> {
@@ -700,8 +1095,22 @@ fn readback(
     Ok(output)
 }
 
-fn iovecs(mem: &GuestMemory, d: &mut Decoder<'_>, count: usize) -> Result<Vec<RutabagaIovec>, u32> {
-    if count > MAX_ENTRIES {
+/// The backing entries of all resources together. The 2D device caps them
+/// at [`MAX_ENTRIES`]. A 3D guest backs every texture, so its cap is
+/// higher: at three 16-byte copies of an entry (the renderer's iovec, the
+/// range kept here, virglrenderer's own) this is about 12 MiB of host memory.
+const MAX_TOTAL_ENTRIES: usize = 16 * MAX_ENTRIES;
+
+/// Decode `count` backing entries. `room` is how many host ranges the
+/// device may still hold over all resources: an entry that crosses a
+/// guest-memory region counts once for each range.
+fn iovecs(
+    mem: &GuestMemory,
+    d: &mut Decoder<'_>,
+    count: usize,
+    room: usize,
+) -> Result<Vec<RutabagaIovec>, u32> {
+    if count > MAX_ENTRIES.min(room) {
         return Err(INVALID);
     }
     let mut result = Vec::with_capacity(count);
@@ -722,6 +1131,9 @@ fn iovecs(mem: &GuestMemory, d: &mut Decoder<'_>, count: usize) -> Result<Vec<Ru
         .map_err(|_| INVALID)?
         .try_for_each(|slice| {
             let slice = slice.map_err(|_| INVALID)?;
+            if result.len() >= room {
+                return Err(INVALID);
+            }
             result.push(RutabagaIovec {
                 base: slice.ptr_guard_mut().as_ptr().cast(),
                 len: slice.len(),
@@ -755,7 +1167,7 @@ impl Backend {
             }
             drop(timeline);
             self.gpu.event_poll();
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > Duration::from_secs(5) || self.lost.get() {
                 return Err(0x1200);
             }
             std::thread::yield_now();
@@ -769,6 +1181,14 @@ impl Backend {
         fence.fence_id = id;
         if guest.is_none() {
             fence.flags = 1;
+        }
+        if trace::on() {
+            let (ctx, ring, guest_id) =
+                guest.map_or((0, 0, 0), |g| (g.ctx_id, g.ring_idx, g.fence_id));
+            trace::write(
+                "fence_new",
+                format_args!("host={id} ctx={ctx} ring={ring} guest={guest_id}"),
+            );
         }
         if let Err(error) = host(self.gpu.create_fence(fence)) {
             self.timeline.lock().pending.remove(&id);
@@ -792,17 +1212,178 @@ impl Backend {
             .any(|signal| !signal.load(std::sync::atomic::Ordering::SeqCst))
         {
             self.gpu.event_poll();
-            if start.elapsed() > Duration::from_secs(5) {
+            if start.elapsed() > Duration::from_secs(5) || self.lost.get() {
                 return Err(0x1200);
             }
             std::thread::yield_now();
         }
         Ok(())
     }
+    /// The host wait of an ordered flip: everything on the timeline,
+    /// whatever context it came from, and then the writers that the kernel
+    /// tracks on the scanout's dma-buf. A guest sees only the fences of its
+    /// own submissions, so it cannot make this wait. A fence on each context
+    /// ring would reach further, but virglrenderer ends a Venus context
+    /// whose ring has lost its queue when it is fenced.
+    fn order(&mut self) -> Result<(), u32> {
+        let start = trace::now_ns();
+        let pending = self.timeline.lock().pending.len();
+        self.synchronize()?;
+        if let Some((id, _)) = self.scanout
+            && let Some(fd) = self.resources.get(&id).and_then(|r| r.exported.clone())
+        {
+            use std::os::fd::AsRawFd;
+            if trace::on() {
+                trace::write_at(
+                    start,
+                    "order",
+                    format_args!(
+                        "res={id} pending={pending} sync_us={} writers={}",
+                        (trace::now_ns() - start) / 1000,
+                        fence_state(fd.as_raw_fd(), DMA_BUF_SYNC_READ)
+                    ),
+                );
+            }
+            if !wait_writers(fd.as_raw_fd(), Duration::from_secs(1)) {
+                log::debug!("scanout {id}: no implicit fence to wait for");
+            }
+        }
+        Ok(())
+    }
+
+    /// [`super::CMD_PRESENT_COPY`]: the copy of a Blt present, ordered on
+    /// the host. It waits for everything on the timeline, the guest's
+    /// fences on every context ring among it, and for the fences the kernel
+    /// tracks on either resource's dma-buf. Then it copies on this thread,
+    /// so no other renderer command runs while the destination is half
+    /// written. The source is a blob the guest has mapped; the destination
+    /// is that, or a resource with a guest backing.
+    fn present_copy(&mut self, request: &super::copy::Request) -> Result<u64, u32> {
+        let memory =
+            |id: u32| -> Result<(super::copy::Segments, Option<Arc<std::os::fd::OwnedFd>>), u32> {
+                let r = self.resources.get(&id).ok_or(RESOURCE)?;
+                let parts = match r.host_map {
+                    Some(part) => vec![part],
+                    None if !r.backing.is_empty() => r.backing.clone(),
+                    None => return Err(INVALID),
+                };
+                Ok((super::copy::Segments { parts }, r.exported.clone()))
+            };
+        let (src, src_fd) = memory(request.src)?;
+        let (mut dst, dst_fd) = memory(request.dst)?;
+        let start = trace::now_ns();
+        let pending = self.timeline.lock().pending.len();
+        if let Err(error) = self.synchronize() {
+            log::warn!("present copy: host GPU wait failed: {error:#x}");
+        }
+        use std::os::fd::AsRawFd;
+        if trace::on() {
+            let state = |fd: &Option<Arc<std::os::fd::OwnedFd>>, flags| {
+                fd.as_ref()
+                    .map_or("nofd", |fd| fence_state(fd.as_raw_fd(), flags))
+            };
+            trace::write_at(
+                start,
+                "pcopy",
+                format_args!(
+                    "src={} dst={} pending={pending} sync_us={} src_writers={} dst_users={}",
+                    request.src,
+                    request.dst,
+                    (trace::now_ns() - start) / 1000,
+                    state(&src_fd, DMA_BUF_SYNC_READ),
+                    state(&dst_fd, DMA_BUF_SYNC_WRITE)
+                ),
+            );
+        }
+        for (fd, flags) in [(src_fd, DMA_BUF_SYNC_READ), (dst_fd, DMA_BUF_SYNC_WRITE)] {
+            if let Some(fd) = fd {
+                wait_fences(fd.as_raw_fd(), flags, Duration::from_secs(1));
+            }
+        }
+        // With the trace on, read the source before and after the copy: rows
+        // that differ were written by other work while the copy read them.
+        let probe = |src: &super::copy::Segments| -> Option<Vec<u8>> {
+            use super::copy::Memory;
+            let top = request.boxes.iter().map(|b| b.src_y).min()?;
+            let bottom = request.boxes.iter().map(|b| b.src_y + b.height).max()?;
+            let start = request.src_offset + u64::from(top) * u64::from(request.src_stride);
+            let len = (u64::from(bottom - top) * u64::from(request.src_stride))
+                .min(src.len().checked_sub(start)?);
+            let mut out = vec![0; usize::try_from(len).ok()?];
+            src.read(start, &mut out).ok()?;
+            Some(out)
+        };
+        let before = trace::on().then(|| probe(&src)).flatten();
+        let copied = super::copy::run(request, &src, &mut dst)?;
+        if let Some(before) = before {
+            let stride = request.src_stride as usize;
+            let rows =
+                |a: &[u8], b: &[u8]| match trace::differing_rows(a, stride, b, stride, stride) {
+                    None => "0".to_string(),
+                    Some((first, last, count)) => format!("{count}:{first}-{last}"),
+                };
+            let after = probe(&src);
+            let during = after
+                .as_ref()
+                .map_or("-".to_string(), |after| rows(&before, after));
+            // The reread knob also looks again 2 ms later.
+            let late = match (&after, trace::reread()) {
+                (Some(after), true) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    probe(&src).map_or("-".to_string(), |late| rows(after, &late))
+                }
+                _ => "-".to_string(),
+            };
+            trace::write(
+                "pcopy_src",
+                format_args!(
+                    "src={} dst={} digest={:016x} during={during} later={late}",
+                    request.src,
+                    request.dst,
+                    trace::digest(&before)
+                ),
+            );
+        }
+        if self.present_copies == 0 {
+            log::info!("virtio-gpu: the guest copies its Blt presents on the host");
+        }
+        self.present_copies += 1;
+        Ok(copied)
+    }
+
+    /// How many backing entries the guest may still attach, over all
+    /// resources ([`MAX_TOTAL_ENTRIES`]).
+    fn entry_room(&self) -> usize {
+        let held: usize = self.resources.values().map(|r| r.backing.len()).sum();
+        MAX_TOTAL_ENTRIES.saturating_sub(held)
+    }
+
+    /// Refuse a resource the descriptor limit cannot pay for.
+    fn admit_resource(&mut self) -> Result<(), u32> {
+        if self.resources.len() < self.budget {
+            return Ok(());
+        }
+        if !self.budget_reported {
+            self.budget_reported = true;
+            log::warn!(
+                "GPU resource limit reached: the guest holds {} resources",
+                self.resources.len()
+            );
+        }
+        Err(if self.budget < MAX_RESOURCES {
+            OUT_OF_MEMORY
+        } else {
+            INVALID
+        })
+    }
+
     fn unref(&mut self, id: u32) -> Result<(), u32> {
-        let r = self.resources.get(&id).ok_or(RESOURCE)?;
+        let r = self.resources.get_mut(&id).ok_or(RESOURCE)?;
         if r.mapped {
             self.mapper.unmap(id).map_err(|_| 0x1200u32)?;
+            // The guest no longer reaches the mapping: neither a failure
+            // below nor the drop of the backend unmaps it again.
+            r.mapped = false;
             host(self.gpu.unmap(id))?;
         }
         host(self.gpu.unref_resource(id))?;
@@ -909,9 +1490,10 @@ impl Backend {
                         flags: d.u32()?,
                     }
                 };
-                if id == 0 || self.resources.len() >= MAX_RESOURCES {
+                if id == 0 {
                     return Err(INVALID);
                 }
+                self.admit_resource()?;
                 host(self.gpu.resource_create_3d(id, create))?;
                 let backing = if create.bind & (1 << 18) != 0 {
                     if self.scanout_copy.is_none() {
@@ -945,6 +1527,8 @@ impl Backend {
                         scanout_info: None,
                         exported: backing.as_ref().map(|(fd, _)| fd.clone()),
                         export_info: backing.map(|(_, info)| info),
+                        host_map: None,
+                        backing: Vec::new(),
                     },
                 );
                 NODATA
@@ -958,6 +1542,7 @@ impl Backend {
             0x106 => {
                 let id = d.u32()?;
                 let count = d.u32()? as usize;
+                let room = self.entry_room();
                 let resource = self.resources.get_mut(&id).ok_or(RESOURCE)?;
                 log::debug!(
                     "GPU attach backing: id={id} entries={count} backed={}",
@@ -966,16 +1551,20 @@ impl Backend {
                 if resource.memory.is_some() {
                     return Err(INVALID);
                 }
-                let vecs = iovecs(mem, &mut d, count)?;
+                let vecs = iovecs(mem, &mut d, count, room)?;
+                let ranges = segments(&vecs);
                 host(self.gpu.attach_backing(id, vecs))?;
                 resource.memory = Some(mem.clone());
+                resource.backing = ranges;
                 NODATA
             }
             0x107 => {
                 let id = d.u32()?;
                 d.u32()?;
                 host(self.gpu.detach_backing(id))?;
-                self.resources.get_mut(&id).ok_or(RESOURCE)?.memory = None;
+                let resource = self.resources.get_mut(&id).ok_or(RESOURCE)?;
+                resource.memory = None;
+                resource.backing.clear();
                 NODATA
             }
             0x105 | 0x205 | 0x206 => {
@@ -1105,18 +1694,16 @@ impl Backend {
                 let count = d.u32()? as usize;
                 let blob_id = d.u64()?;
                 let size = d.u64()?;
-                if id == 0
-                    || size == 0
-                    || size > self.mapper.size()
-                    || self.resources.len() >= MAX_RESOURCES
-                {
+                if id == 0 || size == 0 || size > self.mapper.size() {
                     return Err(INVALID);
                 }
-                let vecs = iovecs(mem, &mut d, count)?;
+                self.admit_resource()?;
+                let vecs = iovecs(mem, &mut d, count, self.entry_room())?;
                 // An empty Vec still has a non-null pointer. Passing it through
                 // the C API would mark a host-only blob as already guest-backed.
                 let vecs = (!vecs.is_empty()).then_some(vecs);
                 let memory = vecs.as_ref().map(|_| mem.clone());
+                let ranges = vecs.as_deref().map(segments).unwrap_or_default();
                 log::debug!("GPU create blob: id={id} ctx={ctx} memory={blob_mem} entries={count}");
                 host(self.gpu.resource_create_blob(
                     ctx,
@@ -1142,6 +1729,8 @@ impl Backend {
                         scanout_info: None,
                         exported: None,
                         export_info: None,
+                        host_map: None,
+                        backing: ranges,
                     },
                 );
                 NODATA
@@ -1230,6 +1819,7 @@ impl Backend {
                     return Err(0x1200);
                 }
                 resource.mapped = true;
+                resource.host_map = Some((mapping.ptr as usize, size as usize));
                 out.extend_from_slice(&(info & RUTABAGA_MAP_CACHE_MASK).to_le_bytes());
                 out.extend_from_slice(&0u32.to_le_bytes());
                 0x1106
@@ -1244,6 +1834,7 @@ impl Backend {
                 self.mapper.unmap(id).map_err(|_| 0x1200u32)?;
                 host(self.gpu.unmap(id))?;
                 resource.mapped = false;
+                resource.host_map = None;
                 NODATA
             }
             _ => return Err(INVALID),
@@ -1306,6 +1897,291 @@ mod tests {
             .unwrap();
             assert_eq!(frame.pixels, [19, 37, 211, 255], "fourcc={fourcc:?}");
         }
+    }
+
+    #[test]
+    fn resource_budget_follows_the_descriptor_limit() {
+        // The default soft limit pays for fewer resources than the device allows.
+        assert_eq!(resource_budget(1024), 384);
+        assert_eq!(resource_budget(4096), 1920);
+        assert_eq!(resource_budget(1 << 20), MAX_RESOURCES);
+        assert_eq!(resource_budget(u64::MAX), MAX_RESOURCES);
+        assert_eq!(resource_budget(0), 0);
+        assert_eq!(resource_budget(RESERVED_DESCRIPTORS), 0);
+    }
+
+    struct TestMapper;
+    impl BlobMapper for TestMapper {
+        fn size(&self) -> u64 {
+            APERTURE_SIZE
+        }
+        fn set_base(&self, _: Option<u64>) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn map(&self, _: u32, _: u64, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn unmap(&self, _: u32) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+
+    fn request(kind: u32, ctx: u32, body: &[u32]) -> Vec<u8> {
+        let mut request = vec![0; 24];
+        request[..4].copy_from_slice(&kind.to_le_bytes());
+        request[16..20].copy_from_slice(&ctx.to_le_bytes());
+        for word in body {
+            request.extend_from_slice(&word.to_le_bytes());
+        }
+        request
+    }
+
+    /// The descriptors of blob memory this process holds. Other tests of the
+    /// binary open and close files of other kinds meanwhile.
+    fn open_descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.contains("vkr-shmem") || target.contains("dmabuf")
+            })
+            .count()
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn a_render_server_that_ends_is_a_lost_host_gpu() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP render server loss: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        // virglrenderer is one per process and does not start again after
+        // its render server is killed: the loss runs in a process of its own.
+        if std::env::var_os("VMLAB_HV_TEST_LOSS_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::gpu::renderer::tests::a_render_server_that_ends_is_a_lost_host_gpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("VMLAB_HV_TEST_LOSS_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "the loss test process: {status}");
+            return;
+        }
+        let renderer =
+            Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
+        let mut watch = renderer.watch();
+        assert_eq!(watch.check(), None);
+        let [pid] = renderer.servers[..] else {
+            panic!("expected one render server, got {:?}", renderer.servers);
+        };
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        renderer.command(&mem, &request(0x200, 1, &create)).unwrap();
+
+        // SAFETY: the signal goes to this test's own child process.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+        let start = std::time::Instant::now();
+        let reason = loop {
+            if let Some(reason) = watch.check() {
+                break reason;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no loss seen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(reason, format!("the render server (pid {pid}) has ended"));
+
+        // Lost: work is refused at once, a release succeeds, and the reset
+        // and the drop end.
+        assert!(renderer.lost().set());
+        let start = std::time::Instant::now();
+        assert_eq!(
+            renderer.command(&mem, &request(0x200, 2, &create)),
+            Err(UNSPEC)
+        );
+        assert_eq!(renderer.fence(3, 1, 1, 0), Err(UNSPEC));
+        assert_eq!(
+            renderer.command(&mem, &request(0x201, 1, &[])),
+            Ok((NODATA, Vec::new()))
+        );
+        renderer.reset().unwrap();
+        drop(renderer);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// One Venus context that makes, maps, unmaps and unreferences `blobs`
+    /// shared-memory blobs, as a guest program does from start to exit.
+    fn guest_program(renderer: &Renderer, mem: &GuestMemory, ctx: u32, blobs: u32) -> usize {
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        let mut create = request(0x200, ctx, &create);
+        create[32..39].copy_from_slice(b"fd-test");
+        renderer.command(mem, &create).unwrap();
+        for id in 1..=blobs {
+            // HOST3D memory, mappable, blob 0: a shared-memory allocation of the context.
+            let blob = [id, 2, 1, 0, 0, 0, 4096, 0];
+            renderer.command(mem, &request(0x10c, ctx, &blob)).unwrap();
+            let map = [id, 0, (id - 1) * 4096, 0];
+            renderer.command(mem, &request(0x208, ctx, &map)).unwrap();
+        }
+        let held = open_descriptors();
+        for id in 1..=blobs {
+            renderer
+                .command(mem, &request(0x209, ctx, &[id, 0]))
+                .unwrap();
+            renderer
+                .command(mem, &request(0x102, ctx, &[id, 0]))
+                .unwrap();
+        }
+        renderer.command(mem, &request(0x201, ctx, &[])).unwrap();
+        held
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn venus_blobs_return_their_descriptors_and_stop_at_the_budget() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP blob descriptors: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        const BLOBS: u32 = 32;
+        let renderer = Renderer::with_budget(
+            GpuMode::Venus,
+            PathBuf::from(node),
+            Arc::new(TestMapper),
+            BLOBS as usize,
+        )
+        .unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        // The first program pays for what the renderer opens once.
+        guest_program(&renderer, &mem, 1, BLOBS);
+        let idle = open_descriptors();
+        for round in 0..16 {
+            let held = guest_program(&renderer, &mem, 2 + round, BLOBS);
+            assert!(
+                held >= idle + BLOBS as usize,
+                "round {round}: {BLOBS} live blobs hold {held} descriptors, idle is {idle}"
+            );
+            assert_eq!(
+                open_descriptors(),
+                idle,
+                "round {round}: descriptors outlived their blobs"
+            );
+        }
+
+        // At the budget the guest gets an error and the host opens nothing.
+        let mut create = vec![7, 4];
+        create.extend_from_slice(&[0; 16]);
+        renderer
+            .command(&mem, &request(0x200, 99, &create))
+            .unwrap();
+        for id in 1..=BLOBS {
+            let blob = [id, 2, 1, 0, 0, 0, 4096, 0];
+            renderer.command(&mem, &request(0x10c, 99, &blob)).unwrap();
+        }
+        let full = open_descriptors();
+        let over = [BLOBS + 1, 2, 1, 0, 0, 0, 4096, 0];
+        assert_eq!(
+            renderer.command(&mem, &request(0x10c, 99, &over)),
+            Err(OUT_OF_MEMORY)
+        );
+        let classic = [BLOBS + 1, 2, 1, 2, 64, 64, 1, 1, 0, 0, 0];
+        assert_eq!(
+            renderer.command(&mem, &request(0x204, 99, &classic)),
+            Err(OUT_OF_MEMORY)
+        );
+        assert_eq!(open_descriptors(), full);
+        renderer
+            .command(&mem, &request(0x102, 99, &[1, 0]))
+            .unwrap();
+        renderer.command(&mem, &request(0x10c, 99, &over)).unwrap();
+        renderer.reset().unwrap();
+        assert_eq!(open_descriptors(), idle);
+    }
+
+    /// `count` one-page backing entries at guest address 0, as request words.
+    fn entries(count: usize) -> Vec<u32> {
+        [0, 0, 4096, 0].repeat(count)
+    }
+
+    #[test]
+    fn backing_entries_stop_at_the_room_left_over_all_resources() {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let decode = |count: usize, room: usize| {
+            let words = entries(count);
+            iovecs(&mem, &mut Decoder::new(words.as_bytes()), count, room).map(|vecs| vecs.len())
+        };
+        assert_eq!(decode(3, 3), Ok(3));
+        assert_eq!(decode(3, 2), Err(INVALID));
+        assert_eq!(decode(1, 0), Err(INVALID));
+        assert_eq!(decode(MAX_ENTRIES, MAX_TOTAL_ENTRIES), Ok(MAX_ENTRIES));
+        assert_eq!(decode(MAX_ENTRIES + 1, MAX_TOTAL_ENTRIES), Err(INVALID));
+
+        // An entry across two memory regions is two host ranges.
+        let split =
+            GuestMemory::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(4096), 4096)])
+                .unwrap();
+        let words = [2048u32, 0, 4096, 0];
+        let decode = |room| {
+            iovecs(&split, &mut Decoder::new(words.as_bytes()), 1, room).map(|vecs| vecs.len())
+        };
+        assert_eq!(decode(2), Ok(2));
+        assert_eq!(decode(1), Err(INVALID));
+    }
+
+    #[test]
+    #[cfg_attr(
+        vmlab_ci_no_host_assets,
+        ignore = "requires an owner-selected DRM render node"
+    )]
+    fn renderer_backing_entries_are_bounded_across_resources() {
+        let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+            eprintln!("SKIP backing entries: set VMLAB_HV_TEST_RENDER_NODE");
+            return;
+        };
+        let renderer =
+            Renderer::new(GpuMode::Venus, PathBuf::from(node), Arc::new(TestMapper)).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let resources = (MAX_TOTAL_ENTRIES / MAX_ENTRIES) as u32;
+        let attach = |id: u32, count: usize| {
+            let mut body = vec![id, count as u32];
+            body.extend(entries(count));
+            renderer.command(&mem, &request(0x106, 0, &body))
+        };
+        for id in 1..=resources + 1 {
+            renderer
+                .command(&mem, &request(0x101, 0, &[id, 1, 64, 64]))
+                .unwrap();
+        }
+        for id in 1..=resources {
+            assert_eq!(attach(id, MAX_ENTRIES), Ok((NODATA, Vec::new())));
+        }
+        // The cap is over all resources: one more entry is one too many.
+        assert_eq!(attach(resources + 1, 1), Err(INVALID));
+        // A detach gives its entries back.
+        renderer.command(&mem, &request(0x107, 0, &[1, 0])).unwrap();
+        assert_eq!(attach(resources + 1, 1), Ok((NODATA, Vec::new())));
+        renderer.reset().unwrap();
+    }
+
+    #[test]
+    fn a_buffer_without_implicit_fences_gives_no_writers_to_wait_for() {
+        use std::os::fd::AsRawFd;
+        // Not a dma-buf: the kernel refuses the export, and the flip goes on.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        assert!(!wait_writers(file.as_raw_fd(), Duration::from_millis(10)));
     }
 
     #[test]

@@ -319,9 +319,16 @@ fn run(
             events: libc::POLLIN,
             revents: 0,
         });
-        for listener in &listeners {
+        for (i, listener) in listeners.iter().enumerate() {
+            // A port takes one client. While it has one, a connection in the
+            // backlog is not accepted, so asking for it would make every
+            // `poll` return at once: `poll` ignores a negative fd.
             polls.push(libc::pollfd {
-                fd: listener.as_raw_fd(),
+                fd: if clients[i].is_none() {
+                    listener.as_raw_fd()
+                } else {
+                    -1
+                },
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -384,14 +391,7 @@ fn run(
                         clients[i] = Some(stream);
                         let mut sh = lock(&shared);
                         sh.ports[i].host_open = true;
-                        let port = i as u16 + 1;
-                        sh.enqueue_ctrl(CtrlMsg {
-                            id: u32::from(port),
-                            event: EV_PORT_OPEN,
-                            value: 1,
-                            name: None,
-                        });
-                        flush_pending(&mut sh);
+                        notify_host_open(&mut sh, i);
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {}
@@ -456,15 +456,23 @@ fn disconnect(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], i
     // chardev does; host bytes already staged still reach the guest.
     sh.ports[i].tx_stage.clear();
     let port = i as u16 + 1;
-    sh.enqueue_ctrl(CtrlMsg {
-        id: u32::from(port),
-        event: EV_PORT_OPEN,
-        value: 0,
-        name: None,
-    });
-    flush_pending(&mut sh);
+    notify_host_open(&mut sh, i);
     drop(sh);
     process_tx(shared, clients, port);
+}
+
+fn notify_host_open(sh: &mut Shared, i: usize) {
+    // PORT_READY will report the current socket state during enumeration.
+    // A host probe can connect and leave before the driver initializes.
+    if sh.device_ready {
+        sh.enqueue_ctrl(CtrlMsg {
+            id: i as u32 + 1,
+            event: EV_PORT_OPEN,
+            value: u16::from(sh.ports[i].host_open),
+            name: None,
+        });
+        flush_pending(sh);
+    }
 }
 
 /// Route a queue kick to its handler.
@@ -504,7 +512,12 @@ fn rx_has_capacity(shared: &Arc<Mutex<Shared>>, queue: u16) -> bool {
     let Some(mem) = sh.mem.as_ref() else {
         return false;
     };
-    let Some(q) = sh.queues.get(usize::from(queue)).and_then(|q| q.as_ref()) else {
+    let Some(q) = sh
+        .queues
+        .get(usize::from(queue))
+        .and_then(Option::as_ref)
+        .filter(|q| q.ready())
+    else {
         return false;
     };
     match q.avail_idx(mem, Ordering::Acquire) {
@@ -528,6 +541,7 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
             .queues
             .get_mut(usize::from(queue))
             .and_then(|q| q.as_mut())
+            .filter(|q| q.ready())
         else {
             return;
         };
@@ -585,6 +599,7 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                 .queues
                 .get_mut(usize::from(queue))
                 .and_then(|q| q.as_mut())
+                .filter(|q| q.ready())
             else {
                 return;
             };
@@ -695,7 +710,12 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
             let Some(mem) = sh.mem.as_ref() else {
                 return;
             };
-            let Some(q) = sh.queues.get_mut(3).and_then(|q| q.as_mut()) else {
+            let Some(q) = sh
+                .queues
+                .get_mut(3)
+                .and_then(Option::as_mut)
+                .filter(|q| q.ready())
+            else {
                 return;
             };
             let mut msgs = Vec::new();
@@ -802,7 +822,12 @@ fn flush_pending(sh: &mut Shared) {
         let Some(mem) = sh.mem.as_ref() else {
             return;
         };
-        let Some(q) = sh.queues.get_mut(2).and_then(|q| q.as_mut()) else {
+        let Some(q) = sh
+            .queues
+            .get_mut(2)
+            .and_then(Option::as_mut)
+            .filter(|q| q.ready())
+        else {
             return;
         };
         while let Some(msg) = sh.pending.front().cloned() {
@@ -1697,6 +1722,40 @@ mod tests {
     }
 
     #[test]
+    fn host_open_before_driver_ready_is_reported_after_port_ready() {
+        let mut f = Fixture::new();
+        f.dev.reset();
+        f.activate();
+        lock(&f.dev.shared).queues[2]
+            .as_mut()
+            .unwrap()
+            .set_ready(false);
+
+        let probe = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("early host connection", || {
+            lock(&f.dev.shared).ports[1].host_open
+        });
+        drop(probe);
+        wait_for("early host disconnect", || {
+            !lock(&f.dev.shared).ports[1].host_open
+        });
+        let _client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host reconnect", || lock(&f.dev.shared).ports[1].host_open);
+        {
+            let mut sh = lock(&f.dev.shared);
+            assert!(sh.pending.is_empty());
+            sh.queues[2].as_mut().unwrap().set_ready(true);
+        }
+
+        f.device_ready(8, 5);
+        let msgs = f.ctrl_delivered();
+        assert_eq!(msgs[0], (1, EV_PORT_ADD, 1, Vec::new()));
+        assert_eq!(msgs[1], (2, EV_PORT_ADD, 1, Vec::new()));
+        assert_eq!(msgs[3], (2, EV_PORT_NAME, 0, b"vmlab.agent.0".to_vec()));
+        assert_eq!(msgs[4], (2, EV_PORT_OPEN, 1, Vec::new()));
+    }
+
+    #[test]
     fn port_open_follows_the_host_connection() {
         let mut f = Fixture::new();
         f.device_ready(8, 4);
@@ -1714,6 +1773,57 @@ mod tests {
                 .last()
                 .is_some_and(|m| *m == (2, EV_PORT_OPEN, 0, Vec::new()))
         });
+    }
+
+    /// CPU time the worker thread has used so far.
+    fn worker_cpu_time(dev: &Console) -> Duration {
+        use std::os::unix::thread::JoinHandleExt;
+        let thread = dev.worker.as_ref().unwrap().as_pthread_t();
+        let mut clock: libc::clockid_t = 0;
+        // SAFETY: the worker is joined only in `Drop`, so the pthread id is
+        // live; `clock` and `ts` are valid out-pointers.
+        let rc = unsafe { libc::pthread_getcpuclockid(thread, &mut clock) };
+        assert_eq!(rc, 0, "pthread_getcpuclockid");
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: as above.
+        let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime");
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    #[test]
+    fn second_client_in_the_backlog_does_not_spin_the_worker() {
+        let mut f = Fixture::new();
+        f.device_ready(8, 4);
+        f.post_ctrl_rx(8);
+        let first = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("PORT_OPEN(2,1)", || {
+            f.ctrl_delivered()
+                .last()
+                .is_some_and(|m| *m == (2, EV_PORT_OPEN, 1, Vec::new()))
+        });
+        // The port is busy, so this one waits in the listener's backlog.
+        let second = UnixStream::connect(&f.agent_sock).unwrap();
+        let before = worker_cpu_time(&f.dev);
+        thread::sleep(Duration::from_millis(300));
+        let used = worker_cpu_time(&f.dev) - before;
+        assert!(
+            used < Duration::from_millis(50),
+            "the worker used {used:?} of CPU in 300 ms with a client in the backlog"
+        );
+
+        // The waiting client is served once the first one leaves.
+        drop(first);
+        f.post_ctrl_rx(9);
+        f.post_ctrl_rx(10);
+        wait_for("PORT_OPEN(2,1) for the second client", || {
+            let got = f.ctrl_delivered();
+            got.len() == 7 && got[6] == (2, EV_PORT_OPEN, 1, Vec::new())
+        });
+        drop(second);
     }
 
     #[test]

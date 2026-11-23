@@ -1,0 +1,47 @@
+Subject: [PATCH 08/11] tgsi_to_nir, d3d10umd: fix array gradients and UAV load component selection
+
+- TXD on array textures passed the array layer as a gradient component,
+  which produces SPIR-V that spirv-val rejects (GravityMark) (F17).
+- Raw UAV loads ignored the source swizzle, so a scalar load into .y read
+  the next DWORD (F28).
+- Typed UAV loads ignored the source swizzle, so uint4.w returned .x (F29).
+
+Prior art: F17, F28, F29 (R/NATIVE-WDDM20.md).
+Origin: codex working tree R/mesa (git diff 374c3022), re-exported by
+vmlab-win3d build/mesa; see build/mesa/README.md.
+---
+diff --git a/src/gallium/auxiliary/nir/tgsi_to_nir.c b/src/gallium/auxiliary/nir/tgsi_to_nir.c
+index 43b86ce..c3cc1d2 100644
+--- a/src/gallium/auxiliary/nir/tgsi_to_nir.c
++++ b/src/gallium/auxiliary/nir/tgsi_to_nir.c
+@@ -1868,13 +1868,15 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
+    }
+ 
+    if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXD) {
++      const unsigned gradient_components =
++         instr->coord_components - instr->is_array;
+       instr->src[src_number] =
+          nir_tex_src_for_ssa(nir_tex_src_ddx,
+-               nir_trim_vector(b, src[1], instr->coord_components));
++               nir_trim_vector(b, src[1], gradient_components));
+       src_number++;
+       instr->src[src_number] =
+          nir_tex_src_for_ssa(nir_tex_src_ddy,
+-               nir_trim_vector(b, src[2], instr->coord_components));
++               nir_trim_vector(b, src[2], gradient_components));
+       src_number++;
+    }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 03b9bed..94076a7 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -4286,7 +4286,7 @@ Shader_tgsi_translate(const unsigned *code,
+                                                ureg_src(coord),
+                                                sx->images[image_index].target,
+                                                sx->images[image_index].format,
+-                                               1, NULL);
++                                               1, opcode.src[1].swizzle);
+             ureg_release_temporary(ureg, coord);
+             break;
+          }

@@ -108,7 +108,7 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, reso
 /// Frame records off the channel and hand them to the workers. The one thing
 /// this thread must not do is serve a request: a read that blocks here would
 /// stop the channel being read at all, and with it every reply's credit.
-fn read_loop(session: Arc<Session>, input: Receiver<Input>, tx: SyncSender<Work>) {
+fn read_loop(session: Arc<Session>, input: crate::mux::InputRx, tx: SyncSender<Work>) {
     let mut decoder = RecordDecoder::new();
     let mut window = RecvWindow::default();
     for msg in input {
@@ -361,7 +361,8 @@ impl Session {
                     set_mode(&path, mode).context(&path)?;
                 }
                 if attrs.size.is_some() || attrs.mtime_ns.is_some() || attrs.atime_ns.is_some() {
-                    let file = OpenOptions::new().write(true).open(&path).context(&path)?;
+                    let file =
+                        open_bounded(OpenOptions::new().write(true), &path).context(&path)?;
                     if let Some(size) = attrs.size {
                         file.set_len(size).context(&path)?;
                     }
@@ -447,9 +448,17 @@ impl Session {
                 ok(Reply::Ok)
             }
             Op::Realpath { path } => {
-                let path = self.path(&path, Last::Follow)?;
+                let resolved = self.path(&path, Last::Follow)?;
+                // Where the session's paths are resolved inside a root (a
+                // container), the answer is a path of that root: the client
+                // sends it back in a later request, and the root goes in
+                // front of it again there (guest-agent review F13).
+                let root = self.path("/", Last::Keep)?;
                 ok(Reply::Name {
-                    path: realpath(&path),
+                    path: match seen_from(&root, &resolved) {
+                        Some(seen) => seen,
+                        None => realpath(&resolved),
+                    },
                 })
             }
             Op::Symlink { target, link, kind } => {
@@ -521,6 +530,41 @@ impl<T> Context<T> for std::io::Result<T> {
     }
 }
 
+/// Open `path`, refusing what would take a worker for good (guest-agent
+/// review F8): a FIFO blocks in `open(2)` until a peer comes, a character
+/// device such as `/dev/zero` has no end for a digest to reach, and a worker
+/// has no cancel. The path is checked first, so the refusal reads the same
+/// for every access; `O_NONBLOCK` then makes the open itself return if a
+/// FIFO was put there in between, and the handle is checked again. A block
+/// device is finite and stays allowed. Windows has no such check.
+fn open_bounded(opts: &mut OpenOptions, path: &str) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            refuse_endless(&meta)?;
+        }
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    refuse_endless(&file.metadata()?)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn refuse_endless(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    if kind.is_fifo() || kind.is_char_device() || kind.is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(())
+}
+
 fn open_file(path: &str, flags: OpenFlags, mode: Option<u32>) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     // An open that names no access at all is a read, which is what a client
@@ -536,7 +580,7 @@ fn open_file(path: &str, flags: OpenFlags, mode: Option<u32>) -> std::io::Result
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
-    let file = opts.open(path)?;
+    let file = open_bounded(&mut opts, path)?;
     // `OpenOptionsExt::mode` only takes when the open actually created the
     // file, and a push over one that already exists still means the mode it
     // asked for. Windows has no Unix bits and ignores this entirely — the
@@ -756,6 +800,27 @@ fn symlink(target: &str, link: &str, kind: LinkKind) -> std::io::Result<()> {
     }
 }
 
+/// `resolved` as a client of a session rooted at `root` names it, or `None`
+/// where the session has no root of its own (`/` resolves to itself) and the
+/// path is the guest's as it stands.
+///
+/// The resolver has already followed every link inside the root and stopped
+/// `..` at it, so the answer is `resolved` without the root in front. It is
+/// not canonicalised: that would follow links in the root's own path, which
+/// the client never named.
+fn seen_from(root: &str, resolved: &str) -> Option<String> {
+    let root = std::path::Path::new(root);
+    // `/` has no parent: the session is not rooted anywhere of its own.
+    root.parent()?;
+    let inside = std::path::Path::new(resolved).strip_prefix(root).ok()?;
+    Some(
+        std::path::Path::new("/")
+            .join(inside)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 /// Canonicalise where the path exists, and fall back to what the client can
 /// still use where it does not — a client asks `realpath` about files it is
 /// about to create, and an error there would break the transfer before it
@@ -781,7 +846,7 @@ fn realpath(path: &str) -> String {
 }
 
 fn digest_file(path: &str) -> std::io::Result<(String, u64)> {
-    let mut file = File::open(path)?;
+    let mut file = open_bounded(OpenOptions::new().read(true), path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut len = 0u64;

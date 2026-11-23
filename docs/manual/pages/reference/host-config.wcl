@@ -167,11 +167,14 @@ SRC
     and at launch, so updating this key requires no daemon restart.
   DOC
   p <<DOC
-    QEMU receives the key in `isa-applesmc,osk=<value>`. vmlab redacts it
+    QEMU receives the key in a configuration file (`-readconfig`) that only
+    your account can read. vmlab writes it in the machine's runtime directory
+    at each launch and removes it once QEMU is up. The key is not in QEMU's
+    process arguments, which every local account can read. vmlab redacts it
     from launch headers, emulator output and startup errors. Debug dumps of
     host configuration and launch paths also redact it. The key is never
-    recorded in templates or OCI metadata. It remains visible to host
-    processes allowed to read QEMU's operating-system process arguments.
+    recorded in templates or OCI metadata. A key that holds a double quote is
+    refused at launch, because QEMU's configuration file cannot carry one.
     vmlab-hv receives the key through a private pipe at its machine
     description's path, replaced by the redacted description once read, so
     under vmlab-hv the key is in no process argument and no file.
@@ -206,7 +209,8 @@ SRC
   list {
     li "Each field is `qemu` or `vmlab`. Any other value is rejected with a parse error that names it."
     li "A machine's own `hypervisor` wins over this block. The field never resolves through a template or a profile."
-    li "Explicit `vmlab` settings are validated against the refusal list. A new machine without a hypervisor setting selects vmlab-hv if supported or QEMU with a reason."
+    li "Explicit `vmlab` settings are validated against the refusal list. A new x86 machine without a hypervisor setting selects vmlab-hv and is validated the same way; a new machine of another architecture selects QEMU with a reason."
+    li "QEMU runs no x86 guest: `vm = \"qemu\"` or `container = \"qemu\"` is a validation error for every x86 machine it reaches, naming the fix. It stays valid for aarch64 and riscv64 machines."
     li "With neither setting, an existing x86 QEMU identity selects vmlab-hv. A hardware refusal fails the start and keeps the old identity. After the checks pass, vmlab saves the switch before boot and `up` reports it once."
     li "Other existing identities survive stops and daemon restarts until destroy or an explicit setting. For older disks, the newest snapshot supplies the identity where recorded. Otherwise vmlab infers QEMU."
     li "Changing an explicit default can move an existing VM. Online snapshots still require the hypervisor that captured them; offline snapshots restore under either."
@@ -218,9 +222,8 @@ SRC
     including the selected vmlab-hv before a migration has been saved.
     Ordinary status also prints fallback reasons, and `status --json` carries
     `hypervisor` and optional `hypervisor_fallback`. `up` prints an info line
-    for each fallback. An x86 machine on QEMU gets the QEMU removal warning
-    instead, at `up`, `vm start`, `validate` and `status`, with
-    `qemu_removal` in `status --json`. See [Host configuration and WSL 2](guide_host) and
+    for each fallback, which only a machine that is not x86 has. See
+    [Host configuration and WSL 2](guide_host) and
     [Snapshots](guide_snapshots).
   DOC
   h2 "gpu \"<name>\" {}"
@@ -248,8 +251,10 @@ SRC
       | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON a `vulkan` guest's renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU's kernel driver." |
       | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
-      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU or vmlab-hv process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for the Venus render server." |
+      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for QEMU's Venus render server. Ignored on vmlab-hv, with a warning." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
+      | "`hide_uncached_memory`" | "bool" | "`false`" | "Under `vulkan`, report an uncached host-visible memory type of this GPU as not host-visible when the same heap has a cached one, so guest drivers map the cached type. For a host where guest images arrive with short dashes. See below." |
+      | "`passthrough_functions`" | "list of utf8" | "none" | "The card's other PCI functions, such as its HDMI/DP audio, that a `passthrough` guest on vmlab-hv gets with it. Each entry is the host PCI address of another function of the same slot, bound to `vfio-pci`. Left out, every function of the slot already bound to `vfio-pci` goes. `[]` sends the card alone. See below." |
   }
   p "The parser enforces these rules:"
   list {
@@ -265,7 +270,16 @@ SRC
     VM start, naming the GPU: its address must name a PCI device, a virgl or
     vulkan guest needs that device to have a DRM render node, and its
     `vulkan_icd` must exist. A GPU bound to `vfio-pci` for passthrough has no
-    render node and needs none. Its `qemu_binary` must be an executable
+    render node and needs none. On vmlab-hv the card's other functions that
+    are bound to `vfio-pci` go to the guest with it, at the same guest slot
+    and under the function number each has on the host, so the guest finds
+    one card with its audio device. A function bound to another driver stays
+    with the host. An entry of `passthrough_functions` is different: it must
+    be another function of the same slot and bound to `vfio-pci`, or the
+    check refuses it and names the driver it is bound to. vmlab never changes
+    a driver binding. The GPU's `address` must be function 0 for another
+    function to go with it. On QEMU the guest gets the one `address`, and a
+    non-empty `passthrough_functions` is ignored with a warning. Its `qemu_binary` must be an executable
     file. A file named `qemu-system-<arch>` must also match the VM's QEMU
     arch, or the check refuses it and names both arches. A file with any
     other name is used as given.
@@ -295,6 +309,19 @@ SRC
     `vmlab status --json` carries it as the VM's `qemu_env` object. Both
     show what the VM was started with, not the host config as it is now.
     Template builds never have a `gpu {}`, so they always run the stock QEMU.
+  DOC
+  p <<DOC
+    `hide_uncached_memory = true` adds `VMLAB_VK_HIDE_UNCACHED=1` to that
+    set, for a `vulkan` guest only. The same layer then changes what the
+    renderer learns about the GPU's memory types: a type that is host-visible
+    and coherent, but neither cached nor device-local, loses those two flags
+    when another type of the same heap has every flag of it and is cached
+    too. A type with no such counterpart is left alone. The first memory
+    query in each renderer process writes the result to `qemu.log`, either
+    `vmlab-hide-uncached: memory type 2 (uncached) is hidden, guests use
+    type 3 (cached)` or `vmlab-hide-uncached: no uncached memory type has a
+    cached counterpart, hid none`. The setting is read when a VM starts, so
+    restart the VM after changing it. It is off by default.
   DOC
   h3 "Runtime power management"
   p <<DOC

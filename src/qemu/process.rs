@@ -105,11 +105,12 @@ impl Proc {
         env: &ChildEnv,
         log_path: &Path,
     ) -> Result<Arc<Proc>> {
-        Self::spawn_with_fds(name, binary, args, env, log_path, Vec::new()).await
+        Self::spawn_with_fds(name, binary, args, env, log_path, Vec::new(), Vec::new()).await
     }
 
     /// [`Proc::spawn`], additionally installing `fds` at their fixed
-    /// descriptor numbers in the child.
+    /// descriptor numbers in the child, and hiding `secrets` — values the
+    /// child holds that are not in its argv — in its output.
     pub async fn spawn_with_fds(
         name: &str,
         binary: &str,
@@ -117,6 +118,7 @@ impl Proc {
         env: &ChildEnv,
         log_path: &Path,
         fds: Vec<ChildFd>,
+        mut secrets: Vec<String>,
     ) -> Result<Arc<Proc>> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -128,7 +130,8 @@ impl Proc {
             .open(log_path)
             .with_context(|| format!("opening {}", log_path.display()))?;
         let log_err = log.try_clone()?;
-        let secrets = osk_secrets(args);
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.extend(osk_secrets(args));
         let filter_output = !secrets.is_empty();
 
         let mut cmd = Command::new(binary);
@@ -391,8 +394,10 @@ pub async fn spawn_swtpm(
 ///
 /// - `name`: our QEMU/micro-VM `-name vmlab:<lab>/<machine>` value (see
 ///   cmdline.rs),
-/// - `runtime`: the lab's runtime directory, where every helper's socket
-///   lives (`swtpm --ctrl type=unixio,path=…/swtpm.sock`, `virtiofsd
+/// - `runtime`: the lab's runtime directory, where QEMU's QMP socket
+///   (`-qmp unix:…/qmp.sock`, which tells the lab apart from a lab of the
+///   same name in another vmlab environment) and every helper's socket
+///   live (`swtpm --ctrl type=unixio,path=…/swtpm.sock`, `virtiofsd
 ///   --socket-path …/virtiofs0.sock`) and vmlab-hv's machine file and control
 ///   socket (`--machine …/machine.json --control …/control.sock`, PRD §22),
 /// - `smb`: the lab's SMB state directory, which is how `smbd -s
@@ -458,9 +463,12 @@ impl LabIdentity {
         };
         let under = |prefix: &str, value: &[u8]| value.starts_with(prefix.as_bytes());
         match LabExecutable::of(argv0) {
-            Some(LabExecutable::Qemu) => option_values(args, "-name")
-                .into_iter()
-                .any(|v| under(&self.name, v)),
+            Some(LabExecutable::Qemu) => {
+                option_values(args, "-name")
+                    .into_iter()
+                    .any(|v| under(&self.name, v))
+                    && self.qmp_under_runtime(args)
+            }
             Some(LabExecutable::VmlabHv) => option_values(args, "--machine")
                 .into_iter()
                 .chain(option_values(args, "--control"))
@@ -491,8 +499,25 @@ impl LabIdentity {
                 args.first() == Some(&&b"-name"[..])
                     && args.get(1).is_some_and(|v| under(&self.name, v))
                     && !option_values(args, "-machine").is_empty()
+                    && self.qmp_under_runtime(args)
             }
         }
+    }
+
+    /// Whether a QEMU argv's `-qmp unix:<path>` lies under this lab's runtime
+    /// directory. The `-name` marker carries only the lab name, which another
+    /// vmlab environment (another `XDG_RUNTIME_DIR`) can use too (F5); every
+    /// QEMU vmlab starts has its QMP socket in the machine's runtime directory
+    /// (cmdline.rs, container.rs).
+    fn qmp_under_runtime(&self, args: &[&[u8]]) -> bool {
+        option_values(args, "-qmp").into_iter().any(|v| {
+            // A VM's argv carries the path with its commas doubled
+            // (`cmdline::opt_path`); a container's does not.
+            let escaped = self.runtime.replace(',', ",,");
+            v.strip_prefix(b"unix:").is_some_and(|path| {
+                path.starts_with(self.runtime.as_bytes()) || path.starts_with(escaped.as_bytes())
+            })
+        })
     }
 }
 
@@ -702,6 +727,39 @@ mod tests {
         assert!(error.contains("[REDACTED]"));
         assert!(!error.contains(&key));
     }
+    /// A key the child got from a file is in no argv element, and its
+    /// output is filtered all the same.
+    #[tokio::test]
+    async fn a_secret_outside_the_argv_is_redacted_in_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("qemu.log");
+        let key = "TEST".repeat(16);
+        let key_file = tmp.path().join("key");
+        std::fs::write(&key_file, format!("{key}\n")).unwrap();
+        let args = vec![
+            "-c".into(),
+            "cat \"$0\"; cat \"$0\" >&2".into(),
+            key_file.to_str().unwrap().to_string(),
+        ];
+        let proc = super::Proc::spawn_with_fds(
+            "redaction",
+            "/bin/sh",
+            &args,
+            &Default::default(),
+            &log,
+            Vec::new(),
+            vec![key.clone()],
+        )
+        .await
+        .unwrap();
+        // No time limit: the waiter publishes the exit after the output is copied.
+        let mut exited = proc.exited.clone();
+        exited.wait_for(|status| status.is_some()).await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains(&key), "{text}");
+        assert_eq!(text.matches("[REDACTED]").count(), 2, "{text}");
+    }
+
     #[tokio::test]
     async fn redaction_hides_both_qemu_escaped_and_raw_keys() {
         let tmp = tempfile::tempdir().unwrap();
@@ -864,14 +922,30 @@ mod tests {
         assert!(!binary_on_path("definitely-not-a-real-binary-1a2b3c"));
     }
 
+    /// The `-qmp` option vmlab gives a QEMU of `lab`'s machine `web`.
+    fn qmp_arg(lab: &str) -> String {
+        format!(
+            "-qmp\0unix:{}/vms/web/qmp.sock,server=on,wait=off\0",
+            crate::paths::lab_runtime_dir(lab).display()
+        )
+    }
+
     #[test]
     fn lab_qemu_cmdline_matching() {
         let lab = LabIdentity::new("mylab", None);
-        // Real-ish argv: NUL-separated, with the -name marker.
-        let cmd = b"qemu-system-x86_64\0-name\0vmlab:mylab/web\0-machine\0q35\0";
+        let qmp = qmp_arg("mylab");
+        // Real-ish argv: NUL-separated, with the -name marker and the QMP
+        // socket under the lab's runtime directory.
+        let cmd = format!("qemu-system-x86_64\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}");
+        let cmd = cmd.as_bytes();
         assert!(lab.started(cmd));
         // A host GPU's `qemu_binary` is an absolute path to the same name.
-        assert!(lab.started(b"/opt/qemu-vmlab/bin/qemu-system-x86_64\0-name\0vmlab:mylab/web\0"));
+        assert!(
+            lab.started(
+                format!("/opt/qemu-vmlab/bin/qemu-system-x86_64\0-name\0vmlab:mylab/web\0{qmp}")
+                    .as_bytes()
+            )
+        );
         // A different lab must not match.
         assert!(!LabIdentity::new("other", None).started(cmd));
         // Prefix collision: `my` must not match `mylab`'s VMs.
@@ -879,25 +953,39 @@ mod tests {
         // No marker at all.
         assert!(!lab.started(b"sleep\x0030\x00"));
         // The marker outside `-name` is not ours.
-        assert!(!lab.started(b"qemu-system-x86_64\0-name\0other\0-L\0vmlab:mylab/web\0"));
+        assert!(!lab.started(
+            format!("qemu-system-x86_64\0-name\0other\0-L\0vmlab:mylab/web\0{qmp}").as_bytes()
+        ));
+        // The marker without a QMP socket under the runtime directory (F5).
+        assert!(!lab.started(b"qemu-system-x86_64\0-name\0vmlab:mylab/web\0-machine\0q35\0"));
         assert!(!lab.started(b""));
     }
 
     /// A host GPU's `qemu_binary` may have any name: its QEMU is known by
-    /// `-name vmlab:<lab>/…` as the first option plus a `-machine`.
+    /// `-name vmlab:<lab>/…` as the first option plus a `-machine` and the
+    /// lab's QMP socket.
     #[test]
     fn a_renamed_qemu_binary_is_matched_by_its_argv_form() {
         let lab = LabIdentity::new("mylab", None);
-        let gpu_qemu = b"/opt/gpu/bin/qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0";
+        let qmp = qmp_arg("mylab");
+        let gpu_qemu =
+            format!("/opt/gpu/bin/qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}");
+        let gpu_qemu = gpu_qemu.as_bytes();
         assert!(lab.started(gpu_qemu));
         assert!(!LabIdentity::new("other", None).started(gpu_qemu));
         assert!(!LabIdentity::new("my", None).started(gpu_qemu));
         // No `-machine`: not our QEMU.
-        assert!(!lab.started(b"qemu-nv\0-name\0vmlab:mylab/web\0"));
+        assert!(!lab.started(format!("qemu-nv\0-name\0vmlab:mylab/web\0{qmp}").as_bytes()));
         // `-name` not first: not our argv.
-        assert!(!lab.started(b"tool\0-v\0-name\0vmlab:mylab/web\0-machine\0q35\0"));
+        assert!(
+            !lab.started(
+                format!("tool\0-v\0-name\0vmlab:mylab/web\0-machine\0q35\0{qmp}").as_bytes()
+            )
+        );
         // The marker as a free argument, not `-name`'s value.
-        assert!(!lab.started(b"tool\0vmlab:mylab/web\0-machine\0q35\0"));
+        assert!(!lab.started(format!("tool\0vmlab:mylab/web\0-machine\0q35\0{qmp}").as_bytes()));
+        // No QMP socket under the lab's runtime directory (F5).
+        assert!(!lab.started(b"qemu-nv\0-name\0vmlab:mylab/web\0-machine\0q35\0"));
     }
 
     /// The argvs vmlab composes for one lab's machines, with the lab's root.
@@ -907,7 +995,10 @@ mod tests {
         vec![
             (
                 "qemu",
-                format!("qemu-system-x86_64\0-name\0vmlab:{lab}/web\0-machine\0q35\0"),
+                format!(
+                    "qemu-system-x86_64\0-name\0vmlab:{lab}/web\0-machine\0q35\0{}",
+                    qmp_arg(lab)
+                ),
             ),
             (
                 "vmlab-hv",
@@ -1038,6 +1129,37 @@ mod tests {
         let picked = lab_orphans(&table, &LabIdentity::new("mylab", Some(root)));
         assert_eq!(picked, vec![100, 101, 102, 103, 104]);
         assert!(lab_orphans(&table, &LabIdentity::new("some-other-lab", None)).is_empty());
+    }
+
+    /// F5: the lab name is unique only inside one environment. A QEMU of a
+    /// lab of the same name in another vmlab environment (another
+    /// `XDG_RUNTIME_DIR`) has its QMP and serial sockets under that
+    /// environment's runtime directory, and is not this lab's orphan.
+    #[test]
+    fn a_qemu_of_another_runtime_directory_is_not_an_orphan() {
+        let other =
+            crate::paths::lab_runtime_dir_in(Path::new("/run/user/elsewhere/vmlab"), "demo");
+        let other = other.display();
+        let table = vec![
+            (
+                400,
+                format!(
+                    "qemu-system-x86_64\0-name\0vmlab:demo/a\0-machine\0q35\0\
+                     -qmp\0unix:{other}/vms/a/qmp.sock,server=on,wait=off\0\
+                     -chardev\0socket,id=vagent0,path={other}/vms/a/agent.sock,server=on,wait=off\0"
+                )
+                .into_bytes(),
+            ),
+            (
+                401,
+                format!(
+                    "/opt/gpu/bin/qemu-nv\0-name\0vmlab:demo/a\0-machine\0q35\0\
+                     -qmp\0unix:{other}/vms/a/qmp.sock,server=on,wait=off\0"
+                )
+                .into_bytes(),
+            ),
+        ];
+        assert!(lab_orphans(&table, &LabIdentity::new("demo", None)).is_empty());
     }
 
     /// `lab move` only refuses, so it still counts a process that mentions

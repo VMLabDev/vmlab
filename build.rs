@@ -56,6 +56,29 @@ fn main() {
         .unwrap_or_else(|e| panic!("running the C compiler for {SOURCE}: {e}"));
     assert!(status.success(), "compiling {SOURCE} failed: {status}");
 
+    // The same file as a program that runs the layer's memory rule on types
+    // given as arguments: what `vk_layer.rs` tests the rule through, with no
+    // GPU and no Vulkan loader. Never embedded or installed.
+    let mut cmd: Command = compiler.to_command();
+    cmd.args([
+        "-std=c11",
+        "-DVMLAB_VK_RULE_CHECK",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-o",
+    ])
+    .arg(out.join("vk-rule-check"))
+    .arg(SOURCE)
+    .arg("-lpthread");
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("running the C compiler for {SOURCE}: {e}"));
+    assert!(
+        status.success(),
+        "compiling {SOURCE} as the rule check failed: {status}"
+    );
+
     let mut cmd: Command = compiler.to_command();
     cmd.args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-s", "-o"])
         .arg(out.join("vmlab-gpu-keepawake"))

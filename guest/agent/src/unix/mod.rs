@@ -1468,6 +1468,44 @@ mod tests {
         );
     }
 
+    /// Guest-agent review F13: `realpath` in a container answers the path
+    /// the container knows the file by, not the micro-VM's path with the
+    /// rootfs in front. The answer is good for a later request as it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn realpath_in_a_container_answers_a_container_path() {
+        use crate::mux::Platform as _;
+        use crate::testutil::{ask, capture_mux};
+        use vmlab_agent_proto::AgentMsg;
+        use vmlab_agent_proto::fileops::{Op, Reply};
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::fs::create_dir_all(rootfs.join("srv")).unwrap();
+        std::fs::write(rootfs.join("etc/sentinel"), "inner").unwrap();
+        std::os::unix::fs::symlink("/etc/sentinel", rootfs.join("srv/link")).unwrap();
+        let p = container_platform(test_ctx(rootfs.to_str().unwrap(), vec![]));
+        let (mux, mut cap) = capture_mux();
+        crate::fileops::open(&mux, p.spawner(), &Identity::Agent, 9, p.path_resolver());
+        assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 9 });
+
+        let mut realpath = |id: u64, path: &str| {
+            ask(&mux, 9, id, Op::Realpath { path: path.into() });
+            match cap.fileops(9).0.reply {
+                Reply::Name { path } => path,
+                other => panic!("expected a name, got {other:?}"),
+            }
+        };
+        assert_eq!(realpath(1, "/srv/link"), "/etc/sentinel");
+        assert_eq!(realpath(2, "/srv/../etc/./sentinel"), "/etc/sentinel");
+        // A file about to be created, and the root itself.
+        assert_eq!(realpath(3, "/srv/new.txt"), "/srv/new.txt");
+        assert_eq!(realpath(4, "/../.."), "/");
+        // The answer names the same file when it is sent back.
+        let again = realpath(5, "/srv/link");
+        assert_eq!(realpath(6, &again), "/etc/sentinel");
+    }
+
     /// A container's shared-app session lives inside its root filesystem,
     /// where the program can reach it, and the program is told the path as
     /// it sees it from in there (PRD §20.3).

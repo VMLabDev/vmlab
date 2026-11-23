@@ -81,15 +81,34 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
     let mut creations: Vec<Action> = Vec::new();
 
     let paths: BTreeSet<&String> = inputs.host.keys().chain(inputs.guest.keys()).collect();
+    let mut refused = BTreeSet::new();
     for path in paths {
-        // A path neither side could be read for is left strictly alone, here
-        // as everywhere: *"nothing is there"* and *"I could not look"* produce
-        // opposite actions, and only one of them is recoverable.
-        if inputs.undecided.contains(path) || colliding.contains(path.as_str()) {
+        // Leave skipped paths and their descendants alone. Parents sort before
+        // descendants, so an oversize refusal also protects any guest subtree
+        // that would have been replaced by that file.
+        if inputs.undecided.contains(path)
+            || colliding.contains(path.as_str())
+            || path.match_indices('/').any(|(end, _)| {
+                inputs.undecided.contains(&path[..end]) || refused.contains(&path[..end])
+            })
+        {
             continue;
         }
         let host = inputs.host.get(path);
         let guest = inputs.guest.get(path);
+        // Apply requires a verified digest to remove or overwrite a guest
+        // file. An oversize guest file was deliberately left unhashed.
+        if let Some(guest) = guest.filter(|guest| guest.oversize)
+            && !host.is_some_and(|host| host.oversize)
+        {
+            plan.oversize.push(Oversize {
+                path: path.clone(),
+                direction: Direction::ToHost,
+                size: guest.size,
+                cap: inputs.max_file_bytes,
+            });
+            continue;
+        }
         match (host, guest) {
             // Host truth does not hold it, so the guest must not either: this
             // is the guest-side work the snapshot captured and the restore is
@@ -114,23 +133,28 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
                     ));
                     continue;
                 }
-                // Neither side can rename a file over a directory, so what is
-                // in the way goes first.
-                if let Some(guest) = guest
-                    && guest.kind != host.kind
-                {
-                    removals.push(Action::Remove {
-                        direction: Direction::ToGuest,
-                        path: path.clone(),
-                        kind: guest.kind,
-                    });
-                }
                 // `None` for the agreement: there is nothing agreed to fall
                 // back on, which is the point — the digest carried here is the
                 // one the host scan just computed.
                 match place(Direction::ToGuest, path, host, inputs, None) {
-                    Ok(action) => creations.push(action),
-                    Err(refusal) => plan.oversize.push(refusal),
+                    Ok(action) => {
+                        // A replacement of a different kind needs the old
+                        // entry removed first.
+                        if let Some(guest) = guest
+                            && guest.kind != host.kind
+                        {
+                            removals.push(Action::Remove {
+                                direction: Direction::ToGuest,
+                                path: path.clone(),
+                                kind: guest.kind,
+                            });
+                        }
+                        creations.push(action);
+                    }
+                    Err(refusal) => {
+                        refused.insert(path.as_str());
+                        plan.oversize.push(refusal);
+                    }
                 }
             }
             (None, None) => unreachable!("a path came from one of the two trees"),
@@ -185,19 +209,20 @@ pub struct Reconverged {
     pub oversize: Vec<Oversize>,
     /// Host paths a case-folding guest cannot hold apart.
     pub collisions: Vec<Collision>,
-    /// Paths neither side could be read for.
+    /// Paths the scan or probe declined to process.
     pub skipped: Vec<Skip>,
+    /// Rule files whose rules were refused (a symlink). Reported, and no part
+    /// of [`complete`](Reconverged::complete): the path itself converges.
+    pub refused_rules: Vec<Skip>,
     /// Paths that did not land and must retry under the host-only policy.
     pub failures: Vec<Failure>,
 }
 
 impl Reconverged {
-    /// Every in-scope path converged without a refusal or an unreadable path.
+    /// Skips and size refusals are warnings. Collisions and failed actions
+    /// keep the re-seed barrier in place.
     pub fn complete(&self) -> bool {
-        self.oversize.is_empty()
-            && self.collisions.is_empty()
-            && self.skipped.is_empty()
-            && self.failures.is_empty()
+        self.collisions.is_empty() && self.failures.is_empty()
     }
 
     /// The one line the event feed and `dev sync status` both carry.
@@ -206,7 +231,7 @@ impl Reconverged {
             return format!(
                 "\"{machine}\"'s workspace re-convergence is incomplete after a snapshot restore: \
                  {} placed, {} removed, {} already matched. The host-only re-seed remains owed \
-                 until failed, skipped, colliding, and oversize paths converge.",
+                 until failed and colliding paths converge.",
                 self.placed, self.removed, self.adopted,
             );
         }
@@ -281,6 +306,7 @@ pub async fn reconverge(
         resolved: &empty_resolutions,
         max_file_bytes: cap,
         case_folding,
+        unwitnessed: false,
     });
     debug_assert!(
         !plan
@@ -313,7 +339,8 @@ pub async fn reconverge(
         adopted: applied.adopted,
         oversize: plan.oversize,
         collisions: plan.collisions,
-        skipped,
+        skipped: skipped.into_iter().chain(scan.unrepresentable).collect(),
+        refused_rules: scan.refused_rules,
         failures: applied
             .failures
             .into_iter()
@@ -435,56 +462,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reseed_refusals_keep_the_durable_barrier() {
-        for refusal in ["skipped", "collision", "oversize"] {
-            let host = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
-            let guest = FakeGuest::new();
-            guest.dir("/src");
-            std::fs::write(host.path().join("file.rs"), "host truth").unwrap();
-            guest.file("/src/file.rs", "restored content", 10);
-            match refusal {
-                "skipped" => guest.unreadable("/src/file.rs"),
-                "collision" => {
-                    std::fs::write(host.path().join("FILE.rs"), "other host file").unwrap();
-                }
-                "oversize" => {}
-                _ => unreachable!(),
-            }
-            let workspace = Workspace {
-                machine: "dev01".into(),
-                host_root: host.path().to_path_buf(),
-                guest_root: "/src".into(),
-                ledger_path: state.path().join("ledger.json"),
-                max_file_bytes: if refusal == "oversize" { 1 } else { NO_CAP },
-                preconditions: Preconditions::default(),
-            };
-            let mut ledger = Ledger::new(host.path(), "/src");
-            ledger.reseed_owed = true;
-            let done = reconverge(
-                &guest,
-                &workspace,
-                false,
-                refusal == "collision",
-                &mut ledger,
-            )
+    async fn a_reseed_collision_keeps_the_durable_barrier() {
+        let host = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let guest = FakeGuest::new();
+        guest.dir("/src");
+        std::fs::write(host.path().join("file.rs"), "host truth").unwrap();
+        std::fs::write(host.path().join("FILE.rs"), "other host file").unwrap();
+        guest.file("/src/file.rs", "restored content", 10);
+        let workspace = Workspace {
+            machine: "dev01".into(),
+            host_root: host.path().to_path_buf(),
+            guest_root: "/src".into(),
+            ledger_path: state.path().join("ledger.json"),
+            max_file_bytes: NO_CAP,
+            preconditions: Preconditions::default(),
+        };
+        let mut ledger = Ledger::new(host.path(), "/src");
+        ledger.reseed_owed = true;
+        let done = reconverge(&guest, &workspace, false, true, &mut ledger)
             .await
             .unwrap();
-            match refusal {
-                "skipped" => assert!(!done.skipped.is_empty()),
-                "collision" => assert!(!done.collisions.is_empty()),
-                "oversize" => assert!(!done.oversize.is_empty()),
-                _ => unreachable!(),
-            }
-            assert!(ledger.reseed_owed, "{refusal} released the reseed barrier");
-            assert!(!done.complete());
-            ledger.save(&workspace.ledger_path).unwrap();
-            assert!(Ledger::load(&workspace.ledger_path, host.path(), "/src").reseed_owed);
-            assert_eq!(
-                std::fs::read_to_string(host.path().join("file.rs")).unwrap(),
-                "host truth"
-            );
-        }
+        assert!(!done.collisions.is_empty());
+        assert!(!done.complete());
+        ledger.save(&workspace.ledger_path).unwrap();
+        assert!(Ledger::load(&workspace.ledger_path, host.path(), "/src").reseed_owed);
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("file.rs")).unwrap(),
+            "host truth"
+        );
     }
 
     fn digest(body: &str) -> String {
@@ -551,6 +557,7 @@ mod tests {
                 resolved: &self.resolved,
                 max_file_bytes: NO_CAP,
                 case_folding: false,
+                unwitnessed: false,
             })
         }
     }
@@ -677,6 +684,7 @@ mod tests {
             resolved: &sides.resolved,
             max_file_bytes: 16,
             case_folding: false,
+            unwitnessed: false,
         });
         assert!(plan.adopt.is_empty(), "never hashed, so never agreed");
         assert!(plan.actions.is_empty(), "refused before transfer");

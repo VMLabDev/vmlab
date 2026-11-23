@@ -226,7 +226,12 @@ a local cert or `appsettings.Development.json` that the app needs guest-side
 takes a negation. Precedence is git's own, deepest file first, `.vmlabignore`
 beating `.gitignore` in one directory, and a path under an ignored directory
 staying ignored. The floor covers the syncer's own scratch names and
-`.git/**/*.lock`, and no repo rule may override it.
+`.git/**/*.lock`, and no repo rule may override it. A `.gitignore` or
+`.vmlabignore` that is a symlink is never read as rules, wherever it points:
+the link syncs as a link, its rules do not apply, and `vmlab dev sync status`
+names it among the skipped paths. Make it a regular file to have its rules
+apply. A directory with one of those names is named the same way: it syncs as
+a directory and holds no rules.
 DOC
 
   p <<'DOC'
@@ -388,6 +393,17 @@ than half of what the ledger had agreed on. A fixed count would punish large
 repos and a bare proportion would let a ten-file project lose everything. A
 single deletion still propagates immediately. `--guest` on the halt is what
 releases the withheld removals.
+DOC
+
+  p <<'DOC'
+**A file the guest lost is not a file the guest deleted.** When a machine stops
+part way through a pass, or is stopped hard, the guest can come back without a
+file it had already taken. The first pass after the machine or its watch comes
+back therefore never deletes a host file only because the guest lacks it. A
+path whose copy had not been seen in the guest since an earlier restart is
+copied again. Any other is held as a halt on that path, for one path as much
+as for many: `--host` copies it back into the guest, and `--guest` deletes it
+on the host if the deletion was intended.
 DOC
 
   p <<'DOC'

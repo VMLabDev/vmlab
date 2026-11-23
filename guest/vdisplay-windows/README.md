@@ -55,9 +55,10 @@ guest bundle. Set `VMLAB_VDISPLAY_PACKAGE_DIR` to use another signed package.
 Source-derived INF versions prevent Windows from reusing an older Driver Store
 copy when testing a rebuilt DLL.
 
-Release CI uses the same split. Its `vdisplay-build` job compiles on Ubuntu,
-`vdisplay-sign` catalogs and signs on Windows, and `guest-assets` downloads the
-signed package before building the bundle. Those jobs run only for a release.
+A release build uses the same split. GitHub builds no version any more:
+`just release::local --display rebuild` runs `rebuild.py --route container` on
+the build host before it builds the bundle, and the default `--display staged`
+takes the package that is staged already (`docs/agents/release-gate.md`).
 
 ## Install on an opted-in guest
 

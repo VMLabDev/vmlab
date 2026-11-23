@@ -7,7 +7,7 @@
 //! enforcement.
 
 use crate::sync::LockRecover;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -96,8 +96,9 @@ pub struct SwitchStats {
     /// Ingress frames flooded (unknown unicast, broadcast, multicast) that
     /// reached at least one port.
     pub frames_flooded: u64,
-    /// Frames that died: hook drops, isolation drops, runts, full or closed
-    /// egress queues, and floods that reached nobody.
+    /// Frames that died: hook drops, isolation drops, runts, guest frames
+    /// from a service port's MAC, full or closed egress queues, and floods
+    /// that reached nobody.
     pub frames_dropped: u64,
     /// Frames forwarded in-kernel by the fast path (already included in
     /// `frames_forwarded`); 0 on a pure-userspace switch.
@@ -108,6 +109,26 @@ struct PortEntry {
     class: PortClass,
     tx: PortTx,
     config: PortConfig,
+    /// The MACs learned on this port, oldest first, at most the port's
+    /// limit ([`mac_limit`]). A MAC that moved to another port stays here
+    /// until it is the oldest.
+    learned: VecDeque<MacAddr>,
+}
+
+/// How many source MACs the switch remembers on one guest port (review F6).
+/// A guest writes the source MAC of its frames, so past this a new one
+/// replaces the oldest learned on that port. A frame for a MAC the switch
+/// no longer remembers is flooded, as for any unknown destination.
+const MAX_MACS_PER_GUEST_PORT: usize = 256;
+/// The same for a service port. A trunk is one: it carries every MAC of the
+/// segment's far side.
+const MAX_MACS_PER_SERVICE_PORT: usize = 4096;
+
+fn mac_limit(class: &PortClass) -> usize {
+    match class {
+        PortClass::Guest { .. } => MAX_MACS_PER_GUEST_PORT,
+        PortClass::Service => MAX_MACS_PER_SERVICE_PORT,
+    }
 }
 
 enum PortTx {
@@ -214,9 +235,26 @@ impl Switch {
     /// Attach a QEMU stream-socket connection as a port. Spawns a reader
     /// task (deframe → ingress) and a writer task (egress queue → frame).
     /// The port is removed automatically on EOF or stream error.
+    #[cfg(test)]
     pub async fn add_stream_port(self: &Arc<Self>, stream: UnixStream, class: PortClass) -> PortId {
         self.add_stream_port_with_config(stream, class, PortConfig::default())
             .await
+    }
+
+    /// [`add_stream_port`](Self::add_stream_port), and a receiver that
+    /// completes once the peer closes the stream (or reading it fails) and
+    /// the port is gone: how a lab daemon learns that the supervisor behind
+    /// a global segment's trunk went away.
+    pub async fn add_stream_port_watched(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        class: PortClass,
+    ) -> (PortId, tokio::sync::oneshot::Receiver<()>) {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let id = self
+            .add_stream_port_inner(stream, class, PortConfig::default(), Some(closed_tx))
+            .await;
+        (id, closed_rx)
     }
 
     pub async fn add_stream_port_with_config(
@@ -224,6 +262,17 @@ impl Switch {
         stream: UnixStream,
         class: PortClass,
         config: PortConfig,
+    ) -> PortId {
+        self.add_stream_port_inner(stream, class, config, None)
+            .await
+    }
+
+    async fn add_stream_port_inner(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        class: PortClass,
+        config: PortConfig,
+        closed: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> PortId {
         let id = self.alloc_port(class);
         let mut rx = self.attach(id, class, config);
@@ -296,6 +345,9 @@ impl Switch {
                 }
             }
             switch.remove_port(id);
+            if let Some(closed) = closed {
+                let _ = closed.send(());
+            }
         });
 
         id
@@ -322,6 +374,7 @@ impl Switch {
                     framing: FramingMode::Raw,
                     mtu,
                 },
+                learned: VecDeque::new(),
             },
         );
 
@@ -337,6 +390,23 @@ impl Switch {
             id,
             tx: ingress_tx,
             rx: egress_rx,
+        }
+    }
+
+    /// Put `mac` on the service port `port` before that port has sent a
+    /// frame, so that no guest can claim it first (review F9). The gateway
+    /// binds its own MAC this way. Does nothing for a port that is gone or
+    /// is a guest's.
+    pub fn bind_mac(&self, port: PortId, mac: MacAddr) {
+        let mut inner = self.inner.lock_recover();
+        if !matches!(inner.ports.get(&port), Some(p) if p.class == PortClass::Service) {
+            return;
+        }
+        let prev = inner.macs.insert(mac, port);
+        if prev != Some(port)
+            && let Some(off) = &self.offload
+        {
+            off.relearn(mac, port);
         }
     }
 
@@ -427,6 +497,7 @@ impl Switch {
                 class,
                 tx: PortTx::Packets(tx),
                 config,
+                learned: VecDeque::new(),
             },
         );
         rx
@@ -535,16 +606,50 @@ impl Switch {
 
         let inner = &mut *self.inner.lock_recover();
 
+        // A MAC a service port holds (the gateway's, bound when it attached,
+        // or one learned behind a trunk) is not a guest's to send from: the
+        // frame is dropped and the MAC stays where it is (review F9). A
+        // guest that could move it would receive, or black-hole, every other
+        // guest's traffic to the gateway.
+        if matches!(ingress_class, PortClass::Guest { .. })
+            && !is_multicast(&src)
+            && let Some(holder) = inner.macs.get(&src)
+            && *holder != port
+            && matches!(inner.ports.get(holder), Some(p) if p.class == PortClass::Service)
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(switch = %self.name, %port, mac = %src, "guest frame from a service port's MAC dropped");
+            return;
+        }
+
         // Learn the source MAC; relearning moves it (VM migrated ports).
         // Binding changes mirror into the kernel fast path: toward the MAC's
         // new port when that port is offloaded, otherwise deleting any stale
         // kernel entry (BPF map updates are ~1µs non-blocking syscalls;
         // deferring them would open learn/unlearn ordering races).
-        if !is_multicast(&src) {
-            let prev = inner.macs.insert(src, port);
-            if prev != Some(port)
-                && let Some(off) = &self.offload
-            {
+        // A port holds a limited number of MACs: past it the oldest one
+        // learned on the port is forgotten, here and in the kernel. A frame
+        // from a port that is gone teaches nothing.
+        if !is_multicast(&src)
+            && inner.macs.get(&src) != Some(&port)
+            && let Some(entry) = inner.ports.get_mut(&port)
+        {
+            let limit = mac_limit(&entry.class);
+            while entry.learned.len() >= limit {
+                let Some(oldest) = entry.learned.pop_front() else {
+                    break;
+                };
+                // Not a MAC that has moved to another port since.
+                if inner.macs.get(&oldest) == Some(&port) {
+                    inner.macs.remove(&oldest);
+                    if let Some(off) = &self.offload {
+                        off.forget(oldest);
+                    }
+                }
+            }
+            entry.learned.push_back(src);
+            inner.macs.insert(src, port);
+            if let Some(off) = &self.offload {
                 off.relearn(src, port);
             }
         }
@@ -1197,5 +1302,138 @@ mod tests {
         )
         .await;
         assert_no_frame(&mut raw.rx).await;
+    }
+
+    /// Review F6: a guest that sends from 100 000 source MACs leaves no more
+    /// than its port's limit in the table, the newest of them is the one
+    /// kept, and what another port taught the switch stays.
+    #[tokio::test]
+    async fn the_mac_table_is_bounded() {
+        fn forged(i: u32) -> MacAddr {
+            let b = i.to_be_bytes();
+            MacAddr([0x02, 0x10, b[0], b[1], b[2], b[3]])
+        }
+
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        sw.ingress(b.id, frame(MAC_BROADCAST, mac(1), b"b is here"));
+
+        const FRAMES: u32 = 100_000;
+        for i in 0..FRAMES {
+            sw.ingress(a.id, frame(MAC_BROADCAST, forged(i), b"x"));
+        }
+        {
+            let inner = sw.inner.lock_recover();
+            assert!(
+                inner.macs.len() <= MAX_MACS_PER_GUEST_PORT + 1,
+                "the table holds {} MACs, over the limit of one guest port ({MAX_MACS_PER_GUEST_PORT}) and the one of port b",
+                inner.macs.len()
+            );
+            assert_eq!(inner.macs.get(&mac(1)), Some(&b.id), "port b's MAC stays");
+            assert_eq!(
+                inner.macs.get(&forged(FRAMES - 1)),
+                Some(&a.id),
+                "the newest MAC is known"
+            );
+            assert_eq!(inner.macs.get(&forged(0)), None, "the oldest was dropped");
+        }
+
+        // Removing the port still purges everything learned on it.
+        sw.remove_port(a.id);
+        assert_eq!(sw.inner.lock_recover().macs.len(), 1);
+    }
+
+    /// A MAC that moved to another port is not dropped when the port it
+    /// left reaches its limit.
+    #[tokio::test]
+    async fn a_moved_mac_outlives_the_limit_of_the_port_it_left() {
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        sw.ingress(a.id, frame(MAC_BROADCAST, mac(7), b"on a"));
+        sw.ingress(b.id, frame(MAC_BROADCAST, mac(7), b"moved to b"));
+        for i in 0..=MAX_MACS_PER_GUEST_PORT as u32 {
+            let n = i.to_be_bytes();
+            let src = MacAddr([0x02, 0x10, n[0], n[1], n[2], n[3]]);
+            sw.ingress(a.id, frame(MAC_BROADCAST, src, b"x"));
+        }
+        assert_eq!(sw.inner.lock_recover().macs.get(&mac(7)), Some(&b.id));
+    }
+
+    /// Review F9: a guest that sends from the gateway's MAC must not become
+    /// where the segment delivers the gateway's frames.
+    #[tokio::test]
+    async fn a_guest_cannot_take_the_gateway_mac() {
+        let sw = Switch::new("seg0".into());
+        let mut svc = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+
+        // The service port speaks from G, so the switch knows where G is.
+        let hello = frame(MAC_BROADCAST, gateway, b"from the gateway");
+        svc.tx.send(hello.clone()).await.unwrap();
+        assert_eq!(recv(&mut a.rx).await, hello);
+        assert_eq!(recv(&mut b.rx).await, hello);
+
+        // Guest A sends one frame with G as its source. Wait until the
+        // switch has dealt with it, whichever way.
+        a.tx.send(frame(mac(9), gateway, b"spoof")).await.unwrap();
+        wait_for(
+            || {
+                let s = sw.stats();
+                s.frames_flooded + s.frames_dropped >= 2
+            },
+            "the spoofed frame handled",
+        )
+        .await;
+        while b.rx.try_recv().is_ok() {}
+        while svc.rx.try_recv().is_ok() {}
+
+        // Guest B's frame to G still reaches the service port, not A.
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        assert_no_frame(&mut a.rx).await;
+        assert_eq!(recv(&mut svc.rx).await, to_gateway);
+    }
+
+    /// A MAC bound to a service port is that port's before it has sent a
+    /// frame, and stays a move between service ports away (a trunk that
+    /// reconnects).
+    #[tokio::test]
+    async fn a_bound_mac_is_held_before_its_port_speaks() {
+        let sw = Switch::new("seg0".into());
+        let mut svc = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+        sw.bind_mac(svc.id, gateway);
+
+        a.tx.send(frame(mac(9), gateway, b"spoof")).await.unwrap();
+        wait_for(
+            || sw.stats().frames_dropped == 1,
+            "the spoofed frame dropped",
+        )
+        .await;
+        assert_no_frame(&mut b.rx).await;
+        assert_no_frame(&mut svc.rx).await;
+
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        assert_eq!(recv(&mut svc.rx).await, to_gateway);
+        assert_no_frame(&mut a.rx).await;
+
+        // Another service port may take it: the MAC moved behind a trunk.
+        let mut trunk = sw.add_channel_port(PortClass::Service);
+        trunk
+            .tx
+            .send(frame(MAC_BROADCAST, gateway, b"moved"))
+            .await
+            .unwrap();
+        recv(&mut b.rx).await;
+        let again = frame(gateway, mac(2), b"to the gateway again");
+        b.tx.send(again.clone()).await.unwrap();
+        assert_eq!(recv(&mut trunk.rx).await, again);
     }
 }

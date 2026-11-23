@@ -50,10 +50,10 @@ page cmd_validate {
 
   p <<DOC
     A valid lab can still earn warnings, printed to standard error before
-    the `ok:` line. One of them is the QEMU removal warning: a line for each
-    x86 machine that would run on QEMU, with the reason and the fix, a line
-    for its online QEMU snapshots, and a line for a host without usable KVM.
-    [Getting ready for the removal](guide_host) explains each reason.
+    the `ok:` line. An x86 machine that a setting puts on QEMU, or that
+    declares `qemu_args`, is an error, and so is an x86 machine on a host
+    without usable KVM: [QEMU runs no x86 guest](guide_host) lists each one
+    and its fix.
   DOC
 
   p <<DOC

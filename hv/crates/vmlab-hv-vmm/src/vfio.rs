@@ -138,7 +138,48 @@ struct Mapping {
     size: u64,
     host: usize,
     slot: u32,
-    base: Option<u64>,
+    // Each ioctl changes one address space, including on partial failure.
+    bases: [Option<u64>; 2],
+}
+
+impl Mapping {
+    fn register(
+        &mut self,
+        base: Option<u64>,
+        mut set_region: impl FnMut(kvm_userspace_memory_region) -> Result<(), kvm_ioctls::Error>,
+    ) -> Result<(), String> {
+        let mut result = Ok(());
+        for (address_space, current) in self.bases.iter_mut().enumerate() {
+            if *current == base {
+                continue;
+            }
+            let slot = ((address_space as u32) << 16) | self.slot;
+            if current.is_some() {
+                let region = kvm_userspace_memory_region {
+                    slot,
+                    ..Default::default()
+                };
+                if let Err(error) = set_region(region) {
+                    result = Err(format!("removing VFIO BAR KVM slot {slot:#x}: {error}"));
+                    continue;
+                }
+                *current = None;
+            }
+            if let Some(base) = base {
+                let region = kvm_userspace_memory_region {
+                    slot,
+                    guest_phys_addr: base + self.offset,
+                    memory_size: self.size,
+                    userspace_addr: self.host as u64,
+                    flags: 0,
+                };
+                set_region(region)
+                    .map_err(|error| format!("registering VFIO BAR KVM slot {slot:#x}: {error}"))?;
+                *current = Some(base);
+            }
+        }
+        result
+    }
 }
 
 struct Domain {
@@ -147,12 +188,67 @@ struct Domain {
     mapped: Mutex<bool>,
 }
 
+/// What the locked-memory limit allows for a guest that needs `need` bytes
+/// pinned: nothing to do, a soft limit to raise, or a refusal in plain words.
+/// The type1 IOMMU backend charges every pinned guest page to RLIMIT_MEMLOCK
+/// and answers ENOMEM past it, which names neither the limit nor the cure.
+fn memlock_plan(need: u64, soft: u64, hard: u64, privileged: bool) -> Result<Option<u64>, String> {
+    if privileged || soft >= need {
+        return Ok(None);
+    }
+    if hard >= need {
+        return Ok(Some(hard));
+    }
+    Err(format!(
+        "PCI passthrough pins all guest RAM ({} MiB), but this process may lock only {} MiB \
+         (RLIMIT_MEMLOCK). Raise the locked-memory limit of the account that runs vmlab to at \
+         least the guest RAM (`ulimit -l unlimited`, a `memlock` line in \
+         /etc/security/limits.conf, or LimitMEMLOCK=infinity on the service), then restart \
+         the vmlab daemons (`vmlab daemon stop`) and start the machine again",
+        need.div_ceil(1 << 20),
+        hard >> 20
+    ))
+}
+
+/// Apply [`memlock_plan`] to this process before the first DMA map.
+fn ensure_memlock(need: u64) -> Result<(), String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a valid rlimit for the kernel to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return Ok(());
+    }
+    // CAP_IPC_LOCK (bit 14) exempts the process from the limit.
+    let privileged = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find_map(|l| l.strip_prefix("CapEff:"))?;
+            u64::from_str_radix(line.trim(), 16).ok()
+        })
+        .is_some_and(|caps| caps & (1 << 14) != 0);
+    if let Some(soft) = memlock_plan(need, limit.rlim_cur, limit.rlim_max, privileged)? {
+        limit.rlim_cur = soft;
+        // SAFETY: limit is a valid rlimit; raising the soft limit to the hard
+        // limit needs no privilege.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) } != 0 {
+            return Err(format!(
+                "raising RLIMIT_MEMLOCK for PCI passthrough: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Domain {
     fn map(&self) -> Result<(), String> {
         let mut mapped = self.mapped.lock();
         if !*mapped {
-            // SAFETY: Domain retains RAM until every device has closed and DMA
-            // mappings have been removed in Drop.
+            use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+            ensure_memlock(self.memory.iter().map(|region| region.len()).sum())?;
+            // SAFETY: Domain retains RAM through DMA unmap in Drop.
             unsafe { self.container.vfio_map_guest_memory(&self.memory) }
                 .map_err(|e| format!("VFIO guest DMA map: {e}"))?;
             *mapped = true;
@@ -163,15 +259,21 @@ impl Domain {
 
 impl Drop for Domain {
     fn drop(&mut self) {
-        if *self.mapped.lock() {
-            let _ = self.container.vfio_unmap_guest_memory(&self.memory);
+        if *self.mapped.get_mut()
+            && let Err(error) = self.container.vfio_unmap_guest_memory(&self.memory)
+        {
+            log::error!("unmapping VFIO guest DMA: {error}");
         }
     }
 }
 
 pub(crate) struct Host {
-    device: VfioDevice,
+    /// Whether the kernel can reset this function ([`resets`]).
+    resets: bool,
+    // Drop the final Domain reference after Host::drop quiesces the devices,
+    // while this device fd still keeps the group's IOMMU backend attached.
     domain: Arc<Domain>,
+    device: VfioDevice,
     vm: Arc<VmFd>,
     slots: Arc<Mutex<BTreeSet<u32>>>,
     routes: Arc<Mutex<Routes>>,
@@ -187,22 +289,6 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    fn register_mapping(&self, mapping: &Mapping, base: Option<u64>) -> Result<(), String> {
-        for space in [0, 1 << 16] {
-            let region = kvm_userspace_memory_region {
-                slot: space | mapping.slot,
-                guest_phys_addr: base.map_or(0, |b| b + mapping.offset),
-                memory_size: base.map_or(0, |_| mapping.size),
-                userspace_addr: mapping.host as u64,
-                flags: 0,
-            };
-            // SAFETY: mapping remains alive until both KVM registrations are removed.
-            unsafe { self.vm.set_user_memory_region(region) }
-                .map_err(|e| format!("VFIO BAR KVM mapping: {e}"))?;
-        }
-        Ok(())
-    }
-
     fn stop_interrupts(&mut self) -> Result<(), String> {
         if self.mode != InterruptMode::Disabled {
             self.device
@@ -260,7 +346,30 @@ fn event_pending(
 
 impl Backend for Host {
     fn read(&self, region: u8, offset: u64, data: &mut [u8]) {
+        if u32::from(region) != VFIO_PCI_ROM_REGION_INDEX {
+            self.device.region_read(u32::from(region), data, offset);
+            return;
+        }
+        // The kernel maps the expansion ROM for each read and checks its
+        // 0xaa55 signature through the device. With memory decoding off, as
+        // it is before the guest enables it, the device answers all-ones and
+        // the read fails with ENOMEM. Decode memory for the length of the read.
+        let mut command = [0; 2];
+        self.device
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, &mut command, 4);
+        let decoding = command[0] & 2 != 0;
+        if !decoding {
+            self.device.region_write(
+                VFIO_PCI_CONFIG_REGION_INDEX,
+                &[command[0] | 2, command[1]],
+                4,
+            );
+        }
         self.device.region_read(u32::from(region), data, offset);
+        if !decoding {
+            self.device
+                .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &command, 4);
+        }
     }
     fn write(&self, region: u8, offset: u64, data: &[u8]) {
         self.device.region_write(u32::from(region), data, offset);
@@ -268,6 +377,9 @@ impl Backend for Host {
 
     fn reset(&mut self) -> Result<(), String> {
         self.stop_interrupts()?;
+        if !self.resets {
+            return Ok(());
+        }
         // VFIO_DEVICE_RESET is _IO(';', 100 + 11), without a pointer argument.
         // SAFETY: the owned fd is a VFIO device, exclusively assigned by its
         // explicit machine-description address. The kernel checks reset scope.
@@ -333,17 +445,16 @@ impl Backend for Host {
                         size: length,
                         host: host as usize,
                         slot,
-                        base: None,
+                        bases: [None; 2],
                     });
                 }
             }
             self.mapped_bars.insert(bar);
         }
-        for i in 0..self.mappings.len() {
-            if self.mappings[i].bar != bar || self.mappings[i].base == base {
+        for mapping in &mut self.mappings {
+            if mapping.bar != bar || mapping.bases == [base; 2] {
                 continue;
             }
-            let m = &self.mappings[i];
             if let Some(base) = base {
                 let end = base
                     .checked_add(self.device.get_region_size(u32::from(bar)))
@@ -360,12 +471,10 @@ impl Backend for Host {
                     return Err("VFIO BAR overlaps RAM or platform MMIO".into());
                 }
             }
-            self.register_mapping(m, None)?;
-            if let Err(error) = self.register_mapping(m, base) {
-                let _ = self.register_mapping(m, None);
-                return Err(error);
-            }
-            self.mappings[i].base = base;
+            // SAFETY: the BAR mmap is live until all slots are removed.
+            mapping.register(base, |region| unsafe {
+                self.vm.set_user_memory_region(region)
+            })?;
         }
         Ok(())
     }
@@ -471,17 +580,68 @@ impl Drop for Host {
             .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &[0, 0], 4);
         let _ = self.stop_interrupts();
         self.device.reset();
-        for mapping in &self.mappings {
-            if self.register_mapping(mapping, None).is_ok() {
-                // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
-                unsafe {
-                    libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize);
-                }
-                self.slots.lock().remove(&mapping.slot);
+        for mapping in &mut self.mappings {
+            // SAFETY: this only removes slots still backed by the live BAR mmap.
+            if let Err(error) = mapping.register(None, |region| unsafe {
+                self.vm.set_user_memory_region(region)
+            }) {
+                log::error!("{error}");
+                continue;
             }
+            // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
+            if unsafe { libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize) }
+                != 0
+            {
+                log::error!("unmapping VFIO BAR: {}", std::io::Error::last_os_error());
+            }
+            self.slots.lock().remove(&mapping.slot);
         }
-        // Domain outlives all device fds and removes DMA mappings before RAM drops.
+        // VfioDevice can close its fd and detach the group after the BAR
+        // mmaps have released their references to the device file.
     }
+}
+
+/// Whether the kernel can reset this function by itself
+/// (`VFIO_DEVICE_FLAGS_RESET`). The audio function of a graphics card often
+/// cannot: it has no function-level reset and shares its bus with the GPU,
+/// and `VFIO_DEVICE_RESET` then fails with EINVAL. Such a function is
+/// assigned without a reset, as QEMU assigns it.
+fn resets(device: &VfioDevice) -> bool {
+    let mut info = vfio_device_info {
+        argsz: std::mem::size_of::<vfio_device_info>() as u32,
+        ..Default::default()
+    };
+    // VFIO_DEVICE_GET_INFO is _IO(';', 100 + 7); the kernel fills `info` up
+    // to its `argsz`.
+    // SAFETY: the fd is an open VFIO device and `info` is a valid, correctly
+    // sized vfio_device_info for the length of the call.
+    let result = unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            (u64::from(VFIO_TYPE) << 8 | u64::from(VFIO_BASE + 7)) as libc::c_ulong,
+            &mut info,
+        )
+    };
+    reset_supported(result, info.flags)
+}
+
+/// [`resets`] over the ioctl's answer. A failed query keeps the reset, so
+/// the failure that matters is the reset's own and names itself.
+fn reset_supported(result: libc::c_int, flags: u32) -> bool {
+    result < 0 || flags & VFIO_DEVICE_FLAGS_RESET != 0
+}
+
+/// Length of the 64-bit PCI window PCI0._CRS must declare for these assigned
+/// BARs. Firmware packs 64-bit BARs largest first from the window base, so
+/// the assigned ones can push every other device's past the default 32 GiB:
+/// a 32 GiB BAR alone fills it. A guest OS that finds a BAR outside the
+/// window treats the firmware's placement as a conflict.
+pub(crate) fn pci64_window(bars: impl Iterator<Item = BarInfo>) -> u64 {
+    let assigned: u64 = bars
+        .filter(|bar| matches!(bar.kind, BarKind::Mmio64 { .. }))
+        .map(|bar| bar.size)
+        .sum();
+    vmlab_hv_firmware::acpi::PCI64_SIZE + assigned.div_ceil(1 << 30) * (1 << 30)
 }
 
 pub(crate) fn build(
@@ -566,7 +726,16 @@ pub(crate) fn build(
             });
         }
         let pin = config[0x3d];
+        let resets = resets(&device);
+        if !resets {
+            log::info!(
+                "VFIO {}: the kernel has no reset for this function, so it keeps its state \
+                 across a guest reset",
+                description.host
+            );
+        }
         let host = Host {
+            resets,
             device,
             domain: domain.clone(),
             vm: kvm.vm.clone(),
@@ -594,6 +763,39 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_cleanup_retries_only_the_slot_that_remains_registered() {
+        let mut mapping = Mapping {
+            bar: 0,
+            offset: 0,
+            size: 4096,
+            host: 0,
+            slot: 64,
+            bases: [Some(1 << 32); 2],
+        };
+        let smm_slot = (1 << 16) | 64;
+        let mut removed = Vec::new();
+        let result = mapping.register(None, |region| {
+            assert_eq!(region.memory_size, 0);
+            if region.slot == smm_slot {
+                return Err(kvm_ioctls::Error::new(libc::ENOMEM));
+            }
+            removed.push(region.slot);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(mapping.bases, [None, Some(1 << 32)]);
+        mapping
+            .register(None, |region| {
+                assert_eq!(region.memory_size, 0);
+                removed.push(region.slot);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(removed, [64, smm_slot]);
+        assert_eq!(mapping.bases, [None; 2]);
+    }
 
     #[test]
     fn intx_or_msi_events_never_set_msix_pending_bits() {
@@ -694,6 +896,50 @@ mod tests {
         assert_eq!(*maps.lock().last().unwrap(), Some(2 << 32));
         root.config_write(0, 6, 0, 4, &0u16.to_le_bytes());
         assert_eq!(*maps.lock().last().unwrap(), None);
+    }
+
+    #[test]
+    fn a_short_locked_memory_limit_is_raised_or_refused_in_plain_words() {
+        let gib = 1u64 << 30;
+        assert_eq!(memlock_plan(16 * gib, u64::MAX, u64::MAX, false), Ok(None));
+        assert_eq!(memlock_plan(16 * gib, 16 * gib, 16 * gib, false), Ok(None));
+        assert_eq!(memlock_plan(16 * gib, 8 << 20, 8 << 20, true), Ok(None));
+        assert_eq!(
+            memlock_plan(16 * gib, 8 << 20, u64::MAX, false),
+            Ok(Some(u64::MAX))
+        );
+        let error = memlock_plan(16 * gib, 8 << 20, 8 << 20, false).unwrap_err();
+        assert!(error.contains("16384 MiB"), "{error}");
+        assert!(error.contains("only 8 MiB"), "{error}");
+        assert!(error.contains("RLIMIT_MEMLOCK"), "{error}");
+        assert!(error.contains("ulimit -l unlimited"), "{error}");
+    }
+
+    #[test]
+    fn a_function_the_kernel_cannot_reset_is_assigned_without_one() {
+        assert!(reset_supported(
+            0,
+            VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI
+        ));
+        assert!(!reset_supported(0, VFIO_DEVICE_FLAGS_PCI));
+        assert!(reset_supported(-1, 0));
+    }
+
+    #[test]
+    fn the_64_bit_pci_window_grows_by_the_assigned_64_bit_bars() {
+        let bar = |index, size, kind| BarInfo { index, size, kind };
+        let wide = BarKind::Mmio64 { prefetchable: true };
+        assert_eq!(pci64_window(std::iter::empty()), 32 << 30);
+        // An RTX 5090: 64 MiB of registers, 32 GiB and 32 MiB prefetchable,
+        // an I/O BAR and the ROM.
+        let gpu = [
+            bar(0, 64 << 20, BarKind::Mmio32),
+            bar(1, 32 << 30, wide),
+            bar(3, 32 << 20, wide),
+            bar(5, 0x80, BarKind::Io),
+            bar(6, 512 << 10, BarKind::Mmio32),
+        ];
+        assert_eq!(pci64_window(gpu.into_iter()), 65 << 30);
     }
 
     #[test]

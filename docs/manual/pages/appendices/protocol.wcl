@@ -35,7 +35,7 @@ page ref_protocol {
 {"type":"req","id":1,"cmd":"machine.ip","args":{"machine":"dc01","nic":null}}
 {"type":"resp","id":1,"ok":"10.0.0.10"}
 {"type":"req","id":2,"cmd":"snapshot.restore","args":{"name":"nope","machine":"dc01","discard":false}}
-{"type":"resp","id":2,"err":"\"dc01\" has no snapshot \"nope\"","code":"not_found"}
+{"type":"resp","id":2,"err":"no snapshot \"nope\" on dc01","code":"not_found"}
 SRC
   }
   p <<DOC

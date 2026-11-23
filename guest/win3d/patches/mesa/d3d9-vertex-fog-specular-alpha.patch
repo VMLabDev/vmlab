@@ -1,0 +1,104 @@
+Subject: [PATCH] d3d9: honor specular alpha as the vertex fog factor
+
+Bypass the bound VS for POSITIONT draws using the runtime fixed-function
+pixel shader. For legacy programmable vertex shaders without oFog, pass
+the final specular alpha through the fog varying.
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Draw.cpp
+@@ -660,21 +660,2 @@
+-static bool
+-D3D9HasTranslatedShaderPair(const D3D9Device *device)
+-{
+-   return D3D9TranslatedVsState(device) && D3D9TranslatedPsState(device);
+-}
+-
+-static bool
+-D3D9TranslatedShaderPairIsRuntimeFixedFunction(const D3D9Device *device)
+-{
+-   const D3D9Object *vs =
+-      (const D3D9Object *)device->vertex_shader_func;
+-   const D3D9Object *ps =
+-      (const D3D9Object *)device->pixel_shader;
+-
+-   return D3D9HasTranslatedShaderPair(device) &&
+-          D3D9ShaderHasRuntimeFixedFunctionComment(vs) &&
+-          D3D9ShaderHasRuntimeFixedFunctionComment(ps);
+-}
+-
+ static HRESULT
+ D3D9FailNoTranslatedShaderPair()
+@@ -2925,9 +2906,5 @@
+    void *translated_ps = D3D9TranslatedPsState(device);
+    void *translated_vs = D3D9TranslatedVsState(device);
+-   const bool translated_shader_pair = translated_vs && translated_ps;
+-   const bool runtime_fixed_function_pair =
+-      translated_shader_pair &&
+-      D3D9TranslatedShaderPairIsRuntimeFixedFunction(device);
+    const bool generate_position_t_ps_input_vs =
+       !translated_vs && D3D9CanUsePositionTPsInputFixedFunction(device);
+    const bool generate_position_t_diffuse_vs =
+@@ -2955,12 +2932,10 @@
+    /*
+-    * D3D9 POSITIONT fixed-function draws consume app-provided texture
+-    * coordinates directly.  The runtime's generated FF VS may still contain
+-    * texture-transform code, so keep the translated FF PS but generate the
+-    * POSITIONT VS from the active declaration.
+-    */
+-   const bool replace_position_t_runtime_ff_vs =
+-      runtime_fixed_function_pair && D3D9ActiveVertexDeclHasPositionT(device) &&
++    * POSITIONT draws bypass vertex shading. Keep the runtime's FF pixel
++    * shader and use the declaration even if an application VS is bound.
++    */
++   const bool replace_position_t_runtime_ff_vs =
++      translated_vs && D3D9ActiveVertexDeclHasPositionT(device) &&
+       D3D9InitPositionTRuntimePsFixedFunctionVsInfo(
+          device, current_ps, &fixed_function_vs_shader);
+ 
+    if (((!translated_vs || replace_position_t_runtime_ff_vs) &&
+diff --git a/src/gallium/frontends/d3d10umd/D3D9NineShader.c b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+--- a/src/gallium/frontends/d3d10umd/D3D9NineShader.c
++++ b/src/gallium/frontends/d3d10umd/D3D9NineShader.c
+@@ -3863,10 +3863,11 @@
+         tx->regs.oPos_out = ureg_DECL_output(tx->ureg, TGSI_SEMANTIC_POSITION, 0);
+         if (tx->version.major < 3) {
+             tx->regs.oCol[0] =
+                 ureg_DECL_output(tx->ureg, TGSI_SEMANTIC_COLOR, 0);
+             tx->regs.oCol[1] =
++                info->fog_enable ? ureg_DECL_temporary(tx->ureg) :
+                 ureg_DECL_output(tx->ureg, TGSI_SEMANTIC_GENERIC, 8);
+             tx->regs.oTex[0] =
+                 ureg_DECL_output(tx->ureg, tx->texcoord_sn, 0);
+ 
+             ureg_MOV(tx->ureg, tx->regs.oCol[0],
+@@ -4087,8 +4088,15 @@
+ 
+     if (IS_VS && tx->version.major < 3 && info->fog_enable) {
+-        unsigned color1_input;
++        struct ureg_src specular = ureg_src(tx->regs.oCol[1]);
++        struct ureg_dst specular_out =
++            ureg_DECL_output(tx->ureg, TGSI_SEMANTIC_GENERIC, 8);
++        unsigned color1_input;
++
++        /* TGSI outputs cannot be read. The legacy specular register was
++         * staged in a temporary so its alpha can also supply vertex fog. */
++        ureg_MOV(tx->ureg, specular_out, specular);
+         if (info->runtime_fixed_function && info->position_t &&
+             nine_find_vs_input(info, NINE_DECLUSAGE_i(COLOR, 1),
+                                &color1_input)) {
+             if (ureg_dst_is_undef(tx->regs.oFog))
+                 tx->regs.oFog = ureg_DECL_output(tx->ureg,
+@@ -4102,11 +4110,11 @@
+         } else if (ureg_dst_is_undef(tx->regs.oFog)) {
+             tx->regs.oFog = ureg_DECL_output(tx->ureg,
+                                              TGSI_SEMANTIC_GENERIC, 16);
+             ureg_MOV(tx->ureg,
+                      ureg_writemask(tx->regs.oFog, TGSI_WRITEMASK_X),
+-                     ureg_imm1f(tx->ureg, 0.0f));
++                     ureg_scalar(specular, TGSI_SWIZZLE_W));
+         }
+     }
+ 
+     if (IS_VS && tx->version.major >= 3) {
+         if (!tx->vs_output_color1) {

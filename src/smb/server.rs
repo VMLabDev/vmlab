@@ -48,6 +48,8 @@ pub enum SmbError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("refusing to write smb.conf: {0}")]
+    Share(#[from] super::config::ShareRefused),
     #[error("failed to write smb.conf {path}: {source}")]
     WriteConf {
         path: PathBuf,
@@ -106,9 +108,11 @@ impl SmbServer {
 
         // 2. Write smb.conf.
         let conf_path = config.conf_path();
-        std::fs::write(&conf_path, config.render_conf()).map_err(|source| SmbError::WriteConf {
-            path: conf_path.clone(),
-            source,
+        std::fs::write(&conf_path, config.render_conf()?).map_err(|source| {
+            SmbError::WriteConf {
+                path: conf_path.clone(),
+                source,
+            }
         })?;
 
         // 3. Create passdb users (unprivileged: tdbsam under lab_dir).
@@ -416,6 +420,55 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// What smbd logs when its port is taken. It writes the log named by
+    /// `-l` (`log.smbd`), not the `log file` of smb.conf.
+    fn lost_its_port(config: &SmbConfig) -> bool {
+        [config.lab_dir.join("log.smbd"), config.log_path()]
+            .iter()
+            .any(|log| {
+                std::fs::read_to_string(log).is_ok_and(|s| s.contains("Address already in use"))
+            })
+    }
+
+    /// Start smbd on the first port of `ports` it can bind. A port from
+    /// [`free_high_port`] is released before smbd binds it, so a parallel
+    /// test can take it in between: smbd then panics with "Address already
+    /// in use", and a core dump can keep it alive past the start wait. A
+    /// start that lost its port is retried on the next one. The server is
+    /// returned once its port accepts, or after 20 s for the caller to judge.
+    fn spawn_on_a_free_port(
+        mut ports: impl Iterator<Item = u16>,
+        config_for: impl Fn(u16) -> SmbConfig,
+        creds: &HashMap<String, String>,
+    ) -> std::result::Result<SmbServer, SmbError> {
+        for _ in 0..5 {
+            let port = ports.next().expect("a port");
+            let config = config_for(port);
+            let _ = std::fs::remove_file(config.lab_dir.join("log.smbd"));
+            let _ = std::fs::remove_file(config.log_path());
+            let mut server = match SmbServer::spawn(config.clone(), creds.clone()) {
+                Ok(server) => server,
+                Err(_) if lost_its_port(&config) => continue,
+                Err(e) => return Err(e),
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Ok(server);
+                }
+                if lost_its_port(&config) {
+                    server.stop();
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(server);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        panic!("smbd lost its port five times");
+    }
+
     fn test_config(dir: PathBuf) -> SmbConfig {
         SmbConfig {
             listen_port: 14450,
@@ -498,9 +551,17 @@ mod tests {
 
         // Twice: the second start finds the passdb (kept with the lab) from
         // the first but a fresh runtime directory, as after any `down`/`up`.
+        //
+        // Round 0 is first offered a port held bound by another socket, as
+        // a parallel test held 33477 when this failed on helios: the start
+        // must move on to a free port rather than fail.
+        let held =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        held.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let held_port = held.local_addr().unwrap().as_socket().unwrap().port();
         for round in 0..2 {
-            let port = free_high_port();
-            let config = SmbConfig {
+            let config_for = |port| SmbConfig {
                 listen_port: port,
                 run_dir: crate::paths::smb_runtime_dir(&smb_dir),
                 lab_dir: smb_dir.clone(),
@@ -517,7 +578,11 @@ mod tests {
             let mut creds = HashMap::new();
             creds.insert(user.to_string(), pass.to_string());
 
-            let server = match SmbServer::spawn(config, creds) {
+            let first = (round == 0).then_some(held_port);
+            let ports = first
+                .into_iter()
+                .chain(std::iter::repeat_with(free_high_port));
+            let server = match spawn_on_a_free_port(ports, config_for, &creds) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&tmp);
@@ -529,6 +594,7 @@ mod tests {
             };
 
             // Wait until the port accepts connections (smbd init can be slow).
+            let port = server.listen_port();
             let mut connected = false;
             for _ in 0..50 {
                 if TcpStream::connect(("127.0.0.1", port)).is_ok() {

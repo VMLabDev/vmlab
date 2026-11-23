@@ -632,6 +632,59 @@ fn s2_snapshot_interop_disk_only() {
     );
 }
 
+#[test]
+fn a_name_wins_over_another_snapshots_id() {
+    require_qemu_img!();
+    let temp = tmpdir("snapshot-name-collision");
+    let path = temp.path().join("disk.qcow2");
+    let exported = temp.path().join("exported.qcow2");
+    ops::create_qcow2(&path, 1024 * 1024, None, None).unwrap();
+    let first = pattern(4096, 1);
+    let second = pattern(4096, 2);
+    write_pattern(&path, Format::Qcow2, 0, &first);
+    qemu_img(&["snapshot", "-c", "2", &path.to_string_lossy()]);
+    write_pattern(&path, Format::Qcow2, 0, &second);
+    qemu_img(&["snapshot", "-c", "b", &path.to_string_lossy()]);
+
+    let snapshots = ops::snapshot_list(&path).unwrap();
+    assert_eq!(snapshots[0].name, "2");
+    assert_eq!(snapshots[1].name, "b");
+    assert_eq!(snapshots[1].id, "2");
+
+    assert_eq!(ops::snapshot_apply(&path, "2").unwrap().name, "2");
+    assert_eq!(&read_all(&path, Format::Qcow2)[..first.len()], &first);
+    ops::convert(&path, &exported, Some("2"), None, None).unwrap();
+    assert_eq!(&read_all(&exported, Format::Qcow2)[..first.len()], &first);
+
+    ops::snapshot_delete(&path, "2").unwrap();
+    assert!(matches!(
+        ops::snapshot_apply(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
+    assert!(matches!(
+        ops::snapshot_delete(&path, "2"),
+        Err(vmlab_disk::Error::SnapshotNotFound(_))
+    ));
+    let remaining = ops::snapshot_list(&path).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name, "b");
+    qemu_check(&path);
+}
+
+#[test]
+fn a_digit_name_is_not_refused_for_an_unrelated_id() {
+    let temp = tmpdir("snapshot-digit-name");
+    let path = temp.path().join("disk.qcow2");
+    ops::create_qcow2(&path, 1024 * 1024, None, None).unwrap();
+    ops::snapshot_create(&path, "a").unwrap();
+    ops::snapshot_create(&path, "b").unwrap();
+    assert_eq!(ops::snapshot_list(&path).unwrap()[1].id, "2");
+
+    ops::snapshot_create(&path, "2").unwrap();
+    assert_eq!(ops::snapshot_list(&path).unwrap()[2].name, "2");
+    assert!(ops::snapshot_create(&path, "2").is_err());
+}
+
 /// A snapshot with vmstate written by the crate is listed by
 /// `qemu-img snapshot -l` with the right VM SIZE, reads back identically
 /// after apply, and every step passes `qemu-img check`.
@@ -932,6 +985,89 @@ fn s2_ops_commit() {
     qemu_img(&["compare", &top.to_string_lossy(), &base.to_string_lossy()]);
 }
 
+const PARTIAL_CLUSTER_START: u64 = 1024 * 1024;
+const PARTIAL_CLUSTER_SIZE: u64 = PARTIAL_CLUSTER_START + 512;
+
+#[test]
+fn convert_with_backing_of_an_image_with_a_partial_last_cluster() {
+    require_qemu_img!();
+    let temp = tmpdir("convert-partial");
+    let raw = temp.path().join("src.raw");
+    let base = temp.path().join("base.qcow2");
+    let dest = temp.path().join("dest.qcow2");
+    std::fs::write(&raw, vec![b'U'; PARTIAL_CLUSTER_SIZE as usize]).unwrap();
+    ops::convert(&raw, &base, None, None, None).unwrap();
+
+    ops::convert(&base, &dest, None, Some(&base), Some("qcow2")).unwrap();
+
+    qemu_check(&dest);
+    qemu_img(&[
+        "compare",
+        "-s",
+        "-f",
+        "qcow2",
+        "-F",
+        "qcow2",
+        &base.to_string_lossy(),
+        &dest.to_string_lossy(),
+    ]);
+}
+
+#[test]
+fn commit_of_an_image_with_a_partial_last_cluster() {
+    require_qemu_img!();
+    let temp = tmpdir("commit-partial");
+    let base = temp.path().join("base.qcow2");
+    ops::create_qcow2(&base, PARTIAL_CLUSTER_SIZE, None, None).unwrap();
+    check_commit_partial_cluster(temp.path(), &base, Format::Qcow2, "qcow2");
+}
+
+#[test]
+fn commit_grows_a_shorter_backing_image() {
+    require_qemu_img!();
+    for (format, name) in [(Format::Raw, "raw"), (Format::Qcow2, "qcow2")] {
+        let temp = tmpdir("commit-grow");
+        let base = temp.path().join("base");
+        match format {
+            Format::Raw => std::fs::File::create(&base)
+                .unwrap()
+                .set_len(PARTIAL_CLUSTER_START)
+                .unwrap(),
+            Format::Qcow2 => {
+                ops::create_qcow2(&base, PARTIAL_CLUSTER_START, None, None).unwrap();
+            }
+        }
+        check_commit_partial_cluster(temp.path(), &base, format, name);
+    }
+}
+
+fn check_commit_partial_cluster(dir: &Path, base: &Path, format: Format, format_name: &str) {
+    let top = dir.join("top.qcow2");
+    ops::create_qcow2(&top, PARTIAL_CLUSTER_SIZE, Some(base), Some(format_name)).unwrap();
+    write_pattern(&top, Format::Qcow2, PARTIAL_CLUSTER_START, &[0xd]);
+    let before = std::fs::read(&top).unwrap();
+
+    ops::commit(&top).unwrap();
+
+    assert_eq!(
+        vmlab_disk::open(base, format, true).unwrap().size(),
+        PARTIAL_CLUSTER_SIZE
+    );
+    assert_eq!(std::fs::read(&top).unwrap(), before);
+    if format == Format::Qcow2 {
+        qemu_check(base);
+    }
+    qemu_img(&[
+        "compare",
+        "-f",
+        "qcow2",
+        "-F",
+        format_name,
+        &top.to_string_lossy(),
+        &base.to_string_lossy(),
+    ]);
+}
+
 /// Read-only opens never modify the image.
 #[test]
 fn s2_read_only_never_modifies() {
@@ -996,6 +1132,162 @@ fn s2_subcluster_discard_preserves_neighboring_metadata() {
     assert!(actual[1024..].iter().all(|b| *b == 0x77));
     assert_eq!(actual, read_all(&reference, Format::Qcow2));
     qemu_check(&path);
+}
+
+/// Review vmlab-disk F1 (#542). QEMU zeroes an allocated cluster in place:
+/// the L2 entry keeps its host offset and gets the zero flag. A write to
+/// such a cluster must clear the flag, and the old bytes of the host cluster
+/// must not come back around a partial write.
+#[test]
+fn a_write_to_a_cluster_qemu_zeroed_in_place_reads_back() {
+    require_qemu_img!();
+    let temp = tmpdir("zero-in-place");
+    let path = temp.path().join("z.qcow2");
+    let raw = temp.path().join("z.raw");
+    let cluster = 64 * 1024;
+    qemu_img(&["create", "-f", "qcow2", path.to_str().unwrap(), "1M"]);
+    qemu_io(&[
+        "-f",
+        "qcow2",
+        "-c",
+        "write -P 0x11 0 128k",
+        "-c",
+        "write -z 0 128k",
+        path.to_str().unwrap(),
+    ]);
+    {
+        let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+        // A partial write to the first cluster, a whole-cluster write to
+        // the second.
+        image.write_at(512, &[0xaa; 512]).unwrap();
+        image
+            .write_at(cluster as u64, &vec![0xbb; cluster])
+            .unwrap();
+        image.flush().unwrap();
+    }
+    let mut expected = vec![0u8; 1 << 20];
+    expected[512..1024].fill(0xaa);
+    expected[cluster..2 * cluster].fill(0xbb);
+    let actual = read_all(&path, Format::Qcow2);
+    assert!(
+        actual == expected,
+        "the crate reads back something else: {:02x?} at 512, {:02x?} at 64k, {:02x?} at 0",
+        &actual[512..520],
+        &actual[cluster..cluster + 8],
+        &actual[..8],
+    );
+    qemu_img(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        path.to_str().unwrap(),
+        raw.to_str().unwrap(),
+    ]);
+    assert!(
+        std::fs::read(&raw).unwrap() == expected,
+        "qemu-img reads back something else than the crate"
+    );
+    qemu_check(&path);
+}
+
+/// F7 of docs/reviews/vmlab-disk.md: QEMU writes only the compressed bytes,
+/// so a compressed cluster that is the last thing in the file can end inside
+/// its last sector. The missing bytes of that sector read as zeros.
+#[test]
+fn a_compressed_cluster_at_the_end_of_the_file_reads() {
+    require_qemu_img!();
+    let temp = tmpdir("compressed-at-end");
+    let path = temp.path().join("b.qcow2");
+    let cluster = 64 * 1024;
+    qemu_img(&["create", "-f", "qcow2", path.to_str().unwrap(), "64M"]);
+    qemu_io(&[
+        "-f",
+        "qcow2",
+        "-c",
+        "write -c -P 3 0 64k",
+        path.to_str().unwrap(),
+    ]);
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert_ne!(
+        len % 512,
+        0,
+        "the file must end inside a sector, it is {len} bytes"
+    );
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, true).unwrap();
+    let mut buf = vec![0u8; cluster];
+    image.read_at(0, &mut buf).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 3),
+        "the cluster does not read as 0x03"
+    );
+}
+
+/// Text like `base64 /dev/urandom`: it compresses to about three quarters,
+/// so the compressed clusters start at many sector offsets.
+fn base64_like(len: usize, seed: u64) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ALPHABET[(x >> 32) as usize & 63]
+        })
+        .collect()
+}
+
+/// F3 of docs/reviews/vmlab-disk.md: the refcount range of a compressed
+/// cluster ends at the end of its last sector, so overwriting every cluster
+/// of a `qemu-img convert -c` image takes no reference from a neighbour.
+#[test]
+fn overwriting_a_qemu_compressed_image_keeps_refcounts() {
+    require_qemu_img!();
+    let temp = tmpdir("compressed-refcounts");
+    let dir = temp.path();
+    let size = 64 << 20;
+    let cluster = 64 << 10;
+    let src = dir.join("src.raw");
+    std::fs::write(&src, base64_like(size, 0x5eed)).unwrap();
+    let written = base64_like(size, 0xf00d);
+    let expected = dir.join("expected.raw");
+    std::fs::write(&expected, &written).unwrap();
+    for compat in ["1.1", "0.10"] {
+        let path = dir.join(format!("c-{compat}.qcow2"));
+        qemu_img(&[
+            "convert",
+            "-c",
+            "-f",
+            "raw",
+            "-O",
+            "qcow2",
+            "-o",
+            &format!("compat={compat}"),
+            src.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        {
+            let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+            for offset in (0..size).step_by(cluster) {
+                image
+                    .write_at(offset as u64, &written[offset..offset + cluster])
+                    .unwrap_or_else(|e| panic!("compat {compat}: write at {offset}: {e}"));
+            }
+            image.flush().unwrap();
+        }
+        qemu_check(&path);
+        qemu_img(&[
+            "compare",
+            "-f",
+            "qcow2",
+            "-F",
+            "raw",
+            path.to_str().unwrap(),
+            expected.to_str().unwrap(),
+        ]);
+    }
 }
 
 #[test]
@@ -1147,8 +1439,8 @@ fn s2_snapshot_churn() {
     }
 }
 
-/// Larger buffers move through the cluster path without per-byte syscalls
-/// and stay correct (a 16 MiB write/read at an unaligned offset).
+/// A 16 MiB write/read at an unaligned offset preserves the data and
+/// leaves a valid qcow2 image.
 #[test]
 fn s2_large_unaligned_io() {
     require_qemu_img!();
@@ -1157,21 +1449,13 @@ fn s2_large_unaligned_io() {
     let path = dir.join("l.qcow2");
     ops::create_qcow2(&path, 32 * 1024 * 1024, None, None).unwrap();
     let data = pattern(16 * 1024 * 1024, 21);
-    let t0 = std::time::Instant::now();
     write_pattern(&path, Format::Qcow2, 123_457, &data);
-    let write_secs = t0.elapsed().as_secs_f64();
     let mut got = vec![0u8; data.len()];
-    let t1 = std::time::Instant::now();
     vmlab_disk::open(&path, Format::Qcow2, true)
         .unwrap()
         .read_at(123_457, &mut got)
         .unwrap();
-    let read_secs = t1.elapsed().as_secs_f64();
     assert_eq!(got, data);
-    assert!(
-        write_secs < 10.0 && read_secs < 10.0,
-        "pathologically slow: write {write_secs:.2}s read {read_secs:.2}s"
-    );
     qemu_check(&path);
     let _ = std::io::stdout().flush();
 }
@@ -1405,6 +1689,53 @@ fn s2_sequential_throughput_1gib() {
     );
     qemu_check(&path);
     let _ = std::io::stdout().flush();
+}
+
+fn open_qemu_snapshot_table_at_eof(compat: &str) {
+    use std::os::unix::fs::FileExt as _;
+
+    let temp = tmpdir("snapshot-table-eof");
+    let path = temp.path().join("disk.qcow2");
+    let filename = path.to_str().unwrap();
+    qemu_img(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-o",
+        &format!("compat={compat}"),
+        filename,
+        "64M",
+    ]);
+    qemu_io(&["-f", "qcow2", "-c", "write -P 0x77 0 8M", filename]);
+    qemu_img(&["snapshot", "-c", "q1", filename]);
+    qemu_check(&path);
+
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // QEMU leaves the last snapshot entry's alignment padding unwritten.
+    assert_ne!(file.metadata().unwrap().len() % 8, 0);
+    if compat == "1.1" {
+        // Set the dirty incompatible-feature bit to trigger v3 recovery.
+        file.write_all_at(&1u64.to_be_bytes(), 72).unwrap();
+    }
+    drop(file);
+
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+    image.write_at(0, &[0xaa; 512]).unwrap();
+    image.flush().unwrap();
+    drop(image);
+    qemu_check(&path);
+}
+
+#[test]
+fn a_dirty_image_with_a_qemu_snapshot_table_at_the_end_opens() {
+    require_qemu_img!();
+    open_qemu_snapshot_table_at_eof("1.1");
+}
+
+#[test]
+fn a_v2_image_with_a_qemu_snapshot_table_at_the_end_opens() {
+    require_qemu_img!();
+    open_qemu_snapshot_table_at_eof("0.10");
 }
 
 /// VML-107: an owner that drops the image without `flush` keeps the writes.

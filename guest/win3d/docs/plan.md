@@ -69,7 +69,7 @@ Wave 3, after the AMD iGPU path passes Done: make Venus work on the host's
 NVIDIA RTX 5090 (prior-art §3 dwm crash, decoder errors).
 Status: done in part. The RTX 5090 works with `patches/mesa/0020` and a
 patched QEMU (`docs/nvidia.md`); an Intel host was added and passes with
-`patches/mesa/0021` (`docs/zeus.md`). `docs/known-limits.md` has the host
+`patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` (`docs/zeus.md`). `docs/known-limits.md` has the host
 matrix.
 
 Wave 2: `package` (INF, catalog, installer and uninstaller, `scripts/build.sh`),

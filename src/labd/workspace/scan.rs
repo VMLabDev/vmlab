@@ -45,6 +45,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use futures::stream::StreamExt;
 
+use crate::labd::vm_agent::{ErrorCode, FileOpsError};
+
 use super::guest::GuestFs;
 use super::ignore::{Ignores, Verdict, join_rel};
 use super::ledger::{Kind, Ledger, Side};
@@ -60,8 +62,7 @@ const PROBE_WINDOW: usize = 32;
 /// content).
 type Content = (String, Option<String>);
 
-/// A path neither direction may touch, and why. Always reported: this is the
-/// one thing a syncer must never do quietly.
+/// A reported path the syncer declined to process, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skip {
     pub path: String,
@@ -87,6 +88,14 @@ pub struct HostScan {
     /// a rule matching at a depth its own text does not name.
     pub pruned: Vec<String>,
     pub skipped: Vec<Skip>,
+    /// Names outside the UTF-8 path space. Their escaped labels are for
+    /// reporting only and can coincide with valid UTF-8 paths.
+    pub unrepresentable: Vec<Skip>,
+    /// Rule files whose rules were refused — a `.gitignore` or `.vmlabignore`
+    /// that is a symlink. Reported like a skip, and apart from
+    /// [`skipped`](HostScan::skipped) because the path itself is still an
+    /// ordinary sync object: only its reading as rules was declined.
+    pub refused_rules: Vec<Skip>,
     /// Git lock files this side is holding right now (§19.6). They never sync
     /// — the ignore floor sees to that — and their *presence* is the only
     /// thing read off them: it defers `.git`'s mutable set until git lets go.
@@ -98,6 +107,9 @@ pub struct HostScan {
 pub struct GuestProbe {
     pub tree: BTreeMap<String, State>,
     pub skipped: Vec<Skip>,
+    /// Directories whose entries could not be listed. Their descendants
+    /// are unknown even though the parent listing reported the directory.
+    pub unlisted_dirs: BTreeSet<String>,
     /// As [`HostScan::locks`], for the other side. A lock is one side's local
     /// claim, so either side holding one defers the set for both.
     pub locks: BTreeSet<String>,
@@ -122,8 +134,15 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
             .with_context(|| format!("reading directory {}", here.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("reading directory {}", here.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = join_rel(&dir, &name);
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                scan.unrepresentable.push(Skip {
+                    path: format!("{:?}", Path::new(&dir).join(&name)),
+                    why: "host: name is not UTF-8".into(),
+                });
+                continue;
+            };
+            let rel = join_rel(&dir, name);
             let path = entry.path();
             // Never followed, so a link is an entry to record rather than a
             // directory to descend.
@@ -217,6 +236,14 @@ pub fn host_scan(root: &Path, ledger: &Ledger, max_file_bytes: u64) -> Result<(H
     scan.dirs.push(String::new());
     scan.dirs.sort();
     scan.pruned.sort();
+    scan.refused_rules = ignores
+        .refused()
+        .iter()
+        .map(|(path, why)| Skip {
+            path: path.clone(),
+            why: why.clone(),
+        })
+        .collect();
     Ok((scan, ignores))
 }
 
@@ -361,21 +388,32 @@ pub async fn guest_walk(
         while let Some((dir, entries)) = listings.next().await {
             let entries = match entries {
                 Ok(entries) => entries,
-                Err(e)
-                    if e.downcast_ref::<super::ignore::GuestListingError>()
-                        .is_some() =>
-                {
-                    return Err(e);
-                }
                 // A directory the login cannot traverse is a named skip, not
                 // a halt — and emphatically not an empty listing, which would
                 // read as the guest having deleted everything under it.
-                Err(e) => {
+                Err(e)
+                    if !dir.is_empty()
+                        && e.downcast_ref::<FileOpsError>().is_some_and(|error| {
+                            matches!(
+                                error.code,
+                                ErrorCode::PermissionDenied
+                                    | ErrorCode::NoSuchFile
+                                    | ErrorCode::NotADirectory
+                            )
+                        }) =>
+                {
+                    probe.unlisted_dirs.insert(dir.clone());
                     probe.skipped.push(Skip {
-                        path: if dir.is_empty() { ".".into() } else { dir },
+                        path: dir,
                         why: format!("guest: cannot read the directory ({e:#})"),
                     });
                     continue;
+                }
+                // A failed root listing or session leaves the walk unusable.
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listing guest directory {}", join_guest(guest_root, &dir))
+                    });
                 }
             };
             super::ignore::entry_budget(0, entries.len(), super::ignore::MAX_DIRECTORY_ENTRIES)?;
@@ -734,6 +772,35 @@ mod tests {
         assert!(scan.tree.contains_key("src/main.rs"));
     }
 
+    /// A directory or a FIFO named like a rule file holds no rules, and it
+    /// must not stop the scan: a guest makes one with `mkdir`, it syncs to the
+    /// host, and a scan that failed on it would fail every pass from then on
+    /// (review labd-sync F9). The name is a named skip, the directory still
+    /// syncs as a directory, and the regular rule file beside it applies.
+    #[test]
+    fn a_rule_file_that_is_not_a_file_is_a_named_skip() {
+        let dir = workspace(&[
+            (".gitignore/inner.txt", "x"),
+            (".vmlabignore", "target/\n"),
+            ("target/out", "o"),
+            ("src/main.rs", "y"),
+        ]);
+        let fifo = dir.path().join("src/.vmlabignore");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (scan, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+
+        assert_eq!(scan.tree[".gitignore"].kind, Kind::Dir);
+        assert!(scan.tree.contains_key(".gitignore/inner.txt"));
+        assert!(scan.tree.contains_key("src/main.rs"));
+        assert!(!scan.tree.contains_key("target/out"));
+        assert_eq!(ignores.prune_list(&[]), vec!["target".to_string()]);
+        let refused: Vec<&str> = scan.refused_rules.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(refused, vec![".gitignore", "src/.vmlabignore"]);
+        assert!(scan.refused_rules[0].why.contains("directory"));
+        assert!(scan.refused_rules[1].why.contains("not a regular file"));
+    }
+
     /// The pre-filter's whole job: a path whose own recorded pair still
     /// matches is not hashed, and one whose does not is.
     #[test]
@@ -859,6 +926,21 @@ mod tests {
             "{:?}",
             walk.skipped[0]
         );
+    }
+
+    #[tokio::test]
+    async fn a_channel_error_during_readdir_fails_the_guest_walk() {
+        let dir = workspace(&[]);
+        let (_, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP).unwrap();
+        let guest = super::super::guest::fake::FakeGuest::new();
+        guest.dir("/src");
+        guest.dir("/src/lib");
+        guest.disconnect_on_readdir("/src/lib");
+
+        let error = guest_walk(&guest, "/src", &ignores, &empty_ledger(), true, NO_CAP)
+            .await
+            .expect_err("a dropped session must fail the walk");
+        assert!(format!("{error:#}").contains("file session closed"));
     }
 
     /// The size guard is symmetric. A guest file over the cap is never hashed

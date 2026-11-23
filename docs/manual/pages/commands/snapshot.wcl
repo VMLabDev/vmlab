@@ -13,7 +13,8 @@ page cmd_snapshot {
     snapshot identically. A snapshot records the machine's power state at
     capture: an online snapshot of a running machine carries disk, RAM and
     device state, and restoring it resumes the machine where it was; an
-    offline snapshot carries disk state only and restoring it leaves the
+    offline snapshot carries disk state, with a VM's UEFI variables and TPM
+    state, and restoring it leaves the
     machine powered off.
   DOC
 
@@ -99,11 +100,12 @@ page cmd_snapshot {
 
   p <<DOC
     Rolls one machine, or every machine in the lab, back to the snapshot
-    `NAME`. A machine with no snapshot by that name fails with `"<machine>"
-    has no snapshot "<name>"`; in the lab-wide form the first such machine
-    stops the whole restore. An online snapshot resumes running; an offline
-    one leaves the machine stopped. A container's snapshot is pinned to the
-    image digest it was taken against, and restoring it against a different
+    `NAME`. If the snapshot or machine is missing, the command prints
+    `no snapshot "<name>" on <machine>` and exits with code 4. In the lab-wide
+    form, the first machine missing the snapshot stops the whole restore.
+    An online snapshot resumes running. An offline snapshot leaves the
+    machine stopped. A container's snapshot is pinned to the image digest
+    it was taken against, and restoring it against a different
     pinned image is refused, naming both digests, with the remedies of
     destroying the machine or restoring the original pin. Prints `snapshot
     "<name>" restored`, followed by the workspace-backup warning when a

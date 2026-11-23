@@ -1,100 +1,117 @@
-"""Release branch dry builds must never acquire signing or publish rights."""
+"""ci.yml builds and publishes no version; the release is local (card 423)."""
 import json
 import os
 from pathlib import Path
 import re
-import shlex
-import shutil
 import subprocess
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = yaml.load((ROOT / '.github/workflows/ci.yml').read_text(), Loader=yaml.BaseLoader)
+CI = (ROOT / '.github/workflows/ci.yml').read_text()
+WORKFLOW = yaml.load(CI, Loader=yaml.BaseLoader)
 JOBS = WORKFLOW['jobs']
+COMMIT = 'c' * 40
 
 
-def test_release_pushes_build_and_prepare():
-    assert 'release/**' in WORKFLOW['on']['push']['branches']
-    assert JOBS['version']['if'] == "github.event_name == 'push'"
-    calc = next(s['run'] for s in JOBS['version']['steps'] if s.get('id') == 'calc')
-    assert 'do_release=false\\nversion=0.0.0-dry-run' in calc
-    for name in ['build', 'vdisplay-build', 'guest-assets', 'hv-build', 'release-assets']:
-        condition = JOBS[name]['if']
-        assert "github.event_name == 'push'" in condition
-        assert "startsWith(github.ref, 'refs/heads/release/')" in condition
-    assert 'always() && !failure() && !cancelled()' in JOBS['guest-assets']['if']
-    assert 'vdisplay-build' in JOBS['guest-assets']['needs']
+def test_ci_has_only_the_cheap_checks():
+    assert set(JOBS) == {'release-dry-run', 'fmt-lint', 'check', 'hv-check',
+                         'guest-crates', 'ebpf-verify'}
+    for name in ['version', 'build', 'vdisplay-build', 'vdisplay-sign', 'guest-assets',
+                 'hv-build', 'release-assets', 'release']:
+        assert name not in JOBS
 
 
-def test_signing_and_publication_are_main_only():
-    for name in ['vdisplay-sign', 'release']:
-        condition = JOBS[name]['if']
-        assert "github.ref == 'refs/heads/main'" in condition
-        assert "github.event_name == 'push'" in condition
-        assert "needs.version.outputs.do_release == 'true'" in condition
-        assert '||' not in condition
+def test_ci_cannot_sign_or_publish():
     assert WORKFLOW['permissions'] == {'contents': 'read'}
-    for name, job in JOBS.items():
-        if name != 'release':
-            assert 'write' not in job.get('permissions', {}).values()
-    prepare = JOBS['release-assets']
-    assert 'release-assets' in JOBS['release']['needs']
-    commands = '\n'.join(step.get('run', '') for step in prepare['steps'])
-    assert 'scripts/release-assets.py' in commands
-    assert 'sha256sum --check SHA256SUMS' in commands
-    assert 'cosign' not in commands
+    for job in JOBS.values():
+        assert 'permissions' not in job
+        assert 'do_release' not in job.get('if', '')
+    # Nothing can run on a second trigger, and no step reaches a release.
+    assert set(WORKFLOW['on']) == {'push', 'pull_request'}
+    code = '\n'.join(line for line in CI.splitlines() if not line.lstrip().startswith('#'))
+    for word in ['cosign', 'id-token', 'gh release', 'action-gh-release', 'upload-artifact',
+                 'release-version.sh', 'release-assets.py', 'guest-package', 'hv-package',
+                 'contents: write']:
+        assert word not in code, word
 
 
-@pytest.mark.parametrize('matrix', JOBS['build']['strategy']['matrix']['include'])
-def test_release_build_uploads_required_assets(tmp_path, matrix):
-    version = '0.0.0-dry-run'
-    expressions = {'needs.version.outputs.version': version,
-                   'matrix.target': matrix['target'], 'matrix.suffix': matrix['suffix']}
+def test_no_other_workflow_publishes_a_vmlab_version():
+    for path in (ROOT / '.github/workflows').glob('*.yml'):
+        text = path.read_text()
+        assert 'action-gh-release' not in text, path.name
+        assert 'release-assets.py' not in text, path.name
 
-    def render(value):
-        return re.sub(r'\$\{\{\s*(.*?)\s*\}\}', lambda match: expressions[match[1]], value)
 
-    # Stand in for the explicit Cargo binary outputs, then run the real staging step.
-    steps = JOBS['build']['steps']
-    build = next(step['run'] for step in steps if step.get('run', '').startswith('cargo build '))
-    args = shlex.split(render(build))
-    output = tmp_path / 'target' / args[args.index('--target') + 1] / 'release'
-    output.mkdir(parents=True)
-    for index, arg in enumerate(args):
-        if arg == '--bin':
-            (output / args[index + 1]).write_bytes(b'compiled fixture')
-    stage = next(step['run'] for step in steps if step.get('name') == 'Stage assets')
-    subprocess.run(['bash', '-e', '-c', render(stage)], cwd=tmp_path, check=True)
-
-    # Stand in for the bundle recipes, then pass only the configured upload files
-    # to the same checksum and provenance step used on release branches.
-    for directory, name in [
-        ('target/guest-package', f'vmlab-guest-{version}.tar.gz'),
-        ('target/dist', f'vmlab-hv-{version}-linux-x86_64.tar.gz'),
-    ]:
-        output = tmp_path / directory
-        output.mkdir(parents=True)
-        (output / name).write_bytes(b'bundle fixture')
-        (output / f'{name}.sha256').write_bytes(b'checksum fixture')
-
+def release_dir(tmp_path, version):
     dist = tmp_path / 'dist'
     dist.mkdir()
-    for job in ('build', 'guest-assets', 'hv-build'):
-        upload = next(step['with'] for step in JOBS[job]['steps']
-                      if step.get('uses', '').startswith('actions/upload-artifact@'))
-        for pattern in render(upload['path']).splitlines():
-            for path in tmp_path.glob(pattern):
-                shutil.copy2(path, dist)
+    for name in [f'vmlab-{version}-linux-x86_64', f'vmlab-fastpath-{version}-linux-x86_64',
+                 f'vmlab-guest-{version}.tar.gz', f'vmlab-hv-{version}-linux-x86_64.tar.gz']:
+        (dist / name).write_bytes(b'fixture ' + name.encode())
+    for name in [f'vmlab-guest-{version}.tar.gz', f'vmlab-hv-{version}-linux-x86_64.tar.gz']:
+        (dist / (name + '.sha256')).write_text('checksum fixture\n')
+    subprocess.run(['python3', str(ROOT / 'scripts/release-assets.py'), 'prepare', str(dist),
+                    version, '--commit', COMMIT, '--builder', 'helios'], check=True)
+    return dist
 
-    prepare = next(step for step in JOBS['release-assets']['steps']
-                   if 'scripts/release-assets.py' in step.get('run', ''))
-    (tmp_path / 'scripts').mkdir()
-    shutil.copy2(ROOT / 'scripts/release-assets.py', tmp_path / 'scripts')
-    env = dict(os.environ, VERSION=render(prepare['env']['VERSION']),
-               GITHUB_SHA='a' * 40, GITHUB_RUN_ID='123')
-    subprocess.run(['bash', '-e', '-c', prepare['run']], cwd=tmp_path, env=env, check=True)
+
+def publish(dist, *args, env=None):
+    return subprocess.run(['bash', str(ROOT / 'scripts/release-publish.sh'), str(dist), *args],
+                          capture_output=True, text=True, env=env)
+
+
+@pytest.mark.parametrize('version,prerelease', [('1.2.3-alpha', True), ('1.2.3', False)])
+def test_publish_prints_the_one_upload_command(tmp_path, version, prerelease):
+    dist = release_dir(tmp_path, version)
+    (dist / 'SHA256SUMS.key.bundle').write_text('signature fixture')
+    result = publish(dist, '--print')
+    assert result.returncode == 0, result.stderr
+    words = result.stdout.split()
+    assert words[:9] == ['gh', 'release', 'create', f'v{version}', '--repo', 'VMLabDev/vmlab',
+                         '--target', COMMIT, '--title']
+    assert ('--prerelease' in words) == prerelease
+    uploaded = sorted(Path(word).name for word in words if word.startswith(str(dist)))
+    assert uploaded == sorted(path.name for path in dist.iterdir())
+    assert 'UNSIGNED' not in result.stderr
+
+
+def test_publish_only_uploads(tmp_path):
+    dist = release_dir(tmp_path, '1.2.3-alpha')
+    before = {path.name: path.read_bytes() for path in dist.iterdir()}
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    (tools / 'gh').write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$GH_LOG"\n')
+    (tools / 'gh').chmod(0o755)
+    env = dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}", GH_LOG=str(tmp_path / 'gh.log'))
+    result = publish(dist, env=env)
+    assert result.returncode == 0, result.stderr
+    assert 'UNSIGNED' in result.stderr
+    arguments = (tmp_path / 'gh.log').read_text().splitlines()
+    assert arguments[:3] == ['release', 'create', 'v1.2.3-alpha']
+    assert '--prerelease' in arguments
+    assert not any(argument.endswith('.bundle') for argument in arguments)
+    assert {path.name: path.read_bytes() for path in dist.iterdir()} == before
+
+
+def test_publish_refuses_a_dry_run_and_a_changed_directory(tmp_path):
+    result = publish(release_dir(tmp_path, '0.0.0-dry-run'), '--print')
+    assert result.returncode != 0
+    assert 'dry run' in result.stderr
+    other = tmp_path / 'other'
+    other.mkdir()
+    dist = release_dir(other, '1.2.3')
+    (dist / 'vmlab-1.2.3-linux-x86_64').write_bytes(b'replaced after the build')
+    result = publish(dist, '--print')
+    assert result.returncode != 0
+    assert result.stdout == ''
+
+
+def test_guest_dry_run_needs_only_the_dry_run_version():
+    package = (ROOT / 'guest/package.sh').read_text()
+    assert "[ \"$version\" = 0.0.0-dry-run ] || die 'dry-run requires the dry-run version'" in package
+    assert 'GITHUB_' not in package
 
 
 def test_action_pins_remain_immutable():

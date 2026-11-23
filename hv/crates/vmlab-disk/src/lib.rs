@@ -137,6 +137,10 @@ pub trait DiskImage: Send {
     fn snapshot_apply(&mut self, name: &str) -> Result<SnapshotInfo>;
     fn snapshot_delete(&mut self, name: &str) -> Result<()>;
     fn write_vmstate(&mut self, offset: u64, buf: &[u8]) -> Result<()>;
+    /// Release the active vmstate clusters covering the attempted stream.
+    fn discard_vmstate(&mut self, _len: u64) -> Result<()> {
+        Err(Error::Unsupported("vmstate discard is unavailable".into()))
+    }
     fn read_vmstate(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 }
 

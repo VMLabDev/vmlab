@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ledger::{Agreed, Kind, Ledger, Side};
+use super::ledger::{Agreed, Keeper, Kind, Ledger, Side};
 
 /// What one side holds at one path right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +192,14 @@ pub enum ConflictKind {
     ModifiedAndDeleted,
     /// One side is now a directory where the other is a file (or a link).
     KindReplaced,
+    /// The guest's copy of an agreed path is gone and **nothing saw it go**:
+    /// it was found missing by the walk that follows a break in the watch — a
+    /// machine that stopped, a channel that dropped — rather than reported by
+    /// the watch as a deletion. An absence is not a deletion. A guest stopped
+    /// hard loses writes it had already answered for, and reading that loss as
+    /// the developer's `rm` deletes the canonical copy of a file nobody
+    /// deleted (#190). So it is held, for any count, until somebody says.
+    MissingUnseen,
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -201,6 +209,11 @@ impl std::fmt::Display for ConflictKind {
             ConflictKind::BothModified => "both sides changed it since they last agreed",
             ConflictKind::ModifiedAndDeleted => "one side changed it and the other deleted it",
             ConflictKind::KindReplaced => "the two sides hold different kinds of entry",
+            ConflictKind::MissingUnseen => {
+                "the guest no longer holds it, and nothing saw it deleted: the machine or its \
+                 watch stopped in between, so the host copy is kept until you say (`--host` \
+                 copies it back into the guest, `--guest` deletes it on the host)"
+            }
         })
     }
 }
@@ -433,6 +446,12 @@ pub struct Plan {
     /// Host paths a case-folding guest cannot hold apart. Nothing is
     /// transferred for any of them.
     pub collisions: Vec<Collision>,
+    /// What the ledger's [`withheld`](Ledger::withheld) set is once this pass
+    /// is done: every agreed path whose guest copy is missing with nothing
+    /// having seen it go, and that this pass did not settle — the
+    /// [`MissingUnseen`](ConflictKind::MissingUnseen) conflicts, and the paths
+    /// it could not decide at all.
+    pub withheld: BTreeSet<String>,
     /// An unusual amount of work in one pass, if there was any. A warning and
     /// nothing else — every action it counted is still in `actions`.
     pub volume: Option<Volume>,
@@ -468,6 +487,7 @@ impl Plan {
             && self.bulk_delete.is_none()
             && self.oversize.is_empty()
             && self.collisions.is_empty()
+            && self.withheld.is_empty()
     }
 
     /// Whether this reconciliation stops the workspace (§19.6) — a conflict in
@@ -540,6 +560,22 @@ pub struct Inputs<'a> {
     /// case-sensitive. Host paths that collide under folding are refused by
     /// name rather than raced onto one guest path.
     pub case_folding: bool,
+    /// The guest tree was read **after a break in the watch** — the first walk
+    /// of a new syncer, or of a reopened channel — so nothing was watching
+    /// while it got into this state (§19.6, #190).
+    ///
+    /// It changes what one thing means: an agreed path the guest does not
+    /// hold. With the watch running that is a deletion somebody made. After a
+    /// break it is only an absence, and the commonest cause of one is a guest
+    /// that stopped before it had written out what it had already answered
+    /// for. So after a break an absence never deletes from the canonical copy:
+    /// an agreement nothing had [borne out](Ledger::unconfirmed) is dropped
+    /// and the path copied again, and any other is a
+    /// [`MissingUnseen`](ConflictKind::MissingUnseen) conflict.
+    ///
+    /// An overflow is not a break. The watch stayed open and the guest stayed
+    /// up, so the walk it forces reads deletions as deletions.
+    pub unwitnessed: bool,
 }
 
 /// One side's position relative to the ledger.
@@ -583,6 +619,14 @@ fn moved(now: Option<&State>, was: Option<&Agreed>) -> Moved {
     }
 }
 
+/// Whether one side holds something other than what was last agreed there.
+///
+/// The same answer the matrix works from, for the caller that has to decide
+/// *before* the plan whether a side that moved has also stopped moving.
+pub fn has_moved(now: Option<&State>, was: Option<&Agreed>) -> bool {
+    moved(now, was).changed()
+}
+
 /// The digest that stands for this side: the one computed, or — where the
 /// pre-filter vouched for the side and none was computed — the agreed one.
 fn digest_of(now: &State, was: &Agreed) -> String {
@@ -614,7 +658,11 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
         .keys()
         .chain(inputs.guest.keys())
         .chain(inputs.ledger.entries.keys())
+        .chain(inputs.ledger.left_standing.keys())
         .collect();
+    // Directories left standing that this pass found still standing, and the
+    // action that would make each again on the side that deleted it.
+    let mut standing: Vec<Action> = Vec::new();
 
     // Before anything is decided about them: a guest that folds case cannot
     // hold `Foo.cs` and `foo.cs` apart, and the second write would land on the
@@ -628,6 +676,15 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
 
     for path in paths {
         if inputs.undecided.contains(path) || colliding.contains(path.as_str()) {
+            // Not decided is not the same as cleared. An absence nothing saw
+            // stays withheld across the pass that could not look at it, or the
+            // next one — with the break behind it — would read it as a delete.
+            if inputs.ledger.entries.contains_key(path)
+                && (inputs.ledger.withheld.contains(path)
+                    || (inputs.unwitnessed && !inputs.guest.contains_key(path)))
+            {
+                plan.withheld.insert(path.clone());
+            }
             continue;
         }
         // Leaving scope is free: out of the ledger, and out of both
@@ -644,10 +701,34 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
         // Neither side has anything left: the agreement has nothing to be
         // about any more.
         if host.is_none() && guest.is_none() {
-            if was.is_some() {
+            if was.is_some() || inputs.ledger.left_standing.contains_key(path) {
                 plan.forget.push(path.clone());
             }
             continue;
+        }
+
+        // A directory one side deleted and the other could not drop, still
+        // exactly so: it is not a creation on the side that kept it. It is
+        // made again only where something synced has to land under it, which
+        // is decided once every path has been.
+        if was.is_none()
+            && !inputs.resolved.contains_key(path)
+            && let Some(keeper) = inputs.ledger.left_standing.get(path)
+        {
+            let (kept, dropped, direction) = match keeper {
+                Keeper::Host => (host, guest, Direction::ToGuest),
+                Keeper::Guest => (guest, host, Direction::ToHost),
+            };
+            if let (Some(state), None) = (kept, dropped)
+                && state.kind == Kind::Dir
+            {
+                standing.push(Action::MakeDir {
+                    direction,
+                    path: path.clone(),
+                    side: state.side(),
+                });
+                continue;
+            }
         }
 
         // Both moved. A resolution the developer has already given makes this
@@ -662,6 +743,33 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
             .get(path)
             .copied()
             .filter(|_| host_moved.changed() || guest_moved.changed());
+        // The guest's copy of an agreed path is missing and nothing saw it go.
+        // **Never a delete on the canonical copy** (#190). An agreement no
+        // later walk had borne out is the interrupted transfer: forget it and
+        // copy the path again. Anything else is held for the developer.
+        // Where the host moved as well, the matrix below already calls it a
+        // conflict; where the developer has answered, the answer stands.
+        if let (Some(state), None, Some(agreed), None) = (host, guest, was, resolution)
+            && (inputs.unwitnessed || inputs.ledger.withheld.contains(path))
+        {
+            if inputs.ledger.unconfirmed.contains(path) {
+                plan.forget.push(path.clone());
+                match place(Direction::ToGuest, path, state, inputs, Some(agreed)) {
+                    Ok(action) => creations.push(action),
+                    Err(refusal) => plan.oversize.push(refusal),
+                }
+                continue;
+            }
+            if !host_moved.changed() {
+                plan.withheld.insert(path.clone());
+                plan.conflicts.push(Conflict {
+                    path: path.clone(),
+                    kind: ConflictKind::MissingUnseen,
+                });
+                continue;
+            }
+        }
+
         if host_moved.changed() && guest_moved.changed() && resolution.is_none() {
             match settle_both(path, host, guest, was) {
                 Settled::Adopt(agreed) => plan.adopt.push((path.clone(), agreed)),
@@ -710,6 +818,21 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
                     Err(refusal) => plan.oversize.push(refusal),
                 }
             }
+        }
+    }
+
+    // A directory left standing comes back with the first synced path that
+    // needs it as a parent, and not before. Deepest first, so one left
+    // standing inside another brings the outer one with it.
+    standing.sort_by(|a, b| b.path().cmp(a.path()));
+    for action in standing {
+        let needed = creations.iter().any(|creation| {
+            creation.direction() == action.direction()
+                && creation.path() != action.path()
+                && at_or_below(creation.path(), action.path())
+        });
+        if needed {
+            creations.push(action);
         }
     }
 
@@ -1105,6 +1228,7 @@ mod tests {
             resolved,
             max_file_bytes: CAP,
             case_folding: false,
+            unwitnessed: false,
         })
     }
 
@@ -1119,6 +1243,7 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: true,
+            unwitnessed: false,
         })
     }
 
@@ -1218,6 +1343,70 @@ mod tests {
             plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
             vec!["src", "src/Foo.cs", "src/foo.cs"],
         );
+    }
+
+    /// A directory left standing is not a creation on the side that kept it
+    /// (review #380 F11): the side that deleted it is left without it.
+    #[test]
+    fn a_directory_left_standing_is_made_on_neither_side() {
+        let kept = tree(&[("crate", dir(1))]);
+        let none = BTreeMap::new();
+        let mut l = ledger(&[]);
+
+        l.left_standing.insert("crate".into(), Keeper::Host);
+        assert!(run(&kept, &none, &l).nothing_to_record());
+
+        l.left_standing.insert("crate".into(), Keeper::Guest);
+        assert!(run(&none, &kept, &l).nothing_to_record());
+    }
+
+    /// The first synced path under a directory left standing needs it as a
+    /// parent, so it is made then, ahead of that path.
+    #[test]
+    fn a_directory_left_standing_comes_back_with_synced_content() {
+        let host = tree(&[
+            ("crate", dir(1)),
+            ("crate/sub", dir(1)),
+            ("crate/sub/b.rs", file(Some("bb"), 1, 1)),
+        ]);
+        let mut l = ledger(&[]);
+        l.left_standing.insert("crate".into(), Keeper::Host);
+        l.left_standing.insert("crate/sub".into(), Keeper::Host);
+        let plan = run(&host, &BTreeMap::new(), &l);
+        assert_eq!(
+            plan.actions.iter().map(Action::path).collect::<Vec<_>>(),
+            vec!["crate", "crate/sub", "crate/sub/b.rs"],
+        );
+    }
+
+    /// The record is about one state only. Gone from both sides it is
+    /// dropped, and a directory on the side that deleted it is an ordinary
+    /// creation again.
+    #[test]
+    fn a_left_standing_record_ends_when_the_directory_moves() {
+        let kept = tree(&[("crate", dir(1))]);
+        let none = BTreeMap::new();
+        let mut l = ledger(&[]);
+        l.left_standing.insert("crate".into(), Keeper::Host);
+
+        let plan = run(&none, &none, &l);
+        assert_eq!(plan.forget, vec!["crate".to_string()]);
+        assert!(plan.actions.is_empty());
+
+        let plan = run(&none, &kept, &l);
+        assert!(
+            matches!(
+                plan.actions.as_slice(),
+                [Action::MakeDir {
+                    direction: Direction::ToHost,
+                    ..
+                }]
+            ),
+            "{plan:?}"
+        );
+
+        let plan = run(&kept, &kept, &l);
+        assert_eq!(plan.adopt.len(), 1, "{plan:?}");
     }
 
     /// Windows picks the object at creation and cannot infer it from a target
@@ -1786,6 +1975,7 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
+            unwitnessed: false,
         });
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
         assert_eq!(plan.forget, vec!["app.log".to_string()]);
@@ -1828,6 +2018,7 @@ mod tests {
             resolved: &BTreeMap::new(),
             max_file_bytes: CAP,
             case_folding: false,
+            unwitnessed: false,
         });
         assert!(plan.nothing_to_record(), "{plan:?}");
         assert!(plan.forget.is_empty());
@@ -1960,6 +2151,142 @@ mod tests {
         guest.remove("f0000.rs");
         let plan = run(&host, &guest, &l);
         assert!(plan.bulk_delete.is_none(), "{:?}", plan.bulk_delete);
+        assert_eq!(
+            plan.actions,
+            vec![Action::Remove {
+                direction: Direction::ToHost,
+                path: "f0000.rs".into(),
+                kind: Kind::File,
+            }]
+        );
+    }
+
+    /// The same, read after a break in the watch.
+    fn run_after_a_break(
+        host: &BTreeMap<String, State>,
+        guest: &BTreeMap<String, State>,
+        l: &Ledger,
+        undecided: &BTreeSet<String>,
+    ) -> Plan {
+        reconcile(&Inputs {
+            host,
+            guest,
+            ledger: l,
+            undecided,
+            guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
+            max_file_bytes: CAP,
+            case_folding: false,
+            unwitnessed: true,
+        })
+    }
+
+    /// **An absence nothing saw is not a deletion** (#190). The agreement was
+    /// never borne out by a later look at the guest, so the likeliest story is
+    /// a transfer the guest answered for and then lost when it stopped: the
+    /// agreement is dropped and the path copied again. The canonical copy is
+    /// not touched.
+    #[test]
+    fn after_a_break_an_unconfirmed_path_the_guest_lacks_is_copied_again() {
+        let (host, mut guest, mut l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        l.unconfirmed.insert("f0000.rs".into());
+        let plan = run_after_a_break(&host, &guest, &l, &BTreeSet::new());
+        assert_eq!(
+            plan.actions,
+            vec![Action::PutFile {
+                direction: Direction::ToGuest,
+                path: "f0000.rs".into(),
+                side: Side::new(3, 100),
+                digest: "x".into(),
+            }]
+        );
+        assert_eq!(plan.forget, vec!["f0000.rs".to_string()]);
+        assert!(!plan.halts(), "{:?}", plan.conflicts);
+    }
+
+    /// Where the agreement *had* been borne out, the guest really did hold the
+    /// file once and no longer does — and still nobody saw why. One path is
+    /// enough to stop on: the mass guard's floor is about deletions somebody
+    /// made, and this is not known to be one.
+    #[test]
+    fn after_a_break_a_confirmed_path_the_guest_lacks_is_held_for_any_count() {
+        let (host, mut guest, l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        let plan = run_after_a_break(&host, &guest, &l, &BTreeSet::new());
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(
+            plan.conflicts,
+            vec![Conflict {
+                path: "f0000.rs".into(),
+                kind: ConflictKind::MissingUnseen,
+            }]
+        );
+        assert!(plan.halts());
+        assert!(plan.withheld.contains("f0000.rs"));
+    }
+
+    /// The break is over by the next pass, and the path is still an agreed one
+    /// the guest does not hold. It stays held by name, or the halt would last
+    /// exactly one pass and the delete would go through on the second.
+    #[test]
+    fn a_withheld_absence_stays_held_on_the_passes_after_the_break() {
+        let (host, mut guest, mut l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        l.withheld.insert("f0000.rs".into());
+        let plan = run(&host, &guest, &l);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::MissingUnseen);
+        assert!(plan.withheld.contains("f0000.rs"));
+
+        // …and so does one a pass could not look at: undecided is not cleared.
+        let undecided = BTreeSet::from(["f0000.rs".to_string()]);
+        l.withheld.clear();
+        let plan = run_after_a_break(&host, &guest, &l, &undecided);
+        assert!(plan.actions.is_empty() && plan.conflicts.is_empty());
+        assert!(plan.withheld.contains("f0000.rs"));
+    }
+
+    /// Both answers work, through the same matrix as every other resolution:
+    /// `--guest` says it was a deletion after all, `--host` puts the file back.
+    #[test]
+    fn a_withheld_absence_is_released_by_either_resolution() {
+        let (host, mut guest, mut l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        l.withheld.insert("f0000.rs".into());
+
+        let plan = run_resolved(&host, &guest, &l, &resolved(&[("f0000.rs", Winner::Guest)]));
+        assert_eq!(
+            plan.actions,
+            vec![Action::Remove {
+                direction: Direction::ToHost,
+                path: "f0000.rs".into(),
+                kind: Kind::File,
+            }]
+        );
+        assert!(!plan.halts() && plan.withheld.is_empty());
+
+        let plan = run_resolved(&host, &guest, &l, &resolved(&[("f0000.rs", Winner::Host)]));
+        assert!(
+            matches!(
+                plan.actions.as_slice(),
+                [Action::PutFile { direction: Direction::ToGuest, path, .. }] if path == "f0000.rs"
+            ),
+            "{:?}",
+            plan.actions
+        );
+        assert!(!plan.halts() && plan.withheld.is_empty());
+    }
+
+    /// An overflow is not a break: the watch stayed open and the guest stayed
+    /// up, so a walk that finds an agreed path gone found a deletion.
+    #[test]
+    fn without_a_break_an_unconfirmed_path_the_guest_deleted_still_propagates() {
+        let (host, mut guest, mut l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        l.unconfirmed.insert("f0000.rs".into());
+        let plan = run(&host, &guest, &l);
         assert_eq!(
             plan.actions,
             vec![Action::Remove {

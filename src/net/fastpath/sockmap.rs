@@ -146,6 +146,12 @@ impl SegmentOffload {
         }
     }
 
+    /// Mirror a MAC the userspace table dropped at a port's limit: its
+    /// frames pass to userspace again, which floods them.
+    pub fn forget(&self, mac: MacAddr) {
+        self.engine.remove_mac(mac.0);
+    }
+
     /// Tear down a port's kernel state and drop its parked write half
     /// (which EOFs QEMU). `purged` is the MACs the switch just unlearned.
     pub fn remove_port(&self, id: PortId, purged: &[MacAddr]) {

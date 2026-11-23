@@ -21,7 +21,7 @@ OWNED = [
     "lab.up.template-changed", "lab.destroy",
     "vm.start", "vm.stop", "vm.restart", "vm.destroy", "vm.ip", "vm.hw.cpus-memory",
     "vm.hw.disk", "vm.hw.disk-from", "vm.hw.cdrom", "vm.hw.floppy",
-    "vm.hw.qemu_args", "vm.hw.nested", "vm.hw.tsc", "vm.scratch", "vm.media.iso", "vm.media.floppy",
+    "vm.hw.nested", "vm.hw.tsc", "vm.scratch", "vm.media.iso", "vm.media.floppy",
     "share.unmountable",
 ]
 
@@ -163,8 +163,12 @@ def build_images(h, lab: pathlib.Path) -> None:
     """`cd.iso` and `fd.img` for the `cdrom`/`floppy` attachments, built from
     `cd/` so no binary image is checked in."""
     h.run(["xorriso", "-as", "mkisofs", "-V", "E2ECDROM", "-o", str(lab / "cd.iso"), str(lab / "cd")])
-    h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(lab / "fd.img"), "1440"])
-    h.run(["mcopy", "-i", str(lab / "fd.img"), str(lab / "cd" / "cdrom.txt"), "::/FD.TXT"])
+    build_floppy(h, lab / "fd.img", lab / "cd" / "cdrom.txt")
+
+
+def build_floppy(h, image, payload):
+    h.run(["mkfs.fat", "-C", "-n", "E2EFD", str(image), "1440"])
+    h.run(["mcopy", "-i", str(image), str(payload), "::/FD.TXT"])
 
 
 PROBE_VM01 = r"""
@@ -525,7 +529,6 @@ def _run(h):
         h.ok("vm.hw.cdrom", p.get("cdrom") == "cdrom attachment e2e", f"E2ECDROM mounted: cdrom.txt={p.get('cdrom')!r}")
         h.ok("vm.media.iso", p.get("media_iso") == "media iso e2e", f"E2EMEDIA mounted: {p.get('media_iso')!r}")
         argv1 = qemu_argv("vm01")
-        h.ok("vm.hw.qemu_args", p.get("serial") == "E2E-QEMU-ARGS", f"guest DMI product_serial={p.get('serial')!r}")
         # vm01 declares `nested = true`, vm02 does not: the switch decides
         # what the guest CPU carries, whatever the host allows.
         virt2 = sh(h, lab, "vm02", "grep -cwE 'vmx|svm' /proc/cpuinfo; true", check=False).out.strip()

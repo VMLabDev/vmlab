@@ -4,8 +4,11 @@
 //! vocabulary in [`proto`], to create taps, load and attach vmlab's two
 //! embedded BPF objects and write their maps. The helper serves exactly
 //! that connection and exits when the daemon closes it, so the BPF objects
-//! and their attachments still live as long as the daemon does. Nothing
-//! else in vmlab needs, or is granted, a capability.
+//! live as long as the daemon does. One thing outlives both: the XDP
+//! program on a tap stays attached until the tap is destroyed, because a
+//! tap lives in every descriptor on it (a hypervisor holds one), and a tap
+//! without its program is an open door into the host's network stack.
+//! Nothing else in vmlab needs, or is granted, a capability.
 
 pub(crate) mod client;
 pub(crate) mod proto;

@@ -1,0 +1,1421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Wil Taylor <ai@wiltaylor.dev>
+Date: Sat, 21 Nov 2026 03:22:20 +0000
+Subject: [PATCH] vkd3d: Emulate ExecuteIndirect vertex and index buffer views
+ without EXT_dgc.
+
+The ExecuteIndirect emulation for devices without
+VK_EXT_device_generated_commands dropped command signatures that set
+vertex or index buffer views. Vulkan binds those buffers by handle while
+recording, so a view that is read on the GPU cannot be bound.
+
+Fetch the data instead. A compute shader reads each sequence's views and
+draw arguments from the argument buffer, copies the indices and the
+range of vertices and instances the draw uses into scratch buffers, and
+writes draw arguments that point there. The scratch buffers are bound
+for every sequence, and each sequence stays one indirect draw. Bindings
+the signature does not set are copied too when they share a rate with
+one it sets, because one draw gives them the same first element.
+
+The scratch buffers have a fixed size. A draw that does not fit is
+dropped, and the command allocator reports that when it is reset.
+
+vmlab-win3d: docs/ei.md.
+---
+ libs/vkd3d/command.c                          | 410 +++++++++++++-
+ libs/vkd3d/meson.build                        |   1 +
+ libs/vkd3d/meta.c                             |  55 ++
+ .../cs_execute_indirect_vertex_fetch.comp     | 524 ++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h                    |  99 ++++
+ libs/vkd3d/vkd3d_shaders.h                    |   1 +
+ 6 files changed, 1068 insertions(+), 22 deletions(-)
+ create mode 100644 libs/vkd3d/shaders/cs_execute_indirect_vertex_fetch.comp
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index af86b00..1cfdfc1 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2922,6 +2922,25 @@ static void d3d12_command_allocator_free_command_pool(
+     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->vk_command_pool, NULL));
+ }
+ 
++/* An emulated ExecuteIndirect that fetches vertices cannot know while recording how much
++ * its sequences draw. Say so when the GPU found more than its scratch buffers hold. */
++static void d3d12_command_allocator_report_execute_indirect_dropped(struct d3d12_command_allocator *allocator)
++{
++    size_t i, dropped = 0;
++
++    for (i = 0; i < allocator->execute_indirect_dropped_count; i++)
++        if (*allocator->execute_indirect_dropped[i])
++            dropped++;
++
++    if (dropped)
++    {
++        ERR("%zu emulated ExecuteIndirect call(s) dropped draws that did not fit the vertex scratch buffers. "
++                "Set VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET to the number of vertices one call may draw.\n", dropped);
++    }
++
++    allocator->execute_indirect_dropped_count = 0;
++}
++
+ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator)
+ {
+     unsigned int i, j;
+@@ -2985,6 +3004,9 @@ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *all
+         d3d12_command_allocator_free_command_pool(&allocator->primary_pool, device);
+         d3d12_command_allocator_free_command_pool(&allocator->fallback_pool, device);
+ 
++        d3d12_command_allocator_report_execute_indirect_dropped(allocator);
++        vkd3d_free(allocator->execute_indirect_dropped);
++
+         for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
+         {
+             for (j = 0; j < allocator->scratch_pools[i].scratch_buffer_count; j++)
+@@ -3133,6 +3155,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
+     if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->fallback_pool)))
+         return hr;
+ 
++    d3d12_command_allocator_report_execute_indirect_dropped(allocator);
++
+     /* Return scratch buffers to the device */
+     for (i = 0; i < VKD3D_SCRATCH_POOL_KIND_COUNT; i++)
+     {
+@@ -7123,6 +7147,8 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+ 
+     list->index_buffer.buffer = VK_NULL_HANDLE;
+     list->index_buffer.is_dirty = true;
++    list->index_buffer_va = 0;
++    memset(list->vertex_buffer_vas, 0, sizeof(list->vertex_buffer_vas));
+ 
+     list->current_pipeline = VK_NULL_HANDLE;
+     list->command_buffer_pipeline = VK_NULL_HANDLE;
+@@ -13983,6 +14009,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
+     TRACE("iface %p, view %p.\n", iface, view);
+ 
+     list->index_buffer.is_dirty = true;
++    list->index_buffer_va = 0;
+ 
+     if (!view || view->SizeInBytes == 0)
+     {
+@@ -14017,6 +14044,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
+             list->index_buffer.buffer = resource->vk_buffer;
+             list->index_buffer.offset = view->BufferLocation - resource->va;
+             list->index_buffer.size = view->SizeInBytes;
++            list->index_buffer_va = view->BufferLocation;
+         }
+         else
+         {
+@@ -14103,6 +14131,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetVertexBuffers(d3d12_comman
+         dyn_state->vertex_buffers[start_slot + i] = buffer;
+         dyn_state->vertex_offsets[start_slot + i] = offset;
+         dyn_state->vertex_sizes[start_slot + i] = size;
++        list->vertex_buffer_vas[start_slot + i] = invalid_va ? 0 : views[i].BufferLocation;
+     }
+ 
+     dyn_state->dirty_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
+@@ -16492,6 +16521,7 @@ static void d3d12_command_list_clear_signature_state(
+                 /* Null IBO */
+                 list->index_buffer.buffer = VK_NULL_HANDLE;
+                 list->index_buffer.is_dirty = true;
++                list->index_buffer_va = 0;
+                 break;
+ 
+             case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+@@ -16502,6 +16532,9 @@ static void d3d12_command_list_clear_signature_state(
+                 list->dynamic_state.vertex_strides[slot] = 0;
+                 list->dynamic_state.vertex_offsets[slot] = 0;
+                 list->dynamic_state.vertex_sizes[slot] = 0;
++                list->dynamic_state.dirty_vbos |= 1u << slot;
++                list->dynamic_state.dirty_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
++                list->vertex_buffer_vas[slot] = 0;
+                 break;
+             }
+ 
+@@ -17099,6 +17132,253 @@ void d3d12_command_list_flush_dgc_batch(struct d3d12_command_list *list)
+             state ? &state->ID3D12PipelineState_iface : NULL);
+ }
+ 
++struct vkd3d_execute_indirect_vertex_fetch
++{
++    struct vkd3d_scratch_allocation params;
++    struct vkd3d_scratch_allocation totals;
++    struct vkd3d_scratch_allocation index_scratch;
++    struct vkd3d_scratch_allocation vertex_scratch[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    VkDeviceSize vertex_sizes[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    VkDeviceSize vertex_strides[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    uint32_t copy_mask;
++    bool indexed;
++};
++
++/* How many vertices one emulated ExecuteIndirect can fetch, over all its sequences.
++ * It has four times as many indices. Draws that do not fit are dropped, and the
++ * command allocator reports that when it is reset. */
++static uint32_t d3d12_execute_indirect_vertex_budget(uint32_t max_command_count)
++{
++    char env[64];
++
++    if (vkd3d_get_env_var("VKD3D_EXECUTE_INDIRECT_VERTEX_BUDGET", env, sizeof(env)) && env[0])
++        return (uint32_t)min(max(strtoull(env, NULL, 0), 1ull), 1ull << 26);
++
++    return (uint32_t)min(max((uint64_t)max_command_count * 1024u, 1ull << 14), 1ull << 20);
++}
++
++static bool d3d12_command_list_prepare_execute_indirect_vertex_fetch(
++        struct d3d12_command_list *list, struct d3d12_command_signature *signature,
++        uint32_t max_command_count, VkDeviceAddress api_buffer_va, VkDeviceAddress indirect_count_va,
++        const struct vkd3d_scratch_allocation *slot_allocation,
++        struct vkd3d_execute_indirect_vertex_fetch *fetch)
++{
++    const struct vkd3d_dynamic_state *dyn_state = &list->dynamic_state;
++    struct vkd3d_execute_indirect_vertex_fetch_binding *binding;
++    struct d3d12_command_allocator *allocator = list->allocator;
++    struct vkd3d_execute_indirect_vertex_fetch_params *params;
++    const struct d3d12_graphics_pipeline_state *graphics;
++    uint32_t vertex_rate_mask, instance_rate_mask, mask;
++    struct vkd3d_scratch_allocation state_allocation;
++    uint32_t budget, max_stride, stride;
++    unsigned int slot;
++
++    memset(fetch, 0, sizeof(*fetch));
++
++    if (!list->state || list->state->pipeline_type != VKD3D_PIPELINE_TYPE_GRAPHICS)
++    {
++        WARN("No graphics pipeline bound, ignoring ExecuteIndirect.\n");
++        return false;
++    }
++
++    graphics = &list->state->graphics;
++    fetch->indexed = signature->desc.pArgumentDescs[signature->desc.NumArgumentDescs - 1].Type ==
++            D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
++
++    vertex_rate_mask = 0;
++    instance_rate_mask = 0;
++    max_stride = 4;
++    mask = graphics->vertex_buffer_mask;
++    while (mask)
++    {
++        slot = vkd3d_bitmask_iter32(&mask);
++        if (graphics->input_rates[slot] == VK_VERTEX_INPUT_RATE_INSTANCE)
++            instance_rate_mask |= 1u << slot;
++        else
++            vertex_rate_mask |= 1u << slot;
++        max_stride = max(max_stride, align(graphics->minimum_vertex_buffer_dynamic_stride[slot], 4));
++    }
++
++    /* One draw gives every binding of a rate the same first element, so when the
++     * signature sets one binding, the others of that rate are copied with it. */
++    if (!(signature->emulation.vertex_buffer_mask & vertex_rate_mask))
++        vertex_rate_mask = 0;
++    if (!(signature->emulation.vertex_buffer_mask & instance_rate_mask))
++        instance_rate_mask = 0;
++    fetch->copy_mask = vertex_rate_mask | instance_rate_mask;
++
++    /* The shader computes scratch offsets in 32 bits. */
++    budget = d3d12_execute_indirect_vertex_budget(max_command_count);
++    budget = min(budget, (1u << 30) / max_stride);
++
++    if (!d3d12_command_allocator_allocate_scratch_memory(allocator, VKD3D_SCRATCH_POOL_KIND_UNIFORM_UPLOAD,
++            sizeof(*params), 16, ~0u, &fetch->params) || !fetch->params.host_ptr ||
++            !d3d12_command_allocator_allocate_scratch_memory(allocator, VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++            (VkDeviceSize)max_command_count * VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_STATE_SIZE,
++            16, ~0u, &state_allocation) ||
++            !d3d12_command_allocator_allocate_scratch_memory(allocator, VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++            VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_TOTALS_SIZE, 16, ~0u, &fetch->totals))
++    {
++        ERR("Failed to allocate ExecuteIndirect vertex fetch state.\n");
++        return false;
++    }
++
++    params = fetch->params.host_ptr;
++    memset(params, 0, sizeof(*params));
++    params->api_buffer_va = api_buffer_va;
++    params->count_va = indirect_count_va;
++    params->slots_va = slot_allocation->va;
++    params->state_va = state_allocation.va;
++    params->totals_va = fetch->totals.va;
++    params->status_va = fetch->params.va + offsetof(struct vkd3d_execute_indirect_vertex_fetch_params, dropped);
++    params->api_stride_words = signature->desc.ByteStride / sizeof(uint32_t);
++    params->slot_stride_words = signature->emulation.slot_stride / sizeof(uint32_t);
++    params->slot_action_word = signature->emulation.action_offset / sizeof(uint32_t);
++    params->draw_src_word = signature->emulation.action_src_word;
++    params->max_commands = max_command_count;
++    params->vertex_budget = budget;
++    params->instance_budget = budget;
++    params->ibv_src_word = UINT32_MAX;
++
++    if (vertex_rate_mask)
++        params->flags |= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_VERTICES;
++    if (instance_rate_mask)
++        params->flags |= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_INSTANCES;
++
++    if (fetch->indexed)
++    {
++        params->flags |= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_INDEXED;
++        /* As vkCmdSetPrimitiveRestartEnable. In Vulkan, the index type gives the cut value. */
++        if (graphics->index_buffer_strip_cut_value != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED &&
++                vk_primitive_topology_supports_restart(dyn_state->vk_primitive_topology))
++            params->flags |= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_RESTART;
++
++        params->index_budget = min((uint64_t)budget * 4u, 1u << 28);
++        if (!d3d12_command_allocator_allocate_scratch_memory(allocator, VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++                (VkDeviceSize)params->index_budget * sizeof(uint32_t), 16, ~0u, &fetch->index_scratch))
++        {
++            ERR("Failed to allocate ExecuteIndirect index scratch.\n");
++            return false;
++        }
++        params->index_scratch_va = fetch->index_scratch.va;
++
++        if (signature->emulation.index_buffer_src_word != UINT32_MAX)
++        {
++            params->ibv_src_word = signature->emulation.index_buffer_src_word;
++        }
++        else if (list->index_buffer.buffer)
++        {
++            params->ib_va = list->index_buffer_va;
++            params->ib_size = min(list->index_buffer.size, UINT32_MAX);
++            params->ib_format = list->index_buffer.vk_type == VK_INDEX_TYPE_UINT32 ?
++                    DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
++        }
++    }
++
++    mask = fetch->copy_mask;
++    while (mask)
++    {
++        slot = vkd3d_bitmask_iter32(&mask);
++        stride = max(align(graphics->minimum_vertex_buffer_dynamic_stride[slot], 4), 4);
++        fetch->vertex_strides[slot] = stride;
++        fetch->vertex_sizes[slot] = (VkDeviceSize)budget * stride;
++
++        if (!d3d12_command_allocator_allocate_scratch_memory(allocator, VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE,
++                fetch->vertex_sizes[slot], 16, ~0u, &fetch->vertex_scratch[slot]))
++        {
++            ERR("Failed to allocate ExecuteIndirect vertex scratch.\n");
++            return false;
++        }
++
++        binding = &params->bindings[params->binding_count++];
++        binding->dst_va = fetch->vertex_scratch[slot].va;
++        binding->dst_stride = stride;
++        if (instance_rate_mask & (1u << slot))
++            binding->flags |= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_BINDING_INSTANCE_RATE;
++
++        if (signature->emulation.vertex_buffer_mask & (1u << slot))
++        {
++            binding->src_word = signature->emulation.vertex_buffer_src_word[slot];
++        }
++        else
++        {
++            binding->src_word = UINT32_MAX;
++            binding->va = list->vertex_buffer_vas[slot];
++            binding->size = min(dyn_state->vertex_sizes[slot], UINT32_MAX);
++            binding->stride = dyn_state->vertex_strides[slot];
++        }
++    }
++
++    if (!vkd3d_array_reserve((void **)&allocator->execute_indirect_dropped, &allocator->execute_indirect_dropped_size,
++            allocator->execute_indirect_dropped_count + 1, sizeof(*allocator->execute_indirect_dropped)))
++        return false;
++    allocator->execute_indirect_dropped[allocator->execute_indirect_dropped_count++] = &params->dropped;
++
++    return true;
++}
++
++static void d3d12_command_list_execute_indirect_vertex_fetch(struct d3d12_command_list *list,
++        struct d3d12_command_signature *signature, const struct vkd3d_execute_indirect_vertex_fetch *fetch)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
++    VkCommandBuffer vk_cmd_buffer = list->cmd.vk_command_buffer;
++    struct vkd3d_execute_indirect_vertex_fetch_args args;
++    VkMemoryBarrier2 barrier;
++    VkDependencyInfo dep_info;
++    unsigned int mode;
++
++    memset(&barrier, 0, sizeof(barrier));
++    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
++            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
++            VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
++
++    memset(&dep_info, 0, sizeof(dep_info));
++    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep_info.memoryBarrierCount = 1;
++    dep_info.pMemoryBarriers = &barrier;
++
++    VK_CALL(vkCmdBindPipeline(vk_cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++            signature->emulation.fetch_pipeline.vk_pipeline));
++
++    memset(&args, 0, sizeof(args));
++    args.params_va = fetch->params.va;
++
++    for (mode = VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_LAYOUT_INDEX;
++            mode <= VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY; mode++)
++    {
++        /* A draw that is not indexed has no indices to lay out or scan. */
++        if (!fetch->indexed && mode < VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_LAYOUT_VERTEX)
++            continue;
++        if (!fetch->copy_mask && mode == VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY)
++            continue;
++
++        args.mode = mode;
++        VK_CALL(vkCmdPushConstants(vk_cmd_buffer, signature->emulation.fetch_pipeline.vk_pipeline_layout,
++                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args));
++
++        switch (mode)
++        {
++            case VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_SCAN_INDEX:
++                VK_CALL(vkCmdDispatchIndirect(vk_cmd_buffer, fetch->totals.buffer, fetch->totals.offset));
++                break;
++            case VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY:
++                VK_CALL(vkCmdDispatchIndirect(vk_cmd_buffer, fetch->totals.buffer,
++                        fetch->totals.offset + VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_DISPATCH_OFFSET));
++                break;
++            default:
++                /* One invocation does the work. */
++                VK_CALL(vkCmdDispatch(vk_cmd_buffer, 1, 1, 1));
++                break;
++        }
++
++        VK_CALL(vkCmdPipelineBarrier2(vk_cmd_buffer, &dep_info));
++    }
++}
++
+ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         struct d3d12_command_list *list, struct d3d12_command_signature *signature,
+         uint32_t max_command_count,
+@@ -17106,9 +17386,11 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         struct d3d12_resource *count_buffer, UINT64 count_buffer_offset)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+-    const struct d3d12_bind_point_layout *bind_point_layout;
++    const struct d3d12_bind_point_layout *bind_point_layout = NULL;
++    bool fetch_vertices = signature->emulation.fetch_vertices;
+     struct vkd3d_scratch_allocation predication_allocation;
+     const struct d3d12_root_signature *root_signature;
++    struct vkd3d_execute_indirect_vertex_fetch fetch;
+     struct vkd3d_scratch_allocation count_allocation;
+     struct vkd3d_scratch_allocation slot_allocation;
+     struct vkd3d_execute_indirect_args patch_args;
+@@ -17123,7 +17405,7 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+     VkCommandBuffer vk_cmd_buffer;
+     VkMemoryBarrier2 barrier;
+     VkDependencyInfo dep_info;
+-    uint32_t stride, i;
++    uint32_t stride, i, mask;
+     uint8_t *slot_ptr;
+ 
+     action_type = signature->desc.pArgumentDescs[signature->desc.NumArgumentDescs - 1].Type;
+@@ -17134,11 +17416,14 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         return;
+     }
+ 
+-    bind_point_layout = d3d12_root_signature_get_layout(root_signature, signature->pipeline_type);
+-    if (!(bind_point_layout->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK))
++    if (signature->emulation.push_root_parameters)
+     {
+-        FIXME("Bound root signature does not use a push UBO, ignoring ExecuteIndirect.\n");
+-        return;
++        bind_point_layout = d3d12_root_signature_get_layout(root_signature, signature->pipeline_type);
++        if (!(bind_point_layout->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK))
++        {
++            FIXME("Bound root signature does not use a push UBO, ignoring ExecuteIndirect.\n");
++            return;
++        }
+     }
+ 
+     stride = signature->emulation.slot_stride;
+@@ -17174,6 +17459,11 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         return;
+     }
+ 
++    /* The vertex layout comes from the bound pipeline, which is known before it is flushed. */
++    if (fetch_vertices && !d3d12_command_list_prepare_execute_indirect_vertex_fetch(list, signature,
++            max_command_count, arg_buffer->res.va + arg_buffer_offset, indirect_count_va, &slot_allocation, &fetch))
++        return;
++
+     /* Patch the slots on the GPU, in order with the rest of the command list. Sequences past
+      * the count keep their zeroed action arguments and draw or dispatch nothing. */
+     d3d12_command_list_end_current_render_pass(list, false);
+@@ -17208,6 +17498,7 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         VK_CALL(vkCmdPipelineBarrier2(vk_cmd_buffer, &dep_info));
+     }
+ 
++    /* A signature that sets only vertex or index buffer views has nothing to patch here. */
+     if (signature->state_template.dgc.pipeline.vk_pipeline)
+     {
+         VK_CALL(vkCmdPushConstants(vk_cmd_buffer, signature->state_template.dgc.pipeline.vk_pipeline_layout,
+@@ -17230,6 +17521,10 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+         VK_CALL(vkCmdPipelineBarrier2(vk_cmd_buffer, &dep_info));
+     }
+ 
++    /* Copy what the sequences draw into the scratch buffers, and write their draw arguments. */
++    if (fetch_vertices)
++        d3d12_command_list_execute_indirect_vertex_fetch(list, signature, &fetch);
++
+     /* Flush the application's state as for a normal draw or dispatch. */
+     if (signature->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE)
+     {
+@@ -17238,7 +17533,8 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+     }
+     else
+     {
+-        if (action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED &&
++        /* With fetched vertices, the scratch index buffer is bound below instead. */
++        if (action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && !fetch_vertices &&
+                 !d3d12_command_list_update_index_buffer(list))
+             return;
+ 
+@@ -17248,7 +17544,7 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+             return;
+         }
+ 
+-        if (action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
++        if (action_type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && !fetch_vertices)
+             d3d12_command_list_check_index_buffer_strip_cut_value(list);
+     }
+ 
+@@ -17271,15 +17567,36 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+     vk_cmd_buffer = list->cmd.vk_command_buffer;
+     d3d12_command_list_debug_mark_begin_region(list, "EI (emulated)");
+ 
++    if (fetch_vertices)
++    {
++        /* Over the application's bindings, which the render pass just flushed. */
++        mask = fetch.copy_mask;
++        while (mask)
++        {
++            i = vkd3d_bitmask_iter32(&mask);
++            VK_CALL(vkCmdBindVertexBuffers2(vk_cmd_buffer, i, 1, &fetch.vertex_scratch[i].buffer,
++                    &fetch.vertex_scratch[i].offset, &fetch.vertex_sizes[i], &fetch.vertex_strides[i]));
++        }
++
++        if (fetch.indexed)
++        {
++            VK_CALL(vkCmdBindIndexBuffer(vk_cmd_buffer, fetch.index_scratch.buffer,
++                    fetch.index_scratch.offset, VK_INDEX_TYPE_UINT32));
++        }
++    }
++
+     for (i = 0; i < max_command_count; i++)
+     {
+         slot = slot_allocation;
+         slot.offset += (VkDeviceSize)i * stride;
+ 
+-        vk_write_descriptor_set_from_scratch_push_ubo(&descriptor_write, &buffer_info, &slot,
+-                D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, root_signature->push_constant_ubo_binding.binding);
+-        VK_CALL(vkCmdPushDescriptorSetKHR(vk_cmd_buffer, vk_bind_point,
+-                bind_point_layout->vk_pipeline_layout, root_signature->root_descriptor_set, 1, &descriptor_write));
++        if (signature->emulation.push_root_parameters)
++        {
++            vk_write_descriptor_set_from_scratch_push_ubo(&descriptor_write, &buffer_info, &slot,
++                    D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, root_signature->push_constant_ubo_binding.binding);
++            VK_CALL(vkCmdPushDescriptorSetKHR(vk_cmd_buffer, vk_bind_point,
++                    bind_point_layout->vk_pipeline_layout, root_signature->root_descriptor_set, 1, &descriptor_write));
++        }
+ 
+         slot.offset += signature->emulation.action_offset;
+ 
+@@ -17304,6 +17621,13 @@ static void d3d12_command_list_execute_indirect_state_template_emulated(
+ 
+     d3d12_command_list_debug_mark_end_region(list);
+ 
++    if (fetch_vertices)
++    {
++        /* The scratch buffers replaced these bindings in the command buffer. */
++        list->dynamic_state.dirty_vbos |= fetch.copy_mask;
++        list->dynamic_state.dirty_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
++    }
++
+     /* State set by the signature is undefined afterwards, and the push UBO now points at the
+      * last slot, so re-emit everything for the next command. */
+     d3d12_command_list_clear_signature_state(list, signature);
+@@ -25632,8 +25956,12 @@ static HRESULT d3d12_command_signature_init_state_template_emulated(struct d3d12
+     uint32_t root_parameter_index, root_data_words;
+     size_t patch_commands_count = 0;
+     size_t patch_commands_size = 0;
++    uint32_t index_buffer_src_word = UINT32_MAX;
++    uint32_t vertex_buffer_mask = 0;
+     uint32_t src_word_offset = 0;
++    bool fetch_vertices = false;
+     uint32_t action_words = 0;
++    bool sets_views = false;
+     uint32_t copy_count;
+     uint32_t dst_word;
+     HRESULT hr = S_OK;
+@@ -25704,14 +26032,37 @@ static HRESULT d3d12_command_signature_init_state_template_emulated(struct d3d12
+                 copy_count = sizeof(VkDeviceAddress) / sizeof(uint32_t);
+                 break;
+ 
++            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
++                /* D3D12_VERTEX_BUFFER_VIEW. Read by the vertex fetch shader, not copied to the slot. */
++                if (argument_desc->VertexBuffer.Slot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)
++                {
++                    hr = E_INVALIDARG;
++                    goto end;
++                }
++                signature->emulation.vertex_buffer_src_word[argument_desc->VertexBuffer.Slot] = src_word_offset;
++                vertex_buffer_mask |= 1u << argument_desc->VertexBuffer.Slot;
++                src_word_offset += sizeof(D3D12_VERTEX_BUFFER_VIEW) / sizeof(uint32_t);
++                sets_views = true;
++                break;
++
++            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
++                /* D3D12_INDEX_BUFFER_VIEW, as above. */
++                index_buffer_src_word = src_word_offset;
++                src_word_offset += sizeof(D3D12_INDEX_BUFFER_VIEW) / sizeof(uint32_t);
++                sets_views = true;
++                break;
++
+             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+                 action_words = sizeof(VkDrawIndirectCommand) / sizeof(uint32_t);
+-                copy_count = action_words;
++                /* With views, the vertex fetch shader writes the draw arguments. */
++                fetch_vertices = sets_views;
++                copy_count = fetch_vertices ? 0 : action_words;
+                 break;
+ 
+             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                 action_words = sizeof(VkDrawIndexedIndirectCommand) / sizeof(uint32_t);
+-                copy_count = action_words;
++                fetch_vertices = sets_views;
++                copy_count = fetch_vertices ? 0 : action_words;
+                 break;
+ 
+             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+@@ -25725,7 +26076,6 @@ static HRESULT d3d12_command_signature_init_state_template_emulated(struct d3d12
+                 break;
+ 
+             default:
+-                /* Vertex and index buffer views are bound on the CPU and cannot come from the GPU. */
+                 FIXME("Cannot emulate indirect argument type %u without EXT_dgc.\n", argument_desc->Type);
+                 hr = E_NOTIMPL;
+                 goto end;
+@@ -25735,6 +26085,7 @@ static HRESULT d3d12_command_signature_init_state_template_emulated(struct d3d12
+         {
+             /* The action is always last. Its words follow the root parameter block. */
+             dst_word = align(root_data_words, 4);
++            signature->emulation.action_src_word = src_word_offset;
+         }
+ 
+         if (copy_count)
+@@ -25757,18 +26108,33 @@ static HRESULT d3d12_command_signature_init_state_template_emulated(struct d3d12
+     signature->emulation.slot_stride = align(signature->emulation.action_offset + action_words * sizeof(uint32_t),
+             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+     signature->emulation.incrementing_constant_word = incrementing_constant_word;
++    /* Without root arguments there is no root signature here, and the bound one need not use
++     * a push UBO. The slots then hold only the action, and the bound root parameters stay. */
++    signature->emulation.push_root_parameters = !!root_signature;
++    signature->emulation.fetch_vertices = fetch_vertices;
++    signature->emulation.vertex_buffer_mask = vertex_buffer_mask;
++    signature->emulation.index_buffer_src_word = index_buffer_src_word;
++
++    /* A signature that sets only views has no word to patch. */
++    if (patch_commands_count)
++    {
++        if (FAILED(hr = d3d12_command_signature_init_patch_commands_buffer(signature, device,
++                patch_commands, patch_commands_count)))
++            goto end;
+ 
+-    if (FAILED(hr = d3d12_command_signature_init_patch_commands_buffer(signature, device,
+-            patch_commands, patch_commands_count)))
+-        goto end;
++        if (FAILED(hr = vkd3d_meta_get_execute_indirect_pipeline(&device->meta_ops, patch_commands_count,
++                &signature->state_template.dgc.pipeline)))
++            goto end;
++    }
+ 
+-    if (FAILED(hr = vkd3d_meta_get_execute_indirect_pipeline(&device->meta_ops, patch_commands_count,
+-            &signature->state_template.dgc.pipeline)))
++    if (fetch_vertices && FAILED(hr = vkd3d_meta_get_execute_indirect_vertex_fetch_pipeline(&device->meta_ops,
++            &signature->emulation.fetch_pipeline)))
+         goto end;
+ 
+     signature->emulation.enabled = true;
+-    INFO("Emulating ExecuteIndirect state (%zu patch words, slot stride %u) without EXT_dgc.\n",
+-            patch_commands_count, signature->emulation.slot_stride);
++    INFO("Emulating ExecuteIndirect state (%zu patch words, slot stride %u%s) without EXT_dgc.\n",
++            patch_commands_count, signature->emulation.slot_stride,
++            fetch_vertices ? ", fetching vertices" : "");
+ 
+ end:
+     vkd3d_free(patch_commands);
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index 477b366..df6eef2 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -35,6 +35,7 @@ vkd3d_shaders =[
+   'shaders/cs_execute_indirect_patch.comp',
+   'shaders/cs_execute_indirect_patch_debug_ring.comp',
+   'shaders/cs_execute_indirect_multi_dispatch.comp',
++  'shaders/cs_execute_indirect_vertex_fetch.comp',
+ 
+   'shaders/cs_sampler_feedback_decode_buffer_min_mip.comp',
+   'shaders/fs_sampler_feedback_decode_image_min_mip.frag',
+diff --git a/libs/vkd3d/meta.c b/libs/vkd3d/meta.c
+index 770efda..816c5aa 100644
+--- a/libs/vkd3d/meta.c
++++ b/libs/vkd3d/meta.c
+@@ -1689,9 +1689,62 @@ static HRESULT vkd3d_execute_indirect_ops_init(struct vkd3d_execute_indirect_ops
+     meta_indirect_ops->pipelines_count = 0;
+     meta_indirect_ops->pipelines_size = 0;
+     meta_indirect_ops->pipelines = NULL;
++    meta_indirect_ops->vk_vertex_fetch_layout = VK_NULL_HANDLE;
++    meta_indirect_ops->vk_vertex_fetch_pipeline = VK_NULL_HANDLE;
+     return S_OK;
+ }
+ 
++HRESULT vkd3d_meta_get_execute_indirect_vertex_fetch_pipeline(struct vkd3d_meta_ops *meta_ops,
++        struct vkd3d_execute_indirect_info *info)
++{
++    struct vkd3d_execute_indirect_ops *meta_indirect_ops = &meta_ops->execute_indirect;
++    VkPushConstantRange push_constant_range;
++    HRESULT hr = S_OK;
++    VkResult vr;
++    int rc;
++
++    if ((rc = pthread_mutex_lock(&meta_indirect_ops->mutex)))
++    {
++        ERR("Failed to lock mutex, error %d.\n", rc);
++        return hresult_from_errno(rc);
++    }
++
++    /* Created on first use: only devices without EXT_dgc need it. */
++    if (!meta_indirect_ops->vk_vertex_fetch_pipeline)
++    {
++        if (!meta_indirect_ops->vk_vertex_fetch_layout)
++        {
++            push_constant_range.offset = 0;
++            push_constant_range.size = sizeof(struct vkd3d_execute_indirect_vertex_fetch_args);
++            push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++
++            if ((vr = vkd3d_meta_create_pipeline_layout(meta_ops->device, 0, NULL, 1,
++                    &push_constant_range, &meta_indirect_ops->vk_vertex_fetch_layout)) < 0)
++            {
++                hr = hresult_from_vk_result(vr);
++                goto out;
++            }
++        }
++
++        if ((vr = vkd3d_meta_create_compute_pipeline(meta_ops->device,
++                sizeof(cs_execute_indirect_vertex_fetch), cs_execute_indirect_vertex_fetch,
++                meta_indirect_ops->vk_vertex_fetch_layout, NULL,
++                true, NULL, &meta_indirect_ops->vk_vertex_fetch_pipeline)) < 0)
++        {
++            meta_indirect_ops->vk_vertex_fetch_pipeline = VK_NULL_HANDLE;
++            hr = hresult_from_vk_result(vr);
++            goto out;
++        }
++    }
++
++    info->vk_pipeline_layout = meta_indirect_ops->vk_vertex_fetch_layout;
++    info->vk_pipeline = meta_indirect_ops->vk_vertex_fetch_pipeline;
++
++out:
++    pthread_mutex_unlock(&meta_indirect_ops->mutex);
++    return hr;
++}
++
+ struct vkd3d_meta_execute_indirect_spec_constant_data
+ {
+     struct vkd3d_shader_debug_ring_spec_constants constants;
+@@ -1799,6 +1852,8 @@ static void vkd3d_execute_indirect_ops_cleanup(struct vkd3d_execute_indirect_ops
+ 
+     for (i = 0; i < meta_indirect_ops->pipelines_count; i++)
+         VK_CALL(vkDestroyPipeline(device->vk_device, meta_indirect_ops->pipelines[i].vk_pipeline, NULL));
++    VK_CALL(vkDestroyPipeline(device->vk_device, meta_indirect_ops->vk_vertex_fetch_pipeline, NULL));
++    VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_indirect_ops->vk_vertex_fetch_layout, NULL));
+     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_indirect_ops->vk_pipeline_layout, NULL));
+     pthread_mutex_destroy(&meta_indirect_ops->mutex);
+     vkd3d_free(meta_indirect_ops->pipelines);
+diff --git a/libs/vkd3d/shaders/cs_execute_indirect_vertex_fetch.comp b/libs/vkd3d/shaders/cs_execute_indirect_vertex_fetch.comp
+new file mode 100644
+index 0000000..6715591
+--- /dev/null
++++ b/libs/vkd3d/shaders/cs_execute_indirect_vertex_fetch.comp
+@@ -0,0 +1,524 @@
++#version 450
++#extension GL_EXT_buffer_reference : require
++#extension GL_EXT_buffer_reference_uvec2 : require
++
++/* ExecuteIndirect emulation without EXT_dgc, for command signatures that set
++ * vertex or index buffer views. Vulkan binds those buffers by handle while
++ * recording, so a view the GPU reads from the argument buffer cannot be bound.
++ * Instead, the indices and the vertices each sequence uses are copied into
++ * scratch buffers that are bound for every sequence, and the draw arguments
++ * are rewritten to point there.
++ *
++ * One pipeline, four passes selected by mode:
++ *  LAYOUT_INDEX  one invocation. Gives each indexed sequence a range of the index scratch.
++ *  SCAN_INDEX    one invocation per index. Copies indices as 32-bit, and finds
++ *                the lowest and highest vertex each sequence uses.
++ *  LAYOUT_VERTEX one invocation. Gives each sequence a range of the vertex and
++ *                instance scratch, and writes its draw arguments.
++ *  COPY          one invocation per vertex or instance element. Copies the elements. */
++
++layout(local_size_x = 64) in;
++
++#define MODE_LAYOUT_INDEX 0u
++#define MODE_SCAN_INDEX 1u
++#define MODE_LAYOUT_VERTEX 2u
++#define MODE_COPY 3u
++
++#define FLAG_INDEXED 1u
++#define FLAG_RESTART 2u
++#define FLAG_COPY_VERTICES 4u
++#define FLAG_COPY_INSTANCES 8u
++
++#define BINDING_INSTANCE_RATE 1u
++
++#define NO_WORD 0xffffffffu
++#define DXGI_FORMAT_R32_UINT 42u
++
++struct Binding
++{
++	/* Word of the view in an argument record, or NO_WORD when the view is the constant below. */
++	uint src_word;
++	uint flags;
++	uvec2 va;
++	uint size;
++	uint stride;
++	uvec2 dst_va;
++	uint dst_stride;
++	uint reserved;
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Params
++{
++	uvec2 api_buffer_va;
++	uvec2 count_va;
++	uvec2 slots_va;
++	uvec2 state_va;
++	uvec2 index_scratch_va;
++	uvec2 totals_va;
++	uvec2 status_va;
++	uint api_stride_words;
++	uint slot_stride_words;
++	uint slot_action_word;
++	uint draw_src_word;
++	uint max_commands;
++	uint flags;
++	uint index_budget;
++	uint vertex_budget;
++	uint instance_budget;
++	/* The index buffer view, as for Binding. format is a DXGI_FORMAT. */
++	uint ibv_src_word;
++	uvec2 ib_va;
++	uint ib_size;
++	uint ib_format;
++	uint binding_count;
++	uint reserved;
++	Binding bindings[32];
++};
++
++struct Sequence
++{
++	uint index_first;
++	uint index_count;
++	uint vertex_min;
++	uint vertex_max;
++	uint vertex_first;
++	uint vertex_count;
++	uint instance_first;
++	uint instance_count;
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer SequenceState
++{
++	Sequence seq[];
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer Totals
++{
++	/* VkDispatchIndirectCommand of SCAN_INDEX, then the number of indices. */
++	uint index_dispatch_x, index_dispatch_y, index_dispatch_z;
++	uint index_total;
++	/* VkDispatchIndirectCommand of COPY, then the number of elements of each kind. */
++	uint copy_dispatch_x, copy_dispatch_y, copy_dispatch_z;
++	uint vertex_total;
++	uint instance_total;
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Status
++{
++	uint dropped;
++};
++
++layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words
++{
++	uint v[];
++};
++
++layout(push_constant) uniform Registers
++{
++	Params params;
++	uint mode;
++};
++
++uvec2 va_add(uvec2 va, uint offset)
++{
++	uint carry;
++	uint lo = uaddCarry(va.x, offset, carry);
++	return uvec2(lo, va.y + carry);
++}
++
++/* A 32-bit load at any byte address. */
++uint load_u32(uvec2 va, uint offset)
++{
++	uvec2 addr = va_add(va, offset);
++	uint shift = (addr.x & 3u) * 8u;
++	Words words = Words(uvec2(addr.x & ~3u, addr.y));
++	uint value = words.v[0];
++	if (shift != 0u)
++		value = (value >> shift) | (words.v[1] << (32u - shift));
++	return value;
++}
++
++/* A 16-bit load at any byte address. */
++uint load_u16(uvec2 va, uint offset)
++{
++	uvec2 addr = va_add(va, offset);
++	uint shift = (addr.x & 3u) * 8u;
++	Words words = Words(uvec2(addr.x & ~3u, addr.y));
++	uint value = words.v[0] >> shift;
++	if (shift == 24u)
++		value |= words.v[1] << 8u;
++	return value & 0xffffu;
++}
++
++uint api_word(uint sequence, uint word)
++{
++	return Words(params.api_buffer_va).v[sequence * params.api_stride_words + word];
++}
++
++uint sequence_count()
++{
++	uint count = params.max_commands;
++	if (any(notEqual(params.count_va, uvec2(0))))
++		count = min(count, Words(params.count_va).v[0]);
++	return count;
++}
++
++void layout_index()
++{
++	SequenceState state = SequenceState(params.state_va);
++	Totals totals = Totals(params.totals_va);
++	uint count = sequence_count();
++	uint total = 0u;
++	bool dropped = false;
++	uint i;
++
++	for (i = 0u; i < params.max_commands; i++)
++	{
++		uint index_count = 0u;
++
++		if (i < count)
++		{
++			uint draw_indices = api_word(i, params.draw_src_word);
++			uint draw_instances = api_word(i, params.draw_src_word + 1u);
++
++			if (draw_indices != 0u && draw_instances != 0u)
++			{
++				if (draw_indices <= params.index_budget - total)
++					index_count = draw_indices;
++				else
++					dropped = true;
++			}
++		}
++
++		state.seq[i].index_first = total;
++		state.seq[i].index_count = index_count;
++		state.seq[i].vertex_min = 0xffffffffu;
++		state.seq[i].vertex_max = 0u;
++		total += index_count;
++	}
++
++	totals.index_dispatch_x = (total + 63u) / 64u;
++	totals.index_dispatch_y = 1u;
++	totals.index_dispatch_z = 1u;
++	totals.index_total = total;
++	if (dropped)
++		Status(params.status_va).dropped = 1u;
++}
++
++void scan_index()
++{
++	SequenceState state = SequenceState(params.state_va);
++	uint element = gl_GlobalInvocationID.x;
++	uint lo = 0u, hi = params.max_commands;
++	uint index_va_lo, index_va_hi, index_size, index_format;
++	uint position, carry, value;
++	bool restart = false;
++
++	if (element >= Totals(params.totals_va).index_total)
++		return;
++
++	/* The last sequence that starts at or before this element. Empty sequences
++	 * share their start with the next one, so this never selects one. */
++	while (hi - lo > 1u)
++	{
++		uint mid = (lo + hi) / 2u;
++		if (state.seq[mid].index_first <= element)
++			lo = mid;
++		else
++			hi = mid;
++	}
++
++	if (params.ibv_src_word != NO_WORD)
++	{
++		index_va_lo = api_word(lo, params.ibv_src_word);
++		index_va_hi = api_word(lo, params.ibv_src_word + 1u);
++		index_size = api_word(lo, params.ibv_src_word + 2u);
++		index_format = api_word(lo, params.ibv_src_word + 3u);
++	}
++	else
++	{
++		index_va_lo = params.ib_va.x;
++		index_va_hi = params.ib_va.y;
++		index_size = params.ib_size;
++		index_format = params.ib_format;
++	}
++
++	/* StartIndexLocation plus the index within the draw. A missing index reads as 0. */
++	position = uaddCarry(api_word(lo, params.draw_src_word + 2u), element - state.seq[lo].index_first, carry);
++	value = 0u;
++
++	if (carry == 0u && (index_va_lo != 0u || index_va_hi != 0u))
++	{
++		if (index_format == DXGI_FORMAT_R32_UINT)
++		{
++			if (position < index_size / 4u)
++			{
++				value = load_u32(uvec2(index_va_lo, index_va_hi), position * 4u);
++				restart = value == 0xffffffffu;
++			}
++		}
++		else if (position < index_size / 2u)
++		{
++			value = load_u16(uvec2(index_va_lo, index_va_hi), position * 2u);
++			restart = value == 0xffffu;
++		}
++	}
++
++	if (restart && (params.flags & FLAG_RESTART) != 0u)
++	{
++		value = 0xffffffffu;
++	}
++	else
++	{
++		atomicMin(state.seq[lo].vertex_min, value);
++		atomicMax(state.seq[lo].vertex_max, value);
++	}
++
++	Words(params.index_scratch_va).v[element] = value;
++}
++
++void layout_vertex()
++{
++	SequenceState state = SequenceState(params.state_va);
++	Totals totals = Totals(params.totals_va);
++	Words slots = Words(params.slots_va);
++	bool indexed = (params.flags & FLAG_INDEXED) != 0u;
++	bool copy_vertices = (params.flags & FLAG_COPY_VERTICES) != 0u;
++	bool copy_instances = (params.flags & FLAG_COPY_INSTANCES) != 0u;
++	uint count = sequence_count();
++	uint vertex_total = 0u;
++	uint instance_total = 0u;
++	bool dropped = false;
++	uint i;
++
++	for (i = 0u; i < params.max_commands; i++)
++	{
++		uint draw_elements = 0u, draw_instances = 0u, draw_first = 0u, draw_base = 0u, draw_first_instance = 0u;
++		uint vertex_min = 0u, vertex_count = 0u, instance_count = 0u;
++		uint word = i * params.slot_stride_words + params.slot_action_word;
++		bool draw = false;
++
++		if (i < count)
++		{
++			draw_elements = api_word(i, params.draw_src_word);
++			draw_instances = api_word(i, params.draw_src_word + 1u);
++			draw_first = api_word(i, params.draw_src_word + 2u);
++
++			if (indexed)
++			{
++				draw_base = api_word(i, params.draw_src_word + 3u);
++				draw_first_instance = api_word(i, params.draw_src_word + 4u);
++				/* Zero when LAYOUT_INDEX found no room for the indices. */
++				draw_elements = state.seq[i].index_count;
++			}
++			else
++			{
++				draw_first_instance = api_word(i, params.draw_src_word + 3u);
++			}
++
++			draw = draw_elements != 0u && draw_instances != 0u;
++		}
++
++		if (draw && copy_vertices)
++		{
++			if (indexed)
++			{
++				vertex_min = state.seq[i].vertex_min;
++				/* Every index was a strip cut: the draw has no vertices. */
++				if (vertex_min <= state.seq[i].vertex_max)
++				{
++					vertex_count = state.seq[i].vertex_max - vertex_min + 1u;
++					/* The whole 32-bit range never fits. */
++					if (vertex_count == 0u)
++						draw = false;
++				}
++				else
++				{
++					vertex_min = 0u;
++				}
++			}
++			else
++			{
++				vertex_min = draw_first;
++				vertex_count = draw_elements;
++			}
++
++			if (vertex_count > params.vertex_budget - vertex_total)
++				draw = false;
++		}
++
++		if (draw && copy_instances)
++		{
++			instance_count = draw_instances;
++			if (instance_count > params.instance_budget - instance_total)
++				draw = false;
++		}
++
++		if (i < count && !draw && draw_instances != 0u && api_word(i, params.draw_src_word) != 0u)
++			dropped = true;
++
++		if (!draw)
++		{
++			vertex_count = 0u;
++			instance_count = 0u;
++		}
++
++		state.seq[i].vertex_min = vertex_min;
++		state.seq[i].vertex_first = vertex_total;
++		state.seq[i].vertex_count = vertex_count;
++		state.seq[i].instance_first = instance_total;
++		state.seq[i].instance_count = instance_count;
++
++		if (draw)
++		{
++			slots.v[word] = draw_elements;
++			slots.v[word + 1u] = draw_instances;
++
++			if (indexed)
++			{
++				slots.v[word + 2u] = state.seq[i].index_first;
++				/* vertexOffset. The vertex shader still sees the application's index. */
++				slots.v[word + 3u] = copy_vertices ? vertex_total - vertex_min : draw_base;
++				slots.v[word + 4u] = copy_instances ? instance_total : draw_first_instance;
++			}
++			else
++			{
++				slots.v[word + 2u] = copy_vertices ? vertex_total : draw_first;
++				slots.v[word + 3u] = copy_instances ? instance_total : draw_first_instance;
++			}
++		}
++		else
++		{
++			/* The slot may hold the arguments of an earlier execution of this command list. */
++			slots.v[word] = 0u;
++			slots.v[word + 1u] = 0u;
++		}
++
++		vertex_total += vertex_count;
++		instance_total += instance_count;
++	}
++
++	totals.copy_dispatch_x = (vertex_total + instance_total + 63u) / 64u;
++	totals.copy_dispatch_y = 1u;
++	totals.copy_dispatch_z = 1u;
++	totals.vertex_total = vertex_total;
++	totals.instance_total = instance_total;
++	if (dropped)
++		Status(params.status_va).dropped = 1u;
++}
++
++void copy_element(uint sequence, uint binding, uint element, bool valid, uint dst_element)
++{
++	uint src_word = params.bindings[binding].src_word;
++	uint dst_stride = params.bindings[binding].dst_stride;
++	Words dst = Words(va_add(params.bindings[binding].dst_va, dst_element * dst_stride));
++	uint va_lo, va_hi, size, stride, offset, offset_hi, i;
++
++	if (src_word != NO_WORD)
++	{
++		va_lo = api_word(sequence, src_word);
++		va_hi = api_word(sequence, src_word + 1u);
++		size = api_word(sequence, src_word + 2u);
++		stride = api_word(sequence, src_word + 3u);
++	}
++	else
++	{
++		va_lo = params.bindings[binding].va.x;
++		va_hi = params.bindings[binding].va.y;
++		size = params.bindings[binding].size;
++		stride = params.bindings[binding].stride;
++	}
++
++	umulExtended(element, stride, offset_hi, offset);
++	valid = valid && offset_hi == 0u && (va_lo != 0u || va_hi != 0u);
++
++	/* Bytes outside the view read as 0. */
++	for (i = 0u; i < dst_stride; i += 4u)
++	{
++		uint value = 0u;
++		uint carry;
++		uint at = uaddCarry(offset, i, carry);
++
++		if (valid && carry == 0u && at < size)
++		{
++			value = load_u32(uvec2(va_lo, va_hi), at);
++			if (size - at < 4u)
++				value &= (1u << ((size - at) * 8u)) - 1u;
++		}
++
++		dst.v[i / 4u] = value;
++	}
++}
++
++void copy()
++{
++	SequenceState state = SequenceState(params.state_va);
++	Totals totals = Totals(params.totals_va);
++	bool indexed = (params.flags & FLAG_INDEXED) != 0u;
++	uint element = gl_GlobalInvocationID.x;
++	uint vertex_total = totals.vertex_total;
++	bool instances = element >= vertex_total;
++	uint lo = 0u, hi = params.max_commands;
++	uint first, src_element, carry, i;
++	bool valid;
++
++	if (instances)
++	{
++		element -= vertex_total;
++		if (element >= totals.instance_total)
++			return;
++	}
++
++	while (hi - lo > 1u)
++	{
++		uint mid = (lo + hi) / 2u;
++		first = instances ? state.seq[mid].instance_first : state.seq[mid].vertex_first;
++		if (first <= element)
++			lo = mid;
++		else
++			hi = mid;
++	}
++
++	if (instances)
++	{
++		/* StartInstanceLocation plus the element. */
++		src_element = uaddCarry(api_word(lo, params.draw_src_word + (indexed ? 4u : 3u)),
++				element - state.seq[lo].instance_first, carry);
++		valid = carry == 0u;
++	}
++	else if (indexed)
++	{
++		/* The index plus BaseVertexLocation, which is signed. */
++		uint index = state.seq[lo].vertex_min + (element - state.seq[lo].vertex_first);
++		int base = int(api_word(lo, params.draw_src_word + 3u));
++		src_element = uaddCarry(index, uint(base), carry);
++		valid = base < 0 ? carry != 0u : carry == 0u;
++	}
++	else
++	{
++		/* StartVertexLocation plus the vertex. */
++		src_element = uaddCarry(state.seq[lo].vertex_min, element - state.seq[lo].vertex_first, carry);
++		valid = carry == 0u;
++	}
++
++	for (i = 0u; i < params.binding_count; i++)
++	{
++		if (((params.bindings[i].flags & BINDING_INSTANCE_RATE) != 0u) == instances)
++			copy_element(lo, i, src_element, valid, element);
++	}
++}
++
++void main()
++{
++	if (mode == MODE_SCAN_INDEX)
++		scan_index();
++	else if (mode == MODE_COPY)
++		copy();
++	else if (gl_GlobalInvocationID.x == 0u)
++	{
++		if (mode == MODE_LAYOUT_INDEX)
++			layout_index();
++		else
++			layout_vertex();
++	}
++}
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index fbddda3..fbbc741 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2657,6 +2657,12 @@ struct d3d12_command_allocator
+     struct d3d12_command_list *current_command_list;
+     struct d3d12_device *device;
+ 
++    /* One word per emulated ExecuteIndirect that fetches vertices, in upload scratch
++     * memory. The GPU sets it when a draw did not fit the scratch buffers. */
++    uint32_t **execute_indirect_dropped;
++    size_t execute_indirect_dropped_size;
++    size_t execute_indirect_dropped_count;
++
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
+ 
+@@ -3207,6 +3213,10 @@ struct d3d12_command_list
+     bool has_replaced_shaders;
+ 
+     struct vkd3d_index_buffer index_buffer;
++    /* The addresses the application bound, for ExecuteIndirect emulation that
++     * fetches vertices on the GPU. 0 for an unbound or invalid view. */
++    VkDeviceAddress index_buffer_va;
++    VkDeviceAddress vertex_buffer_vas[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+     struct vkd3d_dgc_batch dgc_batch;
+ 
+     struct d3d12_command_list_sequence cmd;
+@@ -3821,6 +3831,18 @@ struct d3d12_command_signature
+         uint32_t slot_stride;
+         uint32_t action_offset;
+         uint32_t incrementing_constant_word;
++        /* The root parameter block is part of the slot, and is pushed per sequence. */
++        bool push_root_parameters;
++        /* The signature sets vertex or index buffer views for a draw. Vulkan binds
++         * those by handle while recording, so cs_execute_indirect_vertex_fetch.comp
++         * copies what each sequence uses into scratch buffers and writes the draw
++         * arguments. The words are offsets into an argument record, or UINT32_MAX. */
++        bool fetch_vertices;
++        uint32_t vertex_buffer_mask;
++        uint32_t vertex_buffer_src_word[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++        uint32_t index_buffer_src_word;
++        uint32_t action_src_word;
++        struct vkd3d_execute_indirect_info fetch_pipeline;
+     } emulation;
+     enum vkd3d_pipeline_type pipeline_type;
+ 
+@@ -4782,6 +4804,79 @@ struct vkd3d_execute_indirect_args
+     uint32_t implicit_instance;
+ };
+ 
++/* The parameter block of cs_execute_indirect_vertex_fetch.comp, which emulates
++ * vertex and index buffer view arguments of ExecuteIndirect without EXT_dgc. */
++enum vkd3d_execute_indirect_vertex_fetch_mode
++{
++    VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_LAYOUT_INDEX = 0,
++    VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_SCAN_INDEX = 1,
++    VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_LAYOUT_VERTEX = 2,
++    VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY = 3,
++};
++
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_INDEXED (1u << 0)
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_RESTART (1u << 1)
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_VERTICES (1u << 2)
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_INSTANCES (1u << 3)
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_BINDING_INSTANCE_RATE (1u << 0)
++
++struct vkd3d_execute_indirect_vertex_fetch_binding
++{
++    uint32_t src_word;
++    uint32_t flags;
++    VkDeviceAddress va;
++    uint32_t size;
++    uint32_t stride;
++    VkDeviceAddress dst_va;
++    uint32_t dst_stride;
++    uint32_t reserved;
++};
++
++struct vkd3d_execute_indirect_vertex_fetch_params
++{
++    VkDeviceAddress api_buffer_va;
++    VkDeviceAddress count_va;
++    VkDeviceAddress slots_va;
++    VkDeviceAddress state_va;
++    VkDeviceAddress index_scratch_va;
++    VkDeviceAddress totals_va;
++    VkDeviceAddress status_va;
++    uint32_t api_stride_words;
++    uint32_t slot_stride_words;
++    uint32_t slot_action_word;
++    uint32_t draw_src_word;
++    uint32_t max_commands;
++    uint32_t flags;
++    uint32_t index_budget;
++    uint32_t vertex_budget;
++    uint32_t instance_budget;
++    uint32_t ibv_src_word;
++    VkDeviceAddress ib_va;
++    uint32_t ib_size;
++    uint32_t ib_format;
++    uint32_t binding_count;
++    uint32_t reserved;
++    struct vkd3d_execute_indirect_vertex_fetch_binding bindings[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
++    /* Not read by the shader. It sets this when a draw did not fit the scratch buffers. */
++    uint32_t dropped;
++};
++
++STATIC_ASSERT(offsetof(struct vkd3d_execute_indirect_vertex_fetch_params, ib_va) == 96);
++STATIC_ASSERT(offsetof(struct vkd3d_execute_indirect_vertex_fetch_params, bindings) == 120);
++STATIC_ASSERT(sizeof(struct vkd3d_execute_indirect_vertex_fetch_binding) == 40);
++
++struct vkd3d_execute_indirect_vertex_fetch_args
++{
++    VkDeviceAddress params_va;
++    uint32_t mode;
++};
++
++/* 32-bit words per sequence of cs_execute_indirect_vertex_fetch.comp's state,
++ * and the size of its totals. */
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_STATE_SIZE (8 * sizeof(uint32_t))
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_TOTALS_SIZE (12 * sizeof(uint32_t))
++#define VKD3D_EXECUTE_INDIRECT_VERTEX_FETCH_COPY_DISPATCH_OFFSET (4 * sizeof(uint32_t))
++
+ struct vkd3d_execute_indirect_pipeline
+ {
+     VkPipeline vk_pipeline;
+@@ -4791,6 +4886,8 @@ struct vkd3d_execute_indirect_pipeline
+ struct vkd3d_execute_indirect_ops
+ {
+     VkPipelineLayout vk_pipeline_layout;
++    VkPipelineLayout vk_vertex_fetch_layout;
++    VkPipeline vk_vertex_fetch_pipeline;
+     struct vkd3d_execute_indirect_pipeline *pipelines;
+     size_t pipelines_count;
+     size_t pipelines_size;
+@@ -4980,6 +5077,8 @@ static inline uint32_t vkd3d_meta_get_multi_dispatch_indirect_workgroup_size(voi
+ 
+ HRESULT vkd3d_meta_get_execute_indirect_pipeline(struct vkd3d_meta_ops *meta_ops,
+         uint32_t patch_command_count, struct vkd3d_execute_indirect_info *info);
++HRESULT vkd3d_meta_get_execute_indirect_vertex_fetch_pipeline(struct vkd3d_meta_ops *meta_ops,
++        struct vkd3d_execute_indirect_info *info);
+ 
+ void vkd3d_meta_get_sampler_feedback_resolve_pipeline(struct vkd3d_meta_ops *meta_ops,
+         enum vkd3d_sampler_feedback_resolve_type type, struct vkd3d_sampler_feedback_resolve_info *info);
+diff --git a/libs/vkd3d/vkd3d_shaders.h b/libs/vkd3d/vkd3d_shaders.h
+index ded6b46..515fce1 100644
+--- a/libs/vkd3d/vkd3d_shaders.h
++++ b/libs/vkd3d/vkd3d_shaders.h
+@@ -50,6 +50,7 @@ enum vkd3d_meta_copy_mode
+ #include <cs_execute_indirect_patch.h>
+ #include <cs_execute_indirect_patch_debug_ring.h>
+ #include <cs_execute_indirect_multi_dispatch.h>
++#include <cs_execute_indirect_vertex_fetch.h>
+ #include <vs_fullscreen_layer.h>
+ #include <vs_fullscreen.h>
+ #include <gs_fullscreen.h>
+-- 
+2.39.5
+

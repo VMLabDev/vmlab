@@ -140,6 +140,8 @@ wscript-compiler = { path = "vendor/wscript-compiler" }
 
 [lints.rust]
 unsafe_code = "deny"
+# cargo-fuzz builds with `--cfg fuzzing`; `src/fuzzing.rs` is behind it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
 todo = "warn"

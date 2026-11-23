@@ -20,10 +20,32 @@ page apx_troubleshooting {
     in [Wire protocol and error codes](ref_protocol).
   DOC
 
+  h2 "KVM is required"
+  code text { source = "vm \"{machine}\": KVM is required — x86 guests run on vmlab-hv under KVM only, and /dev/kvm is not usable on this host (PRD §22); …" }
+  p <<DOC
+    An x86 or x86_64 machine runs on vmlab-hv, which has no emulation, and
+    QEMU no longer runs x86 guests. `vmlab validate`, `vmlab up` and the start
+    of the machine refuse it while the daemon user cannot open `/dev/kvm` for
+    reading and writing, and on a host that is not x86_64. Add your user to
+    the `kvm` group and log in again, load the `kvm_intel` or `kvm_amd`
+    module, and enable virtualization in the firmware. On WSL 2, see
+    [Nested virtualisation is off on WSL 2](apx_troubleshooting) below.
+  DOC
+
+  h2 "QEMU no longer runs x86 guests"
+  code text { source = "vm \"{machine}\": hypervisor = \"qemu\" no longer runs x86 guests (PRD §22) — set hypervisor = \"vmlab\", or remove the line; vmlab-hv runs every x86 machine" }
+  p <<DOC
+    The same error names `hypervisor { vm = "qemu" }` in the host config, or
+    `qemu_args`, when that is what put the machine on QEMU. Remove the
+    setting; for `qemu_args`, declare the hardware with the vm block's own
+    keys or a profile. See [QEMU or vmlab-hv](guide_host).
+  DOC
+
   h2 "KVM is unavailable and the guest runs under TCG"
   code text { source = "{machine}: KVM unavailable for {arch} — falling back to TCG (slow)" }
   p <<DOC
-    This is a warning, not an error. The [machine](guide_architecture) still
+    This is a warning, not an error, for an aarch64 or riscv64 guest on QEMU.
+    The [machine](guide_architecture) still
     boots, with `-accel tcg`, and every instruction is emulated. Boot takes
     minutes rather than seconds and provisioning runs at the same pace.
   DOC
@@ -361,6 +383,12 @@ MSG
     .vmlabignore makes that subtree guest-owned if it is build output`, never
     halts. A line under `deferred while git holds a lock` is timing, not a
     conflict, and clears itself when the lock goes.
+  DOC
+  p <<DOC
+    A halted path that says `the guest no longer holds it, and nothing saw it
+    deleted` was found missing in the guest after the machine or its watch
+    stopped. The host copy is kept. `vmlab dev sync resolve <path> --host`
+    copies it back into the guest, and `--guest` deletes it on the host.
   DOC
 
   h2 "A snapshot capture is refused"

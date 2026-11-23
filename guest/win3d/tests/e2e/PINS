@@ -14,3 +14,12 @@ blender-4.2.3  7f8be9b1dc904e7689b3112659791c29cc9ed9d46ce57c4ea5b31a0621489b3a 
 # import. Installed system-wide (/q /norestart), as a game installer would.
 vcredist2010-x64  f3b7a76d84d23f91957aa18456a14b4e90609e4ce8194c5653384ed38dada6f3  https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x64.exe
 vcredist2010-x86  99dce3c841cc6028560830f7866c9ce2928c98cf3256892ef8e6cf755147b0d8  https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6BFFC/vcredist_x86.exe
+# Adapter suite (tests/e2e/adapter.sh).
+# Wine 11.0 source (LGPL-2.1-or-later): tests/e2e/adapter/build.sh builds its
+# Direct3D 9, 10 and 11 tests from it. WineHQ publishes no hash and no longer
+# a prebuilt winetest; this is the file dl.winehq.org served on 2026-11-19.
+wine  c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701  https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
+# Chrome for Testing 158.0.8127.36 (the Stable channel on 2026-11-19), win64,
+# for the two pages in tests/e2e/adapter/pages. Google publishes no hash; this
+# is the file the URL served on 2026-11-19.
+chrome-for-testing  6a8ad290952cc612c7777ffb3eb62f345539a2a1a8d440cfac190c6d36b34d2c  https://storage.googleapis.com/chrome-for-testing-public/158.0.8127.36/win64/chrome-win64.zip

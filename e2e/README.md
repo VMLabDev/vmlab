@@ -31,13 +31,13 @@ The main build sets `VMLAB_SKIP_FIRMWARE=1` for `build-asset.sh` and builds only
 
 ## Hypervisors
 
-A run defaults to `--hypervisor vmlab` (PRD §22); `--hypervisor qemu` retains QEMU coverage. The image builds `vmlab-hv` and its protocol crates from this checkout's in-tree `hv/` workspace, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
+A run defaults to `--hypervisor vmlab` (PRD §22). QEMU runs no x86 guest (§22.4), so `--hypervisor qemu` runs only `arch.emulated`, the aarch64 guest, and skips every other feature with the reason `QEMU runs no x86 guest (PRD §22)`. The image builds `vmlab-hv` and its protocol crates from this checkout's in-tree `hv/` workspace, so the binary always speaks the protocol this vmlab was built against. Its virtio-gpu needs virglrenderer 1.3, newer than Debian trixie's, so the image builds that from source under `/opt/virgl` and `vmlab-hv` finds it by rpath; QEMU keeps the distro's. It is built without PipeWire, so an audio VM plays into vmlab-hv's null sink: `vm.hw.audio` checks the guest's sound card and the node vmlab names, and the host stream is a live check.
 
-The runner writes a host config in every scenario. On `vmlab`, containers are unpinned to exercise automatic selection, and VMs use vmlab-hv when the scenario covers a delivered VM phase. Other VMs are explicitly pinned to QEMU. A QEMU run pins both kinds to QEMU. `QEMU_SCENARIOS` names exceptions and their reasons. A VM feature it reports is skipped on a vmlab run, naming the reason, and never overwrites another scenario's pass.
+A vmlab run writes no hypervisor setting: automatic selection puts every x86 VM and every container on vmlab-hv and the aarch64 guest on QEMU. A QEMU run pins both kinds to QEMU.
 
-`core` keeps the four-machine `core-lab` on QEMU. On vmlab-hv it runs three labs in sequence. Normal cleanup keeps at most two VMs running at once. `core-hv` covers lifecycle, hardware and parallel provisions with two machines. `core-hv-provision` checks a provision dependency with two machines. `core-hv-scratch` checks the blank-disk boot and forced stop with one machine. The labs reuse `core-lab`'s media and provision script. QEMU arguments and both floppy features retain their QEMU-only or phase-4 skip reasons. Reload checks edit QEMU's SMBIOS arguments on QEMU and memory on vmlab-hv. They check the live launch and the guest, including a pending edit, restart, a stopped-machine rebuild, and an unchanged peer PID. `core-unmountable` runs on both hypervisors.
+`core` runs three labs in sequence on vmlab-hv; its four-machine `core-lab` was the QEMU run's. Normal cleanup keeps at most two VMs running at once. `core-hv` covers lifecycle, hardware and parallel provisions with two machines. `core-hv-provision` checks a provision dependency with two machines. `core-hv-scratch` checks the blank-disk boot and forced stop with one machine. The labs reuse `core-lab`'s media and provision script. Both floppy features keep their phase-4 skip reason. Reload checks edit memory. They check the live launch and the guest, including a pending edit, restart, a stopped-machine rebuild, and an unchanged peer PID. `core-unmountable` runs on both hypervisors.
 
-`admin` keeps its aarch64 `admin-lab` and emulation check on QEMU. On vmlab-hv it uses the x86_64 scratch VM in `admin-hv` for the same administration checks and skips only the phase-3 emulation feature. `admin-roots` runs on both. Process checks identify a live QEMU by its lab name or a live vmlab-hv by its exact `--machine` path, so a leftover description file cannot pass a shutdown check.
+`admin` first brings up its aarch64 `admin-lab` on its own, which automatic selection puts on QEMU, for `arch.emulated`, and destroys it. It then uses the x86_64 scratch VM in `admin-hv` on vmlab-hv for the administration checks. `admin-roots` runs on vmlab-hv. Process checks identify a live QEMU by its lab name or a live vmlab-hv by its exact `--machine` path, so a leftover description file cannot pass a shutdown check.
 
 `core-admin-coverage.md` lists the 33 formerly suppressed features, their original labs, and the reason each was skipped.
 
@@ -48,12 +48,14 @@ Every feature in `features.py` carries a phase tag in `PHASES`:
 - `host`: no hypervisor takes part, such as the template store, validation or the supervisor. The feature runs on both.
 - `1`: container micro-VMs.
 - `2a` to `2f`: modern x86_64 VMs: the q35 platform on SeaBIOS (2a), the native frame protocol (2b), OVMF, secure boot, the TPM and Windows (2c), GPU (2d), virtio-fs and audio (2e), USB and vfio (2f).
-- `3`: TCG guests.
+- `3`: TCG guests on vmlab-hv; no feature carries it now.
 - `4`: the legacy PC.
 
-`QEMU_ONLY` lists the features no other hypervisor runs, each with its reason: `qemu_args` and the external-virtiofsd checks.
+`QEMU_ONLY` lists the features of the guests QEMU still runs, each with its reason: `arch.emulated`. They are in scope on every run. The x86 features only QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, were removed with QEMU's x86 support.
 
-On `vmlab`, a feature past the delivered phase (`VMLAB_DELIVERED`, or `--vmlab-phase`) is reported as skipped with the reason `vmlab-hv phase N`, whatever its scenario did. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
+The default `vmlab` run covers phases 1, 2a through 2f, and 4. No feature is tagged phase 3: its one feature, `arch.emulated`, runs on QEMU on every run. Use `--vmlab-phase` to select an earlier cutoff.
+
+An out-of-scope feature is reported as skipped with the reason `vmlab-hv phase N`. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
 
 ## Adding coverage
 
@@ -70,6 +72,9 @@ TempleOS sequentially. It checks agent readiness, exec, a disk write/read,
 a PNG screenshot and emulator exit status zero after `vm stop`. Windows 98
 may reach the emulator-quit rung after ignoring guest shutdown. That is a
 flushed emulator exit, not proof that Windows shut itself down.
+The scenario also checks Windows Server 2016 exec before and after an online
+snapshot restore. The `core` scenario checks raw and folder-built floppies
+on vmlab-hv using FreeDOS, and `unsupported` checks SMB1 using Linux.
 
 The scenario uses these installed templates and disables automatic agent
 refresh:
@@ -79,11 +84,13 @@ x86/freedos-1.3@1.3.0
 x86/windows-98-se@4.10.2222.5
 x86_64/windows-7@7600.0.1
 x86_64/templeos@5.03.2
+x86_64/windows-server-2016@14393.0.0
 ```
 
-If a template is missing, the scenario skips with the missing reference.
+If a template is missing, its check reports the missing reference as a failure
+on vmlab-hv or a skip on QEMU.
 `VMLAB_E2E_LEGACY_STORE` can name a populated source store. The scenario copies
-only its four template versions into the run's store, using sparse files and
+only the required template versions into the run's store, using sparse files and
 reflinks where available. With `just e2e::run`, set `VMLAB_E2E_LEGACY_STORE` on
 the host to the source store; the recipe mounts it read-only at `/legacy-store`
 and sets the variable to that path inside the container, so the source is never
@@ -94,8 +101,6 @@ Before each boot, the scenario waits until fewer than two project VMs run on
 the host, excluding `qemu-system-* -avd` Android emulators. Containers need
 `--pid=host` for that count. On a shared development host, run the VM-owning
 processes inside `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`.
-The four `vm.legacy.*` features remain tagged phase 4 and skip on vmlab-hv
-until that phase is delivered.
 
 The `macos` scenario boots `x86_64/macos-tahoe` on the run's hypervisor
 (`vm.macos`): `validate`, the hypervisor `status -v` names, agent readiness,

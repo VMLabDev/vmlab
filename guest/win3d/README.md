@@ -8,7 +8,8 @@ DLLs, overrides or settings.
 The rendering runs on the Vulkan driver of the host running vmlab-hv. The guest
 reaches it through virtio-gpu Venus, vmlab's `gpu { mode = "vulkan" }`:
 
-- a WDDM kernel driver with Venus support (Yttrium viogpu3d);
+- a WDDM kernel driver with Venus support (Yttrium viogpu3d, the November
+  2026 release with this repository's patches);
 - Mesa's Venus Vulkan ICD;
 - Direct3D 9 to 11 through the Yttrium Mesa UMD, OpenGL through Mesa Zink,
   and Direct3D 12 through vkd3d-proton behind a system `d3d12.dll` bridge.
@@ -33,12 +34,12 @@ off.
   console, and dxdiag reports hardware acceleration
   ([acceptance](docs/acceptance.md)).
 - **Also verified on Intel.** The same checks pass on an Intel Iris Xe host
-  (ANV) with `patches/mesa/0021` ([zeus](docs/zeus.md)).
+  (ANV) with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch` ([zeus](docs/zeus.md)).
 - **Also verified on NVIDIA.** On an RTX 5090 the same checks pass on
   `windows-11` and `windows-10` in the historical QEMU acceptance runs ([nvidia](docs/nvidia.md),
   [acceptance](docs/acceptance.md#nvidia-rtx-5090)), on both cards. The
-  DirectX SDK D3D9 samples render there too after `patches/mesa/0022` to
-  `0025` ([xid69](docs/xid69.md), [nvtex](docs/nvtex.md)). On a laptop RTX 4060 (driver 615.71) Vulkan,
+  DirectX SDK D3D9 samples render there too after `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch` to
+  `0025` ([xid69](docs/xid69.md), [nvtex](docs/nvtex.md); `0025` is upstream's own since the November base). On a laptop RTX 4060 (driver 615.71) Vulkan,
   D3D12 and OpenGL clients hang because Venus feedback writes never reach the
   guest; D3D9 and D3D11 work ([zeus](docs/zeus.md)).
 - Uninstall returns the guest to its state before the install
@@ -96,6 +97,7 @@ No QEMU or standalone render-server tarball is released by win3d.
 | [docs/dxdiag.md](docs/dxdiag.md) | The DirectDraw HAL fix behind dxdiag's hardware acceleration |
 | [docs/gdi-context.md](docs/gdi-context.md) | GDI context creation and the guest reboot regression test |
 | [docs/tdr-recovery.md](docs/tdr-recovery.md) | Forced guest timeout, reset/restart telemetry, and hardware rendering checks |
+| [docs/pointer.md](docs/pointer.md) | The hardware pointer: what it sends, its limits, and the check |
 | [docs/d3d11-apps.md](docs/d3d11-apps.md) | The DirectX SDK D3D11 samples: UMD fixes and a DXUT bug |
 | [docs/nvidia.md](docs/nvidia.md) | Venus on the NVIDIA RTX 5090 |
 | [docs/zeus.md](docs/zeus.md) | Venus on an Intel Iris Xe and a laptop RTX 4060 |

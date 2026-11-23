@@ -1,0 +1,171 @@
+Subject: [PATCH] d3d10umd: keep the device through Wine's d3d10core and d3d11 tests
+
+Wine's d3d10core and d3d11 tests ended on an access violation after calls
+began to answer DXGI_ERROR_DEVICE_REMOVED (GitHub #248). The runtime takes
+an error that a DDI function may not set as a removed device, and the
+tests then read through a pointer that a failed call left NULL. The calls
+that removed the device, and what they do now:
+
+- GetResourceLayout (WDDM 2.0) answered E_INVALIDARG for every resource.
+  The runtime asks for the layout of each DEFAULT texture created with CPU
+  access flags (test_resource_access). It now answers
+  D3DWDDM2_0DDI_TL_UNDEFINED with no allocation and no error: the texture
+  stays opaque, as before, and CPU access still goes through ResourceMap.
+- The Yttrium vertex input had no Vulkan format for R11G11B10_FLOAT, which
+  Direct3D 10 requires for vertex buffers. The draw was dropped and the
+  next draw set E_FAIL (test_vertex_formats). It is fetched as
+  B10G11R11_UFLOAT_PACK32 now. A vertex format that still has no Vulkan
+  format is named in the error log when its input layout is created.
+- A pixel shader that needs more combined texture slots than the 32 of
+  the sampler binding map set E_FAIL at its creation
+  (test_high_resource_count: 50 textures with two samplers and 50
+  buffers), and the test then released the NULL shader. It is created as a
+  shader that writes zero to every colour output, with an error in the log,
+  so it draws zero instead of removing the device.
+
+Evidence: docs/acceptance.md (B10).
+Origin: GitHub VMLabDev/vmlab#248 (card #248).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 4707fc8..cb624b7 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -1203,11 +1203,17 @@ GetResourceLayoutWDDM2_0(D3D10DDI_HDEVICE device, D3D10DDI_HRESOURCE resource,
+    UINT count, D3DKMT_HANDLE *handle, D3DWDDM2_0DDI_TEXTURE_LAYOUT *layout,
+    UINT *transition, D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT *subresources)
+ {
+-   /* Default textures remain opaque; CPU mapping uses ResourceMap. */
++   /* Default textures remain opaque; CPU mapping uses ResourceMap. An
++    * undefined layout is the answer for such a resource, not an error: the
++    * runtime takes an error set here as a removed device, and it asks for
++    * every DEFAULT texture created with CPU access flags. */
++   LOG_ENTRYPOINT();
+    *handle = 0;
+    *layout = D3DWDDM2_0DDI_TL_UNDEFINED;
+-   *transition = 0;
+-   SetError(device, E_INVALIDARG);
++   if (transition)
++      *transition = 0;
++   if (subresources)
++      memset(subresources, 0, sizeof(*subresources) * count);
+ }
+ 
+ static void
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index c49e603..7731333 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -2588,6 +2588,14 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
+     *
+     * Report it instead.  The tessellation paths in this file already do.
+     */
++   if (!pShader->state.tokens && sampler_binding_map &&
++       sampler_binding_map->slot_limit_exceeded) {
++      YTTRIUM_WARN("yttrium: ERROR pixel shader needs more than %u combined texture slots owner=d3d10umd shader=%p action=draw-zero\n",
++                   (unsigned)PIPE_MAX_SAMPLERS, (void *)pShader);
++      memset(sampler_binding_map, 0, sizeof(*sampler_binding_map));
++      pShader->state.typed_buffer_image_mask = 0;
++      pShader->state.tokens = Shader_tgsi_zero_fs();
++   }
+    if (!pShader->state.tokens) {
+       YTTRIUM_WARN("yttrium: d3d10umd pixel shader translation failed shader=%p; CreatePixelShader failing\n",
+                    (void *)pShader);
+diff --git a/src/gallium/frontends/d3d10umd/ShaderParse.h b/src/gallium/frontends/d3d10umd/ShaderParse.h
+index f8381c6..c3ac827 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderParse.h
++++ b/src/gallium/frontends/d3d10umd/ShaderParse.h
+@@ -310,6 +310,9 @@ Shader_parse_tessellation_properties(
+    struct Shader_tessellation_properties *properties);
+ 
+ 
++const struct tgsi_token *
++Shader_tgsi_zero_fs(void);
++
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+                       unsigned *output_mapping,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index fa06c16..eb0323a 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -3084,6 +3084,7 @@ declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+                       resource, sampler, target,
+                       sx->sampler_binding_count);
+          sx->translation_failed = true;
++         sx->sampler_binding_map->slot_limit_exceeded = true;
+          slot = 0;
+       } else {
+          slot = sx->sampler_binding_count++;
+@@ -4026,6 +4027,32 @@ find_counter_image_slots(const unsigned *code, uint8_t *slots)
+    return true;
+ }
+ 
++/*
++ * A pixel shader that writes zero to every colour output. CreatePixelShader
++ * uses it for a shader that needs more combined texture slots than the
++ * device has (Wine's test_high_resource_count: 50 textures sampled with two
++ * samplers and 50 buffers): the shader draws zero instead of removing the
++ * device at its creation.
++ */
++const struct tgsi_token *
++Shader_tgsi_zero_fs(void)
++{
++   struct ureg_program *ureg = ureg_create(MESA_SHADER_FRAGMENT);
++   const struct tgsi_token *tokens;
++
++   if (!ureg)
++      return NULL;
++
++   struct ureg_src zero = ureg_imm4f(ureg, 0.0f, 0.0f, 0.0f, 0.0f);
++   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
++      ureg_MOV(ureg, ureg_DECL_output(ureg, TGSI_SEMANTIC_COLOR, i), zero);
++   ureg_END(ureg);
++
++   tokens = ureg_get_tokens(ureg, NULL);
++   ureg_destroy(ureg);
++   return tokens;
++}
++
+ const struct tgsi_token *
+ Shader_tgsi_translate(const unsigned *code,
+                       unsigned *output_mapping,
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+index 27f1636..1f2d2ae 100644
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -320,6 +320,9 @@ struct pipe_shader_sampler_binding_map
+    uint32_t mixed_return_mask;
+    uint8_t sampler_view_index[PIPE_MAX_SAMPLERS];
+    uint8_t sampler_state_index[PIPE_MAX_SAMPLERS];
++   /* The shader needs more combined texture slots than PIPE_MAX_SAMPLERS;
++    * set by a translation that failed for that reason only. */
++   bool slot_limit_exceeded;
+ };
+ 
+ struct pipe_shader_state
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_state.c b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
+index dd7c3c3..726c1fb 100644
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_state.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_state.c
+@@ -84,6 +84,8 @@ yttrium_vertex_format_to_vk(enum pipe_format format)
+       return VK_FORMAT_B8G8R8A8_UINT;
+    case PIPE_FORMAT_B8G8R8A8_SINT:
+       return VK_FORMAT_B8G8R8A8_SINT;
++   case PIPE_FORMAT_R11G11B10_FLOAT:
++      return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case PIPE_FORMAT_R16_FLOAT:
+       return VK_FORMAT_R16_SFLOAT;
+    case PIPE_FORMAT_R16_UNORM:
+@@ -226,8 +228,11 @@ yttrium_build_vertex_input_state(struct yttrium_vertex_elements_state *state)
+       }
+ 
+       vk_format = yttrium_vertex_format_to_vk(elem->src_format);
+-      if (vk_format == VK_FORMAT_UNDEFINED)
++      if (vk_format == VK_FORMAT_UNDEFINED) {
++         YTTRIUM_WARN("yttrium: vertex input unsupported owner=yttrium-state reason=no-vulkan-vertex-format element=%u format=%u action=drop-draws\n",
++                      i, (unsigned)elem->src_format);
+          state->vk_vertex_input_valid = false;
++      }
+ 
+       VkVertexInputAttributeDescription *attrib =
+          &state->attribs[state->num_attribs++];

@@ -7,7 +7,7 @@ within 90 s, then hung or crashed. The same exhaustion ended Valley D3D9 and
 Heaven D3D9's exit on NVIDIA. `ORDERED_CONTEXT_WORKER=0` in `yttrium.ini`
 avoided it, at about a third of the frame rate.
 
-This page gives the cause, the fix (`patches/mesa/0091` and `0092`) and the
+This page gives the cause, the fix (`patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092`) and the
 evidence. The work was done on 2026-10-19 on helios: NVIDIA 610.57.04 on
 `Nvidia1`, RADV (Mesa 26.2.2) on `AMD1`, QEMU 11.1.1, virglrenderer 1.3.0 and
 vmlab 0.28.0-alpha. The evidence is in [docs/evidence/f6va/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/f6va/).
