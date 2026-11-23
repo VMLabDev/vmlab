@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
+use vmlab_agent_proto::{
+    AgentMsg, FrameDecoder, FrameKind, HostMsg, PROTO_VERSION, encode_ctrl, encode_frame,
+};
+
 use super::vm_agent::conformance::Fixture;
 use super::vm_agent::{AgentHandle, SessionEvent};
 
@@ -37,6 +41,71 @@ async fn legacy_agent_conformance() -> Result<()> {
     let bin = build(dir.path())?;
     let fixture = Fixture::process(&bin, "listen", vec![]).await?;
     fixture.run("legacy", None).await
+}
+
+#[tokio::test]
+async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    // The fixture shares the socket directory with its isolated agent.
+    let fifo = fixture.socket().with_file_name("descendant");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )?;
+    let handle = AgentHandle::connect(fixture.socket(), BUDGET).await?;
+    let mut reader = handle
+        .open_exec(
+            vec!["cat".into(), fifo.to_str().unwrap().into()],
+            vec![],
+            None,
+            None,
+        )
+        .await?;
+    // Preserve the exec's stdin in the background subshell. Closing the
+    // session closes that pipe. A surviving descendant then writes to the
+    // FIFO before exiting. The reader sees EOF in either case.
+    let mut argv =
+        sh("exec 3<&0 4>&1; (echo ready >&4; read -r line <&3; echo survived) >\"$1\" & wait");
+    argv.extend(["sh".into(), fifo.to_str().unwrap().into()]);
+    let mut exec = handle.open_exec(argv, vec![], None, None).await?;
+    loop {
+        match exec.recv().await {
+            Some(SessionEvent::Data(data)) if !data.is_empty() => break,
+            Some(SessionEvent::Exited(_) | SessionEvent::Error(_)) | None => {
+                anyhow::bail!("descendant never became ready");
+            }
+            _ => {}
+        }
+    }
+    exec.close().await;
+    let mut stderr = Vec::new();
+    while let Some(event) = reader.recv().await {
+        match event {
+            SessionEvent::Data(data) => {
+                anyhow::bail!(
+                    "descendant survived close: {}",
+                    String::from_utf8_lossy(&data)
+                );
+            }
+            SessionEvent::Stderr(data) => stderr.extend(data),
+            SessionEvent::Exited(code) => {
+                ensure!(
+                    code == 0,
+                    "FIFO reader exited with {code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                return Ok(());
+            }
+            SessionEvent::Error(err) => anyhow::bail!("FIFO reader: {err}"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("FIFO reader did not report exit")
 }
 
 #[tokio::test]
@@ -115,6 +184,101 @@ async fn legacy_agent_full_argv_and_no_inherited_descriptors() -> Result<()> {
         matches!(exited, Ok(Some(0))),
         "cat did not see its EOF while a later child ran: {exited:?}"
     );
+    Ok(())
+}
+
+/// The agent's control messages off a raw connection, up to the first hello
+/// or pong. The fixture's line noise and the agent's idle bytes are skipped
+/// by the decoder, as the host's reader skips them.
+async fn first_hello_or_pong(stream: &mut tokio::net::UnixStream) -> Result<AgentMsg> {
+    use tokio::io::AsyncReadExt;
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        while let Some(frame) = decoder.next_frame() {
+            if frame.kind != FrameKind::Ctrl {
+                continue;
+            }
+            let msg: AgentMsg = serde_json::from_slice(&frame.payload)?;
+            if matches!(msg, AgentMsg::Hello { .. } | AgentMsg::Pong { .. }) {
+                return Ok(msg);
+            }
+        }
+        let n = stream.read(&mut buf).await?;
+        ensure!(n > 0, "the agent closed the connection");
+        decoder.push(&buf[..n]);
+    }
+}
+
+fn hello(token: &str) -> Result<Vec<u8>> {
+    Ok(encode_ctrl(&HostMsg::Hello {
+        proto_version: PROTO_VERSION,
+        token: token.into(),
+    })?)
+}
+
+/// Review `legacy-agents.md` F6. A serial line gives the agent no sign that
+/// the host hung up, so a frame the host was cut off in stays half read, and
+/// the decoder used to take the next connection's bytes as the rest of it:
+/// 60000 claimed bytes swallowed every hello until they were filled. A hello
+/// inside a frame that is still open now restarts the framing.
+///
+/// No time limit decides this. The bytes after the hello fill the cut
+/// frame's claim exactly, so an agent that waits for the claim answers the
+/// last ping first, and one that restarts answers the hello first.
+#[tokio::test]
+async fn legacy_hello_after_a_truncated_frame_is_answered() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+
+    const CLAIMED: usize = 60000;
+    let mut cut = encode_frame(FrameKind::Data, 7, &[b'x'; CLAIMED]);
+    // The 13-byte header and the first 100 bytes of the payload.
+    cut.truncate(13 + 100);
+    let ping = encode_ctrl(&HostMsg::Ping)?;
+    let mut next = hello("after-the-cut")?;
+    next.extend_from_slice(&ping);
+    let filler = vec![0u8; CLAIMED - 100 - next.len()];
+
+    stream.write_all(&cut).await?;
+    stream.write_all(&next).await?;
+    stream.write_all(&filler).await?;
+    stream.write_all(&ping).await?;
+
+    match first_hello_or_pong(&mut stream).await? {
+        AgentMsg::Hello { token, .. } => assert_eq!(token, "after-the-cut"),
+        other => panic!("the cut frame swallowed the hello; the agent answered {other:?} first"),
+    }
+    Ok(())
+}
+
+/// F6, the short case: the cut frame lacks fewer bytes than a hello has, so
+/// the hello's first bytes complete it and the hello itself straddles its
+/// end. The agent used to take the completed frame, report it unparseable,
+/// and skip the rest of the hello as garbage.
+#[tokio::test]
+async fn legacy_hello_that_straddles_the_end_of_a_truncated_frame_is_answered() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+
+    let ping = encode_ctrl(&HostMsg::Ping)?;
+    let cut = &ping[..ping.len() - 5];
+    // Two writes: the agent may see the completed frame before the hello is
+    // whole, or both at once. Either way the hello is answered.
+    stream.write_all(cut).await?;
+    stream.write_all(&hello("across-the-end")?).await?;
+    stream.write_all(&ping).await?;
+
+    match first_hello_or_pong(&mut stream).await? {
+        AgentMsg::Hello { token, .. } => assert_eq!(token, "across-the-end"),
+        other => panic!("the cut frame swallowed the hello; the agent answered {other:?} first"),
+    }
     Ok(())
 }
 

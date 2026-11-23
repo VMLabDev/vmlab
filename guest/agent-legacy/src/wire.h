@@ -6,6 +6,15 @@
  * stream. The decoder resynchronises by scanning to the next magic, which
  * is what lets a serial line that dropped or replayed bytes (an online
  * snapshot restore) recover without a reset.
+ *
+ * A frame the host was cut off in is the case a magic scan alone does not
+ * cover: the header arrived, the rest never will, and a serial line gives
+ * no sign that the host hung up. The next connection's bytes would be taken
+ * as the missing payload. So the decoder also looks inside a frame for a
+ * whole control frame that the caller's `restart` test accepts (the agent
+ * accepts a hello, which starts every connection) and, on one, drops what
+ * came before it. The price: payload bytes that hold a complete, valid
+ * hello frame are taken for a new connection.
  */
 #ifndef VMLAB_WIRE_H
 #define VMLAB_WIRE_H
@@ -28,14 +37,27 @@
 /* Write a 13-byte header for `len` payload bytes into `hdr`. */
 void wire_header(unsigned char *hdr, int kind, unsigned long channel, unsigned long len);
 
+/* The longest control payload looked at as a restart. A hello is under
+ * 100 bytes plus its token. */
+#define WIRE_RESTART_MAX 1024UL
+
+/* Nonzero when a control payload starts a new connection. */
+typedef int (*wire_restart_fn)(const unsigned char *payload, unsigned long len);
+
 /* Incremental decoder over a caller-owned buffer. */
 struct wire_decoder {
     unsigned char *buf;
     unsigned long cap;
     unsigned long len;
+    /* Bytes before this offset hold no restart; zero after the buffer
+     * moved. */
+    unsigned long scan;
+    wire_restart_fn restart;
 };
 
-void wire_decoder_init(struct wire_decoder *d, unsigned char *buf, unsigned long cap);
+/* `restart` may be null: then a frame cut short is waited for in full. */
+void wire_decoder_init(struct wire_decoder *d, unsigned char *buf, unsigned long cap,
+                       wire_restart_fn restart);
 
 /* Room left for `wire_push`; zero means a frame is pending and must be
  * drained first. */
@@ -52,5 +74,9 @@ int wire_next(struct wire_decoder *d, int *kind, unsigned long *channel,
 
 /* Consume the frame `wire_next` returned. */
 void wire_consume(struct wire_decoder *d);
+
+/* The frame `wire_next` returned was not a message: step past its magic
+ * only, so a frame that starts inside it is still found. */
+void wire_reject(struct wire_decoder *d);
 
 #endif

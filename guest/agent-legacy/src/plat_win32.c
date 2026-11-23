@@ -1,7 +1,7 @@
 /* Win32 adapter: NT4 through XP/2003 (mingw i686 or OpenWatcom `nt`), and
  * Windows 95/98/ME (OpenWatcom `win95`). One source: everything below is
  * ANSI, every API exists on both families, and the few that do not —
- * the SCM service entry points, InitiateSystemShutdown, RegisterServiceProcess
+ * the SCM service entry points, job objects, InitiateSystemShutdown, RegisterServiceProcess
  * — are resolved with GetProcAddress so the binary loads on either.
  *
  * The channel is a COM port opened with zero read timeouts, so ReadFile
@@ -256,8 +256,14 @@ void plat_sleep_ms(int ms)
 
 /* ---- processes ------------------------------------------------------ */
 
+typedef HANDLE (WINAPI *CreateExecJobFn)(LPSECURITY_ATTRIBUTES, LPCSTR);
+typedef BOOL (WINAPI *AssignExecJobFn)(HANDLE, HANDLE);
+typedef BOOL (WINAPI *TerminateExecJobFn)(HANDLE, UINT);
+
 struct plat_proc {
     HANDLE process;
+    HANDLE job;
+    TerminateExecJobFn terminate_job;
     HANDLE in_w;  /* our end of the child's stdin */
     HANDLE out_r; /* our end of the child's stdout */
     HANDLE err_r;
@@ -517,6 +523,11 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     char *envblock;
     DWORD flags;
     DWORD tid;
+    HMODULE kernel = GetModuleHandleA("kernel32.dll");
+    CreateExecJobFn create_job = (CreateExecJobFn)GetProcAddress(kernel, "CreateJobObjectA");
+    AssignExecJobFn assign_job = (AssignExecJobFn)GetProcAddress(kernel, "AssignProcessToJobObject");
+    TerminateExecJobFn terminate_job =
+        (TerminateExecJobFn)GetProcAddress(kernel, "TerminateJobObject");
 
     for (i = 0; i < spec->argc; i++) {
         static char ansi[CMDLINE_CAP];
@@ -578,7 +589,7 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     si.hStdError = err_w;
     /* NT hides a console outright; 9x has no such flag and needs a console
      * for command.com, so it gets a new hidden one. */
-    flags = is_win9x ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+    flags = (is_win9x ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW) | CREATE_SUSPENDED;
     envblock = build_env_block(spec->env, spec->nenv, err, errcap);
     if (!envblock || !CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, flags, envblock,
                                      spec->cwd ? cwd : NULL, &si, &pi)) {
@@ -596,11 +607,31 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         return NULL;
     }
     free(envblock);
-    CloseHandle(pi.hThread);
     CloseHandle(in_r);
     CloseHandle(out_w);
     CloseHandle(err_w);
     p->process = pi.hProcess;
+
+    /* The child must join the job before it can start any descendants.
+     * NT4 and 9x have no jobs and can only terminate the direct child. */
+    if (create_job && assign_job && terminate_job) {
+        p->job = create_job(NULL, NULL);
+        p->terminate_job = terminate_job;
+        if (!p->job || !assign_job(p->job, p->process)) {
+            fmt(err, (size_t)errcap, "exec: cannot assign the process to a job: error %lu",
+                (unsigned long)GetLastError());
+            TerminateProcess(p->process, 137);
+            if (p->job)
+                CloseHandle(p->job);
+            CloseHandle(pi.hThread);
+            CloseHandle(p->process);
+            CloseHandle(p->in_w);
+            CloseHandle(p->out_r);
+            CloseHandle(p->err_r);
+            free(p);
+            return NULL;
+        }
+    }
 
     InitializeCriticalSection(&p->lock);
     p->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -610,13 +641,25 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
          * can feed or free. */
         fmt(err, (size_t)errcap, "exec: cannot start the stdin writer: error %lu",
             (unsigned long)GetLastError());
-        TerminateProcess(p->process, 137);
+        proc_kill(p);
+        if (p->job)
+            CloseHandle(p->job);
+        CloseHandle(pi.hThread);
         CloseHandle(p->process);
         CloseHandle(p->out_r);
         CloseHandle(p->err_r);
         free_writer_side(p);
         return NULL;
     }
+    if (ResumeThread(pi.hThread) == (DWORD)-1) {
+        fmt(err, (size_t)errcap, "exec: cannot resume the process: error %lu",
+            (unsigned long)GetLastError());
+        CloseHandle(pi.hThread);
+        proc_kill(p);
+        proc_free(p);
+        return NULL;
+    }
+    CloseHandle(pi.hThread);
     return p;
 }
 
@@ -738,6 +781,8 @@ int proc_exited(struct plat_proc *p, long *code)
 
 void proc_kill(struct plat_proc *p)
 {
+    if (p->job && p->terminate_job(p->job, 137))
+        return;
     if (!p->exited)
         TerminateProcess(p->process, 137);
 }
@@ -756,6 +801,8 @@ void proc_free(struct plat_proc *p)
     SetEvent(p->wake);
     CloseHandle(p->out_r);
     CloseHandle(p->err_r);
+    if (p->job)
+        CloseHandle(p->job);
     CloseHandle(p->process);
     if (WaitForSingleObject(p->writer, 2000) != WAIT_OBJECT_0) {
         EnterCriticalSection(&p->lock);
