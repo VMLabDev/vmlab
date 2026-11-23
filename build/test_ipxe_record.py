@@ -4,6 +4,7 @@
 import hashlib
 from pathlib import Path
 import runpy
+import subprocess
 import tempfile
 import unittest
 
@@ -90,6 +91,57 @@ class IpxeRecordTest(unittest.TestCase):
 
     def test_cached_objects_are_tied_to_the_flags_and_the_toolchain(self):
         self.assertNotEqual(ipxe["object_inputs"](TOOLS), ipxe["object_inputs"](OTHER_TOOLS))
+
+    def checkout(self):
+        """A git checkout shaped like upstream's: a tracked file in the
+        legacy object directory, which ignores every object beside it."""
+        directory = tempfile.TemporaryDirectory(prefix="vmlab-ipxe-objects-")
+        self.addCleanup(directory.cleanup)
+        source = Path(directory.name) / "upstream"
+        (source / "src/bin").mkdir(parents=True)
+        (source / "src/bin/.gitignore").write_text("*\n!.gitignore\n")
+        (source / "src/main.c").write_text("int main;\n")
+        git = ["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        for arguments in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "pin"]):
+            subprocess.run([*git, *arguments], check=True)
+        return source
+
+    def changes(self, source):
+        return subprocess.check_output(
+            ["git", "-C", str(source), "status", "--porcelain"], text=True)
+
+    def test_removing_stale_objects_leaves_the_checkout_equal_to_the_pin(self):
+        # The next build refuses a checkout with tracked changes.
+        source = self.checkout()
+        (source / "src/bin/old.o").write_text("object")
+        (source / "src/bin-x86_64-efi").mkdir()
+        (source / "src/bin-x86_64-efi/old.o").write_text("object")
+        ipxe["clear_stale_objects"](source, TOOLS)
+        self.assertFalse((source / "src/bin/old.o").exists())
+        self.assertFalse((source / "src/bin-x86_64-efi").exists())
+        self.assertEqual(self.changes(source), "")
+        self.assertEqual((source.parent / "object-inputs").read_text(),
+                         ipxe["object_inputs"](TOOLS))
+        # The same inputs keep the objects. Other inputs remove them again.
+        (source / "src/bin/new.o").write_text("object")
+        ipxe["clear_stale_objects"](source, TOOLS)
+        self.assertTrue((source / "src/bin/new.o").exists())
+        ipxe["clear_stale_objects"](source, OTHER_TOOLS)
+        self.assertFalse((source / "src/bin/new.o").exists())
+        self.assertEqual(self.changes(source), "")
+
+    def test_a_checkout_that_lost_its_object_directory_files_is_restored(self):
+        source = self.checkout()
+        (source / "src/bin/.gitignore").unlink()
+        ipxe["restore_objects"](source)
+        self.assertEqual(self.changes(source), "")
+
+    def test_a_changed_source_file_is_not_restored(self):
+        source = self.checkout()
+        (source / "src/main.c").write_text("int other;\n")
+        (source / "src/bin/.gitignore").write_text("changed\n")
+        ipxe["restore_objects"](source)
+        self.assertEqual(self.changes(source), " M src/bin/.gitignore\n M src/main.c\n")
 
 
 if __name__ == "__main__":
