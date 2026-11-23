@@ -529,13 +529,17 @@ mod tests {
             tmp.path().join("run"),
             run.join("ncalrpc"),
         ] {
-            let refused = render(host.clone()).expect_err(&host.display().to_string());
+            let Err(refused) = render(host.clone()) else {
+                panic!("{} was served", host.display());
+            };
             assert_eq!(refused.name, "src");
             assert!(refused.reason.contains("vmlab's SMB"), "{refused}");
         }
         // Beside the state, and a named volume under `.vmlab`, are served.
         for host in [lab.join("src"), lab.join(".vmlab/volumes/data")] {
-            render(host.clone()).expect(&host.display().to_string());
+            if let Err(refused) = render(host) {
+                panic!("{refused}");
+            }
         }
         // A state directory that does not exist yet is still protected.
         assert!(share_state_problem(&lab, &lab.join("new/.vmlab"), "x").is_some());
