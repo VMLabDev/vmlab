@@ -1726,7 +1726,10 @@ mod tests {
         let mut f = Fixture::new();
         f.dev.reset();
         f.activate();
-        lock(&f.dev.shared).queues[2].as_mut().unwrap().set_ready(false);
+        lock(&f.dev.shared).queues[2]
+            .as_mut()
+            .unwrap()
+            .set_ready(false);
 
         let probe = UnixStream::connect(&f.agent_sock).unwrap();
         wait_for("early host connection", || {
