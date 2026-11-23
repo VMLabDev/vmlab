@@ -84,7 +84,7 @@ page cmd_usb {
       | "Option" | "Meaning" |
       | "`<VM>`" | "The VM, as `[lab/]vm`." |
       | "`<SELECTOR>`" | "The device; see Selectors above." |
-      | "`--force`" | "Attach a HID keyboard or mouse, which the host is probably using." |
+      | "`--force`" | "Attach a HID keyboard or mouse, which the host is probably using, or a disk the host has mounted." |
       | "`--json`" | "Emit the attachment as JSON." |
       | "`-h`, `--help`" | "Print help." |
   }
@@ -101,6 +101,7 @@ page cmd_usb {
     li "the selector is malformed, matches nothing, or matches several devices;"
     li "another VM, in this lab or any other, already holds the device — the message names it as `lab/vm`;"
     li "the device has a HID boot keyboard or mouse interface and `--force` was not given — the host loses it while it is attached;"
+    li "the host has a filesystem mounted from the device and `--force` was not given — the message names each block device and mount point; unmount it first, because the host loses the disk and its unwritten data at the attach;"
     li "the vmlab process cannot open the device node `/dev/bus/usb/BBB/DDD` read-write. The message names the node and gives a `setfacl` command for now and a udev rule for good; see [Troubleshooting](apx_troubleshooting)."
   }
 

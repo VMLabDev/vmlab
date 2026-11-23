@@ -255,7 +255,10 @@ fn plan_attach_refuses_a_mounted_storage_device_without_force() {
     assert!(e.contains("0781:5581"), "{e}");
     assert!(e.contains("/run/media/u/MY STICK"), "{e}");
     assert!(e.contains("sdb1"), "{e}");
-    assert!(e.contains("--force") && e.contains("usb_attach_force"), "{e}");
+    assert!(
+        e.contains("--force") && e.contains("usb_attach_force"),
+        "{e}"
+    );
 
     // Forced, it attaches, as a HID keyboard does.
     assert!(plan_mounted(sys.path(), "port:1-9", &table, true).is_ok());

@@ -613,6 +613,23 @@ fn unescape_mount(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The refusal for a device the host has a filesystem mounted from. The
+/// attach disconnects the host's storage driver at once, so what the host
+/// has not written yet is lost and the mount is left without its disk.
+pub fn mounted_refusal(dev: &HostDevice, mounts: &[HostMount]) -> String {
+    format!(
+        "{} carries a filesystem the host has mounted ({}) — an attach takes the disk away \
+         under it, and data the host has not written yet is lost. Unmount it first, or pass \
+         --force (wscript: `usb_attach_force`) if that is what you want",
+        dev.describe(),
+        mounts
+            .iter()
+            .map(|m| format!("{} at {}", m.block, m.mount_point))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Everything an attach decided before QEMU is asked: which device, and the
 /// `device_add` arguments that pin it.
 #[derive(Debug, Clone, PartialEq)]
@@ -638,7 +655,6 @@ pub fn plan_attach(
     accessible: impl Fn(&Path) -> bool,
 ) -> Result<AttachPlan, String> {
     let dev = resolve(sel, host)?;
-    let _ = &mounted;
     if let Some((_, holder)) = held.iter().find(|(port, _)| *port == dev.port) {
         return Err(format!(
             "{} is already attached to {holder} — `vmlab usb detach {holder} port:{}` first",
@@ -652,6 +668,12 @@ pub fn plan_attach(
              attached. Pass --force (wscript: `usb_attach_force`) if that is what you want",
             dev.describe()
         ));
+    }
+    if !force {
+        let mounts = mounted(dev);
+        if !mounts.is_empty() {
+            return Err(mounted_refusal(dev, &mounts));
+        }
     }
     let node = dev.node(dev_root);
     if !accessible(&node) {

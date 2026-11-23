@@ -125,6 +125,15 @@ hostile guest or peer, wrong result, cosmetic.
   `src/usb/tests.rs`, with a fake sysfs tree that gives the device a block
   child and a mount table that names it.
 - How bad: data loss on the host.
+- Fixed by card #663, for the mounted disk. `plan_attach` refuses a device
+  that carries a filesystem the host has mounted unless `--force` is given,
+  and names each block device and mount point. `host_mounts` finds the block
+  devices below the USB device in sysfs, with their partitions and the
+  mappings in their `holders/`, and looks each up by `major:minor` in
+  `/proc/self/mountinfo`. The proof test failed before the refusal was added
+  and passes with it. Not covered: a disk in use without a mount (swap, a raw
+  device a process has open), a USB network adapter, and a HID device without
+  the boot protocol.
 
 ### F3. A guest stops its VMM with one UHCI queue head that nests itself
 

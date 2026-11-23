@@ -327,7 +327,8 @@ A running VM can be handed a USB device plugged into the host, and given it back
 3. A malformed selector, or one matching no device or several.
 4. A device another machine holds, in this lab or any other, naming the holder as `lab/vm`.
 5. A device with a HID boot keyboard or mouse interface (class 03, protocol 01 or 02) unless forced (`--force`, wscript `usb_attach_force`): the host is probably using it as input, and loses it while it is attached. A receiver carrying both is named a keyboard.
-6. A device node, `/dev/bus/usb/BBB/DDD`, the vmlab process cannot open read-write. A stock node is `root:root 0664`, so this is the usual first refusal. It names the node and two fixes, one line each: `sudo setfacl -m u:<user>:rw <node>` for now, and a udev rule (`SUBSYSTEM=="usb", ATTR{idVendor}=="…", ATTR{idProduct}=="…", TAG+="uaccess"`) for good.
+6. A device that carries a filesystem the host has mounted, unless forced (the same `--force` and `usb_attach_force`): the attach takes the disk from the host's storage driver at once, so the mount loses its disk and what the host has not written yet. The block devices are those sysfs lists below the USB device, with their partitions and the mappings stacked on them (dm-crypt, LVM), each looked up by `major:minor` in `/proc/self/mountinfo`. The refusal names every block device and mount point and says to unmount first.
+7. A device node, `/dev/bus/usb/BBB/DDD`, the vmlab process cannot open read-write. A stock node is `root:root 0664`, so this is the usual first refusal. It names the node and two fixes, one line each: `sudo setfacl -m u:<user>:rw <node>` for now, and a udev rule (`SUBSYSTEM=="usb", ATTR{idVendor}=="…", ATTR{idProduct}=="…", TAG+="uaccess"`) for good.
 
 The attach is then QMP `device_add` of `usb-host` on `usbx.0`, pinned by `hostbus`, `hostport` **and** `hostaddr` (the device number), with the qdev id `usbhost-<port path>`. The device number changes on every replug, so a different device later plugged into the same socket never matches the pin and is never handed to the guest unasked.
 
@@ -904,7 +905,7 @@ declared, rather than the password existing in two places that drift.
 
 ```
 m.usb_attach(selector) -> UsbDevice        # <vid>:<pid>[@serial] | port:<path>
-m.usb_attach_force(selector) -> UsbDevice  # also a HID keyboard or mouse
+m.usb_attach_force(selector) -> UsbDevice  # also a HID keyboard or mouse, or a mounted disk
 m.usb_detach(selector)   m.usb_detach_all()
 m.usb_attached() -> [UsbDevice]
 ```

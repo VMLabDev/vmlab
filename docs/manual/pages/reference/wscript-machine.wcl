@@ -1213,8 +1213,8 @@ SRC
     be running and have started with `usb = true`. The error carries the
     refusal, in the order [vmlab usb attach](cmd_usb) lists them: a container,
     a VM not running or without the controller, a selector matching no device
-    or several, a device another machine holds, a HID keyboard or mouse, and
-    a device node vmlab cannot open. Emits `usb.attached`.
+    or several, a device another machine holds, a HID keyboard or mouse, a
+    disk the host has mounted, and a device node vmlab cannot open. Emits `usb.attached`.
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {
@@ -1228,7 +1228,7 @@ SRC
   }
 
   h2 "Machine.usb_attach_force"
-  p "Hot-plug a host USB device, a HID keyboard or mouse included."
+  p "Hot-plug a host USB device, a HID keyboard or mouse and a disk the host has mounted included."
   code wscript { source = "fn usb_attach_force(self, selector: string) -> Result[UsbDevice, string]" }
   table {
     rows:
