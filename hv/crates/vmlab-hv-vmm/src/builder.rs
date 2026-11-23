@@ -799,11 +799,9 @@ pub fn build(
         let first_slot = layout.regions.len() as u32;
         // The guest decides how much it writes here, so this handle has the
         // serial log's cap too.
-        let debug_port = crate::q35::DebugPort::open(
-            &desc.serial_log,
-            crate::serial_log::SERIAL_LOG_CAP,
-        )
-        .map_err(|e| VmmError::Other(format!("opening firmware debug log: {e}")))?;
+        let debug_port =
+            crate::q35::DebugPort::open(&desc.serial_log, crate::serial_log::SERIAL_LOG_CAP)
+                .map_err(|e| VmmError::Other(format!("opening firmware debug log: {e}")))?;
         io_bus
             .register(0x402, 1, Arc::new(Mutex::new(debug_port)))
             .map_err(VmmError::Other)?;
