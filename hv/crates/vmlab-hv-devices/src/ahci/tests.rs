@@ -1201,7 +1201,14 @@ fn measure_issue_block_time() {
     for round in 0..200u64 {
         for (command, flags) in [(0x35, 0x40), (0xe7, 0)] {
             d.ack(0);
-            d.prepare(command, flags, round * 64, 64, None, &[(0x4000, 0x8000, true)]);
+            d.prepare(
+                command,
+                flags,
+                round * 64,
+                64,
+                None,
+                &[(0x4000, 0x8000, true)],
+            );
             let started = std::time::Instant::now();
             d.write_only(0x138, 1);
             issue.push((command, started.elapsed()));
