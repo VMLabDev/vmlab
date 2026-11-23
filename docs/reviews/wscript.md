@@ -49,7 +49,7 @@ test does not reproduce is wrong and should be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease |
+| F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
 | F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon |
 | F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped |
 | F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it |
@@ -91,6 +91,16 @@ test does not reproduce is wrong and should be dropped.
   "rogue", 80)`. Connect to the port and read which NIC the NAT engine sends
   the SYN to. Expected: `rogue`'s NIC, or an error that names the claim.
   Today: `victim`'s NIC.
+- Fixed by card #665. `SegmentHandle::add_forward` asks
+  `LabRuntime::script_forward_target` (`src/labd/lab.rs`), which takes the
+  machine's NIC on the segment the handle names and the address the segment's
+  DHCP server vouches for on that NIC, as `forward_observations` does. A claim
+  the server refuses is an error that names it, and a machine with no NIC on
+  the segment is refused. The NAT engine binds the address to that NIC's MAC,
+  as for a declared forward. The proof test failed before the fix (the SYN
+  went to `10.0.0.10`) and passes after it. A second test,
+  `a_script_forward_targets_the_nic_on_its_own_segment`, covers the second
+  fault.
 
 ### F2. Dropping a deep value overflows the native stack and aborts the daemon (crash)
 

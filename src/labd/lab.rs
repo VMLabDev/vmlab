@@ -2052,6 +2052,73 @@ impl LabRuntime {
         observed
     }
 
+    /// Where a script's `seg.forward(host_port, vm, guest_port)` on `segment`
+    /// aims: the address of `vm`'s NIC on that segment, and the NIC's
+    /// hardware address for the NAT engine to bind it to.
+    ///
+    /// The rule is [`Self::forward_observations`]'s, for the one NIC the
+    /// segment names: the guest's report says that the NIC carries an
+    /// address, and the segment's DHCP server says which
+    /// ([`DhcpServer::vouched`](crate::net::dhcp::DhcpServer::vouched)). A
+    /// guest that reports another machine's address gets the forward on its
+    /// own lease, or an error naming the claim where it holds none
+    /// (docs/reviews/wscript.md F1). A NIC on another segment is never the
+    /// target, whatever it reports.
+    pub(crate) async fn script_forward_target(
+        &self,
+        segment: &str,
+        vm: &str,
+    ) -> Result<(std::net::Ipv4Addr, Option<crate::config::model::MacAddr>), String> {
+        let m = self.machine(vm).map_err(|e| format!("{e:#}"))?;
+        let on_segment: Vec<usize> = m
+            .nics()
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| nic_segment_name(n) == segment)
+            .map(|(i, _)| i)
+            .collect();
+        if on_segment.is_empty() {
+            return Err(format!("vm {vm} has no NIC on segment \"{segment}\""));
+        }
+        // Taken before the guest is asked: an agent may take seconds to
+        // answer, and the network is not held for that.
+        let server = {
+            let net = self.network.lock().await;
+            net.segments
+                .get(segment)
+                .and_then(|seg| seg.gateway.as_ref()?.dhcp_server())
+        };
+        let ips = m.guest_ips().await.map_err(|e| format!("{e:#}"))?;
+        let macs = m.macs();
+        let mut refused = None;
+        for nic in on_segment {
+            let Some(ip) = ips.get(nic).and_then(Option::as_deref) else {
+                continue;
+            };
+            let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
+                continue;
+            };
+            let mac = macs.get(nic).copied();
+            match (mac, &server) {
+                (Some(mac), Some(server)) => {
+                    let held = server.lock_recover().vouched(mac, ip);
+                    match held {
+                        Some(held) => return Ok((held, Some(mac))),
+                        None => {
+                            refused = Some(format!(
+                                "vm {vm}: its guest reports {ip} on {mac}, an address that \
+                                 NIC does not hold; no forward follows it"
+                            ));
+                        }
+                    }
+                }
+                _ => return Ok((ip, mac)),
+            }
+        }
+        Err(refused
+            .unwrap_or_else(|| format!("vm {vm} has no IPv4 lease on segment \"{segment}\" yet")))
+    }
+
     /// Install one planned forward on the address it binds
     /// ([`ForwardRule::bind`], which worktree isolation has already made
     /// `127.0.0.1`), returning its id and the host port it bound.
@@ -8046,5 +8113,63 @@ fn main(lab: Lab) {{
             to_mac, ROGUE_MAC,
             "the script's forward to rogue is framed to another machine's NIC"
         );
+    }
+
+    /// A script forward is aimed at the machine's NIC on the segment the
+    /// handle names, not at the first NIC that reports an address
+    /// (docs/reviews/wscript.md F1, the second fault), and a machine with no
+    /// NIC there is refused by name.
+    #[tokio::test]
+    async fn a_script_forward_targets_the_nic_on_its_own_segment() {
+        use crate::config::model::MacAddr;
+        use std::net::Ipv4Addr;
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let config = crate::config::load_lab_source(
+            r#"import <vmlab.wcl>
+lab "t" {
+  segment "a" { subnet = "10.0.1.0/24" nat = true }
+  segment "b" { subnet = "10.0.2.0/24" nat = true }
+  segment "c" { subnet = "10.0.3.0/24" nat = true }
+  container "two" { image = "nginx"
+    nic { segment = "a" }
+    nic { segment = "b" }
+  }
+}"#,
+            "<test>",
+            dir.path(),
+        )
+        .expect("lab source");
+        let nics = config.lab.containers[0].nics.clone();
+        let mac_a = MacAddr([0x52, 0x54, 0, 0, 1, 5]);
+        let mac_b = MacAddr([0x52, 0x54, 0, 0, 2, 5]);
+        let two = {
+            let mut m = Arc::into_inner(FakeMachine::networked(
+                "two", &sh, &nics, mac_a, "10.0.1.5",
+            ))
+            .expect("sole owner");
+            m.macs = vec![mac_a, mac_b];
+            m.claims = vec![Some("10.0.1.5".into()), Some("10.0.2.5".into())];
+            Arc::new(m)
+        };
+        let lab_cfg = config.lab.clone();
+        let lab = LabRuntime::with_machines(config, vec![two as Arc<dyn Machine>])
+            .expect("runtime");
+        let macs = HashMap::from([("two".to_string(), vec![mac_a, mac_b])]);
+        lab.network
+            .lock()
+            .await
+            .wire_gateways(&lab_cfg, &macs, &lab.host_cfg);
+
+        assert_eq!(
+            lab.script_forward_target("b", "two").await,
+            Ok((Ipv4Addr::new(10, 0, 2, 5), Some(mac_b)))
+        );
+        assert_eq!(
+            lab.script_forward_target("a", "two").await,
+            Ok((Ipv4Addr::new(10, 0, 1, 5), Some(mac_a)))
+        );
+        let none = lab.script_forward_target("c", "two").await.unwrap_err();
+        assert!(none.contains("no NIC on segment \"c\""), "{none}");
     }
 }
