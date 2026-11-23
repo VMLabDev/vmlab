@@ -373,7 +373,8 @@ no copy of the key. The manual's host-config reference explains how to set it.
 vmlab-hv runs macOS machines (§22, its macOS phase), and a new macOS VM
 selects it like any other supported VM. It presents the profile's hardware as
 QEMU does: VMware SVGA without a VGA BIOS, a USB keyboard, `Skylake-Client-v4`
-with VMware's frequency leaf, unknown MSRs read as 0 (so the `ignore_msrs`
+with VMware's frequency leaf, the MSRs macOS touches answered from a fixed
+table (`hv/docs/macos-msrs.md`; so the `ignore_msrs`
 warning below is QEMU's only), the SMBIOS baseboard and an Apple SMC serving
 the host's key. Its virtio-net is transitional and single-queue, so it takes
 the plain stream socket and no TAP. The key reaches vmlab-hv through a
@@ -391,7 +392,7 @@ the redacted description: it is never on an argv or in a file.
 - **Dev machines** (§19.1) land their workspace at `/Users/Shared/src`: `/` is the sealed system volume, and `/Users/Shared` is on the Data volume, where any login can make a directory.
 - **`vmlab machine repair-agent`** (§19.4) stages `/Library/vmlab/vmlab-agent.new`, renames it over `/Library/vmlab/vmlab-agent` and restarts the job with `launchctl kickstart -k system/dev.vmlab.agent`, detached so it completes though the requester is what it kills.
 
-**The host.** XNU reads Intel MSRs KVM does not emulate, and KVM injects a #GP for each unless the `kvm` module's `ignore_msrs` is on — on an AMD host that is every boot. So `up` warns for a macOS VM (its profile's family, or `apple_smc` resolved on) running on QEMU under KVM when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`, naming the fix: `options kvm ignore_msrs=1 report_ignored_msrs=0` in a file under `/etc/modprobe.d`, and `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` until the next boot. It is a warning, not a refusal; the guest then faults during boot. vmlab-hv needs no module parameter: its machine description reads unknown MSRs as 0 for a macOS guest.
+**The host.** XNU reads Intel MSRs KVM does not emulate, and KVM injects a #GP for each unless the `kvm` module's `ignore_msrs` is on — on an AMD host that is every boot. So `up` warns for a macOS VM (its profile's family, or `apple_smc` resolved on) running on QEMU under KVM when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`, naming the fix: `options kvm ignore_msrs=1 report_ignored_msrs=0` in a file under `/etc/modprobe.d`, and `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` until the next boot. It is a warning, not a refusal; the guest then faults during boot. vmlab-hv needs no module parameter: for a macOS guest it answers the MSRs in `hv/docs/macos-msrs.md` itself, and every other unknown MSR still faults.
 
 ---
 

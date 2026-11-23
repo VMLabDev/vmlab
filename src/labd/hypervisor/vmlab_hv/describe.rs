@@ -352,8 +352,8 @@ pub(crate) fn vm(
     }
     let ovmf = resolved.firmware == Some(crate::profiles::FirmwareKind::Ovmf);
     // A macOS guest (HV macOS phase): VMware SVGA, a USB keyboard, the
-    // pinned Skylake model with VMware's frequency leaf, unknown MSRs read as
-    // 0, an SMBIOS baseboard and the Apple SMC serving the host's key.
+    // pinned Skylake model with VMware's frequency leaf, the MSRs XNU touches
+    // answered by vmlab-hv, an SMBIOS baseboard and the Apple SMC serving the host's key.
     let macos = crate::config::hypervisor::is_macos(resolved);
     let display_device = match resolved.display_device.as_deref() {
         // QEMU's q35 adds a std VGA of its own where nothing names one.
@@ -740,7 +740,7 @@ pub(crate) fn vm(
         tsc_khz,
         vmware_cpuid_freq: macos,
         msr_policy: if macos {
-            MsrPolicy::Ignore
+            MsrPolicy::Macos
         } else {
             MsrPolicy::Fault
         },
@@ -1437,7 +1437,7 @@ mod tests {
     /// describes the template: console 00:01.0, virtio-net 00:02.0 (plain,
     /// single queue), VMware SVGA 00:03.0 without a VGA BIOS, the tablet's
     /// xHCI 00:04.0 with a USB keyboard, AHCI disks, the pinned Skylake model
-    /// with VMware's frequency leaf, the `ignore` MSR policy, SMBIOS type 2
+    /// with VMware's frequency leaf, the `macos` MSR policy, SMBIOS type 2
     /// and the Apple SMC serving the host's key.
     #[test]
     fn macos_is_described_as_the_hypervisors_acceptance_test_boots_it() {
@@ -1450,7 +1450,7 @@ mod tests {
         assert_eq!(d.cpu_model.as_deref(), Some("Skylake-Client-v4"));
         assert!(d.vmware_cpuid_freq && d.invtsc && d.usb_keyboard && d.smbios_type2);
         assert_eq!(d.tsc_khz, Some(2_995_200));
-        assert_eq!(d.msr_policy, MsrPolicy::Ignore);
+        assert_eq!(d.msr_policy, MsrPolicy::Macos);
         assert_eq!(
             d.applesmc.as_ref().map(|s| s.osk.as_str()),
             Some(key.as_str())

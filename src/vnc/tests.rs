@@ -112,6 +112,69 @@ async fn capture_rejects_a_rectangle_outside_the_framebuffer() {
     assert!(err.to_string().contains("outside"), "{err:#}");
 }
 
+/// A Raw rectangle far larger than the screen is refused from its header in
+/// a stream, before its payload is allocated or read.
+#[tokio::test]
+async fn stream_rejects_a_rectangle_outside_the_screen() {
+    let rect = fake::raw_rect_claiming(0, 0, 65535, 65535, &[0; 16]);
+    let server = fake::spawn_closing(4, 4, vec![update(&[rect])]);
+
+    let mut c = VncClient::connect(&server.path).await.unwrap();
+    c.start_stream().await.unwrap();
+    let err = c.next_update().await.unwrap_err();
+    assert!(format!("{err:#}").contains("outside"), "{err:#}");
+}
+
+/// The same rectangle is refused from its header in a capture too, not after
+/// its payload was allocated and read.
+#[tokio::test]
+async fn capture_rejects_an_oversized_rectangle_from_its_header() {
+    let rect = fake::raw_rect_claiming(0, 0, 65535, 65535, &[0; 16]);
+    let server = fake::spawn_closing(4, 4, vec![update(&[rect])]);
+
+    let mut c = VncClient::connect(&server.path).await.unwrap();
+    let err = c.capture().await.unwrap_err();
+    assert!(format!("{err:#}").contains("outside"), "{err:#}");
+}
+
+/// A `ServerCutText` that announces 4 GiB and then ends is an error naming
+/// the length it announced.
+#[tokio::test]
+async fn stream_names_the_length_of_a_cut_text_that_never_arrives() {
+    let server = fake::spawn_closing(4, 4, vec![fake::cut_text_header(0xffff_ffff)]);
+
+    let mut c = VncClient::connect(&server.path).await.unwrap();
+    c.start_stream().await.unwrap();
+    let err = c.next_update().await.unwrap_err();
+    assert!(format!("{err:#}").contains("4294967295"), "{err:#}");
+}
+
+/// A `DesktopSize` above the screen limit ends the stream, so neither this
+/// client nor the recorder allocates a framebuffer for it.
+#[tokio::test]
+async fn stream_rejects_a_desktop_size_above_the_limit() {
+    let server = fake::spawn(4, 4, vec![update(&[desktop_size(65535, 65535)])]);
+
+    let mut c = VncClient::connect(&server.path).await.unwrap();
+    c.start_stream().await.unwrap();
+    let err = c.next_update().await.unwrap_err();
+    assert!(format!("{err:#}").contains("above the limit"), "{err:#}");
+    assert_eq!((c.width, c.height), (4, 4));
+}
+
+/// A cursor above the cursor limit is refused from its header.
+#[tokio::test]
+async fn stream_rejects_a_cursor_above_the_limit() {
+    let mut cursor = fake::alpha_cursor(0, 0, 0, 0, &[]);
+    cursor[4..8].copy_from_slice(&[0xff; 4]);
+    let server = fake::spawn_closing(4, 4, vec![update(&[cursor])]);
+
+    let mut c = VncClient::connect(&server.path).await.unwrap();
+    c.start_stream().await.unwrap();
+    let err = c.next_update().await.unwrap_err();
+    assert!(format!("{err:#}").contains("cursor 65535x65535"), "{err:#}");
+}
+
 /// The client's messages once the server has recorded `n` of them: the last
 /// request is written just before `next_update` returns, so the server may
 /// not have read it yet.

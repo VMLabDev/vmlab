@@ -127,7 +127,7 @@ in the machine description. N6-N8 networking supplies offloaded multiqueue
 virtio-net streams and passed TAP/vhost-net descriptors; the e2e `fastpath`
 scenario follows the selected hypervisor. Kernel tiers still require host
 capabilities. A macOS guest runs too, with the `macos` profile's VMware SVGA, USB
-keyboard, Skylake model, ignored MSRs and an Apple SMC whose key reaches
+keyboard, Skylake model, MSR table (`hv/docs/macos-msrs.md`) and an Apple SMC whose key reaches
 vmlab-hv through a mode-600 pipe, never a file or an argv. Everything else —
 `accel = "tcg"`, `qemu_args`, hosts without KVM — is refused from one list
 naming the phase that brings it, and for an x86 guest that refusal means it
