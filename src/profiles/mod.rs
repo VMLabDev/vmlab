@@ -85,6 +85,18 @@ pub enum Rtc {
     Localtime,
 }
 
+/// What the x86 timer (the PIT) does with ticks the guest was too late to
+/// take (PRD §5.3). `Replay` is KVM's default: every missed tick is delivered
+/// later, one straight after another, which keeps the clock of a guest that
+/// counts ticks. `Discard` drops them, for a guest that does not survive the
+/// burst: the standard-mode DOS extender of Windows 9x Setup faults in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PitTicks {
+    #[default]
+    Replay,
+    Discard,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareKind {
     Ovmf,
@@ -142,6 +154,8 @@ pub struct Profile {
     pub virtiofs: bool,
     /// What the guest reads the RTC as (§7.3).
     pub rtc: Rtc,
+    /// What the PIT does with ticks the guest missed (§5.3).
+    pub pit_ticks: PitTicks,
     /// Guest path an `@dev` workspace lands at when the decorator names none
     /// (§19.1). Guest-OS-shaped — `C:\src` on Windows, `/src` on Linux —
     /// which is why it is profile-sourced rather than a constant. `None`
@@ -341,6 +355,13 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
         rtc: r
             .keyword("rtc", &[("utc", Rtc::Utc), ("localtime", Rtc::Localtime)])
+            .unspan()
+            .unwrap_or_default(),
+        pit_ticks: r
+            .keyword(
+                "pit_ticks",
+                &[("replay", PitTicks::Replay), ("discard", PitTicks::Discard)],
+            )
             .unspan()
             .unwrap_or_default(),
         workspace_guest: r.string("workspace_guest").unspan(),
@@ -569,6 +590,47 @@ mod tests {
             };
             assert_eq!(set.get(name).unwrap().rtc, want, "{name}");
         }
+    }
+
+    /// Only `windows-9x` drops the PIT ticks its guest missed (card #705:
+    /// Windows 95 Setup's DOS extender faults in the replayed burst). The NT
+    /// profiles and TempleOS keep KVM's replay, which holds the clock of a
+    /// guest that counts ticks and which none of them is known to fail on.
+    #[test]
+    fn only_windows_9x_discards_missed_pit_ticks() {
+        let set = ProfileSet::shipped().unwrap();
+        for name in set.names() {
+            let want = if name == "windows-9x" {
+                PitTicks::Discard
+            } else {
+                PitTicks::Replay
+            };
+            assert_eq!(set.get(name).unwrap().pit_ticks, want, "{name}");
+        }
+    }
+
+    /// `pit_ticks` takes `replay` or `discard`, and nothing else.
+    #[test]
+    fn pit_ticks_reads_its_two_keywords_and_refuses_others() {
+        let ok = parse_profiles(
+            "import <vmlab-profile.wcl>\n\
+             profile \"drop\" { pit_ticks = \"discard\" }\n\
+             profile \"keep\" { pit_ticks = \"replay\" }\n\
+             profile \"unset\" {}\n",
+            "<test>",
+        )
+        .unwrap();
+        let of = |n: &str| ok.iter().find(|p| p.name == n).unwrap().pit_ticks;
+        assert_eq!(of("drop"), PitTicks::Discard);
+        assert_eq!(of("keep"), PitTicks::Replay);
+        assert_eq!(of("unset"), PitTicks::Replay);
+
+        let err = parse_profiles(
+            "import <vmlab-profile.wcl>\nprofile \"x\" { pit_ticks = \"delay\" }\n",
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("replay, discard"), "{err:#}");
     }
 
     /// `rtc` takes `utc` or `localtime`, and nothing else.

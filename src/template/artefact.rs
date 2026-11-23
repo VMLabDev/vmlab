@@ -193,19 +193,58 @@ impl Compression {
     }
 }
 
-/// How long an artefact download waits on a server that has stopped
-/// talking: to connect, and then for the response head and between two
-/// reads of the body. Neither bounds the whole download.
+/// The bounds of an artefact download. `connect` and `read` are how long it
+/// waits on a server that has stopped talking: to connect, and then for the
+/// response head and between two reads of the body. Neither bounds the whole
+/// download. `max_bytes` bounds its size: the `sha256` is compared when the
+/// body has ended, so without it a server that never ends the body fills
+/// the filesystem of the cache.
 #[derive(Clone, Copy)]
 struct DownloadLimits {
     connect: std::time::Duration,
     read: std::time::Duration,
+    max_bytes: u64,
 }
 
 const DOWNLOAD_LIMITS: DownloadLimits = DownloadLimits {
     connect: std::time::Duration::from_secs(30),
     read: std::time::Duration::from_secs(60),
+    max_bytes: 32 << 30,
 };
+
+/// What a download leaves free on the filesystem of the cache. The template
+/// store, and usually the disks of running labs, are on it too.
+const FREE_RESERVE: u64 = 1 << 30;
+
+/// How many bytes one download may write: `max_bytes`, and never into the
+/// last [`FREE_RESERVE`] of `free`, the free space where it writes.
+fn byte_budget(max_bytes: u64, free: Option<u64>) -> u64 {
+    match free {
+        Some(free) => max_bytes.min(free.saturating_sub(FREE_RESERVE)),
+        None => max_bytes,
+    }
+}
+
+/// The free space of the filesystem that holds `dir`, when it can be read.
+fn free_space(dir: &Path) -> Option<u64> {
+    let stat = nix::sys::statvfs::statvfs(dir).ok()?;
+    Some((stat.blocks_available() as u64).saturating_mul(stat.fragment_size() as u64))
+}
+
+/// Whether a redirect from a URL of scheme `from` may go to one of scheme
+/// `to`. A download that is on HTTPS stays on it. Only a source that did
+/// not come through a lab file starts on another scheme.
+fn redirect_keeps_scheme(from: &str, to: &str) -> bool {
+    from != "https" || to == "https"
+}
+
+/// Whether `url` is one a definition may name: `https://` and nothing else.
+/// The `sha256` pins the content. It does not keep someone on the path of a
+/// plain HTTP request from answering in the server's place.
+pub fn is_https(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
 
 /// Download `url` into `dest`. The caller verifies the file before it gives
 /// it a name that another resolve reads.
@@ -219,6 +258,17 @@ async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> 
         .user_agent(concat!("vmlab/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(limits.connect)
         .read_timeout(limits.read)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let from = attempt.previous().last().map(|u| u.scheme().to_string());
+            if attempt.previous().len() > 10 {
+                attempt.error("too many redirects")
+            } else if from.is_some_and(|from| !redirect_keeps_scheme(&from, attempt.url().scheme()))
+            {
+                attempt.error("a redirect from https:// to another scheme is refused")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .context("building HTTP client")?;
     let resp = client
@@ -229,10 +279,26 @@ async fn download(url: &str, dest: &Path, limits: DownloadLimits) -> Result<()> 
     if !resp.status().is_success() {
         bail!("GET {url} returned {}", resp.status());
     }
+    let budget = byte_budget(limits.max_bytes, dest.parent().and_then(free_space));
+    let over = |what: String| {
+        anyhow::anyhow!(
+            "GET {url}: {what}, over the limit of {budget} bytes for one download \
+             (at most {} bytes, and {FREE_RESERVE} bytes stay free in the artefact cache)",
+            limits.max_bytes
+        )
+    };
+    if let Some(declared) = resp.content_length().filter(|n| *n > budget) {
+        return Err(over(format!("the server declares {declared} bytes")));
+    }
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
+    let mut written = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        written = written.saturating_add(chunk.len() as u64);
+        if written > budget {
+            return Err(over("the server sent more".to_string()));
+        }
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
@@ -276,6 +342,7 @@ mod tests {
         let limits = DownloadLimits {
             connect: std::time::Duration::from_secs(5),
             read: std::time::Duration::from_millis(300),
+            ..DOWNLOAD_LIMITS
         };
         let done = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -341,6 +408,123 @@ mod tests {
             addr,
             release_first: Some(release_first),
         }
+    }
+
+    /// A loopback HTTP mirror for review F2. It answers every connection
+    /// with a head that declares `declared` bytes, or no length at all, and
+    /// then sends 64 KiB blocks until the client closes or `sent_at_most`
+    /// bytes are out. The bound keeps a client with no limit from filling
+    /// the disk of the test.
+    async fn flood_mirror(declared: Option<u64>, sent_at_most: u64) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let length = declared
+                        .map(|n| format!("Content-Length: {n}\r\n"))
+                        .unwrap_or_default();
+                    let head = format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let block = [0x5au8; 64 * 1024];
+                    let mut sent = 0u64;
+                    while sent < sent_at_most {
+                        if sock.write_all(&block).await.is_err() {
+                            return;
+                        }
+                        sent += block.len() as u64;
+                    }
+                    sock.shutdown().await.ok();
+                });
+            }
+        });
+        addr
+    }
+
+    /// Review template-build F2: a mirror that sends data without end must
+    /// not fill the filesystem of the cache. The download stops at its
+    /// limit, and the cache keeps nothing of it.
+    #[tokio::test]
+    async fn a_download_that_never_ends_is_stopped_at_a_limit() {
+        const LIMIT: u64 = 2 << 20;
+        let limits = DownloadLimits {
+            max_bytes: LIMIT,
+            ..DOWNLOAD_LIMITS
+        };
+        let addr = flood_mirror(None, 16 * LIMIT).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let part = tmp.path().join("x.part");
+        let err = download(&format!("http://{addr}/x.iso"), &part, limits)
+            .await
+            .expect_err("a body past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        let written = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        assert!(written <= LIMIT, "{written} bytes written, limit {LIMIT}");
+
+        let dir = tmp.path().join("artefacts");
+        let source = url_source(format!("http://{addr}/x.iso"), &"0".repeat(64));
+        let err = resolve_in(&dir, &source, |_| {}, limits)
+            .await
+            .expect_err("a body past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        assert_eq!(entries(&dir), Vec::<String>::new());
+    }
+
+    /// Review template-build F2: a declared length past the limit is
+    /// refused from the head, before a byte of the body is written.
+    #[tokio::test]
+    async fn a_declared_length_past_the_limit_writes_nothing() {
+        const LIMIT: u64 = 2 << 20;
+        let limits = DownloadLimits {
+            max_bytes: LIMIT,
+            ..DOWNLOAD_LIMITS
+        };
+        let addr = flood_mirror(Some(LIMIT + 1), LIMIT + 1).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("x.part");
+        let err = download(&format!("http://{addr}/x.iso"), &part, limits)
+            .await
+            .expect_err("a declared length past the limit is an error");
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        let written = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(written, 0);
+    }
+
+    /// Review template-build F2: a redirect may not take a download from
+    /// HTTPS to another scheme.
+    #[test]
+    fn a_redirect_does_not_leave_https() {
+        assert!(redirect_keeps_scheme("https", "https"));
+        assert!(!redirect_keeps_scheme("https", "http"));
+        assert!(!redirect_keeps_scheme("https", "ftp"));
+        // Only a source that did not come through a lab file starts on
+        // plain HTTP, and such a download has nothing to lose.
+        assert!(redirect_keeps_scheme("http", "http"));
+        assert!(redirect_keeps_scheme("http", "https"));
+    }
+
+    /// Review template-build F2: the limit never takes the last free space
+    /// of the filesystem that holds the cache.
+    #[test]
+    fn the_byte_budget_leaves_a_reserve_free() {
+        assert_eq!(byte_budget(100, Some(FREE_RESERVE + 500)), 100);
+        assert_eq!(byte_budget(1000, Some(FREE_RESERVE + 500)), 500);
+        assert_eq!(byte_budget(1000, Some(FREE_RESERVE - 1)), 0);
+        assert_eq!(byte_budget(1000, None), 1000);
     }
 
     fn url_source(url: String, sha256: &str) -> ArtefactSource {
