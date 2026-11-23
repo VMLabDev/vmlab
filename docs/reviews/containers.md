@@ -251,7 +251,7 @@ Not read:
   and `logs --follow` reads what the file gained by offset
   (`read_log_since`, at most 1 MiB a poll) where it read the whole file every
   half second. vmlab-hv writes the serial log through `CappedLog`
-  (`hv/crates/vmlab-hv/src/serial_log.rs`): past 64 MiB the file is cut to
+  (`hv/crates/vmlab-hv-vmm/src/serial_log.rs`): past 64 MiB the file is cut to
   its newest half. Both proving tests are in `src/labd/vm.rs`, the cap's in
   `serial_log.rs`. Not covered: a container on QEMU (an aarch64 or riscv64
   host), whose `-serial file:` has no size limit. Its reads are bounded, its

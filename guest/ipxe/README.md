@@ -50,13 +50,33 @@ are not inputs. Its checkout is `guest/.cache/ipxe/upstream`.
 
 `hv` writes to `hv/target/ipxe`: `1af41000.rom` (legacy BIOS ROM for
 `1af4:1000`), `1af41000.efirom` (x86_64 EFI ROM), `virtio-net.rom` (both,
-combined), `ipxe-source.tar` and `SHA256SUMS`. `SHA256SUMS.hv` records them.
-Its checkout is `hv/target/ipxe/upstream`.
+combined), `ipxe-source.tar` and `SHA256SUMS`. Its checkout is
+`hv/target/ipxe/upstream`.
+
+`SHA256SUMS.hv` records these four hashes and, in its `# ` lines, the compiler
+and the linker that made them. Every `hv` build ends by comparing its outputs
+with the record and fails on a difference, naming the file. So
+`just ci::hv-ipxe-build`, which `just ci::check` runs, is the check. On a host
+whose `gcc --version` or `ld --version` line is not the recorded one, the
+three ROMs are not compared and a warning says so; `ipxe-source.tar` is
+compared on every host. After a change of the pin, a configuration header or
+`build.py`, or a toolchain update on the build host, write the record again
+and commit it:
+
+```sh
+uv run --no-project python guest/ipxe/build.py --profile hv --record
+```
+
+`guest` has no record in the repository: `IPXE-SHA256SUMS` is written by the
+build it describes.
 
 The combined images use upstream `util/catrom.pl`, which updates the PCI
 last-image flag and checksum; the virtio-net one fits the captured 256 KiB NIC
-ROM BAR. A clean rebuild with GCC 16.2.1 and binutils 2.47 produced identical
-ROM hashes; other toolchain versions can produce different bytes.
+ROM BAR. Other toolchain versions can produce different bytes. The checkout
+path does not: iPXE's build id is a checksum of its objects, so `build.py`
+maps the build directory out of their debug information
+(`-ffile-prefix-map`). It removes the objects of a cached checkout when that
+flag or the toolchain changes.
 
 ## Use and verify (hv)
 
