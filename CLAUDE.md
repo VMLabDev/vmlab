@@ -87,9 +87,14 @@ and `dev use`, `attachable`, and the agent's `tunnel` vocabulary. A dev
 machine is reached with `vmlab shell` and `vmlab exec`.
 **A second hypervisor is selectable** (§22, ADR-0021): `hypervisor = "qemu" |
 "vmlab"` on a machine, else an explicit host default, else the VM's persisted
-identity, selects its hypervisor. New supported x86_64 KVM VMs default to
-vmlab-hv; refused declarations fall back to QEMU with a status and `up` reason.
-Supported new containers also default to vmlab-hv and require KVM.
+identity, selects its hypervisor. **QEMU runs no x86 guest** (§22.4, HV-D29):
+every x86 and x86_64 VM, and every container on an x86_64 host, runs on
+vmlab-hv under KVM only. `hypervisor = "qemu"`, a host default of `qemu` that
+reaches an x86 machine, and `qemu_args` on one are validation errors naming the
+replacement; what vmlab-hv refuses is an error with no fallback; a host
+without usable `/dev/kvm` fails with `KVM is required`. QEMU keeps aarch64 and
+riscv64 on the `virt` machine (`src/qemu/cmdline.rs` composes no q35 or pc
+argv), which still fall back to it automatically with a reason.
 **Existing x86 QEMU identities migrate at the next start** (§22.3), including
 identities inferred from old disks and inherited by clones from frozen worktree
 generations. Explicit machine and host settings still take precedence. Machine
@@ -98,8 +103,9 @@ reports any vmlab-hv refusal and keeps the old identity on refusal. After
 the checks pass, `up` saves the identity before boot and announces the switch
 once. Offline snapshots carry over. `snapshot list` names unrestorable online
 QEMU snapshots, and restore refuses them with offline conversion instructions.
-The removal warning (§22.2) remains for x86 machines selected for QEMU
-through explicit settings or automatic fallback. Phase 1 runs container micro-VMs; phases 2a to 2f a
+The removal warning of §22.2 is gone with the removal it announced, and
+`docs/agents/qemu-removal-remaining.md` lists what still uses QEMU. Phase 1
+runs container micro-VMs; phases 2a to 2f a
 modern VM on q35, SeaBIOS or OVMF with secure boot, a TPM and Hyper-V, Linux
 or Windows (`vmlab_hv/describe.rs` places every device where QEMU's q35 would;
 a guest reset happens in place, readiness dropping until the rebooted
@@ -120,8 +126,9 @@ at the first KVM start, keeps `tsc-hz`, and passes `invtsc` and `tsc_khz`
 in the machine description. N6-N8 networking supplies offloaded multiqueue
 virtio-net streams and passed TAP/vhost-net descriptors; the e2e `fastpath`
 scenario follows the selected hypervisor. Kernel tiers still require host
-capabilities. Everything else — macOS, i440fx, `qemu_args`, hosts without
-KVM — is refused from one list naming the phase that brings it. Snapshots
+capabilities. Everything else — macOS, `accel = "tcg"`, `qemu_args`, hosts
+without KVM — is refused from one list naming the phase that brings it, and
+for an x86 guest that refusal means it does not run. Snapshots
 record their hypervisor and an online one refuses to restore under the other;
 a vmlab-hv VM with a GPU takes none (HV D9).
 **The legacy agent tier is built** (#125–#131): `agent_transport` on the
@@ -388,8 +395,10 @@ throughout the code and commit messages.
 - `just e2e::run` is the end-to-end suite: every feature in
   `e2e/features.py`, driven through the CLI inside a privileged container
   with /dev/kvm (`e2e/README.md`). It sits outside the merge bar.
-  `--hypervisor vmlab` runs it on vmlab-hv, skipping each feature past the
-  phase vmlab-hv has delivered (its tag in `features.py`).
+  `--hypervisor vmlab`, the default, runs it on vmlab-hv, skipping each
+  feature past the phase vmlab-hv has delivered (its tag in `features.py`);
+  automatic selection puts `arch.emulated`'s aarch64 guest on QEMU. QEMU runs
+  no x86 guest, so `--hypervisor qemu` runs `arch.emulated` alone.
 - `just release::local` builds one version on the build host (helios) into a
   release directory — the four assets, `SHA256SUMS`, `provenance.json` and the
   signature of `scripts/release-sign.sh` — and `just release::publish` uploads

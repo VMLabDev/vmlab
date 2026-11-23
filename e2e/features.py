@@ -67,7 +67,6 @@ FEATURES: dict[str, str] = {
     "vm.hw.tpm": "`tpm = true` (swtpm)",
     "vm.hw.firmware": "`firmware` selection (OVMF)",
     "vm.hw.secure_boot": "`secure_boot = true`",
-    "vm.hw.qemu_args": "`qemu_args` passthrough",
     "vm.hw.nested": "`nested = true`",
     "vm.hw.tsc": "`tsc = \"host\"` pins an invariant TSC through the selected hypervisor",
     "vm.hw.gpu": "`gpu {}` passthrough / virgl",
@@ -148,7 +147,6 @@ FEATURES: dict[str, str] = {
     "share.readonly": "`share { readonly = true }`",
     "share.smb1": "SMB1 shares for legacy guests",
     "share.unmountable": "`vmlab up` warns, before saying the lab is up, about a share that will not mount",
-    "share.virtiofs.old-virtiofsd": "a virtiofs share on a virtiofsd without `--migration-mode` (Ubuntu 24.04's 1.10.0)",
     # -- containers --------------------------------------------------------
     "container.up": "an OCI container runs as a micro-VM",
     "container.idle": "`mode = :idle`",
@@ -169,7 +167,6 @@ FEATURES: dict[str, str] = {
     "snapshot.clock.set": "an online restore sets the guest clock to the host's time (VM and container)",
     "snapshot.clock.kept": "`clock = \"snapshot\"` keeps the time a restored guest was captured at",
     "snapshot.clock.fixed": "a fixed `clock` starts the guest at the declared date",
-    "snapshot.virtiofs.old-virtiofsd": "online snapshots refused, offline ones taken, on a virtiofsd too old to migrate",
     # -- worktree labs (§21) -----------------------------------------------
     "worktree.isolation.status": "`vmlab status` (and `--json`) in a frozen family says the main and the worktree lab run under worktree isolation",
     "worktree.isolation.forward": "under worktree isolation a forward binds 127.0.0.1: reachable on loopback, not on the host's address",
@@ -298,26 +295,21 @@ _GROUPS: dict[str, list[str]] = {
     "2d": ["vm.hw.gpu"],
     "2e": ["share.virtiofs", "share.readonly", "share.unmountable", "vm.hw.audio"],
     "2f": ["usb.controller", "usb.refusals", "usb.attach", "vm.hw.tsc"],
-    # TCG emulation.
-    "3": ["arch.emulated"],
     # The legacy PC: floppy controller, SMB1 guests.
     "4": ["vm.hw.floppy", "vm.media.floppy", "share.smb1",
           "vm.legacy.freedos", "vm.legacy.windows98", "vm.legacy.windows7", "vm.legacy.templeos",
           "vm.legacy.server2016"],
 }
 
-# Scenarios whose VMs stay on QEMU on a vmlab-hv run, and why.
-# Their host and container features still count;
-# a VM feature they report is skipped with the reason, never passed, since a
-# pass on QEMU says nothing about vmlab-hv (`Harness._record`).
-QEMU_SCENARIOS: dict[str, str] = {}
-
-# Features only QEMU can ever run, and why; skipped on every other hypervisor.
+# Features of the guests QEMU still runs, and why (PRD §22): automatic
+# selection puts a guest that is not x86 on QEMU, so these are in scope on
+# every run. QEMU runs no x86 guest, so on a QEMU run nothing else is.
 QEMU_ONLY: dict[str, str] = {
-    "vm.hw.qemu_args": "`qemu_args` is QEMU's command line; vmlab-hv refuses it",
-    "share.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
-    "snapshot.virtiofs.old-virtiofsd": "tests QEMU's external virtiofsd; vmlab-hv serves virtio-fs in process",
+    "arch.emulated": "an aarch64 guest, which QEMU runs under TCG",
 }
+
+# Why a QEMU run skips every other feature.
+NO_X86_ON_QEMU = "QEMU runs no x86 guest (PRD §22)"
 
 PHASES: dict[str, str] = {fid: phase for phase, ids in _GROUPS.items() for fid in ids}
 
@@ -333,10 +325,10 @@ assert not _untagged and not _unknown and not _twice, (
 def out_of_scope(feature: str, hypervisor: str, delivered: str = VMLAB_DELIVERED) -> str | None:
     """Why `feature` does not apply on `hypervisor` with phases through
     `delivered` landed, or None when it does."""
-    if hypervisor == "qemu":
-        return None
     if feature in QEMU_ONLY:
-        return f"QEMU only: {QEMU_ONLY[feature]}"
+        return None
+    if hypervisor == "qemu":
+        return NO_X86_ON_QEMU
     phase = PHASES[feature]
     if (phase == "3" and delivered != "3"
             or PHASE_ORDER.index(phase) > PHASE_ORDER.index(delivered)):
