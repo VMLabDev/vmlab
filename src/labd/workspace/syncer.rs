@@ -5734,7 +5734,10 @@ mod tests {
         syncers.stop("dev01").await;
 
         let ws = workspace(dir.path(), state.path());
-        syncers.before_capture("dev01", Some(&ws), false).await.unwrap();
+        syncers
+            .before_capture("dev01", Some(&ws), false)
+            .await
+            .unwrap();
         syncers
             .before_restore("dev01", false, Some(&ws), false)
             .await
