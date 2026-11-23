@@ -40,7 +40,8 @@ note "guest: driver, memory and the standard user"
 gps "\$ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force C:\\c752\\out | Out-Null
 Get-LocalUser -Name $USER_NAME -ErrorAction SilentlyContinue | Remove-LocalUser
-net.exe user $USER_NAME '$USER_PASS' /add | Out-Null
+New-LocalUser -Name $USER_NAME -Password (ConvertTo-SecureString '$USER_PASS' -AsPlainText -Force) -PasswordNeverExpires | Out-Null
+Add-LocalGroupMember -SID S-1-5-32-545 -Member $USER_NAME
 icacls.exe C:\\c752 /grant 'BUILTIN\\Users:(OI)(CI)RX' | Out-Null
 icacls.exe C:\\c752\\out /grant 'BUILTIN\\Users:(OI)(CI)M' | Out-Null
 Get-CimInstance Win32_PnPSignedDriver | Where-Object DeviceID -like 'PCI\\VEN_1AF4&DEV_1050*' | ForEach-Object { 'driver: {0} {1} {2}' -f \$_.DeviceName, \$_.DriverVersion, \$_.InfName }
@@ -51,6 +52,7 @@ Get-CimInstance Win32_PnPSignedDriver | Where-Object DeviceID -like 'PCI\\VEN_1A
 in_lab vmlab cp "$PROBE" "$VM:C:\\c752\\submit_probe.exe" || exit 1
 sha256sum "$PROBE" | sed "s|$REPO/||" >>"$EV/guest.txt"
 in_lab vmlab exec --user "$USER_NAME" --password "$USER_PASS" --timeout 60 "$VM" -- cmd.exe /c "whoami /user /groups /fo csv" 2>&1 | tr -d '\r' >"$EV/whoami.txt"
+grep -q 'S-1-5-32-545' "$EV/whoami.txt" || { note "no logon as the probe user: $(head -1 "$EV/whoami.txt")"; exit 1; }
 grep -q 'S-1-5-32-544' "$EV/whoami.txt" && { note "the probe user is an administrator"; exit 1; }
 bugchecks >"$EV/bugchecks-before.txt" 2>/dev/null
 
