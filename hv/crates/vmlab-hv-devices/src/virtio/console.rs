@@ -391,14 +391,7 @@ fn run(
                         clients[i] = Some(stream);
                         let mut sh = lock(&shared);
                         sh.ports[i].host_open = true;
-                        let port = i as u16 + 1;
-                        sh.enqueue_ctrl(CtrlMsg {
-                            id: u32::from(port),
-                            event: EV_PORT_OPEN,
-                            value: 1,
-                            name: None,
-                        });
-                        flush_pending(&mut sh);
+                        notify_host_open(&mut sh, i);
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {}
@@ -463,15 +456,23 @@ fn disconnect(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], i
     // chardev does; host bytes already staged still reach the guest.
     sh.ports[i].tx_stage.clear();
     let port = i as u16 + 1;
-    sh.enqueue_ctrl(CtrlMsg {
-        id: u32::from(port),
-        event: EV_PORT_OPEN,
-        value: 0,
-        name: None,
-    });
-    flush_pending(&mut sh);
+    notify_host_open(&mut sh, i);
     drop(sh);
     process_tx(shared, clients, port);
+}
+
+fn notify_host_open(sh: &mut Shared, i: usize) {
+    // PORT_READY will report the current socket state during enumeration.
+    // A host probe can connect and leave before the driver initializes.
+    if sh.device_ready {
+        sh.enqueue_ctrl(CtrlMsg {
+            id: i as u32 + 1,
+            event: EV_PORT_OPEN,
+            value: u16::from(sh.ports[i].host_open),
+            name: None,
+        });
+        flush_pending(sh);
+    }
 }
 
 /// Route a queue kick to its handler.
@@ -511,7 +512,12 @@ fn rx_has_capacity(shared: &Arc<Mutex<Shared>>, queue: u16) -> bool {
     let Some(mem) = sh.mem.as_ref() else {
         return false;
     };
-    let Some(q) = sh.queues.get(usize::from(queue)).and_then(|q| q.as_ref()) else {
+    let Some(q) = sh
+        .queues
+        .get(usize::from(queue))
+        .and_then(Option::as_ref)
+        .filter(|q| q.ready())
+    else {
         return false;
     };
     match q.avail_idx(mem, Ordering::Acquire) {
@@ -535,6 +541,7 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
             .queues
             .get_mut(usize::from(queue))
             .and_then(|q| q.as_mut())
+            .filter(|q| q.ready())
         else {
             return;
         };
@@ -592,6 +599,7 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                 .queues
                 .get_mut(usize::from(queue))
                 .and_then(|q| q.as_mut())
+                .filter(|q| q.ready())
             else {
                 return;
             };
@@ -702,7 +710,12 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
             let Some(mem) = sh.mem.as_ref() else {
                 return;
             };
-            let Some(q) = sh.queues.get_mut(3).and_then(|q| q.as_mut()) else {
+            let Some(q) = sh
+                .queues
+                .get_mut(3)
+                .and_then(Option::as_mut)
+                .filter(|q| q.ready())
+            else {
                 return;
             };
             let mut msgs = Vec::new();
@@ -809,7 +822,12 @@ fn flush_pending(sh: &mut Shared) {
         let Some(mem) = sh.mem.as_ref() else {
             return;
         };
-        let Some(q) = sh.queues.get_mut(2).and_then(|q| q.as_mut()) else {
+        let Some(q) = sh
+            .queues
+            .get_mut(2)
+            .and_then(Option::as_mut)
+            .filter(|q| q.ready())
+        else {
             return;
         };
         while let Some(msg) = sh.pending.front().cloned() {
@@ -1701,6 +1719,37 @@ mod tests {
         // The used length of a name message covers header plus name.
         let (_, len) = f.vqs[2].used_entry(&f.mem, 2);
         assert_eq!(len as usize, 8 + "vmlab.ctl.0".len());
+    }
+
+    #[test]
+    fn host_open_before_driver_ready_is_reported_after_port_ready() {
+        let mut f = Fixture::new();
+        f.dev.reset();
+        f.activate();
+        lock(&f.dev.shared).queues[2].as_mut().unwrap().set_ready(false);
+
+        let probe = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("early host connection", || {
+            lock(&f.dev.shared).ports[1].host_open
+        });
+        drop(probe);
+        wait_for("early host disconnect", || {
+            !lock(&f.dev.shared).ports[1].host_open
+        });
+        let _client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host reconnect", || lock(&f.dev.shared).ports[1].host_open);
+        {
+            let mut sh = lock(&f.dev.shared);
+            assert!(sh.pending.is_empty());
+            sh.queues[2].as_mut().unwrap().set_ready(true);
+        }
+
+        f.device_ready(8, 5);
+        let msgs = f.ctrl_delivered();
+        assert_eq!(msgs[0], (1, EV_PORT_ADD, 1, Vec::new()));
+        assert_eq!(msgs[1], (2, EV_PORT_ADD, 1, Vec::new()));
+        assert_eq!(msgs[3], (2, EV_PORT_NAME, 0, b"vmlab.agent.0".to_vec()));
+        assert_eq!(msgs[4], (2, EV_PORT_OPEN, 1, Vec::new()));
     }
 
     #[test]
