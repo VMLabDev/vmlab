@@ -742,9 +742,11 @@ MSG
     On a Wayland host, a Linux guest's windows arrive over waypipe, and the
     lab daemon found no `waypipe` on the login's `PATH`. `{login}` is the
     account the program would run as, or `the agent identity`. When the host
-    has `DISPLAY` set, `vmlab app run` prints the same words followed by
-    `; falling back to X11 through Xwayland` and carries on over X11. You
-    see this message as a refusal only when there is no X11 to fall back to.
+    has `DISPLAY` set, the message goes on to say that vmlab does not fall
+    back to X11 on the guest's word, and names `--via x11` and
+    `app_x11_fallback = true` in the [host config](ref_host). With that
+    setting, `vmlab app run` prints the first words followed by
+    `; falling back to X11 through Xwayland` and carries on over X11.
   DOC
   p <<DOC
     Install the distribution's `waypipe` package in the guest, for example

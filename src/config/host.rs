@@ -87,6 +87,10 @@ pub struct HostConfig {
     /// The FreeRDP client for shared apps from Windows guests (PRD §20.4);
     /// `None` = `xfreerdp3`, then `xfreerdp`, on `PATH`.
     pub freerdp: Option<std::path::PathBuf>,
+    /// Whether `vmlab app run` may fall back from waypipe to X11 when the
+    /// guest says it has no waypipe (PRD §20.1). Off by default: the guest
+    /// answers that question, and X11 opens the host's X server to it.
+    pub app_x11_fallback: bool,
     /// The ffmpeg console recordings are encoded with (PRD §11.1); `None` =
     /// `ffmpeg` on `PATH`. Read by the lab daemon when a recording starts.
     pub ffmpeg: Option<std::path::PathBuf>,
@@ -211,6 +215,7 @@ impl Default for HostConfig {
             viewer: None,
             waypipe: None,
             freerdp: None,
+            app_x11_fallback: false,
             ffmpeg: None,
             oci_chunk_size: crate::oci::chunking::DEFAULT_CHUNK_SIZE,
             fastpath: crate::net::fastpath::FastpathMode::Auto,
@@ -297,6 +302,9 @@ impl HostConfig {
             cfg.waypipe = r.path("waypipe").unspan();
             cfg.ffmpeg = r.path("ffmpeg").unspan();
             cfg.freerdp = r.path("freerdp").unspan();
+            if let Some(v) = r.bool("app_x11_fallback").unspan() {
+                cfg.app_x11_fallback = v;
+            }
             if let Some(v) = r
                 .keyword("fastpath", crate::net::fastpath::FastpathMode::NAMES)
                 .unspan()
@@ -645,6 +653,7 @@ host {
   waypipe          = "/opt/waypipe/bin/waypipe"
   ffmpeg           = "/opt/ffmpeg/bin/ffmpeg"
   freerdp          = "/usr/bin/sdl-freerdp3"
+  app_x11_fallback = true
   btrfs_nocow      = false
 }
 "#,
@@ -660,6 +669,7 @@ host {
         assert_eq!(cfg.fastpath, crate::net::fastpath::FastpathMode::Sockmap);
         assert_eq!(cfg.workspace_max_file, 2 << 30);
         assert!(!cfg.btrfs_nocow);
+        assert!(cfg.app_x11_fallback);
         assert_eq!(cfg.firmware_dir.as_deref(), Some(Path::new("/opt/edk2")));
         assert_eq!(
             cfg.waypipe.as_deref(),

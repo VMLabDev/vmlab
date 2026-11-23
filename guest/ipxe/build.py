@@ -84,6 +84,29 @@ def object_inputs(tools):
     return "\n".join([*make_variables("<src>"), *tools]) + "\n"
 
 
+def restore_objects(source):
+    """Put back the tracked files that are missing from the object directories
+    of a checkout (upstream tracks `src/bin/.gitignore`). Removing an object
+    directory removes them too, and the checkout must stay equal to the pin."""
+    tracked = subprocess.check_output(
+        ["git", "-C", str(source), "ls-files", "--deleted", "--",
+         *(f"src/{name}" for name in OBJECTS)], text=True).split("\n")
+    missing = [path for path in tracked if path]
+    if missing:
+        run("git", "-C", str(source), "checkout", "HEAD", "--", *missing)
+
+
+def clear_stale_objects(source, tools):
+    """Remove the objects of a checkout when `object_inputs` differs from the
+    stamp beside it, and write the stamp. The checkout stays equal to the pin."""
+    stamp = source.parent / "object-inputs"
+    if not stamp.exists() or stamp.read_text() != object_inputs(tools):
+        for name in OBJECTS:
+            shutil.rmtree(source / "src" / name, ignore_errors=True)
+        restore_objects(source)
+        stamp.write_text(object_inputs(tools))
+
+
 def parse_record(text):
     """A record as (toolchain lines, {name: sha256}). The toolchain is the
     `# ` lines at its head, which `sha256sum -c` skips."""
@@ -174,6 +197,8 @@ def main():
         ["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if actual != pin["commit"]:
         raise SystemExit(f"{source}: expected {pin['commit']}, got {actual}")
+    # A checkout whose objects an earlier build.py removed lacks them.
+    restore_objects(source)
     if subprocess.check_output(["git", "-C", str(source), "diff", "HEAD", "--"]):
         raise SystemExit(f"{source}: tracked changes; refusing an unpinned build")
     if subprocess.check_output(
@@ -187,11 +212,7 @@ def main():
     env = dict(os.environ, SOURCE_DATE_EPOCH=pin["source_date_epoch"], LC_ALL="C", TZ="UTC")
     # make does not rebuild an object when a flag or the compiler changes.
     tools = toolchain()
-    stamp = source.parent / "object-inputs"
-    if not stamp.exists() or stamp.read_text() != object_inputs(tools):
-        for name in OBJECTS:
-            shutil.rmtree(src / name, ignore_errors=True)
-        stamp.write_text(object_inputs(tools))
+    clear_stale_objects(source, tools)
     names = []
     for model, pci in plan["models"]:
         legacy, efi = f"bin/{pci}.rom", f"bin-x86_64-efi/{pci}.efirom"

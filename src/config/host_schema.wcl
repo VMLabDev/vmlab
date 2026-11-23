@@ -32,6 +32,8 @@ type HostConfig {
   waypipe: utf8?
   @doc("FreeRDP 3 client for shared apps from Windows guests (§20.4); default: `xfreerdp3`, then `xfreerdp`, on PATH")
   freerdp: utf8?
+  @doc("Let `vmlab app run` fall back from waypipe to X11 when the guest reports no waypipe (§20.1); X11 gives the guest program access to the host's X server; default `false`")
+  app_x11_fallback: bool?
   @doc("ffmpeg for console recordings (§11.1); default: `ffmpeg` on PATH")
   ffmpeg: utf8?
   @doc("Network fast path: `auto` (probe; default), `off`, `sockmap`, or `afxdp`")
