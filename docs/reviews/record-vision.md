@@ -84,7 +84,7 @@ Not read:
 | F4 | wrong result | Two captures of one machine share one scratch file |
 | F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match |
 | F6 | wrong result | The match score ignores colour, brightness and contrast |
-| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory |
+| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720) |
 | F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind |
 | F9 | crash of a request | A large duration panics `Settings::resolve` |
 | F10 | wrong result | The match threshold is not checked |
@@ -194,6 +194,11 @@ Not read:
 
 ### F3. A stalled ffmpeg blocks `record stop`, `down` and `destroy`
 
+- Fixed in #719. Frame writes time out after 10 seconds without progress.
+  After stdin closes, ffmpeg has five minutes to write the trailer and
+  complete the MP4 faststart rewrite. The recorder kills ffmpeg if either
+  timeout expires. A concurrent reader drains stderr and retains its final
+  16 KiB for diagnostics.
 - Where: `src/record/executor.rs:205-207` and `248-250` (`write_frame` is
   awaited outside the `select!` that watches the stop signal),
   `src/record/encoder.rs:199-204` (stderr is a pipe), `229-240` (`finish`
@@ -215,9 +220,12 @@ Not read:
   spec is a script that never reads stdin (`exec sleep infinity`). Start a
   recording against `vnc::fake`, then await `Recorder::stop` inside
   `tokio::time::timeout`. Assert that `stop` returns (an error is fine).
-  Today the timeout fires. A second test, `finish_reads_stderr_before_it_waits`:
-  the script writes 1 MiB to stderr, then reads stdin to the end and exits 1.
-  Assert that `stop` returns the error with ffmpeg's text.
+  Before the fix the timeout fires. A second test, `finish_reads_stderr_before_it_waits`:
+  the script writes 1 MiB to stderr before reading stdin, then another 1 MiB
+  after EOF before reporting the diagnostic and exiting 1. Assert that
+  `stop` returns the error with ffmpeg's text. The paused-clock test
+  `slow_frame_write_can_finish_while_making_progress` checks that partial
+  writes can take longer in total than the stall timeout.
 - Confidence: high for the order of the awaits. Low for how often ffmpeg
   fills its stderr at `-loglevel error`.
 
@@ -343,6 +351,13 @@ Not read:
   names, run `ocr`, assert that the victim file is unchanged. Today it
   holds a PNG.
 - Confidence: high.
+- Fixed by card #720. `ocr` makes a directory with a random name and mode
+  0700 under the temp directory, and in it the PNG as a file created
+  exclusively with mode 0600. Both are removed when the run ends. Both
+  proof tests are in `src/vision/ocr.rs`. They reach the code through
+  `ocr_with`, which takes the scratch root and the command, so they change
+  neither `PATH` nor `TMPDIR` of the test process. The lab's runtime
+  directory is still not used: `ocr` gets no lab.
 
 ### F8. A cancelled or timed-out OCR leaves tesseract running and its file behind
 
