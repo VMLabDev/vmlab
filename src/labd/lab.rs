@@ -7865,18 +7865,20 @@ lab "t" {
         assert!(runs[0].0.ends_with("hook.ws"));
     }
 
-    /// A forward and the NAT engine's binding go to the address the segment's
-    /// DHCP server leased to the machine's NIC, whatever address the guest
-    /// says that NIC carries (docs/reviews/containers.md F1). `rogue` claims
-    /// `victim`'s leased address: its forward still targets its own lease, and
-    /// the engine still sends what it originates toward `victim`'s address to
-    /// `victim`'s NIC.
-    #[tokio::test]
-    async fn a_forward_targets_the_dhcp_lease_not_the_guest_claim() {
-        use crate::config::model::MacAddr;
-        use std::net::Ipv4Addr;
-        let dir = tempfile::tempdir().unwrap();
-        let sh = shared(dir.path());
+    const VICTIM_MAC: crate::config::model::MacAddr =
+        crate::config::model::MacAddr([0x52, 0x54, 0, 0, 0, 10]);
+    const ROGUE_MAC: crate::config::model::MacAddr =
+        crate::config::model::MacAddr([0x52, 0x54, 0, 0, 0, 11]);
+    const VICTIM_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 10);
+    const ROGUE_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 11);
+
+    /// A lab whose segment `lan` leased [`VICTIM_IP`] to `victim` and
+    /// [`ROGUE_IP`] to `rogue`, where `rogue`'s guest reports `victim`'s
+    /// address as its own. With it, the segment's NAT engine.
+    async fn claimed_lease_lab(
+        dir: &std::path::Path,
+    ) -> (Arc<LabRuntime>, Arc<crate::net::nat::NatEngine>) {
+        let sh = shared(dir);
         let config = crate::config::load_lab_source(
             r#"import <vmlab.wcl>
 lab "t" {
@@ -7889,27 +7891,23 @@ lab "t" {
   }
 }"#,
             "<test>",
-            dir.path(),
+            dir,
         )
         .expect("lab source");
         let nics = |name: &str| {
             let c = config.lab.containers.iter().find(|c| c.name == name);
             c.expect("declared").nics.clone()
         };
-        let victim_mac = MacAddr([0x52, 0x54, 0, 0, 0, 10]);
-        let rogue_mac = MacAddr([0x52, 0x54, 0, 0, 0, 11]);
-        let victim_ip = Ipv4Addr::new(10, 0, 0, 10);
-        let rogue_ip = Ipv4Addr::new(10, 0, 0, 11);
         // `victim` reports its lease. `rogue` reports `victim`'s address.
         let machines: Vec<Arc<dyn Machine>> = vec![
-            FakeMachine::networked("victim", &sh, &nics("victim"), victim_mac, "10.0.0.10"),
-            FakeMachine::networked("rogue", &sh, &nics("rogue"), rogue_mac, "10.0.0.10"),
+            FakeMachine::networked("victim", &sh, &nics("victim"), VICTIM_MAC, "10.0.0.10"),
+            FakeMachine::networked("rogue", &sh, &nics("rogue"), ROGUE_MAC, "10.0.0.10"),
         ];
         let lab_cfg = config.lab.clone();
         let lab = LabRuntime::with_machines(config, machines).expect("runtime");
         let macs = HashMap::from([
-            ("victim".to_string(), vec![victim_mac]),
-            ("rogue".to_string(), vec![rogue_mac]),
+            ("victim".to_string(), vec![VICTIM_MAC]),
+            ("rogue".to_string(), vec![ROGUE_MAC]),
         ]);
         let engine = {
             let mut net = lab.network.lock().await;
@@ -7917,10 +7915,24 @@ lab "t" {
             let seg = &net.segments["lan"];
             let dhcp = seg.gateway.as_ref().unwrap().dhcp_server().unwrap();
             let mut dhcp = dhcp.lock_recover();
-            dhcp.grant(victim_mac, victim_ip);
-            dhcp.grant(rogue_mac, rogue_ip);
+            dhcp.grant(VICTIM_MAC, VICTIM_IP);
+            dhcp.grant(ROGUE_MAC, ROGUE_IP);
             seg.services.as_ref().unwrap().nat.clone().expect("nat")
         };
+        (lab, engine)
+    }
+
+    /// A forward and the NAT engine's binding go to the address the segment's
+    /// DHCP server leased to the machine's NIC, whatever address the guest
+    /// says that NIC carries (docs/reviews/containers.md F1). `rogue` claims
+    /// `victim`'s leased address: its forward still targets its own lease, and
+    /// the engine still sends what it originates toward `victim`'s address to
+    /// `victim`'s NIC.
+    #[tokio::test]
+    async fn a_forward_targets_the_dhcp_lease_not_the_guest_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, engine) = claimed_lease_lab(dir.path()).await;
+        let (victim_mac, victim_ip, rogue_ip) = (VICTIM_MAC, VICTIM_IP, ROGUE_IP);
 
         // The smaller form: the address `rogue` claims is another NIC's
         // lease, so it is not what the network is said to know of `rogue`.
@@ -7954,6 +7966,84 @@ lab "t" {
             engine.guest_mac(victim_ip),
             victim_mac,
             "the engine sends victim's address to another NIC"
+        );
+    }
+
+    /// A script's `seg.forward()` goes to the address the segment's DHCP
+    /// server leased to the machine's NIC, as a declared forward does
+    /// (docs/reviews/wscript.md F1). `rogue` reports `victim`'s leased
+    /// address: a connection to the host port the script forwarded to
+    /// `rogue` opens toward `rogue`'s lease, framed to `rogue`'s NIC.
+    #[tokio::test]
+    async fn a_script_forward_targets_the_dhcp_lease_not_the_guest_claim() {
+        use crate::net::frame::{EthView, Ipv4View, TcpView};
+        use crate::net::switch::PortClass;
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, engine) = claimed_lease_lab(dir.path()).await;
+        // `victim` is up with its own forward, so the engine knows its NIC.
+        engine.learn_mac(VICTIM_IP, VICTIM_MAC);
+        // A NIC on the segment that has taught the switch no address: it is
+        // sent what the switch floods, so every frame for a NIC that has not
+        // spoken either.
+        let mut tap = {
+            let net = lab.network.lock().await;
+            net.segments["lan"]
+                .switch
+                .add_channel_port(PortClass::Guest { isolated: false })
+        };
+        // A port that was free a moment ago; `seg.forward()` takes a number.
+        let host_port = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let script = format!(
+            r#"use vmlab
+
+fn main(lab: Lab) {{
+    let lan = lab.segment("lan").expect("segment")
+    lan.forward({host_port}, "rogue", 80).expect("forward")
+}}
+"#
+        );
+        let sink: crate::scripting::OutputSink = Arc::new(|_: String| {});
+        crate::scripting::run_script_source(
+            lab.clone(),
+            script,
+            "forward.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            sink,
+        )
+        .await
+        .expect("script");
+
+        // Held open: the forward opens toward the guest once it accepts.
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", host_port))
+            .await
+            .expect("the forwarded port accepts");
+        let (to_mac, to_ip) = loop {
+            let frame = tap.rx.recv().await.expect("the segment's switch is up");
+            let Some(eth) = EthView::parse(&frame) else {
+                continue;
+            };
+            let Some(ip) = Ipv4View::parse(eth.payload()) else {
+                continue;
+            };
+            match TcpView::parse(ip.payload()) {
+                Some(tcp) if tcp.dst_port() == 80 => break (eth.dst_mac(), ip.dst()),
+                _ => {}
+            }
+        };
+        assert_eq!(
+            to_ip, ROGUE_IP,
+            "the script's forward to rogue opens toward another machine's address"
+        );
+        assert_eq!(
+            to_mac, ROGUE_MAC,
+            "the script's forward to rogue is framed to another machine's NIC"
         );
     }
 }
