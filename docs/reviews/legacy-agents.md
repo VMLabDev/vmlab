@@ -223,7 +223,7 @@ Not read:
   time with `opened`, one DATA frame, `eof` and `exited` code 0. Assert that
   `exec` returns that output and code 0.
 
-### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included
+### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included (fixed, card #722)
 
 - Where: `guest/agent-legacy/src/wire.c:93-94` (`wire_next` waits for the
   whole claimed payload), `guest/agent-legacy/src/agent.c:473-480` (a hello
@@ -260,6 +260,31 @@ Not read:
   hello, then one ping. Assert that the agent's hello arrives. Today neither
   reply arrives. The same test with a mock for the TempleOS agent is not
   possible; there the steps are the same on a guest.
+- Fixed by card #722. Both decoders look inside a frame that is still open
+  for a whole control frame on channel 0, of at most 1024 payload bytes,
+  whose message is a hello. On one they drop what came before it and answer
+  it. A hello starts every connection, so it is the one message that says
+  the host connected again. In the C agent this is `restart_inside` in
+  `wire.c`, with `is_hello` of `agent.c` as its test, and each byte is
+  looked at once. In `VmlabAgt.HC` it is in `VaReadFrame`. The C agent also
+  steps past the magic only, not past the whole frame, when a control
+  payload does not parse (`wire_reject`): that is the cut frame whose
+  missing rest is shorter than a hello, which the hello's first bytes
+  complete. Proof tests in `src/labd/legacy_agent_tests.rs`:
+  `legacy_hello_after_a_truncated_frame_is_answered` (the steps above, then
+  filler up to the claimed length and a second ping, so that the order of
+  the replies decides and no time limit does) and
+  `legacy_hello_that_straddles_the_end_of_a_truncated_frame_is_answered`.
+  Both failed before the fix: the agent answered the last ping first. What
+  stays open:
+  - The TempleOS change was not run on a guest. No TempleOS guest was
+    started for this card, and no test in the repo compiles HolyC.
+  - A cut DATA frame that lacks fewer bytes than a hello has is completed
+    by the hello's first bytes when the two arrive in separate reads. That
+    hello is lost, and the next one is answered. The TempleOS agent has
+    this for a cut control frame too.
+  - Payload bytes that hold a complete, valid hello frame are taken for a
+    new connection. No caller sends stdin to a legacy guest today.
 
 ### F7. `VmlabAgentInstall` on a TempleOS guest that already runs the agent starts a second agent on the same UART
 
