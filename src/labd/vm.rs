@@ -808,6 +808,17 @@ impl VmInstance {
     /// Create disks on first use (PRD §7.1): linked clone of the template,
     /// or a blank qcow2 for scratch; extra disks blank or FAT-from-folder.
     pub async fn ensure_disks(&self) -> Result<()> {
+        // Validation refuses this too (§5.1); a disk's image is named by its
+        // block, so two blocks with one name would be one image as two drives.
+        for (i, d) in self.cfg.extra_disks.iter().enumerate() {
+            if self.cfg.extra_disks[..i].iter().any(|e| e.name == d.name) {
+                bail!(
+                    "{}: disk \"{}\" is declared twice; each `disk` block needs its own name",
+                    self.cfg.name,
+                    d.name
+                );
+            }
+        }
         std::fs::create_dir_all(&self.dirs.local)?;
         self.check_clone_source()?;
         let primary = self.dirs.primary_disk();

@@ -109,6 +109,12 @@ impl Qcow2Image {
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as usize;
             let entry_len = (40 + extra + id_len + name_len) as u64;
             checked_file_range(file_len, off, entry_len)?;
+            if l1_size > super::MAX_L1_ENTRIES {
+                return Err(Error::Format {
+                    format: "qcow2",
+                    reason: format!("snapshot L1 table too large ({l1_size} entries)"),
+                });
+            }
             checked_file_range(file_len, l1_table_offset, u64::from(l1_size) * 8)?;
             // Only the first two extra fields are consumed. Never allocate
             // according to an untrusted extra-data length.
@@ -190,6 +196,12 @@ impl Qcow2Image {
         if entries.iter().any(|e| e.name == name) {
             return Err(Error::Unsupported(format!(
                 "snapshot {name:?} already exists"
+            )));
+        }
+        if entries.len() >= super::MAX_SNAPSHOTS as usize {
+            return Err(Error::Unsupported(format!(
+                "an image holds at most {} snapshots",
+                super::MAX_SNAPSHOTS
             )));
         }
         let id = next_snapshot_id(&entries, name)?;
