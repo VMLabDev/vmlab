@@ -8003,7 +8003,8 @@ lab "t" {
 
 fn main(lab: Lab) {{
     let lan = lab.segment("lan").expect("segment")
-    lan.forward({host_port}, "rogue", 80).expect("forward")
+    let id = lan.forward({host_port}, "rogue", 80).expect("forward")
+    lab.log("forward " + fmt("{{}}", id))
 }}
 "#
         );
