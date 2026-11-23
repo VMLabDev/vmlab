@@ -92,7 +92,8 @@ fn at_secure(auxv: &[u8]) -> Option<bool> {
     const AT_SECURE: usize = 23;
     const WORD: usize = std::mem::size_of::<usize>();
     let word = |bytes: &[u8]| <[u8; WORD]>::try_from(bytes).ok().map(usize::from_ne_bytes);
-    auxv.chunks_exact(2 * WORD).find_map(|entry| {
+    let (entries, _) = auxv.as_chunks::<{ 2 * WORD }>();
+    entries.iter().find_map(|entry| {
         let (key, value) = entry.split_at(WORD);
         (word(key)? == AT_SECURE).then_some(word(value)? != 0)
     })
