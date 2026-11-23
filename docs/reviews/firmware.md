@@ -74,7 +74,7 @@ hostile guest or peer, wrong result, cosmetic.
 
 | Code | Severity | Fault |
 | --- | --- | --- |
-| F1 | security against a hostile guest | The firmware debug port (0x402) writes the serial log file past its size cap |
+| F1 | security against a hostile guest | The firmware debug port (0x402) writes the serial log file past its size cap (fixed, card #736) |
 | F2 | security, wrong result | `secure_boot = true` on a VM that already has a variable store boots the secure-boot firmware on that store, blank or guest-written |
 | F3 | security inside the guest | aarch64 secure boot keeps its variable store on flash the guest OS can write |
 | F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start |
@@ -121,6 +121,13 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   are in different crates (`vmlab-hv` and `vmlab-hv-vmm`), so the test goes in
   `vmlab-hv`, or the debug port takes its sink from the device factory.
 - Confidence: high.
+- Fixed by card #736. `CappedLog` moved to
+  `hv/crates/vmlab-hv-vmm/src/serial_log.rs`, and `DebugPort` holds its own
+  `CappedLog` on the serial log (`DebugPort::open`, `q35.rs`) where it held a
+  plain append handle. Each writer now runs the size check on its own bytes,
+  so the file passes the cap by at most `cap / 16` for each of the two
+  writers. The proof test is in `serial_log.rs`: on `next` the file reached
+  1,048,576 bytes under a cap of 65,536.
 
 ### F2. Turning secure boot on later boots the old variable store
 

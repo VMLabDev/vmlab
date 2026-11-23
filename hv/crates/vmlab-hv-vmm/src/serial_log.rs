@@ -20,10 +20,12 @@ const CUT_NOTE: &[u8] = b"[vmlab-hv: older serial output was dropped at the log 
 /// An append-only log file that never stays above `cap` bytes.
 ///
 /// The file is opened with `O_APPEND`, so a second writer of the same path
-/// that also appends (the firmware debug port) keeps landing at the end after
-/// a cut. The size is read from the file, not counted, so that writer's bytes
-/// are under the cap too. The check runs once per `cap / 16` bytes written
-/// here, which is how far the file can pass the cap.
+/// keeps landing at the end after a cut. The UART and the firmware debug port
+/// are two such writers, each through its own `CappedLog`: a writer that
+/// appended past this type would never be checked while the other is silent
+/// (firmware review F1). The size is read from the file, not counted, so each
+/// check sees both writers' bytes. The check runs once per `cap / 16` bytes
+/// written here, which is how far one writer can take the file past the cap.
 pub struct CappedLog {
     file: File,
     cap: u64,
@@ -173,13 +175,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serial.log");
         let _uart = CappedLog::open(&path, CAP).unwrap();
-        // As the machine builder opens it.
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
-        let mut port = vmlab_hv_vmm::q35::DebugPort(file);
+        let mut port = crate::q35::DebugPort::open(&path, CAP).unwrap();
         let page = [b'x'; 4096];
         let mut largest = 0;
         for _ in 0..256 {
