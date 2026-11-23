@@ -406,7 +406,7 @@ the redacted description: it is never on an argv or in a file.
 Templates are defined in `template {}` blocks — in a dedicated WCL file or alongside a lab — and built with `vmlab template build`. A template block specifies:
 
 - **Source** — one of:
-  - `iso` — installer ISO, local path or URL + required hash (`sha256 = "..."`). URL artefacts are downloaded to a cache and verified before use.
+  - `iso` — installer ISO, local path or URL + required hash (`sha256 = "..."`). A URL is `https://` only, and a redirect does not leave HTTPS. URL artefacts are downloaded to a cache and verified before use. One download is refused past 32 GiB, or where it would leave less than 1 GiB free on the filesystem of the cache.
   - `qcow2` — existing disk image, local path or URL + hash. Imported as the base.
   - another template (`from = "<arch>/<name>@<version>[#<variant>]"`) — layered builds: take an existing template, run more provisioning, seal as a new template. The reference resolves as a build context (§6.6): no `#` seeds from the source's default variant (its base, when it has none), `#<variant>` from that variant, `#base` from the base. Seeding flattens the selected disk's chain into the working disk. The surface check and the first-boot script the build boot runs come from the *effective* metadata of what was selected; `#base` runs no first-boot script.
   - `scratch` (§6.5) — blank disk; the build's attached installer media and provision script do everything.

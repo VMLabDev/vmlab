@@ -1150,6 +1150,13 @@ fn extract_source(b: &Block, issues: &mut IssueList) -> Option<TemplateSource> {
     let artefact = |r: &mut Reader| -> Option<ArtefactSource> {
         match (path.clone(), url.clone()) {
             (Some(p), None) => Some(ArtefactSource::Path { path: p, span }),
+            (None, Some(u)) if !crate::template::artefact::is_https(&u) => {
+                r.issue(format!(
+                    "`url` must start with `https://`, got `{u}` — `sha256` pins the \
+                     content, not who answers (PRD §6.1)"
+                ));
+                None
+            }
             (None, Some(u)) => match sha256.clone() {
                 // The artefact cache names its files by this value.
                 Some(h) => match crate::template::artefact::digest_name(&h) {
