@@ -149,7 +149,7 @@ Not read:
   `two_machines_do_not_share_a_writable_floppy` is in
   `src/labd/lifecycle_tests.rs`.
 
-### F2. The guest decides that the session falls back from waypipe to X11
+### F2. The guest decides that the session falls back from waypipe to X11 (fixed, card #739)
 
 - Where: `src/appshare/mod.rs:243-251` and `:278-290`,
   `src/labd/app_share.rs:226-244`.
@@ -171,6 +171,15 @@ Not read:
 - Severity: security against a hostile guest.
 - Confidence: high for the code path. The size of the reach under Xwayland
   (other X clients only, not Wayland clients) is from memory.
+- Fixed by card #739. The decision between §1.2 and §20.1: X11 is the user's
+  to opt into, so a guest's answer alone does not select it. The host config
+  has a new key, `app_x11_fallback` (default `false`), and
+  `daemon_fallback` falls back only when it is `true`. Without it,
+  `app run` refuses with the daemon's message and names `--via x11` and the
+  key. The fallback for a host that has no waypipe is unchanged, because the
+  host decides it. PRD §1.2 and §20.1, ADR-0016 and the manual say so. The
+  proof test `a_guest_refusal_does_not_select_x11_unasked` failed before the
+  fix and passes after it.
 
 ### F3. An RDP session shares the host clipboard with the guest, both ways, with no way to turn it off
 
@@ -357,7 +366,7 @@ Not read:
 - Severity: wrong result.
 - Confidence: high.
 
-### F12. The guest can write the two records that only the daemon may write
+### F12. The guest can write the two records that only the daemon may write (fixed, card #739)
 
 - Where: `src/labd/app_share.rs:293-311`, `src/appshare/mod.rs:431-449`,
   `guest/agent-proto/src/app.rs:65-72`.
@@ -376,6 +385,15 @@ Not read:
   `failed` record).
 - Severity: wrong result.
 - Confidence: high.
+- Fixed by card #739. The relay decodes the agent's stream
+  (`AgentRecords` in `src/labd/app_share.rs`) and passes on only `ready`,
+  `pending`, `log` and `diagnostic`. An agent-written `exited` or `failed`
+  record, or a record that does not decode, ends the session with the
+  daemon's own `failed` record, and the daemon closes the channel on the
+  agent, so the guest program does not run on. The proof test
+  `an_agent_written_exited_record_does_not_end_the_session` failed before
+  the fix and passes after it, with two more beside it for `failed` and for
+  an unknown record.
 
 ### F13. Guest text reaches the terminal with its control characters
 

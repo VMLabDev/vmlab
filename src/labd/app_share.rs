@@ -291,22 +291,67 @@ fn bind(path: &Path) -> Result<UnixListener> {
 
 /// What one session event puts on the control socket.
 enum Relay {
-    /// Record bytes, already framed by the agent.
+    /// Records the agent may write, encoded again by the daemon.
     More(Vec<u8>),
     /// The last record: the session is over.
     Last(Vec<u8>),
+    /// The agent wrote what it may not. The bytes are the records before it
+    /// and the daemon's own `failed` record; the session is over and the
+    /// relay closes it on the agent.
+    Rejected(Vec<u8>),
 }
 
-fn relay_of(ev: Option<SessionEvent>) -> Option<Relay> {
-    let last = |record| Some(Relay::Last(app::encode_record(&record)));
-    match ev {
-        Some(SessionEvent::Data(bytes)) => Some(Relay::More(bytes)),
-        Some(SessionEvent::Exited(code)) => last(AppRecord::Exited { code }),
-        Some(SessionEvent::Error(msg)) => last(AppRecord::Failed { msg }),
-        None => last(AppRecord::Failed {
-            msg: "the agent channel closed".into(),
-        }),
-        Some(SessionEvent::Stderr(_) | SessionEvent::Eof) => None,
+/// The agent's records on their way to the CLI. `exited` and `failed` end a
+/// session and are the daemon's to write, so the relay decodes the agent's
+/// stream and passes on only the records an agent writes. A guest controls
+/// every byte of that stream.
+#[derive(Default)]
+struct AgentRecords {
+    decoder: app::RecordDecoder,
+}
+
+impl AgentRecords {
+    /// The bytes for the control socket that `data` from the agent yields:
+    /// the complete records in it, or the refusal that ends the session.
+    fn pass(&mut self, data: &[u8]) -> Relay {
+        self.decoder.push(data);
+        let mut out = Vec::new();
+        loop {
+            let refusal = match self.decoder.next_record() {
+                Ok(None) => return Relay::More(out),
+                Ok(Some(
+                    record @ (AppRecord::Ready { .. }
+                    | AppRecord::Pending
+                    | AppRecord::Log { .. }
+                    | AppRecord::Diagnostic { .. }),
+                )) => {
+                    out.extend(app::encode_record(&record));
+                    continue;
+                }
+                Ok(Some(AppRecord::Exited { .. })) => {
+                    "the agent wrote an `exited` record, which only the lab daemon writes".into()
+                }
+                Ok(Some(AppRecord::Failed { .. })) => {
+                    "the agent wrote a `failed` record, which only the lab daemon writes".into()
+                }
+                Err(e) => format!("the agent's record stream is unusable: {e}"),
+            };
+            out.extend(app::encode_record(&AppRecord::Failed { msg: refusal }));
+            return Relay::Rejected(out);
+        }
+    }
+
+    fn relay_of(&mut self, ev: Option<SessionEvent>) -> Option<Relay> {
+        let last = |record| Some(Relay::Last(app::encode_record(&record)));
+        match ev {
+            Some(SessionEvent::Data(bytes)) => Some(self.pass(&bytes)),
+            Some(SessionEvent::Exited(code)) => last(AppRecord::Exited { code }),
+            Some(SessionEvent::Error(msg)) => last(AppRecord::Failed { msg }),
+            None => last(AppRecord::Failed {
+                msg: "the agent channel closed".into(),
+            }),
+            Some(SessionEvent::Stderr(_) | SessionEvent::Eof) => None,
+        }
     }
 }
 
@@ -330,12 +375,13 @@ async fn relay_control(
     tokio::pin!(grace);
     let mut backlog = Vec::new();
     let mut over = false;
+    let mut records = AgentRecords::default();
     let client = loop {
         tokio::select! {
             accepted = listener.accept() => break accepted.ok().map(|(stream, _)| stream),
             _ = &mut grace => break None,
             Some(text) = notes.recv(), if !over => backlog.extend(note(text)),
-            ev = session.recv(), if !over => match relay_of(ev) {
+            ev = session.recv(), if !over => match records.relay_of(ev) {
                 Some(Relay::More(bytes)) => {
                     backlog.extend(bytes);
                     if backlog.len() > BACKLOG_LIMIT {
@@ -349,6 +395,11 @@ async fn relay_control(
                 Some(Relay::Last(bytes)) => {
                     backlog.extend(bytes);
                     over = true;
+                }
+                Some(Relay::Rejected(bytes)) => {
+                    backlog.extend(bytes);
+                    session.close().await;
+                    return finish_unread(listener, backlog, grace).await;
                 }
                 None => {}
             },
@@ -387,7 +438,7 @@ async fn relay_control(
                     return;
                 }
             }
-            ev = session.recv() => match relay_of(ev) {
+            ev = session.recv() => match records.relay_of(ev) {
                 Some(Relay::More(bytes)) => {
                     if client_tx.write_all(&bytes).await.is_err() {
                         session.close().await;
@@ -396,6 +447,11 @@ async fn relay_control(
                 }
                 Some(Relay::Last(bytes)) => {
                     let _ = client_tx.write_all(&bytes).await;
+                    return;
+                }
+                Some(Relay::Rejected(bytes)) => {
+                    let _ = client_tx.write_all(&bytes).await;
+                    session.close().await;
                     return;
                 }
                 None => {}
@@ -999,6 +1055,54 @@ mod tests {
                         .into()
                 },
             ]
+        );
+        expect_close(&mut agent, id).await;
+    }
+
+    /// The same for `failed`, written before the CLI connected: the text the
+    /// CLI reports is the daemon's, not the guest's.
+    #[tokio::test]
+    async fn an_agent_written_failed_record_is_not_relayed() {
+        let (_dir, mut agent, id, reply) = x11_session().await;
+        agent
+            .record(
+                id,
+                AppRecord::Failed {
+                    msg: "the lab daemon says no".into(),
+                },
+            )
+            .await;
+        expect_close(&mut agent, id).await;
+        let mut control = UnixStream::connect(path_of(&reply, "control"))
+            .await
+            .unwrap();
+        assert_eq!(
+            records_to_the_end(&mut control).await,
+            [AppRecord::Failed {
+                msg: "the agent wrote a `failed` record, which only the lab daemon writes".into()
+            }]
+        );
+    }
+
+    /// A record of a kind the protocol does not have fails the session at the
+    /// daemon, and nothing of it reaches the CLI.
+    #[tokio::test]
+    async fn an_unknown_agent_record_fails_the_session() {
+        let (_dir, mut agent, id, reply) = x11_session().await;
+        let mut control = UnixStream::connect(path_of(&reply, "control"))
+            .await
+            .unwrap();
+        let json = br#"{"record":"shutdown"}"#;
+        let mut data = (json.len() as u32).to_le_bytes().to_vec();
+        data.extend_from_slice(json);
+        agent.data(id, &data).await;
+        let records = records_to_the_end(&mut control).await;
+        let [AppRecord::Failed { msg }] = records.as_slice() else {
+            panic!("expected one failed record, got {records:?}");
+        };
+        assert!(
+            msg.starts_with("the agent's record stream is unusable: undecodable app record"),
+            "{msg}"
         );
         expect_close(&mut agent, id).await;
     }

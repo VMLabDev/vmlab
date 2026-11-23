@@ -57,6 +57,7 @@ host {
   viewer               = "vncviewer {}"
   waypipe              = "/opt/waypipe/bin/waypipe"
   freerdp              = "/usr/bin/xfreerdp3"
+  app_x11_fallback     = false
   ffmpeg               = "/opt/ffmpeg/bin/ffmpeg"
   fastpath             = "auto"
   oci_chunk_size       = 512MiB
@@ -87,6 +88,7 @@ SRC
       | "`viewer`" | "utf8" | "none" | "VNC viewer command; `{}` is replaced by the target." |
       | "`waypipe`" | "utf8" | "`waypipe` on `PATH`" | "Path to the host's waypipe client for [shared apps](guide_apps) from Linux guests." |
       | "`freerdp`" | "utf8" | "`xfreerdp3`, then `xfreerdp`, on `PATH`" | "Path to the FreeRDP 3 client for [shared apps](guide_apps) from Windows guests." |
+      | "`app_x11_fallback`" | "bool" | "`false`" | "Let `vmlab app run` fall back from waypipe to X11 when the guest reports that it has no waypipe. The guest answers that question, and X11 gives the guest program access to the host's X server. `false` refuses and names `--via x11`. See [Shared apps](guide_apps)." |
       | "`ffmpeg`" | "utf8" | "`ffmpeg` on `PATH`" | "Path to the ffmpeg that encodes [console recordings](guide_recording). It needs `libx264` for `.mp4` and `libvpx-vp9` for `.webm`." |
       | "`fastpath`" | "utf8" | "`auto`" | "Network fast path: `auto` probes, `off` forces userspace, `sockmap` and `afxdp` force a kernel tier." |
       | "`oci_chunk_size`" | "ByteSize" | "`512MiB`" | "OCI layer chunk size for `vmlab template push`." |
@@ -132,7 +134,7 @@ SRC
     override. See [vmlab console](cmd_console) for VNC fallback behavior.
   DOC
   p <<DOC
-    `waypipe` and `freerdp` are read by `vmlab app run` itself rather than by
+    `waypipe`, `freerdp` and `app_x11_fallback` are read by `vmlab app run` itself rather than by
     a daemon, so a change applies to the next shared app with no restart.
     Neither path is checked when the file is read. A wrong one fails when
     `vmlab app run` starts it, naming the path. See [Shared apps](guide_apps).

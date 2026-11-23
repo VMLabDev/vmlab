@@ -51,7 +51,8 @@ page cmd_app {
     rows:
       | "Guest" | "Host session" | "Protocol" |
       | "Linux" | "Wayland" | "`waypipe`" |
-      | "Linux" | "Wayland, and either side lacks waypipe" | "`x11`, through Xwayland, when `DISPLAY` is set" |
+      | "Linux" | "Wayland, and the host lacks waypipe" | "`x11`, through Xwayland, when `DISPLAY` is set" |
+      | "Linux" | "Wayland, the guest lacks waypipe, and the host config sets `app_x11_fallback = true`" | "`x11`, through Xwayland, when `DISPLAY` is set" |
       | "Linux" | "X11" | "`x11`" |
       | "Windows" | "Wayland or X11" | "`rdp`, through FreeRDP" |
   }
@@ -65,6 +66,13 @@ page cmd_app {
   p <<DOC
     `--via` picks the protocol outright and never falls back. A protocol the
     guest family cannot serve is refused by name.
+  DOC
+  p <<DOC
+    A guest that lacks waypipe falls back only when the
+    [host config](ref_host) sets `app_x11_fallback = true`. The guest answers
+    whether it has waypipe, and X11 gives the guest program access to the
+    host's X server, so without the setting the command refuses and names
+    `--via x11` and the setting.
   DOC
 
   p <<DOC
@@ -148,7 +156,8 @@ SRC
       | "`--via x11` needs an X server: DISPLAY is not set" | "`--via x11` on a Wayland desktop with no Xwayland." |
       | "this host has no `waypipe` on PATH (or `waypipe` in config.wcl), and DISPLAY is not set, so there is no X11 to fall back to" | "A Linux guest on a Wayland host with no host waypipe and no Xwayland." |
       | "no FreeRDP 3 on this host: shared apps from a Windows guest need `xfreerdp3` or `xfreerdp` on PATH, or `freerdp` in config.wcl" | "A Windows guest and no FreeRDP client." |
-      | "`{machine}` has no `waypipe` on PATH for `{login}`" | "The guest has no waypipe for the login, and the host has no `DISPLAY` to fall back to." |
+      | "`{machine}` has no `waypipe` on PATH for `{login}`" | "The guest has no waypipe for the login, and the host has no `DISPLAY` to fall back to, or `--via waypipe` was given." |
+      | "`{machine}` has no `waypipe` on PATH for `{login}`; X11 gives the guest program access to this desktop's X server, so vmlab does not fall back to it on the guest's word: pass `--via x11`, or set `app_x11_fallback = true` in config.wcl" | "The guest has no waypipe for the login, the host has `DISPLAY` set, and the host config does not allow the fallback." |
       | "the agent on `{machine}` predates shared apps over `{mode}`; run `vmlab machine repair-agent {machine}`" | "The guest agent was built before shared apps." |
       | "RDP needs an account: declare a `login {}` on `{machine}` or pass --user/--password; the template declares no account" | "A Windows guest with no declared or inherited logins." |
       | "RDP needs an account: select a login on `{machine}` with --user <label>, or pass --user/--password; no template account was selected" | "Logins exist but no account was selected, such as `--user SYSTEM` or multiple machine logins without a default." |
