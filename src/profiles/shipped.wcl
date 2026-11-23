@@ -94,6 +94,8 @@ profile "windows-xp" {
 }
 
 profile "windows-9x" {
+  // DOS and Windows 9x can halt at "It's now safe to turn off your computer".
+  seal_allow_quit = true
   description = "DOS / Windows 3.x-ME / 2000-era PCs: i440fx, SeaBIOS, IDE disk, Cirrus VGA, AMD PCnet NIC (all drivable by these guests); cap RAM low per template"
   machine     = "pc"
   firmware    = "seabios"
