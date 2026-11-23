@@ -54,6 +54,16 @@ impl Pixels {
             _ => Some(None),
         }
     }
+    /// A pin that a client keeps until its Release. See `acquire_revocable`.
+    fn pin_for_client(
+        &self,
+        revoke: impl FnOnce() + Send + 'static,
+    ) -> Option<Option<crate::BufferGuard>> {
+        match self {
+            Self::Leased { lease, .. } => lease.acquire_revocable(revoke).map(Some),
+            _ => Some(None),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -392,7 +402,7 @@ impl DisplayServer {
         Ok(())
     }
     pub fn serve_native(&self, stream: UnixStream) -> io::Result<()> {
-        let _session = self.session(&stream)?;
+        let session = self.session(&stream)?;
         let Message::Hello {
             version: protocol::VERSION,
             capabilities,
@@ -430,7 +440,7 @@ impl DisplayServer {
             let _ = reader.shutdown(Shutdown::Both);
             result
         });
-        let result = self.native_frames(&stream, caps, &local);
+        let result = self.native_frames(&stream, caps, &local, &session);
         let _ = stream.shutdown(Shutdown::Both);
         let input = handle
             .join()
@@ -518,7 +528,9 @@ impl DisplayServer {
         &self,
         stream: &UnixStream,
         caps: Capabilities,
-        local: &Mutex<ClientState>,
+        local: &Arc<Mutex<ClientState>>,
+        // What a revoked lease closes.
+        peer: &Arc<UnixStream>,
     ) -> io::Result<()> {
         let mut ring: Vec<File> = Vec::new();
         let mut dma_buffers: Vec<Arc<OwnedFd>> = Vec::new();
@@ -611,6 +623,35 @@ impl DisplayServer {
                 );
                 let pin = if !dma && matches!(&frame.pixels, Pixels::Leased { .. }) {
                     Some(None)
+                } else if dma {
+                    // The producer waits for this pin until the client's Release.
+                    // A client that sends none loses its connection, not the guest
+                    // its GPU commands: the producer revokes the pin after a while.
+                    let local = Arc::downgrade(local);
+                    let peer = Arc::downgrade(peer);
+                    let shared = Arc::downgrade(&self.shared);
+                    frame.pixels.pin_for_client(move || {
+                        if let Some(local) = local.upgrade() {
+                            let held = {
+                                let mut local = local.lock().unwrap();
+                                local.closed = true;
+                                local.revision += 1;
+                                std::mem::take(&mut local.held)
+                            };
+                            log::warn!(
+                                "display client closed: it kept {} direct frame(s) without \
+                                 Release while the guest needed the buffer",
+                                held.len()
+                            );
+                        }
+                        if let Some(peer) = peer.upgrade() {
+                            let _ = peer.shutdown(Shutdown::Both);
+                        }
+                        if let Some(shared) = shared.upgrade() {
+                            let _state = shared.state.lock().unwrap();
+                            shared.changed.notify_all();
+                        }
+                    })
                 } else {
                     frame.pixels.pin()
                 };
@@ -619,6 +660,11 @@ impl DisplayServer {
                     continue;
                 };
                 let mut s = local.lock().unwrap();
+                // A revocation empties `held` and sets `closed` under this lock.
+                // A pin taken before it must not enter `held` after it.
+                if s.closed {
+                    return Ok(());
+                }
                 // Old dma-buf Frames stay alive until Release, even after reconfigure.
                 if s.held.len() < 3 {
                     let mut buffers_changed = false;

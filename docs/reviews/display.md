@@ -235,6 +235,15 @@ Not read:
   client. Today it stays false until the client disconnects.
 - Confidence: high for the display crate. The GPU device was read at the
   `retire` sites only.
+- Fixed by card #639. `BufferLease::retire` waits `REVOKE_AFTER` (one
+  second) and then revokes the readers that a client holds
+  (`acquire_revocable`). The revocation closes that client and drops all its
+  held frames, so the wait of the GPU device ends. Readers that the server
+  ends by itself (readback) are not revoked. The limit is on the wait, not on
+  a count of newer frames as the proof proposed: a reset can wait with no new
+  frame, and a client may hold three frames while a fourth is published. The
+  proof test therefore retires the first lease as the device does and asserts
+  that the server closed the client. `PROTOCOL.md` states the limit.
 
 ### F5. Display server: CpuCopy is accepted from a client that never got a surface, and each one forces a capture and a full frame for every client
 
