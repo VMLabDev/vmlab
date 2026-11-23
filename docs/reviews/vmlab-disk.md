@@ -23,13 +23,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F1 | data loss | A write to a cluster that QEMU zeroed in place keeps the zero flag, so the written data reads back as zeros (fixed, #542) |
 | F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster (fixed, card #549) |
-| F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes |
+| F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes (fixed, card #556) |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read |
 | F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size |
-| F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory |
-| F10 | crash | Two header fields of a crafted image panic the process |
+| F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory (fixed, card #555) |
+| F10 | crash | Two header fields of a crafted image panic the process (fixed, card #555) |
 | F11 | data loss | `convert` with the same path for source and destination deletes the source |
 
 ### F1. A write to a preallocated zero cluster is lost (data loss)
@@ -179,6 +179,10 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   create snapshot `a`, write its entry again with extra data size 0, create
   snapshot `b`, apply `a`. Expected: `size()` is unchanged and the first
   cluster reads the data of `a`. Today: `size()` is 0.
+- Fixed in card #556. `serialize` writes 8 bytes of extra data (the large
+  vmstate size only) for an entry that records no disk size, so the disk size
+  stays absent through every rewrite and applying the snapshot keeps the
+  current size. An entry with a disk size keeps its 24 bytes.
 
 ### F5. Growing an image shows vmstate as disk data (wrong result)
 
@@ -314,6 +318,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   headers above on a `testsupport::blank` image. Expected:
   `Qcow2Image::open(path, true)` and `open_header` return an error. Today:
   both succeed. No time or memory measurement is needed for the test.
+- Fixed in card #555. `parse` refuses an `l1_size` over 4194304 entries
+  (32 MiB), a refcount table over 8 MiB and more than 65536 snapshots,
+  QEMU's limits, before it allocates anything. The snapshot table parser and
+  refcount recovery refuse a snapshot L1 over the same limit. `create`,
+  `ensure_l1_size` and `snapshot_create` refuse to write an image past them.
+  The two proof tests failed before the fix (`open` succeeded) and pass
+  after it.
 
 ### F10. Two crafted header fields panic the process (crash)
 
@@ -339,6 +350,13 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   `Err`) and `a_header_length_beyond_the_cluster_is_an_error` (`open` or
   `set_backing` returns `Err`). Today both panic. The qcow2 fuzz target of
   `docs/reviews/fuzz-coverage.md` (P26) should reach the first one.
+- Fixed in card #555. `parse` computes the end of the backing name with a
+  checked sum and refuses a `header_length` larger than the cluster.
+  `set_backing` returns an error when the extensions do not fit after the
+  header, which a header length near the cluster size still allowed. The two
+  proof tests and a third,
+  `a_header_length_that_leaves_no_room_for_extensions_is_an_error`, panicked
+  before the fix and pass after it.
 
 ### F11. `convert` onto its own source deletes the source (data loss)
 

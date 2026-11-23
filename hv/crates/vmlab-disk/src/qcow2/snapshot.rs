@@ -39,9 +39,16 @@ impl SnapshotEntry {
         }
     }
 
+    /// Extra data written for this entry: the large vmstate size, then the
+    /// disk size and icount. An entry that records no disk size (old QEMU)
+    /// keeps it absent, because a recorded 0 would shrink the disk on apply.
+    fn extra_len(&self) -> usize {
+        if self.disk_size.is_some() { 24 } else { 8 }
+    }
+
     /// Serialized size, padded to a multiple of 8 as the format requires.
     fn padded_size(&self) -> usize {
-        (40 + 24 + self.id.len() + self.name.len()).div_ceil(8) * 8
+        (40 + self.extra_len() + self.id.len() + self.name.len()).div_ceil(8) * 8
     }
 
     fn serialize(&self, out: &mut Vec<u8>) {
@@ -54,10 +61,12 @@ impl SnapshotEntry {
         out.extend_from_slice(&self.date_nsec.to_be_bytes());
         out.extend_from_slice(&self.vm_clock_nsec.to_be_bytes());
         out.extend_from_slice(&self.vm_state_size.to_be_bytes());
-        out.extend_from_slice(&24u32.to_be_bytes()); // extra data size
+        out.extend_from_slice(&(self.extra_len() as u32).to_be_bytes());
         out.extend_from_slice(&self.effective_vm_state_size().to_be_bytes());
-        out.extend_from_slice(&self.disk_size.unwrap_or(0).to_be_bytes());
-        out.extend_from_slice(&0u64.to_be_bytes()); // icount: disabled
+        if let Some(disk_size) = self.disk_size {
+            out.extend_from_slice(&disk_size.to_be_bytes());
+            out.extend_from_slice(&0u64.to_be_bytes()); // icount: disabled
+        }
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(self.name.as_bytes());
         while !(out.len() - start).is_multiple_of(8) {
@@ -100,6 +109,12 @@ impl Qcow2Image {
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as usize;
             let entry_len = (40 + extra + id_len + name_len) as u64;
             checked_file_range(file_len, off, entry_len)?;
+            if l1_size > super::MAX_L1_ENTRIES {
+                return Err(Error::Format {
+                    format: "qcow2",
+                    reason: format!("snapshot L1 table too large ({l1_size} entries)"),
+                });
+            }
             checked_file_range(file_len, l1_table_offset, u64::from(l1_size) * 8)?;
             // Only the first two extra fields are consumed. Never allocate
             // according to an untrusted extra-data length.
@@ -181,6 +196,12 @@ impl Qcow2Image {
         if entries.iter().any(|e| e.name == name) {
             return Err(Error::Unsupported(format!(
                 "snapshot {name:?} already exists"
+            )));
+        }
+        if entries.len() >= super::MAX_SNAPSHOTS as usize {
+            return Err(Error::Unsupported(format!(
+                "an image holds at most {} snapshots",
+                super::MAX_SNAPSHOTS
             )));
         }
         let id = next_snapshot_id(&entries, name)?;
@@ -545,5 +566,48 @@ fn next_snapshot_id(entries: &[SnapshotEntry], name: &str) -> Result<String> {
         if id != name && !entries.iter().any(|e| e.name == id) {
             return Ok(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testsupport;
+    use crate::DiskImage;
+
+    /// Review F4: an entry of an old image records no disk size. A rewrite of
+    /// the table must keep it absent, not record a disk size of 0.
+    #[test]
+    fn a_snapshot_without_a_recorded_disk_size_keeps_the_size_through_a_rewrite() {
+        let size = 8 << 20;
+        let (_dir, mut img) = testsupport::blank(size);
+        img.write_at(0, &[0x11; 512]).unwrap();
+        img.snapshot_create("a", 0, 0).unwrap();
+        img.write_at(0, &[0x22; 512]).unwrap();
+
+        // Write entry `a` again as old QEMU does: no extra data.
+        let entry = img.parse_table().unwrap().remove(0);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&entry.l1_table_offset.to_be_bytes());
+        raw.extend_from_slice(&entry.l1_size.to_be_bytes());
+        raw.extend_from_slice(&(entry.id.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&(entry.name.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&entry.date_sec.to_be_bytes());
+        raw.extend_from_slice(&entry.date_nsec.to_be_bytes());
+        raw.extend_from_slice(&entry.vm_clock_nsec.to_be_bytes());
+        raw.extend_from_slice(&entry.vm_state_size.to_be_bytes());
+        raw.extend_from_slice(&0u32.to_be_bytes()); // extra data size
+        raw.extend_from_slice(entry.id.as_bytes());
+        raw.extend_from_slice(entry.name.as_bytes());
+        raw.resize(raw.len().div_ceil(8) * 8, 0);
+        let table = img.snapshots_offset;
+        img.write_file(table, &raw).unwrap();
+        assert_eq!(img.parse_table().unwrap()[0].disk_size, None);
+
+        img.snapshot_create("b", 0, 0).unwrap();
+        img.snapshot_apply("a").unwrap();
+        assert_eq!(img.size(), size);
+        let mut first = [0u8; 512];
+        img.read_at(0, &mut first).unwrap();
+        assert_eq!(first, [0x11; 512]);
     }
 }

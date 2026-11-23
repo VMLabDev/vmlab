@@ -4556,6 +4556,105 @@ mod tests {
         }
     }
 
+    /// The fake registry behind the path handling of the real transport:
+    /// the repository goes into a request URL, and the URL parser removes
+    /// dot segments from it, so the repository that answers is the
+    /// normalised one.
+    struct DotSegmentsRemoved(std::sync::Arc<FakeRegistry>);
+
+    impl DotSegmentsRemoved {
+        fn repo(r: &str) -> String {
+            let url = reqwest::Url::parse(&format!("https://registry.test/v2/{r}/end")).unwrap();
+            url.path()
+                .strip_prefix("/v2/")
+                .and_then(|p| p.strip_suffix("/end"))
+                .unwrap_or_else(|| panic!("`{r}` leaves the /v2/ path: {url}"))
+                .to_string()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for DotSegmentsRemoved {
+        async fn blob_exists(&self, r: &str, d: &str) -> Result<bool> {
+            self.0.blob_exists(&Self::repo(r), d).await
+        }
+        async fn get_blob(&self, r: &str, d: &str) -> Result<Vec<u8>> {
+            self.0.get_blob(&Self::repo(r), d).await
+        }
+        async fn put_blob(&self, r: &str, d: &str, data: Vec<u8>) -> Result<()> {
+            self.0.put_blob(&Self::repo(r), d, data).await
+        }
+        async fn put_blob_file(&self, r: &str, d: &str, p: &Path) -> Result<()> {
+            self.0.put_blob_file(&Self::repo(r), d, p).await
+        }
+        async fn get_manifest(&self, r: &str, rf: &str) -> Result<Option<Fetched>> {
+            self.0.get_manifest(&Self::repo(r), rf).await
+        }
+        async fn put_manifest(&self, r: &str, rf: &str, mt: &str, b: Vec<u8>) -> Result<String> {
+            self.0.put_manifest(&Self::repo(r), rf, mt, b).await
+        }
+        async fn list_tags(&self, r: &str) -> Result<Vec<String>> {
+            self.0.list_tags(&Self::repo(r)).await
+        }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            self.0.list_catalog().await
+        }
+    }
+
+    /// Config review F2. `ghcr.io/other/tpl` is in no trust list and its
+    /// template has a `first_boot_script`. Named through `..` segments under
+    /// the default trusted namespace, its text starts with that namespace
+    /// and its requests reach `other/tpl`. The reference is built as a value
+    /// here, because `Reference::parse` refuses it: the trust check must
+    /// refuse the script without that.
+    #[tokio::test]
+    async fn a_dot_segment_reference_does_not_run_another_repositorys_script() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        let disk = b"raw disk".to_vec();
+        m.first_boot_script = Some("fn main(lab) {}".into());
+        m.sha256 = Some(hex::encode(sha2::Sha256::digest(&disk)));
+        make_template(&tdir, &m, &disk);
+        registry_with_fake("ghcr.io/other/tpl:1", fake.clone())
+            .push(
+                &tdir,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let trusted = crate::config::host::HostConfig::default().trusted_template_repositories;
+        assert!(trusted.contains(&"ghcr.io/vmlabdev/vmlab-templates/".to_string()));
+        let reference = Reference {
+            host: "ghcr.io".into(),
+            repository: "vmlabdev/vmlab-templates/../../other/tpl".into(),
+            tag: "1".into(),
+        };
+        let store = store_in(work.path(), "victim");
+        let err = Registry::with_transport(reference, Box::new(DotSegmentsRemoved(fake.clone())))
+            .pull_with_progress(
+                Some("x86_64"),
+                &store,
+                &store.root().join(".oci-pull").join("f2"),
+                false,
+                &VariantWant::default(),
+                &mut |_| {},
+            )
+            .await
+            .expect_err("the script of a repository outside the trust list is refused");
+        assert!(
+            format!("{err:#}").contains("first_boot_script refused"),
+            "{err:#}"
+        );
+        assert!(store.list().unwrap().is_empty());
+    }
+
     async fn pull_want(
         fake: &std::sync::Arc<FakeRegistry>,
         reference: &str,

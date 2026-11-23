@@ -34,9 +34,9 @@ The findings are ranked against these three facts, which the code states:
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry (fixed, card #540) |
-| F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments |
+| F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments (fixed, card #548) |
 | F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read. **Fixed by card #544.** |
-| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file |
+| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file (fixed, card #558) |
 | F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545) |
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
@@ -139,6 +139,20 @@ The findings are ranked against these three facts, which the code states:
   the `scope` parameter. ghcr.io may refuse the token, which would stop the
   pull there. A registry that serves anonymous pulls without a token is not
   protected by that.
+- Fixed in card #548. A repository is plain when every `/`-separated
+  segment is non-empty, holds only ASCII letters, digits, `.`, `_` and `-`,
+  and is not `.` or `..` (`repository_is_plain` in `src/oci/reference.rs`).
+  That also excludes `%2e%2e`, `\`, `?` and `#`, which the URL parser reads
+  as a dot segment, a separator and the end of the path. `Reference::parse`
+  refuses a repository that is not plain, so no request is built from one,
+  and `repository_trusted` returns `false` for one, so the trust check holds
+  for a `Reference` built without the parser too. Host and tag are checked
+  as before. All three proof tests failed before the fix (the trust check
+  returned `true`, the parse was `Ok`, the pull installed the script) and
+  pass after it. Proof 3 is
+  `a_dot_segment_reference_does_not_run_another_repositorys_script` in
+  `src/oci/client.rs`: it puts the fake registry behind a transport that
+  removes dot segments with the `url` crate, as the real transport does.
 
 ### F3. The Apple SMC OSK is in QEMU's argv (security)
 
@@ -191,6 +205,13 @@ is refused at launch, because the file format has no escape for one.
 - I did not read all of vmlab-hv's machine description checks. A search of
   `hv/crates/vmlab-hv-proto/src/machine.rs` for a duplicate-path check found
   none.
+- Fixed in card #558. `validate` refuses a second `disk` block with the name
+  of an earlier one in the same `vm` or `template` (`check_disk_names` in
+  `src/config/validate.rs`), and `VmInstance::ensure_disks` refuses the same
+  before it creates or launches anything, so a configuration that skipped
+  validation still never reaches a launch with one image as two drives. Both
+  proof tests fail before the fix and pass after. The content of a disk name
+  (`/`, `,`) is not part of this fix.
 
 ### F5. A validation error prints passwords and secret values (security)
 
