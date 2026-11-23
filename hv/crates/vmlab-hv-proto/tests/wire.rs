@@ -177,6 +177,31 @@ fn fs_share_socket_and_path_are_alternatives() {
     assert_eq!(neither.backing(), None);
 }
 
+/// `pit_ticks` stays off the wire at KVM's default, so a description written
+/// before the field existed means what it meant, and `discard` is the one
+/// other keyword.
+#[test]
+fn pit_ticks_defaults_to_replay_and_names_discard() {
+    use vmlab_hv_proto::machine::PitTicks;
+    let mut machine = sample_machine();
+    assert_eq!(machine.pit_ticks, PitTicks::Replay);
+    let mut json = serde_json::to_value(&machine).unwrap();
+    assert!(json.get("pit_ticks").is_none());
+    let parsed: MachineDescription = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(parsed.pit_ticks, PitTicks::Replay);
+
+    machine.pit_ticks = PitTicks::Discard;
+    assert_eq!(
+        serde_json::to_value(&machine).unwrap()["pit_ticks"],
+        "discard"
+    );
+    json["pit_ticks"] = "replay".into();
+    let parsed: MachineDescription = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(parsed.pit_ticks, PitTicks::Replay);
+    json["pit_ticks"] = "catchup".into();
+    assert!(serde_json::from_value::<MachineDescription>(json).is_err());
+}
+
 fn sample_machine() -> MachineDescription {
     MachineDescription {
         virtual_display: None,
@@ -193,6 +218,7 @@ fn sample_machine() -> MachineDescription {
         applesmc: None,
         usb_keyboard: false,
         smbios_type2: false,
+        pit_ticks: Default::default(),
         floppy: None,
         serial_log_port: Default::default(),
         hyperv: vec![],

@@ -13,6 +13,32 @@ use crate::error::{VmmError, VmmError as E};
 const KVM_TSS_ADDR: usize = 0xFEFFD000;
 const KVM_IDENTITY_MAP_ADDR: u64 = 0xFEFF_C000;
 
+/// Make the in-kernel PIT drop the ticks the guest was too late to take
+/// (`pit_reinject = 0`). KVM's default replays each of them, one straight
+/// after another, once the guest takes interrupts again. `needed_by` names
+/// the feature in the error of a host without the capability.
+pub fn discard_missed_pit_ticks(
+    kvm: &Kvm,
+    vm: &VmFd,
+    needed_by: &'static str,
+) -> Result<(), VmmError> {
+    use std::os::fd::AsRawFd;
+    if !kvm.check_extension(Cap::ReinjectControl) {
+        return Err(E::KvmCap(needed_by));
+    }
+    let control = kvm_bindings::kvm_reinject_control::default();
+    // Linux x86 _IO(KVMIO, 0x71), with a pointer despite its _IO encoding.
+    // SAFETY: vm is live and control is an initialized UAPI input structure.
+    let result = unsafe { libc::ioctl(vm.as_raw_fd(), 0xae71 as libc::c_ulong, &control) };
+    if result < 0 {
+        return Err(VmmError::Other(format!(
+            "KVM_REINJECT_CONTROL: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// One KVM virtual machine.
 pub struct KvmVm {
     pub kvm: Kvm,
@@ -789,5 +815,109 @@ mod doorbell_tests {
             "mmio 0xa0001000"
         );
         assert_eq!((pending(0), pending(1)), (None, None));
+    }
+}
+
+#[cfg(test)]
+mod pit_tick_tests {
+    use super::*;
+    use kvm_ioctls::VcpuExit;
+    use std::time::{Duration, Instant};
+    use vm_memory::{Bytes, GuestAddress};
+
+    /// The PIT period the guest programs, and how long the host keeps the
+    /// vCPU off the CPU with interrupts disabled: 50 ticks go undelivered.
+    const PERIOD: Duration = Duration::from_millis(20);
+    const STALL: Duration = Duration::from_secs(1);
+    /// Timer interrupts timed after the stall.
+    const TAKEN: u32 = 30;
+
+    /// A real-mode guest that sets up the PIC, runs PIT channel 0 at
+    /// `PERIOD`, reports on port 0xe9 with interrupts still off, and from
+    /// then on reports each IRQ 0 it takes on the same port.
+    fn guest() -> Vec<u8> {
+        let divisor = (1_193_182 * PERIOD.as_millis() as u32 / 1000) as u16;
+        let [low, high] = divisor.to_le_bytes();
+        let mut code = vec![
+            0xfa, // cli
+            0x31, 0xc0, // xor ax, ax
+            0x8e, 0xd0, // mov ss, ax
+            0x8e, 0xd8, // mov ds, ax
+            0xbc, 0x00, 0x70, // mov sp, 0x7000
+            0xc7, 0x06, 0x20, 0x00, 0x00, 0x00, // mov word [0x20], handler
+            0xc7, 0x06, 0x22, 0x00, 0x00, 0x00, // mov word [0x22], 0
+            0xb0, 0x11, 0xe6, 0x20, 0xe6, 0xa0, // ICW1 to both PICs
+            0xb0, 0x08, 0xe6, 0x21, // ICW2: IRQ 0 is vector 8
+            0xb0, 0x70, 0xe6, 0xa1, //
+            0xb0, 0x04, 0xe6, 0x21, // ICW3
+            0xb0, 0x02, 0xe6, 0xa1, //
+            0xb0, 0x01, 0xe6, 0x21, 0xe6, 0xa1, // ICW4
+            0xb0, 0xfe, 0xe6, 0x21, // unmask IRQ 0 alone
+            0xb0, 0xff, 0xe6, 0xa1, //
+            0xb0, 0x34, 0xe6, 0x43, // channel 0, low then high, mode 2
+            0xb0, low, 0xe6, 0x40, //
+            0xb0, high, 0xe6, 0x40, //
+            0xe6, 0xe9, // out 0xe9, al: armed, interrupts off
+            0xfb, // sti
+            0xf4, // hlt
+            0xeb, 0xfd, // jmp to the hlt
+        ];
+        let handler = (0x8000 + code.len()) as u16;
+        code[14..16].copy_from_slice(&handler.to_le_bytes());
+        code.extend([
+            0x50, // push ax
+            0xb0, 0x20, 0xe6, 0x20, // end of interrupt
+            0xe6, 0xe9, // out 0xe9, al: one tick taken
+            0x58, // pop ax
+            0xcf, // iret
+        ]);
+        code
+    }
+
+    /// How long the guest needs to take `TAKEN` timer interrupts after the
+    /// stall.
+    fn time_to_take_ticks(discard: bool) -> Option<Duration> {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("skipping PIT tick policy: /dev/kvm is unavailable");
+            return None;
+        }
+        let vm = KvmVm::new().expect("create PIT test VM");
+        if discard {
+            discard_missed_pit_ticks(&vm.kvm, &vm.vm, "PIT reinjection control").unwrap();
+        }
+        let ram =
+            crate::memory::GuestRam::anonymous(crate::layout::MemLayout::new(16).unwrap()).unwrap();
+        crate::memory::register_memslots(&vm.vm, &ram).unwrap();
+        let mut cpu = vm.create_vcpu(0).unwrap();
+        ram.mem.write_slice(&guest(), GuestAddress(0x8000)).unwrap();
+        crate::loader::init_real_mode(&mut cpu, 0x8000).unwrap();
+        assert!(matches!(cpu.run().unwrap(), VcpuExit::IoOut(0xe9, _)));
+        std::thread::sleep(STALL);
+        let start = Instant::now();
+        for _ in 0..TAKEN {
+            assert!(matches!(cpu.run().unwrap(), VcpuExit::IoOut(0xe9, _)));
+        }
+        Some(start.elapsed())
+    }
+
+    /// KVM's default replays the ticks of the stall one straight after
+    /// another, so the guest takes thirty at once. With them discarded it
+    /// takes one per period, which no host load can shorten.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+    fn discarded_pit_ticks_are_not_replayed_after_a_stall() {
+        let Some(replayed) = time_to_take_ticks(false) else {
+            return;
+        };
+        let discarded = time_to_take_ticks(true).unwrap();
+        let live = PERIOD * (TAKEN - 1);
+        assert!(
+            discarded >= live - 2 * PERIOD,
+            "discarded ticks arrived in {discarded:?}, faster than the timer runs"
+        );
+        assert!(
+            replayed < live / 2,
+            "replayed ticks took {replayed:?}, as long as live ones"
+        );
     }
 }

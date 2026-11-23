@@ -29,6 +29,15 @@ launch. `invtsc` advertises CPUID.80000007H:EDX[8]. Existing timing leaves
 exposes leaf 0x40000010 and remains exclusive with Hyper-V. A pin without
 that flag preserves the Hyper-V CPUID range.
 
+`pit_ticks` in the launch description is what the in-kernel PIT does with
+ticks the guest was too late to take. `replay`, the default, is KVM's own
+behaviour: each missed tick is delivered later, one straight after another.
+`discard` sets `KVM_REINJECT_CONTROL` with `pit_reinject = 0` before any vCPU
+runs, and launch fails on a host without `KVM_CAP_REINJECT_CONTROL`. Hyper-V
+AVIC discards them whatever the field says. The field is outside the
+description digest of an online snapshot, so a snapshot restores under either
+value.
+
 Online snapshots record the frequency per vCPU and reject a changed
 destination frequency before changing guest state. A new host must support
 the original pin, including KVM scaling when required. The host's native

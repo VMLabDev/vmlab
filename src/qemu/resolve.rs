@@ -75,6 +75,9 @@ pub struct ResolvedVm {
     /// for the profiles that cannot read it any other way — is the profile's.
     /// `None` keeps QEMU's default, the host's UTC time.
     pub rtc_base: Option<String>,
+    /// What the PIT does with ticks the guest missed (§5.3). The profile's:
+    /// it is a property of the guest OS, like `rtc`.
+    pub pit_ticks: crate::profiles::PitTicks,
     /// The QEMU `-cpu` model (§5.2), VM > template > profile. `None` keeps
     /// the accelerator default — the host CPU under KVM, `max` under TCG.
     /// Named for guests the host CPU's CPUID breaks (Windows 9x Setup on a
@@ -702,6 +705,7 @@ pub fn resolve_vm(
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
         rtc_base: lab_vm.clock.rtc_base_for(profile.rtc),
+        pit_ticks: profile.pit_ticks,
         cpu_model: cpu_model.map(|(model, _)| model),
         hyperv: pick(
             lab_vm.hyperv,

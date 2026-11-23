@@ -55,20 +55,7 @@ pub fn configure_vm(kvm: &Kvm, vm: &VmFd, features: &[HyperV]) -> Result<(), Vmm
     if !features.contains(&HyperV::Time) {
         return Err(invalid("Hyper-V AVIC PIT policy requires Hyper-V time"));
     }
-    if !kvm.check_extension(Cap::ReinjectControl) {
-        return Err(VmmError::KvmCap("PIT reinjection control for Hyper-V AVIC"));
-    }
-    let control = kvm_bindings::kvm_reinject_control::default();
-    // Linux x86 _IO(KVMIO, 0x71), with a pointer despite its _IO encoding.
-    // SAFETY: vm is live and control is an initialized UAPI input structure.
-    let result = unsafe { libc::ioctl(vm.as_raw_fd(), 0xae71 as libc::c_ulong, &control) };
-    if result < 0 {
-        return Err(VmmError::Other(format!(
-            "KVM_REINJECT_CONTROL: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
+    crate::kvm::discard_missed_pit_ticks(kvm, vm, "PIT reinjection control for Hyper-V AVIC")
 }
 
 /// Query the kernel's Hyper-V capability leaves, not its KVM vendor leaves.
