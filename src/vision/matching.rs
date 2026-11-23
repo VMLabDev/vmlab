@@ -2,7 +2,8 @@
 //!
 //! The score is one minus the root mean square channel difference divided by
 //! 255. It ranges from 0 to 1, with 1 for identical pixels. The search visits
-//! placements in row-major order and keeps the first one on a tie.
+//! placements in row-major order and stops scoring a window once its partial
+//! error rules out meeting the threshold or improving the current match.
 
 use image::RgbImage;
 
@@ -71,10 +72,8 @@ pub fn find_template(screen: &RgbImage, template: &RgbImage, opts: &MatchOptions
         top as usize,
         width as usize,
         height as usize,
-    );
-    if score < opts.threshold {
-        return None;
-    }
+        opts.threshold,
+    )?;
     Some(Match {
         x: x as u32,
         y: y as u32,
@@ -84,7 +83,29 @@ pub fn find_template(screen: &RgbImage, template: &RgbImage, opts: &MatchOptions
     })
 }
 
-/// Find the smallest sum of squared RGB channel differences.
+fn similarity(error: u64, channels: usize) -> f64 {
+    1.0 - (error as f64 / channels as f64).sqrt() / 255.0
+}
+
+/// Invert the score using the same rounding as the final comparison.
+fn error_budget(channels: usize, threshold: f64) -> Option<u64> {
+    if threshold > 1.0 {
+        return None;
+    }
+    let mut low = 0;
+    let mut high = (channels as u64).saturating_mul(255 * 255);
+    while low < high {
+        let middle = high - (high - low) / 2;
+        if similarity(middle, channels) < threshold {
+            high = middle - 1;
+        } else {
+            low = middle;
+        }
+    }
+    Some(low)
+}
+
+/// Find the smallest sum of squared RGB channel differences in budget.
 fn search_best(
     screen: &RgbImage,
     template: &RgbImage,
@@ -92,44 +113,49 @@ fn search_best(
     top: usize,
     width: usize,
     height: usize,
-) -> (usize, usize, f64) {
+    threshold: f64,
+) -> Option<(usize, usize, f64)> {
     let screen_stride = screen.width() as usize * 3;
     let template_stride = template.width() as usize * 3;
     let template_rows = template.as_raw().chunks_exact(template_stride);
     let pixels = screen.as_raw();
-    let mut best = (left, top, u64::MAX);
+    let channels = template.as_raw().len();
+    let mut budget = error_budget(channels, threshold)?;
+    let mut best = None;
 
     for y in top..=top + height - template.height() as usize {
-        for x in left..=left + width - template.width() as usize {
+        'placement: for x in left..=left + width - template.width() as usize {
             let mut error = 0;
             for (row, expected) in template_rows.clone().enumerate() {
                 let start = (y + row) * screen_stride + x * 3;
                 let actual = &pixels[start..start + template_stride];
-                error += actual
-                    .iter()
-                    .zip(expected)
-                    .map(|(&a, &b)| {
-                        let delta = i32::from(a) - i32::from(b);
-                        (delta * delta) as u64
-                    })
-                    .sum::<u64>();
-
-                // Remaining rows can only increase the error.
-                if error >= best.2 {
-                    break;
+                // A u32 sum vectorises more efficiently. Each chunk's
+                // maximum error fits even for very wide templates.
+                for (actual, expected) in actual.chunks(4096).zip(expected.chunks(4096)) {
+                    error += u64::from(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .map(|(&a, &b)| {
+                                let delta = i32::from(a) - i32::from(b);
+                                (delta * delta) as u32
+                            })
+                            .sum::<u32>(),
+                    );
+                    if error > budget {
+                        continue 'placement;
+                    }
                 }
             }
             if error == 0 {
-                return (x, y, 1.0);
+                return Some((x, y, 1.0));
             }
-            if error < best.2 {
-                best = (x, y, error);
-            }
+            best = Some((x, y, error));
+            budget = error - 1;
         }
     }
 
-    let rmse = (best.2 as f64 / template.as_raw().len() as f64).sqrt();
-    (best.0, best.1, 1.0 - rmse / 255.0)
+    best.map(|(x, y, error)| (x, y, similarity(error, channels)))
 }
 
 #[cfg(test)]
@@ -340,6 +366,33 @@ mod tests {
             find_template(&screen, &tmpl, &MatchOptions::default()),
             None
         );
+    }
+
+    #[test]
+    fn hd_search_rejects_absent_template_and_finds_off_grid_occurrence() {
+        let mut screen = test_screen(1920, 1080);
+        let template = RgbImage::from_fn(64, 64, |x, y| {
+            let hash = (x + 1).wrapping_mul(0x9E37_79B1) ^ (y + 1).wrapping_mul(0x85EB_CA77);
+            let hash = (hash ^ (hash >> 13)).wrapping_mul(0xC2B2_AE3D);
+            Rgb([hash as u8, (hash >> 8) as u8, (hash >> 16) as u8])
+        });
+        let opts = MatchOptions::default();
+        assert_eq!(find_template(&screen, &template, &opts), None);
+        imageops::replace(&mut screen, &template, 1731, 951);
+        let found = find_template(&screen, &template, &opts).expect("exact HD match");
+        assert_eq!((found.x, found.y, found.score), (1731, 951, 1.0));
+    }
+
+    #[test]
+    fn a_match_at_the_threshold_is_accepted() {
+        let screen = RgbImage::from_pixel(2, 1, Rgb([0, 0, 0]));
+        let template = RgbImage::from_pixel(1, 1, Rgb([13, 10, 1]));
+        let opts = MatchOptions {
+            threshold: similarity(270, 3),
+            ..Default::default()
+        };
+        let found = find_template(&screen, &template, &opts).expect("match at threshold");
+        assert_eq!((found.x, found.score), (0, opts.threshold));
     }
 
     #[test]
