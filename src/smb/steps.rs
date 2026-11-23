@@ -145,6 +145,7 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
         args,
         share: share.map(str::to_string),
         refused_exit: None,
+        secret: None,
     };
     match os_hint {
         // XP-era guests have no vmlab agent to run commands through and no
@@ -403,6 +404,7 @@ mod tests {
             args: vec!["-t".into(), "cifs".into(), "//10.0.0.1/data".into()],
             share: Some("data".into()),
             refused_exit: None,
+            secret: None,
         }];
         let plan = mount_plan(OsHint::Linux, &mounts()[..1], smb);
         let lines: Vec<String> = plan.steps.iter().map(argv).collect();
