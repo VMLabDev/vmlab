@@ -2444,7 +2444,9 @@ async fn turning_secure_boot_on_does_not_boot_an_unenrolled_store() {
         Err(error) => {
             let said = format!("{error:#}");
             assert!(
-                said.contains("dc01") && said.contains("secure_boot") && said.contains("OVMF_VARS.fd"),
+                said.contains("dc01")
+                    && said.contains("secure_boot")
+                    && said.contains("OVMF_VARS.fd"),
                 "the refusal names the machine, the setting and the store: {said}"
             );
             assert_eq!(hv.starts(), 0, "a refused start launches nothing");

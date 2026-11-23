@@ -377,9 +377,15 @@ mod tests {
 
         assert!(restore(&vm, "plain"));
         assert_eq!(std::fs::read(&vm.vars).unwrap(), b"booted plain");
-        assert_eq!(vars_boot::read(&vm.vars_boot).unwrap(), Some(LastBoot::Plain));
+        assert_eq!(
+            vars_boot::read(&vm.vars_boot).unwrap(),
+            Some(LastBoot::Plain)
+        );
         assert!(restore(&vm, "secure"));
-        assert_eq!(vars_boot::read(&vm.vars_boot).unwrap(), Some(LastBoot::Secure));
+        assert_eq!(
+            vars_boot::read(&vm.vars_boot).unwrap(),
+            Some(LastBoot::Secure)
+        );
         assert!(!sibling(&vm.vars_boot, "restore").exists());
 
         // A capture from before the record was kept holds a store and no

@@ -911,9 +911,7 @@ impl VmInstance {
             if t.resolved.secure_boot {
                 let store = self.dirs.ovmf_vars();
                 let blank = (pairing == qemu::firmware::Pairing::Enrolled)
-                    .then(|| {
-                        sources.lookup_for_vars(arch, qemu::firmware::Pairing::Plain, m.len())
-                    })
+                    .then(|| sources.lookup_for_vars(arch, qemu::firmware::Pairing::Plain, m.len()))
                     .and_then(Result::ok)
                     .map(|fw| fw.vars_template);
                 let record = super::vars_boot::read(&self.dirs.ovmf_vars_boot())?;

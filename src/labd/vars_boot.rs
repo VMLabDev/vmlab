@@ -136,7 +136,10 @@ mod tests {
         let said = refusal("dc01", &store, None, Some(&blank))
             .unwrap()
             .expect("the blank template is refused");
-        assert!(said.contains("dc01") && said.contains("setup mode"), "{said}");
+        assert!(
+            said.contains("dc01") && said.contains("setup mode"),
+            "{said}"
+        );
         // `secure_boot_keys = "setup"` asks for exactly that store.
         assert_eq!(refusal("dc01", &store, None, None).unwrap(), None);
 
