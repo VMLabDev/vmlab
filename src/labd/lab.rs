@@ -5429,6 +5429,37 @@ lab "t" {
         m
     }
 
+    #[tokio::test]
+    async fn a_cancelled_script_stops_without_a_host_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let result = crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    let i = 0
+    while i < 200000 { i = i + 1 }
+    lab.log("done")
+}
+"#
+            .into(),
+            "cancel.ws",
+            dir.path().to_path_buf(),
+            Some(crate::scripting::ScriptOwner::provision("box").cancelled_by(token)),
+            None,
+            Arc::new(move |line| {
+                let _ = output.send(line);
+            }),
+        )
+        .await;
+        assert!(lines.try_recv().is_err(), "cancelled script emitted output");
+        let err = result.expect_err("cancelled script completed");
+        assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
+    }
+
     const REBOOT_SCRIPT: &str = r#"use vmlab
 
 fn main(lab: Lab) {
