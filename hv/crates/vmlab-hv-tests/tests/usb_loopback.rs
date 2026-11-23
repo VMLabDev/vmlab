@@ -111,3 +111,86 @@ fn usb_loopback_over_virtual_hardware() {
     // Detaching hands the device back; the drop must not fail loudly.
     drop(host);
 }
+
+// usbdevfs ioctl numbers on a 64-bit Linux (`linux/usbdevice_fs.h`); the
+// device crate keeps its own private.
+const USBDEVFS_CLAIMINTERFACE: libc::c_ulong = 0x8004_550f;
+const USBDEVFS_RELEASEINTERFACE: libc::c_ulong = 0x8004_5510;
+const USBDEVFS_IOCTL: libc::c_ulong = 0xc010_5512;
+const USBDEVFS_DISCONNECT: libc::c_int = 0x5516;
+
+/// Claim or release interface 0 of an open usbdevfs file the plain way, as
+/// another vmlab-hv process or a libusb program holds it.
+fn usbfs_interface_zero(file: &std::fs::File, request: libc::c_ulong) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let interface: libc::c_uint = 0;
+    // SAFETY: both ioctls read one c_uint through the pointer, which is
+    // valid for the call; the return value is checked.
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), request, &interface) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Unbind the kernel driver of interface 0, if one is bound: the plain
+/// claim does not do that itself.
+fn usbfs_disconnect_interface_zero(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct UsbdevfsIoctl {
+        ifno: libc::c_int,
+        ioctl_code: libc::c_int,
+        data: *mut libc::c_void,
+    }
+    let disconnect = UsbdevfsIoctl {
+        ifno: 0,
+        ioctl_code: USBDEVFS_DISCONNECT,
+        data: std::ptr::null_mut(),
+    };
+    // SAFETY: the ioctl reads one `usbdevfs_ioctl` through the pointer,
+    // which is valid for the call. ENODATA (no driver bound) is expected,
+    // so the result is not checked; the claim after it is.
+    unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_IOCTL, &disconnect) };
+}
+
+/// Review usb.md F1: an open must not take the device from another usbdevfs
+/// user. The first claim is this test's own file; the kernel must refuse
+/// the second claim and leave the first one in place.
+#[test]
+#[cfg_attr(
+    vmlab_ci_no_host_assets,
+    ignore = "requires a configured dummy_hcd USB gadget"
+)]
+fn open_refuses_a_device_another_usbfs_user_holds() {
+    let Some((bus, devnum)) = virtual_gadget() else {
+        return;
+    };
+    let node = format!("/dev/bus/usb/{bus:03}/{devnum:03}");
+    let holder = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&node)
+    {
+        Ok(holder) => holder,
+        Err(e) => {
+            eprintln!("skipping: opening {node} failed: {e}");
+            return;
+        }
+    };
+    usbfs_disconnect_interface_zero(&holder);
+    usbfs_interface_zero(&holder, USBDEVFS_CLAIMINTERFACE)
+        .expect("the first claim of interface 0 through usbfs");
+
+    let error = match HostUsbDevice::open("usbhost-second", bus as u16, devnum as u16) {
+        Ok(_) => panic!("the open took a device another usbfs user holds"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("claiming interface 0 failed"), "{error}");
+    assert!(error.contains("held by another program"), "{error}");
+
+    // The first claim is still in place: releasing it succeeds. Had the
+    // open taken the interface, the kernel would answer EINVAL here.
+    usbfs_interface_zero(&holder, USBDEVFS_RELEASEINTERFACE)
+        .expect("the first claim survived the refused open");
+}
