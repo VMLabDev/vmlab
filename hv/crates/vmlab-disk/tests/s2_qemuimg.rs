@@ -1109,6 +1109,31 @@ fn a_write_to_a_cluster_qemu_zeroed_in_place_reads_back() {
     qemu_check(&path);
 }
 
+/// F7 of docs/reviews/vmlab-disk.md: QEMU writes only the compressed bytes,
+/// so a compressed cluster that is the last thing in the file can end inside
+/// its last sector. The missing bytes of that sector read as zeros.
+#[test]
+fn a_compressed_cluster_at_the_end_of_the_file_reads() {
+    require_qemu_img!();
+    let temp = tmpdir("compressed-at-end");
+    let path = temp.path().join("b.qcow2");
+    let cluster = 64 * 1024;
+    qemu_img(&["create", "-f", "qcow2", path.to_str().unwrap(), "64M"]);
+    qemu_io(&[
+        "-f",
+        "qcow2",
+        "-c",
+        "write -c -P 3 0 64k",
+        path.to_str().unwrap(),
+    ]);
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert_ne!(len % 512, 0, "the file must end inside a sector, it is {len} bytes");
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, true).unwrap();
+    let mut buf = vec![0u8; cluster];
+    image.read_at(0, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 3), "the cluster does not read as 0x03");
+}
+
 /// Text like `base64 /dev/urandom`: it compresses to about three quarters,
 /// so the compressed clusters start at many sector offsets.
 fn base64_like(len: usize, seed: u64) -> Vec<u8> {
