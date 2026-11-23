@@ -1,0 +1,304 @@
+Subject: [PATCH] d3d10umd: draw B8G8R8X8 elements and indexed draws without an index buffer
+
+Three Direct3D 11 draws were dropped, and the driver marked the device as
+removed at the next draw (GitHub #328). Wine's d3d11 test makes all three
+(test_vertex_formats, test_index_buffer_offset) and releases the device
+without another call, so its rows did not show it. What each did, and what
+it does now:
+
+- An input element of the format B8G8R8X8_UNORM. CreateElementLayout
+  stored PIPE_FORMAT_B8G8R8X8_UNORM in pipe_vertex_element::src_format,
+  which has 8 bits, for the vertex formats up to PIPE_FORMAT_VERTEX_END.
+  The value was cut to 26, another format, for which the Yttrium vertex
+  input has no Vulkan format, so every draw with that layout was dropped
+  and the next draw set E_FAIL. A mapping for B8G8R8X8 in the Yttrium
+  table therefore changed nothing. The element is fetched as
+  B8G8R8A8_UNORM now: Direct3D leaves the fourth component of an X8
+  element undefined. Any other format above PIPE_FORMAT_VERTEX_END leaves
+  its element unbound and is named in the error log, instead of being cut
+  to another format.
+- DrawIndexed and DrawIndexedInstanced with no index buffer bound. The
+  frontend made an index buffer of zeros for the one draw. The Yttrium
+  native draw reads the index bounds from a buffer's CPU copy, and that
+  buffer has none, so the draw was dropped and the next draw set E_FAIL.
+  The zeros are passed as user indices now, which the native draw uploads
+  with the draw.
+- DrawIndexedInstancedIndirect with no index buffer bound set
+  E_INVALIDARG, which removes the device. Direct3D allows the draw. It
+  reads the arguments from the buffer now and goes on as
+  DrawIndexedInstanced with zero indices. When the arguments cannot be
+  mapped, the draw is skipped with a line in the error log and no error
+  is set.
+
+Evidence: docs/acceptance/C328.md, tests/e2e/adapter/probes/draws_probe.cpp.
+Origin: GitHub VMLabDev/vmlab#328 (card #328).
+---
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+index a206563..5fee424 100644
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -227,28 +227,31 @@ ResolveState(D3D10DDI_HDEVICE hDevice)
+ }
+ 
+ 
+-static struct pipe_resource *
+-create_null_index_buffer(struct pipe_context *ctx, uint num_indices,
+-                         unsigned *restart_index, unsigned *index_size,
+-                         unsigned *ib_offset)
++/*
++ * An indexed draw with no index buffer bound reads every index as zero.
++ * The indices are passed as user indices: a buffer made here for one draw
++ * has no CPU copy that the Yttrium native draw can read its index bounds
++ * from, so the draw was dropped and the next draw removed the device.
++ * Returns NULL when there is nothing to draw or no memory; the caller then
++ * skips the draw and sets no error.
++ */
++static unsigned *
++create_null_indices(unsigned num_indices, unsigned *restart_index,
++                    unsigned *index_size, unsigned *ib_offset)
+ {
+-   unsigned buf_size = num_indices * sizeof(unsigned);
+-   unsigned *buf = (unsigned*)MALLOC(buf_size);
+-   struct pipe_resource *ibuf;
+-
+-   memset(buf, 0, buf_size);
++   unsigned *indices = num_indices ?
++      (unsigned *)CALLOC(num_indices, sizeof(unsigned)) : NULL;
+ 
+-   ibuf = pipe_buffer_create_with_data(ctx,
+-                                       PIPE_BIND_INDEX_BUFFER,
+-                                       PIPE_USAGE_IMMUTABLE,
+-                                       buf_size, buf);
++   if (!indices && num_indices) {
++      YTTRIUM_WARN("yttrium: draw skipped owner=d3d10umd "
++                   "component=DrawIndexed reason=no_memory_for_null_indices "
++                   "indices=%u action=skip-draw\n", num_indices);
++   }
+    *index_size = 4;
+    *restart_index = 0xffffffff;
+    *ib_offset = 0;
+ 
+-   FREE(buf);
+-
+-   return ibuf;
++   return indices;
+ }
+ 
+ /*
+@@ -309,7 +312,7 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
+    Device *pDevice = CastDevice(hDevice);
+    struct pipe_draw_info info;
+    struct pipe_draw_start_count_bias draw;
+-   struct pipe_resource *null_ib = NULL;
++   unsigned *null_indices = NULL;
+    unsigned restart_index = pDevice->restart_index;
+    unsigned index_size = pDevice->index_size;
+    unsigned ib_offset = pDevice->ib_offset;
+@@ -318,31 +321,34 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
+       return;
+    assert(pDevice->primitive < MESA_PRIM_COUNT);
+ 
+-   /* XXX I don't think draw still needs this? */
+    if (!pDevice->index_buffer) {
+-      null_ib =
+-         create_null_index_buffer(pDevice->pipe,
+-                                  StartIndexLocation + IndexCount,
+-                                  &restart_index, &index_size, &ib_offset);
++      null_indices = create_null_indices(IndexCount, &restart_index,
++                                         &index_size, &ib_offset);
++      if (!null_indices)
++         return;
+    }
+ 
+    if (!ResolveState(hDevice)) {
+-      if (null_ib)
+-         pipe_resource_reference(&null_ib, NULL);
++      FREE(null_indices);
+       return;
+    }
+    if (RunPixelShaderEmulation(pDevice)) {
+-      if (null_ib)
+-         pipe_resource_reference(&null_ib, NULL);
++      FREE(null_indices);
+       return;
+    }
+ 
+    util_draw_init_info(&info);
+    info.index_size = index_size;
+    info.mode = pDevice->primitive;
+-   draw.start = ClampedUAdd(StartIndexLocation, ib_offset / index_size);
+    draw.count = IndexCount;
+-   info.index.resource = null_ib ? null_ib : pDevice->index_buffer;
++   if (null_indices) {
++      draw.start = 0;
++      info.has_user_indices = true;
++      info.index.user = null_indices;
++   } else {
++      draw.start = ClampedUAdd(StartIndexLocation, ib_offset / index_size);
++      info.index.resource = pDevice->index_buffer;
++   }
+    draw.index_bias = BaseVertexLocation;
+    info.primitive_restart = true;
+    info.restart_index = restart_index;
+@@ -350,9 +356,7 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
+    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
+    (void)ConsumeBackendDrawFailure(hDevice);
+ 
+-   if (null_ib) {
+-      pipe_resource_reference(&null_ib, NULL);
+-   }
++   FREE(null_indices);
+ }
+ 
+ 
+@@ -424,7 +428,7 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
+    Device *pDevice = CastDevice(hDevice);
+    struct pipe_draw_info info;
+    struct pipe_draw_start_count_bias draw;
+-   struct pipe_resource *null_ib = NULL;
++   unsigned *null_indices = NULL;
+    unsigned restart_index = pDevice->restart_index;
+    unsigned index_size = pDevice->index_size;
+    unsigned ib_offset = pDevice->ib_offset;
+@@ -437,31 +441,35 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
+       return;
+    }
+ 
+-   /* XXX I don't think draw still needs this? */
+    if (!pDevice->index_buffer) {
+-      null_ib =
+-         create_null_index_buffer(pDevice->pipe,
+-                                  StartIndexLocation + IndexCountPerInstance,
+-                                  &restart_index, &index_size, &ib_offset);
++      null_indices = create_null_indices(IndexCountPerInstance,
++                                         &restart_index, &index_size,
++                                         &ib_offset);
++      if (!null_indices)
++         return;
+    }
+ 
+    if (!ResolveState(hDevice)) {
+-      if (null_ib)
+-         pipe_resource_reference(&null_ib, NULL);
++      FREE(null_indices);
+       return;
+    }
+    if (RunPixelShaderEmulation(pDevice)) {
+-      if (null_ib)
+-         pipe_resource_reference(&null_ib, NULL);
++      FREE(null_indices);
+       return;
+    }
+ 
+    util_draw_init_info(&info);
+    info.index_size = index_size;
+    info.mode = pDevice->primitive;
+-   draw.start = ClampedUAdd(StartIndexLocation, ib_offset / index_size);
+    draw.count = IndexCountPerInstance;
+-   info.index.resource = null_ib ? null_ib : pDevice->index_buffer;
++   if (null_indices) {
++      draw.start = 0;
++      info.has_user_indices = true;
++      info.index.user = null_indices;
++   } else {
++      draw.start = ClampedUAdd(StartIndexLocation, ib_offset / index_size);
++      info.index.resource = pDevice->index_buffer;
++   }
+    draw.index_bias = BaseVertexLocation;
+    info.start_instance = StartInstanceLocation;
+    info.instance_count = InstanceCount;
+@@ -471,9 +479,7 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
+    pDevice->pipe->draw_vbo(pDevice->pipe, &info, 0, NULL, &draw, 1);
+    (void)ConsumeBackendDrawFailure(hDevice);
+ 
+-   if (null_ib) {
+-      pipe_resource_reference(&null_ib, NULL);
+-   }
++   FREE(null_indices);
+ }
+ 
+ static void
+@@ -492,9 +498,9 @@ DrawIndirect(D3D10DDI_HDEVICE hDevice,
+        (AlignedByteOffsetForArgs & 3) ||
+        AlignedByteOffsetForArgs > pArgs->resource->width0 ||
+        args_size > pArgs->resource->width0 - AlignedByteOffsetForArgs ||
+-       (indexed && (!pDevice->index_buffer ||
+-                    (pDevice->index_size != 2 && pDevice->index_size != 4) ||
+-                    pDevice->ib_offset % pDevice->index_size))) {
++       (indexed && pDevice->index_buffer &&
++        ((pDevice->index_size != 2 && pDevice->index_size != 4) ||
++         pDevice->ib_offset % pDevice->index_size))) {
+       YTTRIUM_WARN("yttrium: draw failed owner=d3d10umd "
+                    "component=DrawIndirect reason=invalid_buffer_or_offset "
+                    "indexed=%u offset=%u action=SetError\n",
+@@ -503,6 +509,32 @@ DrawIndirect(D3D10DDI_HDEVICE hDevice,
+       return;
+    }
+ 
++   if (indexed && !pDevice->index_buffer) {
++      /* No index buffer is bound, which Direct3D allows: every index reads
++       * as zero.  The zero indices are made on the CPU for the count in the
++       * arguments, so the arguments are read here and the draw goes on as
++       * DrawIndexedInstanced.  Setting an error for it removed the device.
++       */
++      UINT args[5];
++      struct pipe_transfer *transfer = NULL;
++      void *map = pipe_buffer_map_range(pDevice->pipe, pArgs->resource,
++                                        AlignedByteOffsetForArgs, args_size,
++                                        PIPE_MAP_READ, &transfer);
++      if (!map) {
++         YTTRIUM_WARN("yttrium: draw skipped owner=d3d10umd "
++                      "component=DrawIndirect "
++                      "reason=no_index_buffer_and_arguments_unreadable "
++                      "offset=%u action=skip-draw\n",
++                      AlignedByteOffsetForArgs);
++         return;
++      }
++      memcpy(args, map, sizeof args);
++      pipe_buffer_unmap(pDevice->pipe, transfer);
++      DrawIndexedInstanced(hDevice, args[0], args[1], args[2],
++                           (INT)args[3], args[4]);
++      return;
++   }
++
+    if (!ResolveState(hDevice))
+       return;
+ 
+diff --git a/src/gallium/frontends/d3d10umd/InputAssembly.cpp b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+index 833be9c..f658186 100644
+--- a/src/gallium/frontends/d3d10umd/InputAssembly.cpp
++++ b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+@@ -36,6 +36,8 @@
+ #include "InputAssembly.h"
+ #include "State.h"
+ 
++#include "gallium/winsys/yttrium/gdi/yttrium_trace.h"
++
+ #include "Debug.h"
+ #include "Format.h"
+ 
+@@ -343,7 +345,23 @@ CreateElementLayout(
+ 
+       ve->src_offset          = pVertexElement->AlignedByteOffset;
+       ve->vertex_buffer_index = pVertexElement->InputSlot;
+-      ve->src_format          = FormatTranslate(pVertexElement->Format, false);
++      enum pipe_format format = FormatTranslate(pVertexElement->Format, false);
++      /* pipe_vertex_element::src_format has 8 bits: it holds a vertex
++       * format, and those end at PIPE_FORMAT_VERTEX_END.  A format above
++       * that was cut to its low 8 bits, which name another format, and the
++       * draw was dropped.  B8G8R8X8_UNORM is the one such format Direct3D
++       * takes in an input layout.  The fourth component of an X8 element is
++       * undefined, so it is fetched as B8G8R8A8_UNORM.
++       */
++      if (format == PIPE_FORMAT_B8G8R8X8_UNORM)
++         format = PIPE_FORMAT_B8G8R8A8_UNORM;
++      if (format > PIPE_FORMAT_VERTEX_END) {
++         YTTRIUM_WARN("yttrium: ERROR input element format is not a vertex format owner=d3d10umd component=CreateElementLayout register=%u dxgi_format=%u pipe_format=%u action=leave-element-unbound\n",
++                      pVertexElement->InputRegister,
++                      (unsigned)pVertexElement->Format, (unsigned)format);
++         format = PIPE_FORMAT_NONE;
++      }
++      ve->src_format          = format;
+ 
+       switch (pVertexElement->InputSlotClass) {
+       case D3D10_DDI_INPUT_PER_VERTEX_DATA:

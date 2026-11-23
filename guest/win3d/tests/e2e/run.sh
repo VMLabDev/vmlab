@@ -175,6 +175,7 @@ lab_up() {
     # Record the selected host GPU and hypervisor.
     in_lab vmlab status -v >"$EV/status-v.txt" 2>&1 || true
     qemu_log_lines
+    render_server
     wait_agent || return 1
     in_lab vmlab osinfo "$VM" >"$EV/osinfo.json" 2>&1 || true
     activate
@@ -200,6 +201,31 @@ qemu_log_lines() {
         grep -aE '^vmlab: (argv|env):' "$QLOG"
         grep -aE 'vmlab-pci-filter:' "$QLOG" | sort | uniq -c | sed 's/^ *\([0-9]*\) \(.*\)/\2  (x\1)/'
     } >"$EV/qemu-argv-env.txt"
+}
+
+render_server() {
+    # Which Venus render server the VM's vmlab-hv started. The bundle's launcher
+    # (bin/vmlab-hv) selects the bundle's own, beside the binary in libexec/, which
+    # has patches/virglrenderer. A vmlab-hv run without the launcher starts
+    # virglrenderer's build-time server, the distribution's: on NVIDIA that one
+    # signals every Venus fence up to 10 ms late, and a vsynced present runs at
+    # about 44 frames per second instead of 60 (docs/acceptance/C325.md).
+    local pid exe child server=
+    pid=$(pgrep -f "vmlab-hv --machine .*/labs/$LAB/vms/$VM/" | head -1)
+    [ -n "$pid" ] || return 0
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    for child in $(pgrep -P "$pid"); do
+        case $(readlink "/proc/$child/exe" 2>/dev/null) in
+            */virgl_render_server) server=$(readlink "/proc/$child/exe") ;;
+        esac
+    done
+    {
+        echo "vmlab-hv: ${exe:-unknown}"
+        echo "render server: ${server:-none found}"
+    } >"$EV/render-server.txt"
+    [ -n "$exe" ] && [ -n "$server" ] || return 0
+    [ "$(dirname "$server")" = "$(dirname "$exe")" ] ||
+        note "WARNING: vmlab-hv ($exe) started the render server $server, not its bundle's; NVIDIA present rates will be low (docs/acceptance/C325.md)"
 }
 
 prepare_guest() {

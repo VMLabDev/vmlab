@@ -32,7 +32,7 @@ use crate::net::dhcp::DhcpConfig;
 use crate::net::dns::DnsZone;
 use crate::net::framing::{read_frame, write_frame};
 use crate::net::gateway::{Gateway, GatewayConfig, GatewayHandle, gateway_mac};
-use crate::net::switch::{ChannelPort, PortClass, Switch};
+use crate::net::switch::{ChannelPort, PortClass, PortId, Switch};
 use crate::proto::Event;
 use crate::proto::vocab::GlobalMember;
 
@@ -55,6 +55,60 @@ const JITTER_MS: u32 = 2000;
 #[cfg(test)]
 const JITTER_MS: u32 = 100;
 
+/// How many connections the trunk listener holds that have not finished the
+/// handshake. A connection costs a descriptor and a task for up to
+/// `trunk_auth::TIMEOUT` before its peer has proved anything, and the
+/// listener is open to every host that reaches the port
+/// (docs/reviews/networking.md F11). A real peer dials once per segment and
+/// finishes in milliseconds, and it dials again after `REDIAL_DELAY` when it
+/// is refused.
+const PREAUTH_MAX: usize = 32;
+/// The share of [`PREAUTH_MAX`] one remote address may hold, so that one
+/// address cannot shut the others out.
+const PREAUTH_MAX_PER_ADDR: usize = 8;
+
+/// The connections the trunk listener holds before authentication, counted
+/// per remote address.
+#[derive(Default)]
+struct PreAuth {
+    held: std::sync::Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PreAuth {
+    /// A slot for a new connection from `ip`, or `None` when the address or
+    /// the listener holds its limit: the caller drops the connection.
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthSlot> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = held.get(&ip).copied().unwrap_or(0);
+        if mine >= PREAUTH_MAX_PER_ADDR || held.values().sum::<usize>() >= PREAUTH_MAX {
+            return None;
+        }
+        held.insert(ip, mine + 1);
+        Some(PreAuthSlot {
+            table: self.clone(),
+            ip,
+        })
+    }
+}
+
+/// One held connection. Dropping it gives the slot back.
+struct PreAuthSlot {
+    table: Arc<PreAuth>,
+    ip: IpAddr,
+}
+
+impl Drop for PreAuthSlot {
+    fn drop(&mut self) {
+        let mut held = self.table.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// One cross-host trunk slot.
 enum TrunkState {
     /// Our dialer is mid-handshake to this IP.
@@ -64,8 +118,8 @@ enum TrunkState {
         direction: &'static str, // "dial" | "accept"
         addr: SocketAddr,
         since: chrono::DateTime<chrono::Utc>,
-        /// Abort handle for an inbound bridge (dial bridges are owned by the
-        /// dialer loop, which aborts with the dialer task itself).
+        /// Abort handle for an inbound bridge. Outbound bridges run in the
+        /// dialer task and are dropped when that task is aborted.
         task: Option<tokio::task::AbortHandle>,
     },
 }
@@ -399,13 +453,52 @@ struct GlobalSeg {
     /// Keeps the zone following the leases.
     dns_sync: tokio::task::JoinHandle<()>,
     subnet: Ipv4Net,
-    refcount: usize,
+    /// Who holds the segment (docs/reviews/lab-lifecycle.md F8). A lab is
+    /// one reference however often it attaches, and only a lab that holds
+    /// one can give it back.
+    holders: Holders,
     sock: PathBuf,
     listener: tokio::task::JoinHandle<()>,
     /// Outbound dialer loop (present once some attach declared `connect`).
     dialer: Option<tokio::task::JoinHandle<()>>,
     /// Cross-host trunk slots (dialer + inbound accepts + list()).
     trunks: Arc<TrunkTable>,
+}
+
+/// The references a global segment counts: each attached lab by name, and
+/// the anonymous ones (inbound cross-host trunks, a caller naming no lab).
+#[derive(Default)]
+struct Holders {
+    labs: std::collections::BTreeSet<String>,
+    anonymous: usize,
+}
+
+impl Holders {
+    fn take(&mut self, lab: Option<&str>) {
+        match lab {
+            Some(lab) => {
+                self.labs.insert(lab.to_string());
+            }
+            None => self.anonymous += 1,
+        }
+    }
+
+    /// Give back `lab`'s reference, or one anonymous one. Returns false
+    /// when `lab` holds none, and nothing changes.
+    fn give_back(&mut self, lab: Option<&str>) -> bool {
+        match lab {
+            Some(lab) => self.labs.remove(lab),
+            None if self.anonymous > 0 => {
+                self.anonymous -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.labs.len() + self.anonymous
+    }
 }
 
 impl GlobalSeg {
@@ -493,12 +586,12 @@ impl GlobalSegments {
             crate::paths::runtime_dir().join("global"),
             host.dns_suffix.clone(),
             host.upstream_resolver(),
-            host.psk.clone(),
+            host.psk.as_ref().map(|psk| psk.expose().to_string()),
             events,
         )
     }
 
-    fn new_at(
+    pub(crate) fn new_at(
         sock_dir: PathBuf,
         dns_suffix: String,
         upstream_dns: Option<SocketAddr>,
@@ -516,24 +609,10 @@ impl GlobalSegments {
         })
     }
 
-    async fn alloc_subnet(&self, declared: Option<Ipv4Net>) -> Result<Ipv4Net> {
-        if let Some(d) = declared {
-            return Ok(d);
-        }
-        let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
-        let mut idx = self.next_index.lock().await;
-        let subnet = pool
-            .subnets(24)
-            .expect("pool splits")
-            .nth(*idx as usize)
-            .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?;
-        *idx += 1;
-        Ok(subnet)
-    }
-
     /// Attach to (creating if needed) the global segment `name`. Returns the
-    /// unix socket the caller's lab daemon connects its trunk to, and the
-    /// warnings that lab should show (see [`Directory::admit`]).
+    /// unix socket the caller's lab daemon connects its trunk to, the
+    /// warnings that lab should show (see [`Directory::admit`]) and the
+    /// segment's subnet, which the lab names again when it re-attaches (F9).
     ///
     /// `lab` is the attaching lab and the NICs it puts on the segment; their
     /// names join the segment's DNS, and their static addresses its DHCP
@@ -545,17 +624,20 @@ impl GlobalSegments {
         subnet: Option<Ipv4Net>,
         peer: Option<String>,
         lab: Option<Joining>,
-    ) -> Result<(PathBuf, Vec<String>)> {
+    ) -> Result<(PathBuf, Vec<String>, Ipv4Net)> {
+        check_segment_name(name)?;
+        let peer = peer
+            .map(|peer| self.require_psk().map(|psk| (peer, psk)))
+            .transpose()?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
-            seg.refcount += 1;
+            seg.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
             let warnings = seg.join(name, lab);
             // A later lab may be the one declaring `connect` — start the
             // dialer on an already-existing segment too.
-            if let Some(peer) = peer
+            if let Some((peer, psk)) = peer
                 && seg.dialer.is_none()
             {
-                let psk = self.require_psk()?;
                 seg.dialer = Some(spawn_tcp_peer_dialer(
                     seg.switch.clone(),
                     peer,
@@ -563,12 +645,41 @@ impl GlobalSegments {
                     seg.trunks.clone(),
                 ));
             }
-            return Ok((seg.sock.clone(), warnings));
+            return Ok((seg.sock.clone(), warnings, seg.subnet));
         }
 
-        let subnet = self.alloc_subnet(subnet).await?;
-        let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
+        let mut next_index = self.next_index.lock().await;
+        let automatic_subnet = subnet.is_none();
+        // A subnet named explicitly may be one this pool handed out before:
+        // an adopted lab re-attaching after a supervisor restart (F9) names
+        // the subnet its guests hold leases in. Allocate past it.
+        let pool_index = subnet.and_then(pool_index);
+        let subnet = match subnet {
+            Some(subnet) => subnet,
+            None => {
+                let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
+                pool.subnets(24)
+                    .expect("pool splits")
+                    .nth(*next_index as usize)
+                    .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?
+            }
+        };
+        std::fs::create_dir_all(&self.sock_dir)?;
+        let sock = self.sock_dir.join(format!("{name}.sock"));
         let switch = Switch::new(format!("global/{name}"));
+        let listener = switch
+            .listen_unix(&sock, PortClass::Service)
+            .await
+            .with_context(|| format!("listening on {}", sock.display()))?;
+
+        // Commit the allocation only after the last fallible setup step.
+        if automatic_subnet {
+            *next_index += 1;
+        } else if let Some(index) = pool_index {
+            *next_index = (*next_index).max(index + 1);
+        }
+
+        let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
         let gw_mac = gateway_mac("__global", name);
 
         let mut dhcp = DhcpConfig::new(subnet, gw_ip, gw_mac);
@@ -591,24 +702,9 @@ impl GlobalSegments {
         let directory: Arc<std::sync::Mutex<Directory>> = Arc::default();
         let dns_sync = spawn_dns_sync(&gateway, directory.clone());
 
-        std::fs::create_dir_all(&self.sock_dir)?;
-        let sock = self.sock_dir.join(format!("{name}.sock"));
-        let listener = switch
-            .listen_unix(&sock, PortClass::Service)
-            .await
-            .with_context(|| format!("listening on {}", sock.display()))?;
-
         let trunks = TrunkTable::new(name, self.events.clone());
-        let mut dialer = None;
-        if let Some(peer) = peer {
-            let psk = self.require_psk()?;
-            dialer = Some(spawn_tcp_peer_dialer(
-                switch.clone(),
-                peer,
-                psk,
-                trunks.clone(),
-            ));
-        }
+        let dialer = peer
+            .map(|(peer, psk)| spawn_tcp_peer_dialer(switch.clone(), peer, psk, trunks.clone()));
 
         let seg = GlobalSeg {
             switch,
@@ -616,7 +712,11 @@ impl GlobalSegments {
             directory,
             dns_sync,
             subnet,
-            refcount: 1,
+            holders: {
+                let mut holders = Holders::default();
+                holders.take(lab.as_ref().map(|j| j.lab.as_str()));
+                holders
+            },
             sock: sock.clone(),
             listener,
             dialer,
@@ -625,7 +725,7 @@ impl GlobalSegments {
         let warnings = seg.join(name, lab);
         segs.insert(name.to_string(), seg);
         tracing::info!("global segment \"{name}\" created on {subnet}");
-        Ok((sock, warnings))
+        Ok((sock, warnings, subnet))
     }
 
     fn require_psk(&self) -> Result<String> {
@@ -634,14 +734,21 @@ impl GlobalSegments {
             .ok_or_else(|| anyhow::anyhow!("cross-host segment needs a `psk` in host config"))
     }
 
-    /// Detach; destroys the segment when the last lab leaves. `lab`'s names
-    /// leave the segment's DNS with it.
+    /// Detach; destroys the segment when the last reference goes. `lab`'s
+    /// names leave the segment's DNS with it. A lab that holds no reference
+    /// changes nothing: it cannot take the segment from the labs on it.
     pub async fn detach(self: &Arc<Self>, name: &str, lab: Option<&str>) {
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
+            if !seg.holders.give_back(lab) {
+                tracing::debug!(
+                    "global segment \"{name}\": {} holds no reference to give back",
+                    lab.unwrap_or("an anonymous caller")
+                );
+                return;
+            }
             seg.leave(lab);
-            seg.refcount = seg.refcount.saturating_sub(1);
-            if seg.refcount == 0
+            if seg.holders.count() == 0
                 && let Some(seg) = segs.remove(name)
             {
                 seg.listener.abort();
@@ -656,7 +763,8 @@ impl GlobalSegments {
         }
     }
 
-    /// Segment inventory for `global.list`: name, subnet, refcount, and the
+    /// Segment inventory for `global.list`: name, subnet, refcount, the
+    /// labs attached, and the
     /// live cross-host trunk state (drives the web UI's peer LED).
     pub async fn list(&self) -> Vec<serde_json::Value> {
         self.segs
@@ -667,7 +775,8 @@ impl GlobalSegments {
                 json!({
                     "name": n,
                     "subnet": s.subnet.to_string(),
-                    "refcount": s.refcount,
+                    "refcount": s.holders.count(),
+                    "labs": s.holders.labs.iter().collect::<Vec<_>>(),
                     "mtu": s.directory.lock().expect("global directory").mtu(),
                     "peer_connected": s.trunks.connected(),
                     "peers": s.trunks.peers_json(),
@@ -706,7 +815,7 @@ impl GlobalSegments {
             (seg.switch.clone(), seg.trunks.clone())
         };
         tune_trunk_socket(&stream);
-        let bridge = bridge_tcp_to_switch(switch, stream);
+        let bridge = tokio::spawn(bridge_tcp_to_switch(switch, stream));
         if !trunks.try_reserve_accept(remote, bridge.abort_handle()) {
             bridge.abort();
             self.detach(name, None).await;
@@ -725,38 +834,46 @@ impl GlobalSegments {
     }
 }
 
-/// Bridge a TCP stream (cross-host trunk) onto a switch via a channel port:
-/// frames from the switch are written to TCP; frames from TCP are injected.
-/// The returned handle completes when the trunk dies (read EOF/error), after
-/// the port has been removed from the switch.
+struct TrunkPort {
+    switch: Arc<Switch>,
+    id: PortId,
+}
+
+impl Drop for TrunkPort {
+    fn drop(&mut self) {
+        self.switch.remove_port(self.id);
+    }
+}
+
+/// Bridge a TCP stream onto a switch. Both directions and the port belong to
+/// the returned future, so dropping it closes the trunk and removes the port.
 fn bridge_tcp_to_switch(
     switch: Arc<Switch>,
-    stream: tokio::net::TcpStream,
-) -> tokio::task::JoinHandle<()> {
+    mut stream: tokio::net::TcpStream,
+) -> impl Future<Output = ()> {
     let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Service);
-    let (read_half, write_half) = stream.into_split();
+    let port = TrunkPort { switch, id };
 
-    // Switch → TCP.
-    let mut write_half = write_half;
-    tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if write_frame(&mut write_half, &frame).await.is_err() {
-                break;
-            }
+    async move {
+        let _port = port;
+        let (mut read_half, mut write_half) = stream.split();
+        tokio::select! {
+            () = async {
+                while let Some(frame) = rx.recv().await {
+                    if write_frame(&mut write_half, &frame).await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+            () = async {
+                while let Ok(Some(frame)) = read_frame(&mut read_half).await {
+                    if tx.try_send(frame).is_err() {
+                        tracing::debug!("global trunk ingress queue full");
+                    }
+                }
+            } => {}
         }
-    });
-
-    // TCP → switch; owns the trunk lifetime.
-    let sw = switch.clone();
-    tokio::spawn(async move {
-        let mut read_half = read_half;
-        while let Ok(Some(frame)) = read_frame(&mut read_half).await {
-            if tx.try_send(frame).is_err() {
-                tracing::debug!("global trunk ingress queue full");
-            }
-        }
-        sw.remove_port(id);
-    })
+    }
 }
 
 /// Keepalive-tune a trunk socket so a silently dead peer surfaces as a read
@@ -837,7 +954,7 @@ fn spawn_tcp_peer_dialer(
                     let bridge = bridge_tcp_to_switch(switch.clone(), stream);
                     trunks.activate_dial(addr);
                     // Wait for the bridge to die, then loop around to redial.
-                    let _ = bridge.await;
+                    bridge.await;
                     trunks.clear(addr.ip());
                 }
                 Err(e) => {
@@ -851,6 +968,31 @@ fn spawn_tcp_peer_dialer(
             tokio::time::sleep(REDIAL_DELAY + dial_jitter()).await;
         }
     })
+}
+
+/// Refuse a global segment name that is not one file name. The name becomes
+/// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
+/// sends its own: a separator, `..` or an absolute path would aim that at
+/// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
+/// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
+/// refused here.
+/// Where `subnet` sits among the automatic pool's /24s, if it is one.
+fn pool_index(subnet: Ipv4Net) -> Option<u32> {
+    let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
+    (subnet.prefix_len() == 24 && pool.contains(&subnet))
+        .then(|| (u32::from(subnet.network()) - u32::from(pool.network())) >> 8)
+}
+
+fn check_segment_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| c == '/' || c.is_control());
+    if !ok {
+        bail!("invalid global segment name {name:?}");
+    }
+    Ok(())
 }
 
 /// A global segment's name as a DNS domain label. A worktree lab's global
@@ -899,8 +1041,23 @@ pub async fn bind_peer_listener(
     let addr = listener.local_addr()?;
     tracing::info!("cross-host trunk listener on {addr}");
     let handle = tokio::spawn(async move {
+        let preauth = Arc::new(PreAuth::default());
+        let mut errors = crate::net::accept::AcceptErrors::default();
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+            let (mut stream, remote) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    errors.failed("cross-host trunk listener", &e).await;
+                    continue;
+                }
+            };
+            errors.accepted();
+            // Past the limit the connection is closed here, before it gets a
+            // task or a greeting.
+            let Some(slot) = preauth.admit(remote.ip()) else {
+                tracing::debug!(
+                    "trunk listener: too many unauthenticated connections, {remote} dropped"
+                );
                 continue;
             };
             let globals = globals.clone();
@@ -915,6 +1072,14 @@ pub async fn bind_peer_listener(
                 else {
                     return;
                 };
+                // The peer holds the PSK: it no longer counts.
+                drop(slot);
+                // The peer chose this name, and it names a socket file.
+                if let Err(e) = check_segment_name(&segment) {
+                    tracing::warn!("refusing a peer trunk: {e:#}");
+                    let _ = stream.write_all(b"NO\n").await;
+                    return;
+                }
                 // Single-slot rule: refuse up front when a trunk to/from this
                 // host already exists (mutual connect, duplicate dial). The
                 // atomic reserve inside accept_peer catches the race window.
@@ -949,6 +1114,119 @@ mod tests {
     use crate::net::framing::{read_frame, write_frame};
     use bytes::Bytes;
     use tokio::time::{Duration, sleep, timeout};
+
+    fn globals_without_psk(sock_dir: PathBuf) -> Arc<GlobalSegments> {
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        GlobalSegments::new_at(sock_dir, "test.internal".into(), None, None, events)
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        globals.attach("wan", None, None, None).await.unwrap();
+        let lab = joining("refused", None, vec![member("vm", 1, None)]);
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), Some(lab))
+                .await
+                .is_err()
+        );
+        globals.detach("wan", None).await;
+        assert!(
+            globals.list().await.is_empty(),
+            "refused attach added a reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_on_new_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_dir = dir.path().join("global");
+        let globals = globals_without_psk(sock_dir.clone());
+        assert!(
+            globals
+                .attach("wan", None, Some("127.0.0.1:1".into()), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !sock_dir.join("wan.sock").exists(),
+            "refused attach left a socket"
+        );
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_leaves_nothing_when_socket_setup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("wan.sock");
+        std::fs::create_dir(&socket).unwrap();
+        let globals = globals_without_psk(dir.path().to_path_buf());
+        assert!(globals.attach("wan", None, None, None).await.is_err());
+        assert!(globals.list().await.is_empty());
+        assert_eq!(*globals.next_index.lock().await, 0);
+
+        std::fs::remove_dir(socket).unwrap();
+        globals.attach("wan", None, None, None).await.unwrap();
+        globals.detach("wan", None).await;
+    }
+
+    /// F8 (docs/reviews/lab-lifecycle.md): a lab that never attached gives
+    /// back nothing, so the segment stays for the lab that is on it.
+    #[tokio::test]
+    async fn a_lab_that_never_attached_cannot_destroy_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let b = joining("b", None, vec![member("vm", 1, None)]);
+        globals.attach("corp", None, None, Some(b)).await.unwrap();
+        globals.detach("corp", Some("a")).await;
+        let list = globals.list().await;
+        assert_eq!(list.len(), 1, "lab a destroyed lab b's segment");
+        assert_eq!(list[0]["name"], "corp");
+        assert_eq!(list[0]["refcount"], 1);
+        assert_eq!(list[0]["labs"], json!(["b"]));
+    }
+
+    /// F8: a lab that attaches again (a restarted lab daemon, an adopted lab
+    /// re-attaching) still holds one reference, and its one detach frees it.
+    #[tokio::test]
+    async fn a_second_attach_by_one_lab_is_one_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        for _ in 0..2 {
+            let a = joining("a", None, vec![member("vm", 1, None)]);
+            globals.attach("corp", None, None, Some(a)).await.unwrap();
+        }
+        globals.detach("corp", Some("a")).await;
+        assert!(globals.list().await.is_empty(), "the segment leaked");
+    }
+
+    /// F9: a lab re-attaching with the subnet it was given keeps it, and the
+    /// next automatic allocation does not hand that subnet out again.
+    #[tokio::test]
+    async fn a_reattached_pool_subnet_is_not_allocated_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let held: Ipv4Net = "10.214.0.0/24".parse().unwrap();
+        let a = joining("a", None, Vec::new());
+        globals
+            .attach("corp", Some(held), None, Some(a))
+            .await
+            .unwrap();
+        let b = joining("b", None, Vec::new());
+        globals.attach("lan", None, None, Some(b)).await.unwrap();
+        let list = globals.list().await;
+        let subnet = |name: &str| {
+            list.iter()
+                .find(|s| s["name"] == name)
+                .map(|s| s["subnet"].clone())
+                .unwrap()
+        };
+        assert_eq!(subnet("corp"), "10.214.0.0/24");
+        assert_eq!(subnet("lan"), "10.214.1.0/24");
+    }
 
     struct Instance {
         globals: Arc<GlobalSegments>,
@@ -1024,6 +1302,76 @@ mod tests {
         panic!("segment {name} never reached peer_connected={want}");
     }
 
+    /// A segment name from a trunk peer names a socket file under `sock_dir`:
+    /// one that leaves the directory is refused before anything is unlinked
+    /// (docs/reviews/networking.md F1).
+    #[tokio::test]
+    async fn a_peer_cannot_name_a_segment_outside_the_socket_directory() {
+        use tokio::io::AsyncReadExt;
+        let i = instance("k").await;
+        let victim = i._dir.path().join("victim.sock");
+        let absolute = i._dir.path().join("absolute.sock");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::write(&absolute, b"victim").unwrap();
+        let absolute_name = absolute.with_extension("");
+        for name in ["../victim", absolute_name.to_str().unwrap(), "..", "a/b"] {
+            // The handshake carries at most 128 bytes: a long TMPDIR drops
+            // the absolute case, and the others still prove the fault.
+            if name.len() > 128 {
+                continue;
+            }
+            let mut s = tokio::net::TcpStream::connect(i.addr).await.unwrap();
+            crate::supervisor::trunk_auth::client(&mut s, name, "k")
+                .await
+                .unwrap();
+            let mut answer = [0u8; 3];
+            timeout(Duration::from_secs(10), s.read_exact(&mut answer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(&answer, b"OK\n", "the peer's name {name:?} was accepted");
+            assert!(
+                i.globals.attach(name, None, None, None).await.is_err(),
+                "attach took {name:?}"
+            );
+        }
+        // An accepted trunk is attached after the answer: give a wrong one
+        // the time to reach the file.
+        sleep(Duration::from_millis(200)).await;
+        for file in [&victim, &absolute] {
+            assert!(
+                std::fs::symlink_metadata(file)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{} was replaced",
+                file.display()
+            );
+        }
+        assert!(i.globals.list().await.is_empty());
+    }
+
+    #[test]
+    fn a_segment_name_is_one_file_name() {
+        for ok in ["wan", "wan@feat-x", "wan@my tree", "a.b_c", "wan@..x"] {
+            assert!(check_segment_name(ok).is_ok(), "{ok:?}");
+        }
+        let long = "a".repeat(129);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../vmlabd",
+            "/run/x",
+            "a/b",
+            "a\0b",
+            "a\nb",
+            &long,
+        ] {
+            assert!(check_segment_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[tokio::test]
     async fn two_instances_bridge_and_reconnect() {
         let mut a = instance("s3kr1t").await;
@@ -1086,6 +1434,60 @@ mod tests {
         wait_event(&mut a.events, "segment.peer.up").await;
         wait_connected(&a.globals, "wan", true).await;
         wait_connected(&b.globals, "wan", true).await;
+    }
+
+    #[tokio::test]
+    async fn a_trunk_forms_again_after_the_dialer_detaches() {
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        let target = b.addr.to_string();
+        b.globals.attach("wan", None, None, None).await.unwrap();
+        a.globals
+            .attach("wan", None, Some(target.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        let (old_switch, dialer, gateway_sender) = {
+            let segs = a.globals.segs.lock().await;
+            let seg = &segs["wan"];
+            (
+                seg.switch.clone(),
+                seg.dialer.as_ref().unwrap().abort_handle(),
+                seg.gateway.sender(),
+            )
+        };
+        assert_eq!(old_switch.stats().ports, 2);
+        a.globals.detach("wan", None).await;
+        while !dialer.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        // Keep the gateway port registered so the count isolates the TCP port.
+        assert_eq!(
+            old_switch.stats().ports,
+            1,
+            "dialed trunk port survived detach"
+        );
+        drop(gateway_sender);
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.down");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.down");
+
+        let (a_sock, _, _) = a
+            .globals
+            .attach("wan", None, Some(target), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        // Register B's test port before sending so the frame cannot pass it by.
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        let mut b_port = b_switch.add_channel_port(PortClass::Service);
+        let mut a_client = trunk_client(&a_sock).await;
+        let frame = bcast(b"after reattach");
+        write_frame(&mut a_client, &frame).await.unwrap();
+        assert_eq!(b_port.rx.recv().await.unwrap(), frame);
     }
 
     #[tokio::test]
@@ -1342,7 +1744,7 @@ mod tests {
         let (tx, _events) = tokio::sync::broadcast::channel(8);
         let g = GlobalSegments::new_at(dir.path().into(), "test.internal".into(), None, None, tx);
         let subnet = Some("10.82.9.0/24".parse().unwrap());
-        let (_, warnings) = g
+        let (_, warnings, _) = g
             .attach(
                 "wan",
                 subnet,
@@ -1359,7 +1761,7 @@ mod tests {
             .await
             .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        let (_, warnings) = g
+        let (_, warnings, _) = g
             .attach(
                 "wan",
                 subnet,
@@ -1517,6 +1919,222 @@ mod tests {
         assert_eq!(
             lookup(&g, "wan", "example.com").await,
             crate::net::dns::DnsAnswer::Forward
+        );
+    }
+
+    // ---- the listener before authentication (docs/reviews/networking.md F11) ----
+
+    /// A TCP connection to the trunk listener from a chosen loopback address,
+    /// so one test can be several peers.
+    async fn connect_from(from: [u8; 4], to: SocketAddr) -> tokio::net::TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind((Ipv4Addr::from(from), 0).into()).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// Whether the listener started a handshake on this connection: it sends
+    /// its greeting first. A connection it refused is closed without one.
+    async fn greeted(stream: &mut tokio::net::TcpStream, wait: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut magic = [0u8; 12];
+        matches!(
+            timeout(wait, stream.read_exact(&mut magic)).await,
+            Ok(Ok(_)) if &magic == crate::supervisor::trunk_auth::MAGIC
+        )
+    }
+
+    /// One address that opens connections and says nothing holds its own
+    /// share of the listener and no more: the next one from it is closed at
+    /// once, and another address is still served.
+    #[tokio::test]
+    async fn a_silent_address_holds_only_its_share_of_the_listener() {
+        let i = instance("k").await;
+        let mut held = Vec::new();
+        for n in 0..PREAUTH_MAX_PER_ADDR {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            assert!(
+                greeted(&mut s, Duration::from_secs(2)).await,
+                "connection {n} is inside the share"
+            );
+            held.push(s);
+        }
+        let mut over = connect_from([127, 0, 0, 1], i.addr).await;
+        assert!(
+            !greeted(&mut over, Duration::from_secs(2)).await,
+            "a connection past the address's share is held"
+        );
+        let mut other = connect_from([127, 0, 0, 2], i.addr).await;
+        assert!(
+            greeted(&mut other, Duration::from_secs(2)).await,
+            "one silent address shut another address out"
+        );
+        // A slot comes back when its connection ends.
+        held.pop();
+        let mut again = false;
+        for _ in 0..80 {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            if greeted(&mut s, Duration::from_millis(200)).await {
+                again = true;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(again, "a closed connection never gave its slot back");
+    }
+
+    /// Many addresses together hold a limited number of connections that
+    /// have proved nothing.
+    #[tokio::test]
+    async fn silent_connections_are_limited_in_total() {
+        let i = instance("k").await;
+        let mut held = Vec::new();
+        for n in 0..PREAUTH_MAX {
+            let from = [127, 0, 1, 1 + (n / PREAUTH_MAX_PER_ADDR) as u8];
+            let mut s = connect_from(from, i.addr).await;
+            assert!(
+                greeted(&mut s, Duration::from_secs(2)).await,
+                "connection {n} is inside the limit"
+            );
+            held.push(s);
+        }
+        let mut over = connect_from([127, 0, 2, 1], i.addr).await;
+        assert!(
+            !greeted(&mut over, Duration::from_secs(2)).await,
+            "a connection past the total limit is held"
+        );
+    }
+
+    /// A handshake that finished no longer counts: more trunks than the
+    /// per-address share authenticate one after another from one address.
+    #[tokio::test]
+    async fn an_authenticated_connection_gives_its_slot_back() {
+        use tokio::io::AsyncReadExt;
+        let i = instance("k").await;
+        let mut kept = Vec::new();
+        for n in 0..PREAUTH_MAX_PER_ADDR + 2 {
+            let mut s = connect_from([127, 0, 0, 1], i.addr).await;
+            // A name the listener refuses after authentication, so that no
+            // segment is made: the answer is `NO`, and it is an answer.
+            crate::supervisor::trunk_auth::client(&mut s, "a/b", "k")
+                .await
+                .unwrap_or_else(|e| panic!("handshake {n}: {e:#}"));
+            let mut answer = [0u8; 3];
+            s.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"NO\n");
+            kept.push(s);
+        }
+    }
+
+    const LISTENER_CHILD: &str = "VMLAB_TEST_TRUNK_LISTENER_CHILD";
+
+    /// The other half of the two descriptor-limit tests: a process whose
+    /// descriptor limit the parent set, serving the trunk listener. It prints
+    /// the address and stays.
+    #[tokio::test]
+    async fn trunk_listener_child() {
+        let Ok(mode) = std::env::var(LISTENER_CHILD) else {
+            return;
+        };
+        let i = instance("k").await;
+        // "full": leave three free descriptors, so the listener itself meets
+        // the limit however few connections it holds.
+        let mut filler = Vec::new();
+        if mode == "full" {
+            while let Ok(f) = std::fs::File::open("/dev/null") {
+                filler.push(f);
+            }
+            filler.truncate(filler.len().saturating_sub(3));
+        }
+        // libtest has written `test <name> ... ` on this line already.
+        println!("\nTRUNK-LISTENER {}", i.addr);
+        sleep(Duration::from_secs(60)).await;
+    }
+
+    /// Start [`trunk_listener_child`] with a descriptor limit of 64, open 80
+    /// connections to it that send nothing, and give back the child, its
+    /// address, the connections, and its CPU use over one second as a percent
+    /// of one core.
+    async fn besiege_listener_child(
+        mode: &str,
+    ) -> (
+        tokio::process::Child,
+        SocketAddr,
+        Vec<tokio::net::TcpStream>,
+        f64,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", r#"ulimit -n 64 && exec "$0" "$@""#])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::global::tests::trunk_listener_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LISTENER_CHILD, mode)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let addr: SocketAddr = timeout(Duration::from_secs(30), async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("the child ended before it listened");
+                if let Some(addr) = line.strip_prefix("TRUNK-LISTENER ") {
+                    return addr.parse().unwrap();
+                }
+            }
+        })
+        .await
+        .expect("the child never listened");
+        let mut silent = Vec::new();
+        for _ in 0..80 {
+            silent.push(connect_from([127, 0, 0, 1], addr).await);
+        }
+        sleep(Duration::from_millis(300)).await;
+        let cpu = crate::labd::host_cpu::sample(child.id().unwrap())
+            .await
+            .expect("the child is there to measure");
+        (child, addr, silent, cpu)
+    }
+
+    /// 80 silent connections against a process that may hold 64 descriptors:
+    /// the listener stays under the limit, idle, and serves another address
+    /// while the 80 are still open.
+    #[tokio::test]
+    async fn silent_connections_do_not_take_the_process_to_its_descriptor_limit() {
+        let (_child, addr, _silent, cpu) = besiege_listener_child("limit").await;
+        assert!(
+            cpu < 10.0,
+            "the listener used {cpu:.0}% of a core for one second"
+        );
+        let mut other = connect_from([127, 0, 0, 2], addr).await;
+        assert!(
+            greeted(&mut other, Duration::from_secs(3)).await,
+            "silent connections shut another address out"
+        );
+    }
+
+    /// A process that is at its descriptor limit for another reason: `accept`
+    /// fails at once and the listener waits instead of spinning, and it
+    /// serves again when descriptors come back.
+    #[tokio::test]
+    async fn a_listener_at_the_descriptor_limit_waits() {
+        let (_child, addr, silent, cpu) = besiege_listener_child("full").await;
+        assert!(
+            cpu < 10.0,
+            "the listener used {cpu:.0}% of a core for one second"
+        );
+        drop(silent);
+        let mut later = connect_from([127, 0, 0, 2], addr).await;
+        assert!(
+            greeted(&mut later, Duration::from_secs(20)).await,
+            "the listener never served again"
         );
     }
 }

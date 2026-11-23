@@ -2,8 +2,10 @@
 //! other verb uses to reach the daemons (PRD §3, §12).
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use tokio::process::{Child, Command};
 
 use crate::proto::client::{LabClient, SupClient};
 use crate::proto::{LabRequest, ProtoError, SupRequest};
@@ -40,19 +42,38 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
         }
         // Something holds the socket and will not serve: a supervisor on its
         // way out. A new one cannot bind until it has gone.
-        if !wait_supervisor_gone(&sock).await {
-            bail!("the running supervisor is still shutting down — try again shortly");
-        }
+        wait_supervisor_gone(&sock).await;
     }
 
-    spawn_supervisor()?;
+    let mut scoped = match spawn_supervisor(true) {
+        Ok(child) => Some(child),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            spawn_supervisor(false).context("spawning vmlabd")?;
+            None
+        }
+        Err(err) => return Err(err).context("launching the vmlabd scope"),
+    };
 
-    for _ in 0..100 {
+    let startup_wait = std::time::Duration::from_secs(10);
+    let mut deadline = tokio::time::Instant::now() + startup_wait;
+    while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if let Ok(client) = SupClient::connect(&sock).await
             && client.send(SupRequest::Ping {}).await.is_ok()
         {
             return Ok(client);
+        }
+        if let Some(child) = &mut scoped
+            && let Some(status) = child.try_wait().context("checking the vmlabd scope")?
+        {
+            tracing::debug!(%status, "scoped vmlabd exited before readiness, trying direct spawn");
+            spawn_supervisor(false).context("spawning vmlabd without a systemd scope")?;
+            scoped = None;
+            deadline = tokio::time::Instant::now() + startup_wait;
         }
     }
     bail!(
@@ -61,24 +82,29 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
     )
 }
 
-/// How long a supervisor gets to finish its teardown: every lab it holds is
-/// released, then its background tasks get five seconds to stop.
-const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// When `vmlab daemon stop` says it is still waiting: the supervisor releases
+/// its labs one after the other, each stopping its guests.
+const SHUTDOWN_NOTICE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Wait until nothing is listening on the supervisor socket, or give up after
-/// [`SHUTDOWN_WAIT`]. True when it has gone.
-async fn wait_supervisor_gone(sock: &std::path::Path) -> bool {
-    let deadline = std::time::Instant::now() + SHUTDOWN_WAIT;
-    while std::time::Instant::now() < deadline {
-        if SupClient::connect(sock).await.is_err() {
-            return true;
+/// Wait until nothing is listening on the supervisor socket.
+///
+/// No deadline of its own, as `vmlab down` has none: the supervisor bounds
+/// each lab's release by the stop wait that lab's daemon reports and kills
+/// what outlives it, so a fixed wait here could only call a teardown still
+/// in order a failure.
+async fn wait_supervisor_gone(sock: &std::path::Path) {
+    let notice = std::time::Instant::now() + SHUTDOWN_NOTICE;
+    let mut noticed = false;
+    while SupClient::connect(sock).await.is_ok() {
+        if !noticed && std::time::Instant::now() >= notice {
+            eprintln!("vmlabd is stopping its labs' machines; waiting for it to exit");
+            noticed = true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    false
 }
 
-fn spawn_supervisor() -> Result<()> {
+fn spawn_supervisor(scoped: bool) -> Result<Child> {
     // The supervisor + lab daemons live in the `vmlab` binary; resolve that
     // rather than assuming the current executable is it.
     let exe = crate::paths::vmlab_exe()?;
@@ -90,10 +116,7 @@ fn spawn_supervisor() -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_err = log.try_clone()?;
-    supervisor_command(&exe, log, log_err)
-        .spawn()
-        .context("spawning vmlabd")?;
-    Ok(())
+    Ok(supervisor_command(&exe, log, log_err, scoped).spawn()?)
 }
 
 /// The supervisor's spawn, minus the binary's own location.
@@ -102,14 +125,34 @@ fn spawn_supervisor() -> Result<()> {
 /// [`crate::supervisor::start_session`], and `setsid` refuses a process-group
 /// leader. Its own session is what lets it — and the lab daemons it spawns,
 /// which inherit that session — outlive the terminal the CLI ran in.
+/// A transient scope also lets the process tree outlive the starter's
+/// cgroup. Scope mode preserves the caller's environment and working directory.
 fn supervisor_command(
     exe: &Path,
     log: std::fs::File,
     log_err: std::fs::File,
-) -> std::process::Command {
-    let mut cmd = std::process::Command::new(exe);
+    scoped: bool,
+) -> Command {
+    let mut cmd = if scoped {
+        let mut cmd = Command::new("systemd-run");
+        cmd.args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--description=vmlab supervisor",
+        ]);
+        // Argument expansion in scope mode arrived with this option in v254.
+        // Ordinary paths also work with older systemd releases.
+        if exe.as_os_str().as_encoded_bytes().contains(&b'$') {
+            cmd.arg("--expand-environment=no");
+        }
+        cmd.arg("--").arg(exe);
+        cmd
+    } else {
+        Command::new(exe)
+    };
     cmd.arg("__supervisord")
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
     cmd
@@ -162,17 +205,28 @@ fn same_build(what: &str, answer: Option<serde_json::Value>) -> Result<()> {
 /// `lab.ensure` (`status`, `down`, `destroy`): a lab daemon's socket is keyed
 /// by name, so without this a second checkout declaring the same name would
 /// read, stop or destroy the first one's lab as if it were its own. No
-/// supervisor running means nothing is registered, so nothing conflicts.
+/// supervisor running does not mean nothing is registered: a lab daemon
+/// outlives a supervisor that crashed or was killed, so the registry the
+/// supervisor persisted (`labs.json`) is read instead, as the next supervisor
+/// would adopt it.
 pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
-    let Ok(supervisor) = SupClient::connect(&crate::paths::supervisor_socket()).await else {
-        return Ok(());
+    use crate::supervisor::registry::{LabEntry, Registry};
+    let labs: Vec<LabEntry> = match SupClient::connect(&crate::paths::supervisor_socket()).await {
+        Ok(supervisor) => {
+            let labs = supervisor
+                .send(SupRequest::Status {})
+                .await
+                .map_err(remote)?;
+            serde_json::from_value(labs)
+                .context("the supervisor reported a registry vmlab cannot read")?
+        }
+        // Unreadable is not empty: the name may be registered from
+        // another root, and this verb would then act on that lab.
+        Err(_) => Registry::load()
+            .context("cannot tell whether this lab's name is registered elsewhere")?
+            .labs()
+            .to_vec(),
     };
-    let labs = supervisor
-        .send(SupRequest::Status {})
-        .await
-        .map_err(remote)?;
-    let labs: Vec<crate::supervisor::registry::LabEntry> = serde_json::from_value(labs)
-        .context("the supervisor reported a registry vmlab cannot read")?;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     match labs.iter().find(|entry| entry.name == name) {
         Some(entry) => entry.claims(name, &root).map_err(anyhow::Error::new),
@@ -261,14 +315,8 @@ pub fn cmd_daemon(cmd: DaemonCmd) -> Result<()> {
                         let _ = client.send(SupRequest::Shutdown {}).await;
                         // The reply comes before the teardown, so "stopped"
                         // waits for the process to be gone.
-                        if wait_supervisor_gone(&sock).await {
-                            println!("vmlabd stopped");
-                        } else {
-                            bail!(
-                                "vmlabd is still shutting down after {}s",
-                                SHUTDOWN_WAIT.as_secs()
-                            );
-                        }
+                        wait_supervisor_gone(&sock).await;
+                        println!("vmlabd stopped");
                     }
                     Err(_) => println!("vmlabd is not running"),
                 }
@@ -358,7 +406,7 @@ mod tests {
         let log = std::fs::File::create(dir.path().join("log")).unwrap();
         let log_err = log.try_clone().unwrap();
         let exe = std::env::current_exe().unwrap();
-        let mut cmd = supervisor_command(&exe, log, log_err);
+        let mut cmd = supervisor_command(&exe, log, log_err, false);
         cmd.args([
             "--exact",
             "cli::daemon::tests::session_helper",
@@ -367,7 +415,7 @@ mod tests {
             "--test-threads=1",
         ])
         .env(HELPER_ENV, "1");
-        let status = cmd.status().unwrap();
+        let status = cmd.as_std_mut().status().unwrap();
         assert!(status.success());
         let out = std::fs::read_to_string(dir.path().join("log")).unwrap();
         let line = out
@@ -379,5 +427,70 @@ mod tests {
         let pid: i32 = pid.trim_start_matches("PID=").parse().unwrap();
         assert_ne!(sid, ours, "the supervisor stayed in the spawner's session");
         assert_eq!(sid, pid, "the supervisor leads its own session");
+    }
+
+    const REGISTRATION_HELPER: &str = "VMLAB_TEST_REGISTRATION_HELPER";
+
+    /// Lab-lifecycle F3: with no supervisor running, `check_registration`
+    /// took that for "nothing is registered", so `down` and `destroy` in a
+    /// second checkout reached the first checkout's daemon by name. The
+    /// registration on disk must still hold. Run in a child with scratch XDG
+    /// directories so the paths of this process are untouched.
+    #[test]
+    fn a_registration_holds_while_no_supervisor_answers() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::daemon::tests::registration_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REGISTRATION_HELPER, "1")
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `mylab` registered from `/labs/first` in `labs.json`, no supervisor
+    /// socket bound: a check from `/labs/second` is the ADR-0011 conflict,
+    /// and a check from `/labs/first` or for another name passes.
+    #[test]
+    #[ignore = "subprocess helper for a_registration_holds_while_no_supervisor_answers"]
+    fn registration_helper() {
+        if std::env::var_os(REGISTRATION_HELPER).is_none() {
+            return;
+        }
+        let state = crate::paths::state_dir();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("labs.json"),
+            r#"{"labs":[{"name":"mylab","root":"/labs/first","pid":1,"state":"running"}]}"#,
+        )
+        .unwrap();
+        assert!(!crate::paths::supervisor_socket().exists());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(check_registration("mylab", Path::new("/labs/second")))
+            .expect_err("a second checkout passed while the first holds the name");
+        let err = err
+            .downcast_ref::<crate::proto::CommandError>()
+            .expect("the ADR-0011 conflict");
+        assert_eq!(err.code, crate::proto::error::ErrorCode::Conflict);
+        assert!(err.message.contains("/labs/first"), "{}", err.message);
+        rt.block_on(check_registration("mylab", Path::new("/labs/first")))
+            .expect("the registered root holds its own name");
+        rt.block_on(check_registration("otherlab", Path::new("/labs/second")))
+            .expect("an unregistered name is free");
     }
 }

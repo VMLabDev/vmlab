@@ -167,11 +167,14 @@ SRC
     and at launch, so updating this key requires no daemon restart.
   DOC
   p <<DOC
-    QEMU receives the key in `isa-applesmc,osk=<value>`. vmlab redacts it
+    QEMU receives the key in a configuration file (`-readconfig`) that only
+    your account can read. vmlab writes it in the machine's runtime directory
+    at each launch and removes it once QEMU is up. The key is not in QEMU's
+    process arguments, which every local account can read. vmlab redacts it
     from launch headers, emulator output and startup errors. Debug dumps of
     host configuration and launch paths also redact it. The key is never
-    recorded in templates or OCI metadata. It remains visible to host
-    processes allowed to read QEMU's operating-system process arguments.
+    recorded in templates or OCI metadata. A key that holds a double quote is
+    refused at launch, because QEMU's configuration file cannot carry one.
     vmlab-hv continues to refuse Apple SMC machines until its macOS phase.
   DOC
 
@@ -246,7 +249,7 @@ SRC
       | "`vulkan_icd`" | "utf8" | "none" | "Path to a Vulkan ICD JSON a `vulkan` guest's renderer loads, set as `VK_DRIVER_FILES`. Overrides the driver picked from the GPU's kernel driver." |
       | "`default`" | "bool" | "`false`" | "The GPU a lab gets when it names none, or names one this host lacks under virgl or vulkan. A lone `gpu` block is the default without it." |
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
-      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU or vmlab-hv process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for the Venus render server." |
+      | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for QEMU's Venus render server. Ignored on vmlab-hv, with a warning." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
       | "`hide_uncached_memory`" | "bool" | "`false`" | "Under `vulkan`, report an uncached host-visible memory type of this GPU as not host-visible when the same heap has a cached one, so guest drivers map the cached type. For a host where guest images arrive with short dashes. See below." |
   }

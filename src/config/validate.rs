@@ -108,15 +108,28 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     check_dns_label(&lab.name, lab.span, "lab name", &mut issues);
 
     // -- segments -------------------------------------------------------
-    let mut seg_names: HashMap<&str, Span> = HashMap::new();
+    let mut seg_names = HashSet::new();
     for seg in &lab.segments {
-        if seg_names.insert(&seg.name, seg.span).is_some() {
+        if !seg_names.insert(seg.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 seg.span,
                 format!("duplicate segment \"{}\"", seg.name),
             ));
         }
         check_dns_label(&seg.name, seg.span, "segment name", &mut issues);
+        // A /0 covers the entire auto-subnet pool. At the other end, a
+        // segment needs at least two usable addresses for a gateway and guest.
+        if let Some(subnet) = seg.subnet
+            && !(1..=30).contains(&subnet.prefix_len())
+        {
+            issues.push(Issue::at(
+                seg.span,
+                format!(
+                    "segment \"{}\" subnet {subnet} must have a prefix length from /1 to /30",
+                    seg.name
+                ),
+            ));
+        }
         for other in &lab.segments {
             if !std::ptr::eq(seg, other)
                 && let (Some(a), Some(b)) = (seg.subnet, other.subnet)
@@ -242,15 +255,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     // -- VMs --------------------------------------------------------------
-    // VMs and containers share one name namespace (they share DNS, forwards,
-    // and dependency waves).
-    let mut machine_names: HashSet<&str> = HashSet::new();
+    // VMs and containers share one name namespace, and DNS folds ASCII case.
+    let mut machine_names = HashSet::new();
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
     for vm in &lab.vms {
         let vm_hypervisor = selected_hypervisor(MachineCfg::Vm(vm), ctx);
-        if !machine_names.insert(&vm.name) {
+        if !machine_names.insert(vm.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 vm.span,
                 format!(
@@ -321,6 +333,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         share.guest
                     ),
                 ));
+            } else if let Some(problem) = crate::smb::config::share_name_problem(&share.name) {
+                // A derived name is already `[a-z0-9_]`; an explicit one is
+                // taken as written and becomes an `smb.conf` section header.
+                issues.push(Issue::at(
+                    share.span,
+                    format!("share name \"{}\": {problem}", share.name.escape_debug()),
+                ));
+            }
+            if let Some(problem) = crate::smb::config::share_host_problem(&share.host) {
+                issues.push(Issue::at(share.span, format!("share {problem}")));
             }
             // vmlab-hv serves its VMs' shares itself (§22, phase 2e): the
             // host's virtiofsd is not asked.
@@ -341,12 +363,23 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref()),
             &mut issues,
         );
+        if let Some(dev) = &vm.dev {
+            check_dev_arguments(
+                dev,
+                &file.root,
+                login_family(
+                    effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref(),
+                ),
+                &mut issues,
+            );
+        }
         for m in &vm.media {
             check_media(&file.root, m, &mut issues);
         }
         for d in &vm.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(&format!("vm \"{}\"", vm.name), &vm.extra_disks, &mut issues);
         if let Some(gpu) = &vm.gpu {
             check_virtual_display_family(
                 gpu,
@@ -388,7 +421,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     // -- containers ---------------------------------------------------------
     for c in &lab.containers {
-        if !machine_names.insert(&c.name) {
+        if !machine_names.insert(c.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 c.span,
                 format!(
@@ -480,6 +513,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             LoginFamily::Linux,
             &mut issues,
         );
+        if let Some(dev) = &c.dev {
+            check_dev_arguments(dev, &file.root, LoginFamily::Linux, &mut issues);
+        }
 
         for v in &c.volumes {
             if let VolumeSource::Host(host) = &v.source {
@@ -782,6 +818,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(
+            &format!("template \"{}\"", t.name),
+            &t.extra_disks,
+            &mut issues,
+        );
         // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
         // that builds: the same check, including `passthrough`, which a
         // build may ask for on the same terms a lab VM may.
@@ -825,6 +866,30 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     .as_deref()
                     .map_or(base_family, |p| login_family(Some(p)));
                 check_virtual_display_family(gpu, family, &mut issues);
+            }
+        }
+        // What a template block says here is recorded in its metadata, and a
+        // VM cloned from the template takes it from there, where only a
+        // display device by name is accepted (`TEMPLATE_DISPLAYS`). Say so at
+        // the block, not after the build.
+        let displays = std::iter::once((t.span, String::new(), &t.display)).chain(
+            t.variants
+                .iter()
+                .map(|v| (v.span, format!(" variant \"{}\"", v.name), &v.display)),
+        );
+        for (span, variant, display) in displays {
+            let known = crate::qemu::resolve::TEMPLATE_DISPLAYS;
+            if let Some(d) = display
+                && !known.contains(&d.as_str())
+            {
+                issues.push(Issue::at(
+                    span,
+                    format!(
+                        "template \"{}\"{variant}: display = \"{d}\" is not a display device a template can record; use one of {}",
+                        t.name,
+                        known.join(", ")
+                    ),
+                ));
             }
         }
         check_logins("template", &t.name, &t.logins, base_family, &mut issues);
@@ -1770,9 +1835,11 @@ fn check_nics(
 
 /// The daemon claims the first usable address of every segment as its
 /// gateway (DHCP/DNS/NAT/share endpoint).
+/// Saturate at the final IPv4 address so NIC validation can report issues
+/// even when a segment declares an invalid prefix.
 pub fn gateway_ip(net: ipnet::Ipv4Net) -> Ipv4Addr {
     let base = u32::from(net.network());
-    Ipv4Addr::from(base + 1)
+    Ipv4Addr::from(base.saturating_add(1))
 }
 
 /// One ordering key's graph (§7.2) is acyclic. `key` names it in the issue;
@@ -1917,6 +1984,25 @@ fn check_media(root: &Path, m: &Media, issues: &mut IssueList) {
     }
 }
 
+/// A `disk` block's image is `disk-<name>.qcow2` in the machine's directory,
+/// so two blocks with one name would be two drives on one image file. QEMU's
+/// image lock refuses the second; vmlab-hv takes no lock, and writes through
+/// both corrupt the image. `who` is the block they sit in (`vm "a"`).
+fn check_disk_names(who: &str, disks: &[DiskBlock], issues: &mut IssueList) {
+    for (i, d) in disks.iter().enumerate() {
+        if disks[..i].iter().any(|e| e.name == d.name) {
+            issues.push(Issue::at(
+                d.span,
+                format!(
+                    "{who}: disk \"{}\" is declared twice; each `disk` block needs its own name, \
+                     because the name is its image file",
+                    d.name
+                ),
+            ));
+        }
+    }
+}
+
 fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
     match (&d.size, &d.from) {
         (None, None) => issues.push(Issue::at(
@@ -1944,7 +2030,8 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 /// (`<vm>.<lab>.<suffix>`, §9.5).
 /// A lab has at most one default dev machine (§19.1).
 ///
-/// This is the *only* `@dev` rule §5.1 owns. The decorator's own errors — an
+/// This is the only `@dev` rule that spans machines; each machine's own
+/// arguments are [`check_dev_arguments`]'s. The decorator's own errors — an
 /// undeclared `@dve`, a wrong-typed or unknown argument, `@dev` on a `nic {}`,
 /// a repeated `@dev @dev` — come from WCL, which validates an instance
 /// decorator against its declaration. What WCL cannot see is this one, because
@@ -2016,6 +2103,20 @@ fn selected_hypervisor(machine: MachineCfg<'_>, ctx: &dyn ValidationContext) -> 
         .kind
 }
 
+/// The hypervisor each VM of `lab` runs on, selected the way validation
+/// selects it.
+pub fn vm_hypervisors(lab: &Lab, ctx: &dyn ValidationContext) -> Vec<(String, HypervisorKind)> {
+    lab.vms
+        .iter()
+        .map(|vm| {
+            (
+                vm.name.clone(),
+                selected_hypervisor(MachineCfg::Vm(vm), ctx),
+            )
+        })
+        .collect()
+}
+
 /// A VM's resolved hardware, when this context can resolve it: a store
 /// template it holds, and the profile that names. `None` otherwise — a
 /// registry template not pulled yet, an unknown profile (reported
@@ -2037,6 +2138,48 @@ fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::Reso
         None => crate::profiles::ProfileSet::of([]),
     };
     crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
+}
+
+/// One machine's `@dev` arguments (§19.1, §19.6), held to what a share is held
+/// to: the host `workspace` must be a directory now, not at `up`, where a
+/// missing one only stops the syncer; and `workspace_guest` must be an absolute
+/// path for the guest's family, and not the root of its file system, which
+/// would make the whole guest the workspace.
+fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: &mut IssueList) {
+    if let Some(workspace) = &dev.workspace
+        && !root.join(workspace).is_dir()
+    {
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace {} is not a directory", workspace.display()),
+        ));
+    }
+    let Some(guest) = &dev.workspace_guest else {
+        return;
+    };
+    if let Some(problem) = guest_path_problem(guest, family) {
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace_guest {problem}"),
+        ));
+    } else if is_guest_root(guest) {
+        issues.push(Issue::at(
+            dev.span,
+            format!(
+                "@dev workspace_guest \"{guest}\" is the root of the guest's file system — the \
+                 workspace syncer would own the whole guest; name a directory below it"
+            ),
+        ));
+    }
+}
+
+/// `/`, `C:\` and the like: an absolute guest path with nothing below the root.
+fn is_guest_root(path: &str) -> bool {
+    let rest = match path.as_bytes() {
+        [d, b':', rest @ ..] if d.is_ascii_alphabetic() => rest,
+        rest => rest,
+    };
+    rest.iter().all(|&b| b == b'/' || b == b'\\')
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -2104,6 +2247,7 @@ pub(crate) mod tests {
             created: chrono::Utc::now(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -2689,6 +2833,26 @@ lab "l" { vm "a" { template = "aarch64/t" cpu_model = "Westmere,+aes" } }"#,
         assert!(es.iter().all(|m| !m.contains("cpu_model")), "{es:#?}");
     }
 
+    /// A template block's `display` ends up in template metadata, which
+    /// carries a display device by name only (docs/reviews/config.md F1).
+    #[test]
+    fn a_template_block_display_is_a_known_device() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "bochs-display,vgamem=8M"
+  source "scratch" { } }"#,
+            "template \"t\": display = \"bochs-display,vgamem=8M\" is not a display device",
+        );
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" { }
+template "t" { arch = "x86" version = "1" disk = 1GiB display = "cirrus-vga"
+  source "scratch" { } }"#,
+        );
+        assert!(es.iter().all(|m| !m.contains("display")), "{es:#?}");
+    }
+
     fn assert_nested_cpu_model_conflict(ctx: &Hardware, src: &str, needle: &str) {
         let es = hw_errs(ctx, src);
         let found = es
@@ -2976,11 +3140,68 @@ template "t" {
         );
     }
 
+    /// F4 (docs/reviews/config.md): two `disk` blocks with one name would
+    /// give the VM two writable drives on one image file.
+    #[test]
+    fn two_disks_with_one_name_are_refused() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "data" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("vm \"a\"") && m.contains("disk \"data\" is declared twice")),
+            "expected the duplicate disk name to be refused, got: {es:#?}"
+        );
+        let distinct = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "logs" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            !distinct.iter().any(|m| m.contains("declared twice")),
+            "two names are two images: {distinct:#?}"
+        );
+    }
+
     #[test]
     fn undeclared_segment() {
         assert_err(
             "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" nic { segment = \"nope\" } } }",
             "undeclared segment",
+        );
+    }
+
+    #[test]
+    fn a_subnet_too_small_for_a_gateway_and_a_guest_is_refused() {
+        for subnet in ["255.255.255.255/32", "10.1.1.0/31", "0.0.0.0/0"] {
+            assert_err(
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ segment \"s\" {{ subnet = \"{subnet}\" }} }}"
+                ),
+                &format!("segment \"s\" subnet {subnet} must have a prefix length from /1 to /30"),
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_ip_does_not_overflow() {
+        let last = Ipv4Addr::new(255, 255, 255, 255);
+        assert_eq!(gateway_ip("255.255.255.255/32".parse().unwrap()), last);
+        assert_eq!(
+            gateway_ip("255.255.255.252/30".parse().unwrap()),
+            Ipv4Addr::new(255, 255, 255, 253)
         );
     }
 
@@ -3072,6 +3293,73 @@ lab "l" {
         }
     }
 
+    /// Review F13 (config): `@dev`'s arguments are checked as a share's are.
+    /// A missing host `workspace` and a relative `workspace_guest` are each an
+    /// issue, and so is a guest root, which would make the whole guest the
+    /// workspace. The guest path is judged by the machine's family.
+    #[test]
+    fn dev_arguments_are_checked_like_a_share() {
+        let dev_errs = |dev: &str, machine: &str| {
+            errs(&format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n@dev({dev}) {machine}\n}}"
+            ))
+        };
+        let linux = r#"vm "dev01" { template = "x86_64/t" profile = "linux" }"#;
+        let es = dev_errs(r#"workspace = "./nope", workspace_guest = "src""#, linux);
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("./nope")), "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("\"src\"")), "{es:#?}");
+
+        let windows = r#"vm "dev01" { template = "x86_64/t" profile = "windows-11" }"#;
+        let container = r#"container "dev01" { image = "sdk:9.0" }"#;
+        for (dev, machine) in [
+            (r#"workspace_guest = "/""#, linux),
+            (r#"workspace_guest = "C:\\""#, windows),
+            (r#"workspace_guest = "/src""#, windows),
+            (r#"workspace_guest = "C:\\src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
+        }
+        for (dev, machine) in [
+            (r#"workspace = ".", workspace_guest = "/src""#, linux),
+            (r#"workspace_guest = "C:\\src""#, windows),
+            (r#"workspace_guest = "/home/dev/src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert!(es.is_empty(), "{dev} on {machine} → {es:#?}");
+        }
+    }
+
+    /// Review F12 (config): an explicit share name becomes an `smb.conf`
+    /// section header, so it is held to a plain share name. `global` would
+    /// rewrite the server's settings, and `]` or a line break writes a
+    /// directive of its own.
+    #[test]
+    fn an_explicit_share_name_is_a_plain_share_name() {
+        let share_errs = |name: &str| {
+            errs(&format!(
+                r#"import <vmlab.wcl>
+lab "l" {{
+  segment "s" {{ }}
+  vm "a" {{ template = "x86_64/t" nic {{ segment = "s" }}
+    share {{ host = "." guest = "/mnt/x" name = "{name}" }} }}
+}}"#
+            ))
+        };
+        for bad in ["global", "Homes", "IPC$", "a]b", "a\\nb"] {
+            let es = share_errs(bad);
+            assert!(
+                es.iter().any(|m| m.contains("share name")),
+                "{bad} → {es:#?}"
+            );
+        }
+        for good in ["src", "Data-2", "my.share"] {
+            let es = share_errs(good);
+            assert!(es.is_empty(), "{good} → {es:#?}");
+        }
+    }
+
     /// Everything else about `@dev` is legal: any number of dev machines,
     /// none or one declaring the default, and a bare `@dev` on either kind.
     #[test]
@@ -3080,7 +3368,7 @@ lab "l" {
             r#"@dev vm "dev01" { template = "x86_64/t" }"#,
             r#"@dev vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
-            r#"@dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+            r#"@dev(default = true, workspace = ".") vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
         ] {
             let es = errs(&format!("import <vmlab.wcl>\nlab \"l\" {{\n{lab_src}\n}}"));
@@ -3898,6 +4186,30 @@ lab "l" {
   container "a" { image = "nginx:1.27" }
 }"#,
             "share one namespace",
+        );
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "Web" { template = "x86_64/t" }
+  container "web" { image = "nginx:1.27" }
+}"#,
+            "duplicate name \"web\"",
+        );
+    }
+
+    #[test]
+    fn segment_names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "Web" {}
+  segment "web" {}
+}"#,
+            "duplicate segment \"web\"",
         );
     }
 

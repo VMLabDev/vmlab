@@ -10,4 +10,4 @@ The prior art also carried an unexported 823-line local diff on top of
 its YUY2 emulation, and changed sparse-feedback loads. It was dropped with the
 YUY2 work; see `build/d3d12/README.md`, "Patches".
 
-`build/d3d12/container-build.sh` applies any `*.patch` placed here, in order.
+`build/d3d12/container-build.sh` applies the patches listed here in `series` order.

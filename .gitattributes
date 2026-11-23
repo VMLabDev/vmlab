@@ -1,0 +1,2 @@
+/guest/win3d/patches/*/series merge=union
+/guest/win3d/build/mesa/fixes.md merge=union

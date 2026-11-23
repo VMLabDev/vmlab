@@ -58,7 +58,7 @@ queue.
 
 The device is in `hv/crates/vmlab-hv-devices/src/virtio/gpu/copy.rs`
 (layout, checks and conversion) and `renderer.rs` (`Backend::present_copy`),
-at the root of the vmlab repository. The driver side is `patches/kmd/0010`.
+at the root of the vmlab repository. The driver side is `patches/kmd/kmd-host-present-copy.patch`.
 
 ## Without the bit
 

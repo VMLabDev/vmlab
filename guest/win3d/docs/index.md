@@ -19,6 +19,25 @@ Start with [install](install.md) to build and use the package. Read
 [stack](stack.md) to see what it installs, and [known limits](known-limits.md)
 before you rely on it.
 
+## Add a patch, check, or acceptance note
+
+- Append each independent patch filename on its own line to its component's
+  `series`. Merge prerequisite patches first when application order matters.
+- Add a Bash runner and a Python judge under `tests/e2e/adapter/checks/` with
+  the same filename stem, starting with a numeric run position and a unique
+  name. Files run in filename order. The Bash file defines `check_<name>`
+  (using underscores for hyphens) and appends its public name to `ALL`.
+  The Python file defines `judge(report)` and adds verdicts through `report.row`.
+- Record card-specific acceptance evidence in its own file under
+  [acceptance/](acceptance/). Use the card number as the filename and heading
+  prefix, for example `C328.md` and `# C328. <title>`. Existing B notes
+  in the baseline are historical references.
+- Add independently mergeable Mesa patch descriptions as single rows in the
+  [Mesa fixes table](../build/mesa/fixes.md). The patch inventory in the
+  [stack guide](stack.md#patches) is printed from the series and patch headers.
+  When a component pin changes, update its `PINS` and regenerate the guide's
+  pin table with `scripts/pins-table.py --write`.
+
 ## Quick start
 
 On a Linux host with Docker (no sudo), vmlab 0.25.0-alpha or later, the
@@ -46,6 +65,7 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [release.md](release.md) | Cut a release with `scripts/release.sh`, or install the release assets: the driver zip in a guest and the patched QEMU on an NVIDIA host |
 | [known-limits.md](known-limits.md) | Find out what does not work, has not been tested, or needs a workaround, including which host GPUs work |
 | [`installer/README.txt`](../installer/README.txt) | The short guide that ships inside the bundle |
+| [operator-test.md](operator-test.md) | Test the build of card #409 by hand on helios and zeus: start a lab, what to try, what good looks like, the known limits, and what to send back |
 
 ## How it works
 
@@ -65,36 +85,38 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [acceptance.md](acceptance.md) | See each Done item checked on fresh `windows-11` and `windows-10` labs, the stretch applications, the adapter suite with its baseline, and the index of every evidence directory |
 | [tdr-recovery.md](tdr-recovery.md) | Force a guest timeout and require reset/restart telemetry plus hardware pixel readback |
 | [flip.md](flip.md) | See how vmlab-hv orders a flip after the host GPU work it depends on, behind a private feature bit, and how a driver or a host without the bit keeps the standard path |
-| [tearing.md](tearing.md) | See which waits the guest makes before a flip, why torn frames under host load need a flip ordered by the host, and the vsync fix `patches/kmd/0008` |
-| [chromium.md](chromium.md) | See why Chrome and Edge lost WebGL with the Direct3D 12 bridge installed, how `patches/mesa/0096` and the installer's native copy keep their GPU process alive, and the check |
-| [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/0005` sends to the host, its limits, and the check |
-| [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/0012` to `0014` fixed it |
-| [d2d-coverage.md](d2d-coverage.md) | See why Direct2D's antialiased fills had gaps on NVIDIA (Word's ribbon), the one-pass-per-sample fix `patches/mesa/0094`, and what an AMD host does without it |
-| [d3d11-apps.md](d3d11-apps.md) | See why two DirectX SDK D3D11 samples did not show, the UMD fixes `patches/mesa/0015` to `0017`, and the DXUT window bug |
+| [device-lost.md](device-lost.md) | See how vmlab-hv sees a lost host GPU and tells the guest, behind the same feature bit, and how the kernel driver makes it a removed device in place of a stopped VM |
+| [vblank.md](vblank.md) | See how the driver takes its vblank from vmlab-hv's frame clock in place of a guest timer, behind the same feature bit, and what a host without it keeps |
+| [tearing.md](tearing.md) | See which waits the guest makes before a flip, why torn frames under host load need a flip ordered by the host, and the vsync fix `patches/kmd/kmd-report-flips-after-they-are-sent.patch` |
+| [chromium.md](chromium.md) | See why Chrome and Edge lost WebGL with the Direct3D 12 bridge installed, how `patches/mesa/d3d10umd-preload-native-d3d12-in-chromium-gpu-process.patch` and the installer's native copy keep their GPU process alive, and the check |
+| [pointer.md](pointer.md) | See why the pointer lagged, what the hardware pointer of `patches/kmd/kmd-hardware-pointer.patch` sends to the host, its limits, and the check |
+| [dxdiag.md](dxdiag.md) | See why dxdiag reported DirectDraw "Not Available" and how `patches/mesa/d3d9-directdraw-hal-caps.patch` to `0014` fixed it |
+| [d2d-coverage.md](d2d-coverage.md) | See why Direct2D's antialiased fills had gaps on NVIDIA (Word's ribbon), the one-pass-per-sample fix `patches/mesa/yttrium-forced-sample-coverage-one-pass-per-sample.patch`, and what an AMD host does without it |
+| [d3d11-apps.md](d3d11-apps.md) | See why two DirectX SDK D3D11 samples did not show, the UMD fixes `patches/mesa/d3d10umd-hull-shader-vprim-and-indexed-patch-io.patch` to `0017`, and the DXUT window bug |
 | [d3d12app.md](d3d12app.md) | See how Microsoft's D3D12 samples are built unmodified with clang-cl and xwin, how they ran on AMD1 and Nvidia1, and why ExecuteIndirect draws nothing |
-| [dwmheap.md](dwmheap.md) | Find out why dwm crashed with heap corruption in the first boot on NVIDIA, how the dump traced it to the UMD's trim path, and what `patches/mesa/0060` changes |
-| [ei.md](ei.md) | See why D3D12 `ExecuteIndirect` with root-state arguments drew nothing on Venus, and the vkd3d-proton emulation `patches/vkd3d-proton/0006` |
+| [dwmheap.md](dwmheap.md) | Find out why dwm crashed with heap corruption in the first boot on NVIDIA, how the dump traced it to the UMD's trim path, and what `patches/mesa/d3d10umd-trim-residency-set-leaves-the-context-alone.patch` changes |
+| [ei.md](ei.md) | See why D3D12 `ExecuteIndirect` with root-state arguments drew nothing on Venus, the vkd3d-proton emulation `patches/vkd3d-proton/vkd3d-Emulate-state-changing-ExecuteIndirect-without.patch`, and the vertex fetch `patches/vkd3d-proton/vkd3d-Emulate-ExecuteIndirect-vertex-and-index-buffer.patch` for vertex and index buffer view arguments, with its check |
 | [x86d3d12.md](x86d3d12.md) | See why the x86 D3D12 probe sometimes drew one frame after 20 to 70 s in a fresh lab: Defender's cloud check on the first load of new unsigned images, caught with a phase-traced repro, and the probes' `--seconds` change |
 | [nvidia.md](nvidia.md) | See why Venus failed on the RTX 5090 and what fixed it: `patches/mesa/0020` (upstream's own since the November rebase) and a patched QEMU |
-| [zeus.md](zeus.md) | See the package on an Intel Iris Xe (passes with `patches/mesa/0021`) and a laptop RTX 4060 (Venus feedback writes invisible to the guest) |
-| [nvfb.md](nvfb.md) | See why Venus fences hung on the RTX 4060 Laptop (GPU writes to uncached memory invisible to the guest) and the fixes `patches/mesa/0065` to `0067` |
-| [xid69.md](xid69.md) | See why D3D9 depth draws into the back buffer hung the RTX 5090 (Xid 69) and how `patches/mesa/0022` fixed it |
-| [nvtex.md](nvtex.md) | See why mipmapped textures were black on NVIDIA, and the fixed-function and 16-bit format fixes `patches/mesa/0023` to `0025` |
-| [ds.md](ds.md) | See why D3D11 domain shaders that index patch constants removed the device, and the fix `patches/mesa/0030` |
-| [shaders2.md](shaders2.md) | See which indexed shader inputs and outputs work, how the repro assembles bytecode d3dcompiler_47 refuses, and the output-range and hull shader join-phase fixes `patches/mesa/0031` and `0032` |
+| [zeus.md](zeus.md) | See the package on an Intel Iris Xe (passes with `patches/mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch`) and a laptop RTX 4060 (Venus feedback writes invisible to the guest) |
+| [nvfb.md](nvfb.md) | See why Venus fences hung on the RTX 4060 Laptop (GPU writes to uncached memory invisible to the guest) and the fixes `patches/mesa/venus-feedback-buffers-in-host-cached-memory.patch` to `0067` |
+| [xid69.md](xid69.md) | See why D3D9 depth draws into the back buffer hung the RTX 5090 (Xid 69) and how `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch` fixed it |
+| [nvtex.md](nvtex.md) | See why mipmapped textures were black on NVIDIA, and the fixed-function and 16-bit format fixes `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch` to `0025` |
+| [ds.md](ds.md) | See why D3D11 domain shaders that index patch constants removed the device, and the fix `patches/mesa/d3d10umd-domain-shader-indexed-patch-constants.patch` |
+| [shaders2.md](shaders2.md) | See which indexed shader inputs and outputs work, how the repro assembles bytecode d3dcompiler_47 refuses, and the output-range and hull shader join-phase fixes `patches/mesa/d3d10umd-output-index-ranges-in-every-stage.patch` and `0032` |
 | [installer.md](installer.md) | See how the package keeps its driver bound when Windows Update offers a newer Red Hat `viogpudo` (FeatureScore, forced install, device pin) |
 | [wu.md](wu.md) | See why labs have a NAT NIC and run `slmgr /ato` (the evaluation templates shut down unactivated), and what a real Windows Update driver scan offers the device: nothing, and the package stays bound |
-| [ddraw.md](ddraw.md) | See DirectDraw fullscreen exclusive mode, 16 bpp modes, and the hardware colour-key and mirror blits of `patches/mesa/0035` |
+| [ddraw.md](ddraw.md) | See DirectDraw fullscreen exclusive mode, 16 bpp modes, and the hardware colour-key and mirror blits of `patches/mesa/d3d9-hardware-colour-key-and-mirror-blits.patch` |
 | [dd16.md](dd16.md) | See why 64-bit DirectDraw programs get no 16 bpp modes: the trace through `ddraw.dll`, win32k, CDD and `dxgkrnl.sys`, and the R5G6B5 KMD run |
-| [present.md](present.md) | See why presents were slow (CPU reads of write-combined memory) and why Blender was translucent on Windows 10, the fixes `patches/kmd/0002` and `patches/mesa/0026`, `0027`, and how Desktop Duplication got frames (`patches/kmd/0006`, `patches/mesa/0095`) |
+| [present.md](present.md) | See why presents were slow (CPU reads of write-combined memory) and why Blender was translucent on Windows 10, the fixes `patches/kmd/kmd-cache-gdi-shadow-and-staging-surfaces.patch` and `patches/mesa/d3d9-ddraw-present-sources-in-host-cached-memory.patch`, `0027`, and how Desktop Duplication got frames (`patches/kmd/kmd-present-blt-into-mappable-blob.patch`, `patches/mesa/yttrium-desktop-duplication-surface-as-kernel-written-display-image.patch`) |
 | [n5.md](n5.md) | See why D3D9 presents run below the refresh rate on NVIDIA hosts (slow wake-ups on virglrenderer's exportable fences) and the host-side fix: the vmlab render server, its deployment and A/B ([evidence](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/hostvirgl/README.md)) |
-| [ffp.md](ffp.md) | See how D3D9 fixed function was tested against the reference rasterizer, and the software-vertex-processing, fog and point fixes `patches/mesa/0040` to `0042` |
+| [ffp.md](ffp.md) | See how D3D9 fixed function was tested against the reference rasterizer, and the software-vertex-processing, fog and point fixes `patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch` to `0042` |
 | [compat.md](compat.md) | See which unmodified free applications (Unigine Heaven and Valley, Godot, GZDoom, Crispy Doom) run on AMD1 and Nvidia2 under each API, and each failure in detail, including the Godot Vulkan Xid 69 |
-| [ffp2.md](ffp2.md) | See D3D9 vertex blending, bump mapping, cube texgen, mixed devices and Windows 10 tested against the reference, and the bump-format and blend-palette changes `patches/mesa/0043` and `0044` |
+| [ffp2.md](ffp2.md) | See D3D9 vertex blending, bump mapping, cube texgen, mixed devices and Windows 10 tested against the reference, and the bump-format and blend-palette changes `patches/mesa/d3d9-bump-luminance-formats.patch` and `0044` |
 | [unid3d.md](unid3d.md) | See the Unigine D3D9 and D3D11 findings F5 to F7: the D3D9 depth-bias fix for NVIDIA (`patches/mesa/0090`, upstream's own since the November rebase), Valley D3D9 running out of 32-bit address space, and Heaven D3D11's use-after-free |
-| [unigl.md](unigl.md) | See the Unigine OpenGL finding F4 on NVIDIA: the RTX 5090's small BAR heap, the Venus allocation and Zink mapping fixes (`patches/mesa/0085`, `0086`, with nvva's `0070`), and the proof on both NVIDIA cards and AMD1 |
+| [unigl.md](unigl.md) | See the Unigine OpenGL finding F4 on NVIDIA: the RTX 5090's small BAR heap, the Venus allocation and Zink mapping fixes (`patches/mesa/venus-allocate-from-small-device-local-heap-synchronously.patch`, `0086`, with nvva's `0070`), and the proof on both NVIDIA cards and AMD1 |
 | [godot.md](godot.md) | See why Godot's Vulkan renderer raised a host Xid 69 (ErrorCode `0x13d`) on the RTX 5090 and how `patches/mesa/0075` fixed it on the September base: LINEAR swapchain images plus pipeline fragment-shading-rate state |
-| [f6va.md](f6va.md) | See how compat finding F6 was fixed: 32-bit D3D9 programs (Unigine Valley) ran out of address space through the ordered-context-worker upload path (`patches/mesa/0091` and `0092`) |
+| [f6va.md](f6va.md) | See how compat finding F6 was fixed: 32-bit D3D9 programs (Unigine Valley) ran out of address space through the ordered-context-worker upload path (`patches/mesa/d3d9-stop-copying-vertex-buffer-locks-for-ordered-worker.patch` and `0092`) |
 
 ## Building
 
@@ -110,8 +132,9 @@ or Intel GPU as declared in the host config, `~/.config/vmlab/config.wcl`
 | [`patches/dxil-spirv/README.md`](../patches/dxil-spirv/README.md) | Why dxil-spirv has no patches |
 
 `scripts/build.sh` builds everything. `scripts/pins-table.py --write`
-regenerates the pin and patch tables in `stack.md`, and `--check` fails when
-they are stale. `scripts/check-docs.py` checks that every repository path
+regenerates the pin table in `stack.md`. Run it with no arguments to print
+both tables. Its `--check` verifies the pin table and each patch series.
+`scripts/check-docs.py` checks that every repository path
 named in the documents exists. Shared virglrenderer patches live at the
 repository root in patches/virglrenderer/. The vmlab-hv bundle builds them;
 they are not part of the guest package ([stack](stack.md#host-patches)).

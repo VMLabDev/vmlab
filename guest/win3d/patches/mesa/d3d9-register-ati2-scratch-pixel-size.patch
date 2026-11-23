@@ -1,0 +1,20 @@
+Subject: [PATCH] d3d9: register the ATI2 pixel size for scratch volume textures
+
+The native runtime needs a private-format size for ATI2 when it creates a
+scratch volume texture in system memory. BC5 stores 128 bits per 4x4
+block, or 8 bits per pixel. Supply the size without advertising GPU
+texture operations for this format.
+---
+diff --git a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
+--- a/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/D3D9Adapter.cpp
+@@ -79,6 +79,9 @@ static const FORMATOP g_format_ops[] = {
+    { D3D9_FMT_DXT4, 0x00828007, 0, 0, 0 },
+    { D3D9_FMT_DXT5, 0x00828007, 0, 0, 0 },
+    { D3D9_FMT_ATI1, 0x0082d007, 0, 0, 8 },
++   /* ATI2 (BC5) needs a size for runtime-owned scratch resources. */
++   { D3D9FourCC('A', 'T', 'I', '2'), FORMATOP_PIXELSIZE, 0, 0, 8 },
++
+    { D3D9_FMT_P8, 0x00824007, 0, 0, 0 },
+    { D3D9_FMT_A8P8, 0x00820007, 0, 0, 0 },
+    /* Auto depth-stencil creation can validate the blt MSAA mask even for a

@@ -141,11 +141,74 @@ impl TemplateVersion {
 #[derive(Debug, Clone)]
 pub struct TemplateStore {
     root: PathBuf,
+    /// Asked before an overwriting install replaces a version (see
+    /// [`Self::refusing_replace`]). `None` replaces unasked.
+    replace_guard: Option<ReplaceGuard>,
+}
+
+/// The in-use check of an overwriting install: handed the disks the
+/// replacement would delete, it says why they cannot go.
+#[derive(Clone)]
+struct ReplaceGuard(std::sync::Arc<InUse>);
+
+/// Why the disks it is handed cannot be deleted, `None` when they can.
+type InUse = dyn Fn(&[PathBuf]) -> Option<String> + Send + Sync;
+
+impl std::fmt::Debug for ReplaceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReplaceGuard")
+    }
 }
 
 impl TemplateStore {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            replace_guard: None,
+        }
+    }
+
+    /// This store, with every overwriting install — an import or a pull with
+    /// `overwrite` — first handing `in_use` the disks of the version it would
+    /// replace: the base and every variant overlay on disk. A `Some(reason)`
+    /// (clones backed by one of them, PRD §7.1) refuses the install and
+    /// leaves the version as it is, the way [`Self::remove`] refuses.
+    pub fn refusing_replace(
+        mut self,
+        in_use: impl Fn(&[PathBuf]) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.replace_guard = Some(ReplaceGuard(std::sync::Arc::new(in_use)));
+        self
+    }
+
+    /// Refuse when an overwriting install of `<arch>/<name>@<version>` would
+    /// delete a disk the store's replace guard reports in use. Passes when
+    /// the store has no guard or holds no such version. An install runs this
+    /// itself; a pull calls it before it downloads anything.
+    pub fn check_replace(&self, arch: &str, name: &str, version: &str) -> Result<()> {
+        let Some(guard) = &self.replace_guard else {
+            return Ok(());
+        };
+        let dir = self.version_dir(arch, name, version);
+        // Read from the directory rather than `template.wcl`: an overlay
+        // whose block is gone is deleted with the version all the same.
+        let mut doomed = vec![dir.join(DISK_FILE)];
+        doomed.extend(
+            fs::read_dir(dir.join(VARIANTS_DIR))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path().join(DISK_FILE)),
+        );
+        doomed.retain(|disk| disk.is_file());
+        if let Some(reason) = (guard.0)(&doomed) {
+            bail!(
+                "refusing to replace template {arch}/{name}@{version}: {reason} — replacing its \
+                 disks would corrupt every clone backed by them (remove those machines' disks \
+                 first, or install the template under another version)"
+            );
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -390,21 +453,42 @@ impl TemplateStore {
         // An install interrupted mid-swap left the old version beside `dest`.
         recover_swap(&dest)?;
         if dest.exists() && !overwrite {
-            bail!(
-                "template {}/{}@{} already exists in the store (pass overwrite to replace)",
-                meta.arch,
-                meta.name,
-                meta.version
-            );
+            return Err(anyhow::Error::new(AlreadyInstalled {
+                arch: meta.arch.clone(),
+                name: meta.name.clone(),
+                version: meta.version.clone(),
+            }));
         }
+        if dest.exists() {
+            self.check_replace(&meta.arch, &meta.name, &meta.version)?;
+        }
+        // What the version needs, and held at the first check: the staging
+        // directory is the caller's, and whoever removes it during the
+        // install (a cancelled pull did, review templates-registry F13) must
+        // not leave a version with metadata and no disk.
+        let needed: Vec<PathBuf> = [PathBuf::from(DISK_FILE)]
+            .into_iter()
+            .chain(template_vars(Path::new(""), meta))
+            .chain(
+                meta.variants
+                    .iter()
+                    .map(|v| variant_disk_rel(&v.name))
+                    .filter(|rel| staging.join(rel).is_file()),
+            )
+            .collect();
         (ops.write_meta)(meta, &staging.join(META_FILE))?;
+        still_staged(staging, &needed)?;
         let parent = dest.parent().expect("version dir always has a parent");
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
         if dest.exists() {
-            self.swap_in(staging, &dest, ops)
+            self.swap_in(staging, &dest, &needed, ops)
         } else {
-            self.move_in(staging, &dest, &ops.rename)
+            self.move_in(staging, &dest, &ops.rename)?;
+            // Once more where the remover's path no longer reaches.
+            still_staged(&dest, &needed).inspect_err(|_| {
+                let _ = fs::remove_dir_all(&dest);
+            })
         }
     }
 
@@ -412,7 +496,8 @@ impl TemplateStore {
     /// until the new one is in place:
     ///
     /// 1. `staging` moves to `.next-<version>` beside `dest` (copied first
-    ///    when on another filesystem); the old version is not touched yet,
+    ///    when on another filesystem) and must still hold every file in
+    ///    `needed`; the old version is not touched yet,
     /// 2. the old version is renamed to `.old-<version>`,
     /// 3. `.next-<version>` is renamed to `dest`; on failure the old
     ///    version is renamed back,
@@ -421,10 +506,19 @@ impl TemplateStore {
     /// The dot names keep both out of version listings. An interruption
     /// between 2 and 3 leaves `dest` missing and the old version at
     /// `.old-<version>`; [`recover_swap`] puts it back on the next install.
-    fn swap_in(&self, staging: &Path, dest: &Path, ops: &InstallOps) -> Result<()> {
+    fn swap_in(
+        &self,
+        staging: &Path,
+        dest: &Path,
+        needed: &[PathBuf],
+        ops: &InstallOps,
+    ) -> Result<()> {
         let (next, old) = swap_paths(dest);
         remove_if_present(&next)?;
-        if let Err(e) = self.move_in(staging, &next, &ops.rename) {
+        let moved = self
+            .move_in(staging, &next, &ops.rename)
+            .and_then(|()| still_staged(&next, needed));
+        if let Err(e) = moved {
             let _ = fs::remove_dir_all(&next);
             return Err(e);
         }
@@ -738,6 +832,12 @@ impl TemplateStore {
     /// moves first and the block is written after, so a failure between the
     /// two leaves an overlay with no block — which does not count — never a
     /// block naming a disk that is not there.
+    ///
+    /// An incoming variant whose name the version already holds replaces that
+    /// overlay. `in_use` is handed the overlays that would go and says why
+    /// they cannot — the clones backed by them, each a delta against the
+    /// overlay it was made from — or `None`. It is asked under the store
+    /// lock, before anything moves, and a reason refuses the whole call.
     pub fn add_variants(
         &self,
         arch: &str,
@@ -745,6 +845,7 @@ impl TemplateStore {
         version: &str,
         staging_dir: &Path,
         variants: &[super::meta::VariantMeta],
+        in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
@@ -753,6 +854,23 @@ impl TemplateStore {
         let mut incoming = found.meta.clone();
         incoming.variants = variants.to_vec();
         verify_variants(staging_dir, &incoming, found.meta.sha256.as_deref())?;
+
+        let replaced: Vec<&str> = variants
+            .iter()
+            .map(|v| v.name.as_str())
+            .filter(|n| found.variant_disk(n).exists())
+            .collect();
+        let doomed: Vec<PathBuf> = replaced.iter().map(|n| found.variant_disk(n)).collect();
+        if !doomed.is_empty()
+            && let Some(reason) = in_use(&doomed)
+        {
+            bail!(
+                "refusing to replace {arch}/{name}@{version}#{}: {reason} — replacing the \
+                 overlay a clone is a delta against would corrupt it; destroy those machines \
+                 first",
+                replaced.join(", #")
+            );
+        }
 
         let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
         for v in variants {
@@ -797,6 +915,29 @@ impl TemplateStore {
             .map_err(|(_, errno)| anyhow!("cannot lock template store: {errno}"))
     }
 }
+
+/// An install without `overwrite` found the version in the store. A typed
+/// error, so a pull that lost the race against another pull of the same
+/// version can tell this refusal from every other and use what the winner
+/// installed.
+#[derive(Debug)]
+pub struct AlreadyInstalled {
+    pub arch: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl std::fmt::Display for AlreadyInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "template {}/{}@{} already exists in the store (pass overwrite to replace)",
+            self.arch, self.name, self.version
+        )
+    }
+}
+
+impl std::error::Error for AlreadyInstalled {}
 
 /// A version directory's metadata with the variants it can actually serve:
 /// a variant block whose overlay is missing does not count (§6.6).
@@ -882,6 +1023,75 @@ pub fn qcow2_backing_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&name).into_owned()))
 }
 
+/// The incompatible-feature bit that says a qcow2 image keeps the guest's
+/// clusters in a second host file.
+const QCOW2_INCOMPAT_DATA_FILE: u64 = 1 << 2;
+/// The header extension that names that second file.
+const QCOW2_EXT_DATA_FILE: u32 = 0x4441_5441;
+/// The largest qcow2 cluster, which bounds where header extensions can lie.
+const QCOW2_MAX_CLUSTER: u64 = 2 << 20;
+
+/// Refuse a qcow2 image that keeps its data in an external file. QEMU and
+/// `qemu-img` open the host file such an image names when they open the
+/// image, so a pulled or imported disk could hand the guest any file its
+/// user can read. Refused on the feature bit and on the extension alone,
+/// whichever image tool is selected. A file that is not qcow2 passes.
+pub fn refuse_qcow2_data_file(path: &Path) -> Result<()> {
+    use std::io::Read;
+    regular_file(path)?;
+    let f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut head = Vec::new();
+    f.take(QCOW2_MAX_CLUSTER)
+        .read_to_end(&mut head)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let be32 = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(head.get(at..at + 4)?.try_into().ok()?))
+    };
+    let be64 = |at: usize| -> Option<u64> {
+        Some(u64::from_be_bytes(head.get(at..at + 8)?.try_into().ok()?))
+    };
+    if head.get(..4) != Some(b"QFI\xfb".as_slice()) {
+        return Ok(());
+    }
+    let refused = || {
+        anyhow!(
+            "{} is a qcow2 image with an external data file, which a template disk must not have",
+            path.display()
+        )
+    };
+    // Version 2 has neither feature bits nor a header length. Its
+    // extensions start right after its 72-byte header.
+    let mut at = 72;
+    if be32(4).is_some_and(|version| version >= 3) {
+        if be64(72).is_some_and(|bits| bits & QCOW2_INCOMPAT_DATA_FILE != 0) {
+            return Err(refused());
+        }
+        at = be32(100).map_or(104, |len| (len as usize).max(104));
+    }
+    // Extensions end at the backing file name when there is one.
+    let end = match be64(8) {
+        Some(backing) if backing != 0 => head.len().min(backing as usize),
+        _ => head.len(),
+    };
+    while let (Some(kind), Some(len)) = (be32(at), be32(at + 4)) {
+        if kind == 0 || at + 8 > end {
+            break;
+        }
+        if kind == QCOW2_EXT_DATA_FILE {
+            return Err(refused());
+        }
+        // Each extension's data is padded to eight bytes.
+        let Some(next) = (len as usize)
+            .checked_next_multiple_of(8)
+            .and_then(|padded| at.checked_add(8)?.checked_add(padded))
+        else {
+            break;
+        };
+        at = next;
+    }
+    Ok(())
+}
+
 fn regular_file(path: &Path) -> Result<()> {
     ensure!(
         fs::symlink_metadata(path)?.file_type().is_file(),
@@ -902,6 +1112,7 @@ pub(crate) fn verify_base(path: &Path) -> Result<()> {
             qcow2_backing_file(path)?.is_none(),
             "template base disk must not have a backing file"
         );
+        refuse_qcow2_data_file(path)?;
     }
     Ok(())
 }
@@ -1024,6 +1235,8 @@ fn verify_variants(dir: &Path, meta: &TemplateMeta, base_digest: Option<&str>) -
             v.name,
             backing.as_deref().unwrap_or("nothing")
         );
+        refuse_qcow2_data_file(&overlay)
+            .with_context(|| format!("variant `{}` of {reference}", v.name))?;
     }
     Ok(())
 }
@@ -1214,6 +1427,18 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Fail unless `dir` holds every file in `needed`, paths relative to it.
+fn still_staged(dir: &Path, needed: &[PathBuf]) -> Result<()> {
+    match needed.iter().find(|rel| !dir.join(rel).is_file()) {
+        None => Ok(()),
+        Some(gone) => bail!(
+            "{} was removed from {} during the install; nothing was installed",
+            gone.display(),
+            dir.display()
+        ),
+    }
+}
+
 /// The filesystem steps of an install. [`InstallOps::REAL`] outside tests.
 struct InstallOps {
     write_meta: fn(&TemplateMeta, &Path) -> Result<()>,
@@ -1350,6 +1575,7 @@ mod tests {
             created: "2026-06-12T00:00:00Z".parse().unwrap(),
             origin: None,
             registry: None,
+            pulled_from: None,
             sha256: None,
             first_boot_script: None,
             agent_version: None,
@@ -1893,6 +2119,75 @@ mod tests {
         assert_eq!(version_entries(&store), ["1"]);
     }
 
+    // ---- staged files that go away during the install (F13) ----------------
+
+    /// Review templates-registry F13: the staged disk is removed after
+    /// `install_with` checked it and before the rename. Nothing is installed.
+    #[test]
+    fn a_staged_disk_removed_before_the_rename_installs_nothing() {
+        let (_tmp, store) = new_store();
+        fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"one").unwrap();
+        let err = store
+            .install_with(
+                &staging,
+                &meta("x86_64", "t", "1"),
+                false,
+                &InstallOps {
+                    write_meta: |meta, path| {
+                        fs::remove_file(path.with_file_name(DISK_FILE)).unwrap();
+                        meta.write_to(path)
+                    },
+                    ..InstallOps::REAL
+                },
+            )
+            .expect_err("a version with no disk was installed");
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+        assert!(store.installed("x86_64", "t", "1").unwrap().is_none());
+        assert!(!store.version_dir("x86_64", "t", "1").exists());
+    }
+
+    /// The same during an overwrite: the old version stays.
+    #[test]
+    fn a_staged_disk_removed_before_the_swap_keeps_the_old_version() {
+        let err = overwrite_fails_and_keeps_old(&InstallOps {
+            write_meta: |meta, path| {
+                fs::remove_file(path.with_file_name(DISK_FILE)).unwrap();
+                meta.write_to(path)
+            },
+            ..InstallOps::REAL
+        });
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+    }
+
+    /// The disk goes in the last moment, with the rename itself: the version
+    /// that arrived without it is taken out again.
+    #[test]
+    fn a_staged_disk_removed_at_the_rename_installs_nothing() {
+        let (_tmp, store) = new_store();
+        fs::create_dir_all(store.root()).unwrap();
+        let staging = tempfile::tempdir_in(store.root()).unwrap().keep();
+        fs::write(staging.join(DISK_FILE), b"one").unwrap();
+        let err = store
+            .install_with(
+                &staging,
+                &meta("x86_64", "t", "1"),
+                false,
+                &InstallOps {
+                    rename: |from, to| {
+                        fs::remove_file(from.join(DISK_FILE))?;
+                        fs::rename(from, to)
+                    },
+                    ..InstallOps::REAL
+                },
+            )
+            .expect_err("a version with no disk was installed");
+        assert!(format!("{err:#}").contains(DISK_FILE), "{err:#}");
+        assert!(store.installed("x86_64", "t", "1").unwrap().is_none());
+        assert!(!store.version_dir("x86_64", "t", "1").exists());
+    }
+
     /// The state a crash between setting `x86_64/t@1` aside and the final
     /// rename leaves: no version dir, the old one at `.old-1`, and a
     /// half-staged replacement at `.next-1`.
@@ -1992,8 +2287,9 @@ mod tests {
         let adding = store.clone();
         let staging = tempfile::tempdir_in(store.root()).unwrap();
         let staging_path = staging.path().to_path_buf();
-        let added =
-            returns_within_10s(move || adding.add_variants("x86_64", "t", "1", &staging_path, &[]));
+        let added = returns_within_10s(move || {
+            adding.add_variants("x86_64", "t", "1", &staging_path, &[], &|_| None)
+        });
         assert!(added.is_ok(), "{added:?}");
         assert_eq!(version_entries(&store), ["1"]);
         assert_eq!(version_files(&store).0, before.0);
@@ -2038,6 +2334,49 @@ mod tests {
     }
 
     // ---- remove ---------------------------------------------------------------
+
+    /// An overwriting install asks the store's replace guard about every
+    /// disk of the version it would delete, and a refusal leaves the version
+    /// untouched (review templates-registry F2).
+    #[test]
+    fn an_overwrite_asks_the_replace_guard_and_a_refusal_keeps_the_version() {
+        let (_tmp, store, _) = store_with_old_version();
+        let before = version_files(&store);
+        let dir = store.version_dir("x86_64", "t", "1");
+        fs::create_dir_all(dir.join("variants/extra")).unwrap();
+        fs::write(dir.join("variants/extra/disk.qcow2"), b"overlay").unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let guarded = store.clone().refusing_replace({
+            let asked = asked.clone();
+            move |doomed| {
+                asked.lock().unwrap().extend(doomed.to_vec());
+                Some("the clone of machine lab/vm is backed by it".into())
+            }
+        });
+
+        let staging = tempfile::tempdir_in(store.root()).unwrap();
+        fs::write(staging.path().join(DISK_FILE), b"new disk").unwrap();
+        let err = guarded
+            .install(staging.path(), &new_meta(), true)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("lab/vm"), "{text}");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                dir.join(DISK_FILE),
+                dir.join("variants/extra").join(DISK_FILE)
+            ]
+        );
+        assert_eq!(version_files(&store), before);
+        assert_eq!(version_entries(&store), ["1"]);
+
+        // A guard that finds no clone lets the replacement through.
+        let free = store.clone().refusing_replace(|_| None);
+        free.install(&staging.keep(), &new_meta(), true).unwrap();
+        assert_ne!(version_files(&store), before);
+    }
 
     #[test]
     fn remove_respects_in_use_and_force() {
@@ -2320,6 +2659,83 @@ mod tests {
 
     fn named(n: &str) -> VariantRef {
         VariantRef::Named(n.into())
+    }
+
+    on_both_tools!(adding_a_variant_that_replaces_one_asks_whether_it_is_in_use);
+    /// Review templates-registry F1: `add_variants` with a variant the
+    /// version already holds replaces that overlay, so it asks first. It
+    /// hands the check the overlay that would go, a reason refuses the call
+    /// with nothing moved, and a variant of a new name is not asked about.
+    fn adding_a_variant_that_replaces_one_asks_whether_it_is_in_use() {
+        use std::os::unix::fs::MetadataExt;
+        let (_tmp, store) = variant_store();
+        let found = store.resolve_version("x86_64", "win", Some("1")).unwrap();
+        let base_sha = found.meta.sha256.clone().unwrap();
+        let held = found.variant_disk("standard");
+        let inode = fs::metadata(&held).unwrap().ino();
+
+        // A staged `standard` and a staged `fresh`, each on a copy of the base.
+        let stage = |name: &str| {
+            let staging = tempfile::tempdir_in(store.root()).unwrap();
+            fs::copy(&found.disk_path, staging.path().join(DISK_FILE)).unwrap();
+            let vdir = staging.path().join(VARIANTS_DIR).join(name);
+            fs::create_dir_all(&vdir).unwrap();
+            variant_overlay(&vdir);
+            let mut v = variant_meta(name, name == "standard", &base_sha);
+            v.sha256 = sha256_file(&vdir.join(DISK_FILE)).unwrap();
+            (staging, v)
+        };
+
+        let (staging, v) = stage("standard");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let busy = |doomed: &[PathBuf]| {
+            asked.borrow_mut().extend_from_slice(doomed);
+            Some("the clone of machine a/web is backed by it".to_string())
+        };
+        let err = store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &busy,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x86_64/win@1#standard") && err.contains("a/web"),
+            "{err}"
+        );
+        assert_eq!(*asked.borrow(), std::slice::from_ref(&held));
+        assert_eq!(fs::metadata(&held).unwrap().ino(), inode, "left in place");
+        assert!(staging.path().join(variant_disk_rel("standard")).is_file());
+
+        // Nothing leans on it: replaced.
+        store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &|_| None,
+            )
+            .unwrap();
+        assert_ne!(fs::metadata(&held).unwrap().ino(), inode);
+
+        // A new name replaces nothing, so the check is not asked.
+        let (staging, v) = stage("fresh");
+        store
+            .add_variants(
+                "x86_64",
+                "win",
+                "1",
+                staging.path(),
+                std::slice::from_ref(&v),
+                &|_| panic!("asked about a variant that replaces none"),
+            )
+            .unwrap();
     }
 
     on_both_tools!(a_marked_base_without_its_variants_is_refused);
@@ -2664,6 +3080,80 @@ mod tests {
             sha256_file(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// A version-3 qcow2 header, with the external-data-file feature bit
+    /// when `bit`, the data-file extension naming `/etc/hostname` when
+    /// `extension`, and `backing` as its backing file name.
+    fn qcow2_header(bit: bool, extension: bool, backing: Option<&str>) -> Vec<u8> {
+        let mut bytes = vec![0; 104];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&16u32.to_be_bytes());
+        if bit {
+            bytes[72..80].copy_from_slice(&(1u64 << 2).to_be_bytes());
+        }
+        bytes[100..104].copy_from_slice(&104u32.to_be_bytes());
+        if extension {
+            let name = b"/etc/hostname";
+            bytes.extend_from_slice(&0x4441_5441u32.to_be_bytes());
+            bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+        }
+        // The end-of-extensions marker.
+        bytes.extend_from_slice(&[0; 8]);
+        if let Some(backing) = backing {
+            let offset = bytes.len() as u64;
+            bytes[8..16].copy_from_slice(&offset.to_be_bytes());
+            bytes[16..20].copy_from_slice(&(backing.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(backing.as_bytes());
+        }
+        bytes.resize(512, 0);
+        bytes
+    }
+
+    // Review templates-registry F7.
+    #[test]
+    fn a_base_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join(DISK_FILE);
+        fs::write(&disk, qcow2_header(false, false, None)).unwrap();
+        verify_base(&disk).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            fs::write(&disk, qcow2_header(bit, extension, None)).unwrap();
+            let err = verify_base(&disk).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
+    }
+
+    // Review templates-registry F7: the same for a variant overlay whose
+    // backing name is the correct one.
+    #[test]
+    fn a_variant_with_an_external_data_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(DISK_FILE), qcow2_header(false, false, None)).unwrap();
+        let base_sha = sha256_file(&dir.path().join(DISK_FILE)).unwrap();
+        let overlay = dir.path().join(variant_disk_rel("standard"));
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        let staged = |bit: bool, extension: bool| {
+            fs::write(
+                &overlay,
+                qcow2_header(bit, extension, Some(VARIANT_BACKING)),
+            )
+            .unwrap();
+            let mut variant = variant_meta("standard", true, &base_sha);
+            variant.sha256 = sha256_file(&overlay).unwrap();
+            let mut m = meta("x86_64", "win", "1");
+            m.variants = vec![variant];
+            verify_variants(dir.path(), &m, Some(&base_sha))
+        };
+        staged(false, false).unwrap();
+        for (bit, extension) in [(true, true), (true, false), (false, true)] {
+            let err =
+                staged(bit, extension).expect_err(&format!("bit {bit}, extension {extension}"));
+            assert!(format!("{err:#}").contains("external data file"), "{err:#}");
+        }
     }
 
     #[test]

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Generate the pin and patch tables in docs/stack.md from build/*/PINS and guest patches/.
+"""Read the pin and patch inventories from build/*/PINS and guest patches/.
 
 usage: scripts/pins-table.py           print both tables
-       scripts/pins-table.py --write   rewrite the generated blocks in docs/stack.md
-       scripts/pins-table.py --check   exit 1 if docs/stack.md is out of date
+       scripts/pins-table.py --write   rewrite the pin table in docs/stack.md
+       scripts/pins-table.py --check   check the pin table and patch series
 
 Each build/<component>/PINS has its own line format (see the header of each
 file). The parsers below read every format in the repository and fail on a
 line they do not understand, so a new PINS format cannot be skipped silently.
 
-The patch table lists every *.patch under patches/, recursively (patches/host/
-has one directory per host component). Each row links the document that
+The patch table lists every patch in application order. Each row links the document that
 explains the patch: the first docs/*.md its header names, else DOC_OVERRIDE,
 else DOC_DEFAULT for its directory.
 """
@@ -27,9 +26,9 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 # Patches whose file has no "Subject:" header, by path under patches/.
 SUBJECT_FALLBACK = {
-    "kmd/0001-kmd-r10-copy.patch":
+    "kmd/kmd-r10-copy.patch":
         "Convert R10G10B10A2 sources to 8-bit RGBA or BGRA in the KMD's CPU present blit (the prior art's r10 KMD)",
-    "mesa/0021-yttrium-d3d11-typed-uav-loads-without-formatless-read.patch":
+    "mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch":
         "d3d10umd, yttrium: create WDDM 2.0 D3D11 devices without formatless storage-image reads; "
         "R32 typed UAV loads only, and TypedUAVLoadAdditionalFormats from the host (Intel ANV)",
     "host/virglrenderer/0001-vkr-log-image-creation.patch":
@@ -51,7 +50,7 @@ DOC_DEFAULT = {
     "host/virglrenderer/workaround": "docs/nvidia.md",
 }
 DOC_OVERRIDE = {
-    "mesa/0021-yttrium-d3d11-typed-uav-loads-without-formatless-read.patch": "docs/zeus.md",
+    "mesa/yttrium-d3d11-typed-uav-loads-without-formatless-read.patch": "docs/zeus.md",
 }
 
 
@@ -261,27 +260,53 @@ def doc_link(doc):
     return f"[`{doc}`]({target})"
 
 
+def read_series(directory):
+    series = directory / "series"
+    label = series.relative_to(REPO)
+    if not series.is_file():
+        sys.exit(f"{label}: missing series file")
+    data = series.read_bytes()
+    if data and not data.endswith(b"\n"):
+        sys.exit(f"{label}: each entry must end with a newline")
+    names = data.decode("ascii", errors="replace").split("\n")[:-1]
+    seen = set()
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.patch", name):
+            sys.exit(f"{label}: invalid patch name {name!r}")
+        if name in seen:
+            sys.exit(f"{label}: duplicate entry {name}")
+        if not (directory / name).is_file():
+            sys.exit(f"{label}: missing patch {name}")
+        seen.add(name)
+    unlisted = sorted(p.relative_to(directory).as_posix()
+                      for p in directory.rglob("*.patch")
+                      if p.relative_to(directory).as_posix() not in seen)
+    if unlisted:
+        sys.exit(f"{label}: unlisted patches: {', '.join(unlisted)}")
+    return [directory / name for name in names]
+
+
 def patches_table():
     out = ["| Upstream | Patches | Patch | What it does | Explained in |", "| --- | --- | --- | --- | --- |"]
     root = REPO / "patches"
-    dirs = sorted({p.parent for p in root.rglob("*.patch")} |
-                  {p for p in root.iterdir() if p.is_dir() and
-                   any(child.is_file() for child in p.rglob("*"))})
+    for p in root.glob("*.patch"):
+        sys.exit(f"{p.relative_to(REPO)}: patches belong in a component directory")
+    dirs = sorted(p for p in root.iterdir()
+                  if p.is_dir() and any(child.is_file() for child in p.rglob("*")))
     for d in dirs:
         rel = d.relative_to(root).as_posix()
-        patches = sorted(d.glob("*.patch"))
+        patches = read_series(d)
         if not patches:
-            if not any(d.rglob("*.patch")):  # a directory like patches/dxil-spirv/
-                out.append(f"| {rel} | 0 | — | None; see [`patches/{rel}/`](../patches/{rel}/) | — |")
+            out.append(f"| {rel} | 0 | — | None; see [`patches/{rel}/`](../patches/{rel}/) | — |")
             continue
         for i, p in enumerate(patches):
             first = f"| {rel} | {len(patches)} |" if i == 0 else "| | |"
             desc = subject(p).replace("|", "\\|")
-            out.append(f"{first} [`{p.name[:4]}`](../patches/{rel}/{p.name}) | {desc} | {doc_link(explaining_doc(p))} |")
+            out.append(f"{first} [`{p.stem}`](../patches/{rel}/{p.name}) | {desc} | {doc_link(explaining_doc(p))} |")
     return out
 
 
-BLOCKS = {"pins": pins_table, "patches": patches_table}
+BLOCKS = {"pins": pins_table}
 
 
 def render(text):
@@ -303,9 +328,11 @@ def main():
     g.add_argument("--check", action="store_true", help="fail if docs/stack.md is out of date")
     a = ap.parse_args()
     if not (a.write or a.check):
-        for fn in BLOCKS.values():
+        for fn in (pins_table, patches_table):
             print("\n".join(fn()) + "\n")
         return
+    if a.check:
+        patches_table()
     old = STACK.read_text()
     new = render(old)
     if a.write:

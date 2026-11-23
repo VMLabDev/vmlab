@@ -197,84 +197,117 @@ async fn ensure_current_daemon(
     targets: &[String],
 ) -> Result<CurrentDaemon> {
     let targeted = |machine: &str| targets.is_empty() || targets.iter().any(|t| t == machine);
-    let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
-        // A daemon started now reads the file now.
-        return Ok(CurrentDaemon {
-            client: daemon::ensure_lab_daemon(name, root).await?,
-            pending: Vec::new(),
-            reloaded: false,
-        });
-    };
     // The daemon was handed the canonical root (the supervisor registers it
     // so), and the digest covers it, so load from the same path.
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let digest = crate::config::digest(&load_lab_at(&root)?);
-    let status = lab_status(&client).await?;
-    match daemon_freshness(name, &status, &digest) {
-        DaemonFreshness::Current => Ok(CurrentDaemon {
-            pending: status
-                .pending
-                .into_iter()
-                .filter(|p| targeted(&p.machine))
-                .collect(),
-            client,
-            reloaded: false,
-        }),
-        DaemonFreshness::Refuse(why) => bail!(why),
-        DaemonFreshness::Reload => {
-            println!("lab \"{name}\": vmlab.wcl changed — reloading it into the running lab");
-            let reply = client.send(LabRequest::Reload {}).await.map_err(remote)?;
-            let report: crate::status::ReloadReport = serde_json::from_value(reply)
-                .context("the lab daemon sent a reload report vmlab cannot read")?;
-            for line in reload_lines(&report) {
-                println!("{line}");
-            }
-            Ok(CurrentDaemon {
-                pending: report
-                    .machines
-                    .into_iter()
-                    .filter_map(|m| match m {
-                        crate::status::MachineReload::Pending(p) if targeted(&p.machine) => Some(p),
-                        _ => None,
-                    })
-                    .collect(),
-                client,
-                reloaded: true,
-            })
-        }
-        DaemonFreshness::Restart => {
-            if status.config_digest != digest {
-                println!(
-                    "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
-                );
-            } else {
-                println!(
-                    "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
-                     — restarting the lab daemon to plan its clones again"
-                );
-            }
-            let reply = daemon::ensure_supervisor()
-                .await?
-                .send(SupRequest::LabRestart {
-                    name: name.to_string(),
-                    root,
-                })
-                .await
-                .map_err(remote)?;
-            // The old daemon's socket path is reused, but follow the reply
-            // rather than assume it.
-            let socket = std::path::PathBuf::from(
-                reply["socket"]
-                    .as_str()
-                    .context("malformed lab.restart response")?,
-            );
-            Ok(CurrentDaemon {
-                client: LabClient::connect(&socket).await?,
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // A restart that found another command's successor in place of the
+    // daemon it named replaced nothing, so that successor is checked like
+    // any daemon found here. Once: a second one means the lab's daemon is
+    // being replaced again and again under this command.
+    let mut superseded = false;
+    loop {
+        let Some(client) = daemon::try_own_lab_daemon(name, root).await? else {
+            // A daemon started now reads the file now.
+            return Ok(CurrentDaemon {
+                client: daemon::ensure_lab_daemon(name, root).await?,
                 pending: Vec::new(),
                 reloaded: false,
-            })
+            });
+        };
+        let digest = crate::config::digest(&load_lab_at(&canonical)?);
+        let status = lab_status(&client).await?;
+        match daemon_freshness(name, &status, &digest) {
+            DaemonFreshness::Current => {
+                return Ok(CurrentDaemon {
+                    pending: status
+                        .pending
+                        .into_iter()
+                        .filter(|p| targeted(&p.machine))
+                        .collect(),
+                    client,
+                    reloaded: false,
+                });
+            }
+            DaemonFreshness::Refuse(why) => bail!(why),
+            DaemonFreshness::Reload => {
+                println!("lab \"{name}\": vmlab.wcl changed — reloading it into the running lab");
+                let reply = client.send(LabRequest::Reload {}).await.map_err(remote)?;
+                let report: crate::status::ReloadReport = serde_json::from_value(reply)
+                    .context("the lab daemon sent a reload report vmlab cannot read")?;
+                for line in reload_lines(&report) {
+                    println!("{line}");
+                }
+                return Ok(CurrentDaemon {
+                    pending: report
+                        .machines
+                        .into_iter()
+                        .filter_map(|m| match m {
+                            crate::status::MachineReload::Pending(p) if targeted(&p.machine) => {
+                                Some(p)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    client,
+                    reloaded: true,
+                });
+            }
+            DaemonFreshness::Restart => {
+                if status.config_digest != digest {
+                    println!(
+                        "lab \"{name}\": vmlab.wcl changed — restarting the lab daemon to load it"
+                    );
+                } else {
+                    println!(
+                        "lab \"{name}\": the main checkout's freeze or a machine's disk changed \
+                         — restarting the lab daemon to plan its clones again"
+                    );
+                }
+                let reply = daemon::ensure_supervisor()
+                    .await?
+                    .send(SupRequest::LabRestart {
+                        name: name.to_string(),
+                        root: canonical.clone(),
+                        daemon: named_daemon(&status),
+                    })
+                    .await
+                    .map_err(remote)?;
+                if reply["replaced"] == false {
+                    if superseded {
+                        bail!(
+                            "lab \"{name}\": other commands keep replacing the lab daemon — \
+                             run this command again once they have finished"
+                        );
+                    }
+                    superseded = true;
+                    println!(
+                        "lab \"{name}\": another command restarted the lab daemon first — \
+                         using that daemon"
+                    );
+                    continue;
+                }
+                // The old daemon's socket path is reused, but follow the reply
+                // rather than assume it.
+                let socket = std::path::PathBuf::from(
+                    reply["socket"]
+                        .as_str()
+                        .context("malformed lab.restart response")?,
+                );
+                return Ok(CurrentDaemon {
+                    client: LabClient::connect(&socket).await?,
+                    pending: Vec::new(),
+                    reloaded: false,
+                });
+            }
         }
     }
+}
+
+/// The daemon a restart decided from `status` replaces: the one that
+/// answered it. `None` for a daemon that predates the field, which is
+/// replaced whatever its pid.
+fn named_daemon(status: &LabStatus) -> Option<u32> {
+    (status.daemon_pid != 0).then_some(status.daemon_pid)
 }
 
 /// What a reload did, one line per machine rebuilt, added, dropped or left
@@ -499,6 +532,15 @@ pub fn cmd_destroy() -> Result<()> {
             }
             None if lab_local.exists() => {
                 refuse_destroy_under_freeze(&root).await?;
+                // A daemon that does not answer may still be starting, or
+                // have lost its socket file, and it holds the lab's state
+                // open. The release waits for a start and stops such a
+                // daemon before the directory goes.
+                if let Ok(sup) = daemon::ensure_supervisor().await {
+                    let _ = sup
+                        .send(SupRequest::LabRelease { name: name.clone() })
+                        .await;
+                }
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
                 crate::freeze::ports::release_worktree(&root)?;
@@ -1230,20 +1272,28 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
         // is exactly what restart exists to recover from, and blocking there
         // would make the verb useless when it is needed most (the console's
         // reload button reasons the same way).
+        //
+        // The daemon that answered is the one this restart replaces. The
+        // request names it, so a daemon another command started in between,
+        // which nothing here checked, is left running.
+        let mut checked = None;
         if let Some(client) = daemon::try_lab_daemon(name).await?
             && let Ok(status) = lab_status(&client).await
-            && !status.all_stopped()
         {
-            bail!(
-                "lab \"{name}\" still has machines running — stop them first; \
-                 a restarted daemon cannot re-adopt them"
-            );
+            if !status.all_stopped() {
+                bail!(
+                    "lab \"{name}\" still has machines running — stop them first; \
+                     a restarted daemon cannot re-adopt them"
+                );
+            }
+            checked = named_daemon(&status);
         }
         let supervisor = daemon::ensure_supervisor().await?;
         let reply = supervisor
             .send(SupRequest::LabRestart {
                 name: name.to_string(),
                 root,
+                daemon: checked,
             })
             .await
             .map_err(remote)?;
@@ -1259,8 +1309,15 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
             .send(LabRequest::Ping {})
             .await
             .map_err(remote)?;
-        super::emit(json, &reply, |_| {
-            format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
+        super::emit(json, &reply, |reply| {
+            if reply["replaced"] == false {
+                format!(
+                    "lab \"{name}\" daemon was already restarted by another command, at {}\n",
+                    socket.display()
+                )
+            } else {
+                format!("lab \"{name}\" daemon restarted at {}\n", socket.display())
+            }
         })
     })
 }

@@ -6,7 +6,7 @@ use sha2_10::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const MAGIC: &[u8; 12] = b"VMLABTRUNK2\n";
+pub(super) const MAGIC: &[u8; 12] = b"VMLABTRUNK2\n";
 pub(super) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn proof(

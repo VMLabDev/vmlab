@@ -1,6 +1,6 @@
 # Black textures on NVIDIA and fixed-function texturing
 
-With `patches/mesa/0022`, the DirectX SDK (June 2010) D3D9 samples ran on the
+With `patches/mesa/yttrium-render-shadow-for-linear-colour-with-depth.patch`, the DirectX SDK (June 2010) D3D9 samples ran on the
 RTX 5090, but their textured meshes were black silhouettes
 ([`xid69.md`](xid69.md#open-items)). A fixed-function texture probe also
 failed its draw with `E_FAIL`, on NVIDIA and AMD alike. This page names the
@@ -13,8 +13,8 @@ with the egl-headless patch, virglrenderer 1.3.0. Evidence is in
 
 | Issue | Cause | Fix | GPUs affected |
 | --- | --- | --- | --- |
-| Mipmapped textures black on NVIDIA | Every D3D9 colour texture outside the system-memory pools is a "shared colour" image, which the winsys makes LINEAR. NVIDIA allows LINEAR images with one mip level and one array layer only, so image creation fails | `patches/mesa/0023`: use OPTIMAL tiling when the host refuses LINEAR for the exact create-info | NVIDIA |
-| Pre-transformed fixed-function draws fail with `E_FAIL` | For `XYZRHW` vertices the runtime sends its fixed-function pixel shader and no vertex shader. The UMD built one for only two vertex layouts | `patches/mesa/0024`: build the vertex shader from the declaration for any layout | All |
+| Mipmapped textures black on NVIDIA | Every D3D9 colour texture outside the system-memory pools is a "shared colour" image, which the winsys makes LINEAR. NVIDIA allows LINEAR images with one mip level and one array layer only, so image creation fails | `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch`: use OPTIMAL tiling when the host refuses LINEAR for the exact create-info | NVIDIA |
+| Pre-transformed fixed-function draws fail with `E_FAIL` | For `XYZRHW` vertices the runtime sends its fixed-function pixel shader and no vertex shader. The UMD built one for only two vertex layouts | `patches/mesa/d3d9-positiont-vs-for-runtime-fixed-function-ps.patch`: build the vertex shader from the declaration for any layout | All |
 | R5G6B5 textures black on NVIDIA, red and blue swapped on AMD | D3D `R5G6B5` and `A1R5G5B5` mapped to the wrong Vulkan `PACK16` formats. NVIDIA does not support the format chosen for R5G6B5 at all | `patches/mesa/0025`: map them to `R5G6B5_UNORM_PACK16` and `A1R5G5B5_UNORM_PACK16` | NVIDIA (black), AMD (swapped) |
 
 All three are proven on `Nvidia1` and `AMD1` with a package built at commit
@@ -68,7 +68,7 @@ Before the fix, the matrix gave a clear pattern
 The mip filter, `MAXMIPLEVEL`, LOD bias, shader model and the depth shadow
 made no difference. Only the level count and the format did.
 
-## Mipmapped textures on NVIDIA: `patches/mesa/0023`
+## Mipmapped textures on NVIDIA: `patches/mesa/yttrium-shared-colour-optimal-when-linear-refused.patch`
 
 ### Cause
 
@@ -121,7 +121,7 @@ surface, stay LINEAR wherever the host accepts them, as both NVIDIA and RADV
 do. On RADV every shared image stays LINEAR. ANV was not run.
 The decision comes from the host's answer, not from a vendor check.
 
-## Fixed-function texturing: `patches/mesa/0024`
+## Fixed-function texturing: `patches/mesa/d3d9-positiont-vs-for-runtime-fixed-function-ps.patch`
 
 ### Cause
 
@@ -158,7 +158,7 @@ diffuse in the vertex) checks that.
 ### What fixed function still lacks
 
 Superseded by [`ffp.md`](ffp.md), which tests these and fixes what failed
-(`patches/mesa/0040` to `0042`, including `XYZRHW` vertices with `PSIZE`).
+(`patches/mesa/d3d9-swvp-processed-vertices-keep-declaration-vs.patch` to `0042`, including `XYZRHW` vertices with `PSIZE`).
 As written for `0024`:
 
 The probe covers the vertex formats above, one texture stage, and lighting

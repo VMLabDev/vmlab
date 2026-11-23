@@ -254,15 +254,23 @@ impl Hda {
             );
             let mut bytes =
                 (self.streams[index].fraction / 1_000_000_000) as usize * format.frame_bytes();
+            // The host queue is two periods deep unless the sink asks for
+            // more, which it does after underruns.
+            let floor = PLAYBACK_QUEUE_FRAMES * format.frame_bytes();
+            let limit = self
+                .playback
+                .as_ref()
+                .and_then(|sink| sink.queue_limit_bytes())
+                .map_or(floor, |limit| limit.max(floor));
             while bytes != 0 {
                 let latency = self.playback.as_ref().map_or(0, |sink| sink.queued_bytes());
-                if index == 1 && latency >= PLAYBACK_QUEUE_FRAMES * format.frame_bytes() {
+                if index == 1 && latency >= limit {
                     log::trace!("HDA defer queued={latency} remaining_bytes={bytes}");
                     break;
                 }
                 let mut count = bytes.min(PERIOD_FRAMES * format.frame_bytes());
                 if index == 1 {
-                    count = count.min(PLAYBACK_QUEUE_FRAMES * format.frame_bytes() - latency);
+                    count = count.min(limit - latency);
                 }
                 count -= count % format.frame_bytes();
                 if count == 0 {

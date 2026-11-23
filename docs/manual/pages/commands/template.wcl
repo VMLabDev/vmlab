@@ -432,7 +432,10 @@ SRC
     hash to its block's `sha256`, its `base_sha256` must be the archive's
     base, and its backing file must be `../../disk.qcow2`. A variant that
     fails any of them refuses the whole archive. A version the store already
-    holds is refused unless `--overwrite` is given.
+    holds is refused unless `--overwrite` is given. `--overwrite` is itself
+    refused while a clone in a registered lab is backed by a disk of that
+    version, because replacing the disk would corrupt the clone. The refusal
+    names the machines.
   DOC
 
   code sh { source = "vmlab template import alpine-0.3.1.tar.zst" }
@@ -511,7 +514,14 @@ SRC
     tag pulls `latest`. A multi-architecture index with no `--arch` is
     refused, because the store keys templates by architecture. A version the
     store already holds is used as it stands when its disk is the published
-    image, and refused without `--overwrite` when it differs. `vmlab up` and
+    image, and refused without `--overwrite` when it differs. A version that
+    was pulled from another repository is refused in both cases, naming that
+    repository: the name and version come from the published metadata, so
+    two repositories can state the same ones, and a registry reference is
+    only ever resolved to a version its own repository installed.
+    `--overwrite` is itself refused, before anything is downloaded, while a clone in a
+    registered lab is backed by a disk of that version: the refusal names
+    the machines. `vmlab up` and
     `vmlab pull` pull a machine's template on demand, so this verb is for
     fetching ahead of time or for a template no lab file names yet.
   DOC

@@ -14,6 +14,8 @@ const WAET: &[u8] = include_bytes!("../../../docs/hwref/q35-seabios-linux-generi
 const TPM_DSDT: &[u8] = include_bytes!("../../../docs/hwref/q35-ovmf-win11/guest/acpi/DSDT");
 const SMM_DSDT: &[u8] =
     include_bytes!("../../../docs/hwref/q35-ovmf-win11-secureboot/guest/acpi/DSDT");
+/// The 64-bit PCI window a machine without large assigned BARs declares.
+pub const PCI64_SIZE: u64 = 32 << 30;
 pub const TABLES_FILE: &str = "etc/acpi/tables";
 pub const RSDP_FILE: &str = "etc/acpi/rsdp";
 
@@ -37,6 +39,11 @@ pub struct Platform {
     pub ecam_base: u64,
     /// Firmware-selected 64-bit PCI window; None places it above RAM.
     pub pci64_base: Option<u64>,
+    /// Length of the 64-bit PCI window PCI0._CRS declares. 32 GiB is what
+    /// the firmware defaults were captured with; an assigned device with
+    /// larger BARs needs every one of them inside it, or the guest OS
+    /// treats the firmware's placement as a conflict.
+    pub pci64_size: u64,
     pub tpm: bool,
     /// Firmware negotiates the SMM CPU-hotplug SMI protocol.
     pub smm: bool,
@@ -70,6 +77,7 @@ impl Default for Platform {
             .collect(),
             ecam_base: 0xb000_0000,
             pci64_base: None,
+            pci64_size: PCI64_SIZE,
             tpm: false,
             smm: false,
         }
@@ -179,11 +187,14 @@ fn validate(p: &Platform) -> Result<(), String> {
         }
         previous_end = end;
     }
-    if p.pci64_base.is_some_and(|base| {
-        base < previous_end.max(1 << 32)
-            || base & ((1 << 30) - 1) != 0
-            || base.checked_add(32 << 30).is_none()
-    }) {
+    if p.pci64_size < PCI64_SIZE
+        || p.pci64_size & ((1 << 30) - 1) != 0
+        || p.pci64_base.is_some_and(|base| {
+            base < previous_end.max(1 << 32)
+                || base & ((1 << 30) - 1) != 0
+                || base.checked_add(p.pci64_size).is_none()
+        })
+    {
         return Err("64-bit PCI window must be GiB aligned above RAM without overflow".into());
     }
     if p.ram_regions
@@ -314,7 +325,8 @@ fn dsdt(p: &Platform) -> Vec<u8> {
         .pci64_base
         .unwrap_or_else(|| high_end.div_ceil(1 << 30) * (1 << 30));
     put(&mut source, 0x1e62, high_base, 8);
-    put(&mut source, 0x1e6a, high_base + (32 << 30) - 1, 8);
+    put(&mut source, 0x1e6a, high_base + p.pci64_size - 1, 8);
+    put(&mut source, 0x1e7a, p.pci64_size, 8);
     let mut cpus = source[0x19ca..0x19ed].to_vec();
     let mut notify = Vec::new();
     for id in 0..p.max_cpus {

@@ -162,18 +162,15 @@ impl LabServices for TestLab {
 
     async fn ensure_shares(&self) {}
 
-    async fn attach_nic(
+    async fn attach_nics(
         &self,
-        _segment: &str,
-        sock: &std::path::Path,
-        _mac: crate::config::model::MacAddr,
-        _isolated: bool,
-        _tap_ok: bool,
-        _framing: crate::net::framing::FramingMode,
-    ) -> anyhow::Result<crate::net::fastpath::NicAttachment> {
-        Ok(crate::net::fastpath::NicAttachment::Stream {
-            sock: sock.to_path_buf(),
-        })
+        machine: &dyn Machine,
+    ) -> anyhow::Result<Vec<crate::net::fastpath::NicAttachment>> {
+        Ok((0..machine.nics().len())
+            .map(|i| crate::net::fastpath::NicAttachment::Stream {
+                sock: machine.nic_sock(i),
+            })
+            .collect())
     }
 
     async fn before_resume(&self, machine: &str) -> anyhow::Result<()> {
@@ -813,6 +810,41 @@ async fn a_vm_starts_and_becomes_ready_without_a_hypervisor() {
     assert_eq!(observed.ready_count(), 1, "on_ready fires exactly once");
 
     vm.stop(true).await.expect("stop");
+}
+
+/// F4 (docs/reviews/config.md): a disk's image is `disk-<name>.qcow2`, so
+/// two `disk` blocks with one name are one file. A configuration that reaches
+/// the lab daemon that way must never launch with that file as two drives:
+/// vmlab-hv takes no image lock, and writes through both corrupt it.
+#[tokio::test]
+async fn two_disks_with_one_name_never_launch_as_two_drives() {
+    let dirs = Dirs::new();
+    let decl = r#"vm "dc01" {
+        template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+        disk "data" { size = 1GiB }
+        disk "data" { size = 1GiB }
+    }"#;
+    let (vm, hv) = vm(&dirs, decl, Script::healthy());
+    // As for the primary disk: present, so nothing shells out to qemu-img.
+    std::fs::write(dirs.root.join("local").join("disk-data.qcow2"), b"").expect("disk-data");
+    let (cbs, _observed) = callbacks();
+
+    let started = start_vm(&vm, cbs).await;
+
+    for disks in hv.launched_disks() {
+        let mut seen = std::collections::HashSet::new();
+        for d in &disks {
+            assert!(
+                seen.insert(d),
+                "one image launched as two drives: {disks:?}"
+            );
+        }
+    }
+    let err = started.expect_err("a VM with one disk name twice must not start");
+    assert!(
+        format!("{err:#}").contains("disk \"data\" is declared twice"),
+        "the refusal names the duplicate: {err:#}"
+    );
 }
 
 /// Readiness is when the lab installs whatever is keyed on the machine's
@@ -2127,6 +2159,153 @@ async fn a_container_stops_through_its_ctl_channel() {
 
 // ---- what the seam does not cover -------------------------------------------
 
+#[tokio::test]
+async fn an_offline_capture_excludes_a_concurrent_start() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (vm, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    qimg::create_blank(&vm.dirs.primary_disk(), 1 << 20)
+        .await
+        .unwrap();
+
+    let (entered, release) = testing::pause_next("snapshot");
+    let machine = vm.clone();
+    let capture = tokio::spawn(async move { machine.snapshot("cold").await });
+    tokio::time::timeout(SETTLE, entered)
+        .await
+        .expect("capture did not reach the image tool")
+        .unwrap();
+
+    let (cbs, _observed) = callbacks();
+    let start = tokio::time::timeout(SETTLE, start_vm(&vm, cbs)).await;
+    release.send(()).unwrap();
+    assert!(!capture.await.unwrap().expect("offline capture"));
+    let error = start
+        .expect("start must refuse promptly")
+        .expect_err("start must refuse while an offline snapshot operation holds the disk");
+    assert!(error.to_string().contains("snapshot"), "{error:#}");
+    assert_eq!(vm.state().await, PowerState::Stopped);
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start after capture");
+    vm.stop(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let vm_dirs = Dirs::new();
+    let ctr_dirs = Dirs::new();
+    let (vm, _) = vm(&vm_dirs, LINUX_VM, Script::healthy());
+    let (ctr, _) = container(&ctr_dirs, WORKLOAD, Script::healthy());
+    let vm_disk = vm.dirs.primary_disk();
+    let ctr_disk = ctr.dirs.scratch_disk();
+    let machines: [(Arc<dyn Machine>, PathBuf); 2] = [(vm, vm_disk), (ctr, ctr_disk)];
+
+    for (machine, disk) in machines {
+        qimg::create_blank(&disk, 1 << 20).await.unwrap();
+        let (events, _) = EventLog::recording("t", disk.with_extension("events.jsonl"));
+        let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+        for op in ["capture", "restore", "delete"] {
+            let (entered, release) = testing::pause_next("snapshot");
+            let work = {
+                let machine = machine.clone();
+                let lab = lab.clone();
+                tokio::spawn(async move {
+                    match op {
+                        "capture" => {
+                            assert!(!machine.snapshot("cold").await?);
+                            Ok(())
+                        }
+                        "restore" => machine.restore(lab, "cold", false).await,
+                        _ => machine.delete_snapshot("cold").await,
+                    }
+                })
+            };
+            tokio::time::timeout(SETTLE, entered)
+                .await
+                .unwrap_or_else(|_| panic!("{op} did not reach the image tool"))
+                .unwrap();
+
+            let start =
+                tokio::time::timeout(SETTLE, machine.clone().start(lab.clone(), None)).await;
+            release.send(()).unwrap();
+            work.await.unwrap().unwrap();
+            let error = start
+                .expect("start must refuse promptly")
+                .expect_err("start must refuse during an offline snapshot operation");
+            assert!(error.to_string().contains("snapshot"), "{op}: {error:#}");
+            assert_eq!(machine.state().await, PowerState::Stopped);
+        }
+        machine.clone().start(lab, None).await.unwrap();
+        machine.stop(true).await.unwrap();
+    }
+}
+
+/// An offline snapshot is the whole powered-off machine: the disks, the UEFI
+/// variable store and the TPM's permanent state. A restore that rewound the
+/// disks alone would leave boot entries, enrolled keys and whatever the guest
+/// sealed to the TPM at the present, against a disk from the past.
+#[tokio::test]
+async fn an_offline_restore_returns_the_firmware_variables() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (vm, _) = vm(&dirs, LINUX_VM, Script::healthy());
+    qimg::create_blank(&vm.dirs.primary_disk(), 1 << 20)
+        .await
+        .unwrap();
+    let vars = vm.dirs.ovmf_vars();
+    let tpm = vm.dirs.tpm_state();
+    let permall = tpm.join("tpm2-00.permall");
+    std::fs::write(&vars, b"vars at capture").unwrap();
+    std::fs::create_dir_all(&tpm).unwrap();
+    std::fs::write(&permall, b"tpm at capture").unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let machine: Arc<dyn Machine> = vm.clone();
+    assert!(!machine.snapshot("cold").await.expect("offline capture"));
+
+    // What a boot after the capture does: the guest rewrites a variable,
+    // re-seals to the TPM, and leaves a file the capture never saw.
+    std::fs::write(&vars, b"vars after capture").unwrap();
+    std::fs::write(&permall, b"tpm after capture").unwrap();
+    std::fs::write(tpm.join("later"), b"made after capture").unwrap();
+
+    machine
+        .clone()
+        .restore(lab.clone(), "cold", false)
+        .await
+        .expect("offline restore");
+    assert_eq!(std::fs::read(&vars).unwrap(), b"vars at capture");
+    assert_eq!(std::fs::read(&permall).unwrap(), b"tpm at capture");
+    assert!(
+        !tpm.join("later").exists(),
+        "the TPM state is replaced whole"
+    );
+
+    // A second restore gives the same answer: the capture is not consumed.
+    std::fs::write(&vars, b"vars after restore").unwrap();
+    machine
+        .clone()
+        .restore(lab, "cold", false)
+        .await
+        .expect("second offline restore");
+    assert_eq!(std::fs::read(&vars).unwrap(), b"vars at capture");
+
+    machine.delete_snapshot("cold").await.expect("delete");
+    assert!(
+        !vm.dirs.snapshot_state().join("snap-cold").exists(),
+        "deleting the snapshot deletes what it held beside the disks"
+    );
+}
+
 /// A machine whose hypervisor reports no snapshots capability — the fake's
 /// default — reports exactly what a stopped one does rather than inventing a
 /// result: the honest failure that keeps what a snapshot does to a guest
@@ -2170,7 +2349,7 @@ async fn a_missing_capability_is_refused_as_not_running() {
         assert!(e.contains("dc01: not running"), "{e}");
     };
 
-    refused(m.snapshot("s1").await.expect_err("no snapshots"));
+    refused(m.snapshot("s1").await.expect_err("no snapshots").into());
     refused(
         m.clone()
             .restore(lab, "s1", true)
@@ -2260,6 +2439,35 @@ async fn a_failed_online_snapshot_load_resumes_the_vm() {
     assert!(!hv.paused(), "failed load left CPUs paused");
     assert_eq!(vm.state().await, PowerState::Running);
     vm.stop(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_container_load_resumes_the_container() {
+    let dirs = Dirs::new();
+    let (ctr, hv) = container(
+        &dirs,
+        WORKLOAD,
+        Script {
+            capabilities: Capabilities {
+                snapshots: true,
+                ..Capabilities::default()
+            },
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events));
+
+    let error = ctr
+        .clone()
+        .restore(lab, "missing", true)
+        .await
+        .expect_err("no such snapshot");
+    assert!(format!("{error:#}").contains("does not exist"), "{error:#}");
+    assert!(!hv.paused(), "failed load left CPUs paused");
+    ctr.stop(true).await.expect("stop");
 }
 
 /// A container's online snapshot rides the same capability: absent, the
@@ -3044,11 +3252,24 @@ async fn a_guest_reset_on_vmlab_hv_happens_in_place_as_one_run() {
     );
     // ...and returns with the rebooted guest's agent.
     m.wait_ready(SETTLE).await.expect("ready again");
-    let after = m.agent().await.expect("agent").info();
+    let agent = m.agent().await.expect("agent");
+    let after = agent.info();
     assert_ne!(
         after.instance, before.instance,
         "the new agent was handshaken"
     );
+    let output = agent
+        .exec(
+            vec!["echo".into(), "rebooted".into()],
+            vec![],
+            None,
+            None,
+            SETTLE,
+            None,
+        )
+        .await
+        .expect("exec as soon as ready");
+    assert_eq!(output.exit_code, 0);
     assert_eq!(hv.starts(), 1, "the reset happened in place");
     assert_eq!(observed.ready_count(), 1, "one run, announced once");
     assert!(

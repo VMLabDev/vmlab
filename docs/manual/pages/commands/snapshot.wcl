@@ -13,7 +13,8 @@ page cmd_snapshot {
     snapshot identically. A snapshot records the machine's power state at
     capture: an online snapshot of a running machine carries disk, RAM and
     device state, and restoring it resumes the machine where it was; an
-    offline snapshot carries disk state only and restoring it leaves the
+    offline snapshot carries disk state, with a VM's UEFI variables and TPM
+    state, and restoring it leaves the
     machine powered off.
   DOC
 

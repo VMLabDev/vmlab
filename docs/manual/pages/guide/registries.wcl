@@ -140,6 +140,16 @@ page guide_registries {
   DOC
 
   p <<DOC
+    A variant can be rebuilt and pushed again onto the same version. A pull
+    replaces the overlay your store holds with the rebuilt one only when no
+    machine in any registered lab is cloned from it, because a clone stores
+    only its differences from that overlay. While one is, a pull that asked
+    for that variant is refused and names the machines, and a pull that only
+    brought it along as the default keeps your overlay and fetches the rest.
+    Destroy those machines and pull again to take the rebuilt variant.
+  DOC
+
+  p <<DOC
     An older vmlab that predates variants pulling the version tag sees only
     the base manifest, and installs the base as a base-only template. Asked
     for a `--` tag, it refuses the manifest for its missing whole-image

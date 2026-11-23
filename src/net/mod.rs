@@ -1,5 +1,8 @@
 //! The userspace network fabric (PRD §9).
 //!
+//! - [`accept`]: the pause an accept loop takes when `accept` fails.
+//! - [`bounded`]: the size-limited map behind every table a guest's frames
+//!   fill.
 //! - [`frame`]: ethernet/ARP/IPv4/UDP/TCP/ICMP views and builders.
 //! - [`framing`]: the 4-byte big-endian length framing QEMU uses for
 //!   stream-socket netdevs.
@@ -10,6 +13,8 @@
 //! - [`fastpath`]: opt-in kernel acceleration tiers (eBPF sockmap/XDP) with
 //!   empirical probing and silent fallback to the userspace switch.
 
+pub mod accept;
+mod bounded;
 pub mod dhcp;
 pub mod dns;
 pub mod fastpath;

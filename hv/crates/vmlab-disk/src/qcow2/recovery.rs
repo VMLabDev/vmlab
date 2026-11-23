@@ -16,11 +16,18 @@ impl Qcow2Image {
         self.count_view(&mut counts, &self.l1)?;
 
         let mut offset = self.snapshots_offset;
-        for _ in 0..self.nb_snapshots {
+        for index in 0..self.nb_snapshots {
             let mut fixed = [0u8; 40];
             self.file.read_exact_at(&mut fixed, offset)?;
             let l1_offset = u64::from_be_bytes(fixed[..8].try_into().unwrap());
-            let entries = u32::from_be_bytes(fixed[8..12].try_into().unwrap()) as u64;
+            let entries = u32::from_be_bytes(fixed[8..12].try_into().unwrap());
+            if entries > super::MAX_L1_ENTRIES {
+                return Err(Error::Format {
+                    format: "qcow2",
+                    reason: format!("snapshot L1 table too large ({entries} entries)"),
+                });
+            }
+            let entries = u64::from(entries);
             self.count_range(&mut counts, l1_offset, entries * 8)?;
             let mut bytes = vec![0; (entries * 8) as usize];
             self.file.read_exact_at(&mut bytes, l1_offset)?;
@@ -34,8 +41,16 @@ impl Qcow2Image {
             let id = u16::from_be_bytes(fixed[12..14].try_into().unwrap()) as u64;
             let name = u16::from_be_bytes(fixed[14..16].try_into().unwrap()) as u64;
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as u64;
+            let entry_len = 40 + extra + id + name;
+            // Alignment is required between entries. QEMU may end the file
+            // immediately after the last entry's payload.
+            let span = if index + 1 < self.nb_snapshots {
+                entry_len.div_ceil(8) * 8
+            } else {
+                entry_len
+            };
             offset = offset
-                .checked_add((40 + extra + id + name).div_ceil(8) * 8)
+                .checked_add(span)
                 .ok_or_else(|| Error::Unsupported("snapshot table overflows u64".into()))?;
         }
         if self.nb_snapshots != 0 {
@@ -140,7 +155,9 @@ impl Qcow2Image {
                     let shift = 62 - (self.cluster_bits - 8);
                     let offset = entry & ((1u64 << shift) - 1);
                     let sectors = ((entry >> shift) & ((1u64 << (62 - shift)) - 1)) + 1;
-                    self.count_range(counts, offset, sectors * 512)?;
+                    // The data ends at the end of its last sector.
+                    let end = (offset / 512 + sectors) * 512;
+                    self.count_range(counts, offset, end - offset)?;
                 } else if entry & OFFSET_MASK != 0 {
                     self.count_range(counts, entry & OFFSET_MASK, self.cluster_size)?;
                 }

@@ -39,14 +39,26 @@
 //! and [`NatEngine::udp_bind_guest_flow`] do the same for UDP datagrams.
 //! [`PortForwarder`] ties host listeners to those primitives.
 //!
-//! Under worktree isolation (PRD §21.4) a [`HostGuard`] refuses every new
-//! flow to the host's own addresses: a SYN is answered with RST, a UDP
-//! datagram or an ICMP echo is dropped ([`guard`]).
+//! What a guest can make the engine hold is limited, per guest address and
+//! per engine: guest-opened TCP flows ([`MAX_TCP_FLOWS`], a SYN past the
+//! limit is dropped), UDP flows (a new one past the limit replaces the one
+//! idle the longest, see [`udp`]) and `ping` probes in flight (see
+//! [`icmp`]). Without the limits one guest takes every descriptor of the
+//! lab daemon.
 //!
-//! Frames toward a guest need the guest's MAC: it is learned from every
-//! frame the engine sees, and the gateway can prime the table via
-//! [`NatEngine::learn_mac`] (it sees ARP/DHCP). Unknown guests fall back to
-//! the L2 broadcast address, which the switch floods.
+//! The engine never lets a guest's flow land on the host's loopback
+//! (`127.0.0.0/8`, `0.0.0.0/8`) on its own: a SYN is answered with RST, a
+//! UDP datagram or an ICMP echo is dropped. A segment's [`HostGuard`] admits
+//! the lab's own host services and declared `redirect` targets there, and
+//! under worktree isolation (PRD §21.4) refuses every host address
+//! ([`guard`]).
+//!
+//! Frames toward a guest need the guest's MAC. The lab daemon binds the
+//! address of a forward to the MAC of the NIC that holds its lease with
+//! [`NatEngine::learn_mac`], and no frame changes a bound address (review
+//! F9). An address nobody bound is learned from the frames the engine sees.
+//! Unknown guests fall back to the L2 broadcast address, which the switch
+//! floods.
 
 mod forward;
 pub mod guard;
@@ -75,6 +87,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{
     self, ETHERTYPE_IPV4, EthView, ICMP_ECHO_REQUEST, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP,
     IcmpView, Ipv4View, MAC_BROADCAST, TcpView, UdpView,
@@ -117,17 +130,22 @@ pub struct NatEngine {
     output: mpsc::Sender<Bytes>,
     /// Live vTCP flows; the value feeds guest segments to the flow task.
     tcp_flows: StdMutex<HashMap<FlowKey, mpsc::Sender<vtcp::Segment>>>,
+    /// How many guest-opened vTCP flows each guest address holds; the sum
+    /// is held under [`MAX_TCP_FLOWS`]. Engine-originated flows (port
+    /// forwards) are in `tcp_flows` but not here: no guest opens them.
+    tcp_passive: StdMutex<HashMap<Ipv4Addr, usize>>,
     /// Outbound UDP NAT flows.
     udp_flows: StdMutex<HashMap<FlowKey, udp::UdpFlow>>,
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
     /// (guest_ip, guest_port, gw_port); the value receives guest payloads.
     guest_udp: StdMutex<HashMap<GuestUdpKey, mpsc::Sender<Vec<u8>>>>,
-    /// Learned guest IP → MAC mappings.
-    macs: StdMutex<HashMap<Ipv4Addr, MacAddr>>,
+    /// Guest IP → MAC mappings, bound or seen ([`GuestMacs`]).
+    macs: StdMutex<GuestMacs>,
     icmp: icmp::IcmpState,
     pinger: Arc<dyn Pinger>,
-    /// Worktree isolation's refusal of host addresses (§21.4); unset outside
-    /// a frozen family.
+    /// What of the host a new flow may not reach: the segment's guard, or
+    /// worktree isolation's (§21.4). Unset, the engine refuses the host's
+    /// loopback outright.
     guard: std::sync::OnceLock<Arc<HostGuard>>,
     ip_id: AtomicU16,
     eph_counter: AtomicU32,
@@ -135,6 +153,53 @@ pub struct NatEngine {
     /// except in tests that need to exhaust it.
     eph_span: AtomicU32,
 }
+
+/// Where the engine sends what it originates toward a guest address.
+struct GuestMacs {
+    /// Told by the lab daemon ([`NatEngine::learn_mac`]), which knows the
+    /// NIC that holds the lease. Only another binding replaces an entry,
+    /// and no guest frame adds or removes one (review F9).
+    bound: HashMap<Ipv4Addr, MacAddr>,
+    /// The source MAC of the last frame from each address without a
+    /// binding. Any frame replaces it. A guest writes the source address
+    /// freely, so this table holds [`MAX_GUEST_MACS`] (review F6).
+    seen: BoundedMap<Ipv4Addr, MacAddr>,
+}
+
+/// How many guest-opened vTCP flows the engine holds at once (review F3):
+/// each is a host socket and a task, and a lab daemon that runs out of
+/// descriptors can open no QMP socket, agent socket or disk. A SYN past the
+/// limit is dropped, so the guest's own retransmission retries it.
+pub(super) const MAX_TCP_FLOWS: usize = 256;
+/// How many of [`MAX_TCP_FLOWS`] one guest address may hold, so that one
+/// guest cannot take every slot of its segment.
+pub(super) const MAX_TCP_FLOWS_PER_GUEST: usize = 128;
+
+/// One guest-opened vTCP flow's place under [`MAX_TCP_FLOWS`], held by the
+/// flow task for as long as it runs.
+pub(super) struct PassiveSlot {
+    engine: Arc<NatEngine>,
+    guest: Ipv4Addr,
+}
+
+impl Drop for PassiveSlot {
+    fn drop(&mut self) {
+        let mut held = self.engine.tcp_passive.lock_recover();
+        if let Some(n) = held.get_mut(&self.guest) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                held.remove(&self.guest);
+            }
+        }
+    }
+}
+
+/// How many guest addresses the engine keeps a seen MAC for (review F6).
+/// Past this a new one replaces the oldest. A flow a guest opens carries the
+/// MAC of its own frames. Only a flow the engine opens toward a guest (a
+/// port forward) reads this table, and it broadcasts when the address has
+/// neither a binding nor an entry here.
+pub(super) const MAX_GUEST_MACS: usize = 1024;
 
 /// The ephemeral range 49152..=65535.
 const EPHEMERAL_BASE: u16 = 49152;
@@ -156,9 +221,13 @@ impl NatEngine {
             cfg,
             output,
             tcp_flows: StdMutex::new(HashMap::new()),
+            tcp_passive: StdMutex::new(HashMap::new()),
             udp_flows: StdMutex::new(HashMap::new()),
             guest_udp: StdMutex::new(HashMap::new()),
-            macs: StdMutex::new(HashMap::new()),
+            macs: StdMutex::new(GuestMacs {
+                bound: HashMap::new(),
+                seen: BoundedMap::new(MAX_GUEST_MACS),
+            }),
             icmp: icmp::IcmpState::new(),
             pinger,
             guard: std::sync::OnceLock::new(),
@@ -172,21 +241,37 @@ impl NatEngine {
         &self.cfg
     }
 
-    /// Put the engine under worktree isolation (§21.4): from now on every
-    /// new flow `guard` refuses is reset or dropped. Set once; a second call
-    /// is ignored.
+    /// Give the engine its guard: from now on every new flow `guard`
+    /// refuses is reset or dropped, and nothing else is. Set once; a second
+    /// call is ignored.
     pub fn set_guard(&self, guard: Arc<HostGuard>) {
         let _ = self.guard.set(guard);
     }
 
-    /// Whether worktree isolation refuses a new flow to `dst`.
+    /// Whether a new flow to `dst` is refused: by the guard, and with none
+    /// set, whenever `dst` is the host's loopback.
     fn refused(&self, dst: Ipv4Addr, kind: guard::FlowKind) -> bool {
-        self.guard.get().is_some_and(|g| g.refuses(dst, kind))
+        match self.guard.get() {
+            Some(guard) => guard.refuses(dst, kind),
+            None => guard::is_loopback(dst),
+        }
     }
 
-    /// Prime the IP → MAC table (the gateway sees ARP/DHCP and knows best).
+    /// Bind `ip` to `mac`: every connection the engine originates toward
+    /// `ip` (a port forward) goes to `mac` from now on, whatever MAC a guest
+    /// frame carries that address from (review F9). The caller is the lab
+    /// daemon, which knows the NIC that holds the lease. A later call
+    /// replaces the binding.
     pub fn learn_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
-        self.macs.lock_recover().insert(ip, mac);
+        self.macs.lock_recover().bound.insert(ip, mac);
+    }
+
+    /// Note the MAC a frame from `ip` came from, unless `ip` is bound.
+    fn see_mac(&self, ip: Ipv4Addr, mac: MacAddr) {
+        let mut macs = self.macs.lock_recover();
+        if !macs.bound.contains_key(&ip) {
+            macs.seen.insert(ip, mac);
+        }
     }
 
     /// Entry point: one guest→world IPv4 ethernet frame (dst MAC = gateway).
@@ -202,7 +287,7 @@ impl NatEngine {
         let Some(ip) = Ipv4View::parse(eth.payload()) else {
             return;
         };
-        self.learn_mac(ip.src(), src_mac);
+        self.see_mac(ip.src(), src_mac);
 
         match ip.proto() {
             IPPROTO_TCP => self.handle_tcp(&ip, src_mac).await,
@@ -227,21 +312,40 @@ impl NatEngine {
         let seg = vtcp::Segment::from_view(&tcp);
         let tx = self.tcp_flows.lock_recover().get(&key).cloned();
         if let Some(tx) = tx {
-            // Preserve arrival order and backpressure. Deliberately dropping
-            // here turns a busy in-process proxy into apparent network loss
-            // and can poison protocols such as SMB under sustained writes.
-            let _ = tx.send(seg).await;
+            // Never wait for a flow task: the caller is the gateway task of
+            // the whole segment, and one flow that fell behind would stop
+            // ARP, DHCP, DNS and every other flow with it (review F4).
+            // `try_send` keeps arrival order. Backpressure is the flow's
+            // advertised window, which closes as its host side falls
+            // behind, and the channel holds more than a guest inside that
+            // window has in flight. So only a guest that ignores the window
+            // loses a segment here, and it sends that one again.
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(seg) {
+                trace!(?key, "nat: flow queue full, segment dropped");
+            }
             return;
         }
-        let opens = seg.is_syn() && !seg.is_ack();
+        // A SYN to the gateway's own address never opens a flow (review
+        // F18). The host does not own that address, so a connect to it
+        // would leave by the host's default route. What the gateway serves
+        // over TCP is a flow the engine opened itself, found above, or a
+        // `redirect` rewritten to another address before it gets here.
+        let opens = seg.is_syn() && !seg.is_ack() && key.dst_ip != self.cfg.gw_ip;
         if opens && !self.refused(key.dst_ip, guard::FlowKind::Tcp { port: key.dst_port }) {
+            let Some(slot) = self.claim_passive_tcp(key.guest_ip) else {
+                // Dropped, not reset: the guest's SYN retransmission finds
+                // the slot a finished flow gave back.
+                debug!(?key, "nat: tcp flow limit reached, SYN dropped");
+                return;
+            };
             debug!(?key, "nat: passive vtcp open");
-            let (tx, rx) = mpsc::channel(64);
+            let (tx, rx) = mpsc::channel(vtcp::SEGMENT_QUEUE);
             self.tcp_flows.lock_recover().insert(key, tx);
-            vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx);
+            vtcp::spawn_passive(self.clone(), key, src_mac, seg, rx, slot);
         } else if !seg.is_rst() {
-            // Anything unexpected for an unknown flow, or a SYN worktree
-            // isolation refuses: reset it.
+            // Anything unexpected for an unknown flow, or a SYN to the
+            // gateway address or a host address the engine refuses: reset
+            // it.
             if let Some(rst) = vtcp::rst_for(ip, &tcp, self.next_ip_id()) {
                 self.send_frame(src_mac, &rst).await;
             }
@@ -388,9 +492,10 @@ impl NatEngine {
     // -- internals shared with submodules -------------------------------------
 
     fn guest_mac(&self, ip: Ipv4Addr) -> MacAddr {
-        self.macs
-            .lock_recover()
+        let macs = self.macs.lock_recover();
+        macs.bound
             .get(&ip)
+            .or_else(|| macs.seen.get(&ip))
             .copied()
             .unwrap_or(MAC_BROADCAST)
     }
@@ -436,6 +541,24 @@ impl NatEngine {
             }
         }
         bail!("no free ephemeral port for active open to {guest_ip}:{guest_port}");
+    }
+
+    /// Take a slot for one guest-opened vTCP flow, or `None` when `guest`
+    /// or the engine is at its limit. The slot is given back when dropped.
+    fn claim_passive_tcp(self: &Arc<Self>, guest: Ipv4Addr) -> Option<PassiveSlot> {
+        let mut held = self.tcp_passive.lock_recover();
+        if held.values().sum::<usize>() >= MAX_TCP_FLOWS {
+            return None;
+        }
+        let of_guest = held.entry(guest).or_insert(0);
+        if *of_guest >= MAX_TCP_FLOWS_PER_GUEST {
+            return None;
+        }
+        *of_guest += 1;
+        Some(PassiveSlot {
+            engine: self.clone(),
+            guest,
+        })
     }
 
     fn remove_tcp_flow(&self, key: &FlowKey) {

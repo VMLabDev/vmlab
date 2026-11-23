@@ -112,8 +112,8 @@ a guest reset happens in place, readiness dropping until the rebooted
 guest's agent answers), its screen, input and recording over vmlab-hv's
 native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
 `vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
-host GPU pick resolves, with the host GPU's `qemu_env` applied and
-`qemu_binary` ignored with a warning;
+host GPU pick resolves, with the host GPU's `qemu_binary` and `qemu_env` ignored with a warning
+each, and a second warning when the Venus render server is not the bundle's;
 passthrough as a vfio device vmlab-hv takes only pre-bound), virtio-fs shares
 it serves in process (no virtiofsd; the share plan asks each machine what
 serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
@@ -170,6 +170,10 @@ Module map under `src/`:
   explicit settings, persisted VM identity, then automatic selection — and
   `vmlab_refusals`, the one list of what vmlab-hv cannot run yet, read by
   validation and again by the lab daemon.
+- `fuzzing.rs` — the bodies of the cargo-fuzz targets under `fuzz/` that
+  reach private modules (guest frames, registry documents), compiled under
+  `--cfg fuzzing` only; `docs/reviews/fuzz-coverage.md` lists every parser of
+  hostile input and its target.
 - `instance.rs` — lab instances (ADR-0011's amendment, PRD §3.2): the
   effective name `<declared>-<instance>` a directory runs its lab under, from
   `--instance`, `VMLAB_INSTANCE` or the linked git worktree, slugged to a DNS
@@ -319,6 +323,9 @@ Module map under `src/`:
   sockets;
   `boot_clock.rs` is the guest-clock check every fresh agent handshake runs
   under `clock = "host"` (§7.3, #186): `get_time`, and `set_time` past 2 s;
+  `start_gate.rs` keeps a start from running behind a stop or a destroy: a
+  `down` makes the starts asked for before it stale, a destroy holds the
+  machine until its disks are gone, and a lab that is going away takes none;
   `boot_id.rs` is the per-family boot identity read over the agent's `exec`
   and the loop `wait_rebooted` waits on it with (§10.3);
   `usb.rs` is USB passthrough's lab-wide half (§5.2.1) — selector resolution
@@ -390,6 +397,11 @@ throughout the code and commit messages.
   feature past the phase vmlab-hv has delivered (its tag in `features.py`);
   automatic selection puts `arch.emulated`'s aarch64 guest on QEMU. QEMU runs
   no x86 guest, so `--hypervisor qemu` runs `arch.emulated` alone.
+- `just release::local` builds one version on the build host (helios) into a
+  release directory — the four assets, `SHA256SUMS`, `provenance.json` and the
+  signature of `scripts/release-sign.sh` — and `just release::publish` uploads
+  it with `gh release create`. GitHub Actions builds and publishes no version
+  (`docs/agents/release-gate.md`).
 - `just buildbox::dist` builds every release artefact (binary, strict guest
   bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
   (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the

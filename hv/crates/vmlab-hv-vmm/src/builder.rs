@@ -1589,6 +1589,10 @@ pub fn build(
             } else {
                 kvm.seabios_pci64_base(layout.ram_top() > 1 << 32)
             }),
+            pci64_size: crate::vfio::pci64_window(
+                vfio.iter()
+                    .flat_map(|device| vmlab_hv_devices::PciDevice::bars(&*device.lock())),
+            ),
             tpm: tpm.is_some(),
             smm: secure_smm,
         };
@@ -1715,6 +1719,9 @@ pub fn build(
     *shared.msr_policy.lock() = desc.msr_policy;
     crate::macos::configure_msrs(&shared.kvm, desc.msr_policy)?;
     shared.set_reset_description(desc.clone());
+    crate::snapshot::remove_stale_checkpoints(&snap_disks).map_err(|error| {
+        VmmError::Other(format!("cleaning stale rollback checkpoints: {error}"))
+    })?;
     shared.set_snapshot_registry(Arc::new(SnapshotRegistry {
         digest: machine_digest(desc),
         disks: snap_disks,

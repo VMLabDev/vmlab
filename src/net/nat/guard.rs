@@ -1,4 +1,15 @@
-//! The host guard: worktree isolation's NAT rule (PRD §21.4, ADR-0019).
+//! The host guard: which of the host's own addresses a NAT flow may not
+//! land on (PRD §9.7, §21.4, ADR-0019).
+//!
+//! **Every engine** refuses the host's loopback, `127.0.0.0/8` and
+//! `0.0.0.0/8` ([`is_loopback`]): a service bound to loopback is bound there
+//! to be reachable from the host only, and a guest's flow leaves the engine
+//! as a connection from the host itself. An engine with no guard refuses all
+//! of it. A segment's guard ([`HostGuard::loopback`]) admits what the lab
+//! put there: its own host services, and the target of a `redirect` the
+//! operator declared onto loopback (the [`Grant`]).
+//!
+//! **Worktree isolation** ([`HostGuard::new`]) refuses more.
 //!
 //! Labs of one worktree family run clones of the same guests, so no NAT flow
 //! may land on the host itself: loopback, the unspecified address, and every
@@ -38,13 +49,22 @@ pub enum FlowKind {
     Icmp,
 }
 
+/// Whether `dst` is the host's loopback as a connect reaches it:
+/// `127.0.0.0/8`, or `0.0.0.0/8`, which the kernel delivers to the host
+/// itself. No engine lets a guest's flow land there on its own (§9.7).
+pub fn is_loopback(dst: Ipv4Addr) -> bool {
+    dst.is_loopback() || dst.octets()[0] == 0
+}
+
 /// Whether `dst` is the host itself: loopback, `0.0.0.0/8`, or one of
 /// `host_addrs` (every address and broadcast address on a host interface).
 pub fn is_host_address(dst: Ipv4Addr, host_addrs: &HashSet<Ipv4Addr>) -> bool {
-    dst.is_loopback() || dst.octets()[0] == 0 || host_addrs.contains(&dst)
+    is_loopback(dst) || host_addrs.contains(&dst)
 }
 
-/// Whether a new flow to `dst` is refused under worktree isolation.
+/// Whether a new flow to `dst` is refused, given the host's addresses the
+/// guard covers: all of them under worktree isolation, none (loopback
+/// alone) outside it.
 /// `exposed` are the lab's own host services, TCP ports on `127.0.0.1`.
 pub fn refuses(
     dst: Ipv4Addr,
@@ -78,9 +98,16 @@ pub fn host_addresses() -> HashSet<Ipv4Addr> {
 /// replaced only by tests.
 pub type AddressSource = Box<dyn Fn() -> HashSet<Ipv4Addr> + Send + Sync>;
 
+/// What the lab itself pointed at the host: asked for a new flow before it
+/// is refused, and a `true` admits it. Outside isolation this is the target
+/// of a declared `redirect` (§9.9).
+pub type Grant = Box<dyn Fn(Ipv4Addr, FlowKind) -> bool + Send + Sync>;
+
 /// The guard one NAT engine consults.
 pub struct HostGuard {
     read: AddressSource,
+    /// `None` under worktree isolation, which grants nothing.
+    grant: Option<Grant>,
     cache: Mutex<Option<(Instant, Arc<HashSet<Ipv4Addr>>)>>,
     /// The lab's own host services on this segment, shared with the
     /// segment's services so a port exposed later is admitted from then on.
@@ -88,13 +115,33 @@ pub struct HostGuard {
 }
 
 impl HostGuard {
+    /// The guard of worktree isolation (§21.4): every host address.
     pub fn new(exposed: Arc<Mutex<Vec<u16>>>) -> Self {
         Self::with_source(exposed, Box::new(host_addresses))
+    }
+
+    /// The guard of a segment outside isolation (§9.7): the host's loopback
+    /// only, less the lab's `exposed` host services and whatever `grant`
+    /// admits. The host's interface addresses stay reachable, which is how a
+    /// guest reaches a host-side service.
+    pub fn loopback(exposed: Arc<Mutex<Vec<u16>>>, grant: Grant) -> Self {
+        Self {
+            grant: Some(grant),
+            ..Self::with_source(exposed, Box::new(HashSet::new))
+        }
+    }
+
+    /// A guard that refuses nothing, for the engine tests whose "internet"
+    /// is a listener on the test host's loopback.
+    #[cfg(test)]
+    pub fn open() -> Self {
+        Self::loopback(Arc::default(), Box::new(|_, _| true))
     }
 
     pub fn with_source(exposed: Arc<Mutex<Vec<u16>>>, read: AddressSource) -> Self {
         Self {
             read,
+            grant: None,
             cache: Mutex::new(None),
             exposed,
         }
@@ -116,9 +163,10 @@ impl HostGuard {
 
     /// Whether the engine must refuse a new flow to `dst`.
     pub fn refuses(&self, dst: Ipv4Addr, kind: FlowKind) -> bool {
-        let refused = refuses(dst, kind, &self.addresses(), &self.exposed.lock_recover());
+        let refused = refuses(dst, kind, &self.addresses(), &self.exposed.lock_recover())
+            && !self.grant.as_ref().is_some_and(|grant| grant(dst, kind));
         if refused {
-            tracing::debug!(%dst, ?kind, "nat: worktree isolation refuses a host address");
+            tracing::debug!(%dst, ?kind, "nat: refusing a flow to a host address");
         }
         refused
     }
@@ -227,6 +275,34 @@ mod tests {
             Some((Instant::now() - REFRESH, Arc::new(HashSet::from([LAN]))));
         assert!(guard.refuses(vpn, FlowKind::Tcp { port: 22 }));
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Outside isolation the guard covers loopback and `0.0.0.0/8` alone: a
+    /// host interface address stays reachable, an exposed service too, and
+    /// the grant admits exactly what it names.
+    #[test]
+    fn the_loopback_guard_refuses_loopback_and_nothing_else() {
+        let granted = (Ipv4Addr::LOCALHOST, FlowKind::Udp { port: 5353 });
+        let guard = HostGuard::loopback(
+            Arc::new(Mutex::new(vec![44445])),
+            Box::new(move |dst, kind| (dst, kind) == granted),
+        );
+        let tcp = FlowKind::Tcp { port: 5432 };
+        for dst in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(127, 4, 5, 6),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(0, 1, 2, 3),
+        ] {
+            for kind in [tcp, FlowKind::Udp { port: 53 }, FlowKind::Icmp] {
+                assert!(guard.refuses(dst, kind), "{dst} {kind:?}");
+            }
+        }
+        assert!(!guard.refuses(LAN, tcp), "a host interface address");
+        assert!(!guard.refuses(Ipv4Addr::new(1, 1, 1, 1), tcp));
+        assert!(!guard.refuses(Ipv4Addr::LOCALHOST, FlowKind::Tcp { port: 44445 }));
+        assert!(!guard.refuses(granted.0, granted.1));
+        assert!(guard.refuses(Ipv4Addr::LOCALHOST, FlowKind::Udp { port: 5354 }));
     }
 
     /// The real interface list holds at least loopback's own address.

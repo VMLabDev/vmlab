@@ -53,6 +53,11 @@ const T_DISCARD: u32 = 11;
 /// Legacy barrier flag some older drivers set on IN/OUT; ignored.
 const T_BARRIER: u32 = 0x8000_0000;
 
+/// The most one request stages in host memory at a time on the
+/// scatter-gather path. The guest picks the length of a descriptor chain,
+/// and descriptors may alias one region, so that length is no bound.
+const IO_CHUNK: usize = 1 << 20;
+
 // Request completion statuses (VIRTIO 1.2 §5.2.5).
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
@@ -443,6 +448,11 @@ impl Block {
         // published — the loop the spec's suppression mechanism expects.
         let mut used_any = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !super::avail_idx_in_range(&self.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = self
                 .queues
                 .get_mut(index)
@@ -665,20 +675,20 @@ impl Block {
         if end > self.disk.size() {
             return S_IOERR; // out of range
         }
-        if self.io_buffer.len() < data_len {
-            self.io_buffer.resize(data_len, 0);
+        // The range fits the image, which bounds the request but not the
+        // memory it would take whole: move it a piece at a time.
+        self.io_buffer.resize(data_len.min(IO_CHUNK), 0);
+        let mut done = 0;
+        while done < data_len {
+            let piece = &mut self.io_buffer[..(data_len - done).min(IO_CHUNK)];
+            if self.disk.read_at(offset + done as u64, piece).is_err()
+                || writer.write_all(piece).is_err()
+            {
+                return S_IOERR;
+            }
+            done += piece.len();
         }
-        if self
-            .disk
-            .read_at(offset, &mut self.io_buffer[..data_len])
-            .is_err()
-        {
-            return S_IOERR;
-        }
-        match writer.write_all(&self.io_buffer[..data_len]) {
-            Ok(()) => S_OK,
-            Err(_) => S_IOERR,
-        }
+        S_OK
     }
 
     /// `VIRTIO_BLK_T_OUT`: drain the driver-readable descriptors into the
@@ -695,26 +705,25 @@ impl Block {
         let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
             return S_IOERR;
         };
+        // Nothing is copied before the range check: the guest picks the
+        // length of the chain, and it may be far more than the image holds.
         let data_len = reader.available_bytes();
-        if self.io_buffer.len() < data_len {
-            self.io_buffer.resize(data_len, 0);
-        }
-        if reader.read_exact(&mut self.io_buffer[..data_len]).is_err() {
-            return S_IOERR;
-        }
-        if let Some(end) = offset.checked_add(data_len as u64) {
-            if end > self.disk.size() {
-                return S_IOERR; // out of range
-            }
-        } else {
-            return S_IOERR;
-        }
-        if self
-            .disk
-            .write_at(offset, &self.io_buffer[..data_len])
-            .is_err()
+        if !offset
+            .checked_add(data_len as u64)
+            .is_some_and(|end| end <= self.disk.size())
         {
-            return S_IOERR;
+            return S_IOERR; // out of range
+        }
+        self.io_buffer.resize(data_len.min(IO_CHUNK), 0);
+        let mut done = 0;
+        while done < data_len {
+            let piece = &mut self.io_buffer[..(data_len - done).min(IO_CHUNK)];
+            if reader.read_exact(piece).is_err()
+                || self.disk.write_at(offset + done as u64, piece).is_err()
+            {
+                return S_IOERR;
+            }
+            done += piece.len();
         }
         // The response consumes no writable bytes beyond the status.
         let _ = writer;
@@ -1084,6 +1093,19 @@ mod tests {
 
     fn sector_content(i: u64) -> Vec<u8> {
         (0..512).map(|j| ((i * 512 + j) % 251) as u8).collect()
+    }
+
+    #[test]
+    fn avail_idx_far_ahead_does_not_spin() {
+        let f = Fixture::new(Box::new(MemDisk::new(4096)));
+        f.mem
+            .write_obj(Le16::from(0x8000u16), GuestAddress(f.avail + 2))
+            .unwrap();
+        let mut block = f.block;
+        let returned = crate::virtio::testing::returns_in_time(move || block.queue_notify(0));
+        assert!(returned.is_some(), "queue_notify spins on a broken ring");
+        assert_eq!(f.mem.read_obj::<u16>(GuestAddress(f.used + 2)).unwrap(), 0);
+        assert!(f.interrupt.notifies.lock().is_empty());
     }
 
     #[test]
@@ -1632,6 +1654,89 @@ mod tests {
         f.chain_hdr_data_status(512, true);
         f.submit(0);
         assert_eq!(f.status(), S_IOERR);
+    }
+
+    /// Review virtio-devices F5: the guest picks the length of a chain, and
+    /// descriptors may alias one region, so a request is checked against the
+    /// disk before any of it is copied.
+    #[test]
+    fn write_larger_than_the_disk_is_refused_before_it_is_buffered() {
+        let mut f = Fixture::new(Box::new(MemDisk::new(4096)));
+        f.put_header(T_OUT, 0);
+        f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+        for i in 1..=8 {
+            f.write_desc(i, desc(0x10000, 64 * 1024, NEXT, i + 1));
+        }
+        f.write_desc(9, desc(f.buf + 0x800, 1, WRITE, 0));
+        f.submit(0);
+        assert_eq!(f.status(), S_IOERR);
+        assert!(
+            f.block.io_buffer.capacity() <= 4096,
+            "{} bytes were buffered for a refused write",
+            f.block.io_buffer.capacity()
+        );
+    }
+
+    /// Review virtio-devices F5: a request the disk does hold is moved in
+    /// pieces, so the staging buffer stays bounded whatever the chain's
+    /// length. Both directions take the scatter-gather path here: the read's
+    /// header is split over two descriptors.
+    #[test]
+    fn large_requests_are_staged_in_bounded_pieces() {
+        const PIECE: u32 = 512 * 1024;
+        const PIECES: u16 = 5;
+        let len = (PIECE * u32::from(PIECES)) as usize;
+        for kind in [T_OUT, T_IN] {
+            let disk = MemDisk::new(4 << 20);
+            let content = disk.content();
+            let mut f = Fixture::new(Box::new(disk));
+            let pattern: Vec<u8> = (0..PIECE).map(|i| (i % 241) as u8).collect();
+            f.put_header(kind, 8);
+            let first_data = if kind == T_OUT {
+                f.mem.write_slice(&pattern, GuestAddress(0x40000)).unwrap();
+                f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+                1
+            } else {
+                for piece in content.lock()[4096..4096 + len].chunks_mut(PIECE as usize) {
+                    piece.copy_from_slice(&pattern);
+                }
+                f.write_desc(0, desc(f.headers, 8, NEXT, 1));
+                f.write_desc(1, desc(f.headers + 8, 8, NEXT, 2));
+                2
+            };
+            let flags = NEXT | if kind == T_IN { WRITE } else { 0 };
+            // Every data descriptor names the same 512 KiB of guest memory.
+            for i in first_data..first_data + PIECES {
+                f.write_desc(i, desc(0x40000, PIECE, flags, i + 1));
+            }
+            f.write_desc(first_data + PIECES, desc(f.buf + 0x800, 1, WRITE, 0));
+            f.submit(0);
+            assert_eq!(f.status(), S_OK);
+            assert!(
+                f.block.io_buffer.capacity() <= IO_CHUNK,
+                "{} bytes were staged for one request",
+                f.block.io_buffer.capacity()
+            );
+            if kind == T_OUT {
+                let content = content.lock();
+                for piece in content[4096..4096 + len].chunks(PIECE as usize) {
+                    assert!(piece == pattern.as_slice());
+                }
+                // The image outside the request keeps its own pattern.
+                let untouched = |(i, &b): (usize, &u8)| b == (i % 251) as u8;
+                assert!(content[..4096].iter().enumerate().all(untouched));
+                assert!(content.iter().enumerate().skip(4096 + len).all(untouched));
+            } else {
+                // The last piece of the image range is what the aliased
+                // region holds at the end.
+                let mut received = vec![0; PIECE as usize];
+                f.mem
+                    .read_slice(&mut received, GuestAddress(0x40000))
+                    .unwrap();
+                assert!(received == pattern);
+                assert_eq!(f.used_slot(0), (1, 0, len as u32 + 1));
+            }
+        }
     }
 
     #[test]

@@ -33,7 +33,7 @@ the code is the contract.
 | `status` | — | `cli` | Every lab in the registry. |
 | `lab.ensure` | `name: String`, `root: std::path::PathBuf` | `cli` | Spawn (or find) a lab's daemon; answers with its socket path. |
 | `lab.release` | `name: String` | `cli` | Stop a lab's daemon, after `down` or `destroy`. |
-| `lab.restart` | `name: String`, `root: std::path::PathBuf` | `cli` | Restart a lab's daemon so it re-reads its config; answers with the new socket path. |
+| `lab.restart` | `name: String`, `root: std::path::PathBuf`, `daemon: Option<u32>` | `cli` | Restart a lab's daemon so it re-reads its config; answers with the socket path of the daemon that runs the lab now, and `replaced`. |
 | `lab.exiting` | `name: String`, `pid: u32` | `daemon` | A lab daemon is about to exit by itself (`destroy`, `shutdown`, a termination signal), so its exit is expected rather than a crash. |
 | `global.attach` | `name: String`, `subnet: Option<Ipv4Net>`, `peer: Option<String>`, `lab: Option<String>`, `members: Vec<GlobalMember>`, `mtu: Option<u16>` | `daemon` | Join a global segment (PRD §9.2), creating it on first use; answers with the trunk socket to bridge to. |
 | `global.detach` | `name: String`, `lab: Option<String>` | `daemon` | Leave a global segment. |

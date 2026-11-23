@@ -56,9 +56,16 @@ impl Hypervisor for Qemu {
         let (binary, args) = compose(&spec.machine)?;
         crate::qemu::process::write_launch_header(&spec.log, &binary, &args, &spec.env)?;
         let log_from = crate::qemu::process::log_offset(&spec.log);
-        let proc =
-            Proc::spawn_with_fds(&spec.label, &binary, &args, &spec.env, &spec.log, spec.fds)
-                .await?;
+        let proc = Proc::spawn_with_fds(
+            &spec.label,
+            &binary,
+            &args,
+            &spec.env,
+            &spec.log,
+            spec.fds,
+            Vec::new(),
+        )
+        .await?;
         let qmp = connect_qmp_retry(&spec.control_sock, &proc, &spec.log, log_from).await?;
         // QEMU binds the guest channels itself, from the argv — this adapter
         // has nothing to stand up, only to say where they landed. It is the

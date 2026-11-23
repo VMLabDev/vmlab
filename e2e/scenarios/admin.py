@@ -11,7 +11,7 @@ import subprocess
 import time
 
 from harness import WORK, redact_osk
-from scenarios.core import machine_pid
+from scenarios.core import machine_pid, sh
 
 LAB = "e2e-admin"
 QEMU_NAME = f"vmlab:{LAB}/arm01"
@@ -120,6 +120,30 @@ def two_roots(h):
         )
 
 
+def down_isolation(h, attempts=1):
+    """Exercise a lab-scoped release with a live peer on the same supervisor.
+
+    In #324 the peer's daemon and the shared supervisor received termination
+    signals. Check the peer's guest boot ID so a restart cannot pass.
+    """
+    with h.lab("admin-down-a") as a, h.lab("admin-down-b") as b:
+        h.vmlab("up", cwd=b)
+        h.wait_ready(b, "guest")
+        boot = sh(h, b, "guest", "cat /proc/sys/kernel/random/boot_id").out.strip()
+        assert boot, "lab B returned no boot ID"
+
+        for attempt in range(1, attempts + 1):
+            h.vmlab("up", cwd=a)
+            h.vmlab("down", cwd=a)
+            labs = listed(h)
+            assert "e2e-down-a" not in labs, f"attempt {attempt}: lab A is still registered"
+            assert labs.get("e2e-down-b") == "running", f"attempt {attempt}: {labs}"
+            peer = sh(h, b, "guest", "cat /proc/sys/kernel/random/boot_id", timeout=30)
+            assert peer.out.strip() == boot, f"attempt {attempt}: lab B rebooted"
+            h.log.write(f"Down isolation attempt {attempt}/{attempts} passed\n")
+    return True
+
+
 def emulated_on_qemu(h):
     """`arch.emulated`: the aarch64 guest of `admin-lab`, which QEMU runs
     under TCG on this x86_64 host, in a lab of its own."""
@@ -226,6 +250,8 @@ def run(h):
         h.check("lab.destroy.named", destroy_named, "destroyed by name from outside the lab: gone from list, .vmlab removed")
 
     two_roots(h)
+    h.check("lab.down.isolation", lambda: down_isolation(h),
+            "down released lab A while lab B's same-named guest kept its boot ID")
 
     # -- the supervisor ---------------------------------------------------------
     def daemon():

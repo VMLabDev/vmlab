@@ -78,6 +78,22 @@ const CONFIG_LEN: usize = 16;
 /// `sizeof(virtio_snd_pcm_info)`.
 const PCM_INFO_LEN: usize = 32;
 
+/// The largest per-item `size` a `PCM_INFO` request may name. The field is
+/// the guest's, and the reply is padded to it, so it needs a bound; a
+/// driver built against a later, longer structure still fits.
+const PCM_INFO_SIZE_MAX: usize = 256;
+
+/// The longest control request this device serves (`SET_PARAMS`). A longer
+/// chain is answered `BAD_MSG` without being read.
+const CONTROL_REQUEST_MAX: usize = 24;
+
+/// The most PCM one tx or rx message moves, whatever `buffer_bytes` and
+/// `period_bytes` the guest set: over a second of the widest format
+/// (96 kHz, stereo, float). The guest picks the length of a descriptor
+/// chain, and descriptors may alias one region, so that length cannot size
+/// a host allocation.
+const PCM_MESSAGE_MAX: usize = 1 << 20;
+
 /// The playback pacing watermark: host PCM the device refills up to. One
 /// guest period, at least the 256 frames every backend ring is sized for
 /// (four of them), leaving room for the push in flight.
@@ -126,6 +142,17 @@ struct PcmParams {
 }
 
 impl PcmParams {
+    /// Whether a buffer and a period are sizes a stream can run on: a whole,
+    /// non-zero number of frames per period and of periods per buffer. The
+    /// clock divides by the period in frames, so `SET_PARAMS` and a restored
+    /// snapshot both pass through here.
+    fn sizes_ok(buffer_bytes: u32, period_bytes: u32, format: &AudioFormat) -> bool {
+        buffer_bytes != 0
+            && period_bytes != 0
+            && buffer_bytes.is_multiple_of(period_bytes)
+            && period_bytes.is_multiple_of(format.frame_bytes() as u32)
+    }
+
     /// Whole frames in one hardware period.
     fn period_frames(&self) -> usize {
         self.period_bytes as usize / self.format.frame_bytes()
@@ -278,6 +305,7 @@ impl VirtioSnd {
         let count = u32::from_le_bytes(body[4..8].try_into().unwrap());
         let size = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
         if size == 0
+            || size > PCM_INFO_SIZE_MAX
             || start_id > self.streams.len() as u32
             || count > self.streams.len() as u32 - start_id
         {
@@ -350,11 +378,7 @@ impl VirtioSnd {
             channels,
             rate: rate_hz,
         };
-        if buffer_bytes == 0
-            || period_bytes == 0
-            || buffer_bytes % period_bytes != 0
-            || period_bytes % format.frame_bytes() as u32 != 0
-        {
+        if !PcmParams::sizes_ok(buffer_bytes, period_bytes, &format) {
             return bad_msg();
         }
         // New parameters restart the lifecycle: any host stream opened for
@@ -534,14 +558,17 @@ impl VirtioSnd {
             // other stream, or with no readable PCM, completes cancelled.
             let mut header = [0u8; 4];
             let header_ok = reader.read_exact(&mut header).is_ok();
-            let mut pcm = Vec::new();
-            let pcm_ok = reader.read_to_end(&mut pcm).is_ok();
+            // A message is copied only when it will be played, and never
+            // when it is longer than the buffer the guest negotiated.
             let deliver = !all
                 && header_ok
-                && pcm_ok
                 && started
-                && params.is_some()
-                && u32::from_le_bytes(header) == 0;
+                && u32::from_le_bytes(header) == 0
+                && params.is_some_and(|p| {
+                    reader.available_bytes() <= (p.buffer_bytes as usize).min(PCM_MESSAGE_MAX)
+                });
+            let mut pcm = Vec::new();
+            let deliver = deliver && reader.read_to_end(&mut pcm).is_ok();
             let (code, latency) = if deliver {
                 let frame_bytes = params.unwrap().format.frame_bytes();
                 let mut outcome = (S_IO_ERR, 0);
@@ -683,7 +710,12 @@ impl VirtioSnd {
                 0
             } else if let Some(params) = self.streams[1].params {
                 let frame_bytes = params.format.frame_bytes();
-                let frames = capacity / frame_bytes;
+                // One message carries one period: that is what the banked
+                // time paid for, however much room the chain claims.
+                let room = capacity
+                    .min(params.period_bytes as usize)
+                    .min(PCM_MESSAGE_MAX);
+                let frames = room / frame_bytes;
                 let mut pcm = vec![0u8; frames * frame_bytes];
                 match self.streams[1].host.as_mut() {
                     Some(HostStream::Capture(source)) => {
@@ -764,6 +796,7 @@ impl VirtioSnd {
         {
             let head = chain.head_index();
             let response = match chain.clone().reader(&mem) {
+                Ok(reader) if reader.available_bytes() > CONTROL_REQUEST_MAX => status(S_BAD_MSG),
                 Ok(mut reader) => {
                     let mut request = Vec::new();
                     reader.read_to_end(&mut request).ok();
@@ -1129,15 +1162,25 @@ impl Snapshot for VirtioSnd {
                     PCM_RATE_96000 => 96000,
                     _ => return Err(invalid("bad sound state")),
                 };
+                let buffer_bytes = u32::from_le_bytes(b[1..5].try_into().unwrap());
+                let period_bytes = u32::from_le_bytes(b[5..9].try_into().unwrap());
+                let format = AudioFormat {
+                    sample_format,
+                    channels: b[13],
+                    rate,
+                };
+                // The same bounds `SET_PARAMS` holds a live guest to: the
+                // clock divides by the period in frames.
+                if !(1..=2).contains(&format.channels)
+                    || !PcmParams::sizes_ok(buffer_bytes, period_bytes, &format)
+                {
+                    return Err(invalid("bad sound state"));
+                }
                 Some(PcmParams {
-                    buffer_bytes: u32::from_le_bytes(b[1..5].try_into().unwrap()),
-                    period_bytes: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+                    buffer_bytes,
+                    period_bytes,
                     features: u32::from_le_bytes(b[9..13].try_into().unwrap()),
-                    format: AudioFormat {
-                        sample_format,
-                        channels: b[13],
-                        rate,
-                    },
+                    format,
                     rate_code: b[15],
                 })
             } else {

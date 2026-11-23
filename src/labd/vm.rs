@@ -244,6 +244,18 @@ impl VmDirs {
     pub fn tpm_state(&self) -> PathBuf {
         self.local.join("tpm-state")
     }
+    /// What each offline snapshot holds beside the disks (§7.3): one
+    /// directory per snapshot.
+    pub fn snapshot_state(&self) -> PathBuf {
+        self.local.join("snapshot-state")
+    }
+    fn firmware_state(&self) -> super::snapshot_state::FirmwareState {
+        super::snapshot_state::FirmwareState::new(
+            self.snapshot_state(),
+            self.ovmf_vars(),
+            self.tpm_state(),
+        )
+    }
     /// The TSC frequency a `tsc = "host"` VM was pinned at, at its first KVM
     /// start (§5.2) — kept beside its disk, because an online snapshot only
     /// loads into a VM started at the frequency it was taken at
@@ -312,6 +324,7 @@ pub struct VmInstance {
     /// RAII, so clearing detaches them.
     nic_attachments: Mutex<Vec<NicAttachment>>,
     state: RwLock<PowerState>,
+    snapshot_gate: Arc<Mutex<()>>,
     /// The guest agent answers `guest-ping`. Set by the readiness poller.
     agent_up: RwLock<bool>,
     /// The VM is fully provisioned and usable: agent up AND the first-boot
@@ -441,6 +454,7 @@ impl VmInstance {
             template: std::sync::RwLock::new(Arc::new(template)),
             nic_attachments: Mutex::new(Vec::new()),
             state: RwLock::new(PowerState::Stopped),
+            snapshot_gate: Arc::default(),
             agent_up: RwLock::new(false),
             ready: RwLock::new(false),
             stop_requested: RwLock::new(false),
@@ -789,6 +803,17 @@ impl VmInstance {
     /// Create disks on first use (PRD §7.1): linked clone of the template,
     /// or a blank qcow2 for scratch; extra disks blank or FAT-from-folder.
     pub async fn ensure_disks(&self) -> Result<()> {
+        // Validation refuses this too (§5.1); a disk's image is named by its
+        // block, so two blocks with one name would be one image as two drives.
+        for (i, d) in self.cfg.extra_disks.iter().enumerate() {
+            if self.cfg.extra_disks[..i].iter().any(|e| e.name == d.name) {
+                bail!(
+                    "{}: disk \"{}\" is declared twice; each `disk` block needs its own name",
+                    self.cfg.name,
+                    d.name
+                );
+            }
+        }
         std::fs::create_dir_all(&self.dirs.local)?;
         self.check_clone_source()?;
         let primary = self.dirs.primary_disk();
@@ -1020,6 +1045,27 @@ impl VmInstance {
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
         for warning in &plan.warnings {
             tracing::warn!("{}: {warning}", self.cfg.name);
+        }
+        // The Venus render server this start gets, when it is not the one
+        // of vmlab-hv's bundle (card #447): this process's environment is
+        // the one the launcher inherits.
+        let venus = t
+            .resolved
+            .gpu
+            .as_ref()
+            .is_some_and(|g| g.mode == crate::config::model::GpuMode::Vulkan);
+        if venus && self.hypervisor() == HypervisorKind::Vmlab {
+            let binary = host
+                .vmlab_hv
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(super::hypervisor::vmlab_hv::BINARY));
+            let inherited = std::env::var(qemu::hostgpu::RENDER_SERVER_VAR).ok();
+            if let Some(warning) =
+                qemu::hostgpu::find_binary(&binary, std::env::var_os("PATH").as_deref())
+                    .and_then(|b| qemu::hostgpu::render_server_warning(&b, inherited.as_deref()))
+            {
+                tracing::warn!("{}: {warning}", self.cfg.name);
+            }
         }
         *self.host_gpu.lock_recover() = plan.name.clone();
         *self.qemu_binary.lock_recover() = plan.qemu_binary.clone();
@@ -1260,6 +1306,7 @@ impl VmInstance {
         before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
     ) -> Result<()> {
         {
+            let _snapshot = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
             let mut st = self.state.write().await;
             if *st != PowerState::Stopped {
                 bail!("{} is {:?}", self.cfg.name, *st);
@@ -1526,7 +1573,9 @@ impl VmInstance {
     /// gets back its agent and nothing more: whoever owed it readiness still
     /// does. Ends when the run's control channel goes.
     async fn watch_resets(self: Arc<Self>, mut resets: tokio::sync::watch::Receiver<u64>) {
-        resets.borrow_and_update();
+        if *resets.borrow() != 0 {
+            resets.mark_changed();
+        }
         // Readiness a reset took away, kept across a second reset that comes
         // before the agent answers.
         let mut owed = false;
@@ -1551,9 +1600,14 @@ impl VmInstance {
                     break;
                 }
                 if self.agent_probe().await {
-                    *self.agent_up.write().await = true;
+                    let mut agent_up = self.agent_up.write().await;
+                    let mut ready = self.ready.write().await;
+                    if resets.has_changed().unwrap_or(true) {
+                        break;
+                    }
+                    *agent_up = true;
                     if std::mem::take(&mut owed) {
-                        *self.ready.write().await = true;
+                        *ready = true;
                     }
                     break;
                 }
@@ -1666,11 +1720,24 @@ impl VmInstance {
         *self.qemu.lock().await = None;
     }
 
+    /// What this machine's stop plan is made from, read now.
+    async fn stop_facts(&self, force: bool) -> super::stop_plan::StopFacts {
+        let t = self.template();
+        super::stop_plan::StopFacts {
+            force,
+            agent_channel: t.resolved.agent_transport.has_channel(),
+            agent_answered: self.agent_up_flag().await,
+            agent_sealed: t.agent_version.is_some(),
+            acpi_shutdown: t.resolved.acpi_shutdown,
+            ready_timeout: super::machine::Machine::ready_timeout(self),
+        }
+    }
+
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
     /// powerdown → emulator quit → hard kill, each with a timeout. Which
     /// rungs, and how long each waits, is [`super::stop_plan`]'s.
     async fn stop_ladder(&self, force: bool) -> Result<()> {
-        use super::stop_plan::{Rung, StopFacts, plan_stop};
+        use super::stop_plan::{Rung, plan_stop};
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
             return Ok(()); // already stopped
@@ -1680,15 +1747,7 @@ impl VmInstance {
         if !force && let Err(e) = self.wake(WakeCause::Stop).await {
             tracing::warn!("{e:#}");
         }
-        let t = self.template();
-        let plan = plan_stop(&StopFacts {
-            force,
-            agent_channel: t.resolved.agent_transport.has_channel(),
-            agent_answered: self.agent_up_flag().await,
-            agent_sealed: t.agent_version.is_some(),
-            acpi_shutdown: t.resolved.acpi_shutdown,
-            ready_timeout: super::machine::Machine::ready_timeout(self),
-        });
+        let plan = plan_stop(&self.stop_facts(force).await);
         *self.stop_requested.write().await = true;
         *self.state.write().await = PowerState::Stopping;
         let began = std::time::Instant::now();
@@ -1803,31 +1862,52 @@ impl VmInstance {
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    async fn take_snapshot(&self, name: &str) -> Result<bool> {
+    async fn take_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<bool, super::machine::SnapshotCaptureError> {
+        use super::machine::SnapshotCaptureError::Attempted;
+
         validate_snapshot_name(name)?;
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             PowerState::Running => {
+                drop(guard);
                 if let Some(why) = self.online_snapshot_refusal().await {
-                    bail!("{why}");
+                    return Err(anyhow!("{why}").into());
                 }
                 // See `usb::snapshot_refusal` for why, and PRD §5.2.1.
                 let attached = self.usb.lock().await.clone();
                 if !attached.is_empty() {
-                    bail!(crate::usb::snapshot_refusal(&self.cfg.name, &attached));
+                    return Err(
+                        anyhow!(crate::usb::snapshot_refusal(&self.cfg.name, &attached)).into(),
+                    );
                 }
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                snapshots.save(name, "disk0", &refs).await?;
+                snapshots
+                    .save(name, "disk0", &refs)
+                    .await
+                    .map_err(Attempted)?;
                 Ok(true)
             }
             PowerState::Stopped => {
-                snapshot_offline_disks(&self.all_disk_paths(), name).await?;
+                let disks = self.all_disk_paths();
+                let state = self.dirs.firmware_state();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    capture_offline(&disks, &state, &name).await
+                })
+                .await
+                .map_err(Attempted)?;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
-            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name)),
-            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
+            PowerState::Suspended => Err(super::machine::suspended_error(&self.cfg.name).into()),
+            other => {
+                Err(anyhow!("{} is {:?} — wait for it to settle", self.cfg.name, other).into())
+            }
         }
     }
 
@@ -1877,44 +1957,64 @@ impl VmInstance {
             control.resume().await?;
             Ok(())
         } else {
-            // Offline: power off if needed, apply, stay off.
-            if self.power_state().await != PowerState::Stopped {
-                self.stop_ladder(false).await?;
-                self.settle_stopped(Duration::from_secs(60))
-                    .await
-                    .with_context(|| format!("{} did not stop for restore", self.cfg.name))?;
-            }
-            for disk in self.all_disk_paths() {
-                crate::template::qimg::snapshot_apply(&disk, name).await?;
-            }
-            Ok(())
+            let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
+            let vm = Arc::clone(self);
+            let name = name.to_owned();
+            super::machine::finish_offline_snapshot(guard, async move {
+                let state = vm.dirs.firmware_state();
+                restore_offline(&vm.all_disk_paths(), &state, &name, async {
+                    if vm.power_state().await != PowerState::Stopped {
+                        vm.stop_ladder(false).await?;
+                        vm.settle_stopped(Duration::from_secs(60))
+                            .await
+                            .with_context(|| format!("{} did not stop for restore", vm.cfg.name))?;
+                    }
+                    Ok(())
+                })
+                .await
+            })
+            .await
         }
     }
 
     async fn drop_snapshot(&self, name: &str) -> Result<()> {
+        let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
         match self.power_state().await {
             // Asleep is still a live QEMU holding the disks open, so the
             // offline path's qemu-img must not touch them.
             PowerState::Running | PowerState::Suspended => {
+                drop(guard);
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
                 snapshots.delete(name, &refs).await?;
+                // An offline snapshot can be deleted while the VM runs. What
+                // it held beside the disks is not in use by the emulator.
+                self.dirs.firmware_state().delete(name)?;
             }
-            _ => {
-                for disk in self.all_disk_paths() {
-                    // Capture rollback may already have removed this disk's
-                    // entry. Pending-intent cleanup is idempotent.
-                    if crate::template::qimg::image_info(&disk)
-                        .await?
-                        .snapshots
-                        .iter()
-                        .any(|snapshot| snapshot.name == name)
-                    {
-                        crate::template::qimg::snapshot_delete(&disk, name).await?;
+            PowerState::Stopped => {
+                let disks = self.all_disk_paths();
+                let state = self.dirs.firmware_state();
+                let name = name.to_owned();
+                super::machine::finish_offline_snapshot(guard, async move {
+                    for disk in disks {
+                        // Capture rollback may already have removed this disk's
+                        // entry. Pending-intent cleanup is idempotent.
+                        if disk.try_exists()?
+                            && crate::template::qimg::image_info(&disk)
+                                .await?
+                                .snapshots
+                                .iter()
+                                .any(|snapshot| snapshot.name == name)
+                        {
+                            crate::template::qimg::snapshot_delete(&disk, &name).await?;
+                        }
                     }
-                }
+                    state.delete(&name)
+                })
+                .await?;
             }
+            other => bail!("{} is {:?} — wait for it to settle", self.cfg.name, other),
         }
         Ok(())
     }
@@ -1972,6 +2072,14 @@ impl super::display::DisplayHost for VmInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for VmInstance {
+    async fn stop_wait(&self) -> Duration {
+        if self.qemu.lock().await.is_none() {
+            return Duration::ZERO;
+        }
+        use super::stop_plan::{plan_stop, plan_wait};
+        plan_wait(&plan_stop(&self.stop_facts(false).await))
+    }
+
     async fn debug_available(&self) -> bool {
         self.control
             .lock()
@@ -2230,7 +2338,7 @@ impl super::machine::Machine for VmInstance {
         ));
 
         std::fs::create_dir_all(&self.dirs.run)?;
-        let attachments = super::machine::attach_all_nics(&*self, &*lab).await?;
+        let attachments = lab.attach_nics(&*self).await?;
         self.set_nic_attachments(attachments).await;
 
         let events_exit = events.clone();
@@ -2405,7 +2513,7 @@ impl super::machine::Machine for VmInstance {
         self.agent.clear_failure().await;
     }
 
-    async fn snapshot(&self, name: &str) -> Result<bool> {
+    async fn snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {
         self.take_snapshot(name).await
     }
 
@@ -2624,6 +2732,127 @@ fn disk_nodes(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("disk{i}")).collect()
 }
 
+/// An offline capture (§7.3): the disks, and beside them the UEFI variable
+/// store and the TPM state as they are now. The firmware state is copied
+/// before any disk changes and named only after every disk took the snapshot,
+/// so a failure on either side leaves no half of one.
+async fn capture_offline(
+    disks: &[PathBuf],
+    state: &super::snapshot_state::FirmwareState,
+    name: &str,
+) -> Result<()> {
+    let staged = state.stage_capture()?;
+    if let Err(error) = snapshot_offline_disks(disks, name).await {
+        state.discard_capture(&staged);
+        return Err(error);
+    }
+    if let Err(error) = state.commit_capture(&staged, name) {
+        state.discard_capture(&staged);
+        let mut failures = Vec::new();
+        for disk in disks.iter().rev() {
+            if let Err(rollback) = crate::template::qimg::snapshot_delete(disk, name).await {
+                failures.push(format!("{}: {rollback}", disk.display()));
+            }
+        }
+        return Err(error.context(format!(
+            "offline snapshot failed, rollback errors: {failures:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// An offline restore (§7.3): the disks, then the firmware state the capture
+/// kept with them. The copies are made before the VM stops and before any
+/// disk is rewound, and are renamed into place only once every disk is at the
+/// snapshot. A snapshot that holds no firmware state leaves the VM's alone.
+async fn restore_offline(
+    disks: &[PathBuf],
+    state: &super::snapshot_state::FirmwareState,
+    name: &str,
+    stop: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    let staged = state.stage_restore(name)?;
+    if let Err(error) = restore_offline_disks(disks, name, stop).await {
+        if let Some(staged) = staged {
+            state.discard_restore(staged);
+        }
+        return Err(error);
+    }
+    match staged {
+        Some(staged) => state.commit_restore(staged).with_context(|| {
+            format!(
+                "the disks are at snapshot {name:?} but its UEFI variables and TPM state \
+                 were not put back; restore it again"
+            )
+        }),
+        None => Ok(()),
+    }
+}
+
+async fn restore_offline_disks(
+    disks: &[PathBuf],
+    name: &str,
+    stop: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    use crate::template::qimg;
+
+    for disk in disks {
+        let info = qimg::image_info(disk)
+            .await
+            .with_context(|| format!("checking {} for snapshot {name:?}", disk.display()))?;
+        if !info.snapshots.iter().any(|snapshot| snapshot.name == name) {
+            bail!("{}: snapshot {name:?} is missing", disk.display());
+        }
+    }
+
+    stop.await?;
+    let backup = format!("vmlab-restore-{:032x}", rand::random::<u128>());
+    snapshot_offline_disks(disks, &backup)
+        .await
+        .context("saving disk state before offline restore")?;
+    apply_offline_snapshot(disks, name, &backup).await
+}
+
+async fn apply_offline_snapshot(disks: &[PathBuf], name: &str, backup: &str) -> Result<()> {
+    use crate::template::qimg;
+
+    let mut failure = None;
+    for (index, disk) in disks.iter().enumerate() {
+        if let Err(error) = qimg::snapshot_apply(disk, name).await {
+            failure = Some((index, disk, error));
+            break;
+        }
+    }
+
+    let mut rollback_errors = Vec::new();
+    for (index, disk) in disks.iter().enumerate().rev() {
+        // Include the failed disk: apply can return an error after a write.
+        if failure
+            .as_ref()
+            .is_some_and(|(failed, _, _)| index <= *failed)
+            && let Err(error) = qimg::snapshot_apply(disk, backup).await
+        {
+            rollback_errors.push(format!("{}: {error}", disk.display()));
+            continue;
+        }
+        if let Err(error) = qimg::snapshot_delete(disk, backup).await {
+            tracing::warn!(disk = %disk.display(), backup, %error, "could not delete offline restore backup");
+        }
+    }
+    if let Some((_, disk, error)) = failure {
+        let error =
+            anyhow!(error).context(format!("restoring snapshot {name:?} on {}", disk.display()));
+        if rollback_errors.is_empty() {
+            return Err(error.context("offline restore failed and disk state was rolled back"));
+        }
+        return Err(error.context(format!(
+            "offline restore rollback failed; recovery snapshot {backup:?} retained on affected disks: {}",
+            rollback_errors.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
     // Refuse duplicate names before changing any disk, so rollback never
     // removes a snapshot that predates this operation.
@@ -2750,6 +2979,85 @@ impl KeepAwake {
 #[cfg(test)]
 mod tests {
     use super::{clone_source, clone_source_refusal, no_agent_hint};
+
+    fn write_disk_pattern(path: &std::path::Path) {
+        let mut image = vmlab_disk::open(path, vmlab_disk::Format::Qcow2, false).unwrap();
+        image.write_at(0, &[0x42; 512]).unwrap();
+        image.flush().unwrap();
+    }
+
+    fn assert_disk_pattern(path: &std::path::Path) {
+        let mut data = [0; 512];
+        vmlab_disk::open(path, vmlab_disk::Format::Qcow2, true)
+            .unwrap()
+            .read_at(0, &mut data)
+            .unwrap();
+        assert_eq!(
+            data,
+            [0x42; 512],
+            "post-snapshot data on {}",
+            path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offline_restore_checks_every_disk_first() {
+        use crate::template::qimg;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.qcow2");
+        let second = dir.path().join("second.qcow2");
+        qimg::create_blank(&first, 1 << 20).await.unwrap();
+        qimg::create_blank(&second, 1 << 20).await.unwrap();
+        qimg::snapshot_create(&first, "capture").await.unwrap();
+        write_disk_pattern(&first);
+
+        let disks = [first.clone(), second.clone()];
+        let error = super::restore_offline_disks(&disks, "capture", async {
+            panic!("the VM should not stop when a disk lacks the snapshot");
+        })
+        .await
+        .unwrap_err();
+        assert_disk_pattern(&first);
+        assert!(format!("{error:#}").contains(second.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn offline_restore_rolls_back_when_a_later_apply_fails() {
+        use crate::template::qimg;
+
+        let dir = tempfile::tempdir().unwrap();
+        let disks = [
+            dir.path().join("first.qcow2"),
+            dir.path().join("second.qcow2"),
+        ];
+        for disk in &disks {
+            qimg::create_blank(disk, 1 << 20).await.unwrap();
+            qimg::snapshot_create(disk, "capture").await.unwrap();
+            write_disk_pattern(disk);
+        }
+        super::snapshot_offline_disks(&disks, "backup")
+            .await
+            .unwrap();
+        // Simulate the target becoming unavailable after the preflight.
+        qimg::snapshot_delete(&disks[1], "capture").await.unwrap();
+
+        let error = super::apply_offline_snapshot(&disks, "capture", "backup")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disk state was rolled back"));
+        for disk in &disks {
+            assert_disk_pattern(disk);
+            assert!(
+                qimg::image_info(disk)
+                    .await
+                    .unwrap()
+                    .snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.name != "backup")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn offline_capture_rolls_back_an_earlier_disk_when_a_later_disk_refuses() {

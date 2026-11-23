@@ -1,9 +1,12 @@
 """Host-wide VM counting for the legacy gate's shared-host limit."""
 
+import contextlib
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
+from scenarios import legacy
 from scenarios.legacy import GUESTS, SCREEN_MARKERS, lab_events, project_vms, screen_marker
 
 
@@ -98,6 +101,32 @@ class ScreenMarker(unittest.TestCase):
             for other in SCREEN_MARKERS:
                 if other != machine:
                     self.assertIsNone(screen_marker(other, text), (machine, other))
+
+
+class StagingOrder(unittest.TestCase):
+    def test_every_lab_template_is_staged_before_the_first_guest_boots(self):
+        """`vmlab up freedos` validates the whole lab file: a template staged
+        only before its own machine fails every earlier machine's `up`."""
+        calls = []
+
+        class Harness:
+            hypervisor = "vmlab"
+
+            @contextlib.contextmanager
+            def lab(self, name):
+                yield pathlib.Path("/lab") / name
+
+            def check(self, feature, step, detail=""):
+                step()
+
+        with mock.patch.object(legacy, "stage_template", lambda h, relative: calls.append(("stage", relative))), \
+                mock.patch.object(legacy, "exercise", lambda h, lab, machine: calls.append(("boot", machine))), \
+                mock.patch.object(legacy, "exercise_server2016", lambda h, lab: calls.append(("boot", "server2016"))):
+            legacy.run(Harness())
+        first_boot = calls.index(("boot", "freedos"))
+        self.assertEqual(calls[:first_boot], [("stage", relative) for _, _, relative in GUESTS])
+        self.assertEqual([c for c in calls if c[0] == "boot"],
+                         [("boot", m) for m, _, _ in GUESTS] + [("boot", "server2016")])
 
 
 if __name__ == "__main__":

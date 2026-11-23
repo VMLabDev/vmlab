@@ -283,6 +283,10 @@ impl DiskImage for SharedDisk {
         self.0.lock().write_vmstate(offset, buf)
     }
 
+    fn discard_vmstate(&mut self, len: u64) -> vmlab_disk::Result<()> {
+        self.0.lock().discard_vmstate(len)
+    }
+
     fn read_vmstate(&mut self, offset: u64, buf: &mut [u8]) -> vmlab_disk::Result<()> {
         self.0.lock().read_vmstate(offset, buf)
     }

@@ -317,6 +317,10 @@ class Harness:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
             if r["status"] != "pass":
                 print(f"{r['status'].upper():8} {r['feature']:<{width}}  {r['detail'][:160]}")
-        scope = f"vmlab-hv through phase {self.delivered}" if self.hypervisor == "vmlab" else self.hypervisor
+        scope = self.hypervisor
+        if self.hypervisor == "vmlab":
+            scope = f"vmlab-hv through phase {self.delivered}"
+            if self.delivered == "4":
+                scope += " excluding phase 3"
         print("\n" + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) + f" (of {len(rows)}) on {scope}")
         return 1 if failed else 0

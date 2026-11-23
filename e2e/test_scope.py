@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import harness
-from features import HOST, NO_X86_ON_QEMU, PHASES
+from features import HOST, NO_X86_ON_QEMU, PHASES, out_of_scope
 from run import scenario_features
 from scenarios.fastpath import nic_attachments
 
@@ -27,7 +27,7 @@ class ScenarioScopeTests(unittest.TestCase):
         self.addCleanup(h.log.close)
         return h
 
-    def test_all_35_delivered_core_and_admin_features_follow_vmlab(self):
+    def test_all_38_delivered_core_and_admin_features_follow_vmlab(self):
         h = self.new_harness("vmlab")
         delivered = set()
         for name in ("core", "admin"):
@@ -42,8 +42,24 @@ class ScenarioScopeTests(unittest.TestCase):
                 h.ok(feature, True, "scope regression")
                 self.assertEqual(h.results[feature][0], "pass", feature)
         self.assertIn("vm.hw.tsc", delivered)
+        self.assertIn("lab.down.isolation", delivered)
         self.assertIn("arch.emulated", delivered)
-        self.assertEqual(len(delivered), 35)
+        self.assertEqual(len(delivered), 38)
+
+    def test_default_vmlab_scope_reports_phase_4_results(self):
+        h = self.new_harness("vmlab")
+        phase_4 = {feature for feature, phase in PHASES.items() if phase == "4"}
+        self.assertEqual(len(phase_4), 8)
+        for feature in phase_4:
+            with self.subTest(feature=feature):
+                h.vms_here = h.vms_follow({feature})
+                h.ok(feature, True)
+                self.assertEqual(h.results[feature][0], "pass")
+                h.ok(feature, False)
+                self.assertEqual(h.results[feature][0], "fail")
+                self.assertEqual(out_of_scope(feature, "vmlab", "2f"), "vmlab-hv phase 4")
+        # The aarch64 guest is in scope whatever the cutoff: QEMU runs it.
+        self.assertIsNone(out_of_scope("arch.emulated", "vmlab", "2f"))
 
     def test_host_config_leaves_a_vmlab_run_to_automatic_selection(self):
         for vms in (False, True):
@@ -52,19 +68,6 @@ class ScenarioScopeTests(unittest.TestCase):
             config = self.new_harness("qemu").host_config(vms)
             self.assertIn('container = "qemu"', config)
             self.assertIn('vm = "qemu"', config)
-
-    def test_unsupported_features_keep_their_reasons(self):
-        h = self.new_harness("vmlab")
-        h.vms_here = True
-        for feature, reason in {
-            "vm.hw.floppy": "vmlab-hv phase 4",
-            "vm.media.floppy": "vmlab-hv phase 4",
-        }.items():
-            with self.subTest(feature=feature):
-                h.ok(feature, True)
-                status, detail = h.results[feature]
-                self.assertEqual(status, "skip")
-                self.assertTrue(detail.startswith(reason), detail)
 
     def test_qemu_runs_its_aarch64_guest_alone(self):
         h = self.new_harness("qemu")

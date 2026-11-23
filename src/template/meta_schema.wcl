@@ -36,6 +36,7 @@ type TemplateMeta {
   created: utf8       // RFC 3339
   origin: utf8?       // source ISO URL / registry reference
   registry: utf8?     // full OCI repo this template publishes to
+  pulled_from: utf8?  // the repository a pull installed it from (host/owner/name)
   sha256: utf8?       // hex digest of disk.qcow2
   first_boot_script: utf8?  // embedded wscript script run on first instantiation
   agent_version: utf8?      // vmlab-agent stamp baked in by the template build

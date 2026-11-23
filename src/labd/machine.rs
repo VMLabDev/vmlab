@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::config::model::{self, MacAddr};
 use crate::net::fastpath::NicAttachment;
@@ -54,6 +55,39 @@ use crate::sync::LockRecover;
 /// (ADR-0004) because it is what reaches the CLI, the REST surface and the
 /// console; re-exported here because this is where machines produce it.
 pub use crate::status::{MachineDetail, MachineKind, MachineLabel, MachineStatus, NicStatus};
+
+/// Whether a failed capture reached a backend that could have created artifacts.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotCaptureError {
+    #[error(transparent)]
+    Refused(#[from] anyhow::Error),
+    #[error(transparent)]
+    Attempted(anyhow::Error),
+}
+
+/// Boot reserves only the transition out of Stopped. Offline snapshot work
+/// reserves the power-state check and every disk operation together.
+pub(super) fn snapshot_guard(gate: &Arc<Mutex<()>>, name: &str) -> Result<OwnedMutexGuard<()>> {
+    Arc::clone(gate).try_lock_owned().map_err(|_| {
+        crate::proto::CommandError::conflict(format!(
+            "{name}: an offline snapshot operation is in progress"
+        ))
+        .into()
+    })
+}
+
+/// Keep the machine reserved if the caller is cancelled while an image
+/// tool's blocking disk operation is still running.
+pub(super) async fn finish_offline_snapshot(
+    guard: OwnedMutexGuard<()>,
+    work: impl Future<Output = Result<()>> + Send + 'static,
+) -> Result<()> {
+    tokio::spawn(async move {
+        let _guard = guard;
+        work.await
+    })
+    .await?
+}
 
 /// How long [`Machine::poweroff`] waits for the emulator to actually go.
 pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
@@ -141,22 +175,8 @@ pub trait LabServices: Send + Sync + 'static {
     /// Make sure the lab's shared-folder server is serving. Idempotent.
     async fn ensure_shares(&self);
 
-    /// Wire one NIC into `segment`'s switch, returning how the machine should
-    /// speak to it.
-    ///
-    /// `tap_ok` says this machine can consume a pre-opened tap fd; a machine
-    /// that can only take a stream socket (a container micro-VM builds its
-    /// argv without fd passing) passes `false` and always gets
-    /// [`NicAttachment::Stream`].
-    async fn attach_nic(
-        &self,
-        segment: &str,
-        sock: &Path,
-        mac: MacAddr,
-        isolated: bool,
-        tap_ok: bool,
-        framing: crate::net::framing::FramingMode,
-    ) -> Result<NicAttachment>;
+    /// Wire all of a machine's NICs into the lab fabric in declaration order.
+    async fn attach_nics(&self, machine: &dyn Machine) -> Result<Vec<NicAttachment>>;
 
     /// This machine's agent has answered and it is about to be reported
     /// ready: finish whatever a caller must not race before that happens.
@@ -320,6 +340,14 @@ pub trait Machine: Send + Sync + 'static {
     async fn is_ready(&self) -> bool;
     /// Graceful stop ladder, or an immediate kill when `force`.
     async fn stop(&self, force: bool) -> Result<()>;
+    /// The longest a graceful [`stop`](Self::stop) begun now can take: the
+    /// sum of every wait its ladder may run out. Zero for a machine with
+    /// nothing running. The default is the longest ladder a VM that acts on
+    /// ACPI climbs.
+    async fn stop_wait(&self) -> Duration {
+        use super::stop_plan::{BOOTING_AGENT_WAIT, RUNG_EXIT_WAIT};
+        BOOTING_AGENT_WAIT + RUNG_EXIT_WAIT * 3
+    }
 
     /// Exit the emulator *gracefully*, flushing block-device caches first.
     ///
@@ -611,7 +639,7 @@ pub trait Machine: Send + Sync + 'static {
     // ---- snapshots (PRD §7.3) ---------------------------------------------
 
     /// Take a snapshot; returns whether it was online (running) or offline.
-    async fn snapshot(&self, name: &str) -> Result<bool>;
+    async fn snapshot(&self, name: &str) -> Result<bool, SnapshotCaptureError>;
     async fn delete_snapshot(&self, name: &str) -> Result<()>;
 
     /// The artefact identity a snapshot of this machine is only valid
@@ -811,6 +839,8 @@ impl dyn Machine {
         // restarted in the guest is handshaken again on the way, so the stamp
         // this line reports is the one answering now.
         let detail = self.status_detail().await;
+        // An in-place reset can clear readiness during the agent lookup.
+        let ready = ready && self.is_ready().await;
         let nics = self
             .nics()
             .iter()
@@ -848,41 +878,6 @@ impl dyn Machine {
 }
 
 // ---- shared implementation details -----------------------------------------
-
-/// Wire every one of `m`'s NICs into the lab fabric, in declaration order.
-///
-/// One implementation for both adapters: the segment, socket and MAC come from
-/// the machine, and whether it can take a tap fd is
-/// [`takes_tap_fds`](Machine::takes_tap_fds). A machine that ignores the
-/// returned attachments (a container micro-VM connects to the sockets itself)
-/// simply drops them.
-pub(super) async fn attach_all_nics(
-    m: &dyn Machine,
-    lab: &dyn LabServices,
-) -> Result<Vec<NicAttachment>> {
-    let tap_ok = m.takes_tap_fds();
-    let mut attachments = Vec::with_capacity(m.nics().len());
-    for (i, nic) in m.nics().iter().enumerate() {
-        let sock = m.nic_sock(i);
-        let _ = std::fs::remove_file(&sock);
-        let mac = *m
-            .macs()
-            .get(i)
-            .ok_or_else(|| anyhow!("{}: no persisted MAC for nic {i}", m.name()))?;
-        attachments.push(
-            lab.attach_nic(
-                super::network::nic_segment_name(nic),
-                &sock,
-                mac,
-                nic.isolated,
-                tap_ok,
-                m.net_framing(),
-            )
-            .await?,
-        );
-    }
-    Ok(attachments)
-}
 
 /// [`Machine::eject_cdrom`]'s refusal for a machine that has no install
 /// CD-ROM, naming it and saying which machines do.

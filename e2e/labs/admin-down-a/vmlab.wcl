@@ -1,0 +1,9 @@
+import <vmlab.wcl>
+
+lab "e2e-down-a" {
+  vm "guest" {
+    template = "x86_64/e2e-alpine"
+    cpus = 1
+    memory = 512MiB
+  }
+}

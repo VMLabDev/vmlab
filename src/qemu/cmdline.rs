@@ -102,6 +102,13 @@ pub struct VmPaths {
     pub apic_virtualization: bool,
 }
 
+/// A path as it stands inside a QEMU option value: QEMU splits the value at
+/// each `,` and reads `,,` as one literal comma. A path QEMU takes as a whole
+/// argument (`-bios`, `-readconfig`, `-L`, `-serial file:`) is not escaped.
+pub fn opt_path(path: &Path) -> String {
+    path.display().to_string().replace(',', ",,")
+}
+
 /// The qdev id of a VM's install CD-ROM device (see
 /// [`VmPaths::install_cdrom`]). Only that drive carries an id, so nothing
 /// addressed by it can reach built media or the VMLAB bootstrap ISO.
@@ -472,13 +479,13 @@ pub fn build_args(
     arg(
         &mut a,
         "vnc",
-        format!("unix:{},share=ignore", paths.vnc_sock.display()),
+        format!("unix:{},share=ignore", opt_path(&paths.vnc_sock)),
     );
 
     arg(
         &mut a,
         "qmp",
-        format!("unix:{},server=on,wait=off", paths.qmp_sock.display()),
+        format!("unix:{},server=on,wait=off", opt_path(&paths.qmp_sock)),
     );
     a.push("-monitor".into());
     a.push("none".into());
@@ -496,7 +503,7 @@ pub fn build_args(
         arg(
             &mut a,
             "drive",
-            format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+            format!("if=pflash,format=raw,readonly=on,file={}", opt_path(code)),
         );
         let vars = paths
             .ovmf_vars
@@ -505,7 +512,7 @@ pub fn build_args(
         arg(
             &mut a,
             "drive",
-            format!("if=pflash,format=raw,file={}", vars.display()),
+            format!("if=pflash,format=raw,file={}", opt_path(vars)),
         );
     }
 
@@ -518,7 +525,7 @@ pub fn build_args(
             "chardev",
             format!(
                 "socket,id=vagent0,path={},server=on,wait=off",
-                paths.agent_sock.display()
+                opt_path(&paths.agent_sock)
             ),
         );
         arg(&mut a, "device", "virtio-serial-pci".into());
@@ -541,7 +548,7 @@ pub fn build_args(
         a.push("-blockdev".into());
         a.push(format!(
             "driver=qcow2,node-name={node},file.driver=file,file.filename={}",
-            path.display()
+            opt_path(path)
         ));
         a.push("-device".into());
         let boot = if indexed_boot {
@@ -564,7 +571,7 @@ pub fn build_args(
         a.push("-blockdev".into());
         a.push(format!(
             "driver=raw,node-name=cd{i},read-only=on,file.driver=file,file.filename={}",
-            iso.display()
+            opt_path(iso)
         ));
         a.push("-device".into());
         let boot = if indexed_boot {
@@ -598,7 +605,7 @@ pub fn build_args(
                 "netdev",
                 format!(
                     "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
-                    sock.display()
+                    opt_path(sock)
                 ),
             ),
             NicBackend::Tap { child_fd } => {
@@ -620,7 +627,7 @@ pub fn build_args(
         let rom = paths
             .nic_rom
             .as_ref()
-            .map(|path| format!(",romfile={}", path.display().to_string().replace(',', ",,")))
+            .map(|path| format!(",romfile={}", opt_path(path)))
             .unwrap_or_default();
         arg(
             &mut a,
@@ -642,7 +649,7 @@ pub fn build_args(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=chrtpm,path={}", tpm_sock.display()),
+            format!("socket,id=chrtpm,path={}", opt_path(tpm_sock)),
         );
         arg(&mut a, "tpmdev", "emulator,id=tpm0,chardev=chrtpm".into());
         arg(&mut a, "device", "tpm-tis-device,tpmdev=tpm0".into());
@@ -687,7 +694,7 @@ pub fn build_args(
                 // The scanout has to come from the GPU Venus renders on, or
                 // the console is black.
                 let display = match &paths.gpu_render_node {
-                    Some(node) => format!("egl-headless,rendernode={}", node.display()),
+                    Some(node) => format!("egl-headless,rendernode={}", opt_path(node)),
                     None => "egl-headless".into(),
                 };
                 arg(&mut a, "display", display);
@@ -722,7 +729,7 @@ pub fn build_args(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=vfs{i},path={}", sock.display()),
+            format!("socket,id=vfs{i},path={}", opt_path(sock)),
         );
         arg(
             &mut a,
@@ -813,6 +820,50 @@ mod tests {
         p.nic_rom = Some("/fw/virtio-net.rom".into());
         let args = joined(&build_args("l", &arm(), &p, Accel::Kvm).unwrap());
         assert!(args.contains("romfile=/fw/virtio-net.rom"), "{args}");
+    }
+
+    /// QEMU splits an option value at each `,` and reads `,,` as a literal
+    /// comma, so a path inside an option value must have its commas doubled.
+    /// `-serial file:` takes a path whole, so its path stays as it is.
+    #[test]
+    fn a_comma_in_a_path_is_doubled_in_every_option() {
+        let dir = "/lab/with,comma";
+        let at = |name: &str| PathBuf::from(format!("{dir}/{name}"));
+        let mut p = paths();
+        p.qmp_sock = at("qmp.sock");
+        p.agent_sock = at("agent.sock");
+        p.vnc_sock = at("vnc.sock");
+        p.primary_disk = at("disk0.qcow2");
+        p.extra_disks = vec![("data".into(), at("data.qcow2"))];
+        p.cdroms = vec![at("install.iso"), at("seed.iso")];
+        p.firmware_code = Some(at("AAVMF_CODE.fd"));
+        p.ovmf_vars = Some(at("AAVMF_VARS.fd"));
+        p.nic_rom = Some(at("virtio-net.rom"));
+        p.tpm_sock = Some(at("swtpm.sock"));
+        p.serial_log = Some(at("serial.log"));
+        p.virtiofs_shares = vec![("src".into(), at("vfs0.sock"))];
+        p.nics[0].backend = NicBackend::Stream {
+            sock: at("nic0.sock"),
+        };
+        let mut vm = arm();
+        vm.firmware = Some(FirmwareKind::Ovmf);
+        vm.tpm = true;
+        let args = build_args("lab", &vm, &p, Accel::Tcg).unwrap();
+        let mut seen = 0;
+        for value in &args {
+            if !value.contains("with,") {
+                continue;
+            }
+            seen += 1;
+            if value.starts_with("file:") {
+                assert!(!value.contains("with,,comma"), "{value}");
+            } else {
+                assert!(value.contains("with,,comma"), "{value}");
+            }
+        }
+        // The disks, the CD-ROMs, both firmware files, the QMP, VNC, agent,
+        // NIC, TPM and virtiofs sockets, the ROM and the serial log.
+        assert!(seen >= 14, "{seen}: {args:?}");
     }
 
     /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to

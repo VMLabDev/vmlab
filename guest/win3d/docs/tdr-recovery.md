@@ -70,11 +70,18 @@ https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkm
 The virtio reset contract is at
 https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html.
 
-In vmlab-hv, renderer teardown errors are logged but do not prevent reset
-acknowledgement. The current Venus proxy sends destruction messages without
-waiting for worker exit or GPU idle. Removal of guest BAR aliases limits the
-guest-memory lifetime risk, but an explicit backend quiescence acknowledgement
-is still missing. Record that limitation separately from functional recovery.
+vmlab-hv acknowledges a reset only after its renderer has stopped. The
+renderer frees what the guest held and waits for a fence of its own on the
+host GPU. Each Venus context runs in a render server worker process, and the
+device waits until every worker of the guest's contexts has exited: an exited
+worker has closed its render node, and the kernel driver ends that node's GPU
+work before the close completes. Until then the device status reads
+`DEVICE_NEEDS_RESET` (64), not zero, and a write that starts the device again
+is ignored. A teardown error or a worker still running after 5 seconds is a
+failed reset: the KMD reads a nonzero status and returns `STATUS_IO_TIMEOUT`
+without releasing payloads. Each later status read retries the teardown, and
+the first that confirms it reads zero. The code is
+`hv/crates/vmlab-hv-devices/src/virtio/gpu/teardown.rs`.
 
 ## Feedback mapping regression
 

@@ -39,6 +39,8 @@ pub mod pull_ledger;
 pub mod record;
 pub mod reload_plan;
 pub mod share_plan;
+mod snapshot_state;
+mod start_gate;
 pub mod state;
 pub mod stop_plan;
 pub mod usb;
@@ -99,6 +101,13 @@ pub fn run(lab: String, root: PathBuf) -> Result<()> {
 }
 
 async fn run_async(lab: String, root: PathBuf) -> Result<()> {
+    // One daemon per lab. Building the runtime rewrites the lab's state file
+    // and treats every machine as stopped, so the guard comes before all of
+    // it: a second daemon ends here, having touched nothing.
+    let sock = crate::paths::lab_socket(&lab);
+    let guard = crate::proto::server::SocketGuard::acquire(&sock)
+        .with_context(|| format!("lab {lab} already has a daemon"))?;
+
     let mut config = crate::config::load_lab_root(&root)
         .map_err(|e| anyhow::anyhow!("cannot load lab config: {e}"))?;
     // The CLI chose the name, an instance of the declared one when this
@@ -152,13 +161,11 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     // can cancel and join them deterministically.
     let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
 
-    let sock = crate::paths::lab_socket(&lab);
     let handler: Arc<dyn Handler<LabRequest>> = Arc::new(LabdHandler {
         lab: runtime.clone(),
         tasks: tasks.clone(),
     });
-    let server = Server::bind_with_events(&sock, handler, events_tx.clone())
-        .await
+    let server = Server::bind_guarded(guard, handler, events_tx.clone())
         .with_context(|| format!("binding {}", sock.display()))?;
 
     // Disk-space watchdog on the lab-local filesystem — linked clones grow
@@ -258,7 +265,7 @@ async fn announce_exit(lab: &str) {
 /// switches (§9.2), and cancel + join background tasks so nothing dies
 /// mid-flight.
 async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
-    let _ = lab.down(&[], false).await;
+    lab.stop_for_exit().await;
     if let Some(mut smb) = lab.smb.lock().await.take() {
         smb.stop();
     }
@@ -422,6 +429,20 @@ fn logon_for(
 /// serves.
 fn on_machine<T>(machine: &str, r: Result<T, CommandError>) -> Result<T, CommandError> {
     r.map_err(|e| e.prefixed(machine))
+}
+
+/// The inline form of `machine.push_file`: the caller sent the bytes, not a
+/// host path. They go from memory to the guest. They used to pass through
+/// `<temp_dir>/vmlab-cp-<pid>-<machine>`, a name two pushes to one machine
+/// shared and any local user could plant a symlink at or read.
+async fn push_inline(
+    agent: &vm_agent::AgentHandle,
+    bytes: &[u8],
+    to: &str,
+    mode: Option<u32>,
+    logon: Option<vm_agent::Logon>,
+) -> anyhow::Result<(String, u64)> {
+    agent.push_bytes_as(bytes, to, mode, logon).await
 }
 
 /// A clipboard request that failed, under the machine's name: the agent's
@@ -956,12 +977,7 @@ impl Handler<LabRequest> for LabdHandler {
                                 crate::proto::INLINE_FILE_LIMIT,
                             ));
                         }
-                        let tmp = std::env::temp_dir()
-                            .join(format!("vmlab-cp-{}-{machine}", std::process::id()));
-                        std::fs::write(&tmp, &bytes)
-                            .map_err(|e| CommandError::failed(e.to_string()))?;
-                        let res = agent.push_file_as(&tmp, &to, mode, logon).await;
-                        let _ = std::fs::remove_file(&tmp);
+                        let res = push_inline(&agent, &bytes, &to, mode, logon).await;
                         on_machine(&machine, Ok(res?))?
                     }
                     None => {
@@ -1217,17 +1233,10 @@ impl Handler<LabRequest> for LabdHandler {
                 machine,
                 discard,
             } => {
-                let mut warnings = Vec::new();
-                match machine {
-                    Some(machine) => warnings = lab.restore(&machine, &name, discard).await?,
-                    None => {
-                        let names: Vec<String> =
-                            lab.machines().map(|m| m.name().to_string()).collect();
-                        for vm in names {
-                            warnings.extend(lab.restore(&vm, &name, discard).await?);
-                        }
-                    }
-                }
+                let warnings = match machine {
+                    Some(machine) => lab.restore(&machine, &name, discard).await?,
+                    None => lab.restore_all(&name, discard).await?,
+                };
                 Ok(json!({"warnings": warnings}))
             }
             LabRequest::SnapshotDelete { machine, name } => {
@@ -1269,6 +1278,9 @@ impl Handler<LabRequest> for LabdHandler {
             .unwrap_or_default()),
             LabRequest::Shutdown {} => {
                 tracing::info!("lab daemon shutdown requested");
+                // Read before the teardown begins: how long the caller must
+                // give it before it takes the daemon for hung.
+                let stop_within = lab.stop_wait().await;
                 let lab = lab.clone();
                 let tasks = self.tasks.clone();
                 // Spawned so this command's response reaches the caller before
@@ -1279,7 +1291,7 @@ impl Handler<LabRequest> for LabdHandler {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });
-                Ok(json!(true))
+                Ok(json!({ "stop_within_secs": stop_within.as_secs() }))
             }
         }
     }

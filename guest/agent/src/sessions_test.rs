@@ -307,6 +307,77 @@ fn exec_streams_stdio_and_exit_code() {
 }
 
 #[test]
+fn an_exec_reports_its_exit_while_a_background_child_holds_the_pipe() {
+    let keep_running = tempfile::tempdir().unwrap();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 4,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "(while [ -d \"$1\" ]; do sleep 1; done) & \
+                 printf stdout; printf stderr >&2; exit 3"
+                    .into(),
+                "sh".into(),
+                keep_running.path().to_str().unwrap().into(),
+            ],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    // The background child keeps both pipes open until this directory drops.
+    let (out, err, code) = cap.until_exited(4);
+    assert_eq!(code, 3);
+    assert_eq!(out, b"stdout");
+    assert_eq!(err, b"stderr");
+}
+
+#[test]
+fn stdin_after_the_child_closed_it_is_still_credited() {
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 4,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec 0<&-; printf ready; exec sleep 15".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    cap.data_until(4, b"ready");
+    // Send 600 KiB, replenishing the window after each 150 KiB batch.
+    for _ in 0..4 {
+        for _ in 0..3 {
+            mux.route_input(4, Input::Bytes(vec![0; 50 * 1024]));
+        }
+        assert_eq!(
+            cap.ctrl(),
+            AgentMsg::WindowAdjust {
+                id: 4,
+                bytes: 150 * 1024,
+            }
+        );
+    }
+    open(&mux, &p, HostMsg::Close { id: 4 });
+}
+
+#[test]
 fn exec_missing_binary_reports_error() {
     let (mux, mut cap) = capture_mux();
     let p = platform();
@@ -824,6 +895,100 @@ fn fileops_caps_handles_and_refuses_an_overflowing_offset() {
     assert_eq!(cap.fileops(30).0.reply, Reply::Ok);
     assert!(matches!(open_one(&mut cap, 5004), Reply::Handle { .. }));
     mux.remove(30);
+}
+
+/// Review F8 (guest agents): the file session refuses what is not a file
+/// with an end. A FIFO would hold a worker in `open(2)` until a peer came,
+/// and a digest of `/dev/zero` would read for the life of the agent; a
+/// worker has no cancel, so each such request used to cost the session a
+/// thread for good.
+#[cfg(unix)]
+#[test]
+fn a_digest_of_a_fifo_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let fifo = fifo.to_str().unwrap().to_string();
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenFileOps {
+            id: 12,
+            logon: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 12 });
+
+    let write = OpenFlags {
+        write: true,
+        ..OpenFlags::default()
+    };
+    let requests = [
+        Op::Digest { path: fifo.clone() },
+        Op::Open {
+            path: fifo.clone(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+        Op::Open {
+            path: fifo.clone(),
+            flags: write,
+            mode: None,
+        },
+        // The open a size or time change makes for itself.
+        Op::Setstat {
+            path: fifo.clone(),
+            attrs: vmlab_agent_proto::fileops::SetAttrs {
+                mtime_ns: Some(0),
+                ..Default::default()
+            },
+        },
+        Op::Digest {
+            path: "/dev/zero".into(),
+        },
+        Op::Open {
+            path: "/dev/zero".into(),
+            flags: OpenFlags::read(),
+            mode: None,
+        },
+    ];
+    // More requests than the session has workers: before the fix the first
+    // four each took one and the rest were never served.
+    for (id, op) in requests.into_iter().enumerate() {
+        let what = format!("{op:?}");
+        let asked = std::time::Instant::now();
+        ask(&mux, 12, id as u64, op);
+        let (reply, _) = cap.fileops(12);
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(1),
+            "{what} took {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(reply.id, id as u64);
+        match reply.reply {
+            Reply::Error { msg, .. } => assert!(msg.contains("not a regular file"), "{msg}"),
+            other => panic!("{what}: expected a refusal, got {other:?}"),
+        }
+    }
+
+    // Every worker is still there to serve a real file.
+    let file = dir.path().join("f");
+    std::fs::write(&file, b"abc").unwrap();
+    ask(
+        &mux,
+        12,
+        99,
+        Op::Digest {
+            path: file.to_str().unwrap().into(),
+        },
+    );
+    match cap.fileops(12).0.reply {
+        Reply::Digest { len, .. } => assert_eq!(len, 3),
+        other => panic!("expected a digest, got {other:?}"),
+    }
+    mux.remove(12);
 }
 
 #[test]

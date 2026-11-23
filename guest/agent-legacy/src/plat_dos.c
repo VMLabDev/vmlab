@@ -282,6 +282,13 @@ long proc_read(struct plat_proc *p, int which, void *buf, long cap)
     return -1;
 }
 
+long proc_output_pending(struct plat_proc *p, int which)
+{
+    (void)p;
+    (void)which;
+    return -1; /* DOS has finished writing to the capture files. */
+}
+
 void proc_write_in(struct plat_proc *p, const void *buf, long len)
 {
     (void)buf;

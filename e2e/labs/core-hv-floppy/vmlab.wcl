@@ -1,0 +1,15 @@
+import <vmlab.wcl>
+
+lab "e2e-core-floppy" {
+  vm "raw" {
+    template = "x86/freedos-1.3@1.3.0"
+    agent_update = false
+    floppy = "./fd.img"
+  }
+
+  vm "folder" {
+    template = "x86/freedos-1.3@1.3.0"
+    agent_update = false
+    media { kind = "floppy" from = "./media-floppy/" label = "E2EFLOP" }
+  }
+}

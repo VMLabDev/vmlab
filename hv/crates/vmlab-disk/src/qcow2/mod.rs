@@ -30,6 +30,12 @@ const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 const EXT_END: u32 = 0;
 
 const MAX_BACKING_DEPTH: usize = 8;
+/// QEMU's limits on the header counts (`QCOW_MAX_L1_SIZE`,
+/// `QCOW_MAX_REFTABLE_SIZE`, `QCOW_MAX_SNAPSHOTS`). The file length alone does
+/// not bound them: a sparse file holds a long run of zeros for nothing.
+pub(crate) const MAX_L1_ENTRIES: u32 = (32 << 20) / 8;
+const MAX_REFCOUNT_TABLE_BYTES: u64 = 8 << 20;
+pub(crate) const MAX_SNAPSHOTS: u32 = 65536;
 const INCOMPAT_DIRTY: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -309,6 +315,30 @@ impl Qcow2Image {
                 });
             }
         }
+        if u64::from(header_length) > cluster_size {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("header length {header_length} is larger than the cluster"),
+            });
+        }
+        if l1_size > MAX_L1_ENTRIES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("active L1 table too large ({l1_size} entries)"),
+            });
+        }
+        if u64::from(refcount_table_clusters) * cluster_size > MAX_REFCOUNT_TABLE_BYTES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("refcount table too large ({refcount_table_clusters} clusters)"),
+            });
+        }
+        if nb_snapshots > MAX_SNAPSHOTS {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("snapshot table too large ({nb_snapshots} snapshots)"),
+            });
+        }
         const INCOMPAT_CORRUPT: u64 = 1 << 1;
         const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
         const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -418,16 +448,16 @@ impl Qcow2Image {
                     reason: format!("backing file name too long ({backing_file_size})"),
                 });
             }
-            let start = backing_file_offset as usize;
-            let end = start + backing_file_size as usize;
-            if end > header_cluster.len() {
+            let end = backing_file_offset.checked_add(backing_file_size);
+            let Some(end) = end.filter(|&end| end <= header_cluster.len() as u64) else {
                 return Err(Error::Format {
                     format: "qcow2",
                     reason: format!(
                         "backing file name at {backing_file_offset:#x} is outside the header cluster"
                     ),
                 });
-            }
+            };
+            let (start, end) = (backing_file_offset as usize, end as usize);
             let name = String::from_utf8_lossy(&header_cluster[start..end]).into_owned();
             Some(BackingRef {
                 name,
@@ -673,7 +703,20 @@ impl Qcow2Image {
         let first_sector = host_offset / 512;
         let end = (first_sector + additional_sectors + 1) * 512;
         let mut compressed = vec![0u8; (end - host_offset) as usize];
-        self.read_file(host_offset, &mut compressed)?;
+        // QEMU writes only the compressed bytes, so the file may end inside
+        // the last sector. The bytes past the end of the file stay zeros.
+        let mut filled = 0;
+        while filled < compressed.len() {
+            match self
+                .file
+                .read_at(&mut compressed[filled..], host_offset + filled as u64)
+            {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut decompressor = flate2::Decompress::new(false);
         // One spare byte lets the decoder consume the end marker even when
         // the valid output fills a whole cluster, and detects overlong data.
@@ -833,6 +876,21 @@ impl Qcow2Image {
                     // The copied bit is a hint; the refcount is the truth.
                     self.get_refcount(host / self.cluster_size)? == 1
                 };
+                if owned && zero_flag {
+                    // QEMU zeroes an allocated cluster in place: it sets the
+                    // zero flag and keeps the host cluster, whose old bytes
+                    // stay. The write fills the whole host cluster first,
+                    // zeros around the new bytes, and then clears the flag:
+                    // until the entry changes the cluster still reads as
+                    // zeros.
+                    let mut cluster = vec![0u8; self.cluster_size as usize];
+                    cluster[in_off as usize..in_off as usize + take]
+                        .copy_from_slice(&buf[done..done + take]);
+                    self.write_file(host, &cluster)?;
+                    self.set_l2_entry(l2_host, l2_index, host | COPIED_BIT)?;
+                    done += take;
+                    continue;
+                }
                 if owned {
                     if entry & COPIED_BIT == 0 {
                         self.set_l2_entry(l2_host, l2_index, entry | COPIED_BIT)?;
@@ -879,7 +937,8 @@ impl Qcow2Image {
         let host_offset = entry & ((1u64 << x) - 1);
         let sector_bits = 62 - x;
         let additional_sectors = (entry >> x) & ((1u64 << sector_bits) - 1);
-        let end = host_offset + (additional_sectors + 1) * 512;
+        // The data ends at the end of its last sector, as on the read path.
+        let end = (host_offset / 512 + additional_sectors + 1) * 512;
         let first = host_offset / self.cluster_size;
         let last = end.div_ceil(self.cluster_size) - 1;
         for cluster_idx in first..=last {
@@ -1050,7 +1109,13 @@ impl Qcow2Image {
     ) -> Result<Qcow2Image> {
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
-        let l1_size = size.div_ceil(span).max(1) as u32;
+        let l1_entries = size.div_ceil(span).max(1);
+        if l1_entries > u64::from(MAX_L1_ENTRIES) {
+            return Err(Error::Unsupported(format!(
+                "a {size}-byte disk needs an L1 table over the qcow2 limit at cluster_bits {cluster_bits}"
+            )));
+        }
+        let l1_size = l1_entries as u32;
         let l1_clusters = l1_size_as_clusters(l1_size, cluster_size);
 
         let file = OpenOptions::new()
@@ -1199,16 +1264,24 @@ impl Qcow2Image {
         // unknown extensions; QEMU's rebase does the same for formats it
         // rewrites. Keep it simple: rebuild extensions from scratch.
         let mut ext_off = header_len;
-        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| {
+        // A crafted header length can leave no room for the extensions.
+        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| -> Result<()> {
+            let next = *off + 8 + data.len().div_ceil(8) * 8;
+            if next > hc.len() {
+                return Err(Error::Unsupported(
+                    "header extensions do not fit in the header cluster".into(),
+                ));
+            }
             hc[*off..*off + 4].copy_from_slice(&et.to_be_bytes());
             hc[*off + 4..*off + 8].copy_from_slice(&(data.len() as u32).to_be_bytes());
             hc[*off + 8..*off + 8 + data.len()].copy_from_slice(data);
-            *off += 8 + data.len().div_ceil(8) * 8;
+            *off = next;
+            Ok(())
         };
         if let Some(fmt) = format {
-            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes());
+            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes())?;
         }
-        add_ext(&mut hc, &mut ext_off, EXT_END, &[]);
+        add_ext(&mut hc, &mut ext_off, EXT_END, &[])?;
         let name_bytes = name.as_bytes();
         if name_bytes.len() > 1023 || ext_off + name_bytes.len() > hc.len() {
             return Err(Error::Unsupported(
@@ -1280,10 +1353,84 @@ impl Qcow2Image {
         if new_size == self.size {
             return Ok(());
         }
+        let old_size = self.size;
         self.ensure_l1_covers(new_size)?;
+        // The new area must read as zeros, as `qemu-img resize` makes it.
+        // Mappings past the old size are vmstate (`vmstate_base`), whose
+        // address moves with the size, so the old vmstate is dropped.
+        let cluster_end = old_size.next_multiple_of(self.cluster_size);
+        self.drop_mappings_from(cluster_end)?;
         self.size = new_size;
         self.header_dirty = true;
+        // A longer backing file would show through the new area.
+        let backing_size = self.backing_image.as_ref().map_or(0, |b| b.size());
+        let shadow_end = backing_size.min(new_size);
+        if shadow_end > old_size {
+            let head_end = cluster_end.min(shadow_end);
+            if head_end > old_size {
+                self.write_bytes(old_size, &vec![0u8; (head_end - old_size) as usize])?;
+            }
+            let mut cluster_off = cluster_end;
+            while cluster_off < shadow_end {
+                self.zero_cluster(cluster_off, shadow_end)?;
+                cluster_off += self.cluster_size;
+            }
+        }
         Ok(())
+    }
+
+    /// Unmap every active-layer cluster at or past the cluster-aligned guest
+    /// offset `from`, releasing the host clusters it held.
+    fn drop_mappings_from(&mut self, from: u64) -> Result<()> {
+        let first_l1 = self.l1_index_of(from) as usize;
+        for l1_index in first_l1..self.l1.len() {
+            let l2_host = self.l1[l1_index] & OFFSET_MASK;
+            if l2_host == 0 {
+                continue;
+            }
+            let entry_start = l1_index as u64 * self.l2_span();
+            let skip = from.saturating_sub(entry_start) / self.cluster_size;
+            let indexes: Vec<u64> = self
+                .l2_allocated_indexes(l2_host)?
+                .into_iter()
+                .filter(|&i| i >= skip)
+                .collect();
+            if indexes.is_empty() {
+                continue;
+            }
+            let l2_host = self.cow_l2_if_shared(l1_index)?;
+            for l2_index in indexes {
+                let entry = self.l2_entry(l2_host, l2_index)?;
+                if entry & COMPRESSED_BIT != 0 {
+                    self.adjust_compressed_refcounts(entry, -1)?;
+                } else if entry & OFFSET_MASK != 0 {
+                    self.dec_refcount((entry & OFFSET_MASK) / self.cluster_size)?;
+                }
+                self.set_l2_entry(l2_host, l2_index, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the unmapped cluster at `cluster_off` read as zeros and not
+    /// through the backing file: the zero flag on version 3, written zeros
+    /// up to `end` on version 2, which has no zero flag.
+    fn zero_cluster(&mut self, cluster_off: u64, end: u64) -> Result<()> {
+        if self.version < 3 {
+            let len = self.cluster_size.min(end - cluster_off) as usize;
+            return self.write_bytes(cluster_off, &vec![0u8; len]);
+        }
+        let l1_index = self.l1_index_of(cluster_off) as usize;
+        let mut l2_host = self.cow_l2_if_shared(l1_index)?;
+        if l2_host == 0 {
+            let l2 = self.alloc_cluster()?;
+            self.write_file(l2, &vec![0u8; self.cluster_size as usize])?;
+            self.set_cluster_refcount(l2 / self.cluster_size, 1)?;
+            self.l1[l1_index] = l2 | COPIED_BIT;
+            self.l1_dirty = true;
+            l2_host = l2;
+        }
+        self.set_l2_entry(l2_host, self.l2_index_of(cluster_off), ZERO_BIT)
     }
 
     /// Ensure the active L1 (memory and on-disk region) has at least
@@ -1431,6 +1578,12 @@ impl DiskImage for Qcow2Image {
             .ok_or_else(|| Error::Unsupported("vmstate offset overflows u64".into()))?;
         self.read_bytes(offset, buf)
     }
+
+    fn discard_vmstate(&mut self, len: u64) -> Result<()> {
+        self.check_writable()?;
+        self.punch_vmstate(len)?;
+        self.flush()
+    }
 }
 
 /// Closing an image writes its cached metadata. Data clusters are written at
@@ -1541,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ambiguous_snapshot_lookup_prefers_id() {
+    fn legacy_ambiguous_snapshot_lookup_uses_name() {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         img.snapshot_create("x", 0, 0).unwrap();
         img.snapshot_create("y", 0, 0).unwrap();
@@ -1550,27 +1703,32 @@ mod tests {
         img.file
             .write_all_at(b"2", img.snapshots_offset + 65)
             .unwrap();
-        assert_eq!(img.snapshot_apply("2").unwrap().name, "y");
+        assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
         img.snapshot_delete("2").unwrap();
         let entries = img.snapshots().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "1");
-        assert_eq!(entries[0].name, "2");
+        assert_eq!(entries[0].id, "2");
+        assert_eq!(entries[0].name, "y");
     }
 
     #[test]
-    fn snapshot_namespace_rejects_ids_and_skips_numeric_names() {
+    fn snapshot_ids_skip_numeric_names_and_do_not_select_snapshots() {
         let (_dir, mut img) = testsupport::blank(8 << 20);
         img.snapshot_create("2", 0, 0).unwrap();
         img.snapshot_create("second", 0, 0).unwrap();
         let entries = img.snapshots().unwrap();
         assert_eq!(entries[0].id, "1");
         assert_eq!(entries[1].id, "3");
+        img.snapshot_create("1", 0, 0).unwrap();
         assert!(img.snapshot_create("1", 0, 0).is_err());
         assert!(!img.poisoned, "validation must not poison the image");
         assert_eq!(img.snapshot_apply("2").unwrap().name, "2");
-        img.snapshot_delete("3").unwrap();
-        assert_eq!(img.snapshots().unwrap().len(), 1);
+        assert!(matches!(
+            img.snapshot_delete("3"),
+            Err(Error::SnapshotNotFound(_))
+        ));
+        img.snapshot_delete("second").unwrap();
+        assert_eq!(img.snapshots().unwrap().len(), 2);
     }
 
     #[test]
@@ -1615,6 +1773,89 @@ mod tests {
         img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
         img.file.write_all_at(&u32::MAX.to_be_bytes(), 56).unwrap();
         assert!(Qcow2Image::open(&img.path, true).is_err());
+    }
+
+    #[test]
+    fn an_l1_table_larger_than_the_format_limit_is_refused() {
+        // Card #555 (F9): the file is long enough, sparse, and holds nothing.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let l1_size = MAX_L1_ENTRIES + 1;
+        img.file.write_all_at(&l1_size.to_be_bytes(), 36).unwrap();
+        img.file
+            .set_len(img.l1_table_offset + u64::from(l1_size) * 8)
+            .unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_count_larger_than_the_format_limit_is_refused() {
+        // Card #555 (F9): 40 zero bytes are a valid empty snapshot entry.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let count = MAX_SNAPSHOTS + 1;
+        let offset = img
+            .file
+            .metadata()
+            .unwrap()
+            .len()
+            .next_multiple_of(img.cluster_size);
+        img.file.write_all_at(&count.to_be_bytes(), 60).unwrap();
+        img.file.write_all_at(&offset.to_be_bytes(), 64).unwrap();
+        img.file.set_len(offset + u64::from(count) * 40).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_backing_name_offset_near_the_end_of_u64_is_an_error() {
+        // Card #555 (F10): the end of the name range overflows u64.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        img.file
+            .write_all_at(&0xffff_ffff_ffff_fff8u64.to_be_bytes(), 8)
+            .unwrap();
+        img.file.write_all_at(&16u32.to_be_bytes(), 16).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_header_length_beyond_the_cluster_is_an_error() {
+        // Card #555 (F10): rebase copied header_length bytes from one cluster.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        img.file
+            .write_all_at(&0x0010_0000u32.to_be_bytes(), 100)
+            .unwrap();
+        match Qcow2Image::open(&img.path, false) {
+            Err(_) => {}
+            Ok(mut opened) => assert!(opened.set_backing("base.qcow2", Some("qcow2")).is_err()),
+        }
+    }
+
+    #[test]
+    fn a_header_length_that_leaves_no_room_for_extensions_is_an_error() {
+        // Card #555 (F10): a header that fills its cluster has no room for the
+        // backing-format extension that set_backing writes after it.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let length = img.cluster_size as u32;
+        img.file.write_all_at(&length.to_be_bytes(), 100).unwrap();
+        let mut opened = Qcow2Image::open(&img.path, false).unwrap();
+        assert!(opened.set_backing("base.qcow2", Some("qcow2")).is_err());
+    }
+
+    #[test]
+    fn compressed_refcounts_end_at_the_last_sector() {
+        let (_dir, mut img) = testsupport::blank(8 << 20);
+        let cluster = img.cluster_size;
+        assert_eq!(cluster, 0x10000);
+        // Offset 0x1ff37 with no further sector, moved past the metadata:
+        // the data ends on the boundary of cluster 11.
+        let offset = 10 * cluster + 0xff37;
+        img.set_cluster_refcount(10, 5).unwrap();
+        img.set_cluster_refcount(11, 5).unwrap();
+        img.adjust_compressed_refcounts(COMPRESSED_BIT | offset, 1)
+            .unwrap();
+        assert_eq!(img.get_refcount(10).unwrap(), 6);
+        assert_eq!(img.get_refcount(11).unwrap(), 5);
     }
 
     #[test]
@@ -1782,6 +2023,65 @@ mod tests {
         hc[off..off + 4].copy_from_slice(&EXT_END.to_be_bytes());
         assert_eq!(parse_backing_format(&hc, 112).as_deref(), Some("qcow2"));
         assert_eq!(parse_backing_format(&vec![0u8; 512], 112), None);
+    }
+
+    #[test]
+    fn a_grown_image_reads_zeros_where_vmstate_was() {
+        let (_dir, mut img) = testsupport::blank(1024 * 1024);
+        let span = img.l2_span();
+        img.write_vmstate(0, &[0x77; 4096]).unwrap();
+        img.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        img.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+        img.flush().unwrap();
+        let path = img.path.clone();
+        drop(img);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+    }
+
+    #[test]
+    fn a_grown_overlay_reads_zeros_where_its_longer_backing_has_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_path = dir.path().join("backing.qcow2");
+        let span = 512 << 20;
+        let mut backing = Qcow2Image::create(&backing_path, 2 * span, 16, None).unwrap();
+        assert_eq!(backing.l2_span(), span);
+        backing.write_at(span, &[0x55; 4096]).unwrap();
+        // A tail inside the last cluster of the overlay's old size.
+        backing.write_at(span - 4096, &[0x66; 8192]).unwrap();
+        backing.flush().unwrap();
+        drop(backing);
+        let old_size = span - 2048;
+        let mut overlay = Qcow2Image::create(
+            &dir.path().join("overlay.qcow2"),
+            old_size,
+            16,
+            Some((&backing_path, Some("qcow2"))),
+        )
+        .unwrap();
+        overlay.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 8192];
+        overlay.read_at(span - 4096, &mut buf).unwrap();
+        assert!(buf[..2048].iter().all(|&b| b == 0x66));
+        assert!(
+            buf[2048..].iter().all(|&b| b == 0),
+            "tail {:?}",
+            &buf[2048..2064]
+        );
+        let mut buf = vec![0xffu8; 4096];
+        overlay.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+        overlay.flush().unwrap();
+        let path = overlay.path.clone();
+        drop(overlay);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
     }
 
     #[test]

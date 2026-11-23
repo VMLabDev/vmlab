@@ -4,7 +4,7 @@
 // Every probe takes `--out FILE` and writes one JSON object there:
 //   {"probe": NAME, "result": "ok" | "error", "errors": [...], ...measurements}
 // A probe reports what it measured. Whether a measurement passes is decided
-// on the host, in tests/e2e/adapter/judge.py, so the thresholds are in one
+// on the host, in tests/e2e/adapter/checks/, so the thresholds are in one
 // place. "error" means the probe could not measure (an API call failed).
 #pragma once
 #include <windows.h>

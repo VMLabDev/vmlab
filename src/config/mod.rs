@@ -79,7 +79,7 @@ fn open(source: &str, name: &str, base_dir: Option<&Path>) -> Result<Document, C
     if !source.contains("import <vmlab.wcl>") {
         return Err(ConfigErrors {
             name: name.to_string(),
-            src: NamedSource::new(name, source.to_string()),
+            src: NamedSource::new(name, blank_source(source)),
             issues: vec![Issue::new(
                 "missing schema import — add `import <vmlab.wcl>` at the top of the file",
             )],
@@ -95,9 +95,93 @@ fn open(source: &str, name: &str, base_dir: Option<&Path>) -> Result<Document, C
     )
     .map_err(|e| ConfigErrors {
         name: name.to_string(),
-        src: NamedSource::new(name, source.to_string()),
+        src: NamedSource::new(name, blank_source(source)),
         issues: vec![Issue::new(format!("parse error: {e}"))],
     })
+}
+
+/// The text a diagnostic about `source` renders its excerpts from: `source`
+/// with every secret it declares starred out.
+///
+/// A miette report prints each source line a label covers, and many issues
+/// are labelled with a whole `vm` block, so an unrelated mistake would print
+/// the block's `login { password = … }` and `var { value = … secret = true }`
+/// lines with it. Byte offsets and line breaks are kept, so every span still
+/// points where it did. A file that does not parse has no field to find, and
+/// is blanked whole.
+pub fn diagnostic_source(source: &str, name: &str, root: &Path) -> String {
+    match open(source, name, Some(root)) {
+        Ok(doc) => redacted_source(source, &doc),
+        Err(_) => blank_source(source),
+    }
+}
+
+/// `source` with nothing left but its line breaks.
+fn blank_source(source: &str) -> String {
+    source
+        .bytes()
+        .map(|b| if b == b'\n' { '\n' } else { ' ' })
+        .collect()
+}
+
+/// [`diagnostic_source`] for a file that is open already.
+fn redacted_source(source: &str, doc: &Document) -> String {
+    let mut fields = Vec::new();
+    for block in doc.blocks() {
+        secret_fields(&block, &mut fields);
+    }
+    let mut out = source.as_bytes().to_vec();
+    for (name, span) in fields {
+        let (start, end) = secret_value(source, name, span);
+        for b in &mut out[start..end] {
+            if *b != b'\n' {
+                *b = b'*';
+            }
+        }
+    }
+    // Whole characters were replaced by ASCII, so this cannot fail. A blank
+    // source is the safe answer if it ever does.
+    String::from_utf8(out).unwrap_or_else(|_| blank_source(source))
+}
+
+/// The fields under `block` that hold a secret, by name and span: any
+/// `password`, and the `value` beside a `secret` that is not plainly false.
+fn secret_fields(block: &wcl_lang::Block, out: &mut Vec<(&'static str, model::Span)>) {
+    let mut unused = IssueList::new();
+    let mut r = block::Reader::new(block, &mut unused);
+    if let Some(span) = r.field_span("password") {
+        out.push(("password", span));
+    }
+    // A `secret` that does not evaluate to a bool is an issue of its own,
+    // and no reason to print the value.
+    let secret = r.has("secret") && r.bool("secret").is_none_or(|s| s.value);
+    if secret && let Some(span) = r.field_span("value") {
+        out.push(("value", span));
+    }
+    for child in r.children() {
+        secret_fields(&child, out);
+    }
+}
+
+/// The bytes of the field `name` at `span` to star out, on character
+/// boundaries of `source`: what follows `name =` when the span starts with
+/// that, so the excerpt still shows which field it was, else the whole span.
+fn secret_value(source: &str, name: &str, span: model::Span) -> (usize, usize) {
+    let mut end = span.1.min(source.len());
+    while !source.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut start = span.0.min(end);
+    while !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    let field = &source[start..end];
+    if let Some(rest) = field.strip_prefix(name)
+        && let Some(value) = rest.trim_start().strip_prefix('=')
+    {
+        start = end - value.trim_start().len();
+    }
+    (start, end)
 }
 
 /// Schema violations as positioned issues, so a caller can accumulate them
@@ -143,7 +227,7 @@ pub fn load_lab_source(source: &str, name: &str, root: &Path) -> Result<LabFile,
         Some(lab) if issues.is_empty() => Ok(lab),
         _ => Err(ConfigErrors {
             name: name.to_string(),
-            src: NamedSource::new(name, source.to_string()),
+            src: NamedSource::new(name, redacted_source(source, &doc)),
             issues,
         }),
     }
@@ -235,7 +319,7 @@ pub fn load_template_source(
     } else {
         Err(ConfigErrors {
             name: name.to_string(),
-            src: NamedSource::new(name, source.to_string()),
+            src: NamedSource::new(name, redacted_source(source, &doc)),
             issues,
         })
     }
@@ -900,7 +984,7 @@ template "base" {
   version = "1.0"
   profile = "linux-modern"
   disk    = 20GiB
-  source "iso" { url = "https://example.com/x.iso" sha256 = "abc123" }
+  source "iso" { url = "https://example.com/x.iso" sha256 = "00000000000000000000000000000000000000000000000000000000000000ab" }
   media { kind = "iso" from = "./unattend/" }
   provision "scripts/install.ws" { }
 }
@@ -916,6 +1000,48 @@ template "base" {
         ));
         assert_eq!(t.media.len(), 1);
         assert_eq!(t.provisions.len(), 1);
+    }
+
+    /// Review F15: the artefact cache names its files by this value, so it
+    /// must be a digest and nothing else.
+    #[test]
+    fn a_url_source_needs_a_64_digit_hex_sha256() {
+        let load = |sha256: &str| {
+            let src = format!(
+                r#"import <vmlab.wcl>
+lab "l" {{ vm "a" {{ template = "x86_64/base" }} }}
+template "base" {{
+  arch    = "x86_64"
+  version = "1.0"
+  profile = "linux-modern"
+  disk    = 20GiB
+  source "iso" {{ url = "https://example.com/x.iso" sha256 = "{sha256}" }}
+}}
+"#
+            );
+            load_lab_source(&src, "<test>", Path::new("/tmp"))
+        };
+        for bad in ["../x", "abc123", &"g".repeat(64), &"a".repeat(65)] {
+            let err = match load(bad) {
+                Ok(_) => panic!("`{bad}` must not validate"),
+                Err(e) => e,
+            };
+            assert!(
+                err.issues
+                    .iter()
+                    .any(|i| i.message.contains("64 hex digits")),
+                "{bad}: {:?}",
+                err.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+        }
+        // Either case is a digest. The model holds it in lower case.
+        let lf = load(&"AB".repeat(32)).unwrap();
+        match &lf.templates[0].source {
+            TemplateSource::Iso(ArtefactSource::Url { sha256, .. }) => {
+                assert_eq!(sha256, &"ab".repeat(32));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Every shipped example template's `vmlab.wcl` must parse (keeps the
@@ -1037,5 +1163,73 @@ lab "web" {
         let args = DIGEST_LAB.replace("-no-hpet", "-no-reboot");
         assert_ne!(digest_of(DIGEST_LAB), digest_of(&template));
         assert_ne!(digest_of(DIGEST_LAB), digest_of(&args));
+    }
+
+    /// A load error renders against the source too (config review F5): the
+    /// line of a mistake in a `login` block holds its password.
+    #[test]
+    fn a_load_error_does_not_show_a_secret_value() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" password = "hunter2-login" elevated = "yes" }
+  }
+}
+"#;
+        let err = load_lab_source(source, "<test>", &std::env::temp_dir())
+            .expect_err("`elevated` is not a bool");
+        assert!(err.issues.iter().any(|i| i.span.is_some()), "{err:?}");
+        let shown = format!("{:?}", miette::Report::new(err));
+        assert!(shown.contains("elevated"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+    }
+
+    fn redacted(source: &str) -> String {
+        let doc = open(source, "<test>", None).expect("the source parses");
+        redacted_source(source, &doc)
+    }
+
+    #[test]
+    fn redaction_stars_the_value_and_keeps_every_offset() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dév" password = "pässwörd=1" }
+    playbook "pb" {
+      var "a" { value = "s3cret" secret = true }
+      var "b" { secret = true value = "also=s3cret" }
+      var "c" { value = "shown" secret = false }
+      var "d" { value = "plain" }
+    }
+  }
+}
+"#;
+        let out = redacted(source);
+        assert_eq!(out.len(), source.len());
+        let lines = |s: &str| s.match_indices('\n').map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(lines(&out), lines(source));
+        for secret in ["pässwörd", "s3cret"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+        for kept in [
+            r#"user = "dév" password = *"#,
+            r#"var "a" { value = *"#,
+            "secret = true value = *",
+            r#"value = "shown" secret = false"#,
+            r#"value = "plain""#,
+        ] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_source_that_does_not_parse_is_blanked_whole() {
+        let source = "import <vmlab.wcl>\nlab \"l\" { password = \"hunter2\"\n";
+        let out = diagnostic_source(source, "<test>", &std::env::temp_dir());
+        assert_eq!(out.len(), source.len());
+        assert!(out.chars().all(|c| c == ' ' || c == '\n'), "{out}");
+        assert_eq!(out.matches('\n').count(), 2);
     }
 }

@@ -5,12 +5,15 @@
 
 mod compose;
 mod copy;
+mod lost;
 mod modifiers;
 mod pacer;
 mod renderer;
 mod scanout;
 pub use scanout::DmaFrame;
 mod snapshot;
+mod teardown;
+mod vblank;
 pub use renderer::{APERTURE_SIZE, BlobMapper, GpuMode};
 
 pub enum ScanoutPixels {
@@ -58,8 +61,8 @@ const FEATURES: u64 = (1 << 32) | (1 << 29) | (1 << 28) | (1 << ORDERED_FLIP_FEA
 /// is the furthest from the next standard bit. Only vmlab's viogpu3d driver
 /// acks it (`guest/win3d/docs/flip.md`). A driver that does not know it
 /// keeps `RESOURCE_FLUSH` and its own CPU copy of a Blt present. The bit
-/// enables both of vmlab's commands, [`CMD_ORDERED_FLIP`] and
-/// [`CMD_PRESENT_COPY`].
+/// enables vmlab's commands, [`CMD_ORDERED_FLIP`], [`CMD_PRESENT_COPY`] and
+/// [`CMD_VBLANK`].
 pub const ORDERED_FLIP_FEATURE: u32 = 23;
 /// The first command of [`ORDERED_FLIP_FEATURE`]. It takes the place of
 /// `RESOURCE_FLUSH` for a flip: header, scanout ID, resource ID, the
@@ -77,6 +80,24 @@ pub const CMD_ORDERED_FLIP: u32 = 0x0f00;
 /// destination. The queue serves no later command before that, so the
 /// fence of the present, which follows it, signals after the copy.
 pub const CMD_PRESENT_COPY: u32 = 0x0f01;
+/// The third command of [`ORDERED_FLIP_FEATURE`]: wait for the next vblank
+/// of the scanout's frame clock (`vblank.rs`). Header, scanout ID, reserved,
+/// 32 bytes, with no fence. The device holds it without holding the commands
+/// behind it, and answers [`RESP_OK_VBLANK`] at the first tick after it
+/// arrived. It takes the place of the guest's vsync timer and the empty
+/// command that it sent each tick. Refused on a device without a renderer,
+/// which keeps online snapshots and so cannot hold a chain across one.
+pub const CMD_VBLANK: u32 = 0x0f02;
+/// The answer of [`CMD_VBLANK`], 48 bytes: header, the tick number (u64),
+/// the host's `CLOCK_MONOTONIC` time of the tick in nanoseconds (u64), the
+/// period in nanoseconds (u32), reserved (u32). In the range of OK
+/// responses, above every one VIRTIO 1.2 defines.
+pub const RESP_OK_VBLANK: u32 = 0x11f0;
+/// vmlab's private event of [`ORDERED_FLIP_FEATURE`], in `events_read`: the
+/// host GPU is lost (`lost.rs`). The top bit, the furthest from the
+/// standard `VIRTIO_GPU_EVENT_DISPLAY` (bit 0).
+pub const EVENT_DEVICE_LOST: u32 = 1 << 31;
+const UNSPEC: u32 = 0x1200;
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_RESOURCES: usize = 4096;
 const MAX_ENTRIES: usize = 16384;
@@ -182,12 +203,33 @@ struct State {
     /// Ordered flips served since the last reset. The first is logged, so
     /// that a log shows which flip a guest uses.
     ordered_flips: u64,
+    /// Answers the held vblank waits. Started at the first wait.
+    vblank: Option<Arc<vblank::Clock>>,
+    /// The vblank waits that the next tick answers.
+    vblank_waits: Vec<vblank::Wait>,
+    /// The chain that [`State::chain`] has just held for a vblank.
+    held_vblank: Option<Vec<(GuestAddress, u32)>>,
+    /// Vblanks answered since the last reset. The first is logged.
+    host_vblanks: u64,
+    /// Why the host GPU is lost, from the loss on (`lost.rs`). It
+    /// outlives a device reset: a host GPU does not come back.
+    lost: Option<String>,
+    /// Set with `lost`, and read without the device lock.
+    lost_flag: lost::Flag,
+    /// The render workers of the guest's Venus contexts (`teardown.rs`).
+    workers: teardown::Workers,
+    /// The last reset has not confirmed that the renderer and its workers
+    /// stopped: the transport keeps the status nonzero.
+    unsettled: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         if let Some(pacer) = &self.pacer {
             pacer.close();
+        }
+        if let Some(clock) = &self.vblank {
+            clock.close();
         }
     }
 }
@@ -229,12 +271,43 @@ impl Gpu {
                 flush_pending: None,
                 last_publish: None,
                 ordered_flips: 0,
+                vblank: None,
+                vblank_waits: Vec::new(),
+                held_vblank: None,
+                host_vblanks: 0,
+                lost: None,
+                lost_flag: lost::Flag::default(),
+                workers: teardown::Workers::default(),
+                unsettled: false,
             })),
         }
     }
 
     pub fn native(&self) -> bool {
         self.state.lock().native
+    }
+
+    /// A vblank wait is held: start the frame clock at the first, and have
+    /// it tick.
+    fn arm_vblank(&self, s: &mut State) {
+        if s.vblank.is_none() {
+            match vblank::Clock::spawn(&self.id, Arc::downgrade(&self.state)) {
+                Ok(clock) => s.vblank = Some(clock),
+                Err(error) => {
+                    // No clock to answer it: answer the waits at once, so
+                    // that the guest keeps a vsync, if not a paced one.
+                    log::warn!("{}: no vblank thread: {error}", self.id);
+                    s.answer_vblanks(vblank::Tick {
+                        sequence: 0,
+                        timestamp_ns: monotonic_ns(),
+                    });
+                    return;
+                }
+            }
+        }
+        if let Some(clock) = &s.vblank {
+            clock.arm();
+        }
     }
 
     pub fn enable_3d(
@@ -244,7 +317,31 @@ impl Gpu {
         mapper: Arc<dyn BlobMapper>,
     ) -> Result<(), DeviceError> {
         let renderer = renderer::Renderer::new(mode, node, mapper)?;
-        self.state.lock().renderer = Some(renderer);
+        let flag = renderer.lost();
+        let mut watch = renderer.watch();
+        {
+            let mut s = self.state.lock();
+            s.lost_flag = flag.clone();
+            s.renderer = Some(renderer);
+        }
+        let state = Arc::downgrade(&self.state);
+        std::thread::Builder::new()
+            .name("gpu-loss-watch".into())
+            .spawn(move || {
+                while state.strong_count() != 0 && !flag.get() {
+                    if let Some(reason) = watch.check() {
+                        // Set the flag before the device lock is taken: a
+                        // command that waits on the lost host GPU can hold
+                        // the lock, and the flag ends its wait.
+                        flag.set();
+                        if let Some(state) = state.upgrade() {
+                            lose(&state, reason);
+                        }
+                        return;
+                    }
+                    std::thread::sleep(lost::INTERVAL);
+                }
+            })?;
         let state = Arc::downgrade(&self.state);
         std::thread::Builder::new()
             .name("gpu-fence-completion".into())
@@ -256,6 +353,18 @@ impl Gpu {
                 }
             })?;
         Ok(())
+    }
+
+    /// Treat the host GPU as lost (`lost.rs`). The loss watch calls this
+    /// when it sees the render server end or the render node go; a test
+    /// calls it to simulate a loss. A second call changes nothing.
+    pub fn lose_host_gpu(&self, reason: impl Into<String>) {
+        lose(&self.state, reason.into());
+    }
+
+    /// Why the host GPU is lost, once it is.
+    pub fn host_gpu_lost(&self) -> Option<String> {
+        self.state.lock().lost.clone()
     }
 
     pub fn has_3d_contexts(&self) -> bool {
@@ -340,7 +449,7 @@ impl Gpu {
 
     pub fn frame(&self) -> Option<Frame> {
         let mut s = self.state.lock();
-        if let Some(renderer) = &s.renderer {
+        if let Some(renderer) = s.renderer.as_ref().filter(|_| s.lost.is_none()) {
             match renderer.frame() {
                 Ok(Some(frame)) => return Some(frame),
                 Ok(None) => {}
@@ -364,7 +473,104 @@ impl Gpu {
     }
 }
 
+fn lose(state: &Mutex<State>, reason: String) {
+    state.lock().lose(reason);
+}
+
 impl State {
+    /// The loss of the host GPU, as `lost.rs` describes it.
+    fn lose(&mut self, reason: String) {
+        if self.lost.is_some() {
+            return;
+        }
+        log::error!(
+            "virtio-gpu: the host GPU is lost: {reason}. The device answers its {} pending fences \
+             and refuses further GPU work; the guest is {}",
+            self.fences.len(),
+            if self.acked & (1 << ORDERED_FLIP_FEATURE) != 0 {
+                "told through the device-lost event"
+            } else {
+                "not told: its driver has not acked the vmlab feature bit"
+            }
+        );
+        self.lost_flag.set();
+        self.lost = Some(reason);
+        self.release_fences();
+        self.raise_lost();
+    }
+
+    /// Whether queue `queue` can hold one more chain for a vblank or a
+    /// fence. A driver has at most the queue size of chains outstanding, so
+    /// more than that held is one head published again and again, which
+    /// would otherwise grow the two lists without limit.
+    fn can_hold(&self, queue: u16) -> bool {
+        let held = self
+            .vblank_waits
+            .iter()
+            .filter(|wait| wait.queue == queue)
+            .count()
+            + self
+                .fences
+                .iter()
+                .filter(|fence| fence.queue == queue)
+                .count();
+        self.queues
+            .get(usize::from(queue))
+            .is_some_and(|q| held < usize::from(q.size()))
+    }
+
+    /// Hold a vblank wait until the next tick, or give it back when its
+    /// queue holds a queue size of chains already.
+    fn hold_vblank(&mut self, wait: vblank::Wait) -> Result<(), vblank::Wait> {
+        if !self.can_hold(wait.queue) {
+            return Err(wait);
+        }
+        self.vblank_waits.push(wait);
+        Ok(())
+    }
+
+    /// Hold a fenced chain until its fence signals. False when its queue
+    /// holds a queue size of chains already: the caller answers it at once.
+    fn hold_fence(&mut self, fence: PendingFence) -> bool {
+        if !self.can_hold(fence.queue) {
+            return false;
+        }
+        self.fences.push(fence);
+        true
+    }
+
+    /// Answer every fence the device holds. Their responses are written.
+    fn release_fences(&mut self) {
+        let fences = std::mem::take(&mut self.fences);
+        let Some(mem) = &self.mem else { return };
+        let mut notify = std::collections::BTreeSet::new();
+        for fence in fences {
+            let queue = &mut self.queues[fence.queue as usize];
+            if queue.add_used(mem, fence.head, fence.len).is_ok()
+                && queue.needs_notification(mem).unwrap_or(false)
+            {
+                notify.insert(fence.queue);
+            }
+        }
+        if let Some(irq) = &self.interrupt {
+            for queue in notify {
+                irq.notify_queue(queue);
+            }
+        }
+    }
+
+    /// Put [`EVENT_DEVICE_LOST`] in `events_read`, for a driver that acked
+    /// the vmlab bit, and raise a configuration interrupt.
+    fn raise_lost(&mut self) {
+        if self.lost.is_none() || self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+            return;
+        }
+        self.events |= EVENT_DEVICE_LOST;
+        if let Some(irq) = &self.interrupt {
+            irq.notify_config();
+        }
+    }
+
     fn frame_2d(&mut self) -> Option<ShmFrame> {
         let mode = self.mode()?;
         let scanout = self.scanout.map(|(id, rect)| (&self.resources[&id], rect));
@@ -497,6 +703,57 @@ impl State {
 }
 
 impl State {
+    /// [`CMD_VBLANK`]: check the wait and return the writable descriptors
+    /// its answer goes into at the next tick.
+    fn vblank_wait(
+        &self,
+        request: &[u8],
+        chain: &DescriptorChain<&GuestMemory>,
+    ) -> Result<Vec<(GuestAddress, u32)>, u32> {
+        if self.acked & (1 << ORDERED_FLIP_FEATURE) == 0 {
+            return Err(INVALID);
+        }
+        // The unit tests hold waits on a 2D device, which has no renderer
+        // and so no host GPU to need.
+        if self.renderer.is_none() && !cfg!(test) {
+            return Err(INVALID);
+        }
+        let mut d = Decoder::new(request);
+        d.take(4)?;
+        // A fence on a wait would complete it twice.
+        if d.u32()? & 1 != 0 {
+            return Err(INVALID);
+        }
+        d.take(16)?;
+        if d.u32()? != 0 {
+            return Err(SCANOUT);
+        }
+        d.u32()?;
+        let response: Vec<_> = chain
+            .clone()
+            .filter(|desc| desc.is_write_only())
+            .map(|desc| (desc.addr(), desc.len()))
+            .collect();
+        let room: u64 = response.iter().map(|&(_, len)| u64::from(len)).sum();
+        if room < u64::from(vblank::RESPONSE_LEN) {
+            return Err(INVALID);
+        }
+        Ok(response)
+    }
+
+    /// Answer a command with `error` alone. The used length.
+    fn refuse(mem: &GuestMemory, chain: DescriptorChain<&GuestMemory>, error: u32) -> u32 {
+        let Ok(mut writer) = chain.writer(mem) else {
+            return 0;
+        };
+        let mut response = [0; 24];
+        response[..4].copy_from_slice(&error.to_le_bytes());
+        if writer.available_bytes() < 24 || writer.write_all(&response).is_err() {
+            return 0;
+        }
+        24
+    }
+
     /// A 2D flush changed the scanout at `timestamp_ns`. Leave the compose
     /// to the frame thread, which runs it once for all the flushes of one
     /// frame interval.
@@ -537,6 +794,10 @@ fn valid_format(f: u32) -> bool {
 
 impl State {
     fn complete_fences(&mut self) {
+        if self.lost.is_some() {
+            self.release_fences();
+            return;
+        }
         if self.retry_display {
             self.publish_scanout(self.display_timestamp);
         }
@@ -589,6 +850,11 @@ impl State {
         let mut d = Decoder::new(request);
         let kind = d.u32()?;
         d.take(20)?;
+        if self.lost.is_some() && q == 0 && !matches!(kind, 0x100 | 0x10a) && !lost::releases(kind)
+        {
+            // The host GPU is gone (`lost.rs`).
+            return Err(UNSPEC);
+        }
         if q == 0 && kind == CMD_ORDERED_FLIP {
             return self.ordered_flip(mem, request, &mut d);
         }
@@ -606,6 +872,10 @@ impl State {
             && let Some(renderer) = &self.renderer
         {
             let result = renderer.command(mem, request)?;
+            if kind == 0x200 {
+                // CTX_CREATE: a Venus context has a worker of its own.
+                self.workers.note(renderer.servers());
+            }
             if matches!(kind, 0x103 | 0x10d) {
                 self.native = true;
             }
@@ -869,6 +1139,15 @@ impl State {
         if reader.read_exact(&mut request).is_err() {
             return 0;
         }
+        if q == 0 && request[..4] == CMD_VBLANK.to_le_bytes() {
+            match self.vblank_wait(&request, &chain) {
+                Ok(response) => {
+                    self.held_vblank = Some(response);
+                    return 0;
+                }
+                Err(error) => return Self::refuse(mem, chain, error),
+            }
+        }
         let Ok(mut writer) = chain.writer(mem) else {
             return 0;
         };
@@ -960,7 +1239,10 @@ impl VirtioDevice for Gpu {
     }
     fn ack_features(&mut self, features: u64) {
         let supported = self.features();
-        self.state.lock().acked = features & supported;
+        let mut s = self.state.lock();
+        s.acked = features & supported;
+        // A host GPU lost before this negotiation is still lost.
+        s.raise_lost();
     }
     fn config_len(&self) -> u64 {
         16
@@ -1030,11 +1312,37 @@ impl VirtioDevice for Gpu {
         }
         let mut used = false;
         loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&s.queues[index], &mem) {
+                break;
+            }
             while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
                 let head = chain.head_index();
                 let len = s.chain(&mem, index, chain);
-                if let Some((flags, id, ctx, ring)) = s.current_fence.take() {
-                    s.fences.push(PendingFence {
+                let mut len = len;
+                if let Some(response) = s.held_vblank.take() {
+                    let wait = vblank::Wait {
+                        queue: index as u16,
+                        head,
+                        response,
+                    };
+                    match s.hold_vblank(wait) {
+                        Ok(()) => {
+                            self.arm_vblank(&mut s);
+                            continue;
+                        }
+                        // No room to hold it: refuse it at once.
+                        Err(wait) => {
+                            let mut refusal = [0; 24];
+                            refusal[..4].copy_from_slice(&OUT_OF_MEMORY.to_le_bytes());
+                            vblank::write_response(&mem, &wait.response, &refusal);
+                            len = refusal.len() as u32;
+                        }
+                    }
+                }
+                if let Some((flags, id, ctx, ring)) = s.current_fence.take()
+                    && s.hold_fence(PendingFence {
                         queue: index as u16,
                         head,
                         len,
@@ -1042,9 +1350,11 @@ impl VirtioDevice for Gpu {
                         id,
                         ctx,
                         ring,
-                    });
+                    })
+                {
                     continue;
                 }
+                // A fence with no room to be held is answered here, early.
                 if s.queues[index].add_used(&mem, head, len).is_err() {
                     return;
                 }
@@ -1063,16 +1373,16 @@ impl VirtioDevice for Gpu {
     }
     fn reset(&mut self) {
         let mut s = self.state.lock();
-        if let Some(renderer) = &s.renderer
-            && let Err(error) = renderer.reset()
-        {
-            log::error!("GPU reset failed: {error:#x}");
-        }
+        let patience = s.workers.patience;
+        s.unsettled = !s.teardown(patience);
         s.fences.clear();
         s.flush_pending = None;
         s.retry_display = false;
         s.acked = 0;
         s.ordered_flips = 0;
+        s.vblank_waits.clear();
+        s.held_vblank = None;
+        s.host_vblanks = 0;
         s.events = 0;
         s.resources.clear();
         s.scanout = None;
@@ -1098,6 +1408,41 @@ impl VirtioDevice for Gpu {
                 pixels: ScanoutPixels::Vga,
             });
         }
+    }
+    fn reset_settled(&mut self) -> bool {
+        let mut s = self.state.lock();
+        if s.unsettled && s.teardown(std::time::Duration::ZERO) {
+            log::info!("GPU reset: the renderer and its workers have stopped");
+            s.unsettled = false;
+        }
+        !s.unsettled
+    }
+}
+
+impl State {
+    /// Stop the renderer and wait at most `wait` for the workers of the
+    /// guest's contexts to exit. False, logged, when either is not done.
+    fn teardown(&mut self, wait: std::time::Duration) -> bool {
+        let mut done = true;
+        if let Some(renderer) = &self.renderer {
+            if let Err(error) = renderer.reset() {
+                if !self.unsettled {
+                    log::error!("GPU reset failed: {error:#x}; the device status stays nonzero");
+                }
+                done = false;
+            }
+            // A worker the start of this reset did not know yet.
+            self.workers.note(renderer.servers());
+        }
+        if let Err(running) = self.workers.wait(wait) {
+            if !self.unsettled {
+                log::error!(
+                    "GPU reset: render workers {running:?} have not exited; the device status stays nonzero"
+                );
+            }
+            done = false;
+        }
+        done
     }
 }
 

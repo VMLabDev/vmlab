@@ -4,11 +4,11 @@
 //! CAP_NET_ADMIN, which is why it lives behind the helper's request
 //! protocol (`helper/`) instead of in the daemons (F21).
 
-use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result, anyhow};
 use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray, SockHash, xdp::DevMap};
-use aya::programs::{SkSkb, Xdp, XdpMode};
+use aya::programs::{SkSkb, Xdp};
 
 const XDP_OBJ: &[u8] = include_bytes!("bpf/xdp_switch.bpf.o");
 const SOCKMAP_OBJ: &[u8] = include_bytes!("bpf/fastpath_sockmap.bpf.o");
@@ -53,15 +53,24 @@ impl XdpEngine {
     }
 
     /// Attach the program to a tap in generic (SKB) mode — native XDP on tun
-    /// silently bypasses large frames. The link lives as long as the program
-    /// (this engine); the kernel also detaches it when the device goes.
+    /// silently bypasses large frames.
+    ///
+    /// The attachment belongs to the tap, not to this engine: it is made
+    /// through rtnetlink, so the device holds the program (and through it
+    /// the maps) until the device itself is destroyed. A `bpf_link`, which
+    /// is what aya makes, ends with its descriptor: an `unload`, or the end
+    /// of this process, would leave the tap up and unfiltered in the hands
+    /// of whoever still holds one of its queues, and every frame written
+    /// there would enter the host's network stack.
     pub(super) fn attach(&mut self, ifname: &str) -> Result<()> {
+        let ifindex = ifindex(ifname)?;
         let prog: &mut Xdp = self
             .ebpf
             .program_mut("xdp_switch")
             .expect("loaded above")
             .try_into()?;
-        prog.attach(ifname, XdpMode::Skb)
+        let fd = prog.fd().context("xdp_switch is not loaded")?;
+        attach_until_the_device_goes(ifindex, fd.as_fd())
             .with_context(|| format!("attaching xdp_switch to {ifname} (skb mode)"))?;
         Ok(())
     }
@@ -101,6 +110,97 @@ impl XdpEngine {
         }
         out
     }
+}
+
+// rtnetlink, as `include/uapi/linux/{netlink,rtnetlink,if_link}.h` number it.
+const NLMSG_ERROR: u16 = 2;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_ACK: u16 = 4;
+const RTM_SETLINK: u16 = 19;
+const NLA_F_NESTED: u16 = 1 << 15;
+const IFLA_XDP: u16 = 43;
+const IFLA_XDP_FD: u16 = 1;
+const IFLA_XDP_FLAGS: u16 = 3;
+/// Fail rather than replace a program the device already carries.
+const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1;
+const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
+
+/// The `RTM_SETLINK` message that sets a device's generic-mode XDP program:
+/// `nlmsghdr`, `ifinfomsg`, then `IFLA_XDP { FD, FLAGS }`. Every length here
+/// is a multiple of four, so no attribute needs padding.
+fn xdp_setlink_request(ifindex: u32, prog_fd: i32) -> Vec<u8> {
+    let attr = |kind: u16, value: [u8; 4]| {
+        let mut attr = Vec::with_capacity(8);
+        attr.extend_from_slice(&8u16.to_ne_bytes());
+        attr.extend_from_slice(&kind.to_ne_bytes());
+        attr.extend_from_slice(&value);
+        attr
+    };
+    let nested = [
+        attr(IFLA_XDP_FD, prog_fd.to_ne_bytes()),
+        attr(
+            IFLA_XDP_FLAGS,
+            (XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE).to_ne_bytes(),
+        ),
+    ]
+    .concat();
+
+    let mut message = Vec::with_capacity(52);
+    // nlmsghdr: length (written last), type, flags, sequence, port id.
+    message.extend_from_slice(&[0; 4]);
+    message.extend_from_slice(&RTM_SETLINK.to_ne_bytes());
+    message.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    message.extend_from_slice(&1u32.to_ne_bytes());
+    message.extend_from_slice(&0u32.to_ne_bytes());
+    // ifinfomsg: family, padding and type, then the index, flags and change.
+    message.extend_from_slice(&[0; 4]);
+    message.extend_from_slice(&ifindex.to_ne_bytes());
+    message.extend_from_slice(&[0; 8]);
+    message.extend_from_slice(&(4 + nested.len() as u16).to_ne_bytes());
+    message.extend_from_slice(&(IFLA_XDP | NLA_F_NESTED).to_ne_bytes());
+    message.extend_from_slice(&nested);
+    let len = message.len() as u32;
+    message[..4].copy_from_slice(&len.to_ne_bytes());
+    message
+}
+
+/// The kernel's answer to a request sent with `NLM_F_ACK`: an `NLMSG_ERROR`
+/// message whose first field after the header is zero or a negated errno.
+fn netlink_ack(reply: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let (Some(kind), Some(code)) = (
+        reply.get(4..6).and_then(|b| b.try_into().ok()),
+        reply.get(16..20).and_then(|b| b.try_into().ok()),
+    ) else {
+        return Err(Error::new(ErrorKind::InvalidData, "short netlink reply"));
+    };
+    if u16::from_ne_bytes(kind) != NLMSG_ERROR {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "netlink did not acknowledge",
+        ));
+    }
+    match i32::from_ne_bytes(code) {
+        0 => Ok(()),
+        code => Err(Error::from_raw_os_error(code.saturating_neg())),
+    }
+}
+
+/// Set `prog` as the device's XDP program over rtnetlink. From here on the
+/// device owns the attachment: closing `prog`, or this process ending,
+/// leaves it in place, and only the device's own destruction removes it.
+fn attach_until_the_device_goes(ifindex: u32, prog: BorrowedFd<'_>) -> std::io::Result<()> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, socket_with};
+    let sock = socket_with(
+        AddressFamily::NETLINK,
+        SocketType::RAW,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    rustix::io::write(&sock, &xdp_setlink_request(ifindex, prog.as_raw_fd()))?;
+    let mut reply = [0u8; 4096];
+    let len = rustix::io::read(&sock, &mut reply)?;
+    netlink_ack(&reply[..len])
 }
 
 /// `SOCK_STATE` map value: the BPF side's `SockState` (repr(C): `u64`
@@ -397,5 +497,52 @@ mod tests {
     fn unknown_errno_falls_back_to_the_reassuring_line() {
         let msg = diagnose_tap_failure(Some(nix::libc::EIO), &env(true, None));
         assert!(msg.contains("userspace fabric"), "{msg}");
+    }
+
+    /// The attach request, byte for byte: a wrong length or a missing
+    /// nesting flag is refused by the kernel only on a privileged host.
+    #[test]
+    fn the_setlink_request_carries_the_program_and_the_skb_mode() {
+        let message = xdp_setlink_request(0x0102_0304, 7);
+        let mut want = Vec::new();
+        want.extend_from_slice(&52u32.to_ne_bytes());
+        want.extend_from_slice(&19u16.to_ne_bytes()); // RTM_SETLINK
+        want.extend_from_slice(&5u16.to_ne_bytes()); // REQUEST | ACK
+        want.extend_from_slice(&1u32.to_ne_bytes());
+        want.extend_from_slice(&0u32.to_ne_bytes());
+        want.extend_from_slice(&[0; 4]);
+        want.extend_from_slice(&0x0102_0304u32.to_ne_bytes());
+        want.extend_from_slice(&[0; 8]);
+        want.extend_from_slice(&20u16.to_ne_bytes());
+        want.extend_from_slice(&(43u16 | 0x8000).to_ne_bytes()); // IFLA_XDP, nested
+        want.extend_from_slice(&8u16.to_ne_bytes());
+        want.extend_from_slice(&1u16.to_ne_bytes()); // IFLA_XDP_FD
+        want.extend_from_slice(&7i32.to_ne_bytes());
+        want.extend_from_slice(&8u16.to_ne_bytes());
+        want.extend_from_slice(&3u16.to_ne_bytes()); // IFLA_XDP_FLAGS
+        want.extend_from_slice(&3u32.to_ne_bytes()); // UPDATE_IF_NOEXIST | SKB_MODE
+        assert_eq!(message, want);
+    }
+
+    #[test]
+    fn a_netlink_reply_is_an_ack_or_the_kernels_errno() {
+        let reply = |kind: u16, code: i32| {
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&36u32.to_ne_bytes());
+            reply.extend_from_slice(&kind.to_ne_bytes());
+            reply.extend_from_slice(&[0; 10]);
+            reply.extend_from_slice(&code.to_ne_bytes());
+            reply.extend_from_slice(&[0; 16]);
+            reply
+        };
+        assert!(netlink_ack(&reply(NLMSG_ERROR, 0)).is_ok());
+        let refused = netlink_ack(&reply(NLMSG_ERROR, -nix::libc::EPERM)).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(nix::libc::EPERM));
+        let busy = netlink_ack(&reply(NLMSG_ERROR, -nix::libc::EBUSY)).unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(nix::libc::EBUSY));
+        // Not an answer to the request: never taken for success.
+        assert!(netlink_ack(&reply(3, 0)).is_err());
+        assert!(netlink_ack(&reply(NLMSG_ERROR, 0)[..19]).is_err());
+        assert!(netlink_ack(&[]).is_err());
     }
 }

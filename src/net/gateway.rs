@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::debug;
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::dhcp::{DHCP_SERVER_PORT, DhcpConfig, DhcpServer};
 use crate::net::dns::{DNS_PORT, DnsAction, DnsServer, DnsZone, forward_upstream};
 use crate::net::frame::{
@@ -39,6 +40,11 @@ use crate::net::switch::{ChannelPort, PortClass, Switch};
 /// How long the gateway waits for an upstream DNS resolver.
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How many forwarded DNS queries wait on the upstream at once (review F3):
+/// each is a task and a host UDP socket for up to [`UPSTREAM_DNS_TIMEOUT`].
+/// A query past the limit is dropped, and the guest's resolver retries it.
+const MAX_DNS_FORWARDS: usize = 64;
+
 /// How long a packet routed onto the segment waits for its next hop to
 /// answer ARP before it is dropped, and how often the question is repeated.
 const ARP_PENDING: Duration = Duration::from_secs(3);
@@ -46,6 +52,10 @@ const ARP_RETRY: Duration = Duration::from_secs(1);
 /// Bounds on what waits for ARP: packets per next hop, and next hops.
 const ARP_PENDING_PACKETS: usize = 16;
 const ARP_PENDING_HOSTS: usize = 256;
+/// How many neighbours the gateway remembers (review F6). Past this a new
+/// one replaces the oldest, which the gateway asks for again with ARP when
+/// a routed packet next needs it.
+const MAX_NEIGHBOURS: usize = 1024;
 
 /// Uplink handler: receives every frame the gateway routes off-segment.
 ///
@@ -245,10 +255,20 @@ impl L3Port {
 
 /// What the gateway knows of its segment's hosts, and the routed packets
 /// waiting for one of them to answer ARP.
-#[derive(Default)]
 struct Neighbours {
-    table: HashMap<Ipv4Addr, MacAddr>,
+    /// One entry per ARP sender address, which a guest writes freely, so
+    /// the table holds [`MAX_NEIGHBOURS`] (review F6).
+    table: BoundedMap<Ipv4Addr, MacAddr>,
     pending: HashMap<Ipv4Addr, Pending>,
+}
+
+impl Default for Neighbours {
+    fn default() -> Self {
+        Self {
+            table: BoundedMap::new(MAX_NEIGHBOURS),
+            pending: HashMap::new(),
+        }
+    }
 }
 
 struct Pending {
@@ -311,6 +331,9 @@ impl Gateway {
         } = config;
 
         let ChannelPort { id, tx, rx } = switch.add_channel_port(PortClass::Service);
+        // The gateway's MAC is its port's from the start: no guest frame
+        // can claim it in the switch (review F9).
+        switch.bind_mac(id, gw_mac);
 
         let dhcp = dhcp.map(|mut c| {
             c.gateway = gw_ip;
@@ -335,6 +358,7 @@ impl Gateway {
             dns: dns_zone.clone().map(DnsServer::shared),
             uplink: Arc::clone(&uplink),
             neighbours: Arc::clone(&neighbours),
+            dns_forwards: Arc::new(Semaphore::new(MAX_DNS_FORWARDS)),
         };
         debug!(segment = %task.segment, port = %id, ip = %gw_ip, mac = %gw_mac, "gateway spawned");
         let join = tokio::spawn(task.run(rx));
@@ -361,6 +385,8 @@ struct GatewayTask {
     dns: Option<DnsServer>,
     uplink: SharedUplink,
     neighbours: Arc<Mutex<Neighbours>>,
+    /// One permit per forwarded DNS query in flight ([`MAX_DNS_FORWARDS`]).
+    dns_forwards: Arc<Semaphore>,
 }
 
 impl GatewayTask {
@@ -376,16 +402,40 @@ impl GatewayTask {
             return;
         };
         match eth.ethertype() {
-            ETHERTYPE_ARP => self.handle_arp(eth.payload()),
+            ETHERTYPE_ARP => self.handle_arp(&eth),
             ETHERTYPE_IPV4 => self.handle_ipv4(&eth, frame).await,
             _ => {}
         }
     }
 
-    fn handle_arp(&self, payload: &[u8]) {
-        let Some(arp) = ArpView::parse(payload) else {
+    /// Whether `mac` may speak for `ip` (review F9): false only when this
+    /// segment's DHCP server holds a lease of `ip` for another MAC. An
+    /// address with no lease (a static one) has no owner vmlab knows, so
+    /// whoever uses it is believed, as before.
+    fn may_claim(&self, ip: Ipv4Addr, mac: MacAddr) -> bool {
+        let Some(dhcp) = &self.dhcp else {
+            return true;
+        };
+        if dhcp.lock_recover().leased_to_another(ip, mac) {
+            debug!(segment = %self.segment, %ip, %mac, "frame claims another machine's leased address, dropped");
+            return false;
+        }
+        true
+    }
+
+    fn handle_arp(&self, eth: &EthView<'_>) {
+        let Some(arp) = ArpView::parse(eth.payload()) else {
             return;
         };
+        // An ARP that names a leased address from a MAC that does not hold
+        // the lease teaches the gateway nothing and gets no answer. Both
+        // the ethernet source and the ARP sender address must be the
+        // holder's, because the reply and the neighbour entry use the latter.
+        if !arp.spa().is_unspecified()
+            && !(self.may_claim(arp.spa(), arp.sha()) && self.may_claim(arp.spa(), eth.src_mac()))
+        {
+            return;
+        }
         // Every ARP on the segment teaches the gateway a neighbour: the
         // requests guests broadcast for anyone, and the replies to its own.
         if !arp.spa().is_unspecified() {
@@ -408,6 +458,15 @@ impl GatewayTask {
         let Some(ip) = Ipv4View::parse(eth.payload()) else {
             return;
         };
+
+        // A leased address is its lease holder's alone: a frame from another
+        // MAC with that source is dropped before DNS, the gateway's own
+        // echo, NAT and routing see it (review F9). DHCP's own frames pass
+        // this, because a client sends them from its own address or from
+        // 0.0.0.0, which nobody holds.
+        if !ip.src().is_unspecified() && !self.may_claim(ip.src(), eth.src_mac()) {
+            return;
+        }
 
         // DHCP and DNS first: DHCP arrives broadcast (DISCOVER/REQUEST) or
         // unicast (renewals), so match on the UDP port alone.
@@ -435,7 +494,9 @@ impl GatewayTask {
             // ICMP echo to the gateway itself is answered here. Other
             // gateway-addressed traffic falls through to the uplink: TCP
             // replies to engine-originated flows (port forwards, §9.8) and
-            // gateway-terminated services land in the NAT engine.
+            // gateway-terminated services land in the NAT engine, which
+            // resets a SYN to this address that belongs to neither
+            // (review F18).
             if ip.proto() == IPPROTO_ICMP {
                 if let Some(reply) = icmp_echo_reply_for(eth.payload()) {
                     self.send(eth_build(
@@ -471,9 +532,15 @@ impl GatewayTask {
                 respond,
                 ..
             } => {
+                let Ok(permit) = Arc::clone(&self.dns_forwards).try_acquire_owned() else {
+                    debug!(segment = %self.segment, "DNS forward limit reached, query dropped");
+                    return;
+                };
                 let tx = self.tx.clone();
                 let segment = self.segment.clone();
                 tokio::spawn(async move {
+                    // Given back when the forward ends.
+                    let _permit = permit;
                     match forward_upstream(upstream, &raw_query, UPSTREAM_DNS_TIMEOUT).await {
                         Some(resp) => {
                             if let Some(frame) = respond.build_frame(&resp) {
@@ -547,14 +614,20 @@ mod tests {
 
     /// A minimal DHCP DISCOVER broadcast frame from `mac`.
     fn discover_frame(mac: MacAddr) -> Vec<u8> {
+        dhcp_frame(mac, mac, 1)
+    }
+
+    /// A minimal DHCP broadcast frame of `msg_type` that names `chaddr` as
+    /// its client and leaves the NIC with the MAC `eth_src`.
+    fn dhcp_frame(eth_src: MacAddr, chaddr: MacAddr, msg_type: u8) -> Vec<u8> {
         let mut b = vec![0u8; 240];
         b[0] = 1; // BOOTREQUEST
         b[1] = 1;
         b[2] = 6;
         b[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-        b[28..34].copy_from_slice(&mac.0);
+        b[28..34].copy_from_slice(&chaddr.0);
         b[236..240].copy_from_slice(&[99, 130, 83, 99]);
-        b.extend_from_slice(&[53, 1, 1]); // DISCOVER
+        b.extend_from_slice(&[53, 1, msg_type]);
         b.push(255);
         let udp = udp_build(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, &b).unwrap();
         let ip = ipv4_build(
@@ -566,7 +639,7 @@ mod tests {
             1,
         )
         .unwrap();
-        crate::net::frame::eth_build(MAC_BROADCAST, mac, ETHERTYPE_IPV4, &ip)
+        crate::net::frame::eth_build(MAC_BROADCAST, eth_src, ETHERTYPE_IPV4, &ip)
     }
 
     #[test]
@@ -623,6 +696,52 @@ mod tests {
         assert_eq!(opts[&3], gw.gw_ip().octets().to_vec()); // router
         // The lease shows up in status.
         assert_eq!(gw.dhcp_leases(), vec![(GUEST_MAC, yiaddr)]);
+    }
+
+    /// Networking review F8: a guest cannot release another machine's lease
+    /// by writing that machine's MAC into `chaddr`.
+    #[tokio::test]
+    async fn a_release_from_another_port_keeps_the_lease() {
+        const OTHER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x0B]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut attacker = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        victim
+            .tx
+            .send(Bytes::from(discover_frame(GUEST_MAC)))
+            .await
+            .unwrap();
+        recv(&mut victim.rx).await;
+        let leased = gw.dhcp_leases();
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].0, GUEST_MAC);
+
+        // RELEASE (7) for the victim's MAC, sent from the attacker's NIC.
+        attacker
+            .tx
+            .send(Bytes::from(dhcp_frame(OTHER_MAC, GUEST_MAC, 7)))
+            .await
+            .unwrap();
+        // A RELEASE has no answer: the attacker's own DISCOVER is handled
+        // after it, so its offer says the RELEASE was processed.
+        attacker
+            .tx
+            .send(Bytes::from(discover_frame(OTHER_MAC)))
+            .await
+            .unwrap();
+        loop {
+            let frame = recv(&mut attacker.rx).await;
+            if EthView::parse(&frame).unwrap().dst_mac() == OTHER_MAC {
+                break;
+            }
+        }
+        assert!(
+            gw.dhcp_leases().contains(&leased[0]),
+            "the victim's lease is gone: {:?}",
+            gw.dhcp_leases()
+        );
     }
 
     #[tokio::test]
@@ -704,6 +823,52 @@ mod tests {
         assert_eq!(m[3] & 0x0F, 0); // NOERROR
         assert_eq!(u16::from_be_bytes([m[6], m[7]]), 1); // one answer
         assert_eq!(&m[m.len() - 4..], &web.octets()); // rdata
+    }
+
+    /// A guest that asks for 200 names outside the zone has no more queries
+    /// waiting on the upstream at once than the limit (review F3).
+    #[tokio::test]
+    async fn forwarded_dns_queries_are_bounded() {
+        // An upstream that never answers: every forward waits its 3 s.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(
+            &sw,
+            GatewayConfig {
+                upstream_dns: Some(upstream.local_addr().unwrap()),
+                ..config()
+            },
+        );
+        let mut guest = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        const QUERIES: u16 = 200;
+        for i in 0..QUERIES {
+            let mut q = vec![(i >> 8) as u8, i as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            q.extend_from_slice(&crate::net::dns::encode_qname(&format!("n{i}.example.com")));
+            q.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            let udp = udp_build(GUEST_IP, gw.gw_ip(), 33000, 53, &q).unwrap();
+            let ipp = ipv4_build(GUEST_IP, gw.gw_ip(), IPPROTO_UDP, 64, &udp, 9).unwrap();
+            let frame = eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp);
+            guest.tx.send(Bytes::from(frame)).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        // The gateway handles frames in order: its answer to this ARP
+        // request says that every query before it was handled.
+        let arp = arp_request_build(GUEST_MAC, GUEST_IP, gw.gw_ip());
+        guest.tx.send(Bytes::from(arp)).await.unwrap();
+        recv(&mut guest.rx).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut forwarded = 0;
+        let mut buf = [0u8; 512];
+        while upstream.try_recv_from(&mut buf).is_ok() {
+            forwarded += 1;
+        }
+        assert!(forwarded > 0, "queries are forwarded");
+        assert!(
+            forwarded <= MAX_DNS_FORWARDS,
+            "{forwarded} queries waited on the upstream at once, over the limit of {MAX_DNS_FORWARDS}"
+        );
     }
 
     #[tokio::test]
@@ -899,5 +1064,119 @@ mod tests {
         let arp = ArpView::parse(EthView::parse(&reply).unwrap().payload()).unwrap();
         assert_eq!(arp.op(), ArpOp::Reply);
         assert_eq!(arp.sha(), gw.gw_mac());
+    }
+
+    /// Review F6: ARP from 100 000 sender addresses leaves no more than
+    /// [`MAX_NEIGHBOURS`] entries, and the newest sender is one of them.
+    #[test]
+    fn the_neighbour_table_is_bounded() {
+        let mut n = Neighbours::default();
+        const SENDERS: u32 = 100_000;
+        for i in 0..SENDERS {
+            n.learn(Ipv4Addr::from(0x0A00_0000 + i), GUEST_MAC);
+        }
+        assert!(
+            n.table.len() <= MAX_NEIGHBOURS,
+            "the gateway holds {} neighbours, over its limit of {MAX_NEIGHBOURS}",
+            n.table.len()
+        );
+        assert_eq!(
+            n.table.get(&Ipv4Addr::from(0x0A00_0000 + SENDERS - 1)),
+            Some(&GUEST_MAC)
+        );
+    }
+
+    /// Give `mac` a lease through `port` and return the leased address.
+    async fn lease(gw: &GatewayHandle, port: &mut ChannelPort, mac: MacAddr) -> Ipv4Addr {
+        port.tx
+            .send(Bytes::from(discover_frame(mac)))
+            .await
+            .unwrap();
+        recv(&mut port.rx).await;
+        gw.dhcp
+            .as_ref()
+            .unwrap()
+            .lock_recover()
+            .lease_of(mac)
+            .expect("the discover leaves a lease")
+    }
+
+    /// Review F9: an ARP from another MAC does not move a leased address in
+    /// the gateway's neighbour table, where routed traffic looks it up.
+    #[tokio::test]
+    async fn an_arp_cannot_claim_a_leased_address() {
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut attacker = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let victim_ip = lease(&gw, &mut victim, GUEST_MAC).await;
+        // The offer may be broadcast: the attacker's port sees it then.
+        while timeout(Duration::from_millis(100), attacker.rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // The holder's own ARP is learned and answered.
+        let req = arp_request_build(GUEST_MAC, victim_ip, gw.gw_ip());
+        victim.tx.send(Bytes::from(req)).await.unwrap();
+        loop {
+            let f = recv(&mut victim.rx).await;
+            if EthView::parse(&f).unwrap().ethertype() == ETHERTYPE_ARP {
+                break;
+            }
+        }
+        while timeout(Duration::from_millis(100), attacker.rx.recv())
+            .await
+            .is_ok()
+        {}
+
+        // The attacker's ARP for the same address is not: no answer, and
+        // the neighbour entry stays the holder's.
+        let req = arp_request_build(ATTACKER_MAC, victim_ip, gw.gw_ip());
+        attacker.tx.send(Bytes::from(req)).await.unwrap();
+        let got = timeout(Duration::from_millis(200), attacker.rx.recv()).await;
+        assert!(got.is_err(), "the spoofed ARP was answered: {got:?}");
+        assert_eq!(
+            gw.neighbours.lock_recover().table.get(&victim_ip),
+            Some(&GUEST_MAC)
+        );
+    }
+
+    /// Review F9: an IPv4 frame whose source is a leased address reaches the
+    /// uplink (NAT, routing) only from the MAC that holds the lease.
+    #[tokio::test]
+    async fn a_leased_source_address_needs_its_holders_mac() {
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut victim = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let attacker = sw.add_channel_port(PortClass::Guest { isolated: true });
+        let victim_ip = lease(&gw, &mut victim, GUEST_MAC).await;
+
+        let (utx, mut urx) = mpsc::unbounded_channel::<Bytes>();
+        gw.set_uplink(Arc::new(move |f| {
+            let utx = utx.clone();
+            Box::pin(async move {
+                let _ = utx.send(f);
+            })
+        }));
+
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let udp = udp_build(victim_ip, dst, 5555, 443, b"hello").unwrap();
+        let ipp = ipv4_build(victim_ip, dst, IPPROTO_UDP, 64, &udp, 21).unwrap();
+        let spoofed = Bytes::from(eth_build(gw.gw_mac(), ATTACKER_MAC, ETHERTYPE_IPV4, &ipp));
+        let honest = Bytes::from(eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp));
+
+        attacker.tx.send(spoofed).await.unwrap();
+        let got = timeout(Duration::from_millis(200), urx.recv()).await;
+        assert!(got.is_err(), "the spoofed frame reached the uplink");
+
+        victim.tx.send(honest.clone()).await.unwrap();
+        let got = timeout(Duration::from_secs(2), urx.recv())
+            .await
+            .expect("timed out waiting for uplink frame")
+            .expect("uplink channel closed");
+        assert_eq!(got, honest);
     }
 }

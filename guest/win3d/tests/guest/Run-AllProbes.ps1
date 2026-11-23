@@ -10,7 +10,7 @@ also run a second time with --warp. Results go to OutDir as Run-Probe.ps1
 writes them, plus summary.json:
 
   [{ name, exit_code, result, adapter, software, readback_ok, avg_fps,
-     frames, first_error, graphics_modules }]
+     frames, first_error, first_warning, graphics_modules }]
 
 Prints the summary as a table. Exit code 0 when every run passed, else 1; a
 failure that is expected (Vulkan with no ICD) still counts, so read the
@@ -59,6 +59,7 @@ $summary = foreach ($r in $runs) {
         frames           = $(if ($probe) { $probe.frames_presented } else { $null })
         session_id       = $run.session_id
         first_error      = $(if ($probe -and @($probe.errors).Count) { @($probe.errors)[0] } else { $null })
+        first_warning    = $(if ($probe -and $probe.PSObject.Properties['warnings'] -and @($probe.warnings).Count) { @($probe.warnings)[0] } else { $null })
         graphics_modules = $run.graphics_modules
     }
 }

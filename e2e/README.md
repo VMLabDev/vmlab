@@ -53,7 +53,9 @@ Every feature in `features.py` carries a phase tag in `PHASES`:
 
 `QEMU_ONLY` lists the features of the guests QEMU still runs, each with its reason: `arch.emulated`. They are in scope on every run. The x86 features only QEMU ran, `vm.hw.qemu_args` and the external-virtiofsd checks, were removed with QEMU's x86 support.
 
-On `vmlab`, a feature past the delivered phase (`VMLAB_DELIVERED`, or `--vmlab-phase`) is reported as skipped with the reason `vmlab-hv phase N`, whatever its scenario did. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
+The default `vmlab` run covers phases 1, 2a through 2f, and 4. No feature is tagged phase 3: its one feature, `arch.emulated`, runs on QEMU on every run. Use `--vmlab-phase` to select an earlier cutoff.
+
+An out-of-scope feature is reported as skipped with the reason `vmlab-hv phase N`. A pass from a VM that ran on QEMU says nothing about vmlab-hv. A scenario with no feature in scope does not run. Every feature still passes, fails or skips with a reason, and each row in `results.json` names the run's hypervisor. vmlab-hv's parity gate for a phase is a `--hypervisor vmlab` run that passes every feature in that phase.
 
 ## Adding coverage
 
@@ -70,6 +72,9 @@ TempleOS sequentially. It checks agent readiness, exec, a disk write/read,
 a PNG screenshot and emulator exit status zero after `vm stop`. Windows 98
 may reach the emulator-quit rung after ignoring guest shutdown. That is a
 flushed emulator exit, not proof that Windows shut itself down.
+The scenario also checks Windows Server 2016 exec before and after an online
+snapshot restore. The `core` scenario checks raw and folder-built floppies
+on vmlab-hv using FreeDOS, and `unsupported` checks SMB1 using Linux.
 
 The scenario uses these installed templates and disables automatic agent
 refresh:
@@ -79,11 +84,13 @@ x86/freedos-1.3@1.3.0
 x86/windows-98-se@4.10.2222.5
 x86_64/windows-7@7600.0.1
 x86_64/templeos@5.03.2
+x86_64/windows-server-2016@14393.0.0
 ```
 
-If a template is missing, the scenario skips with the missing reference.
+If a template is missing, its check reports the missing reference as a failure
+on vmlab-hv or a skip on QEMU.
 `VMLAB_E2E_LEGACY_STORE` can name a populated source store. The scenario copies
-only its four template versions into the run's store, using sparse files and
+only the required template versions into the run's store, using sparse files and
 reflinks where available. With `just e2e::run`, set `VMLAB_E2E_LEGACY_STORE` on
 the host to the source store; the recipe mounts it read-only at `/legacy-store`
 and sets the variable to that path inside the container, so the source is never
@@ -94,5 +101,3 @@ Before each boot, the scenario waits until fewer than two project VMs run on
 the host, excluding `qemu-system-* -avd` Android emulators. Containers need
 `--pid=host` for that count. On a shared development host, run the VM-owning
 processes inside `systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0`.
-The four `vm.legacy.*` features remain tagged phase 4 and skip on vmlab-hv
-until that phase is delivered.

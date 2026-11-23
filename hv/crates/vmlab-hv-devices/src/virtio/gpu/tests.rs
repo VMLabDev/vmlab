@@ -443,3 +443,535 @@ fn the_present_copy_is_refused_until_the_driver_acks_the_bit() {
     short.truncate(80);
     assert_eq!(gpu.state.lock().command(&mem, 0, &short), Err(INVALID));
 }
+
+/// A driver's view of the control queue: a 16-entry split queue at fixed
+/// guest addresses, and the memory it builds chains in.
+struct QueueFixture {
+    gpu: Gpu,
+    mem: GuestMemory,
+    interrupt: Arc<Notifies>,
+    submitted: u16,
+}
+
+#[derive(Default)]
+struct Notifies(parking_lot::Mutex<Vec<u16>>);
+
+impl VirtioInterrupt for Notifies {
+    fn notify_queue(&self, queue: u16) {
+        self.0.lock().push(queue);
+    }
+    fn notify_config(&self) {}
+}
+
+const DESC: u64 = 0x1000;
+const AVAIL: u64 = 0x2000;
+const USED: u64 = 0x3000;
+
+impl QueueFixture {
+    fn new(features: u64) -> Self {
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let interrupt = Arc::new(Notifies::default());
+        let mut gpu = Gpu::new("gpu");
+        gpu.ack_features(features);
+        let queues = [(DESC, AVAIL, USED), (0x8000, 0x9000, 0xa000)]
+            .into_iter()
+            .map(|(desc, avail, used)| {
+                let mut q = Queue::new(16).unwrap();
+                q.set_size(16);
+                q.set_desc_table_address(Some(desc as u32), Some(0));
+                q.set_avail_ring_address(Some(avail as u32), Some(0));
+                q.set_used_ring_address(Some(used as u32), Some(0));
+                q.set_ready(true);
+                q
+            })
+            .collect();
+        gpu.activate(
+            mem.clone(),
+            interrupt.clone() as Arc<dyn VirtioInterrupt>,
+            queues,
+        )
+        .unwrap();
+        Self {
+            gpu,
+            mem,
+            interrupt,
+            submitted: 0,
+        }
+    }
+
+    fn write_desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let mut raw = [0u8; 16];
+        raw[..8].copy_from_slice(&addr.to_le_bytes());
+        raw[8..12].copy_from_slice(&len.to_le_bytes());
+        raw[12..14].copy_from_slice(&flags.to_le_bytes());
+        raw[14..16].copy_from_slice(&next.to_le_bytes());
+        self.mem
+            .write_slice(&raw, GuestAddress(DESC + u64::from(i) * 16))
+            .unwrap();
+    }
+
+    /// Put `request` in a chain at descriptors `head` and `head + 1`, with
+    /// a response buffer of `response` bytes, and make it available.
+    fn put(&mut self, head: u16, request: &[u8], response: u32) {
+        let base = 0x10000 + u64::from(head) * 0x1000;
+        self.mem.write_slice(request, GuestAddress(base)).unwrap();
+        self.mem
+            .write_slice(&vec![0xee; response as usize], GuestAddress(base + 0x800))
+            .unwrap();
+        self.write_desc(head, base, request.len() as u32, 1, head + 1);
+        self.write_desc(head + 1, base + 0x800, response, 2, 0);
+        let slot = u64::from(self.submitted % 16);
+        self.mem
+            .write_slice(&head.to_le_bytes(), GuestAddress(AVAIL + 4 + slot * 2))
+            .unwrap();
+        self.submitted += 1;
+        self.mem
+            .write_slice(&self.submitted.to_le_bytes(), GuestAddress(AVAIL + 2))
+            .unwrap();
+    }
+
+    fn notify(&mut self) {
+        self.gpu.queue_notify(0);
+    }
+
+    fn used(&self) -> u16 {
+        self.mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap()
+    }
+
+    /// The head and length of used entry `slot`.
+    fn used_entry(&self, slot: u64) -> (u32, u32) {
+        (
+            self.mem
+                .read_obj(GuestAddress(USED + 4 + slot * 8))
+                .unwrap(),
+            self.mem
+                .read_obj(GuestAddress(USED + 8 + slot * 8))
+                .unwrap(),
+        )
+    }
+
+    fn response(&self, head: u16, len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        let base = 0x10000 + u64::from(head) * 0x1000 + 0x800;
+        self.mem.read_slice(&mut out, GuestAddress(base)).unwrap();
+        out
+    }
+}
+
+#[test]
+fn avail_idx_far_ahead_does_not_spin() {
+    let f = QueueFixture::new(0);
+    f.mem
+        .write_slice(&0x8000u16.to_le_bytes(), GuestAddress(AVAIL + 2))
+        .unwrap();
+    let used = f.mem.clone();
+    let mut gpu = f.gpu;
+    let returned = crate::virtio::testing::returns_in_time(move || gpu.queue_notify(0));
+    assert!(returned.is_some(), "queue_notify spins on a broken ring");
+    assert_eq!(used.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 0);
+    assert!(f.interrupt.0.lock().is_empty());
+}
+
+fn vblank_wait(scanout: u32) -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&CMD_VBLANK.to_le_bytes());
+    request.extend_from_slice(&scanout.to_le_bytes());
+    request.extend_from_slice(&0u32.to_le_bytes());
+    request
+}
+
+fn display_info() -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&0x100u32.to_le_bytes());
+    request
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+#[test]
+fn a_vblank_wait_is_held_until_a_tick_without_holding_the_commands_behind_it() {
+    let mut f = QueueFixture::new(FEATURES);
+    // No clock thread: the test is the clock.
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    f.put(0, &vblank_wait(0), 48);
+    f.put(2, &display_info(), 408);
+    f.notify();
+
+    // The command behind the wait is answered, the wait is not.
+    assert_eq!(f.used(), 1);
+    assert_eq!(f.used_entry(0).0, 2);
+    assert_eq!(u32_at(&f.response(2, 24), 0), 0x1101);
+    assert_eq!(f.response(0, 48), vec![0xee; 48]);
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 1);
+
+    let notified = f.interrupt.0.lock().len();
+    let tick = vblank::Tick {
+        sequence: 7,
+        timestamp_ns: 123_456_789,
+    };
+    assert!(f.gpu.state.lock().answer_vblanks(tick));
+    assert_eq!(f.used(), 2);
+    assert_eq!(f.used_entry(1), (0, vblank::RESPONSE_LEN));
+    let response = f.response(0, 48);
+    assert_eq!(u32_at(&response, 0), RESP_OK_VBLANK);
+    assert_eq!(u64_at(&response, 24), 7);
+    assert_eq!(u64_at(&response, 32), 123_456_789);
+    assert_eq!(u32_at(&response, 40), 16_666_666);
+    assert_eq!(u32_at(&response, 44), 0);
+    assert!(
+        f.interrupt.0.lock().len() > notified,
+        "the guest is interrupted"
+    );
+
+    // A tick with no wait held answers nothing.
+    assert!(!f.gpu.state.lock().answer_vblanks(tick));
+    assert_eq!(f.used(), 2);
+}
+
+#[test]
+fn a_vblank_wait_is_refused_without_the_bit_a_scanout_or_room_for_its_answer() {
+    let bit = 1u64 << ORDERED_FLIP_FEATURE;
+    let mut fenced = vblank_wait(0);
+    fenced[4] = 1;
+    for (features, request, room, error) in [
+        (FEATURES & !bit, vblank_wait(0), 48, INVALID),
+        (FEATURES, vblank_wait(1), 48, SCANOUT),
+        (FEATURES, fenced, 48, INVALID),
+        (FEATURES, vblank_wait(0), 40, INVALID),
+        (FEATURES, vblank_wait(0)[..28].to_vec(), 48, INVALID),
+    ] {
+        let mut f = QueueFixture::new(features);
+        f.put(0, &request, room);
+        f.notify();
+        assert_eq!(f.used(), 1, "a refused wait is answered at once");
+        assert_eq!(f.used_entry(0), (0, 24));
+        assert_eq!(u32_at(&f.response(0, 24), 0), error);
+        assert!(f.gpu.state.lock().vblank_waits.is_empty());
+    }
+}
+
+#[test]
+fn a_reset_drops_the_held_vblank_waits() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    f.put(0, &vblank_wait(0), 48);
+    f.notify();
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 1);
+    f.gpu.reset();
+    assert!(f.gpu.state.lock().vblank_waits.is_empty());
+    assert!(!f.gpu.state.lock().answer_vblanks(vblank::Tick {
+        sequence: 1,
+        timestamp_ns: 1,
+    }));
+}
+
+/// A guest that publishes one head again and again: the queue holds no more
+/// waits than its size, and each surplus chain is refused at once.
+#[test]
+fn held_vblank_waits_are_bounded_by_the_queue_size() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    for _ in 0..40 {
+        f.put(0, &vblank_wait(0), 48);
+        f.notify();
+    }
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 16);
+    assert_eq!(f.used(), 24, "the surplus chains are answered at once");
+    assert_eq!(f.used_entry(0), (0, 24));
+    assert_eq!(u32_at(&f.response(0, 24), 0), OUT_OF_MEMORY);
+
+    // A tick answers the held waits and makes room again.
+    assert!(f.gpu.state.lock().answer_vblanks(vblank::Tick {
+        sequence: 1,
+        timestamp_ns: 1,
+    }));
+    assert_eq!(f.used(), 40);
+    f.put(0, &vblank_wait(0), 48);
+    f.notify();
+    assert_eq!(f.gpu.state.lock().vblank_waits.len(), 1);
+}
+
+/// The fence twin: the fences and the waits of one queue share its size.
+#[test]
+fn held_fences_are_bounded_by_the_queue_size() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
+    f.put(0, &vblank_wait(0), 48);
+    f.notify();
+    let fence = |queue| PendingFence {
+        queue,
+        head: 2,
+        len: 24,
+        flags: 3,
+        id: 1,
+        ctx: 1,
+        ring: 0,
+    };
+    let mut s = f.gpu.state.lock();
+    let held = (0..40).filter(|_| s.hold_fence(fence(0))).count();
+    assert_eq!(held, 15, "one of the 16 places holds the vblank wait");
+    assert_eq!(s.fences.len(), 15);
+    // The cursor queue has its own places, and no queue has none.
+    assert!(s.hold_fence(fence(1)));
+    assert!(!s.hold_fence(fence(2)));
+}
+
+#[test]
+fn the_frame_clock_ticks_at_60_hz_from_its_start_and_never_twice() {
+    use std::time::Duration;
+    let period = Duration::from_nanos(16_666_667);
+    assert_eq!(vblank::next_tick(Duration::ZERO, None), 1);
+    assert_eq!(vblank::next_tick(period / 2, None), 1);
+    assert_eq!(vblank::next_tick(period, None), 2);
+    assert_eq!(vblank::next_tick(period * 600 + period / 3, None), 601);
+    // A wait that arrives after a tick it was answered at gets the next one.
+    assert_eq!(vblank::next_tick(period / 2, Some(1)), 2);
+    assert_eq!(vblank::next_tick(period * 9, Some(3)), 10);
+}
+
+#[test]
+fn the_clock_thread_answers_a_wait_and_each_next_one_a_period_later() {
+    let mut f = QueueFixture::new(FEATURES);
+    let mut ticks = Vec::new();
+    for head in [0, 2, 4] {
+        f.put(head, &vblank_wait(0), 48);
+        f.notify();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while f.used() < ticks.len() as u16 + 1 {
+            assert!(std::time::Instant::now() < deadline, "no vblank in 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let response = f.response(head, 48);
+        assert_eq!(u32_at(&response, 0), RESP_OK_VBLANK);
+        ticks.push((u64_at(&response, 24), u64_at(&response, 32)));
+    }
+    for pair in ticks.windows(2) {
+        let ((first, first_ns), (second, second_ns)) = (pair[0], pair[1]);
+        assert!(second > first, "ticks {ticks:?} go forward");
+        // The host time of a tick follows from its number.
+        let expected = (second - first) * 1_000_000_000 / 60;
+        assert!(
+            (second_ns - first_ns).abs_diff(expected) <= 1,
+            "ticks {ticks:?} are a whole number of periods apart"
+        );
+    }
+}
+
+#[derive(Default)]
+struct Interrupts {
+    queues: parking_lot::Mutex<Vec<u16>>,
+    config: std::sync::atomic::AtomicU32,
+}
+
+impl VirtioInterrupt for Interrupts {
+    fn notify_queue(&self, queue: u16) {
+        self.queues.lock().push(queue);
+    }
+    fn notify_config(&self) {
+        self.config
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn events(gpu: &Gpu) -> u32 {
+    let mut word = [0; 4];
+    gpu.read_config(0, &mut word);
+    u32::from_le_bytes(word)
+}
+
+fn command(kind: u32, words: &[u32]) -> Vec<u8> {
+    let mut request = vec![0; 24];
+    request[..4].copy_from_slice(&kind.to_le_bytes());
+    for word in words {
+        request.extend_from_slice(&word.to_le_bytes());
+    }
+    request
+}
+
+#[test]
+fn a_lost_host_gpu_is_an_event_only_for_a_driver_that_acked_the_bit() {
+    let bit = 1u64 << ORDERED_FLIP_FEATURE;
+    let irq = Arc::new(Interrupts::default());
+
+    // Linux's driver: no event, no configuration interrupt.
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features() & !bit);
+    gpu.state.lock().interrupt = Some(irq.clone());
+    gpu.lose_host_gpu("test");
+    assert_eq!(events(&gpu), 0);
+    assert_eq!(irq.config.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(gpu.host_gpu_lost().as_deref(), Some("test"));
+
+    // vmlab's driver: the event and one interrupt, and a second loss is
+    // not a second event.
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features());
+    gpu.state.lock().interrupt = Some(irq.clone());
+    gpu.lose_host_gpu("test");
+    gpu.lose_host_gpu("again");
+    assert_eq!(events(&gpu), EVENT_DEVICE_LOST);
+    assert_eq!(irq.config.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(gpu.host_gpu_lost().as_deref(), Some("test"));
+
+    // The driver clears it as it clears the display event.
+    gpu.write_config(4, &EVENT_DEVICE_LOST.to_le_bytes());
+    assert_eq!(events(&gpu), 0);
+
+    // The loss outlives a reset, and the next negotiation of the bit
+    // raises the event again.
+    gpu.reset();
+    assert_eq!(events(&gpu), 0);
+    gpu.ack_features(gpu.features() & !bit);
+    assert_eq!(events(&gpu), 0);
+    gpu.ack_features(gpu.features());
+    assert_eq!(events(&gpu), EVENT_DEVICE_LOST);
+    assert!(gpu.host_gpu_lost().is_some());
+}
+
+#[test]
+fn a_lost_host_gpu_refuses_work_but_serves_the_display_and_releases() {
+    let mut gpu = Gpu::new("gpu");
+    gpu.ack_features(gpu.features());
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let mut s = gpu.state.lock();
+    assert!(s.command(&mem, 0, &command(0x101, &[1, 2, 1, 1])).is_ok());
+    drop(s);
+    gpu.lose_host_gpu("test");
+
+    let mut s = gpu.state.lock();
+    for refused in [
+        command(0x101, &[2, 2, 1, 1]),
+        command(0x103, &[0, 0, 1, 1, 0, 1]),
+        command(0x104, &[0, 0, 1, 1, 1, 0]),
+        command(0x108, &[0, 0]),
+        command(0x200, &[0; 18]),
+        command(0x207, &[0, 0]),
+        ordered_flip(0, 1, 1),
+        present_copy(1, 2, &[[0, 0, 0, 0, 4, 4]]),
+    ] {
+        assert_eq!(s.command(&mem, 0, &refused), Err(UNSPEC));
+    }
+    assert_eq!(s.command(&mem, 0, &command(0x100, &[])).unwrap().0, 0x1101);
+    assert_eq!(
+        s.command(&mem, 0, &command(0x10a, &[0, 0])).unwrap().0,
+        0x1104
+    );
+    // A release still releases.
+    assert_eq!(
+        s.command(&mem, 0, &command(0x102, &[1, 0])),
+        Ok((NODATA, Vec::new()))
+    );
+    assert!(s.resources.is_empty());
+    // The cursor queue has no host GPU to wait for.
+    assert!(s.command(&mem, 1, &command(0x301, &[0; 8])).is_ok());
+}
+
+#[test]
+fn a_lost_host_gpu_answers_every_fence_the_device_holds() {
+    let gpu = Gpu::new("gpu");
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+    let mut queue = Queue::new(16).unwrap();
+    queue.try_set_size(16).unwrap();
+    queue.try_set_desc_table_address(GuestAddress(0)).unwrap();
+    queue
+        .try_set_avail_ring_address(GuestAddress(0x400))
+        .unwrap();
+    queue
+        .try_set_used_ring_address(GuestAddress(0x800))
+        .unwrap();
+    queue.set_ready(true);
+    let irq = Arc::new(Interrupts::default());
+    {
+        let mut s = gpu.state.lock();
+        s.mem = Some(mem.clone());
+        s.interrupt = Some(irq.clone());
+        s.queues = vec![queue, Queue::new(16).unwrap()];
+        for head in [3, 5] {
+            s.fences.push(PendingFence {
+                queue: 0,
+                head,
+                len: 24,
+                flags: 3,
+                id: u64::from(head),
+                ctx: 1,
+                ring: 0,
+            });
+        }
+    }
+    gpu.lose_host_gpu("test");
+
+    assert!(gpu.state.lock().fences.is_empty());
+    // The used ring holds both heads, in order, and the guest was told once.
+    let used = |at: u64| mem.read_obj::<u32>(GuestAddress(0x800 + at)).unwrap();
+    assert_eq!(used(0) >> 16, 2);
+    assert_eq!((used(4), used(12)), (3, 5));
+    assert_eq!(irq.queues.lock().as_slice(), [0]);
+}
+
+/// A reset whose render worker exits late, and one whose worker does not
+/// exit: the status reads zero only once the worker has gone, so that the
+/// guest frees nothing a worker can still use (`teardown.rs`).
+#[test]
+fn a_reset_is_acknowledged_only_after_the_render_workers_have_exited() {
+    use crate::PciDevice;
+    use crate::virtio::pci::VirtioPciDevice;
+    use crate::virtio::pci::device_status::DEVICE_NEEDS_RESET;
+    use std::time::{Duration, Instant};
+    use teardown::tests::{proc_entry, scratch};
+
+    let proc = scratch("gpu-reset");
+    let gpu = Gpu::new("gpu");
+    let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+    let mut pci = VirtioPciDevice::new("pci", Box::new(gpu.clone()), mem, None, None);
+    let status = |pci: &mut VirtioPciDevice| {
+        let mut byte = [0];
+        pci.bar_read(4, 0x14, &mut byte);
+        byte[0]
+    };
+    let worker = |patience| {
+        // The render server 10 and its worker 20, of one guest context.
+        proc_entry(&proc, 10, 'S', 1, 100);
+        proc_entry(&proc, 20, 'S', 10, 200);
+        let mut workers = teardown::Workers::at(&proc, patience);
+        workers.note(&[10]);
+        gpu.state.lock().workers = workers;
+    };
+
+    // The worker exits while the reset waits: the reset is acknowledged.
+    worker(Duration::from_secs(5));
+    pci.bar_write(4, 0x14, &[1]);
+    let late = proc.clone();
+    let exit = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::remove_dir_all(late.join("20")).unwrap();
+    });
+    let start = Instant::now();
+    pci.bar_write(4, 0x14, &[0]);
+    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert_eq!(status(&mut pci), 0);
+    exit.join().unwrap();
+
+    // The worker does not exit in time: the status says the reset failed,
+    // and the driver cannot start the device again.
+    worker(Duration::from_millis(20));
+    pci.bar_write(4, 0x14, &[1]);
+    pci.bar_write(4, 0x14, &[0]);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
+    pci.bar_write(4, 0x14, &[1]);
+    assert_eq!(status(&mut pci), DEVICE_NEEDS_RESET);
+    assert!(gpu.state.lock().unsettled);
+
+    // It exits later: the next read finishes the reset.
+    proc_entry(&proc, 20, 'Z', 10, 200);
+    assert_eq!(status(&mut pci), 0);
+    assert!(!gpu.state.lock().unsettled);
+    pci.bar_write(4, 0x14, &[1]);
+    assert_eq!(status(&mut pci), 1);
+    std::fs::remove_dir_all(&proc).unwrap();
+}

@@ -66,12 +66,25 @@ impl Reference {
         if tag.is_empty() {
             bail!("reference `{reference}` has an empty tag");
         }
+        if !repository_is_plain(&repository) {
+            bail!(
+                "reference `{reference}` has an invalid repository `{repository}`: each \
+                 `/`-separated segment is letters, digits, `.`, `_` and `-`, and is not `.` \
+                 or `..`"
+            );
+        }
 
         Ok(Reference {
             host,
             repository,
             tag,
         })
+    }
+
+    /// The repository with its host and without a tag
+    /// (`host/owner/[group/]name`): who publishes what this reference names.
+    pub fn source(&self) -> String {
+        format!("{}/{}", self.host, self.repository)
     }
 
     /// The reference rendered back to canonical text.
@@ -84,6 +97,27 @@ impl Reference {
 /// exactly `localhost`.
 fn looks_like_registry_host(segment: &str) -> bool {
     segment == "localhost" || segment.contains('.') || segment.contains(':')
+}
+
+/// Whether `repository` reaches a registry as the path it is written as.
+///
+/// The repository goes into the request path as text
+/// (`/v2/<repository>/manifests/<tag>`), and the URL parser removes `.` and
+/// `..` segments, their percent-encoded spellings too, reads `\` as `/` and
+/// ends the path at `?` or `#`. With any of those the repository that answers
+/// is not the one the text names, and the text is what the trust list
+/// (`host.trusted_template_repositories`) is matched against. So every
+/// segment is non-empty, holds only ASCII letters, digits, `.`, `_` and `-`,
+/// and is not a dot segment.
+pub(crate) fn repository_is_plain(repository: &str) -> bool {
+    repository.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
 }
 
 /// Render `reference` with `version` as its tag (`host/repository:version`),
@@ -161,6 +195,36 @@ mod tests {
         assert_eq!(r.host, "harbor.example.com");
         assert_eq!(r.repository, "team/project/image");
         assert_eq!(r.tag, "v3");
+    }
+
+    /// The repository goes into the request path as written, and the URL
+    /// parser removes dot segments from it, so a reference with one would
+    /// name another repository than its text says (config review F2).
+    #[test]
+    fn a_repository_with_a_dot_segment_is_rejected() {
+        for bad in [
+            "ghcr.io/a/../b:1",
+            "ghcr.io/a/./b:1",
+            "ghcr.io/../b:1",
+            "ghcr.io/a/..:1",
+            "ghcr.io/a//b:1",
+            "ghcr.io/a/b/:1",
+            "ghcr.io/a/%2e%2e/b:1",
+            "ghcr.io/a\\..\\b/c:1",
+            "ghcr.io/a/b?x:1",
+            "ghcr.io/a/b#x:1",
+            "ghcr.io/a/b c:1",
+        ] {
+            let err = Reference::parse(bad).expect_err(bad);
+            assert!(err.to_string().contains("repository"), "{bad}: {err}");
+        }
+        for good in [
+            "ghcr.io/a/b:1",
+            "ghcr.io/VMLabDev/vmlab-templates/windows-11:1",
+            "ghcr.io/a/b.c_d-e/f..g:1",
+        ] {
+            Reference::parse(good).expect(good);
+        }
     }
 
     #[test]

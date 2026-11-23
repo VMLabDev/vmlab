@@ -12,7 +12,7 @@ missing wait is one that the guest cannot make. Between a frame that the
 guest calls finished and the host's read of it for the scanout, host GPU
 work on the same surface still runs, and the guest has no fence that covers
 it. The host must order the flip. That starts stage 2 of the design (C10,
-a host-ordered flip command). `patches/kmd/0008` fixes one real fault in the
+a host-ordered flip command). `patches/kmd/kmd-report-flips-after-they-are-sent.patch` fixes one real fault in the
 vsync order that the trace found, but it is not the cause of the tears.
 
 ## The probe
@@ -59,7 +59,7 @@ new ones not drawn yet.
 
 ## Which waits were tested
 
-The trace build (`patches/kmd/0007`, `build/kmd/README.md`, "Trace build")
+The trace build (`patches/kmd/kmd-flip-trace-build.patch`, `build/kmd/README.md`, "Trace build")
 records each submission, completion, present copy, flip and vsync with its
 time. Each row below is a wait that a real video card has and that the
 driver could be missing. Load is 90 percent, as in the issue.
@@ -148,7 +148,7 @@ display reads it, and reports the flip back when the old scanout is free.
 A present copy on the host GPU (C12) puts the copy on the same host queue as
 the work around it.
 
-## The vsync fix, `patches/kmd/0008`
+## The vsync fix, `patches/kmd/kmd-report-flips-after-they-are-sent.patch`
 
 The trace found one fault in the vsync order of the driver. It does not end
 the tears, but Windows relies on the order, and the fix passed the win3d e2e

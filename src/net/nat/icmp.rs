@@ -8,7 +8,10 @@
 //! virtually every distribution — once per destination, with the result
 //! cached for 10 seconds so a guest flood ping cannot become a subprocess
 //! storm. While a probe is in flight, further requests for the same
-//! destination are dropped (the guest retransmits).
+//! destination are dropped (the guest retransmits). So is a request that
+//! would start one probe more than [`MAX_PROBES`], or than one guest's
+//! [`MAX_PROBES_PER_GUEST`]: the cache stops a second probe of one address,
+//! and the limits stop a sweep over many.
 //!
 //! On success the guest receives a synthesized echo reply (identifier,
 //! sequence and payload faithfully mirrored); on failure an ICMP
@@ -17,7 +20,7 @@
 //! meaningful.
 
 use crate::sync::LockRecover;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -28,12 +31,24 @@ use async_trait::async_trait;
 use tracing::{debug, trace};
 
 use crate::config::model::MacAddr;
+use crate::net::bounded::BoundedMap;
 use crate::net::frame::{self, IPPROTO_ICMP};
 
 use super::NatEngine;
 
 /// Reachability results are reused for this long.
 const CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// How many results the cache holds (review F6). A guest names the
+/// destination, so past this a new result replaces the oldest, and an echo
+/// to that destination is probed again.
+pub(super) const MAX_CACHED: usize = 1024;
+
+/// How many probes run at once (review F3): each is one `ping` process. An
+/// echo request that would need one more is dropped (the guest retransmits).
+pub(super) const MAX_PROBES: usize = 32;
+/// How many of [`MAX_PROBES`] one guest address may have in flight.
+pub(super) const MAX_PROBES_PER_GUEST: usize = 8;
 
 /// Reachability probe. The default implementation shells out to `ping`;
 /// tests substitute a stub.
@@ -83,15 +98,16 @@ impl Pinger for SubprocessPinger {
 
 /// Per-engine probe cache + in-flight dedup.
 pub(super) struct IcmpState {
-    cache: StdMutex<HashMap<Ipv4Addr, (bool, Instant)>>,
-    pending: StdMutex<HashSet<Ipv4Addr>>,
+    cache: StdMutex<BoundedMap<Ipv4Addr, (bool, Instant)>>,
+    /// Destinations with a probe in flight, and the guest each runs for.
+    pending: StdMutex<HashMap<Ipv4Addr, Ipv4Addr>>,
 }
 
 impl IcmpState {
     pub fn new() -> Self {
         Self {
-            cache: StdMutex::new(HashMap::new()),
-            pending: StdMutex::new(HashSet::new()),
+            cache: StdMutex::new(BoundedMap::new(MAX_CACHED)),
+            pending: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -103,9 +119,24 @@ impl IcmpState {
         }
     }
 
-    /// Try to claim the probe for `dst`; `false` means one is in flight.
-    fn claim(&self, dst: Ipv4Addr) -> bool {
-        self.pending.lock_recover().insert(dst)
+    /// How many results the cache holds.
+    #[cfg(test)]
+    pub(super) fn cached_len(&self) -> usize {
+        self.cache.lock_recover().len()
+    }
+
+    /// Try to claim the probe for `dst` on behalf of `guest`; `false` means
+    /// one is in flight, or `guest` or the engine is at its limit of probes.
+    fn claim(&self, dst: Ipv4Addr, guest: Ipv4Addr) -> bool {
+        let mut pending = self.pending.lock_recover();
+        if pending.contains_key(&dst)
+            || pending.len() >= MAX_PROBES
+            || pending.values().filter(|g| **g == guest).count() >= MAX_PROBES_PER_GUEST
+        {
+            return false;
+        }
+        pending.insert(dst, guest);
+        true
     }
 
     fn complete(&self, dst: Ipv4Addr, ok: bool) {
@@ -123,8 +154,8 @@ pub(super) async fn handle_echo(engine: Arc<NatEngine>, guest_mac: MacAddr, pkt:
     let reachable = match engine.icmp.cached(dst) {
         Some(ok) => ok,
         None => {
-            if !engine.icmp.claim(dst) {
-                trace!(%dst, "nat: probe already in flight, dropping echo");
+            if !engine.icmp.claim(dst, ip.src()) {
+                trace!(%dst, "nat: probe in flight or probe limit reached, dropping echo");
                 return;
             }
             let ok = engine.pinger.ping(dst).await;

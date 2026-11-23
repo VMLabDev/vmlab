@@ -464,12 +464,7 @@ pub async fn start_build(
         });
         // A variant rebuild must not replace an overlay a clone is backed by;
         // the registered labs are asked at the time, not when the build began.
-        let in_use: crate::template::build::InUse = Arc::new(|disks| {
-            Box::pin(async move {
-                let clones = super::store::clones_by_backing().await;
-                super::store::backed_clones_reason(&clones, &disks)
-            })
-        });
+        let in_use = super::store::in_use_check();
         let result = crate::template::build::build_template(
             &def,
             &root,
