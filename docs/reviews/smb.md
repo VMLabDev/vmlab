@@ -32,7 +32,7 @@ be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user |
+| F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606) |
 | F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares |
 | F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run |
 | F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path |
@@ -81,6 +81,19 @@ be dropped.
      on a directory outside the share, then `ls` that new share. Today the
      listing succeeds. The test waits on the listing in a retry loop bounded
      by attempts, not by time.
+- Fixed by card #606. Validation refuses a `share {}` host directory, and a
+  container volume's host directory, that holds the lab's state directory or
+  lies inside it, on every transport (`share_over_lab_state` in
+  `src/config/validate.rs`). `SmbConfig::render_conf` refuses a share over
+  `<lab>/.vmlab/smb` or over the SMB runtime directory, so `smbd` does not
+  start with one (`share_state_problem` in `src/smb/config.rs`). Both compare
+  resolved paths, so a symlink or a `..` does not pass. Named volumes under
+  `.vmlab/volumes` are still served. Proof tests:
+  `a_share_over_the_lab_state_directory_is_refused` and
+  `a_share_that_holds_the_smb_state_cannot_reach_outside_it`
+  (`src/smb/server.rs`). Both failed before the fix on helios. A share of
+  another directory that vmlab keeps state in (`~/.local/share/vmlab`,
+  another lab's root) is not refused.
 
 ### F2. One account for the whole lab (security)
 

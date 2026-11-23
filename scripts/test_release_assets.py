@@ -239,11 +239,7 @@ esac
         self.assertEqual(oct(helper.stat().st_mode & 0o777), oct(0o700))
 
     def test_helper_keeps_owner_only_mode_through_the_grant(self):
-        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
-        self.tool('sudo', '#!/bin/sh\nset -eu\nexit 0\n')
-        self.tool('setcap', '#!/bin/sh\nexit 99\n')
-        self.tool('getcap', '#!/bin/sh\nprintf "%s cap_bpf,cap_net_admin=ep\\n" "$1"\n')
-        self.tool('findmnt', '#!/bin/sh\nprintf "rw,relatime\\n"\n')
+        self.fastpath_tools(swap_in=None)
         result = self.install('--no-guest', '--fastpath')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         helper = self.root / 'installed/vmlab-fastpath'
@@ -251,20 +247,77 @@ esac
         self.assertIn('Any program running as you', result.stderr)
         self.assertIn('serves no other user', result.stderr)
 
-    def test_fastpath_grants_the_helper_and_never_the_binary(self):
-        log = self.root / 'sudo.log'
-        self.env['SUDO_LOG'] = str(log)
+    def fastpath_tools(self, *, swap_in):
+        """Stubs for a grant. `swap_in` names the tool that, when the installer
+        starts it, first renames another program onto the helper's path: what
+        any program running as the user can do while the installer waits
+        (review install-release F1, card 607). `setcap` records the digest of
+        every file it is asked to grant."""
+        self.env['CAP_LOG'] = str(self.root / 'cap.log')
+        self.env['EVIL'] = str(self.root / 'evil')
+        self.env['HELPER_PATH'] = str(self.root / 'installed/vmlab-fastpath')
+        (self.root / 'evil').write_text('#!/bin/sh\necho not the helper\n')
+        swap = ('cp "$EVIL" "$HELPER_PATH.x"\n'
+                'chmod +x "$HELPER_PATH.x"\n'
+                'mv "$HELPER_PATH.x" "$HELPER_PATH"\n')
+        bodies = {
+            'findmnt': 'printf "rw,relatime\\n"\n',
+            'sudo': 'exec "$@"\n',
+        }
+        for name, body in bodies.items():
+            self.tool(name, '#!/bin/sh\nset -eu\n' + (swap if name == swap_in else '') + body)
         self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
-        self.tool('sudo', '#!/bin/sh\nset -eu\nprintf "%s\\n" "$*" >> "$SUDO_LOG"\n')
-        self.tool('setcap', '#!/bin/sh\nexit 99\n')
+        self.tool('setcap', '#!/bin/sh\nset -eu\n[ "$1" = cap_bpf,cap_net_admin+ep ]\n'
+                  'sha256sum "$2" | cut -d" " -f1 >> "$CAP_LOG"\n')
         self.tool('getcap', '#!/bin/sh\nprintf "%s cap_bpf,cap_net_admin=ep\\n" "$1"\n')
-        self.tool('findmnt', '#!/bin/sh\nprintf "rw,relatime\\n"\n')
+
+    def granted(self):
+        """The digest of every file that was given the capabilities."""
+        log = self.root / 'cap.log'
+        return log.read_text().split() if log.exists() else []
+
+    def helper_digest(self):
+        return hashlib.sha256((self.dist / self.helper).read_bytes()).hexdigest()
+
+    def staging_left(self):
+        return [p.name for p in (self.root / 'installed').iterdir()
+                if p.name not in ('vmlab', 'vmlab-fastpath')]
+
+    def test_fastpath_grants_the_helper_and_never_the_binary(self):
+        self.fastpath_tools(swap_in=None)
         result = self.install('--no-guest', '--fastpath')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         helper = self.root / 'installed/vmlab-fastpath'
-        self.assertEqual(log.read_text().splitlines(),
-                         [f'setcap cap_bpf,cap_net_admin+ep {helper}'])
+        self.assertEqual(self.granted(), [self.helper_digest()])
+        self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), self.helper_digest())
+        self.assertTrue(os.access(helper, os.X_OK))
+        self.assertIn('Granted:', result.stdout)
         self.assertIn('only the vmlab-fastpath helper', result.stderr)
+        self.assertEqual(self.staging_left(), [])
+
+    def test_fastpath_refuses_a_file_swapped_in_before_the_grant(self):
+        # The swap happens while the installer still prepares the grant, as it
+        # would while the person reads the [y/N] prompt.
+        self.fastpath_tools(swap_in='findmnt')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.granted(), [])
+        self.assertIn('is not the helper of this release', result.stderr)
+        self.assertNotIn('Granted:', result.stdout)
+        # No advice to grant the file that is at the path now.
+        self.assertNotIn('sudo setcap', result.stdout + result.stderr)
+        self.assertEqual(self.staging_left(), [])
+
+    def test_fastpath_grants_only_verified_bytes_when_swapped_under_sudo(self):
+        # The swap happens after sudo started, as it would while sudo waits
+        # for its password.
+        self.fastpath_tools(swap_in='sudo')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.granted(), [self.helper_digest()])
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), self.helper_digest())
+        self.assertEqual(self.staging_left(), [])
 
     def test_release_without_helper_still_installs_the_binary(self):
         (self.dist / self.helper).unlink()

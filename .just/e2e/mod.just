@@ -39,13 +39,15 @@ require-legacy-store:
 run *args: require-legacy-store image-build
 	mkdir -p e2e/results
 	legacy="${VMLAB_E2E_LEGACY_STORE:+$(realpath "$VMLAB_E2E_LEGACY_STORE")}"; \
+	macos="${VMLAB_E2E_MACOS_STORE:+$(realpath "$VMLAB_E2E_MACOS_STORE")}"; \
 	docker run --rm --init --privileged --device /dev/kvm --memory 24g --memory-swap 24g \
-		-e VMLAB_E2E_RENDER_NODE \
+		-e VMLAB_E2E_RENDER_NODE -e VMLAB_E2E_APPLE_SMC_OSK \
 		-v {{cache}}:/root/.local/share/vmlab/cache/artefacts \
 		-v "$PWD/e2e:/e2e:ro" \
 		-v "$PWD/e2e/results:/results" \
 		$(test -d "$HOME/.local/share/config-weave/bin" && echo "-v $HOME/.local/share/config-weave/bin:/opt/config-weave:ro -e VMLAB_CONFIG_WEAVE_DIR=/opt/config-weave") \
 		${legacy:+-v "$legacy:/legacy-store:ro" -e VMLAB_E2E_LEGACY_STORE=/legacy-store} \
+		${macos:+-v "$macos:/macos-store:ro" -e VMLAB_E2E_MACOS_STORE=/macos-store} \
 		{{image}} {{args}}
 
 # Drop the download cache volume

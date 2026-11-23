@@ -175,8 +175,11 @@ impl SmbConfig {
     ///
     /// Refuses a share whose name is not a plain share name
     /// ([`share_name_problem`]) or whose host path holds a line break: each
-    /// would write configuration of its own into the file. Validation refuses
-    /// both first; this keeps a config built some other way from doing it.
+    /// would write configuration of its own into the file. Refuses a share
+    /// whose directory holds this file or lies beside it
+    /// ([`share_state_problem`]): its guest would write the configuration
+    /// outright. Validation refuses all three first; this keeps a config
+    /// built some other way from doing it.
     pub fn render_conf(&self) -> Result<String, ShareRefused> {
         for s in &self.shares {
             if let Some(reason) = share_name_problem(&s.name) {
@@ -190,6 +193,19 @@ impl SmbConfig {
                     name: s.name.clone(),
                     reason,
                 });
+            }
+            // This file, the passdb and smbd's sockets: a share over any of
+            // them hands the guest the server (docs/reviews/smb.md F1).
+            for (state, what) in [
+                (&self.lab_dir, "vmlab's SMB state directory"),
+                (&self.run_dir, "vmlab's SMB runtime directory"),
+            ] {
+                if let Some(reason) = share_state_problem(&s.host_path, state, what) {
+                    return Err(ShareRefused {
+                        name: s.name.clone(),
+                        reason,
+                    });
+                }
             }
         }
         let dir = self.lab_dir.display();
@@ -353,6 +369,67 @@ pub fn share_host_problem(host: &std::path::Path) -> Option<String> {
         .then(|| format!("the host path {text:?} holds a line break"))
 }
 
+/// Why the directory `host` cannot be shared given that `state` is one of
+/// vmlab's own directories (`what` names it), or `None` when it can.
+///
+/// A share is confined to its declared directory (PRD §2), and that holds
+/// only while the directory and vmlab's state are apart. A share that holds
+/// the lab's `.vmlab`, or lies inside it, shows the guest `smb/smb.conf` —
+/// which `smbd` reads again by itself when it changes, so a guest that can
+/// write it adds a share on any directory of the host user — and every
+/// machine's disks, TPM state and firmware variables, which a read-only
+/// share still hands over.
+///
+/// Both paths are compared as the kernel resolves them, so a symlink or a
+/// `..` does not get a share past this.
+pub fn share_state_problem(
+    host: &std::path::Path,
+    state: &std::path::Path,
+    what: &str,
+) -> Option<String> {
+    let real_host = real_path(host);
+    let real_state = real_path(state);
+    if real_state.starts_with(&real_host) {
+        Some(format!(
+            "the host path {} holds {what} ({}) — a guest could rewrite vmlab's own files \
+             there; share a directory that does not contain it",
+            host.display(),
+            state.display()
+        ))
+    } else if real_host.starts_with(&real_state) {
+        Some(format!(
+            "the host path {} is inside {what} ({}) — a guest could rewrite vmlab's own \
+             files there; share a directory outside it",
+            host.display(),
+            state.display()
+        ))
+    } else {
+        None
+    }
+}
+
+/// `path` as the kernel would resolve it. The part that exists is
+/// canonicalized — a lab that has never run has no `.vmlab` yet — and the
+/// rest is appended as written.
+fn real_path(path: &std::path::Path) -> PathBuf {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut rest = Vec::new();
+    let mut existing = path.as_path();
+    loop {
+        if let Ok(real) = existing.canonicalize() {
+            return rest.iter().rev().fold(real, |p, name| p.join(name));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            // Nothing of it resolves, or it ends in `..`: as written.
+            _ => return path,
+        }
+    }
+}
+
 /// Best-effort current unix username for `force user`. Falls back to the uid
 /// or `nobody` when the environment is unhelpful.
 pub fn current_unix_user() -> String {
@@ -418,6 +495,55 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// docs/reviews/smb.md F1: no share section is written over the server's
+    /// own files, whichever way round the two directories sit and however
+    /// the path is spelled.
+    #[test]
+    fn a_share_over_the_servers_own_state_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lab = tmp.path().join("lab");
+        let smb = lab.join(".vmlab/smb");
+        let run = tmp.path().join("run/smb/0123");
+        std::fs::create_dir_all(&smb).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(lab.join("src")).unwrap();
+        std::fs::create_dir_all(lab.join(".vmlab/volumes/data")).unwrap();
+        std::os::unix::fs::symlink(".vmlab/smb", lab.join("link")).unwrap();
+        let render = |host: PathBuf| {
+            let mut c = cfg(false);
+            c.lab_dir = smb.clone();
+            c.run_dir = run.clone();
+            c.shares[0].host_path = host;
+            c.render_conf()
+        };
+        for host in [
+            lab.clone(),
+            tmp.path().to_path_buf(),
+            lab.join("src/.."),
+            lab.join(".vmlab"),
+            smb.clone(),
+            smb.join("not-there-yet"),
+            lab.join("link"),
+            tmp.path().join("run"),
+            run.join("ncalrpc"),
+        ] {
+            let Err(refused) = render(host.clone()) else {
+                panic!("{} was served", host.display());
+            };
+            assert_eq!(refused.name, "src");
+            assert!(refused.reason.contains("vmlab's SMB"), "{refused}");
+        }
+        // Beside the state, and a named volume under `.vmlab`, are served.
+        for host in [lab.join("src"), lab.join(".vmlab/volumes/data")] {
+            if let Err(refused) = render(host) {
+                panic!("{refused}");
+            }
+        }
+        // A state directory that does not exist yet is still protected.
+        assert!(share_state_problem(&lab, &lab.join("new/.vmlab"), "x").is_some());
+        assert!(share_state_problem(&lab.join("src"), &lab.join("new/.vmlab"), "x").is_none());
     }
 
     #[test]

@@ -639,6 +639,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// docs/reviews/smb.md F1: a writable share whose directory holds
+    /// `smb.conf` let the guest add a section of its own, which smbd read
+    /// by itself, and then list any directory of the host user. The start
+    /// refuses such a share. Should it ever start again, the body below is
+    /// the guest's side of it and the listing must fail.
+    #[test]
+    fn a_share_that_holds_the_smb_state_cannot_reach_outside_it() {
+        if which("smbd").is_none() || which("smbclient").is_none() {
+            eprintln!("SKIP: smbd or smbclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let lab_root = tmp.path().join("lab");
+        let smb_dir = lab_root.join(".vmlab/smb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&smb_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: false,
+            shares: vec![ShareDef {
+                name: "lab".to_string(),
+                host_path: lab_root.clone(),
+                readonly: false,
+                smb1: false,
+                allowed_user: user.to_string(),
+            }],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.to_string(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(SmbError::Share(refused)) => {
+                assert!(refused.reason.contains("state"), "{refused}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return;
+            }
+        };
+
+        // The guest's side: one more section, on a directory outside the
+        // share, put over the server's own configuration.
+        let port = server.listen_port();
+        let mut conf = std::fs::read_to_string(server.config.conf_path()).unwrap();
+        conf.push_str(&format!(
+            "[esc]\n    path = {}\n    read only = no\n    valid users = {user}\n    \
+             force user = {user}\n",
+            outside.display()
+        ));
+        let evil = tmp.path().join("new.conf");
+        std::fs::write(&evil, conf).unwrap();
+        let smbclient = |share: &str, command: &str| {
+            let out = Command::new("smbclient")
+                .arg(format!("//127.0.0.1/{share}"))
+                .arg("-p")
+                .arg(port.to_string())
+                .arg("-U")
+                .arg(format!("{user}%{pass}"))
+                .arg("-c")
+                .arg(command)
+                .output()
+                .expect("run smbclient");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        let put = smbclient(
+            "lab",
+            &format!("put {} .vmlab/smb/smb.conf", evil.display()),
+        );
+        // smbd looks at its configuration again by itself; give it a
+        // bounded number of tries to do so.
+        let mut reached = None;
+        for _ in 0..40 {
+            let listing = smbclient("esc", "ls");
+            if listing.contains("secret.txt") {
+                reached = Some(listing);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        drop(server);
+        assert!(
+            reached.is_none(),
+            "the guest rewrote smb.conf and listed a directory outside its share.\n\
+             put:\n{put}\nls:\n{}",
+            reached.unwrap_or_default()
+        );
+    }
+
     #[test]
     fn start_failure_carries_smbds_own_reason() {
         if which("smbd").is_none() {

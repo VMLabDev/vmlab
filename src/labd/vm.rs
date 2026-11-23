@@ -942,6 +942,11 @@ impl VmInstance {
             );
         }
         Ok(VmPaths {
+            apple_smc_osk: if t.resolved.apple_smc {
+                (self.host_config)()?.apple_smc_osk
+            } else {
+                None
+            },
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
@@ -2170,15 +2175,22 @@ impl super::machine::Machine for VmInstance {
     /// QEMU takes a TAP for any NIC, and vmlab-hv takes TAP queues for
     /// virtio-net. vmlab-hv's emulated pc NICs (e1000, PCnet) have one queue
     /// and attach by stream socket only, so they take no TAP.
+    /// A macOS guest's transitional, single-queue virtio-net takes the plain
+    /// stream on vmlab-hv too (describe.rs), so it takes no TAP either.
     fn takes_tap_fds(&self) -> bool {
+        let resolved = &self.template().resolved;
         self.hypervisor() != HypervisorKind::Vmlab
-            || self.template().resolved.nic_model.starts_with("virtio-net")
+            || (resolved.nic_model.starts_with("virtio-net")
+                && !crate::config::hypervisor::is_macos(resolved))
     }
 
     fn net_framing(&self) -> crate::net::framing::FramingMode {
         let resolved = &self.template().resolved;
+        // A macOS guest's virtio-net is transitional and single-queue on
+        // vmlab-hv (describe.rs): its port carries plain frames.
         if self.hypervisor() == HypervisorKind::Vmlab
             && resolved.nic_model.starts_with("virtio-net")
+            && !crate::config::hypervisor::is_macos(resolved)
         {
             crate::net::framing::FramingMode::Vnet {
                 queue_pairs: crate::net::framing::queue_pairs(resolved.cpus),
@@ -2430,9 +2442,9 @@ impl super::machine::Machine for VmInstance {
     /// TCG, a named `cpu_model` (§5.2). The accelerator is decided the way
     /// [`Self::start`] decides it; one `start` would refuse is its to report.
     ///
-    /// And for a macOS guest (§5.2), what the host lacks for it: KVM's
-    /// `ignore_msrs`, without which the guest faults on the Intel MSRs it
-    /// reads, and a pinned TSC, which TCG cannot give it.
+    /// And for a macOS guest on QEMU (§5.2), what the host lacks for it:
+    /// KVM's `ignore_msrs`, without which the guest faults on the Intel MSRs
+    /// it reads, and a pinned TSC, which TCG cannot give it.
     fn launch_warnings(&self) -> Vec<String> {
         let t = self.template();
         let kvm = qemu::kvm_usable(&t.resolved.arch);
@@ -2447,7 +2459,10 @@ impl super::machine::Machine for VmInstance {
         .flatten()
         .collect();
         let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
+        // vmlab-hv answers unknown MSRs itself (its `ignore` policy); only
+        // QEMU needs the host's kvm.ignore_msrs.
         if macos
+            && self.hypervisor() == HypervisorKind::Qemu
             && plan.accel() == qemu::Accel::Kvm
             && let Some(problem) = qemu::host_msrs_problem()
         {

@@ -9,7 +9,58 @@ hardware references. The owner keeps this host at `kvm.ignore_msrs=N`.
 
 ## Current verification state
 
-The live macOS boot test (`macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop`) is opt-in while macOS is parked under https://github.com/VMLabDev/vmlab/issues/200: run it with `VMLAB_HV_MACOS_ACCEPTANCE=1`. A later gate run failed it with the agent handshake timing out while both vCPUs were still in firmware or OpenCore, one of the intermittent boot stalls that issue tracks. The macOS device and unit tests stay in the default gate.
+The live macOS boot test
+(`macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop`) is
+opt-in: run it with `VMLAB_HV_MACOS_ACCEPTANCE=1`. The cause of the
+intermittent stall of https://github.com/VMLabDev/vmlab/issues/200 is known
+(next section) and lies in the template. The test fails by name on a template
+that has it. `x86_64/macos-tahoe@26.7.0` in the store has it until the
+template is rebuilt from vmlab-templates, where `ProvideCustomSlide` is on, so
+the test stays opt-in and takes a fixed disk through `VMLAB_HV_MACOS_DISK`.
+The macOS device and unit tests stay in the default gate.
+
+On 2026-11-23 the test passed 10 times in a row on an overlay of that
+template with `ProvideCustomSlide` on, with the owner's SMC key read from the
+host configuration and host `kvm.ignore_msrs=N`. The agent answered 16.6 to
+29.9 s after resume (20.8, 16.6, 29.9, 18.3, 22.5, 27.9, 23.9, 18.5, 19.1,
+16.7 s), and one whole run took 122 to 297 s. The host ran other builds
+beside the series, with a load average of 8 to 15 on 32 CPUs. The key
+appears in none of the run logs.
+
+## The intermittent boot stall (vmlab#200)
+
+Measured on 2026-11-19 with `macos_boot_stall_census`, which boots fresh
+overlays of `x86_64/macos-tahoe@26.7.0` with a fake SMC key. No owner key
+was used.
+
+- S1: 15 of 460 boots stalled before XNU (3.3%), all the same way. The
+  screen shows the OpenCore menu with `Macintosh HD` chosen and boot.efi's
+  prohibited sign. vCPU 0 loops in boot.efi and the others sit in OVMF.
+  The other boots reach XNU in 7 s and the agent in 17 s.
+- S2: boot.efi draws a random KASLR slide from 0 to 255 and loads the
+  kernel at 1 MiB + slide x 2 MiB. OVMF keeps its firmware volumes in low
+  memory: the stalled guests' RAM holds the PEI volume at 0x830000 and the
+  DXE volume at 0x900000 with length 0xe80000. Slides 0 to 11 land on
+  them, which is 12 of 256 boots (4.7%). Of 115 good boots whose slide was
+  read, none had a slide below 17.
+- S3: The template's OpenCore configuration sets `Booter > Quirks >
+  ProvideCustomSlide` to false (`macos-tahoe/opencore/mkconfig.py` in
+  vmlab-templates). That quirk exists for this case: OpenCore reads the
+  memory map and keeps boot.efi to the slides that fit.
+- S4: With the quirk set to true in an overlay, through the guest agent,
+  0 of 180 boots stalled and the lowest slide was 13.
+
+The stall belongs to the template and the firmware layout, not to vmlab-hv:
+QEMU boots the same OVMF and the same template. The fix is that one value
+in vmlab-templates and a rebuilt template. P1 reads the value from the
+booted guest and fails with that instruction while it is false.
+
+A second, unrelated slowdown shows only when the host has fewer free CPUs
+than the guest has vCPUs. With vmlab-hv confined to one host CPU, 2 of 2
+boots passed XNU and then did not reach the agent in 120 to 300 s. The
+vCPUs sat with interrupts off in the pause loop of an XNU ticket spinlock,
+whose next holder was not running. This is the usual cost of overcommitted
+vCPUs under a fair lock, and no fault was found in vmlab-hv.
 
 P1, P2, P4, and `just ci::check` pass. Eight complete lifecycle runs passed
 with host `kvm.ignore_msrs=N`. The final workspace gate used
