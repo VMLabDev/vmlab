@@ -304,19 +304,14 @@ download_file "$url" "$tmp" || err "download failed: $url
 The release may not exist or may lack a $suffix asset. See https://github.com/$REPO/releases"
 verify_asset "$asset" "$tmp"
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-chmod +x "$tmp"
-mkdir -p "$BIN_DIR"
-[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-mv "$tmp" "$BIN_DIR/vmlab"
-
-printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
-
 # ── Fast-path helper ────────────────────────────────────────────────────────
 # vmlab-fastpath, the only binary the fast path's capabilities go to. The
 # daemons look for it beside vmlab. A release without it costs only the fast
 # path: the userspace fabric carries every lab without it.
+#
+# It is downloaded and verified before vmlab is replaced: the daemons and the
+# helper exchange no version, so a helper this script refuses must not end
+# with the new vmlab beside the helper of the earlier install.
 helper_asset="vmlab-fastpath-${ver}-${suffix}"
 helper_tmp="$verify_dir/$helper_asset"
 HELPER=""
@@ -324,16 +319,42 @@ HELPER_SHA=""
 if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
   verify_asset "$helper_asset" "$helper_tmp"
   HELPER_SHA="$want"
+  HELPER="$BIN_DIR/vmlab-fastpath"
+fi
+
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
+chmod +x "$tmp"
+mkdir -p "$BIN_DIR"
+[ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
+
+# No helper from this release: the helper of an earlier install, which may
+# still hold file capabilities, goes away before the new vmlab arrives. Its
+# daemons would start it otherwise, an older privileged binary than the user
+# was told about. Removing the file removes its capabilities with it.
+if [ -z "$HELPER" ]; then
+  old_helper="$BIN_DIR/vmlab-fastpath"
+  if [ -e "$old_helper" ] || [ -L "$old_helper" ]; then
+    rm -f -- "$old_helper" \
+      || err "this release gave no $helper_asset, and the vmlab-fastpath of the earlier install at $old_helper cannot be removed. Nothing was installed. Remove it and install again."
+    warn "this release gave no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege. Removed the vmlab-fastpath of the earlier install ($old_helper) and its capabilities with it: it is not the helper of this vmlab."
+  else
+    warn "this release has no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege."
+  fi
+fi
+
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
+mv "$tmp" "$BIN_DIR/vmlab"
+
+if [ -n "$HELPER" ]; then
   [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
   # File capabilities go to whoever executes the file, so no other account
   # may execute it. The helper checks the caller too: this mode is the half
   # that holds for a helper older than that check.
   chmod 0700 "$helper_tmp"
-  mv "$helper_tmp" "$BIN_DIR/vmlab-fastpath"
-  HELPER="$BIN_DIR/vmlab-fastpath"
-else
-  warn "this release has no $helper_asset, so the eBPF fast path stays off; the userspace network fabric needs no privilege."
+  mv "$helper_tmp" "$HELPER"
 fi
+
+printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
 
 # ── PATH hint ───────────────────────────────────────────────────────────────
 case ":$PATH:" in
