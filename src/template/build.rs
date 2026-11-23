@@ -2623,10 +2623,7 @@ mod tests {
 
     /// The arguments of a build that is expected to be refused before it
     /// fetches or boots anything: an empty store and no controls.
-    async fn refused_build(
-        d: &crate::config::model::TemplateDef,
-        version: Option<&str>,
-    ) -> String {
+    async fn refused_build(d: &crate::config::model::TemplateDef, version: Option<&str>) -> String {
         let store_dir = tempfile::tempdir().unwrap();
         let store = TemplateStore::new(store_dir.path().to_path_buf());
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
