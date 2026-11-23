@@ -141,6 +141,12 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F3. A guest stops its VMM with one UHCI queue head that nests itself
 
+- Status: fixed by card #664. `queue` no longer calls itself for a nested
+  queue head. It follows the element link in its own loop, so `MAX_ELEMENTS`
+  bounds the nesting together with the TDs of one call. Proof test:
+  `a_queue_head_nested_in_itself_stays_bounded` (`usb/uhci/tests.rs`), which
+  also covers two queue heads nested in each other. Before the fix it ended
+  with a stack overflow (SIGABRT) in a debug build.
 - Where: `usb/uhci.rs:396-409` (`queue`), line 406.
 - Why it is a fault: a queue head whose element link has the Q bit set makes
   `queue` call itself on the linked queue head. The `MAX_ELEMENTS` limit at
