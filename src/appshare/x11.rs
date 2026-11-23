@@ -429,9 +429,8 @@ async fn connect(endpoint: &Endpoint) -> Result<HostStream> {
             {
                 return Ok(HostStream::Unix(stream));
             }
-            Err(refused).with_context(|| {
-                format!("connecting to the host X server at {}", path.display())
-            })
+            Err(refused)
+                .with_context(|| format!("connecting to the host X server at {}", path.display()))
         }
         Endpoint::Tcp { host, port } => {
             let stream = tokio::net::TcpStream::connect((host.as_str(), *port))
