@@ -194,7 +194,7 @@ SRC
       | "Field" | "Type" | "Default" | "Meaning" |
       | "`kind`" | "utf8 (label)" | "required" | "Source kind: `iso`, `qcow2`, `template` or `scratch`; the inline label." |
       | "`path`" | "utf8" | "none" | "Local file path, for `iso` and `qcow2`. Mutually exclusive with `url`." |
-      | "`url`" | "utf8" | "none" | "Remote artefact URL, for `iso` and `qcow2`. Requires `sha256`." |
+      | "`url`" | "utf8" | "none" | "Remote artefact URL, for `iso` and `qcow2`. `https://` only. Requires `sha256`. A download is refused past 32 GiB, or where it would leave less than 1 GiB free in the cache." |
       | "`sha256`" | "utf8" | "none" | "SHA-256 of the remote artefact, as 64 hex digits. Required with `url`." |
       | "`from`" | "utf8" | "none" | "Source template `<arch>/<name>[@<version>][#<variant>]`, for kind `template`: a layered build. No `#` seeds from the default variant, `#base` from the base." |
   }
