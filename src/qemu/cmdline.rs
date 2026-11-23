@@ -611,10 +611,7 @@ pub fn build_args(
             arg(
                 &mut a,
                 "chardev",
-                format!(
-                    "file,id=fwlog,path={},append=on,mux=on",
-                    opt_path(log)
-                ),
+                format!("file,id=fwlog,path={},append=on,mux=on", opt_path(log)),
             );
             if vm.agent_transport == AgentTransport::IsaSerial {
                 arg(&mut a, "device", "isa-serial,chardev=fwlog,index=1".into());
