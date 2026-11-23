@@ -588,6 +588,7 @@ vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]
 | `[CMD]...` | The program and its arguments, after `--`. No guest shell is involved. |
 | `--via <VIA>` | The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session. |
 | `--detach` | Hand the session to a background helper and return at once. |
+| `--clipboard` | Share this desktop's clipboard with the guest, both ways, for an RDP session. Without it the guest neither reads nor sets it. The other protocols ignore it. |
 | `--cwd <DIR>` | Guest working directory for the program. |
 | `--user <LOGIN>` | Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity. |
 | `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
