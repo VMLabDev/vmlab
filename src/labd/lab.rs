@@ -978,13 +978,14 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// Start the SMB server for the lab's shares — VM `share {}` blocks and
+    /// Start the SMB servers for the lab's shares — VM `share {}` blocks and
     /// container volumes that fall back to CIFS (PRD §18: volumes ride
-    /// virtiofs when the host has a virtiofsd, smbd otherwise) — and DNAT
-    /// each relevant segment gateway's port 445 to it (PRD §7.5).
+    /// virtiofs when the host has a virtiofsd, smbd otherwise) — one per
+    /// sharing machine, and DNAT port 445 of that machine's segment gateway
+    /// to its own server (PRD §7.5).
     ///
     /// Which shares those are, which segments need the rule and which host
-    /// port the server takes are all decided first, as a [`share_plan`]. This
+    /// ports the servers take are all decided first, as a [`share_plan`]. This
     /// only carries it out. Best-effort: a failure is logged and the rest of
     /// the lab still works. Idempotent; called from `up` and from any
     /// individual container start.
@@ -1029,65 +1030,76 @@ impl LabRuntime {
             .iter()
             .map(|e| (e.machine.clone(), e.gateway, e.shares.clone()))
             .collect();
-        // Work down the plan's free ports: one can be taken between the
-        // probe and the bind, and smbd can fail for reasons that have nothing
-        // to do with the port at all.
-        let mut started = None;
-        let mut last_err = String::new();
-        for port in &smb.host_ports {
-            let mut candidate =
-                crate::smb::LabSmb::plan(&self.name, &self.lab_local, *port, &sharing);
-            let config = candidate.build_config();
-            match candidate.spawn(config) {
-                Ok(p) => {
-                    started = Some((candidate, p));
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("smbd on port {port} failed: {e}");
-                    last_err = e.to_string();
-                }
-            }
-        }
-        let Some((labsmb, port)) = started else {
-            tracing::warn!("SMB server failed to start: {last_err}");
+        // One smbd per sharing machine, each with a password of its own
+        // (§7.5). The servers work down the plan's free ports: one can be
+        // taken between the probe and the bind.
+        let mut labsmb = crate::smb::LabSmb::plan(&self.lab_local, &sharing);
+        if let Err(e) = labsmb.start(&smb.host_ports) {
+            tracing::warn!("SMB server failed to start: {e}");
             output(format!(
-                "WARNING: SMB server failed to start — shares will not mount: {last_err}\n"
+                "WARNING: SMB server failed to start — shares will not mount: {e}\n"
             ));
-            self.events.emit("smb.failed", json!({"error": last_err}));
+            self.events
+                .emit("smb.failed", json!({"error": e.to_string()}));
             return;
-        };
-        tracing::info!("SMB server for lab {} on 127.0.0.1:{port}", self.name);
-        output(format!(
-            "smb: serving shares on 127.0.0.1:{port} (guest mounts \\\\<gateway>\\<share>; credentials in .vmlab/smb/creds)\n"
-        ));
-        self.events.emit("smb.started", json!({"port": port}));
+        }
+        for (machine, port) in labsmb.listen_ports() {
+            tracing::info!(
+                "SMB server for {machine} of lab {} on 127.0.0.1:{port}",
+                self.name
+            );
+            output(format!(
+                "smb: serving the shares of {machine} on 127.0.0.1:{port} (guest mounts \\\\<gateway>\\<share>; credentials in {})\n",
+                crate::smb::LabSmb::creds_hint()
+            ));
+            self.events
+                .emit("smb.started", json!({"machine": machine, "port": port}));
+        }
 
-        // DNAT gateway:445 → 127.0.0.1:smbd on each sharing segment, so a
-        // guest mounting \\<gateway>\<share> reaches the local smbd. A
-        // segment without `nat` gets no egress, but still gets this.
+        // DNAT gateway:445 → 127.0.0.1:<its smbd> for each sharing machine's
+        // NIC, so a guest mounting \\<gateway>\<share> reaches its own
+        // server and no other machine's. A segment without `nat` gets no
+        // egress, but still gets this.
         {
             let net = self.network.lock().await;
-            for seg_name in &smb.gateway_segments {
-                if let Some(seg) = net.segments.get(seg_name)
+            for export in &smb.exports {
+                let Some(port) = labsmb.listen_port(&export.machine) else {
+                    continue;
+                };
+                // The plan exports at the first NIC's segment gateway.
+                let mac = self
+                    .machine(&export.machine)
+                    .ok()
+                    .and_then(|m| m.macs().first().copied());
+                let Some(mac) = mac else {
+                    tracing::warn!(
+                        "smb: machine {} has no NIC address to serve its shares to",
+                        export.machine
+                    );
+                    continue;
+                };
+                if let Some(seg) = net.segments.get(&export.segment)
                     && let Some(services) = &seg.services
                     && let Ok(mut rs) = services.rules.lock()
                 {
                     use crate::config::model::{HostPort, RedirectRule};
-                    rs.add_redirect(RedirectRule {
-                        from: HostPort {
-                            ip: seg.service_ip,
-                            port: Some(445),
+                    rs.add_redirect_from(
+                        mac,
+                        RedirectRule {
+                            from: HostPort {
+                                ip: seg.service_ip,
+                                port: Some(445),
+                            },
+                            to: HostPort {
+                                ip: std::net::Ipv4Addr::LOCALHOST,
+                                port: Some(port),
+                            },
+                            proto: None,
+                            span: (0, 0),
                         },
-                        to: HostPort {
-                            ip: std::net::Ipv4Addr::LOCALHOST,
-                            port: Some(labsmb.listen_port()),
-                        },
-                        proto: None,
-                        span: (0, 0),
-                    });
+                    );
                     drop(rs);
-                    services.expose_host_service(labsmb.listen_port());
+                    services.expose_host_service(port);
                 }
             }
         }

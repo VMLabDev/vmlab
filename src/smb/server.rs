@@ -57,6 +57,8 @@ pub enum SmbError {
     },
     #[error("creating passdb user `{user}` failed: {detail}")]
     CreateUser { user: String, detail: String },
+    #[error("no free port is left for the SMB server of \"{machine}\"")]
+    NoPort { machine: String },
     #[error("spawning smbd failed: {0}")]
     Spawn(std::io::Error),
     #[error("smbd exited immediately (code {code:?}): {reason}; check log {log}")]
@@ -71,7 +73,7 @@ pub enum SmbError {
 
 type Result<T> = std::result::Result<T, SmbError>;
 
-/// A running (or recently spawned) `smbd` instance for one lab.
+/// A running (or recently spawned) `smbd` instance, serving one machine.
 #[derive(Debug)]
 pub struct SmbServer {
     child: Option<Child>,
@@ -115,10 +117,25 @@ impl SmbServer {
             }
         })?;
 
+        // The settings NT1 sessions alone get, where a share asks for smb1.
+        // Without one the file is not included; a file left by an earlier
+        // start is removed all the same.
+        let nt1_path = config.nt1_conf_path();
+        match config.render_nt1_conf() {
+            Some(nt1) => std::fs::write(&nt1_path, nt1).map_err(|source| SmbError::WriteConf {
+                path: nt1_path.clone(),
+                source,
+            })?,
+            None => {
+                let _ = std::fs::remove_file(&nt1_path);
+            }
+        }
+
         // 3. Create passdb users (unprivileged: tdbsam under lab_dir).
         for (user, pass) in &creds_by_user {
             create_user(&conf_path, user, pass)?;
         }
+        forbid_password_change(&conf_path);
 
         // 4. Spawn smbd foregrounded.
         //    -F                 : run in the foreground (we own the child)
@@ -392,6 +409,33 @@ fn create_user(conf_path: &PathBuf, user: &str, pass: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Keep the account from changing its own password over SMB1's
+/// `SamOEMChangePassword`, which is no RPC pipe and so is not covered by
+/// `rpc start on demand helpers = no`: a minimum password age of 136 years.
+/// `pdbedit -a` sets the password at each start whatever the age. Best
+/// effort: a server whose policy could not be written still serves.
+fn forbid_password_change(conf_path: &PathBuf) {
+    let done = Command::new("pdbedit")
+        .arg("-s")
+        .arg(conf_path)
+        .arg("-P")
+        .arg("minimum password age")
+        .arg("-C")
+        .arg(u32::MAX.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match done {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(
+            "smb: could not set the minimum password age: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("smb: could not set the minimum password age: {e}"),
+    }
 }
 
 /// Whether `user` exists in the system passwd database (`getent passwd`,
@@ -737,6 +781,146 @@ mod tests {
         );
     }
 
+    /// A lab with one `smb1` share (`old`) and one modern share (`new`), both
+    /// writable, on a real smbd; `None` (with the reason printed) where the
+    /// host cannot run it. The closure runs `smbclient` against a share with
+    /// extra arguments and returns everything it printed.
+    #[allow(clippy::type_complexity)]
+    fn smb1_lab(
+        tmp: &std::path::Path,
+    ) -> Option<(SmbServer, impl Fn(&str, &[&str], &str) -> String + use<>)> {
+        if which("smbd").is_none() || which("smbclient").is_none() {
+            eprintln!("SKIP: smbd or smbclient not found");
+            return None;
+        }
+        if !check_nt1_supported() {
+            eprintln!("SKIP: this smbd has no SMB1 server");
+            return None;
+        }
+        let smb_dir = tmp.join("lab/.vmlab/smb");
+        let old_dir = tmp.join("old");
+        let new_dir = tmp.join("new");
+        for dir in [&smb_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(new_dir.join("hello.txt"), b"hi").unwrap();
+        std::fs::write(old_dir.join("readme.txt"), b"hi").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let share = |name: &str, dir: &PathBuf, smb1| ShareDef {
+            name: name.to_string(),
+            host_path: dir.clone(),
+            readonly: false,
+            smb1,
+            allowed_user: user.clone(),
+        };
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: true,
+            shares: vec![share("old", &old_dir, true), share("new", &new_dir, false)],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.clone(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return None;
+            }
+        };
+        let port = server.listen_port();
+        // `-s /dev/null`: the host's own smb.conf must not decide what the
+        // client offers. The client is allowed down to NT1; `-m` picks the
+        // newest dialect it offers.
+        let smbclient = move |share: &str, args: &[&str], command: &str| {
+            let out = Command::new("smbclient")
+                .arg(format!("//127.0.0.1/{share}"))
+                .args(["-s", "/dev/null", "--option=client min protocol=NT1"])
+                .args(args)
+                .arg("-p")
+                .arg(port.to_string())
+                .arg("-U")
+                .arg(format!("{user}%{pass}"))
+                .arg("-c")
+                .arg(command)
+                .output()
+                .expect("run smbclient");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        Some((server, smbclient))
+    }
+
+    /// docs/reviews/smb.md F4, point 2: Samba's SMB1 server offers the CIFS
+    /// Unix extensions unless told not to, and a client that negotiates them
+    /// creates a symlink with any target in a writable share. Every host
+    /// program that reads the shared directory then follows it.
+    #[test]
+    fn an_smb1_client_cannot_create_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((server, smbclient)) = smb1_lab(tmp.path()) else {
+            return;
+        };
+        // The share works over SMB1 at all, or the test proves nothing.
+        let listing = smbclient("old", &["-m", "NT1"], "ls");
+        let said = smbclient("old", &["-m", "NT1"], "posix; symlink /etc/passwd planted");
+        drop(server);
+        assert!(listing.contains("readme.txt"), "SMB1 ls failed:\n{listing}");
+        let planted = tmp.path().join("old/planted");
+        assert!(
+            planted.symlink_metadata().is_err(),
+            "an SMB1 client planted {} -> {:?}.\nsmbclient:\n{said}",
+            planted.display(),
+            std::fs::read_link(&planted).ok()
+        );
+    }
+
+    /// docs/reviews/smb.md F4, point 1: `smb1 = true` is a property of the
+    /// share. The share beside it is not reachable over SMB1, and no session
+    /// newer than SMB1 logs on with NTLMv1.
+    #[test]
+    fn an_smb1_share_does_not_relax_the_share_beside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((server, smbclient)) = smb1_lab(tmp.path()) else {
+            return;
+        };
+        let ntlmv1 = "--option=client ntlmv2 auth=no";
+        let old_nt1 = smbclient("old", &["-m", "NT1", ntlmv1], "ls");
+        let new_nt1 = smbclient("new", &["-m", "NT1"], "ls");
+        let new_smb3 = smbclient("new", &["-m", "SMB3"], "ls");
+        let new_smb2 = smbclient(
+            "new",
+            &["-m", "SMB2", "--option=client max protocol=SMB2_02"],
+            "ls",
+        );
+        let new_smb3_ntlmv1 = smbclient("new", &["-m", "SMB3", ntlmv1], "ls");
+        let old_smb3_ntlmv1 = smbclient("old", &["-m", "SMB3", ntlmv1], "ls");
+        drop(server);
+        // What `smb1 = true` asks for still works: SMB1 with NTLMv1.
+        assert!(
+            old_nt1.contains("readme.txt"),
+            "the smb1 share refused SMB1 with NTLMv1:\n{old_nt1}"
+        );
+        // The modern share serves every modern dialect.
+        assert!(new_smb3.contains("hello.txt"), "SMB3:\n{new_smb3}");
+        assert!(new_smb2.contains("hello.txt"), "SMB2_02:\n{new_smb2}");
+        // And nothing else.
+        assert!(
+            !new_nt1.contains("hello.txt"),
+            "the modern share was mapped over SMB1:\n{new_nt1}"
+        );
+        for (share, said) in [("new", &new_smb3_ntlmv1), ("old", &old_smb3_ntlmv1)] {
+            assert!(
+                !said.contains(".txt"),
+                "an SMB3 session logged on to \"{share}\" with NTLMv1:\n{said}"
+            );
+        }
+    }
+
     #[test]
     fn start_failure_carries_smbds_own_reason() {
         if which("smbd").is_none() {
@@ -783,6 +967,91 @@ mod tests {
             Some("messaging_dgm_ref failed: File name too long")
         );
         assert_eq!(last_reason("smbd version 4.24.6 started.\n"), None);
+    }
+
+    /// A guest logs in with an ordinary Samba account, and Samba lets an
+    /// account set its password over the SAMR pipe: by the change call, and
+    /// by the administrator's set call too, because an unprivileged smbd
+    /// takes every session for root. After either, the password vmlab hands
+    /// out must still open the share (docs/reviews/smb.md F5).
+    #[test]
+    fn a_guest_cannot_change_the_lab_password() {
+        if which("smbd").is_none() || which("smbclient").is_none() || which("rpcclient").is_none() {
+            eprintln!("SKIP: smbd, smbclient or rpcclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let smb_dir = tmp.path().join("lab/.vmlab/smb");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("hello.txt"), b"hi").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: false,
+            shares: vec![ShareDef {
+                name: "ro".to_string(),
+                host_path: shared.clone(),
+                readonly: true,
+                smb1: false,
+                allowed_user: user.to_string(),
+            }],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.to_string(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return;
+            }
+        };
+        let port = server.listen_port();
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("run {program}: {e}"));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        let port_arg = port.to_string();
+        let login = format!("{user}%{pass}");
+        let ls = || {
+            run(
+                "smbclient",
+                &["//127.0.0.1/ro", "-p", &port_arg, "-U", &login, "-c", "ls"],
+            )
+        };
+        let before = ls();
+        let rpc = |command: String| {
+            run(
+                "rpcclient",
+                &["-p", &port_arg, "-U", &login, "127.0.0.1", "-c", &command],
+            )
+        };
+        let changed = rpc(format!("chgpasswd3 {user} {pass} NewPass456def"));
+        let after_change = ls();
+        let set = rpc(format!("setuserinfo2 {user} 23 OtherPass789ghi"));
+        let after_set = ls();
+        drop(server);
+        assert!(
+            before.contains("hello.txt"),
+            "the share lists at all:\n{before}"
+        );
+        assert!(
+            after_change.contains("hello.txt"),
+            "a guest changed the password of the account.\nchgpasswd3:\n{changed}\nls:\n{after_change}"
+        );
+        assert!(
+            after_set.contains("hello.txt"),
+            "a guest set the password of the account.\nsetuserinfo2:\n{set}\nls:\n{after_set}"
+        );
     }
 
     fn which(bin: &str) -> Option<PathBuf> {

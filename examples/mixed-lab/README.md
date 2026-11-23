@@ -32,5 +32,5 @@ user opening `S:` sees "user name or password is incorrect" until their
 session has the lab credential — double-click **vmlab-shares** on the
 guest's desktop (vmlab drops it there) once per user; it stores the
 credential and `S:` opens normally from then on. Credentials persist in
-`.vmlab/smb/creds` across `vmlab up` cycles; `vmlab destroy` rotates
+`.vmlab/smb/machines/<machine>/creds` across `vmlab up` cycles; `vmlab destroy` rotates
 them (re-run the desktop script after a destroy).
