@@ -4207,6 +4207,30 @@ lab "l" {
     }
 
     #[test]
+    fn names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "Web" { template = "x86_64/t" }
+  container "web" { image = "nginx:1.27" }
+}"#,
+            "duplicate name \"web\"",
+        );
+    }
+
+    #[test]
+    fn segment_names_that_differ_only_in_case_are_duplicates() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "Web" {}
+  segment "web" {}
+}"#,
+            "duplicate segment \"web\"",
+        );
+    }
+
+    #[test]
     fn container_cross_kind_cycle() {
         assert_err(
             r#"import <vmlab.wcl>
