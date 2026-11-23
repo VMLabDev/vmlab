@@ -706,7 +706,8 @@ fn events_do_not_pile_frames_while_nobody_ticks() {
     let mut core = Core::new(settings(30, size, None));
     core.connected(secs(0.0), 16, 16);
     for i in 0..=18_000u32 {
-        let colour = if i % 2 == 0 { RED } else { GREEN };
+        // A new colour in every interval, so no two frames are equal.
+        let colour = [i as u8, (i >> 8) as u8, 7];
         core.rect(
             Duration::from_nanos(u64::from(i) * 1_000_000_000 / 30),
             0,
