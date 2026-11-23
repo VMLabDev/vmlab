@@ -142,6 +142,24 @@ Expected: the build is unaffected. Observed (by reading): it fails with
 `tampered`, which shows the edit reached the release build; an edit that
 compiles would pass silently.
 
+Fixed in card #634. `build/run.sh` takes the prefix of its named volumes from
+`VMLAB_BUILD_VOLUMES` (default `vmlab-build`, so other builds are as before).
+`scripts/release-local.sh` sets it to `vmlab-release-<16 random hex digits>`
+for every container of the release (the display driver build and
+`build/dist.sh`), refuses to start when a volume of that name exists, and
+removes the volumes when it ends. A release so starts from an empty cargo
+home, where cargo downloads each crate and checks it against `Cargo.lock`,
+and from empty target dirs. Every release build is now a cold build. Proof:
+`test_a_release_build_takes_nothing_from_the_volumes_of_another_build` in
+`scripts/test_release_workflow.py`, with a stub `docker` that keeps each
+volume as a directory and writes a file into every volume a container mounts.
+Before the fix the release mounted `vmlab-build-cargo` and the target volumes
+of the earlier build at the same path, each with that file in it. The docker
+test above was not run: the merge bar has no docker. Not covered: the caches
+inside the checkout (`guest/.cache/`, `.ci-cache/`, `guest/dist/`), which
+belong to the release checkout, and code that runs outside a container as the
+build account, which can reach docker itself.
+
 ### F4. The documented vmlab-hv install checks the bundle against an unsigned sidecar (security)
 
 `docs/manual/pages/getting-started/install.wcl:89-98` tells the user to

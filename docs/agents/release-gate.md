@@ -102,7 +102,11 @@ exists. It uploads nothing. Start it like every heavy run on helios.
 The command rebuilds the `vmlab-build` image first, so the image has the
 toolchains that the commit pins. `--image-as-is` skips that for a test build.
 A change of `scripts/guest-toolchains.sh` rebuilds every layer of the image
-(about 10 GiB). A cold build of all assets took 14 minutes on helios and
+(about 10 GiB). Every release build is a cold build: the command gives its
+containers new docker volumes (`vmlab-release-<random>-*`, the cargo home and
+the target dirs) and removes them when it ends, so no earlier build on the
+host can leave sources or outputs for a release. A cold build of all assets
+took 14 minutes on helios and
 about 3 GiB of docker volumes, beside the caches in the checkout. Do not
 start it with less than 15 GiB free: the disk is shared with the e2e runs.
 
