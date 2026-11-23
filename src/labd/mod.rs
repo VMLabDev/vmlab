@@ -1281,6 +1281,9 @@ impl Handler<LabRequest> for LabdHandler {
             .unwrap_or_default()),
             LabRequest::Shutdown {} => {
                 tracing::info!("lab daemon shutdown requested");
+                // Read before the teardown begins: how long the caller must
+                // give it before it takes the daemon for hung.
+                let stop_within = lab.stop_wait().await;
                 let lab = lab.clone();
                 let tasks = self.tasks.clone();
                 // Spawned so this command's response reaches the caller before
@@ -1291,7 +1294,7 @@ impl Handler<LabRequest> for LabdHandler {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     std::process::exit(0);
                 });
-                Ok(json!(true))
+                Ok(json!({ "stop_within_secs": stop_within.as_secs() }))
             }
         }
     }

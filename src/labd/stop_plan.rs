@@ -125,6 +125,24 @@ pub fn plan_stop(facts: &StopFacts) -> Vec<Rung> {
     rungs
 }
 
+/// The longest a stop that climbs `rungs` can take: every wait of every
+/// rung, as if each rung ran out its time. The kill rung waits on nothing.
+/// What a caller waiting on a whole stop from outside the ladder needs, so its
+/// deadline cannot fall inside the ladder (the release of a lab daemon).
+pub fn plan_wait(rungs: &[Rung]) -> Duration {
+    rungs
+        .iter()
+        .map(|rung| match *rung {
+            Rung::Agent {
+                answer_within,
+                exit_within,
+            } => answer_within + exit_within,
+            Rung::Acpi { exit_within } | Rung::Quit { exit_within } => exit_within,
+            Rung::Kill => Duration::ZERO,
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
