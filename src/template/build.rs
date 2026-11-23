@@ -1051,6 +1051,10 @@ pub fn sweep_build_workdirs() -> usize {
 }
 
 fn sweep_workdirs_in(dir: &Path) -> usize {
+    sweep_workdirs_with(dir, |_| {})
+}
+
+pub(crate) fn sweep_workdirs_with(dir: &Path, _reap: impl Fn(&Path)) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };

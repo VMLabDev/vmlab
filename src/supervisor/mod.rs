@@ -1041,6 +1041,45 @@ impl Handler<SupRequest> for SupervisorHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_start_reaps_the_processes_of_a_leftover_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("x86_64-base-1.0");
+        std::fs::create_dir(&work).unwrap();
+        let lab = "build-x86_64-base";
+        let runtime = crate::paths::lab_runtime_dir(lab);
+        let table = [
+            (
+                42,
+                format!(
+                    "vmlab-hv\0--machine\0{}/vm/build/machine.json\0",
+                    runtime.display()
+                ),
+            ),
+            (
+                43,
+                format!(
+                    "swtpm\0socket\0--ctrl\0type=unixio,path={}/vm/build/swtpm.sock\0",
+                    runtime.display()
+                ),
+            ),
+            (44, format!("tail\0{}/vm/build/machine.json\0", runtime.display())),
+        ];
+        let reaped = std::cell::RefCell::new(Vec::new());
+        let swept = crate::template::build::sweep_workdirs_with(dir.path(), |path| {
+            assert_eq!(path, work);
+            assert!(path.is_dir());
+            reaped.borrow_mut().extend(
+                table.iter().filter_map(|(pid, cmdline)| {
+                    crate::qemu::process::cmdline_belongs_to(cmdline.as_bytes(), lab)
+                        .then_some(*pid)
+                }),
+            );
+        });
+        assert_eq!(swept, 1);
+        assert_eq!(reaped.into_inner(), [42, 43]);
+        assert!(!work.exists());
+    }
     use super::{daemon_running, process_running, process_start_time};
 
     /// A release that kills a lab daemon before one guest's graceful stop
