@@ -716,12 +716,8 @@ mod tests {
         ));
         let vm = &file.lab.vms[0];
         let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
-        let picked = HypervisorDefaults::default().select(
-            MachineCfg::Vm(vm),
-            &kvm_host(),
-            Some(&hw),
-            None,
-        );
+        let picked =
+            HypervisorDefaults::default().select(MachineCfg::Vm(vm), &kvm_host(), Some(&hw), None);
         assert_eq!(picked.kind, HypervisorKind::Vmlab, "{setting}");
         assert_eq!(picked.fallback_reason, None, "{setting}");
         assert!(
