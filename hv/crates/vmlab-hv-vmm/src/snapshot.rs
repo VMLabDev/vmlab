@@ -1257,3 +1257,37 @@ pub(crate) fn restore_kernel_state(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_msrs_rejects_a_huge_entry_count() {
+        // Card #612: the count sized a `Vec` before any entry was read.
+        let error = decode_msrs(&u32::MAX.to_le_bytes()).unwrap_err();
+        assert!(
+            error.to_string().contains("4294967295 entries in 0 bytes"),
+            "{error}"
+        );
+        // A count that disagrees with the section's length either way.
+        let mut short = 2u32.to_le_bytes().to_vec();
+        short.extend_from_slice(&[0; 12]);
+        assert!(decode_msrs(&short).is_err());
+        let mut long = 1u32.to_le_bytes().to_vec();
+        long.extend_from_slice(&[0; 13]);
+        assert!(decode_msrs(&long).is_err());
+    }
+
+    #[test]
+    fn decode_msrs_reads_what_encode_wrote() {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (index, data) in [(0x10u32, 7u64), (0xc000_0080, 0x501)] {
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes.extend_from_slice(&data.to_le_bytes());
+        }
+        let entries = decode_msrs(&bytes).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[1].index, entries[1].data), (0xc000_0080, 0x501));
+    }
+}
