@@ -572,10 +572,7 @@ mod tests {
         let log = config.lab_dir.join("log.smbd");
         std::fs::write(&log, "PANIC: Could not bind to any sockets\n").unwrap();
         let startup_logs = startup_logs(&config);
-        let output = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&log)
-            .unwrap();
+        let output = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
         let reason = "smbd_open_one_socket: open_socket_in_protocol failed: Address already in use";
         let mut child = Command::new("sh")
             .args([
