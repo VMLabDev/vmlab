@@ -30,6 +30,8 @@ pub struct FakeCalls {
     pub set_interfaces: Vec<(u8, u8)>,
     pub set_configurations: Vec<u8>,
     pub cleared_halts: Vec<u8>,
+    /// Synchronous control transfers (`UsbFs::control`).
+    pub controls: usize,
 }
 
 /// Device descriptor blob the fake serves from the usbdevfs file: one
@@ -83,6 +85,8 @@ struct Shared {
     completed: VecDeque<usize>,
     lost: bool,
     claim_fails: Vec<u8>,
+    /// The descriptor blob served instead of [`FAKE_DESCRIPTORS`].
+    descriptors: Option<Vec<u8>>,
 }
 
 /// The fake usbdevfs. Cloning shares the same fake device, so a test can
@@ -118,6 +122,22 @@ impl FakeUsbFs {
                 next_tag: std::sync::atomic::AtomicUsize::new(1),
             }),
         }
+    }
+
+    /// A fake whose device has two configurations: [`FAKE_DESCRIPTORS`]
+    /// with its configuration repeated under bConfigurationValue 2. Such a
+    /// device cannot be asked for its active configuration from the
+    /// descriptors alone.
+    pub fn with_two_configurations() -> Self {
+        const DEVICE_LENGTH: usize = 18;
+        let mut descriptors = FAKE_DESCRIPTORS.to_vec();
+        descriptors[DEVICE_LENGTH - 1] = 2; // bNumConfigurations
+        let mut second = FAKE_DESCRIPTORS[DEVICE_LENGTH..].to_vec();
+        second[5] = 2; // bConfigurationValue
+        descriptors.extend(second);
+        let fake = Self::new();
+        fake.shared().lock().descriptors = Some(descriptors);
+        fake
     }
 
     fn shared(&self) -> &Mutex<Shared> {
@@ -238,7 +258,12 @@ impl Default for FakeUsbFs {
 
 impl UsbFs for FakeUsbFs {
     fn read_descriptors(&self) -> io::Result<Vec<u8>> {
-        Ok(FAKE_DESCRIPTORS.to_vec())
+        Ok(self
+            .shared()
+            .lock()
+            .descriptors
+            .clone()
+            .unwrap_or_else(|| FAKE_DESCRIPTORS.to_vec()))
     }
 
     fn submit_urb(&self, urb: *mut sys::usbdevfs_urb) -> io::Result<()> {
@@ -312,7 +337,8 @@ impl UsbFs for FakeUsbFs {
     }
 
     fn control(&self, transfer: &sys::usbdevfs_ctrltransfer) -> io::Result<c_int> {
-        let shared = self.shared().lock();
+        let mut shared = self.shared().lock();
+        shared.calls.controls += 1;
         if shared.lost {
             return Err(Self::errno(libc::ENODEV));
         }

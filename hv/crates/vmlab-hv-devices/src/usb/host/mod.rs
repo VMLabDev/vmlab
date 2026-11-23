@@ -773,6 +773,33 @@ mod tests {
         assert!(fake.submitted_payloads().is_empty());
     }
 
+    /// Review usb.md F4: `UsbFs::control` is a synchronous transfer that
+    /// holds its caller for up to its timeout, and the caller of a guest
+    /// request holds the xHCI lock. A device with two configurations cannot
+    /// answer "which is active" from its descriptors, so the backend must
+    /// know it without asking the device.
+    #[test]
+    fn a_guest_request_makes_no_synchronous_control_transfer() {
+        let fake = FakeUsbFs::with_two_configurations();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        // Opening may ask: it runs before the device is on a controller.
+        let opened = fake.calls().controls;
+        let descriptor = host.control(get_config(0), &[]);
+        assert!(matches!(descriptor, UsbTransfer::Ack(_)), "{descriptor:?}");
+        assert_eq!(
+            fake.calls().controls - opened,
+            0,
+            "GET_DESCRIPTOR(Configuration) made a synchronous control transfer"
+        );
+        let switched = host.control(set_interface(0, 1), &[]);
+        assert_eq!(switched, UsbTransfer::Ack(Vec::new()));
+        assert_eq!(
+            fake.calls().controls - opened,
+            0,
+            "SET_INTERFACE made a synchronous control transfer"
+        );
+    }
+
     #[test]
     fn set_config_unconfigures_reconfigures_and_reclaims() {
         let (mut host, fake) = device();
