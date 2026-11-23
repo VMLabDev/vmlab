@@ -424,6 +424,47 @@ impl std::fmt::Display for Halted {
     }
 }
 
+/// Why a snapshot operation refuses a dev machine that **runs with no
+/// syncer** (docs/reviews/dev-machines.md F3).
+///
+/// No syncer is not the same as a machine that is down. A stopped guest
+/// writes nothing, so its ledger is the last word. A running one may hold
+/// work nothing has looked at, and with no syncer there is no flush to ask.
+/// **Not knowing is a refusal**, as it is for a flush that could not finish.
+/// An `up` whose provisioning failed leaves a machine like this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoSyncer {
+    pub machine: String,
+    /// A restore names its escape flag. A capture has none.
+    pub restore: bool,
+}
+
+impl std::fmt::Display for NoSyncer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\"{}\" is running but its workspace syncer is not running, so nothing can say what \
+             work the guest holds that the canonical copy has never seen",
+            self.machine,
+        )?;
+        if self.restore {
+            write!(
+                f,
+                ", and restoring would discard it. `vmlab up {}` starts the syncer. Pass `{}` to \
+                 restore anyway and re-converge the guest from the host. {}",
+                self.machine, DISCARD_FLAG, NOT_A_BACKUP,
+            )
+        } else {
+            write!(
+                f,
+                ", and this snapshot would capture a tree the host has never agreed with. There \
+                 is no flag for this. `vmlab up {}` starts the syncer. {}",
+                self.machine, NOT_A_BACKUP,
+            )
+        }
+    }
+}
+
 /// The flag that allows a restore or a `destroy` to discard unsynced guest
 /// work.
 pub const DISCARD_FLAG: &str = "--discard-guest-changes";
