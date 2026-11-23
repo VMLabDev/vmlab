@@ -46,7 +46,7 @@ test does not reproduce is wrong and should be dropped.
 |------|----------|-------------------|
 | F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691) |
 | F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
-| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk |
+| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697) |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
 | F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process |
 | F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory |
@@ -138,6 +138,11 @@ name: the refusal comes at the start of the build.
   `extract_source`.
 
 ### F3. The seal accepts a guest that was cut off (wrong result)
+
+**Fixed by card #697.** The base, variant, and verification boot check
+which stop rung ended the VM before sealing. Only profiles with
+`seal_allow_quit = true` can seal after emulator quit. A kill fails the
+seal for every profile.
 
 - Where: `src/template/build.rs:1299-1305` (base), `:575-583` (variant),
   `:1371-1379` (verification boot). `src/labd/vm.rs:1745-1827`

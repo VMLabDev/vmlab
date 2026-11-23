@@ -71,6 +71,8 @@ pub struct Run {
     /// accepts it); nothing happens, which is what forces a stop ladder onto
     /// its next rung.
     pub ignores_powerdown: bool,
+    /// The agent acknowledges shutdown but the guest keeps running.
+    pub ignores_agent_shutdown: bool,
     /// The emulator itself is wedged and ignores a QMP `quit`, which is what
     /// leaves the stop ladder nothing but the kill.
     pub ignores_quit: bool,
@@ -367,6 +369,7 @@ impl Hypervisor for FakeHypervisor {
         let machine = Arc::new(FakeProc {
             journal: self.journal.clone(),
             ignores_detach: run.ignores_detach,
+            ignores_agent_shutdown: run.ignores_agent_shutdown,
             ..FakeProc::new(spec.label.clone())
         });
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
@@ -478,6 +481,7 @@ pub(crate) struct FakeProc {
     journal: Journal,
     /// A `detach` is written down and then never answered.
     ignores_detach: bool,
+    ignores_agent_shutdown: bool,
 }
 
 /// Which agent process answers, and what it calls itself.
@@ -504,6 +508,7 @@ impl FakeProc {
             plugged: Default::default(),
             journal: Journal::default(),
             ignores_detach: false,
+            ignores_agent_shutdown: false,
         }
     }
 
@@ -1095,7 +1100,12 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                     }
                     AgentMsg::Exited { id, code: 0 }
                 }
-                HostMsg::Shutdown { mode } => AgentMsg::ShuttingDown { mode },
+                HostMsg::Shutdown { mode } => {
+                    if machine.ignores_agent_shutdown {
+                        machine.note("agent shutdown ignored".into());
+                    }
+                    AgentMsg::ShuttingDown { mode }
+                }
                 // Advertised so a caller gets as far as asking, refused so
                 // the asking fails the way a real agent's refusal does.
                 HostMsg::OpenFileOps { id, .. } => AgentMsg::Error {
@@ -1111,7 +1121,7 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
             if tx.write_all(&frame).await.is_err() {
                 return;
             }
-            if shutting_down {
+            if shutting_down && !machine.ignores_agent_shutdown {
                 machine.guest_powers_off();
                 return;
             }
