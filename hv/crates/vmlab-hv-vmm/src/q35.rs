@@ -307,6 +307,27 @@ impl BusDevice for Pam {
     }
 }
 
+/// Put the firmware memory below 1 MiB into guest memory: the PAM shadow, and
+/// the legacy SMRAM backing unless SMRAM is isolated.
+pub(crate) fn attach_firmware_memory(
+    ram: &mut crate::memory::GuestRam,
+    pam: &Pam,
+    secure_smm: bool,
+) -> Result<(), VmmError> {
+    ram.mem = ram
+        .mem
+        .insert_region(pam.shadow_region())
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
+    if !secure_smm {
+        ram.mem = ram
+            .mem
+            .insert_region(pam.smram_region())
+            .map_err(|e| VmmError::Memory(e.to_string()))?;
+    }
+    ram.device_mem = ram.mem.clone();
+    Ok(())
+}
+
 struct SmmWiring {
     control: Arc<Mutex<crate::smm::SmramControl>>,
     memory: Arc<Mutex<crate::smm::Smram>>,
@@ -677,6 +698,170 @@ mod tests {
     fn mch() -> Mch {
         let pam = Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap();
         Mch::new(Arc::new(Mutex::new(pam)))
+    }
+
+    /// A `pc` machine's memory and host bridge as the builder wires them,
+    /// with the ISA DMA controller on the device view. No KVM.
+    fn pc_with_isa_dma() -> (
+        crate::memory::GuestRam,
+        Mch,
+        vmlab_hv_devices::chipset::isa::IsaDevices,
+    ) {
+        let layout = crate::layout::MemLayout::pc(16).unwrap();
+        let mut ram = crate::memory::GuestRam::anonymous(layout.clone()).unwrap();
+        let pam = Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap();
+        attach_firmware_memory(&mut ram, &pam, false).unwrap();
+        let mch = Mch::i440fx(Arc::new(Mutex::new(pam)), layout.ram);
+        let mut isa = vmlab_hv_devices::chipset::isa::IsaDevices::new();
+        isa.set_memory(ram.device_mem.clone());
+        (ram, mch, isa)
+    }
+
+    /// Program DMA channel 2 for a device-to-memory transfer of `count`
+    /// bytes at `page:address`, as a floppy READ does, and move `data`.
+    fn floppy_dma_read(
+        isa: &mut vmlab_hv_devices::chipset::isa::IsaDevices,
+        page: u8,
+        address: u16,
+        data: &mut [u8],
+    ) {
+        let count = (data.len() - 1) as u16;
+        isa.io_write(0x0a, 4 | 2);
+        isa.io_write(0x0b, 0x46);
+        isa.io_write(0x0c, 0);
+        isa.io_write(4, address as u8);
+        isa.io_write(4, (address >> 8) as u8);
+        isa.io_write(0x0c, 0);
+        isa.io_write(5, count as u8);
+        isa.io_write(5, (count >> 8) as u8);
+        isa.io_write(0x81, page);
+        isa.io_write(0x0a, 2);
+        let progress = isa.dma_transfer(2, data);
+        assert_eq!(progress.bytes, data.len());
+        assert!(progress.terminal_count);
+    }
+
+    fn backing(memory: &GuestMemoryMmap, address: u64) -> [u8; 512] {
+        let mut bytes = [0; 512];
+        memory
+            .read_slice(&mut bytes, GuestAddress(address))
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn isa_dma_does_not_write_closed_smram() {
+        let (_ram, mch, mut isa) = pc_with_isa_dma();
+        assert!(!mch.pam.lock().smram_open);
+        floppy_dma_read(&mut isa, 0x0a, 0, &mut [0xd7; 512]);
+        assert_eq!(
+            backing(&mch.pam.lock().smram, 0xa0000),
+            [0; 512],
+            "a DMA write to 0xa0000 reached SMRAM while it was closed"
+        );
+    }
+
+    #[test]
+    fn isa_dma_does_not_write_read_only_shadow_ram() {
+        let (_ram, mut mch, mut isa) = pc_with_isa_dma();
+        // PAM0 on pc is 0x59 bits 4-5: bank 12, 0xf0000-0xfffff.
+        mch.config_write(0x58 / 4, 1, &[0x30]);
+        floppy_dma_read(&mut isa, 0x0f, 0, &mut [0x11; 512]);
+        assert_eq!(
+            backing(&mch.pam.lock().shadow, 0xf0000),
+            [0x11; 512],
+            "DMA reaches a write-enabled bank"
+        );
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        floppy_dma_read(&mut isa, 0x0f, 0, &mut [0xd7; 512]);
+        assert_eq!(
+            backing(&mch.pam.lock().shadow, 0xf0000),
+            [0x11; 512],
+            "a DMA write reached a read-only bank"
+        );
+        // Bank 0, 0xc0000, never enabled: it reads the ROM and takes no write.
+        floppy_dma_read(&mut isa, 0x0c, 0, &mut [0xd7; 512]);
+        assert_eq!(backing(&mch.pam.lock().shadow, 0xc0000), [0; 512]);
+    }
+
+    #[test]
+    fn device_view_of_shadow_ram_follows_the_pam_attributes() {
+        let (ram, mut mch, _isa) = pc_with_isa_dma();
+        let device = ram.device_mem.clone();
+        assert_eq!(backing(&device, 0xf0000), [0x5a; 512], "ROM at reset");
+        mch.config_write(0x58 / 4, 1, &[0x30]);
+        device
+            .write_slice(&[0x22; 512], GuestAddress(0xf0000))
+            .unwrap();
+        assert_eq!(backing(&mch.pam.lock().shadow, 0xf0000), [0x22; 512]);
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        assert_eq!(backing(&device, 0xf0000), [0x22; 512], "read-only RAM");
+        mch.config_write(0x58 / 4, 1, &[0]);
+        assert_eq!(backing(&device, 0xf0000), [0x5a; 512], "ROM again");
+        // A restore replaces the shadow under a read-only bank.
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        let state = mch.save_state().unwrap();
+        mch.config_write(0x58 / 4, 1, &[0x30]);
+        mch.pam.lock().write(0x30000, &[0x33; 512]);
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        assert_eq!(backing(&device, 0xf0000), [0x33; 512]);
+        mch.restore_state(&state).unwrap();
+        assert_eq!(backing(&device, 0xf0000), [0x22; 512]);
+    }
+
+    #[test]
+    fn smram_lock_holds_until_reset() {
+        for pc in [false, true] {
+            let pam = Arc::new(Mutex::new(
+                Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap(),
+            ));
+            let mut mch = if pc {
+                Mch::i440fx(pam.clone(), 128 << 20)
+            } else {
+                Mch::new(pam.clone())
+            };
+            let reset = mch.save_state().unwrap();
+            let (reg, offset, at) = if pc {
+                (0x70 / 4, 2, 0x72)
+            } else {
+                (0x9c / 4, 1, 0x9d)
+            };
+            mch.config_write(reg, offset, &[0x4a]);
+            assert!(pam.lock().smram_open, "pc={pc}: open before the lock");
+            mch.config_write(reg, offset, &[0x1a]);
+            assert_eq!(mch.config[at] & 0x50, 0x10, "pc={pc}: lock closes");
+            assert!(!pam.lock().smram_open, "pc={pc}");
+            for value in [0x4a, 0x0a, 0x5a, 0xff, 0] {
+                mch.config_write(reg, offset, &[value]);
+                assert_eq!(
+                    mch.config[at] & 0x50,
+                    0x10,
+                    "pc={pc}: D_LCK set and D_OPEN clear after writing {value:#x}"
+                );
+                assert!(!pam.lock().smram_open, "pc={pc}: {value:#x}");
+            }
+            if !pc {
+                let esmramc = mch.config[0x9e];
+                mch.config_write(0x9c / 4, 2, &[!esmramc]);
+                assert_eq!(mch.config[0x9e], esmramc, "ESMRAMC is locked too");
+            }
+            // A machine reset restores the power-on state, which unlocks.
+            mch.restore_state(&reset).unwrap();
+            mch.config_write(reg, offset, &[0x4a]);
+            assert!(pam.lock().smram_open, "pc={pc}: reset unlocks");
+        }
+    }
+
+    #[test]
+    fn restored_smram_lock_keeps_smram_closed() {
+        let pam = Arc::new(Mutex::new(
+            Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap(),
+        ));
+        let mut mch = Mch::new(pam.clone());
+        let mut state = mch.save_state().unwrap();
+        state[0x9d] = 0x5a;
+        mch.restore_state(&state).unwrap();
+        assert!(!pam.lock().smram_open);
     }
 
     fn captured_i440fx_config() -> Vec<u8> {

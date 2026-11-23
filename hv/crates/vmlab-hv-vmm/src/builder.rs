@@ -827,16 +827,7 @@ pub fn build(
         } else {
             crate::q35::Pam::new(&image, Some(kvm.vm.clone()), first_slot + 1)?
         }));
-        ram.mem = ram
-            .mem
-            .insert_region(pam.lock().shadow_region())
-            .map_err(|e| VmmError::Memory(e.to_string()))?;
-        if !secure_smm {
-            ram.mem = ram
-                .mem
-                .insert_region(pam.lock().smram_region())
-                .map_err(|e| VmmError::Memory(e.to_string()))?;
-        }
+        crate::q35::attach_firmware_memory(&mut ram, &pam.lock(), secure_smm)?;
         mmio_bus
             .register(0xc0000, 0x40000, pam.clone())
             .map_err(VmmError::Other)?;

@@ -18,6 +18,11 @@ use crate::layout::MemLayout;
 /// Built guest memory plus what backs it.
 pub struct GuestRam {
     pub mem: GuestMemoryMmap,
+    /// Guest memory as a device model sees it: `mem` on a machine without
+    /// firmware. On a firmware machine it holds no SMRAM, and its
+    /// 0xc0000-0xfffff follows the PAM write enables (`q35::Pam`). Every
+    /// access made for the guest outside SMM goes through this view.
+    pub device_mem: GuestMemoryMmap,
     layout: MemLayout,
     /// The memfd backing RAM, when shared; kept open so the mapping lives.
     _file: Option<File>,
@@ -32,6 +37,7 @@ impl GuestRam {
             .map_err(|e| VmmError::Memory(format!("allocating guest RAM: {e}")))?;
         dont_dump(&mem)?;
         Ok(GuestRam {
+            device_mem: mem.clone(),
             mem,
             layout,
             _file: None,
@@ -58,6 +64,7 @@ impl GuestRam {
             .map_err(|e| VmmError::Memory(format!("mapping guest RAM: {e}")))?;
         dont_dump(&mem)?;
         Ok(GuestRam {
+            device_mem: mem.clone(),
             mem,
             layout,
             _file: Some(file),
