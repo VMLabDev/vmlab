@@ -942,6 +942,11 @@ impl VmInstance {
             );
         }
         Ok(VmPaths {
+            apple_smc_osk: if t.resolved.apple_smc {
+                (self.host_config)()?.apple_smc_osk
+            } else {
+                None
+            },
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
