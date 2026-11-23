@@ -393,7 +393,11 @@ impl UhciController {
     }
 
     /// Service the queue head at `qh` until it blocks or goes breadth-first.
-    fn queue(&mut self, qh: u32) {
+    ///
+    /// A queue head nested in another's element link is followed in this
+    /// same loop, so `MAX_ELEMENTS` bounds the nesting as it bounds the TDs:
+    /// a guest that nests a queue head in itself costs one bounded walk.
+    fn queue(&mut self, mut qh: u32) {
         for _ in 0..MAX_ELEMENTS {
             let Some(element) = self.read32(qh.wrapping_add(4)) else {
                 return;
@@ -402,9 +406,9 @@ impl UhciController {
                 return;
             }
             if element & 2 != 0 {
-                // A nested queue head: walk it once, then continue across.
-                self.queue(element & !0xf);
-                return;
+                // A nested queue head: service it in place of this one.
+                qh = element & !0xf;
+                continue;
             }
             let td = element & !0xf;
             match self.transfer(td) {
