@@ -588,6 +588,7 @@ vmlab app run [OPTIONS] <MACHINE> [-- <CMD>...]
 | `[CMD]...` | The program and its arguments, after `--`. No guest shell is involved. |
 | `--via <VIA>` | The window protocol: `waypipe`, `x11` or `rdp`. Default: chosen from the guest family and this desktop session. |
 | `--detach` | Hand the session to a background helper and return at once. |
+| `--clipboard` | Share this desktop's clipboard with the guest, both ways, for an RDP session. Without it the guest neither reads nor sets it. The other protocols ignore it. |
 | `--cwd <DIR>` | Guest working directory for the program. |
 | `--user <LOGIN>` | Run as this login: the label a `login {}` block declares, or the account name as an alias. Default: the machine's default login. `SYSTEM` on Windows or `root` on Linux is the agent identity. |
 | `--password <PASSWORD>` | Password for an account the lab file does not declare, or one whose declared password has been rotated. Requires `--user`. |
@@ -598,11 +599,12 @@ The guest family comes from the machine's effective profile: a name starting wit
 | Guest | Host session | Protocol | Guest needs | Host needs |
 | --- | --- | --- | --- | --- |
 | Linux | Wayland | waypipe | `waypipe` on the login's `PATH`, built with lz4, and `/bin/sh` | `waypipe` |
-| Linux | Wayland, either side without waypipe | X11 through Xwayland | nothing | `DISPLAY` set |
+| Linux | Wayland, host without waypipe | X11 through Xwayland | nothing | `DISPLAY` set |
+| Linux | Wayland, guest without waypipe, host config `app_x11_fallback = true` | X11 through Xwayland | nothing | `DISPLAY` set |
 | Linux | X11 | X11 | nothing | the X server |
 | Windows | Wayland or X11 | RDP RemoteApp | Pro, Enterprise, Education or Server edition | FreeRDP 3: `xfreerdp3`, then `xfreerdp`, on `PATH` |
 
-The host config keys `waypipe` and `freerdp` name the host binaries instead (host-profiles.md); the CLI reads them itself, so no restart is needed. waypipe → X11 is the only automatic fallback; it prints the reason on stderr followed by `; falling back to X11 through Xwayland`. `--via` never falls back, and a protocol the guest family cannot serve is refused by name. Prefer waypipe on Wayland: X11 has no compression, and a program without an X11 backend does not run under it. Both waypipe ends run with `--compress lz4`, because a client and server that disagree on compression refuse each other, so a guest waypipe built without lz4 cannot serve a session.
+The host config keys `waypipe` and `freerdp` name the host binaries instead (host-profiles.md); the CLI reads them itself, so no restart is needed. waypipe → X11 is the only automatic fallback; it prints the reason on stderr followed by `; falling back to X11 through Xwayland`. A host without waypipe falls back by itself. A guest without waypipe falls back only with `app_x11_fallback = true` in the host config, because the guest answers that question and X11 gives the guest program access to the host's X server; without the setting the refusal ends in ``; X11 gives the guest program access to this desktop's X server, so vmlab does not fall back to it on the guest's word: pass `--via x11`, or set `app_x11_fallback = true` in config.wcl``. `--via` never falls back, and a protocol the guest family cannot serve is refused by name. Prefer waypipe on Wayland: X11 has no compression, and a program without an X11 backend does not run under it. Both waypipe ends run with `--compress lz4`, because a client and server that disagree on compression refuse each other, so a guest waypipe built without lz4 cannot serve a session.
 
 Identity follows logins.md exactly as for `exec`. The waypipe check runs as the same identity, because the `PATH` that matters is that login's. RDP cannot log on as the agent identity, so a Windows machine needs a `login {}` with a password or `--user`/`--password`. At the start of each RDP session the agent prepares Windows: it turns Remote Desktop on, allows unlisted RemoteApp programs (the `fAllowUnlistedRemotePrograms` policy and `TSAppAllowList`'s `fDisabledAllowList`), adds the account to Remote Desktop Users unless it is an administrator, and starts TermService, changing each only where it differs and leaving it changed. RDP traffic reaches the guest's own `127.0.0.1:3389` from the agent, so no firewall rule is touched. FreeRDP gets the credentials on stdin and `--cwd` as the `/app` working directory; an argument FreeRDP's `/app` parser would alter, such as one with an apostrophe, is refused.
 

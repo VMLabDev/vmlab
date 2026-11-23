@@ -57,18 +57,29 @@ impl Credentials {
 }
 
 /// Every argument FreeRDP is given, in the order it reads them from stdin.
+///
+/// FreeRDP redirects the clipboard unless it is told not to, and a redirected
+/// clipboard tells the guest's RDP server of every host copy and serves its
+/// content without a paste. So the switch is always written: `-clipboard`
+/// unless the request asked for sharing (`clipboard`, `app run --clipboard`).
 pub fn freerdp_args(
     socket: &Path,
     machine: &str,
     argv: &[String],
     cwd: Option<&str>,
     creds: &Credentials,
+    clipboard: bool,
 ) -> Result<Vec<String>> {
     let mut args = vec![
         format!("/v:{}", socket.display()),
         format!("/app:{}", app_option(argv, cwd)?),
         "/cert:ignore".into(),
-        "+clipboard".into(),
+        if clipboard {
+            "+clipboard"
+        } else {
+            "-clipboard"
+        }
+        .into(),
         format!("/wm-class:vmlab-{machine}"),
         format!("/u:{}", creds.user),
     ];
@@ -350,6 +361,7 @@ impl Server {
             &req.argv,
             req.cwd.as_deref(),
             creds,
+            req.clipboard,
         )?;
         self.pending = Some((bin.to_path_buf(), stdin_payload(&args)?, req.verbose));
         Ok(())
@@ -535,6 +547,7 @@ mod tests {
             user: None,
             password: None,
             verbose: false,
+            clipboard: false,
         };
         server.prepare(Some(&bin), &req, &creds()).unwrap();
         server.start().unwrap();
@@ -581,6 +594,7 @@ mod tests {
                 user: None,
                 password: None,
                 verbose: false,
+                clipboard: false,
             };
             server.prepare(Some(&bin), &req, &creds()).unwrap();
             server.start().unwrap();
@@ -635,6 +649,7 @@ mod tests {
             user: None,
             password: None,
             verbose: false,
+            clipboard: false,
         };
         let mut server = Server::bind().unwrap();
         server.prepare(Some(&bin), &req, &creds()).unwrap();
@@ -718,12 +733,20 @@ mod tests {
     fn freerdp_is_told_the_program_and_its_command_line() {
         let socket = Path::new("/run/user/1000/vmlab-app-x/rdp.sock");
         assert_eq!(
-            freerdp_args(socket, "win11", &argv(&["notepad.exe"]), None, &creds()).unwrap(),
+            freerdp_args(
+                socket,
+                "win11",
+                &argv(&["notepad.exe"]),
+                None,
+                &creds(),
+                false
+            )
+            .unwrap(),
             [
                 "/v:/run/user/1000/vmlab-app-x/rdp.sock",
                 "/app:program:notepad.exe",
                 "/cert:ignore",
-                "+clipboard",
+                "-clipboard",
                 "/wm-class:vmlab-win11",
                 "/u:dev",
                 "/d:LAB",
@@ -736,6 +759,7 @@ mod tests {
             &argv(&["notepad.exe", r"C:\Users\dev\my notes.txt", "/A"]),
             Some(r"C:\Users\dev"),
             &creds(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -744,12 +768,65 @@ mod tests {
         );
     }
 
+    /// Review appshare-media F3: FreeRDP redirects the clipboard unless told
+    /// not to, and a redirected clipboard lets the guest read what the user
+    /// copies on the host without a paste. A plain request turns it off.
+    #[test]
+    fn the_rdp_clipboard_is_not_shared_unasked() {
+        let socket = Path::new("/tmp/rdp.sock");
+        let plain = freerdp_args(
+            socket,
+            "win11",
+            &argv(&["notepad.exe"]),
+            None,
+            &creds(),
+            false,
+        )
+        .unwrap();
+        assert!(!plain.iter().any(|a| a == "+clipboard"), "{plain:?}");
+        assert!(plain.iter().any(|a| a == "-clipboard"), "{plain:?}");
+        let asked = freerdp_args(
+            socket,
+            "win11",
+            &argv(&["notepad.exe"]),
+            None,
+            &creds(),
+            true,
+        )
+        .unwrap();
+        assert!(asked.iter().any(|a| a == "+clipboard"), "{asked:?}");
+        assert!(!asked.iter().any(|a| a == "-clipboard"), "{asked:?}");
+    }
+
+    /// What `prepare` hands FreeRDP follows the request's `clipboard`.
+    #[tokio::test]
+    async fn the_stdin_payload_follows_the_requests_clipboard() {
+        for (clipboard, switch) in [(false, "\n-clipboard\n"), (true, "\n+clipboard\n")] {
+            let mut server = Server::bind().unwrap();
+            let req = Request {
+                machine: "win".into(),
+                argv: vec!["notepad.exe".into()],
+                cwd: None,
+                user: None,
+                password: None,
+                verbose: false,
+                clipboard,
+            };
+            server
+                .prepare(Some(Path::new("/nonexistent/freerdp")), &req, &creds())
+                .unwrap();
+            let (_, payload, _) = server.pending.as_ref().unwrap();
+            assert!(payload.contains(switch), "{payload}");
+        }
+    }
+
     /// The password reaches FreeRDP on stdin and nowhere else: argv is the
     /// one switch that says to read stdin.
     #[test]
     fn the_password_is_only_in_the_stdin_payload() {
         let socket = Path::new("/tmp/rdp.sock");
-        let args = freerdp_args(socket, "win11", &argv(&["calc.exe"]), None, &creds()).unwrap();
+        let args =
+            freerdp_args(socket, "win11", &argv(&["calc.exe"]), None, &creds(), false).unwrap();
         let payload = stdin_payload(&args).unwrap();
         assert!(payload.contains("\n/p:s3cret-pw\n"), "{payload}");
         assert!(

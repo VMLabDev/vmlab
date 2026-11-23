@@ -53,7 +53,9 @@ protocol over the agent channel, and the host end runs in the CLI.**
   carries bytes and launches the two ends.
 - The cost is three host-side dependencies (`waypipe`, an X server, FreeRDP)
   and one guest-side one (`waypipe`). A guest without waypipe falls back to X11,
-  the one protocol that needs nothing installed in the guest.
+  the one protocol that needs nothing installed in the guest, where the host
+  config allows it with `app_x11_fallback = true`: the guest reports whether
+  it has waypipe, so it must not pick X11 by itself.
 - X11 forwarding gives the guest program the same reach into the host X server
   as `ssh -X`, including reading input to other X clients. That is consistent
   with §1.2, where vmlab is not a security boundary, but it is a reason to
