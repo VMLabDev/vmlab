@@ -1704,11 +1704,6 @@ mod tests {
         (dir, path, accepted)
     }
 
-    /// **A slow agent keeps its connection** (VML-106). A connect whose
-    /// cached connection's agent answers its ping only after 3 s hands out
-    /// that same connection — its sessions intact — instead of replacing it
-    /// at the 2 s mark.
-
     /// **No host bytes before the guest is there, or in a build** (#678).
     /// A slot nobody armed, and one armed for a guest with no agent
     /// expected (a template build, an install from an ISO), never allow
@@ -1751,6 +1746,10 @@ mod tests {
         assert!(budget.take_try(now + Duration::from_secs(3600)));
     }
 
+    /// **A slow agent keeps its connection** (VML-106). A connect whose
+    /// cached connection's agent answers its ping only after 3 s hands out
+    /// that same connection — its sessions intact — instead of replacing it
+    /// at the 2 s mark.
     #[tokio::test]
     async fn a_connect_keeps_a_slow_agents_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
