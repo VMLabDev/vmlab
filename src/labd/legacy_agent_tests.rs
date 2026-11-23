@@ -64,9 +64,8 @@ async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
     // Preserve the exec's stdin in the background subshell. Closing the
     // session closes that pipe. A surviving descendant then writes to the
     // FIFO before exiting. The reader sees EOF in either case.
-    let mut argv = sh(
-        "exec 3<&0 4>&1; (echo ready >&4; read -r line <&3; echo survived) >\"$1\" & wait",
-    );
+    let mut argv =
+        sh("exec 3<&0 4>&1; (echo ready >&4; read -r line <&3; echo survived) >\"$1\" & wait");
     argv.extend(["sh".into(), fifo.to_str().unwrap().into()]);
     let mut exec = handle.open_exec(argv, vec![], None, None).await?;
     loop {
@@ -79,6 +78,7 @@ async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
         }
     }
     exec.close().await;
+    let mut stderr = Vec::new();
     while let Some(event) = reader.recv().await {
         match event {
             SessionEvent::Data(data) => {
@@ -87,8 +87,13 @@ async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
                     String::from_utf8_lossy(&data)
                 );
             }
+            SessionEvent::Stderr(data) => stderr.extend(data),
             SessionEvent::Exited(code) => {
-                ensure!(code == 0, "FIFO reader exited with {code}");
+                ensure!(
+                    code == 0,
+                    "FIFO reader exited with {code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
                 return Ok(());
             }
             SessionEvent::Error(err) => anyhow::bail!("FIFO reader: {err}"),
