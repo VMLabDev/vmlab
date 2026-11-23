@@ -56,6 +56,11 @@ pub struct SegmentNet {
     /// to a global segment — a static address or an MTU (§9.2). `up` says
     /// them again, since the attach happens before anyone is watching.
     pub global_warnings: Vec<String>,
+    /// Attaches the global segment again whenever its trunk to the
+    /// supervisor closes: a supervisor that dies and is replaced keeps its
+    /// segments in memory only, so the adopted lab daemon must bring its own
+    /// back (docs/reviews/lab-lifecycle.md F9).
+    global_keeper: Option<tokio::task::JoinHandle<()>>,
     /// Gateway service (ARP/ICMP/DHCP/DNS + uplink seam), wired by
     /// [`LabNetwork::wire_gateways`].
     pub gateway: Option<crate::net::gateway::GatewayHandle>,
@@ -178,6 +183,9 @@ impl Drop for SegmentNet {
         for listener in self.listeners.values() {
             listener.abort();
         }
+        if let Some(keeper) = &self.global_keeper {
+            keeper.abort();
+        }
     }
 }
 
@@ -248,6 +256,7 @@ impl LabNetwork {
                     peer: seg.connect.as_ref().map(|c| c.host.clone()),
                     global_members: Vec::new(),
                     global_warnings: Vec::new(),
+                    global_keeper: None,
                     gateway: None,
                     services: None,
                     listeners: HashMap::new(),
@@ -282,6 +291,7 @@ impl LabNetwork {
                     peer: None,
                     global_members: Vec::new(),
                     global_warnings: Vec::new(),
+                    global_keeper: None,
                     gateway: None,
                     services: None,
                     listeners: HashMap::new(),
@@ -366,53 +376,45 @@ impl LabNetwork {
     /// Bridge each global segment to the supervisor's global switch (PRD
     /// §9.2): ask the supervisor to attach (creating the shared segment on
     /// first use), then connect this segment's local switch to the returned
-    /// trunk socket. The supervisor runs the shared DHCP/DNS.
+    /// trunk socket. The supervisor runs the shared DHCP/DNS. Each attached
+    /// segment then keeps itself attached: when its trunk closes it is
+    /// attached again, under the subnet it had (F9).
     pub async fn attach_globals(&mut self, lab: &str) -> anyhow::Result<()> {
-        let supervisor_sock = crate::paths::supervisor_socket();
+        self.attach_globals_via(&crate::paths::supervisor_socket(), lab)
+            .await
+    }
+
+    pub(crate) async fn attach_globals_via(
+        &mut self,
+        supervisor: &Path,
+        lab: &str,
+    ) -> anyhow::Result<()> {
         for seg in self.segments.values_mut() {
             if !seg.global {
                 continue;
             }
-            let client = crate::proto::client::SupClient::connect(&supervisor_sock)
-                .await
-                .context("connecting to supervisor for global segment")?;
-            let resp = client
-                .send(crate::proto::SupRequest::GlobalAttach {
-                    name: seg.global_name.clone(),
-                    subnet: seg.config.as_ref().and_then(|c| c.subnet),
-                    peer: seg.peer.clone(),
-                    lab: Some(lab.to_string()),
-                    members: seg.global_members.clone(),
-                    mtu: Some(seg.effective_mtu()),
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("global.attach: {e}"))?;
-            let trunk_sock = std::path::PathBuf::from(
-                resp["socket"]
-                    .as_str()
-                    .context("malformed global.attach response")?,
-            );
-            seg.global_warnings = resp["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|w| w.as_str().map(str::to_string))
-                .collect();
-            for w in &seg.global_warnings {
-                tracing::warn!("{w}");
-            }
-            let stream = tokio::net::UnixStream::connect(&trunk_sock)
-                .await
-                .with_context(|| format!("connecting global trunk {}", trunk_sock.display()))?;
-            let _port = seg
-                .switch
-                .add_stream_port(stream, crate::net::switch::PortClass::Service)
-                .await;
+            let declared = seg.config.as_ref().and_then(|c| c.subnet);
+            let mut join = GlobalJoin {
+                supervisor: supervisor.to_path_buf(),
+                name: seg.global_name.clone(),
+                subnet: declared,
+                peer: seg.peer.clone(),
+                lab: lab.to_string(),
+                members: seg.global_members.clone(),
+                mtu: seg.effective_mtu(),
+            };
+            let trunk = join_global(&join, &seg.switch).await?;
+            seg.global_warnings = trunk.warnings;
+            join.subnet = declared.or(trunk.subnet);
             tracing::info!(
                 "bridged global segment \"{}\" to supervisor as \"{}\"",
                 seg.name,
                 seg.global_name
             );
+            if let Some(old) = seg.global_keeper.take() {
+                old.abort();
+            }
+            seg.global_keeper = Some(keep_global(join, seg.switch.clone(), trunk.closed));
         }
         Ok(())
     }
@@ -427,6 +429,13 @@ impl LabNetwork {
 
     /// Detach this lab's global segments from the supervisor (on shutdown).
     pub async fn detach_globals(&self, lab: &str) {
+        for keeper in self
+            .segments
+            .values()
+            .filter_map(|s| s.global_keeper.as_ref())
+        {
+            keeper.abort();
+        }
         let names: Vec<String> = self
             .segments
             .values()
@@ -655,6 +664,107 @@ fn declared_route_pairs(lab: &Lab) -> impl Iterator<Item = (&str, &str)> {
         seg.routes_to
             .iter()
             .map(move |target| (seg.name.as_str(), target.as_str()))
+    })
+}
+
+/// How long a lab daemon waits before it attaches a global segment again
+/// whose trunk closed, and between attempts while no supervisor answers.
+#[cfg(not(test))]
+const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// One global segment as this lab asks the supervisor for it.
+struct GlobalJoin {
+    supervisor: PathBuf,
+    name: String,
+    subnet: Option<Ipv4Net>,
+    peer: Option<String>,
+    lab: String,
+    members: Vec<GlobalMember>,
+    mtu: u16,
+}
+
+/// A trunk to the supervisor's global switch, bridged onto a local switch.
+struct GlobalTrunk {
+    warnings: Vec<String>,
+    /// The subnet the supervisor runs the segment on.
+    subnet: Option<Ipv4Net>,
+    /// Completes when the trunk closes.
+    closed: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Attach `join` at the supervisor and bridge `switch` to the trunk it
+/// answers with.
+async fn join_global(join: &GlobalJoin, switch: &Arc<Switch>) -> Result<GlobalTrunk> {
+    let client = crate::proto::client::SupClient::connect(&join.supervisor)
+        .await
+        .context("connecting to supervisor for global segment")?;
+    let resp = client
+        .send(crate::proto::SupRequest::GlobalAttach {
+            name: join.name.clone(),
+            subnet: join.subnet,
+            peer: join.peer.clone(),
+            lab: Some(join.lab.clone()),
+            members: join.members.clone(),
+            mtu: Some(join.mtu),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("global.attach: {e}"))?;
+    let trunk_sock = PathBuf::from(
+        resp["socket"]
+            .as_str()
+            .context("malformed global.attach response")?,
+    );
+    let warnings: Vec<String> = resp["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.as_str().map(str::to_string))
+        .collect();
+    for w in &warnings {
+        tracing::warn!("{w}");
+    }
+    let subnet = resp["subnet"].as_str().and_then(|s| s.parse().ok());
+    let stream = tokio::net::UnixStream::connect(&trunk_sock)
+        .await
+        .with_context(|| format!("connecting global trunk {}", trunk_sock.display()))?;
+    let (_port, closed) = switch
+        .add_stream_port_watched(stream, crate::net::switch::PortClass::Service)
+        .await;
+    Ok(GlobalTrunk {
+        warnings,
+        subnet,
+        closed,
+    })
+}
+
+/// Attach `join` again each time its trunk closes, until aborted (F9).
+fn keep_global(
+    join: GlobalJoin,
+    switch: Arc<Switch>,
+    mut closed: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let _ = (&mut closed).await;
+            tracing::warn!(
+                "global segment \"{}\": the trunk to the supervisor closed; attaching again",
+                join.name
+            );
+            closed = loop {
+                tokio::time::sleep(REATTACH_DELAY).await;
+                match join_global(&join, &switch).await {
+                    Ok(trunk) => {
+                        tracing::info!("global segment \"{}\" attached again", join.name);
+                        break trunk.closed;
+                    }
+                    Err(e) => {
+                        tracing::debug!("re-attaching global segment \"{}\": {e:#}", join.name)
+                    }
+                }
+            };
+        }
     })
 }
 
