@@ -161,6 +161,21 @@ Not read:
   on as a member of Users only and run
   `copy /y %SystemRoot%\system32\cmd.exe C:\vmlab\vmlab-agent-legacy.exe`.
   Assert that the copy is refused.
+- Fixed by card #716. The Win32 agent has `--secure-dir <dir>`
+  (`guest/agent-legacy/src/plat_win32.c`, `secure_dir`): it makes
+  Administrators the owner of the directory and of every entry in it and
+  sets a DACL with full control for Administrators and SYSTEM and no other
+  entry, inheriting on the directory and protected on Windows 2000 and later.
+  The SIDs are written out, so a localised group name does not matter.
+  `install-nt.cmd` runs it from the ISO before the copy and again after it,
+  and stops when it fails. On a FAT volume there is nothing to set: it warns
+  and the install goes on. The proof in the repo is
+  `the_nt_install_secures_its_directory_before_the_service_binary_lands` in
+  `src/template/bootstrap.rs`, which reads the staged script. The call itself
+  was run under Wine with the `windows-nt-x86` build: the entry for Everyone
+  left the directory and the file in it. Wine derives a file's ACL from its
+  Unix mode, so that run does not show the owner or inheritance. The test
+  above on a Windows 2000 guest was not run.
 
 ### F4. A second connect while a DOS or TempleOS command runs cuts the first command's session after 22 s
 
