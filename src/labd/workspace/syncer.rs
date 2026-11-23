@@ -4238,6 +4238,78 @@ mod tests {
         (syncers, guest, sessions)
     }
 
+    /// Review dev-machines F1 (card 690): a `.vmlab` directory in the host
+    /// tree is a lab's state, and it is in the floor. With no rule at all the
+    /// seed leaves it on the host. A `.vmlabignore` the guest writes syncs to
+    /// the host and beats `.gitignore`, and a negation in it still does not
+    /// bring the directory in. A guest file at the same path is the guest's
+    /// own and never reaches the host.
+    ///
+    /// Every wait is a pass the test asked for, so no assertion depends on a
+    /// clock.
+    #[tokio::test]
+    async fn the_lab_state_directory_never_syncs_whatever_the_rules_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".vmlab/smb")).unwrap();
+        std::fs::write(dir.path().join(".vmlab/smb/creds"), "host-secret").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        let seeded = guest.paths();
+
+        let rules = "!.vmlab\n!.vmlab/\n!.vmlab/**\n";
+        guest.file("/src/.vmlabignore", rules, 7);
+        sessions.watcher.mark(".vmlabignore");
+        // One pass carries the rule file to the host, and a later one reads it.
+        for _ in 0..3 {
+            syncer.pass_now().await.unwrap();
+        }
+        let rules_on_host = std::fs::read_to_string(dir.path().join(".vmlabignore")).ok();
+        let after_rules = guest.paths();
+
+        guest.file("/src/.vmlab/smb/creds", "guest-wrote-this", 9);
+        guest.file("/src/new.rs", "n", 10);
+        sessions.watcher.mark(".vmlab/smb/creds");
+        sessions.watcher.mark("new.rs");
+        for _ in 0..3 {
+            syncer.pass_now().await.unwrap();
+        }
+        let report = syncer.report();
+        syncers.stop("dev01").await;
+
+        let in_state = |paths: &[String]| -> Vec<String> {
+            paths
+                .iter()
+                .filter(|p| p.starts_with("/src/.vmlab/") || p.as_str() == "/src/.vmlab")
+                .cloned()
+                .collect()
+        };
+        assert!(
+            in_state(&seeded).is_empty(),
+            "the seed carried the state directory into the guest: {seeded:?}"
+        );
+        // The guest's rule did reach the host, so the passes above ran under it.
+        assert_eq!(rules_on_host.as_deref(), Some(rules));
+        assert!(
+            in_state(&after_rules).is_empty(),
+            "a guest rule brought the state directory into the guest: {after_rules:?}"
+        );
+        // The passes took guest work, and not the guest's file under `.vmlab`.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.rs")).ok().as_deref(),
+            Some("n"),
+            "{report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".vmlab/smb/creds")).unwrap(),
+            "host-secret",
+            "the guest's bytes reached the lab's state: {report:?}"
+        );
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+    }
+
     /// The one-file version, which is every test whose subject is one path
     /// both sides moved.
     async fn halted_lab(
