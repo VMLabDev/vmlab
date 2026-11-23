@@ -278,6 +278,12 @@ and the IDE, AHCI and USB devices on the same buses.
   0x80, then assert `!read_port(0x0000, ..)`. Also, with PMBA = 0xb000,
   assert `!read_port(0xb040, ..)`.
 - Confidence: high.
+- Fixed by card #641. `Lpc::pm_offset` is the one test both port paths use:
+  the block is 64 ports on PIIX4 and 128 on ICH9, the same as the alignment
+  of its base, and the offset comes from a checked subtraction, so a port
+  below the base is never in the block. Tests:
+  `piix4_pm_window_does_not_wrap_or_overclaim` and
+  `ich9_pm_window_keeps_128_ports` in `chipset/lpc.rs`.
 
 ### F8. pc: a VGA framebuffer BAR placed over low RAM ends the VM
 

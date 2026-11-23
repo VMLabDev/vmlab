@@ -122,6 +122,15 @@ impl Lpc {
             & if self.piix4 { 0xffc0 } else { 0xff80 }
     }
 
+    /// Offset of `port` in the PM I/O block, or None outside it. The block is
+    /// as long as its base is aligned: 64 ports on PIIX4, 128 on ICH9. So it
+    /// ends at 0xffff at the latest and never wraps to port 0.
+    fn pm_offset(&self, port: u16) -> Option<u16> {
+        let len = if self.piix4 { 64 } else { 128 };
+        port.checked_sub(self.pm_base())
+            .filter(|offset| self.pm_enabled() && *offset < len)
+    }
+
     pub fn pm_enabled(&self) -> bool {
         if self.piix4 {
             self.config[0x80] & 1 != 0
@@ -191,8 +200,8 @@ impl Lpc {
             }
             return true;
         }
-        if self.pm_enabled() && port.wrapping_sub(self.pm_base()) < 128 {
-            self.read(u64::from(port - self.pm_base()), data);
+        if let Some(offset) = self.pm_offset(port) {
+            self.read(u64::from(offset), data);
             true
         } else if matches!(port, 0xb2 | 0xb3 | 0xcf9) && data.len() == 1 {
             data[0] = if port == 0xcf9 {
@@ -219,8 +228,8 @@ impl Lpc {
             self.update_sci();
             return true;
         }
-        if self.pm_enabled() && port.wrapping_sub(self.pm_base()) < 128 {
-            self.write(u64::from(port - self.pm_base()), data);
+        if let Some(offset) = self.pm_offset(port) {
+            self.write(u64::from(offset), data);
             true
         } else if matches!(port, 0xb2 | 0xb3 | 0xcf9) && data.len() == 1 {
             if port == 0xcf9 {
@@ -614,6 +623,42 @@ mod tests {
         lpc.config_write(0x40 / 4, 0, &[1, 8]);
         assert!(!lpc.read_port(0x608, &mut [0; 4]));
         assert!(lpc.read_port(0x808, &mut [0; 4]));
+    }
+
+    /// PIIX4's PM block is 64 ports (PMBA is 64-aligned). The window must
+    /// stop there and must not wrap past port 0xffff onto the ISA DMA ports.
+    #[test]
+    fn piix4_pm_window_does_not_wrap_or_overclaim() {
+        let mut lpc = Lpc::piix4(Arc::new(Irq::default()), Arc::new(|_| {}));
+        lpc.config_write(0x40 / 4, 0, &0xffc1u16.to_le_bytes());
+        lpc.config_write(0x80 / 4, 0, &[1]);
+        assert_eq!(lpc.pm_base(), 0xffc0);
+        assert!(lpc.read_port(0xffc0, &mut [0; 2]));
+        assert!(lpc.read_port(0xffff, &mut [0; 1]));
+        for port in [0x0000, 0x0008, 0x003f] {
+            assert!(!lpc.read_port(port, &mut [0; 1]), "read {port:#x}");
+            assert!(!lpc.write_port(port, &[0]), "write {port:#x}");
+        }
+
+        lpc.config_write(0x40 / 4, 0, &0xb001u16.to_le_bytes());
+        assert_eq!(lpc.pm_base(), 0xb000);
+        assert!(lpc.read_port(0xb008, &mut [0; 4]));
+        assert!(lpc.read_port(0xb03f, &mut [0; 1]));
+        for port in [0xb040, 0xb07f, 0xafff] {
+            assert!(!lpc.read_port(port, &mut [0; 1]), "read {port:#x}");
+            assert!(!lpc.write_port(port, &[0]), "write {port:#x}");
+        }
+    }
+
+    /// ICH9's PMBASE is 128-aligned and its block keeps all 128 ports.
+    #[test]
+    fn ich9_pm_window_keeps_128_ports() {
+        let (mut lpc, _, _) = fixture();
+        lpc.config_write(0x40 / 4, 0, &[1, 6]);
+        lpc.config_write(0x44 / 4, 0, &[0x80]);
+        assert!(lpc.read_port(0x67f, &mut [0; 1]));
+        assert!(!lpc.read_port(0x680, &mut [0; 1]));
+        assert!(!lpc.read_port(0x5ff, &mut [0; 1]));
     }
 
     #[test]
