@@ -822,8 +822,7 @@ mod tests {
     /// out must still open the share (docs/reviews/smb.md F5).
     #[test]
     fn a_guest_cannot_change_the_lab_password() {
-        if which("smbd").is_none() || which("smbclient").is_none() || which("rpcclient").is_none()
-        {
+        if which("smbd").is_none() || which("smbclient").is_none() || which("rpcclient").is_none() {
             eprintln!("SKIP: smbd, smbclient or rpcclient not found");
             return;
         }
@@ -887,7 +886,10 @@ mod tests {
         let set = rpc(format!("setuserinfo2 {user} 23 OtherPass789ghi"));
         let after_set = ls();
         drop(server);
-        assert!(before.contains("hello.txt"), "the share lists at all:\n{before}");
+        assert!(
+            before.contains("hello.txt"),
+            "the share lists at all:\n{before}"
+        );
         assert!(
             after_change.contains("hello.txt"),
             "a guest changed the password of the account.\nchgpasswd3:\n{changed}\nls:\n{after_change}"

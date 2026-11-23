@@ -467,7 +467,11 @@ mod tests {
         let vmlab_dir = tmp.path().join(".vmlab");
         std::fs::create_dir_all(vmlab_dir.join("smb")).unwrap();
         let user = config::current_unix_user();
-        std::fs::write(vmlab_dir.join("smb/creds"), format!("{user}:LabWidePassword")).unwrap();
+        std::fs::write(
+            vmlab_dir.join("smb/creds"),
+            format!("{user}:LabWidePassword"),
+        )
+        .unwrap();
         let vms = vec![
             (
                 "web".to_string(),
@@ -516,7 +520,10 @@ mod tests {
         assert!(data.readonly);
 
         let web = lab.build_config("web", 14450).unwrap();
-        assert!(!web.any_smb1, "another machine's smb1 share relaxes nothing here");
+        assert!(
+            !web.any_smb1,
+            "another machine's smb1 share relaxes nothing here"
+        );
         assert_eq!(web.shares.len(), 1);
         assert_eq!(web.shares[0].name, "src");
         assert_ne!(web.lab_dir, xp.lab_dir);
@@ -683,7 +690,9 @@ mod tests {
         let held: Vec<_> = (0..n)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
-        held.iter().map(|l| l.local_addr().unwrap().port()).collect()
+        held.iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect()
     }
 
     /// Two machines, a real `smbd`: what `web` was given does not list the
@@ -741,8 +750,14 @@ mod tests {
         let at_own_server = smbclient_ls(web_port, "dbdata", &web);
         let at_their_server = smbclient_ls(db_port, "dbdata", &web);
         lab.stop();
-        assert!(own.contains("websrc.txt"), "web lists its own share:\n{own}");
-        assert!(owner.contains("dbdata.txt"), "db lists its own share:\n{owner}");
+        assert!(
+            own.contains("websrc.txt"),
+            "web lists its own share:\n{own}"
+        );
+        assert!(
+            owner.contains("dbdata.txt"),
+            "db lists its own share:\n{owner}"
+        );
         for theirs in [at_own_server, at_their_server] {
             assert!(
                 !theirs.contains("dbdata.txt"),
