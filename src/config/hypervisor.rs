@@ -710,28 +710,24 @@ mod tests {
     #[test]
     fn automatic_selection_of_an_x86_guest_never_falls_back_to_qemu() {
         let profiles = crate::profiles::ProfileSet::shipped().unwrap();
-        for setting in [
-            r#"profile = "linux-modern" accel = "tcg""#,
-            r#"profile = "linux-modern" accel = "tcg""#,
-        ] {
-            let file = lab(&format!(
-                r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }} }}"#
-            ));
-            let vm = &file.lab.vms[0];
-            let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
-            let picked = HypervisorDefaults::default().select(
-                MachineCfg::Vm(vm),
-                &kvm_host(),
-                Some(&hw),
-                None,
-            );
-            assert_eq!(picked.kind, HypervisorKind::Vmlab, "{setting}");
-            assert_eq!(picked.fallback_reason, None, "{setting}");
-            assert!(
-                !vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).is_empty(),
-                "{setting}"
-            );
-        }
+        let setting = r#"profile = "linux-modern" accel = "tcg""#;
+        let file = lab(&format!(
+            r#"lab "l" {{ vm "v" {{ template = "scratch" arch = "x86_64" disk = 1GiB {setting} }} }}"#
+        ));
+        let vm = &file.lab.vms[0];
+        let hw = crate::qemu::resolve_vm(vm, None, &profiles).unwrap();
+        let picked = HypervisorDefaults::default().select(
+            MachineCfg::Vm(vm),
+            &kvm_host(),
+            Some(&hw),
+            None,
+        );
+        assert_eq!(picked.kind, HypervisorKind::Vmlab, "{setting}");
+        assert_eq!(picked.fallback_reason, None, "{setting}");
+        assert!(
+            !vmlab_refusals(MachineCfg::Vm(vm), &kvm_host(), Some(&hw)).is_empty(),
+            "{setting}"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 import unittest
 
-from features import out_of_scope
+from features import NO_X86_ON_QEMU, out_of_scope
 from harness import ScenarioFailed
 from scenarios.macos import FEATURE, with_key
 
@@ -21,9 +21,9 @@ class MacosScenario(unittest.TestCase):
                 with_key("host {\n}\n", key)
             self.assertNotIn(key.strip(), str(raised.exception))
 
-    def test_macos_runs_on_both_hypervisors(self):
-        for hypervisor in ("qemu", "vmlab"):
-            self.assertIsNone(out_of_scope(FEATURE, hypervisor))
+    def test_macos_runs_on_vmlab_hv_only(self):
+        self.assertIsNone(out_of_scope(FEATURE, "vmlab"))
+        self.assertEqual(out_of_scope(FEATURE, "qemu"), NO_X86_ON_QEMU)
 
 
 if __name__ == "__main__":
