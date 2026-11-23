@@ -273,6 +273,13 @@ impl DhcpServer {
         self.leases.values().any(|l| l.ip == ip && l.expiry > now)
     }
 
+    /// Give `mac` a full lease of `ip`, as an ACK would: for a test that
+    /// needs a lease table without a client.
+    #[cfg(test)]
+    pub fn grant(&mut self, mac: MacAddr, ip: Ipv4Addr) {
+        self.hold(mac, ip, Duration::from_secs(self.config.lease_secs.into()));
+    }
+
     // -- message handling -----------------------------------------------------
 
     fn on_discover(&mut self, req: &BootpRequest) -> Option<Vec<u8>> {
