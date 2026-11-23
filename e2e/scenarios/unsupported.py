@@ -229,7 +229,7 @@ def guest(h):
                 timeout=90, what="the smb1 share to mount")
             line = h.vmlab("exec", "lin01", "--", "sh", "-c", "mount | grep /mnt/legacy", cwd=lab).out
             assert "type cifs" in line and "vers=1.0" in line, line
-            conf = (lab / ".vmlab" / "smb" / "smb.conf").read_text()
+            conf = (lab / ".vmlab" / "smb" / "machines" / "lin01" / "smb.conf").read_text()
             assert "server min protocol = NT1" in conf, "smbd not configured for NT1"
             return True
 

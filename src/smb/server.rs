@@ -57,6 +57,8 @@ pub enum SmbError {
     },
     #[error("creating passdb user `{user}` failed: {detail}")]
     CreateUser { user: String, detail: String },
+    #[error("no free port is left for the SMB server of \"{machine}\"")]
+    NoPort { machine: String },
     #[error("spawning smbd failed: {0}")]
     Spawn(std::io::Error),
     #[error("smbd exited immediately (code {code:?}): {reason}; check log {log}")]
@@ -71,7 +73,7 @@ pub enum SmbError {
 
 type Result<T> = std::result::Result<T, SmbError>;
 
-/// A running (or recently spawned) `smbd` instance for one lab.
+/// A running (or recently spawned) `smbd` instance, serving one machine.
 #[derive(Debug)]
 pub struct SmbServer {
     child: Option<Child>,
@@ -119,6 +121,7 @@ impl SmbServer {
         for (user, pass) in &creds_by_user {
             create_user(&conf_path, user, pass)?;
         }
+        forbid_password_change(&conf_path);
 
         // 4. Spawn smbd foregrounded.
         //    -F                 : run in the foreground (we own the child)
@@ -392,6 +395,33 @@ fn create_user(conf_path: &PathBuf, user: &str, pass: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Keep the account from changing its own password over SMB1's
+/// `SamOEMChangePassword`, which is no RPC pipe and so is not covered by
+/// `rpc start on demand helpers = no`: a minimum password age of 136 years.
+/// `pdbedit -a` sets the password at each start whatever the age. Best
+/// effort: a server whose policy could not be written still serves.
+fn forbid_password_change(conf_path: &PathBuf) {
+    let done = Command::new("pdbedit")
+        .arg("-s")
+        .arg(conf_path)
+        .arg("-P")
+        .arg("minimum password age")
+        .arg("-C")
+        .arg(u32::MAX.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match done {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(
+            "smb: could not set the minimum password age: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("smb: could not set the minimum password age: {e}"),
+    }
 }
 
 /// Whether `user` exists in the system passwd database (`getent passwd`,
@@ -783,6 +813,91 @@ mod tests {
             Some("messaging_dgm_ref failed: File name too long")
         );
         assert_eq!(last_reason("smbd version 4.24.6 started.\n"), None);
+    }
+
+    /// A guest logs in with an ordinary Samba account, and Samba lets an
+    /// account set its password over the SAMR pipe: by the change call, and
+    /// by the administrator's set call too, because an unprivileged smbd
+    /// takes every session for root. After either, the password vmlab hands
+    /// out must still open the share (docs/reviews/smb.md F5).
+    #[test]
+    fn a_guest_cannot_change_the_lab_password() {
+        if which("smbd").is_none() || which("smbclient").is_none() || which("rpcclient").is_none() {
+            eprintln!("SKIP: smbd, smbclient or rpcclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let smb_dir = tmp.path().join("lab/.vmlab/smb");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("hello.txt"), b"hi").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: false,
+            shares: vec![ShareDef {
+                name: "ro".to_string(),
+                host_path: shared.clone(),
+                readonly: true,
+                smb1: false,
+                allowed_user: user.to_string(),
+            }],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.to_string(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return;
+            }
+        };
+        let port = server.listen_port();
+        let run = |program: &str, args: &[&str]| {
+            let out = Command::new(program)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("run {program}: {e}"));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        let port_arg = port.to_string();
+        let login = format!("{user}%{pass}");
+        let ls = || {
+            run(
+                "smbclient",
+                &["//127.0.0.1/ro", "-p", &port_arg, "-U", &login, "-c", "ls"],
+            )
+        };
+        let before = ls();
+        let rpc = |command: String| {
+            run(
+                "rpcclient",
+                &["-p", &port_arg, "-U", &login, "127.0.0.1", "-c", &command],
+            )
+        };
+        let changed = rpc(format!("chgpasswd3 {user} {pass} NewPass456def"));
+        let after_change = ls();
+        let set = rpc(format!("setuserinfo2 {user} 23 OtherPass789ghi"));
+        let after_set = ls();
+        drop(server);
+        assert!(
+            before.contains("hello.txt"),
+            "the share lists at all:\n{before}"
+        );
+        assert!(
+            after_change.contains("hello.txt"),
+            "a guest changed the password of the account.\nchgpasswd3:\n{changed}\nls:\n{after_change}"
+        );
+        assert!(
+            after_set.contains("hello.txt"),
+            "a guest set the password of the account.\nsetuserinfo2:\n{set}\nls:\n{after_set}"
+        );
     }
 
     fn which(bin: &str) -> Option<PathBuf> {

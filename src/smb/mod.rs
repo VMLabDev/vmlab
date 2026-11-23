@@ -14,23 +14,32 @@
 //!   transports (virtiofs and SMB).
 //!
 //! The top-level [`LabSmb`] ties these together for the daemon: given the
-//! lab's VMs, gateways, and shares it assigns a port, mints per-VM credentials,
-//! builds share definitions, spawns one `smbd`, and produces a per-VM mount
-//! plan plus its credential.
+//! lab's VMs, gateways, and shares it mints a credential per machine, builds
+//! share definitions, spawns **one `smbd` per sharing machine**, and produces
+//! a per-VM mount plan plus its credential.
+//!
+//! ## One server per machine
+//!
+//! A share is mappable only with its owning machine's credential (PRD §7.5).
+//! An unprivileged passdb holds one account, the host user's, so one server
+//! for the lab meant one password for the lab: a guest with one read-only
+//! share could write every other machine's (docs/reviews/smb.md F2). Each
+//! machine therefore gets a server of its own — its own state directory,
+//! passdb, password and port — that exports its shares and nothing else.
 //!
 //! ## Network boundary (NOT this module's job)
 //!
 //! This module exposes [`LabSmb::listen_port`]. The **daemon must proxy** the
-//! segment gateway's TCP port 445 to `127.0.0.1:<listen_port>` on every segment
-//! a sharing VM sits on — that proxy is the network layer's responsibility, not
-//! the SMB module's.
+//! segment gateway's TCP port 445 to `127.0.0.1:<that machine's port>` for
+//! what that machine's NIC sends — that proxy is the network layer's
+//! responsibility, not the SMB module's.
 
 pub mod config;
 pub mod mount;
 pub mod server;
 pub mod steps;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -79,38 +88,31 @@ struct VmPlan {
     shares: Vec<(String, PathBuf, String, bool, bool)>,
 }
 
+/// How many ports one machine's `smbd` is tried on before the start fails: a
+/// port free when the plan was made can be taken by the time `smbd` binds it.
+const PORT_TRIES: usize = 10;
+
 /// High-level SMB orchestration for one lab.
 #[derive(Debug)]
 pub struct LabSmb {
-    listen_port: u16,
     smb_dir: PathBuf,
-    /// Where smbd's sockets go ([`crate::paths::smb_runtime_dir`]).
-    run_dir: PathBuf,
-    vms: HashMap<String, VmPlan>,
-    server: Option<SmbServer>,
+    vms: BTreeMap<String, VmPlan>,
+    /// The running servers, by machine.
+    servers: BTreeMap<String, SmbServer>,
 }
 
 impl LabSmb {
     /// Build a lab's SMB plan. `vmlab_dir` is the lab's `.vmlab` directory;
-    /// SMB state lands under `<vmlab_dir>/smb`. `vms` is each sharing VM with
-    /// its gateway IP and declared shares.
+    /// SMB state lands under `<vmlab_dir>/smb`, one directory per machine.
+    /// `vms` is each sharing VM with its gateway IP and declared shares.
     ///
-    /// Credentials are minted deterministically per call but the passwords are
-    /// random, so they are stable within one `LabSmb` instance (the daemon
-    /// keeps one per lab while it is up).
-    pub fn plan(
-        lab: &str,
-        vmlab_dir: &Path,
-        listen_port: u16,
-        vms: &[(String, Ipv4Addr, Vec<Share>)],
-    ) -> LabSmb {
+    /// Each machine's credential is read from its state directory, or minted
+    /// and kept there, so it is stable from one start to the next.
+    pub fn plan(vmlab_dir: &Path, vms: &[(String, Ipv4Addr, Vec<Share>)]) -> LabSmb {
         let smb_dir = vmlab_dir.join("smb");
-        // One stable credential per lab (see load_or_create) — also keeps
-        // the passdb consistent when several VMs share (same unix user).
-        let lab_creds = SmbCredentials::load_or_create(lab, &smb_dir);
-        let mut plans = HashMap::new();
+        let mut plans = BTreeMap::new();
         for (vm_name, gateway, shares) in vms {
-            let creds = lab_creds.clone();
+            let creds = SmbCredentials::load_or_create(&machine_dir(&smb_dir, vm_name));
             let share_tuples = shares
                 .iter()
                 .map(|s| {
@@ -133,11 +135,9 @@ impl LabSmb {
             );
         }
         LabSmb {
-            listen_port,
-            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
             smb_dir,
             vms: plans,
-            server: None,
+            servers: BTreeMap::new(),
         }
     }
 
@@ -148,64 +148,118 @@ impl LabSmb {
         self.vms.get(vm).map(|p| &p.creds)
     }
 
-    /// The high port `smbd` listens on. The daemon must proxy each relevant
-    /// segment gateway's port 445 to `127.0.0.1:<this>`.
-    pub fn listen_port(&self) -> u16 {
-        self.listen_port
+    /// The high port a machine's `smbd` listens on, once started. The daemon
+    /// must proxy the machine's `gateway:445` to `127.0.0.1:<this>`.
+    pub fn listen_port(&self, vm: &str) -> Option<u16> {
+        self.servers.get(vm).map(SmbServer::listen_port)
     }
 
-    /// Build the [`SmbConfig`] for this lab from all VMs' shares.
-    pub fn build_config(&self) -> SmbConfig {
-        let mut shares = Vec::new();
-        let mut any_smb1 = false;
-        // Deterministic ordering for stable conf output.
-        let mut vm_names: Vec<&String> = self.vms.keys().collect();
-        vm_names.sort();
-        for vm in vm_names {
-            let plan = &self.vms[vm];
-            for (name, host, _guest, readonly, smb1) in &plan.shares {
-                if *smb1 {
-                    any_smb1 = true;
+    /// Every running server's machine and port, by machine name.
+    pub fn listen_ports(&self) -> Vec<(String, u16)> {
+        self.servers
+            .iter()
+            .map(|(vm, server)| (vm.clone(), server.listen_port()))
+            .collect()
+    }
+
+    /// Where a machine's `creds` file is, for the line `up` prints.
+    pub fn creds_hint() -> &'static str {
+        ".vmlab/smb/machines/<machine>/creds"
+    }
+
+    /// Build the [`SmbConfig`] of one machine's server, on `listen_port`,
+    /// from that machine's shares. `None` for a machine with no plan.
+    pub fn build_config(&self, vm: &str, listen_port: u16) -> Option<SmbConfig> {
+        let plan = self.vms.get(vm)?;
+        let shares: Vec<ShareDef> = plan
+            .shares
+            .iter()
+            .map(|(name, host, _guest, readonly, smb1)| ShareDef {
+                name: name.clone(),
+                host_path: host.clone(),
+                readonly: *readonly,
+                smb1: *smb1,
+                allowed_user: plan.creds.username.clone(),
+            })
+            .collect();
+        let lab_dir = machine_dir(&self.smb_dir, vm);
+        Some(SmbConfig {
+            listen_port,
+            run_dir: crate::paths::smb_runtime_dir(&lab_dir),
+            lab_dir,
+            any_smb1: shares.iter().any(|s| s.smb1),
+            shares,
+        })
+    }
+
+    /// Spawn one `smbd` per machine, each on a port of `ports` — the free
+    /// ports of the share plan, first choice first. A server that dies at
+    /// start is tried on the next port, [`PORT_TRIES`] times at most; any
+    /// other failure, and a machine left without a port, stops the servers
+    /// already started and fails the whole start, so a lab never runs with
+    /// some machines' shares served and others' silently not.
+    pub fn start(&mut self, ports: &[u16]) -> Result<(), SmbError> {
+        // No share may reach another machine's server state either: the
+        // render refuses a share over its own server's directory only.
+        for plan in self.vms.values() {
+            for (name, host, ..) in &plan.shares {
+                if let Some(reason) =
+                    config::share_state_problem(host, &self.smb_dir, "vmlab's SMB state directory")
+                {
+                    return Err(SmbError::Share(config::ShareRefused {
+                        name: name.clone(),
+                        reason,
+                    }));
                 }
-                shares.push(ShareDef {
-                    name: name.clone(),
-                    host_path: host.clone(),
-                    readonly: *readonly,
-                    smb1: *smb1,
-                    allowed_user: plan.creds.username.clone(),
-                });
             }
         }
-        SmbConfig {
-            listen_port: self.listen_port,
-            lab_dir: self.smb_dir.clone(),
-            run_dir: self.run_dir.clone(),
-            shares,
-            any_smb1,
+        remove_lab_wide_state(&self.smb_dir);
+        let mut ports = ports.iter().copied();
+        let machines: Vec<String> = self.vms.keys().cloned().collect();
+        for vm in machines {
+            match self.start_one(&vm, &mut ports) {
+                Ok(server) => {
+                    self.servers.insert(vm, server);
+                }
+                Err(e) => {
+                    self.stop();
+                    return Err(e);
+                }
+            }
         }
+        Ok(())
     }
 
-    /// Spawn the lab's `smbd` from a fully-formed config (host paths resolved
-    /// by the caller) and the per-VM credential map. Holds the server so it is
-    /// stopped on drop.
-    pub fn spawn(&mut self, config: SmbConfig) -> Result<u16, SmbError> {
-        let creds: HashMap<String, String> = self
-            .vms
-            .values()
-            .map(|p| (p.creds.username.clone(), p.creds.password.clone()))
-            .collect();
-        let server = SmbServer::spawn(config, creds)?;
-        let port = server.listen_port();
-        self.server = Some(server);
-        Ok(port)
+    fn start_one(
+        &self,
+        vm: &str,
+        ports: &mut dyn Iterator<Item = u16>,
+    ) -> Result<SmbServer, SmbError> {
+        let creds = &self.vms[vm].creds;
+        let mut last = None;
+        for port in ports.take(PORT_TRIES) {
+            let config = self.build_config(vm, port).expect("a planned machine");
+            let account = HashMap::from([(creds.username.clone(), creds.password.clone())]);
+            match SmbServer::spawn(config, account) {
+                Ok(server) => return Ok(server),
+                Err(e @ SmbError::DiedOnStart { .. }) => {
+                    tracing::warn!("smbd for \"{vm}\" on port {port} failed: {e}");
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(SmbError::NoPort {
+            machine: vm.to_string(),
+        }))
     }
 
-    /// Stop the lab's `smbd`.
+    /// Stop every `smbd` of the lab.
     pub fn stop(&mut self) {
-        if let Some(s) = self.server.as_mut() {
-            s.stop();
+        for server in self.servers.values_mut() {
+            server.stop();
         }
-        self.server = None;
+        self.servers.clear();
     }
 
     /// Build the per-VM mount plan: one [`MountStep`] sequence the daemon runs
@@ -342,6 +396,21 @@ impl LabSmb {
     }
 }
 
+/// The state directory of one machine's server under the lab's
+/// `.vmlab/smb`: its `smb.conf`, passdb, log and `creds`.
+fn machine_dir(smb_dir: &Path, vm: &str) -> PathBuf {
+    smb_dir.join("machines").join(vm)
+}
+
+/// Remove what the one server of the whole lab kept directly under
+/// `.vmlab/smb` before each machine had its own: above all the `creds` file,
+/// whose password opens nothing any more.
+fn remove_lab_wide_state(smb_dir: &Path) {
+    for name in ["creds", "smb.conf", "passdb.tdb"] {
+        let _ = std::fs::remove_file(smb_dir.join(name));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,7 +440,7 @@ mod tests {
                 vec![share("data", "Z:", true, true)],
             ),
         ];
-        LabSmb::plan("mylab", Path::new("/lab/.vmlab"), 14450, &vms)
+        LabSmb::plan(Path::new("/lab/.vmlab"), &vms)
     }
 
     #[test]
@@ -379,30 +448,111 @@ mod tests {
         let lab = sample();
         let web = lab.credentials("web").unwrap().clone();
         let xp = lab.credentials("xp").unwrap().clone();
-        // Unprivileged passdb: username is the Unix user, shared per lab.
+        // Unprivileged passdb: the username is the Unix user for every
+        // machine. The password is what tells them apart.
         assert_eq!(web.username, config::current_unix_user());
         assert_eq!(web.username, xp.username);
         assert!(!web.password.is_empty());
         // stable within the instance
         assert_eq!(lab.credentials("web").unwrap().password, web.password);
-        assert_eq!(lab.listen_port(), 14450);
+        assert_eq!(lab.listen_port("web"), None, "nothing started yet");
     }
 
+    /// A machine's credential is kept in its own state directory and read
+    /// back at the next start, and the lab-wide file of the one server
+    /// before it is not what any machine is given.
     #[test]
-    fn build_config_collects_shares_and_smb1_flag() {
-        let lab = sample();
-        let cfg = lab.build_config();
-        assert!(cfg.any_smb1); // xp share is smb1
-        assert_eq!(cfg.shares.len(), 2);
-        assert_eq!(cfg.lab_dir, PathBuf::from("/lab/.vmlab/smb"));
+    fn a_machines_credential_is_kept_in_its_own_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vmlab_dir = tmp.path().join(".vmlab");
+        std::fs::create_dir_all(vmlab_dir.join("smb")).unwrap();
+        let user = config::current_unix_user();
+        std::fs::write(
+            vmlab_dir.join("smb/creds"),
+            format!("{user}:LabWidePassword"),
+        )
+        .unwrap();
+        let vms = vec![
+            (
+                "web".to_string(),
+                Ipv4Addr::new(10, 0, 0, 1),
+                vec![share("src", "/mnt/src", false, false)],
+            ),
+            (
+                "db".to_string(),
+                Ipv4Addr::new(10, 0, 0, 1),
+                vec![share("data", "/mnt/data", false, false)],
+            ),
+        ];
+        let first = LabSmb::plan(&vmlab_dir, &vms);
+        let web = first.credentials("web").unwrap().clone();
+        let db = first.credentials("db").unwrap().clone();
+        assert_ne!(web.password, db.password);
+        assert_ne!(web.password, "LabWidePassword");
         assert_eq!(
-            cfg.run_dir,
-            crate::paths::smb_runtime_dir(Path::new("/lab/.vmlab/smb"))
+            std::fs::read_to_string(vmlab_dir.join("smb/machines/web/creds")).unwrap(),
+            format!("{user}:{}", web.password)
         );
-        // each share scoped to the lab's authenticated account
-        let data = cfg.shares.iter().find(|s| s.name == "data").unwrap();
+        let again = LabSmb::plan(&vmlab_dir, &vms);
+        assert_eq!(again.credentials("web"), Some(&web));
+        assert_eq!(again.credentials("db"), Some(&db));
+    }
+
+    /// Each machine's server exports that machine's shares and nothing else,
+    /// from a state directory of its own, and only the server of a machine
+    /// with an `smb1` share is relaxed to NT1.
+    #[test]
+    fn build_config_holds_one_machines_shares() {
+        let lab = sample();
+        let xp = lab.build_config("xp", 14451).unwrap();
+        assert!(xp.any_smb1); // xp share is smb1
+        assert_eq!(xp.listen_port, 14451);
+        assert_eq!(xp.shares.len(), 1);
+        assert_eq!(xp.lab_dir, PathBuf::from("/lab/.vmlab/smb/machines/xp"));
+        assert_eq!(
+            xp.run_dir,
+            crate::paths::smb_runtime_dir(Path::new("/lab/.vmlab/smb/machines/xp"))
+        );
+        // the share scoped to the server's one authenticated account
+        let data = &xp.shares[0];
+        assert_eq!(data.name, "data");
         assert_eq!(data.allowed_user, config::current_unix_user());
         assert!(data.readonly);
+
+        let web = lab.build_config("web", 14450).unwrap();
+        assert!(
+            !web.any_smb1,
+            "another machine's smb1 share relaxes nothing here"
+        );
+        assert_eq!(web.shares.len(), 1);
+        assert_eq!(web.shares[0].name, "src");
+        assert_ne!(web.lab_dir, xp.lab_dir);
+        assert_ne!(web.run_dir, xp.run_dir);
+        assert!(lab.build_config("nope", 14452).is_none());
+    }
+
+    /// A share over the lab's SMB state reaches every machine's server, so
+    /// no server starts with one, whichever machine declares it.
+    #[test]
+    fn a_share_over_another_machines_server_state_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vmlab_dir = tmp.path().join(".vmlab");
+        let mut over = share("over", "/mnt/over", false, false);
+        over.host = vmlab_dir.join("smb/machines/db");
+        let vms = vec![
+            ("web".to_string(), Ipv4Addr::new(10, 0, 0, 1), vec![over]),
+            (
+                "db".to_string(),
+                Ipv4Addr::new(10, 0, 0, 1),
+                vec![share("data", "/mnt/data", false, false)],
+            ),
+        ];
+        let mut lab = LabSmb::plan(&vmlab_dir, &vms);
+        match lab.start(&[14450, 14451]) {
+            Err(SmbError::Share(refused)) => assert_eq!(refused.name, "over"),
+            other => panic!("expected the share to be refused, got {other:?}"),
+        }
+        assert!(lab.listen_ports().is_empty());
     }
 
     /// A macOS guest makes the mount point, then `mount_smbfs`s the share
@@ -466,7 +616,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             vec![share("data", "C:\\mnt\\data", false, false)],
         )];
-        let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
+        let lab = LabSmb::plan(Path::new("/lab/.vmlab"), &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
         assert_eq!(steps.len(), 4); // credential + net use auth + link + hook
         assert_eq!(steps[2].command, "powershell");
@@ -494,11 +644,126 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             vec![share("data", "Z:", false, false)],
         )];
-        let lab = LabSmb::plan("l", Path::new("/lab/.vmlab"), 14451, &vms);
+        let lab = LabSmb::plan(Path::new("/lab/.vmlab"), &vms);
         let steps = lab.mount_plan("win", OsHint::Windows);
         assert_eq!(steps.len(), 5); // credential + cleanup + map + script + hook
         assert!(steps[3].args.join(" ").contains(mount::DESKTOP_SCRIPT));
         assert!(steps[4].args.join(" ").contains("/v vmlab-shares"));
+    }
+
+    /// PRD §7.5: "a share is mappable only with its owning VM's credential".
+    /// The user name is the host user's for every machine, because an
+    /// unprivileged passdb takes no other, so the password is what differs
+    /// (docs/reviews/smb.md F2).
+    #[test]
+    fn each_machine_has_its_own_credential() {
+        let lab = sample();
+        let web = lab.credentials("web").unwrap();
+        let xp = lab.credentials("xp").unwrap();
+        assert_ne!(
+            web.password, xp.password,
+            "one password opens the shares of both machines"
+        );
+    }
+
+    fn which(bin: &str) -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
+    }
+
+    /// `smbclient ... -c ls` on `share` at `port`, stdout and stderr.
+    fn smbclient_ls(port: u16, share: &str, creds: &SmbCredentials) -> String {
+        let out = std::process::Command::new("smbclient")
+            .arg(format!("//127.0.0.1/{share}"))
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-U")
+            .arg(format!("{}%{}", creds.username, creds.password))
+            .arg("-c")
+            .arg("ls")
+            .output()
+            .expect("run smbclient");
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    }
+
+    fn free_ports(n: usize) -> Vec<u16> {
+        let held: Vec<_> = (0..n)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        held.iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect()
+    }
+
+    /// Two machines, a real `smbd`: what `web` was given does not list the
+    /// share of `db`, wherever `web` connects (docs/reviews/smb.md F2).
+    #[test]
+    fn one_machines_credential_does_not_open_anothers_share() {
+        if !which("smbd") || !which("smbclient") {
+            eprintln!("SKIP: smbd or smbclient not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = |name: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{name}.txt")), b"x").unwrap();
+            dir
+        };
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        let mut of_web = share("websrc", "/mnt/src", true, false);
+        of_web.host = host_dir("websrc");
+        let mut of_db = share("dbdata", "/mnt/data", false, false);
+        of_db.host = host_dir("dbdata");
+        let vms = vec![
+            ("web".to_string(), gateway, vec![of_web]),
+            ("db".to_string(), gateway, vec![of_db]),
+        ];
+        let vmlab_dir = tmp.path().join("lab/.vmlab");
+        // A port from `free_ports` is released before smbd binds it, so a
+        // parallel test can take it in between: the start walks on to the
+        // next one, and a start that still fails is tried again.
+        let mut started = None;
+        for _ in 0..5 {
+            let mut lab = LabSmb::plan(&vmlab_dir, &vms);
+            match lab.start(&free_ports(8)) {
+                Ok(()) => {
+                    started = Some(lab);
+                    break;
+                }
+                Err(e) => eprintln!("smbd: {e}"),
+            }
+        }
+        let Some(mut lab) = started else {
+            eprintln!("SKIP: could not spawn smbd");
+            return;
+        };
+        let web = lab.credentials("web").unwrap().clone();
+        let db = lab.credentials("db").unwrap().clone();
+        let web_port = lab.listen_port("web").unwrap();
+        let db_port = lab.listen_port("db").unwrap();
+        assert_ne!(web_port, db_port, "a server each");
+        let own = smbclient_ls(web_port, "websrc", &web);
+        let owner = smbclient_ls(db_port, "dbdata", &db);
+        // The two ways for web to ask: its own server, which does not have
+        // the share, and db's server, which does not know its password.
+        let at_own_server = smbclient_ls(web_port, "dbdata", &web);
+        let at_their_server = smbclient_ls(db_port, "dbdata", &web);
+        lab.stop();
+        assert!(
+            own.contains("websrc.txt"),
+            "web lists its own share:\n{own}"
+        );
+        assert!(
+            owner.contains("dbdata.txt"),
+            "db lists its own share:\n{owner}"
+        );
+        for theirs in [at_own_server, at_their_server] {
+            assert!(
+                !theirs.contains("dbdata.txt"),
+                "web's credential listed db's share:\n{theirs}"
+            );
+        }
     }
 
     #[test]
