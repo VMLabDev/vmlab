@@ -11,7 +11,7 @@ pub mod store;
 pub mod templates;
 mod trunk_auth;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -157,6 +157,18 @@ async fn run_async() -> Result<()> {
     // An unreadable registry is not an empty one: starting on it would
     // forget every lab daemon that runs and overwrite the file.
     let registry = Registry::load().context("the lab registry is unreadable")?;
+
+    // Reap abandoned build labs before listening, so a new build cannot
+    // start in the runtime directory being reaped.
+    let swept = sweep_leftover_builds(
+        &crate::template::build::builds_dir(),
+        &runtime_dir,
+        &registry,
+        crate::qemu::process::kill_build_orphans,
+    );
+    if swept != 0 {
+        tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
+    }
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(registry),
         events: events_tx.clone(),
@@ -194,17 +206,6 @@ async fn run_async() -> Result<()> {
     tracing::info!("vmlabd listening on {}", sock.display());
     supervisor.adopt_existing_labs().await;
 
-    // A build that was in flight when the last supervisor died is not resumed
-    // (ADR-0010) and its working disk is nobody's — the workdir guard is a
-    // `Drop`, and a killed process runs none. Nothing owns a build at this
-    // point, so anything still here is a leftover.
-    match crate::template::build::sweep_build_workdirs() {
-        0 => {}
-        swept => {
-            tracing::info!("cleared {swept} build working director(y|ies) left by a previous run")
-        }
-    }
-
     // Disk-space watchdog on the template store's filesystem (PRD §8.1).
     let store_dir = crate::paths::data_dir();
     crate::paths::ensure_dir(&store_dir)?;
@@ -232,6 +233,77 @@ async fn run_async() -> Result<()> {
     teardown(&supervisor, &tasks).await;
     drop(server);
     Ok(())
+}
+
+fn sweep_leftover_builds(
+    builds: &Path,
+    runtime: &Path,
+    registry: &Registry,
+    kill: impl Fn(&str, &Path) -> bool,
+) -> usize {
+    crate::template::build::sweep_workdirs_with(builds, |work| {
+        reap_leftover_build(work, runtime, registry, &kill)
+    })
+}
+
+/// The sweep holds the workdir lock. The runtime's supervisor socket guard
+/// also excludes a live build of a different version with the same lab name.
+fn reap_leftover_build(
+    work: &Path,
+    runtime: &Path,
+    registry: &Registry,
+    kill: impl FnOnce(&str, &Path) -> bool,
+) -> bool {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let saved_runtime = match std::fs::read(work.join(crate::template::build::BUILD_RUNTIME_FILE)) {
+        Ok(bytes) => PathBuf::from(std::ffi::OsString::from_vec(bytes)),
+        // Older builds used this supervisor's runtime without recording it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => runtime.to_owned(),
+        Err(error) => {
+            tracing::warn!("cannot read build runtime in {}: {error}", work.display());
+            return false;
+        }
+    };
+    let lab_file = work.join(crate::paths::LAB_FILE);
+    match lab_file.try_exists() {
+        Ok(false) => return true, // The synthetic lab was never launched.
+        Ok(true) => {}
+        Err(error) => {
+            tracing::warn!("cannot check {}: {error}", lab_file.display());
+            return false;
+        }
+    }
+    let lab = match crate::config::load_lab_root(work) {
+        Ok(lab) => lab.lab.name,
+        Err(error) => {
+            tracing::warn!("cannot read build lab in {}: {error}", work.display());
+            return false;
+        }
+    };
+    if registry.get(&lab).is_some() {
+        tracing::warn!(
+            "cannot reap build in {}: {lab} is a registered lab",
+            work.display()
+        );
+        return false;
+    }
+    if !saved_runtime.is_absolute() {
+        tracing::warn!("invalid build runtime in {}", work.display());
+        return false;
+    }
+    let _other_guard = if saved_runtime == runtime {
+        None
+    } else {
+        match crate::proto::server::SocketGuard::acquire(&saved_runtime.join("vmlabd.sock")) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!("cannot reap build in {}: {error}", work.display());
+                return false;
+            }
+        }
+    };
+    kill(&lab, &saved_runtime)
 }
 
 /// Stop every template operation (a build stops its own build VM), release
@@ -1042,6 +1114,61 @@ impl Handler<SupRequest> for SupervisorHandler {
 #[cfg(test)]
 mod tests {
     use super::{daemon_running, process_running, process_start_time};
+
+    #[test]
+    fn a_start_reaps_the_processes_of_a_leftover_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("x86_64-base-1.0");
+        std::fs::create_dir(&work).unwrap();
+        let lab = "build-x86_64-base";
+        std::fs::write(
+            work.join(crate::paths::LAB_FILE),
+            format!("import <vmlab.wcl>\nlab \"{lab}\" {{}}\n"),
+        )
+        .unwrap();
+        let runtime = crate::paths::runtime_dir();
+        let lab_runtime = crate::paths::lab_runtime_dir(lab);
+        let table = [
+            (
+                42,
+                format!(
+                    "vmlab-hv\0--machine\0{}/vms/build/machine.json\0",
+                    lab_runtime.display()
+                ),
+            ),
+            (
+                43,
+                format!(
+                    "swtpm\0socket\0--ctrl\0type=unixio,path={}/vms/build/swtpm.sock\0",
+                    lab_runtime.display()
+                ),
+            ),
+            (
+                44,
+                format!("tail\0{}/vms/build/machine.json\0", lab_runtime.display()),
+            ),
+        ];
+        let reaped = std::cell::RefCell::new(Vec::new());
+        let swept = super::sweep_leftover_builds(
+            dir.path(),
+            &runtime,
+            &super::Registry::default(),
+            |lab, found_runtime| {
+                assert!(work.is_dir());
+                assert_eq!(found_runtime, runtime);
+                reaped
+                    .borrow_mut()
+                    .extend(table.iter().filter_map(|(pid, cmdline)| {
+                        crate::qemu::process::cmdline_belongs_to(cmdline.as_bytes(), lab)
+                            .then_some(*pid)
+                    }));
+                true
+            },
+        );
+        assert_eq!(swept, 1);
+        assert_eq!(reaped.into_inner(), [42, 43]);
+        assert!(!work.exists());
+    }
 
     /// A release that kills a lab daemon before one guest's graceful stop
     /// could end cuts that guest's power in the middle of its shutdown

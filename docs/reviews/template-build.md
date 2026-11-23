@@ -46,10 +46,10 @@ test does not reproduce is wrong and should be dropped.
 |------|----------|-------------------|
 | F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691) |
 | F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
-| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk |
+| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697) |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
-| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process |
-| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory |
+| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process (fixed, card #699) |
+| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory **Fixed by card #698.** |
 | F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` |
 | F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered |
 | F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings |
@@ -139,6 +139,11 @@ name: the refusal comes at the start of the build.
 
 ### F3. The seal accepts a guest that was cut off (wrong result)
 
+**Fixed by card #697.** The base, variant, and verification boot check
+which stop rung ended the VM before sealing. Only profiles with
+`seal_allow_quit = true` can seal after emulator quit. A kill fails the
+seal for every profile.
+
 - Where: `src/template/build.rs:1299-1305` (base), `:575-583` (variant),
   `:1371-1379` (verification boot). `src/labd/vm.rs:1745-1827`
   (`stop_ladder`). `src/labd/stop_plan.rs:30` (`RUNG_EXIT_WAIT`, 30 s),
@@ -199,6 +204,11 @@ name: the refusal comes at the start of the build.
 
 ### F5. A build VM outlives a killed supervisor (wrong result)
 
+**Fixed by card #699.** The supervisor reaps the synthetic lab's hypervisor
+and helpers before deleting the abandoned working directory. It holds the
+workdir lock during cleanup and uses the runtime directory recorded by the
+build to identify its processes.
+
 - Where: `src/qemu/process.rs:150` (`kill_on_drop(false)`, and no parent
   death signal). `src/supervisor/mod.rs:197-206` (the sweep at start).
   `src/template/build.rs:994-1017` (`sweep_workdirs_in`).
@@ -224,6 +234,12 @@ name: the refusal comes at the start of the build.
   sweep returns the lab to kill. Today the sweep has no such output.
 
 ### F6. Two builds of one template share one runtime directory (wrong result, hang)
+
+**Fixed by card #698.** Base and variant builds take an exclusive lock for
+the build lab's runtime directory before claiming their working directory.
+A second build targeting that runtime directory is refused while the first
+holds the lock. The proof test also checks that the second build can claim
+the directory after the first releases it.
 
 - Where: `src/template/build.rs:1551-1553` (`build_lab_name`: architecture
   and name), `:977-979` (the working directory: architecture, name and

@@ -22,8 +22,29 @@ use crate::config::model::{
 };
 use crate::config::wcl_str;
 use crate::labd::machine::Machine;
+use crate::labd::stop_plan::Rung;
+use crate::labd::vm::VmInstance;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
+
+/// Stop the build VM and reject disks from guests cut off by the stop ladder.
+pub(crate) async fn shutdown_for_seal(vm: &VmInstance) -> Result<()> {
+    match vm.stop_ladder(false).await? {
+        Some(Rung::Quit { .. }) if vm.template().resolved.seal_allow_quit => {}
+        Some(rung @ (Rung::Quit { .. } | Rung::Kill)) => {
+            bail!(
+                "guest did not power off before the emulator {} rung, refusing to seal the disk",
+                rung.name()
+            );
+        }
+        Some(Rung::Agent { .. } | Rung::Acpi { .. }) | None => {}
+    }
+    vm.wait_state(
+        crate::labd::vm::PowerState::Stopped,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+}
 
 /// A build VM as the machine verbs address it, `<lab>/<vm>` (PRD §6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +176,7 @@ pub async fn build_template(
     // Working area: a throwaway lab root under the artefact cache. Removed on
     // both success and failure, so nothing leaks.
     let work = build_workdir(def);
-    let guard = claim_workdir(&work)?;
+    let guard = claim_build_workdir(def, &work, &crate::paths::runtime_dir())?;
 
     let result = run_build(
         def,
@@ -440,7 +461,7 @@ async fn build_variants(
             "{}-{}-{}-variant-{}",
             def.arch, def.name, def.version, v.name
         ));
-        let guard = claim_workdir(&work)?;
+        let guard = claim_build_workdir(def, &work, &crate::paths::runtime_dir())?;
         let built = build_variant(
             def,
             v,
@@ -532,7 +553,7 @@ async fn build_variant(
             guest_iso: None,
         },
     )?;
-    std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
+    write_build_lab(work, &lab_wcl)?;
     let labfile = crate::config::load_lab_source(&lab_wcl, "<variant build>", work)
         .map_err(|e| anyhow::anyhow!("internal variant build lab invalid: {e:?}"))?;
     let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
@@ -612,14 +633,9 @@ async fn build_variant(
             None => bail!("build cancelled"),
         }
         log("sealing variant: graceful shutdown\n".to_string());
-        vm.stop(false)
+        shutdown_for_seal(&vm)
             .await
             .context("variant build VM did not shut down")?;
-        vm.wait_state(
-            crate::labd::vm::PowerState::Stopped,
-            std::time::Duration::from_secs(120),
-        )
-        .await?;
         Ok(())
     };
     if let Err(e) = sealed.await {
@@ -983,11 +999,10 @@ fn try_lock_workdir(work: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::Fil
     }
 }
 
-/// Claim working directory `work` for a build: take its lock, clear whatever
-/// a dead build left in it, and create it empty.
+/// Claim working directory `work` for a build: take its lock and create it empty.
 ///
 /// Refuses when a live build — in this supervisor or another one on the same
-/// data dir — holds it, rather than deleting that build's disk and media.
+/// data dir — holds it or when startup still needs to reap its build lab.
 pub fn claim_workdir(work: &Path) -> Result<WorkdirGuard> {
     if let Some(parent) = work.parent() {
         std::fs::create_dir_all(parent)
@@ -1000,6 +1015,12 @@ pub fn claim_workdir(work: &Path) -> Result<WorkdirGuard> {
             work.display()
         );
     };
+    if work.join(crate::paths::LAB_FILE).try_exists()? {
+        bail!(
+            "{} still contains a build lab; restart the supervisor to reap its processes",
+            work.display()
+        );
+    }
     let _ = std::fs::remove_dir_all(work);
     std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
     Ok(WorkdirGuard {
@@ -1013,28 +1034,54 @@ pub fn builds_dir() -> PathBuf {
     crate::paths::data_dir().join("cache").join("builds")
 }
 
+pub(crate) const BUILD_RUNTIME_FILE: &str = "runtime-dir";
+
+fn write_build_lab(work: &Path, source: &str) -> Result<()> {
+    let runtime = crate::paths::runtime_dir();
+    std::fs::write(
+        work.join(BUILD_RUNTIME_FILE),
+        runtime.as_os_str().as_encoded_bytes(),
+    )?;
+    std::fs::write(work.join(crate::paths::LAB_FILE), source)?;
+    Ok(())
+}
+
 fn build_workdir(def: &TemplateDef) -> PathBuf {
     builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
 }
 
-/// Delete every build working directory no live build holds, returning how
-/// many went.
+fn claim_build_workdir(
+    def: &TemplateDef,
+    work: &Path,
+    runtime: &Path,
+) -> Result<(WorkdirGuard, nix::fcntl::Flock<std::fs::File>)> {
+    let lab = build_lab_name(&def.arch, &def.name);
+    let lab_dir = crate::paths::lab_runtime_dir_in(runtime, &lab);
+    // Keep the lock outside the lab directory, which build boots can recreate.
+    // Use its fitted name so the lock follows the actual socket directory.
+    crate::paths::ensure_private_dir(runtime)?;
+    let locks = runtime.join("build-locks");
+    crate::paths::ensure_private_dir(&locks)?;
+    let lock_path = locks.join(lab_dir.file_name().expect("lab directory has a name"));
+    let Some(runtime_lock) = try_lock_workdir(&lock_path)? else {
+        bail!("build lab `{lab}` is in use by another build; wait for it to finish");
+    };
+    Ok((claim_workdir(work)?, runtime_lock))
+}
+
+/// Reap and delete build working directories no live build holds, returning
+/// how many went.
 ///
 /// [`WorkdirGuard`] clears one up when its build ends, but it is a `Drop` and
 /// a killed process runs none: a supervisor that is SIGKILLed — or that exits
 /// through `process::exit` on `shutdown` — leaves its in-flight builds' disks
-/// behind, several gigabytes each. The supervisor sweeps at startup, so a
-/// leftover survives at most until the next time the daemon comes up
-/// (ADR-0010).
+/// behind, several gigabytes each. The supervisor sweeps at startup
+/// (ADR-0010) and retains directories whose processes it could not reap.
 ///
 /// A starting supervisor owns no build, but it is not the only supervisor
 /// that can use this data dir: a directory whose lock another process holds
 /// is that process's in-flight build and is left alone.
-pub fn sweep_build_workdirs() -> usize {
-    sweep_workdirs_in(&builds_dir())
-}
-
-fn sweep_workdirs_in(dir: &Path) -> usize {
+pub(crate) fn sweep_workdirs_with(dir: &Path, reap: impl Fn(&Path) -> bool) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -1042,7 +1089,7 @@ fn sweep_workdirs_in(dir: &Path) -> usize {
         .flatten()
         .filter(|e| {
             let path = e.path();
-            if !path.is_dir() {
+            if !e.file_type().is_ok_and(|kind| kind.is_dir()) {
                 return false;
             }
             // A lock that cannot be taken (held, or not even openable) means
@@ -1050,7 +1097,7 @@ fn sweep_workdirs_in(dir: &Path) -> usize {
             let Ok(Some(_held)) = try_lock_workdir(&path) else {
                 return false;
             };
-            std::fs::remove_dir_all(&path).is_ok()
+            reap(&path) && std::fs::remove_dir_all(&path).is_ok()
         })
         .count()
 }
@@ -1133,7 +1180,7 @@ async fn run_build(
             guest_iso: staged.as_ref().map(|s| s.dir.as_path()),
         },
     )?;
-    std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
+    write_build_lab(work, &lab_wcl)?;
 
     let labfile = crate::config::load_lab_source(&lab_wcl, "<build>", work)
         .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
@@ -1336,12 +1383,9 @@ async fn run_build(
             }
         }
         log("sealing: graceful shutdown\n".to_string());
-        vm.stop(false).await.context("build VM did not shut down")?;
-        vm.wait_state(
-            crate::labd::vm::PowerState::Stopped,
-            std::time::Duration::from_secs(120),
-        )
-        .await?;
+        shutdown_for_seal(&vm)
+            .await
+            .context("build VM did not shut down")?;
         Ok(verify_boot)
     };
     let needs_verify_boot = match booted.await {
@@ -1408,14 +1452,9 @@ async fn run_build(
             )
             .await?;
             log("sealing: graceful shutdown (verification boot)\n".to_string());
-            vm2.stop(false)
+            shutdown_for_seal(&vm2)
                 .await
                 .context("verification boot VM did not shut down")?;
-            vm2.wait_state(
-                crate::labd::vm::PowerState::Stopped,
-                std::time::Duration::from_secs(120),
-            )
-            .await?;
             Ok::<_, anyhow::Error>(version)
         }
         .await;
@@ -2455,7 +2494,7 @@ fn synth_spec_lab(
 mod tests {
     use super::{
         BuildBoot, EffectiveHardware, SealedImage, build_lab_name, claim_workdir, seal_meta,
-        sweep_workdirs_in, synth_lab, wcl_str,
+        sweep_workdirs_with, synth_lab, wcl_str,
     };
     use crate::config::model::SecureBootKeys;
     use crate::qemu::resolve::KeyStore;
@@ -2488,6 +2527,36 @@ mod tests {
             build_lab_name(&x64.arch, &x64.name),
             build_lab_name(&x86.arch, &x86.name)
         );
+    }
+
+    #[test]
+    fn two_builds_of_one_template_do_not_share_a_runtime_directory() {
+        let first = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/i.iso" } }"#);
+        let mut second = first.clone();
+        second.version = "2".into();
+        let dir = tempfile::tempdir().unwrap();
+        let first_work = dir
+            .path()
+            .join(super::build_workdir(&first).file_name().unwrap());
+        let second_work = dir
+            .path()
+            .join(super::build_workdir(&second).file_name().unwrap());
+        let runtime = dir.path().join("runtime");
+        assert_ne!(first_work, second_work);
+        let first_claim = super::claim_build_workdir(&first, &first_work, &runtime).unwrap();
+        let err = super::claim_build_workdir(&second, &second_work, &runtime)
+            .err()
+            .expect("both builds claimed the same runtime directory");
+        let error = err.to_string();
+        assert!(
+            error.contains("build lab `build-x86_64-t` is in use"),
+            "{error}"
+        );
+        assert!(!second_work.exists());
+        drop(first_claim);
+        assert!(super::claim_build_workdir(&second, &second_work, &runtime).is_ok());
     }
 
     #[test]
@@ -2529,6 +2598,10 @@ mod tests {
         assert_eq!(sweep_workdirs_in(dir.path()), 2);
         assert!(!dir.path().join("x86_64-base-1.0").exists());
         assert!(dir.path().join("stray").is_file());
+    }
+
+    fn sweep_workdirs_in(dir: &Path) -> usize {
+        sweep_workdirs_with(dir, |_| true)
     }
 
     /// Two supervisors of one account share a data dir (VML-90): one's

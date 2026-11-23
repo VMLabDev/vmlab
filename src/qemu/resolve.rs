@@ -60,6 +60,8 @@ pub struct ResolvedVm {
     /// profile's, true when it says nothing. What the stop ladder plans
     /// from ([`crate::labd::stop_plan`]).
     pub acpi_shutdown: bool,
+    /// Allow emulator quit when sealing a guest that cannot power itself off.
+    pub seal_allow_quit: bool,
     /// The guest mounts virtiofs natively (profile capability) — with a
     /// host virtiofsd, `transport = "auto"` shares attach as vhost-user-fs
     /// devices instead of SMB (§7.5).
@@ -702,6 +704,7 @@ pub fn resolve_vm(
         agent_transport: profile.agent_transport,
         input_transport: profile.input_transport,
         acpi_shutdown: profile.acpi_shutdown.unwrap_or(true),
+        seal_allow_quit: profile.seal_allow_quit,
         virtiofs: profile.virtiofs,
         nested: lab_vm.nested,
         rtc_base: lab_vm.clock.rtc_base_for(profile.rtc),

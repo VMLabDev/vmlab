@@ -148,6 +148,9 @@ pub struct Profile {
     /// The guest acts on an ACPI power-button press (§7.2). `None` = it
     /// does.
     pub acpi_shutdown: Option<bool>,
+    /// A template build may seal after emulator quit for a guest that
+    /// halts without powering itself off.
+    pub seal_allow_quit: bool,
     /// The guest OS mounts virtiofs natively (`mount -t virtiofs` on Linux,
     /// the virtio-win driver + WinFsp on Windows) — makes it a candidate
     /// for `transport = "auto"` shares (§7.5).
@@ -352,6 +355,7 @@ fn extract_profile(b: &Block, issues: &mut IssueList) -> Option<Profile> {
             .unspan()
             .unwrap_or_default(),
         acpi_shutdown: r.bool("acpi_shutdown").unspan(),
+        seal_allow_quit: r.bool("seal_allow_quit").unspan().unwrap_or(false),
         virtiofs: r.bool("virtiofs").unspan().unwrap_or(false),
         rtc: r
             .keyword("rtc", &[("utc", Rtc::Utc), ("localtime", Rtc::Localtime)])

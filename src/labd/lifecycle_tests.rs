@@ -1698,6 +1698,74 @@ async fn a_guest_that_ignores_acpi_ends_at_a_clean_quit() {
     assert_eq!(exit.status, "exit status: 0", "quit, not killed");
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_seal_fails_when_the_guest_does_not_power_off_by_itself() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        LINUX_VM,
+        Script {
+            runs: vec![Run {
+                ignores_agent_shutdown: true,
+                ignores_powerdown: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let seal = crate::template::build::shutdown_for_seal(&vm);
+    tokio::pin!(seal);
+    // Keep Tokio from advancing past the agent handshake while the fake's
+    // socket I/O is pending. Once the request arrives, let the timers run.
+    let result = tokio::select! {
+        result = &mut seal => result,
+        () = async {
+            while hv.journal().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        } => seal.await,
+    };
+
+    assert_eq!(hv.journal(), ["agent shutdown ignored"]);
+    assert_eq!(observed.exit().await.status, "exit status: 0");
+    let error = result.expect_err("emulator quit must fail the seal");
+    assert!(error.to_string().contains("quit rung"), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_legacy_seal_allows_quit_but_rejects_kill() {
+    for ignores_quit in [false, true] {
+        let dirs = Dirs::new();
+        let (vm, _) = vm(
+            &dirs,
+            r#"vm "dos" { template = "scratch" arch = "x86_64" profile = "windows-9x" disk = 1GiB }"#,
+            Script {
+                agent: false,
+                runs: vec![Run {
+                    ignores_powerdown: true,
+                    ignores_quit,
+                    ..Run::forever()
+                }],
+                ..Script::default()
+            },
+        );
+        let (cbs, mut observed) = callbacks();
+        start_vm(&vm, cbs).await.expect("start");
+        let result = crate::template::build::shutdown_for_seal(&vm).await;
+        let exit = observed.exit().await;
+        if ignores_quit {
+            assert_eq!(exit.status, "signal: 9");
+            let error = result.expect_err("kill must fail the seal");
+            assert!(error.to_string().contains("kill rung"), "{error}");
+        } else {
+            assert_eq!(exit.status, "exit status: 0");
+            result.expect("windows-9x allows sealing after emulator quit");
+        }
+    }
+}
+
 /// A booting guest whose agent has not answered yet is not power-cut: the
 /// stop waits for the agent its template sealed and asks it, rather than
 /// skipping to ACPI and the quit — which is what `vmlab down` right after
