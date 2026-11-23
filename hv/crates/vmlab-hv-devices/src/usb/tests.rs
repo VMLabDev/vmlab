@@ -1120,3 +1120,123 @@ fn p4_isochronous_transfer_reaches_a_host_backend() {
     // A lost host device is reported so the machine can detach it.
     assert_eq!(d.hc.lost_ports(), Vec::<u8>::new());
 }
+
+/// A backend that keeps every transfer in flight and records which
+/// endpoints the controller asked for and which it reported as dropped.
+struct Recorder {
+    transfers: Arc<Mutex<Vec<u8>>>,
+    dropped: Arc<Mutex<Vec<u8>>>,
+}
+
+impl super::UsbDevice for Recorder {
+    fn speed(&self) -> super::UsbSpeed {
+        super::UsbSpeed::High
+    }
+    fn reset(&mut self) {}
+    fn control(&mut self, setup: crate::usb::SetupPacket, _data: &[u8]) -> super::UsbTransfer {
+        match (setup.request_type & 0x60, setup.request) {
+            // SET_ADDRESS and SET_CONFIGURATION.
+            (0x00, 5 | 9) => super::UsbTransfer::Ack(Vec::new()),
+            _ => super::UsbTransfer::Stall,
+        }
+    }
+    fn transfer(&mut self, endpoint: u8, _data: &[u8], _max_length: usize) -> super::UsbTransfer {
+        self.transfers.lock().unwrap().push(endpoint);
+        super::UsbTransfer::Nak
+    }
+    fn endpoint_dropped(&mut self, endpoint: u8) {
+        self.dropped.lock().unwrap().push(endpoint);
+    }
+    fn is_host_backed(&self) -> bool {
+        true
+    }
+}
+
+impl crate::Snapshot for Recorder {
+    fn state_id(&self) -> String {
+        "recorder".into()
+    }
+    fn save_state(&self) -> Result<Vec<u8>, crate::DeviceError> {
+        Ok(Vec::new())
+    }
+    fn restore_state(&mut self, _bytes: &[u8]) -> Result<(), crate::DeviceError> {
+        Ok(())
+    }
+}
+
+/// F9 of docs/reviews/usb.md. A transfer is in flight on bulk IN endpoint 1
+/// (DCI 3) of a backend on root port 6. Every way the guest can end that
+/// endpoint must reach the backend as `endpoint_dropped(0x81)`, or the old
+/// transfer's result answers the first TD the guest queues afterwards.
+#[test]
+fn every_endpoint_teardown_reaches_the_backend() {
+    type Teardown = fn(&mut Driver);
+    let teardowns: [(&str, Teardown); 6] = [
+        ("Disable Slot", |d| {
+            assert_eq!(d.command(10, 0, d.slot << 24).status >> 24, 1);
+        }),
+        ("Configure Endpoint with the drop flag", |d| {
+            d.mem32(0x6000, 1 << 3);
+            d.mem32(0x6004, 1);
+            assert_eq!(d.command(12, 0x6000, d.slot << 24).status >> 24, 1);
+        }),
+        ("Configure Endpoint with DC", |d| {
+            assert_eq!(d.command(12, 0, (d.slot << 24) | 0x200).status >> 24, 1);
+        }),
+        ("a port reset", |d| d.write(0x490, 0x210)),
+        ("HCRST", |d| d.write(0x40, 2)),
+        ("a machine reset", |d| {
+            crate::Resettable::reset(&mut d.hc).unwrap()
+        }),
+    ];
+    for (name, teardown) in teardowns {
+        let mut d = Driver::new();
+        let transfers = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        d.hc.attach(
+            6,
+            Box::new(Recorder {
+                transfers: transfers.clone(),
+                dropped: dropped.clone(),
+            }),
+        )
+        .unwrap();
+        d.start();
+        d.write(0x490, 0x210);
+        assert_eq!(d.event(34).parameter, 6 << 24);
+        let t = d.command(9, 0, 0);
+        assert_eq!(t.status >> 24, 1);
+        d.slot = t.control >> 24;
+        d.mem64(0x4000 + u64::from(d.slot) * 8, 0x5000);
+        d.mem32(0x6000, 0);
+        d.mem32(0x6004, 3);
+        d.mem32(0x6020, (3 << 20) | (1 << 27));
+        d.mem32(0x6024, 6 << 16);
+        d.mem32(0x6044, (4 << 3) | (64 << 16));
+        d.mem64(0x6048, 0x7001);
+        assert_eq!(d.command(11, 0x6000, d.slot << 24).status >> 24, 1);
+        // Bulk IN endpoint 1: DCI 3, endpoint type 6, ring at 0x8000.
+        d.mem32(0x6000, 0);
+        d.mem32(0x6004, 9);
+        d.mem32(0x6084, (6 << 3) | (512 << 16));
+        d.mem64(0x6088, 0x8001);
+        assert_eq!(d.command(12, 0x6000, d.slot << 24).status >> 24, 1);
+        // One Normal TRB; the backend NAKs, so the transfer stays in flight.
+        d.trb(0x8000, 0xa000, 64, (1 << 10) | 32);
+        d.write(0x2000 + u64::from(d.slot) * 4, 3);
+        d.hc.poll();
+        assert!(
+            transfers.lock().unwrap().contains(&0x81),
+            "{name}: the transfer never reached the backend"
+        );
+        // Only what the teardown itself reports counts.
+        dropped.lock().unwrap().clear();
+
+        teardown(&mut d);
+        assert!(
+            dropped.lock().unwrap().contains(&0x81),
+            "{name} left the backend's transfer on endpoint 0x81 in flight: saw {:02x?}",
+            dropped.lock().unwrap()
+        );
+    }
+}

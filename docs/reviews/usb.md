@@ -234,6 +234,22 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F5. A forced stop leaves the host device without a driver
 
+- Status: fixed by card #669, for a stop the lab daemon makes. The Kill rung
+  of the stop ladder now asks the hypervisor to detach every held device
+  before it kills the process (`usb_return_before_kill`, `src/labd/vm.rs`),
+  so the backend is dropped and its `Drop` sends `USBDEVFS_CONNECT`. That
+  covers `stop --force` and a graceful stop that ends at the Kill rung. All
+  the detaches together get 5 s, so a hypervisor that does not answer is
+  still killed, and the daemon log then names each device that was not
+  given back. Proof tests in `src/labd/lifecycle_tests.rs`:
+  `a_forced_stop_detaches_usb_devices_before_the_kill` and
+  `a_stop_that_ends_at_the_kill_detaches_usb_devices_first` failed before
+  the fix (the fake saw `attach`, `kill` and no `detach`) and pass with it.
+  `a_forced_stop_kills_a_hypervisor_that_never_answers_the_detach` covers
+  the limit. The check on a real host with a USB stick was not run. Not
+  covered: `kill_lab_orphans` and a crash of vmlab-hv. Nothing asks the
+  hypervisor there, so the device stays without a driver until a replug or
+  a write to `drivers_probe`.
 - Where: `usb/host/mod.rs:581-588` (the `Drop` that issues
   `USBDEVFS_CONNECT`), `src/labd/vm.rs:1813-1820` (the Kill rung),
   `src/labd/stop_plan.rs:94-96` (a forced stop is the Kill rung alone),
@@ -353,6 +369,16 @@ hostile guest or peer, wrong result, cosmetic.
   `run_irq`, then the next `transfer(0x81, ..)` must be `Nak` and not
   `Stall`.
 - How bad: wrong result in the guest.
+- Status: fixed by card #670. The controller now sends `endpoint_dropped`
+  on Disable Slot, on a Configure Endpoint that drops, replaces or
+  deconfigures an endpoint, on a port reset, on HCRST and on a machine
+  reset. The host backend discards its in-flight URBs and its uncollected
+  completions in `set_config` (all but the control endpoint, which carries
+  the request) and in `reset`. A port reset leaves the slot's endpoint
+  contexts as they were, so a TD still on the ring is submitted again as a
+  new transfer. Tests: `every_endpoint_teardown_reaches_the_backend` in
+  `usb/tests.rs`, `set_config_forgets_in_flight_work` and
+  `reset_forgets_in_flight_and_uncollected_work` in `usb/host/mod.rs`.
 
 ### F10. A detach that fails drops the tracking while the device stays held
 
