@@ -215,6 +215,8 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     }
     if (pid == 0) {
         int i;
+        if (setpgid(0, 0) < 0)
+            _exit(127);
         dup2(in[0], 0);
         dup2(out[1], 1);
         dup2(errp[1], 2);
@@ -231,6 +233,9 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         execvp(spec->argv[0], spec->argv);
         _exit(127);
     }
+    /* Establish the group on either side of fork so even a close before
+     * the child runs can address it. The child checks before exec. */
+    setpgid(pid, pid);
     close(in[0]);
     close(out[1]);
     close(errp[1]);
@@ -355,15 +360,21 @@ void proc_close_in(struct plat_proc *p)
 
 int proc_exited(struct plat_proc *p, long *code)
 {
-    int status;
     if (!p->exited) {
-        pid_t r = waitpid(p->pid, &status, WNOHANG);
-        if (r == p->pid) {
+        siginfo_t status;
+        int r;
+        memset(&status, 0, sizeof status);
+        /* Keep the group leader's PID reserved until the session is freed.
+         * A close can still arrive while its last output is draining. */
+        do {
+            r = waitid(P_PID, p->pid, &status, WEXITED | WNOHANG | WNOWAIT);
+        } while (r < 0 && errno == EINTR);
+        if (r == 0 && status.si_pid == p->pid) {
             p->exited = 1;
-            if (WIFEXITED(status))
-                p->code = WEXITSTATUS(status);
-            else if (WIFSIGNALED(status))
-                p->code = 128 + WTERMSIG(status);
+            if (status.si_code == CLD_EXITED)
+                p->code = status.si_status;
+            else if (status.si_code == CLD_KILLED || status.si_code == CLD_DUMPED)
+                p->code = 128 + status.si_status;
             else
                 p->code = 255;
         } else if (r < 0) {
@@ -378,24 +389,22 @@ int proc_exited(struct plat_proc *p, long *code)
 
 void proc_kill(struct plat_proc *p)
 {
+    kill(-p->pid, SIGKILL);
+    /* Also cover a close before either side could establish the group. */
     if (!p->exited)
         kill(p->pid, SIGKILL);
 }
 
 void proc_free(struct plat_proc *p)
 {
-    long code;
     if (p->in_fd >= 0)
         close(p->in_fd);
     if (p->out_fd >= 0)
         close(p->out_fd);
     if (p->err_fd >= 0)
         close(p->err_fd);
-    if (!p->exited) {
-        int status;
-        waitpid(p->pid, &status, 0);
-    }
-    (void)code;
+    while (waitpid(p->pid, NULL, 0) < 0 && errno == EINTR)
+        ;
     free(p->pending);
     free(p);
 }

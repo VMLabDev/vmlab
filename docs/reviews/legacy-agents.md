@@ -325,9 +325,12 @@ Not read:
 - Confidence: high. Proved on the POSIX build: after `open_exec` of
   `sh -c 'sleep 31337 & wait'` and `close`, the `sleep` was still running.
 - Test: `legacy_close_ends_what_the_exec_started` in
-  `src/labd/legacy_agent_tests.rs`. Open an exec of
-  `sh -c 'sleep 300 & echo $!; wait'`, read the pid, close the session, and
-  assert with a second exec (`kill -0 <pid>`) that the process is gone.
+  `src/labd/legacy_agent_tests.rs`. A background child waits for EOF on the
+  exec's stdin. A second exec reads the child's FIFO and must see EOF
+  without the marker the child writes if it survives the close.
+- Fixed by card #723. Cancellation signals the exec's process group on
+  POSIX and terminates its job on Windows with job-object support. NT4
+  and Windows 9x retain direct-child cancellation because they lack jobs.
 
 ### F9. A `shutdown` request ends the agent even when the guest does not shut down
 
