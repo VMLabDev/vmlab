@@ -10,7 +10,7 @@ use std::os::unix::{
     fs::FileExt,
     net::{UnixListener, UnixStream},
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -158,6 +158,7 @@ struct Shared {
     changed: Condvar,
     source: Arc<dyn FrameSource>,
     cpu_clients: AtomicUsize,
+    accept_failures: AtomicU64,
     input: Arc<crate::input::InputQueue>,
     input_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -201,6 +202,7 @@ impl DisplayServer {
                 changed: Condvar::new(),
                 source,
                 cpu_clients: AtomicUsize::new(0),
+                accept_failures: AtomicU64::new(0),
                 input,
                 input_worker: Mutex::new(Some(input_worker)),
             }),
@@ -240,6 +242,21 @@ impl DisplayServer {
         sessions.retain(|session| session.strong_count() != 0);
         sessions.push(Arc::downgrade(&session));
         Ok(session)
+    }
+
+    /// Connections that are open now, unfinished handshakes included.
+    pub fn sessions(&self) -> usize {
+        let sessions = self.shared.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .filter(|session| session.strong_count() != 0)
+            .count()
+    }
+
+    /// How many times an accept loop of this server got an error from
+    /// `accept`.
+    pub fn accept_failures(&self) -> u64 {
+        self.shared.accept_failures.load(Ordering::SeqCst)
     }
 
     /// Capture the source once. No socket or client lock is acquired here.
@@ -379,7 +396,9 @@ impl DisplayServer {
     /// The caller owns socket binding, permissions, and listener lifetime.
     pub fn serve(&self, listener: UnixListener, rfb: bool) -> io::Result<()> {
         for stream in listener.incoming() {
-            let stream = stream?;
+            let stream = stream.inspect_err(|_| {
+                self.shared.accept_failures.fetch_add(1, Ordering::SeqCst);
+            })?;
             let server = self.clone();
             std::thread::spawn(move || {
                 let _ = if rfb {
