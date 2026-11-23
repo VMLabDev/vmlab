@@ -1276,7 +1276,6 @@ mod tests {
     fn passthrough_takes_the_cards_vfio_bound_functions_on_vmlab_hv() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
-        fake_gpu(sys.path(), "0000:03:00.0", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
@@ -1317,7 +1316,6 @@ mod tests {
     fn declared_passthrough_functions_go_or_are_refused_by_name() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
-        fake_gpu(sys.path(), "0000:03:00.0", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
         fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
