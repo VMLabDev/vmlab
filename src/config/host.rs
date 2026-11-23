@@ -151,6 +151,12 @@ pub struct HostGpu {
     /// guest where the same heap has a cached one (PRD §5.2). Off unless
     /// set: for a host whose CPU and GPU do not see that memory alike.
     pub hide_uncached_memory: bool,
+    /// The card's other PCI functions `passthrough` hands a vmlab-hv guest
+    /// with it — its HDMI/DP audio (PRD §5.2). `None`, the key left out,
+    /// takes every function of the slot already bound to `vfio-pci`; a list
+    /// is exactly what goes, each entry refused at resolution
+    /// (`qemu::hostgpu::render_plan`) unless it is bound to `vfio-pci`.
+    pub passthrough_functions: Option<Vec<String>>,
 }
 
 /// A host GPU's `keepawake` (PRD §5.2, ADR-0018): whether the supervisor
@@ -261,7 +267,16 @@ impl HostConfig {
             if let Some(v) = r.string("dns_suffix").unspan() {
                 cfg.dns_suffix = v;
             }
-            cfg.dns_upstream = r.string("dns_upstream").unspan();
+            if let Some(upstream) = r.string("dns_upstream") {
+                if parse_upstream(&upstream.value).is_some() {
+                    cfg.dns_upstream = Some(upstream.value);
+                } else {
+                    r.issue_at(
+                        upstream.span,
+                        "`dns_upstream` must be an IP address, optionally with a port",
+                    );
+                }
+            }
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
                 cfg.disk_low_percent = v;
             }
@@ -355,6 +370,7 @@ impl HostConfig {
                     .unspan()
                     .unwrap_or_default(),
                 hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
+                passthrough_functions: r.opt_string_list("passthrough_functions"),
             };
             if let Some(prev) = cfg
                 .gpus
@@ -408,10 +424,10 @@ impl HostConfig {
     /// `dns_upstream` when set, else the host's own resolver. `None` leaves
     /// unmatched names NXDOMAIN.
     pub fn upstream_resolver(&self) -> Option<std::net::SocketAddr> {
-        self.dns_upstream
-            .as_deref()
-            .and_then(parse_upstream)
-            .or_else(host_resolver)
+        match self.dns_upstream.as_deref() {
+            Some(upstream) => parse_upstream(upstream),
+            None => host_resolver(),
+        }
     }
 }
 
@@ -736,6 +752,30 @@ gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
         assert_eq!(on, [false, true, false]);
     }
 
+    /// `passthrough_functions` tells a key left out from an empty list:
+    /// the first takes what is bound to `vfio-pci`, the second nothing.
+    #[test]
+    fn parses_a_host_gpus_passthrough_functions() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  default = true }
+gpu "Nvidia1" { address = "0000:01:00.0"  passthrough_functions = [] }
+gpu "Nvidia2" { address = "0000:05:00.0"  passthrough_functions = ["0000:05:00.1"] }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let functions: Vec<_> = cfg
+            .gpus
+            .iter()
+            .map(|g| g.passthrough_functions.clone())
+            .collect();
+        assert_eq!(
+            functions,
+            [None, Some(vec![]), Some(vec!["0000:05:00.1".to_string()])]
+        );
+    }
+
     /// `keepawake` reads `auto`, `on` or `off`, defaults to `auto`, and
     /// refuses anything else by name.
     #[test]
@@ -857,6 +897,31 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
         let source = format!("import <vmlab-host.wcl>\n{body}");
         let err = HostConfig::parse(&source, "config.wcl").expect_err("should be rejected");
         format!("{err:#}")
+    }
+
+    #[test]
+    fn a_malformed_dns_upstream_is_refused() {
+        for upstream in ["dns.corp", "10.0.0.1:"] {
+            assert!(
+                host_err(&format!("host {{ dns_upstream = \"{upstream}\" }}\n"))
+                    .contains("config.wcl:2:8: `dns_upstream`")
+            );
+        }
+    }
+
+    #[test]
+    fn a_dns_upstream_ip_accepts_an_optional_port() {
+        for (upstream, address) in [
+            ("192.0.2.1", "192.0.2.1:53"),
+            ("192.0.2.1:5353", "192.0.2.1:5353"),
+            ("2001:db8::1", "[2001:db8::1]:53"),
+            ("[2001:db8::1]:5353", "[2001:db8::1]:5353"),
+        ] {
+            let source =
+                format!("import <vmlab-host.wcl>\nhost {{ dns_upstream = \"{upstream}\" }}");
+            let host = HostConfig::parse(&source, "config.wcl").unwrap();
+            assert_eq!(host.upstream_resolver(), Some(address.parse().unwrap()));
+        }
     }
 
     #[test]

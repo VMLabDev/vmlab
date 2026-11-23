@@ -1924,6 +1924,9 @@ mod tests {
                 .to_string()
                 .contains("duplicate PCI address")
         );
+        // Another function of the card shares its guest slot.
+        machine.vfio[1].pci.function = 1;
+        validate(&machine).unwrap();
         machine.vfio.pop();
         machine.vfio[0].pci.device = 31;
         assert!(

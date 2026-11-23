@@ -845,6 +845,8 @@ impl dyn Machine {
         // restarted in the guest is handshaken again on the way, so the stamp
         // this line reports is the one answering now.
         let detail = self.status_detail().await;
+        // An in-place reset can clear readiness during the agent lookup.
+        let ready = ready && self.is_ready().await;
         let nics = self
             .nics()
             .iter()

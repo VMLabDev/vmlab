@@ -145,6 +145,27 @@ impl Sysfs {
         Ok(())
     }
 
+    /// The other functions of the PCI slot `address` sits in, each with the
+    /// driver it is bound to (`None`: no driver), in function order — a
+    /// graphics card's HDMI/DP audio function above all. Empty when
+    /// `address` is not a PCI address.
+    pub fn sibling_functions(&self, address: &str) -> Vec<(String, Option<String>)> {
+        let Some((slot, own)) = address.rsplit_once('.') else {
+            return Vec::new();
+        };
+        (0..8)
+            .map(|function| format!("{slot}.{function}"))
+            .filter(|sibling| sibling.rsplit_once('.').is_some_and(|(_, f)| f != own))
+            .filter_map(|sibling| {
+                let dev = self.devices().join(&sibling);
+                dev.exists().then(|| {
+                    let driver = driver(&dev);
+                    (sibling, driver)
+                })
+            })
+            .collect()
+    }
+
     /// Resolve a PCI address to its render node and driver. An address with
     /// no device, a device with no render node, or one in a failed power
     /// state is an error naming it.
@@ -395,6 +416,9 @@ pub struct RenderPlan {
     pub name: Option<String>,
     /// The PCI address `passthrough` hands the guest (`vfio-pci,host=`).
     pub passthrough: Option<String>,
+    /// The other functions of that card vmlab-hv hands over with it, in
+    /// function order ([`passthrough_functions`]). QEMU is handed none.
+    pub passthrough_functions: Vec<String>,
     /// The GPU a `virgl`/`vulkan` guest renders on.
     pub gpu: Option<RenderGpu>,
     /// The host GPU's `qemu_binary`, checked: run in place of
@@ -499,6 +523,73 @@ pub fn emulator(qemu_binary: Option<&Path>, arch: &str) -> String {
     }
 }
 
+/// The functions of a passed-through card that go to the guest with it, in
+/// function order (PRD §5.2). A graphics card is more than one PCI function —
+/// its HDMI/DP audio is function 1 — and a guest has sound from the card only
+/// when that function arrives too.
+///
+/// With no `passthrough_functions` on the host GPU it is every other
+/// function of the slot that is bound to `vfio-pci` already; one on another
+/// driver stays with the host and is not an error, since nobody asked for it.
+/// A declared list is exactly what goes, and each entry must be a function of
+/// the same slot bound to `vfio-pci`: vmlab changes no binding, so an entry
+/// that cannot go is refused by name. Either way the card itself must be
+/// function 0, the only place a guest looks for a multi-function device.
+fn passthrough_functions(decl: &HostGpu, sysfs: &Sysfs) -> Result<Vec<String>> {
+    let primary_is_zero = decl.address.ends_with(".0");
+    let siblings = sysfs.sibling_functions(&decl.address);
+    let Some(asked) = &decl.passthrough_functions else {
+        if !primary_is_zero {
+            return Ok(Vec::new());
+        }
+        return Ok(siblings
+            .into_iter()
+            .filter(|(_, driver)| driver.as_deref() == Some("vfio-pci"))
+            .map(|(address, _)| address)
+            .collect());
+    };
+    let name = &decl.name;
+    if !asked.is_empty() && !primary_is_zero {
+        bail!(
+            "host GPU `{name}`: `passthrough_functions` needs the GPU's `address` to be \
+             function 0 of its card, and {} is not",
+            decl.address
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    for address in asked {
+        if *address == decl.address {
+            bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, the GPU's own \
+                 `address` — list only the card's other functions"
+            );
+        }
+        if out.contains(address) {
+            bail!("host GPU `{name}`: `passthrough_functions` names {address} twice");
+        }
+        match siblings.iter().find(|(sibling, _)| sibling == address) {
+            Some((_, Some(driver))) if driver == "vfio-pci" => out.push(address.clone()),
+            Some((_, Some(driver))) => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is bound \
+                 to the host driver `{driver}`, not `vfio-pci` — vmlab never changes a driver \
+                 binding: bind it to `vfio-pci`, or take it off the list"
+            ),
+            Some((_, None)) => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is bound \
+                 to no driver, not `vfio-pci` — vmlab never changes a driver binding: bind \
+                 it to `vfio-pci`, or take it off the list"
+            ),
+            None => bail!(
+                "host GPU `{name}`: `passthrough_functions` names {address}, which is not \
+                 another function of the card at {} on this host",
+                decl.address
+            ),
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Decide a VM's [`RenderPlan`] before the emulator spawns (ADR-0003): pick
 /// the host GPU, then ask sysfs about its address — a PCI device for
 /// `passthrough`, a render node for `virgl`/`vulkan` — and name the GPU in
@@ -546,6 +637,19 @@ pub fn render_plan(
         let decl = decl.expect("pick refuses passthrough with no host GPU");
         sysfs.device(&decl.address).with_context(context)?;
         plan.passthrough = Some(decl.address.clone());
+        if vmlab {
+            plan.passthrough_functions = passthrough_functions(decl, sysfs)?;
+        } else if decl
+            .passthrough_functions
+            .as_ref()
+            .is_some_and(|f| !f.is_empty())
+        {
+            plan.warnings.push(format!(
+                "host GPU `{}`: `passthrough_functions` is ignored on QEMU, which is handed \
+                 {} alone — it applies with hypervisor = \"vmlab\"",
+                decl.name, decl.address
+            ));
+        }
         plan.env = emulator_env(false, None, None, None);
     } else {
         plan.gpu = decl
@@ -915,7 +1019,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::fake_host;
+    use super::testing::{fake_gpu, fake_host};
     use super::*;
 
     fn set(env: &ChildEnv) -> Vec<(&str, &str)> {
@@ -1062,6 +1166,7 @@ mod tests {
             qemu_env: Vec::new(),
             keepawake: KeepAwake::Auto,
             hide_uncached_memory: false,
+            passthrough_functions: None,
         }
     }
 
@@ -1160,6 +1265,127 @@ mod tests {
         assert!(
             e.starts_with("passthrough needs a host GPU: declare `gpu \"<name>\""),
             "{e}"
+        );
+    }
+
+    /// On vmlab-hv a passed-through card takes its other functions with it
+    /// (card #590): every one already bound to `vfio-pci`, in function
+    /// order, and none on another driver, which nobody asked for. QEMU is
+    /// handed the one address.
+    #[test]
+    fn passthrough_takes_the_cards_vfio_bound_functions_on_vmlab_hv() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
+        // Another slot's function is not this card's.
+        fake_gpu(sys.path(), "0000:03:01.1", None, "vfio-pci");
+        let mut h = host();
+        h.gpus.push(decl("Vfio1", "0000:03:00.0", false));
+        let pass = gpu(GpuMode::Passthrough, Some("Vfio1"));
+        let on = |h: &HostConfig, hypervisor| {
+            super::render_plan(
+                Some(&pass),
+                Some("x86_64"),
+                h,
+                &sysfs,
+                Path::new(DATA),
+                hypervisor,
+            )
+        };
+        let plan = on(&h, HypervisorKind::Vmlab).unwrap();
+        assert_eq!(plan.passthrough.as_deref(), Some("0000:03:00.0"));
+        assert_eq!(plan.passthrough_functions, ["0000:03:00.1", "0000:03:00.2"]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        let qemu = on(&h, HypervisorKind::Qemu).unwrap();
+        assert!(qemu.passthrough_functions.is_empty() && qemu.warnings.is_empty());
+
+        // A card declared by a function other than 0 goes alone.
+        h.gpus.last_mut().unwrap().address = "0000:03:00.1".into();
+        let plan = on(&h, HypervisorKind::Vmlab).unwrap();
+        assert!(plan.passthrough_functions.is_empty());
+    }
+
+    /// `passthrough_functions` is exactly what goes: an empty list sends the
+    /// card alone, and an entry that cannot go — on a host driver, on none,
+    /// in another slot, absent, the card itself, or named twice — is refused
+    /// by name, because the user asked for it. On QEMU the list is ignored
+    /// with a warning.
+    #[test]
+    fn declared_passthrough_functions_go_or_are_refused_by_name() {
+        let sys = fake_host();
+        let sysfs = Sysfs::new(sys.path());
+        fake_gpu(sys.path(), "0000:03:00.1", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.2", None, "vfio-pci");
+        fake_gpu(sys.path(), "0000:03:00.3", None, "xhci_hcd");
+        std::fs::create_dir_all(sys.path().join("bus/pci/devices/0000:03:00.4")).unwrap();
+        fake_gpu(sys.path(), "0000:03:01.0", None, "vfio-pci");
+        let pass = gpu(GpuMode::Passthrough, Some("Vfio1"));
+        let on = |functions: &[&str], address: &str, hypervisor| {
+            let mut h = host();
+            h.gpus.push(HostGpu {
+                passthrough_functions: Some(functions.iter().map(|f| f.to_string()).collect()),
+                ..decl("Vfio1", address, false)
+            });
+            super::render_plan(
+                Some(&pass),
+                Some("x86_64"),
+                &h,
+                &sysfs,
+                Path::new(DATA),
+                hypervisor,
+            )
+        };
+        let hv = |functions: &[&str]| on(functions, "0000:03:00.0", HypervisorKind::Vmlab);
+        assert!(hv(&[]).unwrap().passthrough_functions.is_empty());
+        assert_eq!(
+            hv(&["0000:03:00.2"]).unwrap().passthrough_functions,
+            ["0000:03:00.2"]
+        );
+        assert_eq!(
+            hv(&["0000:03:00.2", "0000:03:00.1"])
+                .unwrap()
+                .passthrough_functions,
+            ["0000:03:00.1", "0000:03:00.2"]
+        );
+        let refused = |functions: &[&str]| format!("{:#}", hv(functions).unwrap_err());
+        let e = refused(&["0000:03:00.3"]);
+        assert!(
+            e.starts_with("host GPU `Vfio1`: `passthrough_functions` names 0000:03:00.3")
+                && e.contains("bound to the host driver `xhci_hcd`, not `vfio-pci`")
+                && e.contains("never changes a driver binding"),
+            "{e}"
+        );
+        let e = refused(&["0000:03:00.4"]);
+        assert!(
+            e.contains("0000:03:00.4, which is bound to no driver"),
+            "{e}"
+        );
+        for other in ["0000:03:01.0", "0000:03:00.7", "03:00.1"] {
+            let e = refused(&[other]);
+            assert!(
+                e.contains("is not another function of the card at 0000:03:00.0"),
+                "{e}"
+            );
+        }
+        let e = refused(&["0000:03:00.0"]);
+        assert!(e.contains("the GPU's own `address`"), "{e}");
+        let e = refused(&["0000:03:00.1", "0000:03:00.1"]);
+        assert!(e.contains("names 0000:03:00.1 twice"), "{e}");
+        let e = format!(
+            "{:#}",
+            on(&["0000:03:00.0"], "0000:03:00.1", HypervisorKind::Vmlab).unwrap_err()
+        );
+        assert!(e.contains("to be function 0 of its card"), "{e}");
+
+        let qemu = on(&["0000:03:00.3"], "0000:03:00.0", HypervisorKind::Qemu).unwrap();
+        assert!(qemu.passthrough_functions.is_empty());
+        assert_eq!(qemu.warnings.len(), 1, "{:?}", qemu.warnings);
+        assert!(
+            qemu.warnings[0].contains("`passthrough_functions` is ignored on QEMU"),
+            "{:?}",
+            qemu.warnings
         );
     }
 
