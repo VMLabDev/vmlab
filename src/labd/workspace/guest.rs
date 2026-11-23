@@ -40,6 +40,13 @@ pub trait GuestFs: Send + Sync {
     /// Bring a guest file's bytes to `local`, verified against the guest's
     /// own digest of what it read.
     async fn pull(&self, remote: &str, local: &Path) -> Result<()>;
+    /// A guest file's bytes in memory, for a caller that reads them rather
+    /// than transfers them, verified like a pull.
+    ///
+    /// `limit` is the host's bound and is enforced on the bytes as they
+    /// arrive, never on a size the guest reported. `None` where the file
+    /// holds more than `limit`.
+    async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>>;
     /// Create a directory, treating an existing one as success.
     ///
     /// `case_sensitive` is §19.6's NTFS flag, which takes only while the
@@ -107,6 +114,10 @@ impl GuestFs for FileOps {
         FileOps::pull_to(self, remote, local).await?;
         let mode = FileOps::lstat(self, remote).await?.and_then(|a| a.mode);
         set_host_mode(local, mode)
+    }
+
+    async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        FileOps::pull_capped(self, path, limit).await
     }
 
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
@@ -200,6 +211,9 @@ impl<T: GuestFs + ?Sized> GuestFs for std::sync::Arc<T> {
     async fn pull(&self, remote: &str, local: &Path) -> Result<()> {
         (**self).pull(remote, local).await
     }
+    async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        (**self).read_capped(path, limit).await
+    }
     async fn mkdir(&self, path: &str, case_sensitive: bool) -> Result<()> {
         (**self).mkdir(path, case_sensitive).await
     }
@@ -271,6 +285,11 @@ pub mod fake {
         /// Paths whose pull fails, the same thing in the other direction.
         fail_pull: Vec<String>,
         edit_host_on_pull: Option<(std::path::PathBuf, String)>,
+        /// Sizes this guest reports in `lstat` in place of the true ones: the
+        /// guest's word about a size is only its word.
+        reported_size: BTreeMap<String, u64>,
+        /// How many file bytes this guest has handed across the seam.
+        delivered: u64,
         edit_guest_on_push: Option<(String, String)>,
         edit_after_rename: Option<(String, String)>,
         /// Paths the guest refuses to be read at all.
@@ -413,6 +432,20 @@ pub mod fake {
                 .expect("fake guest")
                 .fail_pull
                 .push(path.to_string());
+        }
+
+        /// Report `size` for `path` in `lstat`, whatever the file holds.
+        pub fn report_size(&self, path: &str, size: u64) {
+            self.inner
+                .lock()
+                .expect("fake guest")
+                .reported_size
+                .insert(path.to_string(), size);
+        }
+
+        /// The file bytes this guest has handed across the seam so far.
+        pub fn delivered(&self) -> u64 {
+            self.inner.lock().expect("fake guest").delivered
         }
 
         pub fn edit_host_on_pull(&self, path: std::path::PathBuf, body: &str) {
@@ -684,6 +717,7 @@ pub mod fake {
                 return Ok(None);
             };
             let (kind, size) = describe(node);
+            let size = guest.reported_size.get(path).copied().unwrap_or(size);
             Ok(Some(Attrs {
                 kind,
                 size,
@@ -756,10 +790,28 @@ pub mod fake {
                 bail!("the channel dropped while pulling {remote}");
             }
             let key = resolve(&guest, remote);
-            match guest.nodes.get(&key) {
-                Some((Node::File(bytes), _)) => Ok(std::fs::write(local, bytes)?),
-                _ => Err(anyhow!("no such file: {remote}")),
+            let Some((Node::File(bytes), _)) = guest.nodes.get(&key) else {
+                return Err(anyhow!("no such file: {remote}"));
+            };
+            std::fs::write(local, bytes)?;
+            guest.delivered += bytes.len() as u64;
+            Ok(())
+        }
+
+        async fn read_capped(&self, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+            let mut guest = self.inner.lock().expect("fake guest");
+            if guest.unreadable.iter().any(|p| p == path) {
+                bail!("permission denied: {path}");
             }
+            let key = resolve(&guest, path);
+            let Some((Node::File(bytes), _)) = guest.nodes.get(&key) else {
+                return Err(anyhow!("no such file: {path}"));
+            };
+            // The real session stops at the chunk that crosses the limit, so
+            // what crosses the seam never exceeds it.
+            let bytes = bytes.clone();
+            guest.delivered += (bytes.len() as u64).min(limit);
+            Ok((bytes.len() as u64 <= limit).then_some(bytes))
         }
 
         async fn digest(&self, path: &str) -> Result<String> {

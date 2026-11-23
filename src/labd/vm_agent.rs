@@ -515,11 +515,14 @@ struct MemorySink {
     remote: String,
     buf: Vec<u8>,
     limit: u64,
+    /// The pull was refused here, at the ceiling, and for no other reason.
+    over: bool,
 }
 
 impl PullSink for MemorySink {
     async fn write(&mut self, chunk: &[u8]) -> Result<()> {
         if self.buf.len() as u64 + chunk.len() as u64 > self.limit {
+            self.over = true;
             return Err(anyhow::Error::new(crate::proto::over_inline_limit(
                 format!("pull {}", self.remote),
                 self.limit,
@@ -1312,6 +1315,7 @@ impl AgentHandle {
             remote: remote.to_string(),
             buf: Vec::new(),
             limit,
+            over: false,
         };
         let ops = self
             .open_fileops(logon)
@@ -2055,6 +2059,27 @@ impl FileOps {
             .await
             .with_context(|| format!("creating {}", local.display()))?;
         self.pull(remote, &mut FileSink::new(file)).await
+    }
+
+    /// Pull a guest file into memory on this session, verified like any pull,
+    /// holding no more than `limit` bytes. `None` where the file holds more.
+    ///
+    /// The bound is on the bytes as they arrive. The size the guest reports
+    /// is its word, and a file can grow after it is given, so no stat is a
+    /// bound: this is the read for a caller that must not trust one
+    /// (`dev sync diff`, §19.6).
+    pub async fn pull_capped(&self, remote: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        let mut sink = MemorySink {
+            remote: remote.to_string(),
+            buf: Vec::new(),
+            limit,
+            over: false,
+        };
+        match self.pull(remote, &mut sink).await {
+            Ok(_) => Ok(Some(sink.buf)),
+            Err(_) if sink.over => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Every entry in `dir`, each described by its own attributes and never
@@ -4991,6 +5016,20 @@ mod tests {
         let coded = crate::proto::CommandError::from(err);
         assert_eq!(coded.code, crate::proto::ErrorCode::InvalidArgument);
         assert!(coded.message.contains("4096"), "{}", coded.message);
+    }
+
+    /// The capped read of a file session: the bytes where the file fits, and
+    /// `None`, not an error and not a cut file, where it holds more.
+    #[tokio::test]
+    async fn pull_capped_answers_none_for_a_file_over_the_limit() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        let bytes = ops.pull_capped("/guest/some-file", 1 << 20).await.unwrap();
+        assert_eq!(bytes.map(|b| b.len()), Some(10_000));
+        let over = ops.pull_capped("/guest/some-file", 4_096).await.unwrap();
+        assert_eq!(over, None);
+        assert!(ops.pull_capped("/guest/absent", 4_096).await.is_err());
     }
 
     /// The throughput decision, asserted rather than assumed: a caller may
