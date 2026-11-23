@@ -196,12 +196,13 @@ page cmd_vm {
 
   h2 "vmlab vm destroy"
 
-  code sh { source = "vmlab vm destroy <VM>" }
+  code sh { source = "vmlab vm destroy [--discard-guest-changes] <VM>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<VM>`" | "The VM, as `[lab/]name`." |
+      | "`--discard-guest-changes`" | "Destroy even where a dev machine's workspace holds guest work the host has not taken, and lose that work." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -213,6 +214,13 @@ page cmd_vm {
     file, so a later `vmlab up <vm>` re-creates it from the template and runs
     its first-boot script again. The rest of the lab keeps running. Prints
     `vm "<name>" destroyed`.
+  DOC
+
+  p <<DOC
+    A dev machine's guest working copy goes with the clone. As
+    [vmlab destroy](cmd_destroy) does, this first asks whether that copy holds
+    work the host has not taken, and refuses with nothing changed if it does
+    or could. `--discard-guest-changes` destroys anyway.
   DOC
 
   callout "Snapshots go with the clone" {

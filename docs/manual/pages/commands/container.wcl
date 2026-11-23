@@ -116,12 +116,13 @@ page cmd_container {
 
   h2 "vmlab container destroy"
 
-  code sh { source = "vmlab container destroy <CONTAINER>" }
+  code sh { source = "vmlab container destroy [--discard-guest-changes] <CONTAINER>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<CONTAINER>`" | "The container, as `[lab/]name`." |
+      | "`--discard-guest-changes`" | "Destroy even where a dev machine's workspace holds guest work the host has not taken, and lose that work." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -131,6 +132,13 @@ page cmd_container {
     and survive until [vmlab destroy](cmd_destroy). The container stays
     declared, so a later `vmlab up <container>` re-creates it from the image.
     Prints `container "<name>" destroyed`.
+  DOC
+
+  p <<DOC
+    A dev container's guest working copy goes with its scratch overlay. As
+    [vmlab destroy](cmd_destroy) does, this first asks whether that copy holds
+    work the host has not taken, and refuses with nothing changed if it does
+    or could. `--discard-guest-changes` destroys anyway.
   DOC
 
   h2 "vmlab container exec"

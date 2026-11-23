@@ -25,6 +25,7 @@
 //!   explicit discard flag allows the restore to throw away the guest copy.
 //!   A stopped workspace can still refuse based on a halt saved in its ledger.
 
+use super::ledger::{LeftOwed, StoppedWork};
 use super::syncer::Report;
 
 /// How many outstanding paths a refusal names before it stops.
@@ -93,6 +94,12 @@ pub struct Outstanding {
     /// The syncer has never completed a pass, so nothing about this workspace
     /// has been agreed at all.
     pub never_synced: bool,
+    /// The machine is down, and its stop left guest work owed or took no last
+    /// pass: what the ledger's [`LeftOwed`] says, in its own words.
+    pub stopped: Option<String>,
+    /// A syncer answered for this workspace. `false` for a machine that is
+    /// down, where the `dev sync` verbs have nothing to ask.
+    pub running: bool,
 }
 
 impl Outstanding {
@@ -113,6 +120,8 @@ impl Outstanding {
             unanswered: report.unanswered.clone(),
             unsynced: report.unsynced.clone(),
             never_synced: report.passes == 0,
+            stopped: None,
+            running: true,
         };
         (found.halt.is_some()
             || found.trouble.is_some()
@@ -160,11 +169,72 @@ impl Outstanding {
             unanswered: None,
             unsynced: halted.to_vec(),
             never_synced: false,
+            stopped: None,
+            running: false,
         };
         (found.halt.is_some() || found.reseed.is_some()).then_some(found)
     }
 
+    /// Guest work a **running** workspace holds that the host has not taken,
+    /// as the pass just run reports it. `None` where there is none to lose.
+    ///
+    /// A workspace waiting on a re-seed is not among them: a restore rewound
+    /// its guest tree, and the re-seed writes it over from the host.
+    pub fn guest_work(machine: &str, report: &Report) -> Option<Outstanding> {
+        if report.reseed.is_some() {
+            return None;
+        }
+        let mut found = Outstanding::of(machine, report)?;
+        // A halt's headline counts its paths, and the guest copy of each is
+        // what would be lost, so they are named with the rest.
+        for path in report.halt.iter().flat_map(super::halt::Halt::paths) {
+            if !found.unsynced.contains(&path) {
+                found.unsynced.push(path);
+            }
+        }
+        Some(found)
+    }
+
+    /// The same question for a machine that is **down**, answered from what
+    /// its stop wrote on the ledger ([`left_at_stop`]).
+    pub fn left_owed(machine: &str, left: &LeftOwed) -> Outstanding {
+        Outstanding {
+            machine: machine.to_string(),
+            halt: None,
+            trouble: None,
+            rescan: None,
+            reseed: None,
+            unanswered: None,
+            unsynced: left.paths.clone(),
+            never_synced: false,
+            stopped: Some(left.why.clone()),
+            running: false,
+        }
+    }
+
+    /// Guest work a stopped machine's ledger records: the halt of its last
+    /// pass, else what its stop left owed.
+    pub fn of_stopped(work: &StoppedWork) -> Option<Outstanding> {
+        Outstanding::when_stopped(&work.machine, &work.halted, false).or_else(|| {
+            work.left_owed
+                .as_ref()
+                .map(|left| Outstanding::left_owed(&work.machine, left))
+        })
+    }
+
     fn write_reasons(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_states(f)?;
+        if !self.unsynced.is_empty() {
+            write!(f, ". Still owed: {}", named(&self.unsynced))?;
+        }
+        Ok(())
+    }
+
+    /// Every reason but the path list.
+    fn write_states(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(stopped) = &self.stopped {
+            write!(f, ". {stopped}")?;
+        }
         if let Some(halt) = &self.halt {
             write!(f, ". {halt}")?;
         }
@@ -188,10 +258,42 @@ impl Outstanding {
                  been agreed with the host at all"
             )?;
         }
-        if !self.unsynced.is_empty() {
-            write!(f, ". Still owed: {}", named(&self.unsynced))?;
-        }
         Ok(())
+    }
+}
+
+/// What a stop writes on the ledger: the guest work the last pass before it
+/// could not carry, or `None` where that pass left the workspace in step.
+///
+/// The record a restore and a `destroy` of the stopped machine refuse on
+/// (§19.6). The syncer that knew this goes away with the stop.
+pub fn left_at_stop(machine: &str, report: &Report) -> Option<LeftOwed> {
+    struct States<'a>(&'a Outstanding);
+    impl std::fmt::Display for States<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.write_states(f)
+        }
+    }
+    let found = Outstanding::guest_work(machine, report)?;
+    let states = States(&found).to_string();
+    Some(LeftOwed {
+        why: format!(
+            "It is not running now, and the last sync pass before it stopped left guest work \
+             the host has not taken{states}"
+        ),
+        paths: found.unsynced,
+    })
+}
+
+/// What a stop that took no last pass writes on the ledger: what the guest
+/// holds is unknown, and not knowing is a refusal.
+pub fn left_unasked(reason: &str, report: &Report) -> LeftOwed {
+    LeftOwed {
+        why: format!(
+            "It is not running now, and {reason}, so guest work the host has not taken could \
+             be in the guest tree"
+        ),
+        paths: report.unsynced.clone(),
     }
 }
 
@@ -225,12 +327,62 @@ impl std::fmt::Display for RestoreOutstanding {
             outstanding.machine,
         )?;
         outstanding.write_reasons(f)?;
+        if outstanding.running {
+            write!(
+                f,
+                ". Run `vmlab dev sync status {}` to see what is outstanding and `vmlab dev \
+                 sync flush {}` to wait for it",
+                outstanding.machine, outstanding.machine,
+            )?;
+        } else {
+            write!(
+                f,
+                ". Start it with `vmlab up {}` to let the workspace sync",
+                outstanding.machine,
+            )?;
+        }
         write!(
             f,
-            ". Run `vmlab dev sync status {}` to see what is outstanding and `vmlab dev sync \
-             flush {}` to wait for it. Pass `{}` to restore anyway and re-converge the guest \
-             from the host. {}",
-            outstanding.machine, outstanding.machine, DISCARD_FLAG, NOT_A_BACKUP,
+            ". Pass `{}` to restore anyway and re-converge the guest from the host. {}",
+            DISCARD_FLAG, NOT_A_BACKUP,
+        )
+    }
+}
+
+/// Why a `destroy` will not go ahead without being asked twice (§19.6).
+///
+/// `destroy` deletes the guest working copy with the clone. That loses
+/// nothing only while the two copies are in step, so guest work the host has
+/// not taken is named first, and the flag second.
+pub struct DestroyOutstanding(pub Outstanding);
+
+impl std::fmt::Display for DestroyOutstanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let outstanding = &self.0;
+        write!(
+            f,
+            "\"{}\"'s workspace could have guest work the host has not taken, and destroying \
+             the machine deletes the guest copy",
+            outstanding.machine,
+        )?;
+        outstanding.write_reasons(f)?;
+        if outstanding.running {
+            write!(
+                f,
+                ". Run `vmlab dev sync status {}` to see what is outstanding and `vmlab dev \
+                 sync flush {}` to wait for it; a halt is answered with `vmlab dev sync resolve`",
+                outstanding.machine, outstanding.machine,
+            )?;
+        } else {
+            write!(
+                f,
+                ". Start it with `vmlab up {}` to let the workspace sync",
+                outstanding.machine,
+            )?;
+        }
+        write!(
+            f,
+            ". Pass `{DISCARD_FLAG}` to destroy anyway and lose that guest work."
         )
     }
 }
@@ -272,7 +424,8 @@ impl std::fmt::Display for Halted {
     }
 }
 
-/// The flag that allows a restore to discard unsynced guest work.
+/// The flag that allows a restore or a `destroy` to discard unsynced guest
+/// work.
 pub const DISCARD_FLAG: &str = "--discard-guest-changes";
 
 /// The halt reported by a completed pre-flight flush, if any.
@@ -434,6 +587,68 @@ mod tests {
         assert!(said.contains(".env"), "{said}");
         assert!(said.contains("dev sync diff"), "{said}");
         assert!(said.contains("dev sync resolve"), "{said}");
+    }
+
+    /// Review dev-machines F4 (card 695): what a stop writes on the ledger
+    /// is the last pass's own report, and a pass that left the workspace in
+    /// step writes nothing. Neither does a workspace waiting on a re-seed,
+    /// whose guest tree is rewritten from the host.
+    #[test]
+    fn a_stop_records_what_its_last_pass_left_owed_and_nothing_when_in_step() {
+        let in_step = Report {
+            passes: 3,
+            ..Report::default()
+        };
+        assert_eq!(left_at_stop("dev01", &in_step), None);
+        let reseeding = Report {
+            reseed: Some("re-seeding".into()),
+            ..Report::default()
+        };
+        assert_eq!(left_at_stop("dev01", &reseeding), None);
+
+        let owed = Report {
+            passes: 3,
+            trouble: Some("the agent channel dropped".into()),
+            unsynced: vec!["new.rs".into()],
+            ..Report::default()
+        };
+        let left = left_at_stop("dev01", &owed).expect("work is owed");
+        assert_eq!(left.paths, ["new.rs"]);
+        assert!(left.why.contains("the agent channel dropped"), "{}", left.why);
+
+        // A restore of the stopped machine says it, and names a verb that can
+        // answer for a machine that is down.
+        let said = RestoreOutstanding(Outstanding::left_owed("dev01", &left)).to_string();
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
+        assert!(!said.contains("dev sync flush"), "{said}");
+        assert!(said.contains(DISCARD_FLAG), "{said}");
+    }
+
+    /// Review dev-machines F5 (card 695): a destroy refusal names what would
+    /// be lost first and the flag second.
+    #[test]
+    fn a_destroy_refusal_names_the_paths_and_then_the_flag() {
+        let report = Report {
+            passes: 9,
+            halt: Some(halt_of(&["src/main.rs"])),
+            ..Report::default()
+        };
+        let found = Outstanding::guest_work("dev01", &report).expect("a halt is guest work");
+        let said = DestroyOutstanding(found).to_string();
+        let lost = said.find("src/main.rs").expect("names the paths");
+        let flag = said.find(DISCARD_FLAG).expect("names the flag");
+        assert!(lost < flag, "{said}");
+        assert!(said.contains("dev sync resolve"), "{said}");
+
+        let stopped = StoppedWork {
+            machine: "dev01".into(),
+            halted: vec!["a.rs".into()],
+            left_owed: None,
+        };
+        let said = DestroyOutstanding(Outstanding::of_stopped(&stopped).unwrap()).to_string();
+        assert!(said.contains("a.rs"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
     }
 
     /// The 30 000-path case is real — un-ignoring a populated `node_modules`

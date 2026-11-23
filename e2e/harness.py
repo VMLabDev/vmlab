@@ -214,7 +214,9 @@ class Harness:
 
     def destroy(self, lab: pathlib.Path) -> None:
         """`vmlab destroy`, which returns only once the lab's daemon is gone."""
-        self.run(["vmlab", "destroy"], cwd=lab, check=False, timeout=300)
+        # A teardown: guest work a scenario left unsynced goes with the lab.
+        self.run(["vmlab", "destroy", "--discard-guest-changes"], cwd=lab, check=False,
+                 timeout=300)
 
     @contextlib.contextmanager
     def lab(self, name: str, under: str = ""):

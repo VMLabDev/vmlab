@@ -112,6 +112,56 @@ pub struct Agreed {
     pub guest: Side,
 }
 
+/// Guest work a stopped workspace still owes the host: what the last pass
+/// before the stop could not carry, or the fact that no last pass ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOwed {
+    /// Why work is owed or could be, in whole sentences.
+    pub why: String,
+    /// The paths the last report named as not carried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// What one stopped machine's ledger says the guest still holds, read with no
+/// daemon and no declaration: the question `destroy` asks before `.vmlab/`
+/// goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedWork {
+    pub machine: String,
+    pub halted: Vec<String>,
+    pub left_owed: Option<LeftOwed>,
+}
+
+/// Every evidence of guest work in the ledgers under `lab_local`, by machine.
+///
+/// The roots a ledger is about are not checked, because the caller has no
+/// declaration to check them against. A ledger about another workspace is
+/// still about this machine's guest tree.
+pub fn stopped_work(lab_local: &Path) -> Vec<StoppedWork> {
+    let Ok(dir) = std::fs::read_dir(lab_local.join("workspace")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<StoppedWork> = dir
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let machine = path.file_name()?.to_str()?.strip_suffix(".json")?.to_string();
+            let ledger: Ledger = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            // A rewound tree is carried back from the host, so it holds
+            // nothing the host lacks.
+            (!ledger.reseed_owed && (!ledger.halted.is_empty() || ledger.left_owed.is_some()))
+                .then_some(StoppedWork {
+                    machine,
+                    halted: ledger.halted,
+                    left_owed: ledger.left_owed,
+                })
+        })
+        .collect();
+    found.sort_by(|a, b| a.machine.cmp(&b.machine));
+    found
+}
+
 /// Every agreement for one (machine, workspace).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
@@ -164,6 +214,17 @@ pub struct Ledger {
     /// holding it.
     #[serde(default)]
     pub halted: Vec<String>,
+    /// What the syncer's stop left owed, if it left anything (§19.6).
+    ///
+    /// Written by the stop itself, after the loop has ended: a `down` takes a
+    /// last pass, and guest work that pass could not carry is known only to
+    /// the syncer that goes away. Without this record an offline restore or a
+    /// `destroy` would discard that work with no refusal. A running syncer
+    /// does not keep it: its own report is the answer while it runs, so the
+    /// loop drops the record once a pass completes, and a rewind drops it
+    /// with the guest work it was about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_owed: Option<LeftOwed>,
     /// Agreements no later look at the guest has borne out (§19.6, #190).
     ///
     /// An apply is verified before it is recorded, but what it verifies is
@@ -216,6 +277,7 @@ impl Ledger {
             prune: Vec::new(),
             reseed_owed: false,
             halted: Vec::new(),
+            left_owed: None,
             unconfirmed: BTreeSet::new(),
             withheld: BTreeSet::new(),
             left_standing: BTreeMap::new(),
@@ -266,6 +328,27 @@ impl Ledger {
     pub fn mark_rewound(path: &Path, host_root: &Path, guest_root: &str) -> Result<()> {
         let mut ledger = Ledger::load(path, host_root, guest_root);
         ledger.reseed_owed = true;
+        // The rewind discards the guest work a stop left owed.
+        ledger.left_owed = None;
+        ledger.save(path)
+    }
+
+    /// Write on the ledger **as it stands on disk** what a stop left owed,
+    /// or that it left nothing (§19.6).
+    ///
+    /// Only with the syncer's loop ended: a running loop saves the ledger
+    /// whole from memory and would erase the record.
+    pub fn note_stop(
+        path: &Path,
+        host_root: &Path,
+        guest_root: &str,
+        left: Option<LeftOwed>,
+    ) -> Result<()> {
+        let mut ledger = Ledger::load(path, host_root, guest_root);
+        if ledger.left_owed == left {
+            return Ok(());
+        }
+        ledger.left_owed = left;
         ledger.save(path)
     }
 
@@ -354,6 +437,61 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review dev-machines F5 (card 695): a destroy with no daemon reads the
+    /// ledgers alone. A halt and a stop record are guest work; a clean ledger
+    /// and one that owes a re-seed are not.
+    #[test]
+    fn stopped_work_names_the_machines_whose_ledgers_record_guest_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = |machine: &str, edit: fn(&mut Ledger)| {
+            let mut ledger = Ledger::new(Path::new("/host/src"), "/src");
+            edit(&mut ledger);
+            ledger.save(&Ledger::path(dir.path(), machine)).unwrap();
+        };
+        ledger("clean", |_| {});
+        ledger("halted", |l| l.halted = vec!["a.rs".into()]);
+        ledger("owed", |l| {
+            l.left_owed = Some(LeftOwed {
+                why: "It is not running now".into(),
+                paths: vec!["b.rs".into()],
+            })
+        });
+        ledger("rewound", |l| {
+            l.halted = vec!["c.rs".into()];
+            l.reseed_owed = true;
+        });
+
+        let found = stopped_work(dir.path());
+        let machines: Vec<&str> = found.iter().map(|w| w.machine.as_str()).collect();
+        assert_eq!(machines, ["halted", "owed"]);
+        assert_eq!(found[0].halted, ["a.rs"]);
+        assert_eq!(found[1].left_owed.as_ref().unwrap().paths, ["b.rs"]);
+        assert!(stopped_work(&dir.path().join("absent")).is_empty());
+    }
+
+    /// The stop record survives a save and a load, is dropped by a rewind,
+    /// and a ledger written before the field existed reads as none.
+    #[test]
+    fn the_stop_record_rides_the_ledger_until_a_rewind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Ledger::path(dir.path(), "dev01");
+        let host = Path::new("/host/src");
+        Ledger::new(host, "/src").save(&path).unwrap();
+        assert_eq!(Ledger::load(&path, host, "/src").left_owed, None);
+
+        let left = LeftOwed {
+            why: "It is not running now".into(),
+            paths: vec!["new.rs".into()],
+        };
+        Ledger::note_stop(&path, host, "/src", Some(left.clone())).unwrap();
+        assert_eq!(Ledger::load(&path, host, "/src").left_owed, Some(left));
+
+        Ledger::mark_rewound(&path, host, "/src").unwrap();
+        let rewound = Ledger::load(&path, host, "/src");
+        assert!(rewound.reseed_owed);
+        assert_eq!(rewound.left_owed, None);
+    }
 
     fn agreed() -> Agreed {
         Agreed {
