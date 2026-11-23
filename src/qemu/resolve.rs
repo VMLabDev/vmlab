@@ -976,7 +976,7 @@ mod tests {
         let mut v = vm(r#"vm "a" { template = "x86_64/win" gpu { mode = "passthrough" } }"#);
         let mut m = meta();
         m.display = Some("virtio-vga".into());
-        let display = |vm, variant| {
+        let display = |vm: &Vm, variant: Option<&str>| {
             resolve_vm_for_variant(vm, Some(&m), variant, &profiles)
                 .unwrap()
                 .display_device
