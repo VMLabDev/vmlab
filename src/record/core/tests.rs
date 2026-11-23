@@ -710,3 +710,82 @@ fn a_whole_screen_repaint_that_changes_a_caret_is_idle() {
     assert_eq!(frames.len(), 5, "3 s of caret blinks becomes 0.5 s");
     assert_eq!(core.cuts().len(), 1);
 }
+
+/// A clock that comes back late owes many intervals. They show one picture,
+/// so the batch must not hold one copy for each (review record-vision F2,
+/// part 1).
+#[test]
+fn a_late_tick_does_not_return_an_unbounded_batch() {
+    let size = Size::new(16, 16);
+    let mut core = Core::new(settings(30, size, None));
+    core.connected(secs(0.0), 16, 16);
+    core.rect(secs(0.0), 0, 0, 16, 16, &solid(16, 16, RED));
+    let frames = core.tick(secs(600.0));
+    assert!(
+        frames.held() <= core.queue_limit(),
+        "the batch holds {} frames",
+        frames.held()
+    );
+    assert_eq!(frames.len(), 18_000, "no output time is lost");
+    assert_eq!(core.dropped_frames(), 0, "one picture, nothing to drop");
+}
+
+/// Display events advance the clock too. With nobody taking the frames, a
+/// guest that paints in every interval must not grow the queue past its
+/// limit (F2, part 2).
+#[test]
+fn events_do_not_pile_frames_while_nobody_ticks() {
+    let size = Size::new(16, 16);
+    let mut core = Core::new(settings(30, size, None));
+    core.connected(secs(0.0), 16, 16);
+    for i in 0..=18_000u32 {
+        // A new colour in every interval, so no two frames are equal.
+        let colour = [i as u8, (i >> 8) as u8, 7];
+        core.rect(
+            Duration::from_nanos(u64::from(i) * 1_000_000_000 / 30),
+            0,
+            0,
+            16,
+            16,
+            &solid(16, 16, colour),
+        );
+    }
+    let frames = core.tick(secs(600.0));
+    assert!(
+        frames.held() <= core.queue_limit(),
+        "the queue holds {} frames",
+        frames.held()
+    );
+    assert_eq!(frames.len(), 18_000, "no output time is lost");
+    assert_eq!(
+        core.dropped_frames(),
+        18_000 - core.queue_limit() as u64,
+        "what did not fit repeats the newest queued picture"
+    );
+    assert_eq!(core.tick(secs(600.0)).len(), 0, "the queue was taken");
+}
+
+/// An idle run that ends below the threshold is written out whole. It is one
+/// picture, so it must not become one copy for each interval (F2, part 3).
+#[test]
+fn a_long_idle_run_below_the_threshold_is_not_cloned() {
+    let size = Size::new(16, 16);
+    let mut core = Core::new(settings(30, size, Some(600.0)));
+    core.connected(secs(0.0), 16, 16);
+    core.rect(secs(0.0), 0, 0, 16, 16, &solid(16, 16, RED));
+    core.input(
+        secs(599.0),
+        InputEvent::Keys {
+            chord: "ret".into(),
+        },
+    );
+    let frames = core.tick(secs(599.1));
+    assert!(
+        frames.held() <= core.queue_limit(),
+        "the batch holds {} frames",
+        frames.held()
+    );
+    assert!(core.cuts().is_empty(), "the run is below the threshold");
+    assert_eq!(frames.len(), 17_971, "no output time is lost");
+    assert_eq!(core.dropped_frames(), 0, "one picture, nothing to drop");
+}
