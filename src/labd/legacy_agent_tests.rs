@@ -42,7 +42,10 @@ async fn legacy_agent_conformance() -> Result<()> {
 #[tokio::test]
 async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let fifo = dir.path().join("descendant");
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    // The fixture shares the socket directory with its isolated agent.
+    let fifo = fixture.socket().with_file_name("descendant");
     rustix::fs::mknodat(
         rustix::fs::CWD,
         &fifo,
@@ -50,8 +53,6 @@ async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
         rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         0,
     )?;
-    let bin = build(dir.path())?;
-    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
     let handle = AgentHandle::connect(fixture.socket(), BUDGET).await?;
     let mut reader = handle
         .open_exec(
