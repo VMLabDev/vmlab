@@ -38,7 +38,8 @@ DOC
     rows:
       | "Guest" | "Host session" | "Protocol" | "Guest needs" | "Host needs" |
       | "Linux" | "Wayland" | "waypipe" | "`waypipe` on the login's `PATH`" | "`waypipe`" |
-      | "Linux" | "Wayland, guest or host without waypipe" | "X11, through Xwayland" | "nothing" | "Xwayland (`DISPLAY` set)" |
+      | "Linux" | "Wayland, host without waypipe" | "X11, through Xwayland" | "nothing" | "Xwayland (`DISPLAY` set)" |
+      | "Linux" | "Wayland, guest without waypipe, `app_x11_fallback = true`" | "X11, through Xwayland" | "nothing" | "Xwayland (`DISPLAY` set)" |
       | "Linux" | "X11" | "X11" | "nothing" | "the X server" |
       | "Windows" | "Wayland or X11" | "RDP RemoteApp" | "an edition with an RDP host" | "FreeRDP 3 (`xfreerdp3` or `xfreerdp`)" |
   }
@@ -56,10 +57,17 @@ DOC
 
   p <<'DOC'
 The step from waypipe down to X11 is the only automatic one. It happens when
-the guest has no `waypipe` for the login, or the host has none, and the host
-has `DISPLAY` set. The command says it fell back, and why, on standard error.
-`--via waypipe`, `--via x11` and `--via rdp` choose outright and never fall
-back.
+the host has no `waypipe` and has `DISPLAY` set. The command says it fell
+back, and why, on standard error. `--via waypipe`, `--via x11` and `--via rdp`
+choose outright and never fall back.
+DOC
+
+  p <<'DOC'
+A guest with no `waypipe` for the login does not fall back by default. The
+guest answers that question, and X11 gives the guest program access to your
+X server, so the choice of X11 is yours: pass `--via x11`, or set
+`app_x11_fallback = true` in the [host config](ref_host) to allow the
+fallback for every shared app.
 DOC
 
   p <<'DOC'
