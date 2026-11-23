@@ -7,8 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 
 use vmlab_agent_proto::{
-    AgentMsg, FrameDecoder, FrameKind, HEADER_LEN, HostMsg, PROTO_VERSION, encode_ctrl,
-    encode_frame,
+    AgentMsg, FrameDecoder, FrameKind, HostMsg, PROTO_VERSION, encode_ctrl, encode_frame,
 };
 
 use super::vm_agent::conformance::Fixture;
@@ -172,7 +171,8 @@ async fn legacy_hello_after_a_truncated_frame_is_answered() -> Result<()> {
 
     const CLAIMED: usize = 60000;
     let mut cut = encode_frame(FrameKind::Data, 7, &[b'x'; CLAIMED]);
-    cut.truncate(HEADER_LEN + 100);
+    // The 13-byte header and the first 100 bytes of the payload.
+    cut.truncate(13 + 100);
     let ping = encode_ctrl(&HostMsg::Ping)?;
     let mut next = hello("after-the-cut")?;
     next.extend_from_slice(&ping);
