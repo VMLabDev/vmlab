@@ -78,7 +78,7 @@ Not read:
 
 | Code | Severity | Fault |
 |------|----------|-------|
-| F1 | data loss, security against a hostile guest | A cursor of size zero panics the recorder and the recording is lost |
+| F1 | data loss, security against a hostile guest | A cursor of size zero panics the recorder and the recording is lost (fixed, card #717) |
 | F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit |
 | F3 | crash (a stop that never returns) | A stalled ffmpeg blocks `record stop`, `down` and `destroy` |
 | F4 | wrong result | Two captures of one machine share one scratch file |
@@ -130,6 +130,12 @@ Not read:
   `Recorder::stop` returns `Ok`.
 - Confidence: high for the panic. Medium for the guest reaching it on
   vmlab-hv.
+- Fixed by card #717. `draw_cursor` draws nothing for a shape with an empty
+  side, or with fewer pixels than its size says. The proof tests are
+  `a_cursor_of_size_zero_draws_nothing` (`src/record/core/tests.rs`) and
+  `a_native_cursor_of_size_zero_keeps_the_recording`
+  (`src/record/executor.rs`). The second one shows that vmlab-hv's display
+  server does send a 0 x 0 shape to its clients.
 
 ### F2. The recorder holds every overdue frame in memory, with no limit
 
