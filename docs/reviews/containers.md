@@ -80,7 +80,7 @@ Not read:
 | # | Severity | Finding |
 |---|----------|---------|
 | F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614) |
-| F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine |
+| F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine (fixed, card #642) |
 | F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image |
 | F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 (fixed, card #643) |
 | F5 | wrong result | A start that fails on its second virtiofsd leaves the first one running |
@@ -182,6 +182,16 @@ Not read:
   `a_ctl_peer_that_never_reads_does_not_block_a_stop`. Assert that the second
   `send` returns an error. Today it never returns, and the test runner's own
   timeout ends the test.
+- Fixed in card #642. `CtlHandle::send` has one deadline (`SEND_TIMEOUT`,
+  5 s) for the wait on the writer mutex and for the write and flush. A write
+  that runs out of time marks the writer as cut short, because part of its
+  line may be on the wire, and every later `send` on that handle fails at
+  once. The ctl watcher's blocked answer therefore releases the mutex, stop
+  rung 1 gets an error instead of waiting, and the stop goes on to the agent
+  shutdown and the kill. Events are still read after a cut-short write.
+  Proof: `a_ctl_peer_that_never_reads_does_not_block_a_stop` in
+  `src/labd/container_ctl.rs`, on a paused clock. It never returned before
+  the fix.
 
 ### F3. Changing `image =` keeps the old writable layer over the new image (wrong result)
 
