@@ -71,6 +71,18 @@ project's `ow-snapshot.tar.xz` there).
 - **No identity.** The NT build runs as an SCM service under SYSTEM; the 9x
   build is a RunServices process; DOS has no accounts at all.
 
+## Installing on NT
+
+`install-nt.cmd` on the bootstrap ISO makes `C:\vmlab`, runs
+`vmlab-agent-legacy.exe --secure-dir C:\vmlab` from the ISO, copies the
+binary in and registers it with `--install`. The service runs as SYSTEM, so
+`--secure-dir` makes Administrators the owner of the directory and of what
+is in it, and leaves full control for Administrators and SYSTEM and no entry
+for anyone else. Without it the directory keeps what the root of `C:` hands
+down, which on NT4 and Windows 2000 is full control for Everyone. On a FAT
+volume there are no permissions to set: it prints a warning and the install
+goes on. An install by hand needs the same step before `--install`.
+
 ## Running by hand
 
 ```
