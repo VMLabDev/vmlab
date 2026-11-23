@@ -113,6 +113,10 @@ for a guest that is not x86.
   0x50, because `__try` does not catch an invalid kernel address.
 - Severity: security against a hostile guest program (a write into kernel
   memory from an unprivileged process, which is a path to SYSTEM), and crash.
+- Fixed: card #751, `guest/win3d/patches/kmd/kmd-check-capset-escape.patch`
+  (driver `100.6.101.58117`). The copy probes the range with `ProbeForWrite`
+  inside the `__try`, and the escape fails with `STATUS_ACCESS_VIOLATION`.
+  The proof and its runs are in `guest/win3d/docs/acceptance/C751.md`.
 
 ### F2. The installer's state directory can be owned or written by a standard user, and a SYSTEM task runs a script from it
 
@@ -165,6 +169,9 @@ for a guest that is not x86.
   escape returns `STATUS_INVALID_PARAMETER_1`. Today the claim is a bugcheck
   0x50 in `viogpu3d.sys`.
 - Severity: crash (the whole guest, from an unprivileged process).
+- Fixed: card #751, the same patch. An id outside 1 to 63 is refused with
+  `STATUS_INVALID_PARAMETER_1` before the shift and the index
+  (`guest/win3d/docs/acceptance/C751.md`).
 
 ### F4. The submit escape adds a user length in 32 bits and then copies that length
 
@@ -229,6 +236,12 @@ for a guest that is not x86.
   that the probe's buffer holds pool memory, or the guest bugchecks.
 - Severity: security against a hostile host together with a guest user
   (kernel memory to user mode), and crash.
+- Fixed: card #751, the same patch. A capset whose `capset_max_size` is above
+  1 MiB is not supported, the response size is computed in 64 bits, the
+  escape copies nothing for a refused size, and the response buffer is
+  zeroed before the request. The proof is a unit test of the driver's bounds
+  header on the build host, with the forged size of this finding. No device
+  model forged the answer to a guest (`guest/win3d/docs/acceptance/C751.md`).
 
 ### F7. Any process can point the scanout at any resource
 
