@@ -217,6 +217,18 @@ indices, and they are the table:
 0000060d 0000061d 00000621 00000630 00000631 00000632 0000064f 000006b0
 ```
 
+With the table in place (commit `bb6ccb8e`, 2026-11-23, host
+`kvm.ignore_msrs=N`, `VMLAB_HV_TEST_REQUIRE_MSR_EXITS=1`, the overlay with
+`ProvideCustomSlide` on), P1 ran three times while the host load average was
+15 to 45 on 32 CPUs. All three runs logged the same 16 indices as answered and
+no index as faulted.
+
+- T1: the agent did not answer in 300 s. The cause is unknown.
+- T2: the agent answered 47.9 s after resume. The run then failed at the
+  keyboard focus probe of the login window.
+- T3: the agent answered 24.3 s after resume and the whole test passed in
+  487 s.
+
 ## Snapshot and shutdown measurements
 
 The S1 regression
