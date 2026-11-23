@@ -712,13 +712,16 @@ impl GlobalSegments {
             directory,
             dns_sync,
             subnet,
-            holders: Holders::default(),
+            holders: {
+                let mut holders = Holders::default();
+                holders.take(lab.as_ref().map(|j| j.lab.as_str()));
+                holders
+            },
             sock: sock.clone(),
             listener,
             dialer,
             trunks,
         };
-        seg.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
         let warnings = seg.join(name, lab);
         segs.insert(name.to_string(), seg);
         tracing::info!("global segment \"{name}\" created on {subnet}");
