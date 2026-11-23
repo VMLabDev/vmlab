@@ -499,6 +499,15 @@ pub fn cmd_destroy() -> Result<()> {
             }
             None if lab_local.exists() => {
                 refuse_destroy_under_freeze(&root).await?;
+                // A daemon that does not answer may still be starting, or
+                // have lost its socket file, and it holds the lab's state
+                // open. The release waits for a start and stops such a
+                // daemon before the directory goes.
+                if let Ok(sup) = daemon::ensure_supervisor().await {
+                    let _ = sup
+                        .send(SupRequest::LabRelease { name: name.clone() })
+                        .await;
+                }
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
                 crate::freeze::ports::release_worktree(&root)?;
