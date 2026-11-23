@@ -242,7 +242,9 @@ mod tests {
                 .position(|l| !l.starts_with("rem ") && wanted(l))
                 .unwrap_or_else(|| panic!("install-nt.cmd has no line that {what}"))
         };
-        let mkdir = at("creates the directory", &|l| l.contains("mkdir %VMLAB_DIR%"));
+        let mkdir = at("creates the directory", &|l| {
+            l.contains("mkdir %VMLAB_DIR%")
+        });
         let secure = at("secures the directory", &|l| {
             l.starts_with("\"%~dp0legacy\\nt\\vmlab-agent-legacy.exe\"")
                 && l.ends_with("--secure-dir %VMLAB_DIR%")
