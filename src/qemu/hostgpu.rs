@@ -1015,7 +1015,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::fake_host;
+    use super::testing::{fake_gpu, fake_host};
     use super::*;
 
     fn set(env: &ChildEnv) -> Vec<(&str, &str)> {
