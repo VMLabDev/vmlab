@@ -298,3 +298,114 @@ fn buttons_have_the_protocols_bits() {
     assert_eq!(button_bit("right").unwrap(), 4);
     assert!(button_bit("fourth").is_err());
 }
+
+/// A shared-memory surface configure of the given geometry.
+fn configure_of(surface_id: u64, width: u32, height: u32, stride: u32) -> Message {
+    Message::SurfaceConfigure {
+        surface_id,
+        width,
+        height,
+        drm_fourcc: XRGB8888,
+        stride,
+        modifier: 0,
+        kind: SurfaceKind::Shm,
+        buffers: 1,
+    }
+}
+
+/// A buffer of `len` bytes to pass as a surface's descriptor.
+fn buffer_of(len: u64) -> File {
+    let file = tempfile::tempfile().expect("a buffer file");
+    file.set_len(len).expect("sizing the buffer file");
+    file
+}
+
+/// Review F1 (docs/reviews/display.md): the peer is a hypervisor process a
+/// guest may have taken over, so a configure is refused before any of its
+/// sizes is used. 1048576 squared would ask the lab daemon for 4 TiB; zero
+/// and 70000 are outside what the recorder's 16-bit events carry; and
+/// `0x4000_0001 * 4` wraps to 4 in 32 bits.
+#[test]
+fn configure_refuses_a_surface_larger_than_the_protocol_limit() {
+    for (width, height, stride) in [
+        (1_048_576, 1_048_576, 4_194_304),
+        (0, 1, 4),
+        (1, 0, 4),
+        (70_000, 1, 280_000),
+        (0x4000_0001, 1, 4),
+        // Each side is in range and the buffer is over 256 MiB.
+        (16_384, 16_384, 65_536),
+    ] {
+        let refused = Surface::configure(
+            &configure_of(1, width, height, stride),
+            vec![buffer_of(0).into()],
+        );
+        assert!(
+            refused.is_err(),
+            "{width}x{height} stride {stride} was accepted"
+        );
+    }
+    let largest = Surface::configure(
+        &configure_of(1, 16_384, 4_096, 65_536),
+        vec![buffer_of(0).into()],
+    );
+    assert!(largest.is_ok(), "the largest surface is still accepted");
+}
+
+/// The same refusal at the socket: a server that reconfigures to a width of
+/// 70000 ends the stream, rather than the recorder getting a `DesktopSize`
+/// and rows cut to 65535.
+#[tokio::test]
+async fn the_stream_refuses_a_configure_wider_than_the_limit() {
+    use vmlab_hv_display::{receive, send};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let server = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let (stream, _) = listener.accept().unwrap();
+        let Message::Hello { capabilities, .. } = receive(&stream).unwrap().message else {
+            panic!("the client opens with a Hello");
+        };
+        let hello = Message::Hello {
+            version: vmlab_hv_display::protocol::VERSION,
+            capabilities,
+        };
+        send(&stream, &hello, &[]).unwrap();
+        let small = buffer_of(16);
+        send(&stream, &configure_of(1, 4, 1, 16), &[small.as_raw_fd()]).unwrap();
+        let wide = buffer_of(280_000);
+        // The client may have gone by the time these are written.
+        let _ = send(
+            &stream,
+            &configure_of(2, 70_000, 1, 280_000),
+            &[wide.as_raw_fd()],
+        );
+        let _ = send(
+            &stream,
+            &Message::FrameReady {
+                flags: FrameFlags::default(),
+                surface_id: 2,
+                buffer: 0,
+                seq: 1,
+                timestamp_ns: 1,
+                damage: vec![Rect {
+                    x: 0,
+                    y: 0,
+                    width: 70_000,
+                    height: 1,
+                }],
+            },
+            &[],
+        );
+        // Hold the connection until the client leaves.
+        while receive(&stream).is_ok() {}
+    });
+    let mut stream = NativeStream::connect(&path).await.unwrap();
+    assert_eq!((stream.width, stream.height), (4, 1));
+    let refused = stream.next_update().await;
+    assert!(refused.is_err(), "the wide configure gave {refused:?}");
+    drop(stream);
+    server.join().unwrap();
+}

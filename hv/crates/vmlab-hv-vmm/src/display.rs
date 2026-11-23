@@ -1,7 +1,9 @@
 //! Standard VGA scanout and platform input adapters for the display server.
 
 use std::io;
-use std::os::unix::net::UnixListener;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Weak, atomic::Ordering};
 
@@ -592,9 +594,9 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
             "display.sock or vnc.sock already exists".into(),
         ));
     }
-    let native_listener = UnixListener::bind(native)
+    let native_listener = bind_owner_only(native)
         .map_err(|e| VmmError::Control(format!("binding {}: {e}", native.display())))?;
-    let rfb_listener = match UnixListener::bind(rfb) {
+    let rfb_listener = match bind_owner_only(rfb) {
         Ok(listener) => listener,
         Err(error) => {
             drop(native_listener);
@@ -671,6 +673,8 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
             .name(name.into())
             .spawn(move || {
                 let mut workers = Vec::new();
+                // SAFETY: geteuid has no preconditions.
+                let own = unsafe { libc::geteuid() };
                 while weak.upgrade().is_some_and(|shared| !shared.exited()) {
                     let stream = match listener.accept() {
                         Ok((stream, _)) => stream,
@@ -683,6 +687,20 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
                             break;
                         }
                     };
+                    // Neither protocol authenticates, so the socket is the
+                    // only gate: its mode, and this check for a connection
+                    // made before the mode was set.
+                    match peer_uid(&stream) {
+                        Ok(uid) if uid_may_connect(uid, own) => {}
+                        Ok(uid) => {
+                            log::warn!("{name}: refused a connection from uid {uid}");
+                            continue;
+                        }
+                        Err(error) => {
+                            log::warn!("{name}: refused a connection, no peer credentials: {error}");
+                            continue;
+                        }
+                    }
                     let server = server.clone();
                     workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
                     workers.push(std::thread::spawn(move || {
@@ -705,6 +723,45 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
     }
     *shared.display.lock() = Some(server);
     Ok(())
+}
+
+/// Bind a display socket that only its owner can connect to. A client of
+/// either display protocol types keys and reads the screen without
+/// authenticating, so the socket must not get the mode the umask leaves.
+///
+/// The mode is set after the bind, because the umask is the whole process's.
+/// A connection made in between is refused by the peer check of the accept
+/// loop ([`uid_may_connect`]).
+fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+/// The user at the other end of a display connection (`SO_PEERCRED`).
+fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+    // SAFETY: an all-zero ucred is a valid value of the plain C struct.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&credentials) as libc::socklen_t;
+    // SAFETY: both pointers refer to correctly sized, writable objects, and
+    // the descriptor is open for the life of `stream`.
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+
+/// Whether a peer of user `peer` may use the display of a machine that runs
+/// as user `own`: the same user, and root, which the file mode never stops.
+fn uid_may_connect(peer: libc::uid_t, own: libc::uid_t) -> bool {
+    peer == own || peer == 0
 }
 
 fn placeholder_pixels() -> Vec<u8> {
@@ -734,6 +791,36 @@ fn placeholder_pixels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review F7 (docs/reviews/display.md). A plain bind leaves the socket
+    /// `0777 & !umask`, which is 0600 only under a umask no test host has.
+    /// The umask is not changed here: it belongs to the whole test process.
+    #[test]
+    fn display_sockets_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["display.sock", "vnc.sock"] {
+            let path = dir.path().join(name);
+            let _listener = bind_owner_only(&path).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_display_peer_of_another_user_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("display.sock");
+        let listener = bind_owner_only(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let own = unsafe { libc::geteuid() };
+        assert_eq!(peer_uid(&accepted).unwrap(), own);
+        assert!(uid_may_connect(own, own));
+        assert!(uid_may_connect(0, 1000));
+        assert!(!uid_may_connect(1001, 1000));
+        assert!(!uid_may_connect(1000, 0));
+    }
 
     #[test]
     fn queued_emulated_damage_is_consumed_once() {
