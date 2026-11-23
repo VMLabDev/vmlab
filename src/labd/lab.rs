@@ -8144,17 +8144,16 @@ lab "t" {
         let mac_a = MacAddr([0x52, 0x54, 0, 0, 1, 5]);
         let mac_b = MacAddr([0x52, 0x54, 0, 0, 2, 5]);
         let two = {
-            let mut m = Arc::into_inner(FakeMachine::networked(
-                "two", &sh, &nics, mac_a, "10.0.1.5",
-            ))
-            .expect("sole owner");
+            let mut m =
+                Arc::into_inner(FakeMachine::networked("two", &sh, &nics, mac_a, "10.0.1.5"))
+                    .expect("sole owner");
             m.macs = vec![mac_a, mac_b];
             m.claims = vec![Some("10.0.1.5".into()), Some("10.0.2.5".into())];
             Arc::new(m)
         };
         let lab_cfg = config.lab.clone();
-        let lab = LabRuntime::with_machines(config, vec![two as Arc<dyn Machine>])
-            .expect("runtime");
+        let lab =
+            LabRuntime::with_machines(config, vec![two as Arc<dyn Machine>]).expect("runtime");
         let macs = HashMap::from([("two".to_string(), vec![mac_a, mac_b])]);
         lab.network
             .lock()
