@@ -117,6 +117,19 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
         check_dns_label(&seg.name, seg.span, "segment name", &mut issues);
+        // A /0 covers the entire auto-subnet pool. At the other end, a
+        // segment needs at least two usable addresses for a gateway and guest.
+        if let Some(subnet) = seg.subnet
+            && !(1..=30).contains(&subnet.prefix_len())
+        {
+            issues.push(Issue::at(
+                seg.span,
+                format!(
+                    "segment \"{}\" subnet {subnet} must have a prefix length from /1 to /30",
+                    seg.name
+                ),
+            ));
+        }
         for other in &lab.segments {
             if !std::ptr::eq(seg, other)
                 && let (Some(a), Some(b)) = (seg.subnet, other.subnet)
@@ -347,6 +360,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &vm.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(&format!("vm \"{}\"", vm.name), &vm.extra_disks, &mut issues);
         if let Some(gpu) = &vm.gpu {
             check_virtual_display_family(
                 gpu,
@@ -782,6 +796,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
         for d in &t.extra_disks {
             check_disk_block(&file.root, d, &mut issues);
         }
+        check_disk_names(
+            &format!("template \"{}\"", t.name),
+            &t.extra_disks,
+            &mut issues,
+        );
         // A build VM's `gpu {}` (§6.1) is a lab VM's, resolved on the host
         // that builds: the same check, including `passthrough`, which a
         // build may ask for on the same terms a lab VM may.
@@ -1794,9 +1813,11 @@ fn check_nics(
 
 /// The daemon claims the first usable address of every segment as its
 /// gateway (DHCP/DNS/NAT/share endpoint).
+/// Saturate at the final IPv4 address so NIC validation can report issues
+/// even when a segment declares an invalid prefix.
 pub fn gateway_ip(net: ipnet::Ipv4Net) -> Ipv4Addr {
     let base = u32::from(net.network());
-    Ipv4Addr::from(base + 1)
+    Ipv4Addr::from(base.saturating_add(1))
 }
 
 /// One ordering key's graph (§7.2) is acyclic. `key` names it in the issue;
@@ -1938,6 +1959,25 @@ fn check_media(root: &Path, m: &Media, issues: &mut IssueList) {
             m.span,
             format!("media source folder {} does not exist", m.from.display()),
         ));
+    }
+}
+
+/// A `disk` block's image is `disk-<name>.qcow2` in the machine's directory,
+/// so two blocks with one name would be two drives on one image file. QEMU's
+/// image lock refuses the second; vmlab-hv takes no lock, and writes through
+/// both corrupt the image. `who` is the block they sit in (`vm "a"`).
+fn check_disk_names(who: &str, disks: &[DiskBlock], issues: &mut IssueList) {
+    for (i, d) in disks.iter().enumerate() {
+        if disks[..i].iter().any(|e| e.name == d.name) {
+            issues.push(Issue::at(
+                d.span,
+                format!(
+                    "{who}: disk \"{}\" is declared twice; each `disk` block needs its own name, \
+                     because the name is its image file",
+                    d.name
+                ),
+            ));
+        }
     }
 }
 
@@ -3051,11 +3091,68 @@ template "t" {
         );
     }
 
+    /// F4 (docs/reviews/config.md): two `disk` blocks with one name would
+    /// give the VM two writable drives on one image file.
+    #[test]
+    fn two_disks_with_one_name_are_refused() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "data" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            es.iter()
+                .any(|m| m.contains("vm \"a\"") && m.contains("disk \"data\" is declared twice")),
+            "expected the duplicate disk name to be refused, got: {es:#?}"
+        );
+        let distinct = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    disk "data" { size = 10GiB }
+    disk "logs" { size = 10GiB }
+  }
+}"#,
+        );
+        assert!(
+            !distinct.iter().any(|m| m.contains("declared twice")),
+            "two names are two images: {distinct:#?}"
+        );
+    }
+
     #[test]
     fn undeclared_segment() {
         assert_err(
             "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" nic { segment = \"nope\" } } }",
             "undeclared segment",
+        );
+    }
+
+    #[test]
+    fn a_subnet_too_small_for_a_gateway_and_a_guest_is_refused() {
+        for subnet in ["255.255.255.255/32", "10.1.1.0/31", "0.0.0.0/0"] {
+            assert_err(
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ segment \"s\" {{ subnet = \"{subnet}\" }} }}"
+                ),
+                &format!("segment \"s\" subnet {subnet} must have a prefix length from /1 to /30"),
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_ip_does_not_overflow() {
+        let last = Ipv4Addr::new(255, 255, 255, 255);
+        assert_eq!(gateway_ip("255.255.255.255/32".parse().unwrap()), last);
+        assert_eq!(
+            gateway_ip("255.255.255.252/30".parse().unwrap()),
+            Ipv4Addr::new(255, 255, 255, 253)
         );
     }
 

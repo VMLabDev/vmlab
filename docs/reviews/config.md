@@ -36,11 +36,11 @@ The findings are ranked against these three facts, which the code states:
 | F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry (fixed, card #540) |
 | F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments (fixed, card #548) |
 | F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read. **Fixed by card #544.** |
-| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file |
+| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file (fixed, card #558) |
 | F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545) |
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
-| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address |
+| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
 | F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites |
 | F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name |
 | F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
@@ -205,6 +205,13 @@ is refused at launch, because the file format has no escape for one.
 - I did not read all of vmlab-hv's machine description checks. A search of
   `hv/crates/vmlab-hv-proto/src/machine.rs` for a duplicate-path check found
   none.
+- Fixed in card #558. `validate` refuses a second `disk` block with the name
+  of an earlier one in the same `vm` or `template` (`check_disk_names` in
+  `src/config/validate.rs`), and `VmInstance::ensure_disks` refuses the same
+  before it creates or launches anything, so a configuration that skipped
+  validation still never reaches a launch with one image as two drives. Both
+  proof tests fail before the fix and pass after. The content of a disk name
+  (`/`, `,`) is not part of this fix.
 
 ### F5. A validation error prints passwords and secret values (security)
 
@@ -281,7 +288,7 @@ is refused at launch, because the file format has no escape for one.
   2. By hand: set `subnet_pool = "10.99.0.0/16"`, run `vmlab up` on such a
      lab, and read the segment's subnet in `vmlab status`. It is `10.213.x.0/24`.
 
-### F8. Any subnet prefix is accepted, and `gateway_ip` overflows (crash, wrong result)
+### F8. Any subnet prefix is accepted, and `gateway_ip` overflows (crash, wrong result, fixed in #564)
 
 - Where: `src/config/extract.rs:133` (`subnet` is any CIDR),
   `src/config/validate.rs:112-134` (only the overlap check),

@@ -35,8 +35,8 @@ Two facts are used by several findings:
 | F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547) |
 | F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name (fixed, card #557) |
 | F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
-| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host |
-| F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down |
+| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559) |
+| F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down (fixed, card #560) |
 | F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon (fixed, card #561) |
 | F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab |
 | F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again |
@@ -236,6 +236,11 @@ Two facts are used by several findings:
   with one QEMU argv whose `-name` is `vmlab:demo/a` and whose QMP and
   serial socket paths lie under another runtime directory. `lab_orphans`
   with the identity of `demo` must return nothing. Today it returns the pid.
+- Fixed in card #559. `LabIdentity::started` in `src/qemu/process.rs` now
+  knows a QEMU (by its name and by the argv form of a renamed host-GPU
+  binary) by its `-name vmlab:<lab>/` marker **and** a `-qmp unix:<path>`
+  under the lab's runtime directory, which `cmdline.rs` and `container.rs`
+  always pass. The proof test failed before the fix and passes after it.
 
 ### F6. The release deadline is shorter than a graceful stop (crash)
 
@@ -262,6 +267,21 @@ Two facts are used by several findings:
   sealed agent and `acpi_shutdown = true`, sum the waits of its rungs, and
   assert the sum is below `RELEASE_DEADLINE`. Today the sum is 150 s. No
   clock is needed: the test compares constants.
+- Fixed in card #560. `plan_wait` in `src/labd/stop_plan.rs` sums a stop
+  plan's waits. Each machine reports the stop wait of the ladder it would
+  climb now (`Machine::stop_wait`, zero when nothing runs), and the lab
+  daemon answers `shutdown` with the sum over its machines
+  (`stop_within_secs`), since waves stop one after the other. `release_lab`
+  waits that sum plus `RELEASE_MARGIN` (30 s) for the rest of the teardown,
+  and never less than `RELEASE_DEADLINE`, now 180 s, which covers the 150 s
+  ladder of a booting guest for a daemon whose reply names nothing.
+  `vmlab daemon stop` has no fixed wait any more: like `vmlab down` it waits
+  until the supervisor is gone, which the supervisor bounds lab by lab, and
+  says after 10 s that it is still waiting. The proof test failed before the
+  fix (150 s against 120 s) and passes after it, beside
+  `a_release_waits_out_the_stop_wait_its_daemon_reports`. Not fixed here:
+  `ensure_lab_locked` still waits `RELEASE_DEADLINE` for a lab that is
+  stopping and then refuses (no kill), whatever the daemon reported.
 
 ### F7. A daemon that does not answer is taken for dead (crash)
 
