@@ -34,8 +34,9 @@ shift 3
 cd "$LABDIR"
 
 U=win3dprobe
-# A throwaway account in a lab VM; the password is not a secret.
-PW='Pr0be-753-statedir'
+# A throwaway account in a lab VM; the password is not a secret. net.exe
+# asks a question for a password of more than 14 characters.
+PW='Pr0be-753-sdir'
 ROOT='C:\ProgramData\vmlab-win3d'
 PROOF='C:\win3d-statedir-proof.txt'
 
