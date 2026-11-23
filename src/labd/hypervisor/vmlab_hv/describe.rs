@@ -8,8 +8,8 @@
 //! mirrors [`crate::qemu::container::build_container_args`], device for
 //! device. A VM's guest is a template built under QEMU, which has to find the
 //! same hardware at the same addresses (HV-D30), so [`vm`] places every PCI
-//! device in the slot QEMU's q35 or pc gives the argv [`crate::qemu::build_args`]
-//! composes for the same machine.
+//! device in the slot QEMU's q35 or pc gave the same machine, before QEMU
+//! stopped running x86 guests (§22).
 
 use std::path::{Path, PathBuf};
 
@@ -281,16 +281,30 @@ fn ide_boot_path(slot: u8) -> String {
     )
 }
 
-/// The enlightenments a `hyperv` VM gets: QEMU's [`crate::qemu::cmdline::HYPERV_FLAGS`],
-/// name for name, and `avic` with them where the host virtualises the APIC,
-/// as the QEMU path adds [`crate::qemu::cmdline::HYPERV_APICV_FLAG`].
+/// The Hyper-V enlightenments `hyperv = true` gives a VM (§5.2), in QEMU's
+/// spelling, which vmlab-hv's names follow: Windows reads its clock from the
+/// reference TSC page instead of an emulated timer, and takes fewer exits for
+/// interrupts, timers, TLB flushes and IPIs.
+const HYPERV_FLAGS: &str = "hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,\
+                            hv-time,hv-synic,hv-stimer,hv-frequencies,hv-reset,hv-tlbflush,\
+                            hv-ipi";
+
+/// Added to [`HYPERV_FLAGS`] where the host's KVM virtualises the APIC
+/// (§5.2): `hv-avic` tells Windows not to use AutoEOI, which KVM cannot do in
+/// hardware, so APICv/AVIC stays on and an end-of-interrupt stops being an
+/// exit.
+const HYPERV_APICV_FLAG: &str = "hv-avic";
+
+/// The enlightenments a `hyperv` VM gets: [`HYPERV_FLAGS`], name for name,
+/// and `avic` with them where the host virtualises the APIC
+/// ([`HYPERV_APICV_FLAG`]).
 fn hyperv_list(resolved: &ResolvedVm, apic_virtualization: bool) -> Result<Vec<HyperV>> {
     if !resolved.hyperv || resolved.cpu_model.is_some() {
         return Ok(Vec::new());
     }
-    let mut flags: Vec<&str> = crate::qemu::cmdline::HYPERV_FLAGS.split(',').collect();
+    let mut flags: Vec<&str> = HYPERV_FLAGS.split(',').collect();
     if apic_virtualization {
-        flags.push(crate::qemu::cmdline::HYPERV_APICV_FLAG);
+        flags.push(HYPERV_APICV_FLAG);
     }
     flags
         .into_iter()
@@ -1747,12 +1761,6 @@ mod tests {
             let back: MachineDescription =
                 serde_json::from_value(serde_json::to_value(&description).unwrap()).unwrap();
             assert_eq!(back, description);
-            assert!(
-                crate::qemu::build_args("l", &resolved, &paths, QemuAccel::Kvm)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("virtual_display")
-            );
         }
     }
 
@@ -1869,7 +1877,7 @@ mod tests {
         );
     }
 
-    fn legacy_matches_qemu(profile: &str, model: NicModel, display: DisplayDevice) {
+    fn legacy_pc_shape(profile: &str, model: NicModel, display: DisplayDevice) {
         let r = declared(&format!("profile = \"{profile}\""), None);
         let mut paths = vm_paths();
         paths
@@ -1880,16 +1888,8 @@ mod tests {
         if profile == "templeos" {
             paths.nics.clear();
         }
-        let args = crate::qemu::build_args("l", &r, &paths, QemuAccel::Kvm).unwrap();
-        let values = |flag: &str| -> Vec<&str> {
-            args.windows(2)
-                .filter(|a| a[0] == flag)
-                .map(|a| a[1].as_str())
-                .collect()
-        };
-        let devices = values("-device");
         let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
-        assert_eq!(values("-machine"), ["pc"]);
+        assert_eq!(r.machine, "pc");
         assert_eq!(d.machine, Machine::Pc);
         assert_eq!(d.ahci_pci, None);
         assert_eq!(
@@ -1900,25 +1900,12 @@ mod tests {
                 function: 2
             })
         );
-        assert!(args.iter().any(|a| a == "-usb") && devices.contains(&"usb-tablet"));
         assert_eq!(d.disks.len(), 4);
         for (i, disk) in d.disks.iter().enumerate() {
             let (channel, unit) = ((i / 2) as u8, (i % 2) as u8);
             assert_eq!(
                 (disk.bus, disk.port, disk.channel, disk.unit),
                 (DiskBus::Ide, None, Some(channel), Some(unit))
-            );
-            let dev = if disk.cdrom { "ide-cd" } else { "ide-hd" };
-            let index = if disk.cdrom { i - 2 } else { 50 + i };
-            assert!(
-                devices.contains(
-                    &format!(
-                        "{dev},drive={},bus=ide.{channel},unit={unit},bootindex={index}",
-                        disk.id
-                    )
-                    .as_str()
-                ),
-                "{args:?}"
             );
         }
         let Boot::Firmware { bootorder, .. } = &d.boot else {
@@ -1934,10 +1921,8 @@ mod tests {
             ]
         );
         assert_eq!(d.floppy, paths.floppy);
-        assert_eq!(values("-drive"), ["if=floppy,format=raw,file=/answer.img"]);
         assert!(!bootorder.iter().any(|p| p.contains("floppy")));
         assert_eq!(d.display.as_ref().unwrap().device, display);
-        assert!(devices.contains(&r.display_device.as_deref().unwrap()));
         let serial = r.agent_transport == AgentTransport::IsaSerial;
         assert_eq!(
             d.ports[0].transport,
@@ -1953,17 +1938,7 @@ mod tests {
         );
         assert_eq!(d.console_pci, (!serial).then(|| at(2).unwrap()));
         assert_eq!(d.ports[0].socket, paths.agent_sock);
-        if serial {
-            assert!(devices.contains(&"isa-serial,chardev=vagent0,index=0"));
-            assert!(devices.contains(&"isa-serial,chardev=serlog,index=1"));
-        } else {
-            assert!(devices.contains(&"virtio-serial-pci"));
-            assert_eq!(values("-serial"), ["file:/logs/l/v/serial.log"]);
-        }
         assert_eq!(d.rtc_base, r.rtc_base);
-        if let Some(base) = &d.rtc_base {
-            assert_eq!(values("-rtc"), [format!("base={base}")]);
-        }
         if profile != "templeos" {
             assert_eq!(d.nics[0].model, model);
             // One queue and no virtio-net header: the plain stream, no ROM.
@@ -1974,16 +1949,10 @@ mod tests {
             );
             assert_eq!(d.nics[0].rom, None);
             assert_eq!(d.nics[0].pci, at(if serial { 2 } else { 3 }));
-            assert!(
-                devices.contains(
-                    &format!("{},netdev=net0,mac=52:54:00:00:00:01", r.nic_model).as_str()
-                )
-            );
         } else {
             assert!(d.nics.is_empty());
         }
-        let cpu = values("-cpu")[0];
-        assert_eq!(!d.hyperv.is_empty(), cpu.contains("hv-relaxed"));
+        assert_eq!(!d.hyperv.is_empty(), r.hyperv && r.cpu_model.is_none());
         assert_eq!(
             d.display.as_ref().unwrap().pci,
             at(if profile == "templeos" {
@@ -2003,36 +1972,34 @@ mod tests {
     }
 
     #[test]
-    fn windows_legacy_matches_the_qemu_argv() {
-        legacy_matches_qemu("windows-legacy", NicModel::E1000, DisplayDevice::StdVga);
+    fn windows_legacy_has_the_pc_shape() {
+        legacy_pc_shape("windows-legacy", NicModel::E1000, DisplayDevice::StdVga);
     }
 
     #[test]
-    fn windows_xp_matches_the_qemu_argv() {
-        legacy_matches_qemu("windows-xp", NicModel::E1000, DisplayDevice::StdVga);
+    fn windows_xp_has_the_pc_shape() {
+        legacy_pc_shape("windows-xp", NicModel::E1000, DisplayDevice::StdVga);
     }
 
     #[test]
-    fn windows_9x_matches_the_qemu_argv() {
-        legacy_matches_qemu("windows-9x", NicModel::Pcnet, DisplayDevice::CirrusVga);
+    fn windows_9x_has_the_pc_shape() {
+        legacy_pc_shape("windows-9x", NicModel::Pcnet, DisplayDevice::CirrusVga);
     }
 
     #[test]
-    fn templeos_matches_the_qemu_argv() {
-        legacy_matches_qemu("templeos", NicModel::E1000, DisplayDevice::StdVga);
+    fn templeos_has_the_pc_shape() {
+        legacy_pc_shape("templeos", NicModel::E1000, DisplayDevice::StdVga);
     }
 
     #[test]
-    fn a_named_pc_cpu_suppresses_hyperv_as_under_qemu() {
+    fn a_named_pc_cpu_suppresses_hyperv() {
         let r = declared(
             r#"profile = "windows-legacy" cpu_model = "pentium3" hyperv = true"#,
             None,
         );
         let p = vm_paths();
-        let args = crate::qemu::build_args("l", &r, &p, QemuAccel::Kvm).unwrap();
         let d = vm("l", &r, &p, QemuAccel::Kvm, &roms()).unwrap();
         assert_eq!(d.cpu_model.as_deref(), Some("pentium3"));
-        assert!(args.windows(2).any(|a| a == ["-cpu", "pentium3"]));
         assert!(d.hyperv.is_empty());
     }
 

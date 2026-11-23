@@ -95,7 +95,7 @@ SRC
     li "Every name in `depends_on` and `depends_on_provision` exists and is not the container itself, and neither key forms a cycle across VMs and containers. A loop that crosses from one key to the other is allowed."
     li "`clock` is `host`, `snapshot`, or an RFC 3339 date-time such as `2020-01-01T00:00:00Z`."
     li "`login {}` blocks are judged against the Linux family regardless of the profile named: `elevated` is rejected and `password` is optional."
-    li "An explicit vmlab container is refused on a host that is not x86_64 or whose `/dev/kvm` is not usable. Automatic selection falls back to QEMU with a reason for those refusals. Containers require KVM on either hypervisor and fail with `KVM is required` when it is unavailable."
+    li "A container runs the host's architecture. On an x86_64 host it runs on vmlab-hv: `hypervisor = \"qemu\"` there is an error, since QEMU runs no x86 guest, and a host whose `/dev/kvm` is not usable fails with `KVM is required`. On another host architecture automatic selection puts it on QEMU with a reason, and it still requires KVM."
   }
   code wcl {
     filename    = "examples/mixed-lab/vmlab.wcl"

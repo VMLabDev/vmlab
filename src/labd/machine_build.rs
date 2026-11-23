@@ -180,7 +180,7 @@ pub(super) async fn build_vm(
         // list snapshots and operate on the stopped disks.
         selection.kind
     } else {
-        checked_hypervisor(MachineCfg::Vm(vm_cfg), Some(&resolved), selection.kind)?
+        checked_hypervisor(MachineCfg::Vm(vm_cfg), Some(&resolved), &selection)?
     };
     // Persist an inferred identity before a reload or deferred pull can rebuild it.
     if existing.is_some()
@@ -370,7 +370,7 @@ pub(super) fn build_container(
         c_state.hypervisor = existing;
         selection.kind
     } else {
-        let hypervisor = checked_hypervisor(MachineCfg::Container(c_cfg), None, selection.kind)?;
+        let hypervisor = checked_hypervisor(MachineCfg::Container(c_cfg), None, &selection)?;
         c_state.hypervisor = Some(hypervisor);
         hypervisor
     };
@@ -397,19 +397,21 @@ pub(super) fn build_container(
 /// The hypervisor `machine` runs on (§22), refusing — in validation's words,
 /// from the one list — a machine vmlab-hv cannot run yet. Validation said so
 /// first; this is the daemon not taking its word for it, since a host config
-/// edited since can move a machine onto vmlab-hv without touching the lab
-/// file.
+/// edited since can move a machine onto vmlab-hv, or an x86 machine onto
+/// QEMU, without touching the lab file.
 fn checked_hypervisor(
     machine: MachineCfg<'_>,
     hardware: Option<&crate::qemu::ResolvedVm>,
-    kind: HypervisorKind,
+    selection: &crate::config::hypervisor::HypervisorSelection,
 ) -> Result<HypervisorKind> {
+    let kind = selection.kind;
+    let host = crate::config::hypervisor::HostFacts::probe();
+    let why = crate::config::hypervisor::qemu_x86_refusals(machine, selection, &host, hardware);
+    if !why.is_empty() {
+        bail!("{}", why.join("\n"));
+    }
     if kind == HypervisorKind::Vmlab {
-        let why = crate::config::hypervisor::vmlab_refusals(
-            machine,
-            &crate::config::hypervisor::HostFacts::probe(),
-            hardware,
-        );
+        let why = crate::config::hypervisor::vmlab_refusals(machine, &host, hardware);
         if !why.is_empty() {
             bail!("{}", why.join("\n"));
         }
