@@ -43,6 +43,9 @@ pub struct MachineDescription {
     pub smbios_type2: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hyperv: Vec<HyperV>,
+    /// What KVM's PIT does with timer ticks the guest was too late to take.
+    #[serde(default, skip_serializing_if = "PitTicks::is_replay")]
+    pub pit_ticks: PitTicks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<Display>,
     /// Optional shared-memory virtual monitor. Absent means disabled.
@@ -424,6 +427,25 @@ pub enum CpuPolicy {
 impl CpuPolicy {
     pub fn is_host(&self) -> bool {
         *self == Self::Host
+    }
+}
+
+/// The in-kernel PIT's policy for ticks it could not deliver in time.
+/// `Replay` is KVM's default: each missed tick is delivered later, one
+/// straight after another, so a guest that counts ticks keeps its time.
+/// `Discard` drops them (`KVM_REINJECT_CONTROL` with `pit_reinject = 0`),
+/// for a guest that does not survive a burst of timer interrupts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PitTicks {
+    #[default]
+    Replay,
+    Discard,
+}
+
+impl PitTicks {
+    pub fn is_replay(&self) -> bool {
+        *self == Self::Replay
     }
 }
 

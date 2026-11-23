@@ -107,6 +107,10 @@ profile "windows-9x" {
   agent_transport = "isa-serial"
   // DOS and Windows 9x know no UTC: the RTC is the local time (§7.3).
   rtc             = "localtime"
+  // Windows 9x Setup runs part of itself in standard mode, and its DOS
+  // extender faults ("Standard Mode: Bad Fault in MS-DOS Extender") when the
+  // ticks it missed arrive as one burst of timer interrupts. Drop them.
+  pit_ticks       = "discard"
   // Real-mode DOS/9x TUIs (fdisk, setup) drop QMP send-key events between menu
   // redraws; drive their keyboard over VNC instead, which lands reliably.
   input_transport = "vnc"
