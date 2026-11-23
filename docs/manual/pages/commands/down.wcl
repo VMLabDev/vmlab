@@ -43,6 +43,17 @@ page cmd_down {
     [Dev machines and the workspace syncer](guide_dev).
   DOC
 
+  p <<DOC
+    The syncer takes a last pass before it stops, while the guest still
+    answers, so a guest edit made a moment before `down` reaches the host.
+    What that pass cannot carry is written on the machine's sync ledger. A
+    `down --force` does not wait on the guest: it takes no last pass, and the
+    ledger says that. While such a record stands,
+    `vmlab snapshot restore` and the destroy verbs refuse for the stopped
+    machine without `--discard-guest-changes`. The next `vmlab up` syncs the
+    workspace and clears the record.
+  DOC
+
   p "Each VM stops through the graceful ladder described in the [lifecycle guide](guide_architecture):"
 
   list {

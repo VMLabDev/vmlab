@@ -600,8 +600,8 @@ impl Handler<LabRequest> for LabdHandler {
                 lab.down(&machines, force).await?;
                 Ok(json!(true))
             }
-            LabRequest::Destroy {} => {
-                lab.destroy().await?;
+            LabRequest::Destroy { discard } => {
+                lab.destroy(discard).await?;
                 // And then go away. This daemon parsed vmlab.wcl once, at
                 // startup, and holds the result for its whole life — so a
                 // daemon that outlives the lab it was built from serves the
@@ -691,8 +691,8 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::MachineRecordStatus { machine } => {
                 Ok(json!(lab.record_status(machine.as_deref()).await))
             }
-            LabRequest::MachineDestroy { machine } => {
-                lab.destroy_machine(&machine).await?;
+            LabRequest::MachineDestroy { machine, discard } => {
+                lab.destroy_machine(&machine, discard).await?;
                 Ok(json!(true))
             }
             // What this machine can do beyond the universal commands, probed

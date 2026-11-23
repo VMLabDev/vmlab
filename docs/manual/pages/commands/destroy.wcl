@@ -16,11 +16,12 @@ page cmd_destroy {
     provisioning again.
   DOC
 
-  code sh { source = "vmlab destroy" }
+  code sh { source = "vmlab destroy [--discard-guest-changes]" }
 
   table {
     rows:
       | "Option" | "Meaning" |
+      | "`--discard-guest-changes`" | "Destroy even where a dev machine's workspace holds guest work the host has not taken, and lose that work." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -30,8 +31,8 @@ page cmd_destroy {
 
   list {
     style = :numbered
-    li "With a lab daemon running, it asks the daemon to destroy the lab. The daemon stops every workspace syncer, force-stops every machine, waits up to 30 seconds for each to settle, then removes `.vmlab/` and each machine's runtime directory."
-    li "With no daemon running, it removes `.vmlab/` itself if the directory exists."
+    li "With a lab daemon running, it asks the daemon to destroy the lab. The daemon first asks every dev machine's workspace whether the guest holds work the host has not taken, and refuses if one does. It then stops every workspace syncer, force-stops every machine, waits up to 30 seconds for each to settle, and removes `.vmlab/` and each machine's runtime directory."
+    li "With no daemon running, it reads the same answer off the sync ledgers in `.vmlab/`, and then removes `.vmlab/` itself if the directory exists."
     li "It asks the supervisor to release the lab, which reaps the lab daemon."
   }
 
@@ -48,8 +49,29 @@ page cmd_destroy {
 
   callout "The workspace survives, the guest tree does not" {
     kind = :warning
-    body = "A dev machine's source lives in the host workspace directory, which `destroy` never touches. The guest copy is deleted with the clone. Any guest edit the syncer has not carried to the host is lost, so run `vmlab dev sync flush` first if the syncer was halted."
+    body = "A dev machine's source lives in the host workspace directory, which `destroy` never touches. The guest copy is deleted with the clone."
   }
+
+  h2 "Guest work the host has not taken"
+
+  p <<DOC
+    Deleting the guest copy loses nothing only while the two copies are in
+    step, so `destroy` asks first. A running [workspace](guide_dev) gets a
+    last sync pass, which carries what it can. A stopped one answers from its
+    sync ledger: a halt its last pass recorded, what the last pass before
+    `vmlab down` could not carry, or the fact that a `down --force` took no
+    last pass. Where guest work is left, or could be, `destroy` refuses
+    before it stops anything, names the machine and the paths, and changes
+    nothing. One refusal stops the destroy of the whole lab.
+  DOC
+
+  p <<DOC
+    To keep the work, bring the machine up so the workspace syncs, or answer
+    the halt with `vmlab dev sync resolve`. To lose it, pass
+    `--discard-guest-changes`. A workspace that owes a re-seed after a
+    snapshot restore is not refused: its guest tree is rewritten from the
+    host anyway.
+  DOC
 
   p <<DOC
     Templates in the store are never written to by a lab and are not removed
@@ -92,7 +114,8 @@ SRC
   p <<DOC
     Exit status is 0 when the lab's state was removed, whether or not a
     daemon was running. A lab directory that cannot be found, a machine that
-    cannot be stopped, or a `.vmlab/` directory that cannot be removed exits
+    cannot be stopped, a `.vmlab/` directory that cannot be removed, or a
+    workspace holding guest work without `--discard-guest-changes` exits
     1 (`failed`). A main lab whose freeze a worktree lab still uses exits 5
     (`conflict`). A usage error exits 2.
   DOC

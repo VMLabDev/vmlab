@@ -603,13 +603,73 @@ impl WorkspaceSyncers {
             })),
             // A restore is not refused for owing a re-seed: it is about to
             // ask for another one, and the second answers the first.
-            None => refuse(super::bracket::halted_when_stopped(
-                machine,
-                &recorded(declared)
-                    .unwrap_or_else(Ledger::about_nothing)
-                    .halted,
-            )),
+            None => {
+                let ledger = recorded(declared).unwrap_or_else(Ledger::about_nothing);
+                if let Some(halt) = super::bracket::halted_when_stopped(machine, &ledger.halted) {
+                    return refuse(Some(halt));
+                }
+                // What the stop left owed went with the syncer that knew it,
+                // so it is read off the ledger the stop wrote it on.
+                refuse(ledger.left_owed.as_ref().map(|left| {
+                    super::bracket::RestoreOutstanding(super::bracket::Outstanding::left_owed(
+                        machine, left,
+                    ))
+                }))
+            }
         }
+    }
+
+    /// What a `destroy` asks first (§19.6): it deletes the guest working copy
+    /// with the clone, so it refuses while that copy holds work the host has
+    /// not taken, or could. `discard` is the explicit flag that lets it go.
+    ///
+    /// A running workspace gets a last pass, which carries what it can. A
+    /// machine that is **down** answers from its ledger through `declared`:
+    /// the halt of its last pass, and what its stop left owed.
+    pub async fn before_destroy(
+        &self,
+        machine: &str,
+        discard: bool,
+        declared: Option<&Workspace>,
+    ) -> Result<()> {
+        if discard {
+            return Ok(());
+        }
+        let found = match self.last_pass(machine).await {
+            Some(report) => super::bracket::Outstanding::guest_work(machine, &report),
+            None => recorded(declared)
+                .filter(|ledger| !ledger.reseed_owed)
+                .and_then(|ledger| {
+                    super::bracket::Outstanding::of_stopped(&super::ledger::StoppedWork {
+                        machine: machine.to_string(),
+                        halted: ledger.halted,
+                        left_owed: ledger.left_owed,
+                    })
+                }),
+        };
+        refuse(found.map(super::bracket::DestroyOutstanding))
+    }
+
+    /// Ask one machine's syncer for a pass and answer with its report, or
+    /// `None` for a machine with no syncer.
+    ///
+    /// A loop that ended by itself cannot run a pass, and asking it would
+    /// wait out the whole verb timeout. Its last report is answered with the
+    /// trouble said, because nothing has watched the guest since.
+    async fn last_pass(&self, machine: &str) -> Option<Report> {
+        let (syncer, ended) = {
+            let running = self.running.lock().await;
+            let running = running.get(machine)?;
+            (running.syncer.clone(), running.task.is_finished())
+        };
+        Some(if ended {
+            Report {
+                trouble: Some(ENDED.to_string()),
+                ..syncer.report()
+            }
+        } else {
+            snapshot_preflight(&syncer).await
+        })
     }
 
     /// Take one machine's syncer off the workspace for the duration of a
@@ -712,7 +772,56 @@ impl WorkspaceSyncers {
             .collect()
     }
 
+    /// Stop one machine's syncer ahead of its machine's stop (§19.6): take a
+    /// **last pass**, end the loop, and write on the ledger what that pass
+    /// left owed.
+    ///
+    /// The last pass carries guest work that is inside its quiet period or
+    /// still in the guest's dirty set. What it cannot carry is known only to
+    /// this syncer, so it goes on the ledger, where a restore or a `destroy`
+    /// of the stopped machine reads it. With `last_pass` false (a forced
+    /// stop, which does not wait on the guest) the record says that no last
+    /// pass ran.
+    pub async fn stop_before_machine(&self, machine: &str, last_pass: bool) {
+        let Some(syncer) = self.get(machine).await else {
+            return;
+        };
+        let left = if last_pass {
+            let report = self.last_pass(machine).await.unwrap_or_default();
+            super::bracket::left_at_stop(machine, &report)
+        } else {
+            // A workspace waiting on a re-seed holds nothing the host lacks,
+            // and its ledger already says what it owes.
+            let report = syncer.report();
+            report.reseed.is_none().then(|| {
+                super::bracket::left_unasked(
+                    "it was stopped by force with no last sync pass",
+                    &report,
+                )
+            })
+        };
+        self.stop(machine).await;
+        let workspace = &syncer.workspace;
+        if let Some(left) = &left {
+            tracing::warn!(
+                "{machine}: the workspace stopped with guest work owed: {}",
+                left.why
+            );
+        }
+        if let Err(e) = Ledger::note_stop(
+            &workspace.ledger_path,
+            &workspace.host_root,
+            &workspace.guest_root,
+            left,
+        ) {
+            tracing::warn!("{machine}: noting on the sync ledger what the stop left owed: {e:#}");
+        }
+    }
+
     /// Stop one machine's syncer and wait for its current work to unwind.
+    ///
+    /// No last pass and no record: a restart of the syncer, a declaration
+    /// that dropped the workspace, a `destroy` that has already asked.
     pub async fn stop(&self, machine: &str) {
         let running = self.running.lock().await.remove(machine);
         if let Some(running) = running {
@@ -781,6 +890,10 @@ fn recorded(declared: Option<&Workspace>) -> Option<Ledger> {
         &workspace.guest_root,
     ))
 }
+
+/// What a syncer whose loop ended by itself has to say for its workspace.
+const ENDED: &str =
+    "the workspace syncer had stopped by itself, so nothing has watched the guest tree since";
 
 /// Why both directions are stopped while the bracket's re-seed runs.
 ///
@@ -889,6 +1002,11 @@ async fn run(
     // restored while it was *down* owes the same re-seed as one restored while
     // it was up (§19.6).
     let mut reseed = ledger.reseed_owed;
+    // What an earlier stop left owed is this syncer's to answer from here on:
+    // its first completed pass walks the guest tree and reports what it finds.
+    // The record on disk stays until that pass, so a syncer that never
+    // reaches the guest leaves it standing.
+    let mut left_owed = ledger.left_owed.take().is_some();
 
     if reseed {
         syncer.publish(Report {
@@ -1136,6 +1254,14 @@ async fn run(
             {
                 Ok(done) => {
                     passes += 1;
+                    if std::mem::take(&mut left_owed)
+                        && let Err(e) = ledger.save(&workspace.ledger_path)
+                    {
+                        tracing::warn!(
+                            "{}: clearing what the last stop left owed: {e:#}",
+                            workspace.machine
+                        );
+                    }
                     if rescan {
                         rescans += 1;
                         if flush {
