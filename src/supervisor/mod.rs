@@ -1430,6 +1430,212 @@ mod tests {
         });
     }
 
+    const SIGNALLED_TEARDOWN_HELPER: &str = "VMLAB_TEST_SIGNALLED_TEARDOWN_ROOT";
+
+    /// Review F11 (card #572): the teardown a termination signal runs must
+    /// close the supervisor to requests, as the `shutdown` request does. A
+    /// lab daemon spawned or registered once the teardown has read its list
+    /// of labs outlives the supervisor.
+    #[test]
+    fn a_signalled_teardown_refuses_requests() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::signalled_teardown_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SIGNALLED_TEARDOWN_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths. This process serves the control socket of the lab
+    /// `f11-held`, whose registry entry names a helper process: the teardown
+    /// sends it `Shutdown` and then waits for that process, so the arrival of
+    /// `Shutdown` proves the teardown has read its list of labs and is inside
+    /// a release. Two things then happen that no teardown may let through: a
+    /// `lab.ensure` for another name arrives, and a `lab.ensure` that was
+    /// accepted before the teardown began registers its daemon.
+    #[test]
+    #[ignore = "subprocess helper for a_signalled_teardown_refuses_requests"]
+    fn signalled_teardown_helper() {
+        use std::sync::Arc;
+
+        use crate::proto::client::SupClient;
+        use crate::proto::server::{Handler, Server, Streamer};
+        use crate::proto::{CommandError, ErrorCode, LabRequest, ProtoError, SupRequest};
+
+        /// Answers every request and reports each `Shutdown` it is sent.
+        struct Held(tokio::sync::mpsc::UnboundedSender<()>);
+
+        #[async_trait::async_trait]
+        impl Handler<LabRequest> for Held {
+            async fn handle(
+                &self,
+                req: LabRequest,
+                _s: &Streamer,
+            ) -> Result<serde_json::Value, CommandError> {
+                if matches!(req, LabRequest::Shutdown {}) {
+                    let _ = self.0.send(());
+                }
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let Some(root) = std::env::var_os(SIGNALLED_TEARDOWN_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (held, late, inflight) = ("f11-held", "f11-late", "f11-inflight");
+            crate::paths::ensure_dir(&crate::paths::state_dir()).unwrap();
+            let root = super::registry::canonical_root(&root).unwrap();
+
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _daemon =
+                Server::<LabRequest>::bind(&crate::paths::lab_socket(held), Arc::new(Held(shutdown_tx)))
+                    .await
+                    .unwrap();
+            // The process the held lab's entry names. The release waits for
+            // it, so the teardown stays inside that release until it is
+            // killed below.
+            let mut helper = tokio::process::Command::new("sleep")
+                .arg("1000")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let held_pid = helper.id().unwrap();
+            let reaper = tokio::spawn(async move {
+                let _ = helper.wait().await;
+            });
+            // A pid no process has: the daemon the in-flight `lab.ensure`
+            // registers. Its release needs no process to wait for.
+            let mut gone = std::process::Command::new("true").spawn().unwrap();
+            let gone_pid = gone.id();
+            gone.wait().unwrap();
+
+            let host = crate::config::host::HostConfig::default();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: held.into(),
+                    root: root.join(held),
+                    pid: held_pid,
+                    started: process_start_time(held_pid),
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            let tasks = Arc::new(crate::lifecycle::TaskGroup::new());
+            let handler = Arc::new(super::SupervisorHandler {
+                sup: supervisor.clone(),
+                tasks: tasks.clone(),
+            });
+            let _server = Server::<SupRequest>::bind(&crate::paths::supervisor_socket(), handler)
+                .await
+                .unwrap();
+            let client = SupClient::connect(&crate::paths::supervisor_socket())
+                .await
+                .unwrap();
+
+            // A `lab.ensure` accepted before the teardown: it holds the
+            // name's lock, as `ensure_lab` does until its daemon answers.
+            let inflight_lock = supervisor.ensure_lock(inflight).await;
+            let inflight_guard = inflight_lock.lock().await;
+
+            // What `run_async` does once `termination_signal` returns.
+            let teardown = tokio::spawn({
+                let (supervisor, tasks) = (supervisor.clone(), tasks.clone());
+                async move { super::teardown(&supervisor, &tasks).await }
+            });
+            shutdown_rx.recv().await.expect("the held lab is released");
+
+            let ensured = client
+                .send(SupRequest::LabEnsure {
+                    name: late.into(),
+                    root: root.clone(),
+                })
+                .await;
+            // Before the fix the unwanted `__labd` child is this test
+            // executable, which rejects that argument, and `lab.ensure`
+            // answers only once its reaper has marked the entry failed.
+            let late_log = crate::paths::state_dir().join(format!("labd-{late}.log"));
+            let late_registered = supervisor.registry.lock().await.get(late).is_some();
+
+            // The in-flight `lab.ensure` registers its daemon and returns.
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: inflight.into(),
+                    root: root.join(inflight),
+                    pid: gone_pid,
+                    started: None,
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            drop(inflight_guard);
+
+            // End the held daemon, so its release and the teardown finish.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(held_pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = reaper.await;
+            teardown.await.unwrap();
+
+            let left: Vec<String> = {
+                let registry = supervisor.registry.lock().await;
+                registry.labs().iter().map(|l| l.name.clone()).collect()
+            };
+            let mut faults = Vec::new();
+            match &ensured {
+                Err(ProtoError::Remote(e))
+                    if e.code == ErrorCode::Conflict && e.message.contains("shutting down") => {}
+                other => faults.push(format!(
+                    "lab.ensure during the teardown was not refused as shutting down: {other:?}"
+                )),
+            }
+            if late_log.exists() || late_registered {
+                faults.push(format!(
+                    "lab.ensure during the teardown spawned a lab daemon (log: {}, entry: \
+                     {late_registered})",
+                    late_log.exists()
+                ));
+            }
+            if !left.is_empty() {
+                faults.push(format!("the teardown left lab(s) registered: {left:?}"));
+            }
+            assert!(faults.is_empty(), "{}", faults.join("\n"));
+        });
+    }
+
     #[test]
     fn an_exited_child_is_not_running_before_it_is_reaped() {
         assert!(process_running(std::process::id()));
