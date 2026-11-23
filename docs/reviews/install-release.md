@@ -178,6 +178,23 @@ tarball and regenerate its `.sha256`. Follow the manual's commands against
 that server: `sha256sum -c` prints `OK`. Verifying against the signed
 `SHA256SUMS` instead reports a mismatch.
 
+Fixed in card #635. `install.sh` has a new option, `--fetch <asset>`: it
+installs nothing, authenticates `SHA256SUMS` with the same cosign check as an
+install, downloads the named asset, checks it against its line in
+`SHA256SUMS`, and only then moves it into the current directory. It takes one
+plain file name, and refuses an asset that `SHA256SUMS` does not name, which
+includes the `.sha256` sidecars. The manual's "Install vmlab-hv" commands
+call it and unpack the bundle only when it succeeds. They read no sidecar,
+and the text says why. The check follows the installer's trust root, so it
+covers a key-signed release once `RELEASE_KEY` is set, and an unsigned
+release needs `--insecure-skip-signature` here as it does for the CLI.
+Proof: `test_manual_hv_install_refuses_a_replaced_bundle_with_its_sidecar`
+in `scripts/test_release_assets.py` takes the commands out of the manual page
+and runs them against a fixture release whose bundle and sidecar were
+replaced. Before the fix it failed: `sha256sum -c` passed, the bundle was
+unpacked and its `install-viewer-icons.sh` ran. The sidecars are still
+uploaded (`scripts/release-publish.sh`), and the sentence of F11 is unchanged.
+
 ### F5. An old helper keeps its capabilities beside a new vmlab (wrong result, security)
 
 Three paths leave the previous `vmlab-fastpath`, with its file capabilities,
