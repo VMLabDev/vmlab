@@ -1353,10 +1353,84 @@ impl Qcow2Image {
         if new_size == self.size {
             return Ok(());
         }
+        let old_size = self.size;
         self.ensure_l1_covers(new_size)?;
+        // The new area must read as zeros, as `qemu-img resize` makes it.
+        // Mappings past the old size are vmstate (`vmstate_base`), whose
+        // address moves with the size, so the old vmstate is dropped.
+        let cluster_end = old_size.next_multiple_of(self.cluster_size);
+        self.drop_mappings_from(cluster_end)?;
         self.size = new_size;
         self.header_dirty = true;
+        // A longer backing file would show through the new area.
+        let backing_size = self.backing_image.as_ref().map_or(0, |b| b.size());
+        let shadow_end = backing_size.min(new_size);
+        if shadow_end > old_size {
+            let head_end = cluster_end.min(shadow_end);
+            if head_end > old_size {
+                self.write_bytes(old_size, &vec![0u8; (head_end - old_size) as usize])?;
+            }
+            let mut cluster_off = cluster_end;
+            while cluster_off < shadow_end {
+                self.zero_cluster(cluster_off, shadow_end)?;
+                cluster_off += self.cluster_size;
+            }
+        }
         Ok(())
+    }
+
+    /// Unmap every active-layer cluster at or past the cluster-aligned guest
+    /// offset `from`, releasing the host clusters it held.
+    fn drop_mappings_from(&mut self, from: u64) -> Result<()> {
+        let first_l1 = self.l1_index_of(from) as usize;
+        for l1_index in first_l1..self.l1.len() {
+            let l2_host = self.l1[l1_index] & OFFSET_MASK;
+            if l2_host == 0 {
+                continue;
+            }
+            let entry_start = l1_index as u64 * self.l2_span();
+            let skip = from.saturating_sub(entry_start) / self.cluster_size;
+            let indexes: Vec<u64> = self
+                .l2_allocated_indexes(l2_host)?
+                .into_iter()
+                .filter(|&i| i >= skip)
+                .collect();
+            if indexes.is_empty() {
+                continue;
+            }
+            let l2_host = self.cow_l2_if_shared(l1_index)?;
+            for l2_index in indexes {
+                let entry = self.l2_entry(l2_host, l2_index)?;
+                if entry & COMPRESSED_BIT != 0 {
+                    self.adjust_compressed_refcounts(entry, -1)?;
+                } else if entry & OFFSET_MASK != 0 {
+                    self.dec_refcount((entry & OFFSET_MASK) / self.cluster_size)?;
+                }
+                self.set_l2_entry(l2_host, l2_index, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the unmapped cluster at `cluster_off` read as zeros and not
+    /// through the backing file: the zero flag on version 3, written zeros
+    /// up to `end` on version 2, which has no zero flag.
+    fn zero_cluster(&mut self, cluster_off: u64, end: u64) -> Result<()> {
+        if self.version < 3 {
+            let len = self.cluster_size.min(end - cluster_off) as usize;
+            return self.write_bytes(cluster_off, &vec![0u8; len]);
+        }
+        let l1_index = self.l1_index_of(cluster_off) as usize;
+        let mut l2_host = self.cow_l2_if_shared(l1_index)?;
+        if l2_host == 0 {
+            let l2 = self.alloc_cluster()?;
+            self.write_file(l2, &vec![0u8; self.cluster_size as usize])?;
+            self.set_cluster_refcount(l2 / self.cluster_size, 1)?;
+            self.l1[l1_index] = l2 | COPIED_BIT;
+            self.l1_dirty = true;
+            l2_host = l2;
+        }
+        self.set_l2_entry(l2_host, self.l2_index_of(cluster_off), ZERO_BIT)
     }
 
     /// Ensure the active L1 (memory and on-disk region) has at least
@@ -1949,6 +2023,65 @@ mod tests {
         hc[off..off + 4].copy_from_slice(&EXT_END.to_be_bytes());
         assert_eq!(parse_backing_format(&hc, 112).as_deref(), Some("qcow2"));
         assert_eq!(parse_backing_format(&vec![0u8; 512], 112), None);
+    }
+
+    #[test]
+    fn a_grown_image_reads_zeros_where_vmstate_was() {
+        let (_dir, mut img) = testsupport::blank(1024 * 1024);
+        let span = img.l2_span();
+        img.write_vmstate(0, &[0x77; 4096]).unwrap();
+        img.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        img.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+        img.flush().unwrap();
+        let path = img.path.clone();
+        drop(img);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+    }
+
+    #[test]
+    fn a_grown_overlay_reads_zeros_where_its_longer_backing_has_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_path = dir.path().join("backing.qcow2");
+        let span = 512 << 20;
+        let mut backing = Qcow2Image::create(&backing_path, 2 * span, 16, None).unwrap();
+        assert_eq!(backing.l2_span(), span);
+        backing.write_at(span, &[0x55; 4096]).unwrap();
+        // A tail inside the last cluster of the overlay's old size.
+        backing.write_at(span - 4096, &[0x66; 8192]).unwrap();
+        backing.flush().unwrap();
+        drop(backing);
+        let old_size = span - 2048;
+        let mut overlay = Qcow2Image::create(
+            &dir.path().join("overlay.qcow2"),
+            old_size,
+            16,
+            Some((&backing_path, Some("qcow2"))),
+        )
+        .unwrap();
+        overlay.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 8192];
+        overlay.read_at(span - 4096, &mut buf).unwrap();
+        assert!(buf[..2048].iter().all(|&b| b == 0x66));
+        assert!(
+            buf[2048..].iter().all(|&b| b == 0),
+            "tail {:?}",
+            &buf[2048..2064]
+        );
+        let mut buf = vec![0xffu8; 4096];
+        overlay.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
+        overlay.flush().unwrap();
+        let path = overlay.path.clone();
+        drop(overlay);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
     }
 
     #[test]
