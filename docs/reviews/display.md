@@ -220,6 +220,24 @@ Not read:
   (`Shared::sessions`, or the entries of `/proc/self/task`) stays below a
   fixed limit. Today it grows by one for each connection.
 - Confidence: high.
+- Fixed by card #638. The accept loop is now `DisplayServer::serve_while` in
+  `display/core.rs`, and both `vmm/display.rs` and `serve` run it. An
+  `accept` error ends it only when it says the listener is unusable (`EBADF`,
+  `EINVAL`, `ENOTSOCK`, `EOPNOTSUPP`, `EFAULT`). Every other error is counted,
+  warned about at most once per five seconds, and tried again. Threads are
+  made with `Builder::spawn`, so a connection that gets no thread is closed
+  and nothing panics. `DisplayServer::session` holds at most `MAX_SESSIONS`
+  (64) connections and at most `MAX_HANDSHAKES` (16) unfinished handshakes.
+  One more unfinished handshake closes the oldest. A handshake read waits at
+  most `HANDSHAKE_TIMEOUT` (10 s). `PROTOCOL.md` says so. The first proof
+  test is `display_survives_descriptor_exhaustion` in
+  `hv/crates/vmlab-hv-display/tests/exhaustion.rs`, not at seam S1: it lowers
+  the descriptor limit of its own process and drives the same accept loop
+  that the hypervisor runs, with no machine and no KVM. The second is
+  `unfinished_handshakes_are_bounded` in `tests/native.rs`. No test covers
+  the handshake timeout, because it would need a wall-clock wait. Not
+  changed: a client with frames still costs three memfds and a copy of each
+  frame. The session limit bounds the count, not the size.
 
 ### F4. Display server: a dma-buf client that does not send Release stops the guest's GPU commands and a machine reset
 

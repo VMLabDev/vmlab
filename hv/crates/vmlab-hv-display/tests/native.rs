@@ -48,6 +48,65 @@ fn frame_flags_are_negotiated_and_flag_changes_publish() {
     let _ = legacy_worker.join().unwrap();
 }
 
+/// Review F3 (docs/reviews/display.md). A connection that sends nothing must
+/// not hold a session for ever: the number of sessions stays below a fixed
+/// limit, the server closes the connections above it, and a client that
+/// speaks is still served.
+#[test]
+fn unfinished_handshakes_are_bounded() {
+    use std::io::Read;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    const SILENT: usize = 64;
+    const LIMIT: usize = 32;
+    let (server, ..) = server();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let serving = server.clone();
+    let _accept = std::thread::spawn(move || serving.serve(listener, false));
+    let silent: Vec<UnixStream> = (0..SILENT)
+        .map(|_| {
+            let stream = UnixStream::connect(&path).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            stream
+        })
+        .collect();
+    // No deadline: the loop ends when the server has more sessions than the
+    // limit (the fault), or has closed every connection above the limit.
+    loop {
+        let live = server.sessions();
+        assert!(
+            live <= LIMIT,
+            "{live} sessions for {SILENT} connections that sent nothing"
+        );
+        let closed = silent
+            .iter()
+            .filter(|&stream| {
+                let mut stream: &UnixStream = stream;
+                matches!(stream.read(&mut [0u8; 1]), Ok(0))
+            })
+            .count();
+        if closed >= SILENT - LIMIT {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let stream = UnixStream::connect(&path).unwrap();
+    send(
+        &stream,
+        &M::Hello {
+            version: vmlab_hv_display::protocol::VERSION,
+            capabilities: C(C::INPUT),
+        },
+        &[],
+    )
+    .unwrap();
+    assert!(matches!(receive(&stream).unwrap().message, M::Hello { .. }));
+    assert!(server.sessions() <= LIMIT);
+    drop(silent);
+    server.shutdown();
+}
+
 fn ready(c: &vmlab_hv_display::Client) -> (u64, u32, u64, Vec<Rect>) {
     let M::FrameReady {
         surface_id,

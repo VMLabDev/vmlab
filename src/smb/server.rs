@@ -19,8 +19,8 @@
 //! `smbd -F` to serve — runs as an ordinary user.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use thiserror::Error;
@@ -61,11 +61,10 @@ pub enum SmbError {
     NoPort { machine: String },
     #[error("spawning smbd failed: {0}")]
     Spawn(std::io::Error),
-    #[error("smbd exited immediately (code {code:?}): {reason}; check log {log}")]
+    #[error("smbd failed to start (code {code:?}): {reason}; check log {log}")]
     DiedOnStart {
         code: Option<i32>,
-        /// smbd's own last words — its log normally holds nothing, because
-        /// the startup failures it hits are logged below `log level = 1`.
+        /// smbd's startup diagnostic.
         reason: String,
         log: PathBuf,
     },
@@ -158,6 +157,7 @@ impl SmbServer {
             path: log.clone(),
             source,
         })?;
+        let startup_logs = startup_logs(&config);
 
         let mut child = Command::new("smbd")
             .arg("-F")
@@ -166,6 +166,7 @@ impl SmbServer {
             .arg(&conf_path)
             .arg("-l")
             .arg(&config.lab_dir)
+            .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file2))
@@ -178,17 +179,10 @@ impl SmbServer {
                 }
             })?;
 
-        // Give smbd a beat; if it died at start (e.g. port in use), report.
-        if let Some(status) = wait_for_start(&mut child, config.listen_port) {
-            let reason = diagnose_start_failure(&config)
-                .or_else(|| last_log_line(&log))
-                .unwrap_or_else(|| "smbd gave no reason".to_string());
+        if let Err(error) = wait_for_start(&mut child, &config, &startup_logs) {
+            clear_stale_pidfile(&config);
             remove_run_dir(&config);
-            return Err(SmbError::DiedOnStart {
-                code: status.code(),
-                reason,
-                log,
-            });
+            return Err(error);
         }
 
         Ok(SmbServer {
@@ -219,33 +213,76 @@ impl Drop for SmbServer {
     }
 }
 
-/// The shortest wait before a live `smbd` counts as started: it covers the
-/// failures that come after the port check, such as the port in use.
+/// Give smbd time to report a bind failure even if another server already
+/// accepts connections on the port.
 const START_MIN: std::time::Duration = std::time::Duration::from_millis(300);
 /// The longest wait for `smbd` to open its port or exit. A live `smbd` past
 /// it counts as started, as one past [`START_MIN`] always did.
 const START_MAX: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Wait for `smbd` to start: `Some(status)` when it exited, `None` when it
-/// is up. It is up once it is alive past [`START_MIN`] with its port
-/// accepting, or alive at [`START_MAX`]. A single check at [`START_MIN`]
-/// took a slow failure for a start on a loaded host (VML-61).
-fn wait_for_start(child: &mut Child, port: u16) -> Option<std::process::ExitStatus> {
+/// Save the append offsets so a failed attempt cannot poison a port retry.
+/// Samba can write to the default file from `-l` or the configured log.
+fn startup_logs(config: &SmbConfig) -> [(PathBuf, u64); 2] {
+    [config.lab_dir.join("log.smbd"), config.log_path()].map(|path| {
+        let offset = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        (path, offset)
+    })
+}
+
+fn bind_failure(log: &Path, offset: u64) -> Option<String> {
+    let mut file = std::fs::File::open(log).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            (line.contains("open_socket_in_protocol failed")
+                && line.contains("Address already in use"))
+                || line.contains("PANIC: Could not bind to any sockets")
+        })
+        .map(str::to_owned)
+}
+
+/// A failed bind can leave the child alive while it dumps core. Check the
+/// startup logs before the readiness probe or the slow-start fallback
+/// (VML-61).
+fn wait_for_start(child: &mut Child, config: &SmbConfig, logs: &[(PathBuf, u64)]) -> Result<()> {
     let started = std::time::Instant::now();
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.listen_port));
     loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status);
+        let status = child.try_wait().ok().flatten();
+        for (log, offset) in logs {
+            if let Some(reason) = bind_failure(log, *offset) {
+                let _ = child.kill();
+                return Err(SmbError::DiedOnStart {
+                    code: child.wait().ok().and_then(|status| status.code()),
+                    reason,
+                    log: log.clone(),
+                });
+            }
+        }
+        if let Some(status) = status {
+            let log = config.log_path();
+            let reason = diagnose_start_failure(config)
+                .or_else(|| last_log_line(&log))
+                .unwrap_or_else(|| "smbd gave no reason".to_string());
+            return Err(SmbError::DiedOnStart {
+                code: status.code(),
+                reason,
+                log,
+            });
         }
         let waited = started.elapsed();
         if waited >= START_MAX {
-            return None;
+            return Ok(());
         }
         if waited >= START_MIN
             && std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
                 .is_ok()
         {
-            return None;
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -464,14 +501,14 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
-    /// What smbd logs when its port is taken. It writes the log named by
-    /// `-l` (`log.smbd`), not the `log file` of smb.conf.
-    fn lost_its_port(config: &SmbConfig) -> bool {
-        [config.lab_dir.join("log.smbd"), config.log_path()]
-            .iter()
-            .any(|log| {
-                std::fs::read_to_string(log).is_ok_and(|s| s.contains("Address already in use"))
-            })
+    fn hold_port() -> (socket2::Socket, u16) {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+        (socket, port)
     }
 
     /// Start smbd on the first port of `ports` it can bind. A port from
@@ -488,11 +525,14 @@ mod tests {
         for _ in 0..5 {
             let port = ports.next().expect("a port");
             let config = config_for(port);
-            let _ = std::fs::remove_file(config.lab_dir.join("log.smbd"));
-            let _ = std::fs::remove_file(config.log_path());
-            let mut server = match SmbServer::spawn(config.clone(), creds.clone()) {
+            let logs = startup_logs(&config);
+            let lost_its_port = || {
+                logs.iter()
+                    .any(|(path, offset)| bind_failure(path, *offset).is_some())
+            };
+            let mut server = match SmbServer::spawn(config, creds.clone()) {
                 Ok(server) => server,
-                Err(_) if lost_its_port(&config) => continue,
+                Err(SmbError::DiedOnStart { .. }) if lost_its_port() => continue,
                 Err(e) => return Err(e),
             };
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -500,7 +540,7 @@ mod tests {
                 if TcpStream::connect(("127.0.0.1", port)).is_ok() {
                     return Ok(server);
                 }
-                if lost_its_port(&config) {
+                if lost_its_port() {
                     server.stop();
                     break;
                 }
@@ -521,6 +561,43 @@ mod tests {
             any_smb1: false,
             shares: vec![],
         }
+    }
+
+    #[test]
+    fn bind_failure_is_reported_while_the_child_is_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_held, port) = hold_port();
+        let mut config = test_config(tmp.path().to_path_buf());
+        config.listen_port = port;
+        let log = config.lab_dir.join("log.smbd");
+        std::fs::write(&log, "PANIC: Could not bind to any sockets\n").unwrap();
+        let startup_logs = startup_logs(&config);
+        let output = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        let reason = "smbd_open_one_socket: open_socket_in_protocol failed: Address already in use";
+        let mut child = Command::new("sh")
+            .args([
+                "-eu",
+                "-c",
+                "printf '%s\\n' \"$1\"\nexec sleep 60",
+                "sh",
+                reason,
+            ])
+            .stdout(output)
+            .spawn()
+            .unwrap();
+
+        let result = wait_for_start(&mut child, &config, &startup_logs);
+        let reaped = child.try_wait().unwrap().is_some();
+        if !reaped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            matches!(result, Err(SmbError::DiedOnStart { reason: ref detail, log: ref path, .. })
+                if detail == reason && path == &log),
+            "{result:?}"
+        );
+        assert!(reaped, "the failed child must be killed and reaped");
     }
 
     #[test]
@@ -599,11 +676,7 @@ mod tests {
         // Round 0 is first offered a port held bound by another socket, as
         // a parallel test held 33477 when this failed on helios: the start
         // must move on to a free port rather than fail.
-        let held =
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-        held.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
-            .unwrap();
-        let held_port = held.local_addr().unwrap().as_socket().unwrap().port();
+        let (_held, held_port) = hold_port();
         for round in 0..2 {
             let config_for = |port| SmbConfig {
                 listen_port: port,

@@ -12,7 +12,10 @@ pub mod trace;
 mod transport;
 
 pub use client::Client;
-pub use core::{Cursor, DisplayServer, Frame, FrameSource, InputSink, Pixels};
+pub use core::{
+    Cursor, DisplayServer, Frame, FrameSource, HANDSHAKE_TIMEOUT, InputSink, MAX_HANDSHAKES,
+    MAX_SESSIONS, Pixels,
+};
 pub use lease::{BufferGuard, BufferLease};
 pub use protocol::{Capabilities, FrameFlags, Message, Rect, SurfaceKind};
 pub use transport::{Packet, receive, send};
