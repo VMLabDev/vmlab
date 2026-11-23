@@ -1150,3 +1150,62 @@ fn media_validation_and_ports_are_checked() {
     assert_eq!(d.packet(&[0]).0, 0x2451);
     assert!(d.hba.insert_media(1, image(vec![0; 4096], true)).is_err());
 }
+
+/// Card #709's measurement: how long the register write that issues a
+/// command holds its caller, which is a vCPU thread. Run it alone, with
+/// `AHCI_MEASURE_DIR` on the file system to measure:
+/// `cargo test -p vmlab-hv-devices measure_issue_block_time -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement on real storage, with no assertion"]
+fn measure_issue_block_time() {
+    let dir = std::env::var_os("AHCI_MEASURE_DIR").map(std::path::PathBuf::from);
+    let temp = TempDir::new();
+    let path = dir
+        .unwrap_or_else(|| temp.0.clone())
+        .join(format!("ahci-measure-{}.raw", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(64 * 1024 * 1024).unwrap();
+    drop(file);
+    let mut d = Driver::new();
+    d.hba
+        .attach_disk(
+            0,
+            vmlab_disk::open(&path, vmlab_disk::Format::Raw, false).unwrap(),
+        )
+        .unwrap();
+    d.start(0);
+    d.put(0x4000, &[0x6b; 0x8000]);
+    let mut issue = Vec::new();
+    let mut complete = Vec::new();
+    for round in 0..200u64 {
+        for (command, flags) in [(0x35, 0x40), (0xe7, 0)] {
+            d.ack(0);
+            d.prepare(command, flags, round * 64, 64, None, &[(0x4000, 0x8000, true)]);
+            let started = std::time::Instant::now();
+            d.hba.bar_write(5, 0x138, &1u32.to_le_bytes());
+            issue.push((command, started.elapsed()));
+            while d.read(0x138) != 0 {
+                std::thread::yield_now();
+            }
+            complete.push((command, started.elapsed()));
+        }
+    }
+    std::fs::remove_file(&path).unwrap();
+    for (name, command) in [("write", 0x35), ("flush", 0xe7)] {
+        for (what, samples) in [("issue", &issue), ("complete", &complete)] {
+            let mut times: Vec<_> = samples
+                .iter()
+                .filter(|(c, _)| *c == command)
+                .map(|(_, t)| *t)
+                .collect();
+            times.sort();
+            eprintln!(
+                "MEASURE {name} {what}: median {:?} p99 {:?} max {:?} total {:?}",
+                times[times.len() / 2],
+                times[times.len() * 99 / 100],
+                times[times.len() - 1],
+                times.iter().sum::<std::time::Duration>(),
+            );
+        }
+    }
+}
