@@ -65,7 +65,7 @@ says "read, not run".
 
 | Code | Fault | How bad |
 |---|---|---|
-| F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync | Security against a hostile guest |
+| F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690) | Security against a hostile guest |
 | F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note | Data loss (canonical copy) |
 | F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush | Data loss (guest work) |
 | F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag | Data loss (guest work) |
@@ -130,6 +130,22 @@ probe with the assertions turned round.
 
 **How bad.** Security against a hostile guest: it reads host files outside
 what it was given, and writes the lab's own state.
+
+**Fixed by card #690.** Three changes. `check_dev_arguments` holds the host
+`workspace` to the share rule (`share_over_lab_state`): a workspace that holds
+the lab's state directory or lies inside it is a validation error, compared as
+the kernel resolves the paths, so `.`, `..`, an absolute parent and a symlink
+into `.vmlab` are all refused. `workspace_of` (`src/labd/lab.rs`) applies the
+same rule in the lab daemon, with the state directory the daemon really uses
+(`VMLAB_WORK_DIR` included): no syncer starts, and `workspace.unavailable`
+gives the reason. The syncer's floor (`src/labd/workspace/ignore.rs`) holds
+`.vmlab` at any depth, so no `.gitignore` or `.vmlabignore` rule brings a state
+directory into the sync in either direction. That also covers a second lab
+nested in the workspace. Both tests named above are in the tree. Before the fix
+both failed on helios: `workspace = "."` gave no issue, and the seed carried
+`/src/.vmlab/smb/creds` into the guest. The test that held `workspace = "."` to
+be valid no longer does. N10 stays open for a workspace outside the lab root
+that does not hold the state directory.
 
 ### F2. A restore while the host workspace directory is away skips the bracket
 

@@ -3289,6 +3289,24 @@ impl LabRuntime {
                 return None;
             }
         };
+        // Validation refuses a workspace over the lab's state directory
+        // (docs/reviews/dev-machines.md F1). This holds a lab that got here
+        // some other way to the same rule: no syncer starts over the state.
+        if let Some(problem) = crate::smb::config::share_state_problem(
+            &host_root,
+            &self.lab_local,
+            "the lab's state directory",
+        ) {
+            self.events.emit(
+                "workspace.unavailable",
+                json!({
+                    "machine": machine,
+                    "workspace": declared.display().to_string(),
+                    "reason": problem,
+                }),
+            );
+            return None;
+        }
         // §19.6, resolved from the declaration alone (ADR-0003): the guest
         // family and the default login's elevation are what decide the three
         // Windows actions, and the syncer should never have to ask.
