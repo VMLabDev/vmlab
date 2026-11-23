@@ -44,6 +44,71 @@ async fn legacy_agent_conformance() -> Result<()> {
 }
 
 #[tokio::test]
+async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    // The fixture shares the socket directory with its isolated agent.
+    let fifo = fixture.socket().with_file_name("descendant");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )?;
+    let handle = AgentHandle::connect(fixture.socket(), BUDGET).await?;
+    let mut reader = handle
+        .open_exec(
+            vec!["cat".into(), fifo.to_str().unwrap().into()],
+            vec![],
+            None,
+            None,
+        )
+        .await?;
+    // Preserve the exec's stdin in the background subshell. Closing the
+    // session closes that pipe. A surviving descendant then writes to the
+    // FIFO before exiting. The reader sees EOF in either case.
+    let mut argv =
+        sh("exec 3<&0 4>&1; (echo ready >&4; read -r line <&3; echo survived) >\"$1\" & wait");
+    argv.extend(["sh".into(), fifo.to_str().unwrap().into()]);
+    let mut exec = handle.open_exec(argv, vec![], None, None).await?;
+    loop {
+        match exec.recv().await {
+            Some(SessionEvent::Data(data)) if !data.is_empty() => break,
+            Some(SessionEvent::Exited(_) | SessionEvent::Error(_)) | None => {
+                anyhow::bail!("descendant never became ready");
+            }
+            _ => {}
+        }
+    }
+    exec.close().await;
+    let mut stderr = Vec::new();
+    while let Some(event) = reader.recv().await {
+        match event {
+            SessionEvent::Data(data) => {
+                anyhow::bail!(
+                    "descendant survived close: {}",
+                    String::from_utf8_lossy(&data)
+                );
+            }
+            SessionEvent::Stderr(data) => stderr.extend(data),
+            SessionEvent::Exited(code) => {
+                ensure!(
+                    code == 0,
+                    "FIFO reader exited with {code}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                return Ok(());
+            }
+            SessionEvent::Error(err) => anyhow::bail!("FIFO reader: {err}"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("FIFO reader did not report exit")
+}
+
+#[tokio::test]
 async fn legacy_exec_reports_exit_with_inherited_output_pipes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let bin = build(dir.path())?;
