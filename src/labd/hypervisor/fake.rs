@@ -1052,6 +1052,13 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                 HostMsg::NetInfo => AgentMsg::NetInfo {
                     interfaces: Vec::new(),
                 },
+                HostMsg::OpenExec { id, .. } => {
+                    let opened = encode_ctrl(&AgentMsg::Opened { id }).unwrap();
+                    if tx.write_all(&opened).await.is_err() {
+                        return;
+                    }
+                    AgentMsg::Exited { id, code: 0 }
+                }
                 HostMsg::Shutdown { mode } => AgentMsg::ShuttingDown { mode },
                 // Advertised so a caller gets as far as asking, refused so
                 // the asking fails the way a real agent's refusal does.
