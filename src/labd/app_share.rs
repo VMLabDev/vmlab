@@ -952,6 +952,54 @@ mod tests {
         assert!(gone(&path_of(&reply, "conns")).await);
     }
 
+    /// Every record left on a control socket that the daemon has closed.
+    async fn records_to_the_end(control: &mut UnixStream) -> Vec<AppRecord> {
+        let mut bytes = Vec::new();
+        control.read_to_end(&mut bytes).await.unwrap();
+        let mut dec = app::RecordDecoder::new();
+        dec.push(&bytes);
+        let mut out = Vec::new();
+        while let Some(record) = dec.next_record().unwrap() {
+            out.push(record);
+        }
+        out
+    }
+
+    /// The next control message the scripted agent saw must close `id`.
+    async fn expect_close(agent: &mut Scripted, id: u32) {
+        match agent.seen.recv().await.expect("the host hung up") {
+            Seen::Ctrl(HostMsg::Close { id: closed }) => assert_eq!(closed, id),
+            other => panic!("expected close, got {other:?}"),
+        }
+    }
+
+    /// `exited` is the daemon's record (review appshare-media F12). An agent
+    /// that writes one does not hand the CLI an exit code: the records before
+    /// it arrive, the daemon fails the session in its own words and closes
+    /// the channel on the agent, so the program does not run on unseen.
+    #[tokio::test]
+    async fn an_agent_written_exited_record_does_not_end_the_session() {
+        let (_dir, mut agent, id, reply) = x11_session().await;
+        let mut control = UnixStream::connect(path_of(&reply, "control"))
+            .await
+            .unwrap();
+        let mut data = app::encode_record(&AppRecord::Log { text: "hi".into() });
+        data.extend(app::encode_record(&AppRecord::Exited { code: 0 }));
+        data.extend(app::encode_record(&AppRecord::Pending));
+        agent.data(id, &data).await;
+        assert_eq!(
+            records_to_the_end(&mut control).await,
+            [
+                AppRecord::Log { text: "hi".into() },
+                AppRecord::Failed {
+                    msg: "the agent wrote an `exited` record, which only the lab daemon writes"
+                        .into()
+                },
+            ]
+        );
+        expect_close(&mut agent, id).await;
+    }
+
     /// The CLI hanging up on the control socket closes the app channel on
     /// the agent, which kills the program, and unlinks both sockets.
     #[tokio::test]

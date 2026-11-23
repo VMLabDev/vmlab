@@ -710,6 +710,22 @@ mod tests {
         assert_eq!(daemon_fallback(Mode::Waypipe, None, &both, &other), None);
     }
 
+    /// The guest answers the waypipe probe, so its refusal alone never picks
+    /// X11 (review appshare-media F2): the fallback needs the host config's
+    /// `app_x11_fallback`.
+    #[test]
+    fn a_guest_refusal_does_not_select_x11_unasked() {
+        let unsupported = CommandError::new(
+            ErrorCode::Unsupported,
+            "`web` has no `waypipe` on PATH for `dev`",
+        );
+        let unasked = host(true, true, true, true);
+        assert_eq!(
+            daemon_fallback(Mode::Waypipe, None, &unasked, &unsupported),
+            None
+        );
+    }
+
     /// The guest family follows the profile name, the way `labd::guest_os`
     /// reads it.
     #[test]
