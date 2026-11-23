@@ -113,7 +113,10 @@ mod tests {
         );
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
-        assert_eq!(lines.next().unwrap().as_bytes(), &CUT_NOTE[..CUT_NOTE.len() - 1]);
+        assert_eq!(
+            lines.next().unwrap().as_bytes(),
+            &CUT_NOTE[..CUT_NOTE.len() - 1]
+        );
         assert!(text.ends_with("line 099999\n"), "the newest line is kept");
         // What is kept is whole lines, in order, with no gap.
         let kept: Vec<&str> = lines.collect();
