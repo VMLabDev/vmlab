@@ -42,7 +42,7 @@ Two facts are used by several findings:
 | F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again |
 | F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
 | F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown |
-| F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started |
+| F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started (fixed, card #573) |
 | F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses |
 | F14 | wrong result | A `labs.json` that does not parse is read as an empty registry |
 
@@ -434,6 +434,25 @@ Two facts are used by several findings:
   successor between them. The second request must leave the successor in
   place (same pid) and must not stop the machine. Today it shuts the
   successor down.
+- Fixed in card #573. A lab daemon's status reports its pid
+  (`LabStatus::daemon_pid`), and `lab.restart` carries the pid of the daemon
+  the caller read its status from (`daemon`). Under the per-lab lock
+  `restart_lab` in `src/supervisor/mod.rs` compares it with the registered
+  pid. Another pid is a successor: the supervisor releases nothing and
+  answers with that daemon's socket and `replaced: false`. `vmlab up` then
+  checks the successor against the lab file as it checks any daemon it
+  finds, one time, and `vmlab lab restart` says that another command
+  restarted the daemon. A request without `daemon` (the status did not
+  answer, or the daemon predates the field) replaces whatever daemon runs
+  the lab, as before. The proof test
+  `a_restart_names_the_daemon_it_replaces` failed before the fix (the
+  successor received `shutdown`) and passes after it.
+  - Not fixed here: a start that reaches the same daemon between a
+    command's status check and its restart is still stopped by that
+    restart. The supervisor names the daemon and does not ask it again
+    whether its machines are stopped.
+  - The pid is not paired with a start time, so a successor that the kernel
+    gave the first daemon's pid would be taken for it.
 
 ### F13. A `stopping` entry is not adopted (wrong result)
 

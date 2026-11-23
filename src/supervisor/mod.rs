@@ -776,8 +776,14 @@ impl Supervisor {
             registry.check_name(name, &root)?;
             registry.get(name).map(|entry| entry.pid)
         };
-        // Not read yet: the proof test of review F12 fails on this.
-        let _ = daemon;
+        if let (Some(registered), Some(named)) = (registered, daemon)
+            && registered != named
+        {
+            // Under the name lock: the successor is up, or `ensure` says
+            // what became of it.
+            let sock = self.ensure_lab_locked(name, root).await?;
+            return Ok((sock, false));
+        }
         if registered.is_some() {
             // Returns once the old daemon is gone, so `ensure_lab` cannot
             // see it still alive (state Running + socket up) and hand back

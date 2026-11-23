@@ -242,9 +242,7 @@ async fn ensure_current_daemon(
                         .machines
                         .into_iter()
                         .filter_map(|m| match m {
-                            crate::status::MachineReload::Pending(p)
-                                if targeted(&p.machine) =>
-                            {
+                            crate::status::MachineReload::Pending(p) if targeted(&p.machine) => {
                                 Some(p)
                             }
                             _ => None,
