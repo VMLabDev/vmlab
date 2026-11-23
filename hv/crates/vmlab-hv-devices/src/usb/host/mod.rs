@@ -682,6 +682,13 @@ impl UsbDevice for HostUsbDevice {
     }
 
     fn control(&mut self, setup: SetupPacket, data: &[u8]) -> UsbTransfer {
+        // usbdevfs owns addressing, so SET_ADDRESS is answered at once in
+        // every state: the xHCI sends it from its Address Device command,
+        // which takes no NAK, and it must not consume the answer that
+        // waits for another request.
+        if setup.request_type == 0 && setup.request == 5 {
+            return UsbTransfer::Ack(Vec::new());
+        }
         self.reap();
         if self.job.is_some() {
             return UsbTransfer::Nak;
@@ -1083,6 +1090,11 @@ mod tests {
         // The device does not answer. The guest and the poll go on.
         assert_eq!(host.control(set_interface(0, 1), &[]), UsbTransfer::Nak);
         assert_eq!(host.control(get_config(0), &[]), UsbTransfer::Nak);
+        assert_eq!(
+            host.control(setup(0x00, 5, 0x22, 0, 0), &[]),
+            UsbTransfer::Ack(Vec::new()),
+            "SET_ADDRESS needs no device"
+        );
         assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Nak);
         assert_eq!(host.transfer_iso(0x83, &[], 1024, 512), UsbTransfer::Nak);
         assert_eq!(host.speed(), UsbSpeed::High);
