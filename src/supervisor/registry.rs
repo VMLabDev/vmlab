@@ -71,19 +71,37 @@ impl Registry {
         crate::paths::state_dir().join("labs.json")
     }
 
+    /// Read the registry a previous supervisor left.
+    ///
+    /// A missing file is a first start and gives an empty registry. A file
+    /// that exists but cannot be read or parsed is *not* an empty one: every
+    /// running lab daemon would be forgotten — not adopted, not watched, not
+    /// released — and the next `save` would replace the file. The caller
+    /// gets the error and the file stays as it is.
     pub fn load() -> anyhow::Result<Self> {
-        Ok(match std::fs::read_to_string(Self::path()) {
-            Ok(s) => {
-                let mut registry: Self = serde_json::from_str(&s).unwrap_or_default();
-                for entry in &mut registry.labs {
-                    if let Ok(root) = canonical_root(&entry.root) {
-                        entry.root = root;
-                    }
-                }
-                registry
+        use anyhow::Context;
+        let path = Self::path();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("reading {}", path.display()));
             }
-            Err(_) => Self::default(),
-        })
+        };
+        let mut registry: Self = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "parsing {} — it lists the lab daemons that run. Stop them (`pgrep -af \
+                 __labd` shows them) and move the file aside to start over",
+                path.display()
+            )
+        })?;
+        for entry in &mut registry.labs {
+            if let Ok(root) = canonical_root(&entry.root) {
+                entry.root = root;
+            }
+        }
+        Ok(registry)
     }
 
     pub fn save(&self) {

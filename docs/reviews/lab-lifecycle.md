@@ -43,8 +43,8 @@ Two facts are used by several findings:
 | F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
 | F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown |
 | F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started |
-| F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses |
-| F14 | wrong result | A `labs.json` that does not parse is read as an empty registry |
+| F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses (fixed, card #574) |
+| F14 | wrong result | A `labs.json` that does not parse is read as an empty registry (fixed, card #574) |
 
 ### F1. No single-instance guard (data loss)
 
@@ -454,6 +454,22 @@ Two facts are used by several findings:
   that answers `ping`. After `adopt_existing_labs`, the entry must be
   `running` (or the daemon must have received `Shutdown`), and its exit
   must be watched. Today the entry is unchanged and nothing watches it.
+- Fixed in card #574. `adopt_stopping` in `src/supervisor/mod.rs` settles a
+  `stopping` entry before the other entries are judged. A daemon that runs
+  and answers `ping` becomes `running` and is adopted like any other: its
+  events are forwarded and its exit is watched. It is not sent `Shutdown`,
+  so its machines keep running, and `up`, `down` and `lab list` see a
+  running lab. A daemon that runs and does not answer keeps `stopping` and
+  its exit is watched, so the entry goes when it does. An entry whose daemon
+  is gone is dropped. A `stopping` entry with a live daemon is no longer
+  dropped when its lab file is gone. The proof test failed before the fix
+  (the entry stayed `stopping`) and passes after it. It also checks the
+  dropped entry and that the adopted daemon's exit is noticed. Not fixed
+  here: a daemon in its teardown answers `ping` like one that was never
+  asked, and nothing in the protocol tells them apart. A supervisor that
+  starts during a teardown therefore adopts that daemon as `running` and
+  marks it `failed` with `lab.daemon_crashed` when it exits. The next `up`
+  starts the lab as usual.
 
 ### F14. An unreadable registry is an empty one (wrong result)
 
@@ -473,6 +489,18 @@ Two facts are used by several findings:
   `{ this is not json` to `labs.json` and call `Registry::load`. It must
   return an error, or keep the file aside and say so. Today it returns an
   empty registry and the next `save` replaces the file.
+- Fixed in card #574. `Registry::load` returns a `Result`, as
+  `LabState::load` does: a missing file is an empty registry, a file that
+  cannot be read or parsed is an error that names the file, and the file is
+  left as it is. The supervisor refuses to start on that error, so it never
+  saves over the file. `check_registration` in `src/cli/daemon.rs`, which
+  reads the registry when no supervisor answers, refuses too and does not
+  take the name for unregistered. The store's backing scan logs a warning
+  and scans no lab. The proof test failed before the fix (`{ this is not
+  json` was read as a registry of 0 labs) and passes after it. It also
+  covers a file cut short and a state this build does not know. Not fixed
+  here: the error of a supervisor that the CLI started reaches the user
+  only as "did not come up" and the supervisor's log.
 
 ## Notes
 

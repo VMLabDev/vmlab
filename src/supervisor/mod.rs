@@ -308,7 +308,10 @@ impl Supervisor {
     async fn adopt_existing_labs(self: &Arc<Self>) {
         let entries: Vec<LabEntry> = self.registry.lock().await.labs().to_vec();
         for entry in entries {
-            if entry.state != LabState::Running {
+            if entry.state == LabState::Stopping && self.adopt_stopping(&entry).await {
+                continue;
+            }
+            if entry.state == LabState::Failed {
                 if !entry.root.join(crate::paths::LAB_FILE).is_file() {
                     tracing::info!(
                         "dropping registry entry for {} — {} is gone",
@@ -353,6 +356,48 @@ impl Supervisor {
             self.watch_lab_events(entry.name.clone()).await;
             self.watch_adopted_exit(entry.name.clone(), entry.pid, started);
         }
+    }
+
+    /// Settle a `stopping` entry an earlier supervisor left. Returns whether
+    /// the entry is dealt with; `false` hands it on to be adopted as a
+    /// running one.
+    ///
+    /// `stopping` is written before the daemon is asked to stop, so a
+    /// supervisor killed in between leaves it for a daemon that was never
+    /// asked and still runs its machines. Nothing tells that daemon from one
+    /// in its teardown, which answers too, so a daemon that answers is taken
+    /// for running: watched, its events forwarded, and open to `up` and to a
+    /// release. One that was in its teardown after all then ends as `failed`,
+    /// because an adopted daemon's exit is expected only when this supervisor
+    /// saw it asked for or announced. A daemon that runs but does not answer
+    /// keeps `stopping` and is watched until it is gone. One that is gone
+    /// ended as its entry said it would, and the entry goes.
+    async fn adopt_stopping(self: &Arc<Self>, entry: &LabEntry) -> bool {
+        if !daemon_running(entry.pid, entry.started) {
+            let mut reg = self.registry.lock().await;
+            reg.remove_daemon(&entry.name, entry.pid);
+            reg.save();
+            return true;
+        }
+        let answers = match LabClient::connect(&crate::paths::lab_socket(&entry.name)).await {
+            Ok(client) => client.send(LabRequest::Ping {}).await.is_ok(),
+            Err(_) => false,
+        };
+        if !answers {
+            self.watch_adopted_exit(entry.name.clone(), entry.pid, entry.started);
+            return true;
+        }
+        tracing::warn!(
+            "lab {} was left stopping, but its daemon {} runs and answers; adopting it as running",
+            entry.name,
+            entry.pid
+        );
+        let mut reg = self.registry.lock().await;
+        if reg.get(&entry.name).is_some_and(|e| e.pid == entry.pid) {
+            reg.set_state(&entry.name, LabState::Running);
+            reg.save();
+        }
+        false
     }
 
     /// Notice the exit of a daemon adopted from an earlier supervisor and
