@@ -26,6 +26,10 @@ use vmlab_cinit_proto::{CtlCommand, CtlEvent, PROTO_VERSION};
 /// whole life, so 64 gives slow subscribers plenty of slack.
 const EVENT_CAPACITY: usize = 64;
 const MAX_CTL_LINE: usize = 64 * 1024;
+/// How long one command may wait for the writer and for the peer to take its
+/// bytes. A command is one short line and the socket buffer holds many, so a
+/// write that waits at all means the guest has stopped reading.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handle to one container's ctl channel. Cheap to clone (`Arc` inner);
 /// dropping every handle does not tear the reader down — that ends on EOF
@@ -37,7 +41,7 @@ pub struct CtlHandle {
 }
 
 struct CtlInner {
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Mutex<CtlWriter>,
     events: broadcast::Sender<CtlEvent>,
     /// Last `net_up` IP reported by the guest.
     last_ip: RwLock<Option<String>>,
@@ -46,6 +50,14 @@ struct CtlInner {
     /// Set to the exit code on the `exited` event. The senders live in the
     /// reader task, so EOF closes these channels and wakes waiters.
     exited: watch::Receiver<Option<i32>>,
+}
+
+/// The write side, and whether a write on it was abandoned part way.
+struct CtlWriter {
+    half: OwnedWriteHalf,
+    /// A write ran out of time. Part of its line may be on the wire, so
+    /// another command would be read as the rest of that line.
+    cut_short: bool,
 }
 
 impl CtlHandle {
@@ -63,7 +75,10 @@ impl CtlHandle {
         let (started_tx, started_rx) = watch::channel(false);
         let (exited_tx, exited_rx) = watch::channel(None);
         let inner = Arc::new(CtlInner {
-            writer: Mutex::new(write_half),
+            writer: Mutex::new(CtlWriter {
+                half: write_half,
+                cut_short: false,
+            }),
             events: events.clone(),
             last_ip: RwLock::new(None),
             started: started_rx,
@@ -126,17 +141,44 @@ impl CtlHandle {
         Ok(CtlHandle { inner })
     }
 
-    /// Send one command as a JSON line.
+    /// Send one command as a JSON line, within [`SEND_TIMEOUT`] for the wait
+    /// on the writer and the write together.
+    ///
+    /// The peer decides when these bytes are taken: a guest that leaves its
+    /// ctl port unread fills the socket buffer, and a write then never ends.
+    /// Without a deadline that write would hold the writer for ever and
+    /// every later command, a stop among them, would wait behind it (review
+    /// F2). A write that is cut short may have put half a line on the wire,
+    /// so the channel takes no command after one.
     pub async fn send(&self, cmd: &CtlCommand) -> Result<()> {
         let mut line = serde_json::to_string(cmd)?;
         line.push('\n');
-        let mut writer = self.inner.writer.lock().await;
-        writer
-            .write_all(line.as_bytes())
+        let deadline = tokio::time::Instant::now() + SEND_TIMEOUT;
+        let mut writer = tokio::time::timeout_at(deadline, self.inner.writer.lock())
             .await
-            .context("writing ctl command")?;
-        writer.flush().await.context("flushing ctl command")?;
-        Ok(())
+            .map_err(|_| {
+                anyhow!("ctl channel busy for {SEND_TIMEOUT:?}: the guest is not reading it")
+            })?;
+        if writer.cut_short {
+            return Err(anyhow!(
+                "ctl channel no longer usable: the guest stopped reading it"
+            ));
+        }
+        let half = &mut writer.half;
+        let written = tokio::time::timeout_at(deadline, async {
+            half.write_all(line.as_bytes()).await?;
+            half.flush().await
+        })
+        .await;
+        match written {
+            Ok(result) => result.context("writing ctl command"),
+            Err(_) => {
+                writer.cut_short = true;
+                Err(anyhow!(
+                    "ctl command not taken within {SEND_TIMEOUT:?}: the guest is not reading its ctl port"
+                ))
+            }
+        }
     }
 
     /// Subscribe to the raw event stream (from now on — no replay).
