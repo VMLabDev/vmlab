@@ -442,6 +442,8 @@ SRC
     no host GPU and the host has more than one render node. Each run's
     `qemu.log` starts with the QEMU command line and the variables vmlab set.
     Under `passthrough` the address becomes `-device vfio-pci,host=<address>`.
+    On vmlab-hv the card's other functions bound to `vfio-pci` go with it
+    (the host GPU's `passthrough_functions`).
   DOC
   p <<DOC
     Validation runs the same pick: it rejects an empty `host_gpu`; a

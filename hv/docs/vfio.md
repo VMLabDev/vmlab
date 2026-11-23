@@ -52,10 +52,12 @@ needs 4 GiB.
 
 ## Run the S1 acceptance test
 
-Install SeaBIOS at `/usr/share/qemu/bios-256k.bin`. Provide the Ubuntu 26.04
-template under `~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
-`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test creates an overlay and
-does not write the template.
+Install matching 4 MiB OVMF CODE and VARS files in the system firmware
+directory or set `VMLAB_HV_FIRMWARE_DIR` to the directory containing them.
+Provide the Ubuntu 26.04 template under
+`~/.local/share/vmlab/templates/x86_64/ubuntu-26.04/`, or set
+`VMLAB_HV_TEST_VM_DISK` to its `disk.qcow2`. The test writes to a disk overlay
+and makes a private copy of the VARS file for each VM start.
 
 ```sh
 systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
@@ -63,14 +65,17 @@ systemd-run --user --scope -q -p MemoryMax=24G -p MemorySwapMax=0 -- \
 ```
 
 The test boots the designated function at guest `00:06.0`, checks `lspci -n`
-against its host vendor and device IDs, refuses snapshot save and load through
-the control socket, and quits. Without the device variable, it prints a skip
-reason before accessing hardware. Missing KVM, firmware, or template assets
-also produce a named skip.
+against its host vendor and device IDs, and checks that the control socket
+refuses snapshot save and load. It reboots the guest, checks the reset event,
+the new boot ID, and the PCI identity, then powers off from the guest. A second
+VM process starts with the same device and disk overlay, checks the PCI
+identity again, and quits through the control socket. Both exits must be
+successful and free of VFIO teardown errors. Without the device variable, it
+prints a skip reason before accessing hardware. With a device specified,
+missing KVM, firmware, or template assets fail the test.
 
 For hardware acceptance, also exercise the function with its normal guest
-driver and repeat the test after guest shutdown and reset. Enumeration alone
-does not prove GPU rendering, DMA throughput, or every interrupt mode.
+driver. That step covers rendering, DMA, and interrupts used by the workload.
 
 After every VM has exited, restore the original host driver if appropriate:
 
@@ -90,8 +95,28 @@ lspci -nnk -s "$BDF"
 ]
 ```
 
+Several functions of one card are separate entries that share a guest slot.
+The card goes at function 0, and each other function keeps its host function
+number:
+
+```json
+"vfio": [
+  {"host": "0000:05:00.0", "pci": {"bus": 0, "device": 4, "function": 0}},
+  {"host": "0000:05:00.1", "pci": {"bus": 0, "device": 4, "function": 1}}
+]
+```
+
+The guest then reads the multi-function bit at function 0 and finds the
+card's HDMI/DP audio function beside it. vmlab writes these entries for a
+`gpu { mode = "passthrough" }` VM from the functions of the host slot that are
+bound to `vfio-pci`, or from the host GPU's `passthrough_functions`.
+
 Assignment requires q35 and an explicit, unoccupied bus-zero guest address.
-The VMM resets the function at start and VM exit, maps guest RAM through a
+The VMM resets the function at start and VM exit when the kernel can reset it
+by itself (`VFIO_DEVICE_FLAGS_RESET`). The audio function of a graphics card
+usually cannot be: it has no function-level reset and shares its bus with the
+GPU. Such a function is assigned without a reset and the log says so. The VMM
+still clears its command register and interrupts. It maps guest RAM through a
 VFIO type1 container, and directly maps mmap-capable BAR pages into both KVM
 address spaces. Sparse mmap areas are respected. MSI-X table and PBA pages
 remain trapped; other registers on those pages use VFIO region access.

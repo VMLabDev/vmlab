@@ -576,7 +576,12 @@ its vmlab-hv bundle, and `validate` and `up` warn when it would start another
 one, from `RENDER_SERVER_EXEC_PATH` in your environment or because `vmlab_hv`
 is not a bundle's `bin/vmlab-hv`. `passthrough` needs the
 GPU already bound to `vfio-pci`, which you do yourself; vmlab-hv refuses one
-that is not, and neither it nor vmlab ever rebinds a device. Shares are
+that is not, and neither it nor vmlab ever rebinds a device. The card's other
+functions that are bound to `vfio-pci`, its HDMI/DP audio above all, go to the
+guest with it as one multi-function device. One bound to another driver stays
+with the host. To choose them yourself, list them in the host GPU's
+`passthrough_functions`: a listed function that is not bound to `vfio-pci` is
+then refused by name, and `[]` sends the card alone. Shares are
 served by vmlab-hv itself from the host directory, so no virtiofsd runs for a
 VM, and `auto` shares follow the same rules as on QEMU. A VM with a GPU takes
 no online snapshot on vmlab-hv; stop it and take an offline one.

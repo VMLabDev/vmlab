@@ -86,6 +86,10 @@ pub struct VmPaths {
     /// The host PCI address a `passthrough` GPU hands the guest: the
     /// declared host GPU the lab daemon picked (`hostgpu::render_plan`).
     pub gpu_passthrough: Option<String>,
+    /// The other functions of that card that go with it on vmlab-hv, in
+    /// function order ([`super::hostgpu::RenderPlan::passthrough_functions`]).
+    /// This argv hands over the one address above.
+    pub gpu_passthrough_functions: Vec<String>,
     /// The TSC frequency, in Hz, a `tsc = "host"` VM is pinned at under KVM
     /// (§5.2): the host's, read from KVM by the lab daemon at the VM's first
     /// start and kept (`tsc::probe_host_hz`). Required there; read nowhere

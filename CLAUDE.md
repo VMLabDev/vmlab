@@ -114,7 +114,9 @@ native frame protocol (`src/hvdisplay.rs`, `vmlab_hv/display.rs`) with RFB on
 `vnc.sock` for viewers; a `gpu {}` (virgl and Venus on the render node the
 host GPU pick resolves, with the host GPU's `qemu_binary` and `qemu_env` ignored with a warning
 each, and a second warning when the Venus render server is not the bundle's;
-passthrough as a vfio device vmlab-hv takes only pre-bound), virtio-fs shares
+passthrough as a vfio device vmlab-hv takes only pre-bound, with the card's
+other `vfio-pci` functions at the same guest slot — `passthrough_functions`
+on the host GPU names them instead), virtio-fs shares
 it serves in process (no virtiofsd; the share plan asks each machine what
 serves its virtio-fs), `usb = true` (attach/detach as `device_add` and
 `device_del`, waiting on `device_deleted`), and **guest audio** — `audio` and
