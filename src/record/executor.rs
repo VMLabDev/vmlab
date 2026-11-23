@@ -192,38 +192,33 @@ async fn run(
     let mut ticks = tokio::time::interval(dt);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ended_by = None;
-    let outcome: Result<()> = async {
-        loop {
-            tokio::select! {
-                _ = ticks.tick() => {}
-                _ = stopped.changed() => break,
-            }
-            let frames = core
+    let write = loop {
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => break Ok(()),
+            _ = ticks.tick() => {}
+        }
+        let frames = core
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tick(started.elapsed());
+        if let Err(e) = write_frames(&mut encoder, &frames).await {
+            break Err(e);
+        }
+        if let Some(max) = settings.max_duration {
+            let video = core
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .tick(started.elapsed());
-            for run in frames.runs() {
-                for _ in 0..run.count {
-                    encoder.write_frame(&run.frame.rgb).await?;
-                }
-            }
-            if let Some(max) = settings.max_duration {
-                let video = core
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .video_duration();
-                if video >= max {
-                    ended_by = Some(format!(
-                        "reached the maximum duration of {:.1} s",
-                        max.as_secs_f64()
-                    ));
-                    break;
-                }
+                .video_duration();
+            if video >= max {
+                ended_by = Some(format!(
+                    "reached the maximum duration of {:.1} s",
+                    max.as_secs_f64()
+                ));
+                break Ok(());
             }
         }
-        Ok(())
-    }
-    .await;
+    };
     reader.abort();
     feed.abort();
 
@@ -232,7 +227,7 @@ async fn run(
     // what it left behind.
     let (frames, duration, timeline) = {
         let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
-        let frames = if outcome.is_ok() {
+        let frames = if write.is_ok() {
             c.finish(started.elapsed())
         } else {
             Frames::default()
@@ -252,21 +247,21 @@ async fn run(
                 .then(|| (c.timeline().to_vec(), c.cuts().to_vec())),
         )
     };
-    let mut write_err = outcome.err();
-    if write_err.is_none() {
-        'flush: for run in frames.runs() {
-            for _ in 0..run.count {
-                if let Err(e) = encoder.write_frame(&run.frame.rgb).await {
-                    write_err = Some(e);
-                    break 'flush;
-                }
-            }
+    let write = match write {
+        Ok(()) => write_frames(&mut encoder, &frames).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = write {
+        // A stalled write may have sent a partial frame. Dropping the
+        // encoder kills ffmpeg and avoids trying to finalise that frame.
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            return Err(e).with_context(|| {
+                format!("ffmpeg timed out writing frames to {}", output.display())
+            });
         }
+        ended_by = Some(format!("writing a frame to ffmpeg: {e}"));
     }
     let path = encoder.finish().await?;
-    if let Some(e) = write_err {
-        ended_by = Some(format!("{e:#}"));
-    }
 
     let timeline = match timeline {
         Some((events, cuts)) => {
@@ -291,6 +286,15 @@ async fn run(
         timeline,
         ended_by,
     })
+}
+
+async fn write_frames(encoder: &mut Encoder, frames: &Frames) -> std::io::Result<()> {
+    for run in frames.runs() {
+        for _ in 0..run.count {
+            encoder.write_frame(&run.frame.rgb).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Feed every update to the core; on a drop, mark the gap and reconnect.
@@ -387,6 +391,64 @@ mod tests {
     use crate::record::input::InputEvent;
     use crate::record::{Format, RecordOptions, Size};
     use crate::vnc::fake::{self, pattern, raw_rect, update};
+
+    async fn start_with_encoder_script(
+        dir: &std::path::Path,
+        server: &fake::FakeRfb,
+        script: &str,
+    ) -> Recorder {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ffmpeg = dir.join("ffmpeg");
+        std::fs::write(&ffmpeg, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = dir.join("recording.mp4");
+        let settings = Settings::resolve(&output, &RecordOptions::default()).unwrap();
+        let (_tx, inputs) = mpsc::unbounded_channel();
+        Recorder::start(RecorderSpec {
+            source: StreamSource::Vnc(server.path.clone()),
+            output,
+            settings,
+            ffmpeg,
+            inputs,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_returns_when_the_encoder_stops_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::spawn(16, 16, vec![]);
+        let rec = start_with_encoder_script(dir.path(), &server, "exec sleep infinity").await;
+        // Even before the first tick, finalization owes at least one frame.
+        // The default frame is larger than the pipe and the child never reads.
+        let error = tokio::time::timeout(Duration::from_secs(60), rec.stop())
+            .await
+            .expect("record stop hung on the encoder")
+            .unwrap_err();
+        assert!(error.to_string().contains("ffmpeg timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn finish_reads_stderr_before_it_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::spawn(16, 16, vec![]);
+        let rec = start_with_encoder_script(
+            dir.path(),
+            &server,
+            concat!(
+                "head -c 1048576 /dev/zero >&2\n",
+                "cat >/dev/null\n",
+                "head -c 1048576 /dev/zero >&2\n",
+                "printf 'encoder diagnostic\\n' >&2\nexit 1",
+            ),
+        )
+        .await;
+        let error = rec.stop().await.unwrap_err().to_string();
+        assert!(error.contains("ffmpeg exited"), "{error}");
+        assert!(error.contains("encoder diagnostic"), "{error}");
+    }
 
     /// Against the fake server: the recorder starts only once connected,
     /// survives the socket vanishing and coming back, takes inputs, and

@@ -17,6 +17,7 @@
 
 #define VA_BASE     0x3F8
 #define VA_MAX_PAY  65536
+#define VA_RESTART_MAX 1024
 #define VA_WINDOW   262144
 #define VA_CHUNK    4096
 #define VA_MAX_TOK  256
@@ -67,28 +68,6 @@ U0 VaTxBuf(U8 *p,I64 n)
 U8 *va_pay;          // one payload, VA_MAX_PAY
 I64 va_kind,va_chan,va_len;
 U8 *va_magic="VMLB";
-
-// Read one frame into va_pay. Blocks until a whole frame has arrived;
-// anything before the magic is skipped.
-U0 VaReadFrame()
-{
-  I64 m=0,i;
-  U8 c;
-  while (m<4) {
-    c=VaRx;
-    if (c==va_magic[m]) m++;
-    else if (c=='V') m=1;
-    else m=0;
-  }
-  va_len=0;
-  for (i=0;i<4;i++) va_len|=VaRx<<(8*i);
-  va_kind=VaRx;
-  va_chan=0;
-  for (i=0;i<4;i++) va_chan|=VaRx<<(8*i);
-  if (va_len>VA_MAX_PAY) { va_len=0; va_kind=-1; return; }
-  for (i=0;i<va_len;i++) va_pay[i]=VaRx;
-  va_pay[va_len]=0;
-}
 
 U0 VaSendFrame(I64 kind,I64 chan,U8 *p,I64 n)
 {
@@ -288,6 +267,74 @@ I64 VaNum(I64 i,I64 dflt)
     v=v*10+va_js[p]-'0';
   }
   return v;
+}
+
+// ---- reading a frame -------------------------------------------------
+
+// A control payload found inside a frame that is still being read: whether
+// it is the hello that starts every connection.
+Bool VaIsHello(U8 *js,I64 len)
+{
+  I64 cmd;
+  if (VaJsonParse(js,len)<0 || va_tok[0].type!=JT_OBJ) return FALSE;
+  cmd=VaGet(0,"cmd");
+  return cmd>=0 && VaStrEq(cmd,"hello");
+}
+
+// Read one frame into va_pay. Blocks until a whole frame has arrived;
+// anything before the magic is skipped.
+//
+// A host that was cut off in a frame leaves its header behind, and the UART
+// gives no sign that it hung up: the next connection's bytes would be read
+// as the missing payload, its hello included. So a whole hello frame seen
+// inside the payload ends the read and is returned as the frame. cs is
+// where such a candidate's magic starts in va_pay, ce where it ends.
+U0 VaReadFrame()
+{
+  I64 m=0,i,pm=0,cs=-1,ce=-1,cl=0;
+  U8 c;
+  while (m<4) {
+    c=VaRx;
+    if (c==va_magic[m]) m++;
+    else if (c=='V') m=1;
+    else m=0;
+  }
+  va_len=0;
+  for (i=0;i<4;i++) va_len|=VaRx<<(8*i);
+  va_kind=VaRx;
+  va_chan=0;
+  for (i=0;i<4;i++) va_chan|=VaRx<<(8*i);
+  if (va_len>VA_MAX_PAY) { va_len=0; va_kind=-1; return; }
+  for (i=0;i<va_len;i++) {
+    c=VaRx;
+    va_pay[i]=c;
+    if (c==va_magic[pm]) pm++;
+    else if (c=='V') pm=1;
+    else pm=0;
+    if (pm==4) {
+      pm=0;
+      if (cs<0) { cs=i-3; ce=-1; }
+    }
+    if (cs>=0 && i==cs+12) {
+      cl=va_pay[cs+4]+(va_pay[cs+5]<<8)+(va_pay[cs+6]<<16)+(va_pay[cs+7]<<24);
+      // Only a control frame on channel 0 of a hello's size is looked at.
+      if (va_pay[cs+8]!=0 || va_pay[cs+9]!=0 || va_pay[cs+10]!=0 ||
+          va_pay[cs+11]!=0 || va_pay[cs+12]!=0 || cl>VA_RESTART_MAX)
+        cs=-1;
+      else
+        ce=cs+12+cl;
+    }
+    if (cs>=0 && i==ce) {
+      if (VaIsHello(va_pay+cs+13,cl)) {
+        MemCpy(va_pay,va_pay+cs+13,cl);
+        va_len=cl; va_kind=0; va_chan=0;
+        va_pay[va_len]=0;
+        return;
+      }
+      cs=-1;
+    }
+  }
+  va_pay[va_len]=0;
 }
 
 // ---- control messages ------------------------------------------------

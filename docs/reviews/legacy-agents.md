@@ -122,7 +122,7 @@ Not read:
   runs it under Wine with COM1 on a pty, and it is skipped on a host that
   has neither. Not run on a real Windows guest.
 
-### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory
+### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory (fixed, card #721)
 
 - Where: `guest/agent-legacy/src/plat_dos.c:211-215`. The results of
   `_dos_setdrive` and `chdir` are not looked at.
@@ -135,13 +135,15 @@ Not read:
   from arithmetic on the character.
 - Severity: data loss. Wire only today: no host caller sends a `cwd`.
 - Confidence: high for the ignored results.
-- Test: a check `exec refuses a missing cwd` in
-  `src/labd/agent_conformance.rs`: `open_exec` of `CD` (DOS) or `pwd` with
-  a `cwd` that does not exist, assert an error reply or an exit code that
-  is not 0 with text that names the directory. Run it against the agent
-  socket of a FreeDOS guest (the external-socket mode of the fixture).
-  Today the DOS agent prints its own directory and exits 0. The same check
-  on the POSIX build in CI covers F13.
+- Test: `dos_exec_refuses_missing_cwd` in `src/labd/agent_conformance.rs`
+  opens `CD` with a missing directory on a FreeDOS guest through the
+  fixture's external socket. It requires an error reply or nonzero exit,
+  with a diagnostic naming the directory. Before the fix, the agent
+  printed its current directory and exited 0.
+- Fixed by card #721. The DOS adapter validates the drive letter, verifies
+  the selected drive and checks `chdir` before launching a child. It restores
+  the original directory and returns an exec error naming the requested path
+  when the directory change fails.
 
 ### F3. The NT install puts a SYSTEM service binary in a directory with inherited permissions
 
@@ -223,7 +225,7 @@ Not read:
   time with `opened`, one DATA frame, `eof` and `exited` code 0. Assert that
   `exec` returns that output and code 0.
 
-### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included
+### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included (fixed, card #722)
 
 - Where: `guest/agent-legacy/src/wire.c:93-94` (`wire_next` waits for the
   whole claimed payload), `guest/agent-legacy/src/agent.c:473-480` (a hello
@@ -260,6 +262,31 @@ Not read:
   hello, then one ping. Assert that the agent's hello arrives. Today neither
   reply arrives. The same test with a mock for the TempleOS agent is not
   possible; there the steps are the same on a guest.
+- Fixed by card #722. Both decoders look inside a frame that is still open
+  for a whole control frame on channel 0, of at most 1024 payload bytes,
+  whose message is a hello. On one they drop what came before it and answer
+  it. A hello starts every connection, so it is the one message that says
+  the host connected again. In the C agent this is `restart_inside` in
+  `wire.c`, with `is_hello` of `agent.c` as its test, and each byte is
+  looked at once. In `VmlabAgt.HC` it is in `VaReadFrame`. The C agent also
+  steps past the magic only, not past the whole frame, when a control
+  payload does not parse (`wire_reject`): that is the cut frame whose
+  missing rest is shorter than a hello, which the hello's first bytes
+  complete. Proof tests in `src/labd/legacy_agent_tests.rs`:
+  `legacy_hello_after_a_truncated_frame_is_answered` (the steps above, then
+  filler up to the claimed length and a second ping, so that the order of
+  the replies decides and no time limit does) and
+  `legacy_hello_that_straddles_the_end_of_a_truncated_frame_is_answered`.
+  Both failed before the fix: the agent answered the last ping first. What
+  stays open:
+  - The TempleOS change was not run on a guest. No TempleOS guest was
+    started for this card, and no test in the repo compiles HolyC.
+  - A cut DATA frame that lacks fewer bytes than a hello has is completed
+    by the hello's first bytes when the two arrive in separate reads. That
+    hello is lost, and the next one is answered. The TempleOS agent has
+    this for a cut control frame too.
+  - Payload bytes that hold a complete, valid hello frame are taken for a
+    new connection. No caller sends stdin to a legacy guest today.
 
 ### F7. `VmlabAgentInstall` on a TempleOS guest that already runs the agent starts a second agent on the same UART
 
