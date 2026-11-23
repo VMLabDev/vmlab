@@ -1044,10 +1044,16 @@ vocabulary! {
             name: String,
         },
         /// Restart a lab's daemon so it re-reads its config; answers with the
-        /// new socket path.
+        /// socket path of the daemon that runs the lab now, and `replaced`.
         LabRestart = "lab.restart" {
             name: String,
             root: std::path::PathBuf,
+            /// The pid of the daemon the caller decided to replace (its
+            /// status reports it). Another daemon found under the name is a
+            /// successor that an earlier restart started: it is left in
+            /// place, and `replaced` is false. Absent, whatever daemon runs
+            /// the lab is replaced.
+            #[serde(default)] daemon: Option<u32>,
         },
         /// A lab daemon is about to exit by itself (`destroy`, `shutdown`, a
         /// termination signal), so its exit is expected rather than a crash.
