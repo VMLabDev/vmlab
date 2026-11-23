@@ -19,8 +19,8 @@ use std::net::Ipv4Addr;
 /// dialect every supported guest negotiates).
 ///
 /// Note on uid/gid: kernel CIFS maps all files to the mounting uid/gid by
-/// default unless the server advertises Unix extensions (which we do not, to
-/// stay Windows-compatible). Callers that need a specific in-guest owner should
+/// default unless the server advertises Unix extensions (which we do not:
+/// `smb1 unix extensions = no`, see [`super::config`]). Callers that need a specific in-guest owner should
 /// append `uid=<n>,gid=<n>` (and optionally `file_mode=`/`dir_mode=`) to the
 /// `-o` list; we keep the baseline minimal and let the provision layer extend
 /// it if a guest needs non-root ownership.

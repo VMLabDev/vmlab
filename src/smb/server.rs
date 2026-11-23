@@ -117,6 +117,20 @@ impl SmbServer {
             }
         })?;
 
+        // The settings NT1 sessions alone get, where a share asks for smb1.
+        // Without one the file is not included; a file left by an earlier
+        // start is removed all the same.
+        let nt1_path = config.nt1_conf_path();
+        match config.render_nt1_conf() {
+            Some(nt1) => std::fs::write(&nt1_path, nt1).map_err(|source| SmbError::WriteConf {
+                path: nt1_path.clone(),
+                source,
+            })?,
+            None => {
+                let _ = std::fs::remove_file(&nt1_path);
+            }
+        }
+
         // 3. Create passdb users (unprivileged: tdbsam under lab_dir).
         for (user, pass) in &creds_by_user {
             create_user(&conf_path, user, pass)?;
@@ -765,6 +779,146 @@ mod tests {
              put:\n{put}\nls:\n{}",
             reached.unwrap_or_default()
         );
+    }
+
+    /// A lab with one `smb1` share (`old`) and one modern share (`new`), both
+    /// writable, on a real smbd; `None` (with the reason printed) where the
+    /// host cannot run it. The closure runs `smbclient` against a share with
+    /// extra arguments and returns everything it printed.
+    #[allow(clippy::type_complexity)]
+    fn smb1_lab(
+        tmp: &std::path::Path,
+    ) -> Option<(SmbServer, impl Fn(&str, &[&str], &str) -> String + use<>)> {
+        if which("smbd").is_none() || which("smbclient").is_none() {
+            eprintln!("SKIP: smbd or smbclient not found");
+            return None;
+        }
+        if !check_nt1_supported() {
+            eprintln!("SKIP: this smbd has no SMB1 server");
+            return None;
+        }
+        let smb_dir = tmp.join("lab/.vmlab/smb");
+        let old_dir = tmp.join("old");
+        let new_dir = tmp.join("new");
+        for dir in [&smb_dir, &old_dir, &new_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(new_dir.join("hello.txt"), b"hi").unwrap();
+        std::fs::write(old_dir.join("readme.txt"), b"hi").unwrap();
+
+        let user = super::super::config::current_unix_user();
+        let pass = "TestPass123abc";
+        let share = |name: &str, dir: &PathBuf, smb1| ShareDef {
+            name: name.to_string(),
+            host_path: dir.clone(),
+            readonly: false,
+            smb1,
+            allowed_user: user.clone(),
+        };
+        let config_for = |port| SmbConfig {
+            listen_port: port,
+            run_dir: crate::paths::smb_runtime_dir(&smb_dir),
+            lab_dir: smb_dir.clone(),
+            any_smb1: true,
+            shares: vec![share("old", &old_dir, true), share("new", &new_dir, false)],
+        };
+        let mut creds = HashMap::new();
+        creds.insert(user.clone(), pass.to_string());
+        let ports = std::iter::repeat_with(free_high_port);
+        let server = match spawn_on_a_free_port(ports, config_for, &creds) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("SKIP: could not spawn smbd: {e}");
+                return None;
+            }
+        };
+        let port = server.listen_port();
+        // `-s /dev/null`: the host's own smb.conf must not decide what the
+        // client offers. The client is allowed down to NT1; `-m` picks the
+        // newest dialect it offers.
+        let smbclient = move |share: &str, args: &[&str], command: &str| {
+            let out = Command::new("smbclient")
+                .arg(format!("//127.0.0.1/{share}"))
+                .args(["-s", "/dev/null", "--option=client min protocol=NT1"])
+                .args(args)
+                .arg("-p")
+                .arg(port.to_string())
+                .arg("-U")
+                .arg(format!("{user}%{pass}"))
+                .arg("-c")
+                .arg(command)
+                .output()
+                .expect("run smbclient");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        Some((server, smbclient))
+    }
+
+    /// docs/reviews/smb.md F4, point 2: Samba's SMB1 server offers the CIFS
+    /// Unix extensions unless told not to, and a client that negotiates them
+    /// creates a symlink with any target in a writable share. Every host
+    /// program that reads the shared directory then follows it.
+    #[test]
+    fn an_smb1_client_cannot_create_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((server, smbclient)) = smb1_lab(tmp.path()) else {
+            return;
+        };
+        // The share works over SMB1 at all, or the test proves nothing.
+        let listing = smbclient("old", &["-m", "NT1"], "ls");
+        let said = smbclient("old", &["-m", "NT1"], "posix; symlink /etc/passwd planted");
+        drop(server);
+        assert!(listing.contains("readme.txt"), "SMB1 ls failed:\n{listing}");
+        let planted = tmp.path().join("old/planted");
+        assert!(
+            planted.symlink_metadata().is_err(),
+            "an SMB1 client planted {} -> {:?}.\nsmbclient:\n{said}",
+            planted.display(),
+            std::fs::read_link(&planted).ok()
+        );
+    }
+
+    /// docs/reviews/smb.md F4, point 1: `smb1 = true` is a property of the
+    /// share. The share beside it is not reachable over SMB1, and no session
+    /// newer than SMB1 logs on with NTLMv1.
+    #[test]
+    fn an_smb1_share_does_not_relax_the_share_beside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((server, smbclient)) = smb1_lab(tmp.path()) else {
+            return;
+        };
+        let ntlmv1 = "--option=client ntlmv2 auth=no";
+        let old_nt1 = smbclient("old", &["-m", "NT1", ntlmv1], "ls");
+        let new_nt1 = smbclient("new", &["-m", "NT1"], "ls");
+        let new_smb3 = smbclient("new", &["-m", "SMB3"], "ls");
+        let new_smb2 = smbclient(
+            "new",
+            &["-m", "SMB2", "--option=client max protocol=SMB2_02"],
+            "ls",
+        );
+        let new_smb3_ntlmv1 = smbclient("new", &["-m", "SMB3", ntlmv1], "ls");
+        let old_smb3_ntlmv1 = smbclient("old", &["-m", "SMB3", ntlmv1], "ls");
+        drop(server);
+        // What `smb1 = true` asks for still works: SMB1 with NTLMv1.
+        assert!(
+            old_nt1.contains("readme.txt"),
+            "the smb1 share refused SMB1 with NTLMv1:\n{old_nt1}"
+        );
+        // The modern share serves every modern dialect.
+        assert!(new_smb3.contains("hello.txt"), "SMB3:\n{new_smb3}");
+        assert!(new_smb2.contains("hello.txt"), "SMB2_02:\n{new_smb2}");
+        // And nothing else.
+        assert!(
+            !new_nt1.contains("hello.txt"),
+            "the modern share was mapped over SMB1:\n{new_nt1}"
+        );
+        for (share, said) in [("new", &new_smb3_ntlmv1), ("old", &old_smb3_ntlmv1)] {
+            assert!(
+                !said.contains(".txt"),
+                "an SMB3 session logged on to \"{share}\" with NTLMv1:\n{said}"
+            );
+        }
     }
 
     #[test]
