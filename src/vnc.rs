@@ -74,6 +74,24 @@ const CAPTURE_PIXEL_FORMAT: [u8; 16] = [
     0, 0, 0, // padding
 ];
 
+/// The largest screen side and screen buffer this client accepts, in a
+/// `ServerInit` or a `DesktopSize`: the limits vmlab-hv's display server and
+/// `crate::hvdisplay` hold a surface to. Every size the server sends is
+/// checked against these, or against the screen they admitted, before a
+/// byte is allocated for it.
+const MAX_SCREEN_SIDE: u16 = 16384;
+const MAX_SCREEN_BYTES: usize = 256 << 20;
+/// The largest cursor side. QEMU's own `cursor_alloc` refuses a cursor above
+/// 512 pixels a side, so no server vmlab talks to sends a larger one.
+const MAX_CURSOR_SIDE: u16 = 512;
+/// How many payload bytes the rectangles of one streamed update may carry
+/// together. [`VncClient::next_update`] holds them all until the update
+/// ends, and an update has up to 65535 rectangles. QEMU's rectangles do not
+/// overlap, so a real update stays below one screen.
+const MAX_UPDATE_BYTES: usize = 2 * MAX_SCREEN_BYTES;
+/// How much of a refusal reason is read and reported.
+const MAX_REASON_BYTES: usize = 1024;
+
 /// How long a capture may take end to end before it is given up on.
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -100,7 +118,7 @@ impl VncClient {
         let count = stream.read_u8().await?;
         if count == 0 {
             let reason_len = stream.read_u32().await? as usize;
-            let mut reason = vec![0u8; reason_len];
+            let mut reason = vec![0u8; reason_len.min(MAX_REASON_BYTES)];
             stream.read_exact(&mut reason).await?;
             bail!(
                 "VNC connection refused: {}",
@@ -124,9 +142,9 @@ impl VncClient {
         let height = stream.read_u16().await?;
         let mut pixel_format = [0u8; 16];
         stream.read_exact(&mut pixel_format).await?;
-        let name_len = stream.read_u32().await? as usize;
-        let mut name = vec![0u8; name_len];
-        stream.read_exact(&mut name).await?;
+        check_screen(width, height)?;
+        let name_len = stream.read_u32().await?;
+        skip(&mut stream, name_len.into(), "the VNC desktop name").await?;
 
         Ok(Self {
             stream,
@@ -227,10 +245,11 @@ impl VncClient {
                 MSG_FB_UPDATE => {
                     let _pad = self.stream.read_u8().await?;
                     let rects = self.stream.read_u16().await?;
-                    let mut events = Vec::with_capacity(rects as usize);
+                    let mut events = Vec::new();
                     let mut resized = false;
+                    let mut budget = MAX_UPDATE_BYTES;
                     for _ in 0..rects {
-                        if let Some(ev) = self.read_stream_rect().await? {
+                        if let Some(ev) = self.read_stream_rect(&mut budget).await? {
                             if matches!(ev, StreamEvent::DesktopSize { .. }) {
                                 resized = true;
                             }
@@ -247,15 +266,15 @@ impl VncClient {
                 MSG_SET_COLOUR_MAP => {
                     let mut head = [0u8; 5];
                     self.stream.read_exact(&mut head).await?;
-                    let count = u16::from_be_bytes([head[3], head[4]]) as usize;
-                    self.skip(count * 6).await?;
+                    let count = u64::from(u16::from_be_bytes([head[3], head[4]]));
+                    skip(&mut self.stream, count * 6, "a VNC colour map").await?;
                 }
                 MSG_BELL => {}
                 MSG_SERVER_CUT_TEXT => {
                     let mut pad = [0u8; 3];
                     self.stream.read_exact(&mut pad).await?;
-                    let len = self.stream.read_u32().await? as usize;
-                    self.skip(len).await?;
+                    let len = self.stream.read_u32().await?;
+                    skip(&mut self.stream, len.into(), "VNC ServerCutText").await?;
                 }
                 other => bail!("VNC server sent unsupported message type {other}"),
             }
@@ -263,8 +282,9 @@ impl VncClient {
     }
 
     /// One rectangle of a streamed update, decoded. `None` for a pseudo-
-    /// rectangle that carries nothing a recorder uses.
-    async fn read_stream_rect(&mut self) -> Result<Option<StreamEvent>> {
+    /// rectangle that carries nothing a recorder uses. Each payload is taken
+    /// out of `budget`, what the update may still carry.
+    async fn read_stream_rect(&mut self, budget: &mut usize) -> Result<Option<StreamEvent>> {
         let x = self.stream.read_u16().await?;
         let y = self.stream.read_u16().await?;
         let w = self.stream.read_u16().await?;
@@ -272,11 +292,14 @@ impl VncClient {
         let encoding = self.stream.read_i32().await?;
         match encoding {
             ENC_RAW => {
-                let mut bgrx = vec![0u8; w as usize * h as usize * 4];
+                let len = self.rect_bytes(x, y, w, h)?;
+                spend(budget, len)?;
+                let mut bgrx = vec![0u8; len];
                 self.stream.read_exact(&mut bgrx).await?;
                 Ok(Some(StreamEvent::Rect { x, y, w, h, bgrx }))
             }
             ENC_DESKTOP_SIZE => {
+                check_screen(w, h)?;
                 self.width = w;
                 self.height = h;
                 Ok(Some(StreamEvent::DesktopSize { w, h }))
@@ -292,7 +315,9 @@ impl VncClient {
                 if sub != ENC_RAW {
                     bail!("VNC alpha cursor uses unsupported sub-encoding {sub}");
                 }
-                let mut px = vec![0u8; w as usize * h as usize * 4];
+                let len = cursor_bytes(w, h)?;
+                spend(budget, len)?;
+                let mut px = vec![0u8; len];
                 self.stream.read_exact(&mut px).await?;
                 let rgba = px
                     .as_chunks::<4>()
@@ -308,7 +333,9 @@ impl VncClient {
                 }))
             }
             ENC_RICH_CURSOR => {
-                let mut px = vec![0u8; w as usize * h as usize * 4];
+                let len = cursor_bytes(w, h)?;
+                spend(budget, len)?;
+                let mut px = vec![0u8; len];
                 self.stream.read_exact(&mut px).await?;
                 let stride = (w as usize).div_ceil(8);
                 let mut mask = vec![0u8; stride * h as usize];
@@ -334,7 +361,7 @@ impl VncClient {
                 }))
             }
             ENC_LED_STATE => {
-                self.skip(1).await?;
+                self.stream.read_u8().await?;
                 Ok(None)
             }
             e if ENC_EMPTY_PSEUDO.contains(&e) => Ok(None),
@@ -395,15 +422,15 @@ impl VncClient {
                 MSG_SET_COLOUR_MAP => {
                     let mut head = [0u8; 5];
                     self.stream.read_exact(&mut head).await?;
-                    let count = u16::from_be_bytes([head[3], head[4]]) as usize;
-                    self.skip(count * 6).await?;
+                    let count = u64::from(u16::from_be_bytes([head[3], head[4]]));
+                    skip(&mut self.stream, count * 6, "a VNC colour map").await?;
                 }
                 MSG_BELL => {}
                 MSG_SERVER_CUT_TEXT => {
                     let mut pad = [0u8; 3];
                     self.stream.read_exact(&mut pad).await?;
-                    let len = self.stream.read_u32().await? as usize;
-                    self.skip(len).await?;
+                    let len = self.stream.read_u32().await?;
+                    skip(&mut self.stream, len.into(), "VNC ServerCutText").await?;
                 }
                 other => bail!("VNC server sent unsupported message type {other}"),
             }
@@ -429,11 +456,12 @@ impl VncClient {
         let h = self.stream.read_u16().await?;
         match self.stream.read_i32().await? {
             ENC_RAW => {
-                let mut px = vec![0u8; w as usize * h as usize * 4];
+                let mut px = vec![0u8; self.rect_bytes(x, y, w, h)?];
                 self.stream.read_exact(&mut px).await?;
                 canvas.paint(x, y, w, h, &px)
             }
             ENC_DESKTOP_SIZE => {
+                check_screen(w, h)?;
                 self.width = w;
                 self.height = h;
                 *canvas = Canvas::new(w, h)?;
@@ -443,12 +471,68 @@ impl VncClient {
         }
     }
 
-    /// Read and discard `n` bytes.
-    async fn skip(&mut self, n: usize) -> Result<()> {
-        let mut buf = vec![0u8; n];
-        self.stream.read_exact(&mut buf).await?;
-        Ok(())
+    /// The payload length of a Raw rectangle, once it is known to lie inside
+    /// the screen. The screen passed [`check_screen`], which bounds the
+    /// length before anything is allocated for it.
+    fn rect_bytes(&self, x: u16, y: u16, w: u16, h: u16) -> Result<usize> {
+        let (fw, fh) = (self.width, self.height);
+        if u32::from(x) + u32::from(w) > u32::from(fw)
+            || u32::from(y) + u32::from(h) > u32::from(fh)
+        {
+            bail!("VNC rectangle {w}x{h}+{x}+{y} lies outside the {fw}x{fh} framebuffer");
+        }
+        Ok(usize::from(w) * usize::from(h) * 4)
     }
+}
+
+/// Refuse a screen size above the limits, as a `ServerInit` or a
+/// `DesktopSize` announces it.
+fn check_screen(w: u16, h: u16) -> Result<()> {
+    if w > MAX_SCREEN_SIDE
+        || h > MAX_SCREEN_SIDE
+        || usize::from(w) * usize::from(h) * 4 > MAX_SCREEN_BYTES
+    {
+        bail!(
+            "VNC server announced a {w}x{h} screen, above the limit of \
+             {MAX_SCREEN_SIDE} a side and {MAX_SCREEN_BYTES} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// The pixel payload length of a `w`x`h` cursor, refused above the limit.
+fn cursor_bytes(w: u16, h: u16) -> Result<usize> {
+    if w > MAX_CURSOR_SIDE || h > MAX_CURSOR_SIDE {
+        bail!("VNC cursor {w}x{h} is above the limit of {MAX_CURSOR_SIDE} a side");
+    }
+    Ok(usize::from(w) * usize::from(h) * 4)
+}
+
+/// Take `len` payload bytes out of what one update may still carry.
+fn spend(budget: &mut usize, len: usize) -> Result<()> {
+    match budget.checked_sub(len) {
+        Some(left) => {
+            *budget = left;
+            Ok(())
+        }
+        None => bail!("VNC update carries more than {MAX_UPDATE_BYTES} bytes of pixels"),
+    }
+}
+
+/// Read and discard `n` bytes of `what` through a fixed buffer, so a length
+/// the server names costs no memory.
+async fn skip(stream: &mut UnixStream, n: u64, what: &str) -> Result<()> {
+    let mut buf = [0u8; 4096];
+    let mut left = n;
+    while left > 0 {
+        let take = left.min(buf.len() as u64) as usize;
+        stream
+            .read_exact(&mut buf[..take])
+            .await
+            .with_context(|| format!("reading past {n} bytes of {what}"))?;
+        left -= take as u64;
+    }
+    Ok(())
 }
 
 /// One decoded rectangle of a streamed `FramebufferUpdate`

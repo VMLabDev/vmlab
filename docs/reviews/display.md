@@ -169,6 +169,22 @@ Not read:
   error that names the length.
 - Confidence: high for the code. The abort depends on the memory and the
   overcommit setting of the host.
+- Fixed by card #637. A `ServerInit` or a `DesktopSize` above 16384 a side
+  or 256 MiB of pixels is refused, the limits of F1. A Raw rectangle is
+  checked against the screen from its header, in `capture` and in the stream,
+  before its payload is allocated. A cursor above 512 a side is refused,
+  which is the limit of QEMU's `cursor_alloc`. The rectangles of one streamed
+  update carry at most 512 MiB together. A `ServerCutText`, a colour map and
+  the desktop name are read past through a 4096-byte buffer, and the error
+  names the length. At most 1024 bytes of a refusal reason are read. The
+  recorder gets no `DesktopSize` above the limit, so `src/record/core.rs` is
+  unchanged. The proof tests are in `src/vnc/tests.rs`:
+  `stream_rejects_a_rectangle_outside_the_screen`,
+  `capture_rejects_an_oversized_rectangle_from_its_header`,
+  `stream_names_the_length_of_a_cut_text_that_never_arrives`,
+  `stream_rejects_a_desktop_size_above_the_limit` and
+  `stream_rejects_a_cursor_above_the_limit`. The 512 MiB limit of one update
+  has no test: a test would have to send that much.
 
 ### F3. Display server: one failed accept ends both display sockets for the life of the VM, and nothing limits connections or the time of a handshake
 
