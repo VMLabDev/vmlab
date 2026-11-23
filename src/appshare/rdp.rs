@@ -74,7 +74,12 @@ pub fn freerdp_args(
         format!("/v:{}", socket.display()),
         format!("/app:{}", app_option(argv, cwd)?),
         "/cert:ignore".into(),
-        if clipboard { "+clipboard" } else { "-clipboard" }.into(),
+        if clipboard {
+            "+clipboard"
+        } else {
+            "-clipboard"
+        }
+        .into(),
         format!("/wm-class:vmlab-{machine}"),
         format!("/u:{}", creds.user),
     ];
@@ -589,7 +594,7 @@ mod tests {
                 user: None,
                 password: None,
                 verbose: false,
-            clipboard: false,
+                clipboard: false,
             };
             server.prepare(Some(&bin), &req, &creds()).unwrap();
             server.start().unwrap();
@@ -728,7 +733,15 @@ mod tests {
     fn freerdp_is_told_the_program_and_its_command_line() {
         let socket = Path::new("/run/user/1000/vmlab-app-x/rdp.sock");
         assert_eq!(
-            freerdp_args(socket, "win11", &argv(&["notepad.exe"]), None, &creds(), false).unwrap(),
+            freerdp_args(
+                socket,
+                "win11",
+                &argv(&["notepad.exe"]),
+                None,
+                &creds(),
+                false
+            )
+            .unwrap(),
             [
                 "/v:/run/user/1000/vmlab-app-x/rdp.sock",
                 "/app:program:notepad.exe",
