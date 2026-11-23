@@ -147,3 +147,89 @@ def test_display_package_requires_signing_unless_explicit_dry_run(tmp_path, unsi
     else:
         assert result.returncode != 0
         assert not output.exists()
+
+
+# A docker that keeps each named volume as a directory. `docker run` lists what
+# every mounted volume holds before the command, and then writes one file into
+# each: the stand-in for a build.rs that edits a crate source in the cargo
+# home, or leaves an output in a target dir.
+STUB_DOCKER = r'''#!/usr/bin/env python3
+import json, os, shutil, sys
+from pathlib import Path
+
+state = Path(os.environ['STUB_DOCKER_STATE'])
+volumes = state / 'volumes'
+volumes.mkdir(parents=True, exist_ok=True)
+args = sys.argv[1:]
+if args[:2] == ['image', 'inspect']:
+    if '-f' in args:
+        print('sha256:' + '0' * 64)
+elif args[:2] == ['volume', 'ls']:
+    print(''.join(name + '\n' for name in sorted(os.listdir(volumes))), end='')
+elif args[:2] == ['volume', 'rm']:
+    for name in args[2:]:
+        shutil.rmtree(volumes / name)
+elif args[:1] == ['run']:
+    mounted = {}
+    for flag, value in zip(args, args[1:]):
+        name = value.split(':')[0]
+        if flag == '-v' and '/' not in name:
+            volume = volumes / name
+            volume.mkdir(exist_ok=True)
+            mounted[name] = sorted(os.listdir(volume))
+            (volume / 'left-by-a-build').write_text(os.environ['STUB_DOCKER_BUILD'])
+    with open(state / 'runs', 'a') as runs:
+        runs.write(json.dumps({'build': os.environ['STUB_DOCKER_BUILD'], 'volumes': mounted}) + '\n')
+else:
+    sys.exit('stub docker: unexpected ' + ' '.join(args))
+'''
+
+
+def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_path):
+    """Review install-release F3: a card build writes to the cargo home and the
+    target volumes; a release from the same checkout path must not read them."""
+    checkout = tmp_path / 'checkout'
+    for name in ['build/run.sh', 'scripts/release-local.sh']:
+        (checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / name).write_bytes((ROOT / name).read_bytes())
+        (checkout / name).chmod(0o755)
+    git = ['git', '-C', str(checkout), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
+    subprocess.run([*git, 'init', '-q'], check=True)
+    subprocess.run([*git, 'add', '-A'], check=True)
+    subprocess.run([*git, 'commit', '-q', '-m', 'release commit'], check=True)
+
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'docker').write_text(STUB_DOCKER)
+    (bin_dir / 'docker').chmod(0o755)
+    state = tmp_path / 'docker-state'
+    env = {k: v for k, v in os.environ.items() if not k.startswith('VMLAB_')}
+    env.update(PATH=f"{bin_dir}:{env['PATH']}", STUB_DOCKER_STATE=str(state))
+
+    def runs():
+        return [json.loads(line) for line in (state / 'runs').read_text().splitlines()]
+
+    card = subprocess.run([str(checkout / 'build/run.sh'), 'true'], capture_output=True, text=True,
+                          env={**env, 'STUB_DOCKER_BUILD': 'card'})
+    assert card.returncode == 0, card.stderr
+    card_volumes = set(runs()[0]['volumes'])
+    assert any(name.endswith('-cargo') for name in card_volumes)
+    assert len(card_volumes) > 1
+
+    # The stub builds nothing, so the release stops where it collects the
+    # assets. Both of its containers (display driver, dist) have run by then.
+    release = subprocess.run([str(checkout / 'scripts/release-local.sh'), '--version', '0.0.0-dry-run',
+                              '--display', 'unsigned', '--image-as-is'], capture_output=True, text=True,
+                             env={**env, 'STUB_DOCKER_BUILD': 'release'})
+    assert 'the build left no' in release.stderr, release.stderr
+    release_runs = [run for run in runs() if run['build'] == 'release']
+    assert len(release_runs) == 2
+    first, second = (run['volumes'] for run in release_runs)
+    assert len(first) == len(card_volumes)
+    # No volume of the card build, and nothing in a volume at the start.
+    assert not card_volumes & set(first)
+    assert all(files == [] for files in first.values()), first
+    # The second container of the release continues in the volumes of the first.
+    assert set(second) == set(first)
+    # The release leaves no volume behind, and the card build keeps its own.
+    assert set(os.listdir(state / 'volumes')) == card_volumes

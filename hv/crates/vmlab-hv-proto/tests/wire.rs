@@ -47,6 +47,12 @@ fn macos_launch_serialization_and_description_redaction_are_separate() {
     let fake = "FAKE".repeat(16);
     assert!(!format!("{description:?}").contains(&fake));
     let redacted = serde_json::to_string(&description.redacted()).unwrap();
+    // `ignore` is the old name of the macOS MSR policy and still parses.
+    assert_eq!(
+        description.msr_policy,
+        vmlab_hv_proto::machine::MsrPolicy::Macos
+    );
+    assert!(redacted.contains(r#""msr_policy":"macos""#));
     assert!(!redacted.contains(&fake));
     let encoded = serde_json::to_vec(&description).unwrap();
     assert_eq!(

@@ -90,21 +90,26 @@ page gs_install {
 
   p <<DOC
     New modern x86_64 KVM VMs use vmlab-hv. The CLI installer does not
-    install it. Download `vmlab-hv-<version>-linux-x86_64.tar.gz` and its
-    `.sha256` from the same release as your CLI. Set `VERSION` below to
-    that version without the leading `v`.
+    install it, but its `--fetch` option downloads the bundle,
+    `vmlab-hv-<version>-linux-x86_64.tar.gz`, from the same release as your
+    CLI and checks it the way it checks the CLI: the cosign signature of the
+    release's `SHA256SUMS`, then the bundle against its line in that file.
+    The bundle reaches the current directory only when both checks pass, and
+    the commands below unpack it only then. Do not check the bundle against
+    the `.sha256` file published beside it. No signature covers that file,
+    so whoever can replace the bundle can replace it too. Set `VERSION`
+    below to the version of your CLI without the leading `v`.
   DOC
 
   code sh { source = <<'SRC'
 VERSION=0.9.0-alpha
 ASSET="vmlab-hv-$VERSION-linux-x86_64.tar.gz"
-curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET"
-curl -fLO "https://github.com/VMLabDev/vmlab/releases/download/v$VERSION/$ASSET.sha256"
-sha256sum -c "$ASSET.sha256"
+rm -f "$ASSET"
 mkdir -p "$HOME/.local/opt"
-tar -xzf "$ASSET" -C "$HOME/.local/opt"
+curl -fsSL https://vmlab.io/install.sh | sh -s -- --version "$VERSION" --fetch "$ASSET" &&
+  tar -xzf "$ASSET" -C "$HOME/.local/opt" &&
+  "$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/install-viewer-icons.sh"
 export PATH="$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/bin:$PATH"
-"$HOME/.local/opt/vmlab-hv-$VERSION-linux-x86_64/install-viewer-icons.sh"
 SRC
   }
 
