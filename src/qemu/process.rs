@@ -511,8 +511,12 @@ impl LabIdentity {
     /// (cmdline.rs, container.rs).
     fn qmp_under_runtime(&self, args: &[&[u8]]) -> bool {
         option_values(args, "-qmp").into_iter().any(|v| {
-            v.strip_prefix(b"unix:")
-                .is_some_and(|path| path.starts_with(self.runtime.as_bytes()))
+            // A VM's argv carries the path with its commas doubled
+            // (`cmdline::opt_path`); a container's does not.
+            let escaped = self.runtime.replace(',', ",,");
+            v.strip_prefix(b"unix:").is_some_and(|path| {
+                path.starts_with(self.runtime.as_bytes()) || path.starts_with(escaped.as_bytes())
+            })
         })
     }
 }
