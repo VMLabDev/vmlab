@@ -79,7 +79,7 @@ impl SegmentServices {
             let ipv4 = eth.payload();
             let verdict = {
                 let rs = hook_rules.lock_recover();
-                rs.eval(ipv4)
+                rs.eval_from(Some(guest_mac), ipv4)
             };
             match verdict {
                 Verdict::Pass => HookAction::Pass,

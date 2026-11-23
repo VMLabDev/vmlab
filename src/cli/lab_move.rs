@@ -439,17 +439,30 @@ fn file_digest(path: &Path) -> Result<(u64, Vec<u8>)> {
 /// Carry the absolute paths the working data stores over to the new root.
 ///
 /// Found by grepping a lab's working data after an `up` with shares and a
-/// `@dev` workspace: `smb/smb.conf` names the old directories, but smbd's
+/// `@dev` workspace: each sharing machine's `smb/machines/<machine>/smb.conf`
+/// names the old directories, but smbd's
 /// start renders it afresh, so it is removed rather than edited; each `@dev`
 /// machine's sync ledger names its host workspace, which is rebased. Disk
 /// clones name their template in the store, not the lab, and SMB's logs are
 /// history. Returns a line per change.
 fn rewrite_paths(lab_local: &Path, from: &Path, to: &Path) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    let conf = lab_local.join("smb").join("smb.conf");
-    if conf.exists() {
-        std::fs::remove_file(&conf).with_context(|| format!("removing {}", conf.display()))?;
-        lines.push("removed smb/smb.conf (the next `up` renders it for this root)".to_string());
+    // One server per sharing machine, each with a configuration of its own.
+    let mut confs: Vec<PathBuf> = std::fs::read_dir(lab_local.join("smb").join("machines"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|machine| machine.path().join("smb.conf"))
+        .collect();
+    confs.sort();
+    for conf in confs {
+        if conf.exists() {
+            std::fs::remove_file(&conf).with_context(|| format!("removing {}", conf.display()))?;
+            lines.push(format!(
+                "removed {} (the next `up` renders it for this root)",
+                conf.strip_prefix(lab_local).unwrap_or(&conf).display()
+            ));
+        }
     }
     let ledgers = lab_local.join("workspace");
     if let Ok(entries) = std::fs::read_dir(&ledgers) {
@@ -694,8 +707,9 @@ lab "moving" {
         use crate::labd::workspace::ledger::Ledger;
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
-        std::fs::create_dir_all(data.join("smb")).unwrap();
-        std::fs::write(data.join("smb/smb.conf"), "path = /a/media\n").unwrap();
+        let conf = data.join("smb/machines/web/smb.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "path = /a/media\n").unwrap();
         let ledger = Ledger::path(data, "dev01");
         Ledger::new(Path::new("/a/src"), "/src")
             .save(&ledger)
@@ -703,7 +717,8 @@ lab "moving" {
 
         let lines = rewrite_paths(data, Path::new("/a"), Path::new("/b")).unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(!data.join("smb/smb.conf").exists());
+        assert!(lines[0].contains("smb/machines/web/smb.conf"), "{lines:?}");
+        assert!(!conf.exists());
         let text = std::fs::read_to_string(&ledger).unwrap();
         assert!(
             text.contains("\"/b/src\"") && !text.contains("/a/src"),

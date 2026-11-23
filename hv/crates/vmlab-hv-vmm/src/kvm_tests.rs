@@ -85,6 +85,14 @@ fn q35_seabios_banner_through_control_socket() {
         &dir.path().join("vnc.sock"),
     )
     .unwrap();
+    for name in ["display.sock", "vnc.sock"] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{name} is owner-only");
+    }
     let mut client = vmlab_hv_proto::client::Client::connect(&socket).unwrap();
     assert!(
         client
