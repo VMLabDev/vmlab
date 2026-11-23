@@ -144,8 +144,8 @@ Linux, and both fail silently, with the watcher armed and quiet and the
 language server simply no longer re-analysing. Source kept guest-side alone
 fails the other way: `destroy` is a first-class verb on disposable clones and
 a snapshot restore would roll uncommitted work back with the machine. With the
-host canonical, `destroy` loses nothing and a restore re-converges the guest
-from the host. `share {}` stays exactly as useful as it was for datasets,
+host canonical, `destroy` loses nothing while the two copies are in step, and
+a restore re-converges the guest from the host. `share {}` stays exactly as useful as it was for datasets,
 installers and build output; the line is a watched source tree.
 DOC
 
@@ -439,7 +439,11 @@ transfers nothing else, and emits no guest-to-host action at all. It compares
 by digest because a restored guest's clock runs behind the host. It completes
 before the watch reopens, and it replaces the stat-walk rather than following
 one. Both the owed re-seed and the halt a restore refuses on ride the ledger,
-because a restore does not need a running machine. Every surface that takes or
+because a restore does not need a running machine. So does what a stop left
+owed: `down` takes a last pass before it stops the syncer, and writes on the
+ledger what that pass could not carry, or that a forced stop took none. A
+restore of the stopped machine refuses on that record too, with the same
+flag. Every surface that takes or
 restores one says the same sentence, and the [Snapshots](guide_snapshots)
 chapter repeats it.
 DOC
@@ -454,7 +458,11 @@ DOC
   p <<'DOC'
 There is no rebuild verb because two existing verbs are one. Destroying the
 machine takes its clone and the guest working copy; the next `up` provisions a
-fresh one and the syncer seeds it again from the host.
+fresh one and the syncer seeds it again from the host. The destroy first asks
+whether the guest copy holds work the host has not taken: a running workspace
+gets a last pass, and a stopped one answers from its ledger. It refuses by
+name where work is left or could be, and `--discard-guest-changes` destroys
+anyway.
 DOC
 
   code sh { source = <<'SRC'

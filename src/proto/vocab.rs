@@ -516,7 +516,14 @@ vocabulary! {
             #[serde(default)] force: bool,
         },
         /// Stop the lab and delete everything it materialised.
-        Destroy = "destroy" {},
+        ///
+        /// `discard` is §19.6's discard flag: a destroy deletes a dev
+        /// machine's guest working copy, so it refuses while a workspace
+        /// holds guest work the host has not taken until this says so. It
+        /// defaults to `false`.
+        Destroy = "destroy" {
+            #[serde(default)] discard: bool,
+        },
 
         /// Start one machine, pulling its template or image first.
         MachineStart = "machine.start" {
@@ -538,8 +545,10 @@ vocabulary! {
             #[serde(default)] record: Vec<RecordRequest>,
         },
         /// Stop one machine and delete everything it materialised.
+        /// `discard` is the flag of `destroy`, for this machine's workspace.
         MachineDestroy = "machine.destroy" {
             #[serde(alias = "vm", alias = "container")] machine: String,
+            #[serde(default)] discard: bool,
         },
         /// What this machine can do beyond the universal commands, probed
         /// live: a display, a console log, in-place reboot, and whichever
