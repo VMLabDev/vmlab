@@ -600,6 +600,17 @@ impl Supervisor {
     }
 
     async fn release_lab(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        // Serialised with `ensure_lab`: a daemon that is still starting has
+        // no socket yet, and must not be taken for a dead one. Waiting for
+        // the start to finish gives it a socket that takes `Shutdown`.
+        let lock = self.ensure_lock(name).await;
+        let _guard = lock.lock().await;
+        self.release_lab_locked(name).await
+    }
+
+    /// The already-serialised half of [`Self::release_lab`], used by a
+    /// restart that holds the name lock across release and start.
+    async fn release_lab_locked(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let sock = crate::paths::lab_socket(name);
         // Captured before the entry can be removed — the orphan reaper needs it
         // to recognise this lab's smbd.
@@ -632,6 +643,32 @@ impl Supervisor {
                 );
                 // Only the daemon itself: its pid may name another process
                 // by now.
+                if daemon_running(pid, started) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                crate::qemu::process::kill_lab_orphans(name, Some(&root));
+                let mut reg = self.registry.lock().await;
+                reg.remove_daemon(name, pid);
+                reg.save();
+            }
+        } else if daemon_running(pid, started) {
+            // The daemon runs but its socket does not answer: the socket file
+            // is gone or replaced. Its machines are its own, so ask it to
+            // stop them the way `Shutdown` would — a termination signal runs
+            // the same teardown — and kill it only past the deadline.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            if !self.wait_daemon_gone(name, pid, RELEASE_DEADLINE).await {
+                tracing::warn!(
+                    "lab daemon for {name} does not answer and did not stop within {}s; \
+                     killing it",
+                    RELEASE_DEADLINE.as_secs()
+                );
                 if daemon_running(pid, started) {
                     let _ = nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(pid as i32),
@@ -713,7 +750,7 @@ impl Supervisor {
             // Returns once the old daemon is gone, so `ensure_lab` cannot
             // see it still alive (state Running + socket up) and hand back
             // the stale socket.
-            self.release_lab(name).await?;
+            self.release_lab_locked(name).await?;
         }
         self.ensure_lab_locked(name, root).await
     }
