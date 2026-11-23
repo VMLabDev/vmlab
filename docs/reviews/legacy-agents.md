@@ -86,7 +86,7 @@ Not read:
 
 ## Findings, worst first
 
-### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard
+### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard (fixed, card #715)
 
 - Where: `guest/agent-legacy/src/plat_win32.c:97`
   (`WideCharToMultiByte(CP_ACP, 0, ..., NULL, NULL)`), used for every
@@ -107,6 +107,20 @@ Not read:
   `vmlab exec <vm> -- cmd /c del C:\t\日本.txt`. Today `ab.txt` is
   deleted. Assert that the exec is refused with an error that names the
   argument. The same steps run under Wine with the `windows-nt-x86` build.
+- Fixed by card #715. `utf8_to_ansi` converts its result back to UTF-16 and
+  compares it with what it converted. Text that does not survive the round
+  trip fails the exec before anything runs, for an argument, the `cwd` and an
+  environment entry alike. That also refuses a best-fit look-alike (a
+  full-width quote that would arrive as `"`) and bytes that are not UTF-8,
+  which the decoder turned into `?` itself. The error names the string by
+  position and gives the first code point that did not convert, for example
+  `exec: argument 3 has the character U+65E5, which the guest's code page
+  1252 cannot represent; nothing was run`. An environment entry that does
+  not convert was left out before and now fails the exec. The proof is
+  `legacy_win32_exec_refuses_text_outside_the_code_page` in
+  `src/labd/legacy_agent_tests.rs`. It builds the NT agent with mingw and
+  runs it under Wine with COM1 on a pty, and it is skipped on a host that
+  has neither. Not run on a real Windows guest.
 
 ### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory
 
