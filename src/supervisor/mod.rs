@@ -468,10 +468,7 @@ impl Supervisor {
         // Checked under the name's lock, which the teardown takes for every
         // name locked before it closed the supervisor: a request that passes
         // here is waited for, and one that arrives later spawns nothing.
-        if self
-            .shutting_down
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(CommandError::conflict("vmlabd is shutting down"));
         }
         let sock = crate::paths::lab_socket(name);
@@ -1531,10 +1528,12 @@ mod tests {
             let root = super::registry::canonical_root(&root).unwrap();
 
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
-            let _daemon =
-                Server::<LabRequest>::bind(&crate::paths::lab_socket(held), Arc::new(Held(shutdown_tx)))
-                    .await
-                    .unwrap();
+            let _daemon = Server::<LabRequest>::bind(
+                &crate::paths::lab_socket(held),
+                Arc::new(Held(shutdown_tx)),
+            )
+            .await
+            .unwrap();
             // The process the held lab's entry names. The release waits for
             // it, so the teardown stays inside that release until it is
             // killed below.
