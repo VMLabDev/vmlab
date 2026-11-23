@@ -173,7 +173,7 @@ SRC
     rows:
       | "Argument" | "Type" | "Default" | "Meaning" |
       | "`default`" | "bool" | "`false`" | "Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly." |
-      | "`workspace`" | "utf8" | "none" | "Host directory whose contents sync into the workspace, relative to the lab root. Without it the machine carries `@dev` but has nothing to sync." |
+      | "`workspace`" | "utf8" | "none" | "Host directory whose contents sync into the workspace, relative to the lab root. It may not hold the lab's state directory (`.vmlab`) or lie inside it. Without it the machine carries `@dev` but has nothing to sync." |
       | "`workspace_guest`" | "utf8" | "profile, else `/src`" | "Guest path the workspace lands at. Inherited from the profile (`C:\\src` on Windows profiles, `/src` on Linux ones, `/Users/Shared/src` on `macos`) if omitted." |
   }
   p <<DOC

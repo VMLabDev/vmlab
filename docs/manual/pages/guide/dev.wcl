@@ -51,7 +51,7 @@ SRC
     rows:
       | "Argument" | "Meaning" |
       | "`default`" | "Make this the lab's default dev machine. At most one per lab. The only `@dev` machine in a lab is the default implicitly, even if it wrote `default = false`; with several and none marked, there is no default." |
-      | "`workspace`" | "Host directory to sync into the guest, relative to the lab root. Without it the machine carries `@dev` and has nothing to sync." |
+      | "`workspace`" | "Host directory to sync into the guest, relative to the lab root. It may not hold the lab's state directory (`.vmlab`) or lie inside it, so `workspace = \".\"` in a lab root is a validation error: name a subdirectory. Without it the machine carries `@dev` and has nothing to sync." |
       | "`workspace_guest`" | "Guest path the workspace lands at. Resolved `@dev` argument, then the profile's `workspace_guest`, then the floor `/src`." |
   }
 
@@ -225,8 +225,9 @@ commit, and `.vmlabignore` covers where "almost" fails: a gitignored `.env`,
 a local cert or `appsettings.Development.json` that the app needs guest-side
 takes a negation. Precedence is git's own, deepest file first, `.vmlabignore`
 beating `.gitignore` in one directory, and a path under an ignored directory
-staying ignored. The floor covers the syncer's own scratch names and
-`.git/**/*.lock`, and no repo rule may override it. A `.gitignore` or
+staying ignored. The floor covers the syncer's own scratch names,
+`.git/**/*.lock` and any directory named `.vmlab` (a lab's state), and no repo
+rule may override it. A `.gitignore` or
 `.vmlabignore` that is a symlink is never read as rules, wherever it points:
 the link syncs as a link, its rules do not apply, and `vmlab dev sync status`
 names it among the skipped paths. Make it a regular file to have its rules
