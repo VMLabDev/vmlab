@@ -570,6 +570,46 @@ mod tests {
     }
 
     #[test]
+    fn the_exact_occurrence_beats_eight_near_copies() {
+        let tmpl = RgbImage::from_fn(16, 16, |x, y| {
+            let h = (x / 4).wrapping_mul(0x9E37_79B1) ^ (y / 4).wrapping_mul(0x85EB_CA77);
+            let h = (h ^ (h >> 13)).wrapping_mul(0xC2B2_AE3D);
+            Rgb([(h >> 8) as u8; 3])
+        });
+        let mut noisy = tmpl.clone();
+        xor_noise(&mut noisy);
+        let mut screen = RgbImage::from_pixel(320, 96, Rgb([128; 3]));
+        for i in 0..8 {
+            imageops::replace(&mut screen, &noisy, 4 + i * 36, 4);
+        }
+        imageops::replace(&mut screen, &tmpl, 150, 62);
+        let m = find_template(&screen, &tmpl, &MatchOptions::default()).expect("exact match");
+        assert_eq!((m.x, m.y), (150, 62));
+        assert!(m.score > 0.999);
+    }
+
+    #[test]
+    fn a_dimmed_copy_is_not_a_full_match() {
+        let tmpl = test_screen(32, 32);
+        let mut screen = tmpl.clone();
+        for pixel in screen.pixels_mut() {
+            *pixel = Rgb(pixel.0.map(|value| value / 2 + 20));
+        }
+        assert_eq!(find_template(&screen, &tmpl, &MatchOptions::default()), None);
+    }
+
+    #[test]
+    fn a_colour_swap_is_not_a_full_match() {
+        let tmpl = RgbImage::from_fn(16, 16, |x, _| {
+            if x < 8 { Rgb([255, 0, 0]) } else { Rgb([0; 3]) }
+        });
+        let screen = RgbImage::from_fn(16, 16, |x, _| {
+            if x < 8 { Rgb([0, 130, 0]) } else { Rgb([0; 3]) }
+        });
+        assert_eq!(find_template(&screen, &tmpl, &MatchOptions::default()), None);
+    }
+
+    #[test]
     fn match_center() {
         let m = Match {
             x: 10,
