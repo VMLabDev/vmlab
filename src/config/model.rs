@@ -1546,8 +1546,9 @@ pub fn parse_image_ref(s: &str) -> Result<ImageRef, String> {
 pub fn parse_host_port(s: &str) -> Result<HostPort, String> {
     let (ip_s, port) = match s.rsplit_once(':') {
         Some((ip, p)) => {
-            let port: u16 = p.parse().map_err(|_| format!("malformed port in `{s}`"))?;
-            (ip, Some(port))
+            let port: std::num::NonZeroU16 =
+                p.parse().map_err(|_| format!("malformed port in `{s}`"))?;
+            (ip, Some(port.get()))
         }
         None => (s, None),
     };
