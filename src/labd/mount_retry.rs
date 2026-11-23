@@ -301,6 +301,53 @@ mod tests {
         assert!(lines[0].contains("will not mount"), "{lines:?}");
     }
 
+    /// A mount step carries the SMB password in its argv, and the agent
+    /// client names the whole argv in the error of an exec that did not run
+    /// (finding F3 of `docs/reviews/smb.md`). Neither the `share.unmountable`
+    /// event nor the report `vmlab up` prints may hold the password.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_exec_does_not_put_the_credential_in_the_event() {
+        let report = report_for("data");
+        let events = Mutex::new(Vec::new());
+        let step = MountStep {
+            os_hint: OsHint::Linux,
+            command: "mount".into(),
+            args: vec![
+                "-t".into(),
+                "cifs".into(),
+                "//10.0.0.1/data".into(),
+                "/mnt/data".into(),
+                "-o".into(),
+                "username=u,password=S3CRET".into(),
+            ],
+            share: Some("data".into()),
+            refused_exit: None,
+        };
+        run_plan(
+            "web",
+            &plan(vec![step]),
+            &report,
+            |argv, timeout| async move {
+                tokio::time::sleep(timeout).await;
+                // The text of `VmAgent::exec`'s timeout error.
+                Err(anyhow::anyhow!(
+                    "exec `{}` timed out after {timeout:?}",
+                    argv.join(" ")
+                ))
+            },
+            |event| events.lock().unwrap().push(event),
+        )
+        .await;
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let payload = events[0].to_string();
+        assert!(payload.contains("timed out after"), "{payload}");
+        assert!(!payload.contains("S3CRET"), "{payload}");
+        let lines = report.lines("web", true).join("\n");
+        assert!(lines.contains("will not mount"), "{lines}");
+        assert!(!lines.contains("S3CRET"), "{lines}");
+    }
+
     /// A guest that never answers an exec is bounded too: the loop stops
     /// waiting shortly after the attempt's own timeout.
     #[tokio::test(start_paused = true)]
