@@ -703,7 +703,20 @@ impl Qcow2Image {
         let first_sector = host_offset / 512;
         let end = (first_sector + additional_sectors + 1) * 512;
         let mut compressed = vec![0u8; (end - host_offset) as usize];
-        self.read_file(host_offset, &mut compressed)?;
+        // QEMU writes only the compressed bytes, so the file may end inside
+        // the last sector. The bytes past the end of the file stay zeros.
+        let mut filled = 0;
+        while filled < compressed.len() {
+            match self
+                .file
+                .read_at(&mut compressed[filled..], host_offset + filled as u64)
+            {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut decompressor = flate2::Decompress::new(false);
         // One spare byte lets the decoder consume the end marker even when
         // the valid output fills a whole cluster, and detects overlong data.
