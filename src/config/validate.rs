@@ -108,9 +108,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     check_dns_label(&lab.name, lab.span, "lab name", &mut issues);
 
     // -- segments -------------------------------------------------------
-    let mut seg_names: HashMap<&str, Span> = HashMap::new();
+    let mut seg_names = HashSet::new();
     for seg in &lab.segments {
-        if seg_names.insert(&seg.name, seg.span).is_some() {
+        if !seg_names.insert(seg.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 seg.span,
                 format!("duplicate segment \"{}\"", seg.name),
@@ -255,15 +255,14 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     // -- VMs --------------------------------------------------------------
-    // VMs and containers share one name namespace (they share DNS, forwards,
-    // and dependency waves).
-    let mut machine_names: HashSet<&str> = HashSet::new();
+    // VMs and containers share one name namespace, and DNS folds ASCII case.
+    let mut machine_names = HashSet::new();
     let mut static_ips: HashMap<Ipv4Addr, Span> = HashMap::new();
     let mut macs: HashMap<MacAddr, Span> = HashMap::new();
     let mut segment_gateways: HashMap<String, Span> = HashMap::new();
     for vm in &lab.vms {
         let vm_hypervisor = selected_hypervisor(MachineCfg::Vm(vm), ctx);
-        if !machine_names.insert(&vm.name) {
+        if !machine_names.insert(vm.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 vm.span,
                 format!(
@@ -422,7 +421,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
 
     // -- containers ---------------------------------------------------------
     for c in &lab.containers {
-        if !machine_names.insert(&c.name) {
+        if !machine_names.insert(c.name.to_ascii_lowercase()) {
             issues.push(Issue::at(
                 c.span,
                 format!(
