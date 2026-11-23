@@ -216,7 +216,7 @@ fn map_into_hole(base: u64, size: usize) -> Option<MmapRegion> {
     mapping.ok()
 }
 
-fn create_memfd() -> Result<File, String> {
+pub(crate) fn create_memfd() -> Result<File, String> {
     const MFD_CLOEXEC: u32 = 0x0001;
     const MFD_ALLOW_SEALING: u32 = 0x0002;
     // SAFETY: memfd_create(2) with a NUL-terminated name; the returned fd is

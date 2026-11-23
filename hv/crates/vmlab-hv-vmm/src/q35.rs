@@ -42,9 +42,22 @@ pub fn pam_bank(index: usize) -> (u64, usize, usize, u8) {
 
 /// CPU mappings select ROM or RAM independently from write permission. Writes
 /// to write-only shadow RAM exit through the read-only ROM memslot.
+///
+/// Device models reach 0xc0000-0xfffff through a second mapping, the device
+/// view, which follows the same attributes: a device write must not land in
+/// a bank the guest write-protected. A bank with its write enable set maps the
+/// shadow shared, so reads and writes are the shadow's (a write-only bank
+/// therefore reads the shadow and not the ROM). Any other bank maps what the
+/// CPU reads there, shadow or ROM, privately: a device write goes to a
+/// copy-on-write page that only the device view sees and that the next change
+/// of the bank drops.
 pub struct Pam {
     shadow: GuestMemoryMmap,
     rom: GuestMemoryMmap,
+    /// The memfd behind `shadow` (offset 0) and `rom` (offset `ALIAS_SIZE`),
+    /// so the device view can map either.
+    backing: std::fs::File,
+    device: GuestMemoryMmap,
     vm: Option<Arc<VmFd>>,
     first_slot: u32,
     attributes: [u8; 13],
@@ -64,6 +77,18 @@ impl Pam {
             .unwrap(),
         )
     }
+    /// 0xc0000-0xfffff as device models see it.
+    pub fn device_region(&self) -> Arc<vm_memory::GuestRegionMmap> {
+        Arc::new(
+            vm_memory::GuestRegionMmap::with_arc(
+                self.device.iter().next().unwrap().get_mmap(),
+                GuestAddress(ALIAS),
+            )
+            .unwrap(),
+        )
+    }
+    /// The legacy SMRAM backing. It belongs in the complete memory view the
+    /// snapshot and the debugger use, and never in the one devices get.
     pub fn smram_region(&self) -> Arc<vm_memory::GuestRegionMmap> {
         Arc::new(
             vm_memory::GuestRegionMmap::with_arc(
@@ -91,9 +116,24 @@ impl Pam {
         first_slot: u32,
         isolated_smram: bool,
     ) -> Result<Self, VmmError> {
-        let shadow = GuestMemoryMmap::from_ranges(&[(GuestAddress(ALIAS), ALIAS_SIZE)])
-            .map_err(|e| VmmError::Memory(e.to_string()))?;
-        let rom = GuestMemoryMmap::from_ranges(&[(GuestAddress(ALIAS), ALIAS_SIZE)])
+        let backing = crate::memory::create_memfd().map_err(VmmError::Memory)?;
+        backing
+            .set_len(2 * ALIAS_SIZE as u64)
+            .map_err(|e| VmmError::Memory(format!("sizing the PAM memfd: {e}")))?;
+        let file_backed = |offset: u64| {
+            let file = backing
+                .try_clone()
+                .map_err(|e| VmmError::Memory(e.to_string()))?;
+            GuestMemoryMmap::from_ranges_with_files([(
+                GuestAddress(ALIAS),
+                ALIAS_SIZE,
+                Some(vm_memory::FileOffset::new(file, offset)),
+            )])
+            .map_err(|e| VmmError::Memory(e.to_string()))
+        };
+        let shadow = file_backed(0)?;
+        let rom = file_backed(ALIAS_SIZE as u64)?;
+        let device = GuestMemoryMmap::from_ranges(&[(GuestAddress(ALIAS), ALIAS_SIZE)])
             .map_err(|e| VmmError::Memory(e.to_string()))?;
         rom.write_slice(&vec![0xff; ALIAS_SIZE], GuestAddress(ALIAS))
             .map_err(|e| VmmError::Memory(e.to_string()))?;
@@ -107,6 +147,8 @@ impl Pam {
         let pam = Self {
             shadow,
             rom,
+            backing,
+            device,
             vm,
             first_slot,
             attributes: [0; 13],
@@ -118,6 +160,7 @@ impl Pam {
         for bank in 0..13 {
             pam.map_bank(bank, false)?;
         }
+        pam.refresh_device_view()?;
         if let Some(vm) = &pam.vm
             && !isolated_smram
         {
@@ -137,6 +180,62 @@ impl Pam {
                 .map_err(|e| VmmError::ioctl("KVM_SET_USER_MEMORY_REGION(SMRAM)", e))?;
         }
         Ok(pam)
+    }
+
+    /// Map one bank of the device view from its attributes.
+    fn map_device_bank(&self, index: usize) -> Result<(), VmmError> {
+        use std::os::fd::AsRawFd;
+        let (base, size, _, _) = pam_bank(index);
+        let attr = self.attributes[index];
+        let host = self
+            .device
+            .get_host_address(GuestAddress(base))
+            .map_err(|e| VmmError::Memory(e.to_string()))?;
+        let within = base - ALIAS;
+        let (sharing, offset) = if attr & 2 != 0 {
+            (libc::MAP_SHARED, within)
+        } else if attr & 1 != 0 {
+            (libc::MAP_PRIVATE, within)
+        } else {
+            (libc::MAP_PRIVATE, ALIAS_SIZE as u64 + within)
+        };
+        // SAFETY: the target is one whole, page-aligned bank inside the
+        // mapping `self.device` owns, and MAP_FIXED replaces those pages
+        // atomically: a device thread copying there reads or writes the old
+        // pages or the new ones. The memfd covers the offset and outlives
+        // the mapping, which `self.device` unmaps when it drops.
+        let mapped = unsafe {
+            libc::mmap(
+                host.cast(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                sharing | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                self.backing.as_raw_fd(),
+                offset as libc::off_t,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(VmmError::Memory(format!(
+                "mapping PAM bank {index} for devices: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: the range is the mapping made above. A new mapping does
+        // not inherit the advice of the one it replaced.
+        if unsafe { libc::madvise(mapped, size, libc::MADV_DONTDUMP) } != 0 {
+            return Err(VmmError::Memory(format!(
+                "MADV_DONTDUMP: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Map every bank of the device view again. A bank that is not writable
+    /// holds private pages, which neither see a shadow replaced under them
+    /// (a restore, a reset) nor forget what a device wrote to them.
+    fn refresh_device_view(&self) -> Result<(), VmmError> {
+        (0..13).try_for_each(|bank| self.map_device_bank(bank))
     }
 
     fn map_bank(&self, index: usize, replace: bool) -> Result<(), VmmError> {
@@ -233,7 +332,9 @@ impl Pam {
     }
 
     fn update(&mut self, config: &[u8; 4096]) -> Result<(), VmmError> {
-        let open = config[0x9d] & 0x40 != 0;
+        // D_OPEN counts only while D_LCK is clear. The register write path
+        // keeps the two apart, and a restored state is held to the same rule.
+        let open = config[0x9d] & 0x50 == 0x40;
         if !self.isolated_smram && open != self.smram_open {
             if let Some(vm) = &self.vm {
                 let region = kvm_userspace_memory_region {
@@ -260,6 +361,7 @@ impl Pam {
             if attr != self.attributes[i] {
                 self.attributes[i] = attr;
                 self.map_bank(i, true)?;
+                self.map_device_bank(i)?;
             }
         }
         Ok(())
@@ -307,25 +409,35 @@ impl BusDevice for Pam {
     }
 }
 
-/// Put the firmware memory below 1 MiB into guest memory: the PAM shadow, and
-/// the legacy SMRAM backing unless SMRAM is isolated.
+/// Put the firmware memory below 1 MiB into guest memory. The complete view
+/// (`ram.mem`: snapshots, the debugger) gets the PAM shadow, and the legacy
+/// SMRAM backing unless SMRAM is isolated. The device view (`ram.device_mem`)
+/// gets `Pam`'s device mapping of the shadow and no SMRAM at all: outside SMM
+/// 0xa0000-0xbffff is the VGA window, which is not memory a device can reach,
+/// so a device access there fails as one to an unmapped address does.
+///
+/// Returns the complete view without SMRAM, for a passed-through device.
 pub(crate) fn attach_firmware_memory(
     ram: &mut crate::memory::GuestRam,
     pam: &Pam,
     secure_smm: bool,
-) -> Result<(), VmmError> {
+) -> Result<GuestMemoryMmap, VmmError> {
+    ram.device_mem = ram
+        .device_mem
+        .insert_region(pam.device_region())
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
     ram.mem = ram
         .mem
         .insert_region(pam.shadow_region())
         .map_err(|e| VmmError::Memory(e.to_string()))?;
+    let without_smram = ram.mem.clone();
     if !secure_smm {
         ram.mem = ram
             .mem
             .insert_region(pam.smram_region())
             .map_err(|e| VmmError::Memory(e.to_string()))?;
     }
-    ram.device_mem = ram.mem.clone();
-    Ok(())
+    Ok(without_smram)
 }
 
 struct SmmWiring {
@@ -490,8 +602,20 @@ impl PciDevice for Mch {
                     _ => 0,
                 }
             };
+            // D_LCK (bit 4 of SMRAMC) makes SMRAMC, and on q35 ESMRAMC,
+            // read-only until a reset, and setting it clears D_OPEN. QEMU's
+            // i440fx does not model the lock. The 82441FX does, and this
+            // follows the chip.
+            let smramc = if self.pc { 0x72 } else { 0x9d };
+            let locked = self.config[smramc] & 0x10 != 0;
+            if locked && (pos == smramc || (!self.pc && pos == 0x9e)) {
+                continue;
+            }
             if pos < self.config.len() {
                 self.config[pos] = (self.config[pos] & !mask) | (byte & mask);
+                if pos == smramc && self.config[pos] & 0x10 != 0 {
+                    self.config[pos] &= !0x40;
+                }
             }
         }
         if let Err(e) = self.update_pam() {
@@ -532,6 +656,11 @@ impl Snapshot for Mch {
             .map_err(|e| DeviceError::Memory(e.to_string()))?;
         drop(pam);
         self.update_pam()
+            .map_err(|e| DeviceError::State(e.to_string()))?;
+        // The shadow changed under the private pages of the device view.
+        self.pam
+            .lock()
+            .refresh_device_view()
             .map_err(|e| DeviceError::State(e.to_string()))
     }
 }
@@ -931,7 +1060,10 @@ mod tests {
             for reg in 0..64 {
                 bridge.config_write(reg, 0, &value.to_le_bytes());
             }
-            let expected = decode_config(phase["config_hex"].as_str().unwrap());
+            let mut expected = decode_config(phase["config_hex"].as_str().unwrap());
+            // QEMU keeps every write to SMRAMC. Here the first phase sets
+            // D_LCK, which clears D_OPEN and holds the byte (card #611).
+            expected[0x72] = 0xbf;
             for (offset, expected) in expected.iter().enumerate() {
                 let actual = (bridge.config_read(offset / 4) >> (offset % 4 * 8)) as u8;
                 if actual != *expected {
@@ -961,8 +1093,8 @@ mod tests {
         bridge.pam.lock().read(0x30000, &mut byte);
         assert_eq!(byte, [0x42]);
         let state = bridge.save_state().unwrap();
-        bridge.config_write(0x70 / 4, 2, &[0x58]);
-        assert_eq!(bridge.config[0x72], 0x58);
+        bridge.config_write(0x70 / 4, 2, &[0x48]);
+        assert_eq!(bridge.config[0x72], 0x48);
         assert!(bridge.pam.lock().smram_open);
         bridge.config_write(0x70 / 4, 2, &[0x40]);
         assert_eq!(bridge.config[0x72], 0x40);
