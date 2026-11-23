@@ -55,8 +55,9 @@ pub fn find_template(screen: &RgbImage, template: &RgbImage, opts: &MatchOptions
         return None;
     }
 
-    let (left, top, width, height) =
-        opts.region.unwrap_or((0, 0, screen.width(), screen.height()));
+    let (left, top, width, height) = opts
+        .region
+        .unwrap_or((0, 0, screen.width(), screen.height()));
     let width = width.min(screen.width().saturating_sub(left));
     let height = height.min(screen.height().saturating_sub(top));
     if tw > width || th > height {
@@ -331,9 +332,8 @@ mod tests {
 
     #[test]
     fn a_colour_swap_is_not_a_full_match() {
-        let shape = |colour| {
-            RgbImage::from_fn(16, 16, |x, _| if x < 8 { colour } else { Rgb([0; 3]) })
-        };
+        let shape =
+            |colour| RgbImage::from_fn(16, 16, |x, _| if x < 8 { colour } else { Rgb([0; 3]) });
         let tmpl = shape(Rgb([255, 0, 0]));
         let screen = shape(Rgb([0, 130, 0]));
         assert_eq!(
