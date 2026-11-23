@@ -680,9 +680,14 @@ pub(crate) fn resolve_vm_for_variant(
     // with a separate PCI identity.
     let inherited_display = if variant == Some("win3d")
         && qemu_arch(&arch) == "x86_64"
-        && lab_vm.gpu.as_ref().is_some_and(|g| g.mode == GpuMode::Passthrough)
-        && matches!(inherited_display, Some("virtio-vga" | "virtio-gpu" | "virtio-gpu-pci"))
-    {
+        && lab_vm
+            .gpu
+            .as_ref()
+            .is_some_and(|g| g.mode == GpuMode::Passthrough)
+        && matches!(
+            inherited_display,
+            Some("virtio-vga" | "virtio-gpu" | "virtio-gpu-pci")
+        ) {
         Some("std")
     } else {
         inherited_display
@@ -968,9 +973,7 @@ mod tests {
     #[test]
     fn win3d_passthrough_uses_standard_vga_for_the_inherited_console() {
         let profiles = ProfileSet::shipped().unwrap();
-        let mut v = vm(
-            r#"vm "a" { template = "x86_64/win" gpu { mode = "passthrough" } }"#,
-        );
+        let mut v = vm(r#"vm "a" { template = "x86_64/win" gpu { mode = "passthrough" } }"#);
         let mut m = meta();
         m.display = Some("virtio-vga".into());
         let display = |vm, variant| {
