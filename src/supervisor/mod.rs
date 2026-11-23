@@ -1495,9 +1495,9 @@ mod tests {
         use crate::proto::server::{Handler, Server, Streamer};
         use crate::proto::{CommandError, LabRequest, SupRequest};
 
-        /// A lab daemon as far as a restart goes: it answers, it runs the
-        /// machine it is asked to start, and a `shutdown` stops that machine
-        /// and ends the daemon's process.
+        /// A lab daemon as far as a restart goes: it answers, it runs a
+        /// machine, and a `shutdown` stops that machine and ends the
+        /// daemon's process.
         struct Successor {
             pid: u32,
             machine_running: AtomicBool,
@@ -1511,19 +1511,13 @@ mod tests {
                 req: LabRequest,
                 _s: &Streamer,
             ) -> Result<serde_json::Value, CommandError> {
-                match req {
-                    LabRequest::MachineStart { .. } => {
-                        self.machine_running.store(true, Ordering::SeqCst);
-                    }
-                    LabRequest::Shutdown {} => {
-                        self.shutdowns.fetch_add(1, Ordering::SeqCst);
-                        self.machine_running.store(false, Ordering::SeqCst);
-                        let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(self.pid as i32),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                    }
-                    _ => {}
+                if let LabRequest::Shutdown {} = req {
+                    self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                    self.machine_running.store(false, Ordering::SeqCst);
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(self.pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
                 }
                 Ok(serde_json::json!(true))
             }
@@ -1605,16 +1599,17 @@ mod tests {
                 .unwrap();
 
             // The first command's `up` boots its machine on the successor.
-            LabClient::connect(&socket)
-                .await
-                .unwrap()
-                .send(LabRequest::MachineStart {
-                    machine: "a".into(),
-                    record: Vec::new(),
-                })
-                .await
-                .unwrap();
-            assert!(successor.machine_running.load(Ordering::SeqCst));
+            // Set here and not sent as `machine.start`: the protocol report
+            // would list the supervisor as a caller of that command.
+            successor.machine_running.store(true, Ordering::SeqCst);
+            assert!(
+                LabClient::connect(&socket)
+                    .await
+                    .unwrap()
+                    .send(LabRequest::Ping {})
+                    .await
+                    .is_ok()
+            );
 
             // The second command's restart, decided against the first daemon.
             let reply = SupClient::connect(&crate::paths::supervisor_socket())
