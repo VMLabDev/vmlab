@@ -1433,9 +1433,9 @@ impl VmInstance {
                         .context("staging OVMF VARS template")?;
                     std::fs::copy(&fw.vars_template, staged.path())
                         .context("copying OVMF VARS template")?;
-                    staged
-                        .persist_noclobber(&store)
-                        .with_context(|| format!("publishing OVMF VARS store {}", store.display()))?;
+                    staged.persist_noclobber(&store).with_context(|| {
+                        format!("publishing OVMF VARS store {}", store.display())
+                    })?;
                 }
                 if boot == super::vars_boot::LastBoot::Secure {
                     super::vars_boot::write(&record, boot)?;
