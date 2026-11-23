@@ -102,6 +102,11 @@ pub struct LabRuntime {
     /// verifies the agent itself, and the artefact it seals must carry the
     /// agent the build staged, not one pushed over it mid-build.
     pub agent_updates: std::sync::atomic::AtomicBool,
+    /// Whether a silent ISA-serial guest may get the host's fallback hello
+    /// on COM1 (#678). A template build turns this off: Windows 9x Setup
+    /// probes COM1 for a serial mouse and takes the hello for one, and the
+    /// agent a build installs speaks first, so it needs none.
+    pub fallback_hello: std::sync::atomic::AtomicBool,
     /// Machines whose readiness waits on an agent refresh (§19.4), and who
     /// runs it: the machine's own
     /// [`before_ready`](super::machine::LabServices::before_ready) when
@@ -579,6 +584,7 @@ impl LabRuntime {
             pre_provision: std::sync::RwLock::new(None),
             provisions_wait_ready: std::sync::atomic::AtomicBool::new(true),
             agent_updates: std::sync::atomic::AtomicBool::new(true),
+            fallback_hello: std::sync::atomic::AtomicBool::new(true),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
             active_captures: std::sync::Mutex::default(),
@@ -657,6 +663,7 @@ impl LabRuntime {
             // which a test must not depend on. The tests of the refresh turn
             // it on and supply their own asset.
             agent_updates: std::sync::atomic::AtomicBool::new(false),
+            fallback_hello: std::sync::atomic::AtomicBool::new(true),
             deferred_refresh: std::sync::Mutex::new(HashMap::new()),
             first_boots: std::sync::Mutex::default(),
             active_captures: std::sync::Mutex::default(),
@@ -4084,6 +4091,11 @@ impl crate::labd::machine::LabServices for LabRuntime {
         // cancellable download tasks that outlive the call — which a `&self`
         // trait method cannot produce; hence [`LabRuntime::arc`].
         self.arc().ensure_pulled(&[machine.to_string()], None).await
+    }
+
+    fn fallback_hello(&self) -> bool {
+        self.fallback_hello
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn ensure_shares(&self) {

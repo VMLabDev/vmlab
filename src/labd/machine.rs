@@ -172,6 +172,14 @@ pub trait LabServices: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether a silent ISA-serial guest of this lab may get the fallback
+    /// hello at all ([`AgentSlot::arm_fallback_hello`]). A template build
+    /// answers no: its guest runs an installer, and the agent it installs
+    /// announces itself.
+    fn fallback_hello(&self) -> bool {
+        true
+    }
+
     /// Make sure the lab's shared-folder server is serving. Idempotent.
     async fn ensure_shares(&self);
 
@@ -1067,9 +1075,9 @@ pub(super) struct AgentSlot {
     /// Whether the channel is ISA serial, where the guest speaks first
     /// ([`Greeting::GuestFirst`]).
     guest_first: std::sync::atomic::AtomicBool,
-    /// When a silent ISA-serial guest last got a fallback hello, so an
-    /// agent-less guest sees one at most every [`LEGACY_HELLO_INTERVAL`].
-    fallback_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// What is left of the fallback hellos a silent ISA-serial guest may
+    /// get ([`FallbackHello`]). Unarmed until the machine's start arms it.
+    fallback: std::sync::Mutex<FallbackHello>,
     handle: tokio::sync::Mutex<Option<AgentHandle>>,
     failed_at: tokio::sync::Mutex<Option<std::time::Instant>>,
     /// The version the last successful handshake reported, kept apart from
@@ -1095,7 +1103,7 @@ impl Default for AgentSlot {
     fn default() -> Self {
         Self {
             guest_first: std::sync::atomic::AtomicBool::new(false),
-            fallback_at: std::sync::Mutex::new(None),
+            fallback: std::sync::Mutex::new(FallbackHello::default()),
             handle: tokio::sync::Mutex::new(None),
             failed_at: tokio::sync::Mutex::new(None),
             answered: std::sync::Mutex::new(None),
@@ -1132,22 +1140,42 @@ impl AgentSlot {
         );
     }
 
+    /// Arm the fallback hello for the boot that starts now
+    /// ([`FallbackHello`]). `agent_expected` is whether this guest is known
+    /// to hold an agent: its template records one, and it is not the VM of
+    /// a template build. Without it the host never speaks first on COM1.
+    pub fn arm_fallback_hello(&self, agent_expected: bool) {
+        *self.fallback.lock_recover() = FallbackHello::armed(agent_expected);
+    }
+
+    /// [`arm_fallback_hello`](Self::arm_fallback_hello) for an expected
+    /// agent, as if the boot had started at `start`.
+    #[cfg(test)]
+    pub(super) fn arm_fallback_hello_since(&self, start: std::time::Instant) {
+        *self.fallback.lock_recover() = FallbackHello::armed_since(true, start);
+    }
+
+    /// The fallback hellos this boot has left.
+    #[cfg(test)]
+    pub(super) fn fallback_hellos_left(&self) -> u32 {
+        self.fallback.lock_recover().tries_left
+    }
+
     /// How this handshake may greet the guest. On ISA serial the host waits
     /// for the guest's first byte, which every current agent sends about
     /// once a second. An agent sealed into a template before that never
-    /// speaks first, so a silent guest still gets a hello after the wait,
-    /// but only once per [`LEGACY_HELLO_INTERVAL`]: a guest with no agent
-    /// yet (Windows 9x Setup probing COM1 for a mouse) sees a hello rarely,
-    /// and only after a full wait.
+    /// speaks first, so a silent guest that is expected to hold an agent
+    /// still gets a hello after the wait, from the budget of
+    /// [`FallbackHello`]. A guest with no agent yet (Windows 9x Setup
+    /// probing COM1 for a mouse) never gets one.
     fn greeting(&self) -> Greeting {
         if !self.guest_first.load(std::sync::atomic::Ordering::Relaxed) {
             return Greeting::HostFirst;
         }
-        let mut last = self.fallback_at.lock_recover();
-        let fallback = last.is_none_or(|at| at.elapsed() >= LEGACY_HELLO_INTERVAL);
-        if fallback {
-            *last = Some(std::time::Instant::now());
-        }
+        let fallback = self
+            .fallback
+            .lock_recover()
+            .take_try(std::time::Instant::now());
         Greeting::GuestFirst { fallback }
     }
 
@@ -1378,6 +1406,9 @@ impl AgentSlot {
     }
 
     fn note_answered(&self, handle: &AgentHandle) {
+        if handle.answered_fallback_hello() {
+            self.fallback.lock_recover().answered();
+        }
         *self.answered.lock_recover() = Some(handle.info().agent_version);
     }
 
@@ -1415,9 +1446,77 @@ impl AgentSlot {
 }
 
 /// The least time between two fallback hellos to a silent ISA-serial guest
-/// ([`AgentSlot::greeting`]): how late an agent that never speaks first can
-/// be found, against how often an agent-less guest has a hello offered.
+/// ([`FallbackHello`]).
 pub const LEGACY_HELLO_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long after a machine's start the first fallback hello may go out:
+/// before that the guest is in its firmware and boot loader, and no agent
+/// can be there to read it.
+pub const LEGACY_HELLO_BOOT_DELAY: Duration = Duration::from_secs(30);
+
+/// How many fallback hellos one boot gets. With the delay and the interval
+/// they span the first minutes after a start, which is when a sealed agent
+/// comes up, and then the host is silent on COM1 again.
+pub const LEGACY_HELLO_TRIES: u32 = 6;
+
+/// The fallback hellos a silent ISA-serial guest may still get.
+///
+/// On ISA serial the guest speaks first, so the host leaves nothing in COM1
+/// for a serial mouse probe to read ("VMLB" holds the `M` a Microsoft mouse
+/// answers with; Windows 9x Setup installs a mouse driver or faults on it).
+/// An agent sealed into a template before the announcement never speaks
+/// first and needs the host's hello. So the hello goes out only where such
+/// an agent can be: the guest is expected to hold an agent, the boot is at
+/// least [`LEGACY_HELLO_BOOT_DELAY`] old, at most [`LEGACY_HELLO_TRIES`]
+/// times, [`LEGACY_HELLO_INTERVAL`] apart. An agent that answered one has
+/// shown what it is, and gets a fresh budget for its next reconnect (a
+/// guest reboot, a snapshot restore).
+#[derive(Debug, Default)]
+struct FallbackHello {
+    /// When the boot this budget belongs to started, if a hello may go out
+    /// in it at all.
+    armed_at: Option<std::time::Instant>,
+    tries_left: u32,
+    last: Option<std::time::Instant>,
+}
+
+impl FallbackHello {
+    fn armed(agent_expected: bool) -> Self {
+        Self::armed_since(agent_expected, std::time::Instant::now())
+    }
+
+    fn armed_since(agent_expected: bool, start: std::time::Instant) -> Self {
+        Self {
+            armed_at: agent_expected.then_some(start),
+            tries_left: LEGACY_HELLO_TRIES,
+            last: None,
+        }
+    }
+
+    /// Whether the handshake dialled at `now` may end its wait with a
+    /// hello, taking one try if so.
+    fn take_try(&mut self, now: std::time::Instant) -> bool {
+        let Some(armed_at) = self.armed_at else {
+            return false;
+        };
+        let due = now.saturating_duration_since(armed_at) >= LEGACY_HELLO_BOOT_DELAY
+            && self
+                .last
+                .is_none_or(|at| now.saturating_duration_since(at) >= LEGACY_HELLO_INTERVAL);
+        if !due || self.tries_left == 0 {
+            return false;
+        }
+        self.tries_left -= 1;
+        self.last = Some(now);
+        true
+    }
+
+    /// An agent answered a fallback hello: it is one that never speaks
+    /// first, so its next reconnect needs the hello again.
+    fn answered(&mut self) {
+        self.tries_left = LEGACY_HELLO_TRIES;
+    }
+}
 
 /// How long a cached connection that missed its first ping still gets to
 /// answer, while it stays open, before a connect replaces it.
@@ -1610,22 +1709,48 @@ mod tests {
     /// that same connection — its sessions intact — instead of replacing it
     /// at the 2 s mark.
 
+    /// **No host bytes before the guest is there, or in a build** (#678).
+    /// A slot nobody armed, and one armed for a guest with no agent
+    /// expected (a template build, an install from an ISO), never allow
+    /// the fallback hello, however long the guest stays silent.
     #[test]
-    fn isa_serial_offers_a_silent_guest_one_fallback_hello_per_interval() {
+    fn isa_serial_never_offers_a_hello_where_no_agent_is_expected() {
         use crate::profiles::AgentTransport;
+        let late = std::time::Instant::now() + Duration::from_secs(24 * 3600);
         let slot = AgentSlot::for_transport(AgentTransport::IsaSerial);
-        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: true });
-        // Every probe inside the interval waits for the guest and gives up.
-        for _ in 0..3 {
-            assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: false });
-        }
-        *slot.fallback_at.lock_recover() = Some(std::time::Instant::now() - LEGACY_HELLO_INTERVAL);
-        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: true });
+        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: false });
+        slot.arm_fallback_hello(false);
+        assert_eq!(slot.greeting(), Greeting::GuestFirst { fallback: false });
+        assert!(!slot.fallback.lock_recover().take_try(late));
+        assert!(!FallbackHello::default().take_try(late));
         assert_eq!(
             AgentSlot::for_transport(AgentTransport::VirtioSerial).greeting(),
             Greeting::HostFirst
         );
     }
+
+    /// **A sealed silent agent still gets its hello after boot, a limited
+    /// number of times** (#678): none inside the boot delay, then one per
+    /// interval until the tries are gone, and a fresh budget only once an
+    /// agent answered one.
+    #[test]
+    fn isa_serial_offers_an_expected_agent_a_bounded_number_of_hellos_after_boot() {
+        let start = std::time::Instant::now();
+        let mut budget = FallbackHello::armed_since(true, start);
+        assert!(!budget.take_try(start));
+        assert!(!budget.take_try(start + LEGACY_HELLO_BOOT_DELAY - Duration::from_secs(1)));
+        let mut now = start + LEGACY_HELLO_BOOT_DELAY;
+        for _ in 0..LEGACY_HELLO_TRIES {
+            assert!(budget.take_try(now));
+            // Every probe inside the interval waits for the guest and gives up.
+            assert!(!budget.take_try(now + Duration::from_secs(1)));
+            now += LEGACY_HELLO_INTERVAL;
+        }
+        assert!(!budget.take_try(now + Duration::from_secs(3600)));
+        budget.answered();
+        assert!(budget.take_try(now + Duration::from_secs(3600)));
+    }
+
     #[tokio::test]
     async fn a_connect_keeps_a_slow_agents_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
