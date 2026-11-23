@@ -41,7 +41,7 @@ Two facts are used by several findings:
 | F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab (fixed, card #571) |
 | F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again (fixed, card #571) |
 | F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
-| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown |
+| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown (fixed, card #572) |
 | F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started |
 | F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses |
 | F14 | wrong result | A `labs.json` that does not parse is read as an empty registry |
@@ -432,6 +432,15 @@ Two facts are used by several findings:
   while it waits on a lab release send `LabEnsure` for another name. The
   request must be refused with the "shutting down" conflict. Today it
   spawns `__labd`.
+- Fixed in card #572. `teardown` in `src/supervisor/mod.rs` sets
+  `shutting_down` itself, so the signal path closes the supervisor as the
+  `shutdown` request does. For the smaller gap, `ensure_lab_locked` checks
+  the flag under the name's lock, and `teardown` releases every name that
+  holds an `ensure` lock as well as every registered one: an ensure that
+  passed the check took its lock before the flag was set, so the teardown
+  waits on that lock and releases the daemon it registered. The proof test
+  covers both: the late `lab.ensure` is refused, and a daemon registered by
+  an ensure that was accepted before the teardown is released.
 
 ### F12. Two restarts of one daemon (wrong result)
 
