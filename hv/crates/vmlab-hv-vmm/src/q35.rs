@@ -941,9 +941,7 @@ mod tests {
     #[test]
     fn smram_lock_holds_until_reset() {
         for pc in [false, true] {
-            let pam = Arc::new(Mutex::new(
-                Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap(),
-            ));
+            let pam = Arc::new(Mutex::new(Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap()));
             let mut mch = if pc {
                 Mch::i440fx(pam.clone(), 128 << 20)
             } else {
@@ -983,9 +981,7 @@ mod tests {
 
     #[test]
     fn restored_smram_lock_keeps_smram_closed() {
-        let pam = Arc::new(Mutex::new(
-            Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap(),
-        ));
+        let pam = Arc::new(Mutex::new(Pam::new(&vec![0x5a; 0x40000], None, 0).unwrap()));
         let mut mch = Mch::new(pam.clone());
         let mut state = mch.save_state().unwrap();
         state[0x9d] = 0x5a;

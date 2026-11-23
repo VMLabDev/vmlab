@@ -1311,7 +1311,11 @@ pub fn build(
     if !virtio_ports.is_empty() {
         let built = add_pci(
             &pci_root,
-            factory.virtio_console(&virtio_ports, &ram.device_mem, wiring(desc.console_pci, 2, true)?),
+            factory.virtio_console(
+                &virtio_ports,
+                &ram.device_mem,
+                wiring(desc.console_pci, 2, true)?,
+            ),
             "virtio-console ports".to_string(),
         )?;
         place(built.function.clone(), desc.console_pci)?;
