@@ -5642,6 +5642,113 @@ lab "t" {
         );
     }
 
+    const DEV_WORKSPACE_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    /// Only `up` used to start a workspace syncer, so a dev machine booted
+    /// any other way ran with a workspace that did not sync and nothing that
+    /// said so (docs/reviews/dev-machines.md F3). A start outside `up` starts
+    /// the syncer, and one that is already there is kept, not replaced.
+    #[tokio::test]
+    async fn a_dev_machine_started_outside_up_gets_its_syncer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        assert!(!lab.workspaces.is_running("dev01").await);
+
+        lab.start_machine("dev01").await.unwrap();
+        assert_eq!(
+            lab.machine("dev01").unwrap().state().await,
+            PowerState::Running
+        );
+        let first = lab
+            .workspaces
+            .get("dev01")
+            .await
+            .expect("a start outside `up` starts the syncer");
+
+        // A second start of a running machine keeps the syncer it has: a
+        // replaced one would lose what its last pass knew.
+        lab.start_machine("dev01").await.unwrap();
+        let second = lab.workspaces.get("dev01").await.expect("still syncing");
+        assert!(Arc::ptr_eq(&first, &second), "the syncer was replaced");
+
+        // The partial `down` takes the syncer off, and `vm restart` puts one
+        // back, as `vm start` does.
+        lab.workspaces.stop("dev01").await;
+        lab.restart_machine("dev01", true, &quiet()).await.unwrap();
+        assert!(lab.workspaces.is_running("dev01").await);
+        lab.workspaces.stop_all().await;
+    }
+
+    /// A machine that runs with no syncer is not a machine that is down: no
+    /// flush can run, so nothing knows what its guest holds. Capture refuses
+    /// with no escape, and restore refuses without the discard flag (§19.6,
+    /// docs/reviews/dev-machines.md F3). An `up` whose provisioning failed
+    /// leaves a machine in this state.
+    #[tokio::test]
+    async fn a_capture_of_a_running_dev_machine_with_no_syncer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        // Control: a stopped machine with nothing on its ledger is captured.
+        lab.snapshot("dev01", "s").await.unwrap();
+
+        lab.start_machine("dev01").await.unwrap();
+        lab.workspaces.stop("dev01").await;
+        assert_eq!(
+            lab.machine("dev01").unwrap().state().await,
+            PowerState::Running
+        );
+
+        let captured = lab
+            .snapshot("dev01", "t")
+            .await
+            .expect_err("a capture of a running dev machine with no syncer is refused");
+        let said = format!("{captured:#}");
+        assert!(said.contains("workspace syncer is not running"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
+        assert!(!said.contains("--discard-guest-changes"), "{said}");
+
+        let restored = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("a restore without the flag is refused too");
+        let said = format!("{restored:#}");
+        assert!(said.contains("workspace syncer is not running"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(
+            !lab.workspaces.is_running("dev01").await,
+            "a refusal starts nothing"
+        );
+
+        // The flag is the developer's word that the guest copy may go. The
+        // machine still runs afterwards, so its syncer is started, and the
+        // ledger owes the re-seed that carries the host tree back.
+        lab.restore("dev01", "s", true).await.unwrap();
+        assert!(lab.workspaces.is_running("dev01").await);
+        lab.workspaces.stop_all().await;
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        assert!(ledger.reseed_owed, "the restore left its note");
+    }
+
     /// Who `up`'s agent refresh asks at all (§19.4), through the real `up`:
     /// a VM double seals an agent but has none answering, so a refresh that
     /// is attempted ends in a warning — and one that is not says nothing.
