@@ -271,6 +271,11 @@ pub mod fake {
         /// Paths whose pull fails, the same thing in the other direction.
         fail_pull: Vec<String>,
         edit_host_on_pull: Option<(std::path::PathBuf, String)>,
+        /// Sizes this guest reports in `lstat` in place of the true ones: the
+        /// guest's word about a size is only its word.
+        reported_size: BTreeMap<String, u64>,
+        /// How many file bytes this guest has handed across the seam.
+        delivered: u64,
         edit_guest_on_push: Option<(String, String)>,
         edit_after_rename: Option<(String, String)>,
         /// Paths the guest refuses to be read at all.
@@ -413,6 +418,20 @@ pub mod fake {
                 .expect("fake guest")
                 .fail_pull
                 .push(path.to_string());
+        }
+
+        /// Report `size` for `path` in `lstat`, whatever the file holds.
+        pub fn report_size(&self, path: &str, size: u64) {
+            self.inner
+                .lock()
+                .expect("fake guest")
+                .reported_size
+                .insert(path.to_string(), size);
+        }
+
+        /// The file bytes this guest has handed across the seam so far.
+        pub fn delivered(&self) -> u64 {
+            self.inner.lock().expect("fake guest").delivered
         }
 
         pub fn edit_host_on_pull(&self, path: std::path::PathBuf, body: &str) {
@@ -684,6 +703,7 @@ pub mod fake {
                 return Ok(None);
             };
             let (kind, size) = describe(node);
+            let size = guest.reported_size.get(path).copied().unwrap_or(size);
             Ok(Some(Attrs {
                 kind,
                 size,
@@ -756,10 +776,12 @@ pub mod fake {
                 bail!("the channel dropped while pulling {remote}");
             }
             let key = resolve(&guest, remote);
-            match guest.nodes.get(&key) {
-                Some((Node::File(bytes), _)) => Ok(std::fs::write(local, bytes)?),
-                _ => Err(anyhow!("no such file: {remote}")),
-            }
+            let Some((Node::File(bytes), _)) = guest.nodes.get(&key) else {
+                return Err(anyhow!("no such file: {remote}"));
+            };
+            std::fs::write(local, bytes)?;
+            guest.delivered += bytes.len() as u64;
+            Ok(())
         }
 
         async fn digest(&self, path: &str) -> Result<String> {

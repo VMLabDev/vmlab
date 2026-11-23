@@ -358,6 +358,35 @@ mod tests {
         assert!(copy.omitted.unwrap().contains("cannot read"));
     }
 
+    /// The cap is the host's, so it holds against a guest whose `lstat` says
+    /// one byte and whose file holds more than the cap: the copy is declined
+    /// as too large, and no more than the cap crosses the seam.
+    #[tokio::test]
+    async fn the_inline_cap_holds_whatever_size_the_guest_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/big.log", &"x".repeat(INLINE as usize + 1), 1);
+        guest.report_size("/src/big.log", 1);
+
+        let sides = one(
+            &guest,
+            &workspace(dir.path()),
+            "big.log",
+            &scratch.path().join("0"),
+        )
+        .await;
+        let copy = sides.guest.expect("it is there");
+        assert!(copy.text.is_none(), "{} bytes came back", copy.size);
+        let omitted = copy.omitted.expect("the bytes are declined by name");
+        assert!(omitted.contains("inline cap"), "{omitted}");
+        assert!(
+            guest.delivered() <= INLINE,
+            "{} bytes crossed the seam, over the {INLINE}-byte cap",
+            guest.delivered()
+        );
+    }
+
     /// Bytes nobody would read are declined by name, and the two sides are
     /// still compared by the thing that answers the question.
     #[tokio::test]
