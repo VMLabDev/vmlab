@@ -1946,23 +1946,23 @@ mod tests {
         img.resize_grow(2 * span).unwrap();
         let mut buf = vec![0xffu8; 4096];
         img.read_at(span, &mut buf).unwrap();
-        assert_eq!(buf, vec![0u8; 4096]);
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
         img.flush().unwrap();
         let path = img.path.clone();
         drop(img);
         let mut reopened = Qcow2Image::open(&path, true).unwrap();
         let mut buf = vec![0xffu8; 4096];
         reopened.read_at(span, &mut buf).unwrap();
-        assert_eq!(buf, vec![0u8; 4096]);
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
     }
 
     #[test]
     fn a_grown_overlay_reads_zeros_where_its_longer_backing_has_data() {
         let dir = tempfile::tempdir().unwrap();
         let backing_path = dir.path().join("backing.qcow2");
-        let mut backing = Qcow2Image::create(&backing_path, 2 << 30, 16, None).unwrap();
-        let span = backing.l2_span();
-        assert_eq!(2 * span, 2 << 30);
+        let span = 512 << 20;
+        let mut backing = Qcow2Image::create(&backing_path, 2 * span, 16, None).unwrap();
+        assert_eq!(backing.l2_span(), span);
         backing.write_at(span, &[0x55; 4096]).unwrap();
         // A tail inside the last cluster of the overlay's old size.
         backing.write_at(span - 4096, &[0x66; 8192]).unwrap();
@@ -1984,14 +1984,14 @@ mod tests {
         assert_eq!(buf, want);
         let mut buf = vec![0xffu8; 4096];
         overlay.read_at(span, &mut buf).unwrap();
-        assert_eq!(buf, vec![0u8; 4096]);
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
         overlay.flush().unwrap();
         let path = overlay.path.clone();
         drop(overlay);
         let mut reopened = Qcow2Image::open(&path, true).unwrap();
         let mut buf = vec![0xffu8; 4096];
         reopened.read_at(span, &mut buf).unwrap();
-        assert_eq!(buf, vec![0u8; 4096]);
+        assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
     }
 
     #[test]
