@@ -71,6 +71,19 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F1. An attach takes a device away from another VM that holds it
 
+- Status: fixed by card #662. `claim_interface` now sends
+  `USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER` with the name `usbfs`, so the
+  kernel answers EBUSY for an interface another usbdevfs user holds, and the
+  attach fails with an error that says so. Proof tests:
+  `a_claim_leaves_the_claim_of_another_usbfs_user_alone` (`usb/host/fs.rs`),
+  `a_claim_another_usbfs_user_holds_is_refused_by_name` (`usb/host/mod.rs`)
+  and `open_refuses_a_device_another_usbfs_user_holds` (`usb_loopback.rs`,
+  which needs root and a `dummy_hcd` gadget and skips without them). The
+  kernel test was not run: the build host has no `dummy_hcd`. The holes in
+  vmlab's own "who holds it" list stay as they are. They now end in the
+  kernel's refusal and not in a taken device. The second proposed test (two
+  labs, no supervisor) was not written: the refusal comes from the kernel,
+  and the fake adapter has none.
 - Where: `usb/host/fs.rs:137-145` (`claim_interface` sends
   `USBDEVFS_DISCONNECT_CLAIM` with `flags: 0`). The constant
   `USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER` exists at `usb/host/sys.rs:209`
@@ -137,6 +150,12 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F3. A guest stops its VMM with one UHCI queue head that nests itself
 
+- Status: fixed by card #664. `queue` no longer calls itself for a nested
+  queue head. It follows the element link in its own loop, so `MAX_ELEMENTS`
+  bounds the nesting together with the TDs of one call. Proof test:
+  `a_queue_head_nested_in_itself_stays_bounded` (`usb/uhci/tests.rs`), which
+  also covers two queue heads nested in each other. Before the fix it ended
+  with a stack overflow (SIGABRT) in a debug build.
 - Where: `usb/uhci.rs:396-409` (`queue`), line 406.
 - Why it is a fault: a queue head whose element link has the Q bit set makes
   `queue` call itself on the linked queue head. The `MAX_ELEMENTS` limit at
