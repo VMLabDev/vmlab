@@ -75,7 +75,7 @@ hostile guest or peer, wrong result, cosmetic.
 | Code | Severity | Fault |
 | --- | --- | --- |
 | F1 | security against a hostile guest | The firmware debug port (0x402) writes the serial log file past its size cap |
-| F2 | security, wrong result | `secure_boot = true` on a VM that already has a variable store boots the secure-boot firmware on that store, blank or guest-written |
+| F2 | security, wrong result | `secure_boot = true` on a VM that already has a variable store boots the secure-boot firmware on that store, blank or guest-written (fixed, card #734) |
 | F3 | security inside the guest | aarch64 secure boot keeps its variable store on flash the guest OS can write |
 | F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start |
 | F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start |
@@ -123,6 +123,15 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 - Confidence: high.
 
 ### F2. Turning secure boot on later boots the old variable store
+
+- Status: fixed by card #734. The start is refused by name. Each start
+  writes `OVMF_VARS.boot` beside the store, saying whether it boots with
+  secure boot, and a secure-boot start on a store last booted without it
+  does not launch (`src/labd/vars_boot.rs`). Offline snapshots and freezes
+  carry the record with the store. A store with no record, from before the
+  fix, is refused only when it equals the blank template under the default
+  key store. The other outcome, replacing the store, was not taken: it
+  would remove the VM's boot entries without the operator asking.
 
 - Where: `src/labd/vm.rs:886-896` and `:1365-1374`,
   `src/qemu/firmware.rs:470-495` (`lookup_for_vars`).

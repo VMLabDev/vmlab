@@ -245,6 +245,11 @@ impl VmDirs {
     pub fn ovmf_vars(&self) -> PathBuf {
         self.local.join("OVMF_VARS.fd")
     }
+    /// Whether the variable store's last start had secure boot
+    /// ([`super::vars_boot`]).
+    pub fn ovmf_vars_boot(&self) -> PathBuf {
+        self.local.join(super::vars_boot::FILE)
+    }
     pub fn tpm_state(&self) -> PathBuf {
         self.local.join("tpm-state")
     }
@@ -257,6 +262,7 @@ impl VmDirs {
         super::snapshot_state::FirmwareState::new(
             self.snapshot_state(),
             self.ovmf_vars(),
+            self.ovmf_vars_boot(),
             self.tpm_state(),
         )
     }
@@ -882,7 +888,9 @@ impl VmInstance {
     /// The UEFI CODE/VARS pair for this VM, or `None` under SeaBIOS: the
     /// host config's `firmware_dir`, else vmlab's bundled firmware, else the
     /// host's (PRD §5.2). A VM whose VARS copy already exists keeps a CODE
-    /// build of that store's layout. Firmware discovery probes the host
+    /// build of that store's layout, and is refused the secure-boot build
+    /// where nothing vouches for the store ([`super::vars_boot`]). Firmware
+    /// discovery probes the host
     /// filesystem, so it happens here — where the runtime paths are
     /// assembled — rather than inside the argv builder, which is a pure
     /// function of what it is handed (ADR-0008).
@@ -897,7 +905,24 @@ impl VmInstance {
         let context = || format!("{}: UEFI firmware", self.cfg.name);
         if let Ok(m) = std::fs::metadata(self.dirs.ovmf_vars()) {
             // The VM's own store exists: it is never replaced, whatever the
-            // key store says now — it holds what the guest enrolled.
+            // key store says now — it holds what the guest enrolled. Which
+            // is why secure boot does not start on one that was booted
+            // without it: its size says nothing of what it holds.
+            if t.resolved.secure_boot {
+                let store = self.dirs.ovmf_vars();
+                let blank = (pairing == qemu::firmware::Pairing::Enrolled)
+                    .then(|| {
+                        sources.lookup_for_vars(arch, qemu::firmware::Pairing::Plain, m.len())
+                    })
+                    .and_then(Result::ok)
+                    .map(|fw| fw.vars_template);
+                let record = super::vars_boot::read(&self.dirs.ovmf_vars_boot())?;
+                if let Some(why) =
+                    super::vars_boot::refusal(&self.cfg.name, &store, record, blank.as_deref())?
+                {
+                    bail!("{why}");
+                }
+            }
             return Ok(Some(
                 sources
                     .lookup_for_vars(arch, pairing, m.len())
@@ -1391,12 +1416,25 @@ impl VmInstance {
             // Per-VM writable OVMF VARS from the firmware template — copied
             // once, at the VM's first start; an existing copy is never
             // replaced, so a VM keeps its enrolled keys and boot entries.
+            // Beside it goes how this start boots it. A start without
+            // secure boot says so before the store exists or the guest
+            // runs; one with it only once the store is in place, so no
+            // order of failures leaves a record vouching for a store it
+            // never saw.
             let firmware = self.uefi_firmware(&t)?;
-            if let Some(fw) = &firmware
-                && !self.dirs.ovmf_vars().exists()
-            {
-                std::fs::copy(&fw.vars_template, self.dirs.ovmf_vars())
-                    .context("copying OVMF VARS template")?;
+            if let Some(fw) = &firmware {
+                let boot = super::vars_boot::LastBoot::of(t.resolved.secure_boot);
+                let record = self.dirs.ovmf_vars_boot();
+                if boot == super::vars_boot::LastBoot::Plain {
+                    super::vars_boot::write(&record, boot)?;
+                }
+                if !self.dirs.ovmf_vars().exists() {
+                    std::fs::copy(&fw.vars_template, self.dirs.ovmf_vars())
+                        .context("copying OVMF VARS template")?;
+                }
+                if boot == super::vars_boot::LastBoot::Secure {
+                    super::vars_boot::write(&record, boot)?;
+                }
             }
 
             if t.resolved.tpm {
