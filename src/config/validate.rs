@@ -3602,6 +3602,81 @@ lab "l" {
         );
     }
 
+    /// A share's host directory may not hold the lab's state directory, or
+    /// lie inside it: the guest would reach `.vmlab/smb/smb.conf`, which
+    /// `smbd` reads again when it changes, and every machine's disks
+    /// (docs/reviews/smb.md F1). The transport does not matter — `auto` can
+    /// land on SMB, and a virtiofs guest writes the same files.
+    #[test]
+    fn a_share_over_the_lab_state_directory_is_refused() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { }
+  vm "a" { template = "x86_64/t" nic { segment = "s" }
+    share { host = "." guest = "/mnt/x" transport = "smb" } }
+}"#,
+            "state directory",
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("lab/.vmlab/smb")).unwrap();
+        std::fs::create_dir_all(root.path().join("lab/src")).unwrap();
+        // A link into the state directory is the state directory.
+        std::os::unix::fs::symlink(".vmlab", root.path().join("lab/link")).unwrap();
+        let lab_root = root.path().join("lab");
+        let share_errs = |block: &str| -> Vec<String> {
+            let src = format!(
+                r#"import <vmlab.wcl>
+lab "l" {{
+  segment "s" {{ }}
+  {block}
+}}"#
+            );
+            let f = load_lab_source(&src, "<test>", &lab_root).expect("source should parse");
+            validate(&f, &Permissive)
+                .into_iter()
+                .map(|i| i.message)
+                .collect()
+        };
+        let vm = |host: &str, transport: &str| {
+            format!(
+                r#"vm "a" {{ template = "x86_64/t" nic {{ segment = "s" }}
+    share {{ host = "{host}" guest = "/mnt/x" transport = "{transport}" }} }}"#
+            )
+        };
+        let parent = root.path().display().to_string();
+        for host in [".", "..", parent.as_str(), ".vmlab", ".vmlab/smb", "link"] {
+            for transport in ["smb", "auto", "virtiofs"] {
+                let es = share_errs(&vm(host, transport));
+                assert!(
+                    es.iter().any(|m| m.contains("state directory")),
+                    "{host} over {transport} → {es:#?}"
+                );
+            }
+            let es = share_errs(&format!(
+                r#"container "c" {{ image = "nginx" nic {{ segment = "s" }}
+    volume {{ host = "{host}" target = "/data" }} }}"#
+            ));
+            assert!(
+                es.iter().any(|m| m.contains("state directory")),
+                "volume {host} → {es:#?}"
+            );
+        }
+        // A directory beside the state directory is what a share is for, and
+        // a named volume lives under the state directory by vmlab's own hand.
+        for transport in ["smb", "auto", "virtiofs"] {
+            let es = share_errs(&vm("src", transport));
+            assert!(es.is_empty(), "src over {transport} → {es:#?}");
+        }
+        let es = share_errs(
+            r#"container "c" { image = "nginx" nic { segment = "s" }
+    volume { host = "src" target = "/data" }
+    volume { name = "data" target = "/named" } }"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
     #[test]
     fn virtiofs_shares_do_not_need_nics() {
         // vhost-user-fs is a local device — no segment involved (PRD §7.5).
