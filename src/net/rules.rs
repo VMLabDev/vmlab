@@ -404,12 +404,18 @@ impl RuleSet {
 
     /// Evaluate a guest-originated IPv4 packet. Non-IPv4 / unparseable input
     /// passes (it is not this layer's job to police framing).
+    ///
+    /// The frame's source is not given, so no redirect for one source
+    /// applies: what a test of the declared rules, or a fuzz target, asks.
+    #[cfg(any(test, fuzzing))]
     pub fn eval(&self, ipv4_packet: &[u8]) -> Verdict {
         self.eval_from(None, ipv4_packet)
     }
 
-    /// [`RuleSet::eval`] for a packet whose frame came from the guest NIC
-    /// `source`, so the redirects of [`RuleSet::add_redirect_from`] apply.
+    /// Evaluate a guest-originated IPv4 packet whose frame came from the
+    /// guest NIC `source`, so the redirects of
+    /// [`RuleSet::add_redirect_from`] apply. Non-IPv4 / unparseable input
+    /// passes.
     pub fn eval_from(&self, source: Option<MacAddr>, ipv4_packet: &[u8]) -> Verdict {
         let Some(ip) = Ipv4View::parse(ipv4_packet) else {
             return Verdict::Pass;

@@ -120,12 +120,11 @@ pub struct SmbPlan {
     /// taken by the time `smbd` binds it. The executor works down the list,
     /// one server after the other.
     pub host_ports: Vec<u16>,
+    /// One server each. An export's segment needs `gateway:445 →
+    /// 127.0.0.1:<the port that machine's smbd took>` for that machine's
+    /// NIC, so a guest mounting `\\<gateway>\<share>` reaches its own smbd —
+    /// with or without `nat` on the segment.
     pub exports: Vec<SmbExport>,
-    /// Segments needing `gateway:445 → 127.0.0.1:<the port a machine's smbd
-    /// took>` for each of their sharing machines, so a guest mounting
-    /// `\\<gateway>\<share>` reaches its own smbd — with or without `nat` on
-    /// the segment.
-    pub gateway_segments: Vec<String>,
     /// Containers whose volumes mount over CIFS, with the gateway their
     /// cinit mounts from.
     pub volume_gateways: Vec<(String, Ipv4Addr)>,
@@ -255,7 +254,6 @@ impl ShareInputs<'_> {
 struct Building {
     virtiofs: Vec<VirtiofsShare>,
     exports: Vec<SmbExport>,
-    gateway_segments: Vec<String>,
     volume_gateways: Vec<(String, Ipv4Addr)>,
     skipped: Vec<Skip>,
     warnings: Vec<String>,
@@ -300,9 +298,6 @@ impl Building {
             gateway,
             shares,
         });
-        if !self.gateway_segments.iter().any(|s| s == segment) {
-            self.gateway_segments.push(segment.to_string());
-        }
         Some(gateway)
     }
 }
@@ -426,7 +421,6 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         Some(SmbPlan {
             host_ports: free_ports(ports, b.exports.len())?,
             exports: b.exports,
-            gateway_segments: b.gateway_segments,
             volume_gateways: b.volume_gateways,
         })
     };
@@ -915,7 +909,20 @@ lab "l" {
             ]),
         };
         let p = plan_on(&lab, &host, &AllFree).unwrap();
-        assert_eq!(p.smb.unwrap().gateway_segments, ["lan", "dmz"]);
+        let segments: Vec<(String, String)> = p
+            .smb
+            .unwrap()
+            .exports
+            .into_iter()
+            .map(|e| (e.machine, e.segment))
+            .collect();
+        assert_eq!(
+            segments,
+            [
+                ("web".to_string(), "lan".to_string()),
+                ("app".to_string(), "dmz".to_string())
+            ]
+        );
     }
 
     /// What serves virtio-fs is per machine: a vmlab-hv VM's in-process
