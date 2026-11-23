@@ -273,6 +273,32 @@ impl DhcpServer {
         self.leases.values().any(|l| l.ip == ip && l.expiry > now)
     }
 
+    /// The address the lab daemon may take `mac`'s NIC to hold, when its
+    /// guest says the NIC carries `claimed` (docs/reviews/containers.md F1).
+    /// A guest writes that report, so it decides nothing this server can
+    /// decide: a NIC with a valid lease holds the leased address, whatever
+    /// its guest says. A NIC with no lease (a static address, or a lease
+    /// table lost with the daemon that kept it) is believed, as a frame from
+    /// it is, unless `claimed` is this server's own address, or is leased or
+    /// reserved to another NIC. `None` is a claim to refuse.
+    pub fn vouched(&self, mac: MacAddr, claimed: Ipv4Addr) -> Option<Ipv4Addr> {
+        if let Some(leased) = self.lease_of(mac) {
+            return Some(leased);
+        }
+        let reserved_to_another = self
+            .config
+            .reservations
+            .iter()
+            .any(|(m, ip)| *ip == claimed && *m != mac);
+        if claimed == self.config.gateway
+            || reserved_to_another
+            || self.leased_to_another(claimed, mac)
+        {
+            return None;
+        }
+        Some(claimed)
+    }
+
     // -- message handling -----------------------------------------------------
 
     fn on_discover(&mut self, req: &BootpRequest) -> Option<Vec<u8>> {
@@ -414,7 +440,9 @@ impl DhcpServer {
             && !self.leases.values().any(|l| l.ip == ip && l.expiry > now)
     }
 
-    fn grant(&mut self, mac: MacAddr, ip: Ipv4Addr) {
+    /// Give `mac` a full lease of `ip`, as an ACK does. Visible to the crate
+    /// for the tests that need a lease table without a client.
+    pub(crate) fn grant(&mut self, mac: MacAddr, ip: Ipv4Addr) {
         self.hold(
             mac,
             ip,
@@ -1269,5 +1297,36 @@ mod tests {
             s.handle(&decline(Ipv4Addr::from(0xC612_0000 + i)));
         }
         assert_eq!(s.declined.len(), 0);
+    }
+
+    /// What the lab daemon may take a NIC to hold (containers review F1):
+    /// its lease whatever its guest claims, and with no lease the claim,
+    /// unless the address is another NIC's or the server's own.
+    #[test]
+    fn a_claim_never_outranks_a_lease() {
+        let mut c = config();
+        let reserved = Ipv4Addr::new(10, 213, 1, 50);
+        c.reservations.insert(mac(3), reserved);
+        let mut s = DhcpServer::new(c);
+        let victim = Ipv4Addr::new(10, 213, 1, 10);
+        let rogue = Ipv4Addr::new(10, 213, 1, 11);
+        s.grant(mac(1), victim);
+        s.grant(mac(2), rogue);
+
+        assert_eq!(s.vouched(mac(1), victim), Some(victim));
+        // A NIC with a lease holds the lease, whatever is claimed for it.
+        assert_eq!(s.vouched(mac(2), victim), Some(rogue));
+        assert_eq!(s.vouched(mac(2), GW), Some(rogue));
+
+        // A NIC with no lease: a free address is believed.
+        let free = Ipv4Addr::new(10, 213, 1, 200);
+        assert_eq!(s.vouched(mac(4), free), Some(free));
+        // Another NIC's lease, another NIC's reservation and the server's
+        // own address are not.
+        assert_eq!(s.vouched(mac(4), victim), None);
+        assert_eq!(s.vouched(mac(4), reserved), None);
+        assert_eq!(s.vouched(mac(4), GW), None);
+        // The reservation's own NIC may claim it before it has the lease.
+        assert_eq!(s.vouched(mac(3), reserved), Some(reserved));
     }
 }

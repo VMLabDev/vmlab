@@ -497,17 +497,9 @@ impl Floppy {
                 self.result(vec![u8::from(self.lock) << 4]);
             }
             0x18 => self.result(vec![0x41]),
-            _ if opcode & 0xbf == 0x0a => {
-                self.start(Operation::ReadId, command);
-            }
-            _ if opcode & 0xbf == 0x0d => {
-                self.start(Operation::Format, command);
-            }
-            _ => match opcode & 0x1f {
-                0x02 | 0x06 | 0x0c => self.start(Operation::Read, command),
-                0x05 | 0x09 => self.start(Operation::Write, command),
-                0x16 => self.start(Operation::Verify, command),
-                _ => self.result(vec![0x80]),
+            _ => match data_operation(opcode) {
+                Some(operation) => self.start(operation, command),
+                None => self.result(vec![0x80]),
             },
         }
     }
@@ -792,6 +784,24 @@ fn lba(at: Position, sectors: u8) -> u64 {
         * SECTOR as u64
 }
 
+/// The data operation an opcode starts, for the opcodes that have an
+/// execution phase. `execute` starts a command by it and `restore_state`
+/// holds a saved command to it.
+fn data_operation(opcode: u8) -> Option<Operation> {
+    match opcode {
+        0x03 | 0x04 | 0x07 | 0x08 | 0x0e | 0x0f | 0x8f | 0xcf | 0x10 | 0x12 | 0x13 | 0x14
+        | 0x94 | 0x18 => None,
+        _ if opcode & 0xbf == 0x0a => Some(Operation::ReadId),
+        _ if opcode & 0xbf == 0x0d => Some(Operation::Format),
+        _ => match opcode & 0x1f {
+            0x02 | 0x06 | 0x0c => Some(Operation::Read),
+            0x05 | 0x09 => Some(Operation::Write),
+            0x16 => Some(Operation::Verify),
+            _ => None,
+        },
+    }
+}
+
 /// Bytes in the command phase, opcode included.
 fn command_length(opcode: u8) -> usize {
     match opcode {
@@ -933,8 +943,21 @@ impl Snapshot for Floppy {
             }
         }
         if let Some(execution) = &saved.execution {
+            // The operation must be the one the opcode starts: it decides
+            // which command bytes the execution reads. A sector in the PIO
+            // buffer belongs to a transfer, on a drive that holds a medium.
+            let transfer = matches!(
+                execution.operation,
+                Operation::Read | Operation::Write | Operation::Verify
+            );
             let valid = execution.command.len() >= 2
                 && execution.command.len() == command_length(execution.command[0])
+                && data_operation(execution.command[0]) == Some(execution.operation)
+                && (execution.pio.is_empty()
+                    || (transfer
+                        && self.drives[usize::from(execution.command[1] & 1)]
+                            .media
+                            .is_some()))
                 && (execution.pio.is_empty() || execution.pio.len() == SECTOR)
                 && (if execution.pio.is_empty() {
                     execution.pio_position == 0

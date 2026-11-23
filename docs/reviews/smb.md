@@ -34,7 +34,7 @@ be dropped.
 |------|----------|-------------------|
 | F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606) |
 | F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares (fixed, card #609) |
-| F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run |
+| F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run (fixed, card #615) |
 | F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path (fixed, card #610) |
 | F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609) |
 | F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory |
@@ -181,6 +181,13 @@ be dropped.
   on the paused clock that module's tests use. Assert that the payload
   handed to `unmountable` and the report's reason do not contain `S3CRET`.
   Today both contain it.
+
+- Fixed by card #615: a `MountStep` names the password its command line
+  carries (`secret`), and `run_plan` passes every text it reports about the
+  step through `MountStep::scrub`: the attempt errors, the reason of the
+  event, the log lines and the mount report. The password, as written and
+  percent-encoded, becomes `[redacted]`. The agent client's `exec` errors
+  still name the whole argv for its other callers.
 
 ### F4. One `smb1` share relaxes every share, and SMB1 lets a guest plant symlinks (security)
 
