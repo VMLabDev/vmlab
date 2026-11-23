@@ -369,6 +369,16 @@ hostile guest or peer, wrong result, cosmetic.
   `run_irq`, then the next `transfer(0x81, ..)` must be `Nak` and not
   `Stall`.
 - How bad: wrong result in the guest.
+- Status: fixed by card #670. The controller now sends `endpoint_dropped`
+  on Disable Slot, on a Configure Endpoint that drops, replaces or
+  deconfigures an endpoint, on a port reset, on HCRST and on a machine
+  reset. The host backend discards its in-flight URBs and its uncollected
+  completions in `set_config` (all but the control endpoint, which carries
+  the request) and in `reset`. A port reset leaves the slot's endpoint
+  contexts as they were, so a TD still on the ring is submitted again as a
+  new transfer. Tests: `every_endpoint_teardown_reaches_the_backend` in
+  `usb/tests.rs`, `set_config_forgets_in_flight_work` and
+  `reset_forgets_in_flight_and_uncollected_work` in `usb/host/mod.rs`.
 
 ### F10. A detach that fails drops the tracking while the device stays held
 

@@ -593,6 +593,17 @@ impl XhciController {
             }
         }
     }
+    /// Tell the backend on root port `port` (one-based, 0 for none) that
+    /// the guest ended the endpoints `endpoints` (xHCI context indices).
+    /// Every way an endpoint ends goes through here, so no in-flight
+    /// backend transfer outlives it and completes a later TD.
+    fn drop_endpoints(&mut self, port: usize, endpoints: std::ops::Range<u8>) {
+        if let Some(device) = port.checked_sub(1).and_then(|p| self.devices[p].as_mut()) {
+            for ep in endpoints {
+                device.endpoint_dropped(endpoint_address(ep));
+            }
+        }
+    }
     fn commands(&mut self) -> Result<(), DeviceError> {
         for _ in 0..BUDGET {
             if self.state.interrupters[self.interrupter].pending.len() >= BUDGET {
@@ -636,6 +647,7 @@ impl XhciController {
         let ep = ((t.control >> 16) & 31) as usize;
         match kind {
             10 => {
+                self.drop_endpoints(self.state.slots[slot].port, 1..32);
                 self.state.slots[slot] = Slot::default();
                 Ok((SUCCESS, slot))
             }
@@ -719,6 +731,7 @@ impl XhciController {
             if self.state.slots[slot].context[3] >> 27 < 2 {
                 return Ok(CONTEXT_ERROR);
             }
+            self.drop_endpoints(self.state.slots[slot].port, 2..32);
             for ep in &mut self.state.slots[slot].endpoints[2..] {
                 *ep = Endpoint::default();
             }
@@ -801,6 +814,11 @@ impl XhciController {
         }
         {
             for ep in 1..32 {
+                // A dropped endpoint, and one an add replaces with a new
+                // ring, both end what the backend has in flight for it.
+                if drop & (1 << ep) != 0 || (add & (1 << ep) != 0 && kind != 13) {
+                    self.drop_endpoints(self.state.slots[slot].port, ep as u8..ep as u8 + 1);
+                }
                 if drop & (1 << ep) != 0 {
                     self.state.slots[slot].endpoints[ep] = Endpoint::default();
                 }
@@ -1155,6 +1173,7 @@ impl XhciController {
             d.reset();
             value = (value & !((15 << 5) | (1 << 4) | (1 << 31))) | 2;
             value |= if v & (1 << 31) != 0 { 1 << 19 } else { 1 << 21 };
+            self.drop_endpoints(p + 1, 1..32);
         }
         self.set(off, value);
         if (value & 0xfe0000) & !(old & 0xfe0000) != 0 {
@@ -1166,6 +1185,9 @@ impl XhciController {
         match off {
             CMD => {
                 if v & 2 != 0 {
+                    for port in 1..=PORTS {
+                        self.drop_endpoints(port, 1..32);
+                    }
                     let pci = self.state.pci;
                     let msix = self.state.regs[MSIX / 4..MSIX / 4 + INTERRUPTERS * 4].to_vec();
                     self.state = Self::initial_state();
@@ -1554,12 +1576,25 @@ impl Snapshot for XhciController {
     }
 }
 
+/// The USB endpoint address of an xHCI endpoint context index: the control
+/// endpoint is address 0, every other index carries its direction bit.
+fn endpoint_address(ep: u8) -> u8 {
+    if ep == 1 {
+        0
+    } else {
+        (ep / 2) | if ep & 1 == 1 { 0x80 } else { 0 }
+    }
+}
+
 // xHCI is a single PCI function. Its snapshot includes all root-port devices;
 // there is no separate transport-wrapped device section.
 impl crate::Resettable for XhciController {
     fn reset(&mut self) -> Result<(), DeviceError> {
         for device in self.devices.iter_mut().flatten() {
             device.reset();
+        }
+        for port in 1..=PORTS {
+            self.drop_endpoints(port, 1..32);
         }
         self.state = Self::initial_state();
         self.interrupter = 0;
