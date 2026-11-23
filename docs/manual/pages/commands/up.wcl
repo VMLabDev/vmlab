@@ -189,7 +189,11 @@ SRC
     lines does not replace the daemon. Replacing the daemon keeps everything
     on disk: clones, snapshots, `.vmlab/state.json` (generated MACs and image
     pins) and the workspace ledgers. It is the same replacement
-    [vmlab lab restart](cmd_lab) makes. [vmlab pull](cmd_pull),
+    [vmlab lab restart](cmd_lab) makes. Two of these commands started
+    together after an edit replace the daemon once: the second finds the
+    daemon the first started, prints `another command restarted the lab
+    daemon first — using that daemon`, and goes on with it.
+    [vmlab pull](cmd_pull),
     `vmlab vm start`, `vmlab vm restart` and their [container](cmd_container)
     spellings check the file the same way, because each builds a machine from
     the daemon's configuration.

@@ -745,6 +745,11 @@ pub struct LabStatus {
     /// replaces it, as it does a daemon whose `config_digest` is stale.
     #[serde(default)]
     pub freeze_stale: bool,
+    /// The pid of the daemon that answered. A restart names it, so that the
+    /// supervisor replaces the daemon this status came from and no other
+    /// (`lab.restart`). Zero from a daemon that predates the field.
+    #[serde(default)]
+    pub daemon_pid: u32,
     /// Machines not on the declaration `config_digest` names (PRD §7.1): a
     /// reload found each changed or removed while it could not be rebuilt,
     /// and says why. Every other machine runs the file as loaded. Empty from
@@ -990,6 +995,7 @@ pub(crate) mod fixtures {
             forwards: Vec::new(),
             isolation: None,
             freeze_stale: false,
+            daemon_pid: 0,
             host_warnings: Vec::new(),
             pending: Vec::new(),
         }

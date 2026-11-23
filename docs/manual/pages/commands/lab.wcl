@@ -163,6 +163,15 @@ page cmd_lab {
     prints the supervisor's reply, which carries the new `socket` path.
   DOC
 
+  p <<DOC
+    The restart replaces the daemon whose status it read and no other. When
+    another command replaced that daemon first, for example a
+    [vmlab up](cmd_up) after an edit, the daemon that command started is
+    left running, the verb prints `lab "<name>" daemon was already
+    restarted by another command, at <socket>`, and the reply carries
+    `replaced: false`.
+  DOC
+
   h2 "vmlab lab destroy"
 
   code sh { source = "vmlab lab destroy <LAB>" }
