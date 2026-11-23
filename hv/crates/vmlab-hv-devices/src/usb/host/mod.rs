@@ -726,6 +726,29 @@ mod tests {
         assert_eq!(calls.connects, vec![0]);
     }
 
+    /// Review usb.md F1: the kernel answers EBUSY for an interface another
+    /// usbdevfs user holds, and the refusal says so.
+    #[test]
+    fn a_claim_another_usbfs_user_holds_is_refused_by_name() {
+        let fake = FakeUsbFs::new();
+        fake.fail_claim(0);
+        let error = match HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())) {
+            Ok(_) => panic!("claiming a held interface must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, Error::ClaimInterface(0, held) if matches!(**held, Error::InterfaceHeld)),
+            "{error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("claiming interface 0 failed"), "{text}");
+        assert!(text.contains("held by another program"), "{text}");
+        // Nothing was claimed, so nothing is released or reconnected: the
+        // holder keeps its claim.
+        let calls = fake.calls();
+        assert!(calls.releases.is_empty() && calls.connects.is_empty());
+    }
+
     #[test]
     fn intercepted_requests_never_reach_usbdevfs() {
         let (mut host, fake) = device();

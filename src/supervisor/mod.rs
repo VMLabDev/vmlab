@@ -272,7 +272,8 @@ impl Supervisor {
     /// tracked here: a lab daemon knows what its VMs hold, survives a
     /// supervisor restart, and takes its devices with it when it goes. A lab
     /// that does not answer in time is left out — its devices list as free,
-    /// and an attach to one is refused by QEMU, which cannot claim it.
+    /// and an attach to one is refused by the hypervisor, whose claim the
+    /// kernel refuses.
     async fn usb_list(&self) -> Result<Vec<crate::usb::Listed>, CommandError> {
         let host = crate::usb::scan(std::path::Path::new(crate::usb::SYSFS_ROOT))
             .map_err(|e| CommandError::failed(format!("reading USB devices: {e}")))?;

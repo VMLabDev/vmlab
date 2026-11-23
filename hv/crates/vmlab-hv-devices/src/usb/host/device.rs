@@ -311,10 +311,15 @@ impl Device {
     }
 
     /// Claim an interface, detaching any host kernel driver bound to it.
+    /// An interface another usbdevfs user holds is refused, not taken.
     pub fn claim_interface(&self, interface_number: u8) -> Result<()> {
         self.fs.claim_interface(interface_number).map_err(|e| {
-            if e.raw_os_error() == Some(libc::ENODEV) {
-                self.lost.store(true, Ordering::SeqCst);
+            match e.raw_os_error() {
+                Some(libc::ENODEV) => self.lost.store(true, Ordering::SeqCst),
+                // The claim excepts the driver `usbfs`, so EBUSY is the
+                // kernel refusing to take another usbdevfs user's claim.
+                Some(libc::EBUSY) => return Error::InterfaceHeld,
+                _ => {}
             }
             Error::IoctlFailed(sys::USBDEVFS_DISCONNECT_CLAIM, e)
         })
