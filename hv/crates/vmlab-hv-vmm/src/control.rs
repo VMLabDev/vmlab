@@ -701,6 +701,45 @@ mod usb_tests {
         );
     }
 
+    /// Review usb.md F4: opening a host device claims its interfaces, and
+    /// the claim waits for the host driver to let go. That wait must not
+    /// hold the controller: the guest, the poll and `device_del` all need
+    /// its lock.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+    fn opening_a_host_device_does_not_hold_the_controller() {
+        let Some(f) = fixture() else { return };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        let lost = f.lost.clone();
+        let handler = ControlHandler::with_usb_opener(
+            f.handle.clone(),
+            Arc::new(move |_bus, _dev| {
+                // The open is in progress until the test releases it.
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(Box::new(FakeHostDevice { lost: lost.clone() }) as Box<dyn UsbDevice>)
+            }),
+        );
+        let attach = std::thread::spawn(move || {
+            handler.handle(device_add("usbhost-1-5", "usb-host", Some("usbx.0")))
+        });
+        entered_rx.recv().unwrap();
+        let controller = f.shared.xhci.lock().clone().unwrap();
+        // `try_lock`, so that a held lock fails the test and does not hang it.
+        let free = controller.try_lock().is_some();
+        if free {
+            // What the 1 ms poll runs: it returns while the open still waits.
+            f.shared.detach_lost_usb();
+        }
+        release_tx.send(()).unwrap();
+        let outcome = attach.join().unwrap();
+        assert!(free, "the open ran with the xHCI lock held");
+        assert!(matches!(outcome, Outcome::Ok { .. }), "{outcome:?}");
+        assert_eq!(f.shared.usb_attachments.lock().len(), 1);
+    }
+
     #[test]
     #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
     fn a_lost_host_device_detaches_with_an_event() {

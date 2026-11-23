@@ -212,9 +212,44 @@ hostile guest or peer, wrong result, cosmetic.
   is released.
 - How bad: the VM hangs (the crash class), caused by a hostile guest or a
   hostile USB device. The host is not affected.
+- Status: fixed by card #668. A guest request makes no blocking usbdevfs
+  call on its own thread. The backend reads the active configuration once
+  at the open and follows it through SET_CONFIGURATION, so
+  GET_DESCRIPTOR(Configuration) and SET_INTERFACE send no GET_CONFIGURATION.
+  SETCONFIGURATION with its release and claim, SETINTERFACE and CLEAR_HALT
+  run on a thread of their own (`Job` in `usb/host/mod.rs`) while the request
+  is NAKed. During that time the backend makes no usbdevfs call, because the
+  kernel serialises the ioctls of one device, so the other transfers of that
+  device are NAKed and a discard waits. The device speed is read at the open.
+  `attach_usb` opens the host device before it takes the controller lock and
+  drops a refused device after it releases the lock. Tests:
+  `a_guest_request_makes_no_synchronous_control_transfer`,
+  `a_blocked_usbdevfs_call_holds_no_caller` and two more in
+  `usb/host/mod.rs`, `opening_a_host_device_does_not_hold_the_controller` in
+  `vmm/control.rs`. Not changed: the drop of a backend (detach, host unplug)
+  still blocks its caller, the control thread or the machine-events thread,
+  with no controller lock held. The statement that the kernel serialises
+  usbdevfs ioctls on the device lock is from `devio.c` as the worker knows
+  it, not checked against a kernel tree.
 
 ### F5. A forced stop leaves the host device without a driver
 
+- Status: fixed by card #669, for a stop the lab daemon makes. The Kill rung
+  of the stop ladder now asks the hypervisor to detach every held device
+  before it kills the process (`usb_return_before_kill`, `src/labd/vm.rs`),
+  so the backend is dropped and its `Drop` sends `USBDEVFS_CONNECT`. That
+  covers `stop --force` and a graceful stop that ends at the Kill rung. All
+  the detaches together get 5 s, so a hypervisor that does not answer is
+  still killed, and the daemon log then names each device that was not
+  given back. Proof tests in `src/labd/lifecycle_tests.rs`:
+  `a_forced_stop_detaches_usb_devices_before_the_kill` and
+  `a_stop_that_ends_at_the_kill_detaches_usb_devices_first` failed before
+  the fix (the fake saw `attach`, `kill` and no `detach`) and pass with it.
+  `a_forced_stop_kills_a_hypervisor_that_never_answers_the_detach` covers
+  the limit. The check on a real host with a USB stick was not run. Not
+  covered: `kill_lab_orphans` and a crash of vmlab-hv. Nothing asks the
+  hypervisor there, so the device stays without a driver until a replug or
+  a write to `drivers_probe`.
 - Where: `usb/host/mod.rs:581-588` (the `Drop` that issues
   `USBDEVFS_CONNECT`), `src/labd/vm.rs:1813-1820` (the Kill rung),
   `src/labd/stop_plan.rs:94-96` (a forced stop is the Kill rung alone),

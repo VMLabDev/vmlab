@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::descriptor::{ConfigDescriptorTree, DeviceDescriptorTree, parse_usbfs_descriptors};
@@ -215,9 +216,19 @@ impl Transfer {
     }
 }
 
+/// What a failed USBDEVFS_DISCONNECT_CLAIM means.
+pub fn claim_error(e: io::Error) -> Error {
+    // The claim excepts the driver `usbfs`, so EBUSY is the kernel refusing
+    // to take another usbdevfs user's claim.
+    if e.raw_os_error() == Some(libc::EBUSY) {
+        return Error::InterfaceHeld;
+    }
+    Error::IoctlFailed(sys::USBDEVFS_DISCONNECT_CLAIM, e)
+}
+
 /// A USB device behind usbdevfs: descriptors plus asynchronous URBs.
 pub struct Device {
-    fs: Box<dyn UsbFs>,
+    fs: Arc<dyn UsbFs>,
     device_descriptor_tree: DeviceDescriptorTree,
     in_flight: HashMap<u64, Transfer>,
     next_tag: u64,
@@ -226,7 +237,7 @@ pub struct Device {
 
 impl Device {
     /// Open a device through `fs`, reading and parsing its descriptors.
-    pub fn new(fs: Box<dyn UsbFs>) -> Result<Self> {
+    pub fn new(fs: Arc<dyn UsbFs>) -> Result<Self> {
         let descriptor_data = fs.read_descriptors().map_err(Error::DescriptorRead)?;
         let device_descriptor_tree = parse_usbfs_descriptors(&descriptor_data)?;
         Ok(Device {
@@ -310,18 +321,28 @@ impl Device {
         self.lost.load(Ordering::SeqCst)
     }
 
+    /// Record that the device is gone, for a caller that saw ENODEV on a
+    /// call it made on [`Device::fs`] itself.
+    pub fn mark_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+    }
+
+    /// The usbdevfs under this device, for a blocking call made on another
+    /// thread. While such a call runs, nothing else may use the device:
+    /// the kernel serialises usbdevfs ioctls on the device lock, so a
+    /// second call would wait for the first.
+    pub fn fs(&self) -> Arc<dyn UsbFs> {
+        self.fs.clone()
+    }
+
     /// Claim an interface, detaching any host kernel driver bound to it.
     /// An interface another usbdevfs user holds is refused, not taken.
     pub fn claim_interface(&self, interface_number: u8) -> Result<()> {
         self.fs.claim_interface(interface_number).map_err(|e| {
-            match e.raw_os_error() {
-                Some(libc::ENODEV) => self.lost.store(true, Ordering::SeqCst),
-                // The claim excepts the driver `usbfs`, so EBUSY is the
-                // kernel refusing to take another usbdevfs user's claim.
-                Some(libc::EBUSY) => return Error::InterfaceHeld,
-                _ => {}
+            if e.raw_os_error() == Some(libc::ENODEV) {
+                self.mark_lost();
             }
-            Error::IoctlFailed(sys::USBDEVFS_DISCONNECT_CLAIM, e)
+            claim_error(e)
         })
     }
 
@@ -339,24 +360,6 @@ impl Device {
         self.fs
             .connect_interface(interface_number)
             .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_IOCTL, e))
-    }
-
-    /// Activate an alternate setting for an interface.
-    pub fn set_interface_alt_setting(
-        &self,
-        interface_number: u8,
-        alternative_setting: u8,
-    ) -> Result<()> {
-        self.fs
-            .set_interface(interface_number, alternative_setting)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_SETINTERFACE, e))
-    }
-
-    /// Set the active configuration.
-    pub fn set_active_configuration(&self, config: u8) -> Result<()> {
-        self.fs
-            .set_configuration(config)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_SETCONFIGURATION, e))
     }
 
     /// Get the device descriptor of this device.
@@ -390,7 +393,9 @@ impl Device {
 
     /// Get bConfigurationValue of the currently active configuration. A
     /// single-configuration device is answered from the descriptors without
-    /// a control transfer.
+    /// a control transfer. Any other device is asked with a synchronous
+    /// control transfer that holds the caller for up to 5 s, so this is for
+    /// the open only, never for a guest request (review usb.md F4).
     pub fn get_active_configuration(&self) -> Result<u8> {
         if self.device_descriptor_tree.bNumConfigurations == 1
             && let Some(config_descriptor) = self
@@ -420,13 +425,6 @@ impl Device {
             .control(&ctrl_transfer)
             .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_CONTROL, e))?;
         Ok(active_config)
-    }
-
-    /// Clear the halt/stall condition for an endpoint.
-    pub fn clear_halt(&self, ep_addr: u8) -> Result<()> {
-        self.fs
-            .clear_halt(ep_addr)
-            .map_err(|e| Error::IoctlFailed(sys::USBDEVFS_CLEAR_HALT, e))
     }
 
     /// Get the speed of this device.
