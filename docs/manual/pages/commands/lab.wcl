@@ -174,12 +174,13 @@ page cmd_lab {
 
   h2 "vmlab lab destroy"
 
-  code sh { source = "vmlab lab destroy <LAB>" }
+  code sh { source = "vmlab lab destroy [--discard-guest-changes] <LAB>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<LAB>`" | "The lab's name." |
+      | "`--discard-guest-changes`" | "Destroy even where a dev machine's workspace holds guest work the host has not taken, and lose that work." |
       | "`-h`, `--help`" | "Print help." |
   }
 
@@ -190,7 +191,9 @@ page cmd_lab {
     removes the lab's `.vmlab/` directory itself. A name the registry does
     not know fails with `lab "<name>" is not running`. Prints `lab "<name>"
     destroyed`. Like `vmlab destroy`, it refuses a main checkout's lab whose
-    [worktree lab](guide_worktrees) freeze a linked worktree still uses.
+    [worktree lab](guide_worktrees) freeze a linked worktree still uses, and
+    a lab with a dev machine whose workspace holds guest work the host has
+    not taken, unless `--discard-guest-changes` says to lose it.
   DOC
 
   h2 "vmlab lab move"

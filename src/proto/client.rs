@@ -338,7 +338,7 @@ mod tests {
                 ErrorCode::Unsupported,
             ),
             (
-                LabRequest::Destroy {},
+                LabRequest::Destroy { discard: false },
                 // Nothing more specific to say: the default.
                 ErrorCode::Failed,
             ),

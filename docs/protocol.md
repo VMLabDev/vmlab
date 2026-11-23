@@ -73,11 +73,11 @@ the code is the contract.
 | `pull.cancel` | `machine: String` | `cli` | Abort one machine's running download; whatever waits on it fails with "download cancelled". |
 | `run` | `script: String`, `record: Vec<RecordRequest>` | `cli` | Run an ad-hoc wscript against the lab (PRD §12), streaming output. |
 | `down` | `machines: Vec<String>`, `force: bool` | `cli` | Stop the lab, or just the named machines (empty = all). |
-| `destroy` | — | `cli` | Stop the lab and delete everything it materialised. |
+| `destroy` | `discard: bool` | `cli` | Stop the lab and delete everything it materialised. `discard` is §19.6's discard flag: a destroy deletes a dev machine's guest working copy, so it refuses while a workspace holds guest work the host has not taken until this says so. It defaults to `false`. |
 | `machine.start` | `machine: String`, `record: Vec<RecordRequest>` | `cli` | Start one machine, pulling its template or image first. |
 | `machine.stop` | `machine: String`, `force: bool` | `cli` | Stop one machine; `force` kills instead of the graceful ladder. |
 | `machine.restart` | `machine: String`, `force: bool`, `record: Vec<RecordRequest>` | `cli` | Stop one machine, wait for it to settle, and boot it again. |
-| `machine.destroy` | `machine: String` | `cli` | Stop one machine and delete everything it materialised. |
+| `machine.destroy` | `machine: String`, `discard: bool` | `cli` | Stop one machine and delete everything it materialised. `discard` is the flag of `destroy`, for this machine's workspace. |
 | `machine.capabilities` | `machine: String` | `cli` | What this machine can do beyond the universal commands, probed live: a display, a console log, in-place reboot, and whichever features its agent negotiated. |
 | `machine.debug` | `machine: String`, `request: vmlab_hv_proto::debug::DebugRequest` | `cli` | Whole-machine debugger operation on a backend advertising the capability. |
 | `machine.ip` | `machine: String`, `nic: Option<usize>` | `cli` | The machine's guest IP, optionally for one NIC index. |

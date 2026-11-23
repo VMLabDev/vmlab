@@ -520,7 +520,27 @@ pub(super) async fn release(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_destroy() -> Result<()> {
+/// What a destroy with no daemon asks before it removes `.vmlab/` (§19.6):
+/// whether a stopped dev machine's ledger records guest work the host has not
+/// taken — a halt, or what its stop left owed. The daemon asks the same of a
+/// lab it holds.
+fn refuse_destroy_over_guest_work(lab_local: &std::path::Path, discard: bool) -> Result<()> {
+    use crate::labd::workspace::bracket::{DestroyOutstanding, Outstanding};
+    if discard {
+        return Ok(());
+    }
+    let refusals: Vec<String> = crate::labd::workspace::ledger::stopped_work(lab_local)
+        .iter()
+        .filter_map(Outstanding::of_stopped)
+        .map(|found| DestroyOutstanding(found).to_string())
+        .collect();
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    bail!("{}", refusals.join("\n"))
+}
+
+pub fn cmd_destroy(discard: bool) -> Result<()> {
     rt()?.block_on(async {
         let (name, root) = current_lab()?;
         // Destroy needs a daemon (to stop VMs and delete state) even if one
@@ -528,10 +548,14 @@ pub fn cmd_destroy() -> Result<()> {
         let lab_local = crate::paths::lab_local_dir(&root);
         match daemon::try_own_lab_daemon(&name, &root).await? {
             Some(client) => {
-                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
+                client
+                    .send(LabRequest::Destroy { discard })
+                    .await
+                    .map_err(remote)?;
             }
             None if lab_local.exists() => {
                 refuse_destroy_under_freeze(&root).await?;
+                refuse_destroy_over_guest_work(&lab_local, discard)?;
                 // A daemon that does not answer may still be starting, or
                 // have lost its socket file, and it holds the lab's state
                 // open. The release waits for a start and stops such a
@@ -1081,7 +1105,15 @@ pub enum LabCmd {
         json: bool,
     },
     /// Stop a lab and delete its clones and local state
-    Destroy { lab: String },
+    ///
+    /// Refuses while a dev machine's workspace holds guest work the host has
+    /// not taken (§19.6).
+    Destroy {
+        lab: String,
+        /// Destroy even where a dev machine's workspace holds guest work the host has not taken
+        #[arg(long)]
+        discard_guest_changes: bool,
+    },
     /// Move a stopped lab's working data to the lab in this directory.
     ///
     /// Run from the checkout that should own the lab: its vmlab.wcl must
@@ -1104,7 +1136,10 @@ pub fn cmd_lab(cmd: LabCmd) -> Result<()> {
         LabCmd::Info { lab, verbose } => cmd_lab_info(&lab, verbose),
         LabCmd::Stop { lab, force } => cmd_lab_stop(&lab, force),
         LabCmd::Restart { lab, json } => cmd_lab_restart(&lab, json),
-        LabCmd::Destroy { lab } => cmd_lab_destroy(&lab),
+        LabCmd::Destroy {
+            lab,
+            discard_guest_changes,
+        } => cmd_lab_destroy(&lab, discard_guest_changes),
         LabCmd::Move { lab, from } => super::lab_move::cmd_lab_move(&lab, from),
     }
 }
@@ -1322,13 +1357,16 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
     })
 }
 
-fn cmd_lab_destroy(name: &str) -> Result<()> {
+fn cmd_lab_destroy(name: &str, discard: bool) -> Result<()> {
     rt()?.block_on(async {
         let labs = registry_labs().await?;
         let root = root_for(&labs, name);
         match daemon::try_lab_daemon(name).await? {
             Some(client) => {
-                client.send(LabRequest::Destroy {}).await.map_err(remote)?;
+                client
+                    .send(LabRequest::Destroy { discard })
+                    .await
+                    .map_err(remote)?;
             }
             None => match &root {
                 // No daemon, but .vmlab may still hold clones to clean up.
@@ -1336,6 +1374,7 @@ fn cmd_lab_destroy(name: &str) -> Result<()> {
                     let lab_local = crate::paths::lab_local_dir(root);
                     if lab_local.exists() {
                         refuse_destroy_under_freeze(root).await?;
+                        refuse_destroy_over_guest_work(&lab_local, discard)?;
                         std::fs::remove_dir_all(&lab_local)
                             .with_context(|| format!("removing {}", lab_local.display()))?;
                     }
@@ -1443,13 +1482,14 @@ pub fn cmd_machine_power(
 
 /// `vmlab vm destroy` and `vmlab container destroy`; `noun` is what the
 /// confirmation calls the machine.
-pub fn cmd_machine_destroy(machine_ref: &str, noun: &str) -> Result<()> {
+pub fn cmd_machine_destroy(machine_ref: &str, noun: &str, discard: bool) -> Result<()> {
     rt()?.block_on(async {
         let (lab, machine) = split_vm_ref(machine_ref)?;
         let (_name, client) = lab_client_for(lab).await?;
         client
             .send(LabRequest::MachineDestroy {
                 machine: machine.clone(),
+                discard,
             })
             .await
             .map_err(remote)?;

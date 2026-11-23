@@ -150,6 +150,10 @@ pub struct LabRuntime {
     /// a developer's source tree must not stop syncing because a terminal
     /// closed.
     pub workspaces: crate::labd::workspace::WorkspaceSyncers,
+    /// The machines an `up` is bringing up now, counted per `up`. That `up`
+    /// starts their syncers itself, after provisioning (§19.6), so a start
+    /// made inside it — a provision's `m.start()` — starts none.
+    ups: std::sync::Mutex<HashMap<String, usize>>,
     /// The console recordings this lab owns, one per machine (§11.1).
     pub recordings: super::record::Recordings,
     /// Worktree isolation (§21.4), decided once when the daemon starts:
@@ -462,6 +466,27 @@ fn freeze_declared(
     vms.chain(containers).collect()
 }
 
+/// `path` with its longest existing ancestor canonicalised and the missing
+/// rest appended as written: where a directory that is away now will resolve
+/// once it is back.
+fn resolved_as_far_as_it_exists(path: &std::path::Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut held = path;
+    loop {
+        if let Ok(root) = held.canonicalize() {
+            return missing.iter().rev().fold(root, |at, name| at.join(name));
+        }
+        match (held.parent(), held.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                held = parent;
+            }
+            // `..` or a root that does not resolve: nothing better to say.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn missing_snapshot(machine: &str, snap: &str) -> crate::proto::CommandError {
     crate::proto::CommandError::not_found(format!("no snapshot {snap:?} on {machine}"))
 }
@@ -596,6 +621,7 @@ impl LabRuntime {
             host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            ups: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
             isolation,
@@ -676,6 +702,7 @@ impl LabRuntime {
             host_cfg: crate::config::host::HostConfig::default(),
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
+            ups: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb,
             isolation,
@@ -1377,7 +1404,9 @@ impl LabRuntime {
         output: Option<&crate::scripting::OutputSink>,
     ) -> Result<()> {
         let ticket = self.starts.ticket()?;
-        self.start_machine_at(name, output, ticket).await
+        self.start_machine_at(name, output, ticket).await?;
+        self.ensure_workspace(name, output).await;
+        Ok(())
     }
 
     /// [`start_machine_with_output`](Self::start_machine_with_output) for a
@@ -1569,8 +1598,14 @@ impl LabRuntime {
     /// Stop one machine and delete everything it materialised, leaving the
     /// rest of the lab running. It stays in the lab config, so a later
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
-    pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+    ///
+    /// The guest working copy of a dev machine goes with the clone, so this
+    /// refuses while that copy holds work the host has not taken, unless
+    /// `discard` says to lose it (§19.6).
+    pub async fn destroy_machine(self: &Arc<Self>, name: &str, discard: bool) -> Result<()> {
         self.machine(name)?;
+        // Asked before anything is stopped, so a refusal changes nothing.
+        self.check_destroy(name, discard).await?;
         // No start of this machine from here to the removal of its disks: a
         // start under way finishes first and is stopped below, one asked for
         // earlier is refused, and a later one waits for the removal.
@@ -1703,7 +1738,9 @@ impl LabRuntime {
     ) -> Result<()> {
         let ticket = self.starts.ticket()?;
         self.start_with_deferred_refresh_at(name, output, ticket)
-            .await
+            .await?;
+        self.ensure_workspace(name, output).await;
+        Ok(())
     }
 
     /// [`start_with_deferred_refresh`](Self::start_with_deferred_refresh)
@@ -2252,6 +2289,9 @@ impl LabRuntime {
             output(format!("warning: {warning}\n"));
         }
         let targets: Vec<String> = plan.machines().cloned().collect();
+        // Until this `up` ends, a start of one of its machines leaves the
+        // syncer to it: it starts them after provisioning.
+        let _syncers_are_ours = UpInFlight::over(&self.ups, &targets);
 
         // `nested = true` asks for VMX/SVM the host may not have to give
         // (§5.2): the machine still boots, so this is said, not refused.
@@ -3061,7 +3101,7 @@ impl LabRuntime {
         }
         for name in &dropped {
             self.stop_mounting(name);
-            self.workspaces.stop(name).await;
+            self.workspaces.stop_before_machine(name, !force).await;
             self.record_finalise_machine(name, "machine stopped").await;
             // A start under way finishes first, so there is something to stop.
             drop(self.starts.hold(name).await);
@@ -3070,10 +3110,13 @@ impl LabRuntime {
 
         // Before the machines go: a syncer whose guest has gone would spend
         // its retry window failing to reach one, and a recording is
-        // finalised while its last frame is still the machine's (D6).
+        // finalised while its last frame is still the machine's (D6). The
+        // syncer takes a last pass while the guest still answers, and writes
+        // what that pass left owed on its ledger (§19.6); a forced stop does
+        // not wait on the guest, and its record says so.
         for name in plan.machines() {
             self.stop_mounting(name);
-            self.workspaces.stop(name).await;
+            self.workspaces.stop_before_machine(name, !force).await;
             self.record_finalise_machine(name, "machine stopped").await;
         }
 
@@ -3134,11 +3177,19 @@ impl LabRuntime {
 
     /// Stop everything and delete clones, lab-local state, and dynamic net
     /// config (PRD §12).
-    pub async fn destroy(self: &Arc<Self>) -> Result<()> {
+    ///
+    /// Every dev machine is asked about its workspace first, and one refusal
+    /// stops the whole destroy before anything is stopped (§19.6); `discard`
+    /// is the flag that skips the question.
+    pub async fn destroy(self: &Arc<Self>, discard: bool) -> Result<()> {
         // Worktree overlays name the frozen files by absolute path (§21.5).
         // With none depending, the freeze goes with the rest of `.vmlab/`.
         self.refuse_while_depended_on("cannot destroy the main lab")
             .await?;
+        let names: Vec<String> = self.machines().map(|m| m.name().to_string()).collect();
+        for name in &names {
+            self.check_destroy(name, discard).await?;
+        }
         // Nothing starts between the stop below and the removal: every start
         // is refused from here on. A destroy that fails leaves a lab, which
         // takes starts again.
@@ -3148,6 +3199,19 @@ impl LabRuntime {
             self.starts.reopen();
         }
         destroyed
+    }
+
+    /// What a destroy of `name` asks first: whether its workspace holds guest
+    /// work the host has not taken (§19.6). A running workspace gets a last
+    /// pass, and a stopped one answers from its ledger.
+    async fn check_destroy(&self, name: &str, discard: bool) -> Result<()> {
+        if discard {
+            return Ok(());
+        }
+        let workspace = self.workspace_of(name);
+        self.workspaces
+            .before_destroy(name, discard, workspace.as_ref())
+            .await
     }
 
     /// [`destroy`](Self::destroy), once the lab is closed to starts.
@@ -3193,6 +3257,39 @@ impl LabRuntime {
             .ok()
             .and_then(|m| m.profile())
             .and_then(|name| self.profiles.get(&name).cloned())
+    }
+
+    /// Start `name`'s workspace syncer when the machine runs and has none
+    /// (docs/reviews/dev-machines.md F3): what every start outside `up`
+    /// calls, because only `up` used to start one, and a dev machine booted
+    /// by `vm start`, `vm restart`, a wscript `start()` or a restore then ran
+    /// with a workspace that did not sync and nothing that said so.
+    ///
+    /// A syncer that is already there is kept: it outlives a `vm stop`, and
+    /// replacing it would lose what its last pass knew. A machine an `up` is
+    /// bringing up now is left to that `up`, which starts the syncer after
+    /// provisioning has made the login it writes as. Outside `up` nothing
+    /// says whether provisioning ever ran, and a syncer whose login is not
+    /// there fails its passes and says so, which the brackets refuse on.
+    async fn ensure_workspace(
+        self: &Arc<Self>,
+        name: &str,
+        output: Option<&crate::scripting::OutputSink>,
+    ) {
+        let in_an_up = self.ups.lock_recover().contains_key(name);
+        if in_an_up || self.workspaces.get(name).await.is_some() {
+            return;
+        }
+        let Ok(machine) = self.machine(name) else {
+            return;
+        };
+        if machine.state().await == PowerState::Stopped {
+            return;
+        }
+        let logged: crate::scripting::OutputSink =
+            Arc::new(|line: String| tracing::warn!("{}", line.trim_end()));
+        self.start_workspaces(&[name.to_string()], output.unwrap_or(&logged))
+            .await;
     }
 
     /// Start the workspace syncer for every `@dev` machine in `scope` that
@@ -3307,6 +3404,16 @@ impl LabRuntime {
             );
             return None;
         }
+        self.workspace_at(machine, host_root, &dev.workspace_guest)
+    }
+
+    /// The workspace of `machine` over a host root that is already decided.
+    fn workspace_at(
+        &self,
+        machine: &str,
+        host_root: PathBuf,
+        guest_root: &str,
+    ) -> Option<crate::labd::workspace::Workspace> {
         // §19.6, resolved from the declaration alone (ADR-0003): the guest
         // family and the default login's elevation are what decide the three
         // Windows actions, and the syncer should never have to ask.
@@ -3315,13 +3422,56 @@ impl LabRuntime {
             machine: machine.to_string(),
             ledger_path: crate::labd::workspace::ledger::Ledger::path(&self.lab_local, machine),
             host_root,
-            guest_root: dev.workspace_guest.clone(),
+            guest_root: guest_root.to_string(),
             max_file_bytes: self.host_cfg.workspace_max_file,
             preconditions: crate::labd::workspace::preconditions(
                 handle.guest_os(),
                 &handle.logins(),
             ),
         })
+    }
+
+    /// The workspace a **restore** brackets (§19.6): what
+    /// [`workspace_of`](Self::workspace_of) answers, and also the workspace
+    /// of a dev machine whose host directory is away
+    /// (docs/reviews/dev-machines.md F2).
+    ///
+    /// A missing directory starts no syncer, and that is all it may decide.
+    /// The halt a restore refuses on and the note that a re-seed is owed both
+    /// ride the ledger, which lives under the lab's state directory and is
+    /// there whether the workspace is or not. A branch without the directory
+    /// or an unmounted volume must not turn a dev machine's restore into the
+    /// restore of a machine with nothing to bracket: the directory comes back,
+    /// and a syncer with no note then carries the rewound tree onto it.
+    ///
+    /// With the directory away its canonical path cannot be asked for, so the
+    /// root is the one the ledger on disk records. With no such ledger it is
+    /// the declared path resolved as far as the host still holds it, which is
+    /// what the directory canonicalises to once it is back unless a symlink
+    /// stands in the missing part.
+    fn restore_workspace_of(&self, machine: &str) -> Option<crate::labd::workspace::Workspace> {
+        use crate::labd::workspace::ledger::Ledger;
+        let dev = self
+            .dev_machines()
+            .into_iter()
+            .find(|d| d.name == machine)?;
+        let declared = self.root.join(dev.workspace.as_ref()?);
+        if declared.canonicalize().is_ok_and(|root| root.is_dir()) {
+            return self.workspace_of(machine);
+        }
+        self.events.emit(
+            "workspace.unavailable",
+            json!({
+                "machine": machine,
+                "workspace": declared.display().to_string(),
+                "reason": "the host workspace directory is not there: the restore still \
+                           reads the sync ledger for a halt and still notes the re-seed",
+            }),
+        );
+        let ledger_path = Ledger::path(&self.lab_local, machine);
+        let host_root = Ledger::recorded_host_root(&ledger_path, &dev.workspace_guest)
+            .unwrap_or_else(|| resolved_as_far_as_it_exists(&declared));
+        self.workspace_at(machine, host_root, &dev.workspace_guest)
     }
 
     /// Run one machine's sync pass now and answer with what it decided
@@ -3589,8 +3739,9 @@ impl LabRuntime {
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
+        let running = m.state().await != PowerState::Stopped;
         self.workspaces
-            .before_capture(vm_name, self.workspace_of(vm_name).as_ref())
+            .before_capture(vm_name, self.workspace_of(vm_name).as_ref(), running)
             .await?;
         let _active = {
             let mut state = self.state.lock().await;
@@ -3703,7 +3854,7 @@ impl LabRuntime {
     pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
         let machines: Vec<_> = self.machines().collect();
         for m in &machines {
-            let workspace = self.workspace_of(m.name());
+            let workspace = self.restore_workspace_of(m.name());
             self.check_restore(m.as_ref(), snap, discard, workspace.as_ref())
                 .await?;
         }
@@ -3746,7 +3897,7 @@ impl LabRuntime {
         let m = self
             .machine(name)
             .map_err(|_| missing_snapshot(name, snap))?;
-        let workspace = self.workspace_of(name);
+        let workspace = self.restore_workspace_of(name);
         let record = self
             .check_restore(m.as_ref(), snap, discard, workspace.as_ref())
             .await?;
@@ -3815,8 +3966,13 @@ impl LabRuntime {
         // Put back on **both** paths. A workspace whose syncer quietly never
         // came back looks exactly like a machine with nothing to sync, which
         // is the silent-divergence failure ADR-0014 exists to rule out.
-        if let Some(bracket) = bracket {
-            self.workspaces.resume(bracket).await;
+        match bracket {
+            Some(bracket) => self.workspaces.resume(bracket).await,
+            // None was taken off, and the machine may run now all the same:
+            // an online restore boots a stopped one, and a discard restore
+            // goes ahead on one that ran with no syncer. Either way the
+            // syncer starts here, owing the re-seed noted above.
+            None => self.ensure_workspace(name, None).await,
         }
         if let (Err(e), Some(workspace)) = (&restored, &workspace) {
             // Said rather than silently undone, for the reason above: the
@@ -3910,8 +4066,9 @@ impl LabRuntime {
             }
         }
         // Flush after any deferred pull, before the caller suspends sync.
+        let running = m.state().await != PowerState::Stopped;
         self.workspaces
-            .before_restore(name, discard, workspace)
+            .before_restore(name, discard, workspace, running)
             .await?;
         Ok(record)
     }
@@ -4305,6 +4462,40 @@ async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, 
             })
             .collect(),
     )
+}
+
+/// The machines one `up` is bringing up, held in [`LabRuntime::ups`] until
+/// that `up` ends, however it ends.
+struct UpInFlight<'a> {
+    ups: &'a std::sync::Mutex<HashMap<String, usize>>,
+    machines: Vec<String>,
+}
+
+impl<'a> UpInFlight<'a> {
+    fn over(ups: &'a std::sync::Mutex<HashMap<String, usize>>, machines: &[String]) -> Self {
+        let mut held = ups.lock_recover();
+        for machine in machines {
+            *held.entry(machine.clone()).or_default() += 1;
+        }
+        Self {
+            ups,
+            machines: machines.to_vec(),
+        }
+    }
+}
+
+impl Drop for UpInFlight<'_> {
+    fn drop(&mut self) {
+        let mut held = self.ups.lock_recover();
+        for machine in &self.machines {
+            if let Some(count) = held.get_mut(machine) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(machine);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5642,6 +5833,176 @@ lab "t" {
         );
     }
 
+    const DEV_WORKSPACE_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    /// Only `up` used to start a workspace syncer, so a dev machine booted
+    /// any other way ran with a workspace that did not sync and nothing that
+    /// said so (docs/reviews/dev-machines.md F3). A start outside `up` starts
+    /// the syncer, and one that is already there is kept, not replaced.
+    #[tokio::test]
+    async fn a_dev_machine_started_outside_up_gets_its_syncer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        assert!(!lab.workspaces.is_running("dev01").await);
+
+        lab.start_machine("dev01").await.unwrap();
+        assert_eq!(
+            lab.machine("dev01").unwrap().state().await,
+            PowerState::Running
+        );
+        let first = lab
+            .workspaces
+            .get("dev01")
+            .await
+            .expect("a start outside `up` starts the syncer");
+
+        // A second start of a running machine keeps the syncer it has: a
+        // replaced one would lose what its last pass knew.
+        lab.start_machine("dev01").await.unwrap();
+        let second = lab.workspaces.get("dev01").await.expect("still syncing");
+        assert!(Arc::ptr_eq(&first, &second), "the syncer was replaced");
+
+        // The partial `down` takes the syncer off, and `vm restart` puts one
+        // back, as `vm start` does.
+        lab.workspaces.stop("dev01").await;
+        lab.restart_machine("dev01", true, &quiet()).await.unwrap();
+        assert!(lab.workspaces.is_running("dev01").await);
+        lab.workspaces.stop_all().await;
+    }
+
+    /// A machine that runs with no syncer is not a machine that is down: no
+    /// flush can run, so nothing knows what its guest holds. Capture refuses
+    /// with no escape, and restore refuses without the discard flag (§19.6,
+    /// docs/reviews/dev-machines.md F3). An `up` whose provisioning failed
+    /// leaves a machine in this state.
+    #[tokio::test]
+    async fn a_capture_of_a_running_dev_machine_with_no_syncer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        // Control: a stopped machine with nothing on its ledger is captured.
+        lab.snapshot("dev01", "s").await.unwrap();
+
+        lab.start_machine("dev01").await.unwrap();
+        lab.workspaces.stop("dev01").await;
+        assert_eq!(
+            lab.machine("dev01").unwrap().state().await,
+            PowerState::Running
+        );
+
+        let captured = lab
+            .snapshot("dev01", "t")
+            .await
+            .expect_err("a capture of a running dev machine with no syncer is refused");
+        let said = format!("{captured:#}");
+        assert!(said.contains("workspace syncer is not running"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
+        assert!(!said.contains("--discard-guest-changes"), "{said}");
+
+        let restored = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("a restore without the flag is refused too");
+        let said = format!("{restored:#}");
+        assert!(said.contains("workspace syncer is not running"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(
+            !lab.workspaces.is_running("dev01").await,
+            "a refusal starts nothing"
+        );
+
+        // The flag is the developer's word that the guest copy may go. The
+        // machine still runs afterwards, so its syncer is started, and the
+        // ledger owes the re-seed that carries the host tree back.
+        lab.restore("dev01", "s", true).await.unwrap();
+        assert!(lab.workspaces.is_running("dev01").await);
+        lab.workspaces.stop_all().await;
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        assert!(ledger.reseed_owed, "the restore left its note");
+    }
+
+    /// A restore brackets the workspace from the **ledger**, which does not
+    /// live in the host directory (docs/reviews/dev-machines.md F2). With that
+    /// directory away — another branch, an unmounted volume — the halt the
+    /// ledger records still refuses, and a restore that goes ahead still
+    /// leaves the note that a re-seed is owed, where the syncer that starts
+    /// once the directory is back reads it.
+    #[tokio::test]
+    async fn a_restore_with_the_host_workspace_away_still_refuses_and_still_notes_the_re_seed() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("dev01", "s").await.unwrap();
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+
+        std::fs::rename(dir.path().join("src"), dir.path().join("src.away")).unwrap();
+        let refused = lab.restore("dev01", "s", false).await;
+        let before = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+        let discarded = lab.restore("dev01", "s", true).await;
+        std::fs::rename(dir.path().join("src.away"), dir.path().join("src")).unwrap();
+        let after = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+
+        let refusal = format!("{:#}", refused.expect_err("the recorded halt refuses"));
+        assert!(refusal.contains("main.rs"), "{refusal}");
+        assert!(!before.reseed_owed, "a refused restore rewinds nothing");
+        discarded.expect("the discard flag lets the restore through");
+        assert!(after.reseed_owed, "the re-seed is owed after the rewind");
+        assert_eq!(after.halted, ["main.rs"], "the note keeps the ledger");
+    }
+
+    /// The same with no ledger on disk yet: the note is written about the
+    /// directory as it resolves once it is back.
+    #[tokio::test]
+    async fn a_restore_with_the_host_workspace_away_and_no_ledger_notes_the_re_seed() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.snapshot("dev01", "s").await.unwrap();
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+
+        std::fs::rename(dir.path().join("src"), dir.path().join("src.away")).unwrap();
+        let restored = lab.restore("dev01", "s", false).await;
+        std::fs::rename(dir.path().join("src.away"), dir.path().join("src")).unwrap();
+        let after = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+
+        restored.expect("nothing is recorded to refuse on");
+        assert!(after.reseed_owed, "the re-seed is owed after the rewind");
+    }
+
     /// Who `up`'s agent refresh asks at all (§19.4), through the real `up`:
     /// a VM double seals an agent but has none answering, so a refresh that
     /// is attempted ends in a warning — and one that is not says nothing.
@@ -6005,7 +6366,7 @@ lab "t" {
         );
         assert!(diverged(&reopened.status().await, "dev01"));
 
-        lab.destroy_machine("dev01").await.expect("destroy");
+        lab.destroy_machine("dev01", false).await.expect("destroy");
         assert!(!diverged(&lab.status().await, "dev01"));
     }
 
@@ -6411,7 +6772,7 @@ lab "t" {
 
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy_machine("a").await }
+            async move { lab.destroy_machine("a", false).await }
         });
         hold.reached().await;
         let start = tokio::spawn({
@@ -6456,7 +6817,7 @@ lab "t" {
         hold.reached().await;
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy_machine("a").await }
+            async move { lab.destroy_machine("a", false).await }
         });
         run_until_stalled().await;
         hold.release();
@@ -6484,7 +6845,7 @@ lab "t" {
 
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy().await }
+            async move { lab.destroy(false).await }
         });
         hold.reached().await;
         let started = lab.start_machine("a").await;
@@ -6538,8 +6899,12 @@ lab "t" {
 }"#,
             vec![vm.clone(), ct.clone()],
         );
-        lab.destroy_machine("dc01").await.expect("destroy dc01");
-        lab.destroy_machine("web").await.expect("destroy web");
+        lab.destroy_machine("dc01", false)
+            .await
+            .expect("destroy dc01");
+        lab.destroy_machine("web", false)
+            .await
+            .expect("destroy web");
         assert_eq!(vm.stops.load(Ordering::SeqCst), 1);
         assert_eq!(ct.stops.load(Ordering::SeqCst), 1);
     }
@@ -7509,8 +7874,8 @@ lab "t" {
             match wait {
                 0 => lab.stop_machine("a", false).await.expect("stop"),
                 1 => lab.down(&[], false).await.expect("down"),
-                2 => lab.destroy_machine("a").await.expect("destroy a"),
-                _ => lab.destroy().await.expect("destroy"),
+                2 => lab.destroy_machine("a", false).await.expect("destroy a"),
+                _ => lab.destroy(false).await.expect("destroy"),
             }
             assert!(lab.recordings.live_machines().await.is_empty(), "{ender}");
             assert!(out.exists(), "{ender} left a file");
@@ -8270,5 +8635,276 @@ lab "t" {
         );
         let none = lab.script_forward_target("c", "two").await.unwrap_err();
         assert!(none.contains("no NIC on segment \"c\""), "{none}");
+    }
+
+    // ---- dev machines review F4 and F5 (card 695) ----
+
+    /// A dev machine's guest as the syncer reaches it: the in-memory guest
+    /// and its watch behind the sessions seam, with no machine under them.
+    struct DevGuest {
+        guest: Arc<crate::labd::workspace::guest::fake::FakeGuest>,
+        watcher: Arc<crate::labd::workspace::guest::fake::FakeWatcher>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::labd::workspace::syncer::GuestSessions for DevGuest {
+        async fn open(&self) -> Result<Box<dyn crate::labd::workspace::guest::GuestFs>> {
+            Ok(Box::new(self.guest.clone()))
+        }
+        async fn watch(
+            &self,
+            _root: &str,
+            _prune: Vec<String>,
+        ) -> Result<Box<dyn crate::labd::workspace::guest::GuestWatch>> {
+            Ok(self.watcher.session())
+        }
+        async fn claim_root(&self, root: &str) -> Result<()> {
+            self.guest.dir(root);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::labd::workspace::windows::GuestRun for DevGuest {
+        async fn run(&self, _argv: Vec<String>) -> Result<crate::labd::workspace::windows::Ran> {
+            Ok(crate::labd::workspace::windows::Ran {
+                exit_code: 0,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const DEV_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    /// A lab whose `dev01` declares the workspace `./src`, holding `main.rs`.
+    fn dev_lab(dir: &std::path::Path) -> Arc<LabRuntime> {
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "agreed").unwrap();
+        let sh = shared(dir);
+        lab_of(
+            dir,
+            DEV_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        )
+    }
+
+    /// Start `dev01`'s syncer over an in-memory guest and wait for the pass
+    /// that seeds it, so every test below starts from an agreed workspace.
+    async fn dev_lab_syncing(
+        lab: &Arc<LabRuntime>,
+    ) -> (
+        crate::labd::workspace::Workspace,
+        Arc<crate::labd::workspace::guest::fake::FakeGuest>,
+        Arc<crate::labd::workspace::guest::fake::FakeWatcher>,
+    ) {
+        use crate::labd::workspace::guest::fake::{FakeGuest, FakeWatcher};
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let guest = Arc::new(FakeGuest::new());
+        let watcher = FakeWatcher::new(guest.clone(), &ws.guest_root);
+        lab.workspaces
+            .start(
+                ws.clone(),
+                Arc::new(DevGuest {
+                    guest: guest.clone(),
+                    watcher: watcher.clone(),
+                }),
+                lab.events.clone(),
+            )
+            .await;
+        let syncer = lab.workspaces.get("dev01").await.expect("the syncer");
+        let seeded = syncer.pass_now().await.expect("the seeding pass");
+        assert!(seeded.trouble.is_none(), "{:?}", seeded.trouble);
+        assert_eq!(
+            guest.text(&format!("{}/main.rs", ws.guest_root)).as_deref(),
+            Some("agreed")
+        );
+        (ws, guest, watcher)
+    }
+
+    /// The guest writes `new.rs`, and no pull of it succeeds: guest work that
+    /// no pass can carry to the host, however many run.
+    fn guest_work_no_pass_can_carry(
+        ws: &crate::labd::workspace::Workspace,
+        guest: &crate::labd::workspace::guest::fake::FakeGuest,
+        watcher: &crate::labd::workspace::guest::fake::FakeWatcher,
+    ) {
+        let path = format!("{}/new.rs", ws.guest_root);
+        guest.file(&path, "guest work", 901);
+        for _ in 0..64 {
+            guest.fail_pull(&path);
+        }
+        watcher.mark("new.rs");
+    }
+
+    /// Review dev-machines F4: `down` stops the syncer ahead of the machine,
+    /// and a guest write the watch has just reported is carried to the host
+    /// by a last pass first. Without one it stays in the guest only.
+    #[tokio::test]
+    async fn a_down_takes_a_last_pass_that_carries_guest_work_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+
+        guest.file(&format!("{}/main.rs", ws.guest_root), "guest work", 900);
+        guest.file(&format!("{}/new.rs", ws.guest_root), "new", 901);
+        watcher.mark("main.rs");
+        watcher.mark("new.rs");
+        lab.down(&[], false).await.expect("down");
+
+        assert!(lab.workspaces.get("dev01").await.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            "guest work",
+            "the stop took no last pass"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/new.rs"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        // In step at the stop, so nothing stands in a restore's way.
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+        lab.restore("dev01", "s", false).await.expect("restore");
+    }
+
+    /// Review dev-machines F4: what the last pass before a stop could not
+    /// carry is written on the ledger, and an offline restore refuses on it
+    /// by name until the discard flag says to lose it.
+    #[tokio::test]
+    async fn a_restore_of_a_stopped_machine_refuses_on_work_its_last_pass_left_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+        lab.down(&[], false).await.expect("down");
+        assert!(!dir.path().join("src/new.rs").exists());
+
+        let refused = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("the restore discards guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+
+        lab.restore("dev01", "s", true).await.expect("discarding");
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        assert!(ledger.reseed_owed);
+        assert_eq!(ledger.left_owed, None, "the rewind discarded what was owed");
+    }
+
+    /// Review dev-machines F5: `destroy` deletes the guest working copy, and
+    /// a halted workspace holds guest versions the host never took. The
+    /// machine is down here, so the halt is the one its ledger records.
+    #[tokio::test]
+    async fn a_destroy_of_a_halted_workspace_refuses_without_the_discard_flag() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+
+        let refused = lab
+            .destroy_machine("dev01", false)
+            .await
+            .expect_err("the destroy deletes the guest copy of a halted path");
+        let said = format!("{refused:#}");
+        assert!(said.contains("main.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(ws.ledger_path.exists(), "a refused destroy removes nothing");
+
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// Review dev-machines F5, for a running machine: the destroy takes a
+    /// last pass, and refuses on the path that pass could not carry.
+    #[tokio::test]
+    async fn a_destroy_of_a_workspace_with_unsynced_paths_refuses_without_the_discard_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+
+        let refused = lab
+            .destroy_machine("dev01", false)
+            .await
+            .expect_err("the destroy deletes guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(
+            lab.workspaces.get("dev01").await.is_some(),
+            "a refused destroy stops nothing"
+        );
+
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
+        assert!(lab.workspaces.get("dev01").await.is_none());
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// Review dev-machines F4 and F5 together: a `down` leaves work owed, and
+    /// the lab's `destroy` refuses on the record that stop wrote.
+    #[tokio::test]
+    async fn a_lab_destroy_refuses_on_work_a_stop_left_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+        lab.down(&[], false).await.expect("down");
+
+        let refused = lab
+            .destroy(false)
+            .await
+            .expect_err("the destroy deletes guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(ws.ledger_path.exists(), "a refused destroy removes nothing");
+
+        lab.destroy(true).await.expect("discarding");
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// A forced `down` does not wait on the guest, so it takes no last pass.
+    /// Its record says so, and a restore of the stopped machine refuses.
+    #[tokio::test]
+    async fn a_forced_down_records_that_no_last_pass_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, _guest, _watcher) = dev_lab_syncing(&lab).await;
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+        lab.down(&[], true).await.expect("down");
+
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        let left = ledger.left_owed.expect("the forced stop left a record");
+        assert!(left.why.contains("by force"), "{}", left.why);
+        let refused = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("nothing asked the guest before the stop");
+        let said = format!("{refused:#}");
+        assert!(said.contains("by force"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
     }
 }

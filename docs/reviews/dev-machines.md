@@ -66,10 +66,10 @@ says "read, not run".
 | Code | Fault | How bad |
 |---|---|---|
 | F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690) | Security against a hostile guest |
-| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note | Data loss (canonical copy) |
-| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush | Data loss (guest work) |
-| F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag | Data loss (guest work) |
-| F5 | `destroy` does not ask about a halted or unsynced workspace | Data loss (guest work) |
+| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note (fixed, card #693) | Data loss (canonical copy) |
+| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush (fixed, card #694) | Data loss (guest work) |
+| F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag (fixed, card #695) | Data loss (guest work) |
+| F5 | `destroy` does not ask about a halted or unsynced workspace (fixed, card #695) | Data loss (guest work) |
 | F6 | One machine's pass holds a host-wide lock across its guest I/O | Security against a hostile guest or peer, and wrong result |
 | F7 | `dev sync diff` reads a guest file of any size into the lab daemon's memory (fixed, card #696) | Security against a hostile guest, and crash |
 | F8 | Guest file names and guest file text reach the developer's terminal with their escape sequences | Security against a hostile guest |
@@ -187,6 +187,26 @@ the same steps, asserting the refusal on the halt, and with
 **How bad.** Data loss on the canonical copy, and a halt that is passed over
 without the discard flag.
 
+**Fixed by card #693.** `restore` and `restore_all` read the workspace through
+`restore_workspace_of` (`src/labd/lab.rs`). Where the host directory is there
+it answers as `workspace_of` does. Where the directory is away it still
+answers for a dev machine that declares a workspace, with the host root that
+the ledger on disk records. With no ledger for that guest root it uses the
+declared path, resolved as far as the host still holds it. So the halt on the
+ledger refuses the restore, and a restore that goes ahead writes `reseed_owed`
+on the ledger that the next syncer loads. `workspace.unavailable` still says
+that the directory is away. `workspace_of` is unchanged: no syncer starts over
+a missing directory. The test named above is in the tree, with a second one
+for a restore with no ledger on disk
+(`a_restore_with_the_host_workspace_away_and_no_ledger_notes_the_re_seed`).
+Before the fix both failed on helios: the restore returned `Ok` past the
+recorded halt, and no `reseed_owed` was on the ledger. Two cases stay open,
+read and not run. A capture (`snapshot`) and a worktree clone still read
+`workspace_of`, so with the directory away a capture does not refuse on a
+recorded halt and a clone leaves no note. A declaration that was changed to a
+directory that is away keeps the old ledger's root, so the note does not reach
+the new workspace, whose first sync starts from an empty ledger.
+
 ### F3. A running dev machine with no syncer is treated as stopped
 
 **Where.** `src/labd/workspace/syncer.rs:537-545` and `syncer.rs:581-588`
@@ -226,6 +246,24 @@ exists, `snapshot` returns `Ok`, and `restore` without the flag returns `Ok`.
 **How bad.** Data loss (guest work that never reached the host), and a
 workspace that does not sync with no word about it.
 
+**Fixed by card #694.** Two changes. Every start outside `up` now starts the
+syncer when the machine runs and has none (`ensure_workspace`,
+`src/labd/lab.rs`): `vm start`, `vm restart`, a wscript `start()`, and a
+restore that leaves the machine running. A syncer that is already there is
+kept. A start made inside an `up` for one of that `up`'s machines starts none,
+because the `up` starts it after provisioning. The second change covers what
+is left, an `up` whose provisioning failed: `before_capture` and
+`before_restore` (`src/labd/workspace/syncer.rs`) take whether the machine
+runs, and a running machine with a declared workspace and no syncer is refused
+(`NoSyncer`, `bracket.rs`). Capture has no flag, restore passes with
+`--discard-guest-changes`, and both refusals name `vmlab up <machine>`. The
+`dev sync` verbs name the same case in their refusal. Both tests named above
+are in `src/labd/lab.rs`. Before the fix both failed on helios: the start left
+no syncer, and the capture returned `Ok`. Not changed: a start outside `up`
+cannot tell whether provisioning ever ran, so on a machine that was never
+provisioned the syncer starts, fails its passes until its login exists, and
+the brackets refuse on that.
+
 ### F4. A stop takes no last pass and records nothing about owed work
 
 **Where.** `src/labd/lab.rs:3059-3073` and `lab.rs:3150` (the syncer is stopped
@@ -257,6 +295,27 @@ fix card decides between a last pass at stop and a record on the ledger.
 
 **How bad.** Data loss (guest work).
 
+**Fixed by card #695.** Both choices were taken. `down` stops each syncer with
+`WorkspaceSyncers::stop_before_machine` (`src/labd/workspace/syncer.rs`): a
+last flush pass while the guest still answers, then the stop, then a record on
+the ledger of what that pass left owed (`Ledger::left_owed`,
+`bracket::left_at_stop`). A forced `down` takes no last pass, so it does not
+wait on a guest that hangs, and its record says that no pass ran.
+`before_restore` refuses for a stopped machine on that record, after the
+recorded halt, and `--discard-guest-changes` answers it. The loop of the next
+syncer clears the record once a pass completes, and `Ledger::mark_rewound`
+clears it with the guest work a rewind discards. A capture of a stopped machine
+still refuses only on a halt or an owed re-seed: it destroys nothing, and the
+restore that would is guarded. A syncer whose loop ended by itself is answered
+from its last report with the trouble said, without the 120 s verb timeout.
+Three tests in `src/labd/lab.rs` drive `down` and `restore` on the lab runtime:
+`a_down_takes_a_last_pass_that_carries_guest_work_to_the_host`,
+`a_restore_of_a_stopped_machine_refuses_on_work_its_last_pass_left_owed` and
+`a_forced_down_records_that_no_last_pass_ran`. Before the fix the first two
+failed on helios: the host did not hold the guest's edit, and the restore
+returned `Ok`. Not covered: `vm stop` of one machine leaves its syncer running
+as before, and a lab daemon that is killed writes no record.
+
 ### F5. `destroy` does not ask about a halted or unsynced workspace
 
 **Where.** `src/labd/lab.rs:1568-1594` (`destroy_machine`), `lab.rs:3150-3159`
@@ -285,6 +344,25 @@ same for a workspace with unsynced paths. Whether `destroy` gets a flag or a
 warning is the fix card's decision.
 
 **How bad.** Data loss (guest work).
+
+**Fixed by card #695.** `destroy` gets the flag a restore has. `destroy`,
+`vm destroy`, `container destroy` and `lab destroy` take
+`--discard-guest-changes`, carried as `discard` on the `destroy` and
+`machine.destroy` requests. Without it `LabRuntime::destroy_machine` and
+`destroy` ask `WorkspaceSyncers::before_destroy` first, before anything is
+stopped: a running workspace gets a last pass and refuses on what the report
+still holds (a halt, unsynced paths, a pass that could not finish), and a
+stopped one refuses on the halt or the F4 record on its ledger. The lab's
+`destroy` asks every machine, and one refusal stops it whole. A destroy with no
+lab daemon, which removes `.vmlab/` in the CLI, reads the same from the ledger
+files (`ledger::stopped_work`). A workspace that owes a re-seed is not refused.
+The tests are `a_destroy_of_a_halted_workspace_refuses_without_the_discard_flag`,
+`a_destroy_of_a_workspace_with_unsynced_paths_refuses_without_the_discard_flag`
+and `a_lab_destroy_refuses_on_work_a_stop_left_owed` in `src/labd/lab.rs`.
+Before the fix all three failed on helios: each destroy returned `Ok`. The
+check reads the workspace through `workspace_of`, so F2 applies to it until F2
+is fixed: with the host directory away, a stopped machine's ledger is not read
+by the daemon.
 
 ### F6. One machine's pass holds a host-wide lock across its guest I/O
 

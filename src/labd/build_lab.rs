@@ -56,7 +56,7 @@ pub fn serves(req: &LabRequest) -> bool {
         | LabRequest::PullCancel { .. }
         | LabRequest::Run { .. }
         | LabRequest::Down { .. }
-        | LabRequest::Destroy {}
+        | LabRequest::Destroy { .. }
         | LabRequest::MachineStart { .. }
         | LabRequest::MachineStop { .. }
         | LabRequest::MachineRestart { .. }
