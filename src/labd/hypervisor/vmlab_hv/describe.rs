@@ -18,7 +18,8 @@ use vmlab_hv_proto::MachineDescription;
 use vmlab_hv_proto::machine::{
     Accel, AppleSmc, Arch, Audio, AudioDevice, Boot, ComPort, CpuPolicy, Disk, DiskBus, DiskFormat,
     Display, DisplayDevice, FirmwareKind, FsShare, FwCfgFile, FwCfgSource, GpuMode, HyperV,
-    Machine, MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, SerialPort, SerialTransport, Tpm,
+    Machine, MsrPolicy, Nic, NicAttachment, NicModel, PciAddress, PitTicks, SerialPort,
+    SerialTransport, Tpm,
     VfioDevice, VirtualDisplay,
 };
 
@@ -127,6 +128,7 @@ pub(crate) fn container(
         applesmc: None,
         usb_keyboard: false,
         smbios_type2: false,
+        pit_ticks: Default::default(),
         cpu: CpuPolicy::Host,
         hyperv: Vec::new(),
         display: None,
@@ -757,6 +759,10 @@ pub(crate) fn vm(
         },
         usb_keyboard: macos && resolved.input == crate::config::model::InputDevices::Usb,
         smbios_type2: resolved.apple_smc,
+        pit_ticks: match resolved.pit_ticks {
+            crate::profiles::PitTicks::Replay => PitTicks::Replay,
+            crate::profiles::PitTicks::Discard => PitTicks::Discard,
+        },
         cpu: if resolved.nested {
             CpuPolicy::Nested
         } else {
@@ -2082,6 +2088,37 @@ mod tests {
     #[test]
     fn templeos_has_the_pc_shape() {
         legacy_pc_shape("templeos", NicModel::E1000, DisplayDevice::StdVga);
+    }
+
+    /// The windows-9x profile reaches vmlab-hv as `pit_ticks = discard`,
+    /// which it applies as `KVM_REINJECT_CONTROL` with `pit_reinject = 0`
+    /// (card #705). A template's `cpu_model`, which Windows 95 needs and
+    /// which takes Hyper-V and its own tick policy away, does not change it.
+    /// Every other pc profile keeps KVM's replay and says nothing.
+    #[test]
+    fn windows_9x_discards_missed_pit_ticks_and_other_pc_profiles_replay_them() {
+        for body in [
+            r#"profile = "windows-9x""#,
+            r#"profile = "windows-9x" cpu_model = "pentium3""#,
+        ] {
+            let r = declared(body, None);
+            let d = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+            assert_eq!(d.pit_ticks, PitTicks::Discard, "{body}");
+            assert_eq!(
+                serde_json::to_value(&d).unwrap()["pit_ticks"],
+                "discard",
+                "{body}"
+            );
+        }
+        for profile in ["windows-xp", "windows-legacy", "templeos"] {
+            let r = declared(&format!(r#"profile = "{profile}""#), None);
+            let d = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap();
+            assert_eq!(d.pit_ticks, PitTicks::Replay, "{profile}");
+            assert!(
+                serde_json::to_value(&d).unwrap().get("pit_ticks").is_none(),
+                "{profile}"
+            );
+        }
     }
 
     #[test]

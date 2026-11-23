@@ -1045,6 +1045,7 @@ fn real_kernel_boots_and_resets() {
         applesmc: None,
         usb_keyboard: false,
         smbios_type2: false,
+        pit_ticks: Default::default(),
         floppy: None,
         serial_log_port: Default::default(),
         hyperv: vec![],
