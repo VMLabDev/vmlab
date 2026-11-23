@@ -1175,6 +1175,64 @@ mod tests {
         assert!(!joined(&build_args("lab", &vm, &p, Accel::Tcg).unwrap()).contains("splash="));
     }
 
+    /// QEMU splits an option value at each `,` and reads `,,` as a literal
+    /// comma, so a path inside an option value must have its commas doubled.
+    /// `-bios`, `-readconfig` and `-serial file:` take a path whole, so their
+    /// path stays as it is.
+    #[test]
+    fn a_comma_in_a_path_is_doubled_in_every_option() {
+        let dir = "/lab/with,comma";
+        let at = |name: &str| PathBuf::from(format!("{dir}/{name}"));
+        let mut p = paths();
+        p.apple_smc_config = at("applesmc.cfg");
+        p.qmp_sock = at("qmp.sock");
+        p.agent_sock = at("agent.sock");
+        p.vnc_sock = at("vnc.sock");
+        p.primary_disk = at("disk0.qcow2");
+        p.extra_disks = vec![("data".into(), at("data.qcow2"))];
+        p.cdroms = vec![at("install.iso"), at("seed.iso")];
+        p.floppy = Some(at("answer.img"));
+        p.firmware_code = Some(at("OVMF_CODE.fd"));
+        p.ovmf_vars = Some(at("OVMF_VARS.fd"));
+        p.nic_rom = Some(at("virtio-net.rom"));
+        p.tpm_sock = Some(at("swtpm.sock"));
+        p.serial_log = Some(at("serial.log"));
+        p.virtiofs_shares = vec![("src".into(), at("vfs0.sock"))];
+        p.nics[0].backend = NicBackend::Stream {
+            sock: at("nic0.sock"),
+        };
+        let mut vm = resolved("linux-modern", "x86_64");
+        vm.firmware = Some(FirmwareKind::Ovmf);
+        vm.tpm = true;
+        let mut isa = vm.clone();
+        isa.agent_transport = AgentTransport::IsaSerial;
+        let mut debug = p.clone();
+        debug.firmware_debug = true;
+        for (vm, p) in [(&vm, &p), (&isa, &p), (&vm, &debug)] {
+            let args = build_args("lab", vm, p, Accel::Kvm).unwrap();
+            let mut seen = 0;
+            for (i, value) in args.iter().enumerate() {
+                if !value.contains("with,") {
+                    continue;
+                }
+                seen += 1;
+                let whole = matches!(
+                    args.get(i.wrapping_sub(1)).map(String::as_str),
+                    Some("-bios" | "-readconfig")
+                ) || value.starts_with("file:");
+                if whole {
+                    assert!(!value.contains("with,,comma"), "{value}");
+                } else {
+                    assert!(value.contains("with,,comma"), "{value}");
+                }
+            }
+            // The disks, the CD-ROMs, the floppy, both firmware files, the
+            // QMP, VNC, agent, NIC, TPM and virtiofs sockets, the ROM and the
+            // serial log.
+            assert!(seen >= 15, "{seen}: {args:?}");
+        }
+    }
+
     /// virtiofs shares attach as vhost-user-fs devices and flip the RAM to
     /// a shared memfd backend; share-less VMs keep plain `-m` (RAM block
     /// name stability for existing snapshots).
