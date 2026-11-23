@@ -445,7 +445,10 @@ impl LabIdentity {
     fn in_runtime(lab: &str, root: Option<&Path>, runtime: &Path) -> Self {
         Self {
             name: format!("vmlab:{lab}/"),
-            runtime: format!("{}/", crate::paths::lab_runtime_dir_in(runtime, lab).display()),
+            runtime: format!(
+                "{}/",
+                crate::paths::lab_runtime_dir_in(runtime, lab).display()
+            ),
             smb: root.map(|root| {
                 format!(
                     "{}/",
@@ -597,7 +600,8 @@ fn signal_lab_orphans(identity: LabIdentity) -> (usize, bool) {
         if let Err(error) = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(*pid),
             nix::sys::signal::Signal::SIGKILL,
-        ) && error != nix::errno::Errno::ESRCH {
+        ) && error != nix::errno::Errno::ESRCH
+        {
             tracing::warn!("could not kill orphaned process {pid}: {error}");
             all_signalled = false;
         }

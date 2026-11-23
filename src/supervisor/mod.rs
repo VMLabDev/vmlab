@@ -1156,12 +1156,12 @@ mod tests {
             |lab, found_runtime| {
                 assert!(work.is_dir());
                 assert_eq!(found_runtime, runtime);
-                reaped.borrow_mut().extend(
-                    table.iter().filter_map(|(pid, cmdline)| {
+                reaped
+                    .borrow_mut()
+                    .extend(table.iter().filter_map(|(pid, cmdline)| {
                         crate::qemu::process::cmdline_belongs_to(cmdline.as_bytes(), lab)
                             .then_some(*pid)
-                    }),
-                );
+                    }));
                 true
             },
         );
