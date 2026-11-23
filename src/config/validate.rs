@@ -344,6 +344,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             if let Some(problem) = crate::smb::config::share_host_problem(&share.host) {
                 issues.push(Issue::at(share.span, format!("share {problem}")));
             }
+            // Whatever the transport: `auto` can land on SMB, and a virtiofs
+            // guest writes the same files (docs/reviews/smb.md F1).
+            let served = crate::labd::share_plan::resolve_share_host(
+                &file.root,
+                Some(&crate::paths::home()),
+                &share.host,
+            );
+            if let Some(problem) = share_over_lab_state(&file.root, &served) {
+                issues.push(Issue::at(share.span, format!("share {problem}")));
+            }
             // vmlab-hv serves its VMs' shares itself (§22, phase 2e): the
             // host's virtiofsd is not asked.
             if share.transport == ShareTransport::Virtiofs
@@ -525,6 +535,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         v.span,
                         format!("volume host path {} is not a directory", host.display()),
                     ));
+                }
+                // A named volume lives under the state directory by vmlab's
+                // own hand; a host bind over it is the guest's way in.
+                if let Some(problem) = share_over_lab_state(&file.root, &path) {
+                    issues.push(Issue::at(v.span, format!("volume {problem}")));
                 }
             }
         }
@@ -2140,6 +2155,17 @@ fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::Reso
     crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
 }
 
+/// Why the directory `served` cannot be handed to a guest of the lab at
+/// `root`, or `None` when it can: it holds the lab's state directory or lies
+/// inside it (PRD §7.5, docs/reviews/smb.md F1).
+fn share_over_lab_state(root: &Path, served: &Path) -> Option<String> {
+    crate::smb::config::share_state_problem(
+        served,
+        &crate::paths::lab_local_dir(root),
+        "the lab's state directory",
+    )
+}
+
 /// One machine's `@dev` arguments (§19.1, §19.6), held to what a share is held
 /// to: the host `workspace` must be a directory now, not at `up`, where a
 /// missing one only stops the syncer; and `workspace_guest` must be an absolute
@@ -3343,7 +3369,7 @@ lab "l" {
 lab "l" {{
   segment "s" {{ }}
   vm "a" {{ template = "x86_64/t" nic {{ segment = "s" }}
-    share {{ host = "." guest = "/mnt/x" name = "{name}" }} }}
+    share {{ host = "/usr" guest = "/mnt/x" name = "{name}" }} }}
 }}"#
             ))
         };
@@ -3720,9 +3746,9 @@ lab "l" {
 lab "l" {
   segment "s" { }
   vm "a" { template = "aarch64/t" hypervisor = "qemu" nic { segment = "s" }
-    share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" }
-    share { host = "." guest = "/mnt/a" name = "a" }
-    share { host = "." guest = "/mnt/s" name = "s" transport = "smb" } }
+    share { host = "/usr" guest = "/mnt/v" name = "v" transport = "virtiofs" }
+    share { host = "/usr" guest = "/mnt/a" name = "a" }
+    share { host = "/usr" guest = "/mnt/s" name = "s" transport = "smb" } }
 }"#);
         let es: Vec<String> = validate(&f, &OldVirtiofsd)
             .into_iter()
@@ -5156,9 +5182,9 @@ lab "l" {
         let f = lab(r#"import <vmlab.wcl>
 lab "l" {
   vm "hv" { template = "x86_64/t" hypervisor = "vmlab"
-    share { host = "." guest = "/mnt/v" name = "v" transport = "virtiofs" } }
+    share { host = "/usr" guest = "/mnt/v" name = "v" transport = "virtiofs" } }
   vm "q" { template = "aarch64/t" hypervisor = "qemu"
-    share { host = "." guest = "/mnt/w" name = "w" transport = "virtiofs" } }
+    share { host = "/usr" guest = "/mnt/w" name = "w" transport = "virtiofs" } }
 }"#);
         let es: Vec<String> = validate(&f, &NoVirtiofsd)
             .into_iter()
