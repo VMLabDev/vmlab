@@ -44,7 +44,7 @@ test does not reproduce is wrong and should be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs |
+| F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691) |
 | F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
 | F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
@@ -55,6 +55,13 @@ test does not reproduce is wrong and should be dropped.
 | F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings |
 
 ### F1. The working directory is named from an unchecked name and version (data loss)
+
+**Fixed by card #691.** `build_template` applies the store's name rule to the
+architecture, the name, the declared version and a pinned version before it
+plans, fetches or claims anything (`check_build_names`), and to the
+auto-incremented version before the working directory is claimed. Both proof
+tests are in `src/template/build.rs`. `vmlab validate` still accepts such a
+name: the refusal comes at the start of the build.
 
 - Where: `src/template/build.rs:977-979` (`build_workdir`), `:153-154` (the
   claim), `:952-970` (`claim_workdir`, the delete at `:964`), `:907-913` (the
