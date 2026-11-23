@@ -5501,7 +5501,10 @@ mod tests {
             "{refused:#}"
         );
         // …and allowed once it is asked for by name.
-        syncers.before_restore("dev01", true, None, false).await.unwrap();
+        syncers
+            .before_restore("dev01", true, None, false)
+            .await
+            .unwrap();
 
         let ws = workspace(dir.path(), state.path());
         restore_bracket(&syncers, &ws, || {}).await;
@@ -5577,7 +5580,10 @@ mod tests {
 
         guest.file("/src/main.rs", "typed just now", 900);
         sessions.watcher.mark("main.rs");
-        syncers.before_restore("dev01", false, None, false).await.unwrap();
+        syncers
+            .before_restore("dev01", false, None, false)
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
             "typed just now",
@@ -5600,7 +5606,10 @@ mod tests {
             Some("written in the guest"),
         );
         assert!(!dir.path().join("late.txt").exists());
-        syncers.before_restore("dev01", true, None, false).await.unwrap();
+        syncers
+            .before_restore("dev01", true, None, false)
+            .await
+            .unwrap();
         syncers.stop("dev01").await;
     }
 
@@ -5609,7 +5618,10 @@ mod tests {
     #[tokio::test]
     async fn a_machine_with_no_workspace_brackets_nothing() {
         let syncers = WorkspaceSyncers::default();
-        syncers.before_capture("plain-vm", None, false).await.unwrap();
+        syncers
+            .before_capture("plain-vm", None, false)
+            .await
+            .unwrap();
         syncers
             .before_restore("plain-vm", false, None, false)
             .await
@@ -5696,7 +5708,10 @@ mod tests {
         // it cannot flush one, but it can still decline to freeze a
         // disagreement.
         assert!(
-            syncers.before_capture("dev01", Some(&ws), false).await.is_err(),
+            syncers
+                .before_capture("dev01", Some(&ws), false)
+                .await
+                .is_err(),
             "a stopped, halted workspace is not a coherent capture",
         );
         // …and the flag answers it, as it does for a running one.
