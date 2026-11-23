@@ -176,7 +176,7 @@ pub async fn build_template(
     // Working area: a throwaway lab root under the artefact cache. Removed on
     // both success and failure, so nothing leaks.
     let work = build_workdir(def);
-    let guard = claim_workdir(&work)?;
+    let guard = claim_build_workdir(def, &work)?;
 
     let result = run_build(
         def,
@@ -461,7 +461,7 @@ async fn build_variants(
             "{}-{}-{}-variant-{}",
             def.arch, def.name, def.version, v.name
         ));
-        let guard = claim_workdir(&work)?;
+        let guard = claim_build_workdir(def, &work)?;
         let built = build_variant(
             def,
             v,
@@ -1031,6 +1031,10 @@ pub fn builds_dir() -> PathBuf {
 
 fn build_workdir(def: &TemplateDef) -> PathBuf {
     builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
+}
+
+fn claim_build_workdir(_def: &TemplateDef, work: &Path) -> Result<WorkdirGuard> {
+    claim_workdir(work)
 }
 
 /// Delete every build working directory no live build holds, returning how
@@ -2496,6 +2500,29 @@ mod tests {
             build_lab_name(&x64.arch, &x64.name),
             build_lab_name(&x86.arch, &x86.name)
         );
+    }
+
+    #[test]
+    fn two_builds_of_one_template_do_not_share_a_runtime_directory() {
+        let first = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/i.iso" } }"#);
+        let mut second = first.clone();
+        second.version = "2".into();
+        let dir = tempfile::tempdir().unwrap();
+        let first_work = dir.path().join(super::build_workdir(&first).file_name().unwrap());
+        let second_work = dir.path().join(super::build_workdir(&second).file_name().unwrap());
+        assert_ne!(first_work, second_work);
+        let first_claim = super::claim_build_workdir(&first, &first_work).unwrap();
+        let second_claim = super::claim_build_workdir(&second, &second_work);
+        if second_claim.is_ok() {
+            assert_ne!(
+                build_lab_name(&first.arch, &first.name),
+                build_lab_name(&second.arch, &second.name),
+                "both builds claimed the same runtime directory"
+            );
+        }
+        drop(first_claim);
     }
 
     #[test]
