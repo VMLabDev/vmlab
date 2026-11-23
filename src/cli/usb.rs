@@ -28,7 +28,8 @@ pub enum UsbCmd {
         /// The VM, as `[lab/]vm`
         vm: String,
         selector: String,
-        /// Attach a HID keyboard or mouse, which the host is probably using
+        /// Attach a HID keyboard or mouse, which the host is probably using, or
+        /// a disk the host has mounted
         #[arg(long)]
         force: bool,
         /// Emit the attachment as JSON
