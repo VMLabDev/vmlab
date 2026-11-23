@@ -35,7 +35,7 @@ Two facts are used by several findings:
 | F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547) |
 | F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name (fixed, card #557) |
 | F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
-| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host |
+| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559) |
 | F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down |
 | F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon |
 | F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab |
@@ -236,6 +236,11 @@ Two facts are used by several findings:
   with one QEMU argv whose `-name` is `vmlab:demo/a` and whose QMP and
   serial socket paths lie under another runtime directory. `lab_orphans`
   with the identity of `demo` must return nothing. Today it returns the pid.
+- Fixed in card #559. `LabIdentity::started` in `src/qemu/process.rs` now
+  knows a QEMU (by its name and by the argv form of a renamed host-GPU
+  binary) by its `-name vmlab:<lab>/` marker **and** a `-qmp unix:<path>`
+  under the lab's runtime directory, which `cmdline.rs` and `container.rs`
+  always pass. The proof test failed before the fix and passes after it.
 
 ### F6. The release deadline is shorter than a graceful stop (crash)
 
