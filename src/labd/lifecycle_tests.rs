@@ -2524,6 +2524,147 @@ async fn poweroff_quits_through_the_control_channel() {
     assert_eq!(observed.exit().await.reason, StopReason::Requested);
 }
 
+/// A forced stop gives a held host USB device back before it kills the
+/// hypervisor (§5.2.1: "A VM stop releases everything it held"). The device
+/// returns to its host driver only when the hypervisor drops its backend, and
+/// a SIGKILL drops nothing: the kernel then releases the claims and binds no
+/// driver, so the host has a device it cannot use until a replug.
+#[tokio::test]
+async fn a_forced_stop_detaches_usb_devices_before_the_kill() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    m.stop(true).await.expect("forced stop");
+
+    assert_eq!(observed.exit().await.status, "signal: 9");
+    assert_eq!(
+        hv.journal(),
+        vec![
+            format!("attach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+            "kill".to_string(),
+        ],
+        "the device goes back to the host while the hypervisor still runs"
+    );
+    assert!(m.usb_attached().await.is_empty());
+}
+
+/// The same for a graceful stop that ends at the kill rung: a guest that
+/// ignores the shutdown request and a hypervisor that ignores `quit`.
+///
+/// Time is paused: the rungs before the kill wait for the guest.
+#[tokio::test(start_paused = true)]
+async fn a_stop_that_ends_at_the_kill_detaches_usb_devices_first() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            agent: false,
+            capabilities: Capabilities::all(),
+            runs: vec![Run {
+                ignores_powerdown: true,
+                ignores_quit: true,
+                ..Run::forever()
+            }],
+            ..Script::default()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    m.stop(false).await.expect("graceful stop");
+
+    assert_eq!(observed.exit().await.status, "signal: 9");
+    assert_eq!(
+        hv.journal(),
+        vec![
+            format!("attach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+            "kill".to_string(),
+        ]
+    );
+}
+
+/// A hypervisor that never answers the detach is killed all the same: the
+/// forced stop is what ends a wedged machine, so the detach has a limit.
+///
+/// Time is paused: the limit is the one the stop itself keeps.
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_kills_a_hypervisor_that_never_answers_the_detach() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            runs: vec![Run {
+                ignores_detach: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    m.stop(true).await.expect("forced stop");
+
+    assert_eq!(observed.exit().await.status, "signal: 9");
+    assert_eq!(
+        hv.journal(),
+        vec![
+            format!("attach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+            "kill".to_string(),
+        ]
+    );
+    assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
+/// A stop that ends before the kill rung detaches nothing: the hypervisor
+/// exits by itself and gives its devices back as it drops them.
+#[tokio::test]
+async fn a_stop_that_ends_before_the_kill_leaves_the_detach_to_the_hypervisor() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    m.stop(false).await.expect("graceful stop");
+
+    assert_eq!(observed.exit().await.status, "exit status: 0");
+    assert_eq!(hv.journal(), vec![format!("attach {}", held.qdev_id)]);
+    assert!(m.usb_attached().await.is_empty());
+}
+
+/// A VM with the hot-plug USB controller.
+const USB_VM: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB usb = true }"#;
+
 /// A host USB device the hot-plug tests attach: an ordinary flash drive.
 fn usb_plan() -> crate::usb::AttachPlan {
     let device = crate::usb::HostDevice {
