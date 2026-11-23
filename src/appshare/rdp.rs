@@ -744,6 +744,17 @@ mod tests {
         );
     }
 
+    /// Review appshare-media F3: FreeRDP redirects the clipboard unless told
+    /// not to, and a redirected clipboard lets the guest read what the user
+    /// copies on the host without a paste. A plain request turns it off.
+    #[test]
+    fn the_rdp_clipboard_is_not_shared_unasked() {
+        let socket = Path::new("/tmp/rdp.sock");
+        let args = freerdp_args(socket, "win11", &argv(&["notepad.exe"]), None, &creds()).unwrap();
+        assert!(!args.iter().any(|a| a == "+clipboard"), "{args:?}");
+        assert!(args.iter().any(|a| a == "-clipboard"), "{args:?}");
+    }
+
     /// The password reaches FreeRDP on stdin and nowhere else: argv is the
     /// one switch that says to read stdin.
     #[test]
