@@ -78,14 +78,15 @@ typedef LONG (WINAPI *destroy_fn)(const destroy_device *);
 typedef LONG (WINAPI *escape_fn)(const escape_args *);
 typedef LONG (WINAPI *close_fn)(const close_adapter *);
 
-/* viogpu/shared/viogpum.h of the driver source. */
-#pragma pack(push, 1)
+/* viogpu/shared/viogpum.h of the driver source. VIOGPU_ADAPTERINFO is not
+ * packed there: four bytes of padding follow the flags. */
 typedef struct {
     uint64_t iam;
     uint32_t flags;
     uint64_t supported_capset_ids;
 } viogpu_adapterinfo;
 
+#pragma pack(push, 1)
 typedef struct {
     uint16_t type;
     uint16_t data_length;
@@ -115,7 +116,7 @@ _Static_assert(sizeof(query_device_ids) == 28, "D3DKMT_QUERY_DEVICE_IDS ABI");
 _Static_assert(offsetof(escape_args, data) == 16, "D3DKMT_ESCAPE ABI");
 _Static_assert(offsetof(create_device, device) == sizeof(void *) + 4, "D3DKMT_CREATEDEVICE ABI");
 _Static_assert(sizeof(create_device) == (sizeof(void *) == 8 ? 64 : 36), "D3DKMT_CREATEDEVICE ABI");
-_Static_assert(sizeof(viogpu_adapterinfo) == 20, "VIOGPU_ADAPTERINFO ABI");
+_Static_assert(sizeof(viogpu_adapterinfo) == 24 && offsetof(viogpu_adapterinfo, supported_capset_ids) == 16, "VIOGPU_ADAPTERINFO ABI");
 _Static_assert(sizeof(viogpu_escape) == 40, "VIOGPU_ESCAPE ABI");
 _Static_assert(sizeof(viogpu_submit_cmd_req) == 12, "VIOGPU_SUBMIT_CMD_REQ ABI");
 _Static_assert(sizeof(submit_request) == 68, "escape buffer size");
