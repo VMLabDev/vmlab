@@ -58,7 +58,15 @@ pub const TEMP_PREFIX: &str = ".vmlab-sync.";
 /// other. The *deferral* the rest of that set needs — hold off while a lock is
 /// held — is timing rather than an ignore rule, and lands with the conflict
 /// halt.
-const FLOOR: &[&str] = &[".vmlab-sync*", ".git/**/*.lock"];
+///
+/// `.vmlab` is a lab's state directory (`crate::paths::LAB_DIR`): `state.json`,
+/// the sync ledgers, each machine's SMB credentials and its disks. Validation
+/// refuses a workspace that holds its own lab's; the floor keeps the name out
+/// at any depth all the same, because `.vmlabignore` syncs from the guest and
+/// beats `.gitignore`, so a repo rule is one the guest can negate
+/// (docs/reviews/dev-machines.md F1). It also covers a second lab nested in
+/// the workspace, which validation does not look for.
+const FLOOR: &[&str] = &[".vmlab-sync*", ".git/**/*.lock", ".vmlab"];
 
 /// Whether `rel` is one of the syncer's own files — an apply's temp or the
 /// halt marker, both under the floor's `.vmlab-sync*` glob.

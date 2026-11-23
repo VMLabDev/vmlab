@@ -1821,7 +1821,11 @@ volume). It need not exist: the syncer makes it before the watch
 opens, and where the default login cannot (`/src` under a root-owned `/`), the
 agent identity creates it and hands it to that login — the one write outside
 the login, and only of the root itself. **At most one workspace per machine**; additional repos are
-ordinary guest-local clones, unsynced. The argument must **not** be spelled bare
+ordinary guest-local clones, unsynced. **A workspace stays clear of the lab's
+state**, as a share does (§7.5): a host path that holds the lab's state
+directory (`.vmlab`) or lies inside it is a validation error, so
+`workspace = "."` in a lab root is refused, and the lab daemon starts no syncer
+over one however the configuration was built. The argument must **not** be spelled bare
 `guest`, and a `workspace {}` child block was rejected for the same reason: that
 is `share {}`'s shape, a share is virtiofs/SMB passthrough where a workspace is a
 synced local copy, and same-looking syntax for opposite mechanisms is how someone
@@ -1839,7 +1843,10 @@ since gitignored files you *do* want guest-side (`.env`, local certs,
 and the reason will be invisible. They fail §19.1's third clause: they describe
 the contents of a *directory*, so they travel with the repo, and they are
 developer-owned — a stale `node_modules` rule must not require editing a
-committed `vmlab.wcl` that every other developer shares.
+committed `vmlab.wcl` that every other developer shares. The floor holds the
+syncer's own scratch names, `.git`'s lock files and `.vmlab` — a lab's state
+directory, at any depth — and no rule overrides it: `.vmlabignore` syncs from
+the guest, so a rule is something a guest can write.
 
 An ignored path is not *skipped*, it is **guest-owned**. `node_modules` is the
 proving case: you do not want it absent guest-side, you want the guest to run its

@@ -2168,17 +2168,23 @@ fn share_over_lab_state(root: &Path, served: &Path) -> Option<String> {
 
 /// One machine's `@dev` arguments (§19.1, §19.6), held to what a share is held
 /// to: the host `workspace` must be a directory now, not at `up`, where a
-/// missing one only stops the syncer; and `workspace_guest` must be an absolute
-/// path for the guest's family, and not the root of its file system, which
-/// would make the whole guest the workspace.
+/// missing one only stops the syncer, and may not hold the lab's state
+/// directory or lie inside it (docs/reviews/dev-machines.md F1) — the syncer
+/// writes guest changes back, so a workspace over the state is a guest's way
+/// to the lab's own files; and `workspace_guest` must be an absolute path for
+/// the guest's family, and not the root of its file system, which would make
+/// the whole guest the workspace.
 fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: &mut IssueList) {
-    if let Some(workspace) = &dev.workspace
-        && !root.join(workspace).is_dir()
-    {
-        issues.push(Issue::at(
-            dev.span,
-            format!("@dev workspace {} is not a directory", workspace.display()),
-        ));
+    if let Some(workspace) = &dev.workspace {
+        let host = root.join(workspace);
+        if !host.is_dir() {
+            issues.push(Issue::at(
+                dev.span,
+                format!("@dev workspace {} is not a directory", workspace.display()),
+            ));
+        } else if let Some(problem) = share_over_lab_state(root, &host) {
+            issues.push(Issue::at(dev.span, format!("@dev workspace: {problem}")));
+        }
     }
     let Some(guest) = &dev.workspace_guest else {
         return;
@@ -3348,12 +3354,53 @@ lab "l" {
             assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
         }
         for (dev, machine) in [
-            (r#"workspace = ".", workspace_guest = "/src""#, linux),
+            (r#"workspace_guest = "/src""#, linux),
             (r#"workspace_guest = "C:\\src""#, windows),
             (r#"workspace_guest = "/home/dev/src""#, container),
         ] {
             let es = dev_errs(dev, machine);
             assert!(es.is_empty(), "{dev} on {machine} → {es:#?}");
+        }
+    }
+
+    /// Review dev-machines F1 (card 690): a workspace is held to what a share
+    /// is held to (§7.5). The syncer copies host files into the guest and
+    /// writes guest changes back, so a workspace that holds the lab's state
+    /// directory, or lies inside it, hands a guest `state.json`, the sync
+    /// ledgers and other machines' SMB credentials. `workspace = "."` in a
+    /// lab root is the common spelling of it.
+    #[test]
+    fn a_dev_workspace_over_the_lab_state_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("lab/.vmlab/smb")).unwrap();
+        std::fs::create_dir_all(root.path().join("lab/src")).unwrap();
+        // A link into the state directory is the state directory.
+        std::os::unix::fs::symlink(".vmlab", root.path().join("lab/link")).unwrap();
+        let lab_root = root.path().join("lab");
+        let dev_errs = |workspace: &str| -> Vec<String> {
+            let src = format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n@dev(workspace = \"{workspace}\") vm \"dev01\" \
+                 {{ template = \"x86_64/t\" }}\n}}"
+            );
+            let f = load_lab_source(&src, "<test>", &lab_root).expect("source should parse");
+            validate(&f, &Permissive)
+                .into_iter()
+                .map(|i| i.message)
+                .collect()
+        };
+        let parent = root.path().display().to_string();
+        for workspace in [".", "..", parent.as_str(), ".vmlab", ".vmlab/smb", "link"] {
+            let es = dev_errs(workspace);
+            assert!(
+                es.iter()
+                    .any(|m| m.contains("@dev workspace") && m.contains("state directory")),
+                "{workspace} → {es:#?}"
+            );
+        }
+        // A directory beside the state directory is what a workspace is.
+        for workspace in ["src", "./src"] {
+            let es = dev_errs(workspace);
+            assert!(es.is_empty(), "{workspace} → {es:#?}");
         }
     }
 
@@ -3394,7 +3441,7 @@ lab "l" {{
             r#"@dev vm "dev01" { template = "x86_64/t" }"#,
             r#"@dev vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
-            r#"@dev(default = true, workspace = ".") vm "dev01" { template = "x86_64/t" }
+            r#"@dev(default = true) vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
         ] {
             let es = errs(&format!("import <vmlab.wcl>\nlab \"l\" {{\n{lab_src}\n}}"));
