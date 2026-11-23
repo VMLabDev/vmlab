@@ -41,6 +41,102 @@ fn restore_rejects_pio_position_at_end_of_buffer() {
     );
 }
 
+#[test]
+fn restore_rejects_execution_inconsistent_with_opcode() {
+    // Card #612. Each state passed the restore, and the next `dma_ready()`
+    // or FIFO read panicked on a command byte or a medium that is not there.
+    let sector = vec![0u8; SECTOR];
+    let cases = [
+        // READ ID's two-byte command run as a read: `run` reads byte 2 to 6.
+        ("floppy", "Read", vec![0x0a, 0], Vec::new(), 0),
+        // A format with a sector in the PIO buffer: the FIFO read that
+        // empties it reads command byte 6 of 6.
+        (
+            "floppy",
+            "Format",
+            vec![0x4d, 0, 2, 18, 0x1b, 0xf6],
+            sector.clone(),
+            SECTOR - 1,
+        ),
+        (
+            "floppy",
+            "ReadId",
+            vec![0x4a, 0],
+            sector.clone(),
+            SECTOR - 1,
+        ),
+        // A transfer in the PIO buffer of a drive that holds no medium.
+        (
+            "empty",
+            "Read",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            sector.clone(),
+            SECTOR - 1,
+        ),
+        // The operation of another transfer opcode.
+        (
+            "floppy",
+            "Write",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            Vec::new(),
+            0,
+        ),
+    ];
+    for (configuration, operation, command, pio, pio_position) in cases {
+        let mut m = Machine::new(configuration);
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&m.floppy.save_state().unwrap()).unwrap();
+        state["phase"] = "Execution".into();
+        state["execution"] = serde_json::json!({
+            "operation":operation, "command":command, "seeked":false,
+            "pio":pio, "pio_position":pio_position, "remaining_ns":0
+        });
+        assert!(
+            m.floppy
+                .restore_state(&serde_json::to_vec(&state).unwrap())
+                .is_err(),
+            "{configuration}: {operation} {command:02x?} was restored"
+        );
+    }
+}
+
+#[test]
+fn restore_keeps_a_command_that_matches_its_opcode() {
+    // The check must not refuse what a save can produce: a read waiting for
+    // DMA, a READ ID in its delay, and a PIO sector half read.
+    let cases = [
+        (
+            "Read",
+            vec![0x66, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            Vec::new(),
+            0,
+            0u64,
+        ),
+        ("ReadId", vec![0x4a, 0], Vec::new(), 0, 1),
+        ("Format", vec![0x4d, 0, 2, 18, 0x1b, 0xf6], Vec::new(), 0, 0),
+        (
+            "Verify",
+            vec![0x56, 0, 0, 0, 1, 2, 18, 0x1b, 0xff],
+            vec![0u8; SECTOR],
+            100,
+            0,
+        ),
+    ];
+    for (operation, command, pio, pio_position, remaining_ns) in cases {
+        let mut m = Machine::new("floppy");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&m.floppy.save_state().unwrap()).unwrap();
+        state["phase"] = "Execution".into();
+        state["execution"] = serde_json::json!({
+            "operation":operation, "command":command, "seeked":false,
+            "pio":pio, "pio_position":pio_position, "remaining_ns":remaining_ns
+        });
+        m.floppy
+            .restore_state(&serde_json::to_vec(&state).unwrap())
+            .unwrap_or_else(|e| panic!("{operation} {command:02x?}: {e:?}"));
+    }
+}
+
 struct Machine {
     isa: Arc<Mutex<IsaDevices>>,
     floppy: Floppy,

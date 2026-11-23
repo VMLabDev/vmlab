@@ -313,6 +313,9 @@ pub fn encode_ram_regions<'a>(
     Ok(out)
 }
 
+/// Bytes of one `(base, len)` entry of the RAM region list.
+const RAM_REGION_ENTRY: usize = 16;
+
 /// Decode the RAM region and stream pages back out through `write_pages`
 /// (guest physical base of the run, then the run's bytes).
 pub fn decode_ram_regions<'a>(
@@ -320,6 +323,13 @@ pub fn decode_ram_regions<'a>(
     mut write_pages: impl FnMut(u64, &[u8]) -> Result<(), String>,
 ) -> Result<Vec<(u64, u64)>, FormatError> {
     let count = reader.u32()? as usize;
+    // The count comes from the file. Every entry is 16 bytes of the stream,
+    // so a count the stream cannot hold is refused before it sizes anything.
+    if count > reader.remaining().len() / RAM_REGION_ENTRY {
+        return Err(FormatError::Corrupt(format!(
+            "RAM region count {count} exceeds the stream"
+        )));
+    }
     let mut regions = Vec::with_capacity(count);
     for _ in 0..count {
         let base = reader.u64()?;
@@ -329,18 +339,36 @@ pub fn decode_ram_regions<'a>(
                 "RAM region {base:#x}+{len:#x} is not page aligned"
             )));
         }
+        if base.checked_add(len).is_none() {
+            return Err(FormatError::Corrupt(format!(
+                "RAM region {base:#x}+{len:#x} overflows the address space"
+            )));
+        }
         regions.push((base, len));
     }
     for (base, len) in &regions {
+        let overrun = || FormatError::Corrupt(format!("RAM region {base:#x} overruns its length"));
         let mut covered = 0u64;
         while covered < *len {
+            // A run is refused when it passes the end of its region, so
+            // `covered` stays at most `len` and `base + covered` cannot
+            // overflow.
+            let left = *len - covered;
             match reader.u8()? {
-                0 => covered += reader.u64()? * PAGE_SIZE,
-                1 => {
-                    let pages = reader.u64()?;
-                    let bytes = pages
+                0 => {
+                    let bytes = reader
+                        .u64()?
                         .checked_mul(PAGE_SIZE)
-                        .ok_or_else(|| FormatError::Corrupt("run overflows".into()))?;
+                        .filter(|bytes| *bytes <= left)
+                        .ok_or_else(overrun)?;
+                    covered += bytes;
+                }
+                1 => {
+                    let bytes = reader
+                        .u64()?
+                        .checked_mul(PAGE_SIZE)
+                        .filter(|bytes| *bytes <= left)
+                        .ok_or_else(overrun)?;
                     let run = reader.take(bytes as usize)?;
                     write_pages(base + covered, run).map_err(FormatError::Corrupt)?;
                     covered += bytes;
@@ -351,11 +379,6 @@ pub fn decode_ram_regions<'a>(
                     )));
                 }
             }
-        }
-        if covered > *len {
-            return Err(FormatError::Corrupt(format!(
-                "RAM region {base:#x} overruns its length"
-            )));
         }
     }
     Ok(regions)
@@ -526,5 +549,72 @@ mod tests {
         })
         .unwrap();
         assert_eq!(pages, MAX_DATA_PAGES + 1);
+    }
+
+    #[test]
+    fn decode_ram_regions_rejects_a_huge_region_count() {
+        // Card #612: the count sized a `Vec` of 16-byte entries before any
+        // entry was read, 64 GiB for this stream.
+        let stream = u32::MAX.to_le_bytes();
+        let error = decode_ram_regions(&mut Reader::new(&stream), |_, _| Ok(())).unwrap_err();
+        assert!(
+            matches!(&error, FormatError::Corrupt(why) if why.contains("region count 4294967295")),
+            "{error}"
+        );
+    }
+
+    /// One region of `len` bytes at `base`, then `records`.
+    fn ram_stream(base: u64, len: u64, records: &[(u8, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, 1);
+        push_u64(&mut out, base);
+        push_u64(&mut out, len);
+        for &(tag, pages) in records {
+            out.push(tag);
+            push_u64(&mut out, pages);
+        }
+        out
+    }
+
+    #[test]
+    fn decode_ram_regions_rejects_a_run_that_overflows() {
+        // Card #612: `pages * PAGE_SIZE` and `base + covered` were unchecked.
+        let cases = [
+            // A zero run of `u64::MAX` pages.
+            ram_stream(0, PAGE_SIZE, &[(0, u64::MAX)]),
+            // A zero run whose byte count wraps to exactly one page.
+            ram_stream(0, PAGE_SIZE, &[(0, (1 << 52) + 1)]),
+            // A zero run past the end of its region.
+            ram_stream(0, PAGE_SIZE, &[(0, 2)]),
+            // A data run of `u64::MAX` pages.
+            ram_stream(0, PAGE_SIZE, &[(1, u64::MAX)]),
+            // A region that ends past the address space.
+            ram_stream(u64::MAX - PAGE_SIZE + 1, 2 * PAGE_SIZE, &[(0, 2)]),
+        ];
+        for (case, stream) in cases.iter().enumerate() {
+            let mut written = false;
+            let result = decode_ram_regions(&mut Reader::new(stream), |_, _| {
+                written = true;
+                Ok(())
+            });
+            assert!(
+                matches!(result, Err(FormatError::Corrupt(_))),
+                "case {case}: {result:?}"
+            );
+            assert!(!written, "case {case} wrote guest memory");
+        }
+    }
+
+    #[test]
+    fn decode_ram_regions_refuses_an_overrunning_data_run_before_it_writes() {
+        let mut stream = ram_stream(0, PAGE_SIZE, &[(1, 2)]);
+        stream.extend_from_slice(&[0x5a; 2 * PAGE_SIZE as usize]);
+        let mut written = false;
+        let result = decode_ram_regions(&mut Reader::new(&stream), |_, _| {
+            written = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(FormatError::Corrupt(_))), "{result:?}");
+        assert!(!written);
     }
 }
