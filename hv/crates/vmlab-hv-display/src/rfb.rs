@@ -78,7 +78,7 @@ struct ClientState {
 }
 impl DisplayServer {
     pub fn serve_rfb(&self, mut stream: UnixStream) -> io::Result<()> {
-        let _session = self.session(&stream)?;
+        let session = self.session(&stream)?;
         let _cpu = self.cpu_client();
         stream.write_all(b"RFB 003.008\n")?;
         if &read::<12>(&mut stream)? != b"RFB 003.008\n" {
@@ -90,6 +90,7 @@ impl DisplayServer {
         }
         stream.write_all(&0u32.to_be_bytes())?;
         read::<1>(&mut stream)?;
+        session.established()?;
         self.publish()?;
         let (frame, ..) = self.snapshot();
         stream.write_all(&(frame.width as u16).to_be_bytes())?;
@@ -107,12 +108,12 @@ impl DisplayServer {
         let local = state.clone();
         let mut reader = stream.try_clone()?;
         let server = self.clone();
-        let thread = std::thread::spawn(move || {
+        let thread = std::thread::Builder::new().spawn(move || {
             let result = server.rfb_input(&mut reader, &local);
             local.lock().unwrap().closed = true;
             let _ = reader.shutdown(Shutdown::Both);
             result
-        });
+        })?;
         let result = self.rfb_updates(&mut stream, &state, (frame.width, frame.height));
         let _ = stream.shutdown(Shutdown::Both);
         let _ = thread.join();
