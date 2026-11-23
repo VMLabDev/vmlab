@@ -192,11 +192,12 @@ impl SmbConfig {
     /// no share asks for `smb1`.
     pub fn render_nt1_conf(&self) -> Option<String> {
         self.any_smb1.then(|| {
-            "    ntlm auth = ntlmv1-permitted
-    lanman auth = yes
-                 client lanman auth = yes
-"
-                .to_string()
+            [
+                "    ntlm auth = ntlmv1-permitted\n",
+                "    lanman auth = yes\n",
+                "    client lanman auth = yes\n",
+            ]
+            .concat()
         })
     }
 
@@ -756,10 +757,8 @@ mod tests {
         // The modern share turns an SMB1 session away, the smb1 share not.
         let modern = section(&conf, "data");
         assert!(modern.contains("preexec close = yes\n"), "{modern}");
-        assert!(
-            modern.contains("preexec = /bin/sh -c \"case %R in SMB[23]_*) exit 0;; esac; exit 1\"\n"),
-            "{modern}"
-        );
+        let gate = "preexec = /bin/sh -c \"case %R in SMB[23]_*) exit 0;; esac; exit 1\"\n";
+        assert!(modern.contains(gate), "{modern}");
         assert!(!section(&conf, "src").contains("preexec"), "{conf}");
     }
 
