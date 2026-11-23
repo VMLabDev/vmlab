@@ -82,7 +82,7 @@ hostile guest or peer, wrong result, cosmetic.
 | F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses |
 | F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check |
 | F8 | wrong result | The iPXE build keeps stale headers in `config/local` of a cached checkout |
-| F9 | cosmetic | The recorded iPXE ROM hashes and the firmware build reports are never compared with a build |
+| F9 | cosmetic | The recorded iPXE ROM hashes and the firmware build reports are never compared with a build (fixed for the iPXE record, card #737) |
 
 No finding lets a guest change another lab's firmware state. The variable
 store is one file per VM (`.vmlab/vms/<vm>/OVMF_VARS.fd`). A destroy removes
@@ -323,6 +323,26 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   the check fails, the record is stale today. If it passes, the fault is only
   that no recipe runs it.
 - Confidence: high that nothing compares. Not run.
+- Fixed by card #737, for the one record the repository holds. The proof
+  steps were run on helios with the toolchain the README names (GCC 16.2.1,
+  binutils 2.47): all four files failed `sha256sum -c`, so the record was
+  stale. A second fault was under it: the ROM bytes depended on the checkout
+  path. iPXE's build id is a checksum of its objects, and their debug
+  information names the build directory, so two checkouts of the same commit
+  on the same host gave different ROMs (five bytes each). `build.py` now
+  passes `-ffile-prefix-map`, removes the objects of a cached checkout when
+  that flag or the toolchain changes, and ends every `hv` build by comparing
+  its outputs with `SHA256SUMS.hv`. A difference fails the build, and with it
+  `just ci::hv-ipxe-build` and `just ci::check`. The record names its
+  toolchain. Under another one the ROMs are not compared and a warning names
+  them, and `ipxe-source.tar` is compared on every host. `--record` writes
+  the record. Proof test: `build/test_ipxe_record.py`.
+- Still open: `BUILDINFO`, `SEABIOS-BUILDINFO` and the guest profile's
+  `IPXE-SHA256SUMS` are written by the build they describe, and the
+  repository holds no record of those outputs. A record for them has to be
+  made in the build container, which `just ci::check` does not run. A
+  toolchain update on the build host turns the ROM comparison into a
+  warning until the record is written again.
 
 ## Notes
 
