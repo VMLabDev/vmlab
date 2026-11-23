@@ -450,7 +450,23 @@ static unsigned long field_ulong(const char *js, int ntok, const char *key, unsi
     return v;
 }
 
-/* Returns -1 when the loop should stop (a shutdown was initiated). */
+/* The decoder's restart test: a hello starts every connection, so one
+ * found inside a frame that is still open means the host was cut off in
+ * that frame and has connected again. */
+static int is_hello(const unsigned char *payload, unsigned long len)
+{
+    const char *js = (const char *)payload;
+    int ntok, cmd_tok;
+
+    ntok = json_parse(js, (int)len, toks, MAX_TOKENS);
+    if (ntok < 0 || toks[0].type != JSON_OBJECT)
+        return 0;
+    cmd_tok = json_get(js, toks, ntok, 0, "cmd");
+    return cmd_tok >= 0 && json_streq(js, toks, cmd_tok, "hello");
+}
+
+/* Returns -1 when the loop should stop (a shutdown was initiated), 1 when
+ * the payload was no message at all. */
 static int handle_ctrl(const unsigned char *payload, unsigned long len)
 {
     const char *js = (const char *)payload;
@@ -461,7 +477,7 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
     ntok = json_parse(js, (int)len, toks, MAX_TOKENS);
     if (ntok < 0 || toks[0].type != JSON_OBJECT) {
         send_error(-1, "unparseable control message");
-        return 0;
+        return 1;
     }
     cmd_tok = json_get(js, toks, ntok, 0, "cmd");
     if (cmd_tok < 0 || json_str(js, toks, cmd_tok, cmd, (int)sizeof cmd) < 0) {
@@ -618,7 +634,7 @@ static int service_sessions(void)
 int agent_run(void)
 {
     int idle_ticks = 0;
-    wire_decoder_init(&dec, inbuf, IN_CAP);
+    wire_decoder_init(&dec, inbuf, IN_CAP, is_hello);
     memset(sessions, 0, sizeof sessions);
 
     for (;;) {
@@ -646,10 +662,17 @@ int agent_run(void)
         while (wire_next(&dec, &kind, &channel, &payload, &len)) {
             active = 1;
             if (kind == WIRE_KIND_CTRL && channel == 0) {
-                if (handle_ctrl(payload, len) < 0) {
+                int handled = handle_ctrl(payload, len);
+                if (handled < 0) {
                     wire_consume(&dec);
                     drop_all_sessions();
                     return 0;
+                }
+                if (handled > 0) {
+                    /* A frame the host was cut off in, filled up by the
+                     * start of the next one: keep what follows its magic. */
+                    wire_reject(&dec);
+                    continue;
                 }
             } else if (kind == WIRE_KIND_DATA) {
                 handle_data(channel, payload, len);

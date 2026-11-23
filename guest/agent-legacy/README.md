@@ -38,7 +38,8 @@ project's `ow-snapshot.tar.xz` there).
 
 - `src/wire.[ch]` — the frame layer: the 13-byte header, and a decoder that
   resynchronises on the magic (a serial line can drop or replay bytes across
-  an online snapshot restore).
+  an online snapshot restore) and restarts on a hello found inside a frame
+  the host was cut off in.
 - `src/json.[ch]` — a tokenizer and writer for the handful of control
   messages this agent answers. No allocation, no dependency.
 - `src/agent.c` — the core: one polling loop that decodes frames, dispatches
