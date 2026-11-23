@@ -28,7 +28,7 @@ vmlab runs machines on QEMU/KVM, driven directly over QMP — no libvirt — and
 - **Multi-host scheduling.** vmlab runs VMs on one host. The only cross-host feature is attaching a network segment to a peer daemon (§9.4); placing or migrating VMs across hosts is out of scope.
 - **Multi-tenancy.** vmlab is a lab tool for a single trusted host user, not a multi-tenant service. Guest input and pulled templates are untrusted.
 
-  Guest-to-host channels must validate messages and bound resource use. Shares must confine guest access to the declared host directory and enforce read-only declarations. Pulled templates, including their metadata and disk contents, must be treated as untrusted input rather than authority to access host resources. This does not isolate X11 shared apps from the host desktop: opting into the X11 app-share transport grants the desktop access described in ADR-0016.
+  Guest-to-host channels must validate messages and bound resource use. Shares must confine guest access to the declared host directory and enforce read-only declarations. Pulled templates, including their metadata and disk contents, must be treated as untrusted input rather than authority to access host resources. This does not isolate X11 shared apps from the host desktop: opting into the X11 app-share transport grants the desktop access described in ADR-0016, and a guest cannot opt in for the user (§20.1).
 - **libvirt compatibility.** No domain XML, no virsh interop.
 - **Hypervisors other than QEMU/KVM and vmlab-hv.** vmlab runs machines on QEMU and, machine by machine, on its own hypervisor vmlab-hv (§22, ADR-0021); it does not drive Xen, Hyper-V, VirtualBox, cloud-hypervisor or any other.
 
@@ -980,7 +980,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 | `vmlab usb list / attach / detach` | Host USB devices and who holds each; hot-plug one into a running VM with `usb = true` and back (§5.2.1) |
 | `vmlab exec [--timeout s] <vm> -- cmd` | Guest-agent exec |
 | `vmlab cp <src> <vm>:<dest>` | Copy a host file/tree into a guest via the agent |
-| `vmlab app run [--via waypipe\|x11\|rdp] [--detach] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
+| `vmlab app run [--via waypipe\|x11\|rdp] [--detach] [--clipboard] <machine> -- cmd` | Show one guest program's windows on the host desktop (§20) |
 | `vmlab osinfo <vm>` | Guest OS identification as JSON |
 | `vmlab script <script.ws> [--record vm=path]` | Ad-hoc script against the current lab; `--record` records a VM for exactly the run (§11.1) |
 | `vmlab logs [lab/][vm]` | Tail/dump JSON-line logs |
@@ -2362,7 +2362,8 @@ The guest family and the host session pick the protocol:
 | Guest | Host session | Protocol | Guest needs | Host needs |
 |---|---|---|---|---|
 | Linux | Wayland | waypipe | `waypipe` on the login's `PATH` | `waypipe` |
-| Linux | Wayland, guest without waypipe | X11, through Xwayland | nothing | Xwayland (`DISPLAY` set) |
+| Linux | Wayland, host without waypipe | X11, through Xwayland | nothing | Xwayland (`DISPLAY` set) |
+| Linux | Wayland, guest without waypipe, `app_x11_fallback = true` | X11, through Xwayland | nothing | Xwayland (`DISPLAY` set) |
 | Linux | X11 | X11 | nothing | the X server |
 | Windows | Wayland or X11 | RDP RemoteApp | an edition with an RDP host | FreeRDP 3 (`xfreerdp3` or `xfreerdp`) |
 
@@ -2375,9 +2376,16 @@ guest (§5.3) serves none of the three, so `app run` refuses it by name before
 it looks at the host session.
 
 The fallback from waypipe to X11 is the only automatic one. It happens when
-the guest has no `waypipe` for the login, or the host has none, and the host
-has `DISPLAY` set. The CLI says it fell back, and why, on stderr. With no
-`DISPLAY` to fall back to, it refuses and names the missing `waypipe`.
+the host has no `waypipe` and has `DISPLAY` set. The CLI says it fell back,
+and why, on stderr. With no `DISPLAY` to fall back to, it refuses and names
+the missing `waypipe`.
+
+A guest with no `waypipe` for the login is a different case, because the
+guest answers that question and X11 is the transport that opens the host's X
+server to it (§1.2). The CLI falls back on the guest's answer only when the
+host config sets `app_x11_fallback = true` (default `false`). Without the
+setting it refuses, names the missing `waypipe`, and names the two ways to
+X11: `--via x11` and the setting.
 
 Each protocol keeps its own costs. X11 has no compression and no shared
 memory, so a busy app is slower than under waypipe, and an app with no X11
@@ -2432,6 +2440,10 @@ connection (`guest/agent-proto/src/app.rs`):
   leaves them changed. The CLI listens on a private unix socket and starts
   `xfreerdp` with `/v:<that socket>`, `/app:program:<argv0>,cmd:<rest>`, and
   the login's credentials passed through `/args-from:stdin`, never argv. It
+  passes `-clipboard`, because FreeRDP otherwise redirects the clipboard, and a
+  redirected clipboard lets the guest read what is copied on the host without
+  a paste, and set it. `app run --clipboard` passes `+clipboard` and shares it
+  both ways for that session. It
   starts FreeRDP only once the agent says the session is ready, which waits for
   the guest's RDP listener to accept: the first session on a machine turns
   Remote Desktop on, and TermService takes about 40 seconds to listen. Each
