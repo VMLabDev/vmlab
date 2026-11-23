@@ -209,4 +209,28 @@ mod tests {
             }
         );
     }
+
+    /// Review appshare-media F8: every local user can read the helper's
+    /// command line for as long as the shared app lives, so the password
+    /// must not be in it.
+    #[test]
+    fn the_detached_helper_argv_holds_no_password() {
+        let typed = RunArgs {
+            machine: "lab/web".into(),
+            via: None,
+            detach: true,
+            verbose: false,
+            cwd: None,
+            run_as: As {
+                user: Some("dev".into()),
+                password: Some("s3cret-pw".into()),
+            },
+            cmd: vec!["foot".into()],
+        };
+        let argv = typed.helper_args();
+        assert!(
+            !argv.iter().any(|a| a.contains("s3cret-pw")),
+            "the helper argv holds the password: {argv:?}"
+        );
+    }
 }
