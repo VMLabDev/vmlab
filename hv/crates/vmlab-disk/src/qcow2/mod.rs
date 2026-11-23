@@ -2054,7 +2054,11 @@ mod tests {
         let mut buf = vec![0xffu8; 8192];
         overlay.read_at(span - 4096, &mut buf).unwrap();
         assert!(buf[..2048].iter().all(|&b| b == 0x66));
-        assert!(buf[2048..].iter().all(|&b| b == 0), "tail {:?}", &buf[2048..2064]);
+        assert!(
+            buf[2048..].iter().all(|&b| b == 0),
+            "tail {:?}",
+            &buf[2048..2064]
+        );
         let mut buf = vec![0xffu8; 4096];
         overlay.read_at(span, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0), "first bytes {:?}", &buf[..16]);
