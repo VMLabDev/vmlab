@@ -226,6 +226,8 @@ impl Drop for Domain {
 }
 
 pub(crate) struct Host {
+    /// Whether the kernel can reset this function ([`resets`]).
+    resets: bool,
     device: VfioDevice,
     domain: Arc<Domain>,
     vm: Arc<VmFd>,
@@ -347,6 +349,9 @@ impl Backend for Host {
 
     fn reset(&mut self) -> Result<(), String> {
         self.stop_interrupts()?;
+        if !self.resets {
+            return Ok(());
+        }
         // VFIO_DEVICE_RESET is _IO(';', 100 + 11), without a pointer argument.
         // SAFETY: the owned fd is a VFIO device, exclusively assigned by its
         // explicit machine-description address. The kernel checks reset scope.
@@ -567,6 +572,36 @@ impl Drop for Host {
     }
 }
 
+/// Whether the kernel can reset this function by itself
+/// (`VFIO_DEVICE_FLAGS_RESET`). The audio function of a graphics card often
+/// cannot: it has no function-level reset and shares its bus with the GPU,
+/// and `VFIO_DEVICE_RESET` then fails with EINVAL. Such a function is
+/// assigned without a reset, as QEMU assigns it.
+fn resets(device: &VfioDevice) -> bool {
+    let mut info = vfio_device_info {
+        argsz: std::mem::size_of::<vfio_device_info>() as u32,
+        ..Default::default()
+    };
+    // VFIO_DEVICE_GET_INFO is _IO(';', 100 + 7); the kernel fills `info` up
+    // to its `argsz`.
+    // SAFETY: the fd is an open VFIO device and `info` is a valid, correctly
+    // sized vfio_device_info for the length of the call.
+    let result = unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            (u64::from(VFIO_TYPE) << 8 | u64::from(VFIO_BASE + 7)) as libc::c_ulong,
+            &mut info,
+        )
+    };
+    reset_supported(result, info.flags)
+}
+
+/// [`resets`] over the ioctl's answer. A failed query keeps the reset, so
+/// the failure that matters is the reset's own and names itself.
+fn reset_supported(result: libc::c_int, flags: u32) -> bool {
+    result < 0 || flags & VFIO_DEVICE_FLAGS_RESET != 0
+}
+
 /// Length of the 64-bit PCI window PCI0._CRS must declare for these assigned
 /// BARs. Firmware packs 64-bit BARs largest first from the window base, so
 /// the assigned ones can push every other device's past the default 32 GiB:
@@ -662,7 +697,16 @@ pub(crate) fn build(
             });
         }
         let pin = config[0x3d];
+        let resets = resets(&device);
+        if !resets {
+            log::info!(
+                "VFIO {}: the kernel has no reset for this function, so it keeps its state \
+                 across a guest reset",
+                description.host
+            );
+        }
         let host = Host {
+            resets,
             device,
             domain: domain.clone(),
             vm: kvm.vm.clone(),
@@ -807,6 +851,16 @@ mod tests {
         assert!(error.contains("only 8 MiB"), "{error}");
         assert!(error.contains("RLIMIT_MEMLOCK"), "{error}");
         assert!(error.contains("ulimit -l unlimited"), "{error}");
+    }
+
+    #[test]
+    fn a_function_the_kernel_cannot_reset_is_assigned_without_one() {
+        assert!(reset_supported(
+            0,
+            VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI
+        ));
+        assert!(!reset_supported(0, VFIO_DEVICE_FLAGS_PCI));
+        assert!(reset_supported(-1, 0));
     }
 
     #[test]

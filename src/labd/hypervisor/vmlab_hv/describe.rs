@@ -591,14 +591,31 @@ pub(crate) fn vm(
 
     // The passed-through GPU, then the VM's own display device, as the
     // argv orders `vfio-pci` and the `display` device. vmlab-hv takes only
-    // a function already bound to vfio-pci; vmlab binds nothing.
-    let vfio: Vec<VfioDevice> = passthrough
-        .into_iter()
-        .map(|host| VfioDevice {
-            host,
-            pci: slots.next(),
-        })
-        .collect();
+    // a function already bound to vfio-pci; vmlab binds nothing. The card's
+    // other functions (its HDMI/DP audio) share its guest slot under the
+    // function number each has on the host, so the guest finds one
+    // multi-function card as the host does.
+    let mut vfio: Vec<VfioDevice> = Vec::new();
+    if let Some(host) = passthrough {
+        let pci = slots.next();
+        vfio.push(VfioDevice { host, pci });
+        for sibling in &paths.gpu_passthrough_functions {
+            let function = sibling
+                .rsplit_once('.')
+                .and_then(|(_, f)| f.parse::<u8>().ok())
+                .filter(|f| (1..8).contains(f) && vfio.iter().all(|v| v.pci.function != *f));
+            let Some(function) = function else {
+                bail!(
+                    "vm \"{name}\": {sibling} cannot go to the guest with its GPU: it needs \
+                     a function number of its own from 1 to 7"
+                );
+            };
+            vfio.push(VfioDevice {
+                host: sibling.clone(),
+                pci: PciAddress { function, ..pci },
+            });
+        }
+    }
     let display_pci = default_vga.unwrap_or_else(|| slots.next());
     let display_device = if accelerated.is_some() {
         DisplayDevice::VirtioVga
@@ -1635,6 +1652,61 @@ mod tests {
         assert_eq!(d.tablet, at(6));
         let err = vm("l", &r, &vm_paths(), QemuAccel::Kvm, &roms()).unwrap_err();
         assert!(err.to_string().contains("needs a host GPU"), "{err}");
+    }
+
+    /// The card's other functions go to the guest at the card's own slot,
+    /// each under the function number it has on the host, and take no slot
+    /// from the display behind them (card #590).
+    #[test]
+    fn a_passed_through_gpus_other_functions_share_its_guest_slot() {
+        let r = declared(
+            r#"profile = "linux-modern" firmware = "seabios" gpu { mode = "passthrough" }"#,
+            None,
+        );
+        let paths = VmPaths {
+            gpu_passthrough: Some("0000:05:00.0".into()),
+            gpu_passthrough_functions: vec!["0000:05:00.1".into(), "0000:05:00.3".into()],
+            ..vm_paths()
+        };
+        let d = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap();
+        let slot = at(4).unwrap();
+        assert_eq!(
+            d.vfio,
+            vec![
+                VfioDevice {
+                    host: "0000:05:00.0".into(),
+                    pci: slot,
+                },
+                VfioDevice {
+                    host: "0000:05:00.1".into(),
+                    pci: PciAddress {
+                        function: 1,
+                        ..slot
+                    },
+                },
+                VfioDevice {
+                    host: "0000:05:00.3".into(),
+                    pci: PciAddress {
+                        function: 3,
+                        ..slot
+                    },
+                },
+            ]
+        );
+        assert_eq!(d.display.unwrap().pci, at(5).unwrap());
+        for bad in [
+            vec!["0000:05:00.0".to_string()],
+            vec!["0000:05:00.1".to_string(), "0000:06:00.1".to_string()],
+            vec!["nonsense".to_string()],
+        ] {
+            let paths = VmPaths {
+                gpu_passthrough: Some("0000:05:00.0".into()),
+                gpu_passthrough_functions: bad,
+                ..vm_paths()
+            };
+            let err = vm("l", &r, &paths, QemuAccel::Kvm, &roms()).unwrap_err();
+            assert!(err.to_string().contains("cannot go to the guest"), "{err}");
+        }
     }
 
     #[test]
