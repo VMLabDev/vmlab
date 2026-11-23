@@ -334,6 +334,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         share.guest
                     ),
                 ));
+            } else if let Some(problem) = crate::smb::config::share_name_problem(&share.name) {
+                // A derived name is already `[a-z0-9_]`; an explicit one is
+                // taken as written and becomes an `smb.conf` section header.
+                issues.push(Issue::at(
+                    share.span,
+                    format!("share name \"{}\": {problem}", share.name.escape_debug()),
+                ));
+            }
+            if let Some(problem) = crate::smb::config::share_host_problem(&share.host) {
+                issues.push(Issue::at(share.span, format!("share {problem}")));
             }
             // vmlab-hv serves its VMs' shares itself (§22, phase 2e): the
             // host's virtiofsd is not asked.
@@ -354,6 +364,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref()),
             &mut issues,
         );
+        if let Some(dev) = &vm.dev {
+            check_dev_arguments(
+                dev,
+                &file.root,
+                login_family(
+                    effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref(),
+                ),
+                &mut issues,
+            );
+        }
         for m in &vm.media {
             check_media(&file.root, m, &mut issues);
         }
@@ -494,6 +514,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             LoginFamily::Linux,
             &mut issues,
         );
+        if let Some(dev) = &c.dev {
+            check_dev_arguments(dev, &file.root, LoginFamily::Linux, &mut issues);
+        }
 
         for v in &c.volumes {
             if let VolumeSource::Host(host) = &v.source {
@@ -2008,7 +2031,8 @@ fn check_disk_block(root: &Path, d: &DiskBlock, issues: &mut IssueList) {
 /// (`<vm>.<lab>.<suffix>`, §9.5).
 /// A lab has at most one default dev machine (§19.1).
 ///
-/// This is the *only* `@dev` rule §5.1 owns. The decorator's own errors — an
+/// This is the only `@dev` rule that spans machines; each machine's own
+/// arguments are [`check_dev_arguments`]'s. The decorator's own errors — an
 /// undeclared `@dve`, a wrong-typed or unknown argument, `@dev` on a `nic {}`,
 /// a repeated `@dev @dev` — come from WCL, which validates an instance
 /// decorator against its declaration. What WCL cannot see is this one, because
@@ -2131,6 +2155,45 @@ fn vm_hardware(vm: &Vm, ctx: &dyn ValidationContext) -> Option<crate::qemu::Reso
         None => crate::profiles::ProfileSet::of([]),
     };
     crate::qemu::resolve_vm(vm, meta.as_ref(), &profiles).ok()
+}
+
+/// One machine's `@dev` arguments (§19.1, §19.6), held to what a share is held
+/// to: the host `workspace` must be a directory now, not at `up`, where a
+/// missing one only stops the syncer; and `workspace_guest` must be an absolute
+/// path for the guest's family, and not the root of its file system, which
+/// would make the whole guest the workspace.
+fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: &mut IssueList) {
+    if let Some(workspace) = &dev.workspace
+        && !root.join(workspace).is_dir()
+    {
+        issues.push(Issue::at(
+            dev.span,
+            format!("@dev workspace {} is not a directory", workspace.display()),
+        ));
+    }
+    let Some(guest) = &dev.workspace_guest else {
+        return;
+    };
+    if let Some(problem) = guest_path_problem(guest, family) {
+        issues.push(Issue::at(dev.span, format!("@dev workspace_guest {problem}")));
+    } else if is_guest_root(guest) {
+        issues.push(Issue::at(
+            dev.span,
+            format!(
+                "@dev workspace_guest \"{guest}\" is the root of the guest's file system — the \
+                 workspace syncer would own the whole guest; name a directory below it"
+            ),
+        ));
+    }
+}
+
+/// `/`, `C:\` and the like: an absolute guest path with nothing below the root.
+fn is_guest_root(path: &str) -> bool {
+    let rest = match path.as_bytes() {
+        [d, b':', rest @ ..] if d.is_ascii_alphabetic() => rest,
+        rest => rest,
+    };
+    rest.iter().all(|&b| b == b'/' || b == b'\\')
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -3244,6 +3307,70 @@ lab "l" {
         }
     }
 
+    /// Review F13 (config): `@dev`'s arguments are checked as a share's are.
+    /// A missing host `workspace` and a relative `workspace_guest` are each an
+    /// issue, and so is a guest root, which would make the whole guest the
+    /// workspace. The guest path is judged by the machine's family.
+    #[test]
+    fn dev_arguments_are_checked_like_a_share() {
+        let dev_errs = |dev: &str, machine: &str| {
+            errs(&format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n@dev({dev}) {machine}\n}}"
+            ))
+        };
+        let linux = r#"vm "dev01" { template = "x86_64/t" profile = "linux" }"#;
+        let es = dev_errs(r#"workspace = "./nope", workspace_guest = "src""#, linux);
+        assert_eq!(es.len(), 2, "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("./nope")), "{es:#?}");
+        assert!(es.iter().any(|m| m.contains("\"src\"")), "{es:#?}");
+
+        let windows = r#"vm "dev01" { template = "x86_64/t" profile = "windows-11" }"#;
+        let container = r#"container "dev01" { image = "sdk:9.0" }"#;
+        for (dev, machine) in [
+            (r#"workspace_guest = "/""#, linux),
+            (r#"workspace_guest = "C:\""#, windows),
+            (r#"workspace_guest = "/src""#, windows),
+            (r#"workspace_guest = "C:\src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
+        }
+        for (dev, machine) in [
+            (r#"workspace = ".", workspace_guest = "/src""#, linux),
+            (r#"workspace_guest = "C:\src""#, windows),
+            (r#"workspace_guest = "/home/dev/src""#, container),
+        ] {
+            let es = dev_errs(dev, machine);
+            assert!(es.is_empty(), "{dev} on {machine} → {es:#?}");
+        }
+    }
+
+    /// Review F12 (config): an explicit share name becomes an `smb.conf`
+    /// section header, so it is held to a plain share name. `global` would
+    /// rewrite the server's settings, and `]` or a line break writes a
+    /// directive of its own.
+    #[test]
+    fn an_explicit_share_name_is_a_plain_share_name() {
+        let share_errs = |name: &str| {
+            errs(&format!(
+                r#"import <vmlab.wcl>
+lab "l" {{
+  segment "s" {{ }}
+  vm "a" {{ template = "x86_64/t" nic {{ segment = "s" }}
+    share {{ host = "." guest = "/mnt/x" name = "{name}" }} }}
+}}"#
+            ))
+        };
+        for bad in ["global", "Homes", "IPC$", "a]b", "a\\nb"] {
+            let es = share_errs(bad);
+            assert!(es.iter().any(|m| m.contains("share name")), "{bad} → {es:#?}");
+        }
+        for good in ["src", "Data-2", "my.share"] {
+            let es = share_errs(good);
+            assert!(es.is_empty(), "{good} → {es:#?}");
+        }
+    }
+
     /// Everything else about `@dev` is legal: any number of dev machines,
     /// none or one declaring the default, and a bare `@dev` on either kind.
     #[test]
@@ -3252,7 +3379,7 @@ lab "l" {
             r#"@dev vm "dev01" { template = "x86_64/t" }"#,
             r#"@dev vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
-            r#"@dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+            r#"@dev(default = true, workspace = ".") vm "dev01" { template = "x86_64/t" }
                @dev container "buildbox" { image = "sdk:9.0" }"#,
         ] {
             let es = errs(&format!("import <vmlab.wcl>\nlab \"l\" {{\n{lab_src}\n}}"));

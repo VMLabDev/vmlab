@@ -48,6 +48,8 @@ pub enum SmbError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("refusing to write smb.conf: {0}")]
+    Share(#[from] super::config::ShareRefused),
     #[error("failed to write smb.conf {path}: {source}")]
     WriteConf {
         path: PathBuf,
@@ -106,7 +108,7 @@ impl SmbServer {
 
         // 2. Write smb.conf.
         let conf_path = config.conf_path();
-        std::fs::write(&conf_path, config.render_conf()).map_err(|source| SmbError::WriteConf {
+        std::fs::write(&conf_path, config.render_conf()?).map_err(|source| SmbError::WriteConf {
             path: conf_path.clone(),
             source,
         })?;
