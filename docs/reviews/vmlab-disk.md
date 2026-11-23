@@ -25,7 +25,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster (fixed, card #549) |
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes (fixed, card #556) |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data (fixed, card #563) |
-| F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
+| F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file (fixed, card #576) |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read (fixed, card #562) |
 | F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size (fixed, card #575) |
 | F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory (fixed, card #555) |
@@ -247,6 +247,9 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   bit 0 in the header, then `Qcow2Image::open(path, false)`, one `write_at`
   and `flush`. Expected: success and `qemu-img check` exits 0. Today: the open
   fails. The same test with `-o compat=0.10` and no bit set.
+- Fixed by card #576. Recovery counts the snapshot table through the last
+  entry's payload, including alignment padding between entries. Both S2
+  cases failed at writable open before the fix.
 
 ### F7. A compressed cluster at the end of the file cannot be read (wrong result)
 

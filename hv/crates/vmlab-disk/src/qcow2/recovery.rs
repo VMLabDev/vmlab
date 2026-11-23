@@ -16,7 +16,7 @@ impl Qcow2Image {
         self.count_view(&mut counts, &self.l1)?;
 
         let mut offset = self.snapshots_offset;
-        for _ in 0..self.nb_snapshots {
+        for index in 0..self.nb_snapshots {
             let mut fixed = [0u8; 40];
             self.file.read_exact_at(&mut fixed, offset)?;
             let l1_offset = u64::from_be_bytes(fixed[..8].try_into().unwrap());
@@ -41,8 +41,16 @@ impl Qcow2Image {
             let id = u16::from_be_bytes(fixed[12..14].try_into().unwrap()) as u64;
             let name = u16::from_be_bytes(fixed[14..16].try_into().unwrap()) as u64;
             let extra = u32::from_be_bytes(fixed[36..40].try_into().unwrap()) as u64;
+            let entry_len = 40 + extra + id + name;
+            // Alignment is required between entries. QEMU may end the file
+            // immediately after the last entry's payload.
+            let span = if index + 1 < self.nb_snapshots {
+                entry_len.div_ceil(8) * 8
+            } else {
+                entry_len
+            };
             offset = offset
-                .checked_add((40 + extra + id + name).div_ceil(8) * 8)
+                .checked_add(span)
                 .ok_or_else(|| Error::Unsupported("snapshot table overflows u64".into()))?;
         }
         if self.nb_snapshots != 0 {
