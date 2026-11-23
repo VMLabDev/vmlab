@@ -1608,6 +1608,53 @@ fn s2_sequential_throughput_1gib() {
     let _ = std::io::stdout().flush();
 }
 
+fn open_qemu_snapshot_table_at_eof(compat: &str) {
+    use std::os::unix::fs::FileExt as _;
+
+    let temp = tmpdir("snapshot-table-eof");
+    let path = temp.path().join("disk.qcow2");
+    let filename = path.to_str().unwrap();
+    qemu_img(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-o",
+        &format!("compat={compat}"),
+        filename,
+        "64M",
+    ]);
+    qemu_io(&["-f", "qcow2", "-c", "write -P 0x77 0 8M", filename]);
+    qemu_img(&["snapshot", "-c", "q1", filename]);
+    qemu_check(&path);
+
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // QEMU leaves the last snapshot entry's alignment padding unwritten.
+    assert_ne!(file.metadata().unwrap().len() % 8, 0);
+    if compat == "1.1" {
+        // Set the dirty incompatible-feature bit to trigger v3 recovery.
+        file.write_all_at(&1u64.to_be_bytes(), 72).unwrap();
+    }
+    drop(file);
+
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+    image.write_at(0, &[0xaa; 512]).unwrap();
+    image.flush().unwrap();
+    drop(image);
+    qemu_check(&path);
+}
+
+#[test]
+fn a_dirty_image_with_a_qemu_snapshot_table_at_the_end_opens() {
+    require_qemu_img!();
+    open_qemu_snapshot_table_at_eof("1.1");
+}
+
+#[test]
+fn a_v2_image_with_a_qemu_snapshot_table_at_the_end_opens() {
+    require_qemu_img!();
+    open_qemu_snapshot_table_at_eof("0.10");
+}
+
 /// VML-107: an owner that drops the image without `flush` keeps the writes.
 /// New clusters get their L2 and refcount updates in the write-back caches;
 /// closing the image must write them. The writes cover the first L2 table,
