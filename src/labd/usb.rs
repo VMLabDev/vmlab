@@ -38,6 +38,9 @@ pub struct UsbHost {
     pub(super) sysfs: PathBuf,
     /// Where their nodes live — `/dev/bus/usb`.
     pub(super) dev: PathBuf,
+    /// The host's mount table — `/proc/self/mountinfo`. An attach reads it
+    /// to refuse a device whose filesystem the host has mounted.
+    pub(super) mounts: PathBuf,
     /// Serialises attaches across the lab's machines, so two cannot both
     /// pass the "already attached" check for one device.
     op: tokio::sync::Mutex<()>,
@@ -53,6 +56,7 @@ impl Default for UsbHost {
         UsbHost {
             sysfs: usb::SYSFS_ROOT.into(),
             dev: usb::DEV_ROOT.into(),
+            mounts: usb::MOUNT_TABLE.into(),
             op: tokio::sync::Mutex::new(()),
             watching: AtomicBool::new(false),
             ask_supervisor: true,
@@ -66,6 +70,9 @@ impl UsbHost {
         UsbHost {
             sysfs,
             dev,
+            // No test attaches a mounted disk through the daemon: the
+            // refusal is proven in `usb/tests.rs`.
+            mounts: "/dev/null".into(),
             ask_supervisor: false,
             ..UsbHost::default()
         }
@@ -146,6 +153,7 @@ impl LabRuntime {
     /// The refusals, in the order they are met: a container; a VM not
     /// running, or booted without `usb = true`; a selector naming no device,
     /// or several; a device another machine holds; a HID keyboard or mouse
+    /// without `force`; a device with a filesystem the host has mounted
     /// without `force`; a device node this process cannot open.
     pub async fn usb_attach(
         self: &Arc<Self>,
@@ -159,12 +167,16 @@ impl LabRuntime {
         let _op = self.usb.op.lock().await;
         let host = self.usb.scan()?;
         let held = self.usb_held().await;
+        // An unreadable mount table refuses nothing: the lookup is a guard
+        // for the host, and a host without /proc has no mounts to lose here.
+        let mount_table = std::fs::read_to_string(&self.usb.mounts).unwrap_or_default();
         let plan = usb::plan_attach(
             &sel,
             &host,
             &held,
             force,
             &self.usb.dev,
+            |dev| usb::host_mounts(&self.usb.sysfs, dev, &mount_table),
             usb::node_accessible,
         )
         .map_err(|e| anyhow!(e))?;

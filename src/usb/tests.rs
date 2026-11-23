@@ -190,8 +190,122 @@ fn plan(sel: &str, held: &[(String, String)], force: bool, ok: bool) -> Result<A
         held,
         force,
         Path::new("/dev/bus/usb"),
+        |_| Vec::new(),
         |_| ok,
     )
+}
+
+/// Give the fake device at `port` a USB mass-storage disk, the way sysfs
+/// nests one: `<iface>/host6/target6:0:0/6:0:0:0/block/<disk>`, with one
+/// partition. `disk` and `part` are `(name, major:minor)`.
+fn storage(root: &Path, port: &str, disk: (&str, &str), part: (&str, &str)) -> std::path::PathBuf {
+    let disk_dir = root
+        .join(port)
+        .join(format!("{port}:1.0/host6/target6:0:0/6:0:0:0/block"))
+        .join(disk.0);
+    let part_dir = disk_dir.join(part.0);
+    std::fs::create_dir_all(&part_dir).unwrap();
+    std::fs::write(disk_dir.join("dev"), format!("{}\n", disk.1)).unwrap();
+    std::fs::write(part_dir.join("dev"), format!("{}\n", part.1)).unwrap();
+    // What every sysfs device directory has, and what the walk must not
+    // follow: a link back up the tree.
+    std::os::unix::fs::symlink(root.join(port), disk_dir.join("device")).unwrap();
+    part_dir
+}
+
+/// A mount table in the format of `/proc/self/mountinfo`: the root on an
+/// NVMe disk, and one line per `(major:minor, mount point)` given.
+fn mount_table(mounts: &[(&str, &str)]) -> String {
+    let mut t = String::from("29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n");
+    for (i, (devno, at)) in mounts.iter().enumerate() {
+        t.push_str(&format!(
+            "{} 29 {devno} / {at} rw,nosuid,nodev shared:{} - vfat /dev/x rw\n",
+            100 + i,
+            200 + i
+        ));
+    }
+    t
+}
+
+fn plan_mounted(sys: &Path, sel: &str, table: &str, force: bool) -> Result<AttachPlan, String> {
+    let devs = scan(sys).unwrap();
+    plan_attach(
+        &Selector::parse(sel).unwrap(),
+        &devs,
+        &[],
+        force,
+        Path::new("/dev/bus/usb"),
+        |d| host_mounts(sys, d, table),
+        |_| true,
+    )
+}
+
+/// Review `docs/reviews/usb.md` F2: the claim disconnects the host's
+/// storage driver at once, so a mounted filesystem loses its disk under its
+/// dirty pages.
+#[test]
+fn plan_attach_refuses_a_mounted_storage_device_without_force() {
+    let sys = fake_sysfs();
+    storage(sys.path(), "1-9", ("sdb", "8:16"), ("sdb1", "8:17"));
+    // The other, identical drive has a disk too, and nothing mounted.
+    storage(sys.path(), "1-10", ("sdc", "8:32"), ("sdc1", "8:33"));
+    let table = mount_table(&[("8:17", "/run/media/u/MY\\040STICK")]);
+
+    let e = plan_mounted(sys.path(), "port:1-9", &table, false).unwrap_err();
+    assert!(e.contains("0781:5581"), "{e}");
+    assert!(e.contains("/run/media/u/MY STICK"), "{e}");
+    assert!(e.contains("sdb1"), "{e}");
+    assert!(e.contains("--force") && e.contains("usb_attach_force"), "{e}");
+
+    // Forced, it attaches, as a HID keyboard does.
+    assert!(plan_mounted(sys.path(), "port:1-9", &table, true).is_ok());
+    // A disk nothing is mounted from attaches unforced: the other drive,
+    // and this one once the host has unmounted it.
+    assert!(plan_mounted(sys.path(), "port:1-10", &table, false).is_ok());
+    assert!(plan_mounted(sys.path(), "port:1-9", &mount_table(&[]), false).is_ok());
+}
+
+#[test]
+fn every_mount_of_the_device_is_named() {
+    let sys = fake_sysfs();
+    let part = storage(sys.path(), "1-9", ("sdb", "8:16"), ("sdb1", "8:17"));
+    // A second partition, and a dm-crypt mapping on the first: sysfs links
+    // the mapping from the partition's `holders/`.
+    let part2 = part.parent().unwrap().join("sdb2");
+    std::fs::create_dir_all(&part2).unwrap();
+    std::fs::write(part2.join("dev"), "8:18\n").unwrap();
+    let dm = sys.path().join("virtual-block-dm-0");
+    std::fs::create_dir_all(&dm).unwrap();
+    std::fs::write(dm.join("dev"), "254:0\n").unwrap();
+    std::fs::create_dir_all(part.join("holders")).unwrap();
+    std::os::unix::fs::symlink(&dm, part.join("holders/dm-0")).unwrap();
+    // 8:17 itself is not mounted: the filesystem is on the mapping. 8:18 is
+    // mounted twice at one place and once at another.
+    let table = mount_table(&[
+        ("8:18", "/mnt/b"),
+        ("254:0", "/mnt/a"),
+        ("8:18", "/mnt/b"),
+        ("8:180", "/mnt/not-ours"),
+    ]);
+    let devs = scan(sys.path()).unwrap();
+    let dev = resolve(&Selector::parse("port:1-9").unwrap(), &devs).unwrap();
+    let got: Vec<(String, String)> = host_mounts(sys.path(), dev, &table)
+        .into_iter()
+        .map(|m| (m.block, m.mount_point))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("dm-0".to_string(), "/mnt/a".to_string()),
+            ("sdb2".to_string(), "/mnt/b".to_string()),
+        ]
+    );
+    let e = plan_mounted(sys.path(), "port:1-9", &table, false).unwrap_err();
+    assert!(e.contains("/mnt/a") && e.contains("/mnt/b"), "{e}");
+    assert!(!e.contains("not-ours"), "{e}");
+    // A device with no disk at all has no mounts.
+    let hid = resolve(&Selector::parse("046d:c547").unwrap(), &devs).unwrap();
+    assert!(host_mounts(sys.path(), hid, &table).is_empty());
 }
 
 #[test]
