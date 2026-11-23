@@ -2990,6 +2990,10 @@ guests, under KVM where the host is that architecture and TCG elsewhere, and
   moves to vmlab-hv at the next start, or that start fails with the refusal.
   Online QEMU snapshots stay on disk and are refused by name with the
   instructions of §22.3.
+- **Host config.** A host config written for the QEMU path still loads. A
+  host `gpu` block's `qemu_binary` and `qemu_env` are ignored on vmlab-hv
+  with a warning that names the field, and still apply to a VM of another
+  architecture on QEMU.
 - **What vmlab-hv cannot run yet.** A guest that vmlab-hv refuses, macOS and
   `accel = "tcg"` among them, does not run on this release.
   `docs/agents/qemu-removal-remaining.md` lists what still uses QEMU.

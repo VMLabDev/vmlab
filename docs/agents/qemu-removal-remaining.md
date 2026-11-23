@@ -3,9 +3,29 @@
 Card #6 (VML-45) removes QEMU as a hypervisor for x86 and x86_64 guests
 (PRD §22.4, HV-D29, MEM-40). This document lists what still uses QEMU on
 the branch `vml-45`, and what the removal leaves without a hypervisor until
-vmlab-hv runs it. The branch must not merge before the proofs #2 (vfio),
-#28 (macOS on vmlab-hv) and #82 (legacy templates that need installer media)
-are in.
+vmlab-hv runs it. Proof #2 (vfio passthrough) is done. The operator decided on
+2026-11-23 to merge without waiting for #28 (macOS on vmlab-hv) and #82
+(legacy templates that need installer media): macOS guests and those templates
+do not run until their cards are done.
+
+## What a user must change
+
+- Remove `hypervisor = "qemu"` from every x86 machine, or set it to
+  `"vmlab"`. Validation refuses it and names the fix.
+- Remove `hypervisor { vm = "qemu" }` and `{ container = "qemu" }` from the
+  host config on an x86_64 host, or set them to `"vmlab"`. The config still
+  loads, but validation refuses each x86 machine the default reaches.
+- Remove `qemu_args` from every x86 VM, and declare the hardware with the vm
+  block's own keys or a profile.
+- Remove `accel = "tcg"` from every x86 VM, and give the user read/write
+  access to `/dev/kvm`.
+- A host `gpu` block's `qemu_binary` and `qemu_env` need no change. The
+  config loads, and a VM on vmlab-hv that picks that GPU ignores both with a
+  warning that names the field (`src/qemu/hostgpu.rs`, card #447). They can
+  be removed where no aarch64 or riscv64 VM uses the GPU.
+- An existing x86 machine needs no change: its QEMU identity moves to
+  vmlab-hv at the next start (§22.3). An online QEMU snapshot must be
+  converted to an offline one under the old release, or taken again.
 
 ## Other architectures
 
@@ -22,9 +42,9 @@ are in.
   TCG fallback (`plan_accel`) serve those guests.
 - The AAVMF and riscv64 firmware lookup in `src/qemu/firmware.rs` serves
   them. The x86 OVMF and SeaBIOS lookups in the same file serve vmlab-hv.
-- A host GPU's `qemu_binary` and the Vulkan PCI filter apply to an aarch64
-  VM on QEMU. vmlab-hv reads the GPU's `qemu_env` and the filter layer, and
-  ignores `qemu_binary`.
+- A host GPU's `qemu_binary`, its `qemu_env` and the Vulkan PCI filter apply
+  to an aarch64 VM on QEMU. vmlab-hv reads the filter layer, and ignores
+  `qemu_binary` and `qemu_env` with a warning each.
 
 ## Shared code that keeps a QEMU name
 
@@ -51,12 +71,14 @@ because QEMU runs no x86 guest and vmlab-hv refuses them:
 - `accel = "tcg"` on an x86 guest, and every x86 guest on a host without
   usable KVM or on a host that is not x86_64: phase 3 has not started.
 - `input = "usb"`, a `cpu_model` on q35, a floppy off the pc machine, an
-  `isa-serial` agent off pc, a pinned `tsc` on pc, and a display or NIC
-  model that vmlab-hv does not present.
+  `isa-serial` agent off pc, a pinned `tsc` or a virtio-net NIC on pc, and a
+  display or NIC model that vmlab-hv does not present. The legacy pc itself
+  (phase 4a to 4d: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI,
+  Cirrus) runs on vmlab-hv.
 - Legacy templates that need installer media to rebuild: proof #82. See
   `qemu-removal-legacy-template-matrix.md` and
   `qemu-removal-template-matrix.md` for the per-template state.
-- vfio passthrough is selectable on vmlab-hv, and its live check is proof #2.
+- vfio passthrough runs on vmlab-hv. Its live check, proof #2, is done.
 
 ## Lab files and scripts in this repository
 
