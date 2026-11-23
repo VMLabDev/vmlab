@@ -235,7 +235,23 @@ impl HostUsbDevice {
         self.endpoints.clear();
     }
 
+    /// Forget every transfer of the endpoints `keep` selects: an in-flight
+    /// URB is discarded and its cancelled completion dropped at the reap,
+    /// and a completion that was never collected is thrown away.
+    fn drop_transfers(&mut self, keep: impl Fn(u8) -> bool) {
+        let endpoints: Vec<u8> = self.pending.keys().copied().filter(|e| keep(*e)).collect();
+        for endpoint in endpoints {
+            self.endpoint_dropped(endpoint);
+        }
+    }
+
     fn set_config(&mut self, config: u8) -> Result<()> {
+        // The old configuration's endpoints end here. Their URBs are
+        // discarded while the interfaces are still claimed; left alone, the
+        // release below cancels them and the reap files each as a stall on
+        // the new configuration's endpoint. The control endpoint carries
+        // this very request and stays.
+        self.drop_transfers(|endpoint| endpoint != 0);
         self.release_interfaces();
         let descriptor = if config == 0 {
             None
@@ -449,7 +465,9 @@ impl UsbDevice for HostUsbDevice {
     fn reset(&mut self) {
         // The lift source skips USBDEVFS_RESET (it would also drop the
         // configuration and the claims); the xHCI re-initializes slot and
-        // endpoint state itself.
+        // endpoint state itself. Nothing in flight belongs to the guest
+        // after a reset, so none of it may complete a later transfer.
+        self.drop_transfers(|_| true);
         self.device.reset();
     }
 
