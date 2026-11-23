@@ -39,7 +39,7 @@ wait_agent || exit 1
 note "guest: driver, memory and the standard user"
 gps "\$ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force C:\\c752\\out | Out-Null
-net.exe user $USER_NAME /delete 2>\$null | Out-Null
+Get-LocalUser -Name $USER_NAME -ErrorAction SilentlyContinue | Remove-LocalUser
 net.exe user $USER_NAME '$USER_PASS' /add | Out-Null
 icacls.exe C:\\c752 /grant 'BUILTIN\\Users:(OI)(CI)RX' | Out-Null
 icacls.exe C:\\c752\\out /grant 'BUILTIN\\Users:(OI)(CI)M' | Out-Null
@@ -78,6 +78,6 @@ for c in "$@"; do
     note "case $c: exit $rc: $(cat "$EV/$c.json" 2>/dev/null | tr -d '\r\n' | cut -c1-600)"
     [ "$rc" = 0 ] || failed=1
 done
-gps "net.exe user $USER_NAME /delete | Out-Null" 60
+gps "Get-LocalUser -Name $USER_NAME -ErrorAction SilentlyContinue | Remove-LocalUser" 60
 [ "$failed" = 0 ] && note "PASS: every case passed" || note "FAIL: a case failed"
 exit "$failed"
