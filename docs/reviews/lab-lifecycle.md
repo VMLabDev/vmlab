@@ -38,10 +38,10 @@ Two facts are used by several findings:
 | F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559) |
 | F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down (fixed, card #560) |
 | F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon (fixed, card #561) |
-| F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab |
-| F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again |
+| F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab (fixed, card #571) |
+| F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again (fixed, card #571) |
 | F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
-| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown |
+| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown (fixed, card #572) |
 | F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started (fixed, card #573) |
 | F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses |
 | F14 | wrong result | A `labs.json` that does not parse is read as an empty registry |
@@ -344,6 +344,12 @@ Two facts are used by several findings:
   it is empty. `a_second_attach_by_one_lab_is_one_reference`: attach `corp`
   as lab `a` twice, detach once, assert `list()` is empty. Today the
   segment stays with count 1.
+- Fixed in card #571. A global segment holds its references by lab name,
+  plus a count of anonymous ones for inbound cross-host trunks. A lab that
+  attaches again is still one reference, and a detach by a lab that holds
+  none changes nothing, so it neither leaves the segment's DNS nor drops the
+  segment. `global.list` names the attached labs (`labs`). Both tests failed
+  before the fix and pass after it.
 
 ### F9. Adopted labs lose their global segments (wrong result)
 
@@ -365,6 +371,21 @@ Two facts are used by several findings:
   and adopts). `global.list` must name the segment with both labs as
   members, and a machine of lab A must still resolve and reach a machine of
   lab B. Today `global.list` is empty.
+- Fixed in card #571. The lab daemon watches each global segment's trunk.
+  When the trunk closes, it attaches the segment again, retrying until a
+  supervisor answers, and names the subnet the first attach answered with.
+  The supervisor allocates its automatic pool past a subnet named this way,
+  so a later segment does not get it. With F8's fix the re-attach of a lab
+  is one reference. The supervisor test
+  `adopted_labs_attach_their_global_segments_again` in
+  `src/supervisor/mod.rs` stands in for the e2e steps: two lab networks
+  attach `corp` to a supervisor that then dies with its trunks. Its
+  successor, a real `SupervisorHandler` that starts empty, must list `corp`
+  with labs `a` and `b` on the first subnet, and a frame from lab `a`'s
+  switch must reach lab `b`'s. Before the fix nothing attaches again and the
+  test does not finish. After it the test passes. Not covered: DHCP leases
+  are not carried to the new supervisor, so a guest keeps its address only
+  by renewing it on the same subnet.
 
 ### F10. Orphans are reaped only through a registry entry (wrong result)
 
@@ -411,6 +432,15 @@ Two facts are used by several findings:
   while it waits on a lab release send `LabEnsure` for another name. The
   request must be refused with the "shutting down" conflict. Today it
   spawns `__labd`.
+- Fixed in card #572. `teardown` in `src/supervisor/mod.rs` sets
+  `shutting_down` itself, so the signal path closes the supervisor as the
+  `shutdown` request does. For the smaller gap, `ensure_lab_locked` checks
+  the flag under the name's lock, and `teardown` releases every name that
+  holds an `ensure` lock as well as every registered one: an ensure that
+  passed the check took its lock before the flag was set, so the teardown
+  waits on that lock and releases the daemon it registered. The proof test
+  covers both: the late `lab.ensure` is refused, and a daemon registered by
+  an ensure that was accepted before the teardown is released.
 
 ### F12. Two restarts of one daemon (wrong result)
 

@@ -235,9 +235,26 @@ impl Switch {
     /// Attach a QEMU stream-socket connection as a port. Spawns a reader
     /// task (deframe → ingress) and a writer task (egress queue → frame).
     /// The port is removed automatically on EOF or stream error.
+    #[cfg(test)]
     pub async fn add_stream_port(self: &Arc<Self>, stream: UnixStream, class: PortClass) -> PortId {
         self.add_stream_port_with_config(stream, class, PortConfig::default())
             .await
+    }
+
+    /// [`add_stream_port`](Self::add_stream_port), and a receiver that
+    /// completes once the peer closes the stream (or reading it fails) and
+    /// the port is gone: how a lab daemon learns that the supervisor behind
+    /// a global segment's trunk went away.
+    pub async fn add_stream_port_watched(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        class: PortClass,
+    ) -> (PortId, tokio::sync::oneshot::Receiver<()>) {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let id = self
+            .add_stream_port_inner(stream, class, PortConfig::default(), Some(closed_tx))
+            .await;
+        (id, closed_rx)
     }
 
     pub async fn add_stream_port_with_config(
@@ -245,6 +262,17 @@ impl Switch {
         stream: UnixStream,
         class: PortClass,
         config: PortConfig,
+    ) -> PortId {
+        self.add_stream_port_inner(stream, class, config, None)
+            .await
+    }
+
+    async fn add_stream_port_inner(
+        self: &Arc<Self>,
+        stream: UnixStream,
+        class: PortClass,
+        config: PortConfig,
+        closed: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> PortId {
         let id = self.alloc_port(class);
         let mut rx = self.attach(id, class, config);
@@ -317,6 +345,9 @@ impl Switch {
                 }
             }
             switch.remove_port(id);
+            if let Some(closed) = closed {
+                let _ = closed.send(());
+            }
         });
 
         id
