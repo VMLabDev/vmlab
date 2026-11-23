@@ -20,11 +20,20 @@
 # Usage: build/run.sh [-t] command [args...]
 #   -t  allocate a terminal (interactive shell)
 # Env: VMLAB_BUILD_IMAGE (default vmlab-build)
+#      VMLAB_BUILD_VOLUMES (default vmlab-build): the prefix of every named
+#      volume. Code that a build runs can write to its volumes, so a build that
+#      must not inherit from another one gets a prefix of its own:
+#      scripts/release-local.sh gives each release fresh volumes.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${VMLAB_BUILD_IMAGE:-vmlab-build}"
+VOLUMES="${VMLAB_BUILD_VOLUMES:-vmlab-build}"
+[[ "$VOLUMES" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
+  echo "build/run.sh: VMLAB_BUILD_VOLUMES is not a volume name prefix: '$VOLUMES'" >&2
+  exit 2
+}
 
 tty=()
 if [[ "${1:-}" == "-t" ]]; then
@@ -56,14 +65,14 @@ TARGETS=(
   ebpf:ebpf/target
 )
 
-mounts=(-v "$ROOT:$ROOT" -v "vmlab-build-cargo:/var/cache/vmlab-build/cargo")
+mounts=(-v "$ROOT:$ROOT" -v "$VOLUMES-cargo:/var/cache/vmlab-build/cargo")
 owned=(/var/cache/vmlab-build/cargo)
 for t in "${TARGETS[@]}"; do
   slot="${t%%:*}" rel="${t#*:}"
   # Created here, as the host user: docker would create a missing mount point
   # inside the bind mount as root.
   mkdir -p "$ROOT/$rel"
-  mounts+=(-v "vmlab-build-$key-$slot:$ROOT/$rel")
+  mounts+=(-v "$VOLUMES-$key-$slot:$ROOT/$rel")
   owned+=("$ROOT/$rel")
 done
 

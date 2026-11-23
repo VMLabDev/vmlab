@@ -117,6 +117,10 @@ The container setup:
   your host build directories without touching them, so a host build and a
   container build never invalidate each other. Remove the volumes with
   `docker volume rm` to start from cold.
+- `VMLAB_BUILD_VOLUMES` replaces the prefix `vmlab-build` of every volume. Code
+  that a build runs can write to its volumes, and so to the shared cargo home.
+  `scripts/release-local.sh` therefore gives each release new volumes
+  (`vmlab-release-<random>-*`) and removes them when it ends.
 
 The Alpine packages `guest/build-asset.sh` downloads are cached in
 `guest/.cache/` inside the checkout, so they are only fetched once.
