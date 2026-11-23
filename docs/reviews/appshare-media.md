@@ -10,7 +10,8 @@ card).
 
 The review is by reading. No test was written or run for a finding, so each
 finding is a claim from the code, and the proposed test is what proves or
-refutes it. No proposed test uses a wall-clock limit.
+refutes it. No proposed test uses a wall-clock limit. One command was run on
+helios, for note N13.
 
 Severity words are those of the card: data loss, crash, security against a
 hostile guest or peer, wrong result, cosmetic. "Confidence" says how sure the
@@ -440,8 +441,9 @@ These have no proving test, or are not faults by the documents.
   entries of long names, or a directory with more entries than one cluster
   holds. Such a folder passes the check and fails in `mcopy` with mtools'
   own message. Two names that differ only in case make `mcopy` ask what to
-  do. With no terminal it reads the end of input. The review did not find
-  out what it does then.
+  do. With no terminal it copies the first file and exits 1 (run once on
+  helios with `setsid` and an empty stdin), so the build fails and does not
+  hang.
 - N14. The label is checked only at build time (`src/media/iso.rs:74-86`,
   `src/media/floppy.rs:118-133`), not by `vmlab validate`. A lower-case
   floppy label and its upper-case form make two cache entries with the same
