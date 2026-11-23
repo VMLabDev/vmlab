@@ -728,7 +728,14 @@ fn blend_premultiplied(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 
 
 /// Draw the cursor with its hotspot at source `(px, py)`, scaled like the
 /// picture (nearest neighbour; cursors are small).
+///
+/// A shape with an empty side, or with fewer pixels than its size says, comes
+/// from the guest and has nothing to draw: it is skipped, not indexed.
 fn draw_cursor(rgb: &mut [u8], size: Size, p: &Placement, cursor: &CursorShape, px: i64, py: i64) {
+    let pixels = usize::from(cursor.width) * usize::from(cursor.height);
+    if pixels == 0 || cursor.rgba.len() < pixels * 4 {
+        return;
+    }
     let (ox, oy) = p.map(
         px as f64 - f64::from(cursor.hotspot.0),
         py as f64 - f64::from(cursor.hotspot.1),

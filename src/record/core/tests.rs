@@ -144,6 +144,39 @@ fn arrow() -> CursorShape {
     }
 }
 
+/// A shape with an empty side has no pixel to draw (review record-vision F1):
+/// the frame comes out without a pointer, on the native path and on RFB.
+#[test]
+fn a_cursor_of_size_zero_draws_nothing() {
+    let size = Size::new(32, 16);
+    let empty = |width, height| CursorShape {
+        hotspot: (0, 0),
+        width,
+        height,
+        rgba: vec![],
+    };
+
+    let mut core = Core::new(settings(10, size, None));
+    core.connected(secs(0.0), 32, 16);
+    core.rect(secs(0.0), 0, 0, 32, 16, &solid(32, 16, GREEN));
+    core.cursor(secs(0.1), empty(0, 0));
+    core.pointer_state(secs(0.1), 3, 3, true);
+    let frames = core.tick(secs(1.0));
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|f| all(f, GREEN)));
+
+    for (width, height) in [(0, 5), (5, 0)] {
+        let mut core = Core::new(settings(10, size, None));
+        core.connected(secs(0.0), 32, 16);
+        core.rect(secs(0.0), 0, 0, 32, 16, &solid(32, 16, GREEN));
+        core.rfb_cursor(secs(0.1), empty(width, height));
+        core.pointer_state(secs(0.1), 3, 3, true);
+        let frames = core.tick(secs(1.0));
+        assert!(!frames.is_empty(), "{width}x{height}");
+        assert!(frames.iter().all(|f| all(f, GREEN)), "{width}x{height}");
+    }
+}
+
 /// No pointer is drawn until a cursor shape arrives; then it sits at the last
 /// position vmlab sent, offset by the hotspot; a `DesktopSize` and a
 /// reconnect forget the shape until the guest defines it again.

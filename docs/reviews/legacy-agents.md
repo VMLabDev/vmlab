@@ -86,7 +86,7 @@ Not read:
 
 ## Findings, worst first
 
-### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard
+### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard (fixed, card #715)
 
 - Where: `guest/agent-legacy/src/plat_win32.c:97`
   (`WideCharToMultiByte(CP_ACP, 0, ..., NULL, NULL)`), used for every
@@ -107,6 +107,20 @@ Not read:
   `vmlab exec <vm> -- cmd /c del C:\t\日本.txt`. Today `ab.txt` is
   deleted. Assert that the exec is refused with an error that names the
   argument. The same steps run under Wine with the `windows-nt-x86` build.
+- Fixed by card #715. `utf8_to_ansi` converts its result back to UTF-16 and
+  compares it with what it converted. Text that does not survive the round
+  trip fails the exec before anything runs, for an argument, the `cwd` and an
+  environment entry alike. That also refuses a best-fit look-alike (a
+  full-width quote that would arrive as `"`) and bytes that are not UTF-8,
+  which the decoder turned into `?` itself. The error names the string by
+  position and gives the first code point that did not convert, for example
+  `exec: argument 3 has the character U+65E5, which the guest's code page
+  1252 cannot represent; nothing was run`. An environment entry that does
+  not convert was left out before and now fails the exec. The proof is
+  `legacy_win32_exec_refuses_text_outside_the_code_page` in
+  `src/labd/legacy_agent_tests.rs`. It builds the NT agent with mingw and
+  runs it under Wine with COM1 on a pty, and it is skipped on a host that
+  has neither. Not run on a real Windows guest.
 
 ### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory
 
@@ -147,6 +161,21 @@ Not read:
   on as a member of Users only and run
   `copy /y %SystemRoot%\system32\cmd.exe C:\vmlab\vmlab-agent-legacy.exe`.
   Assert that the copy is refused.
+- Fixed by card #716. The Win32 agent has `--secure-dir <dir>`
+  (`guest/agent-legacy/src/plat_win32.c`, `secure_dir`): it makes
+  Administrators the owner of the directory and of every entry in it and
+  sets a DACL with full control for Administrators and SYSTEM and no other
+  entry, inheriting on the directory and protected on Windows 2000 and later.
+  The SIDs are written out, so a localised group name does not matter.
+  `install-nt.cmd` runs it from the ISO before the copy and again after it,
+  and stops when it fails. On a FAT volume there is nothing to set: it warns
+  and the install goes on. The proof in the repo is
+  `the_nt_install_secures_its_directory_before_the_service_binary_lands` in
+  `src/template/bootstrap.rs`, which reads the staged script. The call itself
+  was run under Wine with the `windows-nt-x86` build: the entry for Everyone
+  left the directory and the file in it. Wine derives a file's ACL from its
+  Unix mode, so that run does not show the owner or inheritance. The test
+  above on a Windows 2000 guest was not run.
 
 ### F4. A second connect while a DOS or TempleOS command runs cuts the first command's session after 22 s
 
