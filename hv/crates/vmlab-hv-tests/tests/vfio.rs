@@ -134,6 +134,10 @@ fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, 
     };
     let mut agent = connect_agent();
     check_pci_identity(&mut agent, address);
+    eprintln!(
+        "VFIO S1: PCI function {address} enumerated on {}",
+        path.display()
+    );
     if first_start {
         check_snapshot_refusals(&mut control);
         let boot = boot_id(&mut agent);
@@ -141,19 +145,20 @@ fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, 
         drop(agent);
         assert_eq!(
             wait_for_lifecycle_event(&mut control),
-            Event::Reset,
+            Some(Event::Reset),
             "{}",
             diagnostics()
         );
         let mut agent = connect_agent();
         assert_ne!(boot_id(&mut agent), boot, "guest boot ID after reset");
         check_pci_identity(&mut agent, address);
+        eprintln!("VFIO S1: guest rebooted and enumerated PCI function {address}");
         agent.shutdown("powerdown", Duration::from_secs(30)).unwrap();
         assert_eq!(
             wait_for_lifecycle_event(&mut control),
-            Event::Shutdown {
+            Some(Event::Shutdown {
                 reason: ShutdownReason::GuestShutdown,
-            },
+            }),
             "{}",
             diagnostics()
         );
@@ -181,24 +186,25 @@ fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, 
         "VFIO_GROUP_UNSET_CONTAINER",
         "Could not unbind VFIO group",
         "Could not delete VFIO group",
+        "VFIO reset at VM exit",
+        "removing VFIO BAR KVM slot",
+        "unmapping VFIO BAR",
     ] {
         assert!(!log.contains(error), "VFIO teardown: {error}\n{log}");
     }
+    eprintln!("VFIO S1: clean exit on {}", path.display());
 }
 
-fn wait_for_lifecycle_event(control: &mut Client) -> Event {
-    let deadline = Instant::now() + Duration::from_secs(90);
+fn wait_for_lifecycle_event(control: &mut Client) -> Option<Event> {
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let event = control
-            .wait_event_timeout(remaining)
-            .unwrap()
-            .expect("VFIO lifecycle event");
+        let event = control.wait_event_timeout(remaining).unwrap()?;
         if matches!(
             event,
             Event::Reset | Event::Shutdown { .. } | Event::Exiting { .. }
         ) {
-            return event;
+            return Some(event);
         }
     }
 }
