@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::raw::c_int;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use parking_lot::Mutex;
 
@@ -102,6 +102,9 @@ struct Inner {
     in_flight: Mutex<Vec<Submitted>>,
     done: Mutex<Vec<Submitted>>,
     next_tag: std::sync::atomic::AtomicUsize,
+    /// Set by `block_set_interface`: the next `set_interface` reports that
+    /// it was entered and waits to be released.
+    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 // SAFETY: the raw pointers in `Submitted` are only dereferenced between
@@ -120,6 +123,7 @@ impl FakeUsbFs {
                 in_flight: Mutex::new(Vec::new()),
                 done: Mutex::new(Vec::new()),
                 next_tag: std::sync::atomic::AtomicUsize::new(1),
+                gate: Mutex::new(None),
             }),
         }
     }
@@ -147,6 +151,16 @@ impl FakeUsbFs {
     /// Make `claim_interface(interface)` fail with EBUSY.
     pub fn fail_claim(&self, interface: u8) {
         self.shared().lock().claim_fails.push(interface);
+    }
+
+    /// Make the next `set_interface` block inside the "kernel", as a device
+    /// that does not answer does. The receiver yields once the call is
+    /// entered; a send on the sender lets the call return.
+    pub fn block_set_interface(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self.inner.gate.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     /// Queue the completion the next URB `run_irq` services receives.
@@ -376,6 +390,11 @@ impl UsbFs for FakeUsbFs {
     }
 
     fn set_interface(&self, interface: u8, alt_setting: u8) -> io::Result<()> {
+        let gate = self.inner.gate.lock().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         self.shared()
             .lock()
             .calls

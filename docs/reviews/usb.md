@@ -212,6 +212,25 @@ hostile guest or peer, wrong result, cosmetic.
   is released.
 - How bad: the VM hangs (the crash class), caused by a hostile guest or a
   hostile USB device. The host is not affected.
+- Status: fixed by card #668. A guest request makes no blocking usbdevfs
+  call on its own thread. The backend reads the active configuration once
+  at the open and follows it through SET_CONFIGURATION, so
+  GET_DESCRIPTOR(Configuration) and SET_INTERFACE send no GET_CONFIGURATION.
+  SETCONFIGURATION with its release and claim, SETINTERFACE and CLEAR_HALT
+  run on a thread of their own (`Job` in `usb/host/mod.rs`) while the request
+  is NAKed. During that time the backend makes no usbdevfs call, because the
+  kernel serialises the ioctls of one device, so the other transfers of that
+  device are NAKed and a discard waits. The device speed is read at the open.
+  `attach_usb` opens the host device before it takes the controller lock and
+  drops a refused device after it releases the lock. Tests:
+  `a_guest_request_makes_no_synchronous_control_transfer`,
+  `a_blocked_usbdevfs_call_holds_no_caller` and two more in
+  `usb/host/mod.rs`, `opening_a_host_device_does_not_hold_the_controller` in
+  `vmm/control.rs`. Not changed: the drop of a backend (detach, host unplug)
+  still blocks its caller, the control thread or the machine-events thread,
+  with no controller lock held. The statement that the kernel serialises
+  usbdevfs ioctls on the device lock is from `devio.c` as the worker knows
+  it, not checked against a kernel tree.
 
 ### F5. A forced stop leaves the host device without a driver
 

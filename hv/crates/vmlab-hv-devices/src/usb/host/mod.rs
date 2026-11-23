@@ -12,6 +12,12 @@
 //! source never rebinds host kernel drivers after releasing an interface
 //! (notes/03 F23); this backend issues USBDEVFS_CONNECT on detach and on
 //! claim failure so the device returns to the host.
+//!
+//! The lift source makes its synchronous usbdevfs calls (SETCONFIGURATION,
+//! SETINTERFACE, CLEAR_HALT, the claims, GET_CONFIGURATION) on the thread
+//! that serves the guest request. Here that thread holds the xHCI lock, so
+//! a guest request makes none of them: each runs as a [`Job`] on a thread
+//! of its own while the request is `Nak`ed (review usb.md F4).
 
 pub mod descriptor;
 pub mod device;
@@ -25,6 +31,8 @@ pub mod fake;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use descriptor::ConfigDescriptorTree;
 pub use device::{Device, Transfer, TransferStatus};
@@ -58,6 +66,126 @@ enum Pending {
     Done(UsbTransfer),
 }
 
+/// A blocking usbdevfs call that a guest request asked for. usbdevfs has
+/// no asynchronous form of these, and each waits on the device or on a
+/// host driver for as long as that takes.
+#[derive(Clone)]
+enum Job {
+    /// Release `release`, set configuration `config` when `set`, then
+    /// claim interfaces `0..interfaces`.
+    SetConfig {
+        config: u8,
+        release: Vec<u8>,
+        set: bool,
+        interfaces: u8,
+    },
+    /// Switch `interface` to `alt`; `endpoints` is the endpoint table that
+    /// holds once the switch succeeded.
+    SetInterface {
+        interface: u8,
+        alt: u8,
+        endpoints: HashMap<u8, EndpointInfo>,
+    },
+    ClearHalt {
+        endpoint: u8,
+    },
+}
+
+/// What a finished [`Job`] left behind.
+struct JobDone {
+    result: Result<()>,
+    /// The interfaces held now; meaningful for `SetConfig` only.
+    claimed: Vec<u8>,
+    /// The kernel answered ENODEV.
+    lost: bool,
+}
+
+/// The job in flight. At most one runs, and while it does this side makes
+/// no usbdevfs call at all: the kernel serialises the ioctls of one device
+/// on its device lock, so even a URB submission would wait for the job.
+struct Running {
+    job: Job,
+    worker: JoinHandle<JobDone>,
+    /// The guest dropped the control request that started the job. The job
+    /// still finishes and its effect on the device is still recorded; only
+    /// its answer goes nowhere.
+    abandoned: bool,
+}
+
+/// Runs on the job's thread. Touches nothing but `fs`.
+fn run_job(fs: &dyn UsbFs, job: &Job) -> JobDone {
+    let gone = |e: &std::io::Error| e.raw_os_error() == Some(libc::ENODEV);
+    match job {
+        Job::SetConfig {
+            config,
+            release,
+            set,
+            interfaces,
+        } => {
+            for interface in release {
+                // Errors are expected when the device is already gone.
+                let _ = fs.release_interface(*interface);
+            }
+            if *set && let Err(e) = fs.set_configuration(*config) {
+                let lost = gone(&e);
+                let e = Error::IoctlFailed(sys::USBDEVFS_SETCONFIGURATION, e);
+                return JobDone {
+                    result: Err(Error::SetConfiguration(*config, Box::new(e))),
+                    claimed: Vec::new(),
+                    lost,
+                };
+            }
+            let mut claimed = Vec::new();
+            for interface in 0..*interfaces {
+                if let Err(e) = fs.claim_interface(interface) {
+                    // All or none, as at the open: give back what was
+                    // taken so the host's drivers rebind.
+                    for taken in &claimed {
+                        let _ = fs.release_interface(*taken);
+                    }
+                    for taken in &claimed {
+                        let _ = fs.connect_interface(*taken);
+                    }
+                    let lost = gone(&e);
+                    let e = device::claim_error(e);
+                    return JobDone {
+                        result: Err(Error::ClaimInterface(interface, Box::new(e))),
+                        claimed: Vec::new(),
+                        lost,
+                    };
+                }
+                claimed.push(interface);
+            }
+            JobDone {
+                result: Ok(()),
+                claimed,
+                lost: false,
+            }
+        }
+        Job::SetInterface { interface, alt, .. } => {
+            let result = fs.set_interface(*interface, *alt);
+            let lost = result.as_ref().is_err_and(gone);
+            JobDone {
+                result: result.map_err(|e| {
+                    let e = Error::IoctlFailed(sys::USBDEVFS_SETINTERFACE, e);
+                    Error::SetInterface(*interface, *alt, Box::new(e))
+                }),
+                claimed: Vec::new(),
+                lost,
+            }
+        }
+        Job::ClearHalt { endpoint } => {
+            let result = fs.clear_halt(*endpoint);
+            let lost = result.as_ref().is_err_and(gone);
+            JobDone {
+                result: result.map_err(|e| Error::IoctlFailed(sys::USBDEVFS_CLEAR_HALT, e)),
+                claimed: Vec::new(),
+                lost,
+            }
+        }
+    }
+}
+
 /// A host USB device passed through to the guest. One instance owns the
 /// usbdevfs file, its interface claims, and the in-flight URBs.
 pub struct HostUsbDevice {
@@ -74,10 +202,25 @@ pub struct HostUsbDevice {
     /// Endpoints whose in-flight work was dropped; their cancelled
     /// completions are discarded rather than delivered.
     discarded: HashSet<u8>,
+    /// Read once at the open; the xHCI asks for it under its lock.
+    speed: UsbSpeed,
+    /// bConfigurationValue of the active configuration: read from the
+    /// device at the open, then followed through the guest's
+    /// SET_CONFIGURATION requests. `None` when it is not known (the device
+    /// did not answer, or a SET_CONFIGURATION failed in the device).
+    active_config: Option<u8>,
+    /// The blocking usbdevfs call in flight, if any.
+    job: Option<Running>,
+    /// Endpoints dropped while a job ran: their URBs are discarded once
+    /// the job is over.
+    deferred_discards: HashSet<u8>,
 }
 
 impl HostUsbDevice {
-    /// Open `/dev/bus/usb/<bus>/<dev>` and take over its interfaces.
+    /// Open `/dev/bus/usb/<bus>/<dev>` and take over its interfaces. This
+    /// blocks: the claim waits for the host driver to let go, and a device
+    /// with several configurations is asked which one is active. Call it
+    /// before the device is on a controller, with no controller lock held.
     pub fn open(id: impl Into<String>, bus: u16, dev: u16) -> Result<Self> {
         let path = device_node(bus, dev);
         let file = std::fs::OpenOptions::new()
@@ -90,25 +233,37 @@ impl HostUsbDevice {
 
     /// Build the backend over an open usbdevfs (or a fake of one).
     pub fn new(id: impl Into<String>, fs: Box<dyn UsbFs>) -> Result<Self> {
+        let device = Device::new(Arc::from(fs))?;
+        let speed = match device.get_speed().unwrap_or(None) {
+            Some(DeviceSpeed::Low) => UsbSpeed::Low,
+            Some(DeviceSpeed::Full) => UsbSpeed::Full,
+            Some(DeviceSpeed::Super | DeviceSpeed::SuperPlus) => UsbSpeed::Super,
+            _ => UsbSpeed::High,
+        };
+        let active_config = device.get_active_configuration().ok();
         let mut this = Self {
             id: id.into(),
-            device: Device::new(fs)?,
+            device,
             initialized: false,
             alt_settings: HashMap::new(),
             claimed_interfaces: Vec::new(),
             endpoints: HashMap::new(),
             pending: HashMap::new(),
             discarded: HashSet::new(),
+            speed,
+            active_config,
+            job: None,
+            deferred_discards: HashSet::new(),
         };
         // Claim the interfaces of the active configuration, if the device
         // is configured; a freshly plugged device may still be at
         // configuration 0 and is claimed when the guest configures it.
-        if let Ok(config) = this.device.get_active_configuration()
+        if let Some(config) = active_config
             && config != 0
             && let Ok(descriptor) = this.device.get_config_descriptor(config)
         {
             this.claim_interfaces(&descriptor)?;
-            this.rebuild_endpoints(&descriptor)?;
+            this.endpoints = this.endpoint_table(&descriptor, &this.alt_settings)?;
         }
         Ok(this)
     }
@@ -122,16 +277,105 @@ impl HostUsbDevice {
     }
 
     fn usb_speed(&self) -> UsbSpeed {
-        match self.device.get_speed().unwrap_or(None) {
-            Some(DeviceSpeed::Low) => UsbSpeed::Low,
-            Some(DeviceSpeed::Full) => UsbSpeed::Full,
-            Some(DeviceSpeed::Super | DeviceSpeed::SuperPlus) => UsbSpeed::Super,
-            _ => UsbSpeed::High,
+        self.speed
+    }
+
+    /// Hand `job` to a thread of its own and `Nak` the request: a retry
+    /// finds the answer once the job is over.
+    fn start_job(&mut self, job: Job) -> UsbTransfer {
+        let fs = self.device.fs();
+        let work = job.clone();
+        let spawned = std::thread::Builder::new()
+            .name("usb-host-job".into())
+            .spawn(move || run_job(&*fs, &work));
+        match spawned {
+            Ok(worker) => {
+                self.job = Some(Running {
+                    job,
+                    worker,
+                    abandoned: false,
+                });
+                UsbTransfer::Nak
+            }
+            Err(e) => {
+                log::warn!("usb host {}: no thread for a request: {e}", self.describe());
+                UsbTransfer::Stall
+            }
         }
     }
 
-    /// Reap completed URBs and file them under their endpoints.
+    /// Take over the result of the job once it is over (`wait`: block until
+    /// it is): record what it did to the device, file its answer for the
+    /// guest, and catch up on the discards that waited for it.
+    fn settle_job(&mut self, wait: bool) {
+        let Some(running) = self.job.take_if(|r| wait || r.worker.is_finished()) else {
+            return;
+        };
+        let done = running.worker.join().unwrap_or_else(|_| JobDone {
+            result: Err(Error::Other("the usbdevfs worker panicked".into())),
+            claimed: Vec::new(),
+            lost: false,
+        });
+        if done.lost {
+            self.device.mark_lost();
+        }
+        let mut result = done.result;
+        let what = match running.job {
+            Job::SetConfig { config, .. } => {
+                self.claimed_interfaces = done.claimed;
+                self.endpoints.clear();
+                self.active_config = match &result {
+                    // The device may be at its old configuration or at
+                    // none; nothing here can tell which.
+                    Err(Error::SetConfiguration(..)) => None,
+                    _ => Some(config),
+                };
+                if result.is_ok() && config != 0 {
+                    result = self
+                        .device
+                        .get_config_descriptor(config)
+                        .and_then(|descriptor| {
+                            self.endpoint_table(&descriptor, &self.alt_settings)
+                        })
+                        .map(|endpoints| self.endpoints = endpoints);
+                }
+                format!("set config {config}")
+            }
+            Job::SetInterface {
+                interface,
+                alt,
+                endpoints,
+            } => {
+                if result.is_ok() {
+                    self.alt_settings.insert(interface, alt);
+                    self.endpoints = endpoints;
+                }
+                format!("set interface {interface} alt {alt}")
+            }
+            Job::ClearHalt { endpoint } => format!("clear halt {endpoint:#x}"),
+        };
+        let outcome = match result {
+            Ok(()) => UsbTransfer::Ack(Vec::new()),
+            Err(e) => {
+                log::warn!("usb host {}: {what}: {e}", self.describe());
+                UsbTransfer::Stall
+            }
+        };
+        if !running.abandoned {
+            self.pending.insert(0, Pending::Done(outcome));
+        }
+        for endpoint in std::mem::take(&mut self.deferred_discards) {
+            self.device.discard_endpoint(endpoint);
+        }
+    }
+
+    /// Reap completed URBs and file them under their endpoints. While a
+    /// job runs this makes no usbdevfs call, the reap included.
     fn reap(&mut self) {
+        self.settle_job(false);
+        if self.job.is_some() {
+            return;
+        }
         let completed = match self.device.poll_transfers() {
             Ok(completed) => completed,
             Err(_) => return,
@@ -211,8 +455,8 @@ impl HostUsbDevice {
 
     /// Release every claimed interface and let host kernel drivers bind
     /// again (USBDEVFS_CONNECT). This is the detach path and the
-    /// claim-failure path; a guest-driven reconfiguration only releases,
-    /// because the interfaces are about to be claimed again.
+    /// claim-failure path of the open; a guest-driven reconfiguration is a
+    /// [`Job`].
     fn release_and_reconnect(&mut self) {
         for i in &self.claimed_interfaces {
             // Errors are expected when the device is already gone.
@@ -226,60 +470,16 @@ impl HostUsbDevice {
         self.endpoints.clear();
     }
 
-    fn release_interfaces(&mut self) {
-        for i in &self.claimed_interfaces {
-            // Errors are expected when the device is already gone.
-            let _ = self.device.release_interface(*i);
-        }
-        self.claimed_interfaces.clear();
-        self.endpoints.clear();
-    }
-
-    fn set_config(&mut self, config: u8) -> Result<()> {
-        self.release_interfaces();
-        let descriptor = if config == 0 {
-            None
-        } else {
-            Some(self.device.get_config_descriptor(config)?)
-        };
-
-        let mut need_set_config = true;
-        if !self.initialized {
-            let current = self.device.get_active_configuration().ok();
-            need_set_config = current != Some(config);
-            self.initialized = true;
-        }
-        if need_set_config && let Err(e) = self.device.set_active_configuration(config) {
-            return Err(Error::SetConfiguration(config, Box::new(e)));
-        }
-
-        if let Some(descriptor) = &descriptor {
-            self.claim_interfaces(descriptor)?;
-            self.rebuild_endpoints(descriptor)?;
-        }
-        Ok(())
-    }
-
-    fn set_interface(&mut self, interface: u8, alt_setting: u8) -> Result<()> {
-        self.device
-            .set_interface_alt_setting(interface, alt_setting)
-            .map_err(|e| Error::SetInterface(interface, alt_setting, Box::new(e)))?;
-        self.alt_settings.insert(interface, alt_setting);
-        let config = self
-            .device
-            .get_active_configuration()
-            .map_err(|e| Error::GetActiveConfiguration(Box::new(e)))?;
-        let descriptor = self.device.get_config_descriptor(config)?;
-        self.rebuild_endpoints(&descriptor)?;
-        Ok(())
-    }
-
-    /// Rebuild the endpoint table from the claimed interfaces of
-    /// `config_descriptor` at their current alt settings.
-    fn rebuild_endpoints(&mut self, config_descriptor: &ConfigDescriptorTree) -> Result<()> {
+    /// The endpoint table of the claimed interfaces of `config_descriptor`
+    /// at the alt settings `alt_settings`.
+    fn endpoint_table(
+        &self,
+        config_descriptor: &ConfigDescriptorTree,
+        alt_settings: &HashMap<u8, u8>,
+    ) -> Result<HashMap<u8, EndpointInfo>> {
         let mut endpoints = HashMap::new();
         for interface in &self.claimed_interfaces {
-            let alt_setting = self.alt_settings.get(interface).copied().unwrap_or(0);
+            let alt_setting = alt_settings.get(interface).copied().unwrap_or(0);
             let interface_descriptor = config_descriptor
                 .get_interface_descriptor(*interface, alt_setting)
                 .ok_or(Error::NoSuchEndpoint(0x80))?;
@@ -301,8 +501,48 @@ impl HostUsbDevice {
                 );
             }
         }
-        self.endpoints = endpoints;
-        Ok(())
+        Ok(endpoints)
+    }
+
+    /// SET_CONFIGURATION: everything that can be refused from the
+    /// descriptors is refused here, the rest is a job.
+    fn set_config(&mut self, config: u8) -> Result<UsbTransfer> {
+        let interfaces = if config == 0 {
+            0
+        } else {
+            self.device.get_config_descriptor(config)?.bNumInterfaces
+        };
+        // The guest's first SET_CONFIGURATION usually names the
+        // configuration the device is in already; setting it again would
+        // reset the device for nothing.
+        let set = self.initialized || self.active_config != Some(config);
+        self.initialized = true;
+        Ok(self.start_job(Job::SetConfig {
+            config,
+            release: self.claimed_interfaces.clone(),
+            set,
+            interfaces,
+        }))
+    }
+
+    /// SET_INTERFACE: as `set_config`.
+    fn set_interface(&mut self, interface: u8, alt: u8) -> Result<UsbTransfer> {
+        let refused = |e| Error::SetInterface(interface, alt, Box::new(e));
+        let config = self.active_config.ok_or_else(|| {
+            let unknown = Error::Other("the active configuration is not known".into());
+            refused(Error::GetActiveConfiguration(Box::new(unknown)))
+        })?;
+        let descriptor = self.device.get_config_descriptor(config).map_err(refused)?;
+        let mut alt_settings = self.alt_settings.clone();
+        alt_settings.insert(interface, alt);
+        let endpoints = self
+            .endpoint_table(&descriptor, &alt_settings)
+            .map_err(refused)?;
+        Ok(self.start_job(Job::SetInterface {
+            interface,
+            alt,
+            endpoints,
+        }))
     }
 
     /// Serve a GET_DESCRIPTOR(Configuration) request from the cached
@@ -318,9 +558,7 @@ impl HostUsbDevice {
         let config_end = config_start + config_descriptor.total_length() as usize;
         let mut descriptor_data = device_descriptor.raw()[config_start..config_end].to_vec();
 
-        if self.device.get_active_configuration().ok()
-            == Some(config_descriptor.bConfigurationValue)
-        {
+        if self.active_config == Some(config_descriptor.bConfigurationValue) {
             for i in 0..config_descriptor.bNumInterfaces {
                 if !self.claimed_interfaces.contains(&i) {
                     // Rewrite descriptors for unclaimed interfaces to vendor-specific class.
@@ -382,7 +620,7 @@ impl HostUsbDevice {
             (StandardControlRequest::SetConfiguration, Recipient::Device, Dir::HostToDevice) => {
                 let config = (setup.value & 0xff) as u8;
                 Some(match self.set_config(config) {
-                    Ok(()) => UsbTransfer::Ack(Vec::new()),
+                    Ok(started) => started,
                     Err(e) => {
                         log::warn!("usb host {}: set config {config}: {e}", self.describe());
                         UsbTransfer::Stall
@@ -393,7 +631,7 @@ impl HostUsbDevice {
                 let interface = setup.index as u8;
                 let alt = setup.value as u8;
                 Some(match self.set_interface(interface, alt) {
-                    Ok(()) => UsbTransfer::Ack(Vec::new()),
+                    Ok(started) => started,
                     Err(e) => {
                         log::warn!(
                             "usb host {}: set interface {interface} alt {alt}: {e}",
@@ -405,17 +643,9 @@ impl HostUsbDevice {
             }
             (StandardControlRequest::ClearFeature, Recipient::Endpoint, Dir::HostToDevice) => {
                 if setup.value == STD_FEATURE_ENDPOINT_HALT {
-                    Some(match self.device.clear_halt(setup.index as u8) {
-                        Ok(()) => UsbTransfer::Ack(Vec::new()),
-                        Err(e) => {
-                            log::warn!(
-                                "usb host {}: clear halt {:#x}: {e}",
-                                self.describe(),
-                                setup.index
-                            );
-                            UsbTransfer::Stall
-                        }
-                    })
+                    Some(self.start_job(Job::ClearHalt {
+                        endpoint: setup.index as u8,
+                    }))
                 } else {
                     None
                 }
@@ -455,14 +685,19 @@ impl UsbDevice for HostUsbDevice {
 
     fn control(&mut self, setup: SetupPacket, data: &[u8]) -> UsbTransfer {
         self.reap();
+        if self.job.is_some() {
+            return UsbTransfer::Nak;
+        }
+        // Before the interception: the retry of a request that became a
+        // job must find the job's answer, not start the job again.
+        if matches!(self.pending.get(&0), Some(Pending::Done(_))) {
+            return self.take_pending(0);
+        }
         if let Some(outcome) = self.intercept_control(&setup) {
             return outcome;
         }
         if self.device.is_lost() {
             return UsbTransfer::Stall;
-        }
-        if matches!(self.pending.get(&0), Some(Pending::Done(_))) {
-            return self.take_pending(0);
         }
         if self.pending.contains_key(&0) {
             return UsbTransfer::Nak;
@@ -493,6 +728,9 @@ impl UsbDevice for HostUsbDevice {
 
     fn transfer(&mut self, endpoint: u8, data: &[u8], max_length: usize) -> UsbTransfer {
         self.reap();
+        if self.job.is_some() {
+            return UsbTransfer::Nak;
+        }
         if self.device.is_lost() {
             return UsbTransfer::Stall;
         }
@@ -531,6 +769,9 @@ impl UsbDevice for HostUsbDevice {
         packet_size: u32,
     ) -> UsbTransfer {
         self.reap();
+        if self.job.is_some() {
+            return UsbTransfer::Nak;
+        }
         if self.device.is_lost() {
             return UsbTransfer::Stall;
         }
@@ -563,9 +804,19 @@ impl UsbDevice for HostUsbDevice {
     }
 
     fn endpoint_dropped(&mut self, endpoint: u8) {
+        if endpoint == 0
+            && let Some(running) = &mut self.job
+        {
+            running.abandoned = true;
+        }
         if matches!(self.pending.remove(&endpoint), Some(Pending::InFlight)) {
             self.discarded.insert(endpoint);
-            self.device.discard_endpoint(endpoint);
+            if self.job.is_some() {
+                // DISCARDURB would wait for the job in the kernel.
+                self.deferred_discards.insert(endpoint);
+            } else {
+                self.device.discard_endpoint(endpoint);
+            }
         }
     }
 
@@ -582,7 +833,10 @@ impl Drop for HostUsbDevice {
     fn drop(&mut self) {
         // Give the device back to the host: releasing the claims alone
         // leaves the interfaces driverless, because the claim detached the
-        // kernel driver and only USBDEVFS_CONNECT rebinds it.
+        // kernel driver and only USBDEVFS_CONNECT rebinds it. A job in
+        // flight is waited for first, so the claims it takes are known;
+        // the callers drop a backend with no controller lock held.
+        self.settle_job(true);
         self.release_and_reconnect();
     }
 }
@@ -652,6 +906,19 @@ mod tests {
 
     fn clear_halt(endpoint: u8) -> SetupPacket {
         setup(0x02, 1, 0, u16::from(endpoint), 0)
+    }
+
+    /// A control request as the guest sees it in the end: when the request
+    /// became a job, wait for the job and retry, as the controller's poll
+    /// does.
+    fn control(host: &mut HostUsbDevice, request: SetupPacket) -> UsbTransfer {
+        let first = host.control(request, &[]);
+        if host.job.is_none() {
+            return first;
+        }
+        assert_eq!(first, UsbTransfer::Nak, "a request with a job in flight");
+        host.settle_job(true);
+        host.control(request, &[])
     }
 
     #[test]
@@ -767,7 +1034,7 @@ mod tests {
         // Neither interception submits a control URB.
         assert!(fake.submitted_payloads().is_empty());
         assert_eq!(
-            host.control(set_config(1), &[]),
+            control(&mut host, set_config(1)),
             UsbTransfer::Ack(Vec::new())
         );
         assert!(fake.submitted_payloads().is_empty());
@@ -791,13 +1058,86 @@ mod tests {
             0,
             "GET_DESCRIPTOR(Configuration) made a synchronous control transfer"
         );
-        let switched = host.control(set_interface(0, 1), &[]);
+        let switched = control(&mut host, set_interface(0, 1));
         assert_eq!(switched, UsbTransfer::Ack(Vec::new()));
+        assert_eq!(fake.calls().set_interfaces, vec![(0, 1)]);
         assert_eq!(
             fake.calls().controls - opened,
             0,
             "SET_INTERFACE made a synchronous control transfer"
         );
+    }
+
+    /// Review usb.md F4: SETINTERFACE (like SETCONFIGURATION, CLEAR_HALT and
+    /// the claims) waits in the kernel for the device. While it does, every
+    /// call of the controller into the backend returns at once and makes
+    /// no usbdevfs call, because that call would wait behind the first.
+    #[test]
+    fn a_blocked_usbdevfs_call_holds_no_caller() {
+        let (mut host, fake) = device();
+        // A bulk IN is in flight before the guest switches the interface.
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        let before = fake.submitted_payloads().len();
+        let (entered, release) = fake.block_set_interface();
+        assert_eq!(host.control(set_interface(0, 1), &[]), UsbTransfer::Nak);
+        entered.recv().expect("the call reached the kernel");
+
+        // The device does not answer. The guest and the poll go on.
+        assert_eq!(host.control(set_interface(0, 1), &[]), UsbTransfer::Nak);
+        assert_eq!(host.control(get_config(0), &[]), UsbTransfer::Nak);
+        assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Nak);
+        assert_eq!(host.transfer_iso(0x83, &[], 1024, 512), UsbTransfer::Nak);
+        assert_eq!(host.speed(), UsbSpeed::High);
+        assert!(!host.is_lost());
+        host.endpoint_dropped(0x81);
+        assert_eq!(fake.submitted_payloads().len(), before, "a URB was submitted");
+        assert_eq!(host.deferred_discards.len(), 1, "the discard must wait");
+        assert!(fake.calls().set_interfaces.is_empty());
+
+        // The device answers: the retry acknowledges, the discard is made.
+        release.send(()).expect("the call still waits");
+        host.settle_job(true);
+        assert_eq!(
+            host.control(set_interface(0, 1), &[]),
+            UsbTransfer::Ack(Vec::new())
+        );
+        assert_eq!(fake.calls().set_interfaces, vec![(0, 1)]);
+        assert!(host.deferred_discards.is_empty());
+        host.reap();
+        assert!(host.discarded.is_empty(), "the cancelled URB was reaped");
+        assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Nak);
+        assert_eq!(fake.submitted_payloads(), vec![(0x02, b"ping".to_vec())]);
+    }
+
+    /// A request the guest gave up on still changes the device, and its
+    /// answer is not handed to the next request.
+    #[test]
+    fn an_abandoned_request_records_its_effect_and_drops_its_answer() {
+        let (mut host, fake) = device();
+        assert_eq!(host.control(set_config(0), &[]), UsbTransfer::Nak);
+        host.endpoint_dropped(0);
+        host.settle_job(true);
+        assert_eq!(fake.calls().set_configurations, vec![0]);
+        assert!(host.claimed_interfaces.is_empty());
+        assert_eq!(host.active_config, Some(0));
+        // GET_STATUS goes to the device as a URB of its own.
+        assert_eq!(host.control(setup(0x80, 0, 0, 0, 2), &[]), UsbTransfer::Nak);
+        assert_eq!(fake.submitted_payloads().len(), 1);
+    }
+
+    /// A SET_CONFIGURATION whose claim fails leaves nothing claimed, gives
+    /// the taken interfaces back to the host, and stalls.
+    #[test]
+    fn a_failed_reclaim_stalls_and_returns_the_interfaces() {
+        let (mut host, fake) = device();
+        fake.fail_claim(1);
+        assert_eq!(control(&mut host, set_config(1)), UsbTransfer::Stall);
+        let calls = fake.calls();
+        assert_eq!(calls.claims, vec![0, 1, 0]);
+        assert_eq!(calls.releases, vec![0, 1, 0]);
+        assert_eq!(calls.connects, vec![0]);
+        assert!(host.claimed_interfaces.is_empty());
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Stall);
     }
 
     #[test]
@@ -806,7 +1146,7 @@ mod tests {
         // The first SET_CONFIGURATION(1) matches the active configuration,
         // so no SETCONFIGURATION ioctl is issued, but the claims are retaken.
         assert_eq!(
-            host.control(set_config(1), &[]),
+            control(&mut host, set_config(1)),
             UsbTransfer::Ack(Vec::new())
         );
         assert_eq!(fake.calls().set_configurations, Vec::<u8>::new());
@@ -816,7 +1156,7 @@ mod tests {
 
         // Unconfigure: the claims go back and configuration 0 is set.
         assert_eq!(
-            host.control(set_config(0), &[]),
+            control(&mut host, set_config(0)),
             UsbTransfer::Ack(Vec::new())
         );
         let after = fake.calls();
@@ -826,7 +1166,7 @@ mod tests {
 
         // Reconfigure: set again and claimed again.
         assert_eq!(
-            host.control(set_config(1), &[]),
+            control(&mut host, set_config(1)),
             UsbTransfer::Ack(Vec::new())
         );
         let after = fake.calls();
@@ -838,7 +1178,7 @@ mod tests {
     fn set_interface_switches_alt_setting() {
         let (mut host, fake) = device();
         assert_eq!(
-            host.control(set_interface(0, 1), &[]),
+            control(&mut host, set_interface(0, 1)),
             UsbTransfer::Ack(Vec::new())
         );
         assert_eq!(fake.calls().set_interfaces, vec![(0, 1)]);
@@ -850,7 +1190,7 @@ mod tests {
     fn clear_feature_halt_clears_the_endpoint() {
         let (mut host, fake) = device();
         assert_eq!(
-            host.control(clear_halt(0x81), &[]),
+            control(&mut host, clear_halt(0x81)),
             UsbTransfer::Ack(Vec::new())
         );
         assert_eq!(fake.calls().cleared_halts, vec![0x81]);
