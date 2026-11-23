@@ -47,17 +47,33 @@ static void fmt(char *dst, size_t cap, const char *f, ...)
     dst[cap - 1] = 0;
 }
 
+/* Why a wire string did not become an ANSI one. */
+#define CONV_TOO_LONG (-1)
+#define CONV_NOT_UTF8 (-2)
+#define CONV_LOSSY (-3)
+
 /* UTF-8 (the wire) -> the ANSI code page (every A API), by hand through
- * UTF-16 so no code page support is assumed of the guest. 0, or -1 when the
- * text does not fit (`dst` then holds what did, terminated). Called from the
- * core loop's thread only, hence the static scratch. */
-static int utf8_to_ansi(const char *src, char *dst, int cap)
+ * UTF-16 so no code page support is assumed of the guest. 0, or one of the
+ * CONV_ codes with `dst` empty. Called from the core loop's thread only,
+ * hence the static scratch.
+ *
+ * The conversion is exact or it is refused. WideCharToMultiByte reports
+ * success when it puts the default character `?` — a wildcard to cmd.exe
+ * and command.com — or a best-fit look-alike (a full-width quote becomes
+ * `"`) in place of a character the code page lacks, so the result is
+ * converted back and compared: only text that survives the round trip is
+ * the text the host sent. That needs no flag NT4 or Windows 95 lack
+ * (WC_NO_BEST_FIT_CHARS is newer than both). `*bad` is the first code point
+ * that did not survive (CONV_LOSSY). */
+static int utf8_to_ansi(const char *src, char *dst, int cap, unsigned long *bad)
 {
     static WCHAR wide[CMDLINE_CAP];
-    int n = 0, r;
+    static WCHAR back[CMDLINE_CAP];
+    int n = 0, r, m, i;
     const unsigned char *s = (const unsigned char *)src;
-    if (cap <= 0)
-        return -1;
+    *bad = 0;
+    if (cap < 1)
+        return CONV_TOO_LONG;
     dst[0] = 0;
     while (*s && n < CMDLINE_CAP - 2) {
         unsigned long cp;
@@ -75,12 +91,15 @@ static int utf8_to_ansi(const char *src, char *dst, int cap)
             cp = *s & 0x07;
             extra = 3;
         } else {
-            cp = '?';
-            extra = 0;
+            return CONV_NOT_UTF8;
         }
         s++;
-        while (extra-- > 0 && (*s & 0xC0) == 0x80)
+        while (extra > 0 && (*s & 0xC0) == 0x80) {
             cp = (cp << 6) | (*s++ & 0x3F);
+            extra--;
+        }
+        if (extra || cp > 0x10FFFF)
+            return CONV_NOT_UTF8; /* a cut sequence is not a shorter character */
         if (cp >= 0x10000) {
             cp -= 0x10000;
             wide[n++] = (WCHAR)(0xD800 | (cp >> 10));
@@ -91,16 +110,48 @@ static int utf8_to_ansi(const char *src, char *dst, int cap)
     }
     wide[n] = 0;
     if (*s)
-        return -1; /* longer than the scratch */
+        return CONV_TOO_LONG; /* longer than the scratch */
     if (n == 0)
         return 0;
     r = WideCharToMultiByte(CP_ACP, 0, wide, n, dst, cap - 1, NULL, NULL);
     if (r <= 0) {
         dst[0] = 0; /* 0 is ERROR_INSUFFICIENT_BUFFER */
-        return -1;
+        return CONV_TOO_LONG;
     }
     dst[r] = 0;
+    m = MultiByteToWideChar(CP_ACP, 0, dst, r, back, CMDLINE_CAP);
+    for (i = 0; i < n && i < m && wide[i] == back[i]; i++)
+        ;
+    if (i < n || m != n) {
+        /* `i == n` is text that grew on the way back: blame its last unit. */
+        if (i == n)
+            i = n - 1;
+        /* Name a character outside the BMP whole, not one of its halves. */
+        if (wide[i] >= 0xDC00 && wide[i] < 0xE000 && i > 0)
+            i--;
+        *bad = wide[i];
+        if (*bad >= 0xD800 && *bad < 0xDC00 && i + 1 < n)
+            *bad = 0x10000 + ((*bad - 0xD800) << 10) + (wide[i + 1] - 0xDC00);
+        dst[0] = 0;
+        return CONV_LOSSY;
+    }
     return 0;
+}
+
+/* The refusal for a string that did not convert, naming it (`what`: which
+ * argument, which environment entry, the cwd). ASCII only, so the message
+ * itself always converts. */
+static void conv_error(char *err, int errcap, const char *what, int rc, unsigned long bad)
+{
+    if (rc == CONV_LOSSY)
+        fmt(err, (size_t)errcap,
+            "exec: %s has the character U+%04lX, which the guest's code page %u "
+            "cannot represent; nothing was run",
+            what, bad, (unsigned)GetACP());
+    else if (rc == CONV_NOT_UTF8)
+        fmt(err, (size_t)errcap, "exec: %s is not valid UTF-8; nothing was run", what);
+    else
+        fmt(err, (size_t)errcap, "exec: %s too long", what);
 }
 
 /* ---- the channel ---------------------------------------------------- */
@@ -275,16 +326,19 @@ static int quote_arg(const char *arg, char *out, int cap, int *len)
 }
 
 /* The agent's environment with `KEY=VALUE` overrides applied (keys compared
- * case-insensitively, as Windows does). Caller frees. */
-static char *build_env_block(char **env, int nenv)
+ * case-insensitively, as Windows does). Caller frees. NULL with the reason
+ * in `err`: no memory, or an override the code page cannot hold. */
+static char *build_env_block(char **env, int nenv, char *err, int errcap)
 {
     char *base = GetEnvironmentStringsA();
     char *out, *w;
     const char *e;
     size_t total = 1;
     int i;
-    if (!base)
+    if (!base) {
+        fmt(err, (size_t)errcap, "exec: out of memory");
         return NULL;
+    }
     for (e = base; *e; e += strlen(e) + 1)
         total += strlen(e) + 1;
     for (i = 0; i < nenv; i++)
@@ -292,6 +346,7 @@ static char *build_env_block(char **env, int nenv)
     out = malloc(total);
     if (!out) {
         FreeEnvironmentStringsA(base);
+        fmt(err, (size_t)errcap, "exec: out of memory");
         return NULL;
     }
     w = out;
@@ -315,8 +370,19 @@ static char *build_env_block(char **env, int nenv)
         }
     }
     for (i = 0; i < nenv; i++) {
-        /* An entry that does not convert is left out, not truncated. */
-        if (utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1)) == 0 && *w)
+        /* An entry that does not convert exactly fails the exec: the command
+         * was written for the environment the host sent, not a part of it. */
+        unsigned long bad;
+        int rc = utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1), &bad);
+        if (rc < 0) {
+            char what[32];
+            fmt(what, sizeof what, "env entry %d", i);
+            conv_error(err, errcap, what, rc, bad);
+            FreeEnvironmentStringsA(base);
+            free(out);
+            return NULL;
+        }
+        if (*w)
             w += strlen(w) + 1;
     }
     *w = 0;
@@ -454,8 +520,15 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
 
     for (i = 0; i < spec->argc; i++) {
         static char ansi[CMDLINE_CAP];
-        if (utf8_to_ansi(spec->argv[i], ansi, (int)sizeof ansi) < 0 ||
-            (i && len + 1 >= (int)sizeof cmdline)) {
+        unsigned long bad;
+        int rc = utf8_to_ansi(spec->argv[i], ansi, (int)sizeof ansi, &bad);
+        if (rc == CONV_LOSSY || rc == CONV_NOT_UTF8) {
+            char what[32];
+            fmt(what, sizeof what, "argument %d", i);
+            conv_error(err, errcap, what, rc, bad);
+            return NULL;
+        }
+        if (rc < 0 || (i && len + 1 >= (int)sizeof cmdline)) {
             fmt(err, (size_t)errcap, "exec: command line too long");
             return NULL;
         }
@@ -467,9 +540,13 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         }
     }
     cmdline[len] = 0;
-    if (spec->cwd && utf8_to_ansi(spec->cwd, cwd, (int)sizeof cwd) < 0) {
-        fmt(err, (size_t)errcap, "exec: cwd too long");
-        return NULL;
+    if (spec->cwd) {
+        unsigned long bad;
+        int rc = utf8_to_ansi(spec->cwd, cwd, (int)sizeof cwd, &bad);
+        if (rc < 0) {
+            conv_error(err, errcap, "cwd", rc, bad);
+            return NULL;
+        }
     }
 
     p = calloc(1, sizeof *p);
@@ -502,12 +579,10 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     /* NT hides a console outright; 9x has no such flag and needs a console
      * for command.com, so it gets a new hidden one. */
     flags = is_win9x ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
-    envblock = build_env_block(spec->env, spec->nenv);
+    envblock = build_env_block(spec->env, spec->nenv, err, errcap);
     if (!envblock || !CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, flags, envblock,
                                      spec->cwd ? cwd : NULL, &si, &pi)) {
-        if (!envblock)
-            fmt(err, (size_t)errcap, "exec: out of memory");
-        else
+        if (envblock)
             fmt(err, (size_t)errcap, "exec %s: error %lu",
                 spec->argv[0], (unsigned long)GetLastError());
         free(envblock);
@@ -1108,10 +1183,191 @@ static int install_9x(const char *exe)
     return 0;
 }
 
+/* `--secure-dir <dir>`: the NT service runs as LocalSystem from <dir>, and
+ * a directory made under the root of C: inherits that root's permissions —
+ * full control for Everyone on NT4 and Windows 2000 — so any local user
+ * could replace the binary, or put a DLL beside it, and be SYSTEM at the
+ * next boot. This gives the directory and what is already in it to
+ * Administrators (owner) with full control for Administrators and SYSTEM
+ * and nobody else; what is copied in afterwards inherits that. The install
+ * script runs it from the ISO before the copy.
+ *
+ * The SIDs are written out rather than looked up by name, because the
+ * group names are localised. The DACL is marked protected where the system
+ * knows the bit (Windows 2000 on), so a later change to the root of the
+ * drive does not flow back in. */
+#ifndef SE_DACL_PROTECTED
+#define SE_DACL_PROTECTED 0x1000
+#endif
+#ifndef FS_PERSISTENT_ACLS
+#define FS_PERSISTENT_ACLS 0x00000008
+#endif
+
+/* A SID with room for two sub-authorities, laid out as winnt.h's SID. */
+typedef struct {
+    BYTE Revision;
+    BYTE SubAuthorityCount;
+    BYTE IdentifierAuthority[6];
+    DWORD SubAuthority[2];
+} FixedSid;
+static FixedSid sid_system = {1, 1, {0, 0, 0, 0, 0, 5}, {18, 0}};  /* S-1-5-18 */
+static FixedSid sid_admins = {1, 2, {0, 0, 0, 0, 0, 5}, {32, 544}}; /* S-1-5-32-544 */
+
+typedef BOOL(WINAPI *InitializeAclFn)(PACL, DWORD, DWORD);
+typedef BOOL(WINAPI *AddAccessAllowedAceFn)(PACL, DWORD, DWORD, PSID);
+typedef BOOL(WINAPI *GetAceFn)(PACL, DWORD, LPVOID *);
+typedef BOOL(WINAPI *InitializeSecurityDescriptorFn)(PSECURITY_DESCRIPTOR, DWORD);
+typedef BOOL(WINAPI *SetSecurityDescriptorDaclFn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
+typedef BOOL(WINAPI *SetSecurityDescriptorOwnerFn)(PSECURITY_DESCRIPTOR, PSID, BOOL);
+typedef BOOL(WINAPI *SetSecurityDescriptorControlFn)(PSECURITY_DESCRIPTOR, WORD, WORD);
+typedef BOOL(WINAPI *SetFileSecurityFn)(LPCSTR, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+
+static struct {
+    InitializeAclFn init_acl;
+    AddAccessAllowedAceFn add_ace;
+    GetAceFn get_ace;
+    InitializeSecurityDescriptorFn init_sd;
+    SetSecurityDescriptorDaclFn set_dacl;
+    SetSecurityDescriptorOwnerFn set_owner;
+    SetSecurityDescriptorControlFn set_control; /* NULL on NT4 */
+    SetFileSecurityFn set_file;
+} sec;
+
+/* Owner, then DACL: the owner may always write the DACL, so the second
+ * call does not depend on what the old DACL granted. 0, or -1 with the
+ * failing call's error left in GetLastError. */
+static int secure_path(const char *path, int is_dir)
+{
+    static DWORD acl_buf[32]; /* DWORD-aligned, 128 bytes; the ACL needs 52 */
+    PACL acl = (PACL)acl_buf;
+    SECURITY_DESCRIPTOR sd;
+    DWORD i;
+    if (!sec.init_acl(acl, sizeof acl_buf, ACL_REVISION) ||
+        !sec.add_ace(acl, ACL_REVISION, FILE_ALL_ACCESS, (PSID)&sid_admins) ||
+        !sec.add_ace(acl, ACL_REVISION, FILE_ALL_ACCESS, (PSID)&sid_system))
+        return -1;
+    if (is_dir) {
+        /* AddAccessAllowedAceEx is Windows 2000 on; the flags are set by
+         * hand so NT4 gets inheriting entries too. */
+        for (i = 0; i < 2; i++) {
+            LPVOID ace;
+            if (!sec.get_ace(acl, i, &ace))
+                return -1;
+            ((ACE_HEADER *)ace)->AceFlags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        }
+    }
+    if (!sec.init_sd(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+        !sec.set_owner(&sd, (PSID)&sid_admins, FALSE) ||
+        !sec.set_file(path, OWNER_SECURITY_INFORMATION, &sd))
+        return -1;
+    if (!sec.init_sd(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+        !sec.set_dacl(&sd, TRUE, acl, FALSE))
+        return -1;
+    if (sec.set_control && !sec.set_control(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED))
+        return -1;
+    if (!sec.set_file(path, DACL_SECURITY_INFORMATION, &sd))
+        return -1;
+    return 0;
+}
+
+static int secure_dir(const char *dir)
+{
+    static char pattern[MAX_PATH], child[MAX_PATH];
+    char root[4];
+    const char *root_arg = NULL;
+    DWORD attrs, fs_flags = 0;
+    HMODULE adv;
+    HANDLE find;
+    WIN32_FIND_DATAA fd;
+    int failed = 0;
+    size_t len = strlen(dir);
+
+    if (is_win9x) {
+        printf("secure-dir: Windows 9x has no file permissions, nothing to do\n");
+        return 0;
+    }
+    attrs = GetFileAttributesA(dir);
+    if (attrs == 0xFFFFFFFFUL || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        fprintf(stderr, "secure-dir: %s is not a directory\n", dir);
+        return 1;
+    }
+    /* Never a drive root: this takes access away from every other user. */
+    if (len < 4 || dir[1] != ':' || dir[2] != '\\' || len + 3 > sizeof pattern) {
+        fprintf(stderr, "secure-dir: %s: give a directory as X:\\name\n", dir);
+        return 1;
+    }
+    root[0] = dir[0];
+    root[1] = ':';
+    root[2] = '\\';
+    root[3] = 0;
+    root_arg = root;
+    if (!GetVolumeInformationA(root_arg, NULL, 0, NULL, NULL, &fs_flags, NULL, 0)) {
+        fprintf(stderr, "secure-dir: cannot read the volume of %s: %lu\n", dir,
+                (unsigned long)GetLastError());
+        return 1;
+    }
+    if (!(fs_flags & FS_PERSISTENT_ACLS)) {
+        /* FAT: nothing can be set, and nothing protects any other file of
+         * this guest either. Said, not failed. */
+        printf("secure-dir: warning: the volume of %s keeps no permissions (FAT); "
+               "any user of this guest can replace the agent\n", dir);
+        return 0;
+    }
+    adv = LoadLibraryA("advapi32.dll");
+    sec.init_acl = (InitializeAclFn)GetProcAddress(adv, "InitializeAcl");
+    sec.add_ace = (AddAccessAllowedAceFn)GetProcAddress(adv, "AddAccessAllowedAce");
+    sec.get_ace = (GetAceFn)GetProcAddress(adv, "GetAce");
+    sec.init_sd = (InitializeSecurityDescriptorFn)GetProcAddress(adv, "InitializeSecurityDescriptor");
+    sec.set_dacl = (SetSecurityDescriptorDaclFn)GetProcAddress(adv, "SetSecurityDescriptorDacl");
+    sec.set_owner = (SetSecurityDescriptorOwnerFn)GetProcAddress(adv, "SetSecurityDescriptorOwner");
+    sec.set_control =
+        (SetSecurityDescriptorControlFn)GetProcAddress(adv, "SetSecurityDescriptorControl");
+    sec.set_file = (SetFileSecurityFn)GetProcAddress(adv, "SetFileSecurityA");
+    if (!sec.init_acl || !sec.add_ace || !sec.get_ace || !sec.init_sd || !sec.set_dacl ||
+        !sec.set_owner || !sec.set_file) {
+        fprintf(stderr, "secure-dir: security APIs unavailable\n");
+        return 1;
+    }
+    /* The directory first, so nothing new gets in under the old ACL. */
+    if (secure_path(dir, 1) != 0) {
+        fprintf(stderr, "secure-dir: cannot secure %s: %lu\n", dir,
+                (unsigned long)GetLastError());
+        return 1;
+    }
+    /* Then what is already there (a rebuild's binary keeps its own ACL when
+     * `copy /y` writes over it). One level: the install makes no more. */
+    fmt(pattern, sizeof pattern, "%s\\*", dir);
+    find = FindFirstFileA(pattern, &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+                continue;
+            if (len + 1 + strlen(fd.cFileName) >= sizeof child) {
+                fprintf(stderr, "secure-dir: name too long under %s\n", dir);
+                failed = 1;
+                continue;
+            }
+            fmt(child, sizeof child, "%s\\%s", dir, fd.cFileName);
+            if (secure_path(child, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != 0) {
+                fprintf(stderr, "secure-dir: cannot secure %s: %lu\n", child,
+                        (unsigned long)GetLastError());
+                failed = 1;
+            }
+        } while (FindNextFileA(find, &fd));
+        FindClose(find);
+    }
+    if (failed)
+        return 1;
+    printf("secured %s: Administrators and SYSTEM only\n", dir);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int i;
     is_win9x = (GetVersion() & 0x80000000UL) != 0;
+    if (argc == 3 && strcmp(argv[1], "--secure-dir") == 0)
+        return secure_dir(argv[2]);
     if (argc == 2 && strcmp(argv[1], "--install") == 0) {
         static char exe[MAX_PATH];
         GetModuleFileNameA(NULL, exe, sizeof exe);
@@ -1129,7 +1385,8 @@ int main(int argc, char **argv)
                 SetFilePointer(log_file, 0, NULL, FILE_END);
         } else {
             fprintf(stderr, "usage: vmlab-agent-legacy [--console] [--port COMn] [--log file]\n"
-                            "       vmlab-agent-legacy --install\n");
+                            "       vmlab-agent-legacy --install\n"
+                            "       vmlab-agent-legacy --secure-dir X:\\dir\n");
             return 2;
         }
     }
