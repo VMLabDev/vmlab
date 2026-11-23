@@ -220,7 +220,12 @@ pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
             serde_json::from_value(labs)
                 .context("the supervisor reported a registry vmlab cannot read")?
         }
-        Err(_) => Registry::load().labs().to_vec(),
+        // Unreadable is not empty: the name may be registered from
+        // another root, and this verb would then act on that lab.
+        Err(_) => Registry::load()
+            .context("cannot tell whether this lab's name is registered elsewhere")?
+            .labs()
+            .to_vec(),
     };
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     match labs.iter().find(|entry| entry.name == name) {

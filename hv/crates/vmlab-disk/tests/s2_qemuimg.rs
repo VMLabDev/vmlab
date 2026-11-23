@@ -985,6 +985,89 @@ fn s2_ops_commit() {
     qemu_img(&["compare", &top.to_string_lossy(), &base.to_string_lossy()]);
 }
 
+const PARTIAL_CLUSTER_START: u64 = 1024 * 1024;
+const PARTIAL_CLUSTER_SIZE: u64 = PARTIAL_CLUSTER_START + 512;
+
+#[test]
+fn convert_with_backing_of_an_image_with_a_partial_last_cluster() {
+    require_qemu_img!();
+    let temp = tmpdir("convert-partial");
+    let raw = temp.path().join("src.raw");
+    let base = temp.path().join("base.qcow2");
+    let dest = temp.path().join("dest.qcow2");
+    std::fs::write(&raw, vec![b'U'; PARTIAL_CLUSTER_SIZE as usize]).unwrap();
+    ops::convert(&raw, &base, None, None, None).unwrap();
+
+    ops::convert(&base, &dest, None, Some(&base), Some("qcow2")).unwrap();
+
+    qemu_check(&dest);
+    qemu_img(&[
+        "compare",
+        "-s",
+        "-f",
+        "qcow2",
+        "-F",
+        "qcow2",
+        &base.to_string_lossy(),
+        &dest.to_string_lossy(),
+    ]);
+}
+
+#[test]
+fn commit_of_an_image_with_a_partial_last_cluster() {
+    require_qemu_img!();
+    let temp = tmpdir("commit-partial");
+    let base = temp.path().join("base.qcow2");
+    ops::create_qcow2(&base, PARTIAL_CLUSTER_SIZE, None, None).unwrap();
+    check_commit_partial_cluster(temp.path(), &base, Format::Qcow2, "qcow2");
+}
+
+#[test]
+fn commit_grows_a_shorter_backing_image() {
+    require_qemu_img!();
+    for (format, name) in [(Format::Raw, "raw"), (Format::Qcow2, "qcow2")] {
+        let temp = tmpdir("commit-grow");
+        let base = temp.path().join("base");
+        match format {
+            Format::Raw => std::fs::File::create(&base)
+                .unwrap()
+                .set_len(PARTIAL_CLUSTER_START)
+                .unwrap(),
+            Format::Qcow2 => {
+                ops::create_qcow2(&base, PARTIAL_CLUSTER_START, None, None).unwrap();
+            }
+        }
+        check_commit_partial_cluster(temp.path(), &base, format, name);
+    }
+}
+
+fn check_commit_partial_cluster(dir: &Path, base: &Path, format: Format, format_name: &str) {
+    let top = dir.join("top.qcow2");
+    ops::create_qcow2(&top, PARTIAL_CLUSTER_SIZE, Some(base), Some(format_name)).unwrap();
+    write_pattern(&top, Format::Qcow2, PARTIAL_CLUSTER_START, &[0xd]);
+    let before = std::fs::read(&top).unwrap();
+
+    ops::commit(&top).unwrap();
+
+    assert_eq!(
+        vmlab_disk::open(base, format, true).unwrap().size(),
+        PARTIAL_CLUSTER_SIZE
+    );
+    assert_eq!(std::fs::read(&top).unwrap(), before);
+    if format == Format::Qcow2 {
+        qemu_check(base);
+    }
+    qemu_img(&[
+        "compare",
+        "-f",
+        "qcow2",
+        "-F",
+        format_name,
+        &top.to_string_lossy(),
+        &base.to_string_lossy(),
+    ]);
+}
+
 /// Read-only opens never modify the image.
 #[test]
 fn s2_read_only_never_modifies() {

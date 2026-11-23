@@ -27,7 +27,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data (fixed, card #563) |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file (fixed, card #576) |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read (fixed, card #562) |
-| F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size |
+| F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size (fixed, card #575) |
 | F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory (fixed, card #555) |
 | F10 | crash | Two header fields of a crafted image panic the process (fixed, card #555) |
 | F11 | data loss | `convert` with the same path for source and destination deletes the source |
@@ -301,7 +301,11 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 - Proof: S2 tests `commit_of_an_image_with_a_partial_last_cluster` and
   `convert_with_backing_of_an_image_with_a_partial_last_cluster`: the steps
   above with a size of 1 MiB + 512 bytes. Expected: success, and `qemu-img
-  compare` of the result with the top image is identical. Today: both fail.
+  compare` of the result with the top image is identical. Both tests failed
+  before the fix.
+- Fixed in card #575. Both operations copy only the bytes within the virtual
+  size. Commit grows a shorter backing image first, with S2 coverage for
+  raw and qcow2 backing files.
 
 ### F9. Header counts have no upper limit (crash)
 
