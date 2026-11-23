@@ -180,9 +180,8 @@ impl WineAgent {
 
         // COM1 is a pty. The slave stays open here so the master never
         // reports a hang-up between two opens on the Wine side.
-        let master = rustix::pty::openpt(
-            rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY,
-        )?;
+        let master =
+            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)?;
         rustix::pty::grantpt(&master)?;
         rustix::pty::unlockpt(&master)?;
         let pts = rustix::pty::ptsname(&master, Vec::new())?;
