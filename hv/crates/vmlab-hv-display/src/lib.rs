@@ -16,7 +16,7 @@ pub use core::{
     Cursor, DisplayServer, Frame, FrameSource, HANDSHAKE_TIMEOUT, InputSink, MAX_HANDSHAKES,
     MAX_SESSIONS, Pixels,
 };
-pub use lease::{BufferGuard, BufferLease};
+pub use lease::{BufferGuard, BufferLease, REVOKE_AFTER};
 pub use protocol::{Capabilities, FrameFlags, Message, Rect, SurfaceKind};
 pub use transport::{Packet, receive, send};
 

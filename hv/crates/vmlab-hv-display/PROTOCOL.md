@@ -72,6 +72,9 @@ a held allocation until every client releases it or disconnects. Clients must
 not sample a buffer after Release, even if its configure is still cached.
 Holding a direct guest buffer can stall guest rendering. Keep it only for the
 GPU work needed to sample it, not until a later frame arrives.
+The stall has a limit. When the producer has waited one second for a held
+allocation, the server closes every connection that still holds a frame on it.
+That frees all frames of those connections. A closed client can connect again.
 
 Without stable_buffers the server keeps the original per-frame dma-buf
 configure behaviour. Shared-memory clients need no new capability.

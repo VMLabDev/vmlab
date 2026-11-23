@@ -731,6 +731,60 @@ fn snapshot_restores_extended_state_and_a_waiting_blit() {
     assert!(other.restore_state(&truncated).is_err());
 }
 
+/// A saved state with one field of its waiting BitBLT replaced.
+fn with_blit_field(saved: &[u8], field: &str, value: u64) -> Vec<u8> {
+    let core = u64::from_le_bytes(saved[8..16].try_into().unwrap()) as usize;
+    let mut tail: serde_json::Value = serde_json::from_slice(&saved[16 + core..]).unwrap();
+    assert!(tail["blit"][field].is_u64(), "no BitBLT field {field}");
+    tail["blit"][field] = value.into();
+    let mut state = saved[..16 + core].to_vec();
+    state.extend(serde_json::to_vec(&tail).unwrap());
+    state
+}
+
+#[test]
+fn restore_rejects_blit_geometry_outside_the_registers() {
+    let mut dev = device();
+    mode(&mut dev, 640, 480, 3, 2);
+    blit(&mut dev, 0x84, 0x0d, 8, 2, 640, 0, 0x100, 0);
+    dev.legacy_write(0, &[0xff, 0xff]);
+    let saved = dev.save_state().unwrap();
+    // The largest values the registers hold are accepted.
+    for (field, value) in [
+        ("width", 0x2000),
+        ("height", 0x800),
+        ("dst_pitch", 0x1fff),
+        ("src_pitch", 0x1fff),
+        ("dst", 0x3f_ffff),
+        ("src", 0x3f_ffff),
+        ("skip", 7),
+    ] {
+        let state = with_blit_field(&saved, field, value);
+        assert!(
+            device().restore_state(&state).is_ok(),
+            "{field} = {value:#x}"
+        );
+    }
+    for (field, value) in [
+        ("width", 1 << 40),
+        ("width", u64::MAX),
+        ("width", 0x2001),
+        ("width", 0),
+        ("height", 1 << 40),
+        ("height", 0x801),
+        ("dst_pitch", 0x2000),
+        ("src_pitch", 0x2000),
+        ("dst", 0x40_0000),
+        ("src", 0x40_0000),
+        ("skip", 8),
+    ] {
+        let state = with_blit_field(&saved, field, value);
+        let mut other = device();
+        assert!(other.restore_state(&state).is_err(), "{field} = {value:#x}");
+        assert!(other.blit.is_none(), "{field} = {value:#x}");
+    }
+}
+
 #[test]
 fn vga_modes_still_use_the_core() {
     let mut dev = device();
