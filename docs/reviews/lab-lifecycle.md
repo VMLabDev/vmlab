@@ -37,7 +37,7 @@ Two facts are used by several findings:
 | F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
 | F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559) |
 | F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down (fixed, card #560) |
-| F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon |
+| F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon (fixed, card #561) |
 | F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab |
 | F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again |
 | F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
@@ -309,6 +309,16 @@ Two facts are used by several findings:
   process, and no socket at the lab's path. Call `release_lab`. Afterwards
   either the process is gone or the entry is still there. Today the entry
   is gone and the process runs.
+- Fixed in card #561. `release_lab` takes the per-lab `ensure` lock, so a
+  release waits for a start under way and then stops the daemon through its
+  socket. When the socket does not answer but the entry's pid and start time
+  still name a running process, the release sends that daemon SIGTERM (its
+  termination signal runs the same teardown as `Shutdown`) and waits for it
+  up to `RELEASE_DEADLINE`. Only past the deadline does it kill the daemon,
+  reap the lab's orphans and drop the entry. `cmd_destroy` with no answering
+  daemon asks for the release before it removes the lab directory. The test
+  `a_release_does_not_forget_a_live_daemon` in `src/supervisor/mod.rs`
+  failed before the fix and passes after it.
 
 ### F8. A global segment's reference count is anonymous (wrong result)
 
