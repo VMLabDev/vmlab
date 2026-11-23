@@ -486,4 +486,66 @@ fn main() {
         );
         assert_eq!(msg, "no config found (at main)");
     }
+
+    /// Set in the child process of `a_deep_value_faults_instead_of_aborting`.
+    const DEEP_VALUE_CHILD_ENV: &str = "VMLAB_TEST_DEEP_VALUE_CHILD";
+
+    /// Freeing a value nested far deeper than the native stack is high must
+    /// not end the process (docs/reviews/wscript.md F2, card #666): the
+    /// process is the lab daemon. A stack overflow is an abort, not a panic,
+    /// so the script runs in a child process and the abort is its exit
+    /// status. 300,000 levels overflow a 2 MiB stack unless a level costs
+    /// under 7 bytes of it.
+    #[test]
+    fn a_deep_value_faults_instead_of_aborting() {
+        const SCRIPT: &str = r#"
+struct Node { next: Option[Node] }
+
+fn main() {
+    let cur = Node { next: None }
+    let i = 0
+    while i < 300000 {
+        cur = Node { next: Some(cur) }
+        i = i + 1
+    }
+}
+"#;
+        if std::env::var_os(DEEP_VALUE_CHILD_ENV).is_some() {
+            // The stack a script has in the daemon: tokio's blocking
+            // threads, which `run_script_source` runs it on, get 2 MiB.
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| {
+                    let ctx = super::super::context();
+                    let unit = ctx
+                        .compile(SCRIPT)
+                        .unwrap_or_else(|e| panic!("{}", compile_error(e)));
+                    let mut vm = Vm::new(&ctx);
+                    // With or without a fault: the run only has to return.
+                    let _ = vm.call_unit::<_, ()>(&unit, "main", ());
+                    drop(vm);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        // libtest names a test without the crate.
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::a_deep_value_faults_instead_of_aborting"),
+                "--nocapture",
+            ])
+            .env(DEEP_VALUE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "the script run ended its process: {}\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
 }
