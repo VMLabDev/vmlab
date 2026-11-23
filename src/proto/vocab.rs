@@ -706,7 +706,8 @@ vocabulary! {
         /// Hot-plug the host USB device `selector` names into a running VM
         /// booted with `usb = true` (PRD §5.2.1): `<vid>:<pid>`,
         /// `<vid>:<pid>@<serial>` or `port:<bus>-<port>`. A HID keyboard or
-        /// mouse is refused without `force`. Answers with the attachment.
+        /// mouse, and a disk the host has mounted, are refused without
+        /// `force`. Answers with the attachment.
         #[one_way(
             "cli",
             "A script attaches through the lab runtime it is bound to, not \

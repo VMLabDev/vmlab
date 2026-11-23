@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub const SYSFS_ROOT: &str = "/sys/bus/usb/devices";
 /// Where the device nodes QEMU opens live.
 pub const DEV_ROOT: &str = "/dev/bus/usb";
+/// The host's mount table, one line per mount.
+pub const MOUNT_TABLE: &str = "/proc/self/mountinfo";
 /// The qdev id of the xHCI controller a `usb = true` VM boots with; every
 /// hot-plugged device rides its bus, `usbx.0`.
 pub const CONTROLLER_ID: &str = "usbx";
@@ -478,6 +480,156 @@ pub fn permission_refusal(dev: &HostDevice, node: &Path) -> String {
     )
 }
 
+/// A filesystem the host has mounted from a USB device: the block device
+/// below the USB device that carries it, and where it is mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMount {
+    /// The kernel name of the block device (`sdb1`, or `dm-0` for a mapping
+    /// that sits on a partition of the device).
+    pub block: String,
+    pub mount_point: String,
+}
+
+/// How deep the walk below a USB device goes looking for its disks. A disk
+/// sits at `<iface>/host<N>/target<..>/<h:c:t:l>/block/<disk>`, five levels
+/// down; the bound only keeps a strange tree from being walked for ever.
+const BLOCK_WALK_DEPTH: usize = 12;
+/// How many layers of holders (dm-crypt, LVM, md) are followed above a disk.
+const HOLDER_DEPTH: usize = 8;
+
+/// Every filesystem of `dev` the host has mounted: the block devices sysfs
+/// lists below the device at `sysfs_root`, their partitions and whatever
+/// holds them (a dm-crypt or LVM mapping), each looked up by its
+/// `major:minor` in `mount_table` (the text of [`MOUNT_TABLE`]). Sorted by
+/// mount point. An unreadable entry is skipped, as in [`scan`].
+pub fn host_mounts(sysfs_root: &Path, dev: &HostDevice, mount_table: &str) -> Vec<HostMount> {
+    let mut blocks = Vec::new();
+    find_blocks(&sysfs_root.join(&dev.port), BLOCK_WALK_DEPTH, &mut blocks);
+    let mut out: Vec<HostMount> = Vec::new();
+    for line in mount_table.lines() {
+        // `36 35 8:17 / /run/media/u/STICK rw,... - vfat /dev/sdb1 rw`
+        let mut fields = line.split(' ');
+        let (Some(devno), Some(mount_point)) = (fields.nth(2), fields.nth(1)) else {
+            continue;
+        };
+        if let Some((block, _)) = blocks.iter().find(|(_, d)| d == devno) {
+            let mount = HostMount {
+                block: block.clone(),
+                mount_point: unescape_mount(mount_point),
+            };
+            if !out.contains(&mount) {
+                out.push(mount);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    out
+}
+
+/// Collect `(name, major:minor)` of every block device below `dir`. Symlinks
+/// are not followed on the way down: sysfs is full of them (`subsystem`,
+/// `driver`, `device`) and they lead out of the device.
+fn find_blocks(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_name() == "block" {
+            if let Ok(disks) = std::fs::read_dir(&path) {
+                for disk in disks.flatten() {
+                    block_and_parts(&disk.path(), out);
+                }
+            }
+        } else if depth > 0 {
+            find_blocks(&path, depth - 1, out);
+        }
+    }
+}
+
+/// One disk directory: the disk, each partition, and the holders of both.
+fn block_and_parts(disk: &Path, out: &mut Vec<(String, String)>) {
+    block_and_holders(disk, HOLDER_DEPTH, out);
+    if let Ok(entries) = std::fs::read_dir(disk) {
+        for entry in entries.flatten() {
+            let part = entry.path();
+            // A partition is a subdirectory with a `dev` of its own.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) && part.join("dev").is_file() {
+                block_and_holders(&part, HOLDER_DEPTH, out);
+            }
+        }
+    }
+}
+
+/// One block device directory, and — through its `holders/` links — every
+/// mapping stacked on it.
+fn block_and_holders(block: &Path, depth: usize, out: &mut Vec<(String, String)>) {
+    let (Some(name), Ok(devno)) = (
+        block.file_name().map(|n| n.to_string_lossy().into_owned()),
+        std::fs::read_to_string(block.join("dev")),
+    ) else {
+        return;
+    };
+    let entry = (name, devno.trim().to_string());
+    if out.contains(&entry) {
+        return;
+    }
+    out.push(entry);
+    if depth == 0 {
+        return;
+    }
+    if let Ok(holders) = std::fs::read_dir(block.join("holders")) {
+        for holder in holders.flatten() {
+            block_and_holders(&holder.path(), depth - 1, out);
+        }
+    }
+}
+
+/// A mount point as the mount table spells it, with its octal escapes
+/// (`\040` for a space) turned back.
+fn unescape_mount(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = (b[i] == b'\\' && i + 4 <= b.len())
+            .then(|| std::str::from_utf8(&b[i + 1..i + 4]).ok())
+            .flatten()
+            .and_then(|d| u8::from_str_radix(d, 8).ok());
+        match octal {
+            Some(c) => {
+                out.push(c);
+                i += 4;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The refusal for a device the host has a filesystem mounted from. The
+/// attach disconnects the host's storage driver at once, so what the host
+/// has not written yet is lost and the mount is left without its disk.
+pub fn mounted_refusal(dev: &HostDevice, mounts: &[HostMount]) -> String {
+    format!(
+        "{} carries a filesystem the host has mounted ({}) — an attach takes the disk away \
+         under it, and data the host has not written yet is lost. Unmount it first, or pass \
+         --force (wscript: `usb_attach_force`) if that is what you want",
+        dev.describe(),
+        mounts
+            .iter()
+            .map(|m| format!("{} at {}", m.block, m.mount_point))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Everything an attach decided before QEMU is asked: which device, and the
 /// `device_add` arguments that pin it.
 #[derive(Debug, Clone, PartialEq)]
@@ -488,8 +640,10 @@ pub struct AttachPlan {
 
 /// Decide an attach (PRD §5.2.1): resolve `sel` among `host`, refuse a
 /// device another machine holds (`held` maps a port to its holder, `lab/vm`),
-/// refuse a HID keyboard or mouse unless `force`, and refuse a node this
-/// process cannot open (`accessible`). The VM-side refusals — not running,
+/// refuse a HID keyboard or mouse unless `force`, refuse a device that
+/// carries a filesystem the host has mounted (`mounted`, [`host_mounts`])
+/// unless `force`, and refuse a node this process cannot open
+/// (`accessible`). The VM-side refusals — not running,
 /// no `usb = true`, a container — come first, from the machine.
 pub fn plan_attach(
     sel: &Selector,
@@ -497,6 +651,7 @@ pub fn plan_attach(
     held: &[(String, String)],
     force: bool,
     dev_root: &Path,
+    mounted: impl Fn(&HostDevice) -> Vec<HostMount>,
     accessible: impl Fn(&Path) -> bool,
 ) -> Result<AttachPlan, String> {
     let dev = resolve(sel, host)?;
@@ -513,6 +668,12 @@ pub fn plan_attach(
              attached. Pass --force (wscript: `usb_attach_force`) if that is what you want",
             dev.describe()
         ));
+    }
+    if !force {
+        let mounts = mounted(dev);
+        if !mounts.is_empty() {
+            return Err(mounted_refusal(dev, &mounts));
+        }
     }
     let node = dev.node(dev_root);
     if !accessible(&node) {

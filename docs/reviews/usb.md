@@ -138,9 +138,24 @@ hostile guest or peer, wrong result, cosmetic.
   `src/usb/tests.rs`, with a fake sysfs tree that gives the device a block
   child and a mount table that names it.
 - How bad: data loss on the host.
+- Fixed by card #663, for the mounted disk. `plan_attach` refuses a device
+  that carries a filesystem the host has mounted unless `--force` is given,
+  and names each block device and mount point. `host_mounts` finds the block
+  devices below the USB device in sysfs, with their partitions and the
+  mappings in their `holders/`, and looks each up by `major:minor` in
+  `/proc/self/mountinfo`. The proof test failed before the refusal was added
+  and passes with it. Not covered: a disk in use without a mount (swap, a raw
+  device a process has open), a USB network adapter, and a HID device without
+  the boot protocol.
 
 ### F3. A guest stops its VMM with one UHCI queue head that nests itself
 
+- Status: fixed by card #664. `queue` no longer calls itself for a nested
+  queue head. It follows the element link in its own loop, so `MAX_ELEMENTS`
+  bounds the nesting together with the TDs of one call. Proof test:
+  `a_queue_head_nested_in_itself_stays_bounded` (`usb/uhci/tests.rs`), which
+  also covers two queue heads nested in each other. Before the fix it ended
+  with a stack overflow (SIGABRT) in a debug build.
 - Where: `usb/uhci.rs:396-409` (`queue`), line 406.
 - Why it is a fault: a queue head whose element link has the Q bit set makes
   `queue` call itself on the linked queue head. The `MAX_ELEMENTS` limit at

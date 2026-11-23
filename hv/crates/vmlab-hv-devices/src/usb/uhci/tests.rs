@@ -237,6 +237,49 @@ fn cyclic_schedules_and_bad_pointers_stay_bounded() {
     assert!(u16::from_le_bytes(frame) > 0x10);
 }
 
+/// A queue head whose element link names a queue head is followed within
+/// the element bound of one frame: a queue head nested in itself, or two
+/// nested in each other, cost a bounded walk and no stack (usb review F3).
+#[test]
+fn a_queue_head_nested_in_itself_stays_bounded() {
+    let mut machine = Machine::new();
+    machine.replay(Some("GET_DESCRIPTOR(device) at address 0"));
+    let write = |address: u32, value: u32| {
+        machine
+            .memory
+            .write_slice(&value.to_le_bytes(), GuestAddress(u64::from(address)))
+            .unwrap();
+    };
+    let frame_list = 0x102000u32;
+    let (a, b, c) = (0x101000u32, 0x101020u32, 0x101040u32);
+    // A: no horizontal neighbour, its element link is A itself.
+    write(a, 1);
+    write(a + 4, a | 2);
+    // B and C: each the other's element.
+    write(b, 1);
+    write(b + 4, c | 2);
+    write(c, 1);
+    write(c + 4, b | 2);
+    for index in 0..1024 {
+        let qh = if index % 2 == 0 { a } else { b };
+        write(frame_list + index * 4, qh | 2);
+    }
+    machine.uhci.write(8, &frame_list.to_le_bytes());
+    let mut frame = [0; 2];
+    machine.uhci.read(6, &mut frame);
+    let before = u16::from_le_bytes(frame);
+    machine.uhci.advance(4_000_000);
+    machine.uhci.read(6, &mut frame);
+    assert_eq!(
+        u16::from_le_bytes(frame),
+        (before + 4) & 0x7ff,
+        "four frames ran, each through a nested queue head"
+    );
+    // The walk writes nothing into a queue head it cannot make progress in.
+    assert_eq!(machine.uhci.read32(a + 4), Some(a | 2));
+    assert_eq!(machine.uhci.read32(b + 4), Some(c | 2));
+}
+
 /// A host-to-device control transfer accepts at most wLength bytes in its
 /// data stage: further OUT packets stall and the buffer does not grow.
 #[test]
