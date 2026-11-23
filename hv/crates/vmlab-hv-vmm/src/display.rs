@@ -697,7 +697,9 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
                             continue;
                         }
                         Err(error) => {
-                            log::warn!("{name}: refused a connection, no peer credentials: {error}");
+                            log::warn!(
+                                "{name}: refused a connection, no peer credentials: {error}"
+                            );
                             continue;
                         }
                     }
