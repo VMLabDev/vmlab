@@ -117,6 +117,19 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             ));
         }
         check_dns_label(&seg.name, seg.span, "segment name", &mut issues);
+        // A /0 covers the entire auto-subnet pool. At the other end, a
+        // segment needs at least two usable addresses for a gateway and guest.
+        if let Some(subnet) = seg.subnet
+            && !(1..=30).contains(&subnet.prefix_len())
+        {
+            issues.push(Issue::at(
+                seg.span,
+                format!(
+                    "segment \"{}\" subnet {subnet} must have a prefix length from /1 to /30",
+                    seg.name
+                ),
+            ));
+        }
         for other in &lab.segments {
             if !std::ptr::eq(seg, other)
                 && let (Some(a), Some(b)) = (seg.subnet, other.subnet)
@@ -1800,9 +1813,11 @@ fn check_nics(
 
 /// The daemon claims the first usable address of every segment as its
 /// gateway (DHCP/DNS/NAT/share endpoint).
+/// Saturate at the final IPv4 address so NIC validation can report issues
+/// even when a segment declares an invalid prefix.
 pub fn gateway_ip(net: ipnet::Ipv4Net) -> Ipv4Addr {
     let base = u32::from(net.network());
-    Ipv4Addr::from(base + 1)
+    Ipv4Addr::from(base.saturating_add(1))
 }
 
 /// One ordering key's graph (§7.2) is acyclic. `key` names it in the issue;
