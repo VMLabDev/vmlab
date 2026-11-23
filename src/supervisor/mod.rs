@@ -824,11 +824,19 @@ impl Supervisor {
     /// The caller is responsible for ensuring the lab is down (no running VMs):
     /// a restart drops the daemon's in-memory state, so a fresh daemon cannot
     /// re-adopt VMs the old one left running.
+    ///
+    /// That check and this request are two requests, so the caller names the
+    /// daemon it checked (`daemon`, its pid). Two commands that both decided
+    /// against one daemon then replace it once: the second finds a successor
+    /// under the name, which it never checked and which may be booting a
+    /// machine for the first, and leaves it in place. Returns the socket and
+    /// whether this request replaced a daemon or started one.
     async fn restart_lab(
         self: &Arc<Self>,
         name: &str,
         root: PathBuf,
-    ) -> Result<PathBuf, CommandError> {
+        daemon: Option<u32>,
+    ) -> Result<(PathBuf, bool), CommandError> {
         let root = registry::canonical_root(&root)?;
         let lock = self.ensure_lock(name).await;
         let _guard = lock.lock().await;
@@ -836,15 +844,24 @@ impl Supervisor {
         let registered = {
             let registry = self.registry.lock().await;
             registry.check_name(name, &root)?;
-            registry.get(name).is_some()
+            registry.get(name).map(|entry| entry.pid)
         };
-        if registered {
+        if let (Some(registered), Some(named)) = (registered, daemon)
+            && registered != named
+        {
+            // Under the name lock: the successor is up, or `ensure` says
+            // what became of it.
+            let sock = self.ensure_lab_locked(name, root).await?;
+            return Ok((sock, false));
+        }
+        if registered.is_some() {
             // Returns once the old daemon is gone, so `ensure_lab` cannot
             // see it still alive (state Running + socket up) and hand back
             // the stale socket.
             self.release_lab_locked(name).await?;
         }
-        self.ensure_lab_locked(name, root).await
+        let sock = self.ensure_lab_locked(name, root).await?;
+        Ok((sock, true))
     }
 }
 
@@ -887,9 +904,9 @@ impl Handler<SupRequest> for SupervisorHandler {
                 Ok(json!(true))
             }
             // Restart a lab daemon so it re-reads its config.
-            SupRequest::LabRestart { name, root } => {
-                let sock = sup.restart_lab(&name, root).await?;
-                Ok(json!({"socket": sock}))
+            SupRequest::LabRestart { name, root, daemon } => {
+                let (sock, replaced) = sup.restart_lab(&name, root, daemon).await?;
+                Ok(json!({"socket": sock, "replaced": replaced}))
             }
             // A lab daemon about to exit by itself.
             SupRequest::LabExiting { name, pid } => {
@@ -1898,6 +1915,208 @@ mod tests {
                 faults.push(format!("the teardown left lab(s) registered: {left:?}"));
             }
             assert!(faults.is_empty(), "{}", faults.join("\n"));
+        });
+    }
+
+    const SUPERSEDED_RESTART_HELPER: &str = "VMLAB_TEST_SUPERSEDED_RESTART_ROOT";
+
+    /// Review F12 (card #573): two commands read one daemon's status after
+    /// an edit and both ask for `lab.restart`. The first restart replaces
+    /// that daemon and boots a machine on the successor. The second names
+    /// the daemon it decided against, so it must leave the successor, and
+    /// the machine, alone.
+    #[test]
+    fn a_restart_names_the_daemon_it_replaces() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::superseded_restart_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SUPERSEDED_RESTART_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths: the state after the first of the two restarts. The
+    /// registry names the successor, a fake lab daemon whose control socket
+    /// this process serves and whose pid is a helper process, and a machine
+    /// was started on it. The second `lab.restart` arrives over the
+    /// supervisor's socket and names the first daemon, which is gone.
+    #[test]
+    #[ignore = "subprocess helper for a_restart_names_the_daemon_it_replaces"]
+    fn superseded_restart_helper() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        use crate::proto::client::{LabClient, SupClient};
+        use crate::proto::server::{Handler, Server, Streamer};
+        use crate::proto::{CommandError, LabRequest, SupRequest};
+
+        /// A lab daemon as far as a restart goes: it answers, it runs a
+        /// machine, and a `shutdown` stops that machine and ends the
+        /// daemon's process.
+        struct Successor {
+            pid: u32,
+            machine_running: AtomicBool,
+            shutdowns: AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl Handler<LabRequest> for Successor {
+            async fn handle(
+                &self,
+                req: LabRequest,
+                _s: &Streamer,
+            ) -> Result<serde_json::Value, CommandError> {
+                if let LabRequest::Shutdown {} = req {
+                    self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                    self.machine_running.store(false, Ordering::SeqCst);
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(self.pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                Ok(serde_json::json!(true))
+            }
+        }
+
+        let Some(root) = std::env::var_os(SUPERSEDED_RESTART_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let name = "f12-restarted";
+            std::fs::write(
+                root.join("vmlab.wcl"),
+                format!("import <vmlab.wcl>\nlab \"{name}\" {{ }}\n"),
+            )
+            .unwrap();
+            crate::paths::ensure_dir(&crate::paths::state_dir()).unwrap();
+
+            // The successor's process. It lives while the first daemon's
+            // pid is taken, so the two pids differ.
+            let mut process = tokio::process::Command::new("sleep")
+                .arg("1000")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let successor_pid = process.id().unwrap();
+            // Reaped the moment it exits, as the supervisor's reaper reaps
+            // a daemon it spawned.
+            let reaper = tokio::spawn(async move {
+                let _ = process.wait().await;
+            });
+            // The daemon both commands read their status from: replaced by
+            // the first restart, so gone.
+            let mut first = std::process::Command::new("true").spawn().unwrap();
+            let first_pid = first.id();
+            first.wait().unwrap();
+            assert_ne!(first_pid, successor_pid);
+
+            let successor = Arc::new(Successor {
+                pid: successor_pid,
+                machine_running: AtomicBool::new(false),
+                shutdowns: AtomicU32::new(0),
+            });
+            let socket = crate::paths::lab_socket(name);
+            let _daemon = Server::<LabRequest>::bind(&socket, successor.clone())
+                .await
+                .unwrap();
+
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let host = crate::config::host::HostConfig::default();
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: name.into(),
+                    root: super::registry::canonical_root(&root).unwrap(),
+                    pid: successor_pid,
+                    started: process_start_time(successor_pid),
+                    state: super::registry::LabState::Running,
+                })
+                .unwrap();
+            let handler = Arc::new(super::SupervisorHandler {
+                sup: supervisor.clone(),
+                tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+            });
+            let _server = Server::<SupRequest>::bind(&crate::paths::supervisor_socket(), handler)
+                .await
+                .unwrap();
+
+            // The first command's `up` boots its machine on the successor.
+            // Set here and not sent as `machine.start`: the protocol report
+            // would list the supervisor as a caller of that command.
+            successor.machine_running.store(true, Ordering::SeqCst);
+            assert!(
+                LabClient::connect(&socket)
+                    .await
+                    .unwrap()
+                    .send(LabRequest::Ping {})
+                    .await
+                    .is_ok()
+            );
+
+            // The second command's restart, decided against the first daemon.
+            let reply = SupClient::connect(&crate::paths::supervisor_socket())
+                .await
+                .unwrap()
+                .send(SupRequest::LabRestart {
+                    name: name.into(),
+                    root: root.clone(),
+                    daemon: Some(first_pid),
+                })
+                .await;
+
+            let shutdowns = successor.shutdowns.load(Ordering::SeqCst);
+            let machine_running = successor.machine_running.load(Ordering::SeqCst);
+            let entry = supervisor.registry.lock().await.get(name).cloned();
+            let alive = process_start_time(successor_pid).is_some();
+            if alive {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(successor_pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = reaper.await;
+
+            assert_eq!(
+                shutdowns, 0,
+                "the second restart shut the successor down (reply: {reply:?})"
+            );
+            assert!(machine_running, "the second restart stopped the machine");
+            assert!(alive, "the successor's process is gone");
+            let entry = entry.expect("the successor stays registered");
+            assert_eq!(entry.pid, successor_pid, "the same daemon runs the lab");
+            assert_eq!(entry.state, super::registry::LabState::Running);
+            let reply = reply.expect("the restart answers with the successor");
+            assert_eq!(reply["socket"], serde_json::json!(socket));
+            assert_eq!(reply["replaced"], false, "nothing was replaced");
         });
     }
 

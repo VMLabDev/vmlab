@@ -3382,6 +3382,7 @@ impl LabRuntime {
             forwards,
             isolation: self.isolation.as_ref().map(|p| p.status()),
             freeze_stale,
+            daemon_pid: std::process::id(),
             host_warnings,
         }
     }
