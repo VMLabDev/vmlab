@@ -44,6 +44,7 @@ mod start_gate;
 pub mod state;
 pub mod stop_plan;
 pub mod usb;
+mod vars_boot;
 pub mod vm;
 pub mod vm_agent;
 pub mod workspace;
