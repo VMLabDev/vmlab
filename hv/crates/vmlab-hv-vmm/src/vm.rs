@@ -426,29 +426,49 @@ impl VmShared {
         let Some(controller_arc) = self.xhci.lock().clone() else {
             return Err((ErrorCode::Internal, "the USB controller is gone".into()));
         };
-        let mut controller = controller_arc.lock();
         // Open and take over the host device before touching the guest's
         // view: a claim failure returns the device to the host inside the
-        // backend and never reaches the controller.
+        // backend and never reaches the controller. The open blocks (the
+        // claim waits for the host driver to let go), so it runs before
+        // the controller lock is taken: the guest, the poll and
+        // `device_del` all need that lock (review usb.md F4).
         let device = open().map_err(|message| (ErrorCode::Internal, message))?;
         let speed = device.speed();
-        let Some(port) = self.free_usb_port(speed, &controller) else {
-            return Err((
-                ErrorCode::Unsupported,
-                "no free USB root port for this device".into(),
-            ));
-        };
-        controller
-            .attach(port, device)
-            .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
-        self.usb_attachments.lock().push(UsbAttachment {
-            id: id.to_owned(),
-            port,
-            hostbus,
-            hostaddr,
-            hostport: hostport.to_owned(),
-        });
-        Ok(port)
+        let mut device = Some(device);
+        let mut controller = controller_arc.lock();
+        let attached = (|| {
+            // Again, under the lock: another attach of the same id can
+            // have finished while this one was opening.
+            if self.usb_attachments.lock().iter().any(|a| a.id == id) {
+                return Err((
+                    ErrorCode::Unsupported,
+                    format!("a USB device with id {id:?} is already attached"),
+                ));
+            }
+            let Some(port) = self.free_usb_port(speed, &controller) else {
+                return Err((
+                    ErrorCode::Unsupported,
+                    "no free USB root port for this device".into(),
+                ));
+            };
+            let device = device.take().expect("the device is attached once");
+            controller
+                .attach(port, device)
+                .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+            self.usb_attachments.lock().push(UsbAttachment {
+                id: id.to_owned(),
+                port,
+                hostbus,
+                hostaddr,
+                hostport: hostport.to_owned(),
+            });
+            Ok(port)
+        })();
+        drop(controller);
+        // A refused device goes back to the host here, after the lock: the
+        // drop of a host backend makes usbdevfs calls that block.
+        drop(device);
+        attached
     }
 
     /// Whether the machine has a CD-ROM drive for `eject_media`.
