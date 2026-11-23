@@ -4639,6 +4639,7 @@ mod tests {
                         args: vec!["use".into()],
                         share: Some("data".into()),
                         refused_exit: None,
+                        secret: None,
                     }],
                     retry,
                     unsupported: Vec::new(),

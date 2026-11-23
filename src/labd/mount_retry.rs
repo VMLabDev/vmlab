@@ -131,16 +131,20 @@ pub async fn run_plan<E, F>(
             step.refused_exit,
             |timeout| exec(argv.clone(), timeout),
             |attempt, elapsed, err| {
+                let err = &step.scrub(err);
                 tracing::debug!("{vm_name}: mount attempt {attempt} ({elapsed:?}): {err}");
                 report.attempt_failed(step.share.as_deref(), attempt, elapsed, err);
             },
         )
         .await;
+        // The command line of an SMB step holds the password, and an exec
+        // that fails names its command line. Nothing below may say it: the
+        // reason goes to the log, the event history and the `up` output.
+        let command = step.scrub(&step.command);
         let reason = match outcome {
             StepOutcome::Done { attempt, elapsed } => {
                 tracing::info!(
-                    "{vm_name}: mount step `{}` ok (attempt {attempt}, {elapsed:?})",
-                    step.command
+                    "{vm_name}: mount step `{command}` ok (attempt {attempt}, {elapsed:?})"
                 );
                 if let Some(share) = step.share.as_deref()
                     && plan.steps[i + 1..]
@@ -153,20 +157,19 @@ pub async fn run_plan<E, F>(
                 continue;
             }
             StepOutcome::Refused { error } => {
-                format!("`{}` refused: {}", step.command, error.trim())
+                format!("`{command}` refused: {}", step.scrub(error.trim()))
             }
             StepOutcome::GaveUp {
                 attempts,
                 elapsed,
                 error,
             } => format!(
-                "`{}` still failing after {} of retries ({attempts} attempts): {}",
-                step.command,
+                "`{command}` still failing after {} of retries ({attempts} attempts): {}",
                 elapsed_text(elapsed),
-                error.trim()
+                step.scrub(error.trim())
             ),
         };
-        tracing::warn!("{vm_name}: mount step `{}` failed: {reason}", step.command);
+        tracing::warn!("{vm_name}: mount step `{command}` failed: {reason}");
         // A share that never appears is the author's to see, on the feed,
         // not only in the daemon's log.
         unmountable(serde_json::json!({"vm": vm_name, "share": step.share, "reason": reason}));
@@ -193,6 +196,7 @@ mod tests {
             args: vec!["use".into(), r"\\10.0.0.1\repo".into()],
             share: Some(share.into()),
             refused_exit,
+            secret: None,
         }
     }
 
@@ -322,6 +326,7 @@ mod tests {
             ],
             share: Some("data".into()),
             refused_exit: None,
+            secret: Some("S3CRET".into()),
         };
         run_plan(
             "web",
@@ -342,6 +347,7 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         let payload = events[0].to_string();
         assert!(payload.contains("timed out after"), "{payload}");
+        assert!(payload.contains("password=[redacted]"), "{payload}");
         assert!(!payload.contains("S3CRET"), "{payload}");
         let lines = report.lines("web", true).join("\n");
         assert!(lines.contains("will not mount"), "{lines}");

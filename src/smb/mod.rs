@@ -76,6 +76,31 @@ pub struct MountStep {
     /// guest is in a state another attempt will not change, so the executor
     /// reports it at once instead of retrying.
     pub refused_exit: Option<i32>,
+    /// The password this step's command line carries, if any. Whoever runs
+    /// the step passes every text it reports about it through
+    /// [`MountStep::scrub`], because an error that quotes the command line
+    /// quotes the password.
+    pub secret: Option<String>,
+}
+
+/// What [`MountStep::scrub`] puts where the password was.
+pub const REDACTED: &str = "[redacted]";
+
+impl MountStep {
+    /// `text` without this step's password, in the spelling of the command
+    /// line and in the percent-encoded one of a `mount_smbfs` URL.
+    pub fn scrub(&self, text: &str) -> String {
+        let Some(secret) = self.secret.as_deref().filter(|s| !s.is_empty()) else {
+            return text.to_string();
+        };
+        let encoded = mount::url_component(secret);
+        let text = text.replace(secret, REDACTED);
+        if encoded == secret {
+            text
+        } else {
+            text.replace(&encoded, REDACTED)
+        }
+    }
 }
 
 /// Per-VM SMB plan for a lab: the credential, the share definitions, and the
@@ -283,6 +308,7 @@ impl LabSmb {
                         args: vec!["-p".into(), guest.clone()],
                         share: Some(share.clone()),
                         refused_exit: None,
+                        secret: None,
                     });
                     let (cmd, args) = linux_mount_cmd(
                         gw,
@@ -299,6 +325,7 @@ impl LabSmb {
                         args,
                         share: Some(share.clone()),
                         refused_exit: None,
+                        secret: Some(creds.password.clone()),
                     });
                 }
                 OsHint::Windows => {
@@ -311,6 +338,7 @@ impl LabSmb {
                             args: cmd.args,
                             share: Some(share.clone()),
                             refused_exit: cmd.refused_exit,
+                            secret: Some(creds.password.clone()),
                         });
                     }
                 }
@@ -321,6 +349,7 @@ impl LabSmb {
                         args: vec!["-p".into(), guest.clone()],
                         share: Some(share.clone()),
                         refused_exit: None,
+                        secret: None,
                     });
                     let (cmd, args) = macos_mount_cmd(
                         gw,
@@ -336,6 +365,7 @@ impl LabSmb {
                         args,
                         share: Some(share.clone()),
                         refused_exit: None,
+                        secret: Some(creds.password.clone()),
                     });
                 }
                 OsHint::WindowsXp => {
@@ -348,6 +378,7 @@ impl LabSmb {
                         args: Vec::new(),
                         share: Some(share.clone()),
                         refused_exit: None,
+                        secret: Some(creds.password.clone()),
                     });
                 }
             }
@@ -378,6 +409,7 @@ impl LabSmb {
                     args,
                     share: None,
                     refused_exit: None,
+                    secret: Some(creds.password.clone()),
                 });
             }
             // And authenticate future logons automatically — a folder-path
@@ -390,6 +422,7 @@ impl LabSmb {
                 args,
                 share: None,
                 refused_exit: None,
+                secret: Some(creds.password.clone()),
             });
         }
         steps
@@ -568,6 +601,55 @@ mod tests {
         assert!(steps.iter().all(|s| s.share.as_deref() == Some("src")));
         let url = &steps[1].args[steps[1].args.len() - 2];
         assert!(url.ends_with("@10.0.0.1/src"), "{url}");
+    }
+
+    /// Every step of a plan whose command line holds the password names it,
+    /// on each guest family, so the executor can scrub what it reports.
+    #[test]
+    fn every_step_that_carries_the_password_names_it() {
+        let lab = sample();
+        let password = lab.credentials("xp").unwrap().password.clone();
+        for os in [
+            OsHint::Linux,
+            OsHint::Windows,
+            OsHint::WindowsXp,
+            OsHint::Macos,
+        ] {
+            let steps = lab.mount_plan("xp", os);
+            assert!(!steps.is_empty(), "{os:?}");
+            let mut carriers = 0;
+            for step in &steps {
+                let line = format!("{} {}", step.command, step.args.join(" "));
+                if line.contains(&password) {
+                    carriers += 1;
+                    assert_eq!(step.secret.as_deref(), Some(password.as_str()), "{os:?}");
+                    assert!(!step.scrub(&line).contains(&password), "{os:?}");
+                }
+            }
+            assert!(carriers > 0, "{os:?}");
+        }
+    }
+
+    /// The scrub takes the password out in both spellings and leaves a step
+    /// without one alone.
+    #[test]
+    fn scrub_removes_the_password_in_both_spellings() {
+        let mut step = MountStep {
+            os_hint: OsHint::Macos,
+            command: "/sbin/mount_smbfs".into(),
+            args: Vec::new(),
+            share: None,
+            refused_exit: None,
+            secret: Some("p@ss w".into()),
+        };
+        assert_eq!(
+            step.scrub("//u:p%40ss%20w@10.0.0.1/data and p@ss w"),
+            "//u:[redacted]@10.0.0.1/data and [redacted]"
+        );
+        step.secret = None;
+        assert_eq!(step.scrub("p@ss w"), "p@ss w");
+        step.secret = Some(String::new());
+        assert_eq!(step.scrub("p@ss w"), "p@ss w");
     }
 
     #[test]
