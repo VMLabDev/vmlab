@@ -53,7 +53,7 @@ document.
 ## How the findings were proved
 
 F1 to F9 were run. Ten temporary tests were committed on the card's branch
-(`1e15e53b`), run on helios, and removed by the next commit. All ten passed,
+(`1e15e53b`), run on helios, and removed by a later commit of the branch. All ten passed,
 and each passes only while its fault is present. Their source and the command
 are in `docs/reviews/dev-machines-probes.md`. F10 was read, not run.
 

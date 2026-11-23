@@ -5,7 +5,8 @@ These are the temporary tests behind `docs/reviews/dev-machines.md` (card
 present**, so a fix card turns the final assertions round and keeps the rest.
 
 They were committed as `1e15e53b` on the branch `card-672` (base `6eaa1a92`,
-`next` on 2026-11-23), run on helios, and removed by the next commit. The
+`next` on 2026-11-23), run on helios, and removed by a later commit of the
+branch. The
 command:
 
 ```
