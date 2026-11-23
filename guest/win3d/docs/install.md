@@ -51,6 +51,11 @@ block overrides the ICD choice when the driver name is not enough. A
 `host_gpu` the host does not declare makes `vmlab validate` warn and fall
 back to the default GPU.
 
+With vmlab-hv GPU passthrough, the 2D VirtIO console uses PCI revision 2.
+The Win3D INF matches revision 1, so Windows can select the virtio-win
+display-only driver for the console while using the vendor driver for
+the assigned GPU.
+
 A lab for the package:
 
 ```wcl

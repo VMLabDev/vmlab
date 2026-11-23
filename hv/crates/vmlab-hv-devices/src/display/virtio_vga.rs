@@ -117,6 +117,12 @@ impl VirtioVga {
         })
     }
 
+    /// Select the PCI revision before exposing the device to the guest.
+    pub fn set_pci_revision(&mut self, revision: u8) {
+        self.config[8] = revision;
+        self.power_on_config[8] = revision;
+    }
+
     pub fn enable_3d(
         &mut self,
         mode: crate::virtio::gpu::GpuMode,
