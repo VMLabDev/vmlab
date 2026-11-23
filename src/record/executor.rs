@@ -29,8 +29,6 @@ use crate::vnc::{StreamEvent, VncClient};
 
 /// How often a dropped connection is retried.
 const RECONNECT_EVERY: Duration = Duration::from_millis(250);
-/// Bound the wait for ffmpeg to accept a batch or finalize the file.
-const ENCODER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where a recording's frames come from: a socket path, so a reconnect finds
 /// the hypervisor a restart put in place of the old one.
@@ -194,61 +192,42 @@ async fn run(
     let mut ticks = tokio::time::interval(dt);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ended_by = None;
-    let mut write_err = None;
-    let outcome: Result<()> = async {
-        loop {
-            tokio::select! {
-                biased;
-                _ = stopped.changed() => break,
-                _ = ticks.tick() => {}
-            }
-            let frames = core
+    let write = loop {
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => break Ok(()),
+            _ = ticks.tick() => {}
+        }
+        let frames = core
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tick(started.elapsed());
+        if let Err(e) = write_frames(&mut encoder, &frames).await {
+            break Err(e);
+        }
+        if let Some(max) = settings.max_duration {
+            let video = core
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .tick(started.elapsed());
-            let write = tokio::time::timeout(ENCODER_TIMEOUT, async {
-                for run in frames.runs() {
-                    for _ in 0..run.count {
-                        encoder.write_frame(&run.frame.rgb).await?;
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .with_context(|| format!("ffmpeg timed out writing frames to {}", output.display()))?;
-            if let Err(e) = write {
-                write_err = Some(e);
-                break;
-            }
-            if let Some(max) = settings.max_duration {
-                let video = core
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .video_duration();
-                if video >= max {
-                    ended_by = Some(format!(
-                        "reached the maximum duration of {:.1} s",
-                        max.as_secs_f64()
-                    ));
-                    break;
-                }
+                .video_duration();
+            if video >= max {
+                ended_by = Some(format!(
+                    "reached the maximum duration of {:.1} s",
+                    max.as_secs_f64()
+                ));
+                break Ok(());
             }
         }
-        Ok(())
-    }
-    .await;
+    };
     reader.abort();
     feed.abort();
-    // A timed-out write may have sent a partial frame. Drop the encoder to
-    // kill ffmpeg rather than try to continue writing to it.
-    outcome?;
 
     // Flush what the clock owes (an open idle run, the last interval), then
     // the trailer. A write error means ffmpeg is gone; finish still reports
     // what it left behind.
     let (frames, duration, timeline) = {
         let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
-        let frames = if write_err.is_none() {
+        let frames = if write.is_ok() {
             c.finish(started.elapsed())
         } else {
             Frames::default()
@@ -268,24 +247,20 @@ async fn run(
                 .then(|| (c.timeline().to_vec(), c.cuts().to_vec())),
         )
     };
-    let path = tokio::time::timeout(ENCODER_TIMEOUT, async {
-        if write_err.is_none() {
-            'flush: for run in frames.runs() {
-                for _ in 0..run.count {
-                    if let Err(e) = encoder.write_frame(&run.frame.rgb).await {
-                        write_err = Some(e);
-                        break 'flush;
-                    }
-                }
-            }
+    let write = match write {
+        Ok(()) => write_frames(&mut encoder, &frames).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = write {
+        // A stalled write may have sent a partial frame. Dropping the
+        // encoder kills ffmpeg and avoids trying to finalise that frame.
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            return Err(e)
+                .with_context(|| format!("ffmpeg timed out writing frames to {}", output.display()));
         }
-        encoder.finish().await
-    })
-    .await
-    .with_context(|| format!("ffmpeg timed out finalising {}", output.display()))??;
-    if let Some(e) = write_err {
-        ended_by = Some(format!("{e:#}"));
+        ended_by = Some(format!("writing a frame to ffmpeg: {e}"));
     }
+    let path = encoder.finish().await?;
 
     let timeline = match timeline {
         Some((events, cuts)) => {
@@ -310,6 +285,15 @@ async fn run(
         timeline,
         ended_by,
     })
+}
+
+async fn write_frames(encoder: &mut Encoder, frames: &Frames) -> std::io::Result<()> {
+    for run in frames.runs() {
+        for _ in 0..run.count {
+            encoder.write_frame(&run.frame.rgb).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Feed every update to the core; on a drop, mark the gap and reconnect.
@@ -452,7 +436,12 @@ mod tests {
         let rec = start_with_encoder_script(
             dir.path(),
             &server,
-            "cat >/dev/null\nprintf 'encoder diagnostic\\n' >&2\nhead -c 1048576 /dev/zero >&2\nexit 1",
+            concat!(
+                "head -c 1048576 /dev/zero >&2\n",
+                "cat >/dev/null\n",
+                "head -c 1048576 /dev/zero >&2\n",
+                "printf 'encoder diagnostic\\n' >&2\nexit 1",
+            ),
         )
         .await;
         let error = rec.stop().await.unwrap_err().to_string();

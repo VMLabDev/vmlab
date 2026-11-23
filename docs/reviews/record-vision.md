@@ -194,9 +194,11 @@ Not read:
 
 ### F3. A stalled ffmpeg blocks `record stop`, `down` and `destroy`
 
-- Fixed in #719. Frame batches and finalization have deadlines. If ffmpeg
-  stalls past either deadline, the recorder kills it and reports the timeout.
-  A concurrent stderr reader drains the pipe and keeps a bounded diagnostic.
+- Fixed in #719. Frame writes time out after 10 seconds without progress.
+  After stdin closes, ffmpeg has five minutes to write the trailer and
+  complete the MP4 faststart rewrite. The recorder kills ffmpeg if either
+  timeout expires. A concurrent reader drains stderr and retains its final
+  16 KiB for diagnostics.
 - Where: `src/record/executor.rs:205-207` and `248-250` (`write_frame` is
   awaited outside the `select!` that watches the stop signal),
   `src/record/encoder.rs:199-204` (stderr is a pipe), `229-240` (`finish`
@@ -219,8 +221,11 @@ Not read:
   recording against `vnc::fake`, then await `Recorder::stop` inside
   `tokio::time::timeout`. Assert that `stop` returns (an error is fine).
   Before the fix the timeout fires. A second test, `finish_reads_stderr_before_it_waits`:
-  the script reads stdin to the end, writes 1 MiB to stderr and exits 1.
-  Assert that `stop` returns the error with ffmpeg's text.
+  the script writes 1 MiB to stderr before reading stdin, then another 1 MiB
+  after EOF before reporting the diagnostic and exiting 1. Assert that
+  `stop` returns the error with ffmpeg's text. The paused-clock test
+  `slow_frame_write_can_finish_while_making_progress` checks that partial
+  writes can take longer in total than the stall timeout.
 - Confidence: high for the order of the awaits. Low for how often ffmpeg
   fills its stderr at `-loglevel error`.
 
