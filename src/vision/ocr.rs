@@ -211,8 +211,13 @@ async fn ocr_with(
     // directory of its own, mode 0700 under a random name, as a file made
     // exclusively with mode 0600: no other user can read it, and a name
     // made ahead of time is refused instead of written through.
-    let dir = tempfile::Builder::new()
-        .prefix("vmlab-ocr-")
+    let mut dir = tempfile::Builder::new();
+    dir.prefix("vmlab-ocr-");
+    // tempfile makes a file 0600 by itself, but a directory with whatever
+    // the umask leaves.
+    #[cfg(unix)]
+    dir.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let dir = dir
         .tempdir_in(scratch_root)
         .with_context(|| {
             format!(
