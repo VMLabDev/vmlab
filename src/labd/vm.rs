@@ -177,11 +177,6 @@ impl VmDirs {
     pub fn qmp_sock(&self) -> PathBuf {
         self.run.join("qmp.sock")
     }
-    /// The file QEMU reads the Apple SMC key from (§5.2). It exists only
-    /// while QEMU starts.
-    pub fn apple_smc_config(&self) -> PathBuf {
-        self.run.join("applesmc.cfg")
-    }
     /// The socket the VM's hypervisor is controlled on: QMP for QEMU,
     /// vmlab-hv's own protocol beside it (§22). vmlab-hv binds
     /// `display.sock` and `vnc.sock` in the same directory.
@@ -947,12 +942,6 @@ impl VmInstance {
             );
         }
         Ok(VmPaths {
-            apple_smc_osk: if t.resolved.apple_smc {
-                (self.host_config)()?.apple_smc_osk
-            } else {
-                None
-            },
-            apple_smc_config: self.dirs.apple_smc_config(),
             qmp_sock: self.dirs.qmp_sock(),
             agent_sock: self.dirs.agent_sock(),
             vnc_sock: self.dirs.vnc_sock(),
@@ -970,7 +959,6 @@ impl VmInstance {
             floppy: self.floppy.clone(),
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
-            firmware_debug: self.cfg.firmware_debug,
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
             seabios_code: if firmware.is_none() && qemu::qemu_arch(&t.resolved.arch) == "x86_64" {
                 qemu::firmware::seabios(
@@ -1025,7 +1013,11 @@ impl VmInstance {
             return Ok(Some(hz));
         }
         let hz = match self.hypervisor {
-            HypervisorKind::Qemu => qemu::tsc::probe_host_hz(emulator).await,
+            // `tsc-frequency` is an x86 CPU property, and QEMU runs no x86
+            // guest (§22).
+            HypervisorKind::Qemu => Err(anyhow::anyhow!(
+                "a pinned TSC is an x86 CPU property, and QEMU runs no x86 guest (PRD §22)"
+            )),
             HypervisorKind::Vmlab => {
                 super::hypervisor::vmlab_hv::tsc::probe_host_hz(Path::new(emulator)).await
             }
@@ -2202,18 +2194,6 @@ impl super::machine::Machine for VmInstance {
 
     fn hypervisor_fallback(&self) -> Option<String> {
         self.selection().fallback_reason
-    }
-
-    fn qemu_removal(&self) -> Option<crate::config::hypervisor::QemuRemoval> {
-        if self.automatic_hypervisor.is_none() && self.selection_source.is_none() {
-            return None;
-        }
-        crate::config::hypervisor::qemu_removal(
-            crate::config::model::MachineCfg::Vm(&self.cfg),
-            &self.selection(),
-            &(self.host_facts)(),
-            Some(&self.template().resolved),
-        )
     }
 
     fn event_subject(&self) -> &'static str {

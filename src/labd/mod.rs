@@ -371,9 +371,6 @@ async fn start_machine_request(
         lab.start_machine(machine).await?;
         return Ok(());
     }
-    for warning in lab.qemu_removal_warnings(&[machine.to_string()]).await {
-        output(format!("warning: {warning}\n"));
-    }
     if m.pending_first_boot().is_none() {
         lab.start_with_deferred_refresh(machine, Some(output))
             .await?;

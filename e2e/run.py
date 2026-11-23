@@ -6,10 +6,12 @@
 Scenarios run in order; each reports against the feature catalogue. The run
 fails when any feature failed or no scenario covered it.
 
-`--hypervisor vmlab` puts the suite's machines on vmlab-hv through the host
-config's default (PRD §22). A scenario with no feature inside the phases it
-has delivered (`--vmlab-phase`, default in `features.py`) does not run, and
-its features are skipped naming their phase.
+`--hypervisor vmlab`, the default, leaves the suite's machines to automatic
+selection (PRD §22): every x86 machine on vmlab-hv, the aarch64 guest of
+`arch.emulated` on QEMU. A scenario with no feature inside the phases
+vmlab-hv has delivered (`--vmlab-phase`, default in `features.py`) does not
+run, and its features are skipped naming their phase. QEMU runs no x86
+guest, so `--hypervisor qemu` runs `arch.emulated` alone.
 """
 
 from __future__ import annotations
@@ -119,7 +121,8 @@ def main() -> int:
     write_host_config(h)
     registry = start_registry()
     try:
-        if "template" not in runnable and any(n != "legacy" for n in runnable):
+        if (h.hypervisor != "qemu" and "template" not in runnable
+                and any(n != "legacy" for n in runnable)):
             # Every other scenario boots the e2e template; build it without
             # reporting on it.
             h.scenario = "base"
@@ -130,7 +133,7 @@ def main() -> int:
                 continue
             mod = importlib.import_module(f"scenarios.{name}")
             h.scenario = name
-            h.vms_here = h.hypervisor == "qemu" or h.vms_follow(scenario_features(name), name)
+            h.vms_here = h.vms_follow(scenario_features(name), name)
             write_host_config(h, vms=h.vms_here)
             started = time.monotonic()
             print(f"== {name}", flush=True)
