@@ -79,12 +79,12 @@ Not read:
 | Code | Severity | Fault |
 |------|----------|-------|
 | F1 | data loss, security against a hostile guest | A cursor of size zero panics the recorder and the recording is lost (fixed, card #717) |
-| F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit |
+| F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit (fixed, card #718) |
 | F3 | crash (a stop that never returns) | A stalled ffmpeg blocks `record stop`, `down` and `destroy` |
 | F4 | wrong result | Two captures of one machine share one scratch file |
 | F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match |
 | F6 | wrong result | The match score ignores colour, brightness and contrast |
-| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory |
+| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720) |
 | F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind |
 | F9 | crash of a request | A large duration panics `Settings::resolve` |
 | F10 | wrong result | The match threshold is not checked |
@@ -183,6 +183,14 @@ Not read:
   Assert the bound. Today it returns 17970 equal frames.
 - Confidence: high for the counts. Medium for how soon a real encoder falls
   behind at the default settings.
+- Fixed by card #718. `Core::tick` and `finish` return `Frames`, runs of
+  equal frames, so a late tick or an idle run written out whole holds one
+  picture. The queue holds at most `Core::queue_limit` pictures
+  (`QUEUE_BYTES` of 256 MiB at the output size, at least 2 and at most
+  `QUEUE_FRAMES` of 120). A frame that does not fit repeats the newest queued
+  picture: the video keeps its length, `Core::dropped_frames` counts it and
+  the recorder warns at the end. The clock task holds one batch while the
+  core queues the next, so one recording holds at most twice the limit.
 
 ### F3. A stalled ffmpeg blocks `record stop`, `down` and `destroy`
 
@@ -335,6 +343,13 @@ Not read:
   names, run `ocr`, assert that the victim file is unchanged. Today it
   holds a PNG.
 - Confidence: high.
+- Fixed by card #720. `ocr` makes a directory with a random name and mode
+  0700 under the temp directory, and in it the PNG as a file created
+  exclusively with mode 0600. Both are removed when the run ends. Both
+  proof tests are in `src/vision/ocr.rs`. They reach the code through
+  `ocr_with`, which takes the scratch root and the command, so they change
+  neither `PATH` nor `TMPDIR` of the test process. The lab's runtime
+  directory is still not used: `ocr` gets no lab.
 
 ### F8. A cancelled or timed-out OCR leaves tesseract running and its file behind
 

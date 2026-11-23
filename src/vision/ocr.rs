@@ -1,7 +1,8 @@
 //! OCR via the `tesseract` CLI.
 //!
 //! Tesseract is driven as a subprocess: the frame is cropped, turned to
-//! greyscale and upscaled with a Lanczos3 filter, written to a temporary PNG,
+//! greyscale and upscaled with a Lanczos3 filter, written to a temporary PNG
+//! (mode 0600, in a directory of its own with mode 0700),
 //! then `tesseract <png> stdout --psm <n>` is run with stderr discarded.
 //!
 //! The upscale is what makes console fonts readable. Tesseract's model is
@@ -15,9 +16,8 @@
 //! Every decision — the crop, the output size, the page segmentation mode —
 //! is made by [`plan`] as a value before any pixel is touched (ADR-0003).
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
@@ -189,30 +189,70 @@ pub async fn ocr(
     region: Option<(u32, u32, u32, u32)>,
     opts: &OcrOptions,
 ) -> Result<String> {
+    let tesseract = tokio::process::Command::new("tesseract");
+    ocr_with(img, region, opts, &std::env::temp_dir(), tesseract).await
+}
+
+/// [`ocr`] with its two surroundings named: the directory the scratch file
+/// goes under, and the command that reads it (the scratch path and
+/// tesseract's arguments are appended to it).
+async fn ocr_with(
+    img: &RgbImage,
+    region: Option<(u32, u32, u32, u32)>,
+    opts: &OcrOptions,
+    scratch_root: &Path,
+    tesseract: tokio::process::Command,
+) -> Result<String> {
     let plan = plan(img.width(), img.height(), region, opts)?;
     let prepared = prepare(img, &plan);
 
-    let png_path = temp_png_path();
-    write_png(&prepared, &png_path)
-        .with_context(|| format!("failed to write OCR scratch PNG {}", png_path.display()))?;
+    // The picture shows the guest's screen, and `scratch_root` is usually
+    // the temp directory every local user shares. So it goes into a
+    // directory of its own, mode 0700 under a random name, as a file made
+    // exclusively with mode 0600: no other user can read it, and a name
+    // made ahead of time is refused instead of written through.
+    let mut dir = tempfile::Builder::new();
+    dir.prefix("vmlab-ocr-");
+    // tempfile makes a file 0600 by itself, but a directory with whatever
+    // the umask leaves.
+    #[cfg(unix)]
+    dir.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let dir = dir.tempdir_in(scratch_root).with_context(|| {
+        format!(
+            "failed to create the OCR scratch directory under {}",
+            scratch_root.display()
+        )
+    })?;
+    let png = tempfile::Builder::new()
+        .prefix("frame-")
+        .suffix(".png")
+        .tempfile_in(dir.path())
+        .context("failed to create the OCR scratch PNG")?;
+    write_png(&prepared, png.as_file())
+        .with_context(|| format!("failed to write OCR scratch PNG {}", png.path().display()))?;
 
-    let result = run_tesseract(&png_path, plan.psm).await;
-    let _ = std::fs::remove_file(&png_path); // best effort
-    result
+    // Dropping `png` and then `dir` removes both, best effort.
+    run_tesseract(tesseract, png.path(), plan.psm).await
 }
 
 /// Write the scratch PNG with fast compression: it lives for one tesseract
 /// run, and the default level spends longer encoding a 9 MP frame than
 /// tesseract spends reading it.
-fn write_png(img: &GrayImage, path: &std::path::Path) -> Result<()> {
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let encoder = PngEncoder::new_with_quality(file, CompressionType::Fast, PngFilter::NoFilter);
+fn write_png(img: &GrayImage, file: &std::fs::File) -> Result<()> {
+    let mut file = std::io::BufWriter::new(file);
+    let encoder =
+        PngEncoder::new_with_quality(&mut file, CompressionType::Fast, PngFilter::NoFilter);
     img.write_with_encoder(encoder)?;
+    std::io::Write::flush(&mut file)?;
     Ok(())
 }
 
-async fn run_tesseract(png_path: &std::path::Path, psm: u8) -> Result<String> {
-    let output = tokio::process::Command::new("tesseract")
+async fn run_tesseract(
+    mut tesseract: tokio::process::Command,
+    png_path: &Path,
+    psm: u8,
+) -> Result<String> {
+    let output = tesseract
         .arg(png_path)
         .arg("stdout")
         .args(["--psm", &psm.to_string()])
@@ -232,14 +272,6 @@ async fn run_tesseract(png_path: &std::path::Path, psm: u8) -> Result<String> {
         bail!("tesseract failed with {}", output.status);
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Unique scratch path in the system temp dir (no tempfile crate at
-/// runtime; uniqueness via pid + monotonic counter).
-fn temp_png_path() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("vmlab-ocr-{}-{n}.png", std::process::id()))
 }
 
 #[cfg(test)]
@@ -423,6 +455,72 @@ mod tests {
             img.height() / 2,
             imageops::FilterType::Triangle,
         )
+    }
+
+    /// A command in tesseract's place: `script` runs with the scratch path
+    /// as `$1`.
+    fn stand_in(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", script, "sh"]);
+        command
+    }
+
+    /// Card #720: the picture of the guest's screen is readable by its owner
+    /// alone, in a directory that no other user can list or write names into.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_scratch_file_is_private() {
+        let root = tempfile::tempdir().unwrap();
+        let img = RgbImage::from_pixel(8, 8, Rgb([255; 3]));
+        let report =
+            stand_in(r#"stat -c '%a' "$1"; d=$(dirname "$1"); stat -c '%a' "$d"; echo "$d""#);
+
+        let out = ocr_with(&img, None, &OcrOptions::default(), root.path(), report)
+            .await
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "the stand-in printed: {out:?}");
+        assert_eq!(lines[0], "600", "mode of the scratch file");
+        assert_eq!(lines[1], "700", "mode of the scratch file's directory");
+        assert_ne!(
+            Path::new(lines[2]),
+            root.path(),
+            "the scratch file lies in the shared directory itself"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "the scratch directory is removed after the run"
+        );
+    }
+
+    /// Card #720: a name another user made ahead of time is never written
+    /// through. The links stand at the names the scratch file used to take.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_at_the_scratch_name_is_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        // The old name held a counter the whole process shares, so cover
+        // far more names than the tests of this binary can use up.
+        for n in 0..4096 {
+            let name = format!("vmlab-ocr-{}-{n}.png", std::process::id());
+            std::os::unix::fs::symlink(&victim, root.path().join(name)).unwrap();
+        }
+        let img = RgbImage::from_pixel(8, 8, Rgb([255; 3]));
+
+        ocr_with(
+            &img,
+            None,
+            &OcrOptions::default(),
+            root.path(),
+            stand_in("true"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     }
 
     fn tesseract_available() -> bool {
