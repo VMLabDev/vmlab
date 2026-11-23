@@ -237,6 +237,7 @@ pub struct FakeHypervisor {
     /// The extra disk images of every VM launch, in launch order, so a test
     /// can assert what a machine was given.
     launched_disks: std::sync::Mutex<Vec<Vec<PathBuf>>>,
+    launched_floppies: std::sync::Mutex<Vec<Option<PathBuf>>>,
     /// What happened to every machine's hot-plugged devices and to the
     /// machine itself, in order: `attach <id>`, `detach <id>`, `kill`.
     journal: Journal,
@@ -253,6 +254,7 @@ impl FakeHypervisor {
             attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
+            launched_floppies: std::sync::Mutex::new(Vec::new()),
             journal: Journal::default(),
         })
     }
@@ -266,6 +268,14 @@ impl FakeHypervisor {
     /// The extra disk image paths of each VM launch so far.
     pub fn launched_disks(&self) -> Vec<Vec<PathBuf>> {
         self.launched_disks
+            .lock()
+            .expect("fake launch lock")
+            .clone()
+    }
+
+    /// The floppy image of each VM launch so far.
+    pub fn launched_floppies(&self) -> Vec<Option<PathBuf>> {
+        self.launched_floppies
             .lock()
             .expect("fake launch lock")
             .clone()
@@ -361,6 +371,10 @@ impl Hypervisor for FakeHypervisor {
                 .lock()
                 .expect("fake launch lock")
                 .push(paths.extra_disks.iter().map(|(_, p)| p.clone()).collect());
+            self.launched_floppies
+                .lock()
+                .expect("fake launch lock")
+                .push(paths.floppy.clone());
         }
         let run = self.next_run();
         if let Some(msg) = &run.start_fails {

@@ -446,7 +446,7 @@ A failed variant build reports which variant failed and stops; the base and ever
 
 ### 6.3 Media building
 
-`vmlab` can build **ISO and floppy images from folders on disk**, declared inline in template/VM blocks (`media { type = "iso" from = "./unattend/" }`). Built images land in `.vmlab/` and are content-addressed so unchanged folders don't rebuild. Primary use: unattend/answer files, driver bundles, agent installers, payload delivery to guests with no network.
+`vmlab` can build **ISO and floppy images from folders on disk**, declared inline in template/VM blocks (`media { type = "iso" from = "./unattend/" }`). Built images land in `.vmlab/` and are content-addressed so unchanged folders don't rebuild. Primary use: unattend/answer files, driver bundles, agent installers, payload delivery to guests with no network. A built image is shared by every machine that names the folder, so a guest never writes to it: an ISO is attached read-only, and a floppy, which is writable, is attached as the machine's own copy, kept with its disks.
 
 ### 6.4 OCI registry distribution
 
