@@ -288,7 +288,8 @@ impl LabRuntime {
     /// A workspace syncer outlives its machine's stop, holding the instance
     /// it was started on; once a rebuild has replaced that instance it is
     /// handed the new one — or stopped, when the new declaration carries no
-    /// workspace (§19.6). One that was not running stays so: `up` starts it.
+    /// workspace (§19.6). One that was not running stays so: the machine's next
+    /// start starts it.
     pub(super) async fn rebind_workspace(&self, name: &str) {
         if !self.workspaces.reports().await.contains_key(name) {
             return;

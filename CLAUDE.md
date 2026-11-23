@@ -58,7 +58,12 @@ action at all, completes **before the watch reopens**, and replaces the
 stat-walk rather than following one. The note that a re-seed is owed, and the
 halt a restore refuses on, both ride the **ledger**, because a restore does not
 need a running machine. Restore's refusal has the one escape flag in §19.6
-(`--discard-guest-changes`); capture's has none. Every surface that takes or
+(`--discard-guest-changes`); capture's has none. **A stop takes a last pass**
+(#695): `down` flushes each syncer ahead of its machine and writes on the
+ledger what that pass **left owed** (a forced `down` takes none and records
+that), a restore of the stopped machine refuses on the record, and every
+`destroy` verb refuses, under the same flag, while a workspace holds guest
+work the host has not taken. Every surface that takes or
 restores one says **snapshots are not a workspace backup**. The `@dev`
 declaration (#80) and both
 agent vocabularies (§19.5) are built: `watch` (#86) and

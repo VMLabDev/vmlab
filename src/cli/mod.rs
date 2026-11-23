@@ -105,7 +105,14 @@ pub enum Command {
         vms: Vec<String>,
     },
     /// Stop the lab and delete clones, lab-local state, dynamic net config
-    Destroy,
+    ///
+    /// A dev machine's guest working copy goes with its clone, so this refuses
+    /// while a workspace holds guest work the host has not taken (§19.6).
+    Destroy {
+        /// Destroy even where a dev machine's workspace holds guest work the host has not taken
+        #[arg(long)]
+        discard_guest_changes: bool,
+    },
     /// Machine and segment status: what each machine is doing, and its IP
     Status {
         /// Add the raw power state, readiness, and each machine's
@@ -437,7 +444,15 @@ pub enum VmCmd {
         record: record::RecordFlags,
     },
     /// Destroy one VM: stop it and delete its clone (config retained)
-    Destroy { vm: String },
+    ///
+    /// A dev machine's guest working copy goes with its clone, so this refuses
+    /// while its workspace holds guest work the host has not taken (§19.6).
+    Destroy {
+        vm: String,
+        /// Destroy even where a dev machine's workspace holds guest work the host has not taken
+        #[arg(long)]
+        discard_guest_changes: bool,
+    },
     /// Capture a running VM's screen to a PNG file
     Screenshot {
         vm: String,
@@ -510,7 +525,15 @@ pub enum ContainerCmd {
     /// Restart one container
     Restart { container: String },
     /// Destroy one container: stop it and delete its scratch state (config retained)
-    Destroy { container: String },
+    ///
+    /// A dev machine's guest working copy goes with it, so this refuses while
+    /// its workspace holds guest work the host has not taken (§19.6).
+    Destroy {
+        container: String,
+        /// Destroy even where a dev machine's workspace holds guest work the host has not taken
+        #[arg(long)]
+        discard_guest_changes: bool,
+    },
     /// Run a command inside the container via the agent
     Exec {
         container: String,
@@ -742,7 +765,9 @@ pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
         }
         Command::Pull { vms } => lab::cmd_pull(vms),
         Command::Down { vms, force } => lab::cmd_down(vms, force),
-        Command::Destroy => lab::cmd_destroy(),
+        Command::Destroy {
+            discard_guest_changes,
+        } => lab::cmd_destroy(discard_guest_changes),
         Command::Status { verbose, json } => lab::cmd_status(verbose, json),
         Command::Validate => validate::cmd_validate().map(|_| ()),
         Command::Vm { cmd } => match cmd {
@@ -756,7 +781,10 @@ pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
             VmCmd::Restart { vm, record } => record
                 .requests()
                 .and_then(|r| lab::cmd_machine_power(&vm, lab::PowerOp::Restart, false, r)),
-            VmCmd::Destroy { vm } => lab::cmd_machine_destroy(&vm, "vm"),
+            VmCmd::Destroy {
+                vm,
+                discard_guest_changes,
+            } => lab::cmd_machine_destroy(&vm, "vm", discard_guest_changes),
             VmCmd::Screenshot { vm, path } => lab::cmd_vm_screenshot(&vm, &path),
             VmCmd::Sendkeys { vm, chord } => lab::cmd_vm_sendkeys(&vm, &chord),
             VmCmd::MouseMove { vm, x, y } => lab::cmd_vm_mouse_move(&vm, x, y),
@@ -785,9 +813,10 @@ pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
             ContainerCmd::Restart { container } => {
                 lab::cmd_machine_power(&container, lab::PowerOp::Restart, false, Vec::new())
             }
-            ContainerCmd::Destroy { container } => {
-                lab::cmd_machine_destroy(&container, "container")
-            }
+            ContainerCmd::Destroy {
+                container,
+                discard_guest_changes,
+            } => lab::cmd_machine_destroy(&container, "container", discard_guest_changes),
             ContainerCmd::Exec {
                 container,
                 timeout,

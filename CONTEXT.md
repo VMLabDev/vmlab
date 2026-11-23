@@ -687,6 +687,15 @@ every conflicting path by design. **Snapshots are not a workspace backup**, and
 every surface that takes or restores one says so.
 _Avoid_: hook, wrapper, pre/post step
 
+**Last pass**:
+The sync pass a machine's syncer takes when `down` stops it, ahead of the
+machine, while the guest still answers. What it cannot carry is written on the
+**sync ledger** as work the stop **left owed**; a forced stop takes none and
+its record says so. A restore or a `destroy` of the stopped machine refuses on
+that record, as on a recorded **sync halt**, unless `--discard-guest-changes`
+says to lose the guest work. The next syncer to complete a pass clears it.
+_Avoid_: final sync, shutdown flush
+
 **Re-seed**:
 The host-only, digest-based reconcile a **snapshot bracket**'s restore owes: the
 guest tree is walked to decide what to overwrite and delete and for nothing else,

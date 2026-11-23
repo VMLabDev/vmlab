@@ -13,12 +13,14 @@
 //! away from diffing the wrong tree.
 //!
 //! Nothing here changes either side. A halt writes neither copy and deletes
-//! neither, and reading them must not either — so the guest's bytes land in a
-//! scratch file the daemon owns and throws away.
+//! neither, and reading them must not either — so the guest's bytes are read
+//! into the daemon's memory, never onto a disk, and never past the inline cap:
+//! the size a guest reports is only its word, so the cap is enforced on the
+//! bytes as they arrive.
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::guest::GuestFs;
@@ -107,6 +109,20 @@ impl SideCopy {
         }
     }
 
+    /// The guest's file holds more than the cap, whatever size it reported.
+    /// The true size is not known: reading stopped at the cap.
+    fn over_cap(reported: u64) -> SideCopy {
+        SideCopy {
+            size: reported,
+            digest: String::new(),
+            text: None,
+            omitted: Some(format!(
+                "it holds more than the {INLINE}-byte inline cap (the guest reported {reported} \
+                 bytes) — `vmlab cp` moves the file itself"
+            )),
+        }
+    }
+
     fn too_large(size: u64) -> SideCopy {
         SideCopy {
             size,
@@ -122,14 +138,12 @@ impl SideCopy {
 
 /// Read every path from both sides, as one reply.
 ///
-/// The scratch directory the guest's copies are pulled through is this
-/// function's own, and goes when it returns: a diff is a read, and reading must
-/// leave nothing behind on either side any more than a halt does.
+/// One path at a time, so the daemon holds at most one guest copy beyond the
+/// reply it is building.
 pub async fn all(guest: &dyn GuestFs, workspace: &Workspace, paths: &[String]) -> Result<Diff> {
-    let scratch = tempfile::tempdir().context("a host scratch directory for the guest copy")?;
     let mut files = Vec::with_capacity(paths.len());
-    for (n, path) in paths.iter().enumerate() {
-        files.push(one(guest, workspace, path, &scratch.path().join(n.to_string())).await);
+    for path in paths {
+        files.push(one(guest, workspace, path).await);
     }
     Ok(Diff {
         machine: workspace.machine.clone(),
@@ -139,11 +153,10 @@ pub async fn all(guest: &dyn GuestFs, workspace: &Workspace, paths: &[String]) -
     })
 }
 
-/// Read one path from both sides. `scratch` is a host path the guest's copy is
-/// pulled to and the caller throws away.
-pub async fn one(guest: &dyn GuestFs, workspace: &Workspace, rel: &str, scratch: &Path) -> Sides {
+/// Read one path from both sides.
+pub async fn one(guest: &dyn GuestFs, workspace: &Workspace, rel: &str) -> Sides {
     let host = host_side(&workspace.host_root.join(rel));
-    let guest = guest_side(guest, &join_guest(&workspace.guest_root, rel), scratch).await;
+    let guest = guest_side(guest, &join_guest(&workspace.guest_root, rel)).await;
     let identical = match (&host, &guest) {
         (Some(a), Some(b)) => !a.digest.is_empty() && a.digest == b.digest,
         // Absent on both sides is not "the same": there is nothing to be the
@@ -182,7 +195,7 @@ fn host_side(path: &Path) -> Option<SideCopy> {
     }
 }
 
-async fn guest_side(guest: &dyn GuestFs, path: &str, scratch: &Path) -> Option<SideCopy> {
+async fn guest_side(guest: &dyn GuestFs, path: &str) -> Option<SideCopy> {
     let attrs = match guest.lstat(path).await {
         Ok(Some(attrs)) => attrs,
         Ok(None) => return None,
@@ -213,14 +226,12 @@ async fn guest_side(guest: &dyn GuestFs, path: &str, scratch: &Path) -> Option<S
     if attrs.size > INLINE {
         return Some(SideCopy::too_large(attrs.size));
     }
-    if let Err(e) = guest.pull(path, scratch).await {
-        return Some(SideCopy::unreadable(format!(
-            "guest: cannot read it ({e:#})"
-        )));
-    }
-    Some(match std::fs::read(scratch) {
-        Ok(bytes) => SideCopy::of(&bytes),
-        Err(e) => SideCopy::unreadable(format!("guest: the pulled copy could not be read ({e})")),
+    // The size above is the guest's word, and the file may have grown since
+    // it was given. The cap that holds is the one on the bytes themselves.
+    Some(match guest.read_capped(path, INLINE).await {
+        Ok(Some(bytes)) => SideCopy::of(&bytes),
+        Ok(None) => SideCopy::over_cap(attrs.size),
+        Err(e) => SideCopy::unreadable(format!("guest: cannot read it ({e:#})")),
     })
 }
 
@@ -248,18 +259,11 @@ mod tests {
     #[tokio::test]
     async fn both_copies_come_back_and_the_guest_side_crosses_the_seam() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "the host's version").unwrap();
         let guest = Arc::new(FakeGuest::new());
         guest.file("/src/main.rs", "the guest's version", 1);
 
-        let sides = one(
-            &guest,
-            &workspace(dir.path()),
-            "main.rs",
-            &scratch.path().join("0"),
-        )
-        .await;
+        let sides = one(&guest, &workspace(dir.path()), "main.rs").await;
         assert_eq!(
             sides.host.unwrap().text.as_deref(),
             Some("the host's version")
@@ -276,19 +280,12 @@ mod tests {
     #[tokio::test]
     async fn a_diff_writes_to_neither_side() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "host").unwrap();
         let guest = Arc::new(FakeGuest::new());
         guest.file("/src/a.rs", "guest", 1);
 
         let before = guest.paths();
-        one(
-            &guest,
-            &workspace(dir.path()),
-            "a.rs",
-            &scratch.path().join("0"),
-        )
-        .await;
+        one(&guest, &workspace(dir.path()), "a.rs").await;
         assert_eq!(guest.paths(), before);
         assert!(guest.writes().is_empty(), "{:?}", guest.writes());
         assert_eq!(
@@ -302,17 +299,10 @@ mod tests {
     #[tokio::test]
     async fn identical_copies_are_reported_as_identical() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "settled").unwrap();
         let guest = Arc::new(FakeGuest::new());
         guest.file("/src/a.rs", "settled", 1);
-        let sides = one(
-            &guest,
-            &workspace(dir.path()),
-            "a.rs",
-            &scratch.path().join("0"),
-        )
-        .await;
+        let sides = one(&guest, &workspace(dir.path()), "a.rs").await;
         assert!(sides.identical);
     }
 
@@ -322,16 +312,9 @@ mod tests {
     #[tokio::test]
     async fn a_side_that_deleted_the_path_reports_nothing_rather_than_nothing_in_it() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "still here").unwrap();
         let guest = Arc::new(FakeGuest::new());
-        let sides = one(
-            &guest,
-            &workspace(dir.path()),
-            "a.rs",
-            &scratch.path().join("0"),
-        )
-        .await;
+        let sides = one(&guest, &workspace(dir.path()), "a.rs").await;
         assert!(sides.guest.is_none());
         assert!(sides.host.is_some());
         assert!(!sides.identical, "nothing to be identical about");
@@ -342,20 +325,35 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_guest_copy_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         let guest = Arc::new(FakeGuest::new());
         guest.file("/src/a.rs", "root-owned", 1);
         guest.unreadable("/src/a.rs");
-        let sides = one(
-            &guest,
-            &workspace(dir.path()),
-            "a.rs",
-            &scratch.path().join("0"),
-        )
-        .await;
+        let sides = one(&guest, &workspace(dir.path()), "a.rs").await;
         let copy = sides.guest.expect("absence is not the answer");
         assert!(copy.text.is_none());
         assert!(copy.omitted.unwrap().contains("cannot read"));
+    }
+
+    /// The cap is the host's, so it holds against a guest whose `lstat` says
+    /// one byte and whose file holds more than the cap: the copy is declined
+    /// as too large, and no more than the cap crosses the seam.
+    #[tokio::test]
+    async fn the_inline_cap_holds_whatever_size_the_guest_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/big.log", &"x".repeat(INLINE as usize + 1), 1);
+        guest.report_size("/src/big.log", 1);
+
+        let sides = one(&guest, &workspace(dir.path()), "big.log").await;
+        let copy = sides.guest.expect("it is there");
+        assert!(copy.text.is_none(), "{} bytes came back", copy.size);
+        let omitted = copy.omitted.expect("the bytes are declined by name");
+        assert!(omitted.contains("inline cap"), "{omitted}");
+        assert!(
+            guest.delivered() <= INLINE,
+            "{} bytes crossed the seam, over the {INLINE}-byte cap",
+            guest.delivered()
+        );
     }
 
     /// Bytes nobody would read are declined by name, and the two sides are
@@ -363,16 +361,9 @@ mod tests {
     #[tokio::test]
     async fn an_undiffable_copy_is_described_rather_than_dumped() {
         let dir = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.bin"), [0u8, 1, 2, 3]).unwrap();
         let guest = Arc::new(FakeGuest::new());
-        let sides = one(
-            &guest,
-            &workspace(dir.path()),
-            "a.bin",
-            &scratch.path().join("0"),
-        )
-        .await;
+        let sides = one(&guest, &workspace(dir.path()), "a.bin").await;
         let copy = sides.host.expect("it is there");
         assert!(copy.text.is_none());
         assert_eq!(copy.omitted.as_deref(), Some("it is not text"));
