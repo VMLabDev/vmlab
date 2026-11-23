@@ -829,7 +829,7 @@ impl Core {
             } else {
                 self.put32(base + 0x20, 0x80);
             }
-            return Ok(());
+            return Ok(None);
         }
         let count = u16::from_le_bytes([header[2], header[3]]) as usize;
         let mut prds = Vec::with_capacity(count);
