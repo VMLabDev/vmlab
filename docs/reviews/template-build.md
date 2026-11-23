@@ -49,7 +49,7 @@ test does not reproduce is wrong and should be dropped.
 | F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697) |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
 | F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process |
-| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory |
+| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory **Fixed by card #698.** |
 | F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` |
 | F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered |
 | F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings |
@@ -229,6 +229,12 @@ seal for every profile.
   sweep returns the lab to kill. Today the sweep has no such output.
 
 ### F6. Two builds of one template share one runtime directory (wrong result, hang)
+
+**Fixed by card #698.** Base and variant builds take an exclusive lock for
+the build lab's runtime directory before claiming their working directory.
+A second build targeting that runtime directory is refused while the first
+holds the lock. The proof test also checks that the second build can claim
+the directory after the first releases it.
 
 - Where: `src/template/build.rs:1551-1553` (`build_lab_name`: architecture
   and name), `:977-979` (the working directory: architecture, name and
