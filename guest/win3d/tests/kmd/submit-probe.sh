@@ -19,6 +19,7 @@ LABDIR=$(cd "$1" && pwd); VM=$2; EV=$3; shift 3
 PROBE=$REPO/out/probes-extra/x64/submit_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE: run build/probes/build.sh submit" >&2; exit 2; }
 mkdir -p "$EV"
+[ -n "$EV" ] && [ -d "$EV" ] || exit 1
 USER_NAME=c752probe
 # A password for this run only, of a user in a disposable guest.
 USER_PASS="P$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')a!"
