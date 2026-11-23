@@ -760,7 +760,10 @@ fn restore_rejects_blit_geometry_outside_the_registers() {
         ("skip", 7),
     ] {
         let state = with_blit_field(&saved, field, value);
-        assert!(device().restore_state(&state).is_ok(), "{field} = {value:#x}");
+        assert!(
+            device().restore_state(&state).is_ok(),
+            "{field} = {value:#x}"
+        );
     }
     for (field, value) in [
         ("width", 1 << 40),
