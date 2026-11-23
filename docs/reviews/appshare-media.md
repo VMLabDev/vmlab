@@ -172,7 +172,7 @@ Not read:
 - Confidence: high for the code path. The size of the reach under Xwayland
   (other X clients only, not Wayland clients) is from memory.
 
-### F3. An RDP session shares the host clipboard with the guest, both ways, with no way to turn it off
+### F3. An RDP session shares the host clipboard with the guest, both ways, with no way to turn it off (fixed, card #738)
 
 - Where: `src/appshare/rdp.rs:71`.
 - Fault: `freerdp_args` always passes `+clipboard`. While the session runs,
@@ -191,6 +191,17 @@ Not read:
 - Severity: security against a hostile guest.
 - Confidence: high that the argument is unconditional, medium for what
   FreeRDP does with it.
+- Fixed by card #738. `freerdp_args` always writes the switch, and writes
+  `-clipboard` unless the request asks for sharing. FreeRDP redirects the
+  clipboard when it is given no switch, so leaving `+clipboard` out would
+  not turn it off. `vmlab app run --clipboard` asks for sharing, both ways,
+  for that one session (`Request::clipboard`), and the detached helper keeps
+  the flag. There is no direction limit and no host setting. The proof test
+  failed before the fix and passes after it. A second test,
+  `the_stdin_payload_follows_the_requests_clipboard`, checks what
+  `Server::prepare` hands FreeRDP for both values. That FreeRDP 3 takes
+  `-clipboard` is from its documentation, from memory: helios has no FreeRDP
+  binary, so no live session checked it.
 
 ### F4. A changed media folder is not used while the lab daemon runs
 

@@ -259,6 +259,10 @@ pub struct Request {
     pub user: Option<String>,
     pub password: Option<String>,
     pub verbose: bool,
+    /// Share this desktop's clipboard with the guest over an RDP session,
+    /// both ways (`--clipboard`). Off unless asked for: a redirected
+    /// clipboard lets the guest read every host copy without a paste.
+    pub clipboard: bool,
 }
 
 /// Run one shared-app session to its end and return the exit code `app run`
@@ -827,6 +831,7 @@ mod tests {
             user: None,
             password: None,
             verbose: false,
+            clipboard: false,
         };
         let creds = rdp::Credentials {
             user: "dev".into(),
