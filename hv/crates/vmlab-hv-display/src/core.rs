@@ -12,7 +12,19 @@ use std::os::unix::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Connections one server holds at once, unfinished handshakes included. A
+/// connection above the limit is refused.
+pub const MAX_SESSIONS: usize = 64;
+/// Connections that have not finished their handshake. One more closes the
+/// oldest of them, so a client that speaks is never kept out by clients that
+/// send nothing.
+pub const MAX_HANDSHAKES: usize = 16;
+/// The longest wait for one read of a handshake.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACCEPT_RETRY: Duration = Duration::from_millis(50);
+const WARN_EVERY: Duration = Duration::from_secs(5);
 
 /// Immutable snapshots or reusable allocations protected by publication leases.
 #[derive(Clone)]
@@ -118,6 +130,16 @@ impl Frame {
     }
 }
 
+/// Whether an error of `accept` says that the listener itself is unusable.
+/// Every other error is about one connection or about a resource that can
+/// come back (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`).
+fn accept_error_is_final(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP | libc::EFAULT)
+    )
+}
+
 /// Device integration supplies snapshots and synchronized CPU readback.
 /// Immutable dma-bufs stay unchanged while any Frame Arc exists. Leased buffers
 /// instead exclude writes until all sampling guards have been released.
@@ -152,7 +174,8 @@ pub(crate) struct State {
 }
 struct Shared {
     closed: Arc<AtomicBool>,
-    sessions: Mutex<Vec<Weak<UnixStream>>>,
+    sessions: Mutex<Vec<SessionEntry>>,
+    warned: Mutex<Option<Instant>>,
     capture: Mutex<()>,
     state: Mutex<State>,
     changed: Condvar,
@@ -161,6 +184,30 @@ struct Shared {
     accept_failures: AtomicU64,
     input: Arc<crate::input::InputQueue>,
     input_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+struct SessionEntry {
+    stream: Weak<UnixStream>,
+    established: Arc<AtomicBool>,
+}
+/// One connection in the server's list. It leaves the list when this drops.
+pub(crate) struct Session {
+    stream: Arc<UnixStream>,
+    established: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    read_timeout: Option<Duration>,
+}
+impl Session {
+    /// The handshake is over: the connection is no longer one that
+    /// `MAX_HANDSHAKES` may close, and its reads wait as long as before.
+    pub(crate) fn established(&self) -> io::Result<()> {
+        {
+            // Under the list lock, so that a connection is either closed as
+            // an unfinished handshake or established, never both.
+            let _sessions = self.shared.sessions.lock().unwrap();
+            self.established.store(true, Ordering::SeqCst);
+        }
+        self.stream.set_read_timeout(self.read_timeout)
+    }
 }
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -189,6 +236,7 @@ impl DisplayServer {
             shared: Arc::new(Shared {
                 closed,
                 sessions: Mutex::new(Vec::new()),
+                warned: Mutex::new(None),
                 capture: Mutex::new(()),
                 state: Mutex::new(State {
                     frame: Arc::new(frame),
@@ -218,7 +266,7 @@ impl DisplayServer {
             .lock()
             .unwrap()
             .drain(..)
-            .filter_map(|s| s.upgrade())
+            .filter_map(|s| s.stream.upgrade())
         {
             let _ = stream.shutdown(Shutdown::Both);
         }
@@ -233,15 +281,59 @@ impl DisplayServer {
         }
     }
 
-    pub(crate) fn session(&self, stream: &UnixStream) -> io::Result<Arc<UnixStream>> {
+    /// Enter a connection into the list, as an unfinished handshake. This is
+    /// where `MAX_SESSIONS`, `MAX_HANDSHAKES` and `HANDSHAKE_TIMEOUT` apply.
+    pub(crate) fn session(&self, stream: &UnixStream) -> io::Result<Session> {
         let session = Arc::new(stream.try_clone()?);
-        let mut sessions = self.shared.sessions.lock().unwrap();
-        if self.shared.closed.load(Ordering::SeqCst) {
-            return Err(io::Error::other("display server has stopped"));
+        let read_timeout = session.read_timeout()?;
+        let established = Arc::new(AtomicBool::new(false));
+        {
+            let mut sessions = self.shared.sessions.lock().unwrap();
+            if self.shared.closed.load(Ordering::SeqCst) {
+                return Err(io::Error::other("display server has stopped"));
+            }
+            sessions.retain(|session| session.stream.strong_count() != 0);
+            let unfinished = |entry: &SessionEntry| !entry.established.load(Ordering::SeqCst);
+            if sessions.iter().filter(|entry| unfinished(entry)).count() >= MAX_HANDSHAKES
+                && let Some(oldest) = sessions.iter().position(unfinished)
+            {
+                if let Some(stream) = sessions.remove(oldest).stream.upgrade() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                self.warn(format_args!(
+                    "display: closed the oldest of {MAX_HANDSHAKES} unfinished handshakes"
+                ));
+            }
+            if sessions.len() >= MAX_SESSIONS {
+                self.warn(format_args!(
+                    "display: refused a connection, {MAX_SESSIONS} are open"
+                ));
+                return Err(io::Error::other("too many display connections"));
+            }
+            sessions.push(SessionEntry {
+                stream: Arc::downgrade(&session),
+                established: established.clone(),
+            });
         }
-        sessions.retain(|session| session.strong_count() != 0);
-        sessions.push(Arc::downgrade(&session));
-        Ok(session)
+        session.set_read_timeout(Some(
+            read_timeout.map_or(HANDSHAKE_TIMEOUT, |own| own.min(HANDSHAKE_TIMEOUT)),
+        ))?;
+        Ok(Session {
+            stream: session,
+            established,
+            shared: self.shared.clone(),
+            read_timeout,
+        })
+    }
+
+    /// Warn, at most once per five seconds for the whole server.
+    fn warn(&self, text: std::fmt::Arguments<'_>) {
+        let now = Instant::now();
+        let mut warned = self.shared.warned.lock().unwrap();
+        if warned.is_none_or(|last| now.duration_since(last) >= WARN_EVERY) {
+            *warned = Some(now);
+            log::warn!("{text}");
+        }
     }
 
     /// Connections that are open now, unfinished handshakes included.
@@ -249,12 +341,12 @@ impl DisplayServer {
         let sessions = self.shared.sessions.lock().unwrap();
         sessions
             .iter()
-            .filter(|session| session.strong_count() != 0)
+            .filter(|session| session.stream.strong_count() != 0)
             .count()
     }
 
     /// How many times an accept loop of this server got an error from
-    /// `accept`.
+    /// `accept`, temporary or final.
     pub fn accept_failures(&self) -> u64 {
         self.shared.accept_failures.load(Ordering::SeqCst)
     }
@@ -392,26 +484,85 @@ impl DisplayServer {
         }
         Ok(bytes)
     }
-    /// Accept until the supplied listener fails. Each connection has its own worker.
-    /// The caller owns socket binding, permissions, and listener lifetime.
+    /// Accept until the listener fails for good or the server is shut down.
+    /// Each connection has its own worker. The caller owns socket binding,
+    /// permissions, and listener lifetime.
     pub fn serve(&self, listener: UnixListener, rfb: bool) -> io::Result<()> {
-        for stream in listener.incoming() {
-            let stream = stream.inspect_err(|_| {
-                self.shared.accept_failures.fetch_add(1, Ordering::SeqCst);
-            })?;
-            let server = self.clone();
-            std::thread::spawn(move || {
-                let _ = if rfb {
-                    server.serve_rfb(stream)
-                } else {
-                    server.serve_native(stream)
-                };
-            });
+        self.serve_while(&listener, rfb, "display", |_| true, || true)
+            .0
+    }
+    /// The accept loop. It runs while `running` says so and the server is not
+    /// shut down, and starts one worker named `name` for each connection that
+    /// `admit` lets in. An error of `accept` that can pass (no descriptor, no
+    /// memory, a connection that was aborted) is waited out: the listener
+    /// stays. Only an error that says the listener itself is unusable ends
+    /// the loop, and is returned. A connection that gets no thread is closed.
+    ///
+    /// The workers that may still run are returned. Shut the server down
+    /// before joining them.
+    pub fn serve_while(
+        &self,
+        listener: &UnixListener,
+        rfb: bool,
+        name: &str,
+        admit: impl Fn(&UnixStream) -> bool,
+        running: impl Fn() -> bool,
+    ) -> (io::Result<()>, Vec<std::thread::JoinHandle<()>>) {
+        let mut workers = Vec::new();
+        if let Err(error) = listener.set_nonblocking(true) {
+            return (Err(error), workers);
         }
-        Ok(())
+        let result = loop {
+            if !running() || self.shared.closed.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => {
+                    self.shared.accept_failures.fetch_add(1, Ordering::SeqCst);
+                    if accept_error_is_final(&error) {
+                        break Err(error);
+                    }
+                    self.warn(format_args!(
+                        "{name}: accept failed, trying again: {error}"
+                    ));
+                    std::thread::sleep(ACCEPT_RETRY);
+                    continue;
+                }
+            };
+            if !admit(&stream) {
+                continue;
+            }
+            workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
+            let server = self.clone();
+            let label = name.to_owned();
+            let worker = std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || {
+                    let result = if rfb {
+                        server.serve_rfb(stream)
+                    } else {
+                        server.serve_native(stream)
+                    };
+                    if let Err(error) = result {
+                        log::warn!("{label} client ended: {error}");
+                    }
+                });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => self.warn(format_args!(
+                    "{name}: closed a connection, no thread for it: {error}"
+                )),
+            }
+        };
+        (result, workers)
     }
     pub fn serve_native(&self, stream: UnixStream) -> io::Result<()> {
-        let _session = self.session(&stream)?;
+        let session = self.session(&stream)?;
         let Message::Hello {
             version: protocol::VERSION,
             capabilities,
@@ -419,6 +570,7 @@ impl DisplayServer {
         else {
             return Err(invalid("expected display v1 Hello"));
         };
+        session.established()?;
         let caps = Capabilities(capabilities.0 & Capabilities::ALL.0);
         let _cpu = (caps.has(Capabilities::FRAMES) && !caps.has(Capabilities::DMABUF_OK))
             .then(|| self.cpu_client());
@@ -437,7 +589,7 @@ impl DisplayServer {
         let reader = stream.try_clone()?;
         let state = local.clone();
         let server = self.clone();
-        let handle = std::thread::spawn(move || {
+        let handle = std::thread::Builder::new().spawn(move || {
             let result = server.native_input(&reader, caps, &state);
             {
                 let mut local = state.lock().unwrap();
@@ -448,7 +600,7 @@ impl DisplayServer {
             server.shared.changed.notify_all();
             let _ = reader.shutdown(Shutdown::Both);
             result
-        });
+        })?;
         let result = self.native_frames(&stream, caps, &local);
         let _ = stream.shutdown(Shutdown::Both);
         let input = handle
@@ -837,4 +989,30 @@ fn memfd(size: u64) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review F3 (docs/reviews/display.md): a shortage must not end a listener.
+    #[test]
+    fn only_a_broken_listener_ends_the_accept_loop() {
+        for temporary in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+            libc::EPERM,
+        ] {
+            assert!(!accept_error_is_final(&io::Error::from_raw_os_error(
+                temporary
+            )));
+        }
+        for last in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert!(accept_error_is_final(&io::Error::from_raw_os_error(last)));
+        }
+    }
 }

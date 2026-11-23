@@ -283,12 +283,28 @@ Tablet warnings occur at most once per five seconds.
 
 `serve_native(UnixStream)` and `serve_rfb(UnixStream)` run one connection until
 disconnect or error. Each uses a separate input reader. The caller controls
-binding, permissions, socket timeouts, and worker lifetime. Shutting down the
+binding, permissions, and worker lifetime. Shutting down the
 stream terminates both connection workers. A socket error cannot block publish.
 Both capture the current source during connection setup before sending pixels.
 Native connections without the frames capability do not capture the source.
+
+The server limits its connections itself. It holds at most `MAX_SESSIONS` (64)
+at once and refuses one more. At most `MAX_HANDSHAKES` (16) of them may be
+unfinished handshakes: a native connection before its Hello, an RFB connection
+before its ClientInit. One more closes the oldest unfinished one, so silent
+connections cannot keep a client out. Each read of a handshake waits at most
+`HANDSHAKE_TIMEOUT` (10 seconds), or the stream's own read timeout if that is
+shorter. After the handshake the stream has the read timeout the caller gave
+it. `sessions()` is the number of open connections.
+
 `serve(UnixListener, rfb: bool)` accepts connections and starts one worker per
-connection until the listener fails. It does not remove socket paths.
+connection until the server is shut down or the listener fails for good. It
+does not remove socket paths. `serve_while(&listener, rfb, name, admit,
+running)` is the same loop with a check of each accepted stream and a
+condition to stop on, and returns its workers. An `accept` error that can pass
+(`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`, `ECONNABORTED`) does not end either
+loop: it warns at most once per five seconds and tries again. A connection
+that gets no worker thread is closed.
 
 `Client::connect(path, Capabilities)` and `Client::from_stream(stream, caps)`
 complete the handshake. `receive()` returns a `Packet` containing Message and
