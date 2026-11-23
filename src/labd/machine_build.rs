@@ -214,7 +214,10 @@ pub(super) async fn build_vm(
     if let Some(c) = &vm_cfg.cdrom {
         cdroms.push(cx.root.join(c));
     }
-    let mut floppy = vm_cfg.floppy.as_ref().map(|f| cx.root.join(f));
+    let mut floppy = vm_cfg
+        .floppy
+        .as_ref()
+        .map(|f| crate::labd::vm::Floppy::Image(cx.root.join(f)));
 
     // media {} blocks: ISO/floppy images built from folders,
     // content-addressed in .vmlab/media (PRD §6.3).
@@ -240,7 +243,7 @@ pub(super) async fn build_vm(
                         vm_cfg.name
                     );
                 }
-                floppy = Some(built);
+                floppy = Some(crate::labd::vm::Floppy::Built(built));
             }
         }
     }

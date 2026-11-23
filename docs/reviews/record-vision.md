@@ -82,8 +82,8 @@ Not read:
 | F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit (fixed, card #718) |
 | F3 | crash (a stop that never returns) | A stalled ffmpeg blocks `record stop`, `down` and `destroy` |
 | F4 | wrong result | Two captures of one machine share one scratch file |
-| F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match |
-| F6 | wrong result | The match score ignores colour, brightness and contrast |
+| F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match (fixed, card #724) |
+| F6 | wrong result | The match score ignores colour, brightness and contrast (fixed, card #724) |
 | F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720) |
 | F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind |
 | F9 | crash of a request | A large duration panics `Settings::resolve` |

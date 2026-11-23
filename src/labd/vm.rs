@@ -306,6 +306,18 @@ enum AgentGate {
     Bypass,
 }
 
+/// What a VM has in drive A. vmlab-hv opens it writable and takes no lock
+/// on it, so which file that is matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Floppy {
+    /// The lab file's own image (`floppy =`), attached as it is.
+    Image(PathBuf),
+    /// An image built from a `media {}` folder: an entry of the media cache,
+    /// which every machine with that folder shares. The machine attaches its
+    /// own copy of it, never the entry.
+    Built(PathBuf),
+}
+
 pub struct VmInstance {
     pub lab: String,
     pub cfg: model::Vm,
@@ -316,7 +328,7 @@ pub struct VmInstance {
     pub nic_mtus: Vec<u16>,
     /// CD-ROM image paths (config cdrom + built media), resolved absolute.
     pub cdroms: Vec<PathBuf>,
-    pub floppy: Option<PathBuf>,
+    pub floppy: Option<Floppy>,
     /// Absolute host dir per `cfg.shares` entry (relative paths resolved
     /// against the lab root by the lab builder).
     pub share_hosts: Vec<PathBuf>,
@@ -441,7 +453,7 @@ impl VmInstance {
         macs: Vec<MacAddr>,
         nic_mtus: Vec<u16>,
         cdroms: Vec<PathBuf>,
-        floppy: Option<PathBuf>,
+        floppy: Option<Floppy>,
         share_hosts: Vec<PathBuf>,
         template: TemplateParts,
     ) -> Arc<Self> {
@@ -926,6 +938,20 @@ impl VmInstance {
         }))
     }
 
+    /// The image this start puts in drive A. A built floppy is the machine's
+    /// own copy of the cache entry, beside its disks: a guest write reaches
+    /// neither the cache nor another machine, and `destroy` takes the copy
+    /// with the disks.
+    fn floppy_image(&self) -> Result<Option<PathBuf>> {
+        match &self.floppy {
+            None => Ok(None),
+            Some(Floppy::Image(path)) => Ok(Some(path.clone())),
+            Some(Floppy::Built(entry)) => crate::media::private_floppy(entry, &self.dirs.local)
+                .with_context(|| format!("{}: floppy media", self.cfg.name))
+                .map(Some),
+        }
+    }
+
     fn build_paths(
         &self,
         t: &TemplateParts,
@@ -965,7 +991,7 @@ impl VmInstance {
             cdroms: self.cdroms.clone(),
             // The lab builder puts the `cdrom =` attachment first.
             install_cdrom: self.cfg.cdrom.is_some(),
-            floppy: self.floppy.clone(),
+            floppy: self.floppy_image()?,
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
