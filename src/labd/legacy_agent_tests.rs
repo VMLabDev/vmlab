@@ -127,7 +127,7 @@ fn sh(script: &str) -> Vec<String> {
 struct WineAgent {
     dir: tempfile::TempDir,
     socket: PathBuf,
-    child: std::process::Child,
+    child: Option<std::process::Child>,
 }
 
 /// Not a limit a step must meet: the client API wants a budget, and a first
@@ -215,7 +215,7 @@ impl WineAgent {
         let mut agent = Self {
             dir,
             socket,
-            child: Command::new("true").spawn()?,
+            child: None,
         };
         // Wine reads its port map when the prefix starts, so the prefix is
         // made, told, and let stop before the agent starts it again.
@@ -227,13 +227,13 @@ impl WineAgent {
             .status()?;
         ensure!(status.success(), "wine reg add failed: {status}");
         ensure!(agent.wine("wineserver").arg("-w").status()?.success());
-        agent.child.wait()?;
-        agent.child = agent
+        let child = agent
             .wine("wine")
             .arg(&exe)
             .args(["--console", "--port", "COM1"])
             .stdout(std::process::Stdio::null())
             .spawn()?;
+        agent.child = Some(child);
         Ok(Some(agent))
     }
 
@@ -245,8 +245,10 @@ impl WineAgent {
 
 impl Drop for WineAgent {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         // Everything else the prefix started (services, the server itself).
         let _ = self.wine("wineserver").arg("-k").status();
         let _ = self.wine("wineserver").arg("-w").status();
