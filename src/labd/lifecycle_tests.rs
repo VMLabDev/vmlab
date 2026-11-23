@@ -1715,7 +1715,18 @@ async fn a_seal_fails_when_the_guest_does_not_power_off_by_itself() {
     );
     let (cbs, mut observed) = callbacks();
     start_vm(&vm, cbs).await.expect("start");
-    let result = crate::template::build::shutdown_for_seal(&vm).await;
+    let seal = crate::template::build::shutdown_for_seal(&vm);
+    tokio::pin!(seal);
+    // Keep Tokio from advancing past the agent handshake while the fake's
+    // socket I/O is pending. Once the request arrives, let the timers run.
+    let result = tokio::select! {
+        result = &mut seal => result,
+        () = async {
+            while hv.journal().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        } => seal.await,
+    };
 
     assert_eq!(hv.journal(), ["agent shutdown ignored"]);
     assert_eq!(observed.exit().await.status, "exit status: 0");
