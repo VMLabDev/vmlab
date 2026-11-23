@@ -860,6 +860,11 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
     }
 
     #[test]
+    fn a_malformed_dns_upstream_is_refused() {
+        assert!(host_err("host { dns_upstream = \"dns.corp\" }\n").contains("`dns_upstream`"));
+    }
+
+    #[test]
     fn rejects_bad_values() {
         assert_eq!(
             host_err("host { disk_low_percent = 200 }\n"),

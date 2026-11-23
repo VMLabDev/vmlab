@@ -1221,6 +1221,25 @@ mod tests {
         (lab, issues.iter().map(|i| i.message.clone()).collect())
     }
 
+    #[test]
+    fn ports_that_can_never_match_are_refused() {
+        let cases = [
+            (r#"forward { to = "web:0" }"#, "guest port"),
+            (r#"redirect { from = "10.0.0.1:0" to = "10.0.0.2:80" }"#, "port"),
+            (r#"redirect { from = "10.0.0.1:80" to = "10.0.0.2:0" }"#, "port"),
+            (r#"block { cidr = "192.0.2.0/24" proto = "icmp" port = 80 }"#, "`proto`"),
+            (r#"block { cidr = "192.0.2.0/24" port = 80 }"#, "`proto`"),
+        ];
+        let mut accepted = Vec::new();
+        for (rule, expected) in cases {
+            let (_, issues) = lab(&format!(r#"segment "s" {{ {rule} }}"#));
+            if !issues.iter().any(|issue| issue.contains(expected)) {
+                accepted.push((rule, issues));
+            }
+        }
+        assert!(accepted.is_empty(), "expected port diagnostics for {accepted:?}");
+    }
+
     /// Fields the schema declares required but does not itself check for
     /// (wcl enforces required *child blocks* only). Before ADR-0006 each of
     /// these silently dropped the block it was in and the file still loaded.

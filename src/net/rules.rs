@@ -1305,6 +1305,29 @@ mod tests {
     }
 
     #[test]
+    fn icmp_block_with_port_cannot_let_echo_through() {
+        let source = r#"
+import <vmlab.wcl>
+lab "l" {
+  segment "s" {
+    block { cidr = "192.0.2.0/24" proto = "icmp" port = 80 }
+  }
+}
+"#;
+        match crate::config::load_lab_source(source, "<test>", std::path::Path::new("/tmp")) {
+            Err(err) => assert!(err.issues.iter().any(|issue| issue.message.contains("`proto`"))),
+            Ok(file) => {
+                let mut rules = RuleSet::new();
+                for rule in file.lab.segments.into_iter().flat_map(|segment| segment.block_rules) {
+                    rules.add_block(rule);
+                }
+                let packet = icmp_echo_pkt(GUEST, DST_A, 9, false);
+                assert!(matches!(rules.eval(&packet), Verdict::Drop { .. }));
+            }
+        }
+    }
+
+    #[test]
     fn block_icmp_gets_host_unreachable() {
         let mut rs = RuleSet::new();
         rs.add_block(block("192.0.2.0/24", Some(L4Proto::Icmp), None));
