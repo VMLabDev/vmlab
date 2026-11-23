@@ -252,6 +252,7 @@ SRC
       | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for QEMU's Venus render server. Ignored on vmlab-hv, with a warning." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
       | "`hide_uncached_memory`" | "bool" | "`false`" | "Under `vulkan`, report an uncached host-visible memory type of this GPU as not host-visible when the same heap has a cached one, so guest drivers map the cached type. For a host where guest images arrive with short dashes. See below." |
+      | "`passthrough_functions`" | "list of utf8" | "none" | "The card's other PCI functions, such as its HDMI/DP audio, that a `passthrough` guest on vmlab-hv gets with it. Each entry is the host PCI address of another function of the same slot, bound to `vfio-pci`. Left out, every function of the slot already bound to `vfio-pci` goes. `[]` sends the card alone. See below." |
   }
   p "The parser enforces these rules:"
   list {
@@ -267,7 +268,16 @@ SRC
     VM start, naming the GPU: its address must name a PCI device, a virgl or
     vulkan guest needs that device to have a DRM render node, and its
     `vulkan_icd` must exist. A GPU bound to `vfio-pci` for passthrough has no
-    render node and needs none. Its `qemu_binary` must be an executable
+    render node and needs none. On vmlab-hv the card's other functions that
+    are bound to `vfio-pci` go to the guest with it, at the same guest slot
+    and under the function number each has on the host, so the guest finds
+    one card with its audio device. A function bound to another driver stays
+    with the host. An entry of `passthrough_functions` is different: it must
+    be another function of the same slot and bound to `vfio-pci`, or the
+    check refuses it and names the driver it is bound to. vmlab never changes
+    a driver binding. The GPU's `address` must be function 0 for another
+    function to go with it. On QEMU the guest gets the one `address`, and a
+    non-empty `passthrough_functions` is ignored with a warning. Its `qemu_binary` must be an executable
     file. A file named `qemu-system-<arch>` must also match the VM's QEMU
     arch, or the check refuses it and names both arches. A file with any
     other name is used as given.
