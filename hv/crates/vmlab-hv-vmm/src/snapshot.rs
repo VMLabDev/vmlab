@@ -1115,8 +1115,7 @@ fn decode_msrs(bytes: &[u8]) -> Result<Vec<kvm_msr_entry>, SnapshotError> {
     let mut r = format::Reader::new(bytes);
     let count = r.u32().map_err(|_| bad())? as usize;
     // The count comes from the file: it must be what the section holds.
-    if r.remaining().len() / MSR_ENTRY_BYTES != count || r.remaining().len() % MSR_ENTRY_BYTES != 0
-    {
+    if count.checked_mul(MSR_ENTRY_BYTES) != Some(r.remaining().len()) {
         return Err(SnapshotError::Internal(format!(
             "bad msr state: {count} entries in {} bytes",
             r.remaining().len()
