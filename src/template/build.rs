@@ -22,8 +22,18 @@ use crate::config::model::{
 };
 use crate::config::wcl_str;
 use crate::labd::machine::Machine;
+use crate::labd::vm::VmInstance;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
+
+pub(crate) async fn shutdown_for_seal(vm: &VmInstance) -> Result<()> {
+    vm.stop(false).await?;
+    vm.wait_state(
+        crate::labd::vm::PowerState::Stopped,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+}
 
 /// A build VM as the machine verbs address it, `<lab>/<vm>` (PRD §6.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,14 +622,9 @@ async fn build_variant(
             None => bail!("build cancelled"),
         }
         log("sealing variant: graceful shutdown\n".to_string());
-        vm.stop(false)
+        shutdown_for_seal(&vm)
             .await
             .context("variant build VM did not shut down")?;
-        vm.wait_state(
-            crate::labd::vm::PowerState::Stopped,
-            std::time::Duration::from_secs(120),
-        )
-        .await?;
         Ok(())
     };
     if let Err(e) = sealed.await {
@@ -1336,12 +1341,9 @@ async fn run_build(
             }
         }
         log("sealing: graceful shutdown\n".to_string());
-        vm.stop(false).await.context("build VM did not shut down")?;
-        vm.wait_state(
-            crate::labd::vm::PowerState::Stopped,
-            std::time::Duration::from_secs(120),
-        )
-        .await?;
+        shutdown_for_seal(&vm)
+            .await
+            .context("build VM did not shut down")?;
         Ok(verify_boot)
     };
     let needs_verify_boot = match booted.await {
@@ -1408,14 +1410,9 @@ async fn run_build(
             )
             .await?;
             log("sealing: graceful shutdown (verification boot)\n".to_string());
-            vm2.stop(false)
+            shutdown_for_seal(&vm2)
                 .await
                 .context("verification boot VM did not shut down")?;
-            vm2.wait_state(
-                crate::labd::vm::PowerState::Stopped,
-                std::time::Duration::from_secs(120),
-            )
-            .await?;
             Ok::<_, anyhow::Error>(version)
         }
         .await;
