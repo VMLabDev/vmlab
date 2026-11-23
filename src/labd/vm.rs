@@ -1426,9 +1426,16 @@ impl VmInstance {
                 if boot == super::vars_boot::LastBoot::Plain {
                     super::vars_boot::write(&record, boot)?;
                 }
-                if !self.dirs.ovmf_vars().exists() {
-                    std::fs::copy(&fw.vars_template, self.dirs.ovmf_vars())
+                let store = self.dirs.ovmf_vars();
+                if !store.exists() {
+                    // Keep failed copies off the path used to detect an existing store.
+                    let staged = tempfile::NamedTempFile::new_in(&self.dirs.local)
+                        .context("staging OVMF VARS template")?;
+                    std::fs::copy(&fw.vars_template, staged.path())
                         .context("copying OVMF VARS template")?;
+                    staged.persist_noclobber(&store).with_context(|| {
+                        format!("publishing OVMF VARS store {}", store.display())
+                    })?;
                 }
                 if boot == super::vars_boot::LastBoot::Secure {
                     super::vars_boot::write(&record, boot)?;
