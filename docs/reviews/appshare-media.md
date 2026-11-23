@@ -286,6 +286,11 @@ Not read:
 - Severity: security against a peer (another user of the host). PRD §1.2
   says vmlab serves one trusted host user, which lowers this.
 - Confidence: high.
+- Status: fixed by card #733. The helper's command line holds
+  `--password-stdin` in place of the password, and `vmlab app run --detach`
+  writes the password to the helper's stdin, a pipe it then closes. The
+  proof test `the_detached_helper_argv_holds_no_password` failed before the
+  fix and passes after it.
 
 ### F9. The X11 proxy sends the host's real cookie to whoever holds the abstract socket name
 
@@ -307,6 +312,9 @@ Not read:
   of the host. PRD §1.2 lowers this as it does F8.
 - Confidence: high for the code, medium for how many hosts leave the
   abstract name free.
+- Fixed in card #732. The proxy connects to the path socket first. It takes
+  the abstract name only when the path socket refuses, and only when
+  `SO_PEERCRED` says that this user or root listens on it.
 
 ### F10. The host cookie is not found for two common Xauthority shapes
 

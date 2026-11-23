@@ -321,7 +321,7 @@ pub enum Command {
     },
     /// Internal: hold a detached `app run` session
     #[command(name = "__appsession", hide = true)]
-    Appsession(app::RunArgs),
+    Appsession(app::HelperArgs),
     /// Internal: run the supervisor daemon in the foreground
     #[command(name = "__supervisord", hide = true)]
     Supervisord,
@@ -897,7 +897,7 @@ pub(crate) fn run_parsed(cli: Cli) -> ExitCode {
         Command::App { cmd } => match cmd {
             AppCmd::Run(args) => app::cmd_app_run(args),
         },
-        Command::Appsession(args) => app::cmd_app_run(args),
+        Command::Appsession(args) => app::cmd_app_session(args),
         Command::Dev { cmd } => match cmd {
             DevCmd::Sync { cmd } => match cmd {
                 DevSyncCmd::Status { machine } => dev::cmd_dev_sync_status(machine),
