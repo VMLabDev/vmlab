@@ -527,9 +527,7 @@ impl DisplayServer {
                     if accept_error_is_final(&error) {
                         break Err(error);
                     }
-                    self.warn(format_args!(
-                        "{name}: accept failed, trying again: {error}"
-                    ));
+                    self.warn(format_args!("{name}: accept failed, trying again: {error}"));
                     std::thread::sleep(ACCEPT_RETRY);
                     continue;
                 }
