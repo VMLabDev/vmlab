@@ -1590,8 +1590,14 @@ impl LabRuntime {
     /// Stop one machine and delete everything it materialised, leaving the
     /// rest of the lab running. It stays in the lab config, so a later
     /// `up <name>` re-materialises it (per-machine analogue of [`destroy`]).
-    pub async fn destroy_machine(self: &Arc<Self>, name: &str) -> Result<()> {
+    ///
+    /// The guest working copy of a dev machine goes with the clone, so this
+    /// refuses while that copy holds work the host has not taken, unless
+    /// `discard` says to lose it (§19.6).
+    pub async fn destroy_machine(self: &Arc<Self>, name: &str, discard: bool) -> Result<()> {
         self.machine(name)?;
+        // Asked before anything is stopped, so a refusal changes nothing.
+        self.check_destroy(name, discard).await?;
         // No start of this machine from here to the removal of its disks: a
         // start under way finishes first and is stopped below, one asked for
         // earlier is refused, and a later one waits for the removal.
@@ -3082,7 +3088,7 @@ impl LabRuntime {
         }
         for name in &dropped {
             self.stop_mounting(name);
-            self.workspaces.stop(name).await;
+            self.workspaces.stop_before_machine(name, !force).await;
             self.record_finalise_machine(name, "machine stopped").await;
             // A start under way finishes first, so there is something to stop.
             drop(self.starts.hold(name).await);
@@ -3091,10 +3097,13 @@ impl LabRuntime {
 
         // Before the machines go: a syncer whose guest has gone would spend
         // its retry window failing to reach one, and a recording is
-        // finalised while its last frame is still the machine's (D6).
+        // finalised while its last frame is still the machine's (D6). The
+        // syncer takes a last pass while the guest still answers, and writes
+        // what that pass left owed on its ledger (§19.6); a forced stop does
+        // not wait on the guest, and its record says so.
         for name in plan.machines() {
             self.stop_mounting(name);
-            self.workspaces.stop(name).await;
+            self.workspaces.stop_before_machine(name, !force).await;
             self.record_finalise_machine(name, "machine stopped").await;
         }
 
@@ -3155,11 +3164,19 @@ impl LabRuntime {
 
     /// Stop everything and delete clones, lab-local state, and dynamic net
     /// config (PRD §12).
-    pub async fn destroy(self: &Arc<Self>) -> Result<()> {
+    ///
+    /// Every dev machine is asked about its workspace first, and one refusal
+    /// stops the whole destroy before anything is stopped (§19.6); `discard`
+    /// is the flag that skips the question.
+    pub async fn destroy(self: &Arc<Self>, discard: bool) -> Result<()> {
         // Worktree overlays name the frozen files by absolute path (§21.5).
         // With none depending, the freeze goes with the rest of `.vmlab/`.
         self.refuse_while_depended_on("cannot destroy the main lab")
             .await?;
+        let names: Vec<String> = self.machines().map(|m| m.name().to_string()).collect();
+        for name in &names {
+            self.check_destroy(name, discard).await?;
+        }
         // Nothing starts between the stop below and the removal: every start
         // is refused from here on. A destroy that fails leaves a lab, which
         // takes starts again.
@@ -3169,6 +3186,19 @@ impl LabRuntime {
             self.starts.reopen();
         }
         destroyed
+    }
+
+    /// What a destroy of `name` asks first: whether its workspace holds guest
+    /// work the host has not taken (§19.6). A running workspace gets a last
+    /// pass, and a stopped one answers from its ledger.
+    async fn check_destroy(&self, name: &str, discard: bool) -> Result<()> {
+        if discard {
+            return Ok(());
+        }
+        let workspace = self.workspace_of(name);
+        self.workspaces
+            .before_destroy(name, discard, workspace.as_ref())
+            .await
     }
 
     /// [`destroy`](Self::destroy), once the lab is closed to starts.
@@ -6147,7 +6177,7 @@ lab "t" {
         );
         assert!(diverged(&reopened.status().await, "dev01"));
 
-        lab.destroy_machine("dev01").await.expect("destroy");
+        lab.destroy_machine("dev01", false).await.expect("destroy");
         assert!(!diverged(&lab.status().await, "dev01"));
     }
 
@@ -6553,7 +6583,7 @@ lab "t" {
 
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy_machine("a").await }
+            async move { lab.destroy_machine("a", false).await }
         });
         hold.reached().await;
         let start = tokio::spawn({
@@ -6598,7 +6628,7 @@ lab "t" {
         hold.reached().await;
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy_machine("a").await }
+            async move { lab.destroy_machine("a", false).await }
         });
         run_until_stalled().await;
         hold.release();
@@ -6626,7 +6656,7 @@ lab "t" {
 
         let destroy = tokio::spawn({
             let lab = lab.clone();
-            async move { lab.destroy().await }
+            async move { lab.destroy(false).await }
         });
         hold.reached().await;
         let started = lab.start_machine("a").await;
@@ -6680,8 +6710,12 @@ lab "t" {
 }"#,
             vec![vm.clone(), ct.clone()],
         );
-        lab.destroy_machine("dc01").await.expect("destroy dc01");
-        lab.destroy_machine("web").await.expect("destroy web");
+        lab.destroy_machine("dc01", false)
+            .await
+            .expect("destroy dc01");
+        lab.destroy_machine("web", false)
+            .await
+            .expect("destroy web");
         assert_eq!(vm.stops.load(Ordering::SeqCst), 1);
         assert_eq!(ct.stops.load(Ordering::SeqCst), 1);
     }
@@ -7651,8 +7685,8 @@ lab "t" {
             match wait {
                 0 => lab.stop_machine("a", false).await.expect("stop"),
                 1 => lab.down(&[], false).await.expect("down"),
-                2 => lab.destroy_machine("a").await.expect("destroy a"),
-                _ => lab.destroy().await.expect("destroy"),
+                2 => lab.destroy_machine("a", false).await.expect("destroy a"),
+                _ => lab.destroy(false).await.expect("destroy"),
             }
             assert!(lab.recordings.live_machines().await.is_empty(), "{ender}");
             assert!(out.exists(), "{ender} left a file");
@@ -8412,5 +8446,276 @@ lab "t" {
         );
         let none = lab.script_forward_target("c", "two").await.unwrap_err();
         assert!(none.contains("no NIC on segment \"c\""), "{none}");
+    }
+
+    // ---- dev machines review F4 and F5 (card 695) ----
+
+    /// A dev machine's guest as the syncer reaches it: the in-memory guest
+    /// and its watch behind the sessions seam, with no machine under them.
+    struct DevGuest {
+        guest: Arc<crate::labd::workspace::guest::fake::FakeGuest>,
+        watcher: Arc<crate::labd::workspace::guest::fake::FakeWatcher>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::labd::workspace::syncer::GuestSessions for DevGuest {
+        async fn open(&self) -> Result<Box<dyn crate::labd::workspace::guest::GuestFs>> {
+            Ok(Box::new(self.guest.clone()))
+        }
+        async fn watch(
+            &self,
+            _root: &str,
+            _prune: Vec<String>,
+        ) -> Result<Box<dyn crate::labd::workspace::guest::GuestWatch>> {
+            Ok(self.watcher.session())
+        }
+        async fn claim_root(&self, root: &str) -> Result<()> {
+            self.guest.dir(root);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::labd::workspace::windows::GuestRun for DevGuest {
+        async fn run(&self, _argv: Vec<String>) -> Result<crate::labd::workspace::windows::Ran> {
+            Ok(crate::labd::workspace::windows::Ran {
+                exit_code: 0,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    const DEV_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  @dev(default = true, workspace = "./src") vm "dev01" { template = "x86_64/t" }
+}"#;
+
+    /// A lab whose `dev01` declares the workspace `./src`, holding `main.rs`.
+    fn dev_lab(dir: &std::path::Path) -> Arc<LabRuntime> {
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "agreed").unwrap();
+        let sh = shared(dir);
+        lab_of(
+            dir,
+            DEV_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        )
+    }
+
+    /// Start `dev01`'s syncer over an in-memory guest and wait for the pass
+    /// that seeds it, so every test below starts from an agreed workspace.
+    async fn dev_lab_syncing(
+        lab: &Arc<LabRuntime>,
+    ) -> (
+        crate::labd::workspace::Workspace,
+        Arc<crate::labd::workspace::guest::fake::FakeGuest>,
+        Arc<crate::labd::workspace::guest::fake::FakeWatcher>,
+    ) {
+        use crate::labd::workspace::guest::fake::{FakeGuest, FakeWatcher};
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let guest = Arc::new(FakeGuest::new());
+        let watcher = FakeWatcher::new(guest.clone(), &ws.guest_root);
+        lab.workspaces
+            .start(
+                ws.clone(),
+                Arc::new(DevGuest {
+                    guest: guest.clone(),
+                    watcher: watcher.clone(),
+                }),
+                lab.events.clone(),
+            )
+            .await;
+        let syncer = lab.workspaces.get("dev01").await.expect("the syncer");
+        let seeded = syncer.pass_now().await.expect("the seeding pass");
+        assert!(seeded.trouble.is_none(), "{:?}", seeded.trouble);
+        assert_eq!(
+            guest.text(&format!("{}/main.rs", ws.guest_root)).as_deref(),
+            Some("agreed")
+        );
+        (ws, guest, watcher)
+    }
+
+    /// The guest writes `new.rs`, and no pull of it succeeds: guest work that
+    /// no pass can carry to the host, however many run.
+    fn guest_work_no_pass_can_carry(
+        ws: &crate::labd::workspace::Workspace,
+        guest: &crate::labd::workspace::guest::fake::FakeGuest,
+        watcher: &crate::labd::workspace::guest::fake::FakeWatcher,
+    ) {
+        let path = format!("{}/new.rs", ws.guest_root);
+        guest.file(&path, "guest work", 901);
+        for _ in 0..64 {
+            guest.fail_pull(&path);
+        }
+        watcher.mark("new.rs");
+    }
+
+    /// Review dev-machines F4: `down` stops the syncer ahead of the machine,
+    /// and a guest write the watch has just reported is carried to the host
+    /// by a last pass first. Without one it stays in the guest only.
+    #[tokio::test]
+    async fn a_down_takes_a_last_pass_that_carries_guest_work_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+
+        guest.file(&format!("{}/main.rs", ws.guest_root), "guest work", 900);
+        guest.file(&format!("{}/new.rs", ws.guest_root), "new", 901);
+        watcher.mark("main.rs");
+        watcher.mark("new.rs");
+        lab.down(&[], false).await.expect("down");
+
+        assert!(lab.workspaces.get("dev01").await.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            "guest work",
+            "the stop took no last pass"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/new.rs"))
+                .ok()
+                .as_deref(),
+            Some("new")
+        );
+        // In step at the stop, so nothing stands in a restore's way.
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+        lab.restore("dev01", "s", false).await.expect("restore");
+    }
+
+    /// Review dev-machines F4: what the last pass before a stop could not
+    /// carry is written on the ledger, and an offline restore refuses on it
+    /// by name until the discard flag says to lose it.
+    #[tokio::test]
+    async fn a_restore_of_a_stopped_machine_refuses_on_work_its_last_pass_left_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+        lab.down(&[], false).await.expect("down");
+        assert!(!dir.path().join("src/new.rs").exists());
+
+        let refused = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("the restore discards guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+
+        lab.restore("dev01", "s", true).await.expect("discarding");
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        assert!(ledger.reseed_owed);
+        assert_eq!(ledger.left_owed, None, "the rewind discarded what was owed");
+    }
+
+    /// Review dev-machines F5: `destroy` deletes the guest working copy, and
+    /// a halted workspace holds guest versions the host never took. The
+    /// machine is down here, so the halt is the one its ledger records.
+    #[tokio::test]
+    async fn a_destroy_of_a_halted_workspace_refuses_without_the_discard_flag() {
+        use crate::labd::workspace::ledger::Ledger;
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let mut ledger = Ledger::new(&ws.host_root, &ws.guest_root);
+        ledger.halted = vec!["main.rs".into()];
+        ledger.save(&ws.ledger_path).unwrap();
+
+        let refused = lab
+            .destroy_machine("dev01", false)
+            .await
+            .expect_err("the destroy deletes the guest copy of a halted path");
+        let said = format!("{refused:#}");
+        assert!(said.contains("main.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(ws.ledger_path.exists(), "a refused destroy removes nothing");
+
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// Review dev-machines F5, for a running machine: the destroy takes a
+    /// last pass, and refuses on the path that pass could not carry.
+    #[tokio::test]
+    async fn a_destroy_of_a_workspace_with_unsynced_paths_refuses_without_the_discard_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+
+        let refused = lab
+            .destroy_machine("dev01", false)
+            .await
+            .expect_err("the destroy deletes guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(
+            lab.workspaces.get("dev01").await.is_some(),
+            "a refused destroy stops nothing"
+        );
+
+        lab.destroy_machine("dev01", true)
+            .await
+            .expect("discarding");
+        assert!(lab.workspaces.get("dev01").await.is_none());
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// Review dev-machines F4 and F5 together: a `down` leaves work owed, and
+    /// the lab's `destroy` refuses on the record that stop wrote.
+    #[tokio::test]
+    async fn a_lab_destroy_refuses_on_work_a_stop_left_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, guest, watcher) = dev_lab_syncing(&lab).await;
+        guest_work_no_pass_can_carry(&ws, &guest, &watcher);
+        lab.down(&[], false).await.expect("down");
+
+        let refused = lab
+            .destroy(false)
+            .await
+            .expect_err("the destroy deletes guest work the host never took");
+        let said = format!("{refused:#}");
+        assert!(said.contains("new.rs"), "{said}");
+        assert!(said.contains("--discard-guest-changes"), "{said}");
+        assert!(ws.ledger_path.exists(), "a refused destroy removes nothing");
+
+        lab.destroy(true).await.expect("discarding");
+        assert!(!ws.ledger_path.exists());
+    }
+
+    /// A forced `down` does not wait on the guest, so it takes no last pass.
+    /// Its record says so, and a restore of the stopped machine refuses.
+    #[tokio::test]
+    async fn a_forced_down_records_that_no_last_pass_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = dev_lab(dir.path());
+        let (ws, _guest, _watcher) = dev_lab_syncing(&lab).await;
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+        lab.down(&[], true).await.expect("down");
+
+        let ledger = crate::labd::workspace::ledger::Ledger::load(
+            &ws.ledger_path,
+            &ws.host_root,
+            &ws.guest_root,
+        );
+        let left = ledger.left_owed.expect("the forced stop left a record");
+        assert!(left.why.contains("by force"), "{}", left.why);
+        let refused = lab
+            .restore("dev01", "s", false)
+            .await
+            .expect_err("nothing asked the guest before the stop");
+        let said = format!("{refused:#}");
+        assert!(said.contains("by force"), "{said}");
+        assert!(said.contains("vmlab up dev01"), "{said}");
     }
 }

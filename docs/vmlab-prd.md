@@ -967,7 +967,7 @@ The lab daemon records a VM's console to a video file. It holds one long-lived, 
 |---|---|
 | `vmlab up [vm...] [--wait] [--record vm=path]` | Create/start lab (or subset), run provision scripts; always from the lab file as it is on disk now (§7.1); `--wait` returns only once every machine it brought up is ready (§7.2); `--record` records a VM from its first frame (§11.1) |
 | `vmlab down [vm...]` | Graceful stop; clones retained; a full `down` also reaps the lab daemon and releases the lab name |
-| `vmlab destroy` | Stop + delete clones, lab-local state, dynamic net config |
+| `vmlab destroy [--discard-guest-changes]` | Stop + delete clones, lab-local state, dynamic net config; refuses while a dev machine's workspace holds guest work the host has not taken, unless the flag says to lose it (§19.6) |
 | `vmlab lab move <lab> [--from <dir>]` | Run in the lab root that should own a stopped lab (its `vmlab.wcl` declaring the same lab; `<lab>` is the declared name or an instance of it, §3.2): refuses while any of the lab's machines or processes run, or when this root already holds machine data; warns naming each machine the two lab files declare differently; releases the name; moves the working data (`.vmlab/`, or the `VMLAB_WORK_DIR` directory keyed by the root), renaming on one filesystem and otherwise copying, verifying and only then deleting the source; drops `smb/smb.conf` and rebases each `@dev` sync ledger onto the new root; lists each share, volume or workspace folder missing under the new root; and registers the lab from there under the name that root runs it as. `--from` names the old root once the name is released |
 | `vmlab status [-v] [--json]` | Machine status, IPs and segments, installed port forwards with their bound host ports (§9.8), plus `dev` (§19.1); `-v` adds raw state and per-kind detail; `--json` prints the status projection |
 | `vmlab validate` | Full §5.1 validation, no side effects; reports the effective lab name (§3.2) |
@@ -1806,7 +1806,8 @@ the silently-failing `rm -rf` all stand, and *those* are the workload.
 
 **With the host canonical, the snapshot footgun dissolves.** Restore rolls the
 machine back and the workspace re-converges from the host; `destroy` takes the
-clone and the guest working copy and loses nothing. That is `Rebuild Container`'s
+clone and the guest working copy and loses nothing while the two are in step
+(§19.6 says what it asks first where they are not). That is `Rebuild Container`'s
 promise — *resets everything except your local source* — delivered rather than
 traded away. **Snapshots are not a workspace backup**, and §19 says so plainly.
 
@@ -2159,7 +2160,23 @@ wanting to throw the guest away is frequently *why* you restore. `capture`
 refuses with no escape. That includes a guest too slow to answer the flush:
 when the guest's watch has not reported within the flush's bound, its latest
 writes are unknown, so the capture refuses and says so rather than freezing a
-tree without them. The discard flag is restore-only and does not apply here.
+tree without them. The discard flag does not apply to capture.
+
+**A stop takes a last pass, and `destroy` asks first.** `down` stops a machine's
+syncer ahead of the machine, so the syncer takes a last pass while the guest
+still answers and carries what it can. What that pass cannot carry — a failed
+transfer, a path behind a `.git` lock, a halt, a guest that did not answer — is
+known only to the syncer that is going away, so the stop writes it on the
+ledger. A forced `down` does not wait on the guest: it takes no last pass, and
+its record says that. A restore of the stopped machine refuses on that record as
+it refuses on a recorded halt, and the discard flag answers it. The next syncer
+to complete a pass clears the record, because its own report is the answer from
+then on. `destroy` deletes the guest working copy, which loses nothing only while
+the two copies are in step: a running workspace gets a last pass, a stopped one
+answers from its ledger, and where guest work the host has not taken is left, or
+could be, `destroy`, `vm destroy`, `container destroy` and `lab destroy` refuse
+by name. The same `--discard-guest-changes` flag says to lose it. A workspace
+that owes a re-seed is not refused: its guest tree is rewritten from the host.
 
 **There is no resync token, and it costs nothing**, because the list of
 stat-walk triggers — first sync, ledger loss, overflow, post-restore
