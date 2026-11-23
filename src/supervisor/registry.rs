@@ -71,8 +71,8 @@ impl Registry {
         crate::paths::state_dir().join("labs.json")
     }
 
-    pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(match std::fs::read_to_string(Self::path()) {
             Ok(s) => {
                 let mut registry: Self = serde_json::from_str(&s).unwrap_or_default();
                 for entry in &mut registry.labs {
@@ -83,7 +83,7 @@ impl Registry {
                 registry
             }
             Err(_) => Self::default(),
-        }
+        })
     }
 
     pub fn save(&self) {
@@ -186,6 +186,94 @@ mod tests {
             assert!(error.message.contains("run `vmlab down` there"));
             assert!(error.message.contains("vmlab lab stop mylab"));
             assert!(error.message.contains("--instance <id>"));
+        }
+    }
+
+    const UNPARSED_REGISTRY_HELPER: &str = "VMLAB_TEST_UNPARSED_REGISTRY";
+
+    /// Review F14 (card #574): a `labs.json` that does not parse — cut
+    /// short, or written by a newer build — is not an empty registry. Read
+    /// as one, every running lab daemon is forgotten and the next `save`
+    /// replaces the file.
+    #[test]
+    fn a_registry_that_does_not_parse_is_not_empty() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::registry::tests::unparsed_registry_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UNPARSED_REGISTRY_HELPER, "1")
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths: the state directory is this process's own.
+    #[test]
+    #[ignore = "subprocess helper for a_registry_that_does_not_parse_is_not_empty"]
+    fn unparsed_registry_helper() {
+        if std::env::var_os(UNPARSED_REGISTRY_HELPER).is_none() {
+            return;
+        }
+        let path = Registry::path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // No file is a first start, not an error.
+        assert!(Registry::load().unwrap().labs().is_empty());
+
+        // What a supervisor wrote comes back.
+        let root = canonical_root(path.parent().unwrap()).unwrap();
+        let written = Registry {
+            labs: vec![LabEntry {
+                name: "mylab".into(),
+                root: root.clone(),
+                pid: 42,
+                started: Some(7),
+                state: LabState::Stopping,
+            }],
+        };
+        written.save();
+        let read = Registry::load().unwrap();
+        let entry = read.get("mylab").expect("the entry is read back");
+        assert_eq!(entry.root, root);
+        assert_eq!(entry.pid, 42);
+        assert_eq!(entry.started, Some(7));
+        assert_eq!(entry.state, LabState::Stopping);
+
+        for broken in [
+            "{ this is not json",
+            // Cut short in the middle of a write.
+            r#"{ "labs": [ { "name": "mylab", "root": "/labs/my"#,
+            // A state this build does not know.
+            r#"{ "labs": [ { "name": "mylab", "root": "/labs/mylab", "pid": 42, "state": "paused" } ] }"#,
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            let error = match Registry::load() {
+                Ok(registry) => panic!(
+                    "{broken:?} was read as a registry of {} lab(s)",
+                    registry.labs().len()
+                ),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                broken,
+                "the file is left as it was"
+            );
         }
     }
 

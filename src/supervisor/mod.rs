@@ -152,8 +152,11 @@ async fn run_async() -> Result<()> {
     // One aggregate event channel, created before the socket binds so the
     // global-segment trunks can emit through it from day one.
     let (events_tx, _) = tokio::sync::broadcast::channel::<Event>(1024);
+    // An unreadable registry is not an empty one: starting on it would
+    // forget every lab daemon that runs and overwrite the file.
+    let registry = Registry::load().context("the lab registry is unreadable")?;
     let supervisor = Arc::new(Supervisor {
-        registry: Mutex::new(Registry::load()),
+        registry: Mutex::new(registry),
         events: events_tx.clone(),
         globals: GlobalSegments::new(&host_cfg, events_tx.clone()),
         ensure_locks: Mutex::new(std::collections::HashMap::new()),
@@ -1427,6 +1430,198 @@ mod tests {
 
             let client = LabClient::connect(&socket).await.unwrap();
             assert!(client.send(LabRequest::Ping {}).await.is_ok());
+        });
+    }
+
+    const STOPPING_DAEMON_HELPER: &str = "VMLAB_TEST_STOPPING_DAEMON_ROOT";
+    const STOPPING_DAEMON_FAKE: &str = "VMLAB_TEST_STOPPING_DAEMON_FAKE";
+
+    /// Review F13 (card #574): `stopping` is written before the daemon is
+    /// asked to stop, so a supervisor killed in between leaves it for a
+    /// daemon that still runs its machines. The next supervisor must adopt
+    /// that daemon and watch its exit, not leave the lab `stopping` for good.
+    #[test]
+    fn a_stopping_entry_with_a_live_daemon_is_adopted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::stopping_daemon_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STOPPING_DAEMON_HELPER, scratch.path())
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths: a supervisor whose registry has one `stopping` entry
+    /// for a child process that serves the lab's control socket, and a
+    /// second one for a daemon that is gone.
+    #[test]
+    #[ignore = "subprocess helper for a_stopping_entry_with_a_live_daemon_is_adopted"]
+    fn stopping_daemon_helper() {
+        use std::sync::Arc;
+
+        use super::registry::{LabEntry, LabState};
+        use crate::proto::LabRequest;
+        use crate::proto::client::LabClient;
+
+        let Some(root) = std::env::var_os(STOPPING_DAEMON_HELPER) else {
+            return;
+        };
+        let root = super::registry::canonical_root(std::path::Path::new(&root)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let name = "f13-stopping";
+            let gone_name = "f13-gone";
+            std::fs::write(
+                root.join("vmlab.wcl"),
+                format!("import <vmlab.wcl>\nlab \"{name}\" {{ }}\n"),
+            )
+            .unwrap();
+            crate::paths::ensure_private_dir(&crate::paths::runtime_dir()).unwrap();
+            crate::paths::ensure_dir(&crate::paths::state_dir()).unwrap();
+
+            let mut daemon = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "supervisor::tests::stopping_daemon_fake",
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(STOPPING_DAEMON_FAKE, name)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = daemon.id().unwrap();
+            let socket = crate::paths::lab_socket(name);
+            loop {
+                if let Ok(client) = LabClient::connect(&socket).await
+                    && client.send(LabRequest::Ping {}).await.is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    daemon.try_wait().unwrap().is_none(),
+                    "the fake lab daemon exited before it served"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            let mut exited = std::process::Command::new("true").spawn().unwrap();
+            let gone_pid = exited.id();
+            exited.wait().unwrap();
+
+            let host = crate::config::host::HostConfig::default();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let supervisor = Arc::new(super::Supervisor {
+                registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+                events: events.clone(),
+                globals: super::GlobalSegments::new(&host, events.clone()),
+                ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                template_ops: super::templates::TemplateOps::default(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
+                keepers: super::keepawake::Keepers::default(),
+            });
+            {
+                let mut reg = supervisor.registry.lock().await;
+                reg.upsert(LabEntry {
+                    name: name.into(),
+                    root: root.clone(),
+                    pid,
+                    started: process_start_time(pid),
+                    state: LabState::Stopping,
+                })
+                .unwrap();
+                reg.upsert(LabEntry {
+                    name: gone_name.into(),
+                    root: root.clone(),
+                    pid: gone_pid,
+                    started: None,
+                    state: LabState::Stopping,
+                })
+                .unwrap();
+            }
+
+            supervisor.adopt_existing_labs().await;
+
+            let state = |lab: &'static str| {
+                let supervisor = supervisor.clone();
+                async move { supervisor.registry.lock().await.get(lab).map(|e| e.state) }
+            };
+            assert_eq!(
+                state(name).await,
+                Some(LabState::Running),
+                "a daemon that runs and answers is adopted as running"
+            );
+            assert_eq!(
+                state(gone_name).await,
+                None,
+                "a stopping entry whose daemon is gone is dropped"
+            );
+            // The daemon was not asked to stop.
+            let client = LabClient::connect(&socket).await.unwrap();
+            assert!(client.send(LabRequest::Ping {}).await.is_ok());
+            drop(client);
+
+            // Its exit is watched: nobody asked for this one, so the entry
+            // leaves `running` for `failed`. An unwatched entry stays
+            // `running` and this waits without end.
+            daemon.kill().await.unwrap();
+            while state(name).await == Some(LabState::Running) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(state(name).await, Some(LabState::Failed));
+        });
+    }
+
+    /// The live lab daemon of [`stopping_daemon_helper`]: it serves the
+    /// lab's control socket until it is killed.
+    #[test]
+    #[ignore = "subprocess helper for stopping_daemon_helper"]
+    fn stopping_daemon_fake() {
+        use std::sync::Arc;
+
+        use crate::proto::server::{Handler, Server, Streamer};
+        use crate::proto::{CommandError, LabRequest};
+
+        struct Alive;
+
+        #[async_trait::async_trait]
+        impl Handler<LabRequest> for Alive {
+            async fn handle(
+                &self,
+                _req: LabRequest,
+                _s: &Streamer,
+            ) -> Result<serde_json::Value, CommandError> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let Some(name) = std::env::var_os(STOPPING_DAEMON_FAKE) else {
+            return;
+        };
+        let name = name.into_string().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let _daemon =
+                Server::<LabRequest>::bind(&crate::paths::lab_socket(&name), Arc::new(Alive))
+                    .await
+                    .unwrap();
+            std::future::pending::<()>().await;
         });
     }
 
