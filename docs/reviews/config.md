@@ -41,11 +41,11 @@ The findings are ranked against these three facts, which the code states:
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
 | F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
-| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites |
+| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites (fixed, card #569) |
 | F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name |
 | F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
-| F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header |
-| F13 | wrong result | `@dev` arguments are not validated: a relative `workspace_guest`, a missing `workspace` |
+| F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header (fixed, card #570) |
+| F13 | wrong result | `@dev` arguments are not validated: a relative `workspace_guest`, a missing `workspace` (fixed, card #570) |
 | F14 | wrong result | Port 0 as a forward or redirect target, and an ICMP block rule with a port, pass validation |
 | F15 | wrong result | `oci_chunk_size` is bounded only when a push starts |
 | F16 | cosmetic | The lab digest blanks any text that looks like a span, also inside a declared string |
@@ -330,6 +330,15 @@ is refused at launch, because the file format has no escape for one.
   with `primary_disk`, a CD-ROM, the floppy, the firmware files and the
   sockets under `/lab/with,comma/`, and assert that every element that holds
   the directory holds `with,,comma`. Today the splash and three others do.
+- Fixed in card #569. Every path inside a QEMU option value in
+  `src/qemu/cmdline.rs` goes through `opt_path`, which doubles each comma:
+  the disks, the CD-ROMs, the floppy, both pflash files, the QMP, VNC, agent,
+  NIC, TPM and virtiofs sockets, the serial log chardevs, the NIC ROM, the
+  splash and the render node. `-bios`, `-readconfig`, `-L` and `-serial
+  file:` take the path whole and stay unescaped. The process matcher in
+  `src/qemu/process.rs` accepts the escaped QMP path. The proof test fails
+  before the fix and passes after. The container argv
+  (`src/qemu/container.rs`) is not part of this fix.
 
 ### F10. Names that differ only in case share one DNS name (wrong result)
 
@@ -367,6 +376,12 @@ is refused at launch, because the file format has no escape for one.
 
 ### F12. An explicit share `name` is unchecked (wrong result)
 
+**Fixed by card #570.** Validation holds an explicit name to letters, digits,
+`_`, `-` and `.`, at most 80, and none of Samba's reserved section names, and
+refuses a line break in the host path (`share_name_problem`,
+`share_host_problem` in `src/smb/config.rs`). `SmbConfig::render_conf`
+refuses the same shares, so a config built another way cannot write them.
+
 - Where: `src/config/extract.rs:328-331` (taken as written),
   `src/config/validate.rs:316-324` (only the empty check),
   `src/smb/config.rs:254-255` (`[{name}]`, `path = {host}`).
@@ -387,6 +402,10 @@ is refused at launch, because the file format has no escape for one.
      `global` and assert the text holds one `[global]` line. Today it holds two.
 
 ### F13. `@dev` arguments are not validated (wrong result)
+
+**Fixed by card #570.** `check_dev_arguments` in `src/config/validate.rs`
+requires the host `workspace` to be a directory, and `workspace_guest` to be
+an absolute path for the guest's family that is not the file system root.
 
 - Where: `src/config/validate.rs:2072-2088` (`check_dev_defaults`, the only
   `@dev` rule), `src/config/extract.rs:717-725`, `src/labd/lab.rs:3031-3044`
