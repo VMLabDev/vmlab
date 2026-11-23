@@ -322,14 +322,19 @@ impl Display {
         opts: &MatchOptions,
     ) -> Result<Option<Match>> {
         let current = self.grab().await?;
-        for path in templates {
-            let template = vision::load_screen(path)
-                .map_err(|e| anyhow!("reference image {}: {e:#}", path.display()))?;
-            if let Some(m) = vision::find_template(&current, &template, opts) {
-                return Ok(Some(m));
+        let templates = templates.to_vec();
+        let opts = opts.clone();
+        tokio::task::spawn_blocking(move || {
+            for path in &templates {
+                let template = vision::load_screen(path)
+                    .map_err(|e| anyhow!("reference image {}: {e:#}", path.display()))?;
+                if let Some(m) = vision::find_template(&current, &template, &opts) {
+                    return Ok(Some(m));
+                }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
+        .await?
     }
 }
 

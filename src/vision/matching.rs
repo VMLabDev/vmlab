@@ -105,6 +105,20 @@ fn error_budget(channels: usize, threshold: f64) -> Option<u64> {
     Some(low)
 }
 
+/// Sum over at most 4096 channels, so the total fits in a u32.
+fn squared_error(actual: &[u8], expected: &[u8]) -> u32 {
+    actual
+        .iter()
+        .zip(expected)
+        .map(|(&a, &b)| {
+            let delta = i16::from(a) - i16::from(b);
+            // The squared difference fits in an unsigned 16-bit lane.
+            u32::from(delta.wrapping_mul(delta) as u16)
+        })
+        .sum()
+}
+
+
 /// Find the smallest sum of squared RGB channel differences in budget.
 fn search_best(
     screen: &RgbImage,
@@ -132,16 +146,7 @@ fn search_best(
                 // A u32 sum vectorises more efficiently. Each chunk's
                 // maximum error fits even for very wide templates.
                 for (actual, expected) in actual.chunks(4096).zip(expected.chunks(4096)) {
-                    error += u64::from(
-                        actual
-                            .iter()
-                            .zip(expected)
-                            .map(|(&a, &b)| {
-                                let delta = i32::from(a) - i32::from(b);
-                                (delta * delta) as u32
-                            })
-                            .sum::<u32>(),
-                    );
+                    error += u64::from(squared_error(actual, expected));
                     if error > budget {
                         continue 'placement;
                     }
