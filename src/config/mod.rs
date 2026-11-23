@@ -1002,6 +1002,47 @@ template "base" {
         assert_eq!(t.provisions.len(), 1);
     }
 
+    /// Review template-build F2: the `sha256` pins the content and nothing
+    /// else about the answer, so a `url` is fetched over HTTPS only.
+    #[test]
+    fn a_url_source_is_https_only() {
+        let load = |url: &str| {
+            let src = format!(
+                r#"import <vmlab.wcl>
+lab "l" {{ vm "a" {{ template = "x86_64/base" }} }}
+template "base" {{
+  arch    = "x86_64"
+  version = "1.0"
+  profile = "linux-modern"
+  disk    = 20GiB
+  source "iso" {{ url = "{url}" sha256 = "{}" }}
+}}
+"#,
+                "0".repeat(64)
+            );
+            load_lab_source(&src, "<test>", Path::new("/tmp"))
+        };
+        for good in ["https://example.com/x.iso", "HTTPS://example.com/x.iso"] {
+            assert!(load(good).is_ok(), "`{good}` must validate");
+        }
+        for bad in [
+            "http://example.com/x.iso",
+            "ftp://example.com/x.iso",
+            "file:///etc/passwd",
+            "example.com/x.iso",
+        ] {
+            let err = match load(bad) {
+                Ok(_) => panic!("`{bad}` must not validate"),
+                Err(e) => e,
+            };
+            assert!(
+                err.issues.iter().any(|i| i.message.contains("https://")),
+                "{bad}: {:?}",
+                err.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// Review F15: the artefact cache names its files by this value, so it
     /// must be a digest and nothing else.
     #[test]

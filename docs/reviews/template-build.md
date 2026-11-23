@@ -45,7 +45,7 @@ test does not reproduce is wrong and should be dropped.
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691) |
-| F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete |
+| F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
 | F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
 | F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process |
@@ -116,6 +116,17 @@ name: the refusal comes at the start of the build.
   guest gets write errors on its disk. The read timeout
   (`DOWNLOAD_LIMITS`, `:205-208`) does not help, because the server keeps
   sending.
+- Status: **fixed by card #692.** `download` stops at `max_bytes` of
+  `DownloadLimits` (32 GiB) and never writes into the last 1 GiB that is
+  free on the filesystem of the cache. A `Content-Length` past that is
+  refused before a byte is written. `extract_source` refuses a `url` that
+  is not `https://`, and a redirect from HTTPS to another scheme is an
+  error. Tests: `a_download_that_never_ends_is_stopped_at_a_limit`,
+  `a_declared_length_past_the_limit_writes_nothing`,
+  `a_redirect_does_not_leave_https`, `the_byte_budget_leaves_a_reserve_free`
+  (`src/template/artefact.rs`) and `a_url_source_is_https_only`
+  (`src/config/mod.rs`). Not covered: the size of what a compressed source
+  decompresses to.
 - Proof: test `a_download_that_never_ends_is_stopped_at_a_limit` in
   `src/template/artefact.rs`, with the loopback mirror of the existing tests:
   the mirror answers with no `Content-Length` and sends blocks until the
