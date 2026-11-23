@@ -639,7 +639,11 @@ pub fn render_plan(
         plan.passthrough = Some(decl.address.clone());
         if vmlab {
             plan.passthrough_functions = passthrough_functions(decl, sysfs)?;
-        } else if decl.passthrough_functions.as_ref().is_some_and(|f| !f.is_empty()) {
+        } else if decl
+            .passthrough_functions
+            .as_ref()
+            .is_some_and(|f| !f.is_empty())
+        {
             plan.warnings.push(format!(
                 "host GPU `{}`: `passthrough_functions` is ignored on QEMU, which is handed \
                  {} alone — it applies with hypervisor = \"vmlab\"",
@@ -1293,10 +1297,7 @@ mod tests {
         };
         let plan = on(&h, HypervisorKind::Vmlab).unwrap();
         assert_eq!(plan.passthrough.as_deref(), Some("0000:03:00.0"));
-        assert_eq!(
-            plan.passthrough_functions,
-            ["0000:03:00.1", "0000:03:00.2"]
-        );
+        assert_eq!(plan.passthrough_functions, ["0000:03:00.1", "0000:03:00.2"]);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         let qemu = on(&h, HypervisorKind::Qemu).unwrap();
         assert!(qemu.passthrough_functions.is_empty() && qemu.warnings.is_empty());
@@ -1359,7 +1360,10 @@ mod tests {
             "{e}"
         );
         let e = refused(&["0000:03:00.4"]);
-        assert!(e.contains("0000:03:00.4, which is bound to no driver"), "{e}");
+        assert!(
+            e.contains("0000:03:00.4, which is bound to no driver"),
+            "{e}"
+        );
         for other in ["0000:03:01.0", "0000:03:00.7", "03:00.1"] {
             let e = refused(&[other]);
             assert!(

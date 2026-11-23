@@ -855,7 +855,10 @@ mod tests {
 
     #[test]
     fn a_function_the_kernel_cannot_reset_is_assigned_without_one() {
-        assert!(reset_supported(0, VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI));
+        assert!(reset_supported(
+            0,
+            VFIO_DEVICE_FLAGS_RESET | VFIO_DEVICE_FLAGS_PCI
+        ));
         assert!(!reset_supported(0, VFIO_DEVICE_FLAGS_PCI));
         assert!(reset_supported(-1, 0));
     }
