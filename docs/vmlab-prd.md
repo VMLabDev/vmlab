@@ -352,7 +352,7 @@ Profiles bundle known-good hardware defaults. Starter set (final list and exact 
 | `windows-server` | q35 | OVMF | swtpm 2.0 | as above |
 | `windows-legacy` | i440fx or q35 | SeaBIOS | none | IDE/SATA disk, e1000 NIC, std VGA — for Vista/7/2008-era guests with no virtio storage/net drivers at install time; virtio-serial agent channel (virtio-win covers this era) |
 | `windows-xp` | i440fx | SeaBIOS | none | as `windows-legacy`, but `agent_transport = "isa-serial"`: NT4 through XP/2003 have no virtio drivers at all, so the legacy agent (§7.4) speaks over a 16550 on COM1; `rtc = "localtime"` (§7.3) |
-| `windows-9x` | i440fx | SeaBIOS | none | IDE disk, PCnet NIC, Cirrus VGA, VNC input, `isa-serial` agent channel, `rtc = "localtime"` (§7.3) — DOS, Windows 3.x through ME |
+| `windows-9x` | i440fx | SeaBIOS | none | IDE disk, PCnet NIC, Cirrus VGA, VNC input, `isa-serial` agent channel, `rtc = "localtime"` (§7.3), `pit_ticks = "discard"` — DOS, Windows 3.x through ME |
 | `templeos` | i440fx | SeaBIOS | none | IDE disk, std VGA (it drives VBE directly), no network by design; `agent_transport = "isa-serial"` for the HolyC agent |
 | `linux-modern` | q35 | OVMF | none | virtio everything |
 | `linux-generic` | q35 | SeaBIOS | none | virtio disk/net, conservative elsewhere — older or unusual distros |
@@ -362,6 +362,8 @@ Profiles bundle known-good hardware defaults. Starter set (final list and exact 
 Profiles are data, not code: shipped as WCL, user-overridable and user-extensible from a profiles directory in XDG config.
 
 Besides hardware, a profile says how its guest behaves when stopped: `acpi_shutdown` (default `true`) is whether it shuts down on an ACPI power-button press, which the graceful stop ladder plans from (§7.2). Besides that, a profile may carry guest-OS-shaped defaults a lab would otherwise repeat: `workspace_guest` (§19.1) and `playbook_dir`, the guest directory a `playbook {}` block pushes into when it names no `guest_dir` (§5.1) — so a profile for a read-only-root image fixes it for every lab. It must be an absolute guest path.
+
+A profile also says what the x86 timer (the PIT) does with ticks its guest was too late to take: `pit_ticks = "replay"` (the default, and KVM's) delivers each of them later, one straight after another, which keeps the clock of a guest that counts ticks; `"discard"` drops them. It is the profile's alone, a fact about the guest OS like `rtc`. `windows-9x` sets `discard`: Windows 9x Setup runs part of itself in standard mode, and its DOS extender halts with "Bad Fault in MS-DOS Extender" in the burst of timer interrupts a replay is. `windows-xp`, `windows-legacy` and `templeos` keep `replay`: NT keeps its time by counting ticks, and none of them is known to fail on a replay. A machine with Hyper-V AVIC discards them whatever the profile says. The key means nothing on a machine without a PIT (aarch64, riscv64, a container).
 
 #### macOS guests
 

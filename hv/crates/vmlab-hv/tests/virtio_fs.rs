@@ -302,6 +302,7 @@ fn machine(dir: &Dir, share: &Path, initrd: &Path, read_only: bool) -> MachineDe
         applesmc: None,
         usb_keyboard: false,
         smbios_type2: false,
+        pit_ticks: Default::default(),
         floppy: None,
         serial_log_port: Default::default(),
         hyperv: vec![],
