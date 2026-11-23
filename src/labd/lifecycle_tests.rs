@@ -860,8 +860,14 @@ async fn two_machines_do_not_share_a_writable_floppy() {
         launched.push((dirs, floppy));
     }
 
-    assert_ne!(launched[0].1, entry, "a machine launched with the cache entry");
-    assert_ne!(launched[1].1, entry, "a machine launched with the cache entry");
+    assert_ne!(
+        launched[0].1, entry,
+        "a machine launched with the cache entry"
+    );
+    assert_ne!(
+        launched[1].1, entry,
+        "a machine launched with the cache entry"
+    );
     assert_ne!(
         launched[0].1, launched[1].1,
         "two machines launched with one writable floppy image"
