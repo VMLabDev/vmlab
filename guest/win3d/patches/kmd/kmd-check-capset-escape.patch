@@ -1,9 +1,13 @@
 Subject: [PATCH] viogpu3d: check the capset escape and the host capset size
 
 VIOGPU_GET_CAPS copied the capset to an address taken from the escape data
-without a probe. A mapped kernel address was written, and an unmapped one
-was a bugcheck 0x50, from any process. Probe the range and fail the escape
-with STATUS_ACCESS_VIOLATION.
+with a memcpy inside __try, without a probe. A mapped kernel address was
+written, and an unmapped one was a bugcheck, from any process. This build
+is made with clang, whose __try covers the calls in it and not a fault of
+an instruction in it, so an unmapped user address was a bugcheck 0x3B too.
+Probe the range, lock the pages with MmProbeAndLockPages, both calls inside
+__try, and copy through a system mapping. The escape fails with
+STATUS_ACCESS_VIOLATION.
 
 The capset id of the escape was shifted and used as an index without a
 bound. An id of 64 + k passed the mask test when capset k was supported
@@ -136,7 +140,7 @@ index ef478b5..243e589 100644
      RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET));
  
 diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
-index 88ade7a..8d52f4f 100644
+index 88ade7a..70363e7 100644
 --- a/viogpu/viogpu3d/viogpu_adapter.cpp
 +++ b/viogpu/viogpu3d/viogpu_adapter.cpp
 @@ -36,6 +36,7 @@
@@ -147,14 +151,18 @@ index 88ade7a..8d52f4f 100644
  #include "viogpu_device.h"
  
  typedef struct _VIOGPU_SUBMIT_ESCAPE_CTX
-@@ -1400,18 +1401,28 @@ void VioGpuAdapter::FreeShmemRange(ULONGLONG offset, ULONGLONG size)
+@@ -1400,20 +1401,56 @@ void VioGpuAdapter::FreeShmemRange(ULONGLONG offset, ULONGLONG size)
  }
  
  // Keep SEH in a separate function so Escape can use scoped references.
 +// The destination is an address a user program chose. ProbeForWrite raises
-+// for a range that is not all in user space, and the handler turns that and
-+// a fault on an unmapped user page into an error. Without the probe a mapped
-+// kernel address was written, and an unmapped one was a bugcheck.
++// for a range that is not all in user space, and MmProbeAndLockPages raises
++// for a page that is not mapped or not writable. The copy then goes through
++// a system mapping of the locked pages and cannot fault.
++// The copy must not touch the user address itself: this driver is built with
++// clang, whose __try covers the calls in it and not a fault of an
++// instruction in it. A memcpy to an unmapped user address inside __try was
++// a bugcheck 0x3B, and one to a kernel address was a write or a bugcheck.
  static NTSTATUS VioGpuCopyCapsetToUser(void *destination, const void *source, ULONG size)
  {
      PAGED_CODE();
@@ -164,21 +172,47 @@ index 88ade7a..8d52f4f 100644
 +        return STATUS_SUCCESS;
 +    }
 +
++    PMDL mdl = IoAllocateMdl(destination, size, FALSE, FALSE, NULL);
++    if (!mdl)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++
++    NTSTATUS status = STATUS_SUCCESS;
      __try
      {
+-        memcpy(destination, source, size);
 +        ProbeForWrite(destination, size, 1);
-         memcpy(destination, source, size);
++        MmProbeAndLockPages(mdl, UserMode, IoWriteAccess);
      }
      __except (EXCEPTION_EXECUTE_HANDLER)
      {
 -        DbgPrint(TRACE_LEVEL_FATAL, ("Failed to copy"));
 -        return STATUS_INVALID_PARAMETER;
-+        DbgPrint(TRACE_LEVEL_ERROR, ("Failed to copy the capset to the user address\n"));
-+        return STATUS_ACCESS_VIOLATION;
++        DbgPrint(TRACE_LEVEL_ERROR, ("The capset address of the escape is not writable user memory\n"));
++        status = STATUS_ACCESS_VIOLATION;
      }
-     return STATUS_SUCCESS;
+-    return STATUS_SUCCESS;
++
++    if (NT_SUCCESS(status))
++    {
++        void *mapped = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
++        if (mapped)
++        {
++            memcpy(mapped, source, size);
++        }
++        else
++        {
++            status = STATUS_INSUFFICIENT_RESOURCES;
++        }
++        MmUnlockPages(mdl);
++    }
++    IoFreeMdl(mdl);
++    return status;
  }
-@@ -1569,7 +1580,8 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+ 
+ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1569,7 +1606,8 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                      return STATUS_INVALID_BUFFER_SIZE;
                  }
  
@@ -188,7 +222,7 @@ index 88ade7a..8d52f4f 100644
                  {
                      DbgPrint(TRACE_LEVEL_ERROR, ("%s capset id is not supported\n", __FUNCTION__));
                      return STATUS_INVALID_PARAMETER_1;
-@@ -1581,6 +1593,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1581,6 +1619,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                      return STATUS_INVALID_PARAMETER_2;
                  };
  
@@ -200,7 +234,7 @@ index 88ade7a..8d52f4f 100644
                  PGPU_VBUFFER vbuf = 0;
  
                  /* ARE 2025-08-30 Spice server v0.16.0 does not return Capset if the display is not visible */
-@@ -1595,7 +1612,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1595,7 +1638,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                  }
  
                  UCHAR *buf = ((PGPU_RESP_CAPSET)vbuf->resp_buf)->capset_data;
@@ -209,7 +243,7 @@ index 88ade7a..8d52f4f 100644
                  UCHAR *userCapset = (UCHAR *)(ULONG_PTR)pVioGpuEscape->Capset.Capset;
                  status = VioGpuCopyCapsetToUser(userCapset, buf, to_copy);
                  ctrlQueue.ReleaseBuffer(vbuf);
-@@ -4177,6 +4194,19 @@ void VioGpuAdapter::NegotiateCapsets(void)
+@@ -4177,6 +4220,19 @@ void VioGpuAdapter::NegotiateCapsets(void)
              ctrlQueue.ReleaseBuffer(vbuf);
              continue; // Invalid capset id, capsets ids are in range from 1 to 63 per specification
          }
