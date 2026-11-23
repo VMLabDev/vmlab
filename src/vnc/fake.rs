@@ -36,11 +36,29 @@ pub(crate) const CLOSE: Vec<u8> = Vec::new();
 /// Serve a `width`x`height` framebuffer, answering update requests with
 /// `replies` in order.
 pub(crate) fn spawn(width: u16, height: u16, replies: Vec<Vec<u8>>) -> FakeRfb {
+    spawn_raw(width, height, replies, false)
+}
+
+/// As [`spawn`], but the connection is closed as soon as the last reply is
+/// written: a server that sends a header and then nothing more.
+pub(crate) fn spawn_closing(width: u16, height: u16, replies: Vec<Vec<u8>>) -> FakeRfb {
+    spawn_raw(width, height, replies, true)
+}
+
+fn spawn_raw(width: u16, height: u16, replies: Vec<Vec<u8>>, close_at_end: bool) -> FakeRfb {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("vnc.sock");
     let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let connections = Arc::new(AtomicUsize::new(0));
-    let (accept, closed) = listen(&path, width, height, replies, &received, &connections);
+    let (accept, closed) = listen(
+        &path,
+        width,
+        height,
+        replies,
+        close_at_end,
+        &received,
+        &connections,
+    );
     FakeRfb {
         _dir: dir,
         path,
@@ -56,6 +74,7 @@ fn listen(
     width: u16,
     height: u16,
     replies: Vec<Vec<u8>>,
+    close_at_end: bool,
     received: &Arc<Mutex<Vec<Vec<u8>>>>,
     connections: &Arc<AtomicUsize>,
 ) -> (
@@ -74,7 +93,7 @@ fn listen(
             let mut closed = closed_rx.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    r = serve(stream, width, height, replies, rec) => r,
+                    r = serve(stream, width, height, replies, close_at_end, rec) => r,
                     _ = closed.changed() => Ok(()),
                 }
             });
@@ -100,6 +119,7 @@ impl FakeRfb {
             width,
             height,
             replies,
+            false,
             &self.received,
             &self.connections,
         );
@@ -113,6 +133,7 @@ async fn serve(
     width: u16,
     height: u16,
     replies: Vec<Vec<u8>>,
+    close_at_end: bool,
     rec: Arc<Mutex<Vec<Vec<u8>>>>,
 ) -> std::io::Result<()> {
     s.write_all(b"RFB 003.008\n").await?;
@@ -163,6 +184,9 @@ async fn serve(
                 return Ok(());
             }
             s.write_all(&reply).await?;
+            if close_at_end && replies.len() == 0 {
+                return Ok(());
+            }
         }
     }
 }
@@ -252,6 +276,21 @@ fn rect_header(x: u16, y: u16, w: u16, h: u16, encoding: i32) -> Vec<u8> {
     }
     r.extend_from_slice(&encoding.to_be_bytes());
     r
+}
+
+/// A Raw rectangle header claiming `w`x`h` pixels, followed by `payload`
+/// alone: what a server sends when it lies about the size.
+pub(crate) fn raw_rect_claiming(x: u16, y: u16, w: u16, h: u16, payload: &[u8]) -> Vec<u8> {
+    let mut r = rect_header(x, y, w, h, 0);
+    r.extend_from_slice(payload);
+    r
+}
+
+/// A `ServerCutText` header announcing `len` bytes, with no text after it.
+pub(crate) fn cut_text_header(len: u32) -> Vec<u8> {
+    let mut m = vec![3, 0, 0, 0];
+    m.extend_from_slice(&len.to_be_bytes());
+    m
 }
 
 /// A `Bell` message.
