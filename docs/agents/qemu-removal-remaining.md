@@ -5,8 +5,8 @@ Card #6 (VML-45) removes QEMU as a hypervisor for x86 and x86_64 guests
 the branch `vml-45`, and what the removal leaves without a hypervisor until
 vmlab-hv runs it. Proof #2 (vfio passthrough) is done. The operator decided on
 2026-11-23 to merge without waiting for #28 (macOS on vmlab-hv) and #82
-(legacy templates that need installer media): macOS guests and those templates
-do not run until their cards are done.
+(legacy templates that need installer media). Card #28 has since admitted
+macOS guests on vmlab-hv. Those templates do not run until their card is done.
 
 ## What a user must change
 
@@ -66,8 +66,6 @@ do not run until their cards are done.
 These ran on QEMU before the removal. On this branch each is an error,
 because QEMU runs no x86 guest and vmlab-hv refuses them:
 
-- macOS guests (`profile = "macos"`, `apple_smc = true`): the macOS phase,
-  proof #28. `tests/cli_apple_smc.rs` now expects the macOS refusal.
 - `accel = "tcg"` on an x86 guest, and every x86 guest on a host without
   usable KVM or on a host that is not x86_64: phase 3 has not started.
 - `input = "usb"`, a `cpu_model` on q35, a floppy off the pc machine, an

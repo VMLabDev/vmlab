@@ -370,7 +370,15 @@ The profile requires `host.apple_smc_osk` in host configuration before validatio
 or launch can succeed. Obtain the 64-character key from your own Apple hardware
 by reading `OSK0` and `OSK1` with the public `smc_read` approach. vmlab contains
 no copy of the key. The manual's host-config reference explains how to set it.
-vmlab-hv continues to refuse macOS machines until its macOS phase.
+vmlab-hv runs macOS machines (§22, its macOS phase), and a new macOS VM
+selects it like any other supported VM. It presents the profile's hardware as
+QEMU does: VMware SVGA without a VGA BIOS, a USB keyboard, `Skylake-Client-v4`
+with VMware's frequency leaf, unknown MSRs read as 0 (so the `ignore_msrs`
+warning below is QEMU's only), the SMBIOS baseboard and an Apple SMC serving
+the host's key. Its virtio-net is transitional and single-queue, so it takes
+the plain stream socket and no TAP. The key reaches vmlab-hv through a
+mode-600 pipe at the machine description's path, which is then replaced by
+the redacted description: it is never on an argv or in a file.
 
 **The family.** A profile whose name starts with `macos` makes the machine a macOS guest, the way `windows…` makes a Windows one; vmlab's own surfaces then behave as follows.
 
@@ -383,7 +391,7 @@ vmlab-hv continues to refuse macOS machines until its macOS phase.
 - **Dev machines** (§19.1) land their workspace at `/Users/Shared/src`: `/` is the sealed system volume, and `/Users/Shared` is on the Data volume, where any login can make a directory.
 - **`vmlab machine repair-agent`** (§19.4) stages `/Library/vmlab/vmlab-agent.new`, renames it over `/Library/vmlab/vmlab-agent` and restarts the job with `launchctl kickstart -k system/dev.vmlab.agent`, detached so it completes though the requester is what it kills.
 
-**The host.** XNU reads Intel MSRs KVM does not emulate, and KVM injects a #GP for each unless the `kvm` module's `ignore_msrs` is on — on an AMD host that is every boot. So `up` warns for a macOS VM (its profile's family, or `apple_smc` resolved on) running under KVM when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`, naming the fix: `options kvm ignore_msrs=1 report_ignored_msrs=0` in a file under `/etc/modprobe.d`, and `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` until the next boot. It is a warning, not a refusal; the guest then faults during boot.
+**The host.** XNU reads Intel MSRs KVM does not emulate, and KVM injects a #GP for each unless the `kvm` module's `ignore_msrs` is on — on an AMD host that is every boot. So `up` warns for a macOS VM (its profile's family, or `apple_smc` resolved on) running on QEMU under KVM when `/sys/module/kvm/parameters/ignore_msrs` is not `Y`, naming the fix: `options kvm ignore_msrs=1 report_ignored_msrs=0` in a file under `/etc/modprobe.d`, and `echo 1 | sudo tee /sys/module/kvm/parameters/ignore_msrs` until the next boot. It is a warning, not a refusal; the guest then faults during boot. vmlab-hv needs no module parameter: its machine description reads unknown MSRs as 0 for a macOS guest.
 
 ---
 
@@ -2680,6 +2688,7 @@ default for a phase's machines flips only once that phase has passed its gate:
 | 2f | Host USB (`usb = true`) and vfio (`gpu { mode = "passthrough" }`) | Selectable |
 | 3 | Emulated (TCG) riscv64 and aarch64 | Refused |
 | 4 | Legacy PCs: i440fx, IDE, ISA serial, e1000, PCnet, floppy, UHCI and Cirrus | Selectable (4a to 4d); 4e in progress |
+| macOS | Intel macOS on q35 and OVMF: VMware SVGA, a USB keyboard, the Apple SMC, the SMBIOS baseboard and the profile's Skylake model | Selectable |
 
 macOS guests are a phase of their own after 2.
 
@@ -2701,13 +2710,14 @@ disks (both on AHCI), virtio-net NICs, the PS/2 keyboard with the USB tablet,
 a TPM or the Hyper-V enlightenments where it asks (2c), a `gpu {}` of any mode
 (2d, 2f), virtio-fs shares and a sound card (2e), `usb = true` (2f), and
 a pinned `tsc` (§5.2) — the
-Linux profiles and Windows 10, 11 and Server. Everything else is refused: a
-macOS guest (its own phase); on the pc machine, a virtio-net NIC and a pinned `tsc` (the pc machine
+Linux profiles and Windows 10, 11 and Server — and a macOS guest with the
+`macos` profile's VMware SVGA, USB keyboard and CPU model (another `cpu_model`
+for it is refused). Everything else is refused: on the pc machine, a virtio-net NIC and a pinned `tsc` (the pc machine
 core with IDE, a named CPU and `agent_transport = "isa-serial"` (4a), e1000 and
 PCnet (4b), the floppy and the UHCI tablet (4c) and Cirrus (4d) are delivered); a
 floppy on a machine other than pc;
-`accel = "tcg"` (3); another display device, NIC model or `cpu_model`; `input =
-"usb"`; and `qemu_args`, QEMU's own argv, in every phase. QEMU runs no x86
+`accel = "tcg"` (3); another display device, NIC model or `cpu_model`, and `input =
+"usb"`, outside a macOS guest; and `qemu_args`, QEMU's own argv, in every phase. QEMU runs no x86
 guest (§22.4), so for an x86 machine a refusal is an error that only a change
 to the machine resolves. A
 container is refused on a host whose `/dev/kvm` is not usable — containers

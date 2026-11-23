@@ -4943,7 +4943,9 @@ lab "l" {
 
     /// config-weave ships no macOS binary, so a macOS playbook names the one
     /// the guest holds — and a macOS login, like a Linux one, takes no
-    /// `elevated` and needs no password.
+    /// `elevated` and needs no password. The fixture's profiles are blank, so
+    /// the VM declares the `macos` profile's `cpu_model`, which vmlab-hv
+    /// requires of a macOS guest.
     #[test]
     fn a_macos_guest_runs_a_resident_config_weave_and_unix_logins() {
         let (es, _root) = errs_with_playbook_dir(
@@ -4952,16 +4954,11 @@ lab "l" {
   vm "mac" {
     template = "x86_64/t"
     profile = "macos"
+    cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"
     playbook "playbooks/base" { play = "base" }
   }
 }"#,
         );
-        // vmlab-hv does not run macOS yet, and QEMU runs no x86 guest: that
-        // refusal stands beside what this test is about.
-        let es: Vec<_> = es
-            .into_iter()
-            .filter(|e| !e.contains("a macOS guest"))
-            .collect();
         assert!(
             es.len() == 1 && es[0].contains("config-weave ships no macOS binary"),
             "{es:#?}"
@@ -4972,12 +4969,13 @@ lab "l" {
   vm "mac" {
     template = "x86_64/t"
     profile = "macos"
+    cpu_model = "Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on"
     playbook "playbooks/base" { play = "base" guest_bin = "/usr/local/bin/config-weave" }
     login "dev" { user = "dev" }
   }
 }"#,
         );
-        assert!(es.iter().all(|e| e.contains("a macOS guest")), "{es:#?}");
+        assert!(es.is_empty(), "{es:#?}");
         assert_err(
             r#"import <vmlab.wcl>
 lab "l" { vm "a" { template = "x86_64/t" profile = "macos"

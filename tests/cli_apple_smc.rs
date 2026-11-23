@@ -49,11 +49,8 @@ fn missing_osk_refuses_validate_and_up_before_daemons_or_disks() {
     }
 }
 
-/// With the key, the OSK is no longer what validation says: a macOS guest is
-/// refused because vmlab-hv does not run it yet, and QEMU runs no x86 guest
-/// (PRD §22).
 #[test]
-fn a_fake_host_key_leaves_only_the_macos_refusal() {
+fn a_fake_host_key_allows_macos_validation() {
     let scratch = tempfile::tempdir().unwrap();
     lab(scratch.path());
     let config = scratch.path().join("config/vmlab");
@@ -62,8 +59,10 @@ fn a_fake_host_key_leaves_only_the_macos_refusal() {
         "import <vmlab-host.wcl>\nhost { apple_smc_osk = \"TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTEST\" }\n"
     ).unwrap();
     let output = run(scratch.path(), "validate");
-    assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("a macOS guest"), "{error}");
-    assert!(!error.contains("apple_smc_osk"), "{error}");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ok: lab"));
 }

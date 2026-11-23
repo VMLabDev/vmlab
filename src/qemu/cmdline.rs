@@ -27,6 +27,9 @@ pub struct HypervisorShare {
 /// Per-VM runtime paths and attachments supplied by the lab daemon.
 #[derive(Debug, Clone, Default)]
 pub struct VmPaths {
+    /// The host's Apple SMC key for a machine with `apple_smc` (§5.2), which
+    /// vmlab-hv's description carries; its `Debug` is redacted.
+    pub apple_smc_osk: Option<crate::config::host::AppleSmcOsk>,
     pub qmp_sock: PathBuf,
     /// vmlab-agent channel (`vmlab.agent.0`): interactive terminals,
     /// streaming exec, file transfer, metrics — see `guest/agent-proto`.
