@@ -113,6 +113,9 @@ SRC
     before /<pattern>/ matched; tail: <text>" when the shell exits or the
     agent channel closes first. The tail is the last few hundred bytes of
     unmatched output, for debugging.
+    The buffer holds 16 MiB at most. A guest that writes more than that with
+    no match and no `read` ends the session, and the `<why>` of that error
+    names the limit.
   DOC
   code wscript { source = <<'SRC'
 fn main(lab: Lab) {
