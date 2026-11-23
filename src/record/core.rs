@@ -54,6 +54,100 @@ impl std::fmt::Debug for Frame {
     }
 }
 
+/// The most memory the frames waiting for the encoder may take. The clock
+/// task holds one batch while it writes it and the core queues the next, so a
+/// recording holds at most twice this in frames.
+pub const QUEUE_BYTES: usize = 256 * 1024 * 1024;
+
+/// The most distinct frames that wait for the encoder, whatever their size.
+pub const QUEUE_FRAMES: usize = 120;
+
+/// A run of equal frames: one picture and how many times it is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub frame: Frame,
+    pub count: u64,
+}
+
+/// The frames due, in order, as runs of equal frames. Its memory is one
+/// picture for each run, however many frames it stands for: a late clock or
+/// an idle stretch written out whole is one run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Frames {
+    runs: Vec<Run>,
+}
+
+impl Frames {
+    /// The runs, in order: what the encoder writes.
+    pub fn runs(&self) -> &[Run] {
+        &self.runs
+    }
+
+    /// How many pictures this holds in memory.
+    pub fn held(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// How many frames this stands for.
+    pub fn len(&self) -> usize {
+        let frames = self.runs.iter().map(|r| r.count).sum::<u64>();
+        usize::try_from(frames).unwrap_or(usize::MAX)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Every frame in order, a run's picture once for each of its frames.
+    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
+        self.runs.iter().flat_map(|r| {
+            std::iter::repeat_n(&r.frame, usize::try_from(r.count).unwrap_or(usize::MAX))
+        })
+    }
+
+    pub fn last(&self) -> Option<&Frame> {
+        self.runs.last().map(|r| &r.frame)
+    }
+
+    /// Take the last frame off.
+    pub fn pop(&mut self) -> Option<Frame> {
+        let last = self.runs.last_mut()?;
+        if last.count > 1 {
+            last.count -= 1;
+            return Some(last.frame.clone());
+        }
+        self.runs.pop().map(|r| r.frame)
+    }
+
+    /// Add `count` frames showing `frame`. They join the last run when the
+    /// picture is the same. Returns `false`, and adds nothing, when that
+    /// would hold more than `limit` pictures.
+    fn push(&mut self, frame: Frame, count: u64, limit: usize) -> bool {
+        let full = self.runs.len() >= limit;
+        match self.runs.last_mut() {
+            Some(last) if last.frame == frame => last.count += count,
+            _ if full => return false,
+            _ => self.runs.push(Run { frame, count }),
+        }
+        true
+    }
+
+    /// Show the last picture for `count` more frames.
+    fn hold(&mut self, count: u64) {
+        if let Some(last) = self.runs.last_mut() {
+            last.count += count;
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Frames {
+    type Output = Frame;
+
+    fn index(&self, index: usize) -> &Frame {
+        self.iter().nth(index).expect("frame index out of range")
+    }
+}
+
 /// An idle stretch that was shortened: wall-clock bounds and what it became.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cut {
@@ -147,7 +241,13 @@ pub struct Core {
     idle: Option<(Duration, Duration)>,
     cuts: Vec<Cut>,
     timeline: Vec<TimelineEntry>,
-    out: Vec<Frame>,
+    /// The frames due and not yet taken, never more than `queue_limit`
+    /// pictures.
+    out: Frames,
+    /// The most pictures `out` holds.
+    queue_limit: usize,
+    /// Frames that show the picture before them because `out` was full.
+    dropped: u64,
     /// Native recording waits for guest pixels, excluding host placeholders.
     waiting_for_frame: bool,
 }
@@ -155,6 +255,8 @@ pub struct Core {
 impl Core {
     pub fn new(settings: Settings) -> Self {
         let dt = Duration::from_nanos(1_000_000_000 / u64::from(settings.fps));
+        let frame_bytes = settings.size.width as usize * settings.size.height as usize * 3;
+        let queue_limit = (QUEUE_BYTES / frame_bytes.max(1)).clamp(2, QUEUE_FRAMES);
         Self {
             settings,
             dt,
@@ -173,7 +275,9 @@ impl Core {
             idle: None,
             cuts: Vec::new(),
             timeline: Vec::new(),
-            out: Vec::new(),
+            out: Frames::default(),
+            queue_limit,
+            dropped: 0,
             waiting_for_frame: false,
         }
     }
@@ -191,6 +295,19 @@ impl Core {
     /// Output video length so far, cuts applied.
     pub fn video_duration(&self) -> Duration {
         self.video
+    }
+
+    /// The most pictures that wait for the encoder: [`QUEUE_BYTES`] of
+    /// frames at the output size, at least 2 and at most [`QUEUE_FRAMES`].
+    pub fn queue_limit(&self) -> usize {
+        self.queue_limit
+    }
+
+    /// How many frames show the picture before them instead of their own,
+    /// because the encoder took frames slower than the clock made them and
+    /// the queue was full. The video keeps its length.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped
     }
 
     pub fn cuts(&self) -> &[Cut] {
@@ -371,7 +488,7 @@ impl Core {
     // --- the clock ------------------------------------------------------
 
     /// Process every interval that ended by `now` and return the frames due.
-    pub fn tick(&mut self, now: Duration) -> Vec<Frame> {
+    pub fn tick(&mut self, now: Duration) -> Frames {
         self.advance(now);
         std::mem::take(&mut self.out)
     }
@@ -380,12 +497,11 @@ impl Core {
     /// and return the frames due. The last call. A recording stopped before
     /// its first interval ended still gets one frame, so the file it leaves
     /// is a playable video rather than a container with no stream in it.
-    pub fn finish(&mut self, now: Duration) -> Vec<Frame> {
+    pub fn finish(&mut self, now: Duration) -> Frames {
         self.advance(now);
         self.close_idle();
         if self.video.is_zero() {
-            let frame = self.compose(now);
-            self.out.push(frame);
+            self.emit(now, 1);
             self.video += self.dt;
         }
         std::mem::take(&mut self.out)
@@ -397,6 +513,17 @@ impl Core {
 
     fn due(&self, interval: u64) -> Duration {
         Duration::from_nanos(interval * 1_000_000_000 / u64::from(self.settings.fps))
+    }
+
+    /// Queue `count` frames of the picture at wall time `t`. When the queue
+    /// is full they show the newest queued picture instead: the video keeps
+    /// its length and loses the change, and memory stays bounded.
+    fn emit(&mut self, t: Duration, count: u64) {
+        let frame = self.compose(t);
+        if !self.out.push(frame, count, self.queue_limit) {
+            self.out.hold(count);
+            self.dropped += count;
+        }
     }
 
     /// Process intervals whose end is at or before `now`.
@@ -424,8 +551,7 @@ impl Core {
         let active = self.dirty_area > IDLE_AREA || self.input_in_interval || ripple_live;
         if self.settings.compress_idle.is_none() || active {
             self.close_idle();
-            let frame = self.compose(end);
-            self.out.push(frame);
+            self.emit(end, 1);
             self.video += self.dt;
         } else {
             match &mut self.idle {
@@ -458,8 +584,7 @@ impl Core {
         if frames > 0 {
             // Idle frames show the picture as it stands; no ripple can be
             // live, since a ripple keeps an interval active.
-            let frame = self.compose(start + len);
-            self.out.extend(std::iter::repeat_n(frame, frames));
+            self.emit(start + len, frames as u64);
             self.video += self.dt * frames as u32;
         }
         if kept < len {
@@ -603,7 +728,14 @@ fn blend_premultiplied(rgb: &mut [u8], size: Size, x: i64, y: i64, colour: [u8; 
 
 /// Draw the cursor with its hotspot at source `(px, py)`, scaled like the
 /// picture (nearest neighbour; cursors are small).
+///
+/// A shape with an empty side, or with fewer pixels than its size says, comes
+/// from the guest and has nothing to draw: it is skipped, not indexed.
 fn draw_cursor(rgb: &mut [u8], size: Size, p: &Placement, cursor: &CursorShape, px: i64, py: i64) {
+    let pixels = usize::from(cursor.width) * usize::from(cursor.height);
+    if pixels == 0 || cursor.rgba.len() < pixels * 4 {
+        return;
+    }
     let (ox, oy) = p.map(
         px as f64 - f64::from(cursor.hotspot.0),
         py as f64 - f64::from(cursor.hotspot.1),

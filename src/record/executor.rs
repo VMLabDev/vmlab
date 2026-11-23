@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::{mpsc, watch};
 
-use super::core::{Core, CursorShape};
+use super::core::{Core, CursorShape, Frames};
 use super::encoder::{Encoder, EncoderPlan};
 use super::input::TimedInput;
 use super::{Settings, timeline_path};
@@ -207,8 +207,10 @@ async fn run(
                 .unwrap_or_else(|e| e.into_inner())
                 .tick(started.elapsed());
             let write = tokio::time::timeout(ENCODER_TIMEOUT, async {
-                for f in &frames {
-                    encoder.write_frame(&f.rgb).await?;
+                for run in frames.runs() {
+                    for _ in 0..run.count {
+                        encoder.write_frame(&run.frame.rgb).await?;
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             })
@@ -249,8 +251,15 @@ async fn run(
         let frames = if write_err.is_none() {
             c.finish(started.elapsed())
         } else {
-            Vec::new()
+            Frames::default()
         };
+        if c.dropped_frames() > 0 {
+            tracing::warn!(
+                "recorder: {}: the encoder fell behind; {} frames repeat the picture before them",
+                output.display(),
+                c.dropped_frames()
+            );
+        }
         (
             frames,
             c.video_duration(),
@@ -261,10 +270,12 @@ async fn run(
     };
     let path = tokio::time::timeout(ENCODER_TIMEOUT, async {
         if write_err.is_none() {
-            for f in &frames {
-                if let Err(e) = encoder.write_frame(&f.rgb).await {
-                    write_err = Some(e);
-                    break;
+            'flush: for run in frames.runs() {
+                for _ in 0..run.count {
+                    if let Err(e) = encoder.write_frame(&run.frame.rgb).await {
+                        write_err = Some(e);
+                        break 'flush;
+                    }
                 }
             }
         }
@@ -648,6 +659,54 @@ mod tests {
         assert!(!rec.is_finished());
         let done = rec.stop().await.unwrap();
         assert!(done.duration >= Duration::from_millis(1000), "{done:?}");
+        assert!(output.metadata().unwrap().len() > 0);
+    }
+
+    /// A guest that defines a cursor of size zero does not end the recording
+    /// of its own screen (review record-vision F1).
+    #[tokio::test]
+    async fn a_native_cursor_of_size_zero_keeps_the_recording() {
+        let avail = probe(None).await;
+        let Ok(ffmpeg) = check(&avail, Format::Mp4) else {
+            eprintln!("skipping: no ffmpeg with libx264 on this host");
+            return;
+        };
+        let display = crate::hvdisplay::fake::spawn(32, 16);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("zero-cursor.mp4");
+        let settings = Settings::resolve(
+            &output,
+            &RecordOptions {
+                fps: Some(20),
+                size: Some(Size::new(64, 32)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let rec = Recorder::start(RecorderSpec {
+            source: StreamSource::Native(display.path.clone()),
+            output: output.clone(),
+            settings,
+            ffmpeg,
+            inputs: rx,
+        })
+        .await
+        .unwrap();
+        display.cursor(vmlab_hv_display::Cursor {
+            width: 0,
+            height: 0,
+            hot_x: 0,
+            hot_y: 0,
+            argb: vec![],
+            x: 3,
+            y: 3,
+            visible: true,
+        });
+        // Time for the shape to arrive and for frames to be composed with it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!rec.is_finished(), "the recorder task ended");
+        rec.stop().await.unwrap();
         assert!(output.metadata().unwrap().len() > 0);
     }
 
