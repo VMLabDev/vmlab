@@ -177,10 +177,12 @@ pub struct FreezeInput {
 }
 
 /// What a freeze copies beside a machine's frozen disks, when present: the
-/// UEFI variables, the TPM, the template reference, the first-boot mark and
-/// a `tsc = "host"` VM's pinned TSC frequency (§5.2).
-pub const CARRIED: [&str; 5] = [
+/// UEFI variables and how they were last booted, the TPM, the template
+/// reference, the first-boot mark and a `tsc = "host"` VM's pinned TSC
+/// frequency (§5.2).
+pub const CARRIED: [&str; 6] = [
     "OVMF_VARS.fd",
+    "OVMF_VARS.boot",
     "tpm-state",
     "clone-source",
     "firstboot.done",

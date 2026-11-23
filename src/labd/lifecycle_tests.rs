@@ -2429,6 +2429,96 @@ async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
     }
 }
 
+/// A `firmware_dir` laid out like the bundled x86_64 set, each file holding
+/// its own name: the plain and secure-boot CODE builds, the blank VARS
+/// template and the one with keys enrolled. The four are the same length, as
+/// the real templates are, so a size check tells them apart no better here
+/// than it does in production.
+fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
+    let arch = dirs.root.join("firmware/x86_64");
+    std::fs::create_dir_all(&arch).expect("firmware dir");
+    for (name, bytes) in [
+        ("OVMF_CODE_4M.fd", b"code:plain"),
+        ("OVMF_CODE_4M.secboot.fd", b"code:secbt"),
+        ("OVMF_VARS_4M.fd", b"vars:blank"),
+        ("OVMF_VARS_4M.ms.fd", b"vars:keyed"),
+    ] {
+        std::fs::write(arch.join(name), bytes).expect("firmware file");
+    }
+    crate::config::host::HostConfig {
+        firmware_dir: Some(dirs.root.join("firmware")),
+        ..Default::default()
+    }
+}
+
+/// A VM started without secure boot has a variable store nothing vouches
+/// for: it was copied from the blank template, and the guest could write it
+/// while the flash was unprotected. `secure_boot = true` on that VM must not
+/// boot the secure-boot firmware on that store, where it would sit in setup
+/// mode and verify nothing, or enforce keys the guest chose (firmware review
+/// F2). The start is refused by name and the store is left as it was.
+#[tokio::test]
+async fn turning_secure_boot_on_does_not_boot_an_unenrolled_store() {
+    const PLAIN: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#;
+    const SECURE: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = true }"#;
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+
+    let (mut first, _) = vm(&dirs, PLAIN, Script::healthy());
+    first.set_host_config(firmware.clone());
+    let store = first.dirs.ovmf_vars();
+    let machine: Arc<dyn Machine> = first;
+    machine.clone().start(lab.clone(), None).await.unwrap();
+    machine.stop(true).await.unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+    drop(machine);
+
+    // The operator's edit: the same VM, the same directory, secure boot on.
+    let (mut second, hv) = vm(&dirs, SECURE, Script::healthy());
+    second.set_host_config(firmware);
+    let machine: Arc<dyn Machine> = second;
+    let outcome = machine.clone().start(lab.clone(), None).await;
+    let enrolled = std::fs::read(&store).unwrap() == b"vars:keyed";
+    match outcome {
+        Ok(()) => {
+            machine.stop(true).await.unwrap();
+            assert!(
+                enrolled,
+                "secure boot started on the store the VM had without it"
+            );
+        }
+        Err(error) => {
+            let said = format!("{error:#}");
+            assert!(
+                said.contains("dc01")
+                    && said.contains("secure_boot")
+                    && said.contains("OVMF_VARS.fd"),
+                "the refusal names the machine, the setting and the store: {said}"
+            );
+            assert_eq!(hv.starts(), 0, "a refused start launches nothing");
+            assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+            assert_eq!(machine.state().await, PowerState::Stopped);
+        }
+    }
+
+    // A VM that never ran without secure boot is not in the way of this:
+    // its first start copies the enrolled template and every later one
+    // keeps that store.
+    let fresh = Dirs::new();
+    let firmware = fake_firmware(&fresh);
+    for _ in 0..2 {
+        let (mut vm, _) = vm(&fresh, SECURE, Script::healthy());
+        vm.set_host_config(firmware.clone());
+        let store = vm.dirs.ovmf_vars();
+        let machine: Arc<dyn Machine> = vm;
+        machine.clone().start(lab.clone(), None).await.unwrap();
+        machine.stop(true).await.unwrap();
+        assert_eq!(std::fs::read(&store).unwrap(), b"vars:keyed");
+    }
+}
+
 /// An offline snapshot is the whole powered-off machine: the disks, the UEFI
 /// variable store and the TPM's permanent state. A restore that rewound the
 /// disks alone would leave boot entries, enrolled keys and whatever the guest
