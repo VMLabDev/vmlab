@@ -29,6 +29,8 @@ use crate::vnc::{StreamEvent, VncClient};
 
 /// How often a dropped connection is retried.
 const RECONNECT_EVERY: Duration = Duration::from_millis(250);
+/// Bound the wait for ffmpeg to accept a batch or finalize the file.
+const ENCODER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where a recording's frames come from: a socket path, so a reconnect finds
 /// the hypervisor a restart put in place of the old one.
@@ -192,18 +194,29 @@ async fn run(
     let mut ticks = tokio::time::interval(dt);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ended_by = None;
+    let mut write_err = None;
     let outcome: Result<()> = async {
         loop {
             tokio::select! {
-                _ = ticks.tick() => {}
+                biased;
                 _ = stopped.changed() => break,
+                _ = ticks.tick() => {}
             }
             let frames = core
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .tick(started.elapsed());
-            for f in &frames {
-                encoder.write_frame(&f.rgb).await?;
+            let write = tokio::time::timeout(ENCODER_TIMEOUT, async {
+                for f in &frames {
+                    encoder.write_frame(&f.rgb).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .with_context(|| format!("ffmpeg timed out writing frames to {}", output.display()))?;
+            if let Err(e) = write {
+                write_err = Some(e);
+                break;
             }
             if let Some(max) = settings.max_duration {
                 let video = core
@@ -224,13 +237,16 @@ async fn run(
     .await;
     reader.abort();
     feed.abort();
+    // A timed-out write may have sent a partial frame. Drop the encoder to
+    // kill ffmpeg rather than try to continue writing to it.
+    outcome?;
 
     // Flush what the clock owes (an open idle run, the last interval), then
     // the trailer. A write error means ffmpeg is gone; finish still reports
     // what it left behind.
     let (frames, duration, timeline) = {
         let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
-        let frames = if outcome.is_ok() {
+        let frames = if write_err.is_none() {
             c.finish(started.elapsed())
         } else {
             Vec::new()
@@ -243,16 +259,19 @@ async fn run(
                 .then(|| (c.timeline().to_vec(), c.cuts().to_vec())),
         )
     };
-    let mut write_err = outcome.err();
-    if write_err.is_none() {
-        for f in &frames {
-            if let Err(e) = encoder.write_frame(&f.rgb).await {
-                write_err = Some(e);
-                break;
+    let path = tokio::time::timeout(ENCODER_TIMEOUT, async {
+        if write_err.is_none() {
+            for f in &frames {
+                if let Err(e) = encoder.write_frame(&f.rgb).await {
+                    write_err = Some(e);
+                    break;
+                }
             }
         }
-    }
-    let path = encoder.finish().await?;
+        encoder.finish().await
+    })
+    .await
+    .with_context(|| format!("ffmpeg timed out finalising {}", output.display()))??;
     if let Some(e) = write_err {
         ended_by = Some(format!("{e:#}"));
     }
@@ -377,19 +396,20 @@ mod tests {
     use crate::record::{Format, RecordOptions, Size};
     use crate::vnc::fake::{self, pattern, raw_rect, update};
 
-    #[tokio::test(start_paused = true)]
-    async fn stop_returns_when_the_encoder_stops_reading() {
+    async fn start_with_encoder_script(
+        dir: &std::path::Path,
+        server: &fake::FakeRfb,
+        script: &str,
+    ) -> Recorder {
         use std::os::unix::fs::PermissionsExt;
 
-        let server = fake::spawn(16, 16, vec![]);
-        let dir = tempfile::tempdir().unwrap();
-        let ffmpeg = dir.path().join("ffmpeg");
-        std::fs::write(&ffmpeg, "#!/bin/sh\nset -eu\nexec sleep infinity\n").unwrap();
+        let ffmpeg = dir.join("ffmpeg");
+        std::fs::write(&ffmpeg, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
         std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let output = dir.path().join("stalled.mp4");
+        let output = dir.join("recording.mp4");
         let settings = Settings::resolve(&output, &RecordOptions::default()).unwrap();
         let (_tx, inputs) = mpsc::unbounded_channel();
-        let rec = Recorder::start(RecorderSpec {
+        Recorder::start(RecorderSpec {
             source: StreamSource::Vnc(server.path.clone()),
             output,
             settings,
@@ -397,12 +417,36 @@ mod tests {
             inputs,
         })
         .await
-        .unwrap();
+        .unwrap()
+    }
 
+    #[tokio::test(start_paused = true)]
+    async fn stop_returns_when_the_encoder_stops_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::spawn(16, 16, vec![]);
+        let rec = start_with_encoder_script(dir.path(), &server, "exec sleep infinity").await;
         // Even before the first tick, finalization owes at least one frame.
         // The default frame is larger than the pipe and the child never reads.
-        let result = tokio::time::timeout(Duration::from_secs(60), rec.stop()).await;
-        assert!(result.is_ok(), "record stop hung on the encoder");
+        let error = tokio::time::timeout(Duration::from_secs(60), rec.stop())
+            .await
+            .expect("record stop hung on the encoder")
+            .unwrap_err();
+        assert!(error.to_string().contains("ffmpeg timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn finish_reads_stderr_before_it_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake::spawn(16, 16, vec![]);
+        let rec = start_with_encoder_script(
+            dir.path(),
+            &server,
+            "cat >/dev/null\nprintf 'encoder diagnostic\\n' >&2\nhead -c 1048576 /dev/zero >&2\nexit 1",
+        )
+        .await;
+        let error = rec.stop().await.unwrap_err().to_string();
+        assert!(error.contains("ffmpeg exited"), "{error}");
+        assert!(error.contains("encoder diagnostic"), "{error}");
     }
 
     /// Against the fake server: the recorder starts only once connected,

@@ -180,6 +180,9 @@ Not read:
 
 ### F3. A stalled ffmpeg blocks `record stop`, `down` and `destroy`
 
+- Fixed in #719. Frame batches and finalization have deadlines. If ffmpeg
+  stalls past either deadline, the recorder kills it and reports the timeout.
+  A concurrent stderr reader drains the pipe and keeps a bounded diagnostic.
 - Where: `src/record/executor.rs:205-207` and `248-250` (`write_frame` is
   awaited outside the `select!` that watches the stop signal),
   `src/record/encoder.rs:199-204` (stderr is a pipe), `229-240` (`finish`
@@ -201,8 +204,8 @@ Not read:
   spec is a script that never reads stdin (`exec sleep infinity`). Start a
   recording against `vnc::fake`, then await `Recorder::stop` inside
   `tokio::time::timeout`. Assert that `stop` returns (an error is fine).
-  Today the timeout fires. A second test, `finish_reads_stderr_before_it_waits`:
-  the script writes 1 MiB to stderr, then reads stdin to the end and exits 1.
+  Before the fix the timeout fires. A second test, `finish_reads_stderr_before_it_waits`:
+  the script reads stdin to the end, writes 1 MiB to stderr and exits 1.
   Assert that `stop` returns the error with ffmpeg's text.
 - Confidence: high for the order of the awaits. Low for how often ffmpeg
   fills its stderr at `-loglevel error`.

@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::task::JoinSet;
 
 use super::{Format, Settings};
 
@@ -184,6 +185,7 @@ impl EncoderPlan {
 pub struct Encoder {
     child: Child,
     stdin: Option<ChildStdin>,
+    stderr: JoinSet<Vec<u8>>,
     output: PathBuf,
 }
 
@@ -205,9 +207,27 @@ impl Encoder {
             .spawn()
             .with_context(|| format!("starting {}", plan.program.display()))?;
         let stdin = child.stdin.take();
+        // Drain during both frame writes and trailer generation. JoinSet
+        // aborts the reader if a timeout drops the encoder.
+        let mut stderr = JoinSet::new();
+        let mut pipe = child.stderr.take().expect("ffmpeg stderr is piped");
+        stderr.spawn(async move {
+            const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+            let mut diagnostic = Vec::new();
+            let mut chunk = [0; 4096];
+            while let Ok(n) = pipe.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let keep = n.min(DIAGNOSTIC_LIMIT - diagnostic.len());
+                diagnostic.extend_from_slice(&chunk[..keep]);
+            }
+            diagnostic
+        });
         Ok(Self {
             child,
             stdin,
+            stderr,
             output: output.to_path_buf(),
         })
     }
@@ -227,22 +247,19 @@ impl Encoder {
 
     /// Close stdin so ffmpeg writes its trailer, and wait for it.
     pub async fn finish(mut self) -> Result<PathBuf> {
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = stdin.shutdown().await;
-            drop(stdin);
-        }
-        let stderr = self.child.stderr.take();
+        drop(self.stdin.take());
         let status = self.child.wait().await.context("waiting for ffmpeg")?;
-        let mut err = String::new();
-        if let Some(mut s) = stderr {
-            use tokio::io::AsyncReadExt;
-            let _ = s.read_to_string(&mut err).await;
-        }
         if !status.success() {
+            let stderr = self
+                .stderr
+                .join_next()
+                .await
+                .and_then(Result::ok)
+                .unwrap_or_default();
             bail!(
                 "ffmpeg exited with {status} while writing {}: {}",
                 self.output.display(),
-                err.trim()
+                String::from_utf8_lossy(&stderr).trim()
             );
         }
         Ok(self.output)
