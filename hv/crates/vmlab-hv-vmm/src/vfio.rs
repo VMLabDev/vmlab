@@ -138,7 +138,48 @@ struct Mapping {
     size: u64,
     host: usize,
     slot: u32,
-    base: Option<u64>,
+    // Each ioctl changes one address space, including on partial failure.
+    bases: [Option<u64>; 2],
+}
+
+impl Mapping {
+    fn register(
+        &mut self,
+        base: Option<u64>,
+        mut set_region: impl FnMut(kvm_userspace_memory_region) -> Result<(), kvm_ioctls::Error>,
+    ) -> Result<(), String> {
+        let mut result = Ok(());
+        for (address_space, current) in self.bases.iter_mut().enumerate() {
+            if *current == base {
+                continue;
+            }
+            let slot = ((address_space as u32) << 16) | self.slot;
+            if current.is_some() {
+                let region = kvm_userspace_memory_region {
+                    slot,
+                    ..Default::default()
+                };
+                if let Err(error) = set_region(region) {
+                    result = Err(format!("removing VFIO BAR KVM slot {slot:#x}: {error}"));
+                    continue;
+                }
+                *current = None;
+            }
+            if let Some(base) = base {
+                let region = kvm_userspace_memory_region {
+                    slot,
+                    guest_phys_addr: base + self.offset,
+                    memory_size: self.size,
+                    userspace_addr: self.host as u64,
+                    flags: 0,
+                };
+                set_region(region)
+                    .map_err(|error| format!("registering VFIO BAR KVM slot {slot:#x}: {error}"))?;
+                *current = Some(base);
+            }
+        }
+        result
+    }
 }
 
 struct Domain {
@@ -207,8 +248,7 @@ impl Domain {
         if !*mapped {
             use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
             ensure_memlock(self.memory.iter().map(|region| region.len()).sum())?;
-            // SAFETY: Domain retains RAM until every device has closed and DMA
-            // mappings have been removed in Drop.
+            // SAFETY: Domain retains RAM through DMA unmap in Drop.
             unsafe { self.container.vfio_map_guest_memory(&self.memory) }
                 .map_err(|e| format!("VFIO guest DMA map: {e}"))?;
             *mapped = true;
@@ -219,8 +259,10 @@ impl Domain {
 
 impl Drop for Domain {
     fn drop(&mut self) {
-        if *self.mapped.lock() {
-            let _ = self.container.vfio_unmap_guest_memory(&self.memory);
+        if *self.mapped.get_mut()
+            && let Err(error) = self.container.vfio_unmap_guest_memory(&self.memory)
+        {
+            log::error!("unmapping VFIO guest DMA: {error}");
         }
     }
 }
@@ -228,8 +270,10 @@ impl Drop for Domain {
 pub(crate) struct Host {
     /// Whether the kernel can reset this function ([`resets`]).
     resets: bool,
-    device: VfioDevice,
+    // Drop the final Domain reference after Host::drop quiesces the devices,
+    // while this device fd still keeps the group's IOMMU backend attached.
     domain: Arc<Domain>,
+    device: VfioDevice,
     vm: Arc<VmFd>,
     slots: Arc<Mutex<BTreeSet<u32>>>,
     routes: Arc<Mutex<Routes>>,
@@ -245,22 +289,6 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    fn register_mapping(&self, mapping: &Mapping, base: Option<u64>) -> Result<(), String> {
-        for space in [0, 1 << 16] {
-            let region = kvm_userspace_memory_region {
-                slot: space | mapping.slot,
-                guest_phys_addr: base.map_or(0, |b| b + mapping.offset),
-                memory_size: base.map_or(0, |_| mapping.size),
-                userspace_addr: mapping.host as u64,
-                flags: 0,
-            };
-            // SAFETY: mapping remains alive until both KVM registrations are removed.
-            unsafe { self.vm.set_user_memory_region(region) }
-                .map_err(|e| format!("VFIO BAR KVM mapping: {e}"))?;
-        }
-        Ok(())
-    }
-
     fn stop_interrupts(&mut self) -> Result<(), String> {
         if self.mode != InterruptMode::Disabled {
             self.device
@@ -417,17 +445,16 @@ impl Backend for Host {
                         size: length,
                         host: host as usize,
                         slot,
-                        base: None,
+                        bases: [None; 2],
                     });
                 }
             }
             self.mapped_bars.insert(bar);
         }
-        for i in 0..self.mappings.len() {
-            if self.mappings[i].bar != bar || self.mappings[i].base == base {
+        for mapping in &mut self.mappings {
+            if mapping.bar != bar || mapping.bases == [base; 2] {
                 continue;
             }
-            let m = &self.mappings[i];
             if let Some(base) = base {
                 let end = base
                     .checked_add(self.device.get_region_size(u32::from(bar)))
@@ -444,16 +471,10 @@ impl Backend for Host {
                     return Err("VFIO BAR overlaps RAM or platform MMIO".into());
                 }
             }
-            // KVM answers EINVAL to the removal of a slot that does not exist,
-            // so only a mapping the guest can see now is taken away first.
-            if m.base.is_some() {
-                self.register_mapping(m, None)?;
-                self.mappings[i].base = None;
-            }
-            if base.is_some() {
-                self.register_mapping(&self.mappings[i], base)?;
-                self.mappings[i].base = base;
-            }
+            // SAFETY: the BAR mmap is live until all slots are removed.
+            mapping.register(base, |region| unsafe {
+                self.vm.set_user_memory_region(region)
+            })?;
         }
         Ok(())
     }
@@ -559,16 +580,24 @@ impl Drop for Host {
             .region_write(VFIO_PCI_CONFIG_REGION_INDEX, &[0, 0], 4);
         let _ = self.stop_interrupts();
         self.device.reset();
-        for mapping in &self.mappings {
-            if mapping.base.is_none() || self.register_mapping(mapping, None).is_ok() {
-                // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
-                unsafe {
-                    libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize);
-                }
-                self.slots.lock().remove(&mapping.slot);
+        for mapping in &mut self.mappings {
+            // SAFETY: this only removes slots still backed by the live BAR mmap.
+            if let Err(error) = mapping.register(None, |region| unsafe {
+                self.vm.set_user_memory_region(region)
+            }) {
+                log::error!("{error}");
+                continue;
             }
+            // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
+            if unsafe { libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize) }
+                != 0
+            {
+                log::error!("unmapping VFIO BAR: {}", std::io::Error::last_os_error());
+            }
+            self.slots.lock().remove(&mapping.slot);
         }
-        // Domain outlives all device fds and removes DMA mappings before RAM drops.
+        // VfioDevice can close its fd and detach the group after the BAR
+        // mmaps have released their references to the device file.
     }
 }
 
@@ -734,6 +763,39 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bar_cleanup_retries_only_the_slot_that_remains_registered() {
+        let mut mapping = Mapping {
+            bar: 0,
+            offset: 0,
+            size: 4096,
+            host: 0,
+            slot: 64,
+            bases: [Some(1 << 32); 2],
+        };
+        let smm_slot = (1 << 16) | 64;
+        let mut removed = Vec::new();
+        let result = mapping.register(None, |region| {
+            assert_eq!(region.memory_size, 0);
+            if region.slot == smm_slot {
+                return Err(kvm_ioctls::Error::new(libc::ENOMEM));
+            }
+            removed.push(region.slot);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(mapping.bases, [None, Some(1 << 32)]);
+        mapping
+            .register(None, |region| {
+                assert_eq!(region.memory_size, 0);
+                removed.push(region.slot);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(removed, [64, smm_slot]);
+        assert_eq!(mapping.bases, [None; 2]);
+    }
 
     #[test]
     fn intx_or_msi_events_never_set_msix_pending_bits() {
