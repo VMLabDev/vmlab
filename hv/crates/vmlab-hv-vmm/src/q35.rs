@@ -13,7 +13,17 @@ use crate::error::VmmError;
 const ALIAS: u64 = 0xc0000;
 const ALIAS_SIZE: usize = 0x40000;
 
-pub struct DebugPort(pub std::fs::File);
+/// The firmware debug port (0x402): each byte the guest writes is appended to
+/// the serial log, under that log's size cap.
+pub struct DebugPort(crate::serial_log::CappedLog);
+
+impl DebugPort {
+    /// Opens the port's own capped handle on the serial log at `path`.
+    pub fn open(path: &std::path::Path, cap: u64) -> std::io::Result<Self> {
+        crate::serial_log::CappedLog::open(path, cap).map(Self)
+    }
+}
+
 impl BusDevice for DebugPort {
     fn read(&mut self, _: u64, data: &mut [u8]) {
         data.fill(0xe9);

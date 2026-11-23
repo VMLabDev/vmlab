@@ -17,8 +17,7 @@ use vmlab_hv_devices::{GuestMemory, IrqLine, VirtioDevice};
 use vmlab_hv_proto::machine::{Disk, FsBacking, FsShare, Nic, NicAttachment, SerialPort};
 use vmlab_hv_vmm::DeviceUnavailable;
 use vmlab_hv_vmm::factory::{BuiltBlk, BuiltPci, BuiltSerial, SharedDisk};
-
-use crate::serial_log::{CappedLog, SERIAL_LOG_CAP};
+use vmlab_hv_vmm::serial_log::{CappedLog, SERIAL_LOG_CAP};
 
 /// The device set the binary ships.
 #[derive(Debug, Default)]
