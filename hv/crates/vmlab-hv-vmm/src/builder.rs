@@ -797,17 +797,13 @@ pub fn build(
         let image = std::fs::read(code)
             .map_err(|e| VmmError::Other(format!("reading firmware {}: {e}", code.display())))?;
         let first_slot = layout.regions.len() as u32;
-        let debug_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&desc.serial_log)
-            .map_err(|e| VmmError::Other(format!("opening firmware debug log: {e}")))?;
+        // The guest decides how much it writes here, so this handle has the
+        // serial log's cap too.
+        let debug_port =
+            crate::q35::DebugPort::open(&desc.serial_log, crate::serial_log::SERIAL_LOG_CAP)
+                .map_err(|e| VmmError::Other(format!("opening firmware debug log: {e}")))?;
         io_bus
-            .register(
-                0x402,
-                1,
-                Arc::new(Mutex::new(crate::q35::DebugPort(debug_log))),
-            )
+            .register(0x402, 1, Arc::new(Mutex::new(debug_port)))
             .map_err(VmmError::Other)?;
         ram.firmware_rom = Some(if *firmware == FirmwareKind::Ovmf {
             let flash = Arc::new(Mutex::new(
