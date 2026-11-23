@@ -41,7 +41,7 @@ The findings are ranked against these three facts, which the code states:
 | F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
 | F7 | wrong result | `host.subnet_pool` is parsed and never read |
 | F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
-| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites |
+| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites (fixed, card #569) |
 | F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name |
 | F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
 | F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header |
@@ -330,6 +330,15 @@ is refused at launch, because the file format has no escape for one.
   with `primary_disk`, a CD-ROM, the floppy, the firmware files and the
   sockets under `/lab/with,comma/`, and assert that every element that holds
   the directory holds `with,,comma`. Today the splash and three others do.
+- Fixed in card #569. Every path inside a QEMU option value in
+  `src/qemu/cmdline.rs` goes through `opt_path`, which doubles each comma:
+  the disks, the CD-ROMs, the floppy, both pflash files, the QMP, VNC, agent,
+  NIC, TPM and virtiofs sockets, the serial log chardevs, the NIC ROM, the
+  splash and the render node. `-bios`, `-readconfig`, `-L` and `-serial
+  file:` take the path whole and stay unescaped. The process matcher in
+  `src/qemu/process.rs` accepts the escaped QMP path. The proof test fails
+  before the fix and passes after. The container argv
+  (`src/qemu/container.rs`) is not part of this fix.
 
 ### F10. Names that differ only in case share one DNS name (wrong result)
 

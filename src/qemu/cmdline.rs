@@ -119,6 +119,13 @@ pub struct VmPaths {
     pub apic_virtualization: bool,
 }
 
+/// A path as it stands inside a QEMU option value: QEMU splits the value at
+/// each `,` and reads `,,` as one literal comma. A path QEMU takes as a whole
+/// argument (`-bios`, `-readconfig`, `-L`, `-serial file:`) is not escaped.
+pub fn opt_path(path: &Path) -> String {
+    path.display().to_string().replace(',', ",,")
+}
+
 /// The qdev id of a VM's install CD-ROM device (see
 /// [`VmPaths::install_cdrom`]). Only that drive carries an id, so nothing
 /// addressed by it can reach built media or the VMLAB bootstrap ISO.
@@ -588,13 +595,13 @@ pub fn build_args(
     arg(
         &mut a,
         "vnc",
-        format!("unix:{},share=ignore", paths.vnc_sock.display()),
+        format!("unix:{},share=ignore", opt_path(&paths.vnc_sock)),
     );
 
     arg(
         &mut a,
         "qmp",
-        format!("unix:{},server=on,wait=off", paths.qmp_sock.display()),
+        format!("unix:{},server=on,wait=off", opt_path(&paths.qmp_sock)),
     );
     a.push("-monitor".into());
     a.push("none".into());
@@ -606,7 +613,7 @@ pub fn build_args(
                 "chardev",
                 format!(
                     "file,id=fwlog,path={},append=on,mux=on",
-                    log.display().to_string().replace(',', ",,")
+                    opt_path(log)
                 ),
             );
             if vm.agent_transport == AgentTransport::IsaSerial {
@@ -628,10 +635,12 @@ pub fn build_args(
                     arg(
                         &mut a,
                         "chardev",
-                        format!("file,id=serlog,path={}", log.display()),
+                        format!("file,id=serlog,path={}", opt_path(log)),
                     );
                     arg(&mut a, "device", "isa-serial,chardev=serlog,index=1".into());
                 }
+                // `-serial file:` takes the rest of the value as the path,
+                // with no option parsing, so it is not escaped.
                 _ => arg(&mut a, "serial", format!("file:{}", log.display())),
             }
         }
@@ -658,7 +667,7 @@ pub fn build_args(
         arg(
             &mut a,
             "drive",
-            format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+            format!("if=pflash,format=raw,readonly=on,file={}", opt_path(code)),
         );
         let vars = paths
             .ovmf_vars
@@ -667,7 +676,7 @@ pub fn build_args(
         arg(
             &mut a,
             "drive",
-            format!("if=pflash,format=raw,file={}", vars.display()),
+            format!("if=pflash,format=raw,file={}", opt_path(vars)),
         );
         if vm.secure_boot && qemu_arch(vm.arch.as_str()) == "x86_64" {
             // SMM is required for the secboot build to enforce anything.
@@ -695,7 +704,7 @@ pub fn build_args(
                 } else {
                     "on"
                 },
-                splash.display().to_string().replace(',', ",,"),
+                opt_path(splash),
                 if paths.seabios_code.is_some() {
                     0
                 } else {
@@ -717,7 +726,7 @@ pub fn build_args(
             "chardev",
             format!(
                 "socket,id=vagent0,path={},server=on,wait=off",
-                paths.agent_sock.display()
+                opt_path(&paths.agent_sock)
             ),
         );
     }
@@ -762,7 +771,7 @@ pub fn build_args(
         a.push("-blockdev".into());
         a.push(format!(
             "driver=qcow2,node-name={node},file.driver=file,file.filename={}",
-            path.display()
+            opt_path(path)
         ));
         a.push("-device".into());
         let boot = if indexed_boot {
@@ -808,7 +817,7 @@ pub fn build_args(
         a.push("-blockdev".into());
         a.push(format!(
             "driver=raw,node-name=cd{i},read-only=on,file.driver=file,file.filename={}",
-            iso.display()
+            opt_path(iso)
         ));
         a.push("-device".into());
         let boot = if indexed_boot {
@@ -837,7 +846,7 @@ pub fn build_args(
         arg(
             &mut a,
             "drive",
-            format!("if=floppy,format=raw,file={}", floppy.display()),
+            format!("if=floppy,format=raw,file={}", opt_path(floppy)),
         );
     }
 
@@ -850,7 +859,7 @@ pub fn build_args(
                 "netdev",
                 format!(
                     "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
-                    sock.display()
+                    opt_path(sock)
                 ),
             ),
             NicBackend::Tap { child_fd } => {
@@ -877,7 +886,7 @@ pub fn build_args(
         let rom = paths
             .nic_rom
             .as_ref()
-            .map(|path| format!(",romfile={}", path.display().to_string().replace(',', ",,")))
+            .map(|path| format!(",romfile={}", opt_path(path)))
             .unwrap_or_default();
         arg(
             &mut a,
@@ -899,7 +908,7 @@ pub fn build_args(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=chrtpm,path={}", tpm_sock.display()),
+            format!("socket,id=chrtpm,path={}", opt_path(tpm_sock)),
         );
         arg(&mut a, "tpmdev", "emulator,id=tpm0,chardev=chrtpm".into());
         let dev = if qemu_arch(vm.arch.as_str()) == "x86_64" {
@@ -958,7 +967,7 @@ pub fn build_args(
                 // The scanout has to come from the GPU Venus renders on, or
                 // the console is black.
                 let display = match &paths.gpu_render_node {
-                    Some(node) => format!("egl-headless,rendernode={}", node.display()),
+                    Some(node) => format!("egl-headless,rendernode={}", opt_path(node)),
                     None => "egl-headless".into(),
                 };
                 arg(&mut a, "display", display);
@@ -1023,7 +1032,7 @@ pub fn build_args(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=vfs{i},path={}", sock.display()),
+            format!("socket,id=vfs{i},path={}", opt_path(sock)),
         );
         arg(
             &mut a,
