@@ -205,7 +205,11 @@ impl XhciController {
         for p in 0..PORTS {
             let mut value = 0x200 | (5 << 5);
             if let Some(d) = &self.devices[p] {
-                value |= 1 | ((d.speed() as u32) << 10);
+                // A reset controller reports the device it finds as a
+                // connect change (xHCI 4.19.3). A driver that enumerates a
+                // root port on its change bits alone, as EDK2's USB bus
+                // does, finds no device without it.
+                value |= 1 | (1 << 17) | ((d.speed() as u32) << 10);
                 if d.speed() == UsbSpeed::Super {
                     value = (value & !(15 << 5)) | 2;
                 } else {
