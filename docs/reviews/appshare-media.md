@@ -97,7 +97,7 @@ Not read:
 
 ## Findings
 
-### F1. A guest writes into the shared media cache through its floppy
+### F1. A guest writes into the shared media cache through its floppy (fixed, card #731)
 
 - Where: `src/media/cache.rs:44-48` and `:69-71`,
   `src/labd/machine_build.rs:221-243`,
@@ -132,6 +132,22 @@ Not read:
 - Severity: security against a hostile guest (it changes host files that
   other machines and later builds trust), and wrong result.
 - Confidence: high.
+- Fixed by card #731. A machine never attaches a floppy entry of the cache.
+  At each start it attaches its own copy, `floppy-<entry>` beside its disks
+  (`media::private_floppy`, called from `VmInstance::floppy_image` in
+  `src/labd/vm.rs`). The copy is made on first use, keeps what the guest
+  writes for as long as the machine's disks last, and goes with them on
+  `destroy`. A changed folder gives a new copy. A floppy entry also carries a
+  seal, `<entry>.sha256`, the digest of the image as built.
+  `MediaCache::ensure` checks a hit against it and builds the entry again
+  when the check fails or there is no seal, so an entry that a guest changed
+  before this fix is not used again. An image that the lab file names with
+  `floppy =` is still attached as it is. Both proof tests failed before the
+  fix and pass after it. `a_built_floppy_is_not_changed_by_its_reader`
+  compares the written sector and not the whole image, because mtools puts a
+  volume serial number and file times into each build.
+  `two_machines_do_not_share_a_writable_floppy` is in
+  `src/labd/lifecycle_tests.rs`.
 
 ### F2. The guest decides that the session falls back from waypipe to X11
 
@@ -296,6 +312,9 @@ Not read:
   of the host. PRD §1.2 lowers this as it does F8.
 - Confidence: high for the code, medium for how many hosts leave the
   abstract name free.
+- Fixed in card #732. The proxy connects to the path socket first. It takes
+  the abstract name only when the path socket refuses, and only when
+  `SO_PEERCRED` says that this user or root listens on it.
 
 ### F10. The host cookie is not found for two common Xauthority shapes
 

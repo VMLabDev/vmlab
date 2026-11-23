@@ -9,4 +9,4 @@ mod floppy;
 mod hash;
 mod iso;
 
-pub use cache::MediaCache;
+pub use cache::{MediaCache, private_floppy};
