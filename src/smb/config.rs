@@ -172,7 +172,26 @@ impl SmbConfig {
     /// Render the `smb.conf`. Every directive is annotated below; the key
     /// theme is "run as a normal user, keep all state under `lab_dir`" — and
     /// every socket under the short `run_dir`.
-    pub fn render_conf(&self) -> String {
+    ///
+    /// Refuses a share whose name is not a plain share name
+    /// ([`share_name_problem`]) or whose host path holds a line break: each
+    /// would write configuration of its own into the file. Validation refuses
+    /// both first; this keeps a config built some other way from doing it.
+    pub fn render_conf(&self) -> Result<String, ShareRefused> {
+        for s in &self.shares {
+            if let Some(reason) = share_name_problem(&s.name) {
+                return Err(ShareRefused {
+                    name: s.name.clone(),
+                    reason,
+                });
+            }
+            if let Some(reason) = share_host_problem(&s.host_path) {
+                return Err(ShareRefused {
+                    name: s.name.clone(),
+                    reason,
+                });
+            }
+        }
         let dir = self.lab_dir.display();
         let run = self.run_dir.display();
 
@@ -273,8 +292,65 @@ impl SmbConfig {
             out.push('\n');
         }
 
-        out
+        Ok(out)
     }
+}
+
+/// A share [`SmbConfig::render_conf`] will not write, and why.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("share \"{name}\": {reason}")]
+pub struct ShareRefused {
+    pub name: String,
+    pub reason: String,
+}
+
+/// Section names Samba gives a meaning of its own: a share by one of these
+/// names changes the server rather than adding a share. Compared without case,
+/// as Samba compares section names.
+const RESERVED_SHARE_NAMES: [&str; 5] = ["global", "homes", "printers", "print$", "ipc$"];
+
+/// The longest share name Windows clients accept.
+const MAX_SHARE_NAME: usize = 80;
+
+/// Why `name` cannot be a share name, or `None` when it can. A share name is
+/// written into `smb.conf` as a section header (`[name]`), so it is held to
+/// letters, digits, `_`, `-` and `.`, at most 80 of them, and none of the
+/// section names Samba reserves (PRD §7.5).
+pub fn share_name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a share name cannot be empty".to_string());
+    }
+    if name.len() > MAX_SHARE_NAME {
+        return Some(format!(
+            "a share name is at most {MAX_SHARE_NAME} characters, this one is {}",
+            name.len()
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Some(
+            "a share name may hold only letters, digits, `_`, `-` and `.` — it becomes a section \
+             header in smb.conf"
+                .to_string(),
+        );
+    }
+    let lower = name.to_ascii_lowercase();
+    if RESERVED_SHARE_NAMES.contains(&lower.as_str()) {
+        return Some(format!(
+            "\"{name}\" is a section name Samba reserves (global, homes, printers, print$, IPC$)"
+        ));
+    }
+    None
+}
+
+/// Why `host` cannot be a share's host path in `smb.conf`, or `None`. A line
+/// break would end the `path =` line and start a directive of its own.
+pub fn share_host_problem(host: &std::path::Path) -> Option<String> {
+    let text = host.to_string_lossy();
+    text.contains(['\n', '\r'])
+        .then(|| format!("the host path {text:?} holds a line break"))
 }
 
 /// Best-effort current unix username for `force user`. Falls back to the uid
@@ -346,7 +422,7 @@ mod tests {
 
     #[test]
     fn conf_has_unprivileged_dirs() {
-        let conf = cfg(false).render_conf();
+        let conf = cfg(false).render_conf().unwrap();
         for dir_key in [
             "private dir = /run/vmlab/smb/0123456789ab\n",
             "state directory = /labroot/.vmlab/smb",
@@ -361,9 +437,37 @@ mod tests {
         assert!(conf.contains("smb ports = 14450"));
     }
 
+    /// Review F12 (config): a share named `global` would add a second
+    /// `[global]` section that rewrites the server's settings, and a `]` or a
+    /// line break in a name or a host path writes a directive of its own. The
+    /// render refuses each, so the file keeps one `[global]`.
+    #[test]
+    fn a_share_name_cannot_write_configuration_of_its_own() {
+        for name in ["global", "GLOBAL", "homes", "IPC$", "a]b", "a\nb", ""] {
+            let mut c = cfg(false);
+            c.shares[0].name = name.to_string();
+            let refused = c.render_conf().expect_err(name);
+            assert_eq!(refused.name, name);
+        }
+        let mut c = cfg(false);
+        c.shares[0].host_path = PathBuf::from("/home/u/x\n[global]");
+        assert!(c.render_conf().is_err());
+
+        let mut c = cfg(false);
+        c.shares[0].name = "global".to_string();
+        let conf = c.render_conf().unwrap_or_default();
+        assert!(conf.matches("[global]\n").count() <= 1, "{conf}");
+
+        let conf = cfg(false).render_conf().unwrap();
+        assert_eq!(conf.matches("[global]\n").count(), 1);
+        for ok in ["src", "Data-2", "my.share", "x_y"] {
+            assert_eq!(share_name_problem(ok), None, "{ok}");
+        }
+    }
+
     #[test]
     fn conf_per_share_blocks() {
-        let conf = cfg(false).render_conf();
+        let conf = cfg(false).render_conf().unwrap();
         assert!(conf.contains("[src]"));
         assert!(conf.contains("path = /home/u/proj/src"));
         assert!(conf.contains("[data]"));
@@ -381,7 +485,7 @@ mod tests {
     /// read-only.
     #[test]
     fn conf_allows_execute_on_every_share() {
-        let conf = cfg(false).render_conf();
+        let conf = cfg(false).render_conf().unwrap();
         for name in ["[src]", "[data]"] {
             let section = conf
                 .split_once(name)
@@ -398,13 +502,13 @@ mod tests {
 
     #[test]
     fn conf_protocol_floor_toggles_on_smb1() {
-        let modern = cfg(false).render_conf();
+        let modern = cfg(false).render_conf().unwrap();
         assert!(modern.contains("server min protocol = SMB2_02"));
         assert!(modern.contains("server signing = mandatory"));
         assert!(modern.contains("ntlm auth = ntlmv2-only"));
         assert!(!modern.contains("ntlmv1-permitted"));
 
-        let legacy = cfg(true).render_conf();
+        let legacy = cfg(true).render_conf().unwrap();
         assert!(legacy.contains("server min protocol = NT1"));
         // signing relaxed for smb1
         assert!(legacy.contains("server signing = auto"));
@@ -414,7 +518,7 @@ mod tests {
 
     #[test]
     fn conf_never_maps_to_guest() {
-        let conf = cfg(false).render_conf();
+        let conf = cfg(false).render_conf().unwrap();
         assert!(conf.contains("map to guest = never"));
         assert!(conf.contains("security = user"));
     }
