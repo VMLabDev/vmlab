@@ -313,7 +313,11 @@ fn actual_size(path: &Path) -> Result<u64> {
 /// Grow an image to `new_size` bytes (growing only; shrinking needs
 /// `--shrink` in qemu-img and is deliberately not offered, matching vmlab).
 pub fn resize(path: &Path, new_size: u64) -> Result<()> {
-    match probe_format(path)? {
+    resize_with_format(path, probe_format(path)?, new_size)
+}
+
+fn resize_with_format(path: &Path, format: Format, new_size: u64) -> Result<()> {
+    match format {
         Format::Raw => {
             let file = std::fs::OpenOptions::new().write(true).open(path)?;
             let old = file.metadata()?.len();
@@ -461,8 +465,8 @@ fn copy_full(src: &mut dyn DiskImage, dest: &mut Qcow2Image) -> Result<()> {
     Ok(())
 }
 
-/// Copy only the clusters allocated in `src`'s own layer (`convert -B`).
-fn copy_own_layer(src: &mut Qcow2Image, dest: &mut Qcow2Image) -> Result<()> {
+/// Copy only the clusters allocated in `src`'s own layer.
+fn copy_own_layer(src: &mut Qcow2Image, dest: &mut dyn DiskImage) -> Result<()> {
     let cluster = src.cluster_size_bytes();
     let size = src.size();
     src.for_each_own_cluster(&mut |src, guest_cluster| {
@@ -470,7 +474,7 @@ fn copy_own_layer(src: &mut Qcow2Image, dest: &mut Qcow2Image) -> Result<()> {
         if offset >= size {
             return Ok(()); // vmstate area never belongs in the copy
         }
-        let mut buf = vec![0u8; cluster as usize];
+        let mut buf = vec![0u8; cluster.min(size - offset) as usize];
         src.read_at(offset, &mut buf)?;
         dest.write_at(offset, &buf)?;
         Ok(())
@@ -508,7 +512,7 @@ pub fn snapshot_list(path: &Path) -> Result<Vec<crate::SnapshotInfo>> {
 /// Write `top`'s active layer into its backing file, leaving `top` exactly
 /// as it was (`qemu-img commit -d`).
 pub fn commit(top: &Path) -> Result<()> {
-    let img = Qcow2Image::open(top, true)?; // top is only read
+    let mut img = Qcow2Image::open(top, true)?; // top is only read
     let backing_path = img
         .backing_file_path()
         .ok_or_else(|| Error::Unsupported("image has no backing file to commit into".into()))?;
@@ -516,21 +520,14 @@ pub fn commit(top: &Path) -> Result<()> {
         Some(f) => format_to_format(f)?,
         None => probe_format(&backing_path)?,
     };
-    let cluster = img.cluster_size_bytes();
     let top_size = img.size();
-    let mut img = img;
     let mut backing = crate::open(&backing_path, backing_format, false)?;
-    let common = top_size.min(backing.size());
-    img.for_each_own_cluster(&mut |img, guest_cluster| {
-        let offset = guest_cluster * cluster;
-        if offset >= common {
-            return Ok(());
-        }
-        let mut buf = vec![0u8; cluster as usize];
-        img.read_at(offset, &mut buf)?;
-        backing.write_at(offset, &buf)?;
-        Ok(())
-    })?;
+    if backing.size() < top_size {
+        drop(backing);
+        resize_with_format(&backing_path, backing_format, top_size)?;
+        backing = crate::open(&backing_path, backing_format, false)?;
+    }
+    copy_own_layer(&mut img, backing.as_mut())?;
     backing.flush()
 }
 
