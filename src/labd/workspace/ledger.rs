@@ -303,6 +303,18 @@ impl Ledger {
         }
     }
 
+    /// The host root the ledger at `path` records, where this version can
+    /// read it and it is about `guest_root`.
+    ///
+    /// For the one caller that cannot name the host root itself: a snapshot
+    /// restore while the host workspace directory is away, where the canonical
+    /// path [`load`](Ledger::load) compares against cannot be resolved.
+    pub fn recorded_host_root(path: &Path, guest_root: &str) -> Option<PathBuf> {
+        let ledger = serde_json::from_slice::<Ledger>(&std::fs::read(path).ok()?).ok()?;
+        (ledger.version == VERSION && ledger.guest_root == guest_root)
+            .then(|| PathBuf::from(ledger.host_root))
+    }
+
     /// Carry a ledger to a lab that moved to another root (`vmlab lab move`):
     /// a `host_root` under `from` becomes the same relative path under `to`.
     ///

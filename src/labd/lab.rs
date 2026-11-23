@@ -462,6 +462,27 @@ fn freeze_declared(
     vms.chain(containers).collect()
 }
 
+/// `path` with its longest existing ancestor canonicalised and the missing
+/// rest appended as written: where a directory that is away now will resolve
+/// once it is back.
+fn resolved_as_far_as_it_exists(path: &std::path::Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut held = path;
+    loop {
+        if let Ok(root) = held.canonicalize() {
+            return missing.iter().rev().fold(root, |at, name| at.join(name));
+        }
+        match (held.parent(), held.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                held = parent;
+            }
+            // `..` or a root that does not resolve: nothing better to say.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn missing_snapshot(machine: &str, snap: &str) -> crate::proto::CommandError {
     crate::proto::CommandError::not_found(format!("no snapshot {snap:?} on {machine}"))
 }
@@ -3307,6 +3328,16 @@ impl LabRuntime {
             );
             return None;
         }
+        self.workspace_at(machine, host_root, &dev.workspace_guest)
+    }
+
+    /// The workspace of `machine` over a host root that is already decided.
+    fn workspace_at(
+        &self,
+        machine: &str,
+        host_root: PathBuf,
+        guest_root: &str,
+    ) -> Option<crate::labd::workspace::Workspace> {
         // §19.6, resolved from the declaration alone (ADR-0003): the guest
         // family and the default login's elevation are what decide the three
         // Windows actions, and the syncer should never have to ask.
@@ -3315,13 +3346,56 @@ impl LabRuntime {
             machine: machine.to_string(),
             ledger_path: crate::labd::workspace::ledger::Ledger::path(&self.lab_local, machine),
             host_root,
-            guest_root: dev.workspace_guest.clone(),
+            guest_root: guest_root.to_string(),
             max_file_bytes: self.host_cfg.workspace_max_file,
             preconditions: crate::labd::workspace::preconditions(
                 handle.guest_os(),
                 &handle.logins(),
             ),
         })
+    }
+
+    /// The workspace a **restore** brackets (§19.6): what
+    /// [`workspace_of`](Self::workspace_of) answers, and also the workspace
+    /// of a dev machine whose host directory is away
+    /// (docs/reviews/dev-machines.md F2).
+    ///
+    /// A missing directory starts no syncer, and that is all it may decide.
+    /// The halt a restore refuses on and the note that a re-seed is owed both
+    /// ride the ledger, which lives under the lab's state directory and is
+    /// there whether the workspace is or not. A branch without the directory
+    /// or an unmounted volume must not turn a dev machine's restore into the
+    /// restore of a machine with nothing to bracket: the directory comes back,
+    /// and a syncer with no note then carries the rewound tree onto it.
+    ///
+    /// With the directory away its canonical path cannot be asked for, so the
+    /// root is the one the ledger on disk records. With no such ledger it is
+    /// the declared path resolved as far as the host still holds it, which is
+    /// what the directory canonicalises to once it is back unless a symlink
+    /// stands in the missing part.
+    fn restore_workspace_of(&self, machine: &str) -> Option<crate::labd::workspace::Workspace> {
+        use crate::labd::workspace::ledger::Ledger;
+        let dev = self
+            .dev_machines()
+            .into_iter()
+            .find(|d| d.name == machine)?;
+        let declared = self.root.join(dev.workspace.as_ref()?);
+        if declared.canonicalize().is_ok_and(|root| root.is_dir()) {
+            return self.workspace_of(machine);
+        }
+        self.events.emit(
+            "workspace.unavailable",
+            json!({
+                "machine": machine,
+                "workspace": declared.display().to_string(),
+                "reason": "the host workspace directory is not there: the restore still \
+                           reads the sync ledger for a halt and still notes the re-seed",
+            }),
+        );
+        let ledger_path = Ledger::path(&self.lab_local, machine);
+        let host_root = Ledger::recorded_host_root(&ledger_path, &dev.workspace_guest)
+            .unwrap_or_else(|| resolved_as_far_as_it_exists(&declared));
+        self.workspace_at(machine, host_root, &dev.workspace_guest)
     }
 
     /// Run one machine's sync pass now and answer with what it decided
@@ -3703,7 +3777,7 @@ impl LabRuntime {
     pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
         let machines: Vec<_> = self.machines().collect();
         for m in &machines {
-            let workspace = self.workspace_of(m.name());
+            let workspace = self.restore_workspace_of(m.name());
             self.check_restore(m.as_ref(), snap, discard, workspace.as_ref())
                 .await?;
         }
@@ -3746,7 +3820,7 @@ impl LabRuntime {
         let m = self
             .machine(name)
             .map_err(|_| missing_snapshot(name, snap))?;
-        let workspace = self.workspace_of(name);
+        let workspace = self.restore_workspace_of(name);
         let record = self
             .check_restore(m.as_ref(), snap, discard, workspace.as_ref())
             .await?;
