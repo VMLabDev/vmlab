@@ -151,6 +151,12 @@ pub struct HostGpu {
     /// guest where the same heap has a cached one (PRD §5.2). Off unless
     /// set: for a host whose CPU and GPU do not see that memory alike.
     pub hide_uncached_memory: bool,
+    /// The card's other PCI functions `passthrough` hands a vmlab-hv guest
+    /// with it — its HDMI/DP audio (PRD §5.2). `None`, the key left out,
+    /// takes every function of the slot already bound to `vfio-pci`; a list
+    /// is exactly what goes, each entry refused at resolution
+    /// (`qemu::hostgpu::render_plan`) unless it is bound to `vfio-pci`.
+    pub passthrough_functions: Option<Vec<String>>,
 }
 
 /// A host GPU's `keepawake` (PRD §5.2, ADR-0018): whether the supervisor
@@ -364,6 +370,7 @@ impl HostConfig {
                     .unspan()
                     .unwrap_or_default(),
                 hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
+                passthrough_functions: r.opt_string_list("passthrough_functions"),
             };
             if let Some(prev) = cfg
                 .gpus
@@ -743,6 +750,30 @@ gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
         .unwrap();
         let on: Vec<bool> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
         assert_eq!(on, [false, true, false]);
+    }
+
+    /// `passthrough_functions` tells a key left out from an empty list:
+    /// the first takes what is bound to `vfio-pci`, the second nothing.
+    #[test]
+    fn parses_a_host_gpus_passthrough_functions() {
+        let cfg = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1"    { address = "0000:72:00.0"  default = true }
+gpu "Nvidia1" { address = "0000:01:00.0"  passthrough_functions = [] }
+gpu "Nvidia2" { address = "0000:05:00.0"  passthrough_functions = ["0000:05:00.1"] }
+"#,
+            "<test>",
+        )
+        .unwrap();
+        let functions: Vec<_> = cfg
+            .gpus
+            .iter()
+            .map(|g| g.passthrough_functions.clone())
+            .collect();
+        assert_eq!(
+            functions,
+            [None, Some(vec![]), Some(vec!["0000:05:00.1".to_string()])]
+        );
     }
 
     /// `keepawake` reads `auto`, `on` or `off`, defaults to `auto`, and
