@@ -2451,6 +2451,44 @@ fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
     }
 }
 
+/// A failed first copy must leave the next start free to copy a good template
+/// (firmware review F5). Linux exposes /proc/self/mem as a regular file, but a
+/// read at offset zero fails after the destination has been opened.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failed_vars_copy_leaves_no_store() {
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let template = dirs.root.join("firmware/x86_64/OVMF_VARS_4M.fd");
+    std::fs::remove_file(&template).unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", &template).unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let (mut vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#,
+        Script::healthy(),
+    );
+    vm.set_host_config(firmware);
+    let store = vm.dirs.ovmf_vars();
+    let machine: Arc<dyn Machine> = vm;
+
+    let error = machine.clone().start(lab.clone(), None).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("copying OVMF VARS template"),
+        "expected the copy to fail: {error:#}"
+    );
+    assert_eq!(hv.starts(), 0);
+    assert!(!store.exists(), "failed copy left {}", store.display());
+
+    std::fs::remove_file(&template).unwrap();
+    std::fs::write(&template, b"vars:blank").unwrap();
+    machine.clone().start(lab, None).await.unwrap();
+    machine.stop(true).await.unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+}
+
 /// A VM started without secure boot has a variable store nothing vouches
 /// for: it was copied from the blank template, and the guest could write it
 /// while the flash was unprotected. `secure_boot = true` on that VM must not
