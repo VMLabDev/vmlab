@@ -777,6 +777,7 @@ pub fn build(
             .map_err(VmmError::Other)?;
         snap_nodes.push(DeviceNode::Plain(inventory));
     }
+    let mut passthrough_mem = None;
     let mch = if let Boot::Firmware {
         firmware,
         code,
@@ -827,16 +828,11 @@ pub fn build(
         } else {
             crate::q35::Pam::new(&image, Some(kvm.vm.clone()), first_slot + 1)?
         }));
-        ram.mem = ram
-            .mem
-            .insert_region(pam.lock().shadow_region())
-            .map_err(|e| VmmError::Memory(e.to_string()))?;
-        if !secure_smm {
-            ram.mem = ram
-                .mem
-                .insert_region(pam.lock().smram_region())
-                .map_err(|e| VmmError::Memory(e.to_string()))?;
-        }
+        passthrough_mem = Some(crate::q35::attach_firmware_memory(
+            &mut ram,
+            &pam.lock(),
+            secure_smm,
+        )?);
         mmio_bus
             .register(0xc0000, 0x40000, pam.clone())
             .map_err(VmmError::Other)?;
@@ -877,7 +873,11 @@ pub fn build(
     };
     // Firmware construction adds PAM RAM to GuestMemory. Assign devices only
     // after those regions exist, so their IOMMU domain sees the complete RAM map.
-    let vfio = crate::vfio::build(desc, &kvm, &ram.mem).map_err(VmmError::Other)?;
+    // A passed-through device's DMA goes through an IOMMU mapping made once,
+    // which cannot follow PAM. It gets the shadow as plain RAM and never
+    // the legacy SMRAM backing.
+    let vfio_mem = passthrough_mem.unwrap_or_else(|| ram.mem.clone());
+    let vfio = crate::vfio::build(desc, &kvm, &vfio_mem).map_err(VmmError::Other)?;
     for (device, config) in vfio.iter().zip(&desc.vfio) {
         place(device.clone(), Some(config.pci))?;
     }
@@ -1007,7 +1007,7 @@ pub fn build(
                 vmlab_hv_devices::display::virtio_vga::VirtioVga::new(
                     "vga",
                     &rom,
-                    ram.mem.clone(),
+                    ram.device_mem.clone(),
                     Some(transport.msi),
                     transport.intx,
                 )
@@ -1091,7 +1091,7 @@ pub fn build(
     let ide = if pc {
         let ide = Arc::new(Mutex::new(vmlab_hv_devices::ide::Ide::new(
             "piix3-ide",
-            ram.mem.clone(),
+            ram.device_mem.clone(),
             [isa_irq(8, 14), isa_irq(9, 15)],
         )));
         pci_root
@@ -1134,7 +1134,7 @@ pub fn build(
     // snapshot loads (raw images have no internal snapshots).
     let floppy = if pc {
         let chipset = chipset.as_ref().unwrap();
-        chipset.isa.lock().set_memory(ram.mem.clone());
+        chipset.isa.lock().set_memory(ram.device_mem.clone());
         let mut controller =
             vmlab_hv_devices::floppy::Floppy::new("floppy", chipset.isa.clone(), isa_irq(10, 6));
         if let Some(path) = &desc.floppy {
@@ -1172,7 +1172,7 @@ pub fn build(
         let transport = wiring(Some(address), 1, false)?;
         let ahci = Arc::new(Mutex::new(vmlab_hv_devices::ahci::Ahci::new(
             "ahci",
-            ram.mem.clone(),
+            ram.device_mem.clone(),
             transport.intx.unwrap(),
             transport.msi,
         )));
@@ -1278,7 +1278,7 @@ pub fn build(
         let blk = factory
             .virtio_blk(
                 disk,
-                &ram.mem,
+                &ram.device_mem,
                 wiring(disk.pci, (desc.vcpus + 1) as u16, true)?,
             )
             .map_err(|e| VmmError::DeviceUnavailable {
@@ -1311,7 +1311,11 @@ pub fn build(
     if !virtio_ports.is_empty() {
         let built = add_pci(
             &pci_root,
-            factory.virtio_console(&virtio_ports, &ram.mem, wiring(desc.console_pci, 2, true)?),
+            factory.virtio_console(
+                &virtio_ports,
+                &ram.device_mem,
+                wiring(desc.console_pci, 2, true)?,
+            ),
             "virtio-console ports".to_string(),
         )?;
         place(built.function.clone(), desc.console_pci)?;
@@ -1342,7 +1346,7 @@ pub fn build(
         let (function, node): (SharedFunction, SharedSnapshot) = match nic.model {
             NicModel::E1000 => {
                 let dev = Arc::new(Mutex::new(
-                    vmlab_hv_devices::nic::e1000::E1000::new(id, mac, ram.mem.clone(), intx)
+                    vmlab_hv_devices::nic::e1000::E1000::new(id, mac, ram.device_mem.clone(), intx)
                         .map_err(unavailable)?,
                 ));
                 vmlab_hv_devices::nic::e1000::E1000::start(&dev, socket.clone());
@@ -1350,7 +1354,7 @@ pub fn build(
             }
             _ => {
                 let dev = Arc::new(Mutex::new(
-                    vmlab_hv_devices::nic::pcnet::Pcnet::new(id, mac, ram.mem.clone(), intx)
+                    vmlab_hv_devices::nic::pcnet::Pcnet::new(id, mac, ram.device_mem.clone(), intx)
                         .map_err(unavailable)?,
                 ));
                 vmlab_hv_devices::nic::pcnet::Pcnet::start(&dev, socket.clone());
@@ -1375,7 +1379,7 @@ pub fn build(
             &pci_root,
             factory.virtio_net(
                 nic,
-                &ram.mem,
+                &ram.device_mem,
                 wiring(nic.pci, 2 * nic.attachment.queue_pairs() + 2, true)?,
             ),
             format!("nic {}", nic.mac),
@@ -1389,7 +1393,7 @@ pub fn build(
     for share in &desc.shares {
         let built = add_pci(
             &pci_root,
-            factory.fs_share(share, &ram.mem, wiring(share.pci, 2, false)?),
+            factory.fs_share(share, &ram.device_mem, wiring(share.pci, 2, false)?),
             format!("share `{}`", share.tag),
         )?;
         place(built.function.clone(), share.pci)?;
@@ -1412,7 +1416,7 @@ pub fn build(
     if pc && let Some(address) = desc.tablet {
         let intx = crate::q35::PirqRouter::line(&pirqs, address, 4).map_err(VmmError::Other)?;
         let mut controller =
-            vmlab_hv_devices::usb::UhciController::new("uhci", ram.mem.clone(), intx);
+            vmlab_hv_devices::usb::UhciController::new("uhci", ram.device_mem.clone(), intx);
         controller
             .attach(
                 1,
@@ -1446,7 +1450,7 @@ pub fn build(
         let transport = wiring(Some(address), 1, false)?;
         let xhci = Arc::new(Mutex::new(vmlab_hv_devices::usb::XhciController::new(
             "xhci",
-            ram.mem.clone(),
+            ram.device_mem.clone(),
             transport.msi,
             transport.intx,
         )));
@@ -1491,7 +1495,7 @@ pub fn build(
                 let interrupt = wiring(section.pci, 1, false)?;
                 let hda = Arc::new(Mutex::new(vmlab_hv_devices::hda::Hda::new(
                     "hda",
-                    ram.mem.clone(),
+                    ram.device_mem.clone(),
                     host,
                     interrupt.msi,
                     interrupt.intx,
@@ -1520,7 +1524,7 @@ pub fn build(
                     vmlab_hv_devices::virtio::pci::VirtioPciDevice::new(
                         "virtio-snd",
                         Box::new(pci_device),
-                        ram.mem.clone(),
+                        ram.device_mem.clone(),
                         Some(interrupt.msi),
                         interrupt.intx,
                     ),
@@ -1645,16 +1649,16 @@ pub fn build(
                 com2: pc_com2,
                 physical_address_bits: kvm.physical_address_bits(desc.cpu_model.as_deref()),
             };
-            vmlab_hv_firmware::FwCfg::for_pc(ram.mem.clone(), &platform, &options)
+            vmlab_hv_firmware::FwCfg::for_pc(ram.device_mem.clone(), &platform, &options)
         } else {
-            vmlab_hv_firmware::FwCfg::for_platform(ram.mem.clone(), &platform, &options)
+            vmlab_hv_firmware::FwCfg::for_platform(ram.device_mem.clone(), &platform, &options)
         }
         .map_err(VmmError::Other)?;
         add_fw_cfg_files(&mut fw_cfg, desc)?;
         let fw_cfg = Arc::new(Mutex::new(if pc {
-            crate::smm::SmiFwCfg::without_negotiation(fw_cfg, ram.mem.clone())
+            crate::smm::SmiFwCfg::without_negotiation(fw_cfg, ram.device_mem.clone())
         } else {
-            crate::smm::SmiFwCfg::new(fw_cfg, ram.mem.clone()).map_err(VmmError::Other)?
+            crate::smm::SmiFwCfg::new(fw_cfg, ram.device_mem.clone()).map_err(VmmError::Other)?
         }));
         io_bus
             .register(0x510, 0xc, fw_cfg.clone())

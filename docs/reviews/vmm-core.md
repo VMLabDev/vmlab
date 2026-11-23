@@ -86,6 +86,22 @@ and the IDE, AHCI and USB devices on the same buses.
 - Confidence: high for the code. Whether the allocation aborts or is
   granted lazily depends on the host's overcommit setting. The overflow and
   the `decode_msrs` path do not.
+- Fixed by card #612. `decode_ram_regions` refuses a region count that the
+  rest of the stream cannot hold, a region that ends past the address space,
+  and a run that overflows or passes the end of its region. It refuses the
+  run before it writes the pages. `decode_msrs` refuses a count that is not
+  the section's length in 12-byte entries. `restore` bounds the snapshot
+  table's vmstate size by what the machine can have saved (its RAM, nine
+  bytes of record header for each page, and 1 GiB for the sections) and
+  returns an error when the allocator refuses the buffer
+  (`vmstate_buffer`). On the build host the 64 GiB request was granted
+  lazily, so before the fix the count tests failed on the error text and
+  not by an abort. The overflow test panicked. Tests:
+  `decode_ram_regions_rejects_a_huge_region_count`,
+  `decode_ram_regions_rejects_a_run_that_overflows`,
+  `decode_ram_regions_refuses_an_overrunning_data_run_before_it_writes`,
+  `decode_msrs_rejects_a_huge_entry_count` and
+  `load_rejects_a_vmstate_size_no_machine_of_this_size_can_have_saved`.
 
 ### F2. Floppy: a restored command whose operation does not match its opcode panics the host
 
@@ -110,6 +126,13 @@ and the IDE, AHCI and USB devices on the same buses.
   Assert `restore_state` returns `Err`. Today it returns `Ok`, and the next
   `dma_ready()` or `io_read(5)` panics.
 - Confidence: high.
+- Fixed by card #612. `data_operation` is the one table from an opcode to
+  its operation. `execute` starts a command by it, and `restore_state`
+  refuses a saved command whose operation is not the one its opcode starts.
+  A sector in the PIO buffer is accepted only for a read, a write or a
+  verify on a drive that holds a medium. Tests:
+  `restore_rejects_execution_inconsistent_with_opcode` and
+  `restore_keeps_a_command_that_matches_its_opcode`.
 
 ### F3. Cirrus: a restored waiting BitBLT has unchecked geometry
 
@@ -161,6 +184,21 @@ and the IDE, AHCI and USB devices on the same buses.
   12 read-only and address 0xf0000 asserts the shadow is unchanged.
 - Confidence: high for the path. Whether SeaBIOS on this machine keeps live
   SMM code in that region was not checked.
+- Fixed by card #611. Device models get a second view of guest memory,
+  `GuestRam::device_mem`, and `ram.mem` stays the complete view for the
+  snapshot and the debugger. The device view holds no SMRAM, open or closed.
+  Its 0xc0000-0xfffff is `Pam`'s device mapping, remapped per bank when a PAM
+  attribute changes: the shadow shared while the bank's write enable is set,
+  otherwise a private copy-on-write mapping of what the CPU reads there, so a
+  device write does not reach the shadow. The ISA DMA controller, the PCI
+  devices, fw_cfg and the Hyper-V hypercall path use it. A passed-through
+  device (vfio) no longer gets SMRAM, but its IOMMU mapping is made once and
+  still holds the shadow writable whatever PAM says: that part is open. The
+  proof is at the seam the builder wires memory through
+  (`q35::attach_firmware_memory`), without KVM:
+  `isa_dma_does_not_write_closed_smram`,
+  `isa_dma_does_not_write_read_only_shadow_ram` and
+  `device_view_of_shadow_ram_follows_the_pam_attributes` in `q35.rs`.
 
 ### F5. Non-secure q35 and pc: the SMRAM lock (D_LCK) is not enforced
 
@@ -183,6 +221,15 @@ and the IDE, AHCI and USB devices on the same buses.
   config 0x9d still has bit 4 set and bit 6 clear, and that
   `pam.smram_open` is false. The same for pc through 0x72.
 - Confidence: high.
+- Fixed by card #611. Once D_LCK is set, `Mch::config_write` drops writes to
+  SMRAMC (0x9d on q35, 0x72 on pc) and to ESMRAMC on q35, and setting D_LCK
+  clears D_OPEN. `Pam::update` opens the alias only for D_OPEN without
+  D_LCK, which also covers a restored state. A reset restores the power-on
+  state and unlocks. QEMU's i440fx does not model the lock, so the pc byte
+  now differs from the qtest capture on purpose. Tests:
+  `smram_lock_holds_until_reset` and `restored_smram_lock_keeps_smram_closed`
+  in `q35.rs`, `i440fx_smram_uses_72h_and_locks_until_reset` in
+  `tests/pc_chipset.rs`.
 
 ### F6. Floppy: READ ID after an out-of-range sector adds 1 to 255
 

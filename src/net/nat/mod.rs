@@ -491,7 +491,7 @@ impl NatEngine {
 
     // -- internals shared with submodules -------------------------------------
 
-    fn guest_mac(&self, ip: Ipv4Addr) -> MacAddr {
+    pub(crate) fn guest_mac(&self, ip: Ipv4Addr) -> MacAddr {
         let macs = self.macs.lock_recover();
         macs.bound
             .get(&ip)
