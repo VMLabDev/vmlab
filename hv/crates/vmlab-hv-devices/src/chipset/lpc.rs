@@ -122,6 +122,15 @@ impl Lpc {
             & if self.piix4 { 0xffc0 } else { 0xff80 }
     }
 
+    /// Offset of `port` in the PM I/O block, or None outside it. The block is
+    /// as long as its base is aligned: 64 ports on PIIX4, 128 on ICH9. So it
+    /// ends at 0xffff at the latest and never wraps to port 0.
+    fn pm_offset(&self, port: u16) -> Option<u16> {
+        let len = if self.piix4 { 64 } else { 128 };
+        port.checked_sub(self.pm_base())
+            .filter(|offset| self.pm_enabled() && *offset < len)
+    }
+
     pub fn pm_enabled(&self) -> bool {
         if self.piix4 {
             self.config[0x80] & 1 != 0
@@ -191,8 +200,8 @@ impl Lpc {
             }
             return true;
         }
-        if self.pm_enabled() && port.wrapping_sub(self.pm_base()) < 128 {
-            self.read(u64::from(port - self.pm_base()), data);
+        if let Some(offset) = self.pm_offset(port) {
+            self.read(u64::from(offset), data);
             true
         } else if matches!(port, 0xb2 | 0xb3 | 0xcf9) && data.len() == 1 {
             data[0] = if port == 0xcf9 {
@@ -219,8 +228,8 @@ impl Lpc {
             self.update_sci();
             return true;
         }
-        if self.pm_enabled() && port.wrapping_sub(self.pm_base()) < 128 {
-            self.write(u64::from(port - self.pm_base()), data);
+        if let Some(offset) = self.pm_offset(port) {
+            self.write(u64::from(offset), data);
             true
         } else if matches!(port, 0xb2 | 0xb3 | 0xcf9) && data.len() == 1 {
             if port == 0xcf9 {
