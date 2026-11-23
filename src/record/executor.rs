@@ -255,8 +255,9 @@ async fn run(
         // A stalled write may have sent a partial frame. Dropping the
         // encoder kills ffmpeg and avoids trying to finalise that frame.
         if e.kind() == std::io::ErrorKind::TimedOut {
-            return Err(e)
-                .with_context(|| format!("ffmpeg timed out writing frames to {}", output.display()));
+            return Err(e).with_context(|| {
+                format!("ffmpeg timed out writing frames to {}", output.display())
+            });
         }
         ended_by = Some(format!("writing a frame to ffmpeg: {e}"));
     }

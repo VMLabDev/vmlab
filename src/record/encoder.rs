@@ -241,10 +241,9 @@ impl Encoder {
 
     /// Feed one frame while ffmpeg continues to accept bytes.
     pub async fn write_frame(&mut self, rgb: &[u8]) -> io::Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ffmpeg stdin already closed"))?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ffmpeg stdin already closed")
+        })?;
         write_frame_with_progress(stdin, rgb).await
     }
 
@@ -307,10 +306,12 @@ mod tests {
             }
             frame
         };
-        let (written, read) = tokio::join!(write_frame_with_progress(&mut stdin, b"rgb"), read);
-        written.unwrap();
+        let write = async {
+            write_frame_with_progress(&mut stdin, b"rgb").await.unwrap();
+            assert!(started.elapsed() > WRITE_IDLE_TIMEOUT);
+        };
+        let ((), read) = tokio::join!(write, read);
         assert_eq!(&read, b"rgb");
-        assert!(started.elapsed() > WRITE_IDLE_TIMEOUT);
     }
 
     const LISTING: &str = "Encoders:
