@@ -27,6 +27,16 @@ SRC
   }
 
   p <<DOC
+    The host directory must not contain the lab's `.vmlab` directory, and must
+    not be inside it. `share { host = "." }` in the lab root is a validation
+    error, and so is a share of a parent directory of the lab, or of `~` when
+    the lab is under it. `.vmlab` holds every machine's disks and the SMB
+    server's own configuration, so a guest that could reach it would not be
+    confined to the directory you declared. Share a subdirectory such as
+    `./src`. The same holds for the `host` of a container `volume {}`.
+  DOC
+
+  p <<DOC
     On a Windows guest, `guest` is either a drive letter (`guest = "S:"`,
     mapped with `net use`) or a folder on an existing drive
     (`guest = "C:\\data"`, a symbolic link to the share). Pick a free letter:
