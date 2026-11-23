@@ -919,7 +919,7 @@ mod tests {
         assert!(!daemon_running(pid, None));
     }
 
-    const LIVE_DAEMON_HELPER: &str = "VMLAB_TEST_LIVE_DAEMON_ROOT";
+    const SILENT_DAEMON_HELPER: &str = "VMLAB_TEST_SILENT_DAEMON_ROOT";
 
     /// Review F7 (card #561): a daemon whose socket does not answer can
     /// still run — starting, or with its socket file gone. A release must
@@ -930,12 +930,12 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "supervisor::tests::live_daemon_release_helper",
+                "supervisor::tests::silent_daemon_release_helper",
                 "--include-ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(LIVE_DAEMON_HELPER, scratch.path())
+            .env(SILENT_DAEMON_HELPER, scratch.path())
             .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
             .env("XDG_STATE_HOME", scratch.path().join("state"))
             .env("XDG_DATA_HOME", scratch.path().join("data"))
@@ -955,10 +955,10 @@ mod tests {
     /// path.
     #[test]
     #[ignore = "subprocess helper for a_release_does_not_forget_a_live_daemon"]
-    fn live_daemon_release_helper() {
+    fn silent_daemon_release_helper() {
         use std::sync::Arc;
 
-        let Some(root) = std::env::var_os(LIVE_DAEMON_HELPER) else {
+        let Some(root) = std::env::var_os(SILENT_DAEMON_HELPER) else {
             return;
         };
         let root = std::path::PathBuf::from(root);
