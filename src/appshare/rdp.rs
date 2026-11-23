@@ -774,12 +774,26 @@ mod tests {
     #[test]
     fn the_rdp_clipboard_is_not_shared_unasked() {
         let socket = Path::new("/tmp/rdp.sock");
-        let plain =
-            freerdp_args(socket, "win11", &argv(&["notepad.exe"]), None, &creds(), false).unwrap();
+        let plain = freerdp_args(
+            socket,
+            "win11",
+            &argv(&["notepad.exe"]),
+            None,
+            &creds(),
+            false,
+        )
+        .unwrap();
         assert!(!plain.iter().any(|a| a == "+clipboard"), "{plain:?}");
         assert!(plain.iter().any(|a| a == "-clipboard"), "{plain:?}");
-        let asked =
-            freerdp_args(socket, "win11", &argv(&["notepad.exe"]), None, &creds(), true).unwrap();
+        let asked = freerdp_args(
+            socket,
+            "win11",
+            &argv(&["notepad.exe"]),
+            None,
+            &creds(),
+            true,
+        )
+        .unwrap();
         assert!(asked.iter().any(|a| a == "+clipboard"), "{asked:?}");
         assert!(!asked.iter().any(|a| a == "-clipboard"), "{asked:?}");
     }
