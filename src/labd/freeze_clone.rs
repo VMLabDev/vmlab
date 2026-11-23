@@ -216,7 +216,7 @@ pub struct MachineClone {
     /// presence is what marks the machine built, so it appears only once
     /// everything else is in place.
     pub overlays: Vec<Overlay>,
-    /// `OVMF_VARS.fd`, `tpm-state/`, `clone-source`, `firstboot.done` and
+    /// `OVMF_VARS.fd`, `OVMF_VARS.boot`, `tpm-state/`, `clone-source`, `firstboot.done` and
     /// `tsc-hz`, when the frozen machine has them.
     pub copies: Vec<FileCopy>,
     /// `freeze-generation` beside the disks.
@@ -403,6 +403,7 @@ fn machine_source(
     let carried: &[&str] = match m.kind {
         Kind::Vm => &[
             "OVMF_VARS.fd",
+            "OVMF_VARS.boot",
             "tpm-state",
             "clone-source",
             "firstboot.done",

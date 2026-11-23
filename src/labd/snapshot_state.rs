@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 const VARS: &str = "vars";
+/// How the variable store was last booted ([`super::vars_boot`]). It says
+/// what the store may be trusted for, so it goes wherever the store goes.
+const VARS_BOOT: &str = "vars-boot";
 const TPM: &str = "tpm";
 
 /// One VM's firmware state and where its offline snapshots keep theirs.
@@ -32,6 +35,8 @@ pub(super) struct FirmwareState {
     root: PathBuf,
     /// The VM's UEFI variable store, a file.
     vars: PathBuf,
+    /// The record of how that store was last booted, a file.
+    vars_boot: PathBuf,
     /// The VM's TPM state, a directory.
     tpm: PathBuf,
 }
@@ -40,12 +45,18 @@ pub(super) struct FirmwareState {
 #[derive(Debug)]
 pub(super) struct StagedRestore {
     vars: Option<PathBuf>,
+    vars_boot: Option<PathBuf>,
     tpm: Option<PathBuf>,
 }
 
 impl FirmwareState {
-    pub(super) fn new(root: PathBuf, vars: PathBuf, tpm: PathBuf) -> Self {
-        Self { root, vars, tpm }
+    pub(super) fn new(root: PathBuf, vars: PathBuf, vars_boot: PathBuf, tpm: PathBuf) -> Self {
+        Self {
+            root,
+            vars,
+            vars_boot,
+            tpm,
+        }
     }
 
     /// A snapshot name is not a safe file name by itself (`..` is a valid
@@ -76,6 +87,10 @@ impl FirmwareState {
             if self.vars.is_file() {
                 std::fs::copy(&self.vars, staged.join(VARS))
                     .with_context(|| format!("copying {}", self.vars.display()))?;
+            }
+            if self.vars_boot.is_file() {
+                std::fs::copy(&self.vars_boot, staged.join(VARS_BOOT))
+                    .with_context(|| format!("copying {}", self.vars_boot.display()))?;
             }
             if self.tpm.is_dir() {
                 copy_tree(&self.tpm, &staged.join(TPM))
@@ -115,6 +130,7 @@ impl FirmwareState {
         }
         let mut staged = StagedRestore {
             vars: None,
+            vars_boot: None,
             tpm: None,
         };
         let copy = |staged: &mut StagedRestore| -> Result<()> {
@@ -123,6 +139,14 @@ impl FirmwareState {
                 let to = sibling(&self.vars, "restore");
                 remove_tree(&to)?;
                 staged.vars = Some(to.clone());
+                std::fs::copy(&saved, &to)
+                    .with_context(|| format!("copying {}", saved.display()))?;
+            }
+            let saved = entry.join(VARS_BOOT);
+            if saved.is_file() {
+                let to = sibling(&self.vars_boot, "restore");
+                remove_tree(&to)?;
+                staged.vars_boot = Some(to.clone());
                 std::fs::copy(&saved, &to)
                     .with_context(|| format!("copying {}", saved.display()))?;
             }
@@ -145,10 +169,22 @@ impl FirmwareState {
     /// Put a staged restore in place of the VM's own state. The VM must be
     /// stopped: a running TPM emulator writes its state as it goes.
     pub(super) fn commit_restore(&self, staged: StagedRestore) -> Result<()> {
+        // The record first says the least a store can be trusted for, then
+        // the store changes, then the record becomes the snapshot's own. A
+        // restore that stops between the steps leaves no store vouched for
+        // by another store's record.
+        if staged.vars.is_some() || self.vars.exists() {
+            super::vars_boot::write(&self.vars_boot, super::vars_boot::LastBoot::Plain)?;
+        }
         match &staged.vars {
             Some(from) => std::fs::rename(from, &self.vars)
                 .with_context(|| format!("replacing {}", self.vars.display()))?,
             None => remove_tree(&self.vars)?,
+        }
+        match &staged.vars_boot {
+            Some(from) => std::fs::rename(from, &self.vars_boot)
+                .with_context(|| format!("replacing {}", self.vars_boot.display()))?,
+            None => remove_tree(&self.vars_boot)?,
         }
         // A directory cannot be renamed over one that has files in it, so
         // the old one steps aside first.
@@ -176,7 +212,10 @@ impl FirmwareState {
     }
 
     pub(super) fn discard_restore(&self, staged: StagedRestore) {
-        for path in [staged.vars, staged.tpm].into_iter().flatten() {
+        for path in [staged.vars, staged.vars_boot, staged.tpm]
+            .into_iter()
+            .flatten()
+        {
             if let Err(error) = remove_tree(&path) {
                 tracing::warn!(path = %path.display(), %error, "could not remove staged firmware state");
             }
@@ -241,17 +280,25 @@ mod tests {
         _tmp: tempfile::TempDir,
         state: FirmwareState,
         vars: PathBuf,
+        vars_boot: PathBuf,
         tpm: PathBuf,
     }
 
     fn vm() -> Vm {
         let tmp = tempfile::tempdir().unwrap();
         let vars = tmp.path().join("OVMF_VARS.fd");
+        let vars_boot = tmp.path().join(crate::labd::vars_boot::FILE);
         let tpm = tmp.path().join("tpm-state");
         Vm {
-            state: FirmwareState::new(tmp.path().join("snapshot-state"), vars.clone(), tpm.clone()),
+            state: FirmwareState::new(
+                tmp.path().join("snapshot-state"),
+                vars.clone(),
+                vars_boot.clone(),
+                tpm.clone(),
+            ),
             _tmp: tmp,
             vars,
+            vars_boot,
             tpm,
         }
     }
@@ -311,6 +358,41 @@ mod tests {
         assert!(restore(&vm, "pristine"));
         assert!(!vm.vars.exists());
         assert!(!vm.tpm.exists());
+    }
+
+    /// The record of how a store was last booted belongs to that store. A
+    /// restore that brought back a store booted without secure boot under
+    /// the record of the one it replaced would let secure boot start on it.
+    #[test]
+    fn a_restore_brings_back_the_record_of_the_store_it_brings_back() {
+        use crate::labd::vars_boot::{self, LastBoot};
+
+        let vm = vm();
+        std::fs::write(&vm.vars, b"booted plain").unwrap();
+        vars_boot::write(&vm.vars_boot, LastBoot::Plain).unwrap();
+        capture(&vm, "plain");
+        std::fs::write(&vm.vars, b"enrolled").unwrap();
+        vars_boot::write(&vm.vars_boot, LastBoot::Secure).unwrap();
+        capture(&vm, "secure");
+
+        assert!(restore(&vm, "plain"));
+        assert_eq!(std::fs::read(&vm.vars).unwrap(), b"booted plain");
+        assert_eq!(
+            vars_boot::read(&vm.vars_boot).unwrap(),
+            Some(LastBoot::Plain)
+        );
+        assert!(restore(&vm, "secure"));
+        assert_eq!(
+            vars_boot::read(&vm.vars_boot).unwrap(),
+            Some(LastBoot::Secure)
+        );
+        assert!(!sibling(&vm.vars_boot, "restore").exists());
+
+        // A capture from before the record was kept holds a store and no
+        // record: the store comes back as one nothing is recorded about.
+        std::fs::remove_file(vm.state.entry("plain").join(VARS_BOOT)).unwrap();
+        assert!(restore(&vm, "plain"));
+        assert_eq!(vars_boot::read(&vm.vars_boot).unwrap(), None);
     }
 
     /// A snapshot taken before vmlab kept this state has no entry, and a
