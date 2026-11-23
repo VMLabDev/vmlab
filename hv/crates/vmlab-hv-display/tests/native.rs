@@ -659,6 +659,76 @@ fn stable_dma_flip_chain_learns_buffers_and_remaps_reordered_slots() {
     h.join().unwrap().unwrap();
 }
 
+/// F4 of docs/reviews/display.md. The producer waits in `retire` for every
+/// reader of a buffer, and a dma-buf client reads from `FrameReady` until its
+/// `Release`. A client that never sends one must not hold that wait for ever.
+#[test]
+fn an_unreleased_dma_frame_cannot_hold_its_lease_for_ever() {
+    use vmlab_hv_display::BufferLease;
+
+    let (server, source, _) = server();
+    let buffers: Arc<Vec<Arc<OwnedFd>>> = Arc::new(
+        (0..4)
+            .map(|_| Arc::new(File::open("/dev/zero").unwrap().into()))
+            .collect(),
+    );
+    let leases: Vec<_> = (0..4).map(|_| BufferLease::new()).collect();
+    let make = |buffer: u32| {
+        let mut f = frame(9, 4, 3);
+        f.pixels = Pixels::Leased {
+            buffers: buffers.clone(),
+            buffer,
+            acquire: None,
+            lease: leases[buffer as usize].clone(),
+            cpu: None,
+            readback: Arc::new(|| Ok(vec![42; 48])),
+        };
+        f
+    };
+    *source.0.lock().unwrap() = make(0);
+    let (c, h) = client(&server, C::FRAMES | C::DMABUF_OK | C::STABLE_BUFFERS);
+    assert!(matches!(
+        c.receive().unwrap().message,
+        M::SurfaceConfigure {
+            kind: SurfaceKind::Dmabuf,
+            ..
+        }
+    ));
+    // The client takes the first frame and sends no Release, now or later.
+    let first = ready(&c);
+    assert_eq!(first.1, 0);
+    // Three more frames on other buffers. The client holds three frames after
+    // the second of them, so the last one is not sent to it.
+    for buffer in 1..3 {
+        *source.0.lock().unwrap() = make(buffer);
+        server.publish().unwrap();
+        assert_eq!(ready(&c).1, buffer);
+    }
+    *source.0.lock().unwrap() = make(3);
+    server.publish().unwrap();
+    assert!(!leases[0].try_retire(), "the client still holds buffer zero");
+
+    // The GPU device retires a buffer before the guest command that writes
+    // to it, and in a reset. That call has to come back.
+    let lease = leases[0].clone();
+    let producer = std::thread::spawn(move || lease.retire());
+    // The server ends the wait by closing the client that holds the buffer.
+    // Before the fix nothing arrives here and the read ends in the timeout
+    // that `common::socket` sets on every test socket.
+    let closed = c.receive().unwrap_err();
+    assert_eq!(
+        closed.kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "the server did not close the client that holds the buffer: {closed}"
+    );
+    producer.join().unwrap();
+    // Closing the client frees every buffer that it held.
+    for (buffer, lease) in leases.iter().enumerate().take(3) {
+        assert!(lease.try_retire(), "buffer {buffer} is still held");
+    }
+    let _ = h.join().unwrap();
+}
+
 #[test]
 fn a_blocked_resize_cannot_prevent_buffer_release() {
     use std::sync::mpsc;
