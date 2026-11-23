@@ -616,6 +616,42 @@ mod tests {
         assert!(lpc.read_port(0x808, &mut [0; 4]));
     }
 
+    /// PIIX4's PM block is 64 ports (PMBA is 64-aligned). The window must
+    /// stop there and must not wrap past port 0xffff onto the ISA DMA ports.
+    #[test]
+    fn piix4_pm_window_does_not_wrap_or_overclaim() {
+        let mut lpc = Lpc::piix4(Arc::new(Irq::default()), Arc::new(|_| {}));
+        lpc.config_write(0x40 / 4, 0, &0xffc1u16.to_le_bytes());
+        lpc.config_write(0x80 / 4, 0, &[1]);
+        assert_eq!(lpc.pm_base(), 0xffc0);
+        assert!(lpc.read_port(0xffc0, &mut [0; 2]));
+        assert!(lpc.read_port(0xffff, &mut [0; 1]));
+        for port in [0x0000, 0x0008, 0x003f] {
+            assert!(!lpc.read_port(port, &mut [0; 1]), "read {port:#x}");
+            assert!(!lpc.write_port(port, &[0]), "write {port:#x}");
+        }
+
+        lpc.config_write(0x40 / 4, 0, &0xb001u16.to_le_bytes());
+        assert_eq!(lpc.pm_base(), 0xb000);
+        assert!(lpc.read_port(0xb008, &mut [0; 4]));
+        assert!(lpc.read_port(0xb03f, &mut [0; 1]));
+        for port in [0xb040, 0xb07f, 0xafff] {
+            assert!(!lpc.read_port(port, &mut [0; 1]), "read {port:#x}");
+            assert!(!lpc.write_port(port, &[0]), "write {port:#x}");
+        }
+    }
+
+    /// ICH9's PMBASE is 128-aligned and its block keeps all 128 ports.
+    #[test]
+    fn ich9_pm_window_keeps_128_ports() {
+        let (mut lpc, _, _) = fixture();
+        lpc.config_write(0x40 / 4, 0, &[1, 6]);
+        lpc.config_write(0x44 / 4, 0, &[0x80]);
+        assert!(lpc.read_port(0x67f, &mut [0; 1]));
+        assert!(!lpc.read_port(0x680, &mut [0; 1]));
+        assert!(!lpc.read_port(0x5ff, &mut [0; 1]));
+    }
+
     #[test]
     fn acpi_button_gpe_enable_disable_and_write_one_clear() {
         let (mut lpc, irq, _) = fixture();
