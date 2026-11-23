@@ -699,38 +699,4 @@ mod tests {
         assert_eq!(unified("", "new\n"), "  +new\n");
         assert_eq!(unified("gone\n", ""), "  -gone\n");
     }
-
-    // ---- card 672 review probe: PASSES while its fault is present ----
-
-    #[test]
-    fn review672_p7_guest_names_and_text_reach_the_terminal_with_their_escapes() {
-        let name = "a\u{1b}[2J\u{1b}]52;c;ZXZpbA==\u{7}\nfake line.rs";
-        crate::labd::workspace::ignore::validate_entry_name(name, false)
-            .expect("a name the syncer accepts from a guest");
-        let said = sync_report(
-            "dev01",
-            &WorkspaceSyncStatus {
-                conflicts: vec![crate::status::WorkspaceConflictStatus {
-                    path: name.into(),
-                    reason: "both sides changed it since they last agreed".into(),
-                }],
-                conflicts_total: 1,
-                ..halted_sync()
-            },
-        );
-        assert!(said.contains('\u{1b}'), "{said:?}");
-        assert!(said.contains("\nfake line.rs"), "{said:?}");
-
-        let diff: Diff = serde_json::from_value(serde_json::json!({
-            "machine": "dev01", "host_root": "/h", "guest_root": "/src",
-            "files": [{
-                "path": "a.txt",
-                "host": {"size": 2, "digest": "aa", "text": "x\n", "omitted": null},
-                "guest": {"size": 9, "digest": "bb", "text": "\u{1b}[2Jgone\n", "omitted": null},
-                "identical": false
-            }]
-        }))
-        .unwrap();
-        assert!(render_diff(&diff).contains('\u{1b}'));
-    }
 }
