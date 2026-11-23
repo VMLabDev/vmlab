@@ -207,6 +207,11 @@ test does not reproduce is wrong and should be dropped.
 
 ### F5. A script that does not call the host cannot be stopped (wrong result, hang)
 
+Fixed in #671. Script VMs have a finite bytecode budget. Provision failure,
+daemon shutdown and ad-hoc client disconnect cancel script runs. The runner
+checks cancellation before execution and when the VM returns, and interruptible
+host waits observe it while blocked.
+
 - Where: `src/scripting/runner.rs:140` and `:194` (`Vm::new(&ctx)`: the
   default configuration, `fuel: None`), `src/scripting/cancel.rs:10-16` (the
   module says it: "A script spinning without ever calling the host runs on
@@ -232,8 +237,7 @@ test does not reproduce is wrong and should be dropped.
   The same missing limit lets a script grow a list until the daemon is out of
   memory.
 - Proof: test `a_cancelled_script_stops_without_a_host_call` in
-  `src/scripting/runner.rs`: run
-  `fn main(lab: Lab) { let i = 0  while i < 200000000 { i = i + 1 }  lab.log("done") }`
+  `src/labd/lab.rs`: run a bounded bytecode loop followed by `lab.log("done")`
   through `run_script_source` with an owner whose token is cancelled before
   the run starts. Expected: `ScriptCancelled`, and no `done` line. Today: the
   loop runs to its end, `done` is logged (`lab.log` does not look at the

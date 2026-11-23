@@ -582,7 +582,14 @@ impl Handler<LabRequest> for LabdHandler {
                         .await?;
                 }
                 let result = streamed(lab, stream, |output| {
-                    crate::scripting::run_script_file(lab.clone(), &path, None, Some(run), output)
+                    crate::scripting::run_script_file(
+                        lab.clone(),
+                        &path,
+                        None,
+                        Some(run),
+                        Some(stream.disconnect_token()),
+                        output,
+                    )
                 })
                 .await;
                 lab.record_finalise_run(run).await;

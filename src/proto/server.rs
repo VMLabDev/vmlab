@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use super::{CommandError, Event, Message, WireRequest};
 
@@ -29,9 +30,14 @@ const MAX_REQ_LINE: usize = (super::INLINE_FILE_LIMIT as usize).div_ceil(3) * 4 
 pub struct Streamer {
     id: u64,
     tx: mpsc::Sender<Message>,
+    disconnect: CancellationToken,
 }
 
 impl Streamer {
+    pub(crate) fn disconnect_token(&self) -> CancellationToken {
+        self.disconnect.clone()
+    }
+
     pub async fn chunk(&self, text: impl Into<String>) {
         let _ = self
             .tx
@@ -310,6 +316,8 @@ async fn serve_conn<R: WireRequest + Send + 'static>(
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let disconnect = CancellationToken::new();
+    let _cancel_on_close = disconnect.clone().drop_guard();
 
     // All outbound traffic for this connection funnels through one channel so
     // responses, stream chunks, and events interleave without tearing.
@@ -397,6 +405,7 @@ async fn serve_conn<R: WireRequest + Send + 'static>(
         let streamer = Streamer {
             id,
             tx: out_tx.clone(),
+            disconnect: disconnect.clone(),
         };
         let handler = handler.clone();
         let out = out_tx.clone();
