@@ -279,7 +279,11 @@ fn boot_protocol_report_reaches_a_polling_driver_after_controller_reset() {
     assert_eq!(d.read(0x480) & (1 << 17), 0);
     d.write(0x480, (port & 0x0e00_c3e0) | 0x10);
     let port = d.read(0x480);
-    assert_eq!(port & 0x20_0003, 0x20_0003, "the port reset enabled the port");
+    assert_eq!(
+        port & 0x20_0003,
+        0x20_0003,
+        "the port reset enabled the port"
+    );
     d.write(0x480, (port & 0x0e00_c3e0) | (1 << 21));
     assert_eq!(d.event(34).parameter, 5 << 24);
     let t = d.command(9, 0, 0);
@@ -305,14 +309,20 @@ fn boot_protocol_report_reaches_a_polling_driver_after_controller_reset() {
         .read_slice(&mut protocol, GuestAddress(0x9000))
         .unwrap();
     assert_eq!(protocol, [1]);
-    assert_eq!(d.control([0x21, 11, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24, 1);
+    assert_eq!(
+        d.control([0x21, 11, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24,
+        1
+    );
     d.control([0xa1, 3, 0, 0, 0, 0, 1, 0], 1);
     d.mem
         .read_slice(&mut protocol, GuestAddress(0x9000))
         .unwrap();
     assert_eq!(protocol, [0]);
     // SET_IDLE(0), then the keyboard LEDs.
-    assert_eq!(d.control([0x21, 10, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24, 1);
+    assert_eq!(
+        d.control([0x21, 10, 0, 0, 0, 0, 0, 0], 0)[0].status >> 24,
+        1
+    );
     d.mem.write_slice(&[0], GuestAddress(0x9000)).unwrap();
     assert_eq!(d.control([0x21, 9, 0, 2, 0, 0, 1, 0], 1)[0].status >> 24, 1);
     // The asynchronous interrupt transfer the driver leaves queued.
