@@ -1745,12 +1745,13 @@ impl VmInstance {
 
     /// Graceful stop ladder (PRD §7.2): guest-agent shutdown → ACPI
     /// powerdown → emulator quit → hard kill, each with a timeout. Which
-    /// rungs, and how long each waits, is [`super::stop_plan`]'s.
-    async fn stop_ladder(&self, force: bool) -> Result<()> {
+    /// rungs, and how long each waits, is [`super::stop_plan`]'s. Returns the
+    /// rung that ended the process, or `None` when it was already stopped.
+    pub(crate) async fn stop_ladder(&self, force: bool) -> Result<Option<super::stop_plan::Rung>> {
         use super::stop_plan::{Rung, plan_stop};
         let proc = { self.qemu.lock().await.clone() };
         let Some(proc) = proc else {
-            return Ok(()); // already stopped
+            return Ok(None); // already stopped
         };
         // A sleeping guest answers neither the agent nor ACPI, so a graceful
         // stop wakes it first. Failing to is not fatal: the kill still works.
@@ -1766,6 +1767,7 @@ impl VmInstance {
         // teardown clears `control`, so a guard held across a wait below
         // would keep the machine from ever settling at Stopped.
         let control = self.control.lock().await.clone();
+        let mut stopped_at = None;
         for rung in plan {
             let ended = match rung {
                 // The state is already Stopping, so `agent()`'s Running gate
@@ -1833,10 +1835,12 @@ impl VmInstance {
                     rung.name(),
                     began.elapsed().as_secs_f64()
                 );
+                stopped_at = Some(rung);
                 break;
             }
         }
-        self.settle_stopped(STOP_SETTLE).await
+        self.settle_stopped(STOP_SETTLE).await?;
+        Ok(stopped_at)
     }
 
     /// Hand every host USB device this machine holds back to the host while
@@ -2342,7 +2346,8 @@ impl super::machine::Machine for VmInstance {
     }
 
     async fn stop(&self, force: bool) -> Result<()> {
-        self.stop_ladder(force).await
+        self.stop_ladder(force).await?;
+        Ok(())
     }
 
     async fn poweroff(&self) -> Result<()> {

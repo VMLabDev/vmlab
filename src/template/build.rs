@@ -22,12 +22,23 @@ use crate::config::model::{
 };
 use crate::config::wcl_str;
 use crate::labd::machine::Machine;
+use crate::labd::stop_plan::Rung;
 use crate::labd::vm::VmInstance;
 use crate::qemu::resolve::KeyStore;
 use crate::scripting::OutputSink;
 
+/// Stop the build VM and reject disks from guests cut off by the stop ladder.
 pub(crate) async fn shutdown_for_seal(vm: &VmInstance) -> Result<()> {
-    vm.stop(false).await?;
+    match vm.stop_ladder(false).await? {
+        Some(Rung::Quit { .. }) if vm.template().resolved.seal_allow_quit => {}
+        Some(rung @ (Rung::Quit { .. } | Rung::Kill)) => {
+            bail!(
+                "guest did not power off before the emulator {} rung, refusing to seal the disk",
+                rung.name()
+            );
+        }
+        Some(Rung::Agent { .. } | Rung::Acpi { .. }) | None => {}
+    }
     vm.wait_state(
         crate::labd::vm::PowerState::Stopped,
         std::time::Duration::from_secs(120),

@@ -1730,7 +1730,40 @@ async fn a_seal_fails_when_the_guest_does_not_power_off_by_itself() {
 
     assert_eq!(hv.journal(), ["agent shutdown ignored"]);
     assert_eq!(observed.exit().await.status, "exit status: 0");
-    result.expect_err("emulator quit must fail the seal");
+    let error = result.expect_err("emulator quit must fail the seal");
+    assert!(error.to_string().contains("quit rung"), "{error}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_legacy_seal_allows_quit_but_rejects_kill() {
+    for ignores_quit in [false, true] {
+        let dirs = Dirs::new();
+        let (vm, _) = vm(
+            &dirs,
+            r#"vm "dos" { template = "scratch" arch = "x86_64" profile = "windows-9x" disk = 1GiB }"#,
+            Script {
+                agent: false,
+                runs: vec![Run {
+                    ignores_powerdown: true,
+                    ignores_quit,
+                    ..Run::forever()
+                }],
+                ..Script::default()
+            },
+        );
+        let (cbs, mut observed) = callbacks();
+        start_vm(&vm, cbs).await.expect("start");
+        let result = crate::template::build::shutdown_for_seal(&vm).await;
+        let exit = observed.exit().await;
+        if ignores_quit {
+            assert_eq!(exit.status, "signal: 9");
+            let error = result.expect_err("kill must fail the seal");
+            assert!(error.to_string().contains("kill rung"), "{error}");
+        } else {
+            assert_eq!(exit.status, "exit status: 0");
+            result.expect("windows-9x allows sealing after emulator quit");
+        }
+    }
 }
 
 /// A booting guest whose agent has not answered yet is not power-cut: the
