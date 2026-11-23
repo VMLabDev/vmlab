@@ -36,7 +36,9 @@ fn ubuntu_vfio_enumeration_reset_and_second_start() {
     let overlay = dir.path().join("disk.qcow2");
     vmlab_disk::ops::create_linked_clone(&template, &overlay).unwrap();
     for first_start in [true, false] {
-        let path = dir.path().join(if first_start { "first" } else { "second" });
+        let path = dir
+            .path()
+            .join(if first_start { "first" } else { "second" });
         std::fs::create_dir(&path).unwrap();
         run_vm(&path, &overlay, &code, &vars, &address, first_start);
     }
@@ -153,7 +155,9 @@ fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, 
         assert_ne!(boot_id(&mut agent), boot, "guest boot ID after reset");
         check_pci_identity(&mut agent, address);
         eprintln!("VFIO S1: guest rebooted and enumerated PCI function {address}");
-        agent.shutdown("powerdown", Duration::from_secs(30)).unwrap();
+        agent
+            .shutdown("powerdown", Duration::from_secs(30))
+            .unwrap();
         assert_eq!(
             wait_for_lifecycle_event(&mut control),
             Some(Event::Shutdown {

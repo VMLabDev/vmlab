@@ -467,7 +467,9 @@ impl Backend for Host {
                 }
             }
             // SAFETY: the BAR mmap is live until all slots are removed.
-            mapping.register(base, |region| unsafe { self.vm.set_user_memory_region(region) })?;
+            mapping.register(base, |region| unsafe {
+                self.vm.set_user_memory_region(region)
+            })?;
         }
         Ok(())
     }
@@ -582,7 +584,8 @@ impl Drop for Host {
                 continue;
             }
             // SAFETY: no KVM mapping remains and no Rust reference aliases the mmap.
-            if unsafe { libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize) } != 0
+            if unsafe { libc::munmap(mapping.host as *mut libc::c_void, mapping.size as usize) }
+                != 0
             {
                 log::error!("unmapping VFIO BAR: {}", std::io::Error::last_os_error());
             }
