@@ -1033,6 +1033,11 @@ pub fn build(
                 vga.lock()
                     .enable_3d(mode, node, mapper)
                     .map_err(|e| VmmError::Other(e.to_string()))?;
+            } else if !desc.vfio.is_empty() {
+                // Yttrium matches revision 1 and requires 3D. The
+                // display-only driver also matches by vendor and device.
+                // Give the 2D console beside an assigned GPU revision 2.
+                vga.lock().set_pci_revision(2);
             }
             if let Some(doorbells) = transport.doorbells {
                 vga.lock().set_queue_doorbells(doorbells);
