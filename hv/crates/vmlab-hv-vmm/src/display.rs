@@ -664,57 +664,35 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
         (native_listener, false, "display-native"),
         (rfb_listener, true, "display-rfb"),
     ] {
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| VmmError::Control(format!("configuring {name}: {e}")))?;
         let server = server.clone();
         let weak = Arc::downgrade(shared);
         std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let mut workers = Vec::new();
                 // SAFETY: geteuid has no preconditions.
                 let own = unsafe { libc::geteuid() };
-                while weak.upgrade().is_some_and(|shared| !shared.exited()) {
-                    let stream = match listener.accept() {
-                        Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            continue;
-                        }
-                        Err(error) => {
-                            log::error!("{name}: {error}");
-                            break;
-                        }
-                    };
-                    // Neither protocol authenticates, so the socket is the
-                    // only gate: its mode, and this check for a connection
-                    // made before the mode was set.
-                    match peer_uid(&stream) {
-                        Ok(uid) if uid_may_connect(uid, own) => {}
-                        Ok(uid) => {
-                            log::warn!("{name}: refused a connection from uid {uid}");
-                            continue;
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "{name}: refused a connection, no peer credentials: {error}"
-                            );
-                            continue;
-                        }
+                // Neither protocol authenticates, so the socket is the only
+                // gate: its mode, and this check for a connection made
+                // before the mode was set.
+                let admit = |stream: &UnixStream| match peer_uid(stream) {
+                    Ok(uid) if uid_may_connect(uid, own) => true,
+                    Ok(uid) => {
+                        log::warn!("{name}: refused a connection from uid {uid}");
+                        false
                     }
-                    let server = server.clone();
-                    workers.retain(|worker: &std::thread::JoinHandle<()>| !worker.is_finished());
-                    workers.push(std::thread::spawn(move || {
-                        let result = if rfb {
-                            server.serve_rfb(stream)
-                        } else {
-                            server.serve_native(stream)
-                        };
-                        if let Err(error) = result {
-                            log::warn!("{name} client ended: {error}");
-                        }
-                    }));
+                    Err(error) => {
+                        log::warn!("{name}: refused a connection, no peer credentials: {error}");
+                        false
+                    }
+                };
+                // The loop outlives an accept that fails for a while (no
+                // descriptor, an aborted connection): one such error must
+                // not take the screen of the machine away.
+                let (result, workers) = server.serve_while(&listener, rfb, name, admit, || {
+                    weak.upgrade().is_some_and(|shared| !shared.exited())
+                });
+                if let Err(error) = result {
+                    log::error!("{name}: {error}");
                 }
                 server.shutdown();
                 for worker in workers {
