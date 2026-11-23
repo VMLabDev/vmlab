@@ -642,6 +642,63 @@ mod tests {
         assert!(legacy.contains("lanman auth = yes"));
     }
 
+    /// The text of one share's section in a rendered `smb.conf`.
+    fn section<'a>(conf: &'a str, name: &str) -> &'a str {
+        let rest = conf
+            .split_once(&format!("[{name}]\n"))
+            .unwrap_or_else(|| panic!("no [{name}] section in:\n{conf}"))
+            .1;
+        rest.split("\n[").next().unwrap_or(rest)
+    }
+
+    /// One `smb1` share and one modern share, as two machines of one lab
+    /// declare them.
+    fn mixed() -> SmbConfig {
+        let mut c = cfg(false);
+        c.any_smb1 = true;
+        c.shares[0].smb1 = true;
+        c
+    }
+
+    /// docs/reviews/smb.md F4, point 1: the relaxation `smb1 = true` asks for
+    /// belongs to that share. The server-wide settings stay at the baseline
+    /// for every session newer than SMB1, and the modern share refuses an
+    /// SMB1 session. (`an_smb1_share_does_not_relax_the_share_beside_it` in
+    /// `server.rs` asks a real smbd the same.)
+    #[test]
+    fn an_smb1_share_relaxes_only_itself() {
+        let conf = mixed().render_conf().unwrap();
+        let global = conf.split("\n[").next().unwrap();
+        // The baseline, with the dialect on offer: smbd has one floor.
+        assert!(global.contains("server min protocol = NT1\n"), "{global}");
+        assert!(global.contains("ntlm auth = ntlmv2-only\n"), "{global}");
+        for relaxed in ["ntlmv1-permitted", "lanman auth = yes"] {
+            assert!(
+                !global.contains(relaxed),
+                "`{relaxed}` for every session:\n{global}"
+            );
+        }
+        // The modern share turns an SMB1 session away, the smb1 share not.
+        let modern = section(&conf, "data");
+        assert!(modern.contains("preexec close = yes\n"), "{modern}");
+        assert!(modern.contains("preexec = case %R in"), "{modern}");
+        assert!(!section(&conf, "src").contains("preexec"), "{conf}");
+    }
+
+    /// docs/reviews/smb.md F4, point 2: no SMB1 client is offered the CIFS
+    /// Unix extensions, whatever the lab's shares ask for.
+    #[test]
+    fn conf_never_offers_the_smb1_unix_extensions() {
+        for conf in [cfg(false), cfg(true), mixed()] {
+            let conf = conf.render_conf().unwrap();
+            let global = conf.split("\n[").next().unwrap();
+            assert!(
+                global.contains("smb1 unix extensions = no\n"),
+                "the SMB1 Unix extensions are on offer:\n{global}"
+            );
+        }
+    }
+
     #[test]
     fn conf_never_maps_to_guest() {
         let conf = cfg(false).render_conf().unwrap();
