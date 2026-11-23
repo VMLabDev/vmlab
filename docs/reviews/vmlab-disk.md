@@ -26,7 +26,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes (fixed, card #556) |
 | F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
-| F7 | wrong result | A compressed cluster at the end of the file cannot be read |
+| F7 | wrong result | A compressed cluster at the end of the file cannot be read (fixed, card #562) |
 | F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size |
 | F9 | crash | The L1 size and the snapshot count of a header have no upper limit, so a small crafted image takes gigabytes of memory (fixed, card #555) |
 | F10 | crash | Two header fields of a crafted image panic the process (fixed, card #555) |
@@ -259,6 +259,8 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 - Proof: S2 test `a_compressed_cluster_at_the_end_of_the_file_reads`: the two
   commands above, then `read_at(0, ..)` of one cluster. Expected: 64 KiB of
   `0x03`. Today: an error.
+- Fixed in card #562. The read of a compressed cluster stops at the end of
+  the file and leaves the rest of the last sector as zeros, as QEMU does.
 
 ### F8. `convert -B` and `commit` fail on a size that is not a cluster multiple (wrong result)
 
