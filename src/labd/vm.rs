@@ -999,6 +999,7 @@ impl VmInstance {
             hypervisor_shares,
             gpu_render_node: render.gpu.as_ref().map(|g| g.render_node.clone()),
             gpu_passthrough: render.passthrough.clone(),
+            gpu_passthrough_functions: render.passthrough_functions.clone(),
             tsc_hz,
             qemu_data_dir: render.data_dir(&t.resolved.arch, std::env::var_os("PATH").as_deref()),
             apic_virtualization: qemu::host_apic_virtualization(),
@@ -1581,7 +1582,9 @@ impl VmInstance {
     /// gets back its agent and nothing more: whoever owed it readiness still
     /// does. Ends when the run's control channel goes.
     async fn watch_resets(self: Arc<Self>, mut resets: tokio::sync::watch::Receiver<u64>) {
-        resets.borrow_and_update();
+        if *resets.borrow() != 0 {
+            resets.mark_changed();
+        }
         // Readiness a reset took away, kept across a second reset that comes
         // before the agent answers.
         let mut owed = false;
@@ -1606,9 +1609,14 @@ impl VmInstance {
                     break;
                 }
                 if self.agent_probe().await {
-                    *self.agent_up.write().await = true;
+                    let mut agent_up = self.agent_up.write().await;
+                    let mut ready = self.ready.write().await;
+                    if resets.has_changed().unwrap_or(true) {
+                        break;
+                    }
+                    *agent_up = true;
                     if std::mem::take(&mut owed) {
-                        *self.ready.write().await = true;
+                        *ready = true;
                     }
                     break;
                 }

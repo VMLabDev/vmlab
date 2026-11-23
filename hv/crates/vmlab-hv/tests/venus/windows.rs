@@ -762,10 +762,12 @@ fn windows_win3d_venus_context_cleanup() {
             capture_tdr_diagnostics(&mut agent, "first-boot", path);
         }
         let pid = child.id();
-        agent = reboot_guest(&mut control, agent, path);
-        assert_eq!(child.id(), pid);
-        assert!(child.try_wait().unwrap().is_none());
-        eprintln!("Windows in-place reset complete; hypervisor PID unchanged");
+        for reboot in 1..=3 {
+            agent = reboot_guest(&mut control, agent, path);
+            assert_eq!(child.id(), pid);
+            assert!(child.try_wait().unwrap().is_none());
+            eprintln!("Windows in-place reset {reboot} complete; hypervisor PID unchanged");
+        }
         let script = std::fs::read(verify).unwrap();
         let guest_script = "C:\\Windows\\Temp\\vmlab-contexts-verify.ps1";
         write_guest_file(&mut agent, guest_script, &script);
@@ -888,6 +890,10 @@ fn windows_win3d_venus_context_cleanup() {
             }
         }
         let log = std::fs::read_to_string(path.join("hv.log")).unwrap();
+        assert!(
+            !log.contains("trying to process requests on a queue that's not ready"),
+            "Windows boot or reboot accessed an unready virtqueue:\n{log}"
+        );
         assert!(
             !log.contains("invalid context id") && !log.contains("GPU command failed:"),
             "Windows GPU command failure:\n{log}"

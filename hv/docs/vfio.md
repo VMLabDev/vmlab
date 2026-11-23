@@ -90,8 +90,28 @@ lspci -nnk -s "$BDF"
 ]
 ```
 
+Several functions of one card are separate entries that share a guest slot.
+The card goes at function 0, and each other function keeps its host function
+number:
+
+```json
+"vfio": [
+  {"host": "0000:05:00.0", "pci": {"bus": 0, "device": 4, "function": 0}},
+  {"host": "0000:05:00.1", "pci": {"bus": 0, "device": 4, "function": 1}}
+]
+```
+
+The guest then reads the multi-function bit at function 0 and finds the
+card's HDMI/DP audio function beside it. vmlab writes these entries for a
+`gpu { mode = "passthrough" }` VM from the functions of the host slot that are
+bound to `vfio-pci`, or from the host GPU's `passthrough_functions`.
+
 Assignment requires q35 and an explicit, unoccupied bus-zero guest address.
-The VMM resets the function at start and VM exit, maps guest RAM through a
+The VMM resets the function at start and VM exit when the kernel can reset it
+by itself (`VFIO_DEVICE_FLAGS_RESET`). The audio function of a graphics card
+usually cannot be: it has no function-level reset and shares its bus with the
+GPU. Such a function is assigned without a reset and the log says so. The VMM
+still clears its command register and interrupts. It maps guest RAM through a
 VFIO type1 container, and directly maps mmap-capable BAR pages into both KVM
 address spaces. Sparse mmap areas are respected. MSI-X table and PBA pages
 remain trapped; other registers on those pages use VFIO region access.
