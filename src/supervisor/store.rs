@@ -411,7 +411,13 @@ pub(super) async fn clones_by_backing() -> Vec<(PathBuf, String)> {
 
 /// Every registered lab, as (name, root).
 fn registered_labs() -> Vec<(String, PathBuf)> {
+    // The supervisor refuses to start on a registry it cannot read, and
+    // writes only what parses, so an error here is a file changed under it.
     super::registry::Registry::load()
+        .unwrap_or_else(|error| {
+            tracing::warn!("no registered labs for the backing scan: {error:#}");
+            Default::default()
+        })
         .labs()
         .iter()
         .map(|l| (l.name.clone(), l.root.clone()))
