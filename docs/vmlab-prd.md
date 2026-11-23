@@ -1116,7 +1116,10 @@ started, then the first passing healthcheck (when declared) — and gates
 `depends_on` waves. Events `container.starting/ready/stopped/crashed/unhealthy`
 are bindable with `on {}`. The stop ladder mirrors VMs: in-guest stop signal +
 grace, then guest shutdown, then kill. Container stdout/stderr is the serial
-console log (`vmlab container logs [-f]`).
+console log (`vmlab container logs [-f]`). The guest decides how much it
+writes there, so the host bounds both ends: vmlab-hv keeps a serial log under
+64 MiB by dropping its older half, and a read takes the end of the file, never
+the whole of it, with a byte that is not UTF-8 replaced.
 
 **Snapshots.** Containers are snapshottable with full VM parity (§7.3).
 Offline snapshots capture the scratch disk; online snapshots capture scratch

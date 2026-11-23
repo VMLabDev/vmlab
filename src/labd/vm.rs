@@ -2700,6 +2700,10 @@ impl super::machine::Machine for VmInstance {
         Some(tail_file(&self.dirs.logs.join("serial.log"), lines))
     }
 
+    fn console_log_file(&self) -> Option<PathBuf> {
+        Some(self.dirs.logs.join("serial.log"))
+    }
+
     async fn status_detail(&self) -> super::machine::MachineDetail {
         // Hardware as resolved (VM > template > profile, ADR-0008), not as
         // declared: a VM that leaves its arch or size to its template still
@@ -2733,15 +2737,74 @@ impl super::machine::Machine for VmInstance {
 
 /// The last `lines` lines of a log file; a file that was never written is
 /// empty rather than an error (the machine may not have started yet).
+///
+/// The guest writes this file, so it is read as hostile input: from the end,
+/// within the bound of [`crate::logs::tail_with_len`] whatever the file's
+/// size, and with a byte that is not UTF-8 replaced rather than refused.
 pub(super) fn tail_file(path: &Path, lines: usize) -> Result<String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    Ok(tail_file_with_len(path, lines)?.0)
+}
+
+/// [`tail_file`] plus the file length the tail was read at, where a follower
+/// starts.
+pub(super) fn tail_file_with_len(path: &Path, lines: usize) -> Result<(String, u64)> {
+    match std::fs::File::open(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), 0)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    let (tail, len) = crate::logs::tail_with_len(path, lines);
+    Ok((tail.join("\n"), len))
+}
+
+/// The most one poll of a followed log reads. A log that gained more than
+/// this since the last poll is followed from this far before its end.
+const FOLLOW_READ_LIMIT: u64 = 1024 * 1024;
+
+/// What a followed log gained since offset `*seen`, which advances past what
+/// is returned. Bounded by [`FOLLOW_READ_LIMIT`]; a file that shrank (the
+/// hypervisor cut it at its size cap, or a new start replaced it) is followed
+/// from its new end. A character cut by the end of the read waits for the
+/// next poll.
+pub(super) fn read_log_since(path: &Path, seen: &mut u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
     };
-    let all: Vec<&str> = content.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    Ok(all[start..].join("\n"))
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < *seen {
+        *seen = len;
+    }
+    let start = (*seen).max(len.saturating_sub(FOLLOW_READ_LIMIT));
+    let mut buf = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err()
+        || file.take(len - start).read_to_end(&mut buf).is_err()
+    {
+        return String::new();
+    }
+    buf.truncate(buf.len() - cut_character(&buf));
+    *seen = start + buf.len() as u64;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// How many bytes at the end of `buf` begin a UTF-8 character that `buf`
+/// does not finish.
+fn cut_character(buf: &[u8]) -> usize {
+    for back in 1..=buf.len().min(3) {
+        let byte = buf[buf.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue; // a continuation byte: its lead is further back
+        }
+        let width = match byte {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if width > back { back } else { 0 };
+    }
+    0
 }
 
 fn disk_nodes(n: usize) -> Vec<String> {
@@ -3040,6 +3103,41 @@ mod tests {
         file.write_all(b"\none\ntwo\nthree\n").unwrap();
         drop(file);
         assert_eq!(super::tail_file(&log, 2).unwrap(), "two\nthree");
+    }
+
+    /// A follower reads what the log gained, by offset: never the file
+    /// again, never a character in two halves, and from the new end when the
+    /// file was cut.
+    #[test]
+    fn a_followed_log_is_read_by_offset() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("console.log");
+        std::fs::write(&log, b"one\ntwo\n").unwrap();
+        let (tail, mut seen) = super::tail_file_with_len(&log, 1).unwrap();
+        assert_eq!((tail.as_str(), seen), ("two", 8));
+        assert_eq!(super::read_log_since(&log, &mut seen), "");
+
+        // "é" arrives in two writes: the first half waits for the second.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(b"caf\xc3").unwrap();
+        assert_eq!(super::read_log_since(&log, &mut seen), "caf");
+        file.write_all(b"\xa9\n\xff\n").unwrap();
+        assert_eq!(super::read_log_since(&log, &mut seen), "\u{e9}\n\u{fffd}\n");
+
+        // Cut to nothing and written again: followed from the new end.
+        file.set_len(0).unwrap();
+        assert_eq!(super::read_log_since(&log, &mut seen), "");
+        file.write_all(b"again\n").unwrap();
+        assert_eq!(super::read_log_since(&log, &mut seen), "again\n");
+
+        // More than one poll's worth: the follower skips to the end of it.
+        let flood = vec![b'x'; super::FOLLOW_READ_LIMIT as usize + 10];
+        file.write_all(&flood).unwrap();
+        let got = super::read_log_since(&log, &mut seen);
+        assert_eq!(got.len() as u64, super::FOLLOW_READ_LIMIT);
+        assert_eq!(seen, std::fs::metadata(&log).unwrap().len());
     }
 
     #[tokio::test]
