@@ -176,7 +176,7 @@ pub async fn build_template(
     // Working area: a throwaway lab root under the artefact cache. Removed on
     // both success and failure, so nothing leaks.
     let work = build_workdir(def);
-    let guard = claim_workdir(&work)?;
+    let guard = claim_build_workdir(def, &work, &crate::paths::runtime_dir())?;
 
     let result = run_build(
         def,
@@ -461,7 +461,7 @@ async fn build_variants(
             "{}-{}-{}-variant-{}",
             def.arch, def.name, def.version, v.name
         ));
-        let guard = claim_workdir(&work)?;
+        let guard = claim_build_workdir(def, &work, &crate::paths::runtime_dir())?;
         let built = build_variant(
             def,
             v,
@@ -1048,6 +1048,25 @@ fn write_build_lab(work: &Path, source: &str) -> Result<()> {
 
 fn build_workdir(def: &TemplateDef) -> PathBuf {
     builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
+}
+
+fn claim_build_workdir(
+    def: &TemplateDef,
+    work: &Path,
+    runtime: &Path,
+) -> Result<(WorkdirGuard, nix::fcntl::Flock<std::fs::File>)> {
+    let lab = build_lab_name(&def.arch, &def.name);
+    let lab_dir = crate::paths::lab_runtime_dir_in(runtime, &lab);
+    // Keep the lock outside the lab directory, which build boots can recreate.
+    // Use its fitted name so the lock follows the actual socket directory.
+    crate::paths::ensure_private_dir(runtime)?;
+    let locks = runtime.join("build-locks");
+    crate::paths::ensure_private_dir(&locks)?;
+    let lock_path = locks.join(lab_dir.file_name().expect("lab directory has a name"));
+    let Some(runtime_lock) = try_lock_workdir(&lock_path)? else {
+        bail!("build lab `{lab}` is in use by another build; wait for it to finish");
+    };
+    Ok((claim_workdir(work)?, runtime_lock))
 }
 
 /// Reap and delete build working directories no live build holds, returning
@@ -2508,6 +2527,36 @@ mod tests {
             build_lab_name(&x64.arch, &x64.name),
             build_lab_name(&x86.arch, &x86.name)
         );
+    }
+
+    #[test]
+    fn two_builds_of_one_template_do_not_share_a_runtime_directory() {
+        let first = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/i.iso" } }"#);
+        let mut second = first.clone();
+        second.version = "2".into();
+        let dir = tempfile::tempdir().unwrap();
+        let first_work = dir
+            .path()
+            .join(super::build_workdir(&first).file_name().unwrap());
+        let second_work = dir
+            .path()
+            .join(super::build_workdir(&second).file_name().unwrap());
+        let runtime = dir.path().join("runtime");
+        assert_ne!(first_work, second_work);
+        let first_claim = super::claim_build_workdir(&first, &first_work, &runtime).unwrap();
+        let err = super::claim_build_workdir(&second, &second_work, &runtime)
+            .err()
+            .expect("both builds claimed the same runtime directory");
+        let error = err.to_string();
+        assert!(
+            error.contains("build lab `build-x86_64-t` is in use"),
+            "{error}"
+        );
+        assert!(!second_work.exists());
+        drop(first_claim);
+        assert!(super::claim_build_workdir(&second, &second_work, &runtime).is_ok());
     }
 
     #[test]
