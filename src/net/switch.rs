@@ -235,6 +235,7 @@ impl Switch {
     /// Attach a QEMU stream-socket connection as a port. Spawns a reader
     /// task (deframe → ingress) and a writer task (egress queue → frame).
     /// The port is removed automatically on EOF or stream error.
+    #[cfg(test)]
     pub async fn add_stream_port(self: &Arc<Self>, stream: UnixStream, class: PortClass) -> PortId {
         self.add_stream_port_with_config(stream, class, PortConfig::default())
             .await
