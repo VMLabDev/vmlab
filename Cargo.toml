@@ -103,7 +103,9 @@ async-trait = "0.1.91"
 # `net` is for sockopt::socket_cookie (SO_COOKIE), the sockmap fast path's
 # per-socket BPF map key. `fs` is for statfs and the inode-flag ioctls that
 # set NOCOW on a btrfs disk directory (`nocow.rs`).
-rustix = { version = "1.1.4", features = ["termios", "net", "fs"] }
+# `param` is for linux_secure (AT_SECURE), the first half of the
+# fast-path helper's check of who started it.
+rustix = { version = "1.1.4", features = ["termios", "net", "fs", "param"] }
 # The eBPF loader for the network fast path. Its userspace API is safe, so
 # the crate-level `unsafe_code = "deny"` holds.
 aya = { version = "0.14", optional = true }

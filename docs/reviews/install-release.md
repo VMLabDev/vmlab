@@ -85,6 +85,19 @@ starts `~first/.local/bin/vmlab-fastpath` with one end as stdin, and sends
 `XdpLoad` then `XdpTap`. Expected: a refusal. Observed (by reading): a tap
 `vmfp0` appears in `ip link`, up, with the XDP program attached.
 
+Fixed by card #608, in two halves. `install.sh` installs the helper mode
+0700, so no other account can execute it
+(`scripts/test_release_assets.py`: `test_helper_is_executable_by_its_owner_only`,
+`test_helper_keeps_owner_only_mode_through_the_grant`). The helper itself
+refuses a start that gained privilege from its file (`AT_SECURE`) when the
+caller is neither the owner of the file nor root
+(`src/net/fastpath/helper/mod.rs`, `caller_refusal` and its tests), which
+also covers a helper whose mode was changed and one granted by hand. A
+helper that root owns still serves every user: only the administrator can
+have granted it. The limits on engines and taps are per connection as
+before. The two-account test above was not run: the merge bar has one
+account and no way to grant file capabilities.
+
 ### F3. A release is built from caches that any build on the host can write (security)
 
 `build/run.sh:59` mounts one named docker volume, `vmlab-build-cargo`, as the

@@ -230,6 +230,27 @@ esac
         self.assertTrue(helper.is_file())
         self.assertTrue(os.access(helper, os.X_OK))
 
+    def test_helper_is_executable_by_its_owner_only(self):
+        # File capabilities go to whoever executes the file (review F2, card
+        # 608): no other account may be able to start the helper.
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(oct(helper.stat().st_mode & 0o777), oct(0o700))
+
+    def test_helper_keeps_owner_only_mode_through_the_grant(self):
+        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
+        self.tool('sudo', '#!/bin/sh\nset -eu\nexit 0\n')
+        self.tool('setcap', '#!/bin/sh\nexit 99\n')
+        self.tool('getcap', '#!/bin/sh\nprintf "%s cap_bpf,cap_net_admin=ep\\n" "$1"\n')
+        self.tool('findmnt', '#!/bin/sh\nprintf "rw,relatime\\n"\n')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        helper = self.root / 'installed/vmlab-fastpath'
+        self.assertEqual(oct(helper.stat().st_mode & 0o777), oct(0o700))
+        self.assertIn('Any program running as you', result.stderr)
+        self.assertIn('serves no other user', result.stderr)
+
     def test_fastpath_grants_the_helper_and_never_the_binary(self):
         log = self.root / 'sudo.log'
         self.env['SUDO_LOG'] = str(log)
