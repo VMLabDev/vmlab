@@ -1939,6 +1939,62 @@ mod tests {
     }
 
     #[test]
+    fn a_grown_image_reads_zeros_where_vmstate_was() {
+        let (_dir, mut img) = testsupport::blank(1024 * 1024);
+        let span = img.l2_span();
+        img.write_vmstate(0, &[0x77; 4096]).unwrap();
+        img.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        img.read_at(span, &mut buf).unwrap();
+        assert_eq!(buf, vec![0u8; 4096]);
+        img.flush().unwrap();
+        let path = img.path.clone();
+        drop(img);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert_eq!(buf, vec![0u8; 4096]);
+    }
+
+    #[test]
+    fn a_grown_overlay_reads_zeros_where_its_longer_backing_has_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let backing_path = dir.path().join("backing.qcow2");
+        let mut backing = Qcow2Image::create(&backing_path, 2 << 30, 16, None).unwrap();
+        let span = backing.l2_span();
+        assert_eq!(2 * span, 2 << 30);
+        backing.write_at(span, &[0x55; 4096]).unwrap();
+        // A tail inside the last cluster of the overlay's old size.
+        backing.write_at(span - 4096, &[0x66; 8192]).unwrap();
+        backing.flush().unwrap();
+        drop(backing);
+        let old_size = span - 2048;
+        let mut overlay = Qcow2Image::create(
+            &dir.path().join("overlay.qcow2"),
+            old_size,
+            16,
+            Some((&backing_path, Some("qcow2"))),
+        )
+        .unwrap();
+        overlay.resize_grow(2 * span).unwrap();
+        let mut buf = vec![0xffu8; 8192];
+        overlay.read_at(span - 4096, &mut buf).unwrap();
+        let mut want = vec![0x66u8; 2048];
+        want.resize(8192, 0);
+        assert_eq!(buf, want);
+        let mut buf = vec![0xffu8; 4096];
+        overlay.read_at(span, &mut buf).unwrap();
+        assert_eq!(buf, vec![0u8; 4096]);
+        overlay.flush().unwrap();
+        let path = overlay.path.clone();
+        drop(overlay);
+        let mut reopened = Qcow2Image::open(&path, true).unwrap();
+        let mut buf = vec![0xffu8; 4096];
+        reopened.read_at(span, &mut buf).unwrap();
+        assert_eq!(buf, vec![0u8; 4096]);
+    }
+
+    #[test]
     fn vmstate_base_is_first_non_guest_l1_entry() {
         // 10 MiB disk, 64 KiB clusters: L1 span is 512 MiB, so the vmstate
         // starts at 512 MiB (observed from QEMU's savevm).
