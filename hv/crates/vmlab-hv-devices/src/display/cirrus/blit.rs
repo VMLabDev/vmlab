@@ -131,6 +131,20 @@ impl Blit {
         }
     }
 
+    /// Whether the geometry is one `latch` can produce: a 13-bit width and
+    /// 11-bit height (each plus one), 13-bit pitches, 22-bit addresses and a
+    /// 3-bit left clip. A snapshot supplies these fields without the
+    /// registers, so restore checks them here.
+    pub fn within_registers(&self) -> bool {
+        (1..=0x2000).contains(&self.width)
+            && (1..=0x800).contains(&self.height)
+            && self.dst_pitch <= 0x1fff
+            && self.src_pitch <= 0x1fff
+            && self.dst <= 0x3f_ffff
+            && self.src <= 0x3f_ffff
+            && self.skip <= 7
+    }
+
     /// Bytes per pixel: GR30 bits 5:4 select 8, 16, 24 or 32 bits.
     pub fn bpp(&self) -> usize {
         1 + ((self.mode >> 4) & 3) as usize
