@@ -273,7 +273,10 @@ that has keys enrolled for it: a blank store boots in setup mode, where
 nothing is verified, so vmlab refuses rather than boot one. Each VM copies its
 store from the template once, at its first start, into
 `.vmlab/vms/<vm>/OVMF_VARS.fd`, and keeps it, enrolled keys and boot entries
-included. A VM created under a firmware of a different flash layout, such as a
+included. Turning `secure_boot` on for a VM that has already started without
+it is refused at the next start: the guest could write that store while secure
+boot was off, so nothing vouches for the keys in it. Delete the VM's
+`OVMF_VARS.fd` to have the next start copy the enrolled store. A VM created under a firmware of a different flash layout, such as a
 host's old 2 MiB OVMF, keeps booting a build of that layout. Templates record
 `firmware`, `secure_boot` and `secure_boot_keys`, never a firmware path, so
 nothing about the building host travels with them.

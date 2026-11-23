@@ -740,6 +740,54 @@ async fn a_vms_status_reports_its_resolved_hardware() {
     assert_eq!(detail.memory, Some(resolved.memory));
 }
 
+/// Review finding F3 (docs/reviews/firmware.md): QEMU's `virt` machine has no
+/// secure world, so an aarch64 guest's kernel can program the flash that
+/// holds PK, KEK, db and dbx. `secure_boot = true` there must say so before
+/// the VM boots, under either key store, and stay silent for a VM without
+/// secure boot and for an x86_64 one, whose store is written from SMM only.
+#[tokio::test]
+async fn aarch64_secure_boot_says_its_key_store_is_guest_writable() {
+    let warnings = |arch: &str, extra: &str| {
+        let dirs = Dirs::new();
+        let (vm, _hv) = vm(
+            &dirs,
+            &format!(
+                "vm \"sb\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"linux-modern\" \
+                 disk = 1GiB firmware = \"ovmf\" {extra} }}"
+            ),
+            Script::healthy(),
+        );
+        let m: Arc<dyn Machine> = vm;
+        m.launch_warnings()
+    };
+    let about_the_store = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| line.contains("secure_boot = true"))
+            .cloned()
+            .collect()
+    };
+
+    for extra in [
+        "secure_boot = true",
+        "secure_boot = true secure_boot_keys = \"setup\"",
+    ] {
+        let said = about_the_store(&warnings("aarch64", extra));
+        assert_eq!(said.len(), 1, "{extra}: {said:?}");
+        let line = &said[0];
+        assert!(line.starts_with("vm \"sb\": secure_boot = true"), "{line}");
+        assert!(line.contains("the guest's own kernel can write"), "{line}");
+    }
+    assert_eq!(
+        about_the_store(&warnings("aarch64", "secure_boot = false")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        about_the_store(&warnings("x86_64", "secure_boot = true")),
+        Vec::<String>::new()
+    );
+}
+
 /// Host USB passthrough's machine-side refusals (§5.2.1): a container
 /// never; a VM only while running, and only when it booted with the
 /// controller; a stop forgets nothing it did not hold.
@@ -2378,6 +2426,96 @@ async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
         }
         machine.clone().start(lab, None).await.unwrap();
         machine.stop(true).await.unwrap();
+    }
+}
+
+/// A `firmware_dir` laid out like the bundled x86_64 set, each file holding
+/// its own name: the plain and secure-boot CODE builds, the blank VARS
+/// template and the one with keys enrolled. The four are the same length, as
+/// the real templates are, so a size check tells them apart no better here
+/// than it does in production.
+fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
+    let arch = dirs.root.join("firmware/x86_64");
+    std::fs::create_dir_all(&arch).expect("firmware dir");
+    for (name, bytes) in [
+        ("OVMF_CODE_4M.fd", b"code:plain"),
+        ("OVMF_CODE_4M.secboot.fd", b"code:secbt"),
+        ("OVMF_VARS_4M.fd", b"vars:blank"),
+        ("OVMF_VARS_4M.ms.fd", b"vars:keyed"),
+    ] {
+        std::fs::write(arch.join(name), bytes).expect("firmware file");
+    }
+    crate::config::host::HostConfig {
+        firmware_dir: Some(dirs.root.join("firmware")),
+        ..Default::default()
+    }
+}
+
+/// A VM started without secure boot has a variable store nothing vouches
+/// for: it was copied from the blank template, and the guest could write it
+/// while the flash was unprotected. `secure_boot = true` on that VM must not
+/// boot the secure-boot firmware on that store, where it would sit in setup
+/// mode and verify nothing, or enforce keys the guest chose (firmware review
+/// F2). The start is refused by name and the store is left as it was.
+#[tokio::test]
+async fn turning_secure_boot_on_does_not_boot_an_unenrolled_store() {
+    const PLAIN: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#;
+    const SECURE: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = true }"#;
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+
+    let (mut first, _) = vm(&dirs, PLAIN, Script::healthy());
+    first.set_host_config(firmware.clone());
+    let store = first.dirs.ovmf_vars();
+    let machine: Arc<dyn Machine> = first;
+    machine.clone().start(lab.clone(), None).await.unwrap();
+    machine.stop(true).await.unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+    drop(machine);
+
+    // The operator's edit: the same VM, the same directory, secure boot on.
+    let (mut second, hv) = vm(&dirs, SECURE, Script::healthy());
+    second.set_host_config(firmware);
+    let machine: Arc<dyn Machine> = second;
+    let outcome = machine.clone().start(lab.clone(), None).await;
+    let enrolled = std::fs::read(&store).unwrap() == b"vars:keyed";
+    match outcome {
+        Ok(()) => {
+            machine.stop(true).await.unwrap();
+            assert!(
+                enrolled,
+                "secure boot started on the store the VM had without it"
+            );
+        }
+        Err(error) => {
+            let said = format!("{error:#}");
+            assert!(
+                said.contains("dc01")
+                    && said.contains("secure_boot")
+                    && said.contains("OVMF_VARS.fd"),
+                "the refusal names the machine, the setting and the store: {said}"
+            );
+            assert_eq!(hv.starts(), 0, "a refused start launches nothing");
+            assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+            assert_eq!(machine.state().await, PowerState::Stopped);
+        }
+    }
+
+    // A VM that never ran without secure boot is not in the way of this:
+    // its first start copies the enrolled template and every later one
+    // keeps that store.
+    let fresh = Dirs::new();
+    let firmware = fake_firmware(&fresh);
+    for _ in 0..2 {
+        let (mut vm, _) = vm(&fresh, SECURE, Script::healthy());
+        vm.set_host_config(firmware.clone());
+        let store = vm.dirs.ovmf_vars();
+        let machine: Arc<dyn Machine> = vm;
+        machine.clone().start(lab.clone(), None).await.unwrap();
+        machine.stop(true).await.unwrap();
+        assert_eq!(std::fs::read(&store).unwrap(), b"vars:keyed");
     }
 }
 

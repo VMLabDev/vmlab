@@ -378,6 +378,30 @@ pub fn tsc_not_applied(vm: &ResolvedVm, accel: Accel) -> Option<String> {
     })
 }
 
+/// The line `up` prints for a VM whose secure boot rests on a variable store
+/// the guest's own kernel can rewrite (§5.2) — `None` for a VM without
+/// secure boot, and for an x86_64 one. vmlab-hv opens an x86_64 store so
+/// that only SMM writes it. QEMU's `virt` machine, which runs every other
+/// arch, gets the store as plain NOR flash ([`build_args`]) and has no
+/// secure world to keep it in, so nothing above the guest kernel guards PK,
+/// KEK, db and dbx. Said for an inherited `secure_boot` too: the profile or
+/// the template is where it usually comes from.
+pub fn secure_boot_store_unprotected(vm: &ResolvedVm) -> Option<String> {
+    let exposed = vm.secure_boot
+        && vm.firmware == Some(FirmwareKind::Ovmf)
+        && qemu_arch(&vm.arch) != "x86_64";
+    exposed.then(|| {
+        format!(
+            "vm \"{}\": secure_boot = true verifies what the firmware boots, but on {} the \
+             UEFI variable store is flash the guest's own kernel can write — code running in \
+             the guest kernel can replace its secure-boot keys or turn secure boot off, and \
+             the change survives a reset; only an x86_64 guest's store is protected from its \
+             OS (PRD §5.2)",
+            vm.name, vm.arch
+        )
+    })
+}
+
 pub fn emulator_binary(arch: &str) -> String {
     format!("qemu-system-{}", qemu_arch(arch))
 }
@@ -501,7 +525,9 @@ pub fn build_args(
         arg(&mut a, "serial", format!("file:{}", log.display()));
     }
 
-    // UEFI firmware: CODE read-only pflash + per-VM writable VARS.
+    // UEFI firmware: CODE read-only pflash + per-VM writable VARS. `virt` has
+    // no secure world here, so the VARS flash is writable by the guest OS —
+    // under secure boot too, which [`secure_boot_store_unprotected`] says.
     if vm.firmware == Some(FirmwareKind::Ovmf) {
         let code = paths
             .firmware_code
