@@ -1265,6 +1265,19 @@ impl ContainerInstance {
 
 #[async_trait::async_trait]
 impl super::machine::Machine for ContainerInstance {
+    /// [`Self::stop_ladder`]'s waits: the ctl rung's grace and margin, the
+    /// agent's connect, answer and exit, then the kill's exit and settle.
+    async fn stop_wait(&self) -> Duration {
+        if self.qemu.lock().await.is_none() {
+            return Duration::ZERO;
+        }
+        let grace = self
+            .image_parts()
+            .map(|p| p.spec.stop_grace_secs)
+            .unwrap_or(10);
+        Duration::from_secs(grace + 15 + 2 + 5 + 15 + 10 + 10)
+    }
+
     async fn debug_available(&self) -> bool {
         self.control
             .lock()

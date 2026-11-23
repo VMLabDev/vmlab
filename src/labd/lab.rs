@@ -1229,6 +1229,17 @@ impl LabRuntime {
             .ok_or_else(|| anyhow!("no vm or container \"{name}\" in lab \"{}\"", self.name))
     }
 
+    /// The longest stopping every machine can take, each running out its whole
+    /// stop ladder: the sum over machines, since a `down` stops its waves one
+    /// after the other.
+    pub async fn stop_wait(&self) -> std::time::Duration {
+        let mut total = std::time::Duration::ZERO;
+        for m in self.machines() {
+            total += m.stop_wait().await;
+        }
+        total
+    }
+
     /// Every machine in the lab, in name order, as the set held them when
     /// asked.
     pub fn machines(&self) -> impl Iterator<Item = Arc<dyn Machine>> + use<> {

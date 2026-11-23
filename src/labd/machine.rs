@@ -340,6 +340,14 @@ pub trait Machine: Send + Sync + 'static {
     async fn is_ready(&self) -> bool;
     /// Graceful stop ladder, or an immediate kill when `force`.
     async fn stop(&self, force: bool) -> Result<()>;
+    /// The longest a graceful [`stop`](Self::stop) begun now can take: the
+    /// sum of every wait its ladder may run out. Zero for a machine with
+    /// nothing running. The default is the longest ladder a VM that acts on
+    /// ACPI climbs.
+    async fn stop_wait(&self) -> Duration {
+        use super::stop_plan::{BOOTING_AGENT_WAIT, RUNG_EXIT_WAIT};
+        BOOTING_AGENT_WAIT + RUNG_EXIT_WAIT * 3
+    }
 
     /// Exit the emulator *gracefully*, flushing block-device caches first.
     ///
