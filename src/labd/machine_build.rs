@@ -158,12 +158,7 @@ pub(super) async fn build_vm(
         }
     };
 
-    let resolved = crate::qemu::resolve::resolve_vm_for_variant(
-        vm_cfg,
-        meta.as_ref(),
-        variant.as_deref(),
-        cx.profiles,
-    )?;
+    let resolved = crate::qemu::resolve_vm(vm_cfg, meta.as_ref(), cx.profiles)?;
     // A VM on vmlab-hv is refused anything its delivered phases cannot run;
     // a pending pull's placeholder hardware is checked again once it binds.
     let dirs = VmDirs::new(cx.lab, &vm_cfg.name, cx.lab_local);

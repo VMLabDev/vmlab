@@ -795,6 +795,16 @@ fn vga_text_planar_and_snapshot_match_standard_vga() {
 }
 
 #[test]
+fn companion_pci_revision_survives_reset() {
+    let mut d = Driver::new();
+    assert_eq!(d.dev.config_read(2), 0x0300_0001);
+    d.dev.set_pci_revision(2);
+    assert_eq!(d.dev.config_read(2), 0x0300_0002);
+    crate::Resettable::reset(&mut d.dev).unwrap();
+    assert_eq!(d.dev.config_read(2), 0x0300_0002);
+}
+
+#[test]
 fn pci_configuration_access_capability_and_seavgabios_rom() {
     let mut d = Driver::new();
     d.dev.config_write(0x88 / 4, 0, &[2]);
