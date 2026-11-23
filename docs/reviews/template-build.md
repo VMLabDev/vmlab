@@ -48,7 +48,7 @@ test does not reproduce is wrong and should be dropped.
 | F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
 | F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697) |
 | F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
-| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process |
+| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process (fixed, card #699) |
 | F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory |
 | F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` |
 | F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered |
@@ -203,6 +203,11 @@ seal for every profile.
      `keep = 1`. Today it returns `1.0.0`.
 
 ### F5. A build VM outlives a killed supervisor (wrong result)
+
+**Fixed by card #699.** The supervisor reaps the synthetic lab's hypervisor
+and helpers before deleting the abandoned working directory. It holds the
+workdir lock during cleanup and uses the runtime directory recorded by the
+build to identify its processes.
 
 - Where: `src/qemu/process.rs:150` (`kill_on_drop(false)`, and no parent
   death signal). `src/supervisor/mod.rs:197-206` (the sweep at start).

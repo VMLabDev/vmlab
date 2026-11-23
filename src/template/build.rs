@@ -553,7 +553,7 @@ async fn build_variant(
             guest_iso: None,
         },
     )?;
-    std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
+    write_build_lab(work, &lab_wcl)?;
     let labfile = crate::config::load_lab_source(&lab_wcl, "<variant build>", work)
         .map_err(|e| anyhow::anyhow!("internal variant build lab invalid: {e:?}"))?;
     let (events_tx, _) = tokio::sync::broadcast::channel::<crate::proto::Event>(256);
@@ -999,11 +999,10 @@ fn try_lock_workdir(work: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::Fil
     }
 }
 
-/// Claim working directory `work` for a build: take its lock, clear whatever
-/// a dead build left in it, and create it empty.
+/// Claim working directory `work` for a build: take its lock and create it empty.
 ///
 /// Refuses when a live build — in this supervisor or another one on the same
-/// data dir — holds it, rather than deleting that build's disk and media.
+/// data dir — holds it or when startup still needs to reap its build lab.
 pub fn claim_workdir(work: &Path) -> Result<WorkdirGuard> {
     if let Some(parent) = work.parent() {
         std::fs::create_dir_all(parent)
@@ -1016,6 +1015,12 @@ pub fn claim_workdir(work: &Path) -> Result<WorkdirGuard> {
             work.display()
         );
     };
+    if work.join(crate::paths::LAB_FILE).try_exists()? {
+        bail!(
+            "{} still contains a build lab; restart the supervisor to reap its processes",
+            work.display()
+        );
+    }
     let _ = std::fs::remove_dir_all(work);
     std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
     Ok(WorkdirGuard {
@@ -1029,32 +1034,35 @@ pub fn builds_dir() -> PathBuf {
     crate::paths::data_dir().join("cache").join("builds")
 }
 
+pub(crate) const BUILD_RUNTIME_FILE: &str = "runtime-dir";
+
+fn write_build_lab(work: &Path, source: &str) -> Result<()> {
+    let runtime = crate::paths::runtime_dir();
+    std::fs::write(
+        work.join(BUILD_RUNTIME_FILE),
+        runtime.as_os_str().as_encoded_bytes(),
+    )?;
+    std::fs::write(work.join(crate::paths::LAB_FILE), source)?;
+    Ok(())
+}
+
 fn build_workdir(def: &TemplateDef) -> PathBuf {
     builds_dir().join(format!("{}-{}-{}", def.arch, def.name, def.version))
 }
 
-/// Delete every build working directory no live build holds, returning how
-/// many went.
+/// Reap and delete build working directories no live build holds, returning
+/// how many went.
 ///
 /// [`WorkdirGuard`] clears one up when its build ends, but it is a `Drop` and
 /// a killed process runs none: a supervisor that is SIGKILLed — or that exits
 /// through `process::exit` on `shutdown` — leaves its in-flight builds' disks
-/// behind, several gigabytes each. The supervisor sweeps at startup, so a
-/// leftover survives at most until the next time the daemon comes up
-/// (ADR-0010).
+/// behind, several gigabytes each. The supervisor sweeps at startup
+/// (ADR-0010) and retains directories whose processes it could not reap.
 ///
 /// A starting supervisor owns no build, but it is not the only supervisor
 /// that can use this data dir: a directory whose lock another process holds
 /// is that process's in-flight build and is left alone.
-pub fn sweep_build_workdirs() -> usize {
-    sweep_workdirs_in(&builds_dir())
-}
-
-fn sweep_workdirs_in(dir: &Path) -> usize {
-    sweep_workdirs_with(dir, |_| {})
-}
-
-pub(crate) fn sweep_workdirs_with(dir: &Path, _reap: impl Fn(&Path)) -> usize {
+pub(crate) fn sweep_workdirs_with(dir: &Path, reap: impl Fn(&Path) -> bool) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -1062,7 +1070,7 @@ pub(crate) fn sweep_workdirs_with(dir: &Path, _reap: impl Fn(&Path)) -> usize {
         .flatten()
         .filter(|e| {
             let path = e.path();
-            if !path.is_dir() {
+            if !e.file_type().is_ok_and(|kind| kind.is_dir()) {
                 return false;
             }
             // A lock that cannot be taken (held, or not even openable) means
@@ -1070,7 +1078,7 @@ pub(crate) fn sweep_workdirs_with(dir: &Path, _reap: impl Fn(&Path)) -> usize {
             let Ok(Some(_held)) = try_lock_workdir(&path) else {
                 return false;
             };
-            std::fs::remove_dir_all(&path).is_ok()
+            reap(&path) && std::fs::remove_dir_all(&path).is_ok()
         })
         .count()
 }
@@ -1153,7 +1161,7 @@ async fn run_build(
             guest_iso: staged.as_ref().map(|s| s.dir.as_path()),
         },
     )?;
-    std::fs::write(work.join("vmlab.wcl"), &lab_wcl)?;
+    write_build_lab(work, &lab_wcl)?;
 
     let labfile = crate::config::load_lab_source(&lab_wcl, "<build>", work)
         .map_err(|e| anyhow::anyhow!("internal build lab invalid: {e:?}"))?;
@@ -2467,7 +2475,7 @@ fn synth_spec_lab(
 mod tests {
     use super::{
         BuildBoot, EffectiveHardware, SealedImage, build_lab_name, claim_workdir, seal_meta,
-        sweep_workdirs_in, synth_lab, wcl_str,
+        sweep_workdirs_with, synth_lab, wcl_str,
     };
     use crate::config::model::SecureBootKeys;
     use crate::qemu::resolve::KeyStore;
@@ -2541,6 +2549,10 @@ mod tests {
         assert_eq!(sweep_workdirs_in(dir.path()), 2);
         assert!(!dir.path().join("x86_64-base-1.0").exists());
         assert!(dir.path().join("stray").is_file());
+    }
+
+    fn sweep_workdirs_in(dir: &Path) -> usize {
+        sweep_workdirs_with(dir, |_| true)
     }
 
     /// Two supervisors of one account share a data dir (VML-90): one's
