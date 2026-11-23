@@ -5,22 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use vmlab_hv_proto::client::Client;
-use vmlab_hv_proto::control::{Command as Ctrl, Outcome};
+use vmlab_hv_proto::control::{Command as Ctrl, Event, Outcome, ShutdownReason};
 use vmlab_hv_tests::{agent::AgentClient, process::ManagedChild};
 
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
-fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
+fn ubuntu_vfio_enumeration_reset_and_second_start() {
     let Ok(address) = std::env::var("VMLAB_HV_TEST_VFIO_DEVICE") else {
         eprintln!("SKIP VFIO S1: VMLAB_HV_TEST_VFIO_DEVICE is unset; no host device is claimed");
         return;
     };
-    // Parse through the machine type and validation before any host path use.
-    let firmware = Path::new("/usr/share/qemu/bios-256k.bin");
-    if !Path::new("/dev/kvm").exists() || !firmware.is_file() {
-        eprintln!("SKIP VFIO S1: /dev/kvm or SeaBIOS is absent");
-        return;
-    }
+    assert!(Path::new("/dev/kvm").exists(), "VFIO S1 requires /dev/kvm");
+    let (code, vars) = ovmf().expect("VFIO S1 requires matching OVMF CODE and VARS files");
     let template = std::env::var_os("VMLAB_HV_TEST_VM_DISK")
         .map(PathBuf::from)
         .or_else(|| {
@@ -35,20 +31,49 @@ fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
             paths.sort();
             paths.pop()
         });
-    let Some(template) = template else {
-        eprintln!("SKIP VFIO S1: ubuntu-26.04 template absent; set VMLAB_HV_TEST_VM_DISK");
-        return;
-    };
+    let template = template.expect("ubuntu-26.04 template absent; set VMLAB_HV_TEST_VM_DISK");
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    let overlay = path.join("disk.qcow2");
+    let overlay = dir.path().join("disk.qcow2");
     vmlab_disk::ops::create_linked_clone(&template, &overlay).unwrap();
+    for first_start in [true, false] {
+        let path = dir.path().join(if first_start { "first" } else { "second" });
+        std::fs::create_dir(&path).unwrap();
+        run_vm(&path, &overlay, &code, &vars, &address, first_start);
+    }
+}
+
+fn ovmf() -> Option<(PathBuf, PathBuf)> {
+    let directories = std::env::var_os("VMLAB_HV_FIRMWARE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([
+            PathBuf::from("/usr/share/OVMF"),
+            PathBuf::from("/usr/share/OVMF/x64"),
+            PathBuf::from("/usr/share/edk2/x64"),
+        ]);
+    for dir in directories {
+        for (code, vars) in [
+            ("OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd"),
+            ("OVMF_CODE.4m.fd", "OVMF_VARS.4m.fd"),
+        ] {
+            let pair = (dir.join(code), dir.join(vars));
+            if pair.0.is_file() && pair.1.is_file() {
+                return Some(pair);
+            }
+        }
+    }
+    None
+}
+
+fn run_vm(path: &Path, overlay: &Path, code: &Path, vars: &Path, address: &str, first_start: bool) {
+    let vars_copy = path.join("vars.fd");
+    std::fs::copy(vars, &vars_copy).unwrap();
     let description: vmlab_hv_proto::machine::MachineDescription = serde_json::from_value(json!({
         "name": "vfio-s1", "machine": "q35", "arch": "x86_64", "accel": "kvm",
         "vcpus": 2, "memory_mib": 4096,
-        "boot": {"kind": "firmware", "firmware": "seabios", "code": firmware,
-            "bootorder": ["/pci@i0cf8/scsi@2/disk@0,0"]},
+        "boot": {"kind": "firmware", "firmware": "ovmf", "code": code, "vars": vars_copy},
         "console_pci": {"bus": 0, "device": 1, "function": 0},
+        "display": {"device": "virtio-vga", "pci": {"bus": 0, "device": 3, "function": 0}},
         "vfio": [{"host": address, "pci": {"bus": 0, "device": 6, "function": 0}}],
         "disks": [{"id": "disk0", "path": overlay, "format": "qcow2", "read_only": false,
             "vmstate": true, "pci": {"bus": 0, "device": 2, "function": 0}}],
@@ -95,8 +120,102 @@ fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
         );
         std::thread::sleep(Duration::from_millis(25));
     };
-    let mut agent =
-        AgentClient::connect(&path.join("agent.sock"), Duration::from_secs(180)).unwrap();
+    let diagnostics = || {
+        format!(
+            "VFIO VM in {}\nhypervisor:\n{}\nguest serial:\n{}",
+            path.display(),
+            std::fs::read_to_string(path.join("hv.log")).unwrap_or_default(),
+            std::fs::read_to_string(path.join("serial.log")).unwrap_or_default(),
+        )
+    };
+    let connect_agent = || {
+        AgentClient::connect(&path.join("agent.sock"), Duration::from_secs(180))
+            .unwrap_or_else(|error| panic!("VFIO agent: {error}\n{}", diagnostics()))
+    };
+    let mut agent = connect_agent();
+    check_pci_identity(&mut agent, address);
+    if first_start {
+        check_snapshot_refusals(&mut control);
+        let boot = boot_id(&mut agent);
+        agent.shutdown("reboot", Duration::from_secs(30)).unwrap();
+        drop(agent);
+        assert_eq!(
+            wait_for_lifecycle_event(&mut control),
+            Event::Reset,
+            "{}",
+            diagnostics()
+        );
+        let mut agent = connect_agent();
+        assert_ne!(boot_id(&mut agent), boot, "guest boot ID after reset");
+        check_pci_identity(&mut agent, address);
+        agent.shutdown("powerdown", Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            wait_for_lifecycle_event(&mut control),
+            Event::Shutdown {
+                reason: ShutdownReason::GuestShutdown,
+            },
+            "{}",
+            diagnostics()
+        );
+    } else {
+        assert!(matches!(
+            control.call(Ctrl::Quit).unwrap(),
+            Outcome::Ok { .. }
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{status}\n{}", diagnostics());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "VFIO VM failed to exit\n{}",
+            diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let log = std::fs::read_to_string(path.join("hv.log")).unwrap();
+    for error in [
+        "VFIO_GROUP_UNSET_CONTAINER",
+        "Could not unbind VFIO group",
+        "Could not delete VFIO group",
+    ] {
+        assert!(!log.contains(error), "VFIO teardown: {error}\n{log}");
+    }
+}
+
+fn wait_for_lifecycle_event(control: &mut Client) -> Event {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = control
+            .wait_event_timeout(remaining)
+            .unwrap()
+            .expect("VFIO lifecycle event");
+        if matches!(
+            event,
+            Event::Reset | Event::Shutdown { .. } | Event::Exiting { .. }
+        ) {
+            return event;
+        }
+    }
+}
+
+fn boot_id(agent: &mut AgentClient) -> Vec<u8> {
+    let output = agent
+        .exec(
+            &["cat", "/proc/sys/kernel/random/boot_id"],
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert!(!output.stdout.is_empty());
+    output.stdout
+}
+
+fn check_pci_identity(agent: &mut AgentClient, address: &str) {
     let output = agent
         .exec(&["lspci", "-n", "-s", "00:06.0"], Duration::from_secs(30))
         .unwrap();
@@ -107,7 +226,7 @@ fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
         "missing guest VFIO function: {found}"
     );
     // Only read host identity after the VMM has validated the explicit BDF.
-    let host = PathBuf::from("/sys/bus/pci/devices").join(&address);
+    let host = PathBuf::from("/sys/bus/pci/devices").join(address);
     let vendor = std::fs::read_to_string(host.join("vendor")).unwrap();
     let device = std::fs::read_to_string(host.join("device")).unwrap();
     assert!(
@@ -118,6 +237,9 @@ fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
         )),
         "host/guest PCI identity mismatch: {found}"
     );
+}
+
+fn check_snapshot_refusals(control: &mut Client) {
     for command in [
         Ctrl::SnapshotSave {
             name: "assigned".into(),
@@ -132,18 +254,5 @@ fn ubuntu_sees_designated_vfio_function_and_refuses_online_snapshots() {
             "snapshot unexpectedly accepted"
         );
         assert!(format!("{outcome:?}").contains("VFIO"));
-    }
-    assert!(matches!(
-        control.call(Ctrl::Quit).unwrap(),
-        Outcome::Ok { .. }
-    ));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        assert!(Instant::now() < deadline, "VFIO VM failed to quit");
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
