@@ -37,6 +37,7 @@ DOC
       | "`acpi_shutdown`" | "Whether the guest shuts down on an ACPI power-button press (default `true`). The graceful stop ladder plans from it: with it off, a stop goes through the agent alone and waits for a booting guest's agent. Only `macos` turns it off. See [vmlab down](cmd_down)." |
       | "`virtiofs`" | "Whether the guest mounts virtiofs natively, which makes it a candidate for `transport = \"auto\"` shares. See [Shared folders](guide_shares)." |
       | "`rtc`" | "What the guest reads the real-time clock as: `utc` (default), or `localtime` for DOS, Windows 9x and NT4 through XP/2003, which cannot read it as UTC. See [Snapshots](guide_snapshots) for the clock." |
+      | "`pit_ticks`" | "What the x86 timer does with ticks the guest was too late to take: `replay` (default) delivers them later in one burst, `discard` drops them. `windows-9x` sets `discard`, because Windows 9x Setup faults in the burst." |
       | "`workspace_guest`" | "The guest path an `@dev` workspace lands at when the decorator names none. See [Dev machines and the workspace syncer](guide_dev)." |
       | "`playbook_dir`" | "The guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`, for a guest whose default location is not writable. See [Playbooks](guide_playbooks)." |
   }

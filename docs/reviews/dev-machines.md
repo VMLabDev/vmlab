@@ -66,7 +66,7 @@ says "read, not run".
 | Code | Fault | How bad |
 |---|---|---|
 | F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690) | Security against a hostile guest |
-| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note | Data loss (canonical copy) |
+| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note (fixed, card #693) | Data loss (canonical copy) |
 | F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush (fixed, card #694) | Data loss (guest work) |
 | F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag | Data loss (guest work) |
 | F5 | `destroy` does not ask about a halted or unsynced workspace | Data loss (guest work) |
@@ -186,6 +186,26 @@ the same steps, asserting the refusal on the halt, and with
 
 **How bad.** Data loss on the canonical copy, and a halt that is passed over
 without the discard flag.
+
+**Fixed by card #693.** `restore` and `restore_all` read the workspace through
+`restore_workspace_of` (`src/labd/lab.rs`). Where the host directory is there
+it answers as `workspace_of` does. Where the directory is away it still
+answers for a dev machine that declares a workspace, with the host root that
+the ledger on disk records. With no ledger for that guest root it uses the
+declared path, resolved as far as the host still holds it. So the halt on the
+ledger refuses the restore, and a restore that goes ahead writes `reseed_owed`
+on the ledger that the next syncer loads. `workspace.unavailable` still says
+that the directory is away. `workspace_of` is unchanged: no syncer starts over
+a missing directory. The test named above is in the tree, with a second one
+for a restore with no ledger on disk
+(`a_restore_with_the_host_workspace_away_and_no_ledger_notes_the_re_seed`).
+Before the fix both failed on helios: the restore returned `Ok` past the
+recorded halt, and no `reseed_owed` was on the ledger. Two cases stay open,
+read and not run. A capture (`snapshot`) and a worktree clone still read
+`workspace_of`, so with the directory away a capture does not refuse on a
+recorded halt and a clone leaves no note. A declaration that was changed to a
+directory that is away keeps the old ledger's root, so the note does not reach
+the new workspace, whose first sync starts from an empty ledger.
 
 ### F3. A running dev machine with no syncer is treated as stopped
 

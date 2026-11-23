@@ -546,6 +546,14 @@ pub fn build(
     crate::vfio::preflight_machine(desc).map_err(VmmError::InvalidMachine)?;
     let kvm = KvmVm::new()?;
     crate::hyperv::configure_vm(&kvm.kvm, &kvm.vm, &desc.hyperv)?;
+    // The PIT exists since `KvmVm::new`, and no vCPU has run yet.
+    if desc.pit_ticks == vmlab_hv_proto::machine::PitTicks::Discard {
+        crate::kvm::discard_missed_pit_ticks(
+            &kvm.kvm,
+            &kvm.vm,
+            "PIT reinjection control for pit_ticks=discard",
+        )?;
+    }
     if desc.vcpus as usize > kvm.max_vcpus() {
         return Err(VmmError::InvalidMachine(format!(
             "vcpus {} exceeds the host KVM limit {}",
@@ -1778,7 +1786,12 @@ fn disk_index_letter(
 /// serialisation is deterministic for a given build.
 fn machine_digest(desc: &MachineDescription) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(&desc.redacted()).unwrap_or_default();
+    let mut desc = desc.redacted();
+    // How late ticks are delivered is no part of the machine a snapshot
+    // holds: KVM keeps it outside the PIT state, and a snapshot taken before
+    // a profile changed it restores under the new policy.
+    desc.pit_ticks = Default::default();
+    let bytes = serde_json::to_vec(&desc).unwrap_or_default();
     Sha256::digest(&bytes).into()
 }
 
@@ -1975,6 +1988,18 @@ mod tests {
     use super::*;
     use vmlab_hv_proto::machine::{Boot, Disk, DiskFormat, MachineDescription};
 
+    /// A snapshot taken under one PIT tick policy restores under the other:
+    /// the policy is not in the digest a restore compares.
+    #[test]
+    fn pit_tick_policy_is_outside_the_snapshot_digest() {
+        let mut machine = desc();
+        let replay = machine_digest(&machine);
+        machine.pit_ticks = vmlab_hv_proto::machine::PitTicks::Discard;
+        assert_eq!(machine_digest(&machine), replay);
+        machine.vcpus += 1;
+        assert_ne!(machine_digest(&machine), replay);
+    }
+
     fn desc() -> MachineDescription {
         MachineDescription {
             virtual_display: None,
@@ -1991,6 +2016,7 @@ mod tests {
             applesmc: None,
             usb_keyboard: false,
             smbios_type2: false,
+            pit_ticks: Default::default(),
             floppy: None,
             serial_log_port: Default::default(),
             hyperv: vec![],

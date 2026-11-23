@@ -73,6 +73,7 @@ profile "<name>" {
   acpi_shutdown   = true
   virtiofs        = false
   rtc             = "utc"
+  pit_ticks       = "replay"
   workspace_guest = "/src"
   playbook_dir    = "/var/lib/vmlab/weave"
 }
@@ -106,12 +107,13 @@ SRC
       | "`acpi_shutdown`" | "bool" | "`true`" | "The guest shuts down on an ACPI power-button press. `false` makes a graceful stop rely on the agent: it waits for a booting guest's agent as long as readiness would, skips the ACPI rung, and gives the guest two minutes to power off. See [vmlab down](cmd_down). Set to `false` by `macos`." |
       | "`virtiofs`" | "bool" | "`false`" | "The guest mounts virtiofs natively, so `transport = \"auto\"` shares use it instead of SMB." |
       | "`rtc`" | "utf8" | "`utc`" | "What the guest reads the real-time clock as: `utc`, or `localtime` for a guest that cannot read it as UTC, whose RTC then starts at the host's local time (QEMU `-rtc base=localtime`; a fixed `clock` is converted to the host's local time at that instant). Only `windows-xp` and `windows-9x` set `localtime`." |
+      | "`pit_ticks`" | "utf8" | "`replay`" | "What the x86 timer (the PIT) does with ticks the guest was too late to take: `replay` delivers each of them later, one straight after another, which keeps the clock of a guest that counts ticks; `discard` drops them, for a guest the burst of timer interrupts breaks. Only `windows-9x` sets `discard`, because Windows 9x Setup halts in it with `Bad Fault in MS-DOS Extender`. Ignored on a machine without a PIT (aarch64, riscv64)." |
       | "`workspace_guest`" | "utf8" | "unset" | "Guest path an `@dev` workspace lands at when the decorator names none." |
       | "`playbook_dir`" | "utf8" | "unset" | "Guest directory a `playbook {}` block pushes config-weave and its playbook folders into when the block names no `guest_dir`. Must be absolute (`/…` or `C:\\…`). Unset, `/var/lib/vmlab/weave` on Linux and macOS and `C:\\weave` on Windows." |
   }
   p <<DOC
     The parser enforces the keyword sets above for `machine`, `firmware`,
-    `disk_bus`, `accel`, `input`, `tsc`, `input_transport` and `rtc`, `cpus` at least 1, and a non-negative
+    `disk_bus`, `accel`, `input`, `tsc`, `input_transport`, `rtc` and `pit_ticks`, `cpus` at least 1, and a non-negative
     `memory`. `nic_model`, `display` and `cpu_model` are passed to QEMU as
     written; an empty `cpu_model` is refused. A
     profile that sets no `workspace_guest` still hosts a dev machine; the
@@ -151,7 +153,7 @@ SRC
       | "`windows-server`" | "q35" | "ovmf" | "false" | "true" | "virtio" | "virtio-net-pci" | "virtio-vga" | "4" | "8GiB" | "" |
       | "`windows-legacy`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "Vista, 7 and 2008-era guests with no virtio storage or network drivers at install time; virtio-serial agent." |
       | "`windows-xp`" | "pc" | "seabios" | "false" | "false" | "ide" | "e1000" | "std" | "2" | "2GiB" | "`agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. NT4 through XP/2003, the legacy agent on COM1." |
-      | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`, `agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`. DOS, Windows 3.x to ME and 2000-era guests." |
+      | "`windows-9x`" | "pc" | "seabios" | "false" | "false" | "ide" | "pcnet" | "cirrus-vga" | "1" | "256MiB" | "`input_transport = \"vnc\"`, `agent_transport = \"isa-serial\"`, `rtc = \"localtime\"`, `pit_ticks = \"discard\"`. DOS, Windows 3.x to ME and 2000-era guests." |
       | "`linux-modern`" | "q35" | "ovmf" | "false" | "false" | "virtio" | "virtio-net-pci" | "virtio-vga" | "2" | "4GiB" | "`virtiofs = true`." |
       | "`linux-generic`" | "q35" | "seabios" | "false" | "false" | "virtio" | "virtio-net-pci" | "std" | "2" | "2GiB" | "Older or unusual distros." |
       | "`macos`" | "q35" | "ovmf" | "false" | "false" | "sata" | "virtio-net-pci" | "vmware" | "4" | "8GiB" | "`cpu_model = \"Skylake-Client-v4,-hle,-rtm,kvm=on,vendor=GenuineIntel,vmware-cpuid-freq=on\"`, `hyperv = false`, `apple_smc = true`, `input = \"usb\"`, `tsc = \"host\"`, `acpi_shutdown = false`. Intel macOS through OpenCore, which the template carries." |
