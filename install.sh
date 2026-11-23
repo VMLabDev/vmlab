@@ -28,6 +28,10 @@
 #                     key, not the one in this script; or VMLAB_RELEASE_KEY.
 #                     For testing a local build: whoever picks the key picks
 #                     whom the installer trusts.
+#   --fetch <asset>   install nothing: download the named asset of the release
+#                     into the current directory, after the same signature
+#                     check and against the signed SHA256SUMS. For the
+#                     vmlab-hv bundle, which this script does not install.
 #   --help            show this help
 #
 #   VMLAB_RELEASE_BASE_URL  where releases are downloaded from, as
@@ -88,6 +92,7 @@ SKIP_CHECKS=0
 INSECURE_SKIP_SIGNATURE="${VMLAB_INSECURE_SKIP_SIGNATURE:-0}"
 RELEASE_KEY_FILE="${VMLAB_RELEASE_KEY:-}"
 NO_GUEST=0
+FETCH=""
 FASTPATH="${VMLAB_FASTPATH_CAPS:-ask}"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -104,6 +109,7 @@ usage() {
     '  --skip-checks       skip runtime tool checks' \
     '  --insecure-skip-signature  unsafe: skip cosign, still check SHA256SUMS' \
     '  --release-key FILE  cosign public key for a key-signed release (testing)' \
+    '  --fetch ASSET       only download ASSET, verified, into this directory' \
     '  --help              show this help'
   exit "${1:-0}"
 }
@@ -125,11 +131,19 @@ while [ $# -gt 0 ]; do
     --insecure-skip-signature) INSECURE_SKIP_SIGNATURE=1; shift ;;
     --release-key) [ $# -ge 2 ] || err "--release-key needs an argument"; RELEASE_KEY_FILE="$2"; shift 2 ;;
     --release-key=*) RELEASE_KEY_FILE="${1#--release-key=}"; shift ;;
+    --fetch) [ $# -ge 2 ] && [ -n "$2" ] || err "--fetch needs an argument"; FETCH="$2"; shift 2 ;;
+    --fetch=*) FETCH="${1#--fetch=}"; [ -n "$FETCH" ] || err "--fetch needs an argument"; shift ;;
     -h|--help) usage 0 ;;
     -*) err "unknown option: $1 (try --help)" ;;
     *) [ -z "$VERSION" ] || err "unexpected argument: $1"; VERSION="$1"; shift ;;
   esac
 done
+
+# A fetched asset is written under its own name into the current directory:
+# one plain file name, never a path.
+case "$FETCH" in
+  [!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) err "--fetch takes the file name of one release asset, not '$FETCH'" ;;
+esac
 
 case "$FASTPATH" in
   ask|yes|no) ;;
@@ -214,7 +228,7 @@ BASE_URL="${BASE_URL%/}"
 url="$BASE_URL/$tag/$asset"
 
 # ── Download + install ──────────────────────────────────────────────────────
-printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
+[ -n "$FETCH" ] || printf 'Installing vmlab %s to %s\n' "$ver" "$BIN_DIR"
 
 verify_dir="$(mktemp -d)"
 [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || err "unsafe verification directory"
@@ -270,6 +284,20 @@ verify_asset() {
   got="$(sha256sum "$2" | cut -d' ' -f1)" || err "cannot compute SHA256 for $1"
   [ "$want" = "$got" ] || err "checksum mismatch for $1"
 }
+
+# ── Fetch one asset ─────────────────────────────────────────────────────────
+# --fetch: the asset reaches the current directory only after its bytes match
+# the line of the authenticated SHA256SUMS. The .sha256 file a release has
+# beside an asset is covered by no signature and is never read here.
+if [ -n "$FETCH" ]; then
+  fetch_tmp="$verify_dir/$FETCH"
+  download_file "$BASE_URL/$tag/$FETCH" "$fetch_tmp" || err "download failed: $BASE_URL/$tag/$FETCH"
+  verify_asset "$FETCH" "$fetch_tmp"
+  [ -n "$fetch_tmp" ] && [ "$fetch_tmp" != / ] || err "fetch_tmp is empty or /"
+  mv "$fetch_tmp" "./$FETCH"
+  printf 'Fetched: %s (verified against SHA256SUMS of vmlab %s)\n' "$FETCH" "$ver"
+  exit 0
+fi
 
 tmp="$verify_dir/$asset"
 download_file "$url" "$tmp" || err "download failed: $url
