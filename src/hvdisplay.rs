@@ -63,6 +63,14 @@ fn connect(path: &Path, capabilities: u32) -> Result<Client> {
     }
 }
 
+/// The largest surface side vmlab accepts, as vmlab-hv's server core and its
+/// viewer do.
+const MAX_SURFACE_SIDE: u32 = 16384;
+
+/// The largest surface buffer vmlab accepts (`stride * height`), as
+/// vmlab-hv's server core and its viewer do.
+const MAX_SURFACE_BYTES: u64 = 256 << 20;
+
 /// The shared-memory surface the server last configured.
 struct Surface {
     id: u64,
@@ -93,8 +101,20 @@ impl Surface {
         if *drm_fourcc != XRGB8888 && *drm_fourcc != ARGB8888 {
             bail!("vmlab-hv surface format {drm_fourcc:#x} is not XRGB8888");
         }
-        if *stride < width * 4 || fds.is_empty() {
+        // The peer is one machine's hypervisor process and this runs in the
+        // lab daemon: every size is checked here, before any of them sizes
+        // an allocation or is cut to the 16 bits the recorder's events carry.
+        if *width == 0
+            || *height == 0
+            || *width > MAX_SURFACE_SIDE
+            || *height > MAX_SURFACE_SIDE
+            || u64::from(*stride) < u64::from(*width) * 4
+            || fds.is_empty()
+        {
             bail!("vmlab-hv surface {width}x{height} stride {stride} is malformed");
+        }
+        if u64::from(*stride) * u64::from(*height) > MAX_SURFACE_BYTES {
+            bail!("vmlab-hv surface {width}x{height} stride {stride} exceeds 256 MiB");
         }
         Ok(Self {
             id: *surface_id,

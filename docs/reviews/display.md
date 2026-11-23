@@ -126,6 +126,13 @@ Not read:
   with full damage. Assert that `NativeStream::next_update` returns an error.
   Today it returns a `Rect` with `w = 65535` and 280000 bytes.
 - Confidence: high.
+- Fixed by card #613. `Surface::configure` refuses a zero side, a side above
+  16384, a stride below `width * 4` computed in 64 bits, and a buffer above
+  256 MiB, the limits of the server core and the viewer. Both proof tests are
+  in `src/hvdisplay/tests.rs`. The socket test is
+  `the_stream_refuses_a_configure_wider_than_the_limit`: it sends a valid
+  configure first, because `NativeStream::connect` consumes the first one,
+  and the refused one ends the stream at `next_update`.
 
 ### F2. vnc: rectangle, cursor and text sizes from the server are allocated before any check
 
@@ -306,6 +313,14 @@ Not read:
   The test must restore the umask and must not run in parallel with tests
   that create files.
 - Confidence: high.
+- Fixed by card #613. `bind_owner_only` in `vmm/display.rs` sets mode 0600
+  after the bind, and the accept loops refuse a peer whose `SO_PEERCRED` uid
+  is neither the process's own nor root. The peer check also covers a
+  connection made between the bind and the mode change. The proof test
+  `display_sockets_are_owner_only` is in the test module of `vmm/display.rs`,
+  where it needs no KVM, and does not change the umask: a plain bind gives
+  0600 only under a umask of 0177 or stricter. The KVM test in
+  `kvm_tests.rs` asserts the mode of both sockets after `display::serve` too.
 
 ## Notes
 

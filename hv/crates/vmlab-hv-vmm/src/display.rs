@@ -733,7 +733,13 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
 /// A connection made in between is refused by the peer check of the accept
 /// loop ([`uid_may_connect`]).
 fn bind_owner_only(path: &Path) -> io::Result<UnixListener> {
-    UnixListener::bind(path)
+    let listener = UnixListener::bind(path)?;
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(listener)
 }
 
 /// The user at the other end of a display connection (`SO_PEERCRED`).
