@@ -30,6 +30,12 @@ const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 const EXT_END: u32 = 0;
 
 const MAX_BACKING_DEPTH: usize = 8;
+/// QEMU's limits on the header counts (`QCOW_MAX_L1_SIZE`,
+/// `QCOW_MAX_REFTABLE_SIZE`, `QCOW_MAX_SNAPSHOTS`). The file length alone does
+/// not bound them: a sparse file holds a long run of zeros for nothing.
+pub(crate) const MAX_L1_ENTRIES: u32 = (32 << 20) / 8;
+const MAX_REFCOUNT_TABLE_BYTES: u64 = 8 << 20;
+pub(crate) const MAX_SNAPSHOTS: u32 = 65536;
 const INCOMPAT_DIRTY: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -309,6 +315,30 @@ impl Qcow2Image {
                 });
             }
         }
+        if u64::from(header_length) > cluster_size {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("header length {header_length} is larger than the cluster"),
+            });
+        }
+        if l1_size > MAX_L1_ENTRIES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("active L1 table too large ({l1_size} entries)"),
+            });
+        }
+        if u64::from(refcount_table_clusters) * cluster_size > MAX_REFCOUNT_TABLE_BYTES {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("refcount table too large ({refcount_table_clusters} clusters)"),
+            });
+        }
+        if nb_snapshots > MAX_SNAPSHOTS {
+            return Err(Error::Format {
+                format: "qcow2",
+                reason: format!("snapshot table too large ({nb_snapshots} snapshots)"),
+            });
+        }
         const INCOMPAT_CORRUPT: u64 = 1 << 1;
         const INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
         const INCOMPAT_COMPRESSION_TYPE: u64 = 1 << 3;
@@ -418,16 +448,16 @@ impl Qcow2Image {
                     reason: format!("backing file name too long ({backing_file_size})"),
                 });
             }
-            let start = backing_file_offset as usize;
-            let end = start + backing_file_size as usize;
-            if end > header_cluster.len() {
+            let end = backing_file_offset.checked_add(backing_file_size);
+            let Some(end) = end.filter(|&end| end <= header_cluster.len() as u64) else {
                 return Err(Error::Format {
                     format: "qcow2",
                     reason: format!(
                         "backing file name at {backing_file_offset:#x} is outside the header cluster"
                     ),
                 });
-            }
+            };
+            let (start, end) = (backing_file_offset as usize, end as usize);
             let name = String::from_utf8_lossy(&header_cluster[start..end]).into_owned();
             Some(BackingRef {
                 name,
@@ -1066,7 +1096,13 @@ impl Qcow2Image {
     ) -> Result<Qcow2Image> {
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
-        let l1_size = size.div_ceil(span).max(1) as u32;
+        let l1_entries = size.div_ceil(span).max(1);
+        if l1_entries > u64::from(MAX_L1_ENTRIES) {
+            return Err(Error::Unsupported(format!(
+                "a {size}-byte disk needs an L1 table over the qcow2 limit at cluster_bits {cluster_bits}"
+            )));
+        }
+        let l1_size = l1_entries as u32;
         let l1_clusters = l1_size_as_clusters(l1_size, cluster_size);
 
         let file = OpenOptions::new()
@@ -1215,16 +1251,24 @@ impl Qcow2Image {
         // unknown extensions; QEMU's rebase does the same for formats it
         // rewrites. Keep it simple: rebuild extensions from scratch.
         let mut ext_off = header_len;
-        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| {
+        // A crafted header length can leave no room for the extensions.
+        let add_ext = |hc: &mut [u8], off: &mut usize, et: u32, data: &[u8]| -> Result<()> {
+            let next = *off + 8 + data.len().div_ceil(8) * 8;
+            if next > hc.len() {
+                return Err(Error::Unsupported(
+                    "header extensions do not fit in the header cluster".into(),
+                ));
+            }
             hc[*off..*off + 4].copy_from_slice(&et.to_be_bytes());
             hc[*off + 4..*off + 8].copy_from_slice(&(data.len() as u32).to_be_bytes());
             hc[*off + 8..*off + 8 + data.len()].copy_from_slice(data);
-            *off += 8 + data.len().div_ceil(8) * 8;
+            *off = next;
+            Ok(())
         };
         if let Some(fmt) = format {
-            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes());
+            add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes())?;
         }
-        add_ext(&mut hc, &mut ext_off, EXT_END, &[]);
+        add_ext(&mut hc, &mut ext_off, EXT_END, &[])?;
         let name_bytes = name.as_bytes();
         if name_bytes.len() > 1023 || ext_off + name_bytes.len() > hc.len() {
             return Err(Error::Unsupported(
@@ -1642,6 +1686,73 @@ mod tests {
         img.file.write_all_at(&1u32.to_be_bytes(), 36).unwrap();
         img.file.write_all_at(&u32::MAX.to_be_bytes(), 56).unwrap();
         assert!(Qcow2Image::open(&img.path, true).is_err());
+    }
+
+    #[test]
+    fn an_l1_table_larger_than_the_format_limit_is_refused() {
+        // Card #555 (F9): the file is long enough, sparse, and holds nothing.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let l1_size = MAX_L1_ENTRIES + 1;
+        img.file.write_all_at(&l1_size.to_be_bytes(), 36).unwrap();
+        img.file
+            .set_len(img.l1_table_offset + u64::from(l1_size) * 8)
+            .unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_count_larger_than_the_format_limit_is_refused() {
+        // Card #555 (F9): 40 zero bytes are a valid empty snapshot entry.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let count = MAX_SNAPSHOTS + 1;
+        let offset = img
+            .file
+            .metadata()
+            .unwrap()
+            .len()
+            .next_multiple_of(img.cluster_size);
+        img.file.write_all_at(&count.to_be_bytes(), 60).unwrap();
+        img.file.write_all_at(&offset.to_be_bytes(), 64).unwrap();
+        img.file.set_len(offset + u64::from(count) * 40).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_backing_name_offset_near_the_end_of_u64_is_an_error() {
+        // Card #555 (F10): the end of the name range overflows u64.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        img.file
+            .write_all_at(&0xffff_ffff_ffff_fff8u64.to_be_bytes(), 8)
+            .unwrap();
+        img.file.write_all_at(&16u32.to_be_bytes(), 16).unwrap();
+        assert!(Qcow2Image::open(&img.path, true).is_err());
+        assert!(Qcow2Image::open_header(&img.path).is_err());
+    }
+
+    #[test]
+    fn a_header_length_beyond_the_cluster_is_an_error() {
+        // Card #555 (F10): rebase copied header_length bytes from one cluster.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        img.file
+            .write_all_at(&0x0010_0000u32.to_be_bytes(), 100)
+            .unwrap();
+        match Qcow2Image::open(&img.path, false) {
+            Err(_) => {}
+            Ok(mut opened) => assert!(opened.set_backing("base.qcow2", Some("qcow2")).is_err()),
+        }
+    }
+
+    #[test]
+    fn a_header_length_that_leaves_no_room_for_extensions_is_an_error() {
+        // Card #555 (F10): a header that fills its cluster has no room for the
+        // backing-format extension that set_backing writes after it.
+        let (_dir, img) = testsupport::blank(8 << 20);
+        let length = img.cluster_size as u32;
+        img.file.write_all_at(&length.to_be_bytes(), 100).unwrap();
+        let mut opened = Qcow2Image::open(&img.path, false).unwrap();
+        assert!(opened.set_backing("base.qcow2", Some("qcow2")).is_err());
     }
 
     #[test]

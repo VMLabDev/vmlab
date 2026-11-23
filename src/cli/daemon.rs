@@ -202,17 +202,23 @@ fn same_build(what: &str, answer: Option<serde_json::Value>) -> Result<()> {
 /// `lab.ensure` (`status`, `down`, `destroy`): a lab daemon's socket is keyed
 /// by name, so without this a second checkout declaring the same name would
 /// read, stop or destroy the first one's lab as if it were its own. No
-/// supervisor running means nothing is registered, so nothing conflicts.
+/// supervisor running does not mean nothing is registered: a lab daemon
+/// outlives a supervisor that crashed or was killed, so the registry the
+/// supervisor persisted (`labs.json`) is read instead, as the next supervisor
+/// would adopt it.
 pub async fn check_registration(name: &str, root: &Path) -> Result<()> {
-    let Ok(supervisor) = SupClient::connect(&crate::paths::supervisor_socket()).await else {
-        return Ok(());
+    use crate::supervisor::registry::{LabEntry, Registry};
+    let labs: Vec<LabEntry> = match SupClient::connect(&crate::paths::supervisor_socket()).await {
+        Ok(supervisor) => {
+            let labs = supervisor
+                .send(SupRequest::Status {})
+                .await
+                .map_err(remote)?;
+            serde_json::from_value(labs)
+                .context("the supervisor reported a registry vmlab cannot read")?
+        }
+        Err(_) => Registry::load().labs().to_vec(),
     };
-    let labs = supervisor
-        .send(SupRequest::Status {})
-        .await
-        .map_err(remote)?;
-    let labs: Vec<crate::supervisor::registry::LabEntry> = serde_json::from_value(labs)
-        .context("the supervisor reported a registry vmlab cannot read")?;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     match labs.iter().find(|entry| entry.name == name) {
         Some(entry) => entry.claims(name, &root).map_err(anyhow::Error::new),
@@ -419,5 +425,70 @@ mod tests {
         let pid: i32 = pid.trim_start_matches("PID=").parse().unwrap();
         assert_ne!(sid, ours, "the supervisor stayed in the spawner's session");
         assert_eq!(sid, pid, "the supervisor leads its own session");
+    }
+
+    const REGISTRATION_HELPER: &str = "VMLAB_TEST_REGISTRATION_HELPER";
+
+    /// Lab-lifecycle F3: with no supervisor running, `check_registration`
+    /// took that for "nothing is registered", so `down` and `destroy` in a
+    /// second checkout reached the first checkout's daemon by name. The
+    /// registration on disk must still hold. Run in a child with scratch XDG
+    /// directories so the paths of this process are untouched.
+    #[test]
+    fn a_registration_holds_while_no_supervisor_answers() {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::daemon::tests::registration_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REGISTRATION_HELPER, "1")
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `mylab` registered from `/labs/first` in `labs.json`, no supervisor
+    /// socket bound: a check from `/labs/second` is the ADR-0011 conflict,
+    /// and a check from `/labs/first` or for another name passes.
+    #[test]
+    #[ignore = "subprocess helper for a_registration_holds_while_no_supervisor_answers"]
+    fn registration_helper() {
+        if std::env::var_os(REGISTRATION_HELPER).is_none() {
+            return;
+        }
+        let state = crate::paths::state_dir();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("labs.json"),
+            r#"{"labs":[{"name":"mylab","root":"/labs/first","pid":1,"state":"running"}]}"#,
+        )
+        .unwrap();
+        assert!(!crate::paths::supervisor_socket().exists());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(check_registration("mylab", Path::new("/labs/second")))
+            .expect_err("a second checkout passed while the first holds the name");
+        let err = err
+            .downcast_ref::<crate::proto::CommandError>()
+            .expect("the ADR-0011 conflict");
+        assert_eq!(err.code, crate::proto::error::ErrorCode::Conflict);
+        assert!(err.message.contains("/labs/first"), "{}", err.message);
+        rt.block_on(check_registration("mylab", Path::new("/labs/first")))
+            .expect("the registered root holds its own name");
+        rt.block_on(check_registration("otherlab", Path::new("/labs/second")))
+            .expect("an unregistered name is free");
     }
 }
