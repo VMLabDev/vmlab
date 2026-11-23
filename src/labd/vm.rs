@@ -891,7 +891,7 @@ impl VmInstance {
             return Ok(None);
         }
         let arch = qemu::qemu_arch(&t.resolved.arch);
-        let firmware_dir = crate::config::host::HostConfig::load_default()?.firmware_dir;
+        let firmware_dir = (self.host_config)()?.firmware_dir;
         let sources = qemu::firmware::Sources::installed(firmware_dir);
         let pairing = qemu::firmware::Pairing::of(t.resolved.secure_boot, &t.resolved.key_store);
         let context = || format!("{}: UEFI firmware", self.cfg.name);
