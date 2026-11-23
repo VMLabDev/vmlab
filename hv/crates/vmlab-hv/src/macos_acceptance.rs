@@ -417,12 +417,14 @@ fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Lau
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
-    // Opt-in while https://github.com/VMLabDev/vmlab/issues/200 is open: its
-    // intermittent stall is the template's (see `provide_custom_slide`), and
-    // this test has yet to pass ten times in a row on a rebuilt template.
+    // Opt-in: the intermittent stall of
+    // https://github.com/VMLabDev/vmlab/issues/200 is the template's (see
+    // `provide_custom_slide`), and the template in the store has it until it
+    // is rebuilt. This test passed ten times in a row on a fixed overlay
+    // (hv/docs/macos-verification.md).
     if std::env::var_os("VMLAB_HV_MACOS_ACCEPTANCE").is_none() {
         eprintln!(
-            "skipping macOS P1: opt-in while parked under vmlab#200; set VMLAB_HV_MACOS_ACCEPTANCE=1"
+            "skipping macOS P1: opt-in until the template is rebuilt (vmlab#200); set VMLAB_HV_MACOS_ACCEPTANCE=1"
         );
         return;
     }

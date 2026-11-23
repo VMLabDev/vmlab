@@ -9,7 +9,23 @@ hardware references. The owner keeps this host at `kvm.ignore_msrs=N`.
 
 ## Current verification state
 
-The live macOS boot test (`macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop`) is opt-in while https://github.com/VMLabDev/vmlab/issues/200 is open: run it with `VMLAB_HV_MACOS_ACCEPTANCE=1`. The cause of that issue's intermittent stall is known (next section) and lies in the template. The test now fails by name on a template that has it. Ten passes in a row on a rebuilt template are still owed. The macOS device and unit tests stay in the default gate.
+The live macOS boot test
+(`macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop`) is
+opt-in: run it with `VMLAB_HV_MACOS_ACCEPTANCE=1`. The cause of the
+intermittent stall of https://github.com/VMLabDev/vmlab/issues/200 is known
+(next section) and lies in the template. The test fails by name on a template
+that has it. `x86_64/macos-tahoe@26.7.0` in the store has it until the
+template is rebuilt from vmlab-templates, where `ProvideCustomSlide` is on, so
+the test stays opt-in and takes a fixed disk through `VMLAB_HV_MACOS_DISK`.
+The macOS device and unit tests stay in the default gate.
+
+On 2026-11-23 the test passed 10 times in a row on an overlay of that
+template with `ProvideCustomSlide` on, with the owner's SMC key read from the
+host configuration and host `kvm.ignore_msrs=N`. The agent answered 16.6 to
+29.9 s after resume (20.8, 16.6, 29.9, 18.3, 22.5, 27.9, 23.9, 18.5, 19.1,
+16.7 s), and one whole run took 122 to 297 s. The host ran other builds
+beside the series, with a load average of 8 to 15 on 32 CPUs. The key
+appears in none of the run logs.
 
 ## The intermittent boot stall (vmlab#200)
 
