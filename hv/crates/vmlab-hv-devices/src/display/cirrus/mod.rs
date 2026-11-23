@@ -858,6 +858,7 @@ impl Snapshot for CirrusVga {
         if tail.hdr_reads > 4
             || tail.blit.as_ref().is_some_and(|blit| {
                 !blit.system_source()
+                    || !blit.within_registers()
                     || blit.row >= blit.height
                     || blit.pending.len() >= blit.source_row_bytes()
             })
