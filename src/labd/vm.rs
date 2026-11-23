@@ -38,6 +38,10 @@ const WAKE_SETTLE: Duration = Duration::from_secs(10);
 /// How long a USB detach waits for QEMU's `DEVICE_DELETED`. A USB unplug
 /// completes as it is asked for, so this only bounds a wedged emulator.
 const USB_DETACH_WAIT: Duration = Duration::from_secs(10);
+/// How long the kill rung of a stop gives the hypervisor to hand back every
+/// host USB device it holds, all of them together. A hypervisor that is being
+/// killed may be wedged, and a stop must end, so this is short.
+const USB_KILL_DETACH_WAIT: Duration = Duration::from_secs(5);
 
 /// What to tell a user whose guest has no answering vmlab-agent. A failed
 /// handshake alone cannot say why, so the advice leans on what is known:
@@ -1814,6 +1818,9 @@ impl VmInstance {
                     if !force {
                         tracing::warn!("{}: graceful stop timed out, killing", self.cfg.name);
                     }
+                    if proc.is_running() {
+                        self.usb_return_before_kill(control.as_deref()).await;
+                    }
                     proc.kill().await;
                     let _ = proc.wait_exit(Duration::from_secs(10)).await;
                     true
@@ -1830,6 +1837,45 @@ impl VmInstance {
             }
         }
         self.settle_stopped(STOP_SETTLE).await
+    }
+
+    /// Hand every host USB device this machine holds back to the host while
+    /// the hypervisor still runs (PRD §5.2.1: a stop releases everything it
+    /// held). The hypervisor returns a device to its host driver when it
+    /// drops the backend. A killed process drops nothing: the kernel releases
+    /// the claims on close and binds no driver, and the host then has a
+    /// device it cannot use until a replug. So the kill rung asks for each
+    /// detach first, within [`USB_KILL_DETACH_WAIT`] for all of them, and
+    /// names each device it could not give back. The tracking is `teardown`'s.
+    async fn usb_return_before_kill(&self, control: Option<&dyn Control>) {
+        let held = self.usb.lock().await.clone();
+        if held.is_empty() {
+            return;
+        }
+        let hotplug = control.and_then(|c| c.hotplug());
+        let deadline = tokio::time::Instant::now() + USB_KILL_DETACH_WAIT;
+        for a in held {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let outcome = match &hotplug {
+                // The outer limit covers a hypervisor that does not answer
+                // the command at all. The inner one covers the event.
+                Some(hotplug) => {
+                    match tokio::time::timeout(left, hotplug.detach(&a.qdev_id, left)).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => Err(anyhow!("the hypervisor did not answer in time")),
+                    }
+                }
+                None => Err(anyhow!("the hypervisor has no hot-plug control")),
+            };
+            if let Err(e) = outcome {
+                tracing::warn!(
+                    "{}: {} was not detached before the kill ({e:#}); it may have no host \
+                     driver until it is replugged",
+                    self.cfg.name,
+                    a.device.describe()
+                );
+            }
+        }
     }
 
     /// The agent the stop ladder's first rung asks, dialled until it answers
