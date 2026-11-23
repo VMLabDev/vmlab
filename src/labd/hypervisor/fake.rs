@@ -233,7 +233,13 @@ pub struct FakeHypervisor {
     /// The extra disk images of every VM launch, in launch order, so a test
     /// can assert what a machine was given.
     launched_disks: std::sync::Mutex<Vec<Vec<PathBuf>>>,
+    /// What happened to every machine's hot-plugged devices and to the
+    /// machine itself, in order: `attach <id>`, `detach <id>`, `kill`.
+    journal: Journal,
 }
+
+/// The ordered record a test reads through [`FakeHypervisor::journal`].
+type Journal = Arc<std::sync::Mutex<Vec<String>>>;
 
 impl FakeHypervisor {
     pub fn new(script: Script) -> Arc<Self> {
@@ -243,7 +249,14 @@ impl FakeHypervisor {
             attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
+            journal: Journal::default(),
         })
+    }
+
+    /// Every hot-plug call the machines saw and every kill of a machine, in
+    /// the order they happened.
+    pub fn journal(&self) -> Vec<String> {
+        self.journal.lock().expect("fake journal lock").clone()
     }
 
     /// The extra disk image paths of each VM launch so far.
@@ -349,7 +362,10 @@ impl Hypervisor for FakeHypervisor {
         if let Some(msg) = &run.start_fails {
             bail!("{}: {msg}", spec.label);
         }
-        let machine = Arc::new(FakeProc::new(spec.label.clone()));
+        let machine = Arc::new(FakeProc {
+            journal: self.journal.clone(),
+            ..FakeProc::new(spec.label.clone())
+        });
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
 
         if let Some(after) = run.agent_answers_after {
@@ -454,6 +470,9 @@ pub(crate) struct FakeProc {
     snapshots: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// The ids of the host devices hot-plugged into it.
     plugged: std::sync::Mutex<Vec<String>>,
+    /// Where its hot-plug calls and its kill are written down. A machine
+    /// shares the hypervisor's; a helper keeps its own.
+    journal: Journal,
 }
 
 /// Which agent process answers, and what it calls itself.
@@ -478,7 +497,12 @@ impl FakeProc {
             }),
             snapshots: Default::default(),
             plugged: Default::default(),
+            journal: Journal::default(),
         }
+    }
+
+    fn note(&self, entry: String) {
+        self.journal.lock().expect("fake journal lock").push(entry);
     }
 
     /// Whether the agent is mid-restart, with nothing answering.
@@ -548,6 +572,7 @@ impl Process for FakeProc {
     }
 
     async fn kill(&self) {
+        self.note("kill".into());
         self.end("signal: 9");
     }
 }
@@ -704,6 +729,7 @@ impl Frames for FakeCapabilities {
 #[async_trait::async_trait]
 impl Hotplug for FakeCapabilities {
     async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()> {
+        self.0.note(format!("attach {}", plan.device.qdev_id()));
         self.0
             .plugged
             .lock()
@@ -713,6 +739,7 @@ impl Hotplug for FakeCapabilities {
     }
 
     async fn detach(&self, id: &str, _wait: Duration) -> Result<()> {
+        self.0.note(format!("detach {id}"));
         self.0
             .plugged
             .lock()
