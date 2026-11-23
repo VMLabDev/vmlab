@@ -442,7 +442,7 @@ mod usb_tests {
         );
         let controller = Arc::new(parking_lot::Mutex::new(XhciController::new(
             "xhci",
-            ram.mem.clone(),
+            ram.device_mem.clone(),
             Arc::new(Sinks::default()),
             None,
         )));

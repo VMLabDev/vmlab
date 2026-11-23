@@ -1989,8 +1989,27 @@ impl LabRuntime {
     /// the lease, not simply the first: priming the NAT engine with a
     /// multi-NIC machine's NIC-0 address for an address leased on NIC 1 would
     /// point the engine at the wrong port.
+    ///
+    /// Which NIC is asked of the guest; which address that NIC holds is not.
+    /// The guest writes its agent's report, so on a segment with a DHCP
+    /// server the address is the server's lease for that NIC
+    /// ([`DhcpServer::vouched`](crate::net::dhcp::DhcpServer::vouched)): a
+    /// guest that claims another machine's address gets no forward aimed at
+    /// it and no NAT binding for it (docs/reviews/containers.md F1). A global
+    /// segment's DHCP server is the supervisor's, so there the report stands.
     async fn forward_observations(&self, scope: &[String]) -> forward_plan::Observed {
         let mut observed = forward_plan::Observed::default();
+        // Taken before any guest is asked: an agent may take seconds to
+        // answer, and the network is not held for that.
+        let dhcp: HashMap<String, _> = {
+            let net = self.network.lock().await;
+            net.segments
+                .iter()
+                .filter_map(|(name, seg)| {
+                    Some((name.clone(), seg.gateway.as_ref()?.dhcp_server()?))
+                })
+                .collect()
+        };
         for m in self.machines() {
             let name = m.name().to_string();
             if !scope.is_empty() && !scope.contains(&name) {
@@ -2007,8 +2026,26 @@ impl LabRuntime {
             let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
                 continue;
             };
-            if let Some(mac) = m.macs().get(nic) {
-                observed.macs.insert(name.clone(), *mac);
+            let mac = m.macs().get(nic).copied();
+            let server = m
+                .nics()
+                .get(nic)
+                .and_then(|n| dhcp.get(nic_segment_name(n)));
+            let ip = match (mac, server) {
+                (Some(mac), Some(server)) => {
+                    let Some(held) = server.lock_recover().vouched(mac, ip) else {
+                        tracing::warn!(
+                            "\"{name}\": its guest reports {ip} on {mac}, an address that NIC \
+                             does not hold; no forward follows it"
+                        );
+                        continue;
+                    };
+                    held
+                }
+                _ => ip,
+            };
+            if let Some(mac) = mac {
+                observed.macs.insert(name.clone(), mac);
             }
             observed.leases.insert(name, ip);
         }
@@ -4292,6 +4329,13 @@ mod tests {
         /// A first-boot script still to run; until it has, the machine is
         /// not ready, as a real one is not (§6.1).
         first_boot: std::sync::Mutex<Option<String>>,
+        /// The NICs this double sits on, their hardware addresses, and the
+        /// address its guest claims on each: what a real machine's agent
+        /// reports, which the guest writes. Empty for a double off the
+        /// network.
+        nics: Vec<crate::config::model::Nic>,
+        macs: Vec<crate::config::model::MacAddr>,
+        claims: Vec<Option<String>>,
         /// A share "data" that takes this long to mount once the machine is
         /// ready, under the same wait for readiness a VM's mount task makes.
         mount: Option<Duration>,
@@ -4432,6 +4476,9 @@ mod tests {
                 agent: None,
                 agent_stamped: true,
                 first_boot: std::sync::Mutex::new(None),
+                nics: Vec::new(),
+                macs: Vec::new(),
+                claims: Vec::new(),
                 mount: None,
                 failing_mount: None,
                 online_snapshots: false,
@@ -4461,6 +4508,23 @@ mod tests {
             m.hold_start = start.cloned();
             m.hold_settle = settle.cloned();
             m.makes_disk = true;
+            Arc::new(m)
+        }
+
+        /// A container double on the network: `nics` from the lab file, one
+        /// hardware address, and the address its guest claims to carry.
+        fn networked(
+            name: &str,
+            shared: &Shared,
+            nics: &[crate::config::model::Nic],
+            mac: crate::config::model::MacAddr,
+            claim: &str,
+        ) -> Arc<Self> {
+            let mut m = Arc::into_inner(Self::new(name, MachineKind::Container, shared))
+                .expect("sole owner");
+            m.nics = nics.to_vec();
+            m.macs = vec![mac];
+            m.claims = vec![Some(claim.to_string())];
             Arc::new(m)
         }
 
@@ -4556,10 +4620,21 @@ mod tests {
             None
         }
         fn nics(&self) -> &[crate::config::model::Nic] {
-            &[]
+            &self.nics
         }
         fn macs(&self) -> &[crate::config::model::MacAddr] {
-            &[]
+            &self.macs
+        }
+        /// What the guest says its NICs carry. A double off the network
+        /// answers as a machine with no agent does.
+        async fn guest_ips(&self) -> Result<Vec<Option<String>>> {
+            if !self.claims.is_empty() {
+                return Ok(self.claims.clone());
+            }
+            let agent = self.agent().await?;
+            let ifaces = agent.net_interfaces(Duration::from_secs(5)).await?;
+            let macs: Vec<String> = self.macs.iter().map(ToString::to_string).collect();
+            Ok(super::super::vm_agent::ipv4_by_mac(&ifaces, &macs))
         }
         fn logins(&self) -> Vec<crate::config::model::Login> {
             Vec::new()
@@ -7787,5 +7862,97 @@ lab "t" {
         let runs = super::super::matching_handler_runs(&lab, &event);
         assert_eq!(runs.len(), 1);
         assert!(runs[0].0.ends_with("hook.ws"));
+    }
+
+    /// A forward and the NAT engine's binding go to the address the segment's
+    /// DHCP server leased to the machine's NIC, whatever address the guest
+    /// says that NIC carries (docs/reviews/containers.md F1). `rogue` claims
+    /// `victim`'s leased address: its forward still targets its own lease, and
+    /// the engine still sends what it originates toward `victim`'s address to
+    /// `victim`'s NIC.
+    #[tokio::test]
+    async fn a_forward_targets_the_dhcp_lease_not_the_guest_claim() {
+        use crate::config::model::MacAddr;
+        use std::net::Ipv4Addr;
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let config = crate::config::load_lab_source(
+            r#"import <vmlab.wcl>
+lab "t" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true }
+  container "victim" { image = "nginx" nic { segment = "lan" }
+    port { container = 80 }
+  }
+  container "rogue" { image = "nginx" nic { segment = "lan" }
+    port { container = 80 }
+  }
+}"#,
+            "<test>",
+            dir.path(),
+        )
+        .expect("lab source");
+        let nics = |name: &str| {
+            let c = config.lab.containers.iter().find(|c| c.name == name);
+            c.expect("declared").nics.clone()
+        };
+        let victim_mac = MacAddr([0x52, 0x54, 0, 0, 0, 10]);
+        let rogue_mac = MacAddr([0x52, 0x54, 0, 0, 0, 11]);
+        let victim_ip = Ipv4Addr::new(10, 0, 0, 10);
+        let rogue_ip = Ipv4Addr::new(10, 0, 0, 11);
+        // `victim` reports its lease. `rogue` reports `victim`'s address.
+        let machines: Vec<Arc<dyn Machine>> = vec![
+            FakeMachine::networked("victim", &sh, &nics("victim"), victim_mac, "10.0.0.10"),
+            FakeMachine::networked("rogue", &sh, &nics("rogue"), rogue_mac, "10.0.0.10"),
+        ];
+        let lab_cfg = config.lab.clone();
+        let lab = LabRuntime::with_machines(config, machines).expect("runtime");
+        let macs = HashMap::from([
+            ("victim".to_string(), vec![victim_mac]),
+            ("rogue".to_string(), vec![rogue_mac]),
+        ]);
+        let engine = {
+            let mut net = lab.network.lock().await;
+            net.wire_gateways(&lab_cfg, &macs, &lab.host_cfg);
+            let seg = &net.segments["lan"];
+            let dhcp = seg.gateway.as_ref().unwrap().dhcp_server().unwrap();
+            let mut dhcp = dhcp.lock_recover();
+            dhcp.grant(victim_mac, victim_ip);
+            dhcp.grant(rogue_mac, rogue_ip);
+            seg.services.as_ref().unwrap().nat.clone().expect("nat")
+        };
+
+        // The smaller form: the address `rogue` claims is another NIC's
+        // lease, so it is not what the network is said to know of `rogue`.
+        let observed = lab.forward_observations(&[]).await;
+        assert_eq!(observed.leases.get("victim"), Some(&victim_ip));
+        assert_ne!(
+            observed.leases.get("rogue"),
+            Some(&victim_ip),
+            "rogue's claim of victim's leased address was recorded"
+        );
+
+        // `victim` first, then `rogue`: the later install is the one whose
+        // binding would stand.
+        lab.install_forwards(&["victim".to_string()]).await;
+        lab.install_forwards(&["rogue".to_string()]).await;
+
+        let tracked = lab.machine_forwards.lock().await;
+        assert_eq!(tracked["victim"].len(), 1);
+        assert_eq!(tracked["victim"][0].guest_ip, victim_ip);
+        assert!(
+            tracked
+                .get("rogue")
+                .into_iter()
+                .flatten()
+                .all(|f| f.guest_ip == rogue_ip),
+            "rogue's forward targets an address it does not hold: {:?}",
+            tracked.get("rogue")
+        );
+        // What a connection through `victim`'s forward is framed to.
+        assert_eq!(
+            engine.guest_mac(victim_ip),
+            victim_mac,
+            "the engine sends victim's address to another NIC"
+        );
     }
 }

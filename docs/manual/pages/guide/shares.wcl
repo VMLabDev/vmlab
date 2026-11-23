@@ -106,8 +106,13 @@ SRC
     the segment gateway as `\\\\<gateway>\\<share>`, so a Windows guest needs
     nothing extra, a Linux guest needs only `cifs-utils`, and an
     XP-era guest can be served too: `smb1 = true` on a share enables the
-    SMB1 dialect and the NTLMv1 authentication those guests require. It is
-    off unless asked for, and harmless on an isolated lab segment. SMB
+    SMB1 dialect and the NTLMv1 authentication those guests require, for
+    that share alone: the machine's other shares refuse an SMB1 session,
+    and only an SMB1 session logs on with NTLMv1. It is off unless asked
+    for. One thing it does change for the whole machine: while one of its
+    shares has `smb1 = true`, its server offers SMB signing to every
+    session and
+    demands it of none. SMB
     carries no device state at all, so a restored VM's sessions are stale
     TCP that the guest's SMB client re-establishes transparently.
   DOC

@@ -288,7 +288,7 @@ fn run_vcpu(id: u8, vcpu: Arc<Mutex<VcpuFd>>, shared: &Arc<VmShared>) {
                     ));
                     return;
                 };
-                if let Err(e) = crate::hyperv::handle_exit(guard.get_kvm_run(), &ram.mem) {
+                if let Err(e) = crate::hyperv::handle_exit(guard.get_kvm_run(), &ram.device_mem) {
                     shared.request_exit(crate::vm::ExitReason::Error(e.to_string()));
                     return;
                 }
