@@ -162,4 +162,33 @@ mod tests {
         assert_eq!(text.len() as u64, cut + 9, "no hole after the cut");
         assert!(text.ends_with("line 000999\nfirmware\n"));
     }
+
+    /// A guest that writes to the firmware debug port alone, and nothing to
+    /// the UART, does not grow the file past the cap (firmware review F1).
+    #[test]
+    fn the_debug_port_cannot_pass_the_serial_log_cap() {
+        use vmlab_hv_devices::BusDevice;
+
+        const CAP: u64 = 64 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serial.log");
+        let _uart = CappedLog::open(&path, CAP).unwrap();
+        // As the machine builder opens it.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut port = vmlab_hv_vmm::q35::DebugPort(file);
+        let page = [b'x'; 4096];
+        let mut largest = 0;
+        for _ in 0..256 {
+            port.write(0, &page);
+            largest = largest.max(std::fs::metadata(&path).unwrap().len());
+        }
+        assert!(
+            largest <= CAP + CAP / 16,
+            "the file reached {largest} bytes under a cap of {CAP}"
+        );
+    }
 }
