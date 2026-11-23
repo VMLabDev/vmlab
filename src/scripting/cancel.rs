@@ -1,19 +1,16 @@
 //! Cooperative cancellation of a running script (§7.2: the first failed step
 //! fails `up` and cancels the steps still running).
 //!
-//! The wscript VM runs to completion on a blocking thread and has no
-//! interrupt, so a script cannot be stopped from outside. It can be stopped
-//! from inside: every host call that waits on the daemon goes through
+//! Every host call that waits on the daemon goes through
 //! [`block_on`], and `sleep_ms` and the screen polls through [`sleep`]. Once
 //! the script's token is cancelled, the next of those drops the work it was
 //! waiting on and unwinds the script thread with [`Cancelled`], which the
-//! runner turns back into [`ScriptCancelled`]. A script spinning without ever
-//! calling the host runs on until it does.
+//! runner turns back into [`ScriptCancelled`]. The runner also checks for
+//! cancellation before and after execution and limits each VM's bytecode
+//! budget so a script that never calls the host still terminates.
 //!
 //! The token rides a thread-local, set for the length of one script run by
-//! [`enter`], so the many host functions need no extra argument and a script
-//! nobody can cancel (an ad-hoc `vmlab script`, an event handler) behaves
-//! exactly as before.
+//! [`enter`], so the host functions need no extra argument.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -22,7 +19,34 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 thread_local! {
-    static TOKEN: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
+    static TOKEN: RefCell<Option<RunCancellation>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct RunCancellation {
+    lifetime: CancellationToken,
+    request: Option<CancellationToken>,
+}
+
+impl RunCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.lifetime.is_cancelled()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    async fn cancelled(&self) {
+        if let Some(request) = &self.request {
+            tokio::select! {
+                _ = self.lifetime.cancelled() => {}
+                _ = request.cancelled() => {}
+            }
+        } else {
+            self.lifetime.cancelled().await;
+        }
+    }
 }
 
 /// The unwind payload a cancelled script stops with. Raised with
@@ -30,8 +54,7 @@ thread_local! {
 /// crash and writes nothing to the daemon log.
 pub(crate) struct Cancelled;
 
-/// A script stopped because something else failed first. The step that
-/// failed carries the reason; this one only says it did not finish.
+/// A script stopped by cancellation.
 #[derive(Debug)]
 pub struct ScriptCancelled;
 
@@ -54,13 +77,19 @@ impl Drop for Entered {
 }
 
 /// Make `token` the running script's for the life of the guard.
-pub(crate) fn enter(token: Option<CancellationToken>) -> Entered {
-    TOKEN.with(|t| *t.borrow_mut() = token);
+pub(crate) fn enter(lifetime: CancellationToken, request: Option<CancellationToken>) -> Entered {
+    TOKEN.with(|t| *t.borrow_mut() = Some(RunCancellation { lifetime, request }));
     Entered
 }
 
-fn current() -> Option<CancellationToken> {
+fn current() -> Option<RunCancellation> {
     TOKEN.with(|t| t.borrow().clone())
+}
+
+pub(crate) fn check() {
+    if current().is_some_and(|token| token.is_cancelled()) {
+        stop();
+    }
 }
 
 fn stop() -> ! {
@@ -122,7 +151,7 @@ mod tests {
         let handle = rt.handle().clone();
         let t = token.clone();
         let waiter = std::thread::spawn(move || {
-            let _entered = enter(Some(t));
+            let _entered = enter(t, None);
             block_on(&handle, std::future::pending::<()>());
         });
         token.cancel();
@@ -138,7 +167,7 @@ mod tests {
         let t = token.clone();
         let started = Instant::now();
         let payload = std::thread::spawn(move || {
-            let _entered = enter(Some(t));
+            let _entered = enter(t, None);
             sleep(Duration::from_secs(60));
         })
         .join()

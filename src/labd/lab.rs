@@ -59,6 +59,8 @@ pub struct LabRuntime {
     /// makes the starts before it stale, a destroy holds the machine until
     /// its disks are gone, and a lab that is going away takes no start.
     starts: super::start_gate::StartGate,
+    /// Cancels every script when this lab daemon starts shutting down.
+    pub(crate) script_shutdown: tokio_util::sync::CancellationToken,
     /// What the running SMB server exports, as [`reload::smb_exports`]
     /// renders it, so a reload can tell whether the file changed them.
     smb_served: std::sync::Mutex<String>,
@@ -572,6 +574,7 @@ impl LabRuntime {
             doubles: std::sync::Mutex::new(None),
             rebuild_gate: tokio::sync::RwLock::new(()),
             starts: Default::default(),
+            script_shutdown: Default::default(),
             smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(state),
@@ -648,6 +651,7 @@ impl LabRuntime {
             doubles: std::sync::Mutex::new(None),
             rebuild_gate: tokio::sync::RwLock::new(()),
             starts: Default::default(),
+            script_shutdown: Default::default(),
             smb_served: std::sync::Mutex::new(String::new()),
             network: Mutex::new(network),
             state: Mutex::new(LabState::load(&lab_local).unwrap_or_default()),
@@ -2881,9 +2885,8 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// One provision or playbook step on its own machine. A provision script
-    /// is cancelled from inside, at its next host call, and awaited until it
-    /// stops; a playbook apply is abandoned where it stands.
+    /// One provision or playbook step on its own machine. A cancelled script
+    /// is awaited until it stops. A playbook apply is abandoned where it stands.
     async fn run_step(
         self: &Arc<Self>,
         step: &plan::Step,
@@ -2902,6 +2905,7 @@ impl LabRuntime {
                     self.clone(),
                     &script,
                     Some(owner),
+                    None,
                     None,
                     output.clone(),
                 )
@@ -3115,6 +3119,7 @@ impl LabRuntime {
     /// followed by a forced stop of every machine, for the same reason.
     pub async fn stop_for_exit(self: &Arc<Self>) {
         self.starts.close("shutting down");
+        self.script_shutdown.cancel();
         let Err(e) = self.down(&[], false).await else {
             return;
         };
@@ -5455,6 +5460,40 @@ fn main(lab: Lab) {
             }),
         )
         .await;
+        assert!(lines.try_recv().is_err(), "cancelled script emitted output");
+        let err = result.expect_err("cancelled script completed");
+        assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_running_script_stops_on_fuel_exhaustion_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let token = tokio_util::sync::CancellationToken::new();
+        let owner = crate::scripting::ScriptOwner::provision("box").cancelled_by(token.clone());
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let result = crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    lab.log("started")
+    let i = 0
+    while i < 20000000 { i = i + 1 }
+    lab.log("done")
+}
+"#
+            .into(),
+            "cancel.ws",
+            dir.path().to_path_buf(),
+            Some(owner),
+            None,
+            Arc::new(move |line| {
+                token.cancel();
+                let _ = output.send(line);
+            }),
+        )
+        .await;
+        assert_eq!(lines.try_recv().unwrap().trim(), "started");
         assert!(lines.try_recv().is_err(), "cancelled script emitted output");
         let err = result.expect_err("cancelled script completed");
         assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");

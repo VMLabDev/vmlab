@@ -8,11 +8,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
+use tokio_util::sync::CancellationToken;
 use wscript::Vm;
 
 use super::{EventData, LabHandle, SegmentHandle};
 use crate::labd::lab::LabRuntime;
 use crate::labd::record::RunId;
+
+// Bound bytecode execution for every entry point, including scripts that
+// never hand control back to the host. Time spent waiting on a host call
+// does not count against this budget.
+const SCRIPT_FUEL: u64 = 10_000_000;
 
 /// Where script log output goes (lab log + live CLI stream, PRD §10.1).
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -27,7 +33,7 @@ pub struct ScriptOwner {
     /// before the VM is allowed to reach full readiness — so `is_ready` /
     /// `wait_ready` on it mean agent-level readiness instead.
     pub first_boot: bool,
-    /// Cancels the run at its next host call — `up` hands each provision one,
+    /// Cancels the run — `up` hands each provision one,
     /// so the first failed step stops the others (§7.2). See
     /// [`super::cancel`].
     pub cancel: Option<tokio_util::sync::CancellationToken>,
@@ -90,18 +96,19 @@ pub async fn run_script_file(
     script: &Path,
     owner: Option<ScriptOwner>,
     run: Option<RunId>,
+    disconnect: Option<CancellationToken>,
     output: OutputSink,
 ) -> Result<()> {
     let source =
         std::fs::read_to_string(script).with_context(|| format!("reading {}", script.display()))?;
     let name = script.display().to_string();
-    run_script_source(
+    run_main(
         runtime,
         source,
-        &name,
-        script_dir(script),
+        (&name, script_dir(script)),
         owner,
         run,
+        disconnect,
         output,
     )
     .await
@@ -120,6 +127,18 @@ pub async fn run_script_source(
     run: Option<RunId>,
     output: OutputSink,
 ) -> Result<()> {
+    run_main(runtime, source, (name, ref_base), owner, run, None, output).await
+}
+
+async fn run_main(
+    runtime: Arc<LabRuntime>,
+    source: String,
+    (name, ref_base): (&str, std::path::PathBuf),
+    owner: Option<ScriptOwner>,
+    run: Option<RunId>,
+    disconnect: Option<CancellationToken>,
+    output: OutputSink,
+) -> Result<()> {
     let name = name.to_string();
     let ref_base = Arc::new(ref_base);
     let rt = tokio::runtime::Handle::current();
@@ -130,14 +149,8 @@ pub async fn run_script_source(
     // script's own.
     let run = run.unwrap_or_else(|| runtime.recordings.new_run());
     let finalise_on = runtime.clone();
-    let token = owner.as_ref().and_then(|o| o.cancel.clone());
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let _entered = super::cancel::enter(token);
-        let ctx = super::context();
-        let unit = ctx
-            .compile(&source)
-            .map_err(|e| anyhow!("{name}: {}", compile_error(e)))?;
-        let mut vm = Vm::new(&ctx);
+    let token = disconnect.or_else(|| owner.as_ref().and_then(|o| o.cancel.clone()));
+    let result = run_blocking(finalise_on.script_shutdown.child_token(), token, move || {
         let lab = LabHandle {
             runtime,
             rt,
@@ -146,24 +159,17 @@ pub async fn run_script_source(
             owner,
             run,
         };
-        vm.call_unit::<_, ()>(&unit, "main", (lab,))
-            .map_err(|e| anyhow!("{name}: {}", run_error(e)))
+        execute(&source, &name, "main", (lab,))
     })
-    .await
-    .map_err(|e| match e.try_into_panic() {
-        Ok(payload) if payload.is::<super::cancel::Cancelled>() => {
-            anyhow::Error::new(super::cancel::ScriptCancelled)
-        }
-        Ok(_) => anyhow!("script thread panicked"),
-        Err(e) => anyhow!("script thread panicked: {e}"),
-    });
+    .await;
     // Whatever the script recorded and did not stop is finalised here, on
     // success and on failure alike (D7).
     finalise_on.record_finalise_run(run).await;
     // A cancelled run says nothing here: the step that failed first says
     // why, and this one only stopped.
-    let result = result?;
-    if let Err(e) = &result {
+    if let Err(e) = &result
+        && !e.is::<super::cancel::ScriptCancelled>()
+    {
         out_err(format!("script failed: {e:#}\n"));
     }
     result
@@ -186,12 +192,7 @@ pub async fn run_event_handler(
     let rt = tokio::runtime::Handle::current();
     let run = runtime.recordings.new_run();
     let finalise_on = runtime.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let ctx = super::context();
-        let unit = ctx
-            .compile(&source)
-            .map_err(|e| anyhow!("{name}: {}", compile_error(e)))?;
-        let mut vm = Vm::new(&ctx);
+    let result = run_blocking(finalise_on.script_shutdown.child_token(), None, move || {
         let lab = LabHandle {
             runtime,
             rt,
@@ -200,16 +201,50 @@ pub async fn run_event_handler(
             owner: None,
             run,
         };
-        vm.call_unit::<_, ()>(&unit, "handle", (event, lab))
-            .map_err(|e| anyhow!("{name}: {}", run_error(e)))
+        execute(&source, &name, "handle", (event, lab))
     })
     .await;
     finalise_on.record_finalise_run(run).await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("event handler failed: {e:#}"),
-        Err(e) => tracing::warn!("event handler thread panicked: {e}"),
+    if let Err(e) = result
+        && !e.is::<super::cancel::ScriptCancelled>()
+    {
+        tracing::warn!("event handler failed: {e:#}");
     }
+}
+
+async fn run_blocking(
+    token: CancellationToken,
+    request_cancel: Option<CancellationToken>,
+    script: impl FnOnce() -> Result<()> + Send + 'static,
+) -> Result<()> {
+    let _cancel_on_drop = token.clone().drop_guard();
+    tokio::task::spawn_blocking(move || {
+        let _entered = super::cancel::enter(token, request_cancel);
+        super::cancel::check();
+        let result = script();
+        super::cancel::check();
+        result
+    })
+    .await
+    .map_err(|e| match e.try_into_panic() {
+        Ok(payload) if payload.is::<super::cancel::Cancelled>() => {
+            anyhow::Error::new(super::cancel::ScriptCancelled)
+        }
+        Ok(_) => anyhow!("script thread panicked"),
+        Err(e) => anyhow!("script thread panicked: {e}"),
+    })?
+}
+
+fn execute(source: &str, name: &str, entry: &str, args: impl wscript::IntoArgs) -> Result<()> {
+    let ctx = super::context();
+    let unit = ctx
+        .compile(source)
+        .map_err(|e| anyhow!("{name}: {}", compile_error(e)))?;
+    super::cancel::check();
+    let mut vm = Vm::new(&ctx);
+    vm.set_fuel(Some(SCRIPT_FUEL));
+    vm.call_unit::<_, ()>(&unit, entry, args)
+        .map_err(|e| anyhow!("{name}: {}", run_error(e)))
 }
 
 /// Directory a script file lives in — the base for its relative reference-image
