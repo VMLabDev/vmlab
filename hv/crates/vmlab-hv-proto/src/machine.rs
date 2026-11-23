@@ -113,9 +113,15 @@ pub enum FwCfgSource {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MsrPolicy {
+    /// KVM's own behaviour: an MSR it has no model for raises #GP.
     #[default]
     Fault,
-    Ignore,
+    /// A macOS guest: vmlab-hv answers the MSRs XNU touches that KVM has no
+    /// model for, from a fixed table (`hv/docs/macos-msrs.md`). Every other
+    /// unknown MSR still raises #GP. `ignore` is the name this had while it
+    /// answered every unknown MSR.
+    #[serde(alias = "ignore")]
+    Macos,
 }
 
 impl MsrPolicy {
