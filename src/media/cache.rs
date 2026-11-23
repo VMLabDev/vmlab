@@ -186,6 +186,54 @@ mod tests {
         assert_eq!(floppy.extension().unwrap(), "img");
     }
 
+    /// F1 (docs/reviews/appshare-media.md): drive A is writable, so whoever
+    /// reads a built floppy can change the file it was handed. A changed
+    /// entry must not be what the next `ensure` returns.
+    ///
+    /// The comparison is of the sector that was written, not of the whole
+    /// image: mtools stamps a volume serial number and file times into each
+    /// build, so two builds of one folder are not equal byte for byte.
+    #[test]
+    fn a_built_floppy_is_not_changed_by_its_reader() {
+        use std::os::unix::fs::FileExt;
+
+        const SECTOR: usize = 512;
+        // The last sector of a 1.44 MB image: free data area in this build.
+        const LAST: u64 = 2879 * SECTOR as u64;
+        let last_sector = |img: &Path| {
+            let mut sector = [0u8; SECTOR];
+            fs::File::open(img)
+                .unwrap()
+                .read_exact_at(&mut sector, LAST)
+                .unwrap();
+            sector
+        };
+
+        let src = unattend_folder();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let first = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+
+        // What a guest `write_at` on drive A does to the image.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .write_all_at(&[0xEE; SECTOR], LAST)
+            .unwrap();
+
+        let second = cache.ensure(MediaKind::Floppy, src.path(), None).unwrap();
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh = MediaCache::new(fresh_root.path().join("media"))
+            .ensure(MediaKind::Floppy, src.path(), None)
+            .unwrap();
+
+        assert!(
+            last_sector(&second) == last_sector(&fresh),
+            "the cache handed back the sector its reader wrote"
+        );
+    }
+
     #[test]
     fn gc_removes_unkept_entries() {
         let src = unattend_folder();

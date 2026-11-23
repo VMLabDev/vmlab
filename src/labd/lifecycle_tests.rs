@@ -238,6 +238,16 @@ impl Observed {
 /// and sits below this test's subject — `ensure_disks` skips what already
 /// exists, so nothing here depends on the host's QEMU layout.
 fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHypervisor>) {
+    vm_with_floppy(dirs, decl, script, None)
+}
+
+/// [`vm`], with `floppy` in drive A.
+fn vm_with_floppy(
+    dirs: &Dirs,
+    decl: &str,
+    script: Script,
+    floppy: Option<PathBuf>,
+) -> (Arc<VmInstance>, Arc<FakeHypervisor>) {
     let cfg = testing::vm(decl);
     let resolved = crate::qemu::resolve_vm(
         &cfg,
@@ -269,7 +279,7 @@ fn vm(dirs: &Dirs, decl: &str, script: Script) -> (Arc<VmInstance>, Arc<FakeHype
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        None,
+        floppy,
         share_hosts,
         TemplateParts {
             resolved,
@@ -810,6 +820,50 @@ async fn a_vm_starts_and_becomes_ready_without_a_hypervisor() {
     assert_eq!(observed.ready_count(), 1, "on_ready fires exactly once");
 
     vm.stop(true).await.expect("stop");
+}
+
+/// F1 (docs/reviews/appshare-media.md): a floppy built from a `media {}`
+/// folder is an entry of the media cache, which every machine with that folder
+/// is handed. vmlab-hv opens drive A writable and takes no image lock, so no
+/// two machines may launch with one path, and none with the cache entry: what
+/// one guest writes must reach neither the cache nor the other guest.
+#[tokio::test]
+async fn two_machines_do_not_share_a_writable_floppy() {
+    let cache = tempfile::tempdir().expect("cache dir");
+    let entry = cache.path().join("0123456789abcdef.img");
+    std::fs::write(&entry, b"as built").expect("cache entry");
+
+    let mut launched = Vec::new();
+    for _ in 0..2 {
+        let dirs = Dirs::new();
+        let (vm, hv) = vm_with_floppy(&dirs, LINUX_VM, Script::healthy(), Some(entry.clone()));
+        let (cbs, _observed) = callbacks();
+        start_vm(&vm, cbs).await.expect("start");
+        let floppy = hv
+            .launched_floppies()
+            .pop()
+            .flatten()
+            .expect("the launch carries the floppy");
+        assert_eq!(
+            std::fs::read(&floppy).expect("launched floppy"),
+            b"as built",
+            "the guest reads what was built"
+        );
+        // What a guest write to drive A does to the image it was given.
+        std::fs::write(&floppy, b"written by a guest").expect("guest write");
+        vm.stop(true).await.expect("stop");
+        launched.push((dirs, floppy));
+    }
+
+    assert_ne!(
+        launched[0].1, launched[1].1,
+        "two machines launched with one writable floppy image"
+    );
+    assert_eq!(
+        std::fs::read(&entry).expect("cache entry"),
+        b"as built",
+        "a guest wrote into the shared media cache"
+    );
 }
 
 /// F4 (docs/reviews/config.md): a disk's image is `disk-<name>.qcow2`, so
