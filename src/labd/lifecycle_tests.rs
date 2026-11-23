@@ -2599,6 +2599,44 @@ async fn a_stop_that_ends_at_the_kill_detaches_usb_devices_first() {
     );
 }
 
+/// A hypervisor that never answers the detach is killed all the same: the
+/// forced stop is what ends a wedged machine, so the detach has a limit.
+///
+/// Time is paused: the limit is the one the stop itself keeps.
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_kills_a_hypervisor_that_never_answers_the_detach() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            runs: vec![Run {
+                ignores_detach: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    m.stop(true).await.expect("forced stop");
+
+    assert_eq!(observed.exit().await.status, "signal: 9");
+    assert_eq!(
+        hv.journal(),
+        vec![
+            format!("attach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+            "kill".to_string(),
+        ]
+    );
+    assert_eq!(vm.state().await, PowerState::Stopped);
+}
+
 /// A stop that ends before the kill rung detaches nothing: the hypervisor
 /// exits by itself and gives its devices back as it drops them.
 #[tokio::test]

@@ -74,6 +74,8 @@ pub struct Run {
     /// The emulator itself is wedged and ignores a QMP `quit`, which is what
     /// leaves the stop ladder nothing but the kill.
     pub ignores_quit: bool,
+    /// The emulator never answers a `detach`: wedged with the device held.
+    pub ignores_detach: bool,
     /// The guest suspends itself to RAM this long after coming up — the
     /// idle-timeout sleep a Windows client edition takes. It stays asleep
     /// until something wakes it.
@@ -250,6 +252,7 @@ impl FakeHypervisor {
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
             journal: Journal::default(),
+            ignores_detach: false,
         })
     }
 
@@ -364,6 +367,7 @@ impl Hypervisor for FakeHypervisor {
         }
         let machine = Arc::new(FakeProc {
             journal: self.journal.clone(),
+            ignores_detach: run.ignores_detach,
             ..FakeProc::new(spec.label.clone())
         });
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
@@ -473,6 +477,8 @@ pub(crate) struct FakeProc {
     /// Where its hot-plug calls and its kill are written down. A machine
     /// shares the hypervisor's; a helper keeps its own.
     journal: Journal,
+    /// A `detach` is written down and then never answered.
+    ignores_detach: bool,
 }
 
 /// Which agent process answers, and what it calls itself.
@@ -740,6 +746,9 @@ impl Hotplug for FakeCapabilities {
 
     async fn detach(&self, id: &str, _wait: Duration) -> Result<()> {
         self.0.note(format!("detach {id}"));
+        if self.0.ignores_detach {
+            std::future::pending::<()>().await;
+        }
         self.0
             .plugged
             .lock()
