@@ -132,7 +132,7 @@ timeout_secs, threshold, region)` exposes the two options the others fix:
 DOC
 
   list {
-    li "**threshold** is the minimum similarity score, default 0.9. Scores are zero-mean normalised cross-correlation values where 1.0 is a perfect match, compared against the threshold with no rescaling. Matching is done in grayscale."
+    li "**threshold** is the minimum similarity score, default 0.9. The search returns the highest score in the region. The score is one minus the root mean square RGB channel difference divided by 255. Identical pixels score 1.0."
     li "**region** is `[x, y, w, h]` restricting the search to part of the screen, or an empty list for the whole screen. A list of any other length is an error. Coordinates in the returned `Match` are always absolute screen coordinates, even when a region was given."
   }
 
