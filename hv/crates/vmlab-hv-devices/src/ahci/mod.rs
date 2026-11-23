@@ -2,15 +2,31 @@
 //!
 //! Register and DMA layouts follow Intel AHCI 1.3.1, sections 3-5 and 10.
 //! ATA commands follow T13/1410D, and optical commands follow T10 MMC-4.
-//! PCI identity and capabilities match the q35 hardware captures. Commands
-//! complete synchronously, including tagged NCQ commands. Port multipliers and
-//! power management are not advertised. Disk contents belong to the VMM snapshot.
+//! PCI identity and capabilities match the q35 hardware captures. Port
+//! multipliers and power management are not advertised. Disk contents belong
+//! to the VMM snapshot.
+//!
+//! A command that reads, writes or flushes a backing image runs on the
+//! controller's worker thread and completes with an interrupt, so the vCPU
+//! that set its PxCI bit returns to the guest at once. A vCPU held in a host
+//! `fsync` cannot answer an IPI, and macOS panics on one that goes unanswered.
+//! Every other command completes inside the register write. A port runs one
+//! command at a time, tagged NCQ commands included, in slot order.
+//!
+//! The register state sits behind an inner lock the worker takes only to
+//! start and to finish a command, never across the I/O. What cancels a
+//! command list (a cleared PxCMD.ST, a COMRESET, an HBA reset) discards the
+//! completion of the command in flight and waits for its I/O to end before
+//! the register write returns. A snapshot, a restore and a machine reset
+//! wait until no command is outstanding, so a saved state never holds one.
 
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use vm_memory::{Bytes, GuestAddress, GuestMemory as _, Permissions};
 use vmlab_disk::DiskImage;
 
@@ -41,17 +57,308 @@ fn le64(bytes: &[u8]) -> u64 {
 
 pub use crate::ata::MediaState;
 
+/// The most one image read or guest-memory copy moves at a time.
+const CHUNK: usize = 64 * 1024;
+
+/// A drive's backing image as the drive and the worker both hold it. The
+/// worker locks it for the length of one command's I/O and holds no other
+/// lock meanwhile. Size and writability never change under an open image, so
+/// the register path reads them here and never waits on that lock.
+#[derive(Clone)]
+struct SharedImage {
+    image: Arc<Mutex<Box<dyn DiskImage>>>,
+    size: u64,
+    read_only: bool,
+}
+
+impl SharedImage {
+    fn new(image: Box<dyn DiskImage>) -> Self {
+        Self {
+            size: image.size(),
+            read_only: image.read_only(),
+            image: Arc::new(Mutex::new(image)),
+        }
+    }
+}
+
+impl DiskImage for SharedImage {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> vmlab_disk::Result<()> {
+        self.image.lock().read_at(offset, buf)
+    }
+    fn read_into(
+        &mut self,
+        offset: u64,
+        len: usize,
+        target: &mut dyn vmlab_disk::ReadTarget,
+    ) -> vmlab_disk::Result<()> {
+        self.image.lock().read_into(offset, len, target)
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> vmlab_disk::Result<()> {
+        self.image.lock().write_at(offset, buf)
+    }
+    fn flush(&mut self) -> vmlab_disk::Result<()> {
+        self.image.lock().flush()
+    }
+    fn discard(&mut self, offset: u64, len: u64) -> vmlab_disk::Result<()> {
+        self.image.lock().discard(offset, len)
+    }
+    fn snapshots(&self) -> vmlab_disk::Result<Vec<vmlab_disk::SnapshotInfo>> {
+        self.image.lock().snapshots()
+    }
+    fn snapshot_create(
+        &mut self,
+        name: &str,
+        vm_state_size: u64,
+        vm_clock_nsec: u64,
+    ) -> vmlab_disk::Result<()> {
+        self.image
+            .lock()
+            .snapshot_create(name, vm_state_size, vm_clock_nsec)
+    }
+    fn snapshot_apply(&mut self, name: &str) -> vmlab_disk::Result<vmlab_disk::SnapshotInfo> {
+        self.image.lock().snapshot_apply(name)
+    }
+    fn snapshot_delete(&mut self, name: &str) -> vmlab_disk::Result<()> {
+        self.image.lock().snapshot_delete(name)
+    }
+    fn write_vmstate(&mut self, offset: u64, buf: &[u8]) -> vmlab_disk::Result<()> {
+        self.image.lock().write_vmstate(offset, buf)
+    }
+    fn discard_vmstate(&mut self, len: u64) -> vmlab_disk::Result<()> {
+        self.image.lock().discard_vmstate(len)
+    }
+    fn read_vmstate(&mut self, offset: u64, buf: &mut [u8]) -> vmlab_disk::Result<()> {
+        self.image.lock().read_vmstate(offset, buf)
+    }
+}
+
+/// What the worker does to the backing image for one command.
+enum Io {
+    Read {
+        offset: u64,
+        len: usize,
+    },
+    Write {
+        offset: u64,
+        data: Vec<u8>,
+        flush: bool,
+    },
+    Flush,
+}
+
+/// What a command resolved to inside the register write.
+enum Exec {
+    /// The whole response, with no image I/O left to do.
+    Bytes(Vec<u8>),
+    /// Image I/O for the worker.
+    Io(Io),
+}
+
+/// The parsed command header and table of one slot.
+struct Request {
+    slot: usize,
+    header_addr: u64,
+    cfis: [u8; 20],
+    /// Address, length and interrupt-on-completion of each PRD entry.
+    prds: Vec<(u64, usize, bool)>,
+}
+
+/// How a command ended: the task-file status and error, the byte count for
+/// the command header, and whether a fully used PRD asked for an interrupt.
+struct Done {
+    status: u8,
+    error: u8,
+    transferred: usize,
+    ioc: bool,
+}
+
+impl Done {
+    fn error(error: u8) -> Self {
+        Self {
+            status: 0x51,
+            error,
+            transferred: 0,
+            ioc: false,
+        }
+    }
+}
+
+/// One command on its way through the worker.
+struct Job {
+    port: usize,
+    /// The port's generation when the command started. A completion whose
+    /// generation is no longer the port's is discarded.
+    generation: u64,
+    request: Request,
+    io: Io,
+    image: SharedImage,
+}
+
+enum Message {
+    Job(Box<Job>),
+    Stop,
+}
+
+/// Walk a PRD table for `expected` bytes, handing each piece to `chunk` as
+/// (guest address, bytes already moved, length). `chunk` answers `Ok(false)`
+/// for a device error, which ends the walk, and `Err` for a DMA fault. The
+/// result is the bytes moved and whether a fully used PRD had its interrupt
+/// bit set.
+fn walk(
+    prds: &[(u64, usize, bool)],
+    expected: usize,
+    mut chunk: impl FnMut(u64, usize, usize) -> Result<bool, ()>,
+) -> Result<(usize, bool), ()> {
+    let mut copied = 0;
+    let mut ioc = false;
+    for &(address, len, interrupt) in prds {
+        let n = len.min(expected - copied);
+        if n == 0 {
+            break;
+        }
+        let mut done = 0;
+        let mut failed = false;
+        while done < n {
+            let count = (n - done).min(CHUNK);
+            if !chunk(address + done as u64, copied, count)? {
+                failed = true;
+                break;
+            }
+            copied += count;
+            done += count;
+        }
+        if done == len && interrupt {
+            ioc = true;
+        }
+        if copied == expected || failed {
+            break;
+        }
+    }
+    Ok((copied, ioc))
+}
+
+impl Job {
+    /// The image I/O and the guest-memory copy of one command. Runs on the
+    /// worker with no controller lock held. `Err` is a DMA fault.
+    fn perform(&self, memory: &GuestMemory) -> Result<Done, ()> {
+        let mut image = self.image.image.lock();
+        match &self.io {
+            Io::Read { offset, len } => {
+                let mut buffer = vec![0; CHUNK.min(*len)];
+                let mut failed = false;
+                let (transferred, ioc) = walk(&self.request.prds, *len, |address, copied, n| {
+                    if image
+                        .read_at(offset + copied as u64, &mut buffer[..n])
+                        .is_err()
+                    {
+                        failed = true;
+                        return Ok(false);
+                    }
+                    memory
+                        .write_slice(&buffer[..n], GuestAddress(address))
+                        .map_err(|_| ())?;
+                    Ok(true)
+                })?;
+                Ok(Done {
+                    status: if failed { 0x51 } else { 0x50 },
+                    error: if failed { 0x40 } else { 0 },
+                    transferred,
+                    ioc,
+                })
+            }
+            Io::Write {
+                offset,
+                data,
+                flush,
+            } => {
+                if image.write_at(*offset, data).is_err() || (*flush && image.flush().is_err()) {
+                    return Ok(Done::error(0x40));
+                }
+                let (transferred, ioc) = walk(&self.request.prds, data.len(), |_, _, _| Ok(true))?;
+                Ok(Done {
+                    status: 0x50,
+                    error: 0,
+                    transferred,
+                    ioc,
+                })
+            }
+            Io::Flush => Ok(if image.flush().is_err() {
+                Done::error(0x40)
+            } else {
+                Done {
+                    status: 0x50,
+                    error: 0,
+                    transferred: 0,
+                    ioc: false,
+                }
+            }),
+        }
+    }
+}
+
+fn worker(shared: &Shared, memory: &GuestMemory, queue: &mpsc::Receiver<Message>) {
+    while let Ok(Message::Job(job)) = queue.recv() {
+        let outcome = job.perform(memory);
+        shared.core.lock().complete(&job, outcome);
+        shared.done.notify_all();
+    }
+}
+
+struct Shared {
+    core: Mutex<Core>,
+    /// Signalled after every completion, discarded ones included.
+    done: Condvar,
+}
+
 /// An AHCI PCI function with six independently attachable SATA devices.
 pub struct Ahci {
     id: String,
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// The controller's registers and drives, behind [`Shared::core`].
+struct Core {
     memory: GuestMemory,
     irq: Arc<dyn IrqLine>,
     msi: Arc<dyn MsiSink>,
     config: [u8; 256],
     regs: [u8; REGS],
     drives: [Option<Drive>; PORTS],
+    /// The image of each drive that has one, for the worker.
+    images: [Option<SharedImage>; PORTS],
     index: u32,
     msi_pending: u32,
+    /// A port with a command on the worker starts no other until it ends.
+    busy: [bool; PORTS],
+    generation: [u64; PORTS],
+    /// Cancelled commands whose I/O the worker has not finished.
+    stale: usize,
+    jobs: mpsc::Sender<Message>,
+}
+
+fn power_on_config() -> [u8; 256] {
+    let mut config = [0; 256];
+    config[..4].copy_from_slice(&0x2922_8086u32.to_le_bytes());
+    config[6] = 0x10;
+    config[8..12].copy_from_slice(&0x0106_0102u32.to_le_bytes());
+    config[14] = 0x80;
+    config[0x20] = 1;
+    config[0x2c..0x30].copy_from_slice(&0x1100_1af4u32.to_le_bytes());
+    config[0x34] = 0x80;
+    config[0x3c] = 10;
+    config[0x3d] = 1;
+    config[0x80..0x84].copy_from_slice(&[5, 0xa8, 0x80, 0]);
+    config[0x90] = 0x40;
+    config[0x92] = 0x3f;
+    config[0xa8..0xb0].copy_from_slice(&[0x12, 0, 0x10, 0, 0x48, 0, 0, 0]);
+    config
 }
 
 impl Ahci {
@@ -63,32 +370,66 @@ impl Ahci {
         irq: Arc<dyn IrqLine>,
         msi: Arc<dyn MsiSink>,
     ) -> Self {
-        let mut device = Self {
-            id: id.into(),
-            memory,
+        let (jobs, queue) = mpsc::channel();
+        let mut core = Core {
+            memory: memory.clone(),
             irq,
             msi,
-            config: [0; 256],
+            config: power_on_config(),
             regs: [0; REGS],
             drives: std::array::from_fn(|_| None),
+            images: std::array::from_fn(|_| None),
             index: 0,
             msi_pending: 0,
+            busy: [false; PORTS],
+            generation: [0; PORTS],
+            stale: 0,
+            jobs,
         };
-        device.config[..4].copy_from_slice(&0x2922_8086u32.to_le_bytes());
-        device.config[6] = 0x10;
-        device.config[8..12].copy_from_slice(&0x0106_0102u32.to_le_bytes());
-        device.config[14] = 0x80;
-        device.config[0x20] = 1;
-        device.config[0x2c..0x30].copy_from_slice(&0x1100_1af4u32.to_le_bytes());
-        device.config[0x34] = 0x80;
-        device.config[0x3c] = 10;
-        device.config[0x3d] = 1;
-        device.config[0x80..0x84].copy_from_slice(&[5, 0xa8, 0x80, 0]);
-        device.config[0x90] = 0x40;
-        device.config[0x92] = 0x3f;
-        device.config[0xa8..0xb0].copy_from_slice(&[0x12, 0, 0x10, 0, 0x48, 0, 0, 0]);
-        device.reset();
-        device
+        core.reset();
+        let shared = Arc::new(Shared {
+            core: Mutex::new(core),
+            done: Condvar::new(),
+        });
+        let worker = std::thread::Builder::new()
+            .name("ahci".into())
+            .spawn({
+                let shared = shared.clone();
+                move || worker(&shared, &memory, &queue)
+            })
+            .expect("spawn the AHCI worker thread");
+        Self {
+            id: id.into(),
+            shared,
+            worker: Some(worker),
+        }
+    }
+
+    fn core(&self) -> MutexGuard<'_, Core> {
+        self.shared.core.lock()
+    }
+
+    /// The controller with no command outstanding: every command the guest
+    /// issued has completed and no cancelled one is still doing I/O. The
+    /// caller has stopped the vCPUs, or accepts commands issued after this.
+    fn idle(&self) -> MutexGuard<'_, Core> {
+        let mut core = self.core();
+        while core.stale != 0 || core.busy.contains(&true) {
+            self.shared.done.wait(&mut core);
+        }
+        core
+    }
+
+    /// End a register write: wait for the I/O of every command it cancelled.
+    fn drained(&self, mut core: MutexGuard<'_, Core>) {
+        while core.stale != 0 {
+            self.shared.done.wait(&mut core);
+        }
+    }
+
+    /// Wait until no command is outstanding.
+    pub fn wait_idle(&self) {
+        drop(self.idle());
     }
 
     /// Attach an ATA disk before the guest starts. A running port is rejected.
@@ -103,14 +444,16 @@ impl Ahci {
                 "ATA disk size must be a nonzero multiple of 512 bytes within LBA48".into(),
             ));
         }
-        self.attach(
+        let image = SharedImage::new(image);
+        self.core().attach(
             port,
             Drive::Disk(AtaDisk {
-                image,
+                image: Box::new(image.clone()),
                 write_cache: true,
                 transfer_mode: 0x22,
                 ncq_error: [0; 24],
             }),
+            Some(image),
         )
     }
 
@@ -121,10 +464,86 @@ impl Ahci {
         image: Option<Box<dyn DiskImage>>,
     ) -> Result<(), DeviceError> {
         Optical::validate_media(image.as_deref())?;
-        self.attach(port, Drive::Cdrom(Optical::new(image)))
+        let image = image.map(SharedImage::new);
+        let media = image
+            .clone()
+            .map(|image| Box::new(image) as Box<dyn DiskImage>);
+        self.core()
+            .attach(port, Drive::Cdrom(Optical::new(media)), image)
     }
 
-    fn attach(&mut self, port: usize, drive: Drive) -> Result<(), DeviceError> {
+    /// Replace optical media and close the tray. Guest removal locks apply.
+    pub fn insert_media(
+        &mut self,
+        port: usize,
+        image: Box<dyn DiskImage>,
+    ) -> Result<(), DeviceError> {
+        let image = SharedImage::new(image);
+        let mut core = self.core();
+        core.optical_mut(port)?
+            .insert_media(Box::new(image.clone()))?;
+        core.images[port] = Some(image);
+        Ok(())
+    }
+
+    /// Open the tray and remove the host image. Guest removal locks apply.
+    pub fn eject_media(&mut self, port: usize) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
+        let mut core = self.core();
+        let image = core.optical_mut(port)?.eject_media()?;
+        core.forget_removed_image(port);
+        Ok(image)
+    }
+
+    /// Remove the host image whatever the guest locked, leaving the tray
+    /// closed and the drive empty.
+    pub fn force_eject_media(
+        &mut self,
+        port: usize,
+    ) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
+        let mut core = self.core();
+        let image = core.optical_mut(port)?.force_eject();
+        core.forget_removed_image(port);
+        Ok(image)
+    }
+
+    pub fn media_state(&self, port: usize) -> Result<MediaState, DeviceError> {
+        match self.core().drives.get(port) {
+            Some(Some(Drive::Cdrom(optical))) => Ok(optical.media_state()),
+            _ => Err(DeviceError::Other("AHCI port is not a CD-ROM".into())),
+        }
+    }
+
+    /// Access an ATA backing image for the VMM's disk snapshot transaction,
+    /// once no command is outstanding.
+    pub fn with_disk<R>(
+        &mut self,
+        port: usize,
+        access: impl FnOnce(&mut dyn DiskImage) -> R,
+    ) -> Option<R> {
+        match self.idle().drives.get_mut(port) {
+            Some(Some(Drive::Disk(disk))) => Some(access(disk.image.as_mut())),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Ahci {
+    fn drop(&mut self) {
+        // The worker ends the command it is in, then leaves.
+        let _ = self.core().jobs.send(Message::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Core {
+    fn attach(
+        &mut self,
+        port: usize,
+        drive: Drive,
+        image: Option<SharedImage>,
+    ) -> Result<(), DeviceError> {
         if port >= PORTS
             || self.get32(port_base(port) + 0x18) & 0x11 != 0
             || self.drives[port].is_some()
@@ -134,31 +553,9 @@ impl Ahci {
             ));
         }
         self.drives[port] = Some(drive);
+        self.images[port] = image;
         self.reset_port(port);
         Ok(())
-    }
-
-    /// Replace optical media and close the tray. Guest removal locks apply.
-    pub fn insert_media(
-        &mut self,
-        port: usize,
-        image: Box<dyn DiskImage>,
-    ) -> Result<(), DeviceError> {
-        self.optical_mut(port)?.insert_media(image)
-    }
-
-    /// Open the tray and remove the host image. Guest removal locks apply.
-    pub fn eject_media(&mut self, port: usize) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
-        self.optical_mut(port)?.eject_media()
-    }
-
-    /// Remove the host image whatever the guest locked, leaving the tray
-    /// closed and the drive empty.
-    pub fn force_eject_media(
-        &mut self,
-        port: usize,
-    ) -> Result<Option<Box<dyn DiskImage>>, DeviceError> {
-        Ok(self.optical_mut(port)?.force_eject())
     }
 
     fn optical_mut(&mut self, port: usize) -> Result<&mut Optical, DeviceError> {
@@ -168,19 +565,47 @@ impl Ahci {
         }
     }
 
-    pub fn media_state(&self, port: usize) -> Result<MediaState, DeviceError> {
-        match self.drives.get(port) {
-            Some(Some(Drive::Cdrom(optical))) => Ok(optical.media_state()),
-            _ => Err(DeviceError::Other("AHCI port is not a CD-ROM".into())),
+    fn forget_removed_image(&mut self, port: usize) {
+        if matches!(&self.drives[port], Some(Drive::Cdrom(optical)) if optical.image.is_none()) {
+            self.images[port] = None;
         }
     }
 
-    /// Access an ATA backing image for the VMM's disk snapshot transaction.
-    pub fn disk_mut(&mut self, port: usize) -> Option<&mut (dyn DiskImage + 'static)> {
-        match self.drives.get_mut(port) {
-            Some(Some(Drive::Disk(disk))) => Some(disk.image.as_mut()),
-            _ => None,
+    /// Cancel the command a port has on the worker. Its completion is
+    /// discarded, and the register write that got here waits for its I/O.
+    fn cancel(&mut self, port: usize) {
+        if self.busy[port] {
+            self.busy[port] = false;
+            self.generation[port] += 1;
+            self.stale += 1;
         }
+    }
+
+    /// The worker's end of a command: apply its result and start the next.
+    fn complete(&mut self, job: &Job, outcome: Result<Done, ()>) {
+        let port = job.port;
+        if job.generation != self.generation[port] {
+            self.stale -= 1;
+            return;
+        }
+        self.busy[port] = false;
+        let result = match outcome {
+            Ok(mut done) => {
+                if done.error != 0
+                    && matches!(job.io, Io::Read { .. })
+                    && let Some(Drive::Cdrom(optical)) = self.drives[port].as_mut()
+                {
+                    optical.sense = [3, 0x11, 0];
+                    done.error = 0x34;
+                }
+                self.finish(port, &job.request, done)
+            }
+            Err(()) => Err(()),
+        };
+        if self.settle(port, job.request.slot, result) {
+            self.run(port);
+        }
+        self.update_irq();
     }
 
     fn get32(&self, offset: usize) -> u32 {
@@ -208,6 +633,7 @@ impl Ahci {
     }
 
     fn reset_port(&mut self, port: usize) {
+        self.cancel(port);
         let base = port_base(port);
         self.regs[base..base + 0x80].fill(0);
         let signature = self.drives[port].as_ref().map(Drive::signature);
@@ -320,7 +746,8 @@ impl Ahci {
 
     fn run(&mut self, port: usize) {
         let base = port_base(port);
-        if self.config[4] & 4 == 0
+        if self.busy[port]
+            || self.config[4] & 4 == 0
             || self.get32(4) & (1 << 31) == 0
             || self.get32(base + 0x18) & 0x8011 != 0x8011
             || self.get32(base + 0x28) & 0xf != 3
@@ -335,19 +762,39 @@ impl Ahci {
                 base + 0x18,
                 (self.get32(base + 0x18) & !0x1f00) | ((slot as u32) << 8),
             );
-            let result = self.command(port, slot);
-            if result.is_err() {
-                self.port_interrupt(port, HBFS);
-            }
-            // A task-file or host-bus error halts this command list until ST is cleared.
-            if self.get32(base + 0x18) & (1 << 15) == 0 {
+            let result = match self.command(port, slot) {
+                Ok(Some(job)) => {
+                    // The worker finishes this slot, then runs the port again.
+                    self.busy[port] = true;
+                    let _ = self.jobs.send(Message::Job(job));
+                    return;
+                }
+                Ok(None) => Ok(()),
+                Err(()) => Err(()),
+            };
+            if !self.settle(port, slot, result) {
                 break;
             }
-            self.put32(base + 0x38, self.get32(base + 0x38) & !(1 << slot));
         }
     }
 
-    fn command(&mut self, port: usize, slot: usize) -> Result<(), ()> {
+    /// Close a slot after its command. False means the command list halted.
+    fn settle(&mut self, port: usize, slot: usize, result: Result<(), ()>) -> bool {
+        let base = port_base(port);
+        if result.is_err() {
+            self.port_interrupt(port, HBFS);
+        }
+        // A task-file or host-bus error halts this command list until ST is cleared.
+        if self.get32(base + 0x18) & (1 << 15) == 0 {
+            return false;
+        }
+        self.put32(base + 0x38, self.get32(base + 0x38) & !(1 << slot));
+        true
+    }
+
+    /// Parse the command in a slot and run it. A command with image I/O
+    /// comes back as a job for the worker, any other is complete on return.
+    fn command(&mut self, port: usize, slot: usize) -> Result<Option<Box<Job>>, ()> {
         let base = port_base(port);
         let header_addr = self
             .address(base)
@@ -382,7 +829,7 @@ impl Ahci {
             } else {
                 self.put32(base + 0x20, 0x80);
             }
-            return Ok(());
+            return Ok(None);
         }
         let count = u16::from_le_bytes([header[2], header[3]]) as usize;
         let mut prds = Vec::with_capacity(count);
@@ -434,58 +881,75 @@ impl Ahci {
         if cfis[2] == 0xa0 {
             self.dma_read(table.checked_add(0x40).ok_or(())?, &mut packet)?;
         }
-        let response = self.execute(port, &cfis, flags, &packet, &input);
-        let (mut status, mut error, data, expected) = match response {
-            Ok(data) => {
-                let transferred = if write { input.len() } else { data.len() };
-                (0x50, 0, data, transferred)
-            }
-            Err(error) => (0x51, error, Payload::Bytes(Vec::new()), 0),
+        let input_len = input.len();
+        let request = Request {
+            slot,
+            header_addr,
+            cfis,
+            prds,
         };
-        if !write && data.len() > capacity {
-            return Err(());
-        }
-        let mut copied = 0;
-        let mut ioc = false;
-        let mut buffer = vec![0; 64 * 1024];
-        for &(address, len, interrupt) in &prds {
-            let n = len.min(expected - copied);
-            if n == 0 {
-                break;
-            }
-            let mut done = 0;
-            while done < n {
-                let chunk = (n - done).min(buffer.len());
-                if !write {
-                    match &data {
-                        Payload::Bytes(bytes) => {
-                            self.dma_write(address + done as u64, &bytes[copied..copied + chunk])?
-                        }
-                        Payload::Read { offset, .. } => {
-                            if let Err(device_error) = self.read_backing(
-                                port,
-                                offset + copied as u64,
-                                &mut buffer[..chunk],
-                            ) {
-                                status = 0x51;
-                                error = device_error;
-                                break;
-                            }
-                            self.dma_write(address + done as u64, &buffer[..chunk])?;
-                        }
-                    }
+        let done = match self.execute(port, &cfis, flags, &packet, input) {
+            Err(error) => Done::error(error),
+            Ok(Exec::Bytes(bytes)) => {
+                if !write && bytes.len() > capacity {
+                    return Err(());
                 }
-                copied += chunk;
-                done += chunk;
+                let expected = if write { input_len } else { bytes.len() };
+                let memory = &self.memory;
+                let (transferred, ioc) = walk(&request.prds, expected, |address, copied, n| {
+                    if !write {
+                        memory
+                            .write_slice(&bytes[copied..copied + n], GuestAddress(address))
+                            .map_err(|_| ())?;
+                    }
+                    Ok(true)
+                })?;
+                Done {
+                    status: 0x50,
+                    error: 0,
+                    transferred,
+                    ioc,
+                }
             }
-            if done == len && interrupt {
-                ioc = true;
+            Ok(Exec::Io(io)) => {
+                if matches!(io, Io::Read { len, .. } if len > capacity) {
+                    return Err(());
+                }
+                match self.images[port].clone() {
+                    Some(image) => {
+                        return Ok(Some(Box::new(Job {
+                            port,
+                            generation: self.generation[port],
+                            request,
+                            io,
+                            image,
+                        })));
+                    }
+                    None => Done::error(4),
+                }
             }
-            if copied == expected || error != 0 {
-                break;
-            }
-        }
-        let transferred = copied;
+        };
+        self.finish(port, &request, done)?;
+        Ok(None)
+    }
+
+    /// Report a finished command to the guest: the byte count, the FIS, the
+    /// task file and the port's interrupt bits.
+    fn finish(&mut self, port: usize, request: &Request, done: Done) -> Result<(), ()> {
+        let base = port_base(port);
+        let Request {
+            slot,
+            header_addr,
+            cfis,
+            ..
+        } = *request;
+        let Done {
+            status,
+            error,
+            transferred,
+            ioc,
+        } = done;
+        let queued = matches!(cfis[2], 0x60 | 0x61);
         self.dma_write(
             header_addr.checked_add(4).ok_or(())?,
             &(transferred as u32).to_le_bytes(),
@@ -536,10 +1000,6 @@ impl Ahci {
         Ok(())
     }
 
-    fn read_backing(&mut self, port: usize, offset: u64, bytes: &mut [u8]) -> Result<(), u8> {
-        self.drives[port].as_mut().ok_or(4u8)?.read(offset, bytes)
-    }
-
     fn ata_range(fis: &[u8; 20]) -> (u64, usize) {
         let queued = matches!(fis[2], 0x60 | 0x61);
         let ext = queued || matches!(fis[2], 0x25 | 0x35 | 0x24 | 0x34);
@@ -565,20 +1025,23 @@ impl Ahci {
         fis: &[u8; 20],
         flags: u16,
         packet: &[u8; 16],
-        input: &[u8],
-    ) -> Result<Payload, u8> {
+        input: Vec<u8>,
+    ) -> Result<Exec, u8> {
         let drive = self.drives[port].as_mut().ok_or(4u8)?;
         let write = flags & 0x40 != 0;
         match fis[2] {
             0xec if matches!(drive, Drive::Disk(_)) && !write => {
-                Ok(Payload::Bytes(drive.identify(port, Transport::Sata)))
+                Ok(Exec::Bytes(drive.identify(port, Transport::Sata)))
             }
             0xa1 if matches!(drive, Drive::Cdrom(_)) && !write => {
-                Ok(Payload::Bytes(drive.identify(port, Transport::Sata)))
+                Ok(Exec::Bytes(drive.identify(port, Transport::Sata)))
             }
             0xa0 if flags & 0x20 != 0 && (!write || matches!(packet[0], 0x2a | 0xaa)) => {
                 match drive {
-                    Drive::Cdrom(optical) => optical.packet(packet),
+                    Drive::Cdrom(optical) => Ok(match optical.packet(packet)? {
+                        Payload::Bytes(bytes) => Exec::Bytes(bytes),
+                        Payload::Read { offset, len } => Exec::Io(Io::Read { offset, len }),
+                    }),
                     _ => Err(4),
                 }
             }
@@ -587,18 +1050,32 @@ impl Ahci {
                 if write != expected_write {
                     return Err(4);
                 }
+                let Drive::Disk(disk) = drive else {
+                    return Err(4);
+                };
                 let (offset, len) = Self::ata_range(fis);
-                drive.transfer(
+                if offset
+                    .checked_add(len as u64)
+                    .is_none_or(|end| end > disk.image.size())
+                {
+                    return Err(0x10);
+                }
+                if !write {
+                    return Ok(Exec::Io(Io::Read { offset, len }));
+                }
+                if disk.image.read_only() || input.len() != len {
+                    return Err(4);
+                }
+                Ok(Exec::Io(Io::Write {
                     offset,
-                    len,
-                    write.then_some(input),
-                    fis[2] == 0x61 && fis[7] & 0x80 != 0,
-                )
+                    data: input,
+                    flush: !disk.write_cache || (fis[2] == 0x61 && fis[7] & 0x80 != 0),
+                }))
             }
-            0xe7 | 0xea => {
-                drive.flush()?;
-                Ok(Payload::Bytes(Vec::new()))
-            }
+            0xe7 | 0xea => match drive {
+                Drive::Disk(_) => Ok(Exec::Io(Io::Flush)),
+                Drive::Cdrom(_) => Err(4),
+            },
             0x2f if !write && fis[4] == 0x10 && fis[5..7] == [0, 0] && fis[12..14] == [1, 0] => {
                 let Drive::Disk(disk) = drive else {
                     return Err(4);
@@ -615,11 +1092,11 @@ impl Ahci {
                 }
                 log[511] =
                     0u8.wrapping_sub(log.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
-                Ok(Payload::Bytes(log))
+                Ok(Exec::Bytes(log))
             }
             0xef => {
                 drive.set_features(fis[3], fis[12])?;
-                Ok(Payload::Bytes(Vec::new()))
+                Ok(Exec::Bytes(Vec::new()))
             }
             _ => Err(4),
         }
@@ -684,6 +1161,7 @@ impl Ahci {
                             self.put32(base + 0x20, self.get32(base + 0x20) & !0x88);
                         }
                         if cmd & 1 == 0 {
+                            self.cancel(port);
                             self.put32(base + 0x38, 0);
                             self.put32(base + 0x34, 0);
                         }
@@ -694,6 +1172,7 @@ impl Ahci {
                     0x2c => {
                         self.put32(offset, merged & 0xfff);
                         if merged & 0xf == 1 {
+                            self.cancel(port);
                             self.put32(base + 0x28, u32::from(self.drives[port].is_some()));
                             self.put32(base + 0x38, 0);
                             self.put32(base + 0x34, 0);
@@ -728,8 +1207,8 @@ impl Ahci {
     }
 }
 
-impl BusDevice for Ahci {
-    fn read(&mut self, offset: u64, data: &mut [u8]) {
+impl Core {
+    fn read(&self, offset: u64, data: &mut [u8]) {
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = offset
                 .checked_add(i as u64)
@@ -761,8 +1240,8 @@ impl BusDevice for Ahci {
     }
 }
 
-impl PciDevice for Ahci {
-    fn config_read(&mut self, reg: usize) -> u32 {
+impl Core {
+    fn config_read(&self, reg: usize) -> u32 {
         if reg >= 64 {
             return 0;
         }
@@ -805,21 +1284,7 @@ impl PciDevice for Ahci {
         }
         self.update_irq();
     }
-    fn bars(&self) -> Vec<BarInfo> {
-        vec![
-            BarInfo {
-                index: 4,
-                size: 32,
-                kind: BarKind::Io,
-            },
-            BarInfo {
-                index: 5,
-                size: 4096,
-                kind: BarKind::Mmio32,
-            },
-        ]
-    }
-    fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
+    fn bar_read(&self, bar: u8, offset: u64, data: &mut [u8]) {
         match (bar, offset) {
             (5, _) => self.read(offset, data),
             (4, 0x10) if data.len() == 4 => data.copy_from_slice(&self.index.to_le_bytes()),
@@ -837,10 +1302,7 @@ impl PciDevice for Ahci {
     }
 }
 
-impl Snapshot for Ahci {
-    fn state_id(&self) -> String {
-        self.id.clone()
-    }
+impl Core {
     fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
         let mut state = b"AHC3".to_vec();
         state.extend(self.config);
@@ -943,16 +1405,70 @@ impl Snapshot for Ahci {
     }
 }
 
+impl BusDevice for Ahci {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        self.core().read(offset, data);
+    }
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let mut core = self.core();
+        core.write(offset, data);
+        self.drained(core);
+    }
+}
+
+impl PciDevice for Ahci {
+    fn config_read(&mut self, reg: usize) -> u32 {
+        self.core().config_read(reg)
+    }
+    fn config_write(&mut self, reg: usize, offset: u64, data: &[u8]) {
+        let mut core = self.core();
+        core.config_write(reg, offset, data);
+        self.drained(core);
+    }
+    fn bars(&self) -> Vec<BarInfo> {
+        vec![
+            BarInfo {
+                index: 4,
+                size: 32,
+                kind: BarKind::Io,
+            },
+            BarInfo {
+                index: 5,
+                size: 4096,
+                kind: BarKind::Mmio32,
+            },
+        ]
+    }
+    fn bar_read(&mut self, bar: u8, offset: u64, data: &mut [u8]) {
+        self.core().bar_read(bar, offset, data);
+    }
+    fn bar_write(&mut self, bar: u8, offset: u64, data: &[u8]) {
+        let mut core = self.core();
+        core.bar_write(bar, offset, data);
+        self.drained(core);
+    }
+}
+
+impl Snapshot for Ahci {
+    fn quiesce(&mut self) {
+        self.wait_idle();
+    }
+    fn state_id(&self) -> String {
+        self.id.clone()
+    }
+    fn save_state(&self) -> Result<Vec<u8>, DeviceError> {
+        self.idle().save_state()
+    }
+    fn restore_state(&mut self, state: &[u8]) -> Result<(), DeviceError> {
+        self.idle().restore_state(state)
+    }
+}
+
 impl crate::Resettable for Ahci {
     fn reset(&mut self) -> Result<(), DeviceError> {
-        let power_on = Self::new(
-            self.id.clone(),
-            self.memory.clone(),
-            self.irq.clone(),
-            self.msi.clone(),
-        );
-        self.config = power_on.config;
-        for drive in self.drives.iter_mut().flatten() {
+        let mut core = self.idle();
+        core.config = power_on_config();
+        for drive in core.drives.iter_mut().flatten() {
             match drive {
                 Drive::Disk(disk) => {
                     disk.write_cache = true;
@@ -961,12 +1477,15 @@ impl crate::Resettable for Ahci {
                 Drive::Cdrom(optical) => optical.transfer_mode = Optical::new(None).transfer_mode,
             }
         }
-        self.reset();
+        core.reset();
         Ok(())
     }
 }
 
 impl PciSnapshot for Ahci {
+    fn quiesce(&mut self) {
+        self.wait_idle();
+    }
     fn snapshot_id(&self) -> String {
         self.state_id()
     }
