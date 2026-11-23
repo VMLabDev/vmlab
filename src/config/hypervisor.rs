@@ -337,7 +337,7 @@ fn hardware_refusals(
     if macos && h.cpu_model.as_deref() != Some(MACOS_CPU_MODEL) {
         why.push(format!(
             "vm \"{name}\": a macOS guest runs on vmlab-hv with the macos profile's cpu_model only, \
-             not `{}` (PRD §22); remove `cpu_model`, or use hypervisor = \"qemu\"",
+             not `{}` (PRD §22); remove `cpu_model`",
             h.cpu_model.as_deref().unwrap_or("the host CPU")
         ));
     }
