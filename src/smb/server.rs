@@ -57,6 +57,8 @@ pub enum SmbError {
     },
     #[error("creating passdb user `{user}` failed: {detail}")]
     CreateUser { user: String, detail: String },
+    #[error("no free port is left for the SMB server of \"{machine}\"")]
+    NoPort { machine: String },
     #[error("spawning smbd failed: {0}")]
     Spawn(std::io::Error),
     #[error("smbd exited immediately (code {code:?}): {reason}; check log {log}")]
@@ -71,7 +73,7 @@ pub enum SmbError {
 
 type Result<T> = std::result::Result<T, SmbError>;
 
-/// A running (or recently spawned) `smbd` instance for one lab.
+/// A running (or recently spawned) `smbd` instance, serving one machine.
 #[derive(Debug)]
 pub struct SmbServer {
     child: Option<Child>,
@@ -119,6 +121,7 @@ impl SmbServer {
         for (user, pass) in &creds_by_user {
             create_user(&conf_path, user, pass)?;
         }
+        forbid_password_change(&conf_path);
 
         // 4. Spawn smbd foregrounded.
         //    -F                 : run in the foreground (we own the child)
@@ -392,6 +395,33 @@ fn create_user(conf_path: &PathBuf, user: &str, pass: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Keep the account from changing its own password over SMB1's
+/// `SamOEMChangePassword`, which is no RPC pipe and so is not covered by
+/// `rpc start on demand helpers = no`: a minimum password age of 136 years.
+/// `pdbedit -a` sets the password at each start whatever the age. Best
+/// effort: a server whose policy could not be written still serves.
+fn forbid_password_change(conf_path: &PathBuf) {
+    let done = Command::new("pdbedit")
+        .arg("-s")
+        .arg(conf_path)
+        .arg("-P")
+        .arg("minimum password age")
+        .arg("-C")
+        .arg(u32::MAX.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    match done {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => tracing::warn!(
+            "smb: could not set the minimum password age: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("smb: could not set the minimum password age: {e}"),
+    }
 }
 
 /// Whether `user` exists in the system passwd database (`getent passwd`,

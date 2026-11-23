@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::config::model::{BlockRule, L4Proto, RedirectRule};
+use crate::config::model::{BlockRule, L4Proto, MacAddr, RedirectRule};
 use crate::net::frame::{
     self, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, IcmpView,
     Ipv4View, TCP_ACK, TCP_RST, TcpFields, TcpView, UdpView,
@@ -234,6 +234,8 @@ impl Meta {
 pub struct RuleSet {
     next_id: u64,
     redirects: Vec<(RuleId, RedirectRule)>,
+    /// Redirects that hold for one guest NIC only ([`RuleSet::add_redirect_from`]).
+    sourced: Vec<(RuleId, MacAddr, RedirectRule)>,
     blocks: Vec<(RuleId, BlockRule)>,
     conns: Mutex<Conns>,
 }
@@ -292,6 +294,18 @@ impl Conns {
     }
 }
 
+/// The redirect with a port among `matching` when there is one, else the
+/// first: strictly-greater specificity replaces, equal keeps the earlier.
+fn most_specific<'a>(matching: impl Iterator<Item = &'a RedirectRule>) -> Option<&'a RedirectRule> {
+    let mut best: Option<&RedirectRule> = None;
+    for r in matching {
+        if best.is_none_or(|b| r.from.port.is_some() && b.from.port.is_none()) {
+            best = Some(r);
+        }
+    }
+    best
+}
+
 impl RuleSet {
     pub fn new() -> Self {
         Self::default()
@@ -314,14 +328,36 @@ impl RuleSet {
         id
     }
 
+    /// A redirect that holds only for packets from the guest NIC `source`:
+    /// two guests that dial one address reach two targets. The lab's SMB
+    /// servers sit behind it, one per machine at the same `gateway:445`
+    /// (§7.5). It beats every redirect without a source, and it is no
+    /// declared rule, so [`RuleSet::list`] leaves it out.
+    ///
+    /// The source is the frame's own address, which a guest can forge: the
+    /// rule picks a target, it does not guard one. A second rule for the
+    /// same source and `from` replaces the first.
+    pub fn add_redirect_from(&mut self, source: MacAddr, rule: RedirectRule) -> RuleId {
+        // One target per source and address: a rule given again replaces the
+        // one before it, so a server that came back on another port is the
+        // one its guest reaches.
+        self.sourced.retain(|(_, mac, r)| {
+            !(*mac == source && r.from.ip == rule.from.ip && r.from.port == rule.from.port)
+        });
+        let id = self.alloc_id();
+        self.sourced.push((id, source, rule));
+        id
+    }
+
     /// Remove a rule by id. Returns whether anything was removed. Existing
     /// return-path translation entries are left to idle out so in-flight
     /// connections keep receiving rewritten replies.
     pub fn remove(&mut self, id: RuleId) -> bool {
-        let before = self.redirects.len() + self.blocks.len();
+        let before = self.redirects.len() + self.sourced.len() + self.blocks.len();
         self.redirects.retain(|(rid, _)| *rid != id);
+        self.sourced.retain(|(rid, _, _)| *rid != id);
         self.blocks.retain(|(rid, _)| *rid != id);
-        self.redirects.len() + self.blocks.len() != before
+        self.redirects.len() + self.sourced.len() + self.blocks.len() != before
     }
 
     /// All rules in evaluation order (redirects first, then blocks; each in
@@ -369,6 +405,12 @@ impl RuleSet {
     /// Evaluate a guest-originated IPv4 packet. Non-IPv4 / unparseable input
     /// passes (it is not this layer's job to police framing).
     pub fn eval(&self, ipv4_packet: &[u8]) -> Verdict {
+        self.eval_from(None, ipv4_packet)
+    }
+
+    /// [`RuleSet::eval`] for a packet whose frame came from the guest NIC
+    /// `source`, so the redirects of [`RuleSet::add_redirect_from`] apply.
+    pub fn eval_from(&self, source: Option<MacAddr>, ipv4_packet: &[u8]) -> Verdict {
         let Some(ip) = Ipv4View::parse(ipv4_packet) else {
             return Verdict::Pass;
         };
@@ -383,7 +425,7 @@ impl RuleSet {
         }
 
         // Layer 1: redirects.
-        if let Some(rule) = self.best_redirect(&ip, &meta) {
+        if let Some(rule) = self.best_redirect(source, &ip, &meta) {
             let new_ip = rule.to.ip;
             let new_port = meta.dst_port.map(|orig| rule.to.port.unwrap_or(orig));
             // Record the return-path translation entry (reply-direction key).
@@ -466,7 +508,7 @@ impl RuleSet {
     /// declared `redirect` onto it is the operator's own grant (§9.7).
     /// `port` is `None` for a protocol without ports.
     pub fn redirects_onto(&self, ip: Ipv4Addr, proto: L4Proto, port: Option<u16>) -> bool {
-        self.redirects.iter().any(|(_, r)| {
+        self.all_redirects().any(|r| {
             r.to.ip == ip
                 && r.proto.is_none_or(|p| p == proto)
                 // A port-less rule keeps the port the guest dialled, so it
@@ -497,40 +539,46 @@ impl RuleSet {
             return false;
         }
         let proto_ok = |p: Option<L4Proto>| p.is_none_or(|p| meta.l4 == Some(p));
-        self.redirects
-            .iter()
-            .any(|(_, r)| r.from.port.is_some() && r.from.ip == ip.dst() && proto_ok(r.proto))
+        self.all_redirects()
+            .any(|r| r.from.port.is_some() && r.from.ip == ip.dst() && proto_ok(r.proto))
             || self
                 .blocks
                 .iter()
                 .any(|(_, b)| b.port.is_some() && b.cidr.contains(&ip.dst()) && proto_ok(b.proto))
     }
 
-    /// Most specific matching redirect: `ip:port` beats `ip`; ties go to the
+    /// Every redirect, with or without a source.
+    fn all_redirects(&self) -> impl Iterator<Item = &RedirectRule> {
+        self.redirects
+            .iter()
+            .map(|(_, r)| r)
+            .chain(self.sourced.iter().map(|(_, _, r)| r))
+    }
+
+    /// Most specific matching redirect: one for this `source` beats one for
+    /// every source, then `ip:port` beats `ip`; ties go to the
     /// earliest-inserted rule.
-    fn best_redirect(&self, ip: &Ipv4View<'_>, meta: &Meta) -> Option<&RedirectRule> {
-        let mut best: Option<(&RedirectRule, bool)> = None;
-        for (_, r) in &self.redirects {
-            if r.from.ip != ip.dst() {
-                continue;
-            }
-            if let Some(p) = r.proto
-                && meta.l4 != Some(p)
-            {
-                continue;
-            }
-            if let Some(port) = r.from.port
-                && meta.dst_port != Some(port)
-            {
-                continue;
-            }
-            let spec = r.from.port.is_some();
-            // Strictly-greater specificity replaces; equal keeps the earlier.
-            if best.is_none_or(|(_, b)| spec && !b) {
-                best = Some((r, spec));
-            }
-        }
-        best.map(|(r, _)| r)
+    fn best_redirect(
+        &self,
+        source: Option<MacAddr>,
+        ip: &Ipv4View<'_>,
+        meta: &Meta,
+    ) -> Option<&RedirectRule> {
+        let matches = |r: &&RedirectRule| {
+            r.from.ip == ip.dst()
+                && r.proto.is_none_or(|p| meta.l4 == Some(p))
+                && r.from.port.is_none_or(|port| meta.dst_port == Some(port))
+        };
+        let own = source.and_then(|mac| {
+            most_specific(
+                self.sourced
+                    .iter()
+                    .filter(|(_, m, _)| *m == mac)
+                    .map(|(_, _, r)| r)
+                    .filter(matches),
+            )
+        });
+        own.or_else(|| most_specific(self.redirects.iter().map(|(_, r)| r).filter(matches)))
     }
 
     /// Most specific matching block: longest prefix, then with-port beats
@@ -817,6 +865,47 @@ mod tests {
         assert!(matches!(rs.eval(&p), Verdict::Rewrite(_)));
         assert!(rs.remove(rid));
         assert_eq!(rs.eval(&p), Verdict::Pass);
+    }
+
+    /// One address, two guests, two targets: the redirect for a guest's own
+    /// NIC wins, a guest with none falls to the rule for everyone, and the
+    /// loopback guard is told about both.
+    #[test]
+    fn a_redirect_for_one_source_holds_for_that_source_only() {
+        let web = MacAddr([0x52, 0x54, 0, 0, 0, 1]);
+        let xp = MacAddr([0x52, 0x54, 0, 0, 0, 2]);
+        let other = MacAddr([0x52, 0x54, 0, 0, 0, 3]);
+        let lo = Ipv4Addr::LOCALHOST;
+        let mut rs = RuleSet::new();
+        let for_web = rs.add_redirect_from(web, redirect(DST_A, Some(445), lo, Some(14450), None));
+        rs.add_redirect_from(xp, redirect(DST_A, Some(445), lo, Some(14451), None));
+        let p = tcp_pkt(GUEST, DST_A, 40000, 445, frame::TCP_SYN);
+        let port_for = |rs: &RuleSet, source: Option<MacAddr>| match rs.eval_from(source, &p) {
+            Verdict::Rewrite(out) => {
+                let ip = Ipv4View::parse(&out).unwrap();
+                assert_eq!(ip.dst(), lo);
+                Some(TcpView::parse(ip.payload()).unwrap().dst_port())
+            }
+            _ => None,
+        };
+        assert_eq!(port_for(&rs, Some(web)), Some(14450));
+        assert_eq!(port_for(&rs, Some(xp)), Some(14451));
+        assert_eq!(port_for(&rs, Some(other)), None, "no rule for this NIC");
+        assert_eq!(port_for(&rs, None), None);
+        assert!(rs.redirects_onto(lo, L4Proto::Tcp, Some(14451)));
+        assert!(rs.list().is_empty(), "not a declared rule");
+
+        rs.add_redirect(redirect(DST_A, Some(445), lo, Some(9000), None));
+        assert_eq!(port_for(&rs, Some(web)), Some(14450), "its own rule first");
+        assert_eq!(port_for(&rs, Some(other)), Some(9000));
+
+        assert!(rs.remove(for_web));
+        assert_eq!(port_for(&rs, Some(web)), Some(9000));
+
+        // The same source and address again: the newer target, not both.
+        rs.add_redirect_from(xp, redirect(DST_A, Some(445), lo, Some(14460), None));
+        assert_eq!(port_for(&rs, Some(xp)), Some(14460));
+        assert!(!rs.redirects_onto(lo, L4Proto::Tcp, Some(14451)));
     }
 
     #[test]

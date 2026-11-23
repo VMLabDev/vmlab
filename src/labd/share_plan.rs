@@ -22,10 +22,11 @@ use crate::labd::container::resolve_volume_hosts;
 use crate::labd::network::nic_segment_name;
 use crate::labd::plan::Skip;
 
-/// The localhost port range the bundled `smbd` walks. Another lab's smbd — or
-/// an orphan from an unclean daemon death — may hold the earlier ones.
+/// The localhost port range the bundled `smbd`s walk: one server, and so one
+/// port, per sharing machine (PRD §7.5). Another lab's servers — or an orphan
+/// from an unclean daemon death — may hold the earlier ones.
 pub const SMB_PORT_BASE: u16 = 14450;
-pub const SMB_PORT_TRIES: u16 = 10;
+pub const SMB_PORT_TRIES: u16 = 100;
 
 /// Whether a localhost port can be taken. The gateway DNAT hides the number
 /// from guests, so any free one will do — but "free" is host state, and the
@@ -96,29 +97,34 @@ pub struct VirtiofsShare {
     pub readonly: bool,
 }
 
-/// What `smbd` exports for one machine, and the gateway it reaches them at.
+/// What one machine's `smbd` exports, and the gateway it reaches them at.
 #[derive(Debug, Clone)]
 pub struct SmbExport {
     pub machine: String,
+    /// The segment of the machine's first NIC, whose gateway this is.
+    pub segment: String,
     pub gateway: Ipv4Addr,
     pub shares: Vec<Share>,
 }
 
-/// The bundled SMB server, present only when something actually needs it.
+/// The bundled SMB servers, present only when something actually needs them:
+/// one `smbd` per export, so that a machine's credential opens its own
+/// shares and no other machine's (PRD §7.5).
 #[derive(Debug, Clone)]
 pub struct SmbPlan {
-    /// The free localhost ports to try, in range order, first choice first.
-    /// Never empty — a range with nothing free is a [`SharePlanError`].
+    /// The free localhost ports to take, in range order, first choice first.
+    /// Never fewer than the exports — a range with too few free is a
+    /// [`SharePlanError`].
     ///
-    /// More than one, because a port free when the plan was computed can be
-    /// taken by the time `smbd` binds it, and because `smbd` can fail to come
-    /// up for reasons that have nothing to do with the port. The executor
-    /// works down the list.
+    /// Every free one, because a port free when the plan was computed can be
+    /// taken by the time `smbd` binds it. The executor works down the list,
+    /// one server after the other.
     pub host_ports: Vec<u16>,
     pub exports: Vec<SmbExport>,
-    /// Segments needing `gateway:445 → 127.0.0.1:<the port smbd took>`, so a
-    /// guest mounting `\\<gateway>\<share>` reaches the local smbd — with or
-    /// without `nat` on the segment.
+    /// Segments needing `gateway:445 → 127.0.0.1:<the port a machine's smbd
+    /// took>` for each of their sharing machines, so a guest mounting
+    /// `\\<gateway>\<share>` reaches its own smbd — with or without `nat` on
+    /// the segment.
     pub gateway_segments: Vec<String>,
     /// Containers whose volumes mount over CIFS, with the gateway their
     /// cinit mounts from.
@@ -174,14 +180,14 @@ impl SharePlan {
 /// Why a lab's shares cannot be served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharePlanError {
-    /// Two shares would answer to one name. One `smbd` serves the whole lab,
-    /// and one virtio-fs tag namespace serves one machine, so a repeat is a
-    /// share the author will never reach.
+    /// Two shares would answer to one name. An SMB share name is unique in
+    /// the lab, and one virtio-fs tag namespace serves one machine.
     Collision {
         name: String,
         claimants: Vec<String>,
     },
-    /// Every port in the range is taken.
+    /// The range has fewer free ports than the lab has machines sharing
+    /// over SMB.
     NoFreePort { base: u16, tries: u16 },
 }
 
@@ -196,8 +202,9 @@ impl std::fmt::Display for SharePlanError {
             ),
             SharePlanError::NoFreePort { base, tries } => write!(
                 f,
-                "no free localhost port for the share server in {base}..{} — another lab's \
-                 smbd (or an orphan from an unclean daemon exit) is holding them",
+                "not enough free localhost ports for the share servers in {base}..{} (one for \
+                 each machine sharing over SMB) — another lab's smbd (or an orphan from an \
+                 unclean daemon exit) is holding them",
                 base + tries
             ),
         }
@@ -289,6 +296,7 @@ impl Building {
         };
         self.exports.push(SmbExport {
             machine: machine.to_string(),
+            segment: segment.to_string(),
             gateway,
             shares,
         });
@@ -416,7 +424,7 @@ pub fn plan(inputs: &ShareInputs, ports: &dyn PortProbe) -> Result<SharePlan, Sh
         None
     } else {
         Some(SmbPlan {
-            host_ports: free_ports(ports)?,
+            host_ports: free_ports(ports, b.exports.len())?,
             exports: b.exports,
             gateway_segments: b.gateway_segments,
             volume_gateways: b.volume_gateways,
@@ -511,9 +519,10 @@ pub fn resolve_share_host(root: &Path, home: Option<&Path>, host: &Path) -> Path
     host.to_path_buf()
 }
 
-/// One `smbd` serves the whole lab, so an export name repeated across VMs is
-/// a share the author will never reach. Virtio-fs tags are per machine, so
-/// those only collide within one.
+/// An SMB share name is unique in the lab: every machine's server answers at
+/// the same gateway address, and a name that meant another directory on
+/// another machine is a share the author will mix up. Virtio-fs tags are per
+/// machine, so those only collide within one.
 fn check_collisions(
     virtiofs: &[VirtiofsShare],
     exports: &[SmbExport],
@@ -544,14 +553,15 @@ fn check_collisions(
     Ok(())
 }
 
-/// Every free port in the range, in order, or a diagnosable failure. Walking
-/// upward rather than taking an ephemeral port keeps the number predictable
-/// for anyone reading the smb.conf.
-fn free_ports(ports: &dyn PortProbe) -> Result<Vec<u16>, SharePlanError> {
+/// Every free port in the range, in order, or a diagnosable failure when
+/// they are fewer than the `servers` to start. Walking upward rather than
+/// taking an ephemeral port keeps the number predictable for anyone reading
+/// the smb.conf.
+fn free_ports(ports: &dyn PortProbe, servers: usize) -> Result<Vec<u16>, SharePlanError> {
     let free: Vec<u16> = (SMB_PORT_BASE..SMB_PORT_BASE + SMB_PORT_TRIES)
         .filter(|p| ports.is_free(*p))
         .collect();
-    if free.is_empty() {
+    if free.len() < servers.max(1) {
         return Err(SharePlanError::NoFreePort {
             base: SMB_PORT_BASE,
             tries: SMB_PORT_TRIES,
@@ -987,10 +997,13 @@ lab "l" {
     /// the plan offers the executor every free port, not just the best one.
     #[test]
     fn the_plan_carries_a_fallback_for_every_free_port() {
-        let plan = plan_on(&mixed(), &Host::bare(), &Held(8)).unwrap();
+        let plan = plan_on(&mixed(), &Host::bare(), &Held(SMB_PORT_TRIES - 2)).unwrap();
         assert_eq!(
             plan.smb.unwrap().host_ports,
-            [SMB_PORT_BASE + 8, SMB_PORT_BASE + 9]
+            [
+                SMB_PORT_BASE + SMB_PORT_TRIES - 2,
+                SMB_PORT_BASE + SMB_PORT_TRIES - 1
+            ]
         );
     }
 
@@ -1007,7 +1020,7 @@ lab "l" {
             }
         );
         let msg = err.to_string();
-        assert!(msg.contains("14450..14460"), "{msg}");
+        assert!(msg.contains("14450..14550"), "{msg}");
         assert!(msg.contains("smbd"), "{msg}");
     }
 

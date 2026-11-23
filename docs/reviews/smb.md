@@ -33,10 +33,10 @@ be dropped.
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
 | F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606) |
-| F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares |
+| F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares (fixed, card #609) |
 | F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run |
 | F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path |
-| F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out |
+| F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609) |
 | F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory |
 | F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops |
 | F8 | wrong result | The start check takes any listener on the port for the lab's `smbd` |
@@ -124,6 +124,24 @@ be dropped.
   2. Real-`smbd` test: a config of two machines, connect to the second
      machine's share with the first machine's credential, expect
      `NT_STATUS_ACCESS_DENIED`. Today the connect succeeds.
+- Fixed by card #609. An unprivileged `tdbsam` takes no account without a
+  Unix user (`pdbedit -a -u <name>`: "Failed to add entry"), so one `smbd`
+  cannot hold an account per machine without root. vmlab now runs one `smbd`
+  for each sharing machine (`LabSmb::start` in `src/smb/mod.rs`): its own
+  state directory `.vmlab/smb/machines/<machine>/` with its own passdb and
+  `creds`, its own password, its own port, and that machine's shares alone.
+  The gateway rule for port 445 is per machine, chosen by the source MAC of
+  the frame (`RuleSet::add_redirect_from` in `src/net/rules.rs`,
+  `ensure_smb` in `src/labd/lab.rs`). The MAC only picks the server. A guest
+  that forges it reaches a server whose password it was not given. The user
+  name is still the host user's for every machine, so `ShareDef::allowed_user`
+  does not differ as proof 1 asked: the passwords do. The port range grew
+  from 10 to 100 (14450 to 14549), one port per sharing machine. Proof tests:
+  `each_machine_has_its_own_credential` and
+  `one_machines_credential_does_not_open_anothers_share` (`src/smb/mod.rs`,
+  the second with a real `smbd`). Both failed before the fix on helios. Side
+  effect on F4, point 1: `smb1` on a share now relaxes the server of its own
+  machine only. Not checked with a Windows or macOS guest.
 
 ### F3. The SMB password reaches the event history, the log and the `up` output (security)
 
@@ -221,6 +239,23 @@ be dropped.
   when `rpcclient` is absent: run the command above against a spawned
   `SmbServer`, then connect with the original password and assert that the
   listing succeeds. Today it fails with `NT_STATUS_LOGON_FAILURE`.
+- Fixed by card #609. The fault was wider than the finding says: an
+  unprivileged `smbd` runs every session with the uid it started with, and
+  Samba's RPC servers take that uid for root. So `setuserinfo2 <user> 23
+  <new>` set the password too, with no old password, and an account policy
+  ("minimum password age") stopped `chgpasswd3` only. Reproduced on helios.
+  `smb.conf` now holds `rpc start on demand helpers = no`
+  (`SmbConfig::render_conf`): `smbd` serves a pipe only through
+  `samba-dcerpcd`, and this keeps it from starting one, so `samr`, `lsarpc`
+  and `srvsvc` are refused and shares still mount. The share list (`net
+  view`, `smbclient -L`) is empty as a result. The minimum password age is
+  set as well (`forbid_password_change` in `src/smb/server.rs`), for SMB1's
+  `SamOEMChangePassword`, which is no RPC pipe. That path was not run.
+  With F2 fixed, the account is one machine's own in any case. Proof test:
+  `a_guest_cannot_change_the_lab_password` (`src/smb/server.rs`), which runs
+  both `chgpasswd3` and `setuserinfo2`. It failed before the fix on helios.
+  Open: Samba before 4.16 does not know the directive and ignores it, and a
+  Windows guest was not run against a server without `srvsvc`.
 
 ### F6. A `%` in a host path is expanded (wrong result)
 
@@ -377,7 +412,8 @@ No proving test, or not a fault by itself.
 - N7. Inside the guest the password is in the `HKLM\...\Run` value, in
   `C:\Users\Public\Desktop\vmlab-shares.cmd`, and in the argv of `mount` and
   `mount_smbfs` while they run (`src/smb/mount.rs`). Every user of the
-  guest can read it. With F2 that is every share of the lab.
+  guest can read it. With F2 that was every share of the lab. Since card
+  #609 it is the shares of that machine.
 - N8. `remove_run_dir` (`src/smb/server.rs:263-272`) keeps the runtime
   directory while a pid file exists. After a failed start whose diagnostic
   re-run came up (`:279-300`), the re-run's pid file is left and the
