@@ -24,7 +24,7 @@ Severity words: **data loss**, **crash** (of a host process), **security**
 | F2 | security | A qcow2 template build source that names a host file as its backing file is flattened into the build disk (fixed, card #541) |
 | F3 | data loss | The refcount range of a compressed cluster is up to 511 bytes too long, so a write to a compressed image fails or takes a reference from the next cluster (fixed, card #549) |
 | F4 | data loss | A snapshot entry with less than 16 bytes of extra data is rewritten with disk size 0, and applying it makes the disk 0 bytes (fixed, card #556) |
-| F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data |
+| F5 | wrong result | `resize` leaves vmstate clusters in the active layer, and the grown disk shows them as guest data (fixed, card #563) |
 | F6 | wrong result | Refcount recovery refuses an image whose QEMU-written snapshot table is the end of the file |
 | F7 | wrong result | A compressed cluster at the end of the file cannot be read |
 | F8 | wrong result | `convert -B` and `commit` fail when the disk size is not a multiple of the cluster size |
@@ -209,6 +209,15 @@ Severity words: **data loss**, **crash** (of a host process), **security**
   zeros. Today: `0x77`. A second test with a backing image twice the size of
   the overlay: grow the overlay to the backing size and read the new area.
   Expected: zeros.
+- Fixed in card #563. `resize_grow` unmaps every active-layer cluster from
+  the first cluster boundary at or after the old size (the vmstate, whose
+  address moves with the size) and releases its host clusters. When the
+  backing file is longer than the old size, it zeroes the new area up to the
+  backing size: written zeros for the tail of the last old cluster, and the
+  zero flag (written zeros on version 2) for each whole cluster. Proof tests
+  `a_grown_image_reads_zeros_where_vmstate_was` and
+  `a_grown_overlay_reads_zeros_where_its_longer_backing_has_data` in
+  `qcow2/mod.rs` failed before the fix (`0x77` and `0x66`) and pass after.
 
 ### F6. Recovery refuses a QEMU snapshot table at the end of the file (wrong result)
 
