@@ -740,6 +740,54 @@ async fn a_vms_status_reports_its_resolved_hardware() {
     assert_eq!(detail.memory, Some(resolved.memory));
 }
 
+/// Review finding F3 (docs/reviews/firmware.md): QEMU's `virt` machine has no
+/// secure world, so an aarch64 guest's kernel can program the flash that
+/// holds PK, KEK, db and dbx. `secure_boot = true` there must say so before
+/// the VM boots, under either key store, and stay silent for a VM without
+/// secure boot and for an x86_64 one, whose store is written from SMM only.
+#[tokio::test]
+async fn aarch64_secure_boot_says_its_key_store_is_guest_writable() {
+    let warnings = |arch: &str, extra: &str| {
+        let dirs = Dirs::new();
+        let (vm, _hv) = vm(
+            &dirs,
+            &format!(
+                "vm \"sb\" {{ template = \"scratch\" arch = \"{arch}\" profile = \"linux-modern\" \
+                 disk = 1GiB firmware = \"ovmf\" {extra} }}"
+            ),
+            Script::healthy(),
+        );
+        let m: Arc<dyn Machine> = vm;
+        m.launch_warnings()
+    };
+    let about_the_store = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| line.contains("secure_boot = true"))
+            .cloned()
+            .collect()
+    };
+
+    for extra in [
+        "secure_boot = true",
+        "secure_boot = true secure_boot_keys = \"setup\"",
+    ] {
+        let said = about_the_store(&warnings("aarch64", extra));
+        assert_eq!(said.len(), 1, "{extra}: {said:?}");
+        let line = &said[0];
+        assert!(line.starts_with("vm \"sb\": secure_boot = true"), "{line}");
+        assert!(line.contains("the guest's own kernel can write"), "{line}");
+    }
+    assert_eq!(
+        about_the_store(&warnings("aarch64", "secure_boot = false")),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        about_the_store(&warnings("x86_64", "secure_boot = true")),
+        Vec::<String>::new()
+    );
+}
+
 /// Host USB passthrough's machine-side refusals (§5.2.1): a container
 /// never; a VM only while running, and only when it booted with the
 /// controller; a stop forgets nothing it did not hold.
