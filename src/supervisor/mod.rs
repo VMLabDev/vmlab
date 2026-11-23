@@ -1058,7 +1058,6 @@ mod tests {
             agent_answered: false,
             agent_sealed: true,
             acpi_shutdown: true,
-            seal_allow_quit: false,
             ready_timeout: std::time::Duration::from_secs(300),
         };
         let longest = plan_wait(&plan_stop(&booting));
