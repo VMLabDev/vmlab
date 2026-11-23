@@ -14,6 +14,10 @@
 //! regex match and returns the consumed text, so successive expects walk the
 //! stream. The shell sees a real PTY: prompts, echoes and ANSI sequences are
 //! all in the buffer (match accordingly).
+//!
+//! The buffer holds [`TERM_BUFFER_LIMIT`] at most. A guest that writes more
+//! than that with no `expect` matching and no `read` taking it ends the
+//! session, and the `expect` that waited fails naming the limit.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -96,25 +100,34 @@ impl TerminalHandle {
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
         let mut st = self.state.lock().expect("term state");
+        // How much of the buffer the last scan covered with no match: the
+        // same bytes are not scanned a second time.
+        let mut scanned = None;
         loop {
-            let text = String::from_utf8_lossy(&st.buf).into_owned();
-            if let Some(found) = re.find(&text) {
-                let consumed: String = text[..found.end()].to_string();
-                st.buf = text.as_bytes()[found.end()..].to_vec();
-                return Ok(consumed);
+            if scanned != Some(st.buf.len()) {
+                // Borrowed, not copied, while the output is valid UTF-8.
+                let text = String::from_utf8_lossy(&st.buf);
+                if let Some(found) = re.find(&text) {
+                    let consumed = text[..found.end()].to_string();
+                    let rest = text.as_bytes()[found.end()..].to_vec();
+                    drop(text);
+                    st.buf = rest;
+                    return Ok(consumed);
+                }
+                scanned = Some(st.buf.len());
             }
             if let Some(why) = &st.ended {
                 return Err(format!(
                     "{}: terminal ended ({why}) before /{pattern}/ matched; tail: {:?}",
                     self.machine,
-                    tail(&text)
+                    tail(&st.buf)
                 ));
             }
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return Err(format!(
                     "{}: timed out after {timeout_secs}s waiting for /{pattern}/; tail: {:?}",
                     self.machine,
-                    tail(&text)
+                    tail(&st.buf)
                 ));
             };
             self.pump(&mut st, remaining.min(Duration::from_millis(500)));
@@ -168,6 +181,20 @@ impl TerminalHandle {
                     return;
                 }
                 Ok(Some(SessionEvent::Data(b))) | Ok(Some(SessionEvent::Stderr(b))) => {
+                    if st.buf.len() + b.len() > TERM_BUFFER_LIMIT {
+                        // The guest writes and the script takes nothing:
+                        // end the session rather than hold more. Closing
+                        // the channel tells the guest.
+                        st.ended = Some(format!(
+                            "the guest wrote past the terminal buffer's limit of {} MiB with \
+                             no match and no read",
+                            TERM_BUFFER_LIMIT / (1024 * 1024)
+                        ));
+                        if let Some(session) = st.session.take() {
+                            self.rt.block_on(session.close());
+                        }
+                        return;
+                    }
                     st.buf.extend(b);
                     // Keep draining, but only within the original window.
                     remaining = remaining.saturating_sub(started.elapsed());
@@ -193,17 +220,17 @@ impl TerminalHandle {
 }
 
 /// The last few hundred bytes of output, for timeout diagnostics.
-fn tail(text: &str) -> String {
+fn tail(buf: &[u8]) -> String {
     const TAIL: usize = 300;
-    if text.len() <= TAIL {
-        text.to_string()
-    } else {
-        let mut start = text.len() - TAIL;
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        format!("…{}", &text[start..])
+    if buf.len() <= TAIL {
+        return String::from_utf8_lossy(buf).into_owned();
     }
+    // Start on a character, not inside one.
+    let mut start = buf.len() - TAIL;
+    while start < buf.len() && buf[start] & 0xC0 == 0x80 {
+        start += 1;
+    }
+    format!("…{}", String::from_utf8_lossy(&buf[start..]))
 }
 
 #[cfg(test)]
