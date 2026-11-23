@@ -217,14 +217,12 @@ async fn ocr_with(
     // the umask leaves.
     #[cfg(unix)]
     dir.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
-    let dir = dir
-        .tempdir_in(scratch_root)
-        .with_context(|| {
-            format!(
-                "failed to create the OCR scratch directory under {}",
-                scratch_root.display()
-            )
-        })?;
+    let dir = dir.tempdir_in(scratch_root).with_context(|| {
+        format!(
+            "failed to create the OCR scratch directory under {}",
+            scratch_root.display()
+        )
+    })?;
     let png = tempfile::Builder::new()
         .prefix("frame-")
         .suffix(".png")
@@ -474,7 +472,8 @@ mod tests {
     async fn the_scratch_file_is_private() {
         let root = tempfile::tempdir().unwrap();
         let img = RgbImage::from_pixel(8, 8, Rgb([255; 3]));
-        let report = stand_in(r#"stat -c '%a' "$1"; d=$(dirname "$1"); stat -c '%a' "$d"; echo "$d""#);
+        let report =
+            stand_in(r#"stat -c '%a' "$1"; d=$(dirname "$1"); stat -c '%a' "$d"; echo "$d""#);
 
         let out = ocr_with(&img, None, &OcrOptions::default(), root.path(), report)
             .await
@@ -512,9 +511,15 @@ mod tests {
         }
         let img = RgbImage::from_pixel(8, 8, Rgb([255; 3]));
 
-        ocr_with(&img, None, &OcrOptions::default(), root.path(), stand_in("true"))
-            .await
-            .unwrap();
+        ocr_with(
+            &img,
+            None,
+            &OcrOptions::default(),
+            root.path(),
+            stand_in("true"),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     }
 
