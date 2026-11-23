@@ -72,7 +72,7 @@ for step in "$@"; do
         user)
             say "user: the standard user $U"
             {
-                psh "if (-not (Get-LocalUser -Name '$U' -ErrorAction SilentlyContinue)) { net.exe user '$U' '$PW' /add | Out-Null }
+                psh "if (Get-LocalUser -Name '$U' -ErrorAction SilentlyContinue) { net.exe user '$U' '$PW' | Out-Null } else { net.exe user '$U' '$PW' /add | Out-Null }
                     'administrator by group: ' + [bool](Get-LocalGroupMember -SID S-1-5-32-544 | Where-Object { \$_.Name -like '*\\$U' })"
                 usr "'runs as ' + (whoami.exe); 'administrator by token: ' + ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
             } | tee "$out"
