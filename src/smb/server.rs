@@ -115,6 +115,20 @@ impl SmbServer {
             }
         })?;
 
+        // The settings NT1 sessions alone get, where a share asks for smb1.
+        // Without one the file is not included; a file left by an earlier
+        // start is removed all the same.
+        let nt1_path = config.nt1_conf_path();
+        match config.render_nt1_conf() {
+            Some(nt1) => std::fs::write(&nt1_path, nt1).map_err(|source| SmbError::WriteConf {
+                path: nt1_path.clone(),
+                source,
+            })?,
+            None => {
+                let _ = std::fs::remove_file(&nt1_path);
+            }
+        }
+
         // 3. Create passdb users (unprivileged: tdbsam under lab_dir).
         for (user, pass) in &creds_by_user {
             create_user(&conf_path, user, pass)?;
