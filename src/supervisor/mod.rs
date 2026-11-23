@@ -858,8 +858,9 @@ impl Handler<SupRequest> for SupervisorHandler {
                 mtu,
             } => {
                 let joining = lab.map(|lab| global::Joining { lab, members, mtu });
-                let (sock, warnings) = sup.globals.attach(&name, subnet, peer, joining).await?;
-                Ok(json!({"socket": sock, "warnings": warnings}))
+                let (sock, warnings, subnet) =
+                    sup.globals.attach(&name, subnet, peer, joining).await?;
+                Ok(json!({"socket": sock, "warnings": warnings, "subnet": subnet.to_string()}))
             }
             SupRequest::GlobalDetach { name, lab } => {
                 sup.globals.detach(&name, lab.as_deref()).await;
@@ -1674,5 +1675,146 @@ mod tests {
         assert!(!process_running(pid));
         child.wait().unwrap();
         assert!(!process_running(pid));
+    }
+
+    /// Answers `global.attach` with a trunk socket the test holds, as a
+    /// supervisor that is about to be killed would.
+    struct DoomedSupervisor {
+        trunk: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proto::server::Handler<crate::proto::SupRequest> for DoomedSupervisor {
+        async fn handle(
+            &self,
+            req: crate::proto::SupRequest,
+            _stream: &crate::proto::server::Streamer,
+        ) -> Result<serde_json::Value, crate::proto::CommandError> {
+            match req {
+                crate::proto::SupRequest::GlobalAttach { .. } => Ok(serde_json::json!({
+                    "socket": self.trunk,
+                    "warnings": [],
+                    "subnet": "10.214.3.0/24",
+                })),
+                _ => Err(crate::proto::CommandError::internal("not served here")),
+            }
+        }
+    }
+
+    /// F9 (docs/reviews/lab-lifecycle.md): two labs share the global
+    /// segment `corp`. The supervisor they attached to dies, and its
+    /// segments with it. The supervisor that replaces it must hold `corp`
+    /// again with both labs as members, on the subnet their guests have
+    /// leases in, and a frame from one lab must reach the other.
+    #[tokio::test]
+    async fn adopted_labs_attach_their_global_segments_again() {
+        use crate::net::frame::{MAC_BROADCAST, eth_build};
+        use crate::net::switch::PortClass;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sup_sock = dir.path().join("vmlabd.sock");
+        let trunk = dir.path().join("doomed-corp.sock");
+        let network = |lab: &str| {
+            let src = format!(
+                "import <vmlab.wcl>\nlab \"{lab}\" {{ segment \"corp\" {{ global = true }} }}"
+            );
+            let lab = crate::config::load_lab_source(&src, "<t>", std::path::Path::new("/tmp"))
+                .unwrap()
+                .lab;
+            crate::labd::network::LabNetwork::build(&lab).unwrap()
+        };
+        let (mut a, mut b) = (network("a"), network("b"));
+
+        // The first supervisor: both labs attach and bridge their trunks.
+        let doomed = crate::proto::server::Server::<crate::proto::SupRequest>::bind(
+            &sup_sock,
+            Arc::new(DoomedSupervisor {
+                trunk: trunk.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let trunks = tokio::net::UnixListener::bind(&trunk).unwrap();
+        a.attach_globals_via(&sup_sock, "a").await.unwrap();
+        b.attach_globals_via(&sup_sock, "b").await.unwrap();
+        let held = [
+            trunks.accept().await.unwrap().0,
+            trunks.accept().await.unwrap().0,
+        ];
+
+        // It dies: its socket, its trunk listener and both trunks go.
+        drop(doomed);
+        drop(trunks);
+        drop(held);
+
+        // Its successor starts with no segments, as a new vmlabd does.
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        let globals = super::GlobalSegments::new_at(
+            dir.path().join("global"),
+            "test.internal".into(),
+            None,
+            None,
+            events.clone(),
+        );
+        let supervisor = Arc::new(super::Supervisor {
+            registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+            events,
+            globals: globals.clone(),
+            ensure_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            template_ops: super::templates::TemplateOps::default(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            keepers: super::keepawake::Keepers::default(),
+        });
+        let _successor = crate::proto::server::Server::<crate::proto::SupRequest>::bind(
+            &sup_sock,
+            Arc::new(super::SupervisorHandler {
+                sup: supervisor,
+                tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // A frame from lab a's side of `corp` reaches lab b's side once both
+        // have attached again; resend until it does.
+        let from_a = a
+            .segment_mut("corp")
+            .unwrap()
+            .switch
+            .add_channel_port(PortClass::Service);
+        let mut at_b = b
+            .segment_mut("corp")
+            .unwrap()
+            .switch
+            .add_channel_port(PortClass::Service);
+        let frame = bytes::Bytes::from(eth_build(
+            MAC_BROADCAST,
+            crate::config::model::MacAddr([0x02, 0, 0, 0, 0, 0x0a]),
+            0x88b5,
+            b"from lab a",
+        ));
+        'delivered: loop {
+            from_a.tx.send(frame.clone()).await.unwrap();
+            let resend = tokio::time::sleep(std::time::Duration::from_millis(50));
+            tokio::pin!(resend);
+            loop {
+                tokio::select! {
+                    got = at_b.rx.recv() => {
+                        if got.unwrap() == frame {
+                            break 'delivered;
+                        }
+                    }
+                    () = &mut resend => break,
+                }
+            }
+        }
+
+        let list = globals.list().await;
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0]["name"], "corp");
+        assert_eq!(list[0]["labs"], serde_json::json!(["a", "b"]));
+        assert_eq!(list[0]["refcount"], 2);
+        assert_eq!(list[0]["subnet"], "10.214.3.0/24");
     }
 }
