@@ -119,6 +119,7 @@ pub async fn build_template(
     // The declaration is checked before anything is fetched or booted: a
     // base that builds for an hour and then has no default to install its
     // variants under helps nobody.
+    check_build_names(def, version_override)?;
     let order = plan_variants(def, only_variants)?;
     if only_variants.is_some() {
         return build_onto_installed(
@@ -137,6 +138,9 @@ pub async fn build_template(
         Some(v) => v.to_string(),
         None => cancelable(&control.cancel, next_version(def, store, &log)).await?,
     };
+    // The counter is appended to the declared version, which can take a
+    // version at the length limit past it.
+    check_store_name(def, "version", &version)?;
     log(format!("building {}/{}@{}\n", def.arch, def.name, version));
 
     if store.exists(&def.arch, &def.name, Some(&version)) {
@@ -186,6 +190,41 @@ pub async fn build_template(
         .installed(&meta.arch, &meta.name, &meta.version)?
         .map(|v| v.meta)
         .unwrap_or(meta))
+}
+
+/// Refuse a name or a version the store would refuse, before the build does
+/// anything.
+///
+/// The store's rule ([`super::trust::component`]) is applied by the install,
+/// the last step of a build. Two things need it at the first step. The
+/// working directory is named from the architecture, the name and the
+/// declared version, and claiming it deletes what is there: a `/` or a `..`
+/// in one of them moves that delete out of the builds directory. And a
+/// definition the store refuses for its spelling alone (`version = "24H2"`)
+/// would otherwise fetch, install and seal before it is told.
+///
+/// The declared version is checked with a pinned one beside it: the first
+/// names the working directory, the second is what the store is given.
+fn check_build_names(def: &TemplateDef, pinned: Option<&str>) -> Result<()> {
+    check_store_name(def, "architecture", &def.arch)?;
+    check_store_name(def, "name", &def.name)?;
+    check_store_name(def, "version", &def.version)?;
+    if let Some(version) = pinned {
+        check_store_name(def, "version", version)?;
+    }
+    Ok(())
+}
+
+/// One name of [`check_build_names`], with the error saying which it is.
+fn check_store_name(def: &TemplateDef, what: &str, value: &str) -> Result<()> {
+    super::trust::component(value).map_err(|_| {
+        anyhow::anyhow!(
+            "template \"{}\" cannot be built: its {what} `{value}` is not a name the template \
+             store takes — lowercase letters, digits, `.`, `_` and `-`, starting with a letter \
+             or a digit, at most 128 bytes, without `..`",
+            def.name
+        )
+    })
 }
 
 /// The variants a build builds, in the order it builds them (§6.6), after
@@ -2580,6 +2619,80 @@ mod tests {
     fn def(source: &str) -> crate::config::model::TemplateDef {
         let tf = crate::config::load_template_source(source, "<test>", Path::new("/root")).unwrap();
         tf.templates.into_iter().next().unwrap()
+    }
+
+    /// The arguments of a build that is expected to be refused before it
+    /// fetches or boots anything: an empty store and no controls.
+    async fn refused_build(d: &crate::config::model::TemplateDef, version: Option<&str>) -> String {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = TemplateStore::new(store_dir.path().to_path_buf());
+        let profiles = crate::profiles::ProfileSet::shipped().unwrap();
+        let err = super::build_template(
+            d,
+            Path::new("/root"),
+            &store,
+            &profiles,
+            std::sync::Arc::new(|_| {}),
+            super::BuildTarget {
+                version,
+                variants: None,
+            },
+            super::BuildControl::default(),
+        )
+        .await
+        .expect_err("the build must be refused");
+        format!("{err:#}")
+    }
+
+    /// The working directory is `<arch>-<name>-<version>` under the builds
+    /// directory, and claiming it deletes whatever is there. A version with
+    /// `/` and `..` moved that delete out of the cache, so the build refuses
+    /// the name before it forms the path (template-build review F1).
+    #[tokio::test]
+    async fn a_build_working_directory_stays_inside_the_builds_directory() {
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1/../../card-691-proof"
+                 profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(
+            err.contains("version") && err.contains("1/../../card-691-proof"),
+            "{err}"
+        );
+        assert!(!err.contains("card-691.iso"), "{err}");
+
+        // A pinned version is the one the store is given, so it is held to
+        // the same rule.
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, Some("../card-691-proof")).await;
+        assert!(
+            err.contains("version") && err.contains("../card-691-proof"),
+            "{err}"
+        );
+    }
+
+    /// The store's name rule used to be applied by the install, the last
+    /// step: a definition with `version = "24H2"` fetched its source,
+    /// installed the guest and sealed the disk before it was refused. The
+    /// source here does not exist, so an error about the source means the
+    /// fetch ran first (template-build review F1).
+    #[tokio::test]
+    async fn a_name_the_store_refuses_is_refused_before_the_build() {
+        let d = def(r#"import <vmlab.wcl>
+               template "t" { arch = "x86_64" version = "24H2" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(err.contains("version") && err.contains("24H2"), "{err}");
+        assert!(!err.contains("card-691.iso"), "{err}");
+
+        let d = def(r#"import <vmlab.wcl>
+               template "Windows-11" { arch = "x86_64" version = "1" profile = "linux-generic"
+                 disk = 1GiB source "iso" { path = "/nonexistent/card-691.iso" } }"#);
+        let err = refused_build(&d, None).await;
+        assert!(err.contains("name") && err.contains("Windows-11"), "{err}");
+        assert!(!err.contains("card-691.iso"), "{err}");
     }
 
     /// The build render, with the VMLAB bootstrap ISO folder attached or not.
