@@ -131,16 +131,20 @@ pub async fn run_plan<E, F>(
             step.refused_exit,
             |timeout| exec(argv.clone(), timeout),
             |attempt, elapsed, err| {
+                let err = &step.scrub(err);
                 tracing::debug!("{vm_name}: mount attempt {attempt} ({elapsed:?}): {err}");
                 report.attempt_failed(step.share.as_deref(), attempt, elapsed, err);
             },
         )
         .await;
+        // The command line of an SMB step holds the password, and an exec
+        // that fails names its command line. Nothing below may say it: the
+        // reason goes to the log, the event history and the `up` output.
+        let command = step.scrub(&step.command);
         let reason = match outcome {
             StepOutcome::Done { attempt, elapsed } => {
                 tracing::info!(
-                    "{vm_name}: mount step `{}` ok (attempt {attempt}, {elapsed:?})",
-                    step.command
+                    "{vm_name}: mount step `{command}` ok (attempt {attempt}, {elapsed:?})"
                 );
                 if let Some(share) = step.share.as_deref()
                     && plan.steps[i + 1..]
@@ -153,20 +157,19 @@ pub async fn run_plan<E, F>(
                 continue;
             }
             StepOutcome::Refused { error } => {
-                format!("`{}` refused: {}", step.command, error.trim())
+                format!("`{command}` refused: {}", step.scrub(error.trim()))
             }
             StepOutcome::GaveUp {
                 attempts,
                 elapsed,
                 error,
             } => format!(
-                "`{}` still failing after {} of retries ({attempts} attempts): {}",
-                step.command,
+                "`{command}` still failing after {} of retries ({attempts} attempts): {}",
                 elapsed_text(elapsed),
-                error.trim()
+                step.scrub(error.trim())
             ),
         };
-        tracing::warn!("{vm_name}: mount step `{}` failed: {reason}", step.command);
+        tracing::warn!("{vm_name}: mount step `{command}` failed: {reason}");
         // A share that never appears is the author's to see, on the feed,
         // not only in the daemon's log.
         unmountable(serde_json::json!({"vm": vm_name, "share": step.share, "reason": reason}));
@@ -193,6 +196,7 @@ mod tests {
             args: vec!["use".into(), r"\\10.0.0.1\repo".into()],
             share: Some(share.into()),
             refused_exit,
+            secret: None,
         }
     }
 
@@ -299,6 +303,55 @@ mod tests {
         assert!(reason.contains("exec timed out"), "{reason}");
         let lines = report.lines("win", true);
         assert!(lines[0].contains("will not mount"), "{lines:?}");
+    }
+
+    /// A mount step carries the SMB password in its argv, and the agent
+    /// client names the whole argv in the error of an exec that did not run
+    /// (finding F3 of `docs/reviews/smb.md`). Neither the `share.unmountable`
+    /// event nor the report `vmlab up` prints may hold the password.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_exec_does_not_put_the_credential_in_the_event() {
+        let report = report_for("data");
+        let events = Mutex::new(Vec::new());
+        let step = MountStep {
+            os_hint: OsHint::Linux,
+            command: "mount".into(),
+            args: vec![
+                "-t".into(),
+                "cifs".into(),
+                "//10.0.0.1/data".into(),
+                "/mnt/data".into(),
+                "-o".into(),
+                "username=u,password=S3CRET".into(),
+            ],
+            share: Some("data".into()),
+            refused_exit: None,
+            secret: Some("S3CRET".into()),
+        };
+        run_plan(
+            "web",
+            &plan(vec![step]),
+            &report,
+            |argv, timeout| async move {
+                tokio::time::sleep(timeout).await;
+                // The text of `VmAgent::exec`'s timeout error.
+                Err(anyhow::anyhow!(
+                    "exec `{}` timed out after {timeout:?}",
+                    argv.join(" ")
+                ))
+            },
+            |event| events.lock().unwrap().push(event),
+        )
+        .await;
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let payload = events[0].to_string();
+        assert!(payload.contains("timed out after"), "{payload}");
+        assert!(payload.contains("password=[redacted]"), "{payload}");
+        assert!(!payload.contains("S3CRET"), "{payload}");
+        let lines = report.lines("web", true).join("\n");
+        assert!(lines.contains("will not mount"), "{lines}");
+        assert!(!lines.contains("S3CRET"), "{lines}");
     }
 
     /// A guest that never answers an exec is bounded too: the loop stops

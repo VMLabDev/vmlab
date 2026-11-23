@@ -84,7 +84,7 @@ pub fn macos_mount_cmd(
 
 /// `s` percent-encoded for one component of an `smb://` URL: everything but
 /// the RFC 3986 unreserved characters.
-fn url_component(s: &str) -> String {
+pub(super) fn url_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
