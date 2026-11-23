@@ -3016,6 +3016,32 @@ mod tests {
         );
     }
 
+    /// One byte that is not UTF-8 (binary or Latin-1 output of a workload)
+    /// must not take the whole log away (containers review F4).
+    #[test]
+    fn tail_file_survives_bytes_that_are_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("console.log");
+        std::fs::write(&log, b"first\n\xffsecond\nthird\n").unwrap();
+        let tail = super::tail_file(&log, 2).expect("a log with a bad byte still reads");
+        assert_eq!(tail, "\u{fffd}second\nthird");
+    }
+
+    /// The tail reads the end of the file, not the file: a sparse 8 GiB log
+    /// costs what its last lines cost (containers review F4).
+    #[test]
+    fn tail_file_reads_only_the_end() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("console.log");
+        let mut file = std::fs::File::create(&log).unwrap();
+        file.seek(SeekFrom::Start(8 << 30)).unwrap();
+        file.write_all(b"\none\ntwo\nthree\n").unwrap();
+        drop(file);
+        assert_eq!(super::tail_file(&log, 2).unwrap(), "two\nthree");
+    }
+
     #[tokio::test]
     async fn an_offline_restore_checks_every_disk_first() {
         use crate::template::qimg;
