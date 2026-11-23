@@ -47,17 +47,33 @@ static void fmt(char *dst, size_t cap, const char *f, ...)
     dst[cap - 1] = 0;
 }
 
+/* Why a wire string did not become an ANSI one. */
+#define CONV_TOO_LONG (-1)
+#define CONV_NOT_UTF8 (-2)
+#define CONV_LOSSY (-3)
+
 /* UTF-8 (the wire) -> the ANSI code page (every A API), by hand through
- * UTF-16 so no code page support is assumed of the guest. 0, or -1 when the
- * text does not fit (`dst` then holds what did, terminated). Called from the
- * core loop's thread only, hence the static scratch. */
-static int utf8_to_ansi(const char *src, char *dst, int cap)
+ * UTF-16 so no code page support is assumed of the guest. 0, or one of the
+ * CONV_ codes with `dst` empty. Called from the core loop's thread only,
+ * hence the static scratch.
+ *
+ * The conversion is exact or it is refused. WideCharToMultiByte reports
+ * success when it puts the default character `?` — a wildcard to cmd.exe
+ * and command.com — or a best-fit look-alike (a full-width quote becomes
+ * `"`) in place of a character the code page lacks, so the result is
+ * converted back and compared: only text that survives the round trip is
+ * the text the host sent. That needs no flag NT4 or Windows 95 lack
+ * (WC_NO_BEST_FIT_CHARS is newer than both). `*bad` is the first code point
+ * that did not survive (CONV_LOSSY). */
+static int utf8_to_ansi(const char *src, char *dst, int cap, unsigned long *bad)
 {
     static WCHAR wide[CMDLINE_CAP];
-    int n = 0, r;
+    static WCHAR back[CMDLINE_CAP];
+    int n = 0, r, m, i;
     const unsigned char *s = (const unsigned char *)src;
-    if (cap <= 0)
-        return -1;
+    *bad = 0;
+    if (cap < 1)
+        return CONV_TOO_LONG;
     dst[0] = 0;
     while (*s && n < CMDLINE_CAP - 2) {
         unsigned long cp;
@@ -75,12 +91,15 @@ static int utf8_to_ansi(const char *src, char *dst, int cap)
             cp = *s & 0x07;
             extra = 3;
         } else {
-            cp = '?';
-            extra = 0;
+            return CONV_NOT_UTF8;
         }
         s++;
-        while (extra-- > 0 && (*s & 0xC0) == 0x80)
+        while (extra > 0 && (*s & 0xC0) == 0x80) {
             cp = (cp << 6) | (*s++ & 0x3F);
+            extra--;
+        }
+        if (extra || cp > 0x10FFFF)
+            return CONV_NOT_UTF8; /* a cut sequence is not a shorter character */
         if (cp >= 0x10000) {
             cp -= 0x10000;
             wide[n++] = (WCHAR)(0xD800 | (cp >> 10));
@@ -91,16 +110,48 @@ static int utf8_to_ansi(const char *src, char *dst, int cap)
     }
     wide[n] = 0;
     if (*s)
-        return -1; /* longer than the scratch */
+        return CONV_TOO_LONG; /* longer than the scratch */
     if (n == 0)
         return 0;
     r = WideCharToMultiByte(CP_ACP, 0, wide, n, dst, cap - 1, NULL, NULL);
     if (r <= 0) {
         dst[0] = 0; /* 0 is ERROR_INSUFFICIENT_BUFFER */
-        return -1;
+        return CONV_TOO_LONG;
     }
     dst[r] = 0;
+    m = MultiByteToWideChar(CP_ACP, 0, dst, r, back, CMDLINE_CAP);
+    for (i = 0; i < n && i < m && wide[i] == back[i]; i++)
+        ;
+    if (i < n || m != n) {
+        /* `i == n` is text that grew on the way back: blame its last unit. */
+        if (i == n)
+            i = n - 1;
+        /* Name a character outside the BMP whole, not one of its halves. */
+        if (wide[i] >= 0xDC00 && wide[i] < 0xE000 && i > 0)
+            i--;
+        *bad = wide[i];
+        if (*bad >= 0xD800 && *bad < 0xDC00 && i + 1 < n)
+            *bad = 0x10000 + ((*bad - 0xD800) << 10) + (wide[i + 1] - 0xDC00);
+        dst[0] = 0;
+        return CONV_LOSSY;
+    }
     return 0;
+}
+
+/* The refusal for a string that did not convert, naming it (`what`: which
+ * argument, which environment entry, the cwd). ASCII only, so the message
+ * itself always converts. */
+static void conv_error(char *err, int errcap, const char *what, int rc, unsigned long bad)
+{
+    if (rc == CONV_LOSSY)
+        fmt(err, (size_t)errcap,
+            "exec: %s has the character U+%04lX, which the guest's code page %u "
+            "cannot represent; nothing was run",
+            what, bad, (unsigned)GetACP());
+    else if (rc == CONV_NOT_UTF8)
+        fmt(err, (size_t)errcap, "exec: %s is not valid UTF-8; nothing was run", what);
+    else
+        fmt(err, (size_t)errcap, "exec: %s too long", what);
 }
 
 /* ---- the channel ---------------------------------------------------- */
@@ -275,16 +326,19 @@ static int quote_arg(const char *arg, char *out, int cap, int *len)
 }
 
 /* The agent's environment with `KEY=VALUE` overrides applied (keys compared
- * case-insensitively, as Windows does). Caller frees. */
-static char *build_env_block(char **env, int nenv)
+ * case-insensitively, as Windows does). Caller frees. NULL with the reason
+ * in `err`: no memory, or an override the code page cannot hold. */
+static char *build_env_block(char **env, int nenv, char *err, int errcap)
 {
     char *base = GetEnvironmentStringsA();
     char *out, *w;
     const char *e;
     size_t total = 1;
     int i;
-    if (!base)
+    if (!base) {
+        fmt(err, (size_t)errcap, "exec: out of memory");
         return NULL;
+    }
     for (e = base; *e; e += strlen(e) + 1)
         total += strlen(e) + 1;
     for (i = 0; i < nenv; i++)
@@ -292,6 +346,7 @@ static char *build_env_block(char **env, int nenv)
     out = malloc(total);
     if (!out) {
         FreeEnvironmentStringsA(base);
+        fmt(err, (size_t)errcap, "exec: out of memory");
         return NULL;
     }
     w = out;
@@ -315,8 +370,19 @@ static char *build_env_block(char **env, int nenv)
         }
     }
     for (i = 0; i < nenv; i++) {
-        /* An entry that does not convert is left out, not truncated. */
-        if (utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1)) == 0 && *w)
+        /* An entry that does not convert exactly fails the exec: the command
+         * was written for the environment the host sent, not a part of it. */
+        unsigned long bad;
+        int rc = utf8_to_ansi(env[i], w, (int)(strlen(env[i]) * 3 + 1), &bad);
+        if (rc < 0) {
+            char what[32];
+            fmt(what, sizeof what, "env entry %d", i);
+            conv_error(err, errcap, what, rc, bad);
+            FreeEnvironmentStringsA(base);
+            free(out);
+            return NULL;
+        }
+        if (*w)
             w += strlen(w) + 1;
     }
     *w = 0;
@@ -454,8 +520,15 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
 
     for (i = 0; i < spec->argc; i++) {
         static char ansi[CMDLINE_CAP];
-        if (utf8_to_ansi(spec->argv[i], ansi, (int)sizeof ansi) < 0 ||
-            (i && len + 1 >= (int)sizeof cmdline)) {
+        unsigned long bad;
+        int rc = utf8_to_ansi(spec->argv[i], ansi, (int)sizeof ansi, &bad);
+        if (rc == CONV_LOSSY || rc == CONV_NOT_UTF8) {
+            char what[32];
+            fmt(what, sizeof what, "argument %d", i);
+            conv_error(err, errcap, what, rc, bad);
+            return NULL;
+        }
+        if (rc < 0 || (i && len + 1 >= (int)sizeof cmdline)) {
             fmt(err, (size_t)errcap, "exec: command line too long");
             return NULL;
         }
@@ -467,9 +540,13 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         }
     }
     cmdline[len] = 0;
-    if (spec->cwd && utf8_to_ansi(spec->cwd, cwd, (int)sizeof cwd) < 0) {
-        fmt(err, (size_t)errcap, "exec: cwd too long");
-        return NULL;
+    if (spec->cwd) {
+        unsigned long bad;
+        int rc = utf8_to_ansi(spec->cwd, cwd, (int)sizeof cwd, &bad);
+        if (rc < 0) {
+            conv_error(err, errcap, "cwd", rc, bad);
+            return NULL;
+        }
     }
 
     p = calloc(1, sizeof *p);
@@ -502,12 +579,10 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     /* NT hides a console outright; 9x has no such flag and needs a console
      * for command.com, so it gets a new hidden one. */
     flags = is_win9x ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
-    envblock = build_env_block(spec->env, spec->nenv);
+    envblock = build_env_block(spec->env, spec->nenv, err, errcap);
     if (!envblock || !CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, flags, envblock,
                                      spec->cwd ? cwd : NULL, &si, &pi)) {
-        if (!envblock)
-            fmt(err, (size_t)errcap, "exec: out of memory");
-        else
+        if (envblock)
             fmt(err, (size_t)errcap, "exec %s: error %lu",
                 spec->argv[0], (unsigned long)GetLastError());
         free(envblock);
