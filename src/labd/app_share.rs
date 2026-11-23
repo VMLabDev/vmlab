@@ -987,6 +987,9 @@ mod tests {
         data.extend(app::encode_record(&AppRecord::Exited { code: 0 }));
         data.extend(app::encode_record(&AppRecord::Pending));
         agent.data(id, &data).await;
+        // The program's real end, which a relay that took the agent's record
+        // for its own would still be waiting to pass on.
+        agent.say(AgentMsg::Exited { id, code: 7 }).await;
         assert_eq!(
             records_to_the_end(&mut control).await,
             [
