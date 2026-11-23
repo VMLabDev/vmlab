@@ -200,22 +200,22 @@ which incorrectly required both fields to contain TSC kHz. An intermediate
 live run still reset during boot after the timing correction. The
 KVM test also pins a different TSC rate and verifies that EBX remains fixed.
 
-The implementation keeps D2's catch-all policy for KVM's unknown-MSR
-reason. An enumerated list would depend on the XNU version and executed
-power-management paths. Invalid and filtered MSRs retain fault semantics.
-Only machines requesting `msr_policy=ignore` enable userspace unknown-MSR
-exits. Reads return zero, writes are dropped, and indices are logged once
-per machine process. Snapshot load unions the saved log set with indices
-already seen, so rewind and reset do not duplicate messages.
+D2's catch-all policy (every unknown MSR read as 0, every write dropped) was
+replaced on 2026-11-23 by a fixed table: a machine with `msr_policy=macos`
+gets the MSRs in `macos-msrs.md` answered by vmlab-hv, and every other
+unknown MSR raises #GP as it does for any other guest. Invalid and filtered
+MSRs retain fault semantics. Only machines requesting `msr_policy=macos`
+enable userspace unknown-MSR exits. Indices are logged once per machine
+process. Snapshot load unions the saved log set with indices already seen, so
+rewind and reset do not duplicate messages.
 
-The successful P1 run with host MSR ignoring disabled observed these indices:
+The successful P1 runs with host MSR ignoring disabled observed these
+indices, and they are the table:
 
 ```text
 000000e7 000000e8 000003f8 000003f9 000003fa 000003fc 000003fd 000003fe
 0000060d 0000061d 00000621 00000630 00000631 00000632 0000064f 000006b0
 ```
-
-This list is evidence, not an allow-list.
 
 ## Snapshot and shutdown measurements
 

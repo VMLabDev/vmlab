@@ -1,4 +1,4 @@
-//! Named Intel CPU and per-machine userspace handling of unknown MSRs.
+//! Named Intel CPU and the MSRs vmlab-hv answers in user space for a macOS guest.
 
 use crate::{error::VmmError, kvm::KvmVm};
 use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, kvm_cpuid_entry2, kvm_enable_cap};
@@ -161,13 +161,58 @@ fn timing_leaves(entries: &mut [kvm_cpuid_entry2], khz: u32) {
     }
 }
 
+/// How a macOS MSR answers a guest write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MsrWrite {
+    /// The register is writable on real hardware; the write succeeds and is
+    /// dropped, because the value read back stays 0.
+    Drop,
+    /// The register is read-only on real hardware; a write raises #GP there
+    /// and here.
+    Fault,
+}
+
+/// One MSR vmlab-hv answers for a macOS guest. Every read returns 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MacosMsr {
+    pub(crate) index: u32,
+    pub(crate) name: &'static str,
+    pub(crate) write: MsrWrite,
+}
+
+const fn msr(index: u32, name: &'static str, write: MsrWrite) -> MacosMsr {
+    MacosMsr { index, name, write }
+}
+
+/// The MSRs XNU touches that KVM has no model for, sorted by index. The
+/// reason for each one is in `hv/docs/macos-msrs.md`, and a test keeps that
+/// table and this one equal.
+pub(crate) const MACOS_MSRS: &[MacosMsr] = &[
+    msr(0xe7, "IA32_MPERF", MsrWrite::Drop),
+    msr(0xe8, "IA32_APERF", MsrWrite::Drop),
+    msr(0x3f8, "MSR_PKG_C3_RESIDENCY", MsrWrite::Fault),
+    msr(0x3f9, "MSR_PKG_C6_RESIDENCY", MsrWrite::Fault),
+    msr(0x3fa, "MSR_PKG_C7_RESIDENCY", MsrWrite::Fault),
+    msr(0x3fc, "MSR_CORE_C3_RESIDENCY", MsrWrite::Fault),
+    msr(0x3fd, "MSR_CORE_C6_RESIDENCY", MsrWrite::Fault),
+    msr(0x3fe, "MSR_CORE_C7_RESIDENCY", MsrWrite::Fault),
+    msr(0x60d, "MSR_PKG_C2_RESIDENCY", MsrWrite::Fault),
+    msr(0x61d, "MSR_LLC_FLUSHED_RESIDENCY_TIMER", MsrWrite::Fault),
+    msr(0x621, "MSR_RING_PERF_STATUS", MsrWrite::Fault),
+    msr(0x630, "MSR_PKG_C8_RESIDENCY", MsrWrite::Fault),
+    msr(0x631, "MSR_PKG_C9_RESIDENCY", MsrWrite::Fault),
+    msr(0x632, "MSR_PKG_C10_RESIDENCY", MsrWrite::Fault),
+    msr(0x64f, "MSR_CORE_PERF_LIMIT_REASONS", MsrWrite::Drop),
+    msr(0x6b0, "MSR_GRAPHICS_PERF_LIMIT_REASONS", MsrWrite::Drop),
+];
+
 pub(crate) fn configure_msrs(kvm: &KvmVm, policy: MsrPolicy) -> Result<(), VmmError> {
     if policy == MsrPolicy::Fault {
         return Ok(());
     }
     if !kvm.kvm.check_extension(Cap::X86UserSpaceMsr) {
         return Err(VmmError::Other(
-            "msr_policy=ignore requires KVM_CAP_X86_USER_SPACE_MSR".into(),
+            "msr_policy=macos requires KVM_CAP_X86_USER_SPACE_MSR".into(),
         ));
     }
     kvm.vm
@@ -179,32 +224,80 @@ pub(crate) fn configure_msrs(kvm: &KvmVm, policy: MsrPolicy) -> Result<(), VmmEr
         .map_err(|e| VmmError::ioctl("KVM_ENABLE_CAP userspace MSRs", e))
 }
 
-pub(crate) fn ignored_msr(shared: &crate::vm::VmShared, index: u32, reason: MsrExitReason) -> bool {
-    let (allowed, first) = msr_action(
+/// Answers one userspace MSR exit. `Some(value)` completes the access (the
+/// value matters to a read only); `None` makes KVM inject #GP.
+pub(crate) fn user_msr(
+    shared: &crate::vm::VmShared,
+    index: u32,
+    reason: MsrExitReason,
+    write: bool,
+) -> Option<u64> {
+    let (value, line) = answer(
         *shared.msr_policy.lock(),
         &mut shared.ignored_msrs.lock(),
         index,
         reason,
+        write,
     );
-    if !allowed {
-        return false;
+    if let Some(line) = line {
+        eprintln!("{line}");
     }
-    if first {
-        eprintln!("kvm: ignored unknown MSR {index:#010x}");
-    }
-    true
+    value
 }
 
-fn msr_action(
+/// The answer to one access, and the line to log the first time a macOS
+/// machine touches that index. `seen` rides the snapshot, so a rewind or a
+/// reset does not log an index again.
+fn answer(
     policy: MsrPolicy,
     seen: &mut std::collections::BTreeSet<u32>,
     index: u32,
     reason: MsrExitReason,
-) -> (bool, bool) {
-    if policy != MsrPolicy::Ignore || reason != MsrExitReason::Unknown {
-        return (false, false);
+    write: bool,
+) -> (Option<u64>, Option<String>) {
+    match msr_action(policy, index, reason, write) {
+        MsrAction::Answer(entry) => (
+            Some(0),
+            seen.insert(index).then(|| {
+                format!(
+                    "kvm: macOS MSR {index:#010x} ({}) answered in user space",
+                    entry.name
+                )
+            }),
+        ),
+        MsrAction::Unhandled => (
+            None,
+            seen.insert(index).then(|| {
+                let access = if write { "write" } else { "read" };
+                format!("kvm: macOS guest faulted on unhandled MSR {index:#010x} ({access})")
+            }),
+        ),
+        MsrAction::Strict => (None, None),
     }
-    (true, seen.insert(index))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsrAction {
+    /// The table answers the access.
+    Answer(MacosMsr),
+    /// A macOS machine reached an MSR, or a write, the table does not
+    /// handle: #GP, and named once in the log so the table can grow.
+    Unhandled,
+    /// Not a macOS machine, or not KVM's unknown-MSR reason: #GP.
+    Strict,
+}
+
+fn msr_action(policy: MsrPolicy, index: u32, reason: MsrExitReason, write: bool) -> MsrAction {
+    if policy != MsrPolicy::Macos || reason != MsrExitReason::Unknown {
+        return MsrAction::Strict;
+    }
+    match MACOS_MSRS
+        .binary_search_by_key(&index, |entry| entry.index)
+        .map(|at| MACOS_MSRS[at])
+    {
+        Ok(entry) if !write || entry.write == MsrWrite::Drop => MsrAction::Answer(entry),
+        _ => MsrAction::Unhandled,
+    }
 }
 
 #[cfg(test)]
@@ -263,97 +356,207 @@ mod tests {
     }
 
     #[test]
-    fn msr_policy_logs_each_index_once_and_preserves_faults() {
-        let mut seen = Default::default();
-        for reason in [
-            MsrExitReason::Unknown,
-            MsrExitReason::Inval,
-            MsrExitReason::Filter,
-        ] {
+    fn macos_table_is_sorted_and_answers_only_its_own_indices() {
+        assert!(MACOS_MSRS.windows(2).all(|pair| pair[0].index < pair[1].index));
+        for entry in MACOS_MSRS {
             assert_eq!(
-                msr_action(MsrPolicy::Fault, &mut seen, 0xdeadbeef, reason),
-                (false, false)
+                msr_action(MsrPolicy::Macos, entry.index, MsrExitReason::Unknown, false),
+                MsrAction::Answer(*entry),
+                "{}",
+                entry.name
             );
+            let write = msr_action(MsrPolicy::Macos, entry.index, MsrExitReason::Unknown, true);
+            match entry.write {
+                MsrWrite::Drop => assert_eq!(write, MsrAction::Answer(*entry), "{}", entry.name),
+                MsrWrite::Fault => assert_eq!(write, MsrAction::Unhandled, "{}", entry.name),
+            }
         }
-        assert_eq!(
-            msr_action(
-                MsrPolicy::Ignore,
-                &mut seen,
-                0xdeadbeef,
-                MsrExitReason::Unknown
-            ),
-            (true, true)
-        );
-        assert_eq!(
-            msr_action(
-                MsrPolicy::Ignore,
-                &mut seen,
-                0xdeadbeef,
-                MsrExitReason::Unknown
-            ),
-            (true, false)
-        );
-        assert_eq!(
-            msr_action(
-                MsrPolicy::Ignore,
-                &mut seen,
-                0xdeadbeef,
-                MsrExitReason::Inval
-            ),
-            (false, false)
-        );
-        let saved = serde_json::to_vec(&seen).unwrap();
-        let mut restored = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(
-            msr_action(
-                MsrPolicy::Ignore,
-                &mut restored,
-                0xdeadbeef,
-                MsrExitReason::Unknown
-            ),
-            (true, false)
-        );
+        // Neighbours of table entries and an arbitrary index are not answered.
+        for index in [0xe6, 0xe9, 0x3fb, 0x60e, 0x6b1, 0xdeadbeef] {
+            for write in [false, true] {
+                assert_eq!(
+                    msr_action(MsrPolicy::Macos, index, MsrExitReason::Unknown, write),
+                    MsrAction::Unhandled,
+                    "{index:#x}"
+                );
+            }
+        }
     }
 
     #[test]
-    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
-    fn kvm_unknown_msr_exits_return_zero_drop_writes_and_complete() {
+    fn other_guests_and_other_exit_reasons_stay_strict() {
+        for entry in MACOS_MSRS {
+            for write in [false, true] {
+                for reason in [
+                    MsrExitReason::Unknown,
+                    MsrExitReason::Inval,
+                    MsrExitReason::Filter,
+                ] {
+                    assert_eq!(
+                        msr_action(MsrPolicy::Fault, entry.index, reason, write),
+                        MsrAction::Strict
+                    );
+                }
+                for reason in [MsrExitReason::Inval, MsrExitReason::Filter] {
+                    assert_eq!(
+                        msr_action(MsrPolicy::Macos, entry.index, reason, write),
+                        MsrAction::Strict
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn document_lists_exactly_the_table() {
+        let document = include_str!("../../../docs/macos-msrs.md");
+        let rows: Vec<(u32, &str, &str)> = document
+            .lines()
+            .filter(|line| line.starts_with("| `0x"))
+            .map(|line| {
+                let cells: Vec<_> = line.split('|').map(str::trim).collect();
+                let index = cells[1].trim_matches('`').trim_start_matches("0x");
+                (
+                    u32::from_str_radix(index, 16).unwrap(),
+                    cells[2].trim_matches('`'),
+                    cells[4],
+                )
+            })
+            .collect();
+        let table: Vec<_> = MACOS_MSRS
+            .iter()
+            .map(|entry| {
+                let write = match entry.write {
+                    MsrWrite::Drop => "dropped",
+                    MsrWrite::Fault => "#GP",
+                };
+                (entry.index, entry.name, write)
+            })
+            .collect();
+        assert_eq!(rows, table);
+    }
+
+    #[test]
+    fn answers_are_zero_and_each_index_is_logged_once() {
+        let unknown = MsrExitReason::Unknown;
+        let mut seen = std::collections::BTreeSet::new();
+        let (value, line) = answer(MsrPolicy::Macos, &mut seen, 0xe7, unknown, false);
+        assert_eq!(value, Some(0));
+        assert_eq!(
+            line.as_deref(),
+            Some("kvm: macOS MSR 0x000000e7 (IA32_MPERF) answered in user space")
+        );
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0xe7, unknown, true),
+            (Some(0), None)
+        );
+        // A read-only counter: the read is answered, the write faults.
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0x3f8, unknown, false).0,
+            Some(0)
+        );
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0x3f8, unknown, true),
+            (None, None)
+        );
+        let (value, line) = answer(MsrPolicy::Macos, &mut seen, 0xdeadbeef, unknown, true);
+        assert_eq!(value, None);
+        assert_eq!(
+            line.as_deref(),
+            Some("kvm: macOS guest faulted on unhandled MSR 0xdeadbeef (write)")
+        );
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0xdeadbeef, unknown, false),
+            (None, None)
+        );
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0xe8, MsrExitReason::Inval, false),
+            (None, None)
+        );
+        assert_eq!(
+            seen,
+            std::collections::BTreeSet::from([0xe7, 0x3f8, 0xdeadbeef])
+        );
+        // The set survives a snapshot: a restored machine logs nothing again.
+        let saved = serde_json::to_vec(&seen).unwrap();
+        let mut restored: std::collections::BTreeSet<u32> = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut restored, 0xe7, unknown, false),
+            (Some(0), None)
+        );
+        let mut strict = std::collections::BTreeSet::new();
+        assert_eq!(
+            answer(MsrPolicy::Fault, &mut strict, 0xe7, unknown, false),
+            (None, None)
+        );
+        assert!(strict.is_empty());
+    }
+
+    /// Real mode: `rdmsr` of ECX into [0x9000], `wrmsr` of 0x78563412, `rdmsr`
+    /// again into [0x9004], then a byte to port 0xe9.
+    fn msr_guest(index: u32) -> Vec<u8> {
+        let mut code = vec![0x66, 0xb9];
+        code.extend(index.to_le_bytes());
+        code.extend([
+            0x0f, 0x32, 0x66, 0xa3, 0, 0x90, 0x66, 0xb8, 0x12, 0x34, 0x56, 0x78, 0x0f, 0x30, 0x0f,
+            0x32, 0x66, 0xa3, 4, 0x90, 0xe6, 0xe9,
+        ]);
+        code
+    }
+
+    fn kvm_msr_exits_usable(test: &str) -> bool {
         if std::fs::read_to_string("/sys/module/kvm/parameters/ignore_msrs")
             .is_ok_and(|value| value.trim() == "Y")
         {
             eprintln!(
-                "skipping unknown-MSR KVM exits: host ignore_msrs=Y suppresses those exits; rerun with ignore_msrs=N"
+                "skipping {test}: host ignore_msrs=Y suppresses unknown-MSR exits; rerun with ignore_msrs=N"
             );
-            return;
+            return false;
         }
         if !std::path::Path::new("/dev/kvm").exists() {
-            eprintln!("skipping MSR exits: /dev/kvm unavailable");
+            eprintln!("skipping {test}: /dev/kvm unavailable");
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn kvm_macos_msr_reads_zero_drops_the_write_and_completes() {
+        if !kvm_msr_exits_usable("macOS MSR exits") {
             return;
         }
         let vm = KvmVm::new().unwrap();
-        configure_msrs(&vm, MsrPolicy::Ignore).unwrap();
+        configure_msrs(&vm, MsrPolicy::Macos).unwrap();
         let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
         let ram =
             crate::memory::GuestRam::anonymous(crate::layout::MemLayout::new(16).unwrap()).unwrap();
         crate::memory::register_memslots(&vm.vm, &ram).unwrap();
-        let code = [
-            0x66, 0xb9, 0xef, 0xbe, 0xad, 0xde, 0x0f, 0x32, 0x66, 0xa3, 0, 0x90, 0x66, 0xb8, 0x12,
-            0x34, 0x56, 0x78, 0x0f, 0x30, 0x0f, 0x32, 0x66, 0xa3, 4, 0x90, 0xe6, 0xe9,
-        ];
-        ram.mem.write_slice(&code, GuestAddress(0x8000)).unwrap();
+        // MSR_CORE_PERF_LIMIT_REASONS: no KVM model on Intel or AMD hosts,
+        // and writable in the table.
+        ram.mem
+            .write_slice(&msr_guest(0x64f), GuestAddress(0x8000))
+            .unwrap();
+        ram.mem
+            .write_slice(&[0xff; 8], GuestAddress(0x9000))
+            .unwrap();
         let mut cpu = vm.create_vcpu(0).unwrap();
         crate::loader::init_real_mode(&mut cpu, 0x8000).unwrap();
         let mut seen = Default::default();
         for write in [false, true, false] {
             match cpu.run().unwrap() {
                 kvm_ioctls::VcpuExit::X86Rdmsr(exit) if !write => {
-                    assert!(msr_action(MsrPolicy::Ignore, &mut seen, exit.index, exit.reason).0);
+                    assert_eq!(exit.index, 0x64f);
+                    let (value, _) =
+                        answer(MsrPolicy::Macos, &mut seen, exit.index, exit.reason, false);
                     *exit.error = 0;
-                    *exit.data = 0;
+                    *exit.data = value.unwrap();
                 }
                 kvm_ioctls::VcpuExit::X86Wrmsr(exit) if write => {
                     assert_eq!(exit.data, 0x78563412);
-                    assert!(msr_action(MsrPolicy::Ignore, &mut seen, exit.index, exit.reason).0);
+                    let (value, _) =
+                        answer(MsrPolicy::Macos, &mut seen, exit.index, exit.reason, true);
+                    assert!(value.is_some());
                     *exit.error = 0;
                 }
                 other => panic!("unexpected MSR test exit: {other:?}"),
@@ -369,6 +572,48 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, [0; 8]);
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn kvm_macos_policy_faults_an_msr_outside_the_table() {
+        if !kvm_msr_exits_usable("macOS strict MSR") {
+            return;
+        }
+        let _permit = vmlab_hv_tests::process::VmPermit::acquire().unwrap();
+        let vm = KvmVm::new().unwrap();
+        configure_msrs(&vm, MsrPolicy::Macos).unwrap();
+        let ram =
+            crate::memory::GuestRam::anonymous(crate::layout::MemLayout::new(16).unwrap()).unwrap();
+        crate::memory::register_memslots(&vm.vm, &ram).unwrap();
+        ram.mem
+            .write_slice(&msr_guest(0xdeadbeef), GuestAddress(0x8000))
+            .unwrap();
+        // The #GP vector (13) points at 0x8100, which writes 0x42 to port 0xe9.
+        ram.mem
+            .write_slice(&[0, 0x81, 0, 0], GuestAddress(13 * 4))
+            .unwrap();
+        ram.mem
+            .write_slice(&[0xb0, 0x42, 0xe6, 0xe9], GuestAddress(0x8100))
+            .unwrap();
+        let mut cpu = vm.create_vcpu(0).unwrap();
+        crate::loader::init_real_mode(&mut cpu, 0x8000).unwrap();
+        let mut seen = Default::default();
+        match cpu.run().unwrap() {
+            kvm_ioctls::VcpuExit::X86Rdmsr(exit) => {
+                assert_eq!(exit.index, 0xdeadbeef);
+                let (value, line) =
+                    answer(MsrPolicy::Macos, &mut seen, exit.index, exit.reason, false);
+                assert_eq!(value, None);
+                assert!(line.unwrap().contains("unhandled MSR 0xdeadbeef (read)"));
+                *exit.error = 1;
+            }
+            other => panic!("unexpected MSR test exit: {other:?}"),
+        }
+        match cpu.run().unwrap() {
+            kvm_ioctls::VcpuExit::IoOut(0xe9, bytes) => assert_eq!(bytes, [0x42]),
+            other => panic!("unhandled MSR did not enter the guest #GP handler: {other:?}"),
+        }
     }
 
     #[test]

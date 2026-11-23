@@ -2459,8 +2459,8 @@ impl super::machine::Machine for VmInstance {
         .flatten()
         .collect();
         let macos = t.resolved.apple_smc || self.guest_os() == super::guest_os::GuestOs::Macos;
-        // vmlab-hv answers unknown MSRs itself (its `ignore` policy); only
-        // QEMU needs the host's kvm.ignore_msrs.
+        // vmlab-hv answers the MSRs macOS touches itself (its `macos`
+        // policy); only QEMU needs the host's kvm.ignore_msrs.
         if macos
             && self.hypervisor() == HypervisorKind::Qemu
             && plan.accel() == qemu::Accel::Kvm

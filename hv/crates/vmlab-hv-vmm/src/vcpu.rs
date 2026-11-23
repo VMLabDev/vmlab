@@ -187,11 +187,13 @@ fn run_vcpu(id: u8, vcpu: Arc<Mutex<VcpuFd>>, shared: &Arc<VmShared>) {
                 crate::debug::stopped(shared, id, exit);
             }
             Ok(VcpuExit::X86Rdmsr(exit)) => {
-                *exit.error = u8::from(!crate::macos::ignored_msr(shared, exit.index, exit.reason));
-                *exit.data = 0;
+                let value = crate::macos::user_msr(shared, exit.index, exit.reason, false);
+                *exit.error = u8::from(value.is_none());
+                *exit.data = value.unwrap_or(0);
             }
             Ok(VcpuExit::X86Wrmsr(exit)) => {
-                *exit.error = u8::from(!crate::macos::ignored_msr(shared, exit.index, exit.reason));
+                let done = crate::macos::user_msr(shared, exit.index, exit.reason, true);
+                *exit.error = u8::from(done.is_none());
             }
             Ok(VcpuExit::IoIn(port, data)) => {
                 for value in data.chunks_mut(io_dispatch_width(port, width, data.len())) {

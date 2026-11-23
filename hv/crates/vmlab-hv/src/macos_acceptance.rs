@@ -324,7 +324,7 @@ fn launch_macos(path: &Path, template: &Path, firmware: &Path, key: &str) -> Lau
     let stderr = path.join("stderr.log");
     let mut description = serde_json::json!({
         "name":"macos-p1", "machine":"q35", "arch":"x86_64", "accel":"kvm", "vcpus":4,"memory_mib":8192,
-        "cpu_model":"Skylake-Client-v4", "invtsc":true,"vmware_cpuid_freq":true,"msr_policy":"ignore",
+        "cpu_model":"Skylake-Client-v4", "invtsc":true,"vmware_cpuid_freq":true,"msr_policy":"macos",
         "usb_keyboard":true,"smbios_type2":true,
         "boot":{"kind":"firmware","firmware":"ovmf","code":firmware.join("OVMF_CODE_4M.fd"),"vars":vars},
         "ahci_pci":{"bus":0,"device":31,"function":2},
@@ -617,10 +617,21 @@ fn macos_tahoe_p1_agent_display_keyboard_network_reset_snapshot_stop() {
     check_powerdown(status, &diagnostics()).unwrap();
     let ignored: Vec<_> = diagnostics()
         .lines()
-        .filter(|line| line.contains("ignored unknown MSR"))
+        .filter(|line| line.contains("answered in user space"))
         .map(str::to_owned)
         .collect();
-    eprintln!("macOS P1 ignored MSRs: {ignored:?}");
+    eprintln!("macOS P1 MSRs answered in user space: {ignored:?}");
+    // Strict outside the table: an MSR vmlab-hv does not answer reaches the
+    // guest as #GP, and the log names it so the table can grow.
+    let unhandled: Vec<_> = diagnostics()
+        .lines()
+        .filter(|line| line.contains("faulted on unhandled MSR"))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        unhandled.is_empty(),
+        "macOS touched MSRs outside vmlab-hv's table: {unhandled:?}"
+    );
     let host_ignore = std::fs::read_to_string("/sys/module/kvm/parameters/ignore_msrs").unwrap();
     if host_ignore_before.trim() == "N" && host_ignore.trim() == "N" {
         assert!(
