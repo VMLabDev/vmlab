@@ -4298,7 +4298,9 @@ mod tests {
         );
         // The passes took guest work, and not the guest's file under `.vmlab`.
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("new.rs")).ok().as_deref(),
+            std::fs::read_to_string(dir.path().join("new.rs"))
+                .ok()
+                .as_deref(),
             Some("n"),
             "{report:?}"
         );
