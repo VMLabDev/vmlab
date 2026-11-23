@@ -3120,6 +3120,28 @@ lab "l" {
     }
 
     #[test]
+    fn a_subnet_too_small_for_a_gateway_and_a_guest_is_refused() {
+        for subnet in ["255.255.255.255/32", "10.1.1.0/31", "0.0.0.0/0"] {
+            assert_err(
+                &format!(
+                    "import <vmlab.wcl>\nlab \"l\" {{ segment \"s\" {{ subnet = \"{subnet}\" }} }}"
+                ),
+                &format!("segment \"s\" subnet {subnet} must have a prefix length from /1 to /30"),
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_ip_does_not_overflow() {
+        let last = Ipv4Addr::new(255, 255, 255, 255);
+        assert_eq!(gateway_ip("255.255.255.255/32".parse().unwrap()), last);
+        assert_eq!(
+            gateway_ip("255.255.255.252/30".parse().unwrap()),
+            Ipv4Addr::new(255, 255, 255, 253)
+        );
+    }
+
+    #[test]
     fn static_ip_outside_subnet() {
         assert_err(
             r#"import <vmlab.wcl>
