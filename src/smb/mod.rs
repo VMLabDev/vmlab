@@ -213,7 +213,10 @@ impl LabSmb {
         self.servers.len() < self.vms.len()
     }
 
-    pub(crate) fn restart_missing(&mut self, ports: &[u16]) -> Vec<(String, Result<u16, SmbError>)> {
+    pub(crate) fn restart_missing(
+        &mut self,
+        ports: &[u16],
+    ) -> Vec<(String, Result<u16, SmbError>)> {
         let missing: Vec<_> = self
             .vms
             .keys()
