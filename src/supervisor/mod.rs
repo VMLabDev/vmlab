@@ -1164,7 +1164,7 @@ mod tests {
         let mut orphan = tokio::process::Command::new("bash")
             .args([
                 "-c",
-                "exec -a qemu-system-x86_64 bash -c 'printf R; read -r line' -- \"$@\"",
+                "set -eu; exec -a qemu-system-x86_64 bash -c 'set -eu; printf R; read -r line' -- \"$@\"",
                 "--",
                 "-name",
                 &format!("vmlab:{name}/a"),
@@ -1214,7 +1214,10 @@ mod tests {
             supervisor.release_lab(&name).await.unwrap();
         }
         // wait closes stdin, letting the helper exit normally if it survived.
-        assert_eq!(orphan.wait().await.unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(
+            orphan.wait().await.unwrap().signal(),
+            Some(nix::libc::SIGKILL)
+        );
     }
 
     #[test]
