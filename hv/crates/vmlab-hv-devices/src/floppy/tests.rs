@@ -24,6 +24,27 @@ fn sector_255_steps_to_next_track_without_wrapping_to_zero() {
     assert_eq!(m.floppy.drives[0].at.sect, 1);
 }
 
+/// A data command leaves the guest's sector byte on the drive even when it
+/// is past the end of the track; READ ID then reports the next sector of the
+/// track, as QEMU does (`sect % last_sect + 1`), not `255 + 1`.
+#[test]
+fn read_id_after_an_out_of_range_sector_does_not_overflow() {
+    let mut m = Machine::new("floppy");
+    for byte in [0x46, 0, 0, 0, 0xff, 2, 18, 0x1b, 0xff] {
+        m.out(0x3f5, byte);
+    }
+    let refused: Vec<u8> = (0..7).map(|_| m.inp(0x3f5)).collect();
+    assert_eq!(refused, [0x40, 0x80, 0, 0, 0, 0xff, 2]);
+    assert_eq!(m.floppy.drives[0].at.sect, 0xff);
+
+    for byte in [0x4a, 0] {
+        m.out(0x3f5, byte);
+    }
+    m.floppy.advance(READ_ID_NS);
+    let id: Vec<u8> = (0..7).map(|_| m.inp(0x3f5)).collect();
+    assert_eq!(id, [0, 0, 0, 0, 0, 0xff % 18 + 1, 2]);
+}
+
 #[test]
 fn restore_rejects_pio_position_at_end_of_buffer() {
     let mut m = Machine::new("floppy");

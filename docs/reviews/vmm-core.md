@@ -255,6 +255,13 @@ and the IDE, AHCI and USB devices on the same buses.
   `floppy/tests.rs`, with `Machine::new("floppy")` and `m.out(...)` as above.
   Today it panics with "attempt to add with overflow".
 - Confidence: high.
+- Fixed by card #793. `finish_read_id` reports `at.sect % sectors + 1`, the
+  next sector of the track as QEMU computes it, so no stored sector byte can
+  overflow it, from a command or from a restored state. A READ ID at the last
+  sector of the track now reports sector 1, not one past the end. Test:
+  `read_id_after_an_out_of_range_sector_does_not_overflow` in
+  `floppy/tests.rs`, which failed before the fix with "attempt to add with
+  overflow" at `floppy/mod.rs:593`.
 
 ### F7. PIIX4 PM window: 128 ports over a 64-aligned base, and a subtraction that wraps at 0xffff
 
