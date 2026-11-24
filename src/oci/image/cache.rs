@@ -35,8 +35,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::fcntl::{Flock, FlockArg};
 
+use crate::staging::{STAGING_PREFIX, StagingDir};
+
 const LOCK_FILE: &str = ".lock";
-const STAGING_PREFIX: &str = ".staging-";
 
 /// The raw platform manifest inside an image directory.
 pub const MANIFEST_FILE: &str = "manifest.json";
@@ -207,10 +208,8 @@ impl ImageCache {
 
     /// Create a staging directory inside the cache root (same filesystem, so
     /// installs are atomic renames). Removed on drop unless consumed.
-    pub fn staging_dir(&self) -> Result<StagingDir> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("cannot create cache root {}", self.root.display()))?;
-        StagingDir::create(&self.root)
+    pub(crate) fn staging_dir(&self) -> Result<StagingDir> {
+        StagingDir::create(&self.root, STAGING_PREFIX, 0o777)
     }
 
     fn ref_path(&self, host: &str, repository: &str, tag: &str) -> PathBuf {
@@ -265,33 +264,6 @@ fn encode_repo(repo: &str) -> String {
         }
     }
     out
-}
-
-/// Staging directory inside the cache root, removed on drop unless the
-/// install rename already consumed it (mirrors the template store).
-pub struct StagingDir {
-    path: PathBuf,
-}
-
-impl StagingDir {
-    fn create(root: &Path) -> Result<Self> {
-        let path = root.join(format!("{STAGING_PREFIX}{:08x}", rand::random::<u32>()));
-        fs::create_dir_all(&path)
-            .with_context(|| format!("cannot create staging dir {}", path.display()))?;
-        Ok(Self { path })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
 }
 
 #[cfg(test)]

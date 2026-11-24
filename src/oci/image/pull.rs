@@ -212,7 +212,7 @@ pub(crate) async fn pull_with_transport(
     // flatten reads only these links, so another pull removing a shared
     // blob from the cache cannot take it away (F14). The links get a staging
     // dir of their own: `staging` becomes the image directory.
-    let staging = cache.staging_dir()?;
+    let staging = std::sync::Arc::new(cache.staging_dir()?);
     let holds = cache.staging_dir()?;
     let layers_total = manifest.layers.len();
     let bytes_total: u64 = manifest.layers.iter().map(|d| d.size).sum();
@@ -254,22 +254,23 @@ pub(crate) async fn pull_with_transport(
 
     // 5. Flatten to a squashfs, verifying diff_ids (blocking work). The
     // blobs stay in the cache on failure so a retry resumes. Aborting this
-    // task does not stop a blocking thread: the guard, dropped with this
-    // future, sets the flag the flatten stops at.
+    // task does not stop a blocking thread. Signal it to stop and have the
+    // thread keep both staging directories until it exits.
     let rootfs_tmp = staging.path().join(ROOTFS_FILE);
     {
         let layer_files = layer_files.clone();
         let diff_ids = config.rootfs.diff_ids.clone();
         let dest = rootfs_tmp.clone();
+        let output = staging.clone();
         let (_cancel_on_drop, cancel) = CancelOnDrop::pair();
         tokio::task::spawn_blocking(move || {
+            let (_output, _holds) = (output, holds);
             flatten_to_squashfs(&layer_files, &diff_ids, &dest, &cancel)
         })
         .await
         .context("flatten task panicked")?
         .with_context(|| format!("flattening {reference}"))?;
     }
-    drop(holds);
 
     // 6. Install the image atomically, then drop the now-redundant blobs
     // from the cache and record the tag resolution. A pull still flattening
