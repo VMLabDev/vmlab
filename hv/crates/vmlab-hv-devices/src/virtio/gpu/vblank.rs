@@ -204,7 +204,7 @@ impl State {
                 continue;
             };
             if queue.add_used(&mem, wait.head, RESPONSE_LEN).is_ok()
-                && queue.needs_notification(&mem).unwrap_or(false)
+                && crate::virtio::used_needs_interrupt(queue, &mem)
             {
                 notify[wait.queue as usize & 1] = true;
             }
