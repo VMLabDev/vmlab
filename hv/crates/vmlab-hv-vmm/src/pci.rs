@@ -1445,12 +1445,12 @@ mod tests {
         assert_eq!(log, vec![(63, 3, vec![1])]);
         // Register 4 is a BAR of the fake function. A write that starts in
         // register 3 leaves it alone.
-        let before = dev.lock().placements.clone();
+        let bar = cfg.root.lock().config_read(0, 1, 0, 4);
         cfg.write(0, &0x8000_080cu32.to_le_bytes());
         cfg.write(6, &[0xff; 4]);
         let log = dev.lock().config_log.lock().clone();
         assert_eq!(log[1..], [(3, 2, vec![0xff; 2])]);
-        assert_eq!(dev.lock().placements, before);
+        assert_eq!(cfg.root.lock().config_read(0, 1, 0, 4), bar);
     }
 
     #[test]

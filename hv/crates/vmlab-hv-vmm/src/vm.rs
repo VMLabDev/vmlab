@@ -2262,12 +2262,21 @@ mod tests {
     fn io_bar_programmed_below_0x1000_is_dispatched() {
         use vmlab_hv_devices::{BarInfo, BarKind, BusDevice, PciDevice};
         type Log = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
-        struct Function(Log);
+        struct Function(Log, [u8; 4]);
         impl PciDevice for Function {
-            fn config_read(&mut self, _: usize) -> u32 {
-                0
+            fn config_read(&mut self, reg: usize) -> u32 {
+                if reg == 1 {
+                    u32::from_le_bytes(self.1)
+                } else {
+                    0
+                }
             }
-            fn config_write(&mut self, _: usize, _: u64, _: &[u8]) {}
+            fn config_write(&mut self, reg: usize, offset: u64, data: &[u8]) {
+                if reg == 1 {
+                    let offset = offset as usize;
+                    self.1[offset..offset + data.len()].copy_from_slice(data);
+                }
+            }
             fn bars(&self) -> Vec<BarInfo> {
                 vec![BarInfo {
                     index: 0,
@@ -2302,7 +2311,7 @@ mod tests {
         let root = Arc::new(Mutex::new(PciRoot::q35(1 << 32)));
         let slot = 3u8;
         root.lock()
-            .add_device_at(slot, 0, Arc::new(Mutex::new(Function(bar_log.clone()))))
+            .add_device_at(slot, 0, Arc::new(Mutex::new(Function(bar_log.clone(), [0; 4]))))
             .unwrap();
         let mut io_bus = IoBus::new();
         io_bus
