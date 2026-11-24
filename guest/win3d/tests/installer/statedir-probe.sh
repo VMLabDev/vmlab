@@ -14,6 +14,14 @@
 #            place of the copy the startup tasks run, create state.json.tmp,
 #            and create a file in bundle\. Each attempt is recorded as done
 #            or refused.
+#   write    as SYSTEM, with a package installed: one installer run that
+#            fails and so writes state.json exactly once (the staged script
+#            in Install mode finds no bundle beside it and records the
+#            error). Exit 1 when the user owns state.json after it: the
+#            installer wrote through the user's state.json.tmp and renamed
+#            it. A run that writes the state more than once, such as the
+#            repair at boot, replaces the file again, so only a single write
+#            shows the fault without a race.
 #   check    restart the guest, wait for the startup tasks, and judge. Exit 1
 #            when the user's script ran (it writes its identity to
 #            C:\win3d-statedir-proof.txt) or the user owns state.json; exit 0
@@ -26,7 +34,7 @@
 # command.
 set -euo pipefail
 VMLAB=${VMLAB:-vmlab}
-[ $# -ge 4 ] || { sed -n '2,27p' "$0" >&2; exit 2; }
+[ $# -ge 4 ] || { sed -n '2,35p' "$0" >&2; exit 2; }
 LABDIR=$(cd "$1" && pwd)
 VM=$2
 mkdir -p "$3"; EV=$(cd "$3" && pwd)
@@ -66,6 +74,7 @@ tree_state() {
         }" || true
 }
 
+wait_agent
 for step in "$@"; do
     out=$EV/$step.txt
     case $step in
@@ -102,6 +111,18 @@ for step in "$@"; do
         state)
             tree_state >"$out"
             say "state: $(wc -l <"$out") entries in $out"
+            ;;
+        write)
+            say "write: one failed installer run as SYSTEM, then the owner of state.json"
+            {
+                "$VMLAB" exec --timeout 300 "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$ROOT\\vmlab-win3d.ps1" -Mode Install -NoReboot 2>&1 | tr -d '\r' | tail -3 || true
+                psh "\$s = '$ROOT\\state.json'; 'state.json owner: ' + (Get-Acl -LiteralPath \$s).GetOwner([Security.Principal.SecurityIdentifier]).Translate([Security.Principal.NTAccount]).Value
+                    'state.json last_error: ' + (Get-Content -LiteralPath \$s -Raw | ConvertFrom-Json).last_error
+                    'state.json.tmp present: ' + (Test-Path -LiteralPath '$ROOT\\state.json.tmp')"
+            } | tee "$out"
+            if grep '^state.json owner: ' "$out" | grep -qi "\\\\$U\$"; then echo "FAIL: the standard user owns state.json"; exit 1; fi
+            grep -q '^state.json owner: ' "$out" || { echo "no owner read" >&2; exit 2; }
+            echo "PASS: the standard user does not own state.json"
             ;;
         check)
             say "check: restart, then look for $PROOF and at the owner of state.json"
