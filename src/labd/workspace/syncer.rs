@@ -93,10 +93,12 @@ use tokio::sync::{Mutex, Notify, watch};
 use super::apply::{Target, apply};
 use super::guest::{GuestFs, GuestWatch};
 use super::halt::{self, Halt};
-use super::ignore::{TEMP_PREFIX, is_syncer_own, validate_entry_name};
+use super::ignore::{GIT_IGNORE, TEMP_PREFIX, VMLAB_IGNORE, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
-use super::plan::{Inputs, Oversize, State, Volume, Winner, has_moved, reconcile};
+use super::plan::{
+    Action, Direction, Inputs, Oversize, State, Volume, Winner, has_moved, reconcile,
+};
 use super::scan::{Skip, guest_locks, guest_walk, host_scan, join_guest, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
 use super::windows::{GuestRun, Learned, Preconditions, prepare_root, set_line_endings};
@@ -2369,10 +2371,48 @@ async fn pass(
     // anything and the previous pass's transfers completed long ago — which is
     // §19.6's *finish the file in flight* as a property of the shape rather
     // than as a thing to remember.
-    let carried = match halt {
+    let mut carried = match halt {
         Some(_) => plan.while_halted(pending.resolved),
         None => plan.clone(),
     };
+    // Commit guest rule files before copying guest output in their scope.
+    // The next host scan reads the committed rules, including their normal
+    // precedence and pruning. An unsettled rule can arrive in the same batch
+    // as settled output, so hold that output while the rule settles too.
+    let rule_dirs: BTreeSet<String> = carried
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::PutFile {
+                direction: Direction::ToHost,
+                path,
+                ..
+            } => rule_dir(path),
+            _ => None,
+        })
+        .chain(pending.in_flight.iter().filter_map(|path| rule_dir(path)))
+        .map(str::to_owned)
+        .collect();
+    let rule_deferred: BTreeSet<String> = carried
+        .actions
+        .iter()
+        .filter(|action| action.direction() == Direction::ToHost)
+        .map(Action::path)
+        // A removal without a guest copy brings no output across. It may
+        // also clear a child of a directory being replaced by a rule file.
+        .filter(|path| probe.tree.contains_key(*path))
+        .filter(|path| {
+            let own_dir = rule_dir(path);
+            std::iter::once("")
+                .chain(path.match_indices('/').map(|(end, _)| &path[..end]))
+                .any(|dir| own_dir != Some(dir) && rule_dirs.contains(dir))
+        })
+        .map(str::to_owned)
+        .collect();
+    carried
+        .actions
+        .retain(|action| !rule_deferred.contains(action.path()));
+    undecided.extend(rule_deferred.iter().cloned());
     let applied = apply(
         guest.as_ref(),
         &Target {
@@ -2568,6 +2608,7 @@ async fn pass(
     // A full walk can discover a new guest file without a dirty notification.
     // Keep failures directly so the next named probe still includes that file.
     owed.extend(failed.iter().map(|failure| failure.path.clone()));
+    owed.extend(rule_deferred.iter().cloned());
 
     Ok(Passed {
         prune,
@@ -2588,10 +2629,19 @@ async fn pass(
             volume: plan.volume.clone(),
             skipped: skipped.into_iter().take(REPORTED).collect(),
             oversize: plan.oversize.clone(),
-            deferred: deferred.into_iter().take(REPORTED).collect(),
+            deferred: deferred
+                .into_iter()
+                .chain(rule_deferred)
+                .take(REPORTED)
+                .collect(),
             ..Report::default()
         },
     })
+}
+
+fn rule_dir(path: &str) -> Option<&str> {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    matches!(name, GIT_IGNORE | VMLAB_IGNORE).then_some(dir)
 }
 
 /// The bracket's re-seed as one pass: the whole workspace carried back to the
@@ -3685,6 +3735,32 @@ mod tests {
             "baseline"
         );
         syncers.stop("dev01").await;
+    }
+
+    #[tokio::test]
+    async fn a_rule_file_the_guest_wrote_is_applied_before_its_siblings_are_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let ws = workspace(dir.path(), state.path());
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/.gitignore", "target/\n", 60);
+        guest.dir("/src/target");
+        guest.file("/src/target/out.bin", "build output", 61);
+        guest.file("/src/main.rs", "source", 62);
+        let sessions = OneFake::new(guest);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        isolated_pass(ws.clone(), sessions.clone(), events.clone()).await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "target/\n"
+        );
+        assert!(!dir.path().join("target").exists());
+        isolated_pass(ws, sessions, events).await;
+        assert!(!dir.path().join("target").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "source"
+        );
     }
 
     #[tokio::test]
