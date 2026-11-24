@@ -116,6 +116,16 @@ impl Shared {
     }
 
     fn enqueue_ctrl(&mut self, msg: CtrlMsg) {
+        // `PORT_OPEN` is the one event the host side originates after
+        // enumeration, and the guest has no way to ask for it again. It gets
+        // one slot per port above the cap: `process_ctrl_tx` keeps what the
+        // driver causes at or below the cap, and a second change of the same
+        // port replaces the first in place, so the reserve cannot run out.
+        let reserve = if msg.event == EV_PORT_OPEN {
+            self.ports.len()
+        } else {
+            0
+        };
         if let Some(old) = self
             .pending
             .iter_mut()
@@ -124,7 +134,7 @@ impl Shared {
             .filter(|old| old.event == msg.event)
         {
             *old = msg;
-        } else if self.pending.len() < self.control_cap() {
+        } else if self.pending.len() < self.control_cap() + reserve {
             self.pending.push_back(msg);
         } else {
             log::warn!(
@@ -148,9 +158,10 @@ enum Cmd {
 ///
 /// The listeners exist from [`Console::new`]; the worker thread runs until the
 /// device is dropped. Snapshot restore assumes the in-place flow (same
-/// process, same sockets): state is restored faithfully and the worker
-/// reconciles the socket-coupled flags (`host_open`) with its live
-/// connections, so restoring into a fresh device degrades gracefully.
+/// process, same sockets): state is restored faithfully, except that
+/// `host_open` stays what the live connections say, and the guest is sent a
+/// `PORT_OPEN` for every port where that differs from the snapshot. Restoring
+/// into a fresh device therefore tells the guest that its ports closed.
 pub struct Console {
     id: String,
     ports: Vec<PortConfig>,
@@ -479,9 +490,11 @@ fn notify_host_open(sh: &mut Shared, i: usize) {
 fn handle_kick(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], queue: u16) {
     match queue {
         2 => {
-            // The guest added control-receiveq buffers.
-            let mut sh = lock(shared);
-            flush_pending(&mut sh);
+            // The guest added control-receiveq buffers. Delivery makes room
+            // in `pending`, and the control transmitq may hold messages that
+            // were left there for want of it: the driver does not kick queue
+            // 3 again for those.
+            process_ctrl_tx(shared);
         }
         3 => process_ctrl_tx(shared),
         _ => {
@@ -1048,11 +1061,10 @@ impl Snapshot for Console {
         }
         let mut ports = Vec::with_capacity(nports);
         for _ in 0..nports {
-            // `host_open` is decoded for forward compatibility but ignored:
-            // the worker's live connection state is the truth.
-            let _host_open = dec.u8()? == 1;
+            // The stored `host_open` is what the guest in the snapshot was
+            // told, not the state of the port: the live connection is.
             ports.push(PortState {
-                host_open: false,
+                host_open: dec.u8()? == 1,
                 guest_open: dec.u8()? == 1,
                 rx_stage: dec.bytes()?,
                 tx_stage: dec.bytes()?,
@@ -1096,12 +1108,30 @@ impl Snapshot for Console {
         }
         let mut sh = lock(&self.shared);
         sh.device_ready = device_ready;
+        let told_open: Vec<bool> = ports.iter().map(|port| port.host_open).collect();
         for (port, restored) in sh.ports.iter_mut().zip(ports) {
             port.guest_open = restored.guest_open;
             port.rx_stage = restored.rx_stage;
             port.tx_stage = restored.tx_stage;
         }
         sh.pending = pending;
+        // The restored guest believes what the snapshot's device told it.
+        // Where the live connection differs, say so after the restored
+        // messages, or the guest waits on a closed port that is open (Linux
+        // blocks writes on it) or writes into one that has no client.
+        if device_ready {
+            for (i, told) in told_open.into_iter().enumerate() {
+                if told != sh.ports[i].host_open {
+                    let value = u16::from(sh.ports[i].host_open);
+                    sh.enqueue_ctrl(CtrlMsg {
+                        id: i as u32 + 1,
+                        event: EV_PORT_OPEN,
+                        value,
+                        name: None,
+                    });
+                }
+            }
+        }
         if sh.mem.is_some() {
             sh.queues = queues
                 .into_iter()
