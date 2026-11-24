@@ -55,7 +55,7 @@ test does not reproduce is wrong and should be dropped.
 | F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it (fixed, card #803) |
 | F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
 | F6 | security (hostile guest) | A terminal's buffer has no limit, and `expect` scans all of it again on every chunk |
-| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever |
+| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever (fixed, card #804) |
 | F8 | wrong result | `Term.expect` destroys a character that was split across two reads |
 | F9 | wrong result | `vmlab validate` accepts a script with no entry point, or with the wrong one |
 | F10 | wrong result | `print` and `println` write to the daemon's log file, not to the output of `up` |
@@ -313,6 +313,9 @@ host waits observe it while blocked.
   `t.expect("x", i64::MAX)`. Expected: `Err`. Today: a panic. The same test
   for `cancel::sleep(Duration::from_millis(i64::MAX as u64))` inside
   `enter(Some(token))`.
+- Fixed in card #804. Script waits and sleeps over 365 days report an
+  argument error before reaching a clock or blocking. `sleep_ms` raises a
+  script fault and keeps its existing unit return type.
 
 ### F8. `Term.expect` destroys a character split across two reads (wrong result)
 

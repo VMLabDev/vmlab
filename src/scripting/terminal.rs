@@ -98,7 +98,7 @@ impl TerminalHandle {
     /// the error carries the unmatched buffer tail for debugging.
     pub fn expect(&self, pattern: &str, timeout_secs: i64) -> Result<String, String> {
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+        let deadline = std::time::Instant::now() + super::script_timeout(timeout_secs, 0)?;
         let mut st = self.state.lock().expect("term state");
         // How much of the buffer the last scan covered with no match: the
         // same bytes are not scanned a second time.
@@ -243,6 +243,21 @@ mod tests {
         AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
         PROTO_VERSION, encode_ctrl, encode_frame, features,
     };
+
+    #[tokio::test]
+    async fn a_huge_timeout_is_an_error_not_a_panic() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: Vec::new(),
+                ended: Some("closed".into()),
+            })),
+        };
+        let error = term.expect("x", i64::MAX).unwrap_err();
+        assert!(error.contains("timeout_secs"), "{error}");
+    }
 
     /// How the flooding agent's connection ended.
     #[derive(Debug, PartialEq)]
