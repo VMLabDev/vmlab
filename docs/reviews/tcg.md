@@ -177,7 +177,7 @@ beyond the single random words of the first differential run, and
   `a_trace_whose_own_access_is_refused_raises_the_same_guest_fault` in
   `vmlab-hv-tcg/tests/hardening.rs`.
 
-### F3. Writing the `seed` CSR is a host error
+### F3. Writing the `seed` CSR is a host error (fixed, card #771)
 
 - Where: `tcg/lib.rs:346-363` (`call`). The model's `zread_seed_csr` calls
   `zget_16_random_bits`, which the model declares and does not define.
@@ -200,6 +200,15 @@ beyond the single random words of the first differential run, and
   serves each one, so a model upgrade cannot add another silently. The list
   today is the SoftFloat names, `zplat_term_write` and `zget_16_random_bits`.
 - Confidence: high.
+- Fixed by card #771. `call` serves `zget_16_random_bits` from
+  `Interpreter::entropy`, the fixed generator of the Sail oracle with the
+  same start value, so a lockstep run agrees. It is reproducible and not
+  random: the embedder writes a host random value into `entropy` when the
+  guest needs real entropy. The function has no body in the model, so the
+  call is not memoised and a recording stops at it. Both proof tests are in
+  `vmlab-hv-tcg/tests/hardening.rs`: `the_seed_csr_returns_entropy`, and
+  `call_serves_every_function_the_model_does_not_define`, which calls every
+  function the model calls and does not define.
 
 ### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting
 
@@ -252,6 +261,18 @@ beyond the single random words of the first differential run, and
   `vmlab_hv_tcg_ir::lower` on the result aborts the test process (seen:
   `thread ... has overflowed its stack`, SIGABRT).
 - Confidence: high.
+- Fixed by card #772. The parser counts the levels of the expression tree
+  itself: nesting and suffixes add to one height, and `parse` refuses a tree
+  of more than 128 levels (`MAX_EXPR_HEIGHT`) with `expression depth limit
+  exceeded`. That replaces the separate count of suffixes on one operand, so
+  the tallest tree `lower`, `fold` and `format` can be given has 128 levels.
+  The fuzz target is covered by the same bound. Before the fix the proof test
+  aborted with a stack overflow in its own process, because dropping the
+  parsed tree is recursive too. A second test,
+  `the_depth_limit_counts_nesting_and_suffixes_together`, holds the bound at
+  its edge for three shapes. The committed model is far below the bound:
+  all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
+  generated again for this card.
 
 ### F6. The emitter writes a model that the generated crate cannot load
 
@@ -310,7 +331,7 @@ beyond the single random words of the first differential run, and
 - Confidence: high. A fix needs a finer stamp (the bytes a trace fetched)
   or a fallback that stops recording a PC that keeps invalidating itself.
 
-### F8. `read_csr` and `write_csr` take an index past 12 bits and use another CSR
+### F8. `read_csr` and `write_csr` take an index past 12 bits and use another CSR (fixed, card #771)
 
 - Where: `tcg/cpu.rs:170-181`.
 - Fault: both build the CSR number with `Value::bits(12, csr)`, which keeps
@@ -325,6 +346,9 @@ beyond the single random words of the first differential run, and
   be 0. Today the first returns the value of `mstatus`, the second returns
   `Ok`, and `mscratch` reads 7.
 - Confidence: high.
+- Fixed by card #771. Both return `Error::Type` for an index of 4096 or
+  more, before the model is called. The proof test is
+  `a_csr_index_past_twelve_bits_is_refused`.
 
 ## What was checked and found sound
 
