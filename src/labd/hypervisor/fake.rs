@@ -168,6 +168,8 @@ pub struct Script {
     pub tpm_fails: Option<String>,
     /// `start_virtiofsd` fails with this message.
     pub virtiofsd_fails: Option<String>,
+    /// Fail only this numbered (one-based) virtiofsd start.
+    pub virtiofsd_fails_on: Option<usize>,
     /// This host has no virtiofsd, so shares and volumes fall back to SMB.
     pub no_virtiofsd: bool,
     /// This host's virtiofsd predates `--migration-mode` and `--readonly`
@@ -231,6 +233,7 @@ pub struct FakeHypervisor {
     paused: Arc<AtomicBool>,
     /// Which start attempt the next `start_emulator` is.
     attempts: AtomicUsize,
+    virtiofsd_attempts: AtomicUsize,
     /// Every helper the fake started (TPMs, filesystem daemons), so a test
     /// can assert teardown left nothing behind.
     helpers: Mutex<Vec<Arc<FakeProc>>>,
@@ -252,6 +255,7 @@ impl FakeHypervisor {
             script,
             paused: Arc::new(AtomicBool::new(false)),
             attempts: AtomicUsize::new(0),
+            virtiofsd_attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
             launched_floppies: std::sync::Mutex::new(Vec::new()),
@@ -361,6 +365,10 @@ impl Hypervisor for FakeHypervisor {
     ) -> Result<Arc<dyn Process>> {
         if let Some(msg) = &self.script.virtiofsd_fails {
             bail!("{machine}: {msg}");
+        }
+        let attempt = self.virtiofsd_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.script.virtiofsd_fails_on == Some(attempt) {
+            bail!("{machine}: virtiofsd failed on start {attempt}");
         }
         Ok(self.helper(format!("virtiofsd:{machine}")).await)
     }
