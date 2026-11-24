@@ -507,25 +507,68 @@ impl Drop for PullTemp {
     }
 }
 
-/// A new file beside `target`, on its filesystem, for a pull to fill and
-/// rename over it. Never an existing file: the name is taken exclusively.
-async fn create_pull_temp(target: &Path) -> std::io::Result<(tokio::fs::File, PullTemp)> {
+/// The longest file name most Linux filesystems take, in bytes.
+const NAME_MAX: usize = 255;
+
+/// The name of a pull's part-written file: the destination's own name, so a
+/// file left behind by a killed daemon can be told apart, cut on a character
+/// boundary to whatever the suffix leaves of [`NAME_MAX`]. A destination
+/// whose name is already at the limit is as valid as any other.
+fn pull_temp_name(name: &str, pid: u32, n: u64) -> String {
+    let suffix = format!(".vmlab-pull.{pid}.{n}");
+    let mut keep = name.len().min(NAME_MAX.saturating_sub(1 + suffix.len()));
+    while !name.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!(".{}{suffix}", &name[..keep])
+}
+
+/// A new file in `dir` for a pull onto `target` to fill. Never an existing
+/// file: the name is taken exclusively. `private` is for a directory other
+/// users share, where the bytes of a pull are nobody else's to read.
+async fn create_pull_temp(
+    dir: &Path,
+    target: &Path,
+    private: bool,
+) -> std::io::Result<(tokio::fs::File, PullTemp)> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = target.file_name().unwrap_or_default().to_string_lossy();
     loop {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let temp = target.with_file_name(format!(".{name}.vmlab-pull.{}.{n}", std::process::id()));
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await
-        {
+        let temp = dir.join(pull_temp_name(&name, std::process::id(), n));
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if private {
+            options.mode(0o600);
+        }
+        match options.open(&temp).await {
             Ok(file) => return Ok((file, PullTemp(temp))),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Whether replacing this existing destination by a rename would lose
+/// something a write into it keeps: another hard link, which would go on
+/// naming the old bytes, or an owner other than this process, which a new
+/// file cannot be given.
+fn rename_would_lose(existing: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    existing.nlink() > 1 || existing.uid() != nix::unistd::Uid::effective().as_raw()
+}
+
+/// Write the verified bytes of a pull into the destination that is already
+/// there, keeping its inode and everything that hangs off it.
+async fn copy_into(verified: &Path, target: &Path) -> std::io::Result<()> {
+    let mut from = tokio::fs::File::open(verified).await?;
+    let mut to = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(target)
+        .await?;
+    tokio::io::copy(&mut from, &mut to).await?;
+    to.flush().await
 }
 
 /// Into memory, for a caller that wants the bytes. The ceiling is checked
@@ -1299,22 +1342,41 @@ impl AgentHandle {
                 .with_context(|| format!("creating {}", local.display()))?;
             return ops.pull(remote, &mut FileSink::unbounded(file)).await;
         }
-        // The bytes land beside the destination and replace it only once the
-        // digest has matched, so every failure — a guest path that is not
+        // The bytes land in a new file and reach the destination only once
+        // the digest has matched, so every failure — a guest path that is not
         // there, a dropped connection, a mismatch — leaves the host file as
         // it was.
-        let (file, temp) = create_pull_temp(&target)
-            .await
-            .with_context(|| format!("creating {}", local.display()))?;
+        let creating = || format!("creating {}", local.display());
+        let beside = target.parent().unwrap_or(Path::new(""));
+        let mut in_place = existing.as_ref().is_some_and(rename_would_lose);
+        let (file, temp) = match create_pull_temp(beside, &target, false).await {
+            Ok(made) => made,
+            // Writing a file that exists takes the right to write it, not
+            // the right to create beside it: the bytes wait elsewhere.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && existing.is_some() => {
+                in_place = true;
+                create_pull_temp(&std::env::temp_dir(), &target, true)
+                    .await
+                    .with_context(creating)?
+            }
+            Err(e) => return Err(e).with_context(creating),
+        };
         let pulled = ops.pull(remote, &mut FileSink::new(file)).await?;
+        if in_place {
+            // A rename would need the directory, or would leave another
+            // hard link on the old bytes or change the owner. The file is
+            // written where it is instead, from bytes already verified.
+            copy_into(&temp.0, &target).await.with_context(creating)?;
+            return Ok(pulled);
+        }
         if let Some(meta) = existing {
             tokio::fs::set_permissions(&temp.0, meta.permissions())
                 .await
-                .with_context(|| format!("creating {}", local.display()))?;
+                .with_context(creating)?;
         }
         tokio::fs::rename(&temp.0, &target)
             .await
-            .with_context(|| format!("creating {}", local.display()))?;
+            .with_context(creating)?;
         Ok(pulled)
     }
 
@@ -5686,6 +5748,118 @@ mod tests {
         assert_eq!(std::fs::read(&real).unwrap().len(), 10_000);
         let mode = std::fs::metadata(&real).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
+    /// G8: the part-written file's name is the destination's own plus a
+    /// suffix, and a destination already near the 255-byte name limit left no
+    /// room for one, so the pull failed with "File name too long" before a
+    /// byte was read.
+    #[tokio::test]
+    async fn a_pull_onto_a_long_name_succeeds() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("a".repeat(250));
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 1);
+
+        // The same onto a name that is already there, in characters of more
+        // than one byte, which a cut must not split.
+        let dest = work.path().join("\u{e9}".repeat(125));
+        std::fs::write(&dest, b"old").unwrap();
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
+    /// G8: the part-written file's name never passes the limit, whatever the
+    /// destination is called, and a short name is kept whole.
+    #[test]
+    fn a_pull_temp_name_fits_the_name_limit() {
+        assert_eq!(pull_temp_name("f", 7, 3), ".f.vmlab-pull.7.3");
+        for name in [
+            "a".repeat(255),
+            "\u{e9}".repeat(127),
+            "\u{1f600}".repeat(63),
+        ] {
+            let temp = pull_temp_name(&name, u32::MAX, u64::MAX);
+            assert!(temp.len() <= NAME_MAX, "{}", temp.len());
+            assert!(temp.ends_with(&format!(".vmlab-pull.{}.{}", u32::MAX, u64::MAX)));
+        }
+    }
+
+    /// G9: writing a file takes the right to write the file, not the right to
+    /// create and rename beside it. A destination the user may write, in a
+    /// directory they may not, is pulled onto in place — and still only once
+    /// the transfer has verified, so a failed pull leaves it as it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_a_writable_file_in_a_read_only_directory_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Puts the directory's mode back, so the tempdir can be removed
+        /// whichever way the test ends.
+        struct Writable(PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let ro = work.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let dest = ro.join("f");
+        std::fs::write(&dest, b"keep me").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Writable(ro.clone());
+        if std::fs::File::create(ro.join("probe")).is_ok() {
+            // Root, or a filesystem without modes: the directory refuses
+            // nothing here, so there is no fault to show.
+            return;
+        }
+
+        // A failed pull still costs the destination nothing.
+        let err = agent.pull_file("/guest/typo", &dest).await.unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("pull /guest/typo"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(&ro).unwrap().count(), 1);
+    }
+
+    /// G9: a rename gives the destination a new inode, so another name of the
+    /// old file would keep the old bytes. A destination with a second hard
+    /// link is written in place, and both names read the pulled bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_a_hard_linked_file_writes_through_both_names() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("one");
+        let other = work.path().join("two");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::hard_link(&dest, &other).unwrap();
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert!(std::fs::read(&other).unwrap() == std::fs::read(&dest).unwrap());
         assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
     }
 

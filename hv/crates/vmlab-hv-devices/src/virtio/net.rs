@@ -739,10 +739,7 @@ fn read_guest_frame(
                 iov_len: slice.len(),
             })
             .collect();
-        for slice in &payload {
-            slice.bitmap().mark_dirty(0, slice.len());
-        }
-        loop {
+        let read = loop {
             // SAFETY: validated writable mappings and their guards remain live
             // until readv completes. No Rust reference aliases the guest bytes.
             let read =
@@ -755,7 +752,12 @@ fn read_guest_frame(
                 io::ErrorKind::WouldBlock => break Ok(0),
                 _ => break Err(()),
             }
+        };
+        // After the write: a region that discards writes acts on this.
+        for slice in &payload {
+            slice.bitmap().mark_dirty(0, slice.len());
         }
+        read
     };
     let Ok(count) = count else {
         q.set_next_avail(start);
@@ -1477,7 +1479,7 @@ fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool,
 struct TxPacket<'a> {
     head: u16,
     prefix: Option<[u8; 4]>,
-    slices: Vec<VolatileSlice<'a>>,
+    slices: Vec<crate::GuestSlice<'a>>,
     owned: Option<Vec<u8>>,
 }
 
