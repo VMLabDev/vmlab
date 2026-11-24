@@ -143,6 +143,9 @@ impl BusDevice for SmiFwCfg {
             (0, 2) => self.select(u16::from_le_bytes(data.try_into().unwrap())),
             (1, 1) if self.negotiation.selector == self.requested_key => self.dynamic_write(data),
             (4, 4) => self.negotiation.dma_high = u32::from_be_bytes(data.try_into().unwrap()),
+            // A trigger uses up the high half, as it does in the inner
+            // device, so a later low half alone addresses `0:low` in both.
+            (4, 8) | (8, 4) => self.negotiation.dma_high = 0,
             _ => {}
         }
         if let Some((address, header)) = header {
