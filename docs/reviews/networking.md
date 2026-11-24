@@ -40,7 +40,7 @@ Who the attacker is, per finding:
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again (fixed in card #529) |
 | F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC (fixed in card #816) |
-| F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused |
+| F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused (fixed in card #817) |
 | F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
@@ -624,6 +624,10 @@ Who the attacker is, per finding:
   ports and verifies the DHCP OFFER on the trunk socket.
 
 ### F14. A global subnet index is never reused (wrong result)
+
+Fixed in card #817. Automatic allocation uses the first /24 that does not
+overlap a live global segment. Last detach releases the subnet, and a new
+segment's declared subnet is checked against live allocations.
 
 - Where: `src/supervisor/global.rs:519-532` (`alloc_subnet`).
 - Why it is a fault: `next_index` only counts up. Destroying a segment gives
