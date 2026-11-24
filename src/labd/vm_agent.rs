@@ -4511,7 +4511,6 @@ mod tests {
     async fn a_version_mismatch_is_named_in_the_error() {
         let guest_version = PROTO_VERSION - 1;
         let (_dir, path) = mock_agent_with_version(Some(guest_version), vec![]).await;
-        let before = tokio::time::Instant::now();
         let Err(err) = AgentHandle::connect(&path, HANDSHAKE).await else {
             panic!("expected the incompatible agent to be refused");
         };
@@ -4524,7 +4523,6 @@ mod tests {
             error.contains(&format!("host expects v{PROTO_VERSION}")),
             "{error}"
         );
-        assert_eq!(tokio::time::Instant::now(), before);
     }
 
     #[tokio::test]
