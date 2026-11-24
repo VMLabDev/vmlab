@@ -29,7 +29,7 @@ Who the attacker is, per finding:
 |------|----------|-------------------|
 | F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466 (`4ed366d0`)) |
 | F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467 (`ca2b836b`)) |
-| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476 (`43a88d97`)) |
+| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476 (`c489eb61`)) |
 | F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477 (`30faebe6`)) |
 | F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460 (`c2b9e202`)) |
 | F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache (fixed in card #485 (`11152330`)) |
@@ -166,7 +166,7 @@ Who the attacker is, per finding:
   limit). The same shape with SYNs (`tcp_flows`), and with a counting
   `Pinger` stub and 5 000 echo destinations (assert a limit on concurrent
   `ping` calls).
-- Fixed in card #476 (`43a88d97`). Each table has a limit per guest address and a limit
+- Fixed in card #476 (`c489eb61`). Each table has a limit per guest address and a limit
   per engine, so one guest cannot take every slot of its segment. Guest-opened
   TCP flows: 128 per guest and 256 in all (`MAX_TCP_FLOWS` in
   `src/net/nat/mod.rs`). A SYN past the limit is dropped, and the guest's
