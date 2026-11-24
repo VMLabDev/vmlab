@@ -63,8 +63,8 @@ Answer `y`. Then `getcap ~/.local/bin/vmlab-fastpath` shows the capabilities
 on busybox, and `sha256sum` of the file differs from the helper's line in
 `SHA256SUMS`. The expected result is a refusal.
 
-Fixed in card #607. `fastpath_caps` no longer grants a path in the bin
-directory. It opens the helper as the user and gives the stream to one
+Fixed in card #607 (`0a0ad460`). `fastpath_caps` no longer grants a path in
+the bin directory. It opens the helper as the user and gives the stream to one
 `sudo sh -c` script (`FASTPATH_GRANT`), which copies it into a mode 0700
 staging directory of root's inside the bin directory, checks the SHA-256 of
 that copy against the line of the signed `SHA256SUMS`, runs `setcap` on the
@@ -102,8 +102,8 @@ starts `~first/.local/bin/vmlab-fastpath` with one end as stdin, and sends
 `XdpLoad` then `XdpTap`. Expected: a refusal. Observed (by reading): a tap
 `vmfp0` appears in `ip link`, up, with the XDP program attached.
 
-Fixed by card #608, in two halves. `install.sh` installs the helper mode
-0700, so no other account can execute it
+Fixed by card #608 (`737402aa`, `c472b10a`, `6cfaf6c9`), in two halves.
+`install.sh` installs the helper mode 0700, so no other account can execute it
 (`scripts/test_release_assets.py`: `test_helper_is_executable_by_its_owner_only`,
 `test_helper_keeps_owner_only_mode_through_the_grant`). The helper itself
 refuses a start that gained privilege from its file (`AT_SECURE`) when the
@@ -142,8 +142,8 @@ Expected: the build is unaffected. Observed (by reading): it fails with
 `tampered`, which shows the edit reached the release build; an edit that
 compiles would pass silently.
 
-Fixed in card #634. `build/run.sh` takes the prefix of its named volumes from
-`VMLAB_BUILD_VOLUMES` (default `vmlab-build`, so other builds are as before).
+Fixed in card #634 (`c506aef4`). `build/run.sh` takes the prefix of its named
+volumes from `VMLAB_BUILD_VOLUMES` (default `vmlab-build`, so other builds are as before).
 `scripts/release-local.sh` sets it to `vmlab-release-<16 random hex digits>`
 for every container of the release (the display driver build and
 `build/dist.sh`), refuses to start when a volume of that name exists, and
@@ -178,8 +178,8 @@ tarball and regenerate its `.sha256`. Follow the manual's commands against
 that server: `sha256sum -c` prints `OK`. Verifying against the signed
 `SHA256SUMS` instead reports a mismatch.
 
-Fixed in card #635. `install.sh` has a new option, `--fetch <asset>`: it
-installs nothing, authenticates `SHA256SUMS` with the same cosign check as an
+Fixed in card #635 (`d17aa5b1`). `install.sh` has a new option, `--fetch
+<asset>`: it installs nothing, authenticates `SHA256SUMS` with the same cosign check as an
 install, downloads the named asset, checks it against its line in
 `SHA256SUMS`, and only then moves it into the current directory. It takes one
 plain file name, and refuses an asset that `SHA256SUMS` does not name, which
@@ -221,8 +221,8 @@ helper is removed or reported. Observed: `getcap ~/.local/bin/vmlab-fastpath`
 still lists the capabilities, `vmlab --version` is B, and `vmlab fastpath`
 selects a kernel tier through A's helper.
 
-Fixed in card #636. `install.sh` downloads and verifies the helper before it
-replaces `vmlab`, so a helper that fails its checksum ends the install with
+Fixed in card #636 (`b449e0b3`). `install.sh` downloads and verifies the
+helper before it replaces `vmlab`, so a helper that fails its checksum ends the install with
 the earlier `vmlab` and the earlier helper both in place, one release. When
 the helper download fails, the installer removes the `vmlab-fastpath` of the
 earlier install before it moves the new `vmlab` in, and its warning names the
@@ -261,8 +261,8 @@ nearly full filesystem), and run the installer. Expected: the old `vmlab`
 is intact. Observed: a 0600 partial file. A `vmlab` started during the copy
 also sees a partial file.
 
-Fixed in card #799. The installer copies and sets permissions on both verified
-executables in a private directory under the bin directory before replacing
+Fixed in card #799 (`caf569c1`). The installer copies and sets permissions on
+both verified executables in a private directory under the bin directory before replacing
 either one by rename. The regression test limits file writes after downloads
 and checks that a failed copy of either executable preserves both installed
 files and their modes.
@@ -282,8 +282,8 @@ Test: in a clean checkout create `.cargo/config.toml` with
 a refusal of the untracked file. Observed: the build proceeds and the
 provenance names `HEAD`.
 
-Fixed in card #800. `scripts/release-local.sh` refuses, before any container
-runs, a checkout with an untracked file, and names the files. Only the
+Fixed in card #800 (`219e052e`, `1bedaf1c`). `scripts/release-local.sh`
+refuses, before any container runs, a checkout with an untracked file, and names the files. Only the
 tracked `.gitignore` files count as excludes: they are part of `HEAD`.
 `.git/info/exclude` and the user's `core.excludesFile` do not hide a file
 from the check. An untracked `.gitignore` could: one that ignores itself
@@ -322,7 +322,7 @@ it prints the command with the bundle. For the second way, run
 `release-assets.py prepare` again after signing and then `release::verify`:
 it passes, and `cosign verify-blob --key build/release-signing.pub` fails.
 
-Fixed in card #797. `scripts/release-publish.sh` verifies a
+Fixed in card #797 (`4cdadf29`). `scripts/release-publish.sh` verifies a
 `SHA256SUMS.key.bundle` before it prints or runs the upload command, with
 `cosign verify-blob --key build/release-signing.pub` against the `SHA256SUMS`
 beside it, the way `install.sh` does. It reads only the committed public
@@ -348,8 +348,8 @@ and run `build/dist.sh 9.9.9`. Expected: a failure. Observed: cargo
 resolves the crate again and the build passes. `cargo build --locked` on
 the same tree fails.
 
-Fixed in card #798. `build/dist.sh` stamps the version into the `vmlab` entry
-of `Cargo.lock` as well as into `Cargo.toml`, and always builds with
+Fixed in card #798 (`c5febc85`). `build/dist.sh` stamps the version into the
+`vmlab` entry of `Cargo.lock` as well as into `Cargo.toml`, and always builds with
 `--locked`. Both files are put back afterwards, as before. The proof test is
 `build/test_dist.py`, which runs `dist.sh` on a scratch crate with real
 cargo: a lock that misses a package fails the stamped build, and a matching
@@ -367,8 +367,8 @@ symlinked guest directory, which `install.sh:409-412` refuses.
 Test: create `~/.local/share/vmlab/guest/agent/old-target/vmlab-agent` and
 run `just guest-install`. Expected: the file is gone. Observed: it stays.
 
-Fixed in card #801. The recipe stages the new files beside the destination,
-replaces the old directory as a whole, and refuses symlink destinations.
+Fixed in card #801 (`976928e6`). The recipe stages the new files beside the
+destination, replaces the old directory as a whole, and refuses symlink destinations.
 `just ci::guest-install-test` covers stale assets and symlink refusal.
 
 ### F11. The manual describes the guest bundle check and its builder wrongly (cosmetic)
@@ -383,6 +383,9 @@ manual check uses the unsigned sidecar (see F4).
 
 Test: compare the two lines with `install.sh:423-446` and
 `scripts/release-local.sh:2-4`.
+
+Fixed in card #868 (`f4706593`). The manual names helios as the build host
+and the signed `SHA256SUMS` manifest as the source of the bundle checksum.
 
 ## Notes
 
