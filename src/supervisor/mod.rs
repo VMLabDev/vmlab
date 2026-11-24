@@ -160,15 +160,13 @@ async fn run_async() -> Result<()> {
 
     // Reap abandoned build labs before listening, so a new build cannot
     // start in the runtime directory being reaped.
-    let swept = sweep_leftover_builds(
+    sweep_startup_workdirs(
         &crate::template::build::builds_dir(),
+        &crate::paths::template_store_dir(),
         &runtime_dir,
         &registry,
         crate::qemu::process::kill_build_orphans,
     );
-    if swept != 0 {
-        tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
-    }
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(registry),
         events: events_tx.clone(),
@@ -233,6 +231,19 @@ async fn run_async() -> Result<()> {
     teardown(&supervisor, &tasks).await;
     drop(server);
     Ok(())
+}
+
+fn sweep_startup_workdirs(
+    builds: &Path,
+    _store: &Path,
+    runtime: &Path,
+    registry: &Registry,
+    kill: impl Fn(&str, &Path) -> bool,
+) {
+    let swept = sweep_leftover_builds(builds, runtime, registry, kill);
+    if swept != 0 {
+        tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
+    }
 }
 
 fn sweep_leftover_builds(
@@ -1114,6 +1125,36 @@ impl Handler<SupRequest> for SupervisorHandler {
 #[cfg(test)]
 mod tests {
     use super::{daemon_running, process_running, process_start_time};
+
+    #[test]
+    fn a_leftover_pull_work_dir_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("templates");
+        let pull_work = store.join(".oci-pull");
+        let live = crate::template::oci_bridge::fresh_work_dir(&pull_work).unwrap();
+        let staging = store.join(".staging-deadbeef");
+        let abandoned_pull = pull_work.join("op-dead");
+        for file in [
+            staging.join("disk.qcow2"),
+            abandoned_pull.join("chunks/base/chunk-0000.zst"),
+            live.path().join("chunks/base/chunk-0000.zst"),
+        ] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"partial").unwrap();
+        }
+
+        super::sweep_startup_workdirs(
+            &dir.path().join("builds"),
+            &store,
+            dir.path(),
+            &super::Registry::default(),
+            |_, _| unreachable!(),
+        );
+
+        assert!(!staging.exists(), "abandoned template staging survived");
+        assert!(!abandoned_pull.exists(), "abandoned pull survived");
+        assert!(live.path().join("chunks/base/chunk-0000.zst").is_file());
+    }
 
     #[test]
     fn a_start_reaps_the_processes_of_a_leftover_build() {
