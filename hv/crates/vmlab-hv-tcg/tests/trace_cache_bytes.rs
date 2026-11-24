@@ -45,7 +45,7 @@ unsafe impl GlobalAlloc for Counting {
 static ALLOCATOR: Counting = Counting;
 
 const BASE: u64 = 0x8000_0000;
-const INSTRUCTIONS: u64 = 6400;
+const INSTRUCTIONS: u64 = 3200;
 const MIB: usize = 1 << 20;
 
 /// `jal x0, offset`.
@@ -81,11 +81,12 @@ fn straight_run() -> Riscv64<FlatMemory> {
 
 #[test]
 fn the_trace_cache_stays_within_a_byte_budget() {
-    // Twice the cache's own limit. The limit bounds what the cache counts,
-    // the count is an estimate, and a trace is recorded before an older one
-    // is evicted for it.
-    let budget = 2 * TRACE_CACHE_BYTES;
-    assert!(budget <= 64 * MIB, "the budget of one hart is {budget} bytes");
+    // One and a half times the cache's own limit. The limit bounds what the
+    // cache counts, the count is an estimate, and a trace is recorded before
+    // an older one is evicted for it. Without a limit in bytes this run holds
+    // about 71 MiB, and twice that for twice the steps.
+    let budget = TRACE_CACHE_BYTES + TRACE_CACHE_BYTES / 2;
+    assert!(budget <= 48 * MIB, "the budget of one hart is {budget} bytes");
 
     let mut cpu = straight_run();
     // One step outside the measurement: the first step builds what every
@@ -104,7 +105,7 @@ fn the_trace_cache_stays_within_a_byte_budget() {
     }
     let stats = &cpu.specialization_stats;
     assert!(
-        stats.recordings >= 100,
+        stats.recordings >= 90,
         "the run recorded {} traces, too few to fill a cache",
         stats.recordings
     );
