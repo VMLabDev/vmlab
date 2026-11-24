@@ -27,26 +27,26 @@ Who the attacker is, per finding:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466) |
-| F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467) |
-| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476) |
-| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477) |
-| F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460) |
-| F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache (fixed in card #485) |
-| F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet (fixed in card #485) |
-| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501) |
-| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards (fixed in card #502) |
-| F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
-| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
-| F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again (fixed in card #529) |
-| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC (fixed in card #816) |
-| F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused (fixed in card #817) |
-| F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
-| F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
-| F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY (fixed in card #818) |
-| F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
-| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length (fixed in card #819) |
-| F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended |
+| F1 | security (peer) | A trunk peer's segment name becomes a socket path: it can delete and replace any `*.sock` file of the supervisor's user (fixed in card #466 (`4ed366d0`)) |
+| F2 | security (guest, local user) | A tap from `vmlab-fastpath` outlives its XDP filter after `unload`, a helper exit or a daemon crash (fixed in card #467 (`ca2b836b`)) |
+| F3 | security (guest) | NAT has no limit on TCP flows, UDP flows or `ping` subprocesses (fixed in card #476 (`43a88d97`)) |
+| F4 | security (guest) | One stalled NAT TCP flow blocks the gateway task of the whole segment (fixed in card #477 (`30faebe6`)) |
+| F5 | security (guest) | Outside worktree isolation a guest on a NAT segment reaches the host's loopback services (fixed in card #460 (`c2b9e202`)) |
+| F6 | security (guest) | Tables learned from guest frames have no size limit: switch MACs, gateway neighbours, NAT MACs, DHCP declines, ping cache (fixed in card #485 (`11152330`)) |
+| F7 | security (guest) | The redirect connection table has no limit and is scanned in full for every gateway-bound packet (fixed in card #485 (`11152330`)) |
+| F8 | security (guest) | DHCP trusts `chaddr`: any guest can starve the pool, quarantine it for the daemon's life, and drop another machine's lease (fixed in card #501 (`06e6a2fa`)) |
+| F9 | security (guest) | Nothing binds a port to its MAC or IP: a guest, isolated or not, takes over the gateway's or another guest's traffic and its port forwards (fixed in cards #502 (`791a4f9d`) and #614 (`aa2f580b`)) |
+| F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478 (`5bcd146e`)) |
+| F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479 (`626560dc`)) |
+| F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again (fixed in card #529 (`8fc4f80f`)) |
+| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC (fixed in card #816 (`6d27b8f2`, `d1ba04e3`)) |
+| F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused (fixed in card #817 (`293a28c3`)) |
+| F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528 (`b8f2c3a9`)) |
+| F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527 (`ec5242fb`)) |
+| F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY (fixed in card #818 (`25aa695a`)) |
+| F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520 (`7d0ad475`)) |
+| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length (fixed in card #819 (`76866e4a`)) |
+| F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended (fixed in card #820 (`63af5d3c`)) |
 
 ### F1. A trunk segment name is a filesystem path (security, peer)
 
@@ -75,7 +75,7 @@ Who the attacker is, per finding:
   "../victim", "k")`. Read the 3-byte answer. Assert that the answer is not
   `OK\n` and that `<tempdir>/victim.sock` is still a regular file. Today the
   answer is `OK\n` and the file is a socket.
-- Fixed in card #466: `check_segment_name` in `src/supervisor/global.rs`
+- Fixed in card #466 (`4ed366d0`): `check_segment_name` in `src/supervisor/global.rs`
   refuses a name that is not one file name (empty, over 128 bytes, `.`, `..`,
   or holding `/` or a control character). The trunk listener answers `NO\n`
   to such a name, and `attach` refuses it for every caller. The proof test
@@ -124,7 +124,7 @@ Who the attacker is, per finding:
   descriptor. Assert that no neighbour advertisement can be read back within
   one second. Today the host answers. Repeat with the helper process killed
   instead of `unload`.
-- Fixed in card #467. The assumption held: aya attaches through a `bpf_link`,
+- Fixed in card #467 (`ca2b836b`). The assumption held: aya attaches through a `bpf_link`,
   which ends when the helper drops the engine or exits. `XdpEngine::attach`
   (`src/net/fastpath/engine.rs`) now sets the program on the tap through
   rtnetlink (`RTM_SETLINK`, `IFLA_XDP`, generic mode). The device then holds
@@ -166,7 +166,7 @@ Who the attacker is, per finding:
   limit). The same shape with SYNs (`tcp_flows`), and with a counting
   `Pinger` stub and 5 000 echo destinations (assert a limit on concurrent
   `ping` calls).
-- Fixed in card #476. Each table has a limit per guest address and a limit
+- Fixed in card #476 (`43a88d97`). Each table has a limit per guest address and a limit
   per engine, so one guest cannot take every slot of its segment. Guest-opened
   TCP flows: 128 per guest and 256 in all (`MAX_TCP_FLOWS` in
   `src/net/nat/mod.rs`). A SYN past the limit is dropped, and the guest's
@@ -216,7 +216,7 @@ Who the attacker is, per finding:
   after the host socket buffer plus 64 segments. A second form at the
   gateway: with the flow stalled, send an ARP request for the gateway and
   assert a reply within a second.
-- Fixed in card #477. `handle_tcp` hands a segment to its flow with
+- Fixed in card #477 (`30faebe6`). `handle_tcp` hands a segment to its flow with
   `try_send` and never waits: a segment that finds the flow's channel full
   is dropped, and the guest sends it again. The flow task no longer waits
   for the host's socket outside its `select!`. Guest data waits in a buffer
@@ -262,7 +262,7 @@ Who the attacker is, per finding:
   set, send a guest SYN for that address and port. Assert the guest gets a
   RST and the listener accepts nothing. Today the guest gets a SYN-ACK and
   the listener accepts.
-- Fixed in card #460. Every NAT engine refuses a new flow to `127.0.0.0/8`
+- Fixed in card #460 (`c2b9e202`). Every NAT engine refuses a new flow to `127.0.0.0/8`
   and `0.0.0.0/8`: a SYN gets a RST, UDP and ICMP are dropped. An engine with
   no guard refuses all of it (`NatEngine::refused`, `guard::is_loopback`). A
   segment outside isolation gets `HostGuard::loopback`, which admits two
@@ -296,7 +296,7 @@ Who the attacker is, per finding:
   `inner.macs.len()` is at most a stated limit. Today it is 100 000. The same
   shape for the gateway (100 000 ARP requests, `neighbours.table.len()`), for
   `NatEngine::macs`, and for `DhcpServer::declined` (see F8).
-- Fixed in card #485. Each of the five tables has a limit, and a new entry
+- Fixed in card #485 (`11152330`). Each of the five tables has a limit, and a new entry
   past it replaces the oldest one. The switch remembers 256 source MACs per
   guest port and 4 096 per service port, which a trunk is
   (`MAX_MACS_PER_GUEST_PORT` and `MAX_MACS_PER_SERVICE_PORT` in
@@ -353,7 +353,7 @@ Who the attacker is, per finding:
   that 1 000 further `eval` calls of a packet that matches no rule finish
   within a fixed time. Today `conn_count()` is 200 000 and each call scans
   all of them.
-- Fixed in card #485. The table holds 4 096 entries, and one guest address
+- Fixed in card #485 (`11152330`). The table holds 4 096 entries, and one guest address
   1 024 of them (`MAX_CONNS` and `MAX_CONNS_PER_GUEST` in
   `src/net/rules.rs`). A new connection of a guest at its limit replaces
   that guest's entry idle the longest, and in a full table the entry idle
@@ -401,7 +401,7 @@ Who the attacker is, per finding:
   source MAC in the `handle` call, so it is a gateway test in
   `src/net/gateway.rs`: lease as MAC A, send a RELEASE with `chaddr` A in a
   frame whose ethernet source is B, assert `dhcp_leases()` still holds A.
-- Fixed in card #501, in `src/net/dhcp.rs`. `handle` ignores a message whose
+- Fixed in card #501 (`06e6a2fa`), in `src/net/dhcp.rs`. `handle` ignores a message whose
   `chaddr` is not the ethernet source of its frame, so a guest speaks for its
   own NIC only (the segments have no relay agent). A DECLINE quarantines only
   the address its client holds: one with no lease, or one that names another
@@ -454,7 +454,7 @@ Who the attacker is, per finding:
   `handle_frame` with a frame from `attacker_mac` with source `victim_ip`,
   then `open_tcp_to_guest(victim_ip, 22)`. Assert the SYN's destination MAC
   is `victim_mac`. Today it is `attacker_mac`.
-- Fixed in card #502, in three places, each with the knowledge vmlab already
+- Fixed in card #502 (`791a4f9d`), in three places, each with the knowledge vmlab already
   had.
   1. The switch drops a guest port's frame whose source MAC a service port
      holds, and leaves the MAC where it is. `Gateway::spawn` binds the
@@ -480,6 +480,8 @@ Who the attacker is, per finding:
   failover address do. The lease check is only as strong as the lease, which
   the fix of F8 in card #501 now ties to the ethernet source of the DHCP
   message.
+- Card #614 (`aa2f580b`) also makes port forwards and NAT bindings use
+  the DHCP lease when a guest reports a different address.
 
 ### F10. IP fragments evade port rules on routed traffic (security, guest)
 
@@ -505,7 +507,7 @@ Who the attacker is, per finding:
   }`. Build a UDP datagram to `10.0.1.5:53` of 2 000 bytes and split it into
   two fragments (the first with the more-fragments flag). Assert `eval` of
   each fragment is `Verdict::Drop`. Today both are `Verdict::Pass`.
-- Fixed in card #478. `Meta::of` reads no port from a fragment, and
+- Fixed in card #478 (`5bcd146e`). `Meta::of` reads no port from a fragment, and
   `RuleSet::eval` drops a TCP or UDP fragment, with no reply, when a rule
   with a port covers its destination address and protocol
   (`port_rule_covers` in `src/net/rules.rs`). The rule set keeps no
@@ -539,7 +541,7 @@ Who the attacker is, per finding:
   (`getrusage`). Assert it is under 100 ms and that a connection made after
   the first batch timed out still gets the `VMLABTRUNK2` greeting. Today the
   accept loop uses the whole second.
-- Fixed in card #479. `bind_peer_listener` counts the connections that have
+- Fixed in card #479 (`626560dc`). `bind_peer_listener` counts the connections that have
   not finished the handshake in `PreAuth` (`src/supervisor/global.rs`): at
   most 32 in total and 8 from one address. A connection past a limit is
   closed at once, with no task and no greeting, and a slot comes back when
@@ -584,7 +586,7 @@ Who the attacker is, per finding:
   again with the same `peer`, then write a broadcast frame on A's trunk
   socket and read it on B's. Today the read times out, and
   `wait_connected(&a.globals, "wan", true)` never returns.
-- Fixed in card #529. The dialer runs both directions of the bridge in
+- Fixed in card #529 (`8fc4f80f`). The dialer runs both directions of the bridge in
   its own task. Aborting the dialer closes the TCP stream and removes its
   switch port. The regression test checks port removal and frame delivery
   after the segment reattaches.
@@ -618,14 +620,14 @@ Who the attacker is, per finding:
   b.globals.list()[0]["subnet"]`. Today A has `10.214.0.0/24` and B has
   `10.214.1.0/24`. Second assertion: a DHCP DISCOVER written on A's trunk
   socket gets exactly one OFFER. Today it gets two.
-- Fixed in card #816. The dialer's subnet is part of the authenticated trunk
+- Fixed in card #816 (`6d27b8f2`, `d1ba04e3`). The dialer's subnet is part of the authenticated trunk
   handshake. The accepting supervisor bridges to the dialer's gateway,
   DHCP and DNS. The proof checks both subnet listings, counts the service
   ports and verifies the DHCP OFFER on the trunk socket.
 
 ### F14. A global subnet index is never reused (wrong result)
 
-Fixed in card #817. Automatic allocation uses the first /24 that does not
+Fixed in card #817 (`293a28c3`). Automatic allocation uses the first /24 that does not
 overlap a live global segment. Last detach releases the subnet, and a new
 segment's declared subnet is checked against live allocations.
 
@@ -649,7 +651,7 @@ segment's declared subnet is checked against live allocations.
 
 ### F15. A failed global attach leaves state behind (wrong result)
 
-- Fixed in card #528. Attach validates the PSK before changing segment
+- Fixed in card #528 (`b8f2c3a9`). Attach validates the PSK before changing segment
   membership and binds the socket before committing a subnet allocation or
   starting the gateway and DNS sync tasks.
 - Where: `src/supervisor/global.rs:550-566` (existing segment: `refcount +=
@@ -676,7 +678,7 @@ segment's declared subnet is checked against live allocations.
 
 ### F16. Every machine start leaves a NIC listener behind (wrong result)
 
-Fixed in card #527. A replacement closes the old listener before binding the
+Fixed in card #527 (`ec5242fb`). A replacement closes the old listener before binding the
 same path, and a failed NIC attachment rolls back the listeners already
 created for that start.
 
@@ -721,7 +723,7 @@ created for that start.
   zone with an upstream and `add_sinkhole("*.blocked.test", Nxdomain)`. Send
   a query of type 65 for `a.blocked.test`. Assert the action is a `Reply`
   with rcode NXDOMAIN. Today it is `ForwardUpstream`.
-- Fixed in card #818. `DnsServer::handle` applies the zone's answer to every
+- Fixed in card #818 (`25aa695a`). `DnsServer::handle` applies the zone's answer to every
   query type. A name under an NXDOMAIN sinkhole gets NXDOMAIN. A name under
   a 0.0.0.0 sinkhole, and a name the zone holds a record for, get an empty
   NOERROR for every type but A and ANY, because the zone has an address for
@@ -754,7 +756,7 @@ created for that start.
   `src/net/nat/tests.rs`: send a guest SYN to `gw_ip:22` with no flow.
   Assert a RST arrives on the output channel within 100 ms. Today nothing
   arrives until the host connect fails or times out.
-- Fixed in card #520. `NatEngine::handle_tcp` opens no flow for a SYN whose
+- Fixed in card #520 (`7d0ad475`). `NatEngine::handle_tcp` opens no flow for a SYN whose
   destination is the gateway's own address: it answers with a RST in the
   same call, and no host socket is made. TCP that the gateway does serve is
   not affected: the replies of a port forward belong to a flow the engine
@@ -780,7 +782,7 @@ created for that start.
   a config with 40 /32 routes, one DISCOVER. Parse the reply's options and
   assert the walk ends exactly at option 255 and finds option 53. Today a
   debug build panics, and a release build fails the walk.
-- Fixed in card #819. `opt` in `src/net/dhcp.rs` never writes a length
+- Fixed in card #819 (`76866e4a`). `opt` in `src/net/dhcp.rs` never writes a length
   that differs from the value after it: a value longer than 255 bytes goes
   out as several options of the same code, which a client joins in order
   (RFC 3396). Option 121 is split on route boundaries by
@@ -810,6 +812,10 @@ created for that start.
   gateway as the test at `:825` does, lease an address to a named MAC, wait
   for the name to resolve, send a RELEASE, wait two sync periods. Assert the
   name no longer resolves to that address. Today it still does.
+- Fixed in card #820 (`63af5d3c`). Each sync replaces the lease-derived DNS
+  records with those for the current leases. The lab's configured records
+  remain available when a lease ends. The proof test checks both DNS names
+  using a paused clock.
 
 ## Notes
 
