@@ -530,6 +530,10 @@ Not read:
 
 ### F16. A protocol version mismatch is reported as "no agent answered"
 
+- Fixed in card #814. A matching-token hello with an incompatible version
+  ends the handshake with both protocol versions in the error. Container
+  startup checks cinit's boot protocol before sending the spec and refuses
+  an incompatible version.
 - Where: `src/labd/vm_agent.rs:2411-2417` and `392-400`. The same shape for
   cinit at `src/labd/container_ctl.rs:89-96`.
 - Fault: a `hello` with another `proto_version` is logged and dropped. The
@@ -560,6 +564,10 @@ Not read:
 - Test: in `src/labd/legacy_agent_tests.rs`, send `open_exec` with
   `id: 0` and assert an error reply. On a 32-bit build, send
   `id: 3000000000` and assert that the `opened` names that id.
+- Fixed in card #815. Exec opens with a missing or zero ID return an error
+  before creating a session. Reply serialization preserves unsigned channel
+  IDs. The regression tests exercise the control channel on the POSIX build
+  and large IDs in `opened` and `error` on the 32-bit Windows build.
 
 ## Notes
 

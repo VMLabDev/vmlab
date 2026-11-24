@@ -910,9 +910,9 @@ impl ContainerInstance {
             )
             .await?;
             *self.ctl.lock().await = Some(ctl.clone());
-            // cinit blocks its boot on the spec. Send one now (the guest
-            // port is usually already open); the ctl watcher re-answers
-            // every `boot` announcement in case this one raced the guest.
+            // cinit blocks its boot on the spec. Check its protocol before
+            // sending one. The ctl watcher re-answers later announcements.
+            ctl.wait_boot(super::machine::DEFAULT_READY_TIMEOUT).await?;
             self.send_spec(&ctl).await?;
 
             Ok::<_, anyhow::Error>((proc, ctl))
