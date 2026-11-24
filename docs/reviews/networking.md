@@ -46,7 +46,7 @@ Who the attacker is, per finding:
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY (fixed in card #818) |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
 | F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length (fixed in card #819) |
-| F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended (fixed in card #820) |
+| F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended |
 
 ### F1. A trunk segment name is a filesystem path (security, peer)
 
@@ -810,9 +810,6 @@ created for that start.
   gateway as the test at `:825` does, lease an address to a named MAC, wait
   for the name to resolve, send a RELEASE, wait two sync periods. Assert the
   name no longer resolves to that address. Today it still does.
-- Fixed in card #820. Each sync replaces the lease-derived DNS records with
-  those for the current leases. The lab's configured records remain available
-  when a lease ends. The proof test checks both DNS names using a paused clock.
 
 ## Notes
 
