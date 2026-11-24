@@ -1169,7 +1169,11 @@ impl State {
         response[..4].copy_from_slice(&kind.to_le_bytes());
         if request[4] & 1 != 0 {
             response[4..24].copy_from_slice(&request[4..24]);
-            if let Some(renderer) = &self.renderer {
+            // After device loss, complete the request with its fence header
+            // and the command's result without asking the failed renderer.
+            if self.lost.is_none()
+                && let Some(renderer) = &self.renderer
+            {
                 let flags = u32::from_le_bytes(request[4..8].try_into().unwrap());
                 let id = u64::from_le_bytes(request[8..16].try_into().unwrap());
                 let ctx = u32::from_le_bytes(request[16..20].try_into().unwrap());

@@ -469,9 +469,12 @@ const USED: u64 = 0x3000;
 
 impl QueueFixture {
     fn new(features: u64) -> Self {
+        Self::with_gpu(Gpu::new("gpu"), features)
+    }
+
+    fn with_gpu(mut gpu: Gpu, features: u64) -> Self {
         let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         let interrupt = Arc::new(Notifies::default());
-        let mut gpu = Gpu::new("gpu");
         gpu.ack_features(features);
         let queues = [(DESC, AVAIL, USED), (0x8000, 0x9000, 0xa000)]
             .into_iter()
@@ -881,6 +884,57 @@ fn a_lost_host_gpu_refuses_work_but_serves_the_display_and_releases() {
     assert!(s.resources.is_empty());
     // The cursor queue has no host GPU to wait for.
     assert!(s.command(&mem, 1, &command(0x301, &[0; 8])).is_ok());
+}
+
+#[test]
+#[cfg_attr(
+    vmlab_ci_no_host_assets,
+    ignore = "requires an owner-selected DRM render node"
+)]
+fn a_fenced_release_after_a_loss_is_still_ok() {
+    let Some(node) = std::env::var_os("VMLAB_HV_TEST_RENDER_NODE") else {
+        eprintln!("SKIP: set VMLAB_HV_TEST_RENDER_NODE to exercise the host renderer");
+        return;
+    };
+    let gpu = Gpu::new("gpu");
+    gpu.enable_3d(
+        GpuMode::Virgl,
+        node.into(),
+        Arc::new(renderer::tests::TestMapper),
+    )
+    .unwrap();
+    let features = gpu.features();
+    let mut f = QueueFixture::with_gpu(gpu, features);
+    f.put(0, &command(0x101, &[1, 2, 1, 1]), 24);
+    f.notify();
+    assert_eq!(f.used_entry(0), (0, 24));
+    assert_eq!(f.response(0, 4), NODATA.to_le_bytes());
+
+    f.gpu.lose_host_gpu("test");
+    for (slot, (mut request, expected)) in [
+        (command(0x102, &[1, 0]), NODATA),
+        (command(0x100, &[]), 0x1101),
+        (command(0x10a, &[0, 0]), 0x1104),
+        (command(0x101, &[2, 2, 1, 1]), UNSPEC),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let head = 2 * (slot as u16 + 1);
+        request[4..8].copy_from_slice(&1u32.to_le_bytes());
+        request[8..16].copy_from_slice(&u64::from(head).to_le_bytes());
+        f.put(head, &request, 2048);
+        f.notify();
+        assert_eq!(f.used(), head / 2 + 1);
+        let response = f.response(head, 24);
+        assert_eq!(
+            &response[..4],
+            &expected.to_le_bytes(),
+            "command {:?}",
+            &request[..4]
+        );
+        assert_eq!(&response[4..], &request[4..24]);
+    }
 }
 
 #[test]
