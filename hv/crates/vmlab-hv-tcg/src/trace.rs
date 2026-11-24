@@ -1765,17 +1765,17 @@ impl Trace {
         fn names(names: &BTreeSet<String>) -> usize {
             tree(names.len(), size_of::<String>()) + names.iter().map(|name| text(name)).sum::<usize>()
         }
-        fn value(value: &Value) -> usize {
+        fn value_bytes(value: &Value) -> usize {
             match value {
                 Value::Struct(fields) => {
                     tree(fields.len(), size_of::<String>() + size_of::<Value>())
                         + fields
                             .iter()
-                            .map(|(name, field)| text(name) + value(field))
+                            .map(|(name, field)| text(name) + value_bytes(field))
                             .sum::<usize>()
                 }
                 Value::Union(name, payload) => {
-                    text(name) + size_of::<Value>() + value(payload)
+                    text(name) + size_of::<Value>() + value_bytes(payload)
                 }
                 Value::Vector(values) => {
                     values.capacity() * size_of::<Value>()
@@ -1838,7 +1838,7 @@ impl Trace {
                             + fields.iter().map(|name| text(name)).sum::<usize>()
                     }
                     Shape::Union(name) => text(name),
-                    Shape::Other(other) => value(other),
+                    Shape::Other(other) => value_bytes(other),
                     Shape::Scalar(_) | Shape::Bits(_) | Shape::Vector(_) => 0,
                 }
         }
@@ -1881,7 +1881,7 @@ impl Trace {
         }
         let wide_inputs = self.wide_inputs.take();
         let wide = wide_inputs.capacity() * size_of::<Option<Value>>()
-            + wide_inputs.iter().flatten().map(value).sum::<usize>();
+            + wide_inputs.iter().flatten().map(value_bytes).sum::<usize>();
         self.wide_inputs.set(wide_inputs);
         let stamps = self.stamps.take();
         let scratch = self.scratch_len() * size_of::<u128>() + stamps.capacity() * size_of::<u64>();
@@ -1911,7 +1911,7 @@ impl Trace {
                 .map(|guard| text(&guard.name))
                 .sum::<usize>()
             + self.recorded.constants.capacity() * size_of::<Value>()
-            + self.recorded.constants.iter().map(value).sum::<usize>()
+            + self.recorded.constants.iter().map(value_bytes).sum::<usize>()
             + self.recorded.inputs.capacity() * size_of::<Input>()
             + self.recorded.inputs.iter().map(input).sum::<usize>()
             + self.recorded.stop_reason.as_deref().map_or(0, text)
