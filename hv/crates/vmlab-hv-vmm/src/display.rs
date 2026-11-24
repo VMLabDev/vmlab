@@ -507,14 +507,20 @@ fn pointer_message(pointer: &mut vmlab_hv_devices::usb::PointerEvent, message: M
     }
 }
 
-impl InputSink for Input {
-    fn input(&self, message: Message) {
-        let Some(shared) = self.shared.upgrade() else {
-            return;
-        };
+/// The guest devices display input reaches, read once for each message.
+struct InputDevices<'a> {
+    xhci: Option<Arc<Mutex<vmlab_hv_devices::usb::XhciController>>>,
+    /// pc's tablet sits on the PIIX3 UHCI instead.
+    uhci: Option<Arc<Mutex<vmlab_hv_devices::usb::UhciController>>>,
+    ps2: Option<Arc<Mutex<vmlab_hv_devices::chipset::ps2::I8042>>>,
+    exited: &'a dyn Fn() -> bool,
+}
+
+impl Input {
+    fn deliver(&self, message: Message, devices: &InputDevices) {
         match message {
             Message::Key { qcode, down } => {
-                if let Some(xhci) = shared.xhci.lock().as_ref() {
+                if let Some(xhci) = &devices.xhci {
                     let mut xhci = xhci.lock();
                     if xhci.has_keyboard() {
                         if let Err(e) = xhci.inject_key(&qcode, down) {
@@ -523,18 +529,10 @@ impl InputSink for Input {
                         return;
                     }
                 }
-                if let Some(chipset) = shared.chipset.lock().as_ref()
-                    && let Err(e) = chipset.ps2.lock().inject_key(&qcode, down)
+                if let Some(ps2) = &devices.ps2
+                    && let Err(e) = ps2.lock().inject_key(&qcode, down)
                 {
                     log::warn!("display key: {e}");
-                }
-            }
-            Message::RequestSize { width, height } => {
-                if let Some(device) = shared.virtual_display.lock().as_ref() {
-                    device.lock().region.request_size(width, height);
-                }
-                if let Some(vga) = shared.vga.lock().as_ref() {
-                    vga.request_size(width, height);
                 }
             }
             message @ (Message::PointerAbs { .. }
@@ -542,41 +540,59 @@ impl InputSink for Input {
             | Message::Scroll { .. }) => {
                 let mut pointer = self.pointer.lock();
                 pointer_message(&mut pointer, message);
-                let xhci = shared.xhci.lock().clone();
-                // pc's tablet sits on the PIIX3 UHCI instead.
-                let uhci = shared
-                    .chipset
-                    .lock()
-                    .as_ref()
-                    .and_then(|chipset| chipset.uhci.lock().clone());
-                if xhci.is_some() || uhci.is_some() {
-                    loop {
-                        if shared.exited() {
-                            break;
+                loop {
+                    if (devices.exited)() {
+                        break;
+                    }
+                    let result = match (&devices.xhci, &devices.uhci) {
+                        (Some(xhci), _) => xhci.lock().inject_pointer(*pointer),
+                        (None, Some(uhci)) => uhci.lock().inject_pointer(*pointer),
+                        (None, None) => break,
+                    };
+                    match result {
+                        Ok(()) => break,
+                        Err(error @ vmlab_hv_devices::DeviceError::Io(_)) if matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock) =>
+                        {
+                            self.pointer_warning(&error);
+                            // Release all controller locks while the guest drains reports.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        let result = match (&xhci, &uhci) {
-                            (Some(xhci), _) => xhci.lock().inject_pointer(*pointer),
-                            (None, Some(uhci)) => uhci.lock().inject_pointer(*pointer),
-                            (None, None) => break,
-                        };
-                        match result {
-                            Ok(()) => break,
-                            Err(error @ vmlab_hv_devices::DeviceError::Io(_)) if matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock) =>
-                            {
-                                self.pointer_warning(&error);
-                                // Release all controller locks while the guest drains reports.
-                                std::thread::sleep(std::time::Duration::from_millis(1));
-                            }
-                            Err(error) => {
-                                self.pointer_warning(&error);
-                                break;
-                            }
+                        Err(error) => {
+                            self.pointer_warning(&error);
+                            break;
                         }
                     }
                 }
             }
             _ => {}
         }
+    }
+}
+
+impl InputSink for Input {
+    fn input(&self, message: Message) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        if let Message::RequestSize { width, height } = message {
+            if let Some(device) = shared.virtual_display.lock().as_ref() {
+                device.lock().region.request_size(width, height);
+            }
+            if let Some(vga) = shared.vga.lock().as_ref() {
+                vga.request_size(width, height);
+            }
+            return;
+        }
+        let chipset = shared.chipset.lock().clone();
+        let devices = InputDevices {
+            xhci: shared.xhci.lock().clone(),
+            uhci: chipset
+                .as_ref()
+                .and_then(|chipset| chipset.uhci.lock().clone()),
+            ps2: chipset.as_ref().map(|chipset| chipset.ps2.clone()),
+            exited: &|| shared.exited(),
+        };
+        self.deliver(message, &devices);
     }
 }
 
@@ -1140,6 +1156,142 @@ mod tests {
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
         ));
+    }
+
+    /// Review F6 (docs/reviews/display.md). No guest polls the tablet, so its
+    /// report queue fills, and the key that follows must still reach PS/2.
+    /// The test has no clock: the machine-exit probe is the only way out of a
+    /// wait on the tablet, so it is counted, and it ends a wait that a sink
+    /// which never waits would not start.
+    #[test]
+    fn a_full_tablet_queue_does_not_block_keys() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        use vmlab_hv_devices::chipset::ps2::I8042;
+        use vmlab_hv_devices::usb::XhciController;
+        use vmlab_hv_devices::{BusDevice, DeviceError, GuestMemory, IrqLine, MsiMessage, MsiSink};
+        use vmlab_hv_display::{Capabilities, Client};
+
+        /// More transition reports than the tablet queues (1024).
+        const SCROLLS: usize = 1025;
+        /// One probe for each pointer message, one more before the key, and
+        /// room for a few more. A sink that waits on the tablet passes this.
+        const PROBES: usize = SCROLLS + 64;
+
+        struct NoIrq;
+        impl IrqLine for NoIrq {
+            fn set_level(&self, _: bool) {}
+        }
+        impl MsiSink for NoIrq {
+            fn signal(&self, _: MsiMessage) {}
+        }
+        struct OneFrame;
+        impl FrameSource for OneFrame {
+            fn frame(&self) -> io::Result<Frame> {
+                Ok(Frame {
+                    flags: FrameFlags::default(),
+                    generation: 1,
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    drm_fourcc: vmlab_hv_display::protocol::XRGB8888,
+                    modifier: 0,
+                    timestamp_ns: 1,
+                    damage: Vec::new(),
+                    pixels: Pixels::Shm(Arc::new(vec![0; 4])),
+                })
+            }
+            fn readback(&self, _: &Frame) -> io::Result<Vec<u8>> {
+                Ok(vec![0; 4])
+            }
+        }
+        struct Machine {
+            input: Input,
+            xhci: Arc<Mutex<XhciController>>,
+            ps2: Arc<Mutex<I8042>>,
+            probes: AtomicUsize,
+            /// Whether the machine had "exited" when the key was delivered.
+            key: Mutex<mpsc::Sender<bool>>,
+        }
+        impl InputSink for Machine {
+            fn input(&self, message: Message) {
+                let is_key = matches!(message, Message::Key { .. });
+                let exited = || self.probes.fetch_add(1, Ordering::SeqCst) >= PROBES;
+                self.input.deliver(
+                    message,
+                    &InputDevices {
+                        xhci: Some(self.xhci.clone()),
+                        uhci: None,
+                        ps2: Some(self.ps2.clone()),
+                        exited: &exited,
+                    },
+                );
+                if is_key {
+                    let waited = self.probes.load(Ordering::SeqCst) > PROBES;
+                    self.key.lock().send(waited).unwrap();
+                }
+            }
+        }
+
+        let memory = GuestMemory::from_ranges(&[(vm_memory::GuestAddress(0), 0x1000)]).unwrap();
+        let xhci = Arc::new(Mutex::new(XhciController::new(
+            "xhci0",
+            memory,
+            Arc::new(NoIrq),
+            None,
+        )));
+        let ps2 = Arc::new(Mutex::new(I8042::new(
+            Arc::new(NoIrq),
+            Arc::new(NoIrq),
+            Arc::new(|_| {}),
+        )));
+        let (key, delivered) = mpsc::channel();
+        let machine = Arc::new(Machine {
+            input: Input {
+                shared: Weak::new(),
+                pointer: Mutex::new(Default::default()),
+                pointer_warning: Mutex::new(None),
+            },
+            xhci: xhci.clone(),
+            ps2: ps2.clone(),
+            probes: AtomicUsize::new(0),
+            key: Mutex::new(key),
+        });
+        let server = Arc::new(DisplayServer::new(Arc::new(OneFrame), machine.clone()).unwrap());
+        let (a, b) = UnixStream::pair().unwrap();
+        let serving = server.clone();
+        let worker = std::thread::spawn(move || serving.serve_native(a));
+        let client = Client::from_stream(b, Capabilities(Capabilities::INPUT)).unwrap();
+        for _ in 0..SCROLLS {
+            client.send(&Message::Scroll { dx: 0, dy: 1 }).unwrap();
+        }
+        client
+            .send(&Message::Key {
+                qcode: "a".into(),
+                down: true,
+            })
+            .unwrap();
+        let waited = delivered.recv().unwrap();
+        server.shutdown();
+        drop(client);
+        let _ = worker.join().unwrap();
+
+        // No guest read a report, so the queue is still full.
+        let full = xhci.lock().inject_pointer(vmlab_hv_devices::usb::PointerEvent {
+            wheel: 1,
+            ..Default::default()
+        });
+        assert!(
+            matches!(&full, Err(DeviceError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock),
+            "the tablet queue is not full: {full:?}"
+        );
+        assert!(
+            !waited,
+            "the key waited behind a pointer report until the machine exited"
+        );
+        let mut scancode = [0];
+        ps2.lock().read(0, &mut scancode);
+        assert_eq!(scancode, [0x1c], "PS/2 does not hold the make code of `a`");
     }
 
     #[test]
