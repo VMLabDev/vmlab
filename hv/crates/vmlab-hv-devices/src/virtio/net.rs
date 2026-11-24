@@ -1456,7 +1456,6 @@ fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool,
 /// One consumed transmit chain and its validated payload spans.
 struct TxPacket<'a> {
     head: u16,
-    consumed: u32,
     prefix: Option<[u8; 4]>,
     slices: Vec<VolatileSlice<'a>>,
     owned: Option<Vec<u8>>,
@@ -1648,7 +1647,6 @@ fn process_tx_queue(
                 let head = chain.head_index();
                 let mut packet = TxPacket {
                     head,
-                    consumed: 0,
                     prefix: None,
                     slices: Vec::new(),
                     owned: None,
@@ -1674,7 +1672,6 @@ fn process_tx_queue(
                     }
                 }
                 if let Some(total) = total {
-                    packet.consumed = total as u32;
                     let len = total.saturating_sub(hdr_len);
                     if stream.is_some()
                         && len <= MAX_FRAME
@@ -1708,7 +1705,9 @@ fn process_tx_queue(
                 send_tx_batch(socket, &packets, &mut sh.tx_out);
             }
             for packet in packets {
-                if q.add_used(mem, packet.head, packet.consumed).is_err() {
+                // The device wrote nothing into a transmit chain, and the used
+                // length counts written bytes (VIRTIO 1.2 section 2.7.8.2).
+                if q.add_used(mem, packet.head, 0).is_err() {
                     invalid = true;
                     break;
                 }
@@ -2366,7 +2365,6 @@ mod tests {
         mem.write_slice(&frame, GuestAddress(0)).unwrap();
         let mut packet = TxPacket {
             head: 0,
-            consumed: (12 + frame.len()) as u32,
             prefix: Some((frame.len() as u32).to_be_bytes()),
             owned: None,
             slices: vec![
@@ -2412,7 +2410,6 @@ mod tests {
             owned[field..field + 2].copy_from_slice(&[0x12, 0x34]);
             let packet = TxPacket {
                 head: 0,
-                consumed: (12 + MAX_FRAME) as u32,
                 prefix: Some((MAX_FRAME as u32).to_be_bytes()),
                 owned: Some(owned),
                 slices: Vec::new(),
@@ -2685,7 +2682,6 @@ mod tests {
             expected.extend_from_slice(&bytes);
             packets.push(TxPacket {
                 head: head as u16,
-                consumed: (12 + len) as u32,
                 prefix: Some(prefix),
                 slices: vec![mem.get_slice(GuestAddress(address), len).unwrap()],
                 owned: None,
@@ -3055,7 +3051,6 @@ mod tests {
         slice.copy_from(&frame);
         let mut packet = TxPacket {
             head: 0,
-            consumed: 0,
             prefix: None,
             slices: vec![slice],
             owned: None,
@@ -4082,8 +4077,9 @@ mod tests {
         assert_eq!(&got, &frame[..]);
 
         wait_for("tx buffer returned", || f.vqs[1].used_idx(&f.mem) == 1);
+        // The device only read the chain, so it wrote 0 bytes.
         let (_, len) = f.vqs[1].used_entry(&f.mem, 0);
-        assert_eq!(len as usize, 12 + frame.len());
+        assert_eq!(len, 0);
     }
 
     #[test]
@@ -4161,7 +4157,7 @@ mod tests {
         });
         assert_eq!(
             f.vqs[1].used_entry(&f.mem, 0),
-            (u32::from(head), 12 + frame.len() as u32)
+            (u32::from(head), 0)
         );
     }
 

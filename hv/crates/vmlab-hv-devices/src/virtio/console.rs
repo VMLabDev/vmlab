@@ -610,34 +610,25 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                     break;
                 }
                 let head = chain.head_index();
-                let len = match chain.reader(mem) {
-                    Ok(mut reader) => {
-                        if !connected {
-                            reader.available_bytes() as u32
-                        } else {
-                            let size = reader.available_bytes();
-                            if size > MAX_TX_STAGE {
-                                // Refuse a single oversized guest chain.
-                                0
-                            } else if size > MAX_TX_STAGE - pending - out.len() {
-                                q.go_to_previous_position();
-                                blocked = true;
-                                break;
-                            } else {
-                                let start = out.len();
-                                out.resize(start + size, 0);
-                                if reader.read_exact(&mut out[start..]).is_ok() {
-                                    size as u32
-                                } else {
-                                    out.truncate(start);
-                                    0
-                                }
-                            }
+                if connected && let Ok(mut reader) = chain.reader(mem) {
+                    let size = reader.available_bytes();
+                    if size > MAX_TX_STAGE {
+                        // Refuse a single oversized guest chain.
+                    } else if size > MAX_TX_STAGE - pending - out.len() {
+                        q.go_to_previous_position();
+                        blocked = true;
+                        break;
+                    } else {
+                        let start = out.len();
+                        out.resize(start + size, 0);
+                        if reader.read_exact(&mut out[start..]).is_err() {
+                            out.truncate(start);
                         }
                     }
-                    Err(_) => 0,
-                };
-                if q.add_used(mem, head, len).is_err() {
+                }
+                // The used length counts bytes the device wrote (VIRTIO 1.2
+                // section 2.7.8.2). A transmit chain is only read.
+                if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
             }
@@ -726,19 +717,18 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
                 }
                 let head = chain.head_index();
                 let mut buf = [0u8; CTRL_LEN];
-                let mut len = 0;
                 if let Ok(mut reader) = chain.reader(mem)
                     && reader.available_bytes() >= CTRL_LEN
                     && reader.read_exact(&mut buf).is_ok()
                 {
-                    len = CTRL_LEN as u32;
                     msgs.push((
                         u32::from_le_bytes(buf[0..4].try_into().unwrap()),
                         u16::from_le_bytes(buf[4..6].try_into().unwrap()),
                         u16::from_le_bytes(buf[6..8].try_into().unwrap()),
                     ));
                 }
-                if q.add_used(mem, head, len).is_err() {
+                // A control transmit chain is only read: used length 0.
+                if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
             }
@@ -1852,7 +1842,7 @@ mod tests {
         wait_for("large transmit chain returned", || {
             f.vqs[7].used_idx(&f.mem) == 1
         });
-        assert_eq!(f.vqs[7].used_entry(&f.mem, 0).1 as usize, payload.len());
+        assert_eq!(f.vqs[7].used_entry(&f.mem, 0).1, 0);
         wait_for("partial socket write staged", || {
             !lock(&f.dev.shared).ports[1].tx_stage.is_empty()
         });
@@ -1920,8 +1910,6 @@ mod tests {
         client.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello ctl");
         wait_for("tx buffer returned", || f.vqs[5].used_idx(&f.mem) == 1);
-        let (_, len) = f.vqs[5].used_entry(&f.mem, 0);
-        assert_eq!(len, 9);
     }
 
     #[test]

@@ -72,7 +72,7 @@ fn tap_worker_transmit_preserves_gso_and_queue_identity() {
         });
         assert_eq!(
             f.vqs[usize::from(2 * pair + 1)].used_entry(&f.mem, 0).1,
-            (12 + frame.len()) as u32
+            0
         );
     }
     wait_for("TAP queue-specific TX interrupts", || {
