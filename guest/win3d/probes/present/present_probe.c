@@ -586,10 +586,15 @@ int wmain(int argc, wchar_t **argv)
     allocation_info allocation = {0};
     allocation.private_data = &exchange;
     allocation.private_data_size = sizeof(exchange);
+    /* A resource with one allocation, as the user-mode drivers make it. */
+    uint32_t resource_exchange = 0; /* VIOGPU_CREATE_RESOURCE_EXCHANGE */
     create_allocation ca = {0};
     ca.device = device.device;
+    ca.private_data = &resource_exchange;
+    ca.private_data_size = sizeof(resource_exchange);
     ca.num_allocations = 1;
     ca.allocation_info = &allocation;
+    ca.flags = 1; /* D3DKMT_CREATEALLOCATIONFLAGS.CreateResource */
     r.stage = "create_allocation";
     r.create_allocation_status = r.last_status = allocate(&ca);
     if (tc->outcome == CREATE_FAILS) {
