@@ -15,3 +15,5 @@ kmd-allow-180-degree-display-rotation.patch
 kmd-rotate-hardware-pointer.patch
 kmd-check-capset-escape.patch
 kmd-check-submit-escape-size.patch
+kmd-read-helper-pipe-message-inside-buffer.patch
+kmd-check-create-allocation-memory.patch

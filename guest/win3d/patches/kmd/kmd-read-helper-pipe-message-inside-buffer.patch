@@ -1,0 +1,282 @@
+Subject: [PATCH] viogpu helpers: read a pipe message inside its buffer
+
+vgpusrv.exe and viogpuap.exe talk over a named pipe and each keeps a buffer
+of 1024 wchar_t, 2048 bytes. DATA_BUFFER_SIZE had no parentheses, so
+PipeServer::Read asked ReadFile for DATA_BUFFER_SIZE * sizeof(wchar_t) =
+1024 * 2 * 2 = 4096 bytes: one message of more than 2048 bytes wrote past
+the heap buffer of the service, which runs as SYSTEM. Both read loops
+added the byte count of a piece to an index of wchar_t, so the second
+piece of a message landed at twice its offset, and PipeClient::Read asked
+for 2048 bytes at that index. Neither loop left a terminator: a message
+that filled the buffer made GetData read past it.
+
+Read a message through one function, VioGpuPipeReadMessage, that counts in
+bytes, keeps the last unit of the buffer for the terminator and zeroes the
+buffer behind the message. A message that does not fit is taken off the
+pipe and dropped, and the buffer is then an empty string, which Run()
+ignores. The function is in a header with no include:
+tests/kmd/pipe_bounds_test.cpp of the package compiles it on the build
+host. DATA_BUFFER_SIZE gets its parentheses.
+
+Card #757, finding F9 of the win3d driver review. docs/acceptance/C757.md
+has the proof.
+---
+diff --git a/viogpu/shared/pipe.cpp b/viogpu/shared/pipe.cpp
+index 25c29a6..cb91d96 100644
+--- a/viogpu/shared/pipe.cpp
++++ b/viogpu/shared/pipe.cpp
+@@ -1,5 +1,6 @@
+ ﻿#include "pipe.h"
+ #include "log.h"
++#include "pipe_bounds.h"
+ 
+ PipeServer::PipeServer(const std::wstring &sName)
+     : m_sPipeName(sName), m_hPipe(INVALID_HANDLE_VALUE), m_hThread(NULL), m_buffer(NULL)
+@@ -127,27 +128,22 @@ bool PipeServer::Read()
+ {
+     PrintMessage(L"%ws\n", __FUNCTIONW__);
+ 
+-    DWORD drBytes = 0;
+-    BOOL bFinishedRead = FALSE;
+-    int read = 0;
+-    int left = DATA_BUFFER_SIZE * sizeof(wchar_t);
+-    do
+-    {
+-
+-        bFinishedRead = ::ReadFile(m_hPipe, &m_buffer[read], left, &drBytes, NULL);
+-
+-        if (!bFinishedRead && ERROR_MORE_DATA != GetLastError())
+-        {
+-            bFinishedRead = FALSE;
+-            break;
+-        }
+-
+-        read += drBytes;
+-        left -= drBytes;
+-
+-    } while (!bFinishedRead);
++    // One message, into a buffer that stays a terminated string. A message
++    // that does not fit is taken off the pipe and dropped: the buffer is
++    // then empty, and Run() ignores an empty command.
++    int result = VioGpuPipeReadMessage(m_buffer,
++                                       (unsigned int)DATA_BUFFER_LENGTH,
++                                       [this](void *destination, unsigned int room, unsigned int *got) {
++                                           return ReadPiece(destination, room, got);
++                                       });
+ 
+-    if (FALSE == bFinishedRead || 0 == drBytes)
++    if (VIOGPU_PIPE_READ_TOO_LONG == result)
++    {
++        PrintMessage(L"A message longer than %u bytes was dropped\n",
++                     VioGpuPipeMessageRoom<wchar_t>((unsigned int)DATA_BUFFER_LENGTH));
++        return true;
++    }
++    if (VIOGPU_PIPE_READ_OK != result)
+     {
+         PrintMessage(L"ReadFile failed\n");
+         return false;
+@@ -155,6 +151,19 @@ bool PipeServer::Read()
+     return true;
+ }
+ 
++int PipeServer::ReadPiece(void *destination, unsigned int room, unsigned int *got)
++{
++    DWORD drBytes = 0;
++    BOOL bFinishedRead = ::ReadFile(m_hPipe, destination, room, &drBytes, NULL);
++
++    *got = drBytes;
++    if (bFinishedRead)
++    {
++        return VIOGPU_PIPE_PIECE_LAST;
++    }
++    return ERROR_MORE_DATA == GetLastError() ? VIOGPU_PIPE_PIECE_MORE : VIOGPU_PIPE_PIECE_ERROR;
++}
++
+ bool PipeServer::Write()
+ {
+     PrintMessage(L"%ws\n", __FUNCTIONW__);
+@@ -293,23 +302,22 @@ bool PipeClient::Read()
+ {
+     PrintMessage(L"%ws\n", __FUNCTIONW__);
+ 
+-    DWORD drBytes = 0;
+-    BOOL bFinishedRead = FALSE;
+-    int read = 0;
+-    do
+-    {
+-        bFinishedRead = ::ReadFile(m_hPipe, &m_buffer[read], DATA_BUFFER_SIZE, &drBytes, NULL);
+-
+-        if (!bFinishedRead && ERROR_MORE_DATA != GetLastError())
+-        {
+-            bFinishedRead = FALSE;
+-            break;
+-        }
+-        read += drBytes;
++    // One message, into a buffer that stays a terminated string. A message
++    // that does not fit is taken off the pipe and dropped: the buffer is
++    // then empty, and Run() ignores an empty command.
++    int result = VioGpuPipeReadMessage(m_buffer,
++                                       (unsigned int)DATA_BUFFER_LENGTH,
++                                       [this](void *destination, unsigned int room, unsigned int *got) {
++                                           return ReadPiece(destination, room, got);
++                                       });
+ 
+-    } while (!bFinishedRead);
+-
+-    if (FALSE == bFinishedRead || 0 == drBytes)
++    if (VIOGPU_PIPE_READ_TOO_LONG == result)
++    {
++        PrintMessage(L"A message longer than %u bytes was dropped\n",
++                     VioGpuPipeMessageRoom<wchar_t>((unsigned int)DATA_BUFFER_LENGTH));
++        return true;
++    }
++    if (VIOGPU_PIPE_READ_OK != result)
+     {
+         PrintMessage(L"ReadFile failed\n");
+         return false;
+@@ -317,6 +325,19 @@ bool PipeClient::Read()
+     return true;
+ }
+ 
++int PipeClient::ReadPiece(void *destination, unsigned int room, unsigned int *got)
++{
++    DWORD drBytes = 0;
++    BOOL bFinishedRead = ::ReadFile(m_hPipe, destination, room, &drBytes, NULL);
++
++    *got = drBytes;
++    if (bFinishedRead)
++    {
++        return VIOGPU_PIPE_PIECE_LAST;
++    }
++    return ERROR_MORE_DATA == GetLastError() ? VIOGPU_PIPE_PIECE_MORE : VIOGPU_PIPE_PIECE_ERROR;
++}
++
+ bool PipeClient::Write()
+ {
+     PrintMessage(L"%ws\n", __FUNCTIONW__);
+diff --git a/viogpu/shared/pipe.h b/viogpu/shared/pipe.h
+index c99e6ab..e7e80b1 100644
+--- a/viogpu/shared/pipe.h
++++ b/viogpu/shared/pipe.h
+@@ -11,7 +11,7 @@
+ #define PIPE_NAME          L"\\\\.\\pipe\\viogpupipe"
+ #define APP_NAME           L"viogpuap.exe "
+ #define DATA_BUFFER_LENGTH 1024
+-#define DATA_BUFFER_SIZE   DATA_BUFFER_LENGTH * sizeof(wchar_t)
++#define DATA_BUFFER_SIZE   (DATA_BUFFER_LENGTH * sizeof(wchar_t))
+ 
+ class PipeClient
+ {
+@@ -28,6 +28,7 @@ class PipeClient
+     void ConnectToServer();
+     static DWORD WINAPI ClientThread(LPVOID ptr);
+     bool Read();
++    int ReadPiece(void *destination, unsigned int room, unsigned int *got);
+     bool Write();
+     void Run();
+ 
+@@ -53,6 +54,7 @@ class PipeServer
+     void GetData(std::wstring &sData);
+     void SetData(std::wstring &sData);
+     bool Read();
++    int ReadPiece(void *destination, unsigned int room, unsigned int *got);
+     bool Write();
+ 
+   private:
+diff --git a/viogpu/shared/pipe_bounds.h b/viogpu/shared/pipe_bounds.h
+new file mode 100644
+index 0000000..a7a4700
+--- /dev/null
++++ b/viogpu/shared/pipe_bounds.h
+@@ -0,0 +1,91 @@
++#pragma once
++
++// The read of one message from the pipe of the two helpers (vgpusrv.exe and
++// viogpuap.exe), with every bound in one place. No include: the host test
++// tests/kmd/pipe_bounds_test.cpp of the vmlab-win3d package compiles this
++// file as it is, with a pipe of its own.
++//
++// The buffer has `length` units (wchar_t on Windows, 2 bytes). A message may
++// fill all of them but the last, which stays zero, so that the buffer is
++// always a terminated string. The bytes behind the message are zeroed too:
++// a sender ends its text in the middle of a unit (see PipeServer::Write).
++//
++// read_piece(destination, room, &got) reads at most `room` bytes of the
++// current message and returns VIOGPU_PIPE_PIECE_LAST when the message is
++// complete, VIOGPU_PIPE_PIECE_MORE when the message has more bytes
++// (ERROR_MORE_DATA of a pipe in message read mode), and
++// VIOGPU_PIPE_PIECE_ERROR when the read failed.
++
++enum
++{
++    VIOGPU_PIPE_PIECE_ERROR = -1,
++    VIOGPU_PIPE_PIECE_MORE = 0,
++    VIOGPU_PIPE_PIECE_LAST = 1,
++};
++
++enum
++{
++    // The read failed, or the message was empty. The buffer is an empty string.
++    VIOGPU_PIPE_READ_FAILED = 0,
++    // The buffer holds the message.
++    VIOGPU_PIPE_READ_OK = 1,
++    // The message did not fit. All of it was taken off the pipe and thrown
++    // away, and the buffer is an empty string.
++    VIOGPU_PIPE_READ_TOO_LONG = 2,
++};
++
++// The bytes of the longest message a buffer of `length` units takes.
++template <class Unit> unsigned int VioGpuPipeMessageRoom(unsigned int length)
++{
++    return length ? (length - 1) * (unsigned int)sizeof(Unit) : 0;
++}
++
++template <class Unit, class ReadPiece>
++int VioGpuPipeReadMessage(Unit *buffer, unsigned int length, ReadPiece read_piece)
++{
++    unsigned char *bytes = (unsigned char *)buffer;
++    const unsigned int capacity = length * (unsigned int)sizeof(Unit);
++    const unsigned int room = VioGpuPipeMessageRoom<Unit>(length);
++    unsigned int used = 0;
++    int result = VIOGPU_PIPE_READ_FAILED;
++
++    for (;;)
++    {
++        unsigned int got = 0;
++        int piece;
++
++        if (used == room)
++        {
++            // No room, and the message goes on: read the rest into a
++            // scratch buffer, so that the next read starts at a message.
++            unsigned char scratch[256];
++            do
++            {
++                got = 0;
++                piece = read_piece((void *)scratch, (unsigned int)sizeof(scratch), &got);
++            } while (piece == VIOGPU_PIPE_PIECE_MORE && got <= sizeof(scratch));
++            result = piece == VIOGPU_PIPE_PIECE_LAST ? VIOGPU_PIPE_READ_TOO_LONG : VIOGPU_PIPE_READ_FAILED;
++            used = 0;
++            break;
++        }
++
++        piece = read_piece((void *)(bytes + used), room - used, &got);
++        if (piece == VIOGPU_PIPE_PIECE_ERROR || got > room - used)
++        {
++            used = 0;
++            break;
++        }
++        used += got;
++        if (piece == VIOGPU_PIPE_PIECE_LAST)
++        {
++            result = used ? VIOGPU_PIPE_READ_OK : VIOGPU_PIPE_READ_FAILED;
++            break;
++        }
++    }
++
++    for (unsigned int i = used; i < capacity; ++i)
++    {
++        bytes[i] = 0;
++    }
++    return result;
++}
