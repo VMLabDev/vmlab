@@ -217,6 +217,52 @@ fn hello(token: &str) -> Result<Vec<u8>> {
     })?)
 }
 
+async fn open_reply(
+    stream: &mut tokio::net::UnixStream,
+    request: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let payload = serde_json::to_vec(&request)?;
+    stream
+        .write_all(&encode_frame(FrameKind::Ctrl, 0, &payload))
+        .await?;
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        while let Some(frame) = decoder.next_frame() {
+            if frame.kind == FrameKind::Ctrl {
+                let msg: serde_json::Value = serde_json::from_slice(&frame.payload)?;
+                if matches!(msg["event"].as_str(), Some("opened" | "error")) {
+                    return Ok(msg);
+                }
+            }
+        }
+        let n = stream.read(&mut buf).await?;
+        ensure!(n > 0, "the agent closed the connection before replying");
+        decoder.push(&buf[..n]);
+    }
+}
+
+#[tokio::test]
+async fn legacy_open_exec_refuses_control_channel() -> Result<()> {
+    use serde_json::json;
+
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+    for request in [
+        json!({"cmd": "open_exec", "id": 0, "argv": ["true"]}),
+        json!({"cmd": "open_exec", "argv": ["true"]}),
+    ] {
+        let reply = open_reply(&mut stream, request.clone()).await?;
+        assert_eq!(reply["event"], "error", "request {request}: {reply}");
+        assert!(reply.get("id").is_none(), "{reply}");
+    }
+    Ok(())
+}
+
 /// Review `legacy-agents.md` F6. A serial line gives the agent no sign that
 /// the host hung up, so a frame the host was cut off in stays half read, and
 /// the decoder used to take the next connection's bytes as the rest of it:
@@ -416,6 +462,36 @@ impl Drop for WineAgent {
         let _ = self.wine("wineserver").arg("-k").status();
         let _ = self.wine("wineserver").arg("-w").status();
     }
+}
+
+#[tokio::test]
+async fn legacy_win32_replies_keep_large_channel_ids() -> Result<()> {
+    use serde_json::json;
+    use tokio::io::AsyncReadExt;
+
+    let Some(agent) = WineAgent::start()? else {
+        return Ok(());
+    };
+    let mut stream = tokio::net::UnixStream::connect(&agent.socket).await?;
+    // Opening COM1 purges its buffers. Wait for the agent's idle byte before
+    // sending requests so the purge cannot discard them.
+    assert_eq!(stream.read_u8().await?, 0);
+    let reply = open_reply(
+        &mut stream,
+        json!({"cmd": "open_exec", "id": u32::MAX, "argv": []}),
+    )
+    .await?;
+    assert_eq!(reply["event"], "error", "{reply}");
+    assert_eq!(reply["id"], u32::MAX, "{reply}");
+
+    let id = 3_000_000_000u32;
+    let reply = open_reply(
+        &mut stream,
+        json!({"cmd": "open_exec", "id": id, "argv": ["cmd", "/c", "exit"]}),
+    )
+    .await?;
+    assert_eq!(reply, json!({"event": "opened", "id": id}));
+    Ok(())
 }
 
 /// Review `legacy-agents.md` F1. A character the guest's code page lacks
