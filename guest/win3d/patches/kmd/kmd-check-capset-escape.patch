@@ -1,0 +1,265 @@
+Subject: [PATCH] viogpu3d: check the capset escape and the host capset size
+
+VIOGPU_GET_CAPS copied the capset to an address taken from the escape data
+with a memcpy inside __try, without a probe. A mapped kernel address was
+written, and an unmapped one was a bugcheck, from any process. This build
+is made with clang, whose __try covers the calls in it and not a fault of
+an instruction in it, so an unmapped user address was a bugcheck 0x3B too.
+Probe the range, lock the pages with MmProbeAndLockPages, both calls inside
+__try, and copy through a system mapping. The escape fails with
+STATUS_ACCESS_VIOLATION.
+
+The capset id of the escape was shifted and used as an index without a
+bound. An id of 64 + k passed the mask test when capset k was supported
+and then indexed past m_capsetInfos. Refuse an id outside 1 to 63.
+
+capset_max_size of the host was stored unchecked. The response size was
+computed in 32 bits, so a size near 2^32 gave a buffer smaller than its
+header, and the escape copied the unwrapped size from behind it. Refuse a
+capset above 1 MiB at negotiation and in the request, compute the response
+size without a wrap, and zero the response buffer, so that a host that
+writes less than it announced leaves no pool content for the copy.
+
+The bounds are in viogpu/common/viogpu_capset_bounds.h, which has no kernel
+include: tests/kmd/capset_bounds_test.cpp of the package compiles it on the
+build host.
+
+diff --git a/viogpu/common/viogpu_capset_bounds.h b/viogpu/common/viogpu_capset_bounds.h
+new file mode 100644
+index 0000000..3250617
+--- /dev/null
++++ b/viogpu/common/viogpu_capset_bounds.h
+@@ -0,0 +1,63 @@
++/*
++ * Bounds of the capset path, shared by the adapter and the control queue.
++ *
++ * The capset id of VIOGPU_GET_CAPS comes from a user program, and the capset
++ * size comes from the host. Neither is trusted. This header has no kernel
++ * include, so that a test on the build host can compile it.
++ */
++#pragma once
++
++/* Capset ids are 1 to 63 (the supported ids are one 64-bit mask). */
++#define VIOGPU_CAPSET_ID_LIMIT 64u
++
++/*
++ * The largest capset the driver takes from a host. The capsets of
++ * virglrenderer are below 2 KiB. The response buffer is a pool allocation
++ * of this size plus a header, so the limit also bounds that allocation.
++ */
++#define VIOGPU_CAPSET_MAX_SIZE (1024u * 1024u)
++
++/* The bit of a capset id in the mask of supported ids, 0 for an id out of range. */
++static inline unsigned long long VioGpuCapsetIdBit(unsigned int id)
++{
++    if (id == 0 || id >= VIOGPU_CAPSET_ID_LIMIT)
++    {
++        return 0;
++    }
++    return 1ull << id;
++}
++
++static inline int VioGpuCapsetIdSupported(unsigned long long supported, unsigned int id)
++{
++    return (supported & VioGpuCapsetIdBit(id)) != 0;
++}
++
++/* Whether a capset size from the host is one the driver allocates and copies. */
++static inline int VioGpuCapsetSizeAccepted(unsigned int size)
++{
++    return size <= VIOGPU_CAPSET_MAX_SIZE;
++}
++
++/*
++ * The bytes of a response to GET_CAPSET with a header of header_size bytes,
++ * 0 when the capset size is refused. The sum cannot wrap: both terms are
++ * below 2^32 and the result is 64 bits wide.
++ */
++static inline unsigned long long VioGpuCapsetResponseSize(unsigned int header_size, unsigned int capset_size)
++{
++    if (!VioGpuCapsetSizeAccepted(capset_size))
++    {
++        return 0;
++    }
++    return (unsigned long long)header_size + capset_size;
++}
++
++/* The bytes the escape copies to the user: never more than the response holds. */
++static inline unsigned int VioGpuCapsetCopySize(unsigned int user_size, unsigned int capset_size)
++{
++    if (!VioGpuCapsetSizeAccepted(capset_size))
++    {
++        return 0;
++    }
++    return user_size < capset_size ? user_size : capset_size;
++}
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index ef478b5..243e589 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -31,6 +31,7 @@
+ #include "baseobj.h"
+ #include "virgl_hw.h"
+ #include "viogpu_format.h"
++#include "viogpu_capset_bounds.h"
+ #if !DBG
+ #include "viogpu_queue.tmh"
+ #endif
+@@ -774,20 +775,31 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_si
+     PGPU_CMD_GET_CASPSET cmd;
+     PGPU_VBUFFER vbuf = NULL;
+     PGPU_RESP_CAPSET resp_buf;
+-    int resp_size = sizeof(GPU_RESP_CAPSET) + capset_size;
++    // In 32 bits the sum wrapped for a size near 2^32, and the buffer was
++    // then smaller than its own header.
++    ULONG resp_size = (ULONG)VioGpuCapsetResponseSize(sizeof(GPU_RESP_CAPSET), capset_size);
+ 
+     if (buf)
+     {
+         *buf = NULL;
+     }
+ 
++    if (resp_size == 0)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s capset size %lu refused\n", __FUNCTION__, capset_size));
++        return FALSE;
++    }
++
+     resp_buf = reinterpret_cast<PGPU_RESP_CAPSET>(new (NonPagedPoolNx) BYTE[resp_size]);
+ 
+     if (!resp_buf)
+     {
+-        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %d bytes\n", __FUNCTION__, resp_size));
++        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %lu bytes\n", __FUNCTION__, resp_size));
+         return FALSE;
+     }
++    // The caller copies up to capset_size bytes to a user program, and a host
++    // can write fewer. What the host does not write must not be pool content.
++    RtlZeroMemory(resp_buf, resp_size);
+     cmd = (PGPU_CMD_GET_CASPSET)AllocCmdResp(&vbuf, sizeof(GPU_CMD_GET_CAPSET), resp_buf, resp_size);
+     RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET));
+ 
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 88ade7a..70363e7 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -36,6 +36,7 @@
+ #include "baseobj.h"
+ #include "bitops.h"
+ #include "viogpum.h"
++#include "viogpu_capset_bounds.h"
+ #include "viogpu_device.h"
+ 
+ typedef struct _VIOGPU_SUBMIT_ESCAPE_CTX
+@@ -1400,20 +1401,56 @@ void VioGpuAdapter::FreeShmemRange(ULONGLONG offset, ULONGLONG size)
+ }
+ 
+ // Keep SEH in a separate function so Escape can use scoped references.
++// The destination is an address a user program chose. ProbeForWrite raises
++// for a range that is not all in user space, and MmProbeAndLockPages raises
++// for a page that is not mapped or not writable. The copy then goes through
++// a system mapping of the locked pages and cannot fault.
++// The copy must not touch the user address itself: this driver is built with
++// clang, whose __try covers the calls in it and not a fault of an
++// instruction in it. A memcpy to an unmapped user address inside __try was
++// a bugcheck 0x3B, and one to a kernel address was a write or a bugcheck.
+ static NTSTATUS VioGpuCopyCapsetToUser(void *destination, const void *source, ULONG size)
+ {
+     PAGED_CODE();
+ 
++    if (size == 0)
++    {
++        return STATUS_SUCCESS;
++    }
++
++    PMDL mdl = IoAllocateMdl(destination, size, FALSE, FALSE, NULL);
++    if (!mdl)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++
++    NTSTATUS status = STATUS_SUCCESS;
+     __try
+     {
+-        memcpy(destination, source, size);
++        ProbeForWrite(destination, size, 1);
++        MmProbeAndLockPages(mdl, UserMode, IoWriteAccess);
+     }
+     __except (EXCEPTION_EXECUTE_HANDLER)
+     {
+-        DbgPrint(TRACE_LEVEL_FATAL, ("Failed to copy"));
+-        return STATUS_INVALID_PARAMETER;
++        DbgPrint(TRACE_LEVEL_ERROR, ("The capset address of the escape is not writable user memory\n"));
++        status = STATUS_ACCESS_VIOLATION;
+     }
+-    return STATUS_SUCCESS;
++
++    if (NT_SUCCESS(status))
++    {
++        void *mapped = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute);
++        if (mapped)
++        {
++            memcpy(mapped, source, size);
++        }
++        else
++        {
++            status = STATUS_INSUFFICIENT_RESOURCES;
++        }
++        MmUnlockPages(mdl);
++    }
++    IoFreeMdl(mdl);
++    return status;
+ }
+ 
+ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+@@ -1569,7 +1606,8 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     return STATUS_INVALID_BUFFER_SIZE;
+                 }
+ 
+-                if (!(m_supportedCapsetIDs & (1ull << pVioGpuEscape->Capset.CapsetId)))
++                // The id is a user value: bound it before the shift and the index.
++                if (!VioGpuCapsetIdSupported(m_supportedCapsetIDs, pVioGpuEscape->Capset.CapsetId))
+                 {
+                     DbgPrint(TRACE_LEVEL_ERROR, ("%s capset id is not supported\n", __FUNCTION__));
+                     return STATUS_INVALID_PARAMETER_1;
+@@ -1581,6 +1619,11 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     return STATUS_INVALID_PARAMETER_2;
+                 };
+ 
++                if (!VioGpuCapsetSizeAccepted(pCapsetInfo->max_size))
++                {
++                    return STATUS_INVALID_PARAMETER_1;
++                }
++
+                 PGPU_VBUFFER vbuf = 0;
+ 
+                 /* ARE 2025-08-30 Spice server v0.16.0 does not return Capset if the display is not visible */
+@@ -1595,7 +1638,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                 }
+ 
+                 UCHAR *buf = ((PGPU_RESP_CAPSET)vbuf->resp_buf)->capset_data;
+-                ULONG to_copy = min(pVioGpuEscape->Capset.Size, pCapsetInfo->max_size);
++                ULONG to_copy = VioGpuCapsetCopySize(pVioGpuEscape->Capset.Size, pCapsetInfo->max_size);
+                 UCHAR *userCapset = (UCHAR *)(ULONG_PTR)pVioGpuEscape->Capset.Capset;
+                 status = VioGpuCopyCapsetToUser(userCapset, buf, to_copy);
+                 ctrlQueue.ReleaseBuffer(vbuf);
+@@ -4177,6 +4220,19 @@ void VioGpuAdapter::NegotiateCapsets(void)
+             ctrlQueue.ReleaseBuffer(vbuf);
+             continue; // Invalid capset id, capsets ids are in range from 1 to 63 per specification
+         }
++        // The size is a host value. It becomes an allocation size and a copy
++        // length, so a capset with a size past the limit is not supported.
++        if (!VioGpuCapsetSizeAccepted(resp->capset_max_size))
++        {
++            DbgPrint(TRACE_LEVEL_ERROR,
++                     ("%s capset id=%d refused: max_size=%u is over %u\n",
++                      __FUNCTION__,
++                      capset_id,
++                      resp->capset_max_size,
++                      VIOGPU_CAPSET_MAX_SIZE));
++            ctrlQueue.ReleaseBuffer(vbuf);
++            continue;
++        }
+         m_capsetInfos[capset_id].id = capset_id;
+         m_capsetInfos[capset_id].max_size = resp->capset_max_size;
+         m_capsetInfos[capset_id].max_version = resp->capset_max_version;

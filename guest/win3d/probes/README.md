@@ -198,3 +198,48 @@ Use `tests/guest/Run-Probe.ps1`. It runs the probe in the logged-on user's
 desktop session, where Vulkan works and the window is on the console, and it
 records the modules the process loaded. `tests/guest/Set-TestDesktop.ps1`
 creates an autologon user for that session. See `tests/guest/README.md`.
+
+## The capset probe
+
+`capset_probe.exe` is not a rendering probe and `Run-AllProbes.ps1` does not
+find it. It sends the `VIOGPU_GET_CAPS` escape of the kernel driver with the
+hostile arguments of card #751 (findings F1 and F3 of
+[`docs/reviews/win3d-driver.md`](../../../docs/reviews/win3d-driver.md)).
+A driver without `patches/kmd/kmd-check-capset-escape.patch` bugchecks the guest on
+some cases, so run it in a disposable VM. Build it with:
+
+```sh
+build/probes/build.sh capset
+```
+
+The executables are `out/probes-extra/x64/capset_probe.exe` and
+`out/probes-extra/x86/capset_probe.exe`.
+
+```text
+capset_probe.exe --case NAME [--out FILE]
+```
+
+It accepts only one PCI adapter with vendor `1af4` and device `1050`, reads
+the supported capset ids with `D3DKMTQueryAdapterInfo`, and takes the lowest
+one, k. Each run sends one escape:
+
+| Case | Escape arguments | A fixed driver |
+| --- | --- | --- |
+| `read` | Capset k into a 65536-byte buffer of the process | Succeeds and writes the capset |
+| `unmapped-address` | The address `0x10000`, which is not mapped | Fails |
+| `read-only-address` | A read-only page of the process | Fails, the page is unchanged |
+| `kernel-address` | 16 bytes to `0xFFFF800000000000` | Fails. Without the fix: bugcheck `0x50` |
+| `bad-id` | Capset id `0xFFFFFFC0` + k | `STATUS_INVALID_PARAMETER_1`. Without the fix: an index far past the driver's array |
+| `near-id` | Capset id 64 + k | `STATUS_INVALID_PARAMETER_1`. Without the fix: an index just past the array |
+
+The program writes one JSON object to stdout and to `--out`. Before the
+escape it flushes a record with `result` `requesting` to the file, so a
+bugcheck leaves the request on disk. Afterwards `result` is `completed`,
+`escape_status` is the NTSTATUS, `bytes_written` counts the bytes of the
+process buffer that changed, and `pass` says whether the driver did what the
+table says. Exit 0 is a pass, 2 a completed escape that did not pass, 1 an
+API or adapter error, 3 a usage error.
+
+`tests/kmd/capset-probe.sh <lab-dir> <vm> <out-dir>` runs every case in a VM
+as a new standard user, and records a bugcheck of the guest
+([`docs/acceptance/C751.md`](../docs/acceptance/C751.md)).
