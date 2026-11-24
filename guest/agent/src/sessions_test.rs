@@ -748,7 +748,11 @@ fn a_name_that_is_not_utf8_is_refused_or_round_trips() {
     std::fs::write(dir.path().join(OsStr::from_bytes(b"a\xffb")), b"").unwrap();
 
     let (mux, mut cap) = capture_mux();
-    open(&mux, &platform(), HostMsg::OpenFileOps { id: 9, logon: None });
+    open(
+        &mux,
+        &platform(),
+        HostMsg::OpenFileOps { id: 9, logon: None },
+    );
     assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 9 });
     ask(&mux, 9, 1, Op::OpenDir { path: root.into() });
     let Reply::Handle { handle } = cap.fileops(9).0.reply else {
