@@ -458,6 +458,9 @@ fn stream_survivors(
                         .with_context(|| format!("layer {i}: invalid PAX metadata for `{name}`"))?;
                     let key = extension.key_bytes();
                     if key.starts_with(b"SCHILY.xattr.") || key.starts_with(b"LIBARCHIVE.xattr.") {
+                        let key = extension.key().with_context(|| {
+                            format!("layer {i}: invalid xattr name for `{name}`")
+                        })?;
                         xattrs.push((key, extension.value_bytes()));
                     }
                 }
