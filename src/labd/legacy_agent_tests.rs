@@ -467,11 +467,15 @@ impl Drop for WineAgent {
 #[tokio::test]
 async fn legacy_win32_replies_keep_large_channel_ids() -> Result<()> {
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
 
     let Some(agent) = WineAgent::start()? else {
         return Ok(());
     };
     let mut stream = tokio::net::UnixStream::connect(&agent.socket).await?;
+    // Opening COM1 purges its buffers. Wait for the agent's idle byte before
+    // sending requests so the purge cannot discard them.
+    assert_eq!(stream.read_u8().await?, 0);
     let reply = open_reply(
         &mut stream,
         json!({"cmd": "open_exec", "id": u32::MAX, "argv": []}),
