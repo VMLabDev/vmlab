@@ -193,7 +193,7 @@ and the IDE, AHCI and USB devices on the same buses.
 - Confidence: high for the path. Whether SeaBIOS on this machine keeps live
   SMM code in that region was not checked.
 - Fixed by card #611 (`eedbbb1a`). Device models get a second view of guest
-  memory, `GuestRam::device_mem` , and `ram.mem` stays the complete view for
+  memory, `GuestRam::device_mem`, and `ram.mem` stays the complete view for
   the
   snapshot and the debugger. The device view holds no SMRAM, open or closed.
   Its 0xc0000-0xfffff is `Pam`'s device mapping, remapped per bank when a PAM
@@ -355,7 +355,7 @@ and the IDE, AHCI and USB devices on the same buses.
 - Confidence: medium. The window is real in the code. The test needs a
   hook to set the flag, because driving it from the guest is a race.
 - Fixed by card #790 (`38397089`). The pending reset is machine state: a save
-  writes it as the vmstate section `reset-pending` , and a load replaces the
+  writes it as the vmstate section `reset-pending`, and a load replaces the
   flag with
   the recorded value (none in an older snapshot). So a load drops the reset
   of the machine it replaces, a failed load gets it back from the rollback

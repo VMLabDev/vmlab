@@ -223,7 +223,7 @@ Not read:
   fixed limit. Today it grows by one for each connection.
 - Confidence: high.
 - Fixed by card #638 (`818b0072`). The accept loop is now
-  `DisplayServer::serve_while` in `display/core.rs` , and both
+  `DisplayServer::serve_while` in `display/core.rs`, and both
   `vmm/display.rs` and `serve` run it. An
   `accept` error ends it only when it says the listener is unusable (`EBADF`,
   `EINVAL`, `ENOTSOCK`, `EOPNOTSUPP`, `EFAULT`). Every other error is counted,
