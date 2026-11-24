@@ -804,23 +804,19 @@ fn spawn_lease_dns_sync(
     let leases_handle = gateway.leases_probe();
     let lab = lab_name.to_string();
     tokio::spawn(async move {
-        let mut known: HashMap<MacAddr, Ipv4Addr> = HashMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(leases) = leases_handle() else { break };
-            for (mac, ip) in leases {
-                if known.get(&mac) == Some(&ip) {
-                    continue;
-                }
-                let vm = mac_to_vm.read().ok().and_then(|n| n.get(&mac).cloned());
-                if let Some(vm) = vm
-                    && let Ok(mut z) = zone.lock()
-                {
-                    z.register(&format!("{vm}.{lab}"), ip);
-                    z.register(&vm, ip);
-                    known.insert(mac, ip);
-                }
-            }
+            let Ok(machines) = mac_to_vm.read() else {
+                continue;
+            };
+            let Ok(mut zone) = zone.lock() else { continue };
+            zone.set_lease_records(
+                &lab,
+                leases
+                    .into_iter()
+                    .filter_map(|(mac, ip)| machines.get(&mac).map(|vm| (vm.as_str(), ip))),
+            );
         }
     });
 }
@@ -881,6 +877,63 @@ mod tests {
 
     fn lab(src: &str) -> Lab {
         load_lab_source(src, "<t>", Path::new("/tmp")).unwrap().lab
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_released_lease_leaves_dns() {
+        use crate::net::dns::DnsAnswer;
+        use crate::net::frame::{
+            ETHERTYPE_IPV4, IPPROTO_UDP, MAC_BROADCAST, eth_build, ipv4_build, udp_build,
+        };
+        use std::time::Duration;
+
+        let config = lab(r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.50.0.0/24" }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+}"#);
+        let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+        let ip = Ipv4Addr::new(10, 50, 0, 10);
+        let mut net = LabNetwork::build(&config).unwrap();
+        net.wire_gateways(
+            &config,
+            &HashMap::from([("a".into(), vec![mac])]),
+            &crate::config::host::HostConfig::default(),
+        );
+        let gateway = net.segments["lan"].gateway.as_ref().unwrap();
+        let dhcp = gateway.dhcp_server().unwrap();
+        let zone = gateway.dns_zone().unwrap();
+        let suffix = crate::config::host::HostConfig::default().dns_suffix;
+        let names = [format!("a.l.{suffix}"), format!("a.{suffix}")];
+
+        let frame = |message_type| {
+            let mut bootp = vec![0; 240];
+            bootp[..3].copy_from_slice(&[1, 1, 6]); // BOOTREQUEST, Ethernet, MAC length
+            bootp[12..16].copy_from_slice(&ip.octets()); // ciaddr
+            bootp[28..34].copy_from_slice(&mac.0);
+            bootp[236..240].copy_from_slice(&[99, 130, 83, 99]);
+            bootp.extend_from_slice(&[53, 1, message_type, 255]);
+            let udp = udp_build(ip, Ipv4Addr::BROADCAST, 68, 67, &bootp).unwrap();
+            let packet = ipv4_build(ip, Ipv4Addr::BROADCAST, IPPROTO_UDP, 64, &udp, 1).unwrap();
+            eth_build(MAC_BROADCAST, mac, ETHERTYPE_IPV4, &packet)
+        };
+        assert!(dhcp.lock().unwrap().handle(&frame(3)).is_some()); // REQUEST
+        assert_eq!(gateway.dhcp_leases(), vec![(mac, ip)]);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        for name in &names {
+            assert_eq!(zone.lock().unwrap().lookup(name), DnsAnswer::A(ip));
+        }
+
+        dhcp.lock().unwrap().handle(&frame(7)); // RELEASE
+        assert!(gateway.dhcp_leases().is_empty());
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        for name in &names {
+            assert_ne!(
+                zone.lock().unwrap().lookup(name),
+                DnsAnswer::A(ip),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
