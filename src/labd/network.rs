@@ -470,6 +470,14 @@ impl LabNetwork {
     ) {
         let upstream = host.upstream_resolver();
         let router = self.router.clone();
+        // Every lab-local segment's subnet: no segment's NAT dials one on
+        // the host's network (review networking-2 F31).
+        let lab_subnets: Vec<Ipv4Net> = self
+            .segments
+            .values()
+            .filter(|seg| !seg.global)
+            .map(|seg| seg.subnet)
+            .collect();
         if let Ok(mut names) = self.lease_names.write() {
             for (vm, macs) in macs_by_vm {
                 for mac in macs {
@@ -597,6 +605,7 @@ impl LabNetwork {
                 self.isolated,
                 mtu,
                 (&router, &seg.name),
+                lab_subnets.clone(),
             );
             if let Some(cfg) = &seg.config {
                 super::netservices::preinstall_rules(&services, cfg, lab);
