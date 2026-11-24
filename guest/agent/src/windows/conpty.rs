@@ -262,35 +262,37 @@ fn spawn_with_conpty(
                     Err(e) => Err(e),
                 }
             }
-            None => {
-                let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-                let mut cmd = wide(cmdline);
-                // The agent identity has no profile to load, so it simply
-                // inherits the agent's environment — a block is built only
-                // when the open carried overrides, keeping the common case
-                // a null pointer rather than a copy of our own environment.
-                let block = (!env.is_empty()).then(|| agent_env_block(env));
-                let flags = EXTENDED_STARTUPINFO_PRESENT
-                    | block.as_ref().map_or(0, |_| CREATE_UNICODE_ENVIRONMENT);
-                let ok = CreateProcessW(
-                    std::ptr::null(),
-                    cmd.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    flags,
-                    block.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()),
-                    std::ptr::null(),
-                    &si.StartupInfo,
-                    &mut pi,
-                );
-                if ok == 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    CloseHandle(pi.hThread);
-                    Ok(Owned(pi.hProcess))
+            // The agent identity has no profile to load, so it simply
+            // inherits the agent's environment — a block is built only
+            // when the open carried overrides, keeping the common case
+            // a null pointer rather than a copy of our own environment.
+            None => match (!env.is_empty()).then(|| agent_env_block(env)).transpose() {
+                Err(e) => Err(e),
+                Ok(block) => {
+                    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+                    let mut cmd = wide(cmdline);
+                    let flags = EXTENDED_STARTUPINFO_PRESENT
+                        | block.as_ref().map_or(0, |_| CREATE_UNICODE_ENVIRONMENT);
+                    let ok = CreateProcessW(
+                        std::ptr::null(),
+                        cmd.as_mut_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        flags,
+                        block.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()),
+                        std::ptr::null(),
+                        &si.StartupInfo,
+                        &mut pi,
+                    );
+                    if ok == 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        CloseHandle(pi.hThread);
+                        Ok(Owned(pi.hProcess))
+                    }
                 }
-            }
+            },
         };
         DeleteProcThreadAttributeList(attrs);
         spawned
