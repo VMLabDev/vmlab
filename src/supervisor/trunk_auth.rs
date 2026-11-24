@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn proofs_bind_role_segment_subnet_and_fresh_nonces() {
         let subnet = [10, 214, 0, 0, 24];
-        let other_subnet = [10, 214, 1, 0, 24];
+        let other = [10, 214, 1, 0, 24];
         let original = proof("secret", b"client", b"wan", &subnet, &[1; 32], &[2; 32])
             .finalize()
             .into_bytes();
@@ -123,7 +123,7 @@ mod tests {
             proof("wrong", b"client", b"wan", &subnet, &[1; 32], &[2; 32]),
             proof("secret", b"server", b"wan", &subnet, &[1; 32], &[2; 32]),
             proof("secret", b"client", b"other", &subnet, &[1; 32], &[2; 32]),
-            proof("secret", b"client", b"wan", &other_subnet, &[1; 32], &[2; 32]),
+            proof("secret", b"client", b"wan", &other, &[1; 32], &[2; 32]),
             proof("secret", b"client", b"wan", &subnet, &[3; 32], &[2; 32]),
             proof("secret", b"client", b"wan", &subnet, &[1; 32], &[3; 32]),
         ] {
