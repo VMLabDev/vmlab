@@ -656,16 +656,29 @@ impl FileSystem for PassthroughFs {
 
     fn unlink(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.refuse_writes()?;
-        let session = self.inner.lock();
+        let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
-        unlinkat(&parent.fd, checked_name(name)?, false)
+        let bytes = checked_name(name)?;
+        let path = parent.path.join(OsStr::from_bytes(bytes));
+        unlinkat(&parent.fd, bytes, false)?;
+        // The inode stays with the guest until FORGET and its last handle,
+        // but it no longer owns the name: whatever is created there next is
+        // another file and gets another node id.
+        session.by_path.remove(&path);
+        Ok(())
     }
 
     fn rmdir(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
         self.refuse_writes()?;
-        let session = self.inner.lock();
+        let mut session = self.inner.lock();
         let parent = live_inode(&session, parent)?;
-        unlinkat(&parent.fd, checked_name(name)?, true)
+        let bytes = checked_name(name)?;
+        let path = parent.path.join(OsStr::from_bytes(bytes));
+        unlinkat(&parent.fd, bytes, true)?;
+        // As in `unlink`. The host removed an empty directory, so a path
+        // still recorded below it names a file that is gone as well.
+        session.take_subtree(&path);
+        Ok(())
     }
 
     fn rename(
