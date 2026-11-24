@@ -477,9 +477,11 @@ impl DnsServer {
 
         let opcode = (msg[2] >> 3) & 0x0F;
         if opcode != 0 || qclass != QCLASS_IN {
-            return match upstream {
-                Some(u) => forward_action(u, msg, respond),
-                None => reply(build_response(msg, question_end, RCODE_NOTIMP, None)),
+            // Not served here. Only a name the zone has no verdict on goes
+            // upstream: a sinkholed name, or one of the lab's own, stays in.
+            return match (answer, upstream) {
+                (DnsAnswer::Forward, Some(u)) => forward_action(u, msg, respond),
+                _ => reply(build_response(msg, question_end, RCODE_NOTIMP, None)),
             };
         }
 
@@ -511,10 +513,20 @@ impl DnsServer {
                     None => nxdomain(),
                 },
             },
-            // Anything else we don't serve locally.
-            _ => match upstream {
-                Some(u) => forward_action(u, msg, respond),
-                None => reply(build_response(msg, question_end, RCODE_NOTIMP, None)),
+            // Every other type (HTTPS, SVCB, CNAME, TXT, ...). The zone's
+            // verdict is on the name, not on a record type (§9.9): a name it
+            // holds has an address and nothing else, so an empty NOERROR,
+            // and a sinkholed one is refused. Only a name the zone has no
+            // verdict on is forwarded.
+            _ => match answer {
+                DnsAnswer::A(_) | DnsAnswer::Zero => {
+                    reply(build_response(msg, question_end, RCODE_NOERROR, None))
+                }
+                DnsAnswer::Nxdomain => nxdomain(),
+                DnsAnswer::Forward => match upstream {
+                    Some(u) => forward_action(u, msg, respond),
+                    None => nxdomain(),
+                },
             },
         }
     }
@@ -986,15 +998,16 @@ mod tests {
     }
 
     #[test]
-    fn other_qtypes_notimp_without_upstream_forward_with() {
+    fn other_qtypes_nxdomain_without_upstream_forward_with() {
         const QTYPE_MX: u16 = 15;
+        // An unknown name without an upstream takes the A path: NXDOMAIN.
         let server = DnsServer::new(DnsZone::new("vmlab.internal"));
         let DnsAction::Reply(reply) = server.handle(&query_frame(6, "example.com", QTYPE_MX))
         else {
             panic!("expected a reply");
         };
         let (_, rcode, ancount, _) = parse_reply(&reply);
-        assert_eq!(rcode, RCODE_NOTIMP);
+        assert_eq!(rcode, RCODE_NXDOMAIN);
         assert_eq!(ancount, 0);
 
         let mut z = DnsZone::new("vmlab.internal");
