@@ -44,7 +44,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 pub use config::{ShareDef, SmbConfig, SmbCredentials};
-pub use mount::{linux_mount_cmd, macos_mount_cmd, windows_mount_cmds, xp_net_use_string};
+pub use mount::{linux_mount_cmd, macos_mount_cmd, windows_mount_cmds};
 pub use server::{SmbError, SmbServer};
 pub use steps::{VirtiofsMount, guest_os_hint, mount_plan};
 
@@ -57,8 +57,10 @@ pub enum OsHint {
     Linux,
     /// `net use` / a PowerShell link step run via the guest agent.
     Windows,
-    /// `net use` typed via the screen-automation surface (no agent on XP).
+    /// `net use` run via the guest agent.
     WindowsXp,
+    /// DOS and Windows 9x profiles need guest-specific mount setup.
+    Windows9x,
     /// `mount_smbfs` run via the guest agent.
     Macos,
 }
@@ -345,9 +347,7 @@ impl LabSmb {
         self.servers.clear();
     }
 
-    /// Build the per-VM mount plan: one [`MountStep`] sequence the daemon runs
-    /// (via the guest agent, or screen automation on XP) to mount every share.
-    /// `os_hint` selects Linux/Windows/XP/macOS command generation.
+    /// Build the per-VM mount plan the daemon runs through the guest agent.
     pub fn mount_plan(&self, vm: &str, os_hint: OsHint) -> Vec<MountStep> {
         let Some(plan) = self.vms.get(vm) else {
             return Vec::new();
@@ -429,16 +429,18 @@ impl LabSmb {
                 OsHint::WindowsXp => {
                     // XP always maps to a drive letter; `guest` is expected to
                     // be `X:` for these guests.
-                    let s = xp_net_use_string(gw, share, guest, &creds.username, &creds.password);
+                    let (command, args) =
+                        mount::xp_net_use_cmd(gw, share, guest, &creds.username, &creds.password);
                     steps.push(MountStep {
                         os_hint,
-                        command: s,
-                        args: Vec::new(),
+                        command,
+                        args,
                         share: Some(share.clone()),
                         refused_exit: None,
                         secret: Some(creds.password.clone()),
                     });
                 }
+                OsHint::Windows9x => {}
             }
         }
         // The agent's mounts live in SYSTEM's logon session: every session
@@ -730,10 +732,9 @@ mod tests {
         let lab = sample();
         let steps = lab.mount_plan("xp", guest_os_hint(Some("windows-9x")));
         assert!(
-            steps.iter().all(|step| !matches!(
-                step.command.as_str(),
-                "cmdkey" | "powershell" | "reg"
-            )),
+            steps
+                .iter()
+                .all(|step| !matches!(step.command.as_str(), "cmdkey" | "powershell" | "reg")),
             "Windows 9x plan contains a modern Windows command"
         );
     }
@@ -741,7 +742,13 @@ mod tests {
     #[test]
     fn every_mount_step_is_an_argv() {
         let lab = sample();
-        for os_hint in [OsHint::Linux, OsHint::Windows, OsHint::WindowsXp, OsHint::Macos] {
+        for os_hint in [
+            OsHint::Linux,
+            OsHint::Windows,
+            OsHint::WindowsXp,
+            OsHint::Windows9x,
+            OsHint::Macos,
+        ] {
             assert!(
                 lab.mount_plan("xp", os_hint)
                     .iter()
@@ -752,21 +759,19 @@ mod tests {
     }
 
     #[test]
-    fn xp_mount_plan_is_net_use_string() {
+    fn xp_mount_plan_passes_net_use_arguments_to_the_agent() {
         let lab = sample();
         let steps = lab.mount_plan("xp", OsHint::WindowsXp);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].os_hint, OsHint::WindowsXp);
-        assert!(
-            steps[0]
-                .command
-                .starts_with("net use Z: \\\\10.0.1.1\\data")
-        );
-        assert!(
-            steps[0]
-                .command
-                .contains(&format!("/user:{}", config::current_unix_user()))
-        );
+        assert_eq!(steps[0].command, "net");
+        let creds = lab.credentials("xp").unwrap();
+        let args = &steps[0].args;
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[..3], ["use", "Z:", r"\\10.0.1.1\data"]);
+        assert!(args[3] == creds.password, "the password is its own argument");
+        assert_eq!(args[4], format!("/user:{}", creds.username));
+        assert_eq!(args[5], "/persistent:yes");
     }
 
     /// A folder-path share is a symlink to the gateway's UNC path, which any
