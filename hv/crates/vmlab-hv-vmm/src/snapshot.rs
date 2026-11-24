@@ -340,13 +340,18 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
             "snapshot name is reserved for internal rollback checkpoints".into(),
         ));
     }
+    let _op = handle.shared().begin_snapshot();
+    save_locked(handle, name)
+}
+
+/// [`save`] for a caller that holds the snapshot-op lock.
+pub(crate) fn save_locked(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
             "online snapshots are unavailable with assigned VFIO devices".into(),
         ));
     }
-    let _op = shared.begin_snapshot();
     if let Some(xhci) = shared.xhci.lock().as_ref()
         && xhci.lock().has_host_devices()
     {
@@ -656,13 +661,18 @@ pub(crate) fn save_kernel_state(
 /// kernel then devices, and leave the machine in the run state the snapshot
 /// recorded.
 pub fn load(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
+    let _op = handle.shared().begin_snapshot();
+    load_locked(handle, name)
+}
+
+/// [`load`] for a caller that holds the snapshot-op lock.
+pub(crate) fn load_locked(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
             "online snapshots are unavailable with assigned VFIO devices".into(),
         ));
     }
-    let _op = shared.begin_snapshot();
     if let Some(xhci) = shared.xhci.lock().as_ref()
         && xhci.lock().has_host_devices()
     {
