@@ -306,6 +306,25 @@ mod tests {
         assert!(sides.identical);
     }
 
+    /// Review dev-machines F9 (card 859): a symlink is described by the bytes
+    /// of its target, so a link to `target` and a file that holds `target`
+    /// have one digest. The plan calls that pair a kind conflict and keeps
+    /// the halt, and the diff must not say the halt will clear.
+    #[tokio::test]
+    async fn a_link_and_a_file_with_the_same_bytes_are_not_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("x")).unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/x", "target", 1);
+        let sides = one(&guest, &workspace(dir.path()), "x").await;
+        let (host, guest) = (sides.host.unwrap(), sides.guest.unwrap());
+        assert_eq!(host.digest, guest.digest, "the same bytes on both sides");
+        assert!(
+            !sides.identical,
+            "a link and a file are a conflict of kinds"
+        );
+    }
+
     /// One side deleted it, which is half of the conflict this verb is most
     /// often called about — and absence must read as absence rather than as an
     /// empty file.

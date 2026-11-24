@@ -670,6 +670,45 @@ mod tests {
         assert!(said.contains(DISCARD_FLAG), "{said}");
     }
 
+    /// Review dev-machines F10 (card 859): `dev sync status`, `flush` and
+    /// `resolve` all answer "no workspace syncer running" for a machine that
+    /// is down, so a capture refused from its ledger names the verb that can
+    /// answer, and says the rest wait for it.
+    #[test]
+    fn a_refusal_for_a_stopped_machine_says_to_start_it_first() {
+        let halted = Outstanding::when_stopped("dev01", &["src/main.rs".into()], false)
+            .expect("a recorded halt refuses")
+            .to_string();
+        let owed = Outstanding::when_stopped("dev01", &[], true)
+            .expect("an owed re-seed refuses")
+            .to_string();
+        for said in [&halted, &owed] {
+            assert!(said.contains("vmlab up dev01"), "{said}");
+            assert!(!said.contains("dev sync flush"), "{said}");
+            assert!(
+                !said.contains("`vmlab dev sync status dev01` says what is outstanding"),
+                "{said}"
+            );
+            assert!(said.contains("no flag for this"), "{said}");
+            assert!(said.contains(NOT_A_BACKUP), "{said}");
+        }
+        let start = halted.find("vmlab up dev01").unwrap();
+        let resolve = halted
+            .find("dev sync resolve")
+            .expect("the halt still has to be resolved");
+        assert!(start < resolve, "start it first: {halted}");
+
+        // A running machine keeps the verbs that answer for it.
+        let report = Report {
+            passes: 2,
+            unsynced: vec!["src/main.rs".into()],
+            ..Report::default()
+        };
+        let running = Outstanding::of("dev01", &report).unwrap().to_string();
+        assert!(running.contains("dev sync flush dev01"), "{running}");
+        assert!(!running.contains("vmlab up dev01"), "{running}");
+    }
+
     /// Review dev-machines F5 (card 695): a destroy refusal names what would
     /// be lost first and the flag second.
     #[test]

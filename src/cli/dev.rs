@@ -601,6 +601,115 @@ mod tests {
         );
     }
 
+    /// What a terminal acts on, or draws as something else: the C0 and C1
+    /// controls, DEL, and the format characters that reorder or end a line.
+    fn steers_a_terminal(c: char) -> bool {
+        c.is_control()
+            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
+            || ('\u{2028}'..='\u{202e}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+    }
+
+    /// Review dev-machines F8 (card 859): a guest decides its own file names,
+    /// and a name may hold any byte but `/` and NUL. These verbs are where a
+    /// developer picks which copy wins, so a name must not be able to clear
+    /// the screen, write the clipboard, or print a line that reads as vmlab's.
+    #[test]
+    fn a_guest_name_is_printed_with_its_control_bytes_escaped() {
+        let name = "a\u{1b}[2J\u{1b}]52;c;ZXZpbA==\u{7}\nfake line\r\u{9b}31m\u{202e}.rs";
+        crate::labd::workspace::ignore::validate_entry_name(name, false)
+            .expect("a name the syncer accepts from a guest");
+        let reason = "guest: cannot read it (\u{1b}[2Jgone\nfake line)";
+        let said = sync_report(
+            "dev01",
+            &WorkspaceSyncStatus {
+                halt: Some(format!("the workspace has stopped on {name}")),
+                conflicts: vec![crate::status::WorkspaceConflictStatus {
+                    path: name.into(),
+                    reason: reason.into(),
+                }],
+                conflicts_total: 1,
+                volume: Some(format!("this pass is carrying 4000 paths under {name}")),
+                trouble: Some(reason.into()),
+                skipped: vec![crate::status::WorkspaceSkipStatus {
+                    path: name.into(),
+                    reason: reason.into(),
+                }],
+                deferred: vec![name.into()],
+                unsynced: vec![name.into()],
+                ..halted_sync()
+            },
+        );
+        // The report's own line breaks are the only control characters left.
+        let steering: Vec<char> = said
+            .chars()
+            .filter(|c| *c != '\n' && steers_a_terminal(*c))
+            .collect();
+        assert!(steering.is_empty(), "{steering:?} in {said:?}");
+        assert!(
+            !said.lines().any(|line| line.starts_with("fake line")),
+            "a name forged a line: {said:?}"
+        );
+        // The name is still there to be read, and to be typed at `resolve`.
+        assert!(
+            said.contains("a\\u{1b}[2J\\u{1b}]52;c;ZXZpbA==\\u{7}\\nfake line"),
+            "{said:?}"
+        );
+
+        let diff: Diff = serde_json::from_value(serde_json::json!({
+            "machine": "dev01", "host_root": "/h", "guest_root": "/src",
+            "files": [{
+                "path": name,
+                "host": null,
+                "guest": {"size": 0, "digest": "", "text": null, "omitted": reason},
+                "identical": false
+            }]
+        }))
+        .unwrap();
+        let said = render_diff(&diff);
+        let steering: Vec<char> = said
+            .chars()
+            .filter(|c| *c != '\n' && steers_a_terminal(*c))
+            .collect();
+        assert!(steering.is_empty(), "{steering:?} in {said:?}");
+        assert!(
+            !said.lines().any(|line| line.starts_with("fake line")),
+            "a name forged a line: {said:?}"
+        );
+    }
+
+    /// Review dev-machines F8 (card 859): valid UTF-8 with no NUL is taken as
+    /// text, and an escape sequence is both. The diff shows the bytes that
+    /// are there, as text a terminal does not act on. A tab stays a tab.
+    #[test]
+    fn guest_text_with_control_bytes_is_not_shown_raw() {
+        let diff: Diff = serde_json::from_value(serde_json::json!({
+            "machine": "dev01", "host_root": "/h", "guest_root": "/src",
+            "files": [{
+                "path": "a.txt",
+                "host": {"size": 9, "digest": "aa", "text": "\tkept\nsame\n", "omitted": null},
+                "guest": {
+                    "size": 40, "digest": "bb", "omitted": null,
+                    "text": "\tkept\n\u{1b}[2J\u{1b}]52;c;ZXZpbA==\u{7}gone\rover\u{9b}31m\nsame\n",
+                },
+                "identical": false
+            }]
+        }))
+        .unwrap();
+        let said = render_diff(&diff);
+        let steering: Vec<char> = said
+            .chars()
+            .filter(|c| !matches!(c, '\n' | '\t') && steers_a_terminal(*c))
+            .collect();
+        assert!(steering.is_empty(), "{steering:?} in {said:?}");
+        assert!(
+            said.contains("  +\\u{1b}[2J\\u{1b}]52;c;ZXZpbA==\\u{7}gone\\rover\\u{9b}31m"),
+            "{said:?}"
+        );
+        assert!(said.contains("   \tkept"), "{said:?}");
+        assert!(said.contains("   same"), "{said:?}");
+    }
+
     /// The verb this one exists for: the guest's copy, host-side, next to the
     /// host's — because the developer is attached *into* the guest and would
     /// otherwise attach twice to see both.
