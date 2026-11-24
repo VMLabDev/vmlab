@@ -626,7 +626,7 @@ impl Registry {
                     // The index references the exact bytes already held by the registry.
                     index.upsert_arch(
                         &config.arch,
-                        Descriptor::new(&m.media_type, &digest_of(&f.body), f.body.len() as u64),
+                        Descriptor::new(m.media_type, digest_of(&f.body), f.body.len() as u64),
                     );
                     index
                 }
