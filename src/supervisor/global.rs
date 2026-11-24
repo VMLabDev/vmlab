@@ -840,6 +840,22 @@ impl GlobalSegments {
 
         let remote = stream.peer_addr().context("peer_addr")?;
         let mut segs = self.segs.lock().await;
+        let subnet = subnet.trunc();
+        if let Some((other, seg)) = segs.iter().find(|(other, seg)| {
+            other.as_str() != name
+                && (subnet.contains(&seg.subnet) || seg.subnet.contains(&subnet))
+        }) {
+            tracing::warn!(
+                "refusing trunk from {remote} for global segment {name:?}: subnet {subnet} overlaps segment {other:?} ({})",
+                seg.subnet
+            );
+            drop(segs);
+            stream.write_all(b"NO\n").await?;
+            return Ok(());
+        }
+        // Take both locks before changing segment state, in the same order as
+        // attach. Commit the reservation only after admitting the trunk.
+        let mut next_index = self.next_index.lock().await;
         let seg = match segs.entry(name.to_string()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -847,6 +863,7 @@ impl GlobalSegments {
             }
         };
         if !seg.trunks.claim_upstream(remote.ip()) {
+            drop(next_index);
             drop(segs);
             stream.write_all(b"NO\n").await?;
             return Ok(());
@@ -863,6 +880,9 @@ impl GlobalSegments {
             }
         }
         seg.subnet = subnet;
+        if let Some(index) = pool_index(subnet) {
+            *next_index = (*next_index).max(index + 1);
+        }
         seg.holders.take(None);
         let trunks = seg.trunks.clone();
         tune_trunk_socket(&stream);
@@ -1036,11 +1056,13 @@ fn spawn_tcp_peer_dialer(
 /// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
 /// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
 /// refused here.
-/// Where `subnet` sits among the automatic pool's /24s, if it is one.
+/// Index of the last automatic /24 that intersects `subnet`.
 fn pool_index(subnet: Ipv4Net) -> Option<u32> {
     let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
-    (subnet.prefix_len() == 24 && pool.contains(&subnet))
-        .then(|| (u32::from(subnet.network()) - u32::from(pool.network())) >> 8)
+    (pool.contains(&subnet) || subnet.contains(&pool)).then(|| {
+        let last = subnet.broadcast().min(pool.broadcast());
+        (u32::from(last) - u32::from(pool.network())) >> 8
+    })
 }
 
 fn check_segment_name(name: &str) -> Result<()> {
@@ -1456,6 +1478,34 @@ mod tests {
         assert_eq!(bootp[0], 2);
         assert_eq!(&bootp[240..243], &[53, 1, 2]);
         assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_trunk_reserves_its_subnet_from_local_allocation() {
+        let b = instance("secret").await;
+        let subnet = "10.214.0.0/24".parse().unwrap();
+        let _trunk = dial_peer(b.addr, "wan", subnet, "secret").await.unwrap();
+
+        let (_, _, local) = b.globals.attach("lan", None, None, None).await.unwrap();
+        assert_eq!(local, "10.214.1.0/24".parse::<Ipv4Net>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_inbound_trunk_is_refused_if_another_segment_uses_its_subnet() {
+        use tokio::io::AsyncReadExt;
+
+        let b = instance("secret").await;
+        let (_, _, subnet) = b.globals.attach("lan", None, None, None).await.unwrap();
+        let before = b.globals.list().await;
+        let mut trunk = tokio::net::TcpStream::connect(b.addr).await.unwrap();
+        super::super::trunk_auth::client(&mut trunk, "wan", subnet, "secret")
+            .await
+            .unwrap();
+        let mut reply = [0; 3];
+        trunk.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"NO\n");
+        assert_eq!(b.globals.list().await, before);
+        assert!(!b.globals.sock_dir.join("wan.sock").exists());
     }
 
     #[tokio::test]
