@@ -405,32 +405,27 @@ impl MachineHandle {
     ) -> Result<ScriptMatch, String> {
         let display = self.display()?;
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
-        loop {
-            let img = self.block(display.grab()).map_err(estr)?;
-            let text = self
-                .block(vision::ocr(&img, req.region, &req.options))
-                .map_err(estr)?;
-            if let Some(found) = re.find(&text) {
-                return Ok(ScriptMatch {
-                    x: 0,
-                    y: 0,
-                    w: 0,
-                    h: 0,
-                    score: 1.0,
-                    cx: 0,
-                    cy: 0,
-                    text: found.as_str().to_string(),
-                });
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
-                    self.name()
-                ));
-            }
-            cancel::sleep(Duration::from_millis(1000));
-        }
+        let result = self.block(wait_for_text_match(
+            &re,
+            Duration::from_secs(timeout_secs.max(0) as u64),
+            || display.ocr(req.region, &req.options),
+        ));
+        let text = result.map_err(estr)?.ok_or_else(|| {
+            format!(
+                "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
+                self.name()
+            )
+        })?;
+        Ok(ScriptMatch {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+            score: 1.0,
+            cx: 0,
+            cy: 0,
+            text,
+        })
     }
 
     /// `m.record(path, opts)` (§11.1): start recording this machine's
@@ -1396,9 +1391,46 @@ pub fn write_interface(path: &std::path::Path) -> std::io::Result<()> {
     context().write_interface(path)
 }
 
+async fn wait_for_text_match<F>(
+    re: &regex::Regex,
+    timeout: Duration,
+    mut read_text: impl FnMut() -> F,
+) -> anyhow::Result<Option<String>>
+where
+    F: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let text = read_text().await?;
+        if let Some(found) = re.find(&text) {
+            return Ok(Some(found.as_str().to_owned()));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_text_keeps_its_timeout_while_tesseract_runs() {
+        let re = regex::Regex::new("ready").unwrap();
+        let started = std::cell::Cell::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_text_match(&re, Duration::from_secs(1), || {
+                started.set(true);
+                std::future::pending()
+            }),
+        )
+        .await;
+        assert!(started.get());
+        assert_eq!(result.expect("OCR exceeded the wait deadline").unwrap(), None);
+    }
 
     #[test]
     fn api_compiles_against_module() {

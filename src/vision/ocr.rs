@@ -465,6 +465,58 @@ mod tests {
         command
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_ocr_kills_tesseract_and_removes_its_file() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("release");
+        let report = root.path().join("report");
+        let survived = root.path().join("survived");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        // Keep both ends open so releasing a surviving child cannot block.
+        let mut release = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
+        let mut command = stand_in(r#"
+            set -eu
+            printf '%s\n%s\n' "$$" "$1" > "$REPORT"
+            read -r line < "$RELEASE"
+            : > "$SURVIVED"
+        "#);
+        command.env("REPORT", &report).env("RELEASE", fifo).env("SURVIVED", &survived);
+        let img = RgbImage::new(8, 8);
+        let options = OcrOptions::default();
+        let mut ocr = Box::pin(ocr_with(&img, None, &options, root.path(), command));
+        let started = tokio::select! {
+            result = &mut ocr => panic!("stand-in exited early: {result:?}"),
+            started = async {
+                loop {
+                    match std::fs::read_to_string(&report) {
+                        Ok(started) if started.lines().count() == 2 && started.ends_with('\n') => {
+                            break started;
+                        }
+                        Ok(_) => tokio::task::yield_now().await,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(e) => panic!("cannot read stand-in report: {e}"),
+                    }
+                }
+            } => started,
+        };
+        let (pid, scratch) = started.trim_end().split_once('\n').unwrap();
+        let process = std::path::PathBuf::from("/proc").join(pid);
+        assert!(Path::new(scratch).is_file());
+        assert!(process.exists());
+        drop(ocr);
+        writeln!(release, "exit").unwrap();
+        while process.exists() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!Path::new(scratch).exists(), "scratch PNG survived cancellation");
+        assert!(!survived.exists(), "tesseract survived cancellation");
+    }
+
     /// Card #720: the picture of the guest's screen is readable by its owner
     /// alone, in a directory that no other user can list or write names into.
     #[cfg(unix)]
