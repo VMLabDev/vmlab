@@ -462,10 +462,7 @@ fn load_clears_a_pending_guest_reset() {
 
     assert_eq!(resets(&events), 0, "the restored machine was reset");
     assert_eq!(m.counter(), 0x1234, "the restored state is intact");
-    assert_eq!(
-        m.handle.status(),
-        vmlab_hv_proto::control::RunState::Paused
-    );
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
 }
 
 /// vmm-core review F9, the save side: a snapshot taken while a reset is
@@ -496,10 +493,7 @@ fn save_carries_a_pending_guest_reset() {
 
     assert_eq!(resets(&events), 1, "the reset ran once after the load");
     assert!(!shared.reset_pending());
-    assert_eq!(
-        m.handle.status(),
-        vmlab_hv_proto::control::RunState::Paused
-    );
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
 }
 
 #[test]
