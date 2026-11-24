@@ -67,14 +67,15 @@ async fn legacy_exec_names_a_missing_cwd_or_program() -> Result<()> {
         'reply: loop {
             while let Some(frame) = decoder.next_frame() {
                 match frame.kind {
-                    FrameKind::Stderr => stderr.extend(frame.payload),
-                    FrameKind::Ctrl => match serde_json::from_slice(&frame.payload)? {
-                        AgentMsg::Exited { code, .. } => {
+                    FrameKind::DataErr => stderr.extend(frame.payload),
+                    FrameKind::Ctrl => {
+                        if let AgentMsg::Exited { code, .. } =
+                            serde_json::from_slice(&frame.payload)?
+                        {
                             assert_eq!(code, 127);
                             break 'reply;
                         }
-                        _ => {}
-                    },
+                    }
                     _ => {}
                 }
             }
