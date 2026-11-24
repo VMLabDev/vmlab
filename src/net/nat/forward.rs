@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -23,8 +23,12 @@ pub struct PortForwarder;
 const UDP_PEER_IDLE: Duration = Duration::from_secs(60);
 
 /// How many connections one TCP forward holds at once (review networking-2
-/// F28): the limit the proof test states. Nothing holds a forward to it yet.
-#[cfg(test)]
+/// F28). Each is a host socket, a task, a pipe and a vTCP flow of the lab
+/// daemon for as long as its peer keeps it, and whoever reaches the listener
+/// opens them. A connection past the limit is accepted and closed at once.
+/// Every forward of a segment together holds no more than the engine's
+/// [`super::MAX_FORWARDED_TCP`], so this is the share one forward may take
+/// of it.
 pub(super) const MAX_TCP_PER_FORWARD: usize = 128;
 
 /// A non-blocking TCP listener on `listen`, bound the way
@@ -47,7 +51,8 @@ fn bind_tcp(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
 
 impl PortForwarder {
     /// Listen on `listen`; every accepted TCP connection becomes a vTCP
-    /// active open to `guest_ip:guest_port` with bytes copied both ways.
+    /// active open to `guest_ip:guest_port` with bytes copied both ways, up
+    /// to [`MAX_TCP_PER_FORWARD`] at once.
     ///
     /// The bind happens here, before the task is spawned, so a port that is
     /// already taken is the caller's error to report rather than a warning
@@ -75,6 +80,10 @@ impl PortForwarder {
     ) {
         info!(addr = ?listener.local_addr().ok(), %guest_ip, guest_port, "tcp forward up");
         let mut errors = crate::net::accept::AcceptErrors::default();
+        let own = Arc::new(Semaphore::new(MAX_TCP_PER_FORWARD));
+        // Whether the last connection was refused, so that a run of
+        // refusals is one warning.
+        let mut full = false;
         loop {
             let (mut sock, peer) = match listener.accept().await {
                 Ok(a) => a,
@@ -84,8 +93,28 @@ impl PortForwarder {
                 }
             };
             errors.accepted();
+            // A slot of this forward and one of the engine, both held by the
+            // connection's task until it ends.
+            let slots = own
+                .clone()
+                .try_acquire_owned()
+                .ok()
+                .zip(engine.forwarded_tcp.clone().try_acquire_owned().ok());
+            let Some(slots) = slots else {
+                if !full {
+                    full = true;
+                    warn!(
+                        %peer, %guest_ip, guest_port,
+                        "tcp forward: at its connection limit, closing new connections until one ends"
+                    );
+                }
+                // Dropping `sock` closes it.
+                continue;
+            };
+            full = false;
             let engine = engine.clone();
             tokio::spawn(async move {
+                let _slots = slots;
                 match engine.open_tcp_to_guest(guest_ip, guest_port).await {
                     Ok(mut guest) => {
                         let _ = tokio::io::copy_bidirectional(&mut sock, &mut guest).await;

@@ -1046,6 +1046,45 @@ async fn forwarded_connections_are_bounded() {
     assert!(peak > 0, "the forward took no connection at all");
 }
 
+/// The forwards of one engine share its limit: three of them, whose own
+/// shares add up to more, together hold no more than
+/// [`super::MAX_FORWARDED_TCP`].
+#[tokio::test]
+async fn forwarded_connections_are_bounded_across_forwards() {
+    use super::MAX_FORWARDED_TCP;
+    use super::forward::MAX_TCP_PER_FORWARD;
+    use crate::sync::LockRecover;
+
+    const { assert!(3 * MAX_TCP_PER_FORWARD > MAX_FORWARDED_TCP) };
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let mut addrs = Vec::new();
+    for port in [80, 81, 82] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        tokio::spawn(PortForwarder::serve_tcp(
+            listener,
+            engine.clone(),
+            GUEST_IP,
+            port,
+        ));
+    }
+    let mut peak = 0;
+    for _ in 0..400 {
+        for addr in &addrs {
+            drop(TcpStream::connect(addr).await.unwrap());
+            tokio::task::yield_now().await;
+            peak = peak.max(engine.tcp_flows.lock_recover().len());
+        }
+    }
+    assert!(
+        peak <= MAX_FORWARDED_TCP,
+        "the forwards held {peak} connections, over the engine's limit of {MAX_FORWARDED_TCP}"
+    );
+}
+
 #[tokio::test]
 async fn udp_port_forward_end_to_end() {
     let (engine, mut rx) = engine();
