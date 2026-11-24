@@ -808,6 +808,9 @@ impl Supervisor {
     /// The already-serialised half of [`Self::release_lab`], used by a
     /// restart that holds the name lock across release and start.
     async fn release_lab_locked(self: &Arc<Self>, name: &str) -> Result<(), String> {
+        if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+            return Err(format!("invalid lab name `{name}`"));
+        }
         let sock = crate::paths::lab_socket(name);
         // Keep the root even if the daemon's exit removes its registry entry.
         let entry = {
