@@ -982,6 +982,55 @@ mod tests {
         assert_ne!(std::fs::read(&installed.disk_path).unwrap(), before);
     }
 
+    /// The replace guard looks at the clones when the install asks it, not
+    /// when the operation starts: a clone made while a long pull downloads
+    /// or an import unpacks is a delta against the version still installed,
+    /// and replacing that version corrupts it (review templates-registry
+    /// F20).
+    #[tokio::test]
+    async fn an_overwriting_import_asks_about_the_clones_at_the_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first.tar.zst");
+        let second = tmp.path().join("second.tar.zst");
+        archive_of_a_version(&tmp.path().join("a"), 1 << 20, &first);
+        archive_of_a_version(&tmp.path().join("b"), 2 << 20, &second);
+
+        let store = TemplateStore::new(tmp.path().join("store"));
+        std::fs::create_dir_all(store.root()).unwrap();
+        import_into(store.clone(), &[], first, false, false)
+            .await
+            .unwrap();
+        let installed = store.resolve_version("x86_64", "t", Some("1")).unwrap();
+        let before = std::fs::read(&installed.disk_path).unwrap();
+
+        // The lab is registered, with no clone yet, when the operation
+        // starts and its guard is made.
+        let lab_root = tmp.path().join("lab");
+        let machine = crate::paths::lab_local_dir(&lab_root).join("vms/dc01");
+        std::fs::create_dir_all(&machine).unwrap();
+        let labs = vec![("corp".to_string(), lab_root)];
+        let guarded = guarding_replace(store.clone(), true, &labs).await;
+
+        // `up` makes a linked clone of the installed version in the window.
+        crate::template::qimg::tool()
+            .create_linked_clone(
+                &installed.disk_path.canonicalize().unwrap(),
+                &machine.join("disk0.qcow2"),
+            )
+            .unwrap();
+
+        let err = tokio::task::spawn_blocking(move || {
+            guarded.import_trusting_scripts(&second, true, false)
+        })
+        .await
+        .unwrap()
+        .expect_err("the clone of corp/dc01 made in the window is backed by the version");
+        let text = format!("{err:#}");
+        assert!(text.contains("refusing to replace"), "{text}");
+        assert!(text.contains("corp/dc01"), "{text}");
+        assert_eq!(std::fs::read(&installed.disk_path).unwrap(), before);
+    }
+
     #[test]
     fn a_variant_reference_is_refused_where_a_version_is_meant() {
         let err = parse_version_ref("x86_64/win11@1#extra").unwrap_err();
