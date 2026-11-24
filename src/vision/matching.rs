@@ -29,7 +29,7 @@ impl Match {
 /// Options for [`find_template`].
 #[derive(Debug, Clone)]
 pub struct MatchOptions {
-    /// Minimum similarity score to report a match (`1.0` = perfect).
+    /// Minimum similarity score in `0.0..=1.0` (`1.0` = perfect).
     pub threshold: f64,
     /// Restrict the search to `(x, y, w, h)` of the screen, if set.
     pub region: Option<(u32, u32, u32, u32)>,
@@ -44,13 +44,26 @@ impl Default for MatchOptions {
     }
 }
 
+/// Check a caller-supplied threshold before capture, polling or serialization.
+pub(crate) fn validate_threshold(threshold: f64) -> Result<(), String> {
+    if (0.0..=1.0).contains(&threshold) {
+        Ok(())
+    } else {
+        Err(format!(
+            "match threshold must be finite and between 0.0 and 1.0, got {threshold}"
+        ))
+    }
+}
+
 /// Find the best occurrence of `template` in `screen`.
 ///
 /// Returns `None` if the template does not fit the (possibly
 /// region-restricted) screen or if the best score is below
-/// `opts.threshold`. Coordinates in the returned [`Match`] are always
+/// `opts.threshold`. An invalid threshold also returns `None`.
+/// Coordinates in the returned [`Match`] are always
 /// absolute screen coordinates, even when a region is given.
 pub fn find_template(screen: &RgbImage, template: &RgbImage, opts: &MatchOptions) -> Option<Match> {
+    validate_threshold(opts.threshold).ok()?;
     let (tw, th) = template.dimensions();
     if tw == 0 || th == 0 || screen.width() == 0 || screen.height() == 0 {
         return None;
@@ -88,10 +101,7 @@ fn similarity(error: u64, channels: usize) -> f64 {
 }
 
 /// Invert the score using the same rounding as the final comparison.
-fn error_budget(channels: usize, threshold: f64) -> Option<u64> {
-    if threshold > 1.0 {
-        return None;
-    }
+fn error_budget(channels: usize, threshold: f64) -> u64 {
     let mut low = 0;
     let mut high = (channels as u64).saturating_mul(255 * 255);
     while low < high {
@@ -102,7 +112,7 @@ fn error_budget(channels: usize, threshold: f64) -> Option<u64> {
             low = middle;
         }
     }
-    Some(low)
+    low
 }
 
 /// Sum over at most 4096 channels, so the total fits in a u32.
@@ -133,7 +143,7 @@ fn search_best(
     let template_rows = template.as_raw().chunks_exact(template_stride);
     let pixels = screen.as_raw();
     let channels = template.as_raw().len();
-    let mut budget = error_budget(channels, threshold)?;
+    let mut budget = error_budget(channels, threshold);
     let mut best = None;
 
     for y in top..=top + height - template.height() as usize {
@@ -293,7 +303,10 @@ mod tests {
                 find_template(&screen, &template, &opts).is_some()
             })
             .collect();
-        assert!(accepted.is_empty(), "accepted invalid thresholds: {accepted:?}");
+        assert!(
+            accepted.is_empty(),
+            "accepted invalid thresholds: {accepted:?}"
+        );
     }
 
     #[test]

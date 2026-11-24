@@ -212,7 +212,7 @@ impl From<crate::labd::vm_agent::MetricsSnapshot> for GuestStats {
     }
 }
 
-/// An image/text match: location + score, usable to anchor a relative
+/// An image match: location + score, usable to anchor a relative
 /// mouse click (PRD §10.3).
 #[derive(Script, Clone)]
 #[script(name = "Match")]
@@ -225,7 +225,14 @@ pub struct ScriptMatch {
     /// Center point, for `vm.mouse_move(m.cx, m.cy)`.
     pub cx: i64,
     pub cy: i64,
-    /// For wait_for_text: the matched text.
+    /// Always empty for an image match.
+    pub text: String,
+}
+
+/// A regex match in OCR output. Plain-text OCR supplies only the matched text.
+#[derive(Script, Clone)]
+#[script(name = "TextMatch")]
+pub struct ScriptTextMatch {
     pub text: String,
 }
 
@@ -402,7 +409,7 @@ impl MachineHandle {
         pattern: &str,
         timeout_secs: i64,
         req: ocr::OcrRequest,
-    ) -> Result<ScriptMatch, String> {
+    ) -> Result<ScriptTextMatch, String> {
         let timeout = script_timeout(timeout_secs, 0)?;
         let display = self.display()?;
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
@@ -415,16 +422,7 @@ impl MachineHandle {
                 self.name()
             )
         })?;
-        Ok(ScriptMatch {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-            score: 1.0,
-            cx: 0,
-            cy: 0,
-            text,
-        })
+        Ok(ScriptTextMatch { text })
     }
 
     /// `m.record(path, opts)` (§11.1): start recording this machine's
@@ -539,6 +537,7 @@ impl MachineHandle {
     }
 
     fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
+        vision::validate_threshold(threshold)?;
         let region = match region.len() {
             0 => None,
             4 => Some((
@@ -1171,7 +1170,7 @@ pub fn lab_module() -> Module {
             |h: &MachineHandle,
              pattern: String,
              timeout_secs: i64|
-             -> Result<ScriptMatch, String> {
+             -> Result<ScriptTextMatch, String> {
                 h.wait_for_text(&pattern, timeout_secs, ocr::OcrRequest::default())
             },
         )
@@ -1181,7 +1180,7 @@ pub fn lab_module() -> Module {
              pattern: String,
              timeout_secs: i64,
              opts: std::collections::HashMap<String, String>|
-             -> Result<ScriptMatch, String> {
+             -> Result<ScriptTextMatch, String> {
                 h.wait_for_text(&pattern, timeout_secs, ocr::parse_opts(&opts)?)
             },
         )
@@ -1384,6 +1383,7 @@ pub fn context() -> Context {
         .module(lab_module())
         .register_type::<ExecResult>()
         .register_type::<ScriptMatch>()
+        .register_type::<ScriptTextMatch>()
         .register_type::<EventData>()
         .register_type::<GuestStats>()
         .register_type::<DiskStat>()
@@ -1774,8 +1774,6 @@ fn main(lab: Lab) {
         check_script_source(src).expect("record API surface should type-check");
     }
 
-    /// The OCR options surface (surface 5): `ocr_opts` and
-    /// `wait_for_text_opts` beside the plain calls they extend.
     #[test]
     fn a_text_match_has_no_click_point() {
         for call in [
@@ -1791,10 +1789,24 @@ fn main(vm: Machine) {{
 }}
 "#
             );
-            assert!(check_script_source(&source).is_err(), "{call} exposes a click point");
+            let error = check_script_source(&source).expect_err("OCR exposes a click point");
+            assert!(error.contains("no field `cx`"), "{error}");
         }
     }
 
+    #[test]
+    fn image_wait_options_reject_invalid_thresholds() {
+        for threshold in [f64::NAN, -1.0, 1.5] {
+            let error = MachineHandle::match_opts(threshold, vec![]).unwrap_err();
+            assert!(error.contains("match threshold"), "{error}");
+        }
+        for threshold in [0.0, 1.0] {
+            assert!(MachineHandle::match_opts(threshold, vec![]).is_ok());
+        }
+    }
+
+    /// The OCR options surface (surface 5): `ocr_opts` and
+    /// `wait_for_text_opts` beside the plain calls they extend.
     #[test]
     fn ocr_options_api_compiles() {
         let src = r#"
@@ -1810,7 +1822,8 @@ fn main(lab: Lab) {
         Ok(m) => lab.log(m.text),
         Err(e) => lab.log(e),
     }
-    let plain = vm.wait_for_text("login:", 30)
+    let plain: TextMatch = vm.wait_for_text("login:", 30).expect("login prompt")
+    lab.log(plain.text)
 }
 "#;
         check_script_source(src).expect("OCR options surface should type-check");
