@@ -80,8 +80,8 @@ hostile guest or peer, wrong result, cosmetic.
 | F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start (fixed, card #805) |
 | F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start (fixed, card #740) |
 | F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses (fixed, card #806) |
-| F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check |
-| F8 | wrong result | The iPXE build keeps stale headers in `config/local` of a cached checkout |
+| F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check (fixed, card #855) |
+| F8 | wrong result | The iPXE build keeps stale headers in `config/local` of a cached checkout (fixed, card #855) |
 | F9 | cosmetic | The recorded iPXE ROM hashes and the firmware build reports are never compared with a build (fixed for the iPXE record, card #737) |
 
 No finding lets a guest change another lab's firmware state. The variable
@@ -121,7 +121,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   are in different crates (`vmlab-hv` and `vmlab-hv-vmm`), so the test goes in
   `vmlab-hv`, or the debug port takes its sink from the device factory.
 - Confidence: high.
-- Fixed by card #736. `CappedLog` moved to
+- Fixed by card #736 (`0e24d418`). `CappedLog` moved to
   `hv/crates/vmlab-hv-vmm/src/serial_log.rs`, and `DebugPort` holds its own
   `CappedLog` on the serial log (`DebugPort::open`, `q35.rs`) where it held a
   plain append handle. Each writer now runs the size check on its own bytes,
@@ -131,7 +131,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F2. Turning secure boot on later boots the old variable store
 
-- Status: fixed by card #734. The start is refused by name. Each start
+- Status: fixed by card #734 (`1b1ee74f`). The start is refused by name. Each start
   writes `OVMF_VARS.boot` beside the store, saying whether it boots with
   secure boot, and a secure-boot start on a store last booted without it
   does not launch (`src/labd/vars_boot.rs`). Offline snapshots and freezes
@@ -202,7 +202,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   the byte is unchanged. If the file changed, the finding holds.
 - Confidence: medium. It rests on the first point of "How the review was
   done". If the pinned AAVMF does protect its store, this finding is void.
-- Fixed by card #735, as far as the last sentence of the fault goes: the
+- Fixed by card #735 (`40f7bc74`), as far as the last sentence of the fault goes: the
   difference is now said. `up` prints a warning for every VM that resolves
   OVMF with `secure_boot = true` on an arch other than x86_64
   (`secure_boot_store_unprotected` in `src/qemu/cmdline.rs`, through
@@ -220,7 +220,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F4. A read-only VARS template gives a store the VM cannot open
 
-- Fixed in card #805. First start sets the owner write bit on the staged
+- Fixed in card #805 (`feb73ccf`). First start sets the owner write bit on the staged
   copy before publishing the per-VM store.
 - Where: `src/labd/vm.rs:1369-1374`, against
   `src/labd/freeze_clone.rs:536-542` and
@@ -244,7 +244,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F5. A failed first copy leaves a partial store
 
-- Fixed in card #740. First start stages the copy in the VM directory and
+- Fixed in card #740 (`b6276ca5`). First start stages the copy in the VM directory and
   publishes it only after the copy succeeds, without replacing an existing store.
 
 - Where: `src/labd/vm.rs:1369-1374` and `:886-896`.
@@ -267,7 +267,7 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F6. An x86 store of another layout is selected and then refused
 
-Fixed by card #806. The VM start checks the existing store and selected
+Fixed by card #806 (`1e24f224`). The VM start checks the existing store and selected
 firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
 
 - Where: `src/qemu/firmware.rs:470-495`, against
@@ -309,6 +309,8 @@ firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
   `Err(VmmError::Kernel)` whose text contains "does not fit". Today the test
   panics on the subtraction.
 - Confidence: high.
+- Fixed by card #855 (`268000cd`). The loader uses checked subtraction and
+  returns the existing "does not fit" error when the initrd exceeds low RAM.
 
 ### F8. The iPXE build keeps stale local headers
 
@@ -332,6 +334,9 @@ firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
   `#error`, or, with a harmless stale define, succeeds with it built in. A
   unit test of the same is possible once the checkout check is a function.
 - Confidence: medium, see the second point of "How the review was done".
+- Fixed by card #855 (`268000cd`). The build removes and names stale entries
+  in `src/config/local` and keeps the empty headers generated by iPXE. The
+  matching source archive hash was recorded in `638d8e68`.
 
 ### F9. Recorded firmware hashes are never compared with a build
 
@@ -352,7 +357,8 @@ firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
   the check fails, the record is stale today. If it passes, the fault is only
   that no recipe runs it.
 - Confidence: high that nothing compares. Not run.
-- Fixed by card #737, for the one record the repository holds. The proof
+- Fixed by card #737 (`ddf8dc39`, `8bf00915`), for the one record the
+  repository holds. The proof
   steps were run on helios with the toolchain the README names (GCC 16.2.1,
   binutils 2.47): all four files failed `sha256sum -c`, so the record was
   stale. A second fault was under it: the ROM bytes depended on the checkout
