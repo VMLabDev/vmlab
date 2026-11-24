@@ -2827,8 +2827,6 @@ impl super::machine::Machine for VmInstance {
     /// What to run is a [`crate::smb::mount_plan`] — this only drives it, and
     /// only knows how to retry. The commands themselves, and every piece of
     /// guest-OS knowledge behind them, live next to the mount-step type.
-    /// XP-era guests without an agent are mounted by provision scripts via
-    /// screen automation instead (documented; not attempted here).
     ///
     /// Waits for its own readiness rather than making the wave wait on the
     /// retry window — Windows needs minutes before `net use` stops returning
@@ -2877,7 +2875,12 @@ impl super::machine::Machine for VmInstance {
             );
         }
         if plan.is_empty() {
-            report.abandoned("no mount step applies to this guest");
+            let reason = if os_hint == crate::smb::OsHint::Windows9x {
+                "shares on the windows-9x profile require guest-specific mount setup"
+            } else {
+                "no mount step applies to this guest"
+            };
+            report.abandoned(reason);
             return;
         }
         let Ok(agent) = self.agent_handle().await else {
