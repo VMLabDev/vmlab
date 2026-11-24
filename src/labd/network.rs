@@ -723,9 +723,16 @@ async fn join_global(join: &GlobalJoin, switch: &Arc<Switch>) -> Result<GlobalTr
     let stream = tokio::net::UnixStream::connect(&trunk_sock)
         .await
         .with_context(|| format!("connecting global trunk {}", trunk_sock.display()))?;
-    let (_port, closed) = switch
+    let (port, closed) = switch
         .add_stream_port_watched(stream, crate::net::switch::PortClass::Service)
         .await;
+    // The segment's gateway is the supervisor's, behind this trunk: no NIC
+    // of this lab speaks as it (review F29, F30). The supervisor's answer
+    // names the subnet the segment runs on.
+    if let Some(subnet) = subnet.or(join.subnet) {
+        use crate::supervisor::global::{global_gateway, hold_gateway_behind};
+        hold_gateway_behind(switch, port, global_gateway(&join.name, subnet));
+    }
     Ok(GlobalTrunk {
         warnings,
         subnet,
