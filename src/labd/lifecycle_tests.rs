@@ -3465,7 +3465,7 @@ async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_i
     // The directory is secured: the prepare step ran, and only then was the
     // file session asked for (which this fake refuses, ending the push).
     let dirs = Dirs::new();
-    let (vm, hv) = vm(
+    let (win, hv) = vm(
         &dirs,
         WINDOWS_VM,
         Script {
@@ -3477,8 +3477,8 @@ async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_i
         },
     );
     let (cbs, _observed) = callbacks();
-    start_vm(&vm, cbs).await.expect("start");
-    let m: Arc<dyn Machine> = vm.clone();
+    start_vm(&win, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = win.clone();
     let err = super::agent_repair::push(&m, &asset_in(&dirs))
         .await
         .expect_err("the fake agent serves no file session");
@@ -3488,12 +3488,12 @@ async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_i
         [format!("agent exec {prepare}"), "agent fileops".to_string()],
         "prepare first, then the push"
     );
-    vm.stop(true).await.expect("stop");
+    win.stop(true).await.expect("stop");
 
     // The directory cannot be secured, or the staging name is taken and
     // cannot be freed: the push is refused before anything is written.
     let dirs = Dirs::new();
-    let (vm, hv) = vm(
+    let (win, hv) = vm(
         &dirs,
         WINDOWS_VM,
         Script {
@@ -3506,8 +3506,8 @@ async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_i
         },
     );
     let (cbs, _observed) = callbacks();
-    start_vm(&vm, cbs).await.expect("start");
-    let m: Arc<dyn Machine> = vm.clone();
+    start_vm(&win, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = win.clone();
     let err = super::agent_repair::push(&m, &asset_in(&dirs))
         .await
         .expect_err("a directory that cannot be prepared refuses the push");
@@ -3520,7 +3520,7 @@ async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_i
         "no file session, no swap and no restart after a refused prepare"
     );
     assert!(m.agent_answering().await, "the old agent is untouched");
-    vm.stop(true).await.expect("stop");
+    win.stop(true).await.expect("stop");
 }
 
 /// **A refresh cut short by a stop is said quietly and accurately.** The
