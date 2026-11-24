@@ -1,0 +1,99 @@
+Subject: [PATCH] viogpu3d: return an error when CreateAllocation has no memory
+
+DxgkCreateAllocation called allocation->IsValid() on the result of
+new (NonPagedPoolNx) VioGpuAllocation(...) with no test, and that result
+is NULL when the pool has no memory. The test alone would come too late:
+operator new was not noexcept, so the compiler may assume it never returns
+NULL, and clang runs the constructor on the NULL pointer first. Declare
+both pool allocators noexcept, which makes the compiler skip the
+constructor for a NULL result at every new expression of the driver, and
+return STATUS_INSUFFICIENT_RESOURCES from DxgkCreateAllocation.
+
+The function also filled pAllocationInfo[0] only, whatever NumAllocations
+said: the other entries kept no driver handle. Refuse a count other than
+one with STATUS_INVALID_PARAMETER.
+
+Card #757, finding F10 of the win3d driver review. docs/acceptance/C757.md
+has the proof.
+---
+diff --git a/viogpu/common/baseobj.cpp b/viogpu/common/baseobj.cpp
+index c111c05..7048d05 100644
+--- a/viogpu/common/baseobj.cpp
++++ b/viogpu/common/baseobj.cpp
+@@ -5,7 +5,7 @@
+ _When_((PoolType & NonPagedPoolMustSucceed) != 0,
+     __drv_reportError("Must succeed pool allocations are forbidden. "
+         "Allocation failures cause a system crash"))
+-    void* __cdecl operator new(size_t Size, POOL_TYPE PoolType)
++    void* __cdecl operator new(size_t Size, POOL_TYPE PoolType) noexcept
+ // clang-format on
+ {
+     Size = (Size != 0) ? Size : 1;
+@@ -26,7 +26,7 @@ _When_((PoolType & NonPagedPoolMustSucceed) != 0,
+ _When_((PoolType & NonPagedPoolMustSucceed) != 0,
+        __drv_reportError("Must succeed pool allocations are forbidden. "
+                          "Allocation failures cause a system crash")) void *__cdecl
+-operator new[](size_t Size, POOL_TYPE PoolType)
++operator new[](size_t Size, POOL_TYPE PoolType) noexcept
+ {
+ 
+     Size = (Size != 0) ? Size : 1;
+diff --git a/viogpu/common/baseobj.h b/viogpu/common/baseobj.h
+index 1f2e18c..c3edc9b 100644
+--- a/viogpu/common/baseobj.h
++++ b/viogpu/common/baseobj.h
+@@ -1,14 +1,19 @@
+ #pragma once
+ #include "helper.h"
+ 
++// Both allocators return NULL when the pool has no memory. They are
++// noexcept so that the compiler tests the pointer before it runs a
++// constructor on it: without it, clang constructs the object at address 0
++// and the caller's own NULL check comes too late.
++
+ _When_((PoolType & NonPagedPoolMustSucceed) != 0,
+        __drv_reportError("Must succeed pool allocations are forbidden. "
+                          "Allocation failures cause a system crash")) void *__cdecl
+-operator new(size_t Size, POOL_TYPE PoolType = PagedPool);
++operator new(size_t Size, POOL_TYPE PoolType = PagedPool) noexcept;
+ _When_((PoolType & NonPagedPoolMustSucceed) != 0,
+        __drv_reportError("Must succeed pool allocations are forbidden. "
+                          "Allocation failures cause a system crash")) void *__cdecl
+-operator new[](size_t Size, POOL_TYPE PoolType = PagedPool);
++operator new[](size_t Size, POOL_TYPE PoolType = PagedPool) noexcept;
+ void __cdecl operator delete(void *pObject);
+ void __cdecl operator delete[](void *pObject);
+ void __cdecl operator delete(void *pObject, size_t Size);
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index a46f0b7..543040a 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -858,6 +858,16 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+ 
++    // This function fills one DXGK_ALLOCATIONINFO. A call with more would
++    // leave the others without a driver handle, and a call with none has no
++    // entry to read.
++    if (pCreateAllocation->NumAllocations != 1 || !pCreateAllocation->pAllocationInfo)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR,
++                 ("<--- %s NumAllocations %u is not supported\n", __FUNCTION__, pCreateAllocation->NumAllocations));
++        return STATUS_INVALID_PARAMETER;
++    }
++
+     DXGK_ALLOCATIONINFO *allocationInfo = pCreateAllocation->pAllocationInfo;
+ 
+     const SIZE_T legacyExchangeSize =
+@@ -885,6 +895,11 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+                   min(resourceExchangeSize, sizeof(localExchange)));
+ 
+     VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &localExchange);
++    if (!allocation)
++    {
++        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s no memory for the allocation\n", __FUNCTION__));
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
+     if (!allocation->IsValid())
+     {
+         delete allocation;

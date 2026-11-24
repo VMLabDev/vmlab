@@ -113,6 +113,15 @@ beyond the single random words of the first differential run, and
   No time is measured.
 - Confidence: high for the measurement. The split of the bytes between
   bindings, frames and constants was read from the code and not measured.
+- Fixed by card #769. The cache keeps a count of bytes beside the count of
+  units (`Trace::cache_bytes`, from the capacity of every table a trace
+  owns), and a hart keeps at most `TRACE_CACHE_BYTES` (32 MiB) of it. One
+  trace takes no further fragment past a quarter of that. The proof test is
+  in its own file, `vmlab-hv-tcg/tests/trace_cache_bytes.rs`, because it
+  counts live heap bytes through a global allocator and not resident pages.
+  Over 3200 steps of the straight run the hart held 72.6 MB before the fix
+  and holds under 48 MiB after it, and the cache's own count is within a
+  factor of two of the heap the run holds.
 
 ### F2. A guest access outside the host's RAM is a host error and the hart cannot pass it (fixed, card #770)
 
