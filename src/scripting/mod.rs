@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wscript::{Context, Module, Script, ScriptType, Type};
+use wscript::{Context, Fault, HostError, Module, Script, ScriptType, Type};
 
 use crate::labd::display::Display;
 use crate::labd::guest_os::GuestOs;
@@ -403,13 +403,12 @@ impl MachineHandle {
         timeout_secs: i64,
         req: ocr::OcrRequest,
     ) -> Result<ScriptMatch, String> {
+        let timeout = script_timeout(timeout_secs, 0)?;
         let display = self.display()?;
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
-        let result = self.block(wait_for_text_match(
-            &re,
-            Duration::from_secs(timeout_secs.max(0) as u64),
-            || display.ocr(req.region, &req.options),
-        ));
+        let result = self.block(wait_for_text_match(&re, timeout, || {
+            display.ocr(req.region, &req.options)
+        }));
         let text = result.map_err(estr)?.ok_or_else(|| {
             format!(
                 "timed out after {timeout_secs}s waiting for /{pattern}/ on {}",
@@ -580,7 +579,8 @@ impl MachineHandle {
         interval_ms: i64,
     ) -> Result<ScriptMatch, String> {
         let opts = Self::match_opts(threshold, region)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+        let timeout = script_timeout(timeout_secs, 0)?;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(m) = self.find_once(refs, &opts)? {
                 return Ok(m);
@@ -592,7 +592,10 @@ impl MachineHandle {
                     self.name()
                 ));
             }
-            cancel::sleep(Duration::from_millis(interval_ms.max(50) as u64));
+            cancel::sleep(
+                "interval_ms",
+                Duration::from_millis(interval_ms.max(50) as u64),
+            )?;
         }
     }
 }
@@ -620,6 +623,24 @@ impl LabHandle {
 // Module registration
 // ---------------------------------------------------------------------------
 
+fn script_duration(argument: &str, duration: Duration) -> Result<Duration, String> {
+    // Bound the wait even when the platform's clock can represent it.
+    const MAX_SCRIPT_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+    if duration > MAX_SCRIPT_DURATION {
+        return Err(format!(
+            "{argument} of {duration:?} exceeds the maximum of 365 days"
+        ));
+    }
+    Ok(duration)
+}
+
+fn script_timeout(timeout_secs: i64, minimum_secs: i64) -> Result<Duration, String> {
+    script_duration(
+        "timeout_secs",
+        Duration::from_secs(timeout_secs.max(minimum_secs) as u64),
+    )
+}
+
 /// Build the `lab` host module (PRD §10). All state rides inside the opaque
 /// handles, so the same module serves compile-checking and live execution.
 pub fn lab_module() -> Module {
@@ -627,7 +648,10 @@ pub fn lab_module() -> Module {
     m.doc("vmlab lab/VM/segment API (PRD §10)");
 
     m.fn_("sleep_ms", |ms: i64| {
-        cancel::sleep(Duration::from_millis(ms.max(0) as u64));
+        Fault(
+            cancel::sleep("sleep_ms", Duration::from_millis(ms.max(0) as u64))
+                .map_err(HostError::msg),
+        )
     });
 
     // Host environment variable, or "" when unset. Lets build/provision
@@ -881,7 +905,7 @@ pub fn lab_module() -> Module {
         .method(
             "wait_ready",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
-                let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+                let timeout = script_timeout(timeout_secs, 0)?;
                 if h.first_boot_gated {
                     h.block(h.machine.wait_agent_answering(timeout))
                         .map_err(estr)
@@ -914,7 +938,7 @@ pub fn lab_module() -> Module {
         .method(
             "wait_rebooted",
             |h: &MachineHandle, since: String, timeout_secs: i64| -> Result<(), String> {
-                let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+                let timeout = script_timeout(timeout_secs, 0)?;
                 let deadline = tokio::time::Instant::now() + timeout;
                 h.block(async {
                     h.machine.wait_rebooted(&since, timeout).await?;
@@ -931,10 +955,10 @@ pub fn lab_module() -> Module {
         .method(
             "wait_shutdown",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
-                h.block(h.machine.wait_state(
-                    PowerState::Stopped,
-                    Duration::from_secs(timeout_secs.max(0) as u64),
-                ))
+                h.block(
+                    h.machine
+                        .wait_state(PowerState::Stopped, script_timeout(timeout_secs, 0)?),
+                )
                 .map_err(estr)
             },
         )
@@ -1177,7 +1201,7 @@ pub fn lab_module() -> Module {
              args: Vec<String>,
              timeout_secs: i64|
              -> Result<ExecResult, String> {
-                h.exec(cmd, args, Duration::from_secs(timeout_secs.max(1) as u64))
+                h.exec(cmd, args, script_timeout(timeout_secs, 1)?)
             },
         )
         .method(
@@ -1416,6 +1440,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_huge_sleep_ms_faults_without_a_cancellation_token() {
+        let ctx = context();
+        let unit = ctx
+            .compile("use vmlab\nfn main() { vmlab::sleep_ms(9223372036854775807) }\n")
+            .unwrap();
+        let error = wscript::Vm::new(&ctx)
+            .call_unit::<_, ()>(&unit, "main", ())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sleep_ms"), "{error}");
+        assert!(error.contains("exceeds the maximum"), "{error}");
+    }
 
     #[tokio::test(start_paused = true)]
     async fn wait_for_text_keeps_its_timeout_while_tesseract_runs() {

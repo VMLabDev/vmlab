@@ -1442,11 +1442,21 @@ impl VmInstance {
                 }
                 let store = self.dirs.ovmf_vars();
                 if !store.exists() {
+                    use std::os::unix::fs::PermissionsExt;
+
                     // Keep failed copies off the path used to detect an existing store.
                     let staged = tempfile::NamedTempFile::new_in(&self.dirs.local)
                         .context("staging OVMF VARS template")?;
                     std::fs::copy(&fw.vars_template, staged.path())
                         .context("copying OVMF VARS template")?;
+                    let file = staged.as_file();
+                    let mut permissions = file
+                        .metadata()
+                        .context("reading staged OVMF VARS permissions")?
+                        .permissions();
+                    permissions.set_mode(permissions.mode() | 0o200);
+                    file.set_permissions(permissions)
+                        .context("making staged OVMF VARS owner-writable")?;
                     staged.persist_noclobber(&store).with_context(|| {
                         format!("publishing OVMF VARS store {}", store.display())
                     })?;
