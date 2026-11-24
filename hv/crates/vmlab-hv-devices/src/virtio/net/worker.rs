@@ -109,7 +109,6 @@ pub(super) fn process_tap(shared: &Arc<Mutex<Shared>>) {
                         let head = chain.head_index();
                         let mut packet = TxPacket {
                             head,
-                            consumed: 0,
                             prefix: None,
                             slices: Vec::new(),
                             owned: None,
@@ -177,10 +176,8 @@ pub(super) fn process_tap(shared: &Arc<Mutex<Shared>>) {
                                 }
                             }
                         }
-                        if queue
-                            .add_used(mem, head, if valid { total as u32 } else { 0 })
-                            .is_err()
-                        {
+                        // A transmit chain is read only: used length 0.
+                        if queue.add_used(mem, head, 0).is_err() {
                             invalid = true;
                             break;
                         }

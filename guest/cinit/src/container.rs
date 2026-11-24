@@ -18,7 +18,7 @@ use nix::unistd::{Gid, Pid, Uid, chdir, chroot, execve, setgid, setuid};
 
 use vmlab_cinit_proto::ContainerSpec;
 
-use crate::mounts::ROOTFS;
+use crate::mounts::{ROOTFS, rootfs_dir};
 use crate::users::ResolvedUser;
 use crate::util::{Ctx, Result, in_root};
 
@@ -194,6 +194,11 @@ pub fn spawn(
     let c_proc = CString::new(proc_dir.into_os_string().into_vec())
         .ctx("NUL byte in the container /proc path")?;
     let identity = ExecIdentity::new(spec.workdir.as_deref(), user)?;
+    // Prepare the directory in the shared overlay so the workload and its
+    // healthcheck can both enter it after chroot.
+    if let Some(workdir) = &spec.workdir {
+        rootfs_dir(workdir).ctx(&format!("prepare workdir {workdir:?}"))?;
+    }
     let mut ready_fds = [0_i32; 2];
     if unsafe { libc::pipe2(ready_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(format!(
