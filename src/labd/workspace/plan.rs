@@ -32,7 +32,9 @@
 //! **Deletion guards**: host→guest deletes are unguarded, because the guest
 //! copy is the reconstructible one, where a guest→host bulk delete is
 //! [withheld](BulkDelete) past a proportion with a floor — the guard is about
-//! *mass*, so a single deletion still propagates. And **a directory delete
+//! *mass*, so a single deletion still propagates, and the mass is counted
+//! [across passes](Deleting), because a pass sees only part of a deletion
+//! that is still running. And **a directory delete
 //! expands via the ledger**: the two platforms disagree on whether a delete
 //! reports its children, so the expansion is the ledger's list of what was
 //! agreed to be in there — which falls out here for free, because every ledger
@@ -272,9 +274,13 @@ impl Winner {
 pub struct BulkDelete {
     /// Every path that would have been removed from the canonical copy.
     pub paths: Vec<String>,
-    /// How many paths the ledger held agreement about, which is what the
-    /// proportion is *of*.
+    /// How many paths the ledger held agreement about when the guest started
+    /// deleting, which is what the proportion is *of*.
     pub agreed: usize,
+    /// How many of them earlier passes had already removed from the canonical
+    /// copy, each under the threshold on its own, before the count
+    /// [across passes](Deleting) reached it.
+    pub carried: usize,
 }
 
 /// The floor: below this many paths a deletion is ordinary work whatever the
@@ -300,11 +306,51 @@ impl std::fmt::Display for BulkDelete {
         write!(
             f,
             "the guest deleted {} of the {} paths this workspace had agreed on, which is a rewrite \
-             of the canonical copy rather than an edit: nothing was removed on the host",
-            self.paths.len(),
+             of the canonical copy rather than an edit: ",
+            self.paths.len() + self.carried,
             self.agreed,
-        )
+        )?;
+        match self.carried {
+            0 => write!(f, "nothing was removed on the host"),
+            carried => write!(
+                f,
+                "{carried} were removed on the host before the count reached the threshold, and \
+                 the other {} were not",
+                self.paths.len(),
+            ),
+        }
     }
+}
+
+/// What the passes before this one did with the guest's deletions (§19.6).
+///
+/// **The mass guard judges a deletion, and a pass sees only part of one.** A
+/// pass decides the removals whose events have settled, and a walk decides
+/// whatever is gone at that moment, so an `rm -rf` still running in the guest
+/// arrives in slices. Counted a pass at a time, every slice of half the ledger
+/// or less is ordinary work, the ledger shrinks by it, and the next slice is
+/// measured against the smaller number — a whole tree goes without the guard
+/// ever firing. So the two numbers outlive the pass:
+///
+/// - **the count is of the run**, not of the pass: what earlier passes carried
+///   out since the guest last stopped deleting is added to both the removals
+///   and the agreement they are a proportion of;
+/// - **a mass waits for the guest to stop**: past the floor, removals that are
+///   still under the proportion are [held](Plan::held) rather than carried
+///   out until nothing new has joined them for a hold period, so a deletion
+///   that is still running is judged whole and before any of it is replicated.
+///
+/// A deletion under the floor still propagates at once, which is the PRD's
+/// *a single deletion still propagates immediately*.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Deleting<'a> {
+    /// Guest→host removals already carried out in this run of deletions.
+    pub carried: usize,
+    /// The held removals nothing has joined for a whole hold period. A mass
+    /// is carried out only when every path of it is in here. `None` holds
+    /// nothing back: a verb is waiting on this pass, and what it promises is
+    /// that the pass decides.
+    pub ripe: Option<&'a BTreeSet<String>>,
 }
 
 /// One pass carrying an unusual amount of work, under one subtree (§19.6).
@@ -442,6 +488,11 @@ pub struct Plan {
     /// `actions`: nothing is deleted from the canonical copy until a developer
     /// says so.
     pub bulk_delete: Option<BulkDelete>,
+    /// Guest→host removals this pass leaves for a later one, because the
+    /// guest may still be deleting ([`Deleting`]). **Not a halt**: nothing is
+    /// asked of the developer, and the same paths are decided again by every
+    /// pass until they are carried out or the mass guard takes them.
+    pub held: Vec<String>,
     pub oversize: Vec<Oversize>,
     /// Host paths a case-folding guest cannot hold apart. Nothing is
     /// transferred for any of them.
@@ -553,6 +604,9 @@ pub struct Inputs<'a> {
     /// the ordinary propagation the winner's own change would have been, and
     /// releases it from the mass-deletion guard's count.
     pub resolved: &'a BTreeMap<String, Winner>,
+    /// What earlier passes did with the guest's deletions, which is what lets
+    /// the mass guard count a deletion that spans passes as one.
+    pub deleting: Deleting<'a>,
     /// The size guard's per-file cap.
     pub max_file_bytes: u64,
     /// The guest folds two names differing only in case onto one object
@@ -844,7 +898,14 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
     // The one place the two directions are not the same rule: mass arriving
     // *from* the guest is withheld, because the copy it would be replicated
     // onto is the one nothing re-derives.
-    plan.bulk_delete = withhold_bulk_delete(&mut removals, inputs);
+    (plan.bulk_delete, plan.held) = withhold_bulk_delete(&mut removals, inputs);
+    // A held removal that clears the way for another kind takes the
+    // replacement with it: a file cannot be placed over a directory that is
+    // still there.
+    let held: BTreeSet<&str> = plan.held.iter().map(String::as_str).collect();
+    creations.retain(|creation| {
+        creation.direction() != Direction::ToHost || !held.contains(creation.path())
+    });
 
     plan.actions = removals;
     plan.actions.extend(creations);
@@ -857,13 +918,24 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
 /// them, leaving everything else — including every host→guest removal, and
 /// every deletion the developer has already answered for — where it was.
 ///
+/// Returns what the mass guard withholds, which halts, and what is only
+/// [held](Plan::held) for a later pass, which does not. Never both.
+///
 /// **What trips the guard is the mass, and a resolution releases one path from
 /// it — it never re-argues the threshold.** Recounting only the unanswered
 /// removals would mean that saying yes to *some* of a 40-file deletion drops the
 /// count back under the floor and lets the other 39 through unasked, which is
 /// the one outcome this guard exists to make impossible.
-fn withhold_bulk_delete(removals: &mut Vec<Action>, inputs: &Inputs<'_>) -> Option<BulkDelete> {
-    let onto_host = |action: &&Action| {
+///
+/// **The mass is the run's, not the pass's** ([`Deleting`]): what earlier
+/// passes already carried out counts toward it, and is put back into the
+/// agreement it is a proportion of, because the ledger has shrunk by exactly
+/// that much since the guest started deleting.
+fn withhold_bulk_delete(
+    removals: &mut Vec<Action>,
+    inputs: &Inputs<'_>,
+) -> (Option<BulkDelete>, Vec<String>) {
+    let onto_host = |action: &Action| {
         matches!(
             action,
             Action::Remove {
@@ -872,25 +944,50 @@ fn withhold_bulk_delete(removals: &mut Vec<Action>, inputs: &Inputs<'_>) -> Opti
             }
         )
     };
-    let mass = removals.iter().filter(onto_host).count();
-    if !BulkDelete::triggered(mass, inputs.ledger.entries.len()) {
-        return None;
+    // Still the developer's to answer: an answered removal is carried out
+    // whatever the count says.
+    let unanswered = |action: &Action| {
+        onto_host(action) && inputs.resolved.get(action.path()) != Some(&Winner::Guest)
+    };
+    // BEFORE-FIX PROBE (card 952): the count and the hold are switched off, so
+    // this commit behaves as `next` does and the proof tests must fail on it.
+    let carried = 0 * inputs.deleting.carried;
+    let mass = removals.iter().filter(|action| onto_host(action)).count() + carried;
+    let agreed = inputs.ledger.entries.len() + carried;
+    let withhold = BulkDelete::triggered(mass, agreed);
+    // Under the proportion but past the floor: carried out only once the
+    // guest has stopped adding to it.
+    let hold = !withhold
+        && mass > usize::MAX - 1
+        && inputs.deleting.ripe.is_some_and(|ripe| {
+            removals
+                .iter()
+                .any(|action| unanswered(action) && !ripe.contains(action.path()))
+        });
+    if !withhold && !hold {
+        return (None, Vec::new());
     }
     let mut paths = Vec::new();
     removals.retain(|action| {
-        if !onto_host(&action) || inputs.resolved.get(action.path()) == Some(&Winner::Guest) {
+        if !unanswered(action) {
             return true;
         }
         paths.push(action.path().to_string());
         false
     });
     paths.sort();
+    paths.dedup();
+    if hold {
+        return (None, paths);
+    }
     // Every one of them answered: the mass tripped the guard, and there is
     // nothing left it is still holding back.
-    (!paths.is_empty()).then_some(BulkDelete {
-        agreed: inputs.ledger.entries.len(),
+    let bulk = (!paths.is_empty()).then_some(BulkDelete {
+        agreed,
+        carried,
         paths,
-    })
+    });
+    (bulk, Vec::new())
 }
 
 /// The subtree one pass's work is concentrated in, where there is enough of it
@@ -1226,6 +1323,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
             resolved,
+            deleting: Deleting::default(),
             max_file_bytes: CAP,
             case_folding: false,
             unwitnessed: false,
@@ -1241,6 +1339,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
+            deleting: Deleting::default(),
             max_file_bytes: CAP,
             case_folding: true,
             unwitnessed: false,
@@ -1973,6 +2072,7 @@ mod tests {
             undecided: &BTreeSet::new(),
             guest_owned: &BTreeSet::from(["app.log".to_string()]),
             resolved: &BTreeMap::new(),
+            deleting: Deleting::default(),
             max_file_bytes: CAP,
             case_folding: false,
             unwitnessed: false,
@@ -2016,6 +2116,7 @@ mod tests {
             undecided: &BTreeSet::from(["a.sock".to_string()]),
             guest_owned: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
+            deleting: Deleting::default(),
             max_file_bytes: CAP,
             case_folding: false,
             unwitnessed: false,
@@ -2175,6 +2276,7 @@ mod tests {
             undecided,
             guest_owned: &BTreeSet::new(),
             resolved: &BTreeMap::new(),
+            deleting: Deleting::default(),
             max_file_bytes: CAP,
             case_folding: false,
             unwitnessed: true,
@@ -2311,6 +2413,158 @@ mod tests {
         assert!(plan.halts());
         let said = bulk.to_string();
         assert!(said.contains("40 of the 40"), "{said}");
+    }
+
+    /// One pass over the three trees with what earlier passes did with the
+    /// guest's deletions.
+    fn run_deleting(
+        host: &BTreeMap<String, State>,
+        guest: &BTreeMap<String, State>,
+        l: &Ledger,
+        deleting: Deleting<'_>,
+    ) -> Plan {
+        reconcile(&Inputs {
+            host,
+            guest,
+            ledger: l,
+            undecided: &BTreeSet::new(),
+            guest_owned: &BTreeSet::new(),
+            resolved: &BTreeMap::new(),
+            deleting,
+            max_file_bytes: CAP,
+            case_folding: false,
+            unwitnessed: false,
+        })
+    }
+
+    /// Carry a plan's guest→host removals out as the apply does: the host
+    /// loses the path and so does the ledger. Returns how many.
+    fn carry_out(plan: &Plan, host: &mut BTreeMap<String, State>, l: &mut Ledger) -> usize {
+        for action in &plan.actions {
+            assert!(
+                matches!(
+                    action,
+                    Action::Remove {
+                        direction: Direction::ToHost,
+                        ..
+                    }
+                ),
+                "{action:?}"
+            );
+            host.remove(action.path());
+            l.forget(action.path());
+        }
+        plan.actions.len()
+    }
+
+    /// Review labd-sync-2 F12 (card 952). The guest loses 100 agreed files and
+    /// the passes see it in parts of 50, 25, 12 and 13. Each part is half of
+    /// what the ledger still holds or less, so a guard that counts one pass
+    /// lets all four through. Counted as one deletion, the second part is 75
+    /// of 100 and the guard fires.
+    #[test]
+    fn a_guest_deletion_seen_in_slices_is_counted_as_one() {
+        let (mut host, mut guest, mut l) = agreed_tree(100);
+        let mut carried = 0;
+        let mut caught = None;
+        for slice in [50, 25, 12, 13] {
+            let gone: Vec<String> = guest.keys().take(slice).cloned().collect();
+            for path in &gone {
+                guest.remove(path);
+            }
+            // No hold: only the count is on trial here.
+            let plan = run_deleting(&host, &guest, &l, Deleting { carried, ripe: None });
+            if let Some(bulk) = plan.bulk_delete.clone() {
+                assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+                caught = Some(bulk);
+                break;
+            }
+            carried += carry_out(&plan, &mut host, &mut l);
+        }
+        let bulk = caught.expect("every part was carried out and the guard never fired");
+        assert_eq!(host.len(), 50, "more than the first part left the host");
+        assert_eq!((bulk.paths.len(), bulk.carried, bulk.agreed), (25, 50, 100));
+        let said = bulk.to_string();
+        assert!(said.contains("75 of the 100"), "{said}");
+        assert!(said.contains("50 were removed on the host"), "{said}");
+    }
+
+    /// The count alone still loses the first part. So a mass past the floor
+    /// that is under the proportion is not carried out while the guest may
+    /// still be deleting: it is held, which is not a halt, and when the rest
+    /// of the deletion arrives the guard judges all of it with the host whole.
+    #[test]
+    fn a_mass_under_the_proportion_waits_for_the_guest_to_stop_deleting() {
+        let (host, mut guest, l) = agreed_tree(100);
+        let first: Vec<String> = guest.keys().take(45).cloned().collect();
+        for path in &first {
+            guest.remove(path);
+        }
+        let nothing_ripe = BTreeSet::new();
+        let holding = Deleting {
+            carried: 0,
+            ripe: Some(&nothing_ripe),
+        };
+        let plan = run_deleting(&host, &guest, &l, holding);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.held, first);
+        assert!(!plan.halts() && plan.bulk_delete.is_none());
+
+        // The guest went quiet: the same 45 are ordinary work.
+        let ripe: BTreeSet<String> = first.iter().cloned().collect();
+        let quiet = Deleting {
+            carried: 0,
+            ripe: Some(&ripe),
+        };
+        let plan = run_deleting(&host, &guest, &l, quiet);
+        assert_eq!(plan.actions.len(), 45);
+        assert!(plan.held.is_empty() && !plan.halts());
+
+        // It did not: ten more are gone, so none of the 55 is ripe to go, and
+        // 55 of 100 is the guard's to withhold.
+        let more: Vec<String> = guest.keys().take(10).cloned().collect();
+        for path in &more {
+            guest.remove(path);
+        }
+        let plan = run_deleting(&host, &guest, &l, quiet);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        let bulk = plan.bulk_delete.clone().expect("the guard never fired");
+        assert_eq!((bulk.paths.len(), bulk.carried, bulk.agreed), (55, 0, 100));
+        assert!(plan.held.is_empty());
+    }
+
+    /// Under the floor a deletion still propagates at once, hold or no hold.
+    /// But the floor is the run's too: parts that are each under it are held
+    /// from the moment they add up to more.
+    #[test]
+    fn deletions_under_the_floor_go_at_once_until_they_add_up_past_it() {
+        let (mut host, mut guest, mut l) = agreed_tree(100);
+        let nothing_ripe = BTreeSet::new();
+        let first: Vec<String> = guest.keys().take(15).cloned().collect();
+        for path in &first {
+            guest.remove(path);
+        }
+        let holding = Deleting {
+            carried: 0,
+            ripe: Some(&nothing_ripe),
+        };
+        let plan = run_deleting(&host, &guest, &l, holding);
+        assert!(plan.held.is_empty(), "{:?}", plan.held);
+        let carried = carry_out(&plan, &mut host, &mut l);
+        assert_eq!(carried, 15);
+
+        let second: Vec<String> = guest.keys().take(10).cloned().collect();
+        for path in &second {
+            guest.remove(path);
+        }
+        let holding = Deleting {
+            carried,
+            ripe: Some(&nothing_ripe),
+        };
+        let plan = run_deleting(&host, &guest, &l, holding);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.held, second);
+        assert!(!plan.halts());
     }
 
     /// The floor is what keeps a ten-file project from being halted for

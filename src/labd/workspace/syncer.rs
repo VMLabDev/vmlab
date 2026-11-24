@@ -97,7 +97,7 @@ use super::ignore::{GIT_IGNORE, TEMP_PREFIX, VMLAB_IGNORE, is_syncer_own, valida
 use super::ledger::{Kind, Ledger};
 use super::locks;
 use super::plan::{
-    Action, Direction, Inputs, Oversize, State, Volume, Winner, has_moved, reconcile,
+    Action, Deleting, Direction, Inputs, Oversize, State, Volume, Winner, has_moved, reconcile,
 };
 use super::scan::{Skip, guest_locks, guest_walk, host_scan, join_guest, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
@@ -191,6 +191,15 @@ const LOCK_RETRY: Duration = Duration::from_secs(1);
 /// How long a verb waits for the guest to answer the drain its pass settles
 /// on — see [`settle_guest`].
 const SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a mass of guest-side deletions waits for more of them before it
+/// is carried onto the host (§19.6, [`Deletions`]).
+///
+/// Several quiet periods, because what it has to outlast is the gap *inside*
+/// one deletion: an `rm -rf` that stalls on a large directory, or a watch
+/// that reports a tree in batches. Short enough that deleting a directory in
+/// the guest still reaches the host while the developer is looking at it.
+const DELETE_HOLD: Duration = Duration::from_secs(2);
 
 /// How many halted paths and named skips the projection carries.
 ///
@@ -388,6 +397,9 @@ pub struct Syncer {
     /// How long a verb's pass waits for the guest's watch to answer: [`SETTLE`],
     /// shorter only in tests.
     settle: Duration,
+    /// How long a mass of guest-side deletions is held: [`DELETE_HOLD`],
+    /// different only in tests.
+    hold: Duration,
 }
 
 impl Syncer {
@@ -395,6 +407,7 @@ impl Syncer {
         Syncer {
             workspace,
             settle,
+            hold: DELETE_HOLD,
             report: std::sync::Mutex::new(Report::default()),
             resolved: std::sync::Mutex::new(BTreeMap::new()),
             wake: Notify::new(),
@@ -491,6 +504,10 @@ pub struct WorkspaceSyncers {
     /// Set only by tests, so a guest watch that never answers costs a test a
     /// fraction of a second rather than the real bound twice.
     settle: Option<Duration>,
+    /// The deletion hold of every syncer started here, `None` for
+    /// [`DELETE_HOLD`]. Set only by tests, so one that asks what a held
+    /// deletion does is not racing the hold's end.
+    hold: Option<Duration>,
 }
 
 struct Running {
@@ -531,7 +548,9 @@ impl WorkspaceSyncers {
         self.stop(&workspace.machine).await;
         let (stop, halted) = watch::channel(false);
         let machine = workspace.machine.clone();
-        let syncer = Arc::new(Syncer::new(workspace, self.settle.unwrap_or(SETTLE)));
+        let mut syncer = Syncer::new(workspace, self.settle.unwrap_or(SETTLE));
+        syncer.hold = self.hold.unwrap_or(DELETE_HOLD);
+        let syncer = Arc::new(syncer);
         let task = tokio::spawn(run(
             syncer.clone(),
             sessions.clone(),
@@ -983,6 +1002,9 @@ async fn run(
     // never loses a save.
     let mut owed: BTreeSet<String> = BTreeSet::new();
     let mut host_dirty: BTreeSet<String> = BTreeSet::new();
+    // What the passes have done with the guest's deletions, so the mass guard
+    // counts a deletion that spans several of them as one.
+    let mut deletions = Deletions::default();
 
     // The prune list the watch is open with. Remembered in the ledger because
     // it has to be known *before* the watch opens, and the walk that computes
@@ -1255,6 +1277,11 @@ async fn run(
             }
             let drained = std::mem::take(&mut owed);
             let resolutions = syncer.take_resolutions();
+            let now = Instant::now();
+            deletions.begin(now, syncer.hold);
+            // A verb's pass decides: `flush` promises that what the guest did
+            // before it has been carried or refused, not that it is waiting.
+            let ripe = (!flush).then(|| deletions.ripe(now, syncer.hold));
             match pass(
                 &workspace,
                 sessions.as_ref(),
@@ -1274,6 +1301,8 @@ async fn run(
                     lock_candidates: &lock_candidates,
                     sighted: &sighted,
                     resolved: &resolutions,
+                    deletions: &deletions,
+                    ripe: ripe.as_ref(),
                     previous_halt: syncer.report().halt,
                     marker: marker.clone(),
                 },
@@ -1284,6 +1313,7 @@ async fn run(
             {
                 Ok(done) => {
                     passes += 1;
+                    deletions.record(&done, Instant::now());
                     if std::mem::take(&mut left_owed)
                         && let Err(e) = ledger.save(&workspace.ledger_path)
                     {
@@ -1409,6 +1439,11 @@ async fn run(
             // re-arms so the mutable set is not stalled until whenever the
             // developer next types.
             look_again.map(|at| at.saturating_duration_since(now)),
+            // A held deletion is carried out by a pass too, and nothing else
+            // asks for one once the guest has gone quiet.
+            deletions
+                .ripens(syncer.hold)
+                .map(|at| at.saturating_duration_since(now)),
         ]
         .into_iter()
         .flatten()
@@ -1520,6 +1555,9 @@ async fn run(
                 let now = Instant::now();
                 if look_again.is_some_and(|at| at <= now) {
                     look_again = None;
+                    due = true;
+                }
+                if deletions.ripens(syncer.hold).is_some_and(|at| at <= now) {
                     due = true;
                 }
                 let ready = host_debounce.settled(now);
@@ -1787,11 +1825,90 @@ struct Pending<'a> {
     sighted: &'a Sighted,
     /// Who wins where, as the developer has already said.
     resolved: &'a BTreeMap<String, Winner>,
+    /// What earlier passes did with the guest's deletions.
+    deletions: &'a Deletions,
+    /// The held deletions that have waited long enough, `None` where this
+    /// pass holds nothing back ([`Deleting::ripe`]).
+    ripe: Option<&'a BTreeSet<String>>,
     /// Conflicts a deferred comparison cannot clear.
     previous_halt: Option<Halt>,
     /// What the guest's halt marker currently says, so an unchanged halt does
     /// not rewrite it once a pass.
     marker: Option<String>,
+}
+
+/// The guest's deletions across passes (§19.6, [`Deleting`]).
+///
+/// One **run** of deletions is everything the guest deletes without stopping
+/// for a hold period. The mass guard is asked about the run: what it has
+/// already had carried onto the host, and what is waiting for it to end.
+///
+/// Kept by the loop and not on the ledger. A syncer that starts again walks
+/// the guest after a break, and that walk deletes nothing on the host that it
+/// did not see go (#190), so there is no run for it to inherit.
+#[derive(Debug, Default)]
+struct Deletions {
+    /// Guest→host removals carried out in this run.
+    carried: usize,
+    /// When a pass last carried one out.
+    last: Option<Instant>,
+    /// Removals held back, and since when each has been.
+    held: BTreeMap<String, Instant>,
+    /// The last pass halted on the mass guard. The run cannot end under a
+    /// halt: its count is what the halt was decided on, and forgetting it
+    /// would let the rest through as a smaller deletion of a smaller tree.
+    withheld: bool,
+}
+
+impl Deletions {
+    /// End the run where the guest has stopped deleting: nothing is held,
+    /// nothing is withheld, and nothing was carried out for a hold period.
+    fn begin(&mut self, now: Instant, hold: Duration) {
+        let quiet = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= hold);
+        if self.held.is_empty() && !self.withheld && quiet {
+            self.carried = 0;
+            self.last = None;
+        }
+    }
+
+    /// When the held removals have all waited a hold period, with nothing
+    /// having joined them since.
+    fn ripens(&self, hold: Duration) -> Option<Instant> {
+        self.held.values().max().map(|newest| *newest + hold)
+    }
+
+    /// The held removals a pass may now carry out: all of them or none,
+    /// because one that joined late says the guest was still deleting.
+    fn ripe(&self, now: Instant, hold: Duration) -> BTreeSet<String> {
+        if self.ripens(hold).is_some_and(|at| at <= now) {
+            self.held.keys().cloned().collect()
+        } else {
+            BTreeSet::new()
+        }
+    }
+
+    /// Take in what a completed pass did.
+    fn record(&mut self, done: &Passed, now: Instant) {
+        if done.host_removed > 0 {
+            self.carried += done.host_removed;
+            self.last = Some(now);
+        }
+        self.held = done
+            .held
+            .iter()
+            .map(|path| {
+                let since = self.held.get(path).copied().unwrap_or(now);
+                (path.clone(), since)
+            })
+            .collect();
+        self.withheld = done
+            .report
+            .halt
+            .as_ref()
+            .is_some_and(|halt| halt.bulk_delete.is_some());
+    }
 }
 
 /// What a pass saw at one path that had moved against the ledger, and when it
@@ -1921,6 +2038,10 @@ struct Passed {
     /// Resolutions to hand back: their apply failed, so the developer's answer
     /// has not been carried out yet.
     unresolved: BTreeMap<String, Winner>,
+    /// Guest→host removals this pass held back for the guest to stop deleting.
+    held: Vec<String>,
+    /// How many removals this pass carried out on the host.
+    host_removed: usize,
     /// What the marker now says, `None` where there is none.
     marker: Option<String>,
     report: Report,
@@ -2268,10 +2389,36 @@ async fn pass(
         undecided: &undecided,
         guest_owned: &guest_owned,
         resolved: pending.resolved,
+        deleting: Deleting {
+            carried: pending.deletions.carried,
+            ripe: pending.ripe,
+        },
         max_file_bytes: workspace.max_file_bytes,
         case_folding: learned.case_folding(),
         unwitnessed: pending.unwitnessed,
     });
+    // Said when the held set grows and not once a pass: the same paths are
+    // held by every pass until the guest goes quiet.
+    if plan
+        .held
+        .iter()
+        .any(|path| !pending.deletions.held.contains_key(path))
+    {
+        events.emit(
+            "workspace.deferred",
+            json!({
+                "machine": workspace.machine,
+                "reason": format!(
+                    "the guest deleted {} path(s), which is a deletion large enough to wait for: \
+                     they are removed on the host once the guest has deleted nothing more for a \
+                     moment, so a deletion that is still running is judged whole",
+                    plan.held.len() + pending.deletions.carried,
+                ),
+                "held": plan.held.len(),
+                "paths": plan.held.iter().take(REPORTED).collect::<Vec<_>>(),
+            }),
+        );
+    }
     // A flush that overlaps a watch reopen defers changed guest paths for
     // another quiet window. Keep their known conflicts until a pass can
     // compare the copies, so this pass cannot resume transfers or accept the
@@ -2609,6 +2756,9 @@ async fn pass(
     // Keep failures directly so the next named probe still includes that file.
     owed.extend(failed.iter().map(|failure| failure.path.clone()));
     owed.extend(rule_deferred.iter().cloned());
+    // A held deletion is guest work the host has not taken, and is listed as
+    // such until a pass carries it out.
+    owed.extend(plan.held.iter().cloned());
 
     Ok(Passed {
         prune,
@@ -2622,6 +2772,8 @@ async fn pass(
         found_host,
         found_guest,
         unresolved,
+        held: plan.held.clone(),
+        host_removed: applied.to_host.removed,
         marker: wanted,
         report: Report {
             trouble,
@@ -3007,6 +3159,8 @@ mod tests {
                 lock_candidates: &BTreeSet::new(),
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
+                deletions: &Deletions::default(),
+                ripe: None,
                 previous_halt: None,
                 marker: None,
             },
@@ -3388,6 +3542,8 @@ mod tests {
                 lock_candidates: &BTreeSet::new(),
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
+                deletions: &Deletions::default(),
+                ripe: None,
                 previous_halt: None,
                 marker: None,
             };
@@ -3802,6 +3958,8 @@ mod tests {
             lock_candidates: &BTreeSet::new(),
             sighted: &Sighted::default(),
             resolved: &BTreeMap::new(),
+            deletions: &Deletions::default(),
+            ripe: None,
             previous_halt: None,
             marker: None,
         };
@@ -4512,6 +4670,101 @@ mod tests {
         assert!(last_degraded < first_sync, "reported after the fact");
     }
 
+    /// How many held-deletion notices the lab has emitted.
+    fn held_notices(state: &std::path::Path) -> usize {
+        events_of(state)
+            .iter()
+            .filter(|(name, data)| name == "workspace.deferred" && data["held"].is_u64())
+            .count()
+    }
+
+    /// Review labd-sync-2 F12 (card 952): the mass guard counted one pass, so
+    /// an `rm -rf` that a pass saw part of was carried out part by part. The
+    /// guest deletes 45 of 100 files, a pass sees them, and then it deletes
+    /// the other 55. The first part is under the proportion on its own, and it
+    /// is still not removed on the host: it waits for the guest to stop, and
+    /// the whole deletion is what the guard judges.
+    #[tokio::test]
+    async fn a_guest_deletion_that_spans_passes_is_held_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for n in 0..100 {
+            std::fs::write(dir.path().join(format!("f{n:03}.rs")), "x").unwrap();
+        }
+        // A hold the test cannot outlast, so the second part never arrives
+        // "too late" on a slow host.
+        let hold = Duration::from_secs(24 * 60 * 60);
+        let (syncers, guest, sessions) =
+            seeded_lab_holding(dir.path(), state.path(), "/src/f099.rs", hold).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+        let on_host = |dir: &std::path::Path| std::fs::read_dir(dir).unwrap().count();
+        assert_eq!(on_host(dir.path()), 100);
+
+        // The guest's `rm -rf` has removed 45 files when the first pass looks.
+        for n in 0..45 {
+            guest.unlink(&format!("/src/f{n:03}.rs"));
+            sessions.watcher.mark(&format!("f{n:03}.rs"));
+        }
+        // A pass has decided the first part, one way or the other: it holds
+        // it, or (the fault) it has removed it from the host.
+        let decided = {
+            let (dir, state) = (dir.path().to_path_buf(), state.path().to_path_buf());
+            eventually(move || {
+                held_notices(&state) > 0 || std::fs::read_dir(&dir).unwrap().count() < 100
+            })
+            .await
+        };
+        assert!(decided, "no pass looked at the first part");
+        let after_first = on_host(dir.path());
+
+        // And the rest by the next.
+        for n in 45..100 {
+            guest.unlink(&format!("/src/f{n:03}.rs"));
+            sessions.watcher.mark(&format!("f{n:03}.rs"));
+        }
+        let halt = halt_of(&syncers, "dev01").await;
+        syncers.stop("dev01").await;
+
+        assert_eq!(after_first, 100, "the first part was removed on the host");
+        let halt = halt.expect("the deletion was not caught");
+        let bulk = halt.bulk_delete.clone().expect("not the mass guard");
+        assert_eq!((bulk.paths.len(), bulk.carried, bulk.agreed), (100, 0, 100));
+        assert_eq!(on_host(dir.path()), 100, "the canonical copy lost files");
+    }
+
+    /// The other half of the hold: a deletion past the floor that stays under
+    /// the proportion is ordinary work, and it reaches the host once the guest
+    /// has stopped deleting, with no halt and nothing asked of the developer.
+    #[tokio::test]
+    async fn a_held_deletion_is_carried_out_once_the_guest_stops_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for n in 0..100 {
+            std::fs::write(dir.path().join(format!("f{n:03}.rs")), "x").unwrap();
+        }
+        let hold = Duration::from_millis(100);
+        let (syncers, guest, sessions) =
+            seeded_lab_holding(dir.path(), state.path(), "/src/f099.rs", hold).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        for n in 0..30 {
+            guest.unlink(&format!("/src/f{n:03}.rs"));
+            sessions.watcher.mark(&format!("f{n:03}.rs"));
+        }
+        let carried = {
+            let dir = dir.path().to_path_buf();
+            eventually(move || std::fs::read_dir(&dir).unwrap().count() == 70).await
+        };
+        let report = syncer.report();
+        syncers.stop("dev01").await;
+
+        assert!(carried, "the held deletion never reached the host");
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        assert_eq!(held_notices(state.path()), 1, "said once, not once a pass");
+    }
+
     /// Start a syncer over the host tree already laid out in `dir`, and wait
     /// until `landed` — a guest path — proves the seed went through.
     ///
@@ -4534,10 +4787,33 @@ mod tests {
         landed: &str,
         settle: Option<Duration>,
     ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
+        seeded_lab_with(dir, state, landed, settle, None).await
+    }
+
+    /// [`seeded_lab`] with the deletion hold set: long, so a test of what a
+    /// held deletion does is not racing the hold's end, or short, so a test of
+    /// the end does not wait out the real [`DELETE_HOLD`].
+    async fn seeded_lab_holding(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+        landed: &str,
+        hold: Duration,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
+        seeded_lab_with(dir, state, landed, None, Some(hold)).await
+    }
+
+    async fn seeded_lab_with(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+        landed: &str,
+        settle: Option<Duration>,
+        hold: Option<Duration>,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>) {
         let guest = Arc::new(FakeGuest::new());
         let (events, _rx) = EventLog::recording("lab", state.join("events.jsonl"));
         let syncers = WorkspaceSyncers {
             settle,
+            hold,
             ..WorkspaceSyncers::default()
         };
         let sessions = OneFake::new(guest.clone());
