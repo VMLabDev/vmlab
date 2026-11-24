@@ -83,8 +83,33 @@ agent-socket-conformance socket root tier='auto': require-cargo
 # Build + install the guest asset and agent binaries into ~/.local/share/vmlab/guest
 [group('build')]
 guest-install: guest-build agent-build agent-legacy-build
-	mkdir -p ~/.local/share/vmlab/guest
-	cp -r guest/dist/* ~/.local/share/vmlab/guest/
+	#!/usr/bin/env bash
+	set -eu
+	parent="${HOME:?}/.local/share/vmlab"
+	dest="$parent/guest"
+	[ "$dest" != / ] && [ -n "$dest" ] || exit 1
+	if [ -L "$dest" ] || { [ -e "$dest" ] && { [ ! -d "$dest" ] || [ ! -O "$dest" ]; }; }; then
+		printf 'Refusing to replace symlink or non-owned guest directory: %s\n' "$dest" >&2
+		exit 1
+	fi
+	mkdir -p -- "$parent"
+	stage=$(mktemp -d "$parent/.vmlab-guest.XXXXXX")
+	[ "$stage" != / ] && [ -n "$stage" ] || exit 1
+	# Keep the backup if the swap fails and the old directory cannot be restored.
+	trap 'if [ ! -e "$stage/old" ] && [ ! -L "$stage/old" ]; then rm -rf -- "$stage"; fi' EXIT
+	mkdir -- "$stage/new"
+	cp -r -- guest/dist/* "$stage/new/"
+	if [ -d "$dest" ]; then
+		mv -T -- "$dest" "$stage/old"
+	fi
+	if ! mv -T -- "$stage/new" "$dest"; then
+		if [ -e "$stage/old" ] && ! mv -T -- "$stage/old" "$dest"; then
+			printf 'Previous guest directory saved at %s\n' "$stage/old" >&2
+		fi
+		exit 1
+	fi
+	rm -rf -- "$stage"
+	trap - EXIT
 
 # Build every guest target and pack the release bundle (version defaults to Cargo.toml's; a missing toolchain fails it)
 [group('build')]
