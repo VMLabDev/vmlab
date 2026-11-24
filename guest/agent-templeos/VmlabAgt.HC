@@ -711,12 +711,13 @@ U0 VmlabAgentTask(U8 *data)
 
 U0 VmlabAgentStart()
 {
-  Spawn(&VmlabAgentTask,NULL,"VmlabAgent");
+  if (!TaskValidate(va_task))
+    va_task=Spawn(&VmlabAgentTask,NULL,"VmlabAgent");
 }
 
 // Register the agent to start at every boot — StartOS.HC ends with
 // `#include "~/MakeHome"`, which resolves to ~/MakeHome.HC.Z — and start it
-// now. Idempotent: a rebuild that already registered it changes nothing.
+// now if it is not already running.
 U0 VmlabAgentInstall()
 {
   I64 sz;

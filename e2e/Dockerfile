@@ -104,6 +104,7 @@ COPY --from=firmware /src/guest/dist/firmware /usr/share/vmlab/guest/firmware
 # A second Linux agent with a different stamp, for the agent-refresh check.
 COPY --from=build /out/stale-agent /usr/share/vmlab/e2e/stale-agent
 COPY e2e /e2e
+COPY guest/agent-templeos/VmlabAgt.HC /guest/agent-templeos/VmlabAgt.HC
 # Catch missing runtime libraries before a suite waits for guests that cannot
 # start. The hypervisor has no host audio session and uses its null backend.
 RUN vmlab --version && vmlab-hv --help > /dev/null
