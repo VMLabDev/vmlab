@@ -1442,6 +1442,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_861_a_script_without_its_entry_point_fails_validation() {
+        for source in [
+            "fn mian(lab: Lab) {}",
+            "fn main() {}",
+            "fn main(n: int) {}",
+            "fn main(lab: Lab) -> int { 1 }",
+        ] {
+            assert!(check_script_source(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn card_861_region_coordinates_do_not_wrap() {
+        let coordinates = vec![4294967301, 0, 10, 10];
+        let matches = MachineHandle::match_opts(0.9, coordinates).unwrap();
+        let ocr = ocr::parse_opts(&[("region".into(), "4294967301,0,10,10".into())].into())
+            .unwrap();
+        assert_eq!(
+            (matches.region, ocr.region),
+            (Some((u32::MAX, 0, 10, 10)), Some((u32::MAX, 0, 10, 10)))
+        );
+    }
+
+    #[test]
     fn a_huge_sleep_ms_faults_without_a_cancellation_token() {
         let ctx = context();
         let unit = ctx

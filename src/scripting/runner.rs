@@ -488,6 +488,13 @@ mod tests {
         run_error(err)
     }
 
+    #[test]
+    fn card_861_a_recursion_fault_has_a_short_trace() {
+        let msg = fault_of("fn f(n: int) -> int { f(n + 1) }\nfn main() { let x = f(0) }");
+        assert!(msg.contains("stack overflow"), "{msg}");
+        assert!(msg.len() < 1000, "fault length: {}", msg.len());
+    }
+
     /// A provision that stops on `expect` names its own step and the `Err`
     /// that caused it (#170), not the step alone.
     #[test]

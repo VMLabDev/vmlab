@@ -245,6 +245,22 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn card_861_expect_keeps_a_character_split_across_reads() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: b"\xffok\xe2\x82".to_vec(),
+                ended: Some("closed".into()),
+            })),
+        };
+        assert_eq!(term.expect("ok", 0).unwrap(), "�ok");
+        term.state.lock().unwrap().buf.push(0xac);
+        assert_eq!(term.read(), "€");
+    }
+
+    #[tokio::test]
     async fn a_huge_timeout_is_an_error_not_a_panic() {
         let term = TerminalHandle {
             machine: "vm".into(),
