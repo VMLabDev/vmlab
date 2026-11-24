@@ -169,6 +169,11 @@ async fn run_async() -> Result<()> {
     if swept != 0 {
         tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
     }
+    sweep_leftover_staging(
+        &crate::paths::template_store_dir(),
+        &crate::paths::data_dir().join(crate::template::oci_bridge::PUSH_WORK_SUBDIR),
+        &crate::paths::oci_cache_dir(),
+    );
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(registry),
         events: events_tx.clone(),
@@ -233,6 +238,28 @@ async fn run_async() -> Result<()> {
     teardown(&supervisor, &tasks).await;
     drop(server);
     Ok(())
+}
+
+fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path) {
+    use crate::staging::{STAGING_PREFIX, sweep};
+    use crate::template::oci_bridge::{PULL_WORK_SUBDIR, WORK_PREFIX};
+
+    for (root, prefix) in [
+        (store, STAGING_PREFIX),
+        (&store.join(PULL_WORK_SUBDIR), WORK_PREFIX),
+        (push_work, WORK_PREFIX),
+        (image_cache, STAGING_PREFIX),
+    ] {
+        match sweep(root, prefix) {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(path = %root.display(), count, "cleared abandoned staging directories")
+            }
+            Err(err) => {
+                tracing::warn!(path = %root.display(), %err, "could not sweep staging directories")
+            }
+        }
+    }
 }
 
 fn sweep_leftover_builds(
@@ -1114,6 +1141,58 @@ impl Handler<SupRequest> for SupervisorHandler {
 #[cfg(test)]
 mod tests {
     use super::{daemon_running, process_running, process_start_time};
+
+    #[test]
+    fn a_leftover_pull_work_dir_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("templates");
+        let pull_work = store.join(".oci-pull");
+        let push_work = dir.path().join("cache/oci-push");
+        let image_cache = dir.path().join("oci");
+        let staging = store.join(".staging-deadbeef");
+        let abandoned_pull = pull_work.join("op-dead");
+        let abandoned_push = push_work.join("op-dead");
+        let abandoned_image = image_cache.join(".staging-deadbeef");
+        let live_store =
+            crate::staging::StagingDir::create(&store, crate::staging::STAGING_PREFIX, 0o777)
+                .unwrap();
+        let live_pull = crate::template::oci_bridge::fresh_work_dir(&pull_work).unwrap();
+        let live_push = crate::template::oci_bridge::fresh_work_dir(&push_work).unwrap();
+        let live_image = crate::oci::image::cache::ImageCache::new(image_cache.clone())
+            .staging_dir()
+            .unwrap();
+        let installed = store.join("x86_64/base/1.0");
+        let chunk = "chunks/base/chunk-0000.zst";
+        for file in [
+            staging.join("disk.qcow2"),
+            abandoned_pull.join(chunk),
+            abandoned_push.join(chunk),
+            abandoned_image.join("layer-0000"),
+            live_store.path().join("disk.qcow2"),
+            live_pull.path().join(chunk),
+            live_push.path().join(chunk),
+            live_image.path().join("layer-0000"),
+            installed.join("disk.qcow2"),
+        ] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"partial").unwrap();
+        }
+
+        super::sweep_leftover_staging(&store, &push_work, &image_cache);
+
+        assert!(!staging.exists(), "abandoned template staging survived");
+        assert!(!abandoned_pull.exists(), "abandoned pull survived");
+        assert!(!abandoned_push.exists(), "abandoned push survived");
+        assert!(
+            !abandoned_image.exists(),
+            "abandoned image staging survived"
+        );
+        assert!(live_store.path().join("disk.qcow2").is_file());
+        assert!(live_pull.path().join(chunk).is_file());
+        assert!(live_push.path().join(chunk).is_file());
+        assert!(live_image.path().join("layer-0000").is_file());
+        assert!(installed.join("disk.qcow2").is_file());
+    }
 
     #[test]
     fn a_start_reaps_the_processes_of_a_leftover_build() {
