@@ -362,6 +362,8 @@ the cause. A first reading is not a diagnosis.
   substitutes a zero-output shader. The 11 NV12 failures and the
   `B8G8R8X8_UNORM` failure of the earlier runs are gone.
 - Known card: none open. C375 changed documentation only.
+- Fixed by card #909: the slot range has 192 entries, and both checks pass
+  on AMD1 (`guest/win3d/docs/acceptance/C909.md`).
 
 ### D5. win3d: `CreateDepthStencilSurfaceEx` with a restricted usage fails
 

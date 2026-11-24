@@ -769,7 +769,9 @@ What the baseline says:
   - A pixel shader that needs more than 32 combined texture slots set
     `E_FAIL` at its creation (`test_high_resource_count`), and the test then
     released the NULL shader. It is created as a shader that writes zero
-    ([known-limits.md](known-limits.md#direct3d-10-and-11-at-most-32-texture-and-sampler-pairs-in-one-shader)).
+    ([known-limits.md](known-limits.md#direct3d-10-and-11-at-most-192-texture-and-sampler-pairs-in-one-shader)).
+    [C909](acceptance/C909.md) raised the limit to 192 slots, and the two
+    checks of the test pass.
 
   The runs of 2026-11-21 at commit `022cd405`, each a fresh lab with
   `tests/e2e/run.sh --template windows-11 --host-gpu <gpu> --keep` and
