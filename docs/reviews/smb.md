@@ -32,17 +32,17 @@ be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606) |
-| F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares (fixed, card #609) |
-| F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run (fixed, card #615) |
-| F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path (fixed, card #610) |
-| F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609) |
-| F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory |
-| F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops (fixed, card #776) |
-| F8 | wrong result | The start check takes any listener on the port for the lab's `smbd` |
-| F9 | wrong result | Nothing notices that `smbd` died, and nothing starts it again (fixed, card #776) |
-| F10 | wrong result | A credential file that cannot be parsed gives a new password at every start |
-| F11 | cosmetic | Files a guest creates are executable on the host |
+| F1 | security | A writable share that holds the lab's `.vmlab` lets the guest rewrite `smb.conf` and reach any directory of the host user (fixed, card #606, `d6776a18`) |
+| F2 | security | One SMB account serves the whole lab, so any sharing guest reads and writes every other machine's shares (fixed, card #609, `36f3e2cf`) |
+| F3 | security | The lab's SMB password is written to the event history, the daemon log and the `up` output when a mount command fails to run (fixed, card #615, `dfd7e9d9`) |
+| F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path (fixed, card #610, `d978d745` and `e4123325`) |
+| F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609, `36f3e2cf`) |
+| F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory (fixed, card #846, `9e8178c1`) |
+| F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops (fixed, card #776, `6665e537`) |
+| F8 | wrong result | The start check takes any listener on the port for the lab's `smbd` (partially fixed, card #652, `e2cc37aa`) |
+| F9 | wrong result | Nothing notices that `smbd` died, and nothing starts it again (fixed, card #776, `6665e537`) |
+| F10 | wrong result | A credential file that cannot be parsed gives a new password at every start (fixed, card #846, `9e8178c1`) |
+| F11 | cosmetic | Files a guest creates are executable on the host (fixed, card #868, `f4706593`) |
 
 ### F1. A writable share that holds `.vmlab` gives the guest the whole host account (security)
 
@@ -363,6 +363,10 @@ be dropped.
   as the child, call `wait_for_start(&mut child, port)`. Today it returns
   `None` (started). The test kills the child at its end and has no limit of
   its own.
+- Card #652 (`e2cc37aa`) rejects a bind failure reported in the startup
+  log. The readiness probe still accepts a listener without checking which
+  process owns it, and the timeout still accepts a live child without a
+  listener.
 
 ### F9. A dead `smbd` is not noticed (wrong result)
 
