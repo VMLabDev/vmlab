@@ -99,10 +99,12 @@ for step in "$@"; do
             say "attack: $U changes the state directory"
             {
                 # In a directory the user owns, the script is not the user's
-                # to write but is the user's to delete.
+                # to write but is the user's to delete. Remove-Item -Force
+                # is no use for that: it first clears file attributes, which
+                # needs a right on the file itself.
                 attempt 'replace the script the startup tasks run' "
                     \$f = '$ROOT\\vmlab-win3d.ps1'; \$new = 'whoami.exe | Set-Content -LiteralPath $PROOF'
-                    try { Set-Content -LiteralPath \$f -Value \$new } catch { Remove-Item -LiteralPath \$f -Force; Set-Content -LiteralPath \$f -Value \$new }"
+                    try { Set-Content -LiteralPath \$f -Value \$new } catch { [IO.File]::Delete(\$f); Set-Content -LiteralPath \$f -Value \$new }"
                 attempt 'create state.json.tmp' "Set-Content -LiteralPath '$ROOT\\state.json.tmp' -Value '{}'"
                 attempt 'create a file in bundle' "Set-Content -LiteralPath '$ROOT\\bundle\\win3dprobe.txt' -Value 'x'"
                 tree_state
