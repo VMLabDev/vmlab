@@ -845,12 +845,9 @@ impl GlobalSegments {
         let remote = stream.peer_addr().context("peer_addr")?;
         let mut segs = self.segs.lock().await;
         let subnet = subnet.trunc();
-        if let Some((other, seg)) = segs
-            .iter()
-            .find(|(other, seg)| {
-                other.as_str() != name && global_subnets_conflict(name, subnet, other, seg.subnet)
-            })
-        {
+        if let Some((other, seg)) = segs.iter().find(|(other, seg)| {
+            other.as_str() != name && global_subnets_conflict(name, subnet, other, seg.subnet)
+        }) {
             tracing::warn!(
                 "refusing trunk from {remote} for global segment {name:?}: subnet {subnet} overlaps segment {other:?} ({})",
                 seg.subnet
