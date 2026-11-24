@@ -77,7 +77,7 @@ hostile guest or peer, wrong result, cosmetic.
 | F1 | security against a hostile guest | The firmware debug port (0x402) writes the serial log file past its size cap (fixed, card #736) |
 | F2 | security, wrong result | `secure_boot = true` on a VM that already has a variable store boots the secure-boot firmware on that store, blank or guest-written (fixed, card #734) |
 | F3 | security inside the guest | aarch64 secure boot keeps its variable store on flash the guest OS can write (fixed by card #735: said, not closed) |
-| F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start |
+| F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start (fixed, card #805) |
 | F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start (fixed, card #740) |
 | F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses |
 | F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check |
@@ -220,6 +220,8 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F4. A read-only VARS template gives a store the VM cannot open
 
+- Fixed in card #805. First start sets the owner write bit on the staged
+  copy before publishing the per-VM store.
 - Where: `src/labd/vm.rs:1369-1374`, against
   `src/labd/freeze_clone.rs:536-542` and
   `hv/vmlab-hv-devices/src/pflash/mod.rs:52`.
