@@ -111,6 +111,77 @@ pub const WINDOWS_DIR_GRANTS: [&str; 3] = [
     "*S-1-5-32-545:(OI)(CI)RX",
 ];
 
+/// The directory the Windows installer puts the agent in.
+const WINDOWS_DIR: &str = r"C:\ProgramData\vmlab";
+
+/// One PowerShell script as an argv. The scripts carry no double quote, so
+/// the string reaches `powershell.exe` as the one argument it is.
+fn powershell(script: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        script.to_string(),
+    ]
+}
+
+/// The Windows prepare step: secure `dir`, then free the staging name.
+///
+/// `C:\ProgramData\vmlab` was made with a plain `mkdir` by every installer
+/// before this one, and a directory made that way lets every local account
+/// create files in it. The push opens the staging file with create and
+/// truncate, which keeps the owner and the access list of a file that is
+/// already there, so an account that made it first would own the service
+/// executable after the swap (docs/reviews/guest-agents-2.md G2).
+///
+/// The order matters. The access list is set first, so that from then on no
+/// standard account can create a name in the directory. Only then is the
+/// staging name freed, by a **rename** to a name nobody chose: a rename
+/// follows no link and enters no directory, where a recursive delete run as
+/// SYSTEM over a name a user controls would delete whatever a junction
+/// points at. The renamed file is deleted with `File.Delete`, which removes
+/// one file and refuses a directory. What is left of the name is read from
+/// the directory's own listing, because a file that is being deleted is
+/// still listed there and can be brought back by whoever holds it open.
+fn windows_prepare(dir: &str, staging: &str) -> String {
+    let name = staging.rsplit('\\').next().unwrap_or(staging);
+    let grants = WINDOWS_DIR_GRANTS.map(|g| format!("'{g}'")).join(" ");
+    format!(
+        "$d = '{dir}'; $n = '{name}'; \
+         icacls.exe $d /setowner '*S-1-5-32-544' /q | Out-Null; \
+         if ($LASTEXITCODE -ne 0) {{ \
+           [Console]::Error.WriteLine('could not give ' + $d + ' to Administrators'); exit 1 }}; \
+         icacls.exe $d /inheritance:r /grant:r {grants} /q | Out-Null; \
+         if ($LASTEXITCODE -ne 0) {{ \
+           [Console]::Error.WriteLine('could not set the access list of ' + $d); exit 1 }}; \
+         if (@([IO.Directory]::GetFileSystemEntries($d, $n)).Count -gt 0) {{ \
+           $a = $d + '\\vmlab-agent.stale-' + [guid]::NewGuid().ToString('N') + '.exe'; \
+           try {{ [IO.Directory]::Move($d + '\\' + $n, $a); [IO.File]::Delete($a) }} catch {{ }} }}; \
+         if (@([IO.Directory]::GetFileSystemEntries($d, $n)).Count -gt 0) {{ \
+           [Console]::Error.WriteLine($d + '\\' + $n + ' exists and could not be moved aside; \
+         remove it in the guest as an administrator'); exit 1 }}; \
+         exit 0"
+    )
+}
+
+/// The Windows verify step: the staged file is one this push created.
+///
+/// A file the SYSTEM agent creates is owned by Administrators (or by SYSTEM
+/// itself), and in the secured directory nobody else can create one. A file
+/// with any other owner was there before the push and is still its owner's
+/// to rewrite, so it must not become the service executable.
+fn windows_verify(staging: &str) -> String {
+    format!(
+        "$o = [IO.File]::GetAccessControl('{staging}')\
+         .GetOwner([Security.Principal.SecurityIdentifier]).Value; \
+         if ($o -ne 'S-1-5-32-544' -and $o -ne 'S-1-5-18') {{ \
+           [Console]::Error.WriteLine('{staging} is owned by ' + $o + ', not by Administrators \
+         or SYSTEM: the push did not create it'); exit 1 }}; \
+         exit 0"
+    )
+}
+
 /// The plan for `guest_os`.
 ///
 /// Both paths are the ones the bootstrap installer wrote at build time
@@ -191,9 +262,9 @@ pub fn plan(guest_os: GuestOs) -> RepairPlan {
             }
         }
         GuestOs::Windows => {
-            let install = r"C:\ProgramData\vmlab\vmlab-agent.exe".to_string();
-            let staging = r"C:\ProgramData\vmlab\vmlab-agent.new.exe".to_string();
-            let previous = r"C:\ProgramData\vmlab\vmlab-agent.old.exe".to_string();
+            let install = format!(r"{WINDOWS_DIR}\vmlab-agent.exe");
+            let staging = format!(r"{WINDOWS_DIR}\vmlab-agent.new.exe");
+            let previous = format!(r"{WINDOWS_DIR}\vmlab-agent.old.exe");
             RepairPlan {
                 // Windows refuses to *overwrite* a running image but allows it
                 // to be *renamed*, so the live agent is moved aside and the
@@ -230,8 +301,8 @@ pub fn plan(guest_os: GuestOs) -> RepairPlan {
                 // what a developer restores by hand if the new one never
                 // starts.
                 replaced: Some(previous),
-                prepare: None,
-                verify: None,
+                prepare: Some(powershell(&windows_prepare(WINDOWS_DIR, &staging))),
+                verify: Some(powershell(&windows_verify(&staging))),
                 staging,
                 install,
             }
@@ -344,10 +415,42 @@ pub async fn push_under(
         );
     }
 
+    // Before a byte is written: the directory must be one only the guest's
+    // administrators create names in, and the staging name must be free.
+    if let Some(prepare) = &plan.prepare {
+        let prepared = agent
+            .exec(prepare.clone(), vec![], None, None, SWAP_TIMEOUT, None)
+            .await
+            .context("securing the agent's directory before the push")?;
+        if prepared.exit_code != 0 {
+            bail!(
+                "\"{name}\": the agent's directory could not be secured for {} ({}), so \
+                 nothing was pushed: {}",
+                plan.staging,
+                prepared.exit_code,
+                String::from_utf8_lossy(&prepared.stderr).trim(),
+            );
+        }
+    }
+
     agent
         .push_file(&asset.path, &plan.staging, Some(0o755))
         .await
         .with_context(|| format!("pushing the shipped agent to {}", plan.staging))?;
+
+    if let Some(verify) = &plan.verify {
+        let verified = agent
+            .exec(verify.clone(), vec![], None, None, SWAP_TIMEOUT, None)
+            .await
+            .context("checking the pushed agent before it is put in place")?;
+        if verified.exit_code != 0 {
+            bail!(
+                "\"{name}\": the pushed agent was not put in place ({}): {}",
+                verified.exit_code,
+                String::from_utf8_lossy(&verified.stderr).trim(),
+            );
+        }
+    }
 
     let swapped = agent
         .exec(plan.swap.clone(), vec![], None, None, SWAP_TIMEOUT, None)
