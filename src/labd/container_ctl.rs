@@ -262,7 +262,9 @@ impl CtlHandle {
 }
 
 fn protocol_mismatch(version: u32) -> anyhow::Error {
-    anyhow!("guest init speaks proto v{version}, host expects v{PROTO_VERSION} — rebuild the guest asset")
+    anyhow!(
+        "guest init speaks proto v{version}, host expects v{PROTO_VERSION} — rebuild the guest asset"
+    )
 }
 
 /// One read of the ctl stream.
