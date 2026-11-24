@@ -2723,7 +2723,10 @@ async fn a_freeze_point_restore_excludes_a_concurrent_start() {
 
     release.send(()).unwrap();
     restore.await.unwrap().expect("freeze-point restore");
-    start.await.unwrap().expect("the start runs after the restore");
+    start
+        .await
+        .unwrap()
+        .expect("the start runs after the restore");
     assert_eq!(hv.launched_disks().len(), 1);
     // It booted on the restored overlay: the mark of the freeze point, the
     // snapshot carried over, and no hold left by a plan that was cut short.
@@ -2766,7 +2769,10 @@ async fn a_freeze_point_restore_excludes_a_concurrent_destroy() {
     release.send(()).unwrap();
     // The plan ran to its end on disks that were still there.
     restore.await.unwrap().expect("freeze-point restore");
-    destroy.await.unwrap().expect("the destroy runs after the restore");
+    destroy
+        .await
+        .unwrap()
+        .expect("the destroy runs after the restore");
     assert!(!machine.dirs.local.exists());
 }
 
