@@ -86,7 +86,10 @@ fn the_trace_cache_stays_within_a_byte_budget() {
     // an older one is evicted for it. Without a limit in bytes this run holds
     // about 71 MiB, and twice that for twice the steps.
     let budget = TRACE_CACHE_BYTES + TRACE_CACHE_BYTES / 2;
-    assert!(budget <= 48 * MIB, "the budget of one hart is {budget} bytes");
+    assert!(
+        budget <= 48 * MIB,
+        "the budget of one hart is {budget} bytes"
+    );
 
     let mut cpu = straight_run();
     // One step outside the measurement: the first step builds what every

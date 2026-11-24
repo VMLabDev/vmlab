@@ -1763,7 +1763,8 @@ impl Trace {
             entries * entry * 3 / 2
         }
         fn names(names: &BTreeSet<String>) -> usize {
-            tree(names.len(), size_of::<String>()) + names.iter().map(|name| text(name)).sum::<usize>()
+            tree(names.len(), size_of::<String>())
+                + names.iter().map(|name| text(name)).sum::<usize>()
         }
         fn value_bytes(value: &Value) -> usize {
             match value {
@@ -1792,7 +1793,10 @@ impl Trace {
             2 * size_of::<usize>()
                 + size_of::<Vec<Binding>>()
                 + bindings.len() * size_of::<Binding>()
-                + bindings.iter().map(|binding| text(&binding.name)).sum::<usize>()
+                + bindings
+                    .iter()
+                    .map(|binding| text(&binding.name))
+                    .sum::<usize>()
         }
         fn recipe(recipe: &Recipe) -> usize {
             match recipe {
@@ -1856,12 +1860,12 @@ impl Trace {
         // locals: each allocation is paid once.
         let mut seen = BTreeSet::new();
         let mut shared = 0;
-        for globals in block
-            .exits
-            .iter()
-            .map(|exit| &exit.globals)
-            .chain(block.checkpoints.iter().map(|checkpoint| &checkpoint.globals))
-        {
+        for globals in block.exits.iter().map(|exit| &exit.globals).chain(
+            block
+                .checkpoints
+                .iter()
+                .map(|checkpoint| &checkpoint.globals),
+        ) {
             if seen.insert(std::sync::Arc::as_ptr(globals) as usize) {
                 shared += bindings(globals);
             }
@@ -1876,7 +1880,11 @@ impl Trace {
                 shared += 2 * size_of::<usize>()
                     + size_of::<Vec<String>>()
                     + frame.local_names.len() * size_of::<String>()
-                    + frame.local_names.iter().map(|name| text(name)).sum::<usize>();
+                    + frame
+                        .local_names
+                        .iter()
+                        .map(|name| text(name))
+                        .sum::<usize>();
             }
         }
         let wide_inputs = self.wide_inputs.take();
@@ -1896,7 +1904,8 @@ impl Trace {
                 .exits
                 .iter()
                 .map(|exit| {
-                    exit.frames.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::SourceFrame>()
+                    exit.frames.capacity()
+                        * size_of::<vmlab_hv_tcg_ir::native::block::SourceFrame>()
                 })
                 .sum::<usize>()
             + frames
@@ -1911,7 +1920,12 @@ impl Trace {
                 .map(|guard| text(&guard.name))
                 .sum::<usize>()
             + self.recorded.constants.capacity() * size_of::<Value>()
-            + self.recorded.constants.iter().map(value_bytes).sum::<usize>()
+            + self
+                .recorded
+                .constants
+                .iter()
+                .map(value_bytes)
+                .sum::<usize>()
             + self.recorded.inputs.capacity() * size_of::<Input>()
             + self.recorded.inputs.iter().map(input).sum::<usize>()
             + self.recorded.stop_reason.as_deref().map_or(0, text)
@@ -1929,8 +1943,7 @@ impl Trace {
             + names(&self.options.small_integer_globals)
             + (self.input_slots.capacity() + self.scalar_input_slots.capacity())
                 * size_of::<Option<usize>>()
-            + self.binding_slots.capacity()
-                * (size_of::<(usize, crate::publication::Plan)>() + 1)
+            + self.binding_slots.capacity() * (size_of::<(usize, crate::publication::Plan)>() + 1)
             + self
                 .binding_slots
                 .values()
