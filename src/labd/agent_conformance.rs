@@ -1720,3 +1720,122 @@ async fn dos_exec_refuses_missing_cwd() -> Result<()> {
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "requires a FreeDOS agent on COM1 in VMLAB_CONFORMANCE_SOCKET"]
+async fn dos_exec_opens_before_the_child_runs() -> Result<()> {
+    let socket = std::env::var_os("VMLAB_CONFORMANCE_SOCKET")
+        .context("set VMLAB_CONFORMANCE_SOCKET to a FreeDOS agent socket")?;
+    let mut stream = UnixStream::connect(Path::new(&socket)).await?;
+    let token = "dos-exec-order";
+    stream
+        .write_all(&encode_ctrl(&HostMsg::Hello {
+            proto_version: PROTO_VERSION,
+            token: token.into(),
+        })?)
+        .await?;
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0; 4096];
+    'handshake: loop {
+        let n = stream.read(&mut buf).await?;
+        ensure(n > 0, "DOS agent socket closed during handshake")?;
+        decoder.push(&buf[..n]);
+        while let Some(frame) = decoder.next_frame() {
+            if let AgentMsg::Hello {
+                token: reply, os, ..
+            } = serde_json::from_slice(&frame.payload)?
+                && reply == token
+            {
+                ensure(os == "dos", "expected a DOS agent")?;
+                break 'handshake;
+            }
+        }
+    }
+    // DOS AUX is COM1. The child writes a marker to the same serial stream
+    // as the agent, so byte order proves which ran first.
+    stream
+        .write_all(&encode_ctrl(&HostMsg::OpenExec {
+            id: 1,
+            argv: vec!["ECHO".into(), "!".into(), ">AUX".into()],
+            env: vec![],
+            cwd: None,
+            logon: None,
+        })?)
+        .await?;
+    let mut opened = false;
+    let mut marker = false;
+    // Read one byte at a time so the marker is seen in wire order even
+    // when the OS delivers it in the same packet as a control frame.
+    loop {
+        let byte = stream.read_u8().await?;
+        if byte == b'!' {
+            ensure(opened, "DOS command wrote to COM1 before opened")?;
+            marker = true;
+        }
+        decoder.push(&[byte]);
+        while let Some(frame) = decoder.next_frame() {
+            if frame.kind == FrameKind::Ctrl {
+                match serde_json::from_slice(&frame.payload)? {
+                    AgentMsg::Opened { id: 1 } => opened = true,
+                    AgentMsg::Exited { id: 1, code } => {
+                        return ensure(marker && code == 0, "DOS marker command failed");
+                    }
+                    AgentMsg::Error { msg, .. } => bail!("{msg}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a FreeDOS agent socket in VMLAB_CONFORMANCE_SOCKET"]
+async fn dos_exec_environment_override_does_not_outlive_the_child() -> Result<()> {
+    let socket = std::env::var_os("VMLAB_CONFORMANCE_SOCKET")
+        .map(PathBuf::from)
+        .context("set VMLAB_CONFORMANCE_SOCKET to a FreeDOS agent socket")?;
+    let handle = AgentHandle::connect_serial(&socket, BUDGET, greeting("legacy")).await?;
+    ensure(handle.info().os == "dos", "expected a DOS agent")?;
+
+    async fn list(handle: &AgentHandle, env: Vec<(String, String)>) -> Result<Vec<u8>> {
+        let mut session = handle.open_exec(vec!["SET".into()], env, None, None).await?;
+        let mut stdout = Vec::new();
+        while let Some(event) = session.recv().await {
+            match event {
+                SessionEvent::Data(bytes) => stdout.extend(bytes),
+                SessionEvent::Exited(0) => return Ok(stdout),
+                SessionEvent::Exited(code) => bail!("SET exited {code}"),
+                SessionEvent::Error(message) => bail!("{message}"),
+                _ => {}
+            }
+        }
+        bail!("SET closed without an exit status")
+    }
+
+    let before = list(&handle, vec![]).await?;
+    let during = list(
+        &handle,
+        vec![
+            ("PATH".into(), r"C:\VML847".into()),
+            ("VML847".into(), "set".into()),
+        ],
+    )
+    .await?;
+    let after = list(&handle, vec![]).await?;
+    let lines = |bytes: &[u8]| {
+        let mut lines: Vec<_> = String::from_utf8_lossy(bytes)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        lines
+    };
+    let during = lines(&during);
+    ensure(
+        during.iter().any(|line| line == r"PATH=C:\VML847")
+            && during.iter().any(|line| line == "VML847=set"),
+        "DOS child did not receive both overrides",
+    )?;
+    assert_eq!(lines(&after), lines(&before), "DOS agent environment changed");
+    Ok(())
+}
