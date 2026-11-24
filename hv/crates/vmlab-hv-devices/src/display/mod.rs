@@ -178,6 +178,13 @@ impl StandardVga {
         Self::with_vram(id, rom, VRAM_SIZE)
     }
 
+    /// VMware SVGA with an optional legacy VGA BIOS. OVMF supplies its own GOP.
+    pub fn new_vmware(id: impl Into<String>, rom: Option<&[u8]>) -> Result<Self, DeviceError> {
+        let mut device = Self::with_optional_rom(id, rom, VRAM_SIZE)?;
+        device.enable_vmware();
+        Ok(device)
+    }
+
     /// A VGA core with `vram_size` bytes of video memory, for adapters that
     /// reuse the VGA register and planar logic with a smaller framebuffer.
     pub(crate) fn with_vram(
@@ -185,7 +192,16 @@ impl StandardVga {
         rom: &[u8],
         vram_size: usize,
     ) -> Result<Self, DeviceError> {
-        if rom.len() < 3 || rom.len() > ROM_SIZE || rom[..2] != [0x55, 0xaa] {
+        Self::with_optional_rom(id, Some(rom), vram_size)
+    }
+
+    fn with_optional_rom(
+        id: impl Into<String>,
+        rom: Option<&[u8]>,
+        vram_size: usize,
+    ) -> Result<Self, DeviceError> {
+        if rom.is_some_and(|rom| rom.len() < 3 || rom.len() > ROM_SIZE || rom[..2] != [0x55, 0xaa])
+        {
             return Err(DeviceError::Other("invalid VGA option ROM".into()));
         }
         let mut dev = Self {
@@ -197,7 +213,7 @@ impl StandardVga {
             dispi: [0; 16],
             vram: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), vram_size)])
                 .map_err(|e| DeviceError::Memory(e.to_string()))?,
-            rom: vec![0xff; ROM_SIZE],
+            rom: Vec::new(),
             seq_index: 0,
             gc_index: 0,
             crtc_index: 0,
@@ -219,7 +235,10 @@ impl StandardVga {
             cached_frame: None,
             render_vram: Vec::new(),
         };
-        dev.rom[..rom.len()].copy_from_slice(rom);
+        if let Some(rom) = rom {
+            dev.rom.resize(ROM_SIZE, 0xff);
+            dev.rom[..rom.len()].copy_from_slice(rom);
+        }
         dev.config[..4].copy_from_slice(&[0x34, 0x12, 0x11, 0x11]);
         dev.config[4] = 3;
         dev.config[8..12].copy_from_slice(&[2, 0, 0, 3]);
@@ -869,7 +888,7 @@ impl PciDevice for StandardVga {
                 (0x10, 0xfffffff0u32, 1),
                 (0x14, 0xff000000, 8),
                 (0x18, 0xffff0000, 8),
-                (0x30, 0xffff0001, 0),
+                (0x30, if self.rom.is_empty() { 0 } else { 0xffff0001 }, 0),
             ] {
                 let value = u32::from_le_bytes(self.config[off..off + 4].try_into().expect("BAR"));
                 self.config[off..off + 4].copy_from_slice(&((value & mask) | flags).to_le_bytes());
@@ -907,7 +926,7 @@ impl PciDevice for StandardVga {
 
     fn bars(&self) -> Vec<BarInfo> {
         if self.svga.is_some() {
-            return vec![
+            let mut bars = vec![
                 BarInfo {
                     index: 0,
                     size: 16,
@@ -923,12 +942,15 @@ impl PciDevice for StandardVga {
                     size: 65536,
                     kind: BarKind::Mmio32,
                 },
-                BarInfo {
+            ];
+            if !self.rom.is_empty() {
+                bars.push(BarInfo {
                     index: ROM_BAR,
                     size: 65536,
                     kind: BarKind::Mmio32,
-                },
-            ];
+                });
+            }
+            return bars;
         }
         vec![
             BarInfo {
@@ -1130,10 +1152,12 @@ impl PciDevice for StandardVga {
 
 impl crate::Resettable for StandardVga {
     fn reset(&mut self) -> Result<(), DeviceError> {
-        let mut device = Self::new(self.id.clone(), &self.rom)?;
-        if self.svga.is_some() {
-            device.enable_vmware();
-        }
+        let device = if self.svga.is_some() {
+            let rom = (!self.rom.is_empty()).then_some(self.rom.as_slice());
+            Self::new_vmware(self.id.clone(), rom)?
+        } else {
+            Self::new(self.id.clone(), &self.rom)?
+        };
         let initial = device.save_state()?;
         self.restore_state(&initial)
     }
