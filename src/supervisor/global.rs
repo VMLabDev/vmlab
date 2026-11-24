@@ -1373,6 +1373,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bridged_segment_has_one_subnet() {
+        use crate::net::frame::{EthView, Ipv4View, UdpView};
+
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        b.globals.attach("other", None, None, None).await.unwrap();
+        b.globals.detach("other", None).await;
+        let (a_sock, _, subnet) = a
+            .globals
+            .attach("wan", None, Some(b.addr.to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(
+            a.globals.list().await[0]["subnet"],
+            b.globals.list().await[0]["subnet"]
+        );
+
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        // With no lab socket connected on B, its only port must be the
+        // trunk. There is no second gateway that could produce a late OFFER.
+        assert_eq!(b_switch.stats().ports, 1);
+        let mut client = trunk_client(&a_sock).await;
+        let discover = crate::net::gateway::tests::discover_frame(MacAddr([2, 0, 0, 0, 0, 42]));
+        write_frame(&mut client, &discover).await.unwrap();
+        let offer = read_frame(&mut client).await.unwrap().unwrap();
+        let eth = EthView::parse(&offer).unwrap();
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        let udp = UdpView::parse(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (67, 68));
+        let bootp = udp.payload();
+        assert_eq!(bootp[0], 2);
+        assert_eq!(&bootp[240..243], &[53, 1, 2]);
+        assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
+    }
+
+    #[tokio::test]
     async fn two_instances_bridge_and_reconnect() {
         let mut a = instance("s3kr1t").await;
         let mut b = instance("s3kr1t").await;

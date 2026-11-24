@@ -569,7 +569,7 @@ impl GatewayTask {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use ipnet::Ipv4Net;
@@ -613,7 +613,7 @@ mod tests {
     }
 
     /// A minimal DHCP DISCOVER broadcast frame from `mac`.
-    fn discover_frame(mac: MacAddr) -> Vec<u8> {
+    pub(crate) fn discover_frame(mac: MacAddr) -> Vec<u8> {
         dhcp_frame(mac, mac, 1)
     }
 
