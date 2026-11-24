@@ -333,9 +333,23 @@ impl TemplateMeta {
             };
         }
         over!(
-            profile, cpus, memory, firmware, tpm, secure_boot, secure_boot_keys,
-            display, cpu_model, hyperv, apple_smc, input, tsc, accel,
-            first_boot_script, agent_version, wscript_surface,
+            profile,
+            cpus,
+            memory,
+            firmware,
+            tpm,
+            secure_boot,
+            secure_boot_keys,
+            display,
+            cpu_model,
+            hyperv,
+            apple_smc,
+            input,
+            tsc,
+            accel,
+            first_boot_script,
+            agent_version,
+            wscript_surface,
         );
         if !m.logins.is_empty() {
             m.wscript_surface = m.wscript_surface.max(self.wscript_surface);

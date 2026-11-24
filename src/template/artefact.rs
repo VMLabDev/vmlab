@@ -28,9 +28,9 @@ pub(crate) fn sweep_abandoned_downloads(dir: &Path) -> Result<usize> {
             && digest.bytes().all(|b| b.is_ascii_hexdigit())
             && stamp.next().is_some_and(|pid| pid.parse::<u32>().is_ok())
             && stamp.next().is_some_and(|n| n.parse::<u64>().is_ok())
-            && stamp.next().is_some_and(|nanos| {
-                nanos.len() == 9 && nanos.bytes().all(|b| b.is_ascii_digit())
-            })
+            && stamp
+                .next()
+                .is_some_and(|nanos| nanos.len() == 9 && nanos.bytes().all(|b| b.is_ascii_digit()))
             && stamp.next().is_none()
     })
 }

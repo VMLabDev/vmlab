@@ -241,7 +241,12 @@ async fn run_async() -> Result<()> {
     Ok(())
 }
 
-fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path, artefact_cache: &Path) {
+fn sweep_leftover_staging(
+    store: &Path,
+    push_work: &Path,
+    image_cache: &Path,
+    artefact_cache: &Path,
+) {
     use crate::staging::{STAGING_PREFIX, sweep};
     use crate::template::oci_bridge::{PULL_WORK_SUBDIR, WORK_PREFIX};
 
@@ -273,8 +278,12 @@ fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path, ar
     ] {
         match result {
             Ok(0) => {}
-            Ok(count) => tracing::info!(path = %root.display(), count, "cleared abandoned temporary files"),
-            Err(err) => tracing::warn!(path = %root.display(), %err, "could not sweep temporary files"),
+            Ok(count) => {
+                tracing::info!(path = %root.display(), count, "cleared abandoned temporary files")
+            }
+            Err(err) => {
+                tracing::warn!(path = %root.display(), %err, "could not sweep temporary files")
+            }
         }
     }
 }

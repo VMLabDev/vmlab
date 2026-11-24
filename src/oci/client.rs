@@ -986,7 +986,8 @@ impl Registry {
                 .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
-            let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(destination_base)?;
+            let variant =
+                TemplateConfig::from_json(&config_bytes)?.into_variant(destination_base)?;
             crate::template::trust::component(&variant.name)?;
             let checked = destination_base.effective(Some(&variant));
             let trusted = crate::template::trust::repository_trusted(

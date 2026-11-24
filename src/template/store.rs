@@ -999,9 +999,18 @@ impl TemplateStore {
         let _lock = self.lock()?;
         let prefix = format!(".{META_FILE}.");
         let mut removed = 0;
-        for arch in subdirs(&self.root)?.into_iter().filter(|path| !path.is_symlink()) {
-            for name in subdirs(&arch)?.into_iter().filter(|path| !path.is_symlink()) {
-                for version in subdirs(&name)?.into_iter().filter(|path| !path.is_symlink()) {
+        for arch in subdirs(&self.root)?
+            .into_iter()
+            .filter(|path| !path.is_symlink())
+        {
+            for name in subdirs(&arch)?
+                .into_iter()
+                .filter(|path| !path.is_symlink())
+            {
+                for version in subdirs(&name)?
+                    .into_iter()
+                    .filter(|path| !path.is_symlink())
+                {
                     removed += crate::staging::sweep_files(&version, |name| {
                         name.strip_prefix(&prefix).is_some_and(|suffix| {
                             suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
