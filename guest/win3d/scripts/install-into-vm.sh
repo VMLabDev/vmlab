@@ -58,6 +58,9 @@ say "running $CMD"
 rc=0
 "$VMLAB" exec --timeout 1200 "$VM" -- cmd.exe /c "$CMD" || rc=$?
 say "$ACTION.cmd exited $rc"
+# 3: the installer refused its state directory (a standard user owns it or
+# something in it) and changed nothing, so state.json will not move.
+[ "$rc" -ne 3 ] || { say "refused: the state directory is not safe (see the message above)"; exit 1; }
 
 deadline=$((SECONDS + TIMEOUT))
 last=
