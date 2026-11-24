@@ -1524,6 +1524,146 @@ mod tests {
     /// The port id the driver puts in DEVICE_READY (VIRTIO_CONSOLE_BAD_ID).
     const BAD_ID_FOR_TEST: u32 = u32::MAX;
 
+    impl Fixture {
+        /// Return once the worker has handled every kick sent so far.
+        fn settle(&self) {
+            let (done, wait) = mpsc::channel();
+            self.dev.kicks.send(Cmd::Barrier(done)).unwrap();
+            self.dev.wake_worker();
+            wait.recv().unwrap();
+        }
+
+        /// Put the control receiveq's used index back, as a restore of guest
+        /// memory does.
+        fn rewind_ctrl_rx_used(&self, idx: u16) {
+            self.mem
+                .write_obj(idx, GuestAddress(self.vqs[2].used + 2))
+                .unwrap();
+        }
+
+        /// Restore `state` in place and let the worker deliver what it owes.
+        fn restore_in_place(&mut self, state: &[u8], ctrl_rx_used: u16) {
+            self.dev.quiesce();
+            self.dev.restore_state(state).unwrap();
+            self.rewind_ctrl_rx_used(ctrl_rx_used);
+            self.dev.resume_snapshot();
+            self.dev.queue_notify(2);
+            self.settle();
+        }
+    }
+
+    #[test]
+    fn restore_reannounces_the_live_host_connection() {
+        let mut f = Fixture::new();
+        f.device_ready(8, 4);
+        let state = f.dev.save_state().unwrap();
+        let told = f.ctrl_delivered();
+        assert_eq!(told.len(), 4);
+
+        let _client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host open", || lock(&f.dev.shared).ports[1].host_open);
+
+        // The guest of the snapshot was never told of the client.
+        f.restore_in_place(&state, 4);
+        let mut want = told;
+        want.push((2, EV_PORT_OPEN, 1, Vec::new()));
+        assert_eq!(f.ctrl_delivered(), want);
+        assert!(lock(&f.dev.shared).ports[1].host_open);
+    }
+
+    #[test]
+    fn restore_tells_the_guest_that_its_host_client_left() {
+        let mut f = Fixture::new();
+        f.device_ready(8, 4);
+        let client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host open", || f.ctrl_delivered().len() == 5);
+        let state = f.dev.save_state().unwrap();
+        let told = f.ctrl_delivered();
+
+        drop(client);
+        wait_for("host closed", || f.ctrl_delivered().len() == 6);
+
+        f.restore_in_place(&state, 5);
+        let mut want = told;
+        want.push((2, EV_PORT_OPEN, 0, Vec::new()));
+        assert_eq!(f.ctrl_delivered(), want);
+
+        // The same connection state as the snapshot's needs no message.
+        let state = f.dev.save_state().unwrap();
+        f.restore_in_place(&state, 6);
+        assert_eq!(f.ctrl_delivered(), want);
+    }
+
+    #[test]
+    fn control_tx_resumes_when_control_rx_buffers_arrive() {
+        let mut f = Fixture::new();
+        let _client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host open", || lock(&f.dev.shared).ports[1].host_open);
+
+        // With no control receive buffer, every PORT_READY of the connected
+        // port leaves a name and an open in `pending`: twelve fill it.
+        for _ in 0..14 {
+            f.send_ctrl(2, EV_PORT_READY, 1);
+        }
+        f.settle();
+        assert_eq!(f.vqs[3].used_idx(&f.mem), 12);
+
+        for i in 0..24 {
+            f.post_ctrl_rx(i % 16);
+        }
+        f.dev.queue_notify(2);
+        f.settle();
+        assert_eq!(f.vqs[3].used_idx(&f.mem), 14);
+        assert_eq!(f.vqs[2].used_idx(&f.mem), 28);
+    }
+
+    #[test]
+    fn a_host_connection_change_is_kept_when_pending_is_full() {
+        let f = Fixture::new();
+        let mut sh = lock(&f.dev.shared);
+        sh.device_ready = true;
+        // Fill `pending` to its cap with events that do not coalesce.
+        let cap = sh.control_cap();
+        for n in 0..cap {
+            sh.enqueue_ctrl(CtrlMsg {
+                id: 1 + (n % 2) as u32,
+                event: 100 + (n / 2) as u16,
+                value: 0,
+                name: None,
+            });
+        }
+        assert_eq!(sh.pending.len(), cap);
+
+        let open = |id: u32, value: u16| CtrlMsg {
+            id,
+            event: EV_PORT_OPEN,
+            value,
+            name: None,
+        };
+        for i in 0..2 {
+            sh.ports[i].host_open = true;
+            notify_host_open(&mut sh, i);
+        }
+        assert_eq!(sh.pending.len(), cap + 2);
+        assert_eq!(sh.pending[cap], open(1, 1));
+        assert_eq!(sh.pending[cap + 1], open(2, 1));
+
+        // Every later change of a port replaces the one that waits.
+        for _ in 0..1000 {
+            for i in 0..2 {
+                sh.ports[i].host_open = !sh.ports[i].host_open;
+                notify_host_open(&mut sh, i);
+            }
+        }
+        assert_eq!(sh.pending.len(), cap + 2);
+        assert_eq!(sh.pending[cap], open(1, 1));
+        assert_eq!(sh.pending[cap + 1], open(2, 1));
+        // Leave the state as the worker has it before it runs again.
+        for port in &mut sh.ports {
+            port.host_open = false;
+        }
+    }
+
     #[test]
     fn duplicate_control_messages_do_not_grow_pending() {
         let f = Fixture::new();
