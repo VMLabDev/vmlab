@@ -330,6 +330,18 @@ for a guest that is not x86.
   The reviewer did not work out how often `Patch` is reached with the source
   not resident: the test decides whether this is real.
 - Severity: crash.
+- Fixed: card #756,
+  `guest/win3d/patches/kmd/kmd-map-present-source-in-present.patch` (driver
+  `100.6.101.58119`). A blob source without the mappable flag is refused
+  when the copy is staged, `Present` maps the source blob in every case, and
+  `Patch` no longer returns the status of a failed mapping.
+  What the test decided (`guest/win3d/docs/acceptance/C756.md`): the defect
+  is real and the crash was not reached. As a standard user the old driver
+  accepts the present of a blob with `BlobFlags = 0` that is not resident
+  yet, and Windows 11 (26100) stops that DMA buffer before it calls `Patch`
+  and returns `0xC01E0200`. No run gave a bugcheck. A blob the host does not
+  know is refused by `D3DKMTCreateAllocation`, because the driver creates
+  the blob when the allocation is opened, so `:513-519` is not a route.
 
 ### F9. The pipe of the two helpers reads more bytes than its buffer has
 

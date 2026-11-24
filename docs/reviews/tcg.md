@@ -288,7 +288,7 @@ beyond the single random words of the first differential run, and
   all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
   generated again for this card.
 
-### F6. The emitter writes a model that the generated crate cannot load
+### F6. The emitter writes a model that the generated crate cannot load (fixed, card #775)
 
 - Where: `emit/main.rs:10` (`serde_json::to_vec`), `emit/main.rs:32` and
   `vmlab-hv-tcg-riscv64/src/lib.rs:176`
@@ -312,6 +312,16 @@ beyond the single random words of the first differential run, and
   test saw the limit between 60 and 62 field accesses, and between 30 and 40
   struct literals.
 - Confidence: high.
+- Fixed by card #775. `generate` reads the JSON it wrote back with
+  `serde_json::from_slice::<Program>`, the call the generated `model()`
+  makes, and returns the error `the generated crate cannot load this model
+  IR` when that fails. So neither a write nor `--check` passes for a model
+  the crate cannot load, and the fault shows when the model is generated,
+  not at the first `model()`. The reader's limit is unchanged: a model that
+  needs more than 128 JSON levels is refused, not loaded. Before the fix the
+  proof test failed with `recursion limit exceeded at line 1 column 760`.
+  The test also runs 1 to 120 field accesses and 1 to 120 nested struct
+  literals, and each is either loaded or refused.
 
 ### F7. A loop that stores into its own code page never reuses a trace (fixed, card #773)
 

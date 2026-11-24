@@ -1156,6 +1156,11 @@ console) is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/
 review, the command size of the submit escape that wrapped in 32 bits, with
 the guest proof before and after and the end-to-end run on the fixed driver.
 
+[C756](acceptance/C756.md) records the fix of finding F8, a present copy
+whose source was mapped in `DxgkDdiPatch`. The probe of that card shows that
+the old driver accepts such a present as a standard user, and that Windows 11
+stops it before `DxgkDdiPatch`: the bugcheck of the finding was not reached.
+
 [C757](acceptance/C757.md) records the fixes of findings F9 and F10: the
 read of the helpers' pipe, which wrote past its buffer, and
 `DxgkCreateAllocation`, which used the result of a failed pool allocation.
