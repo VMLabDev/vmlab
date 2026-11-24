@@ -1121,6 +1121,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_destroyed_segment_gives_its_subnet_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        for creation in 1..=257 {
+            globals
+                .attach("s", None, None, None)
+                .await
+                .unwrap_or_else(|err| panic!("creation {creation}: {err:#}"));
+            globals.detach("s", None).await;
+        }
+    }
+
+    #[tokio::test]
     async fn a_refused_attach_leaves_nothing_on_existing_segment() {
         let dir = tempfile::tempdir().unwrap();
         let globals = globals_without_psk(dir.path().join("global"));
