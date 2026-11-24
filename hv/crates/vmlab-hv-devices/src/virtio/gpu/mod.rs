@@ -1155,10 +1155,16 @@ impl State {
         if q == 0 && writer.available_bytes() < 24 {
             return 0;
         }
-        let (mut kind, payload) = match self.command(mem, q, &request) {
+        let (mut kind, mut payload) = match self.command(mem, q, &request) {
             Ok(response) => response,
             Err(error) => (error, Vec::new()),
         };
+        // The command has run. A buffer that holds the header but not the
+        // payload still gets a header, with an error in it.
+        if writer.available_bytes() >= 24 && writer.available_bytes() < 24 + payload.len() {
+            kind = INVALID;
+            payload.clear();
+        }
         let mut response = vec![0; 24];
         response[..4].copy_from_slice(&kind.to_le_bytes());
         if request[4] & 1 != 0 {

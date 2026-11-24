@@ -657,6 +657,17 @@ fn a_vblank_wait_is_refused_without_the_bit_a_scanout_or_room_for_its_answer() {
 }
 
 #[test]
+fn a_short_response_buffer_gets_an_error_header() {
+    let mut f = QueueFixture::new(FEATURES);
+    // Room for the header, not for the display info behind it.
+    f.put(0, &display_info(), 24);
+    f.notify();
+    assert_eq!(f.used(), 1);
+    assert_eq!(f.used_entry(0), (0, 24));
+    assert_eq!(u32_at(&f.response(0, 24), 0), INVALID);
+}
+
+#[test]
 fn a_reset_drops_the_held_vblank_waits() {
     let mut f = QueueFixture::new(FEATURES);
     f.gpu.state.lock().vblank = Some(Arc::new(vblank::Clock::idle()));
