@@ -101,6 +101,10 @@ class IpxeRecordTest(unittest.TestCase):
         (source / "src/bin").mkdir(parents=True)
         (source / "src/bin/.gitignore").write_text("*\n!.gitignore\n")
         (source / "src/main.c").write_text("int main;\n")
+        # Upstream ignores every local configuration header, so git lists
+        # none of them as untracked.
+        (source / "src/config/local").mkdir(parents=True)
+        (source / "src/config/local/.gitignore").write_text("*\n!.gitignore\n")
         git = ["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         for arguments in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "pin"]):
             subprocess.run([*git, *arguments], check=True)
@@ -142,6 +146,49 @@ class IpxeRecordTest(unittest.TestCase):
         (source / "src/bin/.gitignore").write_text("changed\n")
         ipxe["restore_objects"](source)
         self.assertEqual(self.changes(source), " M src/bin/.gitignore\n M src/main.c\n")
+
+    def headers(self, **contents):
+        """Configuration headers as the repository holds them."""
+        directory = tempfile.TemporaryDirectory(prefix="vmlab-ipxe-config-")
+        self.addCleanup(directory.cleanup)
+        paths = []
+        for name, content in sorted(contents.items()):
+            path = Path(directory.name) / f"{name}.h"
+            path.write_text(content)
+            paths.append(path)
+        return paths
+
+    def test_a_stale_local_header_is_removed_by_name(self):
+        # docs/reviews/firmware.md, F8: a header that an earlier revision of
+        # guest/ipxe/config held stays in a cached checkout, and git does not
+        # list it because upstream ignores the directory.
+        source = self.checkout()
+        local = source / "src/config/local"
+        (local / "settings.h").write_text("#error stale\n")
+        (local / "old").mkdir()
+        (local / "old/general.h").write_text("#define STALE\n")
+        (local / "general.h").write_text("#define EARLIER\n")
+        # make writes an empty header for each one the build does not give.
+        (local / "colour.h").write_text("")
+        self.assertEqual(self.changes(source), "")
+        removed = ipxe["install_configs"](
+            source, self.headers(general="#define NOW\n", console="#define CONSOLE\n"))
+        self.assertEqual(removed, ["old", "settings.h"])
+        self.assertEqual(sorted(path.name for path in local.iterdir()),
+                         [".gitignore", "colour.h", "console.h", "general.h"])
+        self.assertEqual((local / "general.h").read_text(), "#define NOW\n")
+        self.assertEqual((local / "console.h").read_text(), "#define CONSOLE\n")
+        self.assertEqual((local / "colour.h").read_text(), "")
+        self.assertEqual(self.changes(source), "")
+
+    def test_a_checkout_with_only_the_given_headers_loses_nothing(self):
+        source = self.checkout()
+        headers = self.headers(general="#define NOW\n")
+        self.assertEqual(ipxe["install_configs"](source, headers), [])
+        (source / "src/config/local/colour.h").write_text("")
+        self.assertEqual(ipxe["install_configs"](source, headers), [])
+        self.assertEqual(sorted(path.name for path in (source / "src/config/local").iterdir()),
+                         [".gitignore", "colour.h", "general.h"])
 
 
 if __name__ == "__main__":

@@ -257,9 +257,22 @@ pub(super) async fn build_vm(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, true),
     );
-    // Report invalid media when loading a machine, as on reload. Each boot
-    // resolves the images again because the source folders can change.
-    vm.media_images().await?;
+    // No media folder is hashed or built here: a folder that cannot be built
+    // fails the start of its machine, not the load of the lab. What the lab
+    // file alone shows is refused now.
+    let floppies = usize::from(vm_cfg.floppy.is_some())
+        + vm_cfg
+            .media
+            .iter()
+            .filter(|m| m.kind == crate::config::model::MediaKind::Floppy)
+            .count();
+    if floppies > 1 {
+        bail!(
+            "vm \"{}\": both a floppy attachment and floppy media declared — \
+             a VM has one floppy drive",
+            vm_cfg.name
+        );
+    }
     Ok((
         vm.with_hypervisor_fallback(selection.fallback_reason)
             .with_selection_source(selection.source)
