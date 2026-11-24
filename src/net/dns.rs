@@ -31,6 +31,8 @@ pub const DNS_PORT: u16 = 53;
 pub const QTYPE_A: u16 = 1;
 pub const QTYPE_AAAA: u16 = 28;
 pub const QTYPE_ANY: u16 = 255;
+const QTYPE_CNAME: u16 = 5;
+const QTYPE_DNAME: u16 = 39;
 pub const QCLASS_IN: u16 = 1;
 
 pub const RCODE_NOERROR: u8 = 0;
@@ -245,17 +247,8 @@ impl DnsZone {
     pub fn lookup(&self, qname: &str) -> DnsAnswer {
         let name = normalize(qname);
 
-        let mut best: Option<(&SinkholeEntry, (usize, bool))> = None;
-        for s in &self.sinkholes {
-            if pattern_matches(&s.pattern, &name) {
-                let k = specificity(&s.pattern);
-                if best.is_none_or(|(_, bk)| k > bk) {
-                    best = Some((s, k));
-                }
-            }
-        }
-        if let Some((s, _)) = best {
-            return match s.mode {
+        if let Some(mode) = self.sinkhole(&name) {
+            return match mode {
                 SinkholeMode::Nxdomain => DnsAnswer::Nxdomain,
                 SinkholeMode::Zero => DnsAnswer::Zero,
             };
@@ -286,6 +279,22 @@ impl DnsZone {
         } else {
             DnsAnswer::Nxdomain
         }
+    }
+
+    /// The mode of the sinkhole that holds `name`: the most specific
+    /// pattern that matches it, declaration order breaking ties.
+    fn sinkhole(&self, name: &str) -> Option<SinkholeMode> {
+        let name = normalize(name);
+        let mut best: Option<(&SinkholeEntry, (usize, bool))> = None;
+        for s in &self.sinkholes {
+            if pattern_matches(&s.pattern, &name) {
+                let k = specificity(&s.pattern);
+                if best.is_none_or(|(_, bk)| k > bk) {
+                    best = Some((s, k));
+                }
+            }
+        }
+        best.map(|(s, _)| s.mode)
     }
 
     /// Serializable copy of the zone's contents for display surfaces (the
@@ -424,6 +433,7 @@ pub enum DnsAction {
 }
 
 /// The DNS protocol engine over a shared [`DnsZone`].
+#[derive(Clone)]
 pub struct DnsServer {
     zone: Arc<Mutex<DnsZone>>,
 }
@@ -558,6 +568,112 @@ impl DnsServer {
             },
         }
     }
+}
+
+impl DnsServer {
+    /// What reaches the guest of `resp`, the upstream's answer to `query`
+    /// (review networking-2 F33). The sinkhole holds for every name of the
+    /// answer section, the owner of each record and the target of a CNAME
+    /// or DNAME, not only for the question: an alias outside a sinkhole
+    /// that leads into one is answered as the sinkholed name would be. An
+    /// answer this cannot read is not relayed (`None`), since what it holds
+    /// cannot be checked.
+    pub fn screen_upstream(&self, query: &[u8], resp: &[u8]) -> Option<Vec<u8>> {
+        let names = answer_names(resp)?;
+        let hit = {
+            let zone = self.zone.lock_recover();
+            names.iter().find_map(|name| zone.sinkhole(name))
+        };
+        let Some(mode) = hit else {
+            return Some(resp.to_vec());
+        };
+        debug!(?names, ?mode, "upstream DNS answer leads into a sinkhole");
+        let (_, off) = parse_qname(query, 12)?;
+        let qtype = u16::from_be_bytes([*query.get(off)?, *query.get(off + 1)?]);
+        let question_end = off + 4;
+        if query.len() < question_end {
+            return None;
+        }
+        Some(match mode {
+            SinkholeMode::Nxdomain => build_response(query, question_end, RCODE_NXDOMAIN, None),
+            SinkholeMode::Zero => {
+                let zero = matches!(qtype, QTYPE_A | QTYPE_ANY).then_some(Ipv4Addr::UNSPECIFIED);
+                build_response(query, question_end, RCODE_NOERROR, zero)
+            }
+        })
+    }
+}
+
+/// Every name of a DNS message's answer section: the owner of each record,
+/// and the target of each CNAME and DNAME. `None` when the message does not
+/// parse.
+fn answer_names(msg: &[u8]) -> Option<Vec<String>> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]);
+    let mut off = 12;
+    for _ in 0..qdcount {
+        let (_, end) = read_name(msg, off)?;
+        off = end + 4;
+    }
+    let mut names = Vec::new();
+    for _ in 0..ancount {
+        let (owner, end) = read_name(msg, off)?;
+        let fixed = msg.get(end..end + 10)?;
+        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let rdlen = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let rdata = end + 10;
+        msg.get(rdata..rdata + rdlen)?;
+        names.push(owner);
+        if matches!(rtype, QTYPE_CNAME | QTYPE_DNAME) {
+            names.push(read_name(msg, rdata)?.0);
+        }
+        off = rdata + rdlen;
+    }
+    Some(names)
+}
+
+/// Read a possibly compressed name at `off`: the lowercased dotted name and
+/// the offset just past it where it starts. A pointer loop, a reserved label
+/// type or a name past 255 bytes is `None`.
+fn read_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut end = None;
+    let mut jumps = 0;
+    loop {
+        let len = *msg.get(off)?;
+        match len & 0xC0 {
+            0x00 if len == 0 => {
+                off += 1;
+                break;
+            }
+            0x00 => {
+                let len = usize::from(len);
+                let label = msg.get(off + 1..off + 1 + len)?;
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.extend(label.iter().map(|b| char::from(b.to_ascii_lowercase())));
+                if name.len() > 255 {
+                    return None;
+                }
+                off += 1 + len;
+            }
+            0xC0 => {
+                let target = (usize::from(len & 0x3F) << 8) | usize::from(*msg.get(off + 1)?);
+                end.get_or_insert(off + 2);
+                jumps += 1;
+                if jumps > 64 {
+                    return None;
+                }
+                off = target;
+            }
+            _ => return None,
+        }
+    }
+    Some((name, end.unwrap_or(off)))
 }
 
 fn forward_action(upstream: SocketAddr, msg: &[u8], respond: DnsRespondCtx) -> DnsAction {
