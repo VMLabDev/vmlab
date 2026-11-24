@@ -540,6 +540,12 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         format!("volume host path {} is not a directory", host.display()),
                     ));
                 }
+                // A volume can ride CIFS, where smb.conf takes the path as
+                // a line and Samba expands a `%` in it (docs/reviews/smb-2.md
+                // F18): refuse it here, not at `up`.
+                if let Some(problem) = crate::smb::config::share_host_problem(&path, true) {
+                    issues.push(Issue::at(v.span, format!("volume {problem}")));
+                }
                 // A named volume lives under the state directory by vmlab's
                 // own hand; a host bind over it is the guest's way in.
                 if let Some(problem) = share_over_lab_state(&file.root, &path) {

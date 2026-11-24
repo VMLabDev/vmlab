@@ -235,6 +235,20 @@ impl SmbConfig {
                     reason,
                 });
             }
+            // The server's own directories go into `[global]` (`include`,
+            // `log file`, the state paths), where Samba expands a `%` as it
+            // does in a share's path (docs/reviews/smb-2.md F17).
+            for (dir, what) in [
+                (&self.lab_dir, "vmlab's SMB state directory"),
+                (&self.run_dir, "vmlab's SMB runtime directory"),
+            ] {
+                if let Some(reason) = server_dir_problem(dir, what) {
+                    return Err(ShareRefused {
+                        name: s.name.clone(),
+                        reason,
+                    });
+                }
+            }
             // This file, the passdb and smbd's sockets: a share over any of
             // them hands the guest the server (docs/reviews/smb.md F1).
             for (state, what) in [
@@ -453,6 +467,24 @@ pub fn share_host_problem(host: &Path, may_use_smb: bool) -> Option<String> {
     } else if may_use_smb && text.contains('%') {
         Some(format!(
             "the host path {text:?} contains %, which Samba uses for variable expansion"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Why `dir`, one of the server's own directories (`what` names it), cannot
+/// be written into `smb.conf`'s `[global]`, or `None`. The same two faults as
+/// [`share_host_problem`]: a line break ends the line, and Samba expands a
+/// `%` in `include`, `log file` and the state paths.
+fn server_dir_problem(dir: &Path, what: &str) -> Option<String> {
+    let text = dir.to_string_lossy();
+    if text.contains(['\n', '\r']) {
+        Some(format!("{what} {text:?} holds a line break"))
+    } else if text.contains('%') {
+        Some(format!(
+            "{what} {text:?} contains %, which Samba uses for variable expansion; \
+             move the lab to a path without one"
         ))
     } else {
         None
