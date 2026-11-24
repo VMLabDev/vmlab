@@ -396,7 +396,10 @@ impl VmShared {
         if self.chipset.lock().is_some() {
             return Ok(());
         }
-        self.pm.lock().restore_state(state).map_err(|e| e.to_string())
+        self.pm
+            .lock()
+            .restore_state(state)
+            .map_err(|e| e.to_string())
     }
 
     pub(crate) fn reset_platform(&self) {
