@@ -7,6 +7,7 @@
 //! must follow host consumption, not the guest's pace.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -15,6 +16,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32};
 use super::VirtioSnd;
 use crate::Snapshot;
 use crate::audio::recording::RecordingHost;
+use crate::audio::ring::SpscRing;
 use crate::audio::{AudioClock, CaptureSource, HostAudio, PlaybackSink};
 use crate::virtio::pci::VirtioPciDevice;
 use crate::virtio::sound::SoundPci;
@@ -1223,6 +1225,143 @@ fn driver_reset_returns_the_device_to_power_on() {
         host.playback_opens(),
         2,
         "the reset closed the first stream"
+    );
+}
+
+/// A host whose sink is a ring of the PulseAudio backend's size (1024
+/// frames of S16 stereo) that only the test reads, counting every byte a
+/// push dropped.
+#[derive(Clone)]
+struct RingHost {
+    ring: Arc<SpscRing>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl RingHost {
+    fn new() -> Self {
+        Self {
+            ring: Arc::new(SpscRing::with_capacity_bytes(4 * 256 * 4)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The host plays `bytes` of what the ring holds.
+    fn play(&self, bytes: usize) -> Vec<u8> {
+        let mut out = vec![0; bytes];
+        let moved = self.ring.pop_max(&mut out);
+        out.truncate(moved);
+        out
+    }
+}
+
+struct RingSink(RingHost);
+
+impl PlaybackSink for RingSink {
+    fn write_period(&mut self, pcm: &[u8]) {
+        let dropped = self.0.ring.push_drop_oldest(pcm);
+        self.0.dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+    fn latency_bytes(&self) -> usize {
+        self.0.ring.used_bytes()
+    }
+    fn room_bytes(&self) -> Option<usize> {
+        Some(self.0.ring.free_bytes())
+    }
+}
+
+impl HostAudio for RingHost {
+    fn name(&self) -> &'static str {
+        "ring"
+    }
+    fn open_playback(
+        &self,
+        _: crate::audio::AudioFormat,
+    ) -> Result<Box<dyn PlaybackSink>, DeviceError> {
+        Ok(Box::new(RingSink(self.clone())))
+    }
+    fn open_capture(
+        &self,
+        _: crate::audio::AudioFormat,
+    ) -> Result<Box<dyn CaptureSource>, DeviceError> {
+        Err(DeviceError::State("no capture".into()))
+    }
+}
+
+// Review virtio-devices-2, F6.
+#[test]
+fn a_period_larger_than_the_sink_ring_is_not_dropped() {
+    const MESSAGE: u64 = 0x80000;
+    const STATUS: u64 = 0x90000;
+    let host = RingHost::new();
+    let mut g = Guest::new(Arc::new(host.clone()), false);
+    g.negotiate();
+    g.setup_queues();
+    // A period of 2048 frames: twice what the ring holds.
+    let period = 2048 * 4;
+    assert_eq!(g.set_params(0, 4 * period, period), S_OK);
+    assert_eq!(g.pcm_command(R_PCM_PREPARE, 0), S_OK);
+    assert_eq!(g.pcm_command(R_PCM_START, 0), S_OK);
+
+    let pcm: Vec<u8> = (0..period).map(|byte| (byte % 251) as u8).collect();
+    let mut message = 0u32.to_le_bytes().to_vec();
+    message.extend_from_slice(&pcm);
+    g.write_bytes(MESSAGE, &message);
+    g.submit(
+        VQ_TX,
+        &[(MESSAGE, message.len() as u32, NEXT), (STATUS, 8, WRITE)],
+    );
+    // One period of machine time lets the message play.
+    g.advance(8 * period_time());
+    assert_eq!(host.ring.used_bytes(), 4096, "the ring is full");
+    assert_eq!(host.dropped(), 0, "the sink dropped PCM it had not played");
+    // The ring holds the first half. The message is not complete.
+    assert_eq!(g.used_idx(VQ_TX), 0);
+
+    // The host plays, and the device moves the rest without a kick and
+    // without a further period of machine time.
+    let mut played = Vec::new();
+    for _ in 0..8 {
+        played.extend(host.play(1024));
+        g.advance(Duration::from_millis(1));
+    }
+    played.extend(host.play(period as usize));
+    assert_eq!(host.dropped(), 0);
+    assert_eq!(played, pcm, "every frame plays one time, in order");
+    assert_eq!(g.used_idx(VQ_TX), 1);
+    assert_eq!(g.used_entry(VQ_TX, 0).1, 8);
+    let status = g.read_bytes(STATUS, 4);
+    assert_eq!(u32::from_le_bytes(status.try_into().unwrap()), S_OK);
+}
+
+// Review virtio-devices-2, F10.
+#[test]
+fn completions_respect_avail_no_interrupt() {
+    let host = PacedHost::default();
+    let mut g = Guest::new(Arc::new(host.clone()), false);
+    g.setup_msix();
+    g.negotiate();
+    g.setup_queues();
+    g.start_streams();
+    g.msi.messages.lock().clear();
+
+    // VIRTQ_AVAIL_F_NO_INTERRUPT on the control and the tx queue.
+    for queue in [VQ_CONTROL, VQ_TX] {
+        g.mem
+            .write_obj(Le16::from(1), GuestAddress(rings(queue).1))
+            .unwrap();
+    }
+    assert_eq!(g.pcm_command(R_PCM_STOP, 0), S_OK);
+    assert_eq!(g.pcm_command(R_PCM_START, 0), S_OK);
+    g.tx(0, 0, &period_pcm(0xAA));
+    g.advance(period_time());
+    assert_eq!(g.used_idx(VQ_TX), 1);
+    assert!(
+        g.msi.messages.lock().is_empty(),
+        "the driver turned interrupts off on both queues"
     );
 }
 

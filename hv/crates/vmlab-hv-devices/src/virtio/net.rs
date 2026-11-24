@@ -478,7 +478,7 @@ fn run(
                         );
                     }
                     Err(()) => {
-                        drop_link(&mut stream, &shared);
+                        drop_link_and_release_tx(&mut stream, &shared, &negotiated);
                         continue;
                     }
                 }
@@ -487,7 +487,7 @@ fn run(
                 && let Some(s) = stream.as_mut()
                 && flush_tx(&shared, s).is_err()
             {
-                drop_link(&mut stream, &shared);
+                drop_link_and_release_tx(&mut stream, &shared, &negotiated);
                 continue;
             }
             if revents & libc::POLLOUT != 0 {
@@ -500,7 +500,7 @@ fn run(
                 );
             }
             if dead {
-                drop_link(&mut stream, &shared);
+                drop_link_and_release_tx(&mut stream, &shared, &negotiated);
             }
         }
 
@@ -604,6 +604,26 @@ fn drop_link(stream: &mut Option<UnixStream>, shared: &Arc<Mutex<Shared>>) {
     if was_up {
         fire_config(shared);
     }
+}
+
+/// Drop the switch connection from the worker loop, then serve the transmit
+/// queues once with the link down. A queue that stopped behind full staging
+/// left its kick suppressed and waited for `POLLOUT`, which the dead
+/// connection never delivers: without this pass its chains are never
+/// completed and the guest never kicks again.
+fn drop_link_and_release_tx(
+    stream: &mut Option<UnixStream>,
+    shared: &Arc<Mutex<Shared>>,
+    negotiated: &AtomicU64,
+) {
+    drop_link(stream, shared);
+    // With a TAP attached the TAP worker owns the transmit queues, and
+    // the switch staging never held them back.
+    if lock(shared).tap_mode {
+        return;
+    }
+    let features = negotiated.load(Ordering::Acquire);
+    process_tx(shared, stream, hdr_len(features), features & F_CSUM != 0);
 }
 
 /// True while no complete frame is waiting for a receiveq buffer — the worker
@@ -4279,6 +4299,39 @@ mod tests {
         let mut got = vec![0u8; frame.len()];
         reconnected.read_exact(&mut got).unwrap();
         assert_eq!(&got, &frame[..]);
+    }
+
+    #[test]
+    fn transmit_resumes_after_the_link_drops_under_backpressure() {
+        let mut f = Fixture::new();
+        // The switch accepts and never reads.
+        let switch = f.take_switch_side();
+        wait_for("link up", || f.status() & S_LINK_UP != 0);
+
+        // 96 frames of 32 KiB are 3 MiB: more than the socket buffer and
+        // the 1 MiB of staging together, so some chains must stay queued.
+        let frame = vec![0x5a_u8; 32 * 1024];
+        let chains: u16 = 96;
+        for _ in 0..chains {
+            f.queue_tx(&frame);
+        }
+        f.dev.queue_notify(1);
+        wait_for("staging to fill", || {
+            lock(&f.dev.shared).tx_out.len() >= MAX_TX_STAGE
+        });
+        assert!(
+            f.vqs[1].used_idx(&f.mem) < chains,
+            "the queue must be held back behind full staging"
+        );
+
+        // The switch dies and comes back. The guest sends no kick: the
+        // device suppressed it when it stopped behind the full staging.
+        drop(switch);
+        let _reconnected = f.take_switch_side();
+        wait_for("the held-back transmit chains to complete", || {
+            f.vqs[1].used_idx(&f.mem) == chains
+        });
+        assert!(lock(&f.dev.shared).tx_out.len() < MAX_TX_STAGE);
     }
 
     #[test]
