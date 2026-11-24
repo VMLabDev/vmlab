@@ -889,13 +889,13 @@ mod parking {
     }
 
     /// The bound endpoint, and the display it claimed (X11 only).
-    struct Bound {
+    pub(crate) struct Bound {
         endpoint: Endpoint,
         display: Option<u32>,
     }
 
     /// Bind the protocol's listeners and write what the program will read.
-    fn listen(home: &AppHome, protocol: &Protocol) -> std::io::Result<Bound> {
+    pub(crate) fn listen(home: &AppHome, protocol: &Protocol) -> std::io::Result<Bound> {
         let (listeners, unlink, display) = match protocol {
             Protocol::Waypipe => {
                 let path = home.dir.join("wp.sock");
@@ -935,7 +935,7 @@ mod parking {
     }
 
     /// Hand `path` to the session's identity with `mode`.
-    fn give(path: &Path, owner: Option<(u32, u32)>, mode: u32) -> std::io::Result<()> {
+    pub(crate) fn give(path: &Path, owner: Option<(u32, u32)>, mode: u32) -> std::io::Result<()> {
         if let Some((uid, gid)) = owner {
             std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
         }
@@ -1210,5 +1210,6 @@ mod parking {
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use parking::{
-    FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, x11_dir, x11_dir_owner_trusted, xauthority,
+    FAMILY_LOCAL, FAMILY_WILD, Protocol, give, listen, waypipe_argv, x11_dir,
+    x11_dir_owner_trusted, xauthority,
 };

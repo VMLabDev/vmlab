@@ -22,7 +22,8 @@ use vmlab_agent_proto::app::{AppMode, AppRecord, RecordDecoder};
 use vmlab_agent_proto::{AgentMsg, Frame, FrameKind, HostMsg, Logon};
 
 use crate::app::{
-    FAMILY_LOCAL, FAMILY_WILD, waypipe_argv, x11_dir, x11_dir_owner_trusted, xauthority,
+    AppHome, FAMILY_LOCAL, FAMILY_WILD, Protocol, give, listen, waypipe_argv, x11_dir,
+    x11_dir_owner_trusted, xauthority,
 };
 use crate::fake_spawner::TestPlatform;
 use crate::mux::{Input, Mux, Platform};
@@ -968,4 +969,85 @@ fn the_x11_socket_dir_owner_must_be_root_the_agent_or_the_session() {
     assert!(!x11_dir_owner_trusted(1001, agent, Some((1000, 1000))));
     assert!(!x11_dir_owner_trusted(1001, agent, None));
     assert!(x11_dir_owner_trusted(500, 500, None), "the agent's own");
+}
+
+/// The test's own identity, which a chown to needs no privilege.
+fn me() -> (u32, u32) {
+    (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    )
+}
+
+/// A file an account must not be able to reach through a session: its
+/// content and its mode are what a write or a hand-over through a link
+/// would change.
+fn victim(dir: &Path) -> PathBuf {
+    let file = dir.join("victim");
+    std::fs::write(&file, "keep me").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    file
+}
+
+fn assert_untouched(victim: &Path) {
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep me");
+    let mode = std::fs::metadata(victim).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o644, "the link's target was not handed over");
+}
+
+/// Review guest-agents-2 G1: the session's account owns the private
+/// directory before the agent writes into it, so it can plant a symlink at
+/// `Xauthority`. The agent refuses the name rather than writing the cookie
+/// through the link and handing the link's target to the account.
+#[test]
+fn an_app_session_does_not_write_through_a_planted_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = victim(tmp.path());
+    let dir = tmp.path().join("private");
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("Xauthority")).unwrap();
+    let x11_unix = tmp.path().join(".X11-unix");
+    let home = AppHome {
+        dir,
+        seen: "/run/vmlab-app/test".into(),
+        x11_unix: x11_unix.clone(),
+        owner: Some(me()),
+        hostname: "guest".into(),
+    };
+
+    let bound = listen(
+        &home,
+        &Protocol::X11 {
+            cookie: COOKIE.into(),
+        },
+    );
+    assert_untouched(&target);
+    assert!(bound.is_err(), "a planted name fails the session");
+    assert_eq!(
+        std::fs::read_dir(&x11_unix).unwrap().count(),
+        0,
+        "the display the failed session claimed is unlinked"
+    );
+}
+
+/// Review guest-agents-2 G1, the race half: between the bind and the
+/// hand-over the account can swap the session's socket for a link. What is
+/// handed over is the socket the agent bound or nothing — never the target
+/// of a symlink, and never a file hard-linked to the name.
+#[test]
+fn a_session_socket_swapped_for_a_link_is_not_handed_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = victim(tmp.path());
+
+    let soft = tmp.path().join("soft.sock");
+    std::os::unix::fs::symlink(&target, &soft).unwrap();
+    let handed = give(&soft, Some(me()), 0o600);
+    assert_untouched(&target);
+    assert!(handed.is_err(), "a symlink is refused");
+
+    let hard = tmp.path().join("hard.sock");
+    std::fs::hard_link(&target, &hard).unwrap();
+    let handed = give(&hard, Some(me()), 0o600);
+    assert_untouched(&target);
+    assert!(handed.is_err(), "a file that is no socket is refused");
 }
