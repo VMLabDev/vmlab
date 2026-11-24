@@ -372,6 +372,23 @@ for a guest that is not x86.
   calls `D3DKMTCreateAllocation` with `NumAllocations = 2`, and the test
   passes when the call fails or both allocations work.
 - Severity: crash.
+- Fixed: card #757,
+  `guest/win3d/patches/kmd/kmd-check-create-allocation-memory.patch` (driver
+  `100.6.101.58120`). `DxgkCreateAllocation` returns
+  `STATUS_INSUFFICIENT_RESOURCES` for a NULL result, the pool `operator new`
+  of the driver is `noexcept`, and a `NumAllocations` other than 1 is
+  `STATUS_INVALID_PARAMETER`. The proof is `guest/win3d/probes/alloc` under
+  Driver Verifier's low resources simulation, as a standard user
+  (`guest/win3d/docs/acceptance/C757.md`): the old driver bugchecks the
+  guest with `0x3B` at the first failed pool allocation, after 602 calls
+  that succeeded. With the fix 200 calls fail, all with
+  `STATUS_INSUFFICIENT_RESOURCES`, and the guest stays up. Two corrections
+  to the text above, from those runs. The fault is not at the call of
+  `IsValid()`: clang runs the constructor on the NULL pointer first, at this
+  and at every other `new` of an object in the driver, so a NULL check alone
+  is no fix. And the second half is no crash: a call with
+  `NumAllocations = 2` fails with `STATUS_INVALID_PARAMETER` on the old
+  driver too.
 
 ## Notes
 
