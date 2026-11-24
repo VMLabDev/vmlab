@@ -117,8 +117,11 @@ def exercise_templeos_reinstall(h, lab):
     source = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("//"))
     h.vmlab("exec", machine, "--", f'FileWrite("~/VmlabAgt.HC",{json.dumps(source)},{len(source)});', cwd=lab)
     h.vmlab("vm", "restart", machine, cwd=lab)
-    h.wait_ready(lab, machine, timeout=300)
+    h.wait_ready(lab, machine)
     wait_for_screen(h, lab, machine)
+    screen = h.vmlab("vm", "ocr", machine, cwd=lab).out
+    if "take tour" in screen.lower():
+        h.vmlab("script", "decline-tour.ws", cwd=lab)
     h.vmlab("script", "reinstall.ws", cwd=lab)
     for attempt in range(1, 11):
         result = h.vmlab("exec", machine, "--", r'if (FileFind("~/F7DONE.TXT")) "ok\n";', cwd=lab, check=False)
