@@ -480,12 +480,18 @@ static LONG present_once(present_fn present, UINT context, HWND window, UINT sou
     p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
     p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
     p->flags = PRESENT_BLT | PRESENT_DST_RECT_VALID | PRESENT_SRC_RECT_VALID;
+    /* One sub-rectangle, the whole source: the runtimes pass the visible
+     * region of the window here, and a present without one is refused. */
+    static RECT sub_rect;
+    sub_rect = p->src_rect;
+    p->sub_rect_count = 1;
+    p->src_sub_rects = &sub_rect;
     switch (variant) {
     case 0: p->window = window; break;
     case 1: p->window = window; p->destination = destination; break;
     case 2: p->destination = destination; break;
-    case 3: p->window = window; p->destination = destination; p->flags = PRESENT_BLT; break;
-    default: p->window = window; p->flags = PRESENT_BLT; break;
+    case 3: p->window = window; p->destination = destination; p->sub_rect_count = 0; p->src_sub_rects = NULL; break;
+    default: p->window = window; p->destination = destination; p->flags = PRESENT_BLT; break;
     }
     return present(request);
 }
