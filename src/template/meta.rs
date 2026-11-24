@@ -95,7 +95,8 @@ pub struct TemplateMeta {
 
 /// One sealed variant of a template version (§6.6): a `variant` block inside
 /// `template_meta`. Every `Option` hardware or script field overrides the
-/// base's own when set; [`TemplateMeta::effective`] is the merge.
+/// base's own when set. A pulled variant may also clear inherited values;
+/// [`TemplateMeta::effective`] is the merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantMeta {
     pub name: String,
@@ -108,6 +109,8 @@ pub struct VariantMeta {
     /// since changed is stale ([`TemplateMeta::is_stale`]).
     pub base_sha256: String,
     pub description: Option<String>,
+    /// Whether absent variant fields clear the base's values.
+    pub replace_fields: bool,
     pub first_boot_script: Option<String>,
     pub agent_version: Option<String>,
     pub wscript_surface: Option<crate::scripting::WscriptSurfaceVersion>,
@@ -322,28 +325,32 @@ impl TemplateMeta {
         m.variants.clear();
         let Some(v) = variant else { return m };
         m.variants_expected = false;
-        fn over<T: Clone>(slot: &mut Option<T>, value: &Option<T>) {
-            if value.is_some() {
-                slot.clone_from(value);
-            }
+        macro_rules! over {
+            ($($field:ident),+ $(,)?) => {
+                $(if v.replace_fields || v.$field.is_some() {
+                    m.$field.clone_from(&v.$field);
+                })+
+            };
         }
-        over(&mut m.profile, &v.profile);
-        over(&mut m.cpus, &v.cpus);
-        over(&mut m.memory, &v.memory);
-        over(&mut m.firmware, &v.firmware);
-        over(&mut m.tpm, &v.tpm);
-        over(&mut m.secure_boot, &v.secure_boot);
-        over(&mut m.secure_boot_keys, &v.secure_boot_keys);
-        over(&mut m.display, &v.display);
-        over(&mut m.cpu_model, &v.cpu_model);
-        over(&mut m.hyperv, &v.hyperv);
-        over(&mut m.apple_smc, &v.apple_smc);
-        over(&mut m.input, &v.input);
-        over(&mut m.tsc, &v.tsc);
-        over(&mut m.accel, &v.accel);
-        over(&mut m.first_boot_script, &v.first_boot_script);
-        over(&mut m.agent_version, &v.agent_version);
-        over(&mut m.wscript_surface, &v.wscript_surface);
+        over!(
+            profile,
+            cpus,
+            memory,
+            firmware,
+            tpm,
+            secure_boot,
+            secure_boot_keys,
+            display,
+            cpu_model,
+            hyperv,
+            apple_smc,
+            input,
+            tsc,
+            accel,
+            first_boot_script,
+            agent_version,
+            wscript_surface,
+        );
         if !m.logins.is_empty() {
             m.wscript_surface = m.wscript_surface.max(self.wscript_surface);
         }
@@ -565,6 +572,9 @@ fn write_variant(out: &mut String, v: &VariantMeta) {
     let _ = writeln!(out, "    base_sha256 = {}", quote(&v.base_sha256));
     if let Some(d) = &v.description {
         let _ = writeln!(out, "    description = {}", quote(d));
+    }
+    if v.replace_fields {
+        let _ = writeln!(out, "    replace_fields = true");
     }
     if let Some(s) = &v.first_boot_script {
         let _ = writeln!(out, "    first_boot_script = {}", quote(s));
@@ -800,6 +810,7 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
     let base_sha256 = r.required_string("base_sha256");
     let default = r.bool("default").unspan().unwrap_or(false);
     let description = r.string("description").unspan();
+    let replace_fields = r.bool("replace_fields").unspan().unwrap_or(false);
     let first_boot_script = r.string("first_boot_script").unspan();
     let agent_version = r.string("agent_version").unspan();
     let wscript_surface = r
@@ -842,6 +853,7 @@ fn extract_variant(b: &Block, issues: &mut IssueList) -> Option<VariantMeta> {
         sha256: sha256?.value,
         base_sha256: base_sha256?.value,
         description,
+        replace_fields,
         first_boot_script,
         agent_version,
         wscript_surface,
@@ -1261,6 +1273,7 @@ login "dev" { user = "dev" }
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,

@@ -184,34 +184,47 @@ impl TemplateConfig {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("variant `{}`'s config blob has no sha256", v.name))?;
         let m = self.into_meta(None)?;
-        fn over<T: PartialEq + Clone>(effective: &Option<T>, base: &Option<T>) -> Option<T> {
-            (effective != base).then(|| effective.clone()).flatten()
+        macro_rules! variant {
+            ($($field:ident),+ $(,)?) => {{
+                // An omitted override normally inherits. If any published field
+                // is absent but present in the destination base, store all the
+                // published fields so the omission stays an absence.
+                let replace_fields = $( (m.$field.is_none() && base.$field.is_some()) )||+;
+                VariantMeta {
+                    name: v.name,
+                    default: v.default,
+                    created: m.created,
+                    sha256,
+                    base_sha256: v.base_sha256,
+                    description: v.description,
+                    replace_fields,
+                    $($field: if replace_fields || m.$field != base.$field {
+                        m.$field
+                    } else {
+                        None
+                    }),+
+                }
+            }};
         }
-        Ok(VariantMeta {
-            name: v.name,
-            default: v.default,
-            created: m.created,
-            sha256,
-            base_sha256: v.base_sha256,
-            description: v.description,
-            first_boot_script: over(&m.first_boot_script, &base.first_boot_script),
-            agent_version: over(&m.agent_version, &base.agent_version),
-            wscript_surface: over(&m.wscript_surface, &base.wscript_surface),
-            profile: over(&m.profile, &base.profile),
-            cpus: over(&m.cpus, &base.cpus),
-            memory: over(&m.memory, &base.memory),
-            firmware: over(&m.firmware, &base.firmware),
-            tpm: over(&m.tpm, &base.tpm),
-            secure_boot: over(&m.secure_boot, &base.secure_boot),
-            secure_boot_keys: over(&m.secure_boot_keys, &base.secure_boot_keys),
-            display: over(&m.display, &base.display),
-            cpu_model: over(&m.cpu_model, &base.cpu_model),
-            hyperv: over(&m.hyperv, &base.hyperv),
-            apple_smc: over(&m.apple_smc, &base.apple_smc),
-            input: over(&m.input, &base.input),
-            tsc: over(&m.tsc, &base.tsc),
-            accel: over(&m.accel, &base.accel),
-        })
+        Ok(variant!(
+            first_boot_script,
+            agent_version,
+            wscript_surface,
+            profile,
+            cpus,
+            memory,
+            firmware,
+            tpm,
+            secure_boot,
+            secure_boot_keys,
+            display,
+            cpu_model,
+            hyperv,
+            apple_smc,
+            input,
+            tsc,
+            accel,
+        ))
     }
 
     /// Convert back into a [`TemplateMeta`]. `origin_override`, when set,
@@ -508,6 +521,7 @@ mod tests {
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
@@ -542,6 +556,7 @@ mod tests {
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: Some("3D".into()),
+            replace_fields: false,
             first_boot_script: Some("variant script".into()),
             agent_version: None,
             wscript_surface: None,
