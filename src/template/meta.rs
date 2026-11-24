@@ -59,6 +59,7 @@ pub struct TemplateMeta {
     /// Where the template came from — source ISO URL, registry ref, …
     pub origin: Option<String>,
     /// Full OCI repository this template publishes to (host/owner/[group/]name).
+    /// A pull writes the repository it pulled from, never the blob's value.
     pub registry: Option<String>,
     /// The repository (`host/owner/[group/]name`, no tag) a pull installed
     /// this version from. `None` for a build or an import. A pull writes it
