@@ -696,6 +696,38 @@ mod tests {
     }
 
     #[test]
+    fn a_file_capability_survives_the_flatten() {
+        if !have(SQFSTAR) || !have("unsquashfs") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // VFS_CAP_REVISION_2, effective, with CAP_NET_RAW permitted.
+        let capability = b"\x01\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let mut layer = Layer::new();
+        layer
+            .tar
+            .append_pax_extensions([("SCHILY.xattr.security.capability", capability.as_slice())])
+            .unwrap();
+        let (path, media, diff_id) = layer
+            .file("ping", 0o755, 0, b"ping")
+            .file("plain", 0o755, 0, b"plain")
+            .build(tmp.path(), "layer.tar", false);
+        let dest = tmp.path().join("out.sqfs");
+        flatten_to_squashfs(&[(path, media)], &[diff_id], &dest, &AtomicBool::new(false))
+            .unwrap();
+
+        // Read the xattrs from the image without needing privileges to set
+        // security.capability on an extracted file.
+        let listing = unsquashfs(&["-pf", "-", dest.to_str().unwrap()]);
+        let xattrs: Vec<_> = listing
+            .lines()
+            .filter(|line| line.contains(" x security.capability="))
+            .collect();
+        assert_eq!(xattrs.len(), 1, "{listing}");
+        assert!(xattrs[0].starts_with("ping x security.capability="), "{listing}");
+    }
+
+    #[test]
     fn flatten_applies_layer_semantics() {
         if !have(SQFSTAR) {
             return;
