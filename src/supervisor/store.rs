@@ -483,21 +483,49 @@ pub async fn export(reference: String, out: PathBuf) -> Result<Value, CommandErr
 }
 
 /// `store` as an install with `overwrite` must see it: refusing to replace
-/// a version while a clone in one of the `labs`, or in the rest of a lab's
-/// worktree family, is backed by one of its disks. Replacing a version
-/// deletes its disks exactly as removing it does, and every clone is a delta
-/// against them. Without `overwrite` no version is replaced and no lab is
-/// scanned.
-async fn guarding_replace(
+/// a version while a clone in one of the labs `labs` names, or in the rest
+/// of a lab's worktree family, is backed by one of its disks. Replacing a
+/// version deletes its disks exactly as removing it does, and every clone is
+/// a delta against them. Without `overwrite` no version is replaced and no
+/// lab is scanned.
+///
+/// The labs and their clones are read each time the store asks — under its
+/// lock at the install — not when the operation starts: a pull downloads
+/// and an import unpacks for minutes before it installs, and a clone made or
+/// a lab registered in that window must stop the replace (review
+/// templates-registry F20).
+fn guarding_replace(
     store: TemplateStore,
     overwrite: bool,
-    labs: &[(String, PathBuf)],
+    labs: impl Fn() -> Vec<(String, PathBuf)> + Send + Sync + 'static,
 ) -> TemplateStore {
     if !overwrite {
         return store;
     }
-    let in_use = clones_of(labs).await;
-    store.refusing_replace(move |doomed| backed_clones_reason(&in_use, doomed))
+    store.refusing_replace(move |doomed| match clones_now(&labs()) {
+        Ok(in_use) => backed_clones_reason(&in_use, doomed),
+        Err(reason) => Some(reason),
+    })
+}
+
+/// [`clones_of`] for a synchronous caller, whatever thread it runs on: the
+/// store asks its guard from a blocking thread at the install and from a
+/// pull's task before the download. The scan runs on a thread of its own
+/// with its own runtime, so it neither needs nor blocks on the caller's. A
+/// scan that cannot run is the reason the replace is refused.
+fn clones_now(labs: &[(String, PathBuf)]) -> Result<Vec<(PathBuf, String)>, String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|runtime| runtime.block_on(clones_of(labs)))
+                    .map_err(|e| format!("cannot scan the labs for clones: {e}"))
+            })
+            .join()
+            .unwrap_or_else(|_| Err("the scan of the labs for clones failed".to_string()))
+    })
 }
 
 /// `store.import`: read a template back out of an archive, with its
@@ -510,7 +538,7 @@ pub async fn import(
 ) -> Result<Value, CommandError> {
     let meta = import_into(
         store(),
-        &registered_labs(),
+        registered_labs,
         archive,
         overwrite,
         trust_scripts,
@@ -525,12 +553,12 @@ pub async fn import(
 /// [`import`] into `store`, with `labs` the registered labs.
 async fn import_into(
     store: TemplateStore,
-    labs: &[(String, PathBuf)],
+    labs: impl Fn() -> Vec<(String, PathBuf)> + Send + Sync + 'static,
     archive: PathBuf,
     overwrite: bool,
     trust_scripts: bool,
 ) -> Result<TemplateMeta> {
-    let store = guarding_replace(store, overwrite, labs).await;
+    let store = guarding_replace(store, overwrite, labs);
     tokio::task::spawn_blocking(move || {
         store.import_trusting_scripts(&archive, overwrite, trust_scripts)
     })
@@ -548,7 +576,7 @@ pub async fn pull(
     overwrite: bool,
     all_variants: bool,
 ) -> Result<Value, CommandError> {
-    let store = guarding_replace(store(), overwrite, &registered_labs()).await;
+    let store = guarding_replace(store(), overwrite, registered_labs);
     let meta = crate::template::oci_bridge::pull(
         &target,
         arch.as_deref(),
@@ -948,7 +976,7 @@ mod tests {
 
         let store = TemplateStore::new(tmp.path().join("store"));
         std::fs::create_dir_all(store.root()).unwrap();
-        import_into(store.clone(), &[], first, false, false)
+        import_into(store.clone(), Vec::new, first, false, false)
             .await
             .unwrap();
         let installed = store.resolve_version("x86_64", "t", Some("1")).unwrap();
@@ -967,16 +995,22 @@ mod tests {
             .unwrap();
         let labs = vec![("corp".to_string(), lab_root)];
 
-        let err = import_into(store.clone(), &labs, second.clone(), true, false)
-            .await
-            .expect_err("the clone of corp/dc01 is backed by the version");
+        let err = import_into(
+            store.clone(),
+            move || labs.clone(),
+            second.clone(),
+            true,
+            false,
+        )
+        .await
+        .expect_err("the clone of corp/dc01 is backed by the version");
         let text = format!("{err:#}");
         assert!(text.contains("refusing to replace"), "{text}");
         assert!(text.contains("corp/dc01"), "{text}");
         assert_eq!(std::fs::read(&installed.disk_path).unwrap(), before);
 
         // With no clone backed by it, the same import replaces the version.
-        import_into(store.clone(), &[], second, true, false)
+        import_into(store.clone(), Vec::new, second, true, false)
             .await
             .unwrap();
         assert_ne!(std::fs::read(&installed.disk_path).unwrap(), before);
@@ -997,7 +1031,7 @@ mod tests {
 
         let store = TemplateStore::new(tmp.path().join("store"));
         std::fs::create_dir_all(store.root()).unwrap();
-        import_into(store.clone(), &[], first, false, false)
+        import_into(store.clone(), Vec::new, first, false, false)
             .await
             .unwrap();
         let installed = store.resolve_version("x86_64", "t", Some("1")).unwrap();
@@ -1009,7 +1043,7 @@ mod tests {
         let machine = crate::paths::lab_local_dir(&lab_root).join("vms/dc01");
         std::fs::create_dir_all(&machine).unwrap();
         let labs = vec![("corp".to_string(), lab_root)];
-        let guarded = guarding_replace(store.clone(), true, &labs).await;
+        let guarded = guarding_replace(store.clone(), true, move || labs.clone());
 
         // `up` makes a linked clone of the installed version in the window.
         crate::template::qimg::tool()

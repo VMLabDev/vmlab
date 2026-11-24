@@ -887,8 +887,17 @@ impl Registry {
         // lands here rather than in an offline cache hit.
         let local = if overwrite {
             // Refused here rather than at the install alone, so a pull that
-            // cannot replace the version downloads nothing first.
-            dest_store.check_replace(&meta.arch, &meta.name, &meta.version)?;
+            // cannot replace the version downloads nothing first. The guard
+            // scans the labs' disks, so it runs on a blocking thread.
+            let (store, arch, name, version) = (
+                dest_store.clone(),
+                meta.arch.clone(),
+                meta.name.clone(),
+                meta.version.clone(),
+            );
+            tokio::task::spawn_blocking(move || store.check_replace(&arch, &name, &version))
+                .await
+                .map_err(|e| anyhow!("template replace check task: {e}"))??;
             None
         } else {
             dest_store.installed(&meta.arch, &meta.name, &meta.version)?
