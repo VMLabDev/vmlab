@@ -1201,7 +1201,7 @@ pub(crate) fn restore_kernel_state(
     let missing = |key: &str| SnapshotError::Internal(format!("snapshot lacks section {key:?}"));
     if let Some(bytes) = sections.get("ignored-msrs") {
         let saved: std::collections::BTreeSet<u32> = from_json(bytes, "ignored-msrs")?;
-        shared.ignored_msrs.lock().extend(saved);
+        crate::macos::merge_logged(&mut shared.ignored_msrs.lock(), saved);
     }
     let pending = sections
         .get("pending-smis")

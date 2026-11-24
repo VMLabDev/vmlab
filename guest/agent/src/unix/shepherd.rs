@@ -196,7 +196,7 @@ pub(super) fn spawn(mut plan: ExecPlan, tree: &str) -> std::io::Result<Spawned> 
     let command = std::mem::take(&mut plan.spec.argv);
     plan.spec.argv = shepherd_argv(command, &mut plan.spec.env);
     let w = status_w.as_raw_fd();
-    let spawned = spawn_piped_with(plan, |cmd| {
+    let spawned = spawn_piped_with(plan, false, |cmd| {
         // SAFETY: dup2/fcntl between fork and exec, both async-signal-safe.
         // dup2 onto itself would keep the close-on-exec flag, so fd 3 is
         // cleared explicitly in that case.
