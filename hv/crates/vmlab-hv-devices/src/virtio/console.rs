@@ -1638,7 +1638,7 @@ mod tests {
         f.settle();
         assert_eq!(f.vqs[3].used_idx(&f.mem), 12);
 
-        for i in 0..24 {
+        for i in 0..28 {
             f.post_ctrl_rx(i % 16);
         }
         f.dev.queue_notify(2);
