@@ -128,7 +128,7 @@ fn apmc_enable_status_lock_and_snapshot() {
 }
 
 fn firmware() -> (SmiFwCfg, vmlab_hv_devices::GuestMemory) {
-    let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+    let memory = GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
     (
         SmiFwCfg::new(FwCfg::new(memory.clone()), memory.clone()).unwrap(),
         memory,
@@ -274,7 +274,7 @@ fn dma(
 fn fw_cfg_low_half_dma_after_a_64_bit_one() {
     const HIGH: u64 = 1 << 32;
     let memory =
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000), (GuestAddress(HIGH), 0x10000)])
+        GuestMemory::from_ranges(&[(GuestAddress(0), 0x10000), (GuestAddress(HIGH), 0x10000)])
             .unwrap();
     let mut fw = SmiFwCfg::new(FwCfg::new(memory.clone()), memory.clone()).unwrap();
     let request = selector(&mut fw, "etc/smi/requested-features");
@@ -368,7 +368,7 @@ fn kvm_smi_handler_writes_private_smram_and_returns_with_rsm() {
         eprintln!("skipping SMM execution: {e}");
         return;
     }
-    let memory = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x50000)]).unwrap();
+    let memory = GuestMemory::from_ranges(&[(GuestAddress(0), 0x50000)]).unwrap();
     for (space, size) in [(0, 0x50000), (SMM_ADDRESS_SPACE, 0x30000)] {
         let region = kvm_userspace_memory_region {
             slot: space,

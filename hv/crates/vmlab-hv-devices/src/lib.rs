@@ -31,7 +31,95 @@ pub mod virtio;
 mod qtest_oracle;
 
 /// Guest physical memory as devices see it.
-pub type GuestMemory = vm_memory::GuestMemoryMmap<()>;
+pub type GuestMemory = vm_memory::GuestMemoryMmap<WriteDiscard>;
+
+/// One region of [`GuestMemory`].
+pub type GuestRegion = vm_memory::GuestRegionMmap<WriteDiscard>;
+
+/// A slice of one region of [`GuestMemory`].
+pub type GuestSlice<'a> =
+    vm_memory::VolatileSlice<'a, vm_memory::bitmap::RefSlice<'a, WriteDiscard>>;
+
+/// What a region of [`GuestMemory`] does after each write that vm-memory
+/// makes to it. This is vm-memory's dirty-bitmap seam, and it is the only
+/// place that sees a device write: devices copy straight into the mapping.
+///
+/// Guest RAM does nothing here. A region armed with
+/// [`WriteDiscard::arm`] is one where a device write may land in a private
+/// copy-on-write page (the write-protected PAM banks of the chipset, which
+/// store a device write nowhere). After each write there the pages are
+/// handed back with `MADV_DONTNEED`: a private page loses the write and reads
+/// what it maps again, a shared page loses nothing.
+///
+/// Code that writes through a raw pointer calls `bitmap().mark_dirty` after
+/// the write, as vm-memory asks. A write the kernel makes for another process
+/// (vhost) does not come past here.
+#[derive(Debug, Default)]
+pub struct WriteDiscard(std::sync::OnceLock<(usize, usize)>);
+
+impl WriteDiscard {
+    const PAGE: usize = 4096;
+
+    /// Discard, from now on, the private pages a write leaves in the `len`
+    /// bytes mapped at `host`.
+    ///
+    /// # Safety
+    /// `host` is the page-aligned start of the mapping this value tracks,
+    /// `len` its length, and every page of it is a file mapping (shared, or
+    /// private and never meant to keep a write) for as long as the region
+    /// lives.
+    pub unsafe fn arm(&self, host: *mut u8, len: usize) {
+        let _ = self.0.set((host as usize, len));
+    }
+}
+
+impl<'a> vm_memory::bitmap::WithBitmapSlice<'a> for WriteDiscard {
+    type S = vm_memory::bitmap::RefSlice<'a, Self>;
+}
+
+impl vm_memory::bitmap::Bitmap for WriteDiscard {
+    fn mark_dirty(&self, offset: usize, len: usize) {
+        let Some(&(host, size)) = self.0.get() else {
+            return;
+        };
+        // vm-memory checks the range before the write. The clamp keeps a
+        // caller's wrong range inside the mapping all the same.
+        let start = offset.min(size) & !(Self::PAGE - 1);
+        let end = offset
+            .saturating_add(len)
+            .min(size)
+            .next_multiple_of(Self::PAGE)
+            .min(size);
+        if start >= end {
+            return;
+        }
+        // SAFETY: the range is whole pages inside the mapping `arm` was
+        // given, whose pages are all file mappings. MADV_DONTNEED keeps the
+        // mapping and drops only private copies, so a thread that reads or
+        // writes there at the same time sees the old page or the new one.
+        if unsafe { libc::madvise((host + start) as *mut _, end - start, libc::MADV_DONTNEED) } != 0
+        {
+            log::warn!(
+                "discarding a device write: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn dirty_at(&self, _: usize) -> bool {
+        false
+    }
+
+    fn slice_at(&self, offset: usize) -> vm_memory::bitmap::RefSlice<'_, Self> {
+        vm_memory::bitmap::RefSlice::new(self, offset)
+    }
+}
+
+impl vm_memory::bitmap::NewBitmap for WriteDiscard {
+    fn with_len(_: usize) -> Self {
+        Self::default()
+    }
+}
 
 /// A level-triggered legacy interrupt line (e.g. the UART's IRQ 4).
 pub trait IrqLine: Send + Sync {

@@ -1468,7 +1468,7 @@ impl PciSnapshot for VirtioPciDevice {
 
 #[cfg(test)]
 mod tests {
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32};
+    use vm_memory::{Bytes, GuestAddress, Le16, Le32};
 
     use super::*;
     use crate::Snapshot;
@@ -1486,7 +1486,7 @@ mod tests {
     /// A block device behind the transport, plus its memory and sinks.
     struct Guest {
         pci: VirtioPciDevice,
-        mem: GuestMemoryMmap<()>,
+        mem: GuestMemory,
         msi: Arc<RecMsi>,
         irq: Arc<RecIrq>,
     }
@@ -1501,7 +1501,7 @@ mod tests {
         }
 
         fn with_device(device: Box<dyn VirtioDevice>) -> Self {
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+            let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
             let msi = Arc::new(RecMsi::default());
             let irq = Arc::new(RecIrq::default());
             let pci = VirtioPciDevice::new(
