@@ -40,6 +40,15 @@ pub trait Memory {
     fn code_stamp(&self, _address: u64, _len: usize) -> Option<CodeStamp> {
         None
     }
+    /// Copies bytes that `code_stamp` covers, with no side effect, and says
+    /// whether it did. A stamp moves on any write to its pages, also on a
+    /// write that leaves the fetched bytes as they were. With this copy a
+    /// trace compares its fetched bytes and stays valid across such a write.
+    /// `false`, the default, means every moved stamp ends the trace.
+    /// Shared implementations must serialize this copy with their writes.
+    fn code_bytes(&self, _address: u64, _bytes: &mut [u8]) -> bool {
+        false
+    }
     /// Inclusive numeric bounds of the RAM region containing this address.
     /// Specialization must guard the resulting range and retain memory effects.
     fn ram_bounds(&self, _address: u64) -> Option<(u64, u64)> {
@@ -139,6 +148,15 @@ impl Memory for FlatMemory {
             generation: *self.page_generations[first..=last].iter().max()?,
         })
     }
+    fn code_bytes(&self, address: u64, bytes: &mut [u8]) -> bool {
+        match self.range(address, bytes.len()) {
+            Ok(range) => {
+                bytes.copy_from_slice(&self.data[range]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
     fn reservation_generation(&self, address: u64, len: usize) -> u64 {
         // Every write stamps its pages with a fresh global generation, so the
         // newest stamp over the covered granules moves exactly when one of
@@ -213,6 +231,9 @@ impl Memory for SharedMemory {
     fn code_stamp(&self, address: u64, len: usize) -> Option<CodeStamp> {
         self.with(|memory| memory.code_stamp(address, len))
     }
+    fn code_bytes(&self, address: u64, bytes: &mut [u8]) -> bool {
+        self.with(|memory| memory.code_bytes(address, bytes))
+    }
     fn reservation_generation(&self, address: u64, len: usize) -> u64 {
         self.with(|memory| memory.reservation_generation(address, len))
     }
@@ -259,6 +280,22 @@ mod tests {
         assert_ne!(memory.code_stamp(0x8ffe, 4), Some(crossing));
         memory.write(0x8fff, &[1, 2]).unwrap();
         assert_ne!(memory.code_stamp(0x8000, 4), Some(first));
+    }
+
+    #[test]
+    fn code_bytes_copy_ram_and_refuse_what_is_outside_it() {
+        let mut memory = FlatMemory::new(0x8000, vec![0; PAGE_SIZE]);
+        memory.write(0x8ffc, &[1, 2, 3, 4]).unwrap();
+        let stamp = memory.code_stamp(0x8ffc, 4);
+        let mut bytes = [0; 4];
+        assert!(memory.code_bytes(0x8ffc, &mut bytes));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(memory.code_stamp(0x8ffc, 4), stamp);
+        assert!(!memory.code_bytes(0x8ffe, &mut bytes));
+        assert!(!memory.code_bytes(0x7fff, &mut bytes));
+        let shared = SharedMemory::new(memory);
+        assert!(shared.code_bytes(0x8ffc, &mut bytes));
+        assert_eq!(bytes, [1, 2, 3, 4]);
     }
 
     #[test]
