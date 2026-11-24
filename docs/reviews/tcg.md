@@ -163,8 +163,9 @@ beyond the single random words of the first differential run, and
   end of host RAM writes its bytes inside RAM before it faults, which the
   architecture allows. Only `Error::Memory` is the guest's fault. Every other
   error of a `Memory` is still a host error. Tests
-  `an_access_past_host_ram_raises_a_guest_fault` and
-  `a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault` in
+  `an_access_past_host_ram_raises_a_guest_fault`,
+  `a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault` and
+  `a_trace_whose_own_access_is_refused_raises_the_same_guest_fault` in
   `vmlab-hv-tcg/tests/hardening.rs`.
 
 ### F3. Writing the `seed` CSR is a host error
