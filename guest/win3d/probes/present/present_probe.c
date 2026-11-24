@@ -1,10 +1,17 @@
 /* Presents a blob allocation with a Blt to a window of the process, in a
  * Venus context of the viogpu3d kernel driver: card #756
  * (docs/reviews/win3d-driver.md F8), as whatever user runs it. Run it in the
- * desktop session, where the window has a surface. One case per run. For a
- * blob that exists on the host and has no mappable flag, a driver without
- * the fix accepts the present and bugchecks the guest with 0x119 when
- * Windows calls DxgkDdiPatch. Run it in a disposable VM. */
+ * desktop session, where the window has a surface. One case per run.
+ *
+ * The case of the finding is a blob that exists on the host, has no
+ * mappable flag and is not resident yet when the present comes (--backlog).
+ * A driver without the fix accepts that present and leaves the mapping of
+ * the source to DxgkDdiPatch, which cannot refuse. Windows 11 (26100) stops
+ * the DMA buffer before it calls DxgkDdiPatch and D3DKMTPresent returns
+ * STATUS_GRAPHICS_GPU_EXCEPTION_ON_DEVICE. A fixed driver refuses in
+ * DxgkDdiPresent and D3DKMTPresent returns STATUS_GRAPHICS_PRESENT_OCCLUDED.
+ * Run it in a disposable VM: an older Windows may call DxgkDdiPatch, and a
+ * failure there is bugcheck 0x119. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
@@ -263,6 +270,9 @@ enum {
     IMAGE_HEIGHT = 256,
 };
 #define VIOGPU_IAM 0x56696f475055ull
+/* What D3DKMTPresent returns when Windows put the device into its error
+ * state: here, when it stopped a DMA buffer whose source was not paged in. */
+#define NT_GPU_EXCEPTION_ON_DEVICE ((LONG)0xc01e0200u)
 /* A blob id that no Venus context of this process made. */
 #define UNKNOWN_BLOB_ID 0x0000756c62373536ull
 /* The size of the device memory that the Venus commands allocate. */
@@ -286,13 +296,13 @@ static const test_case cases[] = {
      "when the allocation is opened (the same before the fix)"},
     {"mappable", BLOB_SHM, PRESENT_WORKS, BLOB_FLAG_MAPPABLE,
      "every present is accepted and the guest stays up: shared memory of the Venus context is a mappable "
-     "blob (the same before the fix)"},
+     "blob (the same before the fix). With --backlog: Windows refuses the present, the source is not resident"},
     {"not-mappable", BLOB_DEVICE_MEMORY, PRESENT_FAILS, 0,
-     "every present fails: a blob without VIRTGPU_BLOB_FLAG_USE_MAPPABLE cannot be the source of a present "
-     "copy (before the fix: the present is accepted and DxgkDdiPatch fails, bugcheck 0x119)"},
+     "the driver refuses every present: a blob without VIRTGPU_BLOB_FLAG_USE_MAPPABLE cannot be the source "
+     "of a present copy (before the fix, with --backlog: the driver accepts the present and Windows stops it)"},
     {"shareable", BLOB_DEVICE_MEMORY, PRESENT_FAILS, BLOB_FLAG_SHAREABLE,
-     "every present fails: the blob flags of exported device memory that is not host visible "
-     "(before the fix: the present is accepted and DxgkDdiPatch fails, bugcheck 0x119)"},
+     "the driver refuses every present: the blob flags of exported device memory that is not host visible "
+     "(before the fix, with --backlog: the driver accepts the present and Windows stops it)"},
 };
 
 /* The Venus wire format: a stream of 32-bit words. A 64-bit value is two
@@ -381,7 +391,7 @@ typedef struct {
     LONG paging_queue_status, make_resident_status;
     DWORD win32_error, session;
     uint64_t supported;
-    uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted, backlog;
+    uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted, presents_stopped, backlog;
     uint64_t blob_id;
     query_device_ids ids;
 } result;
@@ -391,6 +401,7 @@ static void emit(FILE *f, const result *r)
     fprintf(f, "{\"schema\":1,\"probe\":\"present\",\"case\":\"%s\",\"expect\":\"%s\","
             "\"result\":\"%s\",\"stage\":\"%s\",\"pass\":%s,\"session\":%lu,"
             "\"presents_asked\":%u,\"presents_done\":%u,\"presents_failed\":%u,\"presents_accepted\":%u,"
+            "\"presents_stopped_by_windows\":%u,"
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
             "\"paging_queue_status\":\"0x%08lx\",\"make_resident_status\":\"0x%08lx\",\"backlog\":%u,"
@@ -398,7 +409,7 @@ static void emit(FILE *f, const result *r)
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
             r->pass ? "true" : "false", (unsigned long)r->session,
-            r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted,
+            r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted, r->presents_stopped,
             (unsigned long)r->first_present_status, (unsigned long)r->last_present_status,
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
             (unsigned long)r->venus_status,
@@ -716,6 +727,7 @@ int wmain(int argc, wchar_t **argv)
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;
         ++r.presents_done;
+        if (status == NT_GPU_EXCEPTION_ON_DEVICE) ++r.presents_stopped;
         if (status < 0) ++r.presents_failed;
         else {
             ++r.presents_accepted;
@@ -730,7 +742,12 @@ int wmain(int argc, wchar_t **argv)
     /* Windows refuses a present whose source is not resident yet, whatever the blob is. */
     const int expect_failure = tc->outcome == PRESENT_FAILS || r.backlog;
     r.pass = (expect_failure ? r.presents_failed : r.presents_accepted) == r.presents_asked;
-    r.result = r.pass ? "pass" : r.presents_accepted ? "present_accepted" : "present_failed";
+    /* A present that the driver must refuse was stopped by Windows instead:
+     * the driver had accepted it. */
+    if (tc->outcome == PRESENT_FAILS && r.presents_stopped) r.pass = 0;
+    r.result = r.pass ? "pass"
+               : r.presents_accepted ? "present_accepted"
+               : tc->outcome == PRESENT_FAILS ? "accepted_by_driver_stopped_by_windows" : "present_failed";
     exit_code = r.pass ? 0 : 2;
 
 destroy_context:

@@ -13,12 +13,16 @@
 # session of the autologon user win3d, which tests/guest/Set-TestDesktop.ps1
 # makes as a member of Users only. The script makes that desktop when the
 # guest has none (one reboot), and refuses an administrator on the console.
-# PRESENT_COUNT is the number of presents per case (default 1).
+# With no case names it runs all four, the harmless ones first.
 #
-# With no case names it runs all four, the harmless ones first. A driver
-# without the fix accepts the present of the cases not-mappable and
-# shareable, and bugchecks the guest.
-# The script then waits for the guest to come back and records the bugcheck
+# PRESENT_COUNT is the number of presents per case (default 1).
+# PRESENT_BACKLOG=N puts N allocations of 16 MiB on the paging queue in
+# front of the source, so that the source is not resident yet when the
+# present comes: the state of the finding. A driver without the fix accepts
+# the present of the cases not-mappable and shareable then. Windows 11
+# stops that DMA buffer, and the case fails with the result
+# accepted_by_driver_stopped_by_windows. An older Windows may bugcheck: the
+# script then waits for the guest to come back and records the bugcheck
 # event. Use a disposable VM: the script also turns off the recovery screen
 # that Windows shows after two bugchecks.
 #
