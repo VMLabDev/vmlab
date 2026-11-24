@@ -210,7 +210,7 @@ beyond the single random words of the first differential run, and
   `call_serves_every_function_the_model_does_not_define`, which calls every
   function the model calls and does not define.
 
-### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting
+### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting (fixed, card #774)
 
 - Where: `tcg/lib.rs:671` (`self.reservation = None` after every write) and
   `tcg/trace.rs:1460` (the same in a trace).
@@ -235,6 +235,20 @@ beyond the single random words of the first differential run, and
 - Confidence: medium. The value of the flag was read from the running model.
   That the Sail emulator succeeds in this case follows from the flag's
   meaning and was not run.
+- Fixed by card #774. The Jib of the model declares the setting and never
+  reads it: it is a setting for the platform, so the interpreter reads it.
+  `Interpreter::store` makes every ordinary store, from the interpreter and
+  from a trace. With the setting on it cancels the reservation. With it off,
+  or absent, the reservation stays as it was: where the store moved the write
+  generation of the reserved granules and the reservation was intact, it
+  takes the new generation, under the transaction lock of the memory, so a
+  store to the reserved page or to the reserved doubleword keeps it too. A
+  reservation that another hart's store broke stays broken. The proof tests
+  are in `vmlab-hv-tcg/tests/hardening.rs`:
+  `a_same_hart_store_keeps_the_reservation`,
+  `a_same_hart_store_in_a_trace_keeps_the_reservation`,
+  `a_same_hart_store_cancels_the_reservation_when_the_model_says_so` and
+  `a_same_hart_store_does_not_restore_a_broken_reservation`.
 
 ### F5. Jib text within the parser's nesting limits overflows the stack in `lower`
 
@@ -309,7 +323,7 @@ beyond the single random words of the first differential run, and
   The test also runs 1 to 120 field accesses and 1 to 120 nested struct
   literals, and each is either loaded or refused.
 
-### F7. A loop that stores into its own code page never reuses a trace
+### F7. A loop that stores into its own code page never reuses a trace (fixed, card #773)
 
 - Where: `tcg/memory.rs:110-138` (`write` stamps a 4 KiB page,
   `code_stamp` reads the stamp), `tcg/record.rs:1074-1082` (a trace keeps
@@ -340,6 +354,17 @@ beyond the single random words of the first differential run, and
   1501. No time is measured.
 - Confidence: high. A fix needs a finer stamp (the bytes a trace fetched)
   or a fallback that stops recording a PC that keeps invalidating itself.
+- Fixed by card #773. A recording keeps the bytes of each fetch
+  (`Recorded::code`). The page stamp stays the first check. When only its
+  generation moved, the trace compares those bytes with memory through the
+  new `Memory::code_bytes` (`Trace::code_unchanged`), and when they are as
+  recorded it stays valid and takes the new stamps. A `Memory` that does not
+  implement `code_bytes` keeps the old rule. The proof test had 0 hits
+  before the fix and passes after it. A second test,
+  `a_store_that_changes_its_own_loop_ends_the_trace`, has the loop store
+  over its own instructions, first the same bytes and then other ones, and
+  compares every round with the plain interpreter. N1 is open: nothing yet
+  stops recording for an entry PC that keeps missing for another reason.
 
 ### F8. `read_csr` and `write_csr` take an index past 12 bits and use another CSR (fixed, card #771)
 

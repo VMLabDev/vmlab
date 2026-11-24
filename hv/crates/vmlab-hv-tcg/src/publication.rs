@@ -162,6 +162,7 @@ mod tests {
                 range: None,
             }],
             stop_reason: None,
+            code: None,
             dynamic_pc: false,
         };
         let (plans, constants) = compile(

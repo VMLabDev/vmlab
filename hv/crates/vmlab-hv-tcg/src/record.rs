@@ -59,6 +59,38 @@ pub(crate) struct Recorded {
     pub inputs: Vec<Input>,
     pub stop_reason: Option<String>,
     pub dynamic_pc: bool,
+    /// The bytes of every fetch the block was specialized on. `None` when
+    /// the memory gave no copy of one of them: then the page stamps of
+    /// `code_guards` alone say whether the block is still valid.
+    pub code: Option<Vec<FetchedCode>>,
+}
+
+/// One instruction fetch of a recording: where it read and what it read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FetchedCode {
+    pub address: u64,
+    pub len: u8,
+    pub bytes: [u8; 8],
+}
+
+impl FetchedCode {
+    fn read(memory: &impl Memory, address: u64, len: usize) -> Option<Self> {
+        let mut bytes = [0; 8];
+        memory
+            .code_bytes(address, bytes.get_mut(..len)?)
+            .then_some(Self {
+                address,
+                len: len as u8,
+                bytes,
+            })
+    }
+
+    /// Whether memory still holds what the recording fetched here.
+    pub fn unchanged(&self, memory: &impl Memory) -> bool {
+        let len = usize::from(self.len);
+        let mut bytes = [0; 8];
+        memory.code_bytes(self.address, &mut bytes[..len]) && bytes[..len] == self.bytes[..len]
+    }
 }
 
 enum Pending {
@@ -129,6 +161,7 @@ pub(crate) struct Recorder {
     returned: Option<ValueId>,
     completed_steps: u32,
     fetch_address: Option<ValueId>,
+    code: Option<Vec<FetchedCode>>,
     stopped: Option<String>,
     folded_result: Option<crate::Result<Value>>,
 }
@@ -232,6 +265,7 @@ impl Recorder {
             returned: None,
             completed_steps: 0,
             fetch_address: None,
+            code: Some(Vec::new()),
             stopped: None,
             folded_result: None,
         }
@@ -1071,6 +1105,14 @@ impl Recorder {
                             exit: error,
                         });
                     }
+                    // The recording holds the transaction lock, so these are
+                    // the bytes the fetch just read.
+                    let fetched =
+                        FetchedCode::read(&interpreter.memory, actual_address, bytes as usize);
+                    match (&mut self.code, fetched) {
+                        (Some(code), Some(fetched)) => code.push(fetched),
+                        _ => self.code = None,
+                    }
                     self.block.code_guards.push(CodeGuard {
                         address: actual_address,
                         len: bytes as usize,
@@ -1217,6 +1259,11 @@ impl Recorder {
                 guard.last_page,
             ))
         });
+        if let Some(code) = &mut self.code {
+            code.sort_unstable();
+            code.dedup();
+            code.shrink_to_fit();
+        }
         let constants = vmlab_hv_tcg_ir::native::dce::prune(&mut self.block);
         self.constants = constants
             .into_iter()
@@ -1228,6 +1275,7 @@ impl Recorder {
             inputs: self.inputs,
             stop_reason: self.stopped,
             dynamic_pc,
+            code: self.code,
         }
     }
 
