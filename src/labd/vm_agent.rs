@@ -1698,10 +1698,11 @@ struct FileOpsInner {
     wire: Mutex<()>,
     pending: std::sync::Mutex<Pending>,
     next_id: AtomicU64,
-    /// When the guest last answered *anything* on this channel — the
+    /// When the guest last answered a request on this channel — the
     /// watchdog's notion of progress. A reply to any request counts: a
     /// pipelined transfer is judged by whether the channel moves, not by
-    /// whether one particular chunk has been acknowledged yet.
+    /// whether one particular chunk has been acknowledged yet. A record
+    /// with an id no call waits for does not count.
     last_reply: std::sync::Mutex<tokio::time::Instant>,
     /// How long the channel may stay silent before a call gives up, in
     /// milliseconds — [`FILEOPS_STALL`] unless a caller set otherwise.
@@ -2428,7 +2429,7 @@ impl FileOpsInner {
         Duration::from_millis(self.stall_ms.load(Ordering::SeqCst))
     }
 
-    /// When the guest last answered anything on this channel.
+    /// When the guest last answered a request on this channel.
     fn last_reply(&self) -> tokio::time::Instant {
         *self.last_reply.lock_recover()
     }
@@ -2597,9 +2598,13 @@ async fn fileops_pump(mut session: AgentSession, inner: Arc<FileOpsInner>) {
                 loop {
                     match decoder.next_record::<Response>() {
                         Ok(Some((response, payload))) => {
-                            *inner.last_reply.lock_recover() = tokio::time::Instant::now();
                             let waiter = inner.pending.lock_recover().waiters.remove(&response.id);
+                            // Only a record that answers a call is
+                            // progress. One with an id nobody waits for
+                            // leaves the watchdog's clock alone, or a guest
+                            // could hold every call open with such records.
                             if let Some(waiter) = waiter {
+                                *inner.last_reply.lock_recover() = tokio::time::Instant::now();
                                 let _ = waiter.send(Ok((response.reply, payload)));
                             }
                         }
