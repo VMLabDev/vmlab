@@ -453,4 +453,21 @@ mod tests {
         }
         assert_eq!(checked_command_line(&[]).unwrap(), "");
     }
+
+    /// G7: `CreateProcessW` reads a command line up to its first NUL, so an
+    /// argument holding one would cut the line there and run something other
+    /// than what was asked for. It is refused, for a program and for a batch
+    /// file, wherever in the argv it sits.
+    #[test]
+    fn a_nul_in_an_argument_is_refused() {
+        for argv in [
+            &["prog", "a\0b"][..],
+            &["prog", "ok", "\0"],
+            &["pr\0og", "ok"],
+            &["run.bat", "a\0b"],
+        ] {
+            let err = checked_command_line(&args(argv)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{argv:?}");
+        }
+    }
 }

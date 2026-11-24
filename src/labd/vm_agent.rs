@@ -5461,6 +5461,99 @@ mod tests {
         assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
     }
 
+    /// G8: the part-written file's name is the destination's own plus a
+    /// suffix, and a destination already near the 255-byte name limit left no
+    /// room for one, so the pull failed with "File name too long" before a
+    /// byte was read.
+    #[tokio::test]
+    async fn a_pull_onto_a_long_name_succeeds() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("a".repeat(250));
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 1);
+
+        // The same onto a name that is already there, in characters of more
+        // than one byte, which a cut must not split.
+        let dest = work.path().join("\u{e9}".repeat(125));
+        std::fs::write(&dest, b"old").unwrap();
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
+    /// G9: writing a file takes the right to write the file, not the right to
+    /// create and rename beside it. A destination the user may write, in a
+    /// directory they may not, is pulled onto in place — and still only once
+    /// the transfer has verified, so a failed pull leaves it as it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_a_writable_file_in_a_read_only_directory_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Puts the directory's mode back, so the tempdir can be removed
+        /// whichever way the test ends.
+        struct Writable(PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let ro = work.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        let dest = ro.join("f");
+        std::fs::write(&dest, b"keep me").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Writable(ro.clone());
+        if std::fs::File::create(ro.join("probe")).is_ok() {
+            // Root, or a filesystem without modes: the directory refuses
+            // nothing here, so there is no fault to show.
+            return;
+        }
+
+        // A failed pull still costs the destination nothing.
+        let err = agent.pull_file("/guest/typo", &dest).await.unwrap_err();
+        assert!(format!("{err:#}").starts_with("pull /guest/typo"), "{err:#}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(&ro).unwrap().count(), 1);
+    }
+
+    /// G9: a rename gives the destination a new inode, so another name of the
+    /// old file would keep the old bytes. A destination with a second hard
+    /// link is written in place, and both names read the pulled bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pull_onto_a_hard_linked_file_writes_through_both_names() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join("one");
+        let other = work.path().join("two");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::hard_link(&dest, &other).unwrap();
+
+        let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();
+        assert_eq!(len, 10_000);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 10_000);
+        assert_eq!(std::fs::read(&other).unwrap(), std::fs::read(&dest).unwrap());
+        assert_eq!(std::fs::read_dir(work.path()).unwrap().count(), 2);
+    }
+
     const MOCK_NO_DESKTOP: &str = "no one is logged on to the desktop";
     /// How far ahead of the host the mock guest's clock runs.
     const MOCK_CLOCK_AHEAD_MS: i64 = 3_600_000;
