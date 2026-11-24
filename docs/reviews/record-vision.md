@@ -78,17 +78,17 @@ Not read:
 
 | Code | Severity | Fault |
 |------|----------|-------|
-| F1 | data loss, security against a hostile guest | A cursor of size zero panics the recorder and the recording is lost (fixed, card #717) |
-| F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit (fixed, card #718) |
-| F3 | crash (a stop that never returns) | A stalled ffmpeg blocks `record stop`, `down` and `destroy` |
-| F4 | wrong result | Two captures of one machine share one scratch file |
-| F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match (fixed, card #724) |
-| F6 | wrong result | The match score ignores colour, brightness and contrast (fixed, card #724) |
-| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720) |
-| F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind |
-| F9 | crash of a request | A large duration panics `Settings::resolve` |
-| F10 | wrong result | The match threshold is not checked |
-| F11 | wrong result | A text match carries the click point (0, 0) |
+| F1 | data loss, security against a hostile guest | A cursor of size zero panics the recorder and the recording is lost (fixed, card #717, `29e9c105`) |
+| F2 | crash of the lab daemon | The recorder holds every overdue frame in memory, with no limit (fixed, card #718, `67568902`) |
+| F3 | crash (a stop that never returns) | A stalled ffmpeg blocks `record stop`, `down` and `destroy` (fixed, card #719, `a570aae6` and `7ad4297d`) |
+| F4 | wrong result | Two captures of one machine share one scratch file (fixed, card #856, `780d4692`) |
+| F5 | wrong result | The matcher returns the best of 8 coarse candidates, not the best match (fixed, card #724, `84fd9e5c`) |
+| F6 | wrong result | The match score ignores colour, brightness and contrast (fixed, card #724, `84fd9e5c`) |
+| F7 | security against a local peer | The OCR scratch file has a predictable name in the shared temp directory (fixed, card #720, `2efe6926` and `bc548c58`) |
+| F8 | wrong result | A cancelled or timed-out OCR leaves tesseract running and its file behind (fixed, card #760, `bfc54ea1`) |
+| F9 | crash of a request | A large duration panics `Settings::resolve` (fixed, card #856, `780d4692`) |
+| F10 | wrong result | The match threshold is not checked (fixed, card #857, `d6e6e86f`) |
+| F11 | wrong result | A text match carries the click point (0, 0) (fixed, card #857, `d6e6e86f`) |
 
 ### F1. A cursor of size zero panics the recorder and the recording is lost
 
@@ -130,9 +130,9 @@ Not read:
   `Recorder::stop` returns `Ok`.
 - Confidence: high for the panic. Medium for the guest reaching it on
   vmlab-hv.
-- Fixed by card #717. `draw_cursor` draws nothing for a shape with an empty
-  side, or with fewer pixels than its size says. The proof tests are
-  `a_cursor_of_size_zero_draws_nothing` (`src/record/core/tests.rs`) and
+- Fixed by card #717 (`29e9c105`). `draw_cursor` draws nothing for a shape
+  with an empty side, or with fewer pixels than its size says. The proof
+  tests are `a_cursor_of_size_zero_draws_nothing` (`src/record/core/tests.rs`) and
   `a_native_cursor_of_size_zero_keeps_the_recording`
   (`src/record/executor.rs`). The second one shows that vmlab-hv's display
   server does send a 0 x 0 shape to its clients.
@@ -183,8 +183,8 @@ Not read:
   Assert the bound. Today it returns 17970 equal frames.
 - Confidence: high for the counts. Medium for how soon a real encoder falls
   behind at the default settings.
-- Fixed by card #718. `Core::tick` and `finish` return `Frames`, runs of
-  equal frames, so a late tick or an idle run written out whole holds one
+- Fixed by card #718 (`67568902`). `Core::tick` and `finish` return `Frames`,
+  runs of equal frames, so a late tick or an idle run written out whole holds one
   picture. The queue holds at most `Core::queue_limit` pictures
   (`QUEUE_BYTES` of 256 MiB at the output size, at least 2 and at most
   `QUEUE_FRAMES` of 120). A frame that does not fit repeats the newest queued
@@ -194,7 +194,8 @@ Not read:
 
 ### F3. A stalled ffmpeg blocks `record stop`, `down` and `destroy`
 
-- Fixed in #719. Frame writes time out after 10 seconds without progress.
+- Fixed by card #719 (`a570aae6` and `7ad4297d`). Frame writes time out
+  after 10 seconds without progress.
   After stdin closes, ffmpeg has five minutes to write the trailer and
   complete the MP4 faststart rewrite. The recorder kills ffmpeg if either
   timeout expires. A concurrent reader drains stderr and retains its final
@@ -263,6 +264,9 @@ Not read:
   multi-thread runtime). Medium for QEMU, where the time between the end of
   `screendump` and the read is short.
 
+- Fixed by card #856 (`780d4692`). Each capture writes to its own temporary
+  directory, which is removed when the capture returns, including on error.
+
 ### F5. The matcher returns the best of 8 coarse candidates, not the best match
 
 - Where: `src/vision/matching.rs:282-339` (`search_best`), `373-401`
@@ -295,6 +299,9 @@ Not read:
 - Confidence: medium. The test was not run, and the coarse score of the
   shifted occurrence is estimated, not measured.
 
+- Fixed by card #724 (`84fd9e5c`). The matcher finds the best placement at
+  full resolution.
+
 ### F6. The match score ignores colour, brightness and contrast
 
 - Where: `src/vision/matching.rs:121-129` (`GrayF::from_rgb`), `239-259`
@@ -321,6 +328,10 @@ Not read:
   two colours, (255, 0, 0) on black. A screen with the same shape in
   (0, 130, 0) on black. Today it matches with a score near 1.0.
 - Confidence: high. It follows from the formula.
+
+- Fixed by card #724 (`84fd9e5c`). The score uses the root mean square
+  difference across RGB channels, so changes in colour, brightness and
+  contrast affect the score.
 
 ### F7. The OCR scratch file has a predictable name in the shared temp directory
 
@@ -351,8 +362,9 @@ Not read:
   names, run `ocr`, assert that the victim file is unchanged. Today it
   holds a PNG.
 - Confidence: high.
-- Fixed by card #720. `ocr` makes a directory with a random name and mode
-  0700 under the temp directory, and in it the PNG as a file created
+- Fixed by card #720 (`2efe6926` and `bc548c58`). `ocr` makes a directory
+  with a random name and mode 0700 under the temp directory, and in it the
+  PNG as a file created
   exclusively with mode 0600. Both are removed when the run ends. Both
   proof tests are in `src/vision/ocr.rs`. They reach the code through
   `ocr_with`, which takes the scratch root and the command, so they change
@@ -392,8 +404,8 @@ Not read:
   `src/scripting`: the same script, `timeout_secs` 1. Assert that the call
   returns the timeout error. Today it never returns.
 - Confidence: high.
-- Fixed by card #760. Dropping OCR kills the tesseract child and drops the
-  scratch PNG and its directory. The text wait applies one deadline to
+- Fixed by card #760 (`bfc54ea1`). Dropping OCR kills the tesseract child
+  and drops the scratch PNG and its directory. The text wait applies one deadline to
   capture, OCR and polling, and the OCR plan resamples oversized crops to
   fit the pixel budget.
 
@@ -416,6 +428,9 @@ Not read:
   returns `Err`. Today it panics. The same for `compress_idle`.
 - Confidence: high.
 
+- Fixed by card #856 (`780d4692`). Both duration options use checked
+  conversion and report an error when the duration is too large.
+
 ### F10. The match threshold is not checked
 
 - Where: `src/vision/matching.rs:102` (`if score < opts.threshold`),
@@ -437,6 +452,9 @@ Not read:
   `Some`. Assert an error for `1.5`.
 - Confidence: high.
 
+- Fixed by card #857 (`d6e6e86f`). Image matching accepts only finite
+  thresholds from 0 to 1 inclusive.
+
 ### F11. A text match carries the click point (0, 0)
 
 - Where: `src/scripting/mod.rs:414-424`.
@@ -453,6 +471,9 @@ Not read:
   Today `cx == 0 && cy == 0 && score == 1.0`.
 - Confidence: high for the values. The script API may document it. I did
   not read the manual page.
+
+- Fixed by card #857 (`d6e6e86f`). Both OCR wait methods return a
+  `TextMatch` whose only field is the matched text.
 
 ## Notes
 
