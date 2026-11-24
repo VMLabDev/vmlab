@@ -675,10 +675,10 @@ mod tests {
 
         // A lab deep enough that the old layout (sockets under `.vmlab/smb`)
         // put `msg.sock/<pid>` past sun_path's 108 bytes and smbd died at start.
-        let tmp = std::env::temp_dir().join(format!("vmlab-smb-test-{}", std::process::id()));
-        let smb_dir = tmp.join("d".repeat(120)).join(".vmlab/smb");
+        let tmp = tempfile::tempdir().unwrap();
+        let smb_dir = tmp.path().join("d".repeat(120)).join(".vmlab/smb");
         assert!(smb_dir.as_os_str().len() > 120);
-        let share_dir = tmp.join("share");
+        let share_dir = tmp.path().join("share");
         std::fs::create_dir_all(&share_dir).unwrap();
         std::fs::write(share_dir.join("hello.txt"), b"hi").unwrap();
 
@@ -718,7 +718,6 @@ mod tests {
             let server = match spawn_on_a_free_port(ports, config_for, &creds) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&tmp);
                     // The lab-path defect this layout fixes is never a skip.
                     assert!(!e.to_string().contains("too long"), "{e}");
                     eprintln!("SKIP: could not spawn smbd: {e}");
@@ -741,7 +740,6 @@ mod tests {
             if which("smbclient").is_none() {
                 eprintln!("SKIP smbclient ls assertion: smbclient not found (smbd spawn OK)");
                 drop(server);
-                let _ = std::fs::remove_dir_all(&tmp);
                 return;
             }
 
@@ -763,9 +761,8 @@ mod tests {
             drop(server);
             assert!(!run_dir.exists(), "{} outlived smbd", run_dir.display());
             if !out.status.success() || !stdout.contains("hello.txt") {
-                let _ = std::fs::remove_dir_all(&tmp);
                 panic!(
-                    "round {round}: smbclient ls did not list hello.txt.\n\
+                    "round {round}: smbclient could not list or upload hello.txt.\n\
                      stdout:\n{stdout}\nstderr:\n{stderr}"
                 );
             }
@@ -775,7 +772,6 @@ mod tests {
             let mode = std::fs::metadata(uploaded).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode & 0o111, 0, "guest upload has host mode {mode:o}");
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// docs/reviews/smb.md F1: a writable share whose directory holds
