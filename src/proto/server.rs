@@ -34,6 +34,17 @@ pub struct Streamer {
 }
 
 impl Streamer {
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(16);
+        let stream = Self {
+            id: 1,
+            tx,
+            disconnect: CancellationToken::new(),
+        };
+        (stream, rx)
+    }
+
     pub(crate) fn disconnect_token(&self) -> CancellationToken {
         self.disconnect.clone()
     }
