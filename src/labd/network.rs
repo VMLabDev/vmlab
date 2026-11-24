@@ -215,16 +215,12 @@ impl LabNetwork {
     pub fn build(lab: &Lab, pool: Ipv4Net) -> Result<LabNetwork> {
         let declared: Vec<Ipv4Net> = lab.segments.iter().filter_map(|s| s.subnet).collect();
 
-        let mut auto = pool
-            .subnets(24)
-            .into_iter()
-            .flatten()
-            .filter(|c| {
-                c.prefix_len() == 24
-                    && !declared
-                        .iter()
-                        .any(|d| d.contains(&c.network()) || c.contains(&d.network()))
-            });
+        let mut auto = pool.subnets(24).into_iter().flatten().filter(|c| {
+            c.prefix_len() == 24
+                && !declared
+                    .iter()
+                    .any(|d| d.contains(&c.network()) || c.contains(&d.network()))
+        });
         let mut alloc_auto = || -> Result<Ipv4Net> {
             auto.next()
                 .ok_or_else(|| anyhow::anyhow!("auto-subnet pool {pool} has no available /24"))
