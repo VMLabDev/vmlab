@@ -8,6 +8,7 @@
 
 use crate::sync::LockRecover;
 use std::collections::{HashMap, VecDeque};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::fastpath;
+use super::frame::{ArpView, ETHERTYPE_ARP, ETHERTYPE_IPV4, EthView, IPPROTO_UDP};
 use super::framing::{self, FramingMode, Packet};
 use crate::config::model::MacAddr;
 
@@ -97,7 +99,9 @@ pub struct SwitchStats {
     /// reached at least one port.
     pub frames_flooded: u64,
     /// Frames that died: hook drops, isolation drops, runts, guest frames
-    /// from a service port's MAC, full or closed egress queues, and floods
+    /// from a service port's MAC, frames that use what another port has
+    /// bound (a MAC, an address in ARP, the DHCP server role), full or
+    /// closed egress queues, and floods
     /// that reached nobody.
     pub frames_dropped: u64,
     /// Frames forwarded in-kernel by the fast path (already included in
@@ -156,7 +160,61 @@ impl Default for PortConfig {
 struct Inner {
     ports: HashMap<PortId, PortEntry>,
     macs: HashMap<MacAddr, PortId>,
+    /// What a service port holds against every other port, guest or
+    /// service (review F29, F30): see [`Switch::bind_mac`],
+    /// [`Switch::bind_ip`] and [`Switch::bind_dhcp_server`].
+    bound_macs: HashMap<MacAddr, PortId>,
+    bound_ips: HashMap<Ipv4Addr, PortId>,
+    dhcp_server: Option<PortId>,
 }
+
+impl Inner {
+    fn is_service(&self, port: PortId) -> bool {
+        matches!(self.ports.get(&port), Some(p) if p.class == PortClass::Service)
+    }
+
+    /// Why a frame from `port` is not that port's to send, if it is not:
+    /// its source MAC, the address its ARP speaks for, or the DHCP server
+    /// role belongs to another port.
+    fn refusal(&self, port: PortId, src: &MacAddr, frame: &[u8]) -> Option<&'static str> {
+        if self.bound_macs.get(src).is_some_and(|h| *h != port) {
+            return Some("source MAC is bound to another port");
+        }
+        if self.bound_ips.is_empty() && self.dhcp_server.is_none() {
+            return None;
+        }
+        let eth = EthView::parse(frame)?;
+        match eth.ethertype() {
+            ETHERTYPE_ARP => {
+                let arp = ArpView::parse(eth.payload())?;
+                self.bound_ips
+                    .get(&arp.spa())
+                    .is_some_and(|h| *h != port)
+                    .then_some("ARP speaks for an address bound to another port")
+            }
+            ETHERTYPE_IPV4 if self.dhcp_server.is_some_and(|h| h != port) => {
+                // Read the fixed header only: a frame the views would
+                // refuse (a short or oddly sized one) must not pass as
+                // "not DHCP" and still be read as an offer by a guest.
+                let ip = eth.payload();
+                if ip.len() < 20 || ip[0] >> 4 != 4 || ip[9] != IPPROTO_UDP {
+                    return None;
+                }
+                // Only the first fragment carries the ports.
+                if u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
+                    return None;
+                }
+                let udp = ip.get(usize::from(ip[0] & 0x0f) * 4..)?;
+                (udp.len() >= 2 && u16::from_be_bytes([udp[0], udp[1]]) == DHCP_SERVER_PORT)
+                    .then_some("DHCP server frame from a port that is not the server")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The UDP port a DHCP server sends from.
+const DHCP_SERVER_PORT: u16 = 67;
 
 /// A virtual L2 switch for one segment.
 pub struct Switch {
@@ -394,14 +452,17 @@ impl Switch {
     }
 
     /// Put `mac` on the service port `port` before that port has sent a
-    /// frame, so that no guest can claim it first (review F9). The gateway
-    /// binds its own MAC this way. Does nothing for a port that is gone or
-    /// is a guest's.
+    /// frame, and hold it there: a frame from any other port, guest or
+    /// service, with `mac` as its source is dropped and moves nothing
+    /// (review F9, F30). The gateway binds its own MAC this way, and a
+    /// trunk the MAC of the gateway behind it. Does nothing for a port that
+    /// is gone or is a guest's.
     pub fn bind_mac(&self, port: PortId, mac: MacAddr) {
         let mut inner = self.inner.lock_recover();
-        if !matches!(inner.ports.get(&port), Some(p) if p.class == PortClass::Service) {
+        if !inner.is_service(port) {
             return;
         }
+        inner.bound_macs.insert(mac, port);
         let prev = inner.macs.insert(mac, port);
         if prev != Some(port)
             && let Some(off) = &self.offload
@@ -410,8 +471,37 @@ impl Switch {
         }
     }
 
+    /// Hold the IPv4 address `ip` for the service port `port`: an ARP frame
+    /// from any other port that names `ip` as its sender address is dropped
+    /// (review F29). The gateway holds its own address this way, so no
+    /// guest answers for it. Does nothing for a port that is gone or is a
+    /// guest's.
+    ///
+    /// Fast-path caveat: as for the ingress hook, a known-unicast frame
+    /// between two offloaded guest ports is forwarded in-kernel and is not
+    /// checked here. A broadcast, and the first frame to any MAC, is.
+    pub fn bind_ip(&self, port: PortId, ip: Ipv4Addr) {
+        let mut inner = self.inner.lock_recover();
+        if inner.is_service(port) {
+            inner.bound_ips.insert(ip, port);
+        }
+    }
+
+    /// Make the service port `port` the one DHCP server of the segment: an
+    /// IPv4 frame from any other port with UDP source port 67 is dropped
+    /// (review F29). Only a gateway that serves DHCP asks for this, so a
+    /// segment with `dhcp = false` keeps a guest's own server. The same
+    /// fast-path caveat as [`bind_ip`](Self::bind_ip). Does nothing for a
+    /// port that is gone or is a guest's.
+    pub fn bind_dhcp_server(&self, port: PortId) {
+        let mut inner = self.inner.lock_recover();
+        if inner.is_service(port) {
+            inner.dhcp_server = Some(port);
+        }
+    }
+
     /// Detach a port and purge every MAC learned on it (kernel fast-path
-    /// state included). Idempotent.
+    /// state included) and everything bound to it. Idempotent.
     pub fn remove_port(&self, id: PortId) {
         let purged = {
             let mut inner = self.inner.lock_recover();
@@ -425,6 +515,11 @@ impl Switch {
                 .map(|(m, _)| *m)
                 .collect();
             inner.macs.retain(|_, p| *p != id);
+            inner.bound_macs.retain(|_, p| *p != id);
+            inner.bound_ips.retain(|_, p| *p != id);
+            if inner.dhcp_server == Some(id) {
+                inner.dhcp_server = None;
+            }
             debug!(switch = %self.name, %id, "port removed");
             purged
         };
@@ -606,6 +701,16 @@ impl Switch {
 
         let inner = &mut *self.inner.lock_recover();
 
+        // What a service port has bound is that port's alone, whatever the
+        // class of the port the frame came in on: the gateway's MAC, the
+        // address its ARP answers for, and the DHCP server role (review F29,
+        // F30). The frame is dropped before it teaches the switch anything.
+        if let Some(why) = inner.refusal(port, &src, frame) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            debug!(switch = %self.name, %port, mac = %src, why, "frame dropped");
+            return;
+        }
+
         // A MAC a service port holds (the gateway's, bound when it attached,
         // or one learned behind a trunk) is not a guest's to send from: the
         // frame is dropped and the MAC stays where it is (review F9). A
@@ -639,8 +744,10 @@ impl Switch {
                 let Some(oldest) = entry.learned.pop_front() else {
                     break;
                 };
-                // Not a MAC that has moved to another port since.
-                if inner.macs.get(&oldest) == Some(&port) {
+                // Not a MAC that has moved to another port since, and not
+                // one bound to this port.
+                if inner.macs.get(&oldest) == Some(&port) && !inner.bound_macs.contains_key(&oldest)
+                {
                     inner.macs.remove(&oldest);
                     if let Some(off) = &self.offload {
                         off.forget(oldest);
@@ -1399,8 +1506,7 @@ mod tests {
     }
 
     /// A MAC bound to a service port is that port's before it has sent a
-    /// frame, and stays a move between service ports away (a trunk that
-    /// reconnects).
+    /// frame, until it is bound to another.
     #[tokio::test]
     async fn a_bound_mac_is_held_before_its_port_speaks() {
         let sw = Switch::new("seg0".into());
@@ -1424,16 +1530,127 @@ mod tests {
         assert_eq!(recv(&mut svc.rx).await, to_gateway);
         assert_no_frame(&mut a.rx).await;
 
-        // Another service port may take it: the MAC moved behind a trunk.
+        // Binding it to another service port moves it: the gateway is now
+        // behind that trunk.
         let mut trunk = sw.add_channel_port(PortClass::Service);
-        trunk
-            .tx
-            .send(frame(MAC_BROADCAST, gateway, b"moved"))
-            .await
-            .unwrap();
-        recv(&mut b.rx).await;
+        sw.bind_mac(trunk.id, gateway);
         let again = frame(gateway, mac(2), b"to the gateway again");
         b.tx.send(again.clone()).await.unwrap();
         assert_eq!(recv(&mut trunk.rx).await, again);
+    }
+
+    /// Review F30: a bound MAC is held against a service port too. On a
+    /// global segment every port of the supervisor's switch is one, and a
+    /// frame from a trunk with the gateway's MAC as its source must not
+    /// move the gateway behind that trunk.
+    #[tokio::test]
+    async fn a_bound_mac_is_held_against_a_service_port() {
+        let sw = Switch::new("global/seg0".into());
+        let mut g = sw.add_channel_port(PortClass::Service);
+        let mut t1 = sw.add_channel_port(PortClass::Service);
+        let t2 = sw.add_channel_port(PortClass::Service);
+        let gateway = mac(0x47);
+        sw.bind_mac(g.id, gateway);
+
+        t1.tx
+            .send(frame(MAC_BROADCAST, gateway, b"spoof"))
+            .await
+            .unwrap();
+        // T2's frame follows the spoofed one into the switch only by
+        // chance of scheduling, so wait until the switch has dealt with
+        // the spoofed one, whichever way.
+        while {
+            let s = sw.stats();
+            s.frames_flooded + s.frames_dropped == 0
+        } {
+            tokio::task::yield_now().await;
+        }
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        t2.tx.send(to_gateway.clone()).await.unwrap();
+
+        // The first frame G reads is T2's: the spoofed one was not flooded
+        // to it, and the gateway's MAC is still on G.
+        assert_eq!(g.rx.recv().await.unwrap(), to_gateway);
+        // The marker reaches T1 after anything the switch gave it before.
+        let marker = frame(MAC_BROADCAST, mac(2), b"marker");
+        t2.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(t1.rx.recv().await.unwrap(), marker);
+    }
+
+    /// A bound MAC stays when its port learns more MACs than it may hold:
+    /// a trunk that carries the gateway also carries a far side a guest
+    /// there can fill with forged sources (review F21's way around F9).
+    #[tokio::test]
+    async fn a_bound_mac_outlives_the_limit_of_its_port() {
+        let sw = Switch::new("seg0".into());
+        let mut trunk = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+        // Learned first, then bound: the MAC is the oldest of the port.
+        trunk
+            .tx
+            .send(frame(MAC_BROADCAST, gateway, b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(a.rx.recv().await.unwrap().len(), 14 + 5);
+        sw.bind_mac(trunk.id, gateway);
+
+        for i in 0..MAX_MACS_PER_SERVICE_PORT as u32 {
+            let b4 = i.to_be_bytes();
+            let src = MacAddr([2, 9, b4[0], b4[1], b4[2], b4[3]]);
+            trunk
+                .tx
+                .send(frame(MAC_BROADCAST, src, b"x"))
+                .await
+                .unwrap();
+            // Keep A's queue empty, so nothing is dropped for a full one.
+            a.rx.recv().await.unwrap();
+        }
+
+        // A frame to the gateway is still unicast to the trunk: A, a
+        // third port, does not see it flooded before the marker.
+        while trunk.rx.try_recv().is_ok() {}
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        let marker = frame(MAC_BROADCAST, mac(2), b"marker");
+        b.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(a.rx.recv().await.unwrap(), marker);
+        assert_eq!(trunk.rx.recv().await.unwrap(), to_gateway);
+    }
+
+    /// Review F29 at the switch: a held address and the DHCP server role
+    /// are let go with the port that held them.
+    #[tokio::test]
+    async fn what_a_port_bound_goes_with_the_port() {
+        use crate::net::frame::arp_reply_build;
+        let sw = Switch::new("seg0".into());
+        let svc = sw.add_channel_port(PortClass::Service);
+        let a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let ip = Ipv4Addr::new(10, 0, 0, 1);
+        sw.bind_mac(svc.id, mac(0x47));
+        sw.bind_ip(svc.id, ip);
+        sw.bind_dhcp_server(svc.id);
+        // A guest port binds nothing.
+        sw.bind_ip(a.id, Ipv4Addr::new(10, 0, 0, 9));
+        sw.bind_dhcp_server(a.id);
+        {
+            let inner = sw.inner.lock_recover();
+            assert_eq!(inner.bound_ips.len(), 1);
+            assert_eq!(inner.dhcp_server, Some(svc.id));
+        }
+
+        sw.remove_port(svc.id);
+        {
+            let inner = sw.inner.lock_recover();
+            assert!(inner.bound_macs.is_empty());
+            assert!(inner.bound_ips.is_empty());
+            assert_eq!(inner.dhcp_server, None);
+        }
+        // With no holder the address is anyone's again.
+        let arp = Bytes::from(arp_reply_build(mac(1), ip, MAC_BROADCAST, ip));
+        a.tx.send(arp.clone()).await.unwrap();
+        assert_eq!(b.rx.recv().await.unwrap(), arp);
     }
 }

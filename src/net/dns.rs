@@ -443,8 +443,12 @@ impl DnsServer {
         Self { zone }
     }
 
-    /// Process one ethernet frame addressed to UDP port 53.
-    pub fn handle(&self, eth_frame: &[u8]) -> DnsAction {
+    /// Process one ethernet frame addressed to UDP port 53. A reply leaves
+    /// with `server_mac`, the server's own MAC, as its ethernet source. It
+    /// is never the ethernet destination of the query: the client chooses
+    /// that field, and a switch learns the source of a reply on the server's
+    /// port (second networking review, F21).
+    pub fn handle(&self, eth_frame: &[u8], server_mac: MacAddr) -> DnsAction {
         let Some(eth) = EthView::parse(eth_frame) else {
             return DnsAction::Ignore;
         };
@@ -483,7 +487,7 @@ impl DnsServer {
 
         let respond = DnsRespondCtx {
             client_mac: eth.src_mac(),
-            server_mac: eth.dst_mac(),
+            server_mac,
             client_ip: ip.src(),
             server_ip: ip.dst(),
             client_port: udp.src_port(),
@@ -957,7 +961,7 @@ mod tests {
         let ipp = ipv4_build(CLIENT_IP, SERVER_IP, IPPROTO_UDP, 64, &udp, 3).unwrap();
         let frame = eth_build(SERVER_MAC, CLIENT_MAC, ETHERTYPE_IPV4, &ipp);
 
-        let DnsAction::Reply(reply) = server.handle(&frame) else {
+        let DnsAction::Reply(reply) = server.handle(&frame, SERVER_MAC) else {
             panic!("expected a reply");
         };
         let (id, rcode, ancount, answer) = parse_reply(&reply);
@@ -971,7 +975,7 @@ mod tests {
     fn nxdomain_reply_has_flags_and_no_answers() {
         let server = DnsServer::new(DnsZone::new("vmlab.internal"));
         let DnsAction::Reply(reply) =
-            server.handle(&query_frame(7, "nope.vmlab.internal", QTYPE_A))
+            server.handle(&query_frame(7, "nope.vmlab.internal", QTYPE_A), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -989,7 +993,8 @@ mod tests {
         z.add_sinkhole("*.telemetry.example.com", SinkholeMode::Nxdomain);
         let server = DnsServer::new(z);
 
-        let DnsAction::Reply(reply) = server.handle(&query_frame(1, "x.ads.example.com", QTYPE_A))
+        let DnsAction::Reply(reply) =
+            server.handle(&query_frame(1, "x.ads.example.com", QTYPE_A), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -997,9 +1002,10 @@ mod tests {
         assert_eq!(rcode, RCODE_NOERROR);
         assert_eq!(answer, Some((QTYPE_A, ANSWER_TTL, Ipv4Addr::UNSPECIFIED)));
 
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(2, "x.telemetry.example.com", QTYPE_A))
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(2, "x.telemetry.example.com", QTYPE_A),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, ancount, _) = parse_reply(&reply);
@@ -1012,18 +1018,20 @@ mod tests {
         let mut z = DnsZone::new("vmlab.internal");
         z.register("web", ip(20));
         let server = DnsServer::new(z);
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(3, "web.vmlab.internal", QTYPE_AAAA))
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(3, "web.vmlab.internal", QTYPE_AAAA),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, ancount, _) = parse_reply(&reply);
         assert_eq!(rcode, RCODE_NOERROR);
         assert_eq!(ancount, 0);
         // Unknown AAAA without upstream takes the A path: NXDOMAIN.
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(4, "gone.vmlab.internal", QTYPE_AAAA))
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(4, "gone.vmlab.internal", QTYPE_AAAA),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, _, _) = parse_reply(&reply);
@@ -1036,7 +1044,7 @@ mod tests {
         z.register("web", ip(20));
         let server = DnsServer::new(z);
         let DnsAction::Reply(reply) =
-            server.handle(&query_frame(5, "web.vmlab.internal", QTYPE_ANY))
+            server.handle(&query_frame(5, "web.vmlab.internal", QTYPE_ANY), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -1050,7 +1058,8 @@ mod tests {
         const QTYPE_MX: u16 = 15;
         // An unknown name without an upstream takes the A path: NXDOMAIN.
         let server = DnsServer::new(DnsZone::new("vmlab.internal"));
-        let DnsAction::Reply(reply) = server.handle(&query_frame(6, "example.com", QTYPE_MX))
+        let DnsAction::Reply(reply) =
+            server.handle(&query_frame(6, "example.com", QTYPE_MX), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -1062,7 +1071,7 @@ mod tests {
         z.upstream = Some(upstream());
         let server = DnsServer::new(z);
         let frame = query_frame(0xBEEF, "example.com", QTYPE_MX);
-        match server.handle(&frame) {
+        match server.handle(&frame, SERVER_MAC) {
             DnsAction::ForwardUpstream {
                 upstream: u,
                 query_id,
@@ -1082,7 +1091,7 @@ mod tests {
         }
         // Unknown A queries also forward when upstream is set.
         assert!(matches!(
-            server.handle(&query_frame(8, "unknown.example.com", QTYPE_A)),
+            server.handle(&query_frame(8, "unknown.example.com", QTYPE_A), SERVER_MAC),
             DnsAction::ForwardUpstream { .. }
         ));
     }
@@ -1105,7 +1114,7 @@ mod tests {
 
         for qtype in [QTYPE_HTTPS, QTYPE_SVCB, QTYPE_CNAME, QTYPE_TXT, QTYPE_SRV] {
             // An NXDOMAIN sinkhole refuses the name whatever is asked of it.
-            match server.handle(&query_frame(1, "a.blocked.test", qtype)) {
+            match server.handle(&query_frame(1, "a.blocked.test", qtype), SERVER_MAC) {
                 DnsAction::Reply(reply) => {
                     let (id, rcode, ancount, _) = parse_reply(&reply);
                     assert_eq!(id, 1);
@@ -1117,7 +1126,7 @@ mod tests {
             // A 0.0.0.0 sinkhole and a name of the lab's own have an address
             // and nothing else: an empty NOERROR, answered here.
             for name in ["a.zero.test", "dc01.vmlab.internal"] {
-                match server.handle(&query_frame(2, name, qtype)) {
+                match server.handle(&query_frame(2, name, qtype), SERVER_MAC) {
                     DnsAction::Reply(reply) => {
                         let (_, rcode, ancount, _) = parse_reply(&reply);
                         assert_eq!(rcode, RCODE_NOERROR, "{name} qtype {qtype}");
@@ -1128,7 +1137,7 @@ mod tests {
             }
             // A name the zone has no verdict on still goes upstream.
             assert!(matches!(
-                server.handle(&query_frame(3, "example.com", qtype)),
+                server.handle(&query_frame(3, "example.com", qtype), SERVER_MAC),
                 DnsAction::ForwardUpstream { .. }
             ));
         }
@@ -1162,7 +1171,7 @@ mod tests {
         };
 
         for frame in [chaos("a.blocked.test"), status("a.blocked.test")] {
-            match server.handle(&frame) {
+            match server.handle(&frame, SERVER_MAC) {
                 DnsAction::Reply(reply) => {
                     let (_, rcode, ancount, _) = parse_reply(&reply);
                     assert_eq!(rcode, RCODE_NOTIMP);
@@ -1174,7 +1183,7 @@ mod tests {
         // Names the zone has no verdict on forward as before.
         for frame in [chaos("example.com"), status("example.com")] {
             assert!(matches!(
-                server.handle(&frame),
+                server.handle(&frame, SERVER_MAC),
                 DnsAction::ForwardUpstream { .. }
             ));
         }
@@ -1209,18 +1218,18 @@ mod tests {
         let udp = udp_build(CLIENT_IP, SERVER_IP, 1000, 123, b"x").unwrap();
         let ipp = ipv4_build(CLIENT_IP, SERVER_IP, IPPROTO_UDP, 64, &udp, 1).unwrap();
         let f = eth_build(SERVER_MAC, CLIENT_MAC, ETHERTYPE_IPV4, &ipp);
-        assert!(matches!(server.handle(&f), DnsAction::Ignore));
+        assert!(matches!(server.handle(&f, SERVER_MAC), DnsAction::Ignore));
         // A DNS *response* (QR set) is ignored.
         let mut q = build_query(1, "a.b", QTYPE_A);
         q[2] |= 0x80;
         let udp = udp_build(CLIENT_IP, SERVER_IP, CLIENT_PORT, DNS_PORT, &q).unwrap();
         let ipp = ipv4_build(CLIENT_IP, SERVER_IP, IPPROTO_UDP, 64, &udp, 1).unwrap();
         let f = eth_build(SERVER_MAC, CLIENT_MAC, ETHERTYPE_IPV4, &ipp);
-        assert!(matches!(server.handle(&f), DnsAction::Ignore));
+        assert!(matches!(server.handle(&f, SERVER_MAC), DnsAction::Ignore));
         // Truncation sweep never panics.
         let f = query_frame(2, "sweep.example.com", QTYPE_A);
         for n in 0..f.len() {
-            let _ = server.handle(&f[..n]);
+            let _ = server.handle(&f[..n], SERVER_MAC);
         }
     }
 
@@ -1283,12 +1292,18 @@ mod tests {
         // Label length claims 63 bytes but only 2 are present.
         let mut m = header(1);
         m.extend_from_slice(&[63, b'a', b'b']);
-        assert!(matches!(server.handle(&raw_frame(&m)), DnsAction::Ignore));
+        assert!(matches!(
+            server.handle(&raw_frame(&m), SERVER_MAC),
+            DnsAction::Ignore
+        ));
 
         // Compression pointer in the question (unsupported → ignored).
         let mut m = header(1);
         m.extend_from_slice(&[0xC0, 0x0C, 0, QTYPE_A as u8, 0, QCLASS_IN as u8]);
-        assert!(matches!(server.handle(&raw_frame(&m)), DnsAction::Ignore));
+        assert!(matches!(
+            server.handle(&raw_frame(&m), SERVER_MAC),
+            DnsAction::Ignore
+        ));
 
         // A maximal name: enough 63-byte labels to approach the UDP payload
         // limit. The echoed response would not fit an IPv4 packet; the server
@@ -1302,7 +1317,7 @@ mod tests {
         m.push(0);
         m.extend_from_slice(&QTYPE_A.to_be_bytes());
         m.extend_from_slice(&QCLASS_IN.to_be_bytes());
-        match server.handle(&raw_frame(&m)) {
+        match server.handle(&raw_frame(&m), SERVER_MAC) {
             DnsAction::Reply(f) => {
                 assert!(EthView::parse(&f).is_some());
             }
@@ -1314,7 +1329,7 @@ mod tests {
         for i in 0..good.len() {
             let mut f = good.clone();
             f[i] ^= 0xFF;
-            if let DnsAction::Reply(reply) = server.handle(&f) {
+            if let DnsAction::Reply(reply) = server.handle(&f, SERVER_MAC) {
                 assert!(EthView::parse(&reply).is_some());
             }
         }
