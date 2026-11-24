@@ -43,6 +43,8 @@ pub struct CtlHandle {
 struct CtlInner {
     writer: Mutex<CtlWriter>,
     events: broadcast::Sender<CtlEvent>,
+    /// Guest's boot protocol version. A mismatch terminates the reader.
+    boot: watch::Receiver<Option<u32>>,
     /// Last `net_up` IP reported by the guest.
     last_ip: RwLock<Option<String>>,
     /// Flips true on the `started` event.
@@ -72,6 +74,7 @@ impl CtlHandle {
         let (read_half, write_half) = stream.into_split();
 
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (boot_tx, boot_rx) = watch::channel(None);
         let (started_tx, started_rx) = watch::channel(false);
         let (exited_tx, exited_rx) = watch::channel(None);
         let inner = Arc::new(CtlInner {
@@ -80,6 +83,7 @@ impl CtlHandle {
                 cut_short: false,
             }),
             events: events.clone(),
+            boot: boot_rx,
             last_ip: RwLock::new(None),
             started: started_rx,
             exited: exited_rx,
@@ -111,11 +115,10 @@ impl CtlHandle {
                 };
                 match &ev {
                     CtlEvent::Boot { proto_version } => {
+                        boot_tx.send_replace(Some(*proto_version));
                         if *proto_version != PROTO_VERSION {
-                            tracing::error!(
-                                "ctl: guest init speaks proto v{proto_version}, \
-                                 host expects v{PROTO_VERSION} — rebuild the guest asset"
-                            );
+                            tracing::error!("ctl: {}", protocol_mismatch(*proto_version));
+                            break;
                         }
                     }
                     CtlEvent::NetUp { ip } => {
@@ -141,6 +144,29 @@ impl CtlHandle {
         Ok(CtlHandle { inner })
     }
 
+    /// Wait for cinit to identify its protocol before sending the first spec.
+    pub async fn wait_boot(&self, timeout: Duration) -> Result<()> {
+        let mut rx = self.inner.boot.clone();
+        let version = tokio::time::timeout(timeout, rx.wait_for(Option::is_some))
+            .await
+            .map_err(|_| anyhow!("guest init did not announce boot within {timeout:?}"))?
+            .map_err(|_| anyhow!("ctl channel closed before guest init announced boot"))?
+            .expect("boot announcement arrived");
+        if version != PROTO_VERSION {
+            return Err(protocol_mismatch(version));
+        }
+        Ok(())
+    }
+
+    fn check_protocol(&self) -> Result<()> {
+        if let Some(version) = *self.inner.boot.borrow()
+            && version != PROTO_VERSION
+        {
+            return Err(protocol_mismatch(version));
+        }
+        Ok(())
+    }
+
     /// Send one command as a JSON line, within [`SEND_TIMEOUT`] for the wait
     /// on the writer and the write together.
     ///
@@ -159,6 +185,7 @@ impl CtlHandle {
             .map_err(|_| {
                 anyhow!("ctl channel busy for {SEND_TIMEOUT:?}: the guest is not reading it")
             })?;
+        self.check_protocol()?;
         if writer.cut_short {
             return Err(anyhow!(
                 "ctl channel no longer usable: the guest stopped reading it"
@@ -197,13 +224,18 @@ impl CtlHandle {
         let mut rx = self.inner.started.clone();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            self.check_protocol()?;
             if *rx.borrow() {
                 return Ok(());
             }
             tokio::time::timeout_at(deadline, rx.changed())
                 .await
                 .map_err(|_| anyhow!("container did not start within {timeout:?}"))?
-                .map_err(|_| anyhow!("ctl channel closed before the container started"))?;
+                .map_err(|_| {
+                    self.check_protocol().err().unwrap_or_else(|| {
+                        anyhow!("ctl channel closed before the container started")
+                    })
+                })?;
         }
     }
 
@@ -213,15 +245,24 @@ impl CtlHandle {
         let mut rx = self.inner.exited.clone();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            self.check_protocol()?;
             if let Some(code) = *rx.borrow() {
                 return Ok(code);
             }
             tokio::time::timeout_at(deadline, rx.changed())
                 .await
                 .map_err(|_| anyhow!("container did not exit within {timeout:?}"))?
-                .map_err(|_| anyhow!("ctl channel closed before the container exited"))?;
+                .map_err(|_| {
+                    self.check_protocol().err().unwrap_or_else(|| {
+                        anyhow!("ctl channel closed before the container exited")
+                    })
+                })?;
         }
     }
+}
+
+fn protocol_mismatch(version: u32) -> anyhow::Error {
+    anyhow!("guest init speaks proto v{version}, host expects v{PROTO_VERSION} — rebuild the guest asset")
 }
 
 /// One read of the ctl stream.
@@ -370,7 +411,13 @@ mod tests {
     #[tokio::test]
     async fn events_update_state_and_broadcast() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
-            write_line(&mut stream, &CtlEvent::Boot { proto_version: 1 }).await;
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
             write_line(
                 &mut stream,
                 &CtlEvent::NetUp {
@@ -396,6 +443,7 @@ mod tests {
         let ctl = CtlHandle::connect(&path).await.unwrap();
         let mut rx = ctl.subscribe();
 
+        ctl.wait_boot(LONG).await.unwrap();
         ctl.wait_started(LONG).await.unwrap();
         assert_eq!(ctl.ip().await.as_deref(), Some("10.0.0.9"));
 
@@ -405,7 +453,9 @@ mod tests {
         // The broadcast stream carries every event in order.
         assert_eq!(
             rx.recv().await.unwrap(),
-            CtlEvent::Boot { proto_version: 1 }
+            CtlEvent::Boot {
+                proto_version: PROTO_VERSION,
+            }
         );
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -421,15 +471,32 @@ mod tests {
     async fn a_version_mismatch_is_named_in_the_ctl_error() {
         let guest_version = PROTO_VERSION - 1;
         let (_dir, path) = spawn_mock(move |mut stream| async move {
-            write_line(&mut stream, &CtlEvent::Boot { proto_version: guest_version }).await;
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: guest_version,
+                },
+            )
+            .await;
             write_line(&mut stream, &CtlEvent::Started { pid: 7 }).await;
         })
         .await;
 
         let ctl = CtlHandle::connect(&path).await.unwrap();
         let error = ctl.wait_started(LONG).await.unwrap_err().to_string();
-        assert!(error.contains(&format!("guest init speaks proto v{guest_version}")), "{error}");
-        assert!(error.contains(&format!("host expects v{PROTO_VERSION}")), "{error}");
+        assert!(
+            error.contains(&format!("guest init speaks proto v{guest_version}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("host expects v{PROTO_VERSION}")),
+            "{error}"
+        );
+        assert_eq!(ctl.wait_boot(LONG).await.unwrap_err().to_string(), error);
+        assert_eq!(
+            ctl.send(&CtlCommand::Resync).await.unwrap_err().to_string(),
+            error
+        );
     }
 
     #[tokio::test]
@@ -486,7 +553,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_ctl_peer_that_never_reads_does_not_block_a_stop() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
-            write_line(&mut stream, &CtlEvent::Boot { proto_version: 1 }).await;
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
             // Keep the socket open and never read it.
             std::future::pending::<()>().await;
         })
@@ -538,7 +611,13 @@ mod tests {
     #[tokio::test]
     async fn eof_closes_waiters_gracefully() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
-            write_line(&mut stream, &CtlEvent::Boot { proto_version: 1 }).await;
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
             // QEMU dies: the socket closes without `exited`.
         })
         .await;
@@ -553,7 +632,13 @@ mod tests {
     #[tokio::test]
     async fn wait_times_out_when_nothing_happens() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
-            write_line(&mut stream, &CtlEvent::Boot { proto_version: 1 }).await;
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
             tokio::time::sleep(Duration::from_secs(5)).await;
         })
         .await;

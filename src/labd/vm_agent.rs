@@ -339,7 +339,7 @@ struct Inner {
     open_waiters: std::sync::Mutex<HashMap<u32, OpenWaiter>>,
     next_id: AtomicU32,
     /// The handshake result (`None` until the token echo arrives).
-    hello: watch::Sender<Option<AgentInfo>>,
+    hello: watch::Sender<Option<Result<AgentInfo, u32>>>,
     /// Incremented per `pong`, with the agent instance that sent it.
     pong: watch::Sender<(u64, Option<String>)>,
     /// Latest metrics sample.
@@ -648,15 +648,17 @@ impl AgentHandle {
             .await
             .context("sending agent handshake")?;
 
-        loop {
-            if rx.borrow().is_some() {
-                return Ok(handle);
-            }
-            tokio::time::timeout_at(deadline, rx.changed())
-                .await
-                .map_err(|_| anyhow!("no vmlab-agent answered on the agent channel"))?
-                .map_err(|_| anyhow!("agent channel closed during handshake"))?;
+        let reply = tokio::time::timeout_at(deadline, rx.wait_for(Option::is_some))
+            .await
+            .map_err(|_| anyhow!("no vmlab-agent answered on the agent channel"))?
+            .map_err(|_| anyhow!("agent channel closed during handshake"))?;
+        if let Some(Err(proto_version)) = *reply {
+            bail!(
+                "agent speaks proto v{proto_version}, host expects v{PROTO_VERSION} — \
+                 rebuild the template to update its agent"
+            );
         }
+        Ok(handle)
     }
 
     /// The handshake info (always present after a successful `connect`).
@@ -672,6 +674,7 @@ impl AgentHandle {
             .borrow()
             .clone()
             .expect("connect completed the handshake")
+            .expect("connect accepted the agent protocol version")
     }
 
     pub fn has_feature(&self, feature: &str) -> bool {
@@ -779,6 +782,7 @@ impl AgentHandle {
             .hello
             .borrow()
             .as_ref()
+            .and_then(|reply| reply.as_ref().ok())
             .and_then(|info| info.instance.clone());
         if pong != handshook {
             tracing::debug!(
@@ -2830,19 +2834,22 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
                 // Stale reply from before a snapshot restore — not ours.
                 return;
             }
-            if proto_version != PROTO_VERSION {
-                tracing::error!(
-                    "agent speaks proto v{proto_version}, host expects v{PROTO_VERSION} — \
-                     rebuild the template to update its agent"
-                );
-                return;
-            }
-            let _ = inner.hello.send(Some(AgentInfo {
-                agent_version,
-                os,
-                features,
-                instance,
-            }));
+            inner.hello.send_if_modified(|reply| {
+                if reply.is_some() {
+                    return false;
+                }
+                *reply = Some(if proto_version == PROTO_VERSION {
+                    Ok(AgentInfo {
+                        agent_version,
+                        os,
+                        features,
+                        instance,
+                    })
+                } else {
+                    Err(proto_version)
+                });
+                true
+            });
         }
         AgentMsg::Opened { id } => {
             if let Some(w) = inner.open_waiters.lock_recover().remove(&id) {
@@ -3159,7 +3166,7 @@ mod tests {
             if legacy {
                 let mut info = handle.info();
                 info.agent_version = "agent-legacy=test".into();
-                handle.inner.hello.send_replace(Some(info));
+                handle.inner.hello.send_replace(Some(Ok(info)));
             }
             let before = tokio::time::Instant::now();
             let result = handle
@@ -3442,7 +3449,7 @@ mod tests {
                                     // A stale hello first — the host must
                                     // ignore it (wrong token).
                                     send(AgentMsg::Hello {
-                                        proto_version: PROTO_VERSION,
+                                        proto_version: PROTO_VERSION - 1,
                                         agent_version: "stale".into(),
                                         os: "linux".into(),
                                         features: vec![],
@@ -4509,8 +4516,14 @@ mod tests {
             panic!("expected the incompatible agent to be refused");
         };
         let error = err.to_string();
-        assert!(error.contains(&format!("agent speaks proto v{guest_version}")), "{error}");
-        assert!(error.contains(&format!("host expects v{PROTO_VERSION}")), "{error}");
+        assert!(
+            error.contains(&format!("agent speaks proto v{guest_version}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("host expects v{PROTO_VERSION}")),
+            "{error}"
+        );
         assert_eq!(tokio::time::Instant::now(), before);
     }
 
