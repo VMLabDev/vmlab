@@ -1779,7 +1779,7 @@ impl Trace {
                 }
                 Value::Vector(values) => {
                     values.capacity() * size_of::<Value>()
-                        + values.iter().map(self::value).sum::<usize>()
+                        + values.iter().map(value_bytes).sum::<usize>()
                 }
                 Value::Bits { value, .. } => value.bits().div_ceil(64) as usize * 8,
                 Value::Integer(value) => value.bits().div_ceil(64) as usize * 8,
