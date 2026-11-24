@@ -754,7 +754,6 @@ impl ContainerInstance {
             self.virtiofs_active.store(false, Ordering::SeqCst);
             return Ok(Vec::new());
         }
-        let mut procs = Vec::new();
         let mut devices = Vec::new();
         for (i, (share, host, ro)) in self.volumes.iter().enumerate() {
             let sock = self.dirs.vfs_sock(i);
@@ -768,11 +767,11 @@ impl ContainerInstance {
                     &self.dirs.logs.join(format!("virtiofsd{i}.log")),
                 )
                 .await?;
-            procs.push(proc);
+            // Register each daemon so teardown can stop it if a later volume fails.
+            self.virtiofsd.lock().await.push(proc);
             devices.push((share.clone(), sock));
         }
         self.virtiofs_active.store(true, Ordering::SeqCst);
-        *self.virtiofsd.lock().await = procs;
         Ok(devices)
     }
 
@@ -921,8 +920,8 @@ impl ContainerInstance {
         let (proc, ctl) = match run.await {
             Ok(v) => v,
             Err(e) => {
-                *self.state.write().await = PowerState::Stopped;
                 self.teardown().await;
+                *self.state.write().await = PowerState::Stopped;
                 return Err(e);
             }
         };
