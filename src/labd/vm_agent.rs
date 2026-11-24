@@ -3371,7 +3371,10 @@ mod tests {
             }
         };
         assert!(error.contains("queue"), "{error}");
-        assert!(events <= SESSION_QUEUE + 1, "{events} events sat in one queue");
+        assert!(
+            events <= SESSION_QUEUE + 1,
+            "{events} events sat in one queue"
+        );
     }
 
     /// Wait, without reading the session, until the reader has queued the
