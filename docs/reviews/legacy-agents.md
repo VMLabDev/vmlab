@@ -308,6 +308,9 @@ Not read:
 - Test: on a `templeos` guest whose agent answers, type
   `VmlabAgentInstall;` at the shell once more, then run
   `vmlab exec <vm> -- '"ok\n";'` ten times. Assert ten answers of `ok`.
+- Fixed by card #759. The installer reuses the live task, and the typed
+  install defers loading the updated file until boot when COM1 already has
+  an agent. The legacy guest scenario checks ten replies and one agent task.
 
 ### F8. `close` and `hello` kill only the direct child of an exec; what it started keeps running
 

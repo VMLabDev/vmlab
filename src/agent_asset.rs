@@ -170,7 +170,7 @@ fn find_in(dirs: &[PathBuf], os: AgentOs, arch: &str) -> Result<AgentAsset> {
 
 /// The text a provision types at the TempleOS shell to land the agent:
 /// every line of `source` as an `A("…")` statement into a buffer, then one
-/// `FileWrite` to `~/VmlabAgt.HC`, the include, and the spawn. Comment-only
+/// `FileWrite` to `~/VmlabAgt.HC` and a guarded include and install. Comment-only
 /// and blank lines are dropped because every character costs a keystroke.
 /// TempleOS reads no ISO 9660 and has no network, so the screen is the one
 /// way in, and this is the shape that survives a shell that compiles each
@@ -196,8 +196,14 @@ pub fn templeos_typescript(source: &str) -> String {
         out.push_str("\");\n");
     }
     out.push_str("FileWrite(\"~/VmlabAgt.HC\",g_src,g_n);Free(g_src);\n");
-    out.push_str("#include \"~/VmlabAgt\"\n");
-    out.push_str("VmlabAgentInstall;\n");
+    // Find even a task started by an older copy of the agent before compiling
+    // the new definitions. The updated file will be included on the next boot.
+    out.push_str(concat!(
+        "U0 VaInstallIfStopped(){CTask *t=adam_task;",
+        "do {if (!StrCmp(t->task_name,\"VmlabAgent\")) return; t=t->next_task;} while (t!=adam_task);",
+        "ExePrint(\"#include \\\"~/VmlabAgt\\\"\\nVmlabAgentInstall;\\n\");}\n",
+        "VaInstallIfStopped;\n",
+    ));
     out
 }
 
@@ -216,8 +222,8 @@ mod tests {
             lines[2],
             "A(\"U0 F(){ \\\"say \\\\\\\"hi\\\\\\\"\\\\n\\\"; }\");"
         );
-        assert_eq!(lines.len(), 6, "{ts}");
-        assert!(ts.ends_with("#include \"~/VmlabAgt\"\nVmlabAgentInstall;\n"));
+        assert_eq!(lines[3], "FileWrite(\"~/VmlabAgt.HC\",g_src,g_n);Free(g_src);");
+        assert!(ts.ends_with("VaInstallIfStopped;\n"));
     }
 
     /// The agent is typed at a DolDoc shell, where a typed `$` opens a
