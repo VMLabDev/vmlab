@@ -380,7 +380,7 @@ async fn legacy_exec_refuses_a_nul_in_argv_and_env() -> Result<()> {
         let reply = open_reply(&mut stream, request.clone()).await?;
         assert_eq!(reply["event"], "error", "request {request}: {reply}");
         assert_eq!(reply["id"], request["id"], "{reply}");
-        let message = reply["message"].as_str().unwrap_or_default();
+        let message = reply["msg"].as_str().unwrap_or_default();
         assert!(message.contains("NUL"), "request {request}: {reply}");
     }
     Ok(())
