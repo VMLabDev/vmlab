@@ -98,7 +98,7 @@ impl TerminalHandle {
     /// the error carries the unmatched buffer tail for debugging.
     pub fn expect(&self, pattern: &str, timeout_secs: i64) -> Result<String, String> {
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs.max(0) as u64);
+        let deadline = std::time::Instant::now() + super::script_timeout(timeout_secs, 0)?;
         let mut st = self.state.lock().expect("term state");
         // How much of the buffer the last scan covered with no match: the
         // same bytes are not scanned a second time.

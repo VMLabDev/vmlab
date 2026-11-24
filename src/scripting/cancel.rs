@@ -115,10 +115,11 @@ pub(crate) fn block_on<F: Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Out
 }
 
 /// `std::thread::sleep`, cut short when the running script is cancelled.
-pub(crate) fn sleep(d: Duration) {
+pub(crate) fn sleep(argument: &str, d: Duration) -> Result<(), String> {
+    let d = super::script_duration(argument, d)?;
     let Some(token) = current() else {
         std::thread::sleep(d);
-        return;
+        return Ok(());
     };
     let deadline = Instant::now() + d;
     loop {
@@ -127,7 +128,7 @@ pub(crate) fn sleep(d: Duration) {
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return;
+            return Ok(());
         }
         std::thread::sleep(left.min(Duration::from_millis(50)));
     }
@@ -142,14 +143,15 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let _entered = enter(token, None);
-        let _ = sleep(Duration::from_millis(i64::MAX as u64));
+        let error = sleep("sleep_ms", Duration::from_millis(i64::MAX as u64)).unwrap_err();
+        assert!(error.contains("sleep_ms"), "{error}");
     }
 
     #[test]
     fn without_a_token_nothing_changes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         assert_eq!(block_on(rt.handle(), async { 7 }), 7);
-        sleep(Duration::from_millis(1));
+        sleep("sleep_ms", Duration::from_millis(1)).unwrap();
     }
 
     #[test]
@@ -176,7 +178,7 @@ mod tests {
         let started = Instant::now();
         let payload = std::thread::spawn(move || {
             let _entered = enter(t, None);
-            sleep(Duration::from_secs(60));
+            sleep("sleep_ms", Duration::from_secs(60)).unwrap();
         })
         .join()
         .unwrap_err();
