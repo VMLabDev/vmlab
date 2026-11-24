@@ -490,7 +490,7 @@ impl GatewayTask {
             }
             if udp.dst_port() == DNS_PORT && ip.dst() == self.gw_ip {
                 if let Some(dns) = &self.dns {
-                    self.handle_dns(dns.handle(frame));
+                    self.handle_dns(dns.handle(frame, self.gw_mac));
                 }
                 return;
             }
@@ -829,6 +829,71 @@ pub(crate) mod tests {
         assert_eq!(m[3] & 0x0F, 0); // NOERROR
         assert_eq!(u16::from_be_bytes([m[6], m[7]]), 1); // one answer
         assert_eq!(&m[m.len() - 4..], &web.octets()); // rdata
+    }
+
+    /// A DNS reply leaves with the gateway's MAC as its ethernet source,
+    /// whatever ethernet destination the query was sent to. With the
+    /// destination as the source, the switch learned that MAC on the
+    /// gateway's service port and dropped every frame of its real owner
+    /// (second networking review, F21).
+    #[tokio::test]
+    async fn a_dns_reply_comes_from_the_gateway_mac() {
+        // A unicast MAC nothing on the segment uses yet.
+        const X: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x99]);
+        const B_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x0B]);
+
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut a = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let b = sw.add_channel_port(PortClass::Guest { isolated: false });
+        gw.dns_zone()
+            .expect("dns enabled")
+            .lock()
+            .unwrap()
+            .register("web", Ipv4Addr::new(10, 213, 1, 77));
+
+        let q = {
+            let mut q = vec![0x21, 0x01, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            q.extend_from_slice(&crate::net::dns::encode_qname("web.vmlab.internal"));
+            q.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            q
+        };
+        let udp = udp_build(GUEST_IP, gw.gw_ip(), 33000, 53, &q).unwrap();
+        let ipp = ipv4_build(GUEST_IP, gw.gw_ip(), IPPROTO_UDP, 64, &udp, 9).unwrap();
+        // The switch floods a frame to an unknown unicast MAC, so the
+        // gateway receives this query and answers it.
+        let frame = eth_build(X, GUEST_MAC, ETHERTYPE_IPV4, &ipp);
+        a.tx.send(Bytes::from(frame)).await.unwrap();
+
+        let reply = recv(&mut a.rx).await;
+        let eth = EthView::parse(&reply).unwrap();
+        assert_eq!(eth.dst_mac(), GUEST_MAC);
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        let udp = UdpView::parse(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (53, 33000));
+        assert_eq!(
+            eth.src_mac(),
+            gw.gw_mac(),
+            "a DNS reply claims the MAC its query was sent to"
+        );
+
+        // The machine that owns X still reaches the segment: its frame
+        // arrives, ahead of the one that follows it out of the same port.
+        // An experimental ethertype, so no service answers either frame.
+        let dropped_before = sw.stats().frames_dropped;
+        for src in [X, B_MAC] {
+            let frame = eth_build(MAC_BROADCAST, src, 0x88B5, b"still here");
+            b.tx.send(Bytes::from(frame)).await.unwrap();
+        }
+        let first = recv(&mut a.rx).await;
+        assert_eq!(
+            EthView::parse(&first).unwrap().src_mac(),
+            X,
+            "the switch dropped the frame of the MAC's owner"
+        );
+        let second = recv(&mut a.rx).await;
+        assert_eq!(EthView::parse(&second).unwrap().src_mac(), B_MAC);
+        assert_eq!(sw.stats().frames_dropped, dropped_before);
     }
 
     /// A guest that asks for 200 names outside the zone has no more queries
