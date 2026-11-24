@@ -9,14 +9,16 @@
 # build/probes/build.sh scanout. With LOCK=1 the console session is
 # disconnected first, so that the screen is the sign-in screen of Windows,
 # which is on the secure desktop. A case passes when the driver refused the
-# probe and the screenshot taken meanwhile has none of the probe's colour. A
-# driver without the fix shows the colour in place of the desktop: use a
-# disposable lab.
+# probe and the screenshot taken meanwhile shows what Windows shows: none of
+# the probe's colour, and not one colour alone. A driver without the fix
+# shows the colour in place of the desktop, or the host's "Display output is
+# not active" where the host cannot show the resource, and the screen stays
+# so until Windows draws again: use a disposable lab.
 # Exit status: 0 when every case passed, 1 otherwise, 2 on usage.
 # check-shell-paths: no-errexit a case that fails is recorded and the next one runs (VML-88).
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-[ $# -ge 4 ] || { sed -n '2,15p' "$0" >&2; exit 2; }
+[ $# -ge 4 ] || { sed -n '2,17p' "$0" >&2; exit 2; }
 LABDIR=$(cd "$1" && pwd); VM=$2; EV=$3; shift 3
 PROBE=$REPO/out/probes-extra/x64/scanout_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE: run build/probes/build.sh scanout" >&2; exit 2; }
@@ -40,7 +42,8 @@ wait_agent() {
 bugchecks() { # the bugcheck records of the System log, newest first
     gps 'Get-WinEvent -FilterHashtable @{LogName="System"; Id=1001; ProviderName="Microsoft-Windows-WER-SystemErrorReporting"} -ErrorAction SilentlyContinue | ForEach-Object { "{0:o} {1}" -f $_.TimeCreated, ($_.Message -replace "\s+", " ") }' 120
 }
-# The share of the pixels of a screenshot that have the probe's colour, in percent.
+# Of a screenshot: its size, the share of its pixels that have the probe's
+# colour, and the share of its most frequent colour, in percent.
 colour_share() {
     python3 - "$1" <<'PY'
 import struct, sys, zlib
@@ -61,6 +64,7 @@ raw = zlib.decompress(idat)
 stride = width * bpp
 prev = bytearray(stride)
 hits = 0
+counts = {}
 for y in range(height):
     start = y * (stride + 1)
     kind = raw[start]
@@ -79,9 +83,24 @@ for y in range(height):
     for x in range(0, stride, bpp):
         if line[x] >= 240 and line[x + 1] <= 15 and line[x + 2] >= 240:
             hits += 1
+        key = bytes(line[x:x + 3])
+        counts[key] = counts.get(key, 0) + 1
     prev = line
-print('%dx%d %.1f' % (width, height, 100.0 * hits / (width * height)))
+print('%dx%d %.1f %.1f' % (width, height, 100.0 * hits / (width * height), 100.0 * max(counts.values()) / (width * height)))
 PY
+}
+
+# Windows sends no frame while nothing changes. After a case that took the
+# screen away, a key makes it draw again.
+live_screen() {
+    for _ in 1 2 3 4 5 6; do
+        in_lab vmlab vm screenshot "$VM" "$EV/$1.before.png" >/dev/null 2>&1
+        set -- "$1" $(colour_share "$EV/$1.before.png" 2>/dev/null | tail -1)
+        [ -n "${4:-}" ] && awk -v d="$4" 'BEGIN { exit !(d < 90) }' && return 0
+        in_lab vmlab vm sendkeys "$VM" super >/dev/null 2>&1
+        sleep 4
+    done
+    return 1
 }
 
 wait_agent || exit 1
@@ -114,7 +133,7 @@ failed=0
 for c in "$@"; do
     note "case $c"
     rm -f "$EV/$c.json" "$EV/$c.stdout.json" "$EV/$c.stderr.txt" "$EV/$c.rc" "$EV/$c".*.png "$EV/$c.share.txt"
-    in_lab vmlab vm screenshot "$VM" "$EV/$c.before.png" >/dev/null 2>&1
+    live_screen "$c" || { note "case $c: the screen shows one colour before the probe ran"; failed=1; continue; }
     (
         in_lab vmlab exec --user "$USER_NAME" --password "$USER_PASS" --timeout 120 "$VM" -- \
             'C:\c755\scanout_probe.exe' --case "$c" --seconds "$SECONDS_OF_PROBE" --out "C:\\c755\\out\\$c.json" >"$EV/$c.stdout.json" 2>"$EV/$c.stderr.txt"
@@ -132,14 +151,16 @@ for c in "$@"; do
         printf '%s %s\n' "$shot" "$(colour_share "$EV/$c.$shot.png" 2>&1 | tail -1)"
     done >"$EV/$c.share.txt"
     share=$(awk '$1 == "during" { print $3 }' "$EV/$c.share.txt")
+    one=$(awk '$1 == "during" { print $4 }' "$EV/$c.share.txt")
     bugchecks >"$EV/bugchecks-after-$c.txt" 2>/dev/null
     if ! cmp -s "$EV/bugchecks-before.txt" "$EV/bugchecks-after-$c.txt"; then
         note "case $c: BUGCHECK: $(head -1 "$EV/bugchecks-after-$c.txt")"
         cp "$EV/bugchecks-after-$c.txt" "$EV/bugchecks-before.txt"
         rc=bugcheck
     fi
-    note "case $c: exit $rc, the probe's colour on ${share:-?} % of the screen meanwhile: $(tr -d '\r\n' <"$EV/$c.json" 2>/dev/null | cut -c1-700)"
+    note "case $c: exit $rc, meanwhile the probe's colour on ${share:-?} % of the screen and one colour on ${one:-?} %: $(tr -d '\r\n' <"$EV/$c.json" 2>/dev/null | cut -c1-700)"
     case "$share" in 0.0) ;; *) rc="$rc+colour" ;; esac
+    awk -v d="${one:-100}" 'BEGIN { exit !(d < 90) }' || rc="$rc+no-desktop"
     [ "$rc" = 0 ] || failed=1
 done
 gps "Get-LocalUser -Name $USER_NAME -ErrorAction SilentlyContinue | Remove-LocalUser" 60
