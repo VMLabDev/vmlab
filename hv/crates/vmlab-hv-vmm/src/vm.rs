@@ -2251,6 +2251,112 @@ mod tests {
 
     #[test]
     #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn io_bar_programmed_below_0x1000_is_dispatched() {
+        use vmlab_hv_devices::{BarInfo, BarKind, BusDevice, PciDevice};
+        type Log = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+        struct Function(Log);
+        impl PciDevice for Function {
+            fn config_read(&mut self, _: usize) -> u32 {
+                0
+            }
+            fn config_write(&mut self, _: usize, _: u64, _: &[u8]) {}
+            fn bars(&self) -> Vec<BarInfo> {
+                vec![BarInfo {
+                    index: 0,
+                    size: 0x20,
+                    kind: BarKind::Io,
+                }]
+            }
+            fn bar_read(&mut self, _: u8, offset: u64, data: &mut [u8]) {
+                data.fill(0x40 + offset as u8);
+            }
+            fn bar_write(&mut self, _: u8, offset: u64, data: &[u8]) {
+                self.0.lock().push((offset, data.to_vec()));
+            }
+        }
+        struct Fixed(Log);
+        impl BusDevice for Fixed {
+            fn read(&mut self, _: u64, data: &mut [u8]) {
+                data.fill(0x77);
+            }
+            fn write(&mut self, offset: u64, data: &[u8]) {
+                self.0.lock().push((offset, data.to_vec()));
+            }
+        }
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP I/O BAR below 0x1000: /dev/kvm absent");
+            return;
+        }
+        let bar_log = Log::default();
+        let fixed_log = Log::default();
+        // The root of a firmware machine: a BAR decodes once the guest has
+        // set I/O decode in the command register.
+        let root = Arc::new(Mutex::new(PciRoot::q35(1 << 32)));
+        let slot = 3u8;
+        root.lock()
+            .add_device_at(slot, 0, Arc::new(Mutex::new(Function(bar_log.clone()))))
+            .unwrap();
+        let mut io_bus = IoBus::new();
+        io_bus
+            .register(
+                0xcf8,
+                8,
+                Arc::new(Mutex::new(crate::pci::PciConfigIo::new(root.clone()))),
+            )
+            .unwrap();
+        io_bus
+            .register(0xe00, 8, Arc::new(Mutex::new(Fixed(fixed_log.clone()))))
+            .unwrap();
+        let signal = Arc::new(SleepSignal::default());
+        let shared = VmShared::new(
+            KvmVm::new().unwrap(),
+            io_bus,
+            MmioBus::new(),
+            root,
+            Arc::new(Mutex::new(PmDevice::new(Arc::new(NullIrq), signal.sink()))),
+            signal,
+            1 << 32,
+        );
+        // What the guest does: BAR = `base`, then I/O decode, through the
+        // configuration ports.
+        let place = |base: u32| {
+            let address = 0x8000_0000 | u32::from(slot) << 11;
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &0u16.to_le_bytes());
+            shared.io_write(0xcf8, &(address | 0x10).to_le_bytes());
+            shared.io_write(0xcfc, &base.to_le_bytes());
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &1u16.to_le_bytes());
+        };
+
+        place(0x0d01);
+        shared.io_write(0x0d04, &[1]);
+        assert_eq!(
+            *bar_log.lock(),
+            vec![(4, vec![1])],
+            "a write inside an I/O BAR at 0x0d00 did not reach the function"
+        );
+        let mut read = [0u8; 1];
+        shared.io_read(0x0d05, &mut read);
+        assert_eq!(read, [0x45]);
+        // Outside the BAR nothing answers.
+        shared.io_read(0x0d20, &mut read);
+        assert_eq!(read, [0xff]);
+
+        // A BAR moved over a fixed device does not take its ports.
+        place(0x0e01);
+        shared.io_write(0x0e04, &[2]);
+        assert_eq!(*fixed_log.lock(), vec![(4, vec![2])]);
+        assert_eq!(bar_log.lock().len(), 1);
+        shared.io_read(0x0e04, &mut read);
+        assert_eq!(read, [0x77]);
+        // The rest of that BAR, past the fixed device, is the function's.
+        shared.io_write(0x0e08, &[3]);
+        assert_eq!(bar_log.lock().last(), Some(&(8, vec![3])));
+    }
+
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
     fn ordinary_io_does_not_scan_pci_errors_without_vfio() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use vmlab_hv_devices::{BarInfo, BarKind, PciDevice};

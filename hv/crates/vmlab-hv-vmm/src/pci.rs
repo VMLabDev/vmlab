@@ -1432,6 +1432,25 @@ mod tests {
     }
 
     #[test]
+    fn cfc_write_does_not_cross_the_dword() {
+        let (root, dev) = root_with_fake();
+        let mut cfg = PciConfigIo::new(root);
+        // Slot 1, register 63: the last dword CF8 can address.
+        cfg.write(0, &0x8000_08fcu32.to_le_bytes());
+        cfg.write(7, &[1, 2, 3, 4]);
+        let log = dev.lock().config_log.lock().clone();
+        assert_eq!(log, vec![(63, 3, vec![1])]);
+        // Register 4 is a BAR of the fake function. A write that starts in
+        // register 3 leaves it alone.
+        let before = dev.lock().placements.clone();
+        cfg.write(0, &0x8000_080cu32.to_le_bytes());
+        cfg.write(6, &[0xff; 4]);
+        let log = dev.lock().config_log.lock().clone();
+        assert_eq!(log[1..], [(3, 2, vec![0xff; 2])]);
+        assert_eq!(dev.lock().placements, before);
+    }
+
+    #[test]
     fn cf8_disable_bit_and_cfc_location() {
         let (root, _) = root_with_fake();
         let mut io = PciConfigIo::new(root);
