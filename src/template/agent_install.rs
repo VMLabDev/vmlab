@@ -92,9 +92,22 @@ pub async fn verify(
          install script?)",
     )?;
 
-    let info = handle.info();
+    Ok(Some(verified_version(
+        handle.info(),
+        staged,
+        machine.profile().as_deref(),
+        log,
+    )))
+}
+
+fn verified_version(
+    info: crate::labd::vm_agent::AgentInfo,
+    staged: &StagedGuestIso,
+    profile: Option<&str>,
+    log: &(dyn Fn(String) + Sync),
+) -> String {
     let legacy = is_legacy_agent(&info.agent_version);
-    let os = agent_flavour(&info.os, legacy, machine.profile().as_deref());
+    let os = agent_flavour(&info.os, legacy, profile);
     // The staged stamp identifies what the ISO carried; the handshake's own
     // version is the fallback if the flavour somehow wasn't staged — and is
     // the answer for the legacy agent, whose stamp *is* its version string.
@@ -111,7 +124,7 @@ pub async fn verify(
         os.key(),
         version
     ));
-    Ok(Some(version))
+    version
 }
 
 /// Try `attempt` every five seconds until it succeeds or `wait` has passed
@@ -134,6 +147,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sealed_version_is_the_one_the_agent_reports() {
+        let info = crate::labd::vm_agent::AgentInfo {
+            agent_version: "agent=old".into(),
+            os: "linux".into(),
+            features: Vec::new(),
+            instance: None,
+        };
+        let staged = StagedGuestIso {
+            dir: "guest-iso".into(),
+            versions: vec![(AgentOs::Linux, "agent=new".into())],
+        };
+        assert_eq!(verified_version(info, &staged, None, &|_| {}), "agent=old");
+    }
 
     /// The Rust agent answers with its crate version, and must not be mistaken
     /// for the exec-only tier — the mistake that sealed a Windows 7 template

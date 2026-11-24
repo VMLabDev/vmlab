@@ -841,6 +841,20 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn prune_keeps_the_newest_usable_version() {
+        let mut pending = meta("x86_64", "win", "1.0.1");
+        pending.variants_expected = true;
+        assert_eq!(
+            refs(&superseded(
+                vec![meta("x86_64", "win", "1.0.0"), pending],
+                None,
+                1,
+            )),
+            ["x86_64/win@1.0.1"]
+        );
+    }
+
     /// The store lists ascending by version within a family, so the newest
     /// `keep` are its tail and everything before them is superseded.
     #[test]

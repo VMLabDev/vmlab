@@ -2636,6 +2636,19 @@ mod tests {
         VariantRef::Named(n.into())
     }
 
+    on_both_tools!(an_unversioned_reference_skips_a_version_without_its_default);
+    fn an_unversioned_reference_skips_a_version_without_its_default() {
+        let (_tmp, store) = variant_store();
+        let mut pending = meta("x86_64", "win", "2");
+        pending.variants_expected = true;
+        install(&store, &pending, b"pending base").unwrap();
+
+        let resolved = store
+            .resolve("x86_64", "win", None, None, Purpose::Lab)
+            .unwrap();
+        assert_eq!(resolved.reference(), "x86_64/win@1#standard");
+    }
+
     on_both_tools!(adding_a_variant_that_replaces_one_asks_whether_it_is_in_use);
     /// Review templates-registry F1: `add_variants` with a variant the
     /// version already holds replaces that overlay, so it asks first. It

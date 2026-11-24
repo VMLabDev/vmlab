@@ -1467,12 +1467,54 @@ async fn run_build(
         }
     }
 
-    // Seal: flatten the working disk into a staging dir, then install.
+    let agent_version = agent_version.lock().expect("agent_version lock").clone();
+    let meta = seal_base(
+        def,
+        &hw,
+        root,
+        work,
+        &disk0,
+        store,
+        log,
+        version,
+        agent_version,
+        inherited_logins,
+        &run.control.cancel,
+    )
+    .await?;
+    log(format!(
+        "installed {}/{}@{}\n",
+        meta.arch, meta.name, meta.version
+    ));
+    events.emit(
+        "template.built",
+        serde_json::json!({
+            "arch": meta.arch, "name": meta.name, "version": meta.version,
+        }),
+    );
+    Ok(meta)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seal_base(
+    def: &TemplateDef,
+    hw: &EffectiveHardware,
+    root: &Path,
+    work: &Path,
+    disk0: &Path,
+    store: &TemplateStore,
+    log: &OutputSink,
+    version: &str,
+    agent_version: Option<String>,
+    inherited_logins: Vec<crate::config::model::Login>,
+    _cancel: &tokio_util::sync::CancellationToken,
+) -> Result<TemplateMeta> {
+    // Flatten the working disk into a staging dir, then install.
     let staging = work.join("staging");
     std::fs::create_dir_all(&staging)?;
     let sealed = staging.join("disk.qcow2");
     log("flattening sealed image\n".to_string());
-    super::qimg::convert_to_qcow2(&disk0, &sealed).await?;
+    super::qimg::convert_to_qcow2(disk0, &sealed).await?;
 
     let info = super::qimg::image_info(&sealed).await?;
     let sha = super::store::sha256_file(&sealed).context("hashing sealed image")?;
@@ -1491,13 +1533,13 @@ async fn run_build(
     };
     let mut meta = seal_meta(
         def,
-        &hw,
+        hw,
         version,
         SealedImage {
             disk: info.virtual_size,
             sha256: sha,
             first_boot_script,
-            agent_version: agent_version.lock().expect("agent_version lock").clone(),
+            agent_version,
         },
     );
     if meta.logins.is_empty() {
@@ -1515,16 +1557,6 @@ async fn run_build(
     store
         .install(&staging, &meta, false)
         .context("installing into the store")?;
-    log(format!(
-        "installed {}/{}@{}\n",
-        meta.arch, meta.name, meta.version
-    ));
-    events.emit(
-        "template.built",
-        serde_json::json!({
-            "arch": meta.arch, "name": meta.name, "version": meta.version,
-        }),
-    );
     Ok(meta)
 }
 
@@ -2501,6 +2533,36 @@ mod tests {
     use crate::template::meta::TemplateMeta;
     use crate::template::store::{DISK_FILE, TemplateStore};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn a_stop_during_the_seal_installs_nothing() {
+        use crate::template::qimg;
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let disk = work.join("working.qcow2");
+        qimg::create_blank(&disk, 16 << 20).await.unwrap();
+        let store = TemplateStore::new(work.join("templates"));
+        let def = def("scratch {}");
+        let hw = hw(&def);
+        let cancel = CancellationToken::new();
+        let log: crate::scripting::OutputSink = std::sync::Arc::new(|_| {});
+        let (entered, release) = qimg::testing::pause_next("convert");
+        let stop = async {
+            entered.await.unwrap();
+            cancel.cancel();
+            let _ = release.send(());
+        };
+        let (result, ()) = tokio::join!(
+            super::seal_base(
+                &def, &hw, work, work, &disk, &store, &log, "1", None, Vec::new(), &cancel,
+            ),
+            stop
+        );
+        assert!(!store.exists(&def.arch, &def.name, Some("1")));
+        assert_eq!(result.unwrap_err().to_string(), "build cancelled");
+    }
 
     /// Two builds of one short name — the same template for two
     /// architectures — must not share a lab, because the lab name is what
