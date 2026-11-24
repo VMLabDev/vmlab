@@ -144,6 +144,20 @@ impl FakeUsbFs {
         fake
     }
 
+    /// A fake whose bulk interface has other endpoints at alt setting 1
+    /// (0x84 in, 0x05 out) than at alt setting 0 (0x81 in, 0x02 out).
+    pub fn with_distinct_alt_setting() -> Self {
+        let mut descriptors = FAKE_DESCRIPTORS.to_vec();
+        let end = descriptors.len();
+        assert_eq!(descriptors[end - 12], 0x81);
+        assert_eq!(descriptors[end - 5], 0x02);
+        descriptors[end - 12] = 0x84;
+        descriptors[end - 5] = 0x05;
+        let fake = Self::new();
+        fake.shared().lock().descriptors = Some(descriptors);
+        fake
+    }
+
     fn shared(&self) -> &Mutex<Shared> {
         &self.inner.shared
     }

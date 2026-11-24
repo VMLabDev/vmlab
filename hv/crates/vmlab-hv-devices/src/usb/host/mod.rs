@@ -209,6 +209,10 @@ pub struct HostUsbDevice {
     /// SET_CONFIGURATION requests. `None` when it is not known (the device
     /// did not answer, or a SET_CONFIGURATION failed in the device).
     active_config: Option<u8>,
+    /// bConfigurationValue of the configuration the host had the device in
+    /// at the open, which the detach puts back (review usb.md F6). `None`
+    /// when the device did not say.
+    opened_config: Option<u8>,
     /// The blocking usbdevfs call in flight, if any.
     job: Option<Running>,
     /// Endpoints dropped while a job ran: their URBs are discarded once
@@ -252,6 +256,7 @@ impl HostUsbDevice {
             discarded: HashSet::new(),
             speed,
             active_config,
+            opened_config: active_config,
             job: None,
             deferred_discards: HashSet::new(),
         };
@@ -324,6 +329,10 @@ impl HostUsbDevice {
             Job::SetConfig { config, .. } => {
                 self.claimed_interfaces = done.claimed;
                 self.endpoints.clear();
+                // SET_CONFIGURATION puts every interface of the device at
+                // alt setting 0; what SET_INTERFACE chose before belongs to
+                // the old configuration.
+                self.alt_settings.clear();
                 self.active_config = match &result {
                     // The device may be at its old configuration or at
                     // none; nothing here can tell which.
@@ -452,9 +461,10 @@ impl HostUsbDevice {
     }
 
     /// Release every claimed interface and let host kernel drivers bind
-    /// again (USBDEVFS_CONNECT). This is the detach path and the
-    /// claim-failure path of the open; a guest-driven reconfiguration is a
-    /// [`Job`].
+    /// again (USBDEVFS_CONNECT). This is the claim-failure path of the open
+    /// and the detach of a device that is still in the configuration found
+    /// at the open ([`Self::return_to_host`]); a guest-driven
+    /// reconfiguration is a [`Job`].
     fn release_and_reconnect(&mut self) {
         for i in &self.claimed_interfaces {
             // Errors are expected when the device is already gone.
@@ -466,6 +476,55 @@ impl HostUsbDevice {
         }
         self.claimed_interfaces.clear();
         self.endpoints.clear();
+    }
+
+    /// The detach: give the device back to the host as the host had it.
+    ///
+    /// The guest may have left the device in another configuration than the
+    /// one found at the open, or in none (SET_CONFIGURATION with value 0).
+    /// A device without a configuration has no interfaces, so no host
+    /// driver binds to it until a replug. The configuration found at the
+    /// open is set again in that case. Setting it when the device still has
+    /// it would only reset the device, so that is not done.
+    ///
+    /// A device that was at configuration 0 at the open stays in the
+    /// guest's configuration: that leaves the host more than it had.
+    fn return_to_host(&mut self) {
+        let restore = self
+            .opened_config
+            .filter(|opened| *opened != 0 && self.active_config != Some(*opened));
+        let Some(opened) = restore else {
+            self.release_and_reconnect();
+            return;
+        };
+        // The kernel refuses SETCONFIGURATION while an interface is
+        // claimed, so the guest's claims go first.
+        for i in &self.claimed_interfaces {
+            // Errors are expected when the device is already gone.
+            let _ = self.device.release_interface(*i);
+        }
+        self.claimed_interfaces.clear();
+        self.endpoints.clear();
+        if self.device.is_lost() {
+            return;
+        }
+        if let Err(e) = self.device.fs().set_configuration(opened) {
+            log::warn!(
+                "usb host {}: the device does not return to configuration {opened}: {e}",
+                self.describe()
+            );
+            return;
+        }
+        self.active_config = Some(opened);
+        // The kernel probes the drivers of a configuration it has just
+        // set. The connect covers an interface whose probe did not bind.
+        let interfaces = self
+            .device
+            .get_config_descriptor(opened)
+            .map_or(0, |descriptor| descriptor.bNumInterfaces);
+        for i in 0..interfaces {
+            let _ = self.device.connect_interface(i);
+        }
     }
 
     /// The endpoint table of the claimed interfaces of `config_descriptor`
@@ -523,7 +582,10 @@ impl HostUsbDevice {
         // The guest's first SET_CONFIGURATION usually names the
         // configuration the device is in already; setting it again would
         // reset the device for nothing.
-        let set = self.initialized || self.active_config != Some(config);
+        // A guest that chose an alt setting first has changed the device:
+        // only setting the configuration puts its interfaces back at 0.
+        let set =
+            self.initialized || self.active_config != Some(config) || !self.alt_settings.is_empty();
         self.initialized = true;
         // The old configuration's endpoints end here. Their URBs are
         // discarded before the job releases the interfaces; left alone, the
@@ -872,7 +934,7 @@ impl Drop for HostUsbDevice {
         // flight is waited for first, so the claims it takes are known;
         // the callers drop a backend with no controller lock held.
         self.settle_job(true);
-        self.release_and_reconnect();
+        self.return_to_host();
     }
 }
 
@@ -1011,6 +1073,71 @@ mod tests {
         let calls = fake.calls();
         assert_eq!(calls.releases, vec![0, 1]);
         assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// Review usb.md F6: a guest that unconfigures the device does not
+    /// hand it back to the host without a configuration.
+    #[test]
+    fn detach_restores_the_configuration_found_at_open() {
+        let (mut host, fake) = device();
+        assert_eq!(
+            control(&mut host, set_config(0)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        assert_eq!(fake.calls().set_configurations, vec![0]);
+        assert_eq!(fake.calls().connects, Vec::<u8>::new());
+        drop(host);
+        let calls = fake.calls();
+        assert_eq!(calls.set_configurations, vec![0, 1]);
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// Review usb.md F6, second half: the host does not get the device
+    /// back in another configuration the guest chose.
+    #[test]
+    fn detach_restores_the_configuration_the_guest_replaced() {
+        let fake = FakeUsbFs::with_two_configurations();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(
+            control(&mut host, set_config(2)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        assert_eq!(fake.calls().set_configurations, vec![2]);
+        drop(host);
+        let calls = fake.calls();
+        // The guest's claims are released before the configuration is set:
+        // the kernel refuses SETCONFIGURATION on a claimed interface.
+        assert_eq!(calls.releases, vec![0, 1, 0, 1]);
+        assert_eq!(calls.set_configurations, vec![2, 1]);
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// A guest that leaves the device in the configuration it had makes
+    /// the detach set none: SETCONFIGURATION would reset the device.
+    #[test]
+    fn detach_sets_no_configuration_the_device_still_has() {
+        let (mut host, fake) = device();
+        assert_eq!(
+            control(&mut host, set_config(1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        drop(host);
+        let calls = fake.calls();
+        assert_eq!(calls.set_configurations, Vec::<u8>::new());
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// An unplugged device is asked for nothing at the detach.
+    #[test]
+    fn detach_sets_no_configuration_on_a_lost_device() {
+        let (mut host, fake) = device();
+        assert_eq!(
+            control(&mut host, set_config(0)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        host.device.mark_lost();
+        drop(host);
+        assert_eq!(fake.calls().set_configurations, vec![0]);
     }
 
     #[test]
@@ -1266,6 +1393,66 @@ mod tests {
         assert_eq!(fake.calls().set_interfaces, vec![(0, 1)]);
         // The bulk endpoints survive the alt switch.
         assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Nak);
+    }
+
+    /// F13 of docs/reviews/usb.md: SET_CONFIGURATION puts every interface
+    /// of the device back at alt setting 0, so the endpoint table is that
+    /// of alt setting 0 and not of the alt setting the guest chose before.
+    #[test]
+    fn set_configuration_resets_alternate_settings() {
+        let fake = FakeUsbFs::with_distinct_alt_setting();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(
+            control(&mut host, set_interface(0, 1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        // Alt setting 1 has endpoint 0x05 and lacks 0x02.
+        assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Stall);
+        assert_eq!(host.transfer(0x05, b"ping", 64), UsbTransfer::Nak);
+
+        assert_eq!(
+            control(&mut host, set_config(1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        // The device was told, or its interface is still at alt setting 1.
+        assert_eq!(fake.calls().set_configurations, vec![1]);
+        assert!(host.alt_settings.is_empty());
+        assert_eq!(
+            host.transfer(0x05, b"ping", 64),
+            UsbTransfer::Stall,
+            "an endpoint only alt setting 1 has"
+        );
+        assert_eq!(
+            host.transfer(0x02, b"ping", 64),
+            UsbTransfer::Nak,
+            "an endpoint only alt setting 0 has"
+        );
+        assert_eq!(
+            fake.submitted_payloads().last(),
+            Some(&(0x02, b"ping".to_vec()))
+        );
+    }
+
+    /// F8 of docs/reviews/usb.md, the backend's half: the control transfer
+    /// is kept under endpoint 0, which is what the controller reports when
+    /// the guest stops the control endpoint. The old URB's answer, already
+    /// complete, does not answer the next, different request.
+    #[test]
+    fn a_dropped_control_transfer_does_not_answer_the_next_request() {
+        let (mut host, fake) = device();
+        // GET_STATUS, completed by the device but not collected.
+        fake.complete_with(Completion::Data(b"old".to_vec()));
+        assert_eq!(host.control(setup(0x80, 0, 0, 0, 2), &[]), UsbTransfer::Nak);
+        fake.run_irq();
+        host.endpoint_dropped(0);
+        // GET_DESCRIPTOR(String) is a URB of its own.
+        assert_eq!(
+            host.control(setup(0x80, 6, 3 << 8, 0, 255), &[]),
+            UsbTransfer::Nak
+        );
+        let in_flight = fake.submitted_payloads();
+        assert_eq!(in_flight.len(), 1, "the old URB was reaped and dropped");
+        assert_eq!(in_flight[0].1[..8], [0x80, 6, 0, 3, 0, 0, 255, 0]);
     }
 
     #[test]
