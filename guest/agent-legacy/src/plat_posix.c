@@ -229,9 +229,12 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
             close(errp[1]);
         for (i = 0; i < spec->nenv; i++)
             putenv(spec->env[i]);
-        if (spec->cwd && chdir(spec->cwd) < 0)
+        if (spec->cwd && chdir(spec->cwd) < 0) {
+            fprintf(stderr, "exec: chdir '%s': %s\n", spec->cwd, strerror(errno));
             _exit(127);
+        }
         execvp(spec->argv[0], spec->argv);
+        fprintf(stderr, "exec: execvp '%s': %s\n", spec->argv[0], strerror(errno));
         _exit(127);
     }
     /* Establish the group on either side of fork so even a close before

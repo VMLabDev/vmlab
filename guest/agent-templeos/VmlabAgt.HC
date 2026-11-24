@@ -443,12 +443,16 @@ U0 VaSendOsInfo()
 
 CTask *va_task;    // the agent's task; output from any other passes through
 Bool va_capturing;
+Bool va_capoverflow;
 U8 *va_cap;
 I64 va_caplen;
 
 U0 VaCapPut(U8 *s,I64 n)
 {
-  if (n>VA_MAX_PAY-1-va_caplen) n=VA_MAX_PAY-1-va_caplen;
+  if (n>VA_MAX_PAY-1-va_caplen) {
+    va_capoverflow=TRUE;
+    n=VA_MAX_PAY-1-va_caplen;
+  }
   if (n>0) {
     MemCpy(va_cap+va_caplen,s,n);
     va_caplen+=n;
@@ -571,6 +575,7 @@ U0 VaExec(I64 id)
   I64 argv_tok,t,i,n=0,l;
   U8 *src=MAlloc(VA_MAX_PAY);
   U8 *arg=MAlloc(VA_MAX_PAY);
+  U8 error[96];
   I64 code=0,outlen;
 
   if (VaGet(0,"logon")>=0 && va_tok[VaGet(0,"logon")].type==JT_OBJ) {
@@ -608,6 +613,7 @@ U0 VaExec(I64 id)
   // leaves the exception's kind behind; anything else that escapes is
   // caught here and reported the same way.
   va_caplen=0;
+  va_capoverflow=FALSE;
   Fs->except_ch=0;
   va_capturing=TRUE;
   try {
@@ -618,6 +624,11 @@ U0 VaExec(I64 id)
     code=1;
   }
   va_capturing=FALSE;
+  if (va_capoverflow) {
+    StrPrint(error,"templeos exec: output exceeded the %d-byte capture limit",VA_MAX_PAY-1);
+    VaSendError(id,error);
+    Free(src); Free(arg); return;
+  }
   if (Fs->except_ch=='Compiler') code=1;
   outlen=VaDolStrip(va_cap,va_caplen);
   VaSendText(id,va_cap,outlen);
