@@ -407,6 +407,19 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F11. One poll does unbounded work for the guest
 
+- Status: fixed by card #787. One xHCI `poll` reads at most `POLL_READS`
+  (1024) TRBs of the command ring and as many of all the transfer rings
+  together, Link TRBs included, and what is left waits for the next poll. A
+  poll that runs out starts the next one behind the endpoint that took the
+  reads, so a ring that never runs dry does not starve the others, and a TD
+  that a whole poll's reads cannot walk ends as a TRB Error. One UHCI
+  `advance` visits at most `ADVANCE_ELEMENTS` (4096) queue heads and TDs
+  over all its frames, and a frame that finds none left runs no schedule.
+  The data buffers of a TD are outside both limits. Tests:
+  `one_poll_handles_a_bounded_number_of_tds`,
+  `a_looping_endpoint_does_not_starve_the_others` and
+  `a_td_one_whole_poll_cannot_walk_is_refused` in `usb/tests.rs`,
+  `one_advance_handles_a_bounded_number_of_elements` in `usb/uhci/tests.rs`.
 - Where: `usb/xhci.rs:569-595` (`poll`) and `847-893` (`transfers`);
   `usb/uhci.rs:330-409` (`advance`, `walk`, `queue`).
 - Why it is a fault: `usb/xhci.rs:567-568` says "No guest-controlled

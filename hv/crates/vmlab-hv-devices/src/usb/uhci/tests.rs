@@ -321,3 +321,43 @@ fn control_out_data_is_bounded_by_the_setup_length() {
     ));
     assert!(port.control.out.is_empty());
 }
+
+/// F11 of docs/reviews/usb.md. Every frame-list entry names a queue head
+/// whose horizontal link is itself, so each frame walks to the element
+/// limit, and a catch-up of 128 frames walks 128 times that. One `advance`
+/// reads a fixed amount of guest memory, whatever the guest scheduled.
+#[test]
+fn one_advance_handles_a_bounded_number_of_elements() {
+    let mut machine = Machine::new();
+    machine.replay(Some("GET_DESCRIPTOR(device) at address 0"));
+    let write = |address: u32, value: u32| {
+        machine
+            .memory
+            .write_slice(&value.to_le_bytes(), GuestAddress(u64::from(address)))
+            .unwrap();
+    };
+    let frame_list = 0x102000u32;
+    let qh = 0x101000u32;
+    write(qh, qh | 2);
+    write(qh + 4, 1);
+    for index in 0..1024 {
+        write(frame_list + index * 4, qh | 2);
+    }
+    machine.uhci.write(8, &frame_list.to_le_bytes());
+    let mut frame = [0; 2];
+    machine.uhci.read(6, &mut frame);
+    let before = u16::from_le_bytes(frame);
+    crate::usb::dma_probe::take();
+    machine.uhci.advance(128_000_000);
+    let reads = crate::usb::dma_probe::take();
+    assert!(
+        reads <= 16_384,
+        "one advance read guest memory {reads} times for a looping schedule"
+    );
+    machine.uhci.read(6, &mut frame);
+    assert_eq!(
+        u16::from_le_bytes(frame),
+        (before + 128) & 0x7ff,
+        "the frame counter still covers the whole advance"
+    );
+}
