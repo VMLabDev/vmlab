@@ -184,7 +184,7 @@ pub struct Registry {
     /// ([`Self::guarding`]). Without one, no held overlay is replaced.
     in_use: Option<crate::template::build::InUse>,
     /// The owner of a pull's work directory ([`Self::holding`]).
-    work: Option<std::sync::Arc<tempfile::TempDir>>,
+    work: Option<std::sync::Arc<crate::staging::StagingDir>>,
 }
 
 impl Registry {
@@ -217,7 +217,7 @@ impl Registry {
     /// that an abort of the pull's task does not stop: it keeps this owner
     /// until it ends, so a cancel cannot remove the staged disks under it
     /// (review templates-registry F13).
-    pub fn holding(mut self, work: std::sync::Arc<tempfile::TempDir>) -> Self {
+    pub(crate) fn holding(mut self, work: std::sync::Arc<crate::staging::StagingDir>) -> Self {
         self.work = Some(work);
         self
     }
@@ -1507,9 +1507,10 @@ pub async fn ensure_registry_template(
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
     // at once must not share (and then delete) one.
-    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(
-        &crate::paths::template_store_dir().join(".oci-pull"),
-    )?);
+    let pull_work = store
+        .root()
+        .join(crate::template::oci_bridge::PULL_WORK_SUBDIR);
+    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(&pull_work)?);
     let meta = registry
         .guarding(in_use)
         .holding(work.clone())

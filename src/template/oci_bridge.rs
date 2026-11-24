@@ -6,6 +6,11 @@ use anyhow::Result;
 
 use super::meta::TemplateMeta;
 use super::store::TemplateStore;
+use crate::staging::StagingDir;
+
+pub(crate) const PULL_WORK_SUBDIR: &str = ".oci-pull";
+pub(crate) const PUSH_WORK_SUBDIR: &str = "cache/oci-push";
+pub(crate) const WORK_PREFIX: &str = "op-";
 
 pub async fn push(
     template_dir: &Path,
@@ -19,7 +24,7 @@ pub async fn push(
     // Chunks stage anywhere, but each push needs its own directory: they are
     // named by index, so two pushes sharing one would upload each other's
     // bytes under their own digests and the registry would refuse them.
-    let work = fresh_work_dir(&crate::paths::data_dir().join("cache").join("oci-push"))?;
+    let work = fresh_work_dir(&crate::paths::data_dir().join(PUSH_WORK_SUBDIR))?;
     registry
         .push(
             template_dir,
@@ -35,9 +40,8 @@ pub async fn push(
 /// A work directory of its own under `base`, removed when dropped. Concurrent
 /// pushes and pulls each get one, so none can overwrite or delete another's
 /// staged files.
-pub(crate) fn fresh_work_dir(base: &Path) -> Result<tempfile::TempDir> {
-    std::fs::create_dir_all(base)?;
-    Ok(tempfile::Builder::new().prefix("op-").tempdir_in(base)?)
+pub(crate) fn fresh_work_dir(base: &Path) -> Result<StagingDir> {
+    StagingDir::create(base, WORK_PREFIX, 0o700)
 }
 
 /// Pull `target` — a registry reference, maybe ending `#<variant>` — into
@@ -63,7 +67,7 @@ pub async fn pull(
     // Pull staging must share the store's filesystem for the atomic install
     // rename (the OCI module documents this), and each pull gets its own
     // directory so a concurrent one cannot delete it.
-    let work = fresh_work_dir(&crate::paths::template_store_dir().join(".oci-pull"))?;
+    let work = fresh_work_dir(&store.root().join(PULL_WORK_SUBDIR))?;
     let work = std::sync::Arc::new(work);
     registry
         .guarding(in_use)

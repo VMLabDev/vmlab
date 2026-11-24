@@ -38,6 +38,7 @@ pub use qemu::kvm_available;
 mod qmp;
 mod scripting;
 mod smb;
+mod staging;
 mod supervisor;
 mod sync;
 pub mod template;

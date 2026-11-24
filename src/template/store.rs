@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::meta::{META_FILE, TemplateMeta, VARIANTS_DIR, variant_disk_rel};
 use crate::config::model::{BASE_VARIANT, VariantRef};
+use crate::staging::{STAGING_PREFIX, StagingDir};
 
 /// Disk image file name inside a version directory.
 pub const DISK_FILE: &str = "disk.qcow2";
@@ -35,7 +36,6 @@ pub fn template_vars(dir: &Path, meta: &TemplateMeta) -> Option<PathBuf> {
         .then(|| dir.join(VARS_FILE))
 }
 const LOCK_FILE: &str = ".lock";
-const STAGING_PREFIX: &str = ".staging-";
 
 /// One installed template version, as stored: its directory, its base disk,
 /// and its metadata as the file records it — base fields and the variant
@@ -561,7 +561,7 @@ impl TemplateStore {
         match rename(staging, dest) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                let local = StagingDir::create(&self.root)?;
+                let local = StagingDir::create(&self.root, STAGING_PREFIX, 0o777)?;
                 copy_tree(staging, local.path()).with_context(|| {
                     format!(
                         "cannot copy staged template {} into the store",
@@ -758,7 +758,7 @@ impl TemplateStore {
         trust_scripts: bool,
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
-        let staging = StagingDir::create(&self.root)?;
+        let staging = StagingDir::create(&self.root, STAGING_PREFIX, 0o777)?;
 
         let file =
             File::open(archive).with_context(|| format!("cannot open {}", archive.display()))?;
@@ -1520,31 +1520,6 @@ fn remove_if_present(dir: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("cannot remove {}", dir.display())),
-    }
-}
-
-struct StagingDir {
-    path: PathBuf,
-}
-
-impl StagingDir {
-    fn create(root: &Path) -> Result<Self> {
-        let path = root.join(format!("{STAGING_PREFIX}{:08x}", rand::random::<u32>()));
-        fs::create_dir_all(&path)
-            .with_context(|| format!("cannot create staging dir {}", path.display()))?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
 
