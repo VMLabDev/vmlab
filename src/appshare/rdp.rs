@@ -92,6 +92,30 @@ pub fn freerdp_args(
     Ok(args)
 }
 
+/// Refuse, before the session is opened, a request that [`Server::prepare`]
+/// would refuse on the command line alone: no FreeRDP on the host, an argv
+/// or `--cwd` its `/app` rules would change, a line break in an argument.
+/// Opening the session changes the guest (§20.3), so these come first. The
+/// account and password are the daemon's to answer and are checked when it
+/// has.
+pub fn check_request(bin: Option<&Path>, req: &Request) -> Result<()> {
+    bin.ok_or_else(|| anyhow!("no FreeRDP 3 on this host"))?;
+    let no_account = Credentials {
+        user: String::new(),
+        domain: None,
+        password: None,
+    };
+    let args = freerdp_args(
+        Path::new(""),
+        &req.machine,
+        &req.argv,
+        req.cwd.as_deref(),
+        &no_account,
+        req.clipboard,
+    )?;
+    stdin_payload(&args).map(drop)
+}
+
 /// What FreeRDP reads on stdin: one argument per line, ended by an empty
 /// line. An argument holding a line break cannot be carried, and is refused
 /// rather than split.
@@ -517,6 +541,8 @@ fn log_tail(path: &Path) -> Result<String> {
         .rev()
         .filter(|line| !is_backtrace(line))
         .take(20)
+        // FreeRDP logs strings the guest's RDP server sent.
+        .map(super::printable)
         .collect();
     lines.reverse();
     Ok(lines.join("\n"))
@@ -713,6 +739,43 @@ mod tests {
         bytes.extend_from_slice(b"\nfinal \xff\n");
         std::fs::write(&log, bytes).unwrap();
         assert_eq!(log_tail(&log).unwrap(), "final \u{fffd}");
+    }
+
+    /// FreeRDP logs strings the guest's RDP server sent, and the tail goes
+    /// to the terminal: its control characters do not (review F13).
+    #[test]
+    fn tail_has_no_control_characters() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log = scratch.path().join("freerdp.log");
+        std::fs::write(&log, "one\u{1b}]0;x\u{7}\rtwo\tthree\nfour\n").unwrap();
+        assert_eq!(
+            log_tail(&log).unwrap(),
+            "one\u{fffd}]0;x\u{fffd}\u{fffd}two\tthree\nfour"
+        );
+    }
+
+    /// What the command line alone decides is refused without a session.
+    #[test]
+    fn a_request_is_checked_without_the_daemons_answer() {
+        let req = |argv: &[&str], cwd: Option<&str>| Request {
+            machine: "win".into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            cwd: cwd.map(str::to_string),
+            user: None,
+            password: None,
+            verbose: false,
+            clipboard: false,
+        };
+        let bin = Some(Path::new("/usr/bin/xfreerdp3"));
+        check_request(bin, &req(&["notepad", "a.txt"], None)).unwrap();
+        for (bin, req) in [
+            (None, req(&["notepad"], None)),
+            (bin, req(&["notepad", "it's.txt"], None)),
+            (bin, req(&["notepad"], Some("C:\\a\nb"))),
+            (bin, req(&[], None)),
+        ] {
+            assert!(check_request(bin, &req).is_err(), "{req:?}");
+        }
     }
 
     fn creds() -> Credentials {
