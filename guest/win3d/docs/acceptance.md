@@ -1156,6 +1156,11 @@ console) is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/
 review, the command size of the submit escape that wrapped in 32 bits, with
 the guest proof before and after and the end-to-end run on the fixed driver.
 
+[C756](acceptance/C756.md) records the fix of finding F8, a present copy
+whose source was mapped in `DxgkDdiPatch`. The probe of that card shows that
+the old driver accepts such a present as a standard user, and that Windows 11
+stops it before `DxgkDdiPatch`: the bugcheck of the finding was not reached.
+
 ## Evidence index
 
 Every directory under [docs/evidence/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/). "Historical" marks evidence from the
