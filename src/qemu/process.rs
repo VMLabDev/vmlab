@@ -592,7 +592,9 @@ pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
 pub(crate) async fn reap_lab_orphans(lab: &str, root: Option<&Path>) -> Result<(), String> {
     let (mut processes, all_signalled) = signal_lab_orphans(LabIdentity::new(lab, root));
     if !all_signalled {
-        return Err(format!("could not kill all orphaned processes for lab {lab}"));
+        return Err(format!(
+            "could not kill all orphaned processes for lab {lab}"
+        ));
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

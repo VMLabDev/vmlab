@@ -96,7 +96,9 @@ use super::halt::{self, Halt};
 use super::ignore::{GIT_IGNORE, TEMP_PREFIX, VMLAB_IGNORE, is_syncer_own, validate_entry_name};
 use super::ledger::{Kind, Ledger};
 use super::locks;
-use super::plan::{Action, Direction, Inputs, Oversize, State, Volume, Winner, has_moved, reconcile};
+use super::plan::{
+    Action, Direction, Inputs, Oversize, State, Volume, Winner, has_moved, reconcile,
+};
 use super::scan::{Skip, guest_locks, guest_walk, host_scan, join_guest, probe_guest};
 use super::watcher::{Debounce, HostEvent, HostWatch, QUIET};
 use super::windows::{GuestRun, Learned, Preconditions, prepare_root, set_line_endings};
