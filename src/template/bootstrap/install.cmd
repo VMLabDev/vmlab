@@ -13,6 +13,17 @@ set VMLAB_ARCH=x86_64
 if /i "%PROCESSOR_ARCHITECTURE%"=="x86" set VMLAB_ARCH=x86
 set VMLAB_DIR=C:\ProgramData\vmlab
 if not exist "%VMLAB_DIR%" mkdir "%VMLAB_DIR%"
+rem The service runs as LocalSystem, and a directory made under
+rem C:\ProgramData inherits a list that lets every local account create
+rem files in it: a DLL dropped beside the agent would load into the service.
+rem Give the directory to Administrators and set the whole list: nothing
+rem inherited, full control for SYSTEM (S-1-5-18) and Administrators
+rem (S-1-5-32-544), read and execute for Users (S-1-5-32-545). The binary
+rem copied in next inherits it. `vmlab machine repair-agent` sets the same.
+icacls "%VMLAB_DIR%" /setowner *S-1-5-32-544 /q
+if errorlevel 1 exit /b 1
+icacls "%VMLAB_DIR%" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /q
+if errorlevel 1 exit /b 1
 copy /y "%~dp0windows\%VMLAB_ARCH%\vmlab-agent.exe" "%VMLAB_DIR%\vmlab-agent.exe"
 if errorlevel 1 exit /b 1
 rem `sc create` fails when the service exists (rebuilds); reconfigure then.
