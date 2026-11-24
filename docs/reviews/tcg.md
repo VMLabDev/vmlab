@@ -275,6 +275,18 @@ beyond the single random words of the first differential run, and
   `vmlab_hv_tcg_ir::lower` on the result aborts the test process (seen:
   `thread ... has overflowed its stack`, SIGABRT).
 - Confidence: high.
+- Fixed by card #772. The parser counts the levels of the expression tree
+  itself: nesting and suffixes add to one height, and `parse` refuses a tree
+  of more than 128 levels (`MAX_EXPR_HEIGHT`) with `expression depth limit
+  exceeded`. That replaces the separate count of suffixes on one operand, so
+  the tallest tree `lower`, `fold` and `format` can be given has 128 levels.
+  The fuzz target is covered by the same bound. Before the fix the proof test
+  aborted with a stack overflow in its own process, because dropping the
+  parsed tree is recursive too. A second test,
+  `the_depth_limit_counts_nesting_and_suffixes_together`, holds the bound at
+  its edge for three shapes. The committed model is far below the bound:
+  all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
+  generated again for this card.
 
 ### F6. The emitter writes a model that the generated crate cannot load
 
@@ -301,7 +313,7 @@ beyond the single random words of the first differential run, and
   struct literals.
 - Confidence: high.
 
-### F7. A loop that stores into its own code page never reuses a trace
+### F7. A loop that stores into its own code page never reuses a trace (fixed, card #773)
 
 - Where: `tcg/memory.rs:110-138` (`write` stamps a 4 KiB page,
   `code_stamp` reads the stamp), `tcg/record.rs:1074-1082` (a trace keeps
@@ -332,6 +344,17 @@ beyond the single random words of the first differential run, and
   1501. No time is measured.
 - Confidence: high. A fix needs a finer stamp (the bytes a trace fetched)
   or a fallback that stops recording a PC that keeps invalidating itself.
+- Fixed by card #773. A recording keeps the bytes of each fetch
+  (`Recorded::code`). The page stamp stays the first check. When only its
+  generation moved, the trace compares those bytes with memory through the
+  new `Memory::code_bytes` (`Trace::code_unchanged`), and when they are as
+  recorded it stays valid and takes the new stamps. A `Memory` that does not
+  implement `code_bytes` keeps the old rule. The proof test had 0 hits
+  before the fix and passes after it. A second test,
+  `a_store_that_changes_its_own_loop_ends_the_trace`, has the loop store
+  over its own instructions, first the same bytes and then other ones, and
+  compares every round with the plain interpreter. N1 is open: nothing yet
+  stops recording for an entry PC that keeps missing for another reason.
 
 ### F8. `read_csr` and `write_csr` take an index past 12 bits and use another CSR (fixed, card #771)
 

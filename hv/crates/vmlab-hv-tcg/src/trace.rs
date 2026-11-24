@@ -72,6 +72,9 @@ pub(crate) struct Trace {
     binding_slots: HashMap<usize, crate::publication::Plan>,
     pc_slot: Option<usize>,
     compact_loop: std::sync::OnceLock<bool>,
+    /// For each code guard, the page stamp generation under which the
+    /// fetched bytes were last seen as recorded.
+    code_generations: Vec<Cell<u64>>,
     wide_inputs: Cell<Vec<Option<Value>>>,
     scalar_input_slots: Vec<Option<usize>>,
     slots: Vec<usize>,
@@ -748,6 +751,12 @@ impl Trace {
                 guard.last_page,
             ))
         });
+        let code_generations = recorded
+            .block
+            .code_guards
+            .iter()
+            .map(|guard| Cell::new(guard.generation))
+            .collect();
         let input_slots = recorded
             .inputs
             .iter()
@@ -953,6 +962,7 @@ impl Trace {
             binding_slots,
             pc_slot: interpreter.globals.slot("zPC"),
             compact_loop: std::sync::OnceLock::new(),
+            code_generations,
             wide_inputs: Cell::new(wide_inputs),
             scalar_input_slots,
             slots,
@@ -1003,18 +1013,61 @@ impl Trace {
         len
     }
 
+    /// The current stamp of a guard's pages, or `None` when the pages are no
+    /// longer the memory and mapping the trace was recorded from.
+    fn code_generation(
+        memory: &impl Memory,
+        guard: &vmlab_hv_tcg_ir::native::block::CodeGuard,
+    ) -> Option<u64> {
+        memory
+            .code_stamp(guard.address, guard.len)
+            .filter(|stamp| {
+                stamp.identity == guard.identity
+                    && stamp.mapping == guard.mapping
+                    && stamp.first_page == guard.first_page
+                    && stamp.last_page == guard.last_page
+            })
+            .map(|stamp| stamp.generation)
+    }
+
     fn code_valid(&self, memory: &impl Memory) -> bool {
-        self.recorded.block.code_guards.iter().all(|guard| {
-            memory
-                .code_stamp(guard.address, guard.len)
-                .is_some_and(|stamp| {
-                    stamp.generation == guard.generation
-                        && stamp.identity == guard.identity
-                        && stamp.mapping == guard.mapping
-                        && stamp.first_page == guard.first_page
-                        && stamp.last_page == guard.last_page
-                })
-        })
+        let guards = &self.recorded.block.code_guards;
+        let mut written = false;
+        for (guard, seen) in guards.iter().zip(&self.code_generations) {
+            match Self::code_generation(memory, guard) {
+                Some(generation) => written |= generation != seen.get(),
+                None => return false,
+            }
+        }
+        !written || self.code_unchanged(memory)
+    }
+
+    /// A page of the trace's code was written. A page stamp cannot tell a
+    /// store to code from a store to data beside it, so compare the bytes the
+    /// recording fetched. When they are all as recorded the trace stays
+    /// valid, and it keeps the new stamps so the next check is the short one.
+    #[cold]
+    fn code_unchanged(&self, memory: &impl Memory) -> bool {
+        let Some(code) = &self.recorded.code else {
+            return false;
+        };
+        // Read the stamps before the bytes: a write that lands after a stamp
+        // was read moves that stamp again, and the next check sees it.
+        let guards = &self.recorded.block.code_guards;
+        let Some(generations) = guards
+            .iter()
+            .map(|guard| Self::code_generation(memory, guard))
+            .collect::<Option<Vec<u64>>>()
+        else {
+            return false;
+        };
+        if !code.iter().all(|fetched| fetched.unchanged(memory)) {
+            return false;
+        }
+        for (seen, generation) in self.code_generations.iter().zip(generations) {
+            seen.set(generation);
+        }
+        true
     }
 
     pub fn run<M: Memory>(
@@ -1930,6 +1983,10 @@ impl Trace {
             + shared
             + block.checkpoints.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::Checkpoint>()
             + block.code_guards.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::CodeGuard>()
+            + self.code_generations.capacity() * size_of::<Cell<u64>>()
+            + self.recorded.code.as_ref().map_or(0, |code| {
+                code.capacity() * size_of::<crate::record::FetchedCode>()
+            })
             + block.context_guards.capacity()
                 * size_of::<vmlab_hv_tcg_ir::native::block::ContextGuard>()
             + block
