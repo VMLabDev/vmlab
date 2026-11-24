@@ -2248,6 +2248,45 @@ mod tests {
         assert!(plan.withheld.contains("f0000.rs"));
     }
 
+    /// Review labd-sync-2 F13 (card 953): the host edited the path during the
+    /// same break. That pass calls it the matrix's conflict, and the path is
+    /// still an absence nothing saw: it stays held by name, so the pass after
+    /// the developer takes the edit back halts on it and deletes nothing.
+    #[test]
+    fn an_unwitnessed_absence_the_host_also_changed_stays_withheld() {
+        let (mut host, mut guest, mut l) = agreed_tree(4);
+        guest.remove("f0000.rs");
+        let agreed = host["f0000.rs"].clone();
+        host.insert("f0000.rs".into(), file(Some("edited"), 9, 500));
+        let plan = run_after_a_break(&host, &guest, &l, &BTreeSet::new());
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(
+            plan.conflicts,
+            vec![Conflict {
+                path: "f0000.rs".into(),
+                kind: ConflictKind::ModifiedAndDeleted,
+            }]
+        );
+        assert!(
+            plan.withheld.contains("f0000.rs"),
+            "the absence nothing saw lost its mark"
+        );
+
+        // What the syncer records, and then the edit is taken back.
+        l.withheld = plan.withheld.clone();
+        host.insert("f0000.rs".into(), agreed);
+        let plan = run(&host, &guest, &l);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(
+            plan.conflicts,
+            vec![Conflict {
+                path: "f0000.rs".into(),
+                kind: ConflictKind::MissingUnseen,
+            }]
+        );
+        assert!(plan.withheld.contains("f0000.rs"));
+    }
+
     /// Both answers work, through the same matrix as every other resolution:
     /// `--guest` says it was a deletion after all, `--host` puts the file back.
     #[test]
