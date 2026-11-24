@@ -1867,6 +1867,7 @@ pub fn cmd_vm_find_image(
     threshold: f64,
     region: Option<Vec<i64>>,
 ) -> Result<()> {
+    crate::vision::validate_threshold(threshold).map_err(anyhow::Error::msg)?;
     let img = std::fs::canonicalize(image).with_context(|| format!("reference image {image}"))?;
     let region = region_value(region)?;
     rt()?.block_on(async {
