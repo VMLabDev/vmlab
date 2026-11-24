@@ -1436,4 +1436,60 @@ mod tests {
         b.tx.send(again.clone()).await.unwrap();
         assert_eq!(recv(&mut trunk.rx).await, again);
     }
+
+    /// The next frame queued for a port, without a wait: `Switch::ingress`
+    /// has queued every frame it delivers by the time it returns.
+    fn next(port: &mut ChannelPort) -> Option<Bytes> {
+        port.rx.try_recv().ok()
+    }
+
+    /// Review F22: a frame from behind a trunk that carries a local guest's
+    /// source MAC moves the MAC to the trunk, and the guest takes it back
+    /// with its next frame.
+    #[tokio::test]
+    async fn a_trunk_does_not_keep_a_guests_mac() {
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let t = sw.add_channel_port(PortClass::Service);
+        let x = mac(0x21);
+
+        let first = frame(MAC_BROADCAST, x, b"first");
+        sw.ingress(a.id, first.clone());
+        let far = frame(MAC_BROADCAST, x, b"from behind the trunk");
+        sw.ingress(t.id, far.clone());
+        let second = frame(MAC_BROADCAST, x, b"second");
+        sw.ingress(a.id, second.clone());
+        let marker = frame(MAC_BROADCAST, mac(0x22), b"marker");
+        sw.ingress(t.id, marker.clone());
+
+        assert_eq!(next(&mut b), Some(first));
+        assert_eq!(next(&mut b), Some(far));
+        assert_eq!(next(&mut b), Some(second), "A's frame after the trunk's");
+        assert_eq!(next(&mut b), Some(marker));
+        assert_eq!(sw.stats().frames_dropped, 0);
+    }
+
+    /// Review F26: an isolated NIC exchanges no frame with a guest behind a
+    /// trunk. `lab` is a lab's switch and `sup` the supervisor's; the test
+    /// carries the frame over the trunk between them by hand.
+    #[tokio::test]
+    async fn an_isolated_nic_reaches_no_guest_behind_a_trunk() {
+        let lab = Switch::new("lab".into());
+        let isolated = lab.add_channel_port(GUEST_ISOLATED);
+        let mut lab_trunk = lab.add_channel_port(PortClass::Service);
+        let sup = Switch::new("sup".into());
+        let sup_trunk = sup.add_channel_port(PortClass::Service);
+        let mut far_guest = sup.add_channel_port(GUEST);
+        let mut service = sup.add_channel_port(PortClass::Service);
+
+        let hello = frame(MAC_BROADCAST, mac(1), b"from the isolated nic");
+        lab.ingress(isolated.id, hello.clone());
+        let on_trunk = next(&mut lab_trunk).expect("the broadcast on the trunk");
+        sup.ingress(sup_trunk.id, on_trunk);
+        let marker = frame(MAC_BROADCAST, mac(0x47), b"marker");
+        sup.ingress(service.id, marker.clone());
+        assert_eq!(next(&mut far_guest), Some(marker));
+        assert_eq!(next(&mut service), Some(hello));
+    }
 }
