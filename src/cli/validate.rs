@@ -6,6 +6,7 @@ use anyhow::Result;
 use miette::NamedSource;
 
 use crate::config::{self, ConfigErrors, ValidationContext};
+use crate::scripting::ScriptEntry;
 
 /// Real validation context: consults the on-disk template store and the
 /// profile set. Script compile checking is wired to the wscript host module.
@@ -95,9 +96,9 @@ impl ValidationContext for HostContext {
         crate::config::hypervisor::HostFacts::probe()
     }
 
-    fn check_script(&self, path: &Path) -> Result<(), String> {
+    fn check_script(&self, path: &Path, entry: ScriptEntry) -> Result<(), String> {
         let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        crate::scripting::check_script_source(&source)
+        crate::scripting::check_script_entry(&source, entry)
     }
 
     fn check_host_gpu(
@@ -340,7 +341,7 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
-        fn check_script(&self, _: &Path) -> Result<(), String> {
+        fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
             Ok(())
         }
     }

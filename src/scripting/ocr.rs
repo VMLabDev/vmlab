@@ -35,8 +35,7 @@ pub fn parse_opts(opts: &HashMap<String, String>) -> Result<OcrRequest, String> 
                         parts.len()
                     ));
                 };
-                let at = |v: i64| v.max(0) as u32;
-                out.region = Some((at(x), at(y), at(w), at(h)));
+                out.region = Some(super::region_coordinates([x, y, w, h]));
             }
             "scale" => {
                 out.options.scale = Some(
