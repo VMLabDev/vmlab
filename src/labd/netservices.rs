@@ -403,8 +403,15 @@ mod tests {
                 upstream_dns: None,
             },
         );
-        let services =
-            SegmentServices::install(&sw, &gw, nat, isolated, 1500, (&Router::new(), "seg"), Vec::new());
+        let services = SegmentServices::install(
+            &sw,
+            &gw,
+            nat,
+            isolated,
+            1500,
+            (&Router::new(), "seg"),
+            Vec::new(),
+        );
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
         (services, gw, guest)
     }

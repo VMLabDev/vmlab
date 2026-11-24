@@ -1016,7 +1016,20 @@ pub(crate) mod tests {
         });
 
         let ask = |id: u16, name: &str| {
-            let mut q = vec![(id >> 8) as u8, id as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            let mut q = vec![
+                (id >> 8) as u8,
+                id as u8,
+                0x01,
+                0x00,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
             q.extend_from_slice(&encode_qname(name));
             q.extend_from_slice(&[0, 1, 0, 1]); // A IN
             let udp = udp_build(GUEST_IP, gw.gw_ip(), 33001, 53, &q).unwrap();

@@ -1607,9 +1607,17 @@ async fn a_syn_on_a_live_flow_is_answered() {
     let answer = recv_tcp(&mut rx).await;
     assert_eq!(answer.dst, (GUEST_IP, sport));
     assert_eq!(answer.src, dst);
-    assert_eq!(answer.flags & (TCP_SYN | TCP_RST), 0, "a challenge ACK, not {answer:?}");
+    assert_eq!(
+        answer.flags & (TCP_SYN | TCP_RST),
+        0,
+        "a challenge ACK, not {answer:?}"
+    );
     assert_ne!(answer.flags & TCP_ACK, 0, "the SYN is answered with an ACK");
-    assert_eq!(answer.ack, isn + 1, "the ACK names what the old flow expects");
+    assert_eq!(
+        answer.ack,
+        isn + 1,
+        "the ACK names what the old flow expects"
+    );
     assert_eq!(answer.seq, s_next);
 
     // The guest knows no such connection and resets it.
@@ -1674,7 +1682,10 @@ async fn nat_does_not_dial_an_address_of_the_lab() {
         guest_icmp_echo(&engine, dst, 7, b"ping").await;
     }
     tokio::task::yield_now().await;
-    assert!(rx.try_recv().is_err(), "UDP or ICMP to a lab address was answered");
+    assert!(
+        rx.try_recv().is_err(),
+        "UDP or ICMP to a lab address was answered"
+    );
     assert_eq!(
         pinger.calls.load(Ordering::SeqCst),
         0,
@@ -1684,8 +1695,22 @@ async fn nat_does_not_dial_an_address_of_the_lab() {
     // An address outside the lab is still dialed.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    guest_tcp(&engine, 40410, (Ipv4Addr::LOCALHOST, port), 1, 0, TCP_SYN, &[], &[]).await;
-    assert_eq!(engine.tcp_flows.lock().unwrap().len(), 1, "egress still opens a flow");
+    guest_tcp(
+        &engine,
+        40410,
+        (Ipv4Addr::LOCALHOST, port),
+        1,
+        0,
+        TCP_SYN,
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        engine.tcp_flows.lock().unwrap().len(),
+        1,
+        "egress still opens a flow"
+    );
 }
 
 /// The same for the rest of `127.0.0.0/8`, for `0.0.0.0`, and for UDP and
