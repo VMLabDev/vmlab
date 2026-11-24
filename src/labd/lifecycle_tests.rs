@@ -1493,7 +1493,9 @@ async fn a_failed_second_virtiofsd_stops_the_first() {
     );
     let (cbs, _observed) = callbacks();
 
-    let err = start_container(&ctr, cbs).await.expect_err("start must fail");
+    let err = start_container(&ctr, cbs)
+        .await
+        .expect_err("start must fail");
     assert!(
         format!("{err:#}").contains("/second: virtiofsd failed on start 2"),
         "{err:#}"
