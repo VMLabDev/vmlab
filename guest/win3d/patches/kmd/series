@@ -13,6 +13,10 @@ kmd-host-vblank.patch
 kmd-host-scan-line.patch
 kmd-allow-180-degree-display-rotation.patch
 kmd-rotate-hardware-pointer.patch
+kmd-bound-host-scanout-count.patch
 kmd-check-capset-escape.patch
 kmd-check-submit-escape-size.patch
 kmd-map-present-source-in-present.patch
+kmd-read-helper-pipe-message-inside-buffer.patch
+kmd-check-create-allocation-memory.patch
+kmd-scanout-only-for-its-owner.patch

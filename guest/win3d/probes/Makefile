@@ -58,6 +58,24 @@ endef
 
 $(foreach a,$(ARCHES),$(eval $(call submit_rules,$(a))))
 
+# Explicit test-only target, like tdr: the two ways of a program to the
+# scanout (card #755). A driver without the fix shows the probe's colour.
+scanout: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/scanout_probe.exe $(OUT)-extra/$(a)/scanout_owner.exe)
+
+define scanout_rules
+$(OUT)-extra/$(1)/scanout_probe.exe: scanout/scanout_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+
+# The other side of the check: the fullscreen program that Windows gives
+# the scanout is still served.
+$(OUT)-extra/$(1)/scanout_owner.exe: scanout/scanout_owner.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$< -ld3d9
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call scanout_rules,$(a))))
+
 # Explicit test-only target, like tdr: the hostile arguments of the capset
 # escape (card #751). A driver without the fix bugchecks the guest.
 capset: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/capset_probe.exe)
@@ -81,6 +99,33 @@ $(OUT)-extra/$(1)/present_probe.exe: present/present_probe.c
 endef
 
 $(foreach a,$(ARCHES),$(eval $(call present_rules,$(a))))
+
+# Explicit test-only target, like tdr: the requests of card #757 to
+# D3DKMTCreateAllocation. A driver without the fix can bugcheck the guest.
+alloc: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/alloc_probe.exe)
+
+define alloc_rules
+$(OUT)-extra/$(1)/alloc_probe.exe: alloc/alloc_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call alloc_rules,$(a))))
+
+# Explicit test-only target: the pipe classes of the two helpers of the
+# kernel driver package with the messages of card #757, linked with pipe.cpp
+# of the driver source before and after the patch of that card. PIPE_SRC has
+# the two source copies (build/probes/pipe-source.sh makes them, and
+# build/probes/build.sh runs it for this target). The helpers are x64 only.
+PIPE_SRC ?= $(OUT)/deps/pipe-src
+pipe: $(OUT)-extra/x64/pipe_probe_before.exe $(OUT)-extra/x64/pipe_probe_after.exe
+
+$(OUT)-extra/x64/pipe_probe_%.exe: pipe/pipe_probe.cpp $(PIPE_SRC)/%/viogpu/shared/pipe.cpp $(PIPE_SRC)/%/viogpu/shared/pipe.h
+	@mkdir -p $(dir $@)
+	$(triple_x64)-clang++ -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter -municode -DUNICODE -D_UNICODE \
+	    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -fms-extensions -include ../build/kmd/mingw-compat.h \
+	    -DPIPE_PROBE_BUILD='"$*"' -I$(PIPE_SRC)/$*/viogpu/shared -mconsole -static -s -Wl,--no-insert-timestamp \
+	    -o $@ pipe/pipe_probe.cpp $(PIPE_SRC)/$*/viogpu/shared/pipe.cpp
 
 $(BUILD)/gen/vulkan_shaders.h: vulkan/probe.vert vulkan/probe.frag
 	@mkdir -p $(dir $@)
@@ -113,5 +158,6 @@ clean:
 	rm -rf $(BUILD) $(OUT)/deps $(foreach a,$(ARCHES),$(OUT)/$(a))
 
 .PHONY: all clean tdr capset
-.PHONY: submit
+.PHONY: submit alloc pipe
+.PHONY: scanout
 .PHONY: present

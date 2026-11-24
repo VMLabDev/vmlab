@@ -214,6 +214,24 @@ package does not overwrite `opengl32.dll`, and it sets no `TdrDebugMode` or
 | `backup\` | Original `d3d12.dll`, `vulkan-1.dll` and `vulkaninfo.exe` |
 | `bundle\` | The staged bundle, which the startup tasks run from |
 
+Only SYSTEM and Administrators can change this directory. The two startup
+tasks run `vmlab-win3d.ps1` from it as SYSTEM, and uninstall restores system
+files from what `state.json` records, so the installer creates the directory
+with an access list of its own (full control for SYSTEM and Administrators,
+read for Users) and not the one `C:\ProgramData` hands down, under which any
+user may create files. It checks the directory at every run, before it reads
+or writes anything there:
+
+| It finds | It does |
+| --- | --- |
+| No directory | Creates it with that access list. |
+| A directory an older package made, with the inherited access list | Replaces the access list, and writes that to the journal. |
+| A directory that a standard user owns (the user made it before the first install), or an entry in it that a standard user owns or can change, or a link | Stops with exit code 3 and names the entries. It installs nothing and writes nothing. `scripts/install-into-vm.sh` then exits 1. |
+
+After a stop, look at the named entries from an elevated prompt, delete what
+a standard user put there (the whole directory when nothing is installed),
+and run `Install.cmd` again. [C753](acceptance/C753.md) has the proof.
+
 ### Rerun and upgrade
 
 `Install.cmd` is idempotent. Each step checks before it changes anything:

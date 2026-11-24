@@ -37,6 +37,11 @@ fn lower_stage(graph: &Graph, slots: &[usize], stage: Vec<ScalarId>) -> Stage {
         .collect()
 }
 
+/// A trace takes no further fragment once it holds this many bytes, and no
+/// fragment of more than half of it. So one trace stays under the cache's
+/// limit and the cache never has to drop it whole.
+const FRAGMENTS_BYTES: usize = crate::TRACE_CACHE_BYTES / 4;
+
 pub(crate) struct Trace {
     recorded: Recorded,
     revision: Option<u64>,
@@ -56,15 +61,20 @@ pub(crate) struct Trace {
     returned_runs: u32,
     trained_steps: u32,
     cache_units: usize,
+    cache_bytes: usize,
     pub last_used: u64,
     options: Options,
     fragments: RefCell<BTreeMap<usize, Vec<Trace>>>,
     fragment_units: Cell<usize>,
+    fragment_bytes: Cell<usize>,
     branch_depth: u8,
     input_slots: Vec<Option<usize>>,
     binding_slots: HashMap<usize, crate::publication::Plan>,
     pc_slot: Option<usize>,
     compact_loop: std::sync::OnceLock<bool>,
+    /// For each code guard, the page stamp generation under which the
+    /// fetched bytes were last seen as recorded.
+    code_generations: Vec<Cell<u64>>,
     wide_inputs: Cell<Vec<Option<Value>>>,
     scalar_input_slots: Vec<Option<usize>>,
     slots: Vec<usize>,
@@ -741,6 +751,12 @@ impl Trace {
                 guard.last_page,
             ))
         });
+        let code_generations = recorded
+            .block
+            .code_guards
+            .iter()
+            .map(|guard| Cell::new(guard.generation))
+            .collect();
         let input_slots = recorded
             .inputs
             .iter()
@@ -935,15 +951,18 @@ impl Trace {
             returned_runs: 0,
             trained_steps: steps,
             cache_units: 0,
+            cache_bytes: 0,
             last_used: 0,
             options,
             fragments: RefCell::new(BTreeMap::new()),
             fragment_units: Cell::new(0),
+            fragment_bytes: Cell::new(0),
             branch_depth: 0,
             input_slots,
             binding_slots,
             pc_slot: interpreter.globals.slot("zPC"),
             compact_loop: std::sync::OnceLock::new(),
+            code_generations,
             wide_inputs: Cell::new(wide_inputs),
             scalar_input_slots,
             slots,
@@ -983,6 +1002,7 @@ impl Trace {
         trace.scratch.set(scratch);
         trace.stamps.set(stamps);
         trace.cache_units = trace.calculate_cache_units();
+        trace.cache_bytes = trace.calculate_cache_bytes();
         trace
     }
 
@@ -993,18 +1013,61 @@ impl Trace {
         len
     }
 
+    /// The current stamp of a guard's pages, or `None` when the pages are no
+    /// longer the memory and mapping the trace was recorded from.
+    fn code_generation(
+        memory: &impl Memory,
+        guard: &vmlab_hv_tcg_ir::native::block::CodeGuard,
+    ) -> Option<u64> {
+        memory
+            .code_stamp(guard.address, guard.len)
+            .filter(|stamp| {
+                stamp.identity == guard.identity
+                    && stamp.mapping == guard.mapping
+                    && stamp.first_page == guard.first_page
+                    && stamp.last_page == guard.last_page
+            })
+            .map(|stamp| stamp.generation)
+    }
+
     fn code_valid(&self, memory: &impl Memory) -> bool {
-        self.recorded.block.code_guards.iter().all(|guard| {
-            memory
-                .code_stamp(guard.address, guard.len)
-                .is_some_and(|stamp| {
-                    stamp.generation == guard.generation
-                        && stamp.identity == guard.identity
-                        && stamp.mapping == guard.mapping
-                        && stamp.first_page == guard.first_page
-                        && stamp.last_page == guard.last_page
-                })
-        })
+        let guards = &self.recorded.block.code_guards;
+        let mut written = false;
+        for (guard, seen) in guards.iter().zip(&self.code_generations) {
+            match Self::code_generation(memory, guard) {
+                Some(generation) => written |= generation != seen.get(),
+                None => return false,
+            }
+        }
+        !written || self.code_unchanged(memory)
+    }
+
+    /// A page of the trace's code was written. A page stamp cannot tell a
+    /// store to code from a store to data beside it, so compare the bytes the
+    /// recording fetched. When they are all as recorded the trace stays
+    /// valid, and it keeps the new stamps so the next check is the short one.
+    #[cold]
+    fn code_unchanged(&self, memory: &impl Memory) -> bool {
+        let Some(code) = &self.recorded.code else {
+            return false;
+        };
+        // Read the stamps before the bytes: a write that lands after a stamp
+        // was read moves that stamp again, and the next check sees it.
+        let guards = &self.recorded.block.code_guards;
+        let Some(generations) = guards
+            .iter()
+            .map(|guard| Self::code_generation(memory, guard))
+            .collect::<Option<Vec<u64>>>()
+        else {
+            return false;
+        };
+        if !code.iter().all(|fetched| fetched.unchanged(memory)) {
+            return false;
+        }
+        for (seen, generation) in self.code_generations.iter().zip(generations) {
+            seen.set(generation);
+        }
+        true
     }
 
     pub fn run<M: Memory>(
@@ -1260,9 +1323,12 @@ impl Trace {
         let variants = fragments.entry(exit).or_default();
         for fragment in variants.iter_mut() {
             let before = fragment.cache_units();
+            let bytes_before = fragment.cache_bytes();
             let result = fragment.run_bound(interpreter, evaluation, exit);
             self.fragment_units
                 .set(self.fragment_units.get() - before + fragment.cache_units());
+            self.fragment_bytes
+                .set(self.fragment_bytes.get() - bytes_before + fragment.cache_bytes());
             match result? {
                 Outcome::Miss => {}
                 Outcome::Returned(value, steps) => {
@@ -1273,7 +1339,7 @@ impl Trace {
                 }
             }
         }
-        if self.cache_units() > 500_000 {
+        if self.cache_units() > 500_000 || self.cache_bytes() > FRAGMENTS_BYTES {
             return evaluation
                 .resume(interpreter, exit)
                 .map(|value| Outcome::Resumed(value, completed + 1));
@@ -1329,12 +1395,17 @@ impl Trace {
         let mut fragment = Self::from_record(interpreter, recorder.finish(), options, 1);
         fragment.branch_depth = self.branch_depth + 1;
         let units = fragment.cache_units();
-        if units <= 250_000 {
+        let bytes = fragment.cache_bytes();
+        if units <= 250_000 && bytes <= FRAGMENTS_BYTES / 2 {
             if variants.len() == 4 {
+                let evicted = variants.remove(0);
                 self.fragment_units
-                    .set(self.fragment_units.get() - variants.remove(0).cache_units());
+                    .set(self.fragment_units.get() - evicted.cache_units());
+                self.fragment_bytes
+                    .set(self.fragment_bytes.get() - evicted.cache_bytes());
             }
             self.fragment_units.set(self.fragment_units.get() + units);
+            self.fragment_bytes.set(self.fragment_bytes.get() + bytes);
             variants.push(fragment);
         }
         Ok(Outcome::Resumed(value, completed + 1))
@@ -1432,6 +1503,16 @@ impl Trace {
                         .memory
                         .read(address, &mut data[..bytes as usize])
                     {
+                        if matches!(source, Error::Memory(_)) {
+                            // The interpreter repeats the access and gives the
+                            // guest its access fault.
+                            return evaluation.resume(interpreter, error).map(|value| {
+                                Outcome::Resumed(
+                                    value,
+                                    self.recorded.block.exits[error].completed_steps + 1,
+                                )
+                            });
+                        }
                         evaluation
                             .bindings(interpreter, &self.recorded.block.exits[error].globals)?;
                         return Err(evaluation.error(error, source));
@@ -1451,13 +1532,21 @@ impl Trace {
                     let address = u64::try_from(evaluation.scalar(address)?)
                         .map_err(|_| Error::Type("native physical address".into()))?;
                     let data = evaluation.scalar(value)?.to_le_bytes();
-                    if let Err(source) = interpreter.memory.write(address, &data[..bytes as usize])
-                    {
+                    if let Err(source) = interpreter.store(address, &data[..bytes as usize]) {
+                        if matches!(source, Error::Memory(_)) {
+                            // The interpreter repeats the access and gives the
+                            // guest its access fault.
+                            return evaluation.resume(interpreter, error).map(|value| {
+                                Outcome::Resumed(
+                                    value,
+                                    self.recorded.block.exits[error].completed_steps + 1,
+                                )
+                            });
+                        }
                         evaluation
                             .bindings(interpreter, &self.recorded.block.exits[error].globals)?;
                         return Err(evaluation.error(error, source));
                     }
-                    interpreter.reservation = None;
                     if interpreter.watch_store.is_some_and(|watch| {
                         watch
                             .checked_sub(address)
@@ -1687,6 +1776,13 @@ impl Trace {
         self.cache_units + self.fragment_units.get()
     }
 
+    /// An estimate of the host heap bytes this trace and its fragments hold.
+    /// It is what the cache of a hart is bounded by: a unit of
+    /// [`Self::cache_units`] has no fixed size in bytes.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes + self.fragment_bytes.get()
+    }
+
     pub fn cache_breakdown(&self) -> [usize; 4] {
         let block = &self.recorded.block;
         let mut seen = BTreeSet::new();
@@ -1720,6 +1816,220 @@ impl Trace {
             locals,
             globals,
         ]
+    }
+
+    /// The heap bytes of this trace without its fragments, which it has none
+    /// of when this runs. Every table is counted at its capacity. What a
+    /// trace shares with the model (an `Arc<Function>`) is not counted, and
+    /// what exits share between themselves is counted once.
+    fn calculate_cache_bytes(&self) -> usize {
+        use std::mem::size_of;
+        // The header of a heap `String` is in its owner; this is the text.
+        fn text(text: &str) -> usize {
+            text.len()
+        }
+        // A B-tree node holds up to 11 entries and is at least half full
+        // but for the root, so an entry costs about one and a half slots.
+        fn tree(entries: usize, entry: usize) -> usize {
+            entries * entry * 3 / 2
+        }
+        fn names(names: &BTreeSet<String>) -> usize {
+            tree(names.len(), size_of::<String>())
+                + names.iter().map(|name| text(name)).sum::<usize>()
+        }
+        fn value_bytes(value: &Value) -> usize {
+            match value {
+                Value::Struct(fields) => {
+                    tree(fields.len(), size_of::<String>() + size_of::<Value>())
+                        + fields
+                            .iter()
+                            .map(|(name, field)| text(name) + value_bytes(field))
+                            .sum::<usize>()
+                }
+                Value::Union(name, payload) => {
+                    text(name) + size_of::<Value>() + value_bytes(payload)
+                }
+                Value::Vector(values) => {
+                    values.capacity() * size_of::<Value>()
+                        + values.iter().map(value_bytes).sum::<usize>()
+                }
+                Value::Bits { value, .. } => value.bits().div_ceil(64) as usize * 8,
+                Value::Integer(value) => value.bits().div_ceil(64) as usize * 8,
+                Value::String(name) | Value::Enum(name) | Value::Ref(name) => text(name),
+                Value::Unit | Value::Bool(_) | Value::Undefined => 0,
+            }
+        }
+        fn bindings(bindings: &[Binding]) -> usize {
+            // The two counters of the `Arc` and the header of its `Vec`.
+            2 * size_of::<usize>()
+                + size_of::<Vec<Binding>>()
+                + size_of_val(bindings)
+                + bindings
+                    .iter()
+                    .map(|binding| text(&binding.name))
+                    .sum::<usize>()
+        }
+        fn recipe(recipe: &Recipe) -> usize {
+            match recipe {
+                Recipe::Constant(_) | Recipe::Scalar { .. } | Recipe::Input(_) => 0,
+                Recipe::Struct(fields) => {
+                    fields.capacity() * size_of::<(String, ValueId)>()
+                        + fields.iter().map(|(name, _)| text(name)).sum::<usize>()
+                }
+                Recipe::Union(name, _) => text(name),
+                Recipe::Vector(values) => values.capacity() * size_of::<ValueId>(),
+                Recipe::Deferred {
+                    operation, args, ..
+                } => {
+                    args.capacity() * size_of::<ValueId>()
+                        + match operation {
+                            DeferredOperation::Intrinsic { name, .. } => text(name),
+                            DeferredOperation::Native { .. } => 0,
+                        }
+                }
+            }
+        }
+        fn input(input: &Input) -> usize {
+            let path = |path: &Vec<Projection>| {
+                path.capacity() * size_of::<Projection>()
+                    + path
+                        .iter()
+                        .map(|step| match step {
+                            Projection::Field(name) | Projection::Payload(name) => text(name),
+                            Projection::Index(_) => 0,
+                        })
+                        .sum::<usize>()
+            };
+            let source = match &input.source {
+                InputSource::Global(name, steps) | InputSource::Local(_, name, steps) => {
+                    text(name) + path(steps)
+                }
+                InputSource::Argument(_) | InputSource::FetchAddress => 0,
+            };
+            source
+                + match &input.shape {
+                    Shape::Struct(fields) => {
+                        fields.capacity() * size_of::<String>()
+                            + fields.iter().map(|name| text(name)).sum::<usize>()
+                    }
+                    Shape::Union(name) => text(name),
+                    Shape::Other(other) => value_bytes(other),
+                    Shape::Scalar(_) | Shape::Bits(_) | Shape::Vector(_) => 0,
+                }
+        }
+        let stages = |stages: &Vec<Stage>| {
+            stages.capacity() * size_of::<Stage>()
+                + stages
+                    .iter()
+                    .map(|stage| {
+                        stage.capacity() * size_of::<vmlab_hv_tcg_ir::native::packed::Packed>()
+                    })
+                    .sum::<usize>()
+        };
+        let block = &self.recorded.block;
+        // Exits and checkpoints share their binding lists and their frames'
+        // locals: each allocation is paid once.
+        let mut seen = BTreeSet::new();
+        let mut shared = 0;
+        for globals in block.exits.iter().map(|exit| &exit.globals).chain(
+            block
+                .checkpoints
+                .iter()
+                .map(|checkpoint| &checkpoint.globals),
+        ) {
+            if seen.insert(std::sync::Arc::as_ptr(globals) as usize) {
+                shared += bindings(globals);
+            }
+        }
+        let mut frames = 0;
+        for frame in block.exits.iter().flat_map(|exit| &exit.frames) {
+            frames += frame.declared.capacity() * size_of::<u64>();
+            if seen.insert(std::sync::Arc::as_ptr(&frame.locals) as usize) {
+                shared += bindings(&frame.locals);
+            }
+            if seen.insert(std::sync::Arc::as_ptr(&frame.local_names) as usize) {
+                shared += 2 * size_of::<usize>()
+                    + size_of::<Vec<String>>()
+                    + size_of_val(frame.local_names.as_slice())
+                    + frame
+                        .local_names
+                        .iter()
+                        .map(|name| text(name))
+                        .sum::<usize>();
+            }
+        }
+        let wide_inputs = self.wide_inputs.take();
+        let wide = wide_inputs.capacity() * size_of::<Option<Value>>()
+            + wide_inputs.iter().flatten().map(value_bytes).sum::<usize>();
+        self.wide_inputs.set(wide_inputs);
+        let stamps = self.stamps.take();
+        let scratch = self.scratch_len() * size_of::<u128>() + stamps.capacity() * size_of::<u64>();
+        self.stamps.set(stamps);
+        size_of::<Self>()
+            + block.graph.heap_bytes()
+            + block.values.capacity() * size_of::<Recipe>()
+            + block.values.iter().map(recipe).sum::<usize>()
+            + block.events.capacity() * size_of::<Event>()
+            + block.exits.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::Exit>()
+            + block
+                .exits
+                .iter()
+                .map(|exit| {
+                    exit.frames.capacity()
+                        * size_of::<vmlab_hv_tcg_ir::native::block::SourceFrame>()
+                })
+                .sum::<usize>()
+            + frames
+            + shared
+            + block.checkpoints.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::Checkpoint>()
+            + block.code_guards.capacity() * size_of::<vmlab_hv_tcg_ir::native::block::CodeGuard>()
+            + self.code_generations.capacity() * size_of::<Cell<u64>>()
+            + self.recorded.code.as_ref().map_or(0, |code| {
+                code.capacity() * size_of::<crate::record::FetchedCode>()
+            })
+            + block.context_guards.capacity()
+                * size_of::<vmlab_hv_tcg_ir::native::block::ContextGuard>()
+            + block
+                .context_guards
+                .iter()
+                .map(|guard| text(&guard.name))
+                .sum::<usize>()
+            + self.recorded.constants.capacity() * size_of::<Value>()
+            + self
+                .recorded
+                .constants
+                .iter()
+                .map(value_bytes)
+                .sum::<usize>()
+            + self.recorded.inputs.capacity() * size_of::<Input>()
+            + self.recorded.inputs.iter().map(input).sum::<usize>()
+            + self.recorded.stop_reason.as_deref().map_or(0, text)
+            + self.context_slots.capacity() * size_of::<usize>()
+            + stages(&self.stages)
+            + stages(&self.checkpoint_stages)
+            + self.fused_guards.capacity()
+                * size_of::<Option<vmlab_hv_tcg_ir::native::linear::Guard>>()
+            + scratch
+            + wide
+            + self.waiting.capacity() * size_of::<Option<bool>>()
+            + self.input_values.capacity()
+            + names(&self.options.dynamic_globals)
+            + names(&self.options.unbounded_globals)
+            + names(&self.options.small_integer_globals)
+            + (self.input_slots.capacity() + self.scalar_input_slots.capacity())
+                * size_of::<Option<usize>>()
+            + self.binding_slots.capacity() * (size_of::<(usize, crate::publication::Plan)>() + 1)
+            + self
+                .binding_slots
+                .values()
+                .map(|plan| {
+                    plan.slots.capacity() * size_of::<usize>()
+                        + plan.words.capacity() * size_of::<Option<crate::publication::Word>>()
+                })
+                .sum::<usize>()
+            + (self.slots.capacity() + self.fast_events.capacity()) * size_of::<usize>()
+            + self.fast_code.capacity() * size_of::<vmlab_hv_tcg_ir::native::packed::Packed>()
+            + self.event_steps.capacity() * size_of::<u32>()
     }
 
     fn calculate_cache_units(&self) -> usize {

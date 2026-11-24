@@ -26,6 +26,11 @@ State lives in C:\ProgramData\vmlab-win3d:
   journal.log    every action, timestamped
   backup\        the original files the package replaced
   bundle\        the staged package that the startup tasks run from
+Two startup tasks run the copy of this script in that directory as SYSTEM, so
+only SYSTEM and Administrators may change anything in it. The script gives the
+directory an access list of its own, and stops before it reads or writes a
+file there when a standard user owns the directory or anything in it
+(Protect-StateRoot). It then exits 3; every other failure exits 1.
 #>
 [CmdletBinding()]
 param(
@@ -45,6 +50,9 @@ $BackupDir = Join-Path $Root 'backup'
 $BundleDir = Join-Path $Root 'bundle'
 $TrashDir = Join-Path $Root 'trash'
 $ScriptCopy = Join-Path $Root 'vmlab-win3d.ps1'
+# Set by the main block once Protect-StateRoot has passed. Until then nothing
+# is written into $Root.
+$RootTrusted = $false
 $ResumeTask = 'vmlab-win3d-resume'
 $RepairTask = 'vmlab-win3d-repair'
 $Sys32 = Join-Path $env:SystemRoot 'System32'
@@ -70,7 +78,7 @@ $BridgeMarker = [Text.Encoding]::Unicode.GetBytes('d3d12-native.dll')
 function Write-Journal([string]$Message) {
     $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss.fffzzz'), $Mode, $Message
     Write-Host $line
-    if (Test-Path -LiteralPath $Root) {
+    if ($script:RootTrusted) {
         Add-Content -LiteralPath $JournalPath -Value $line -Encoding UTF8
     }
 }
@@ -82,6 +90,9 @@ function Read-Json([string]$Path) {
 
 function Write-Json([string]$Path, $Object) {
     $tmp = $Path + '.tmp'
+    # Never write through a file that is there already: it keeps its owner
+    # and its access list across the rename.
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
     ConvertTo-Json -InputObject $Object -Depth 8 | Set-Content -LiteralPath $tmp -Encoding UTF8
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
@@ -141,6 +152,107 @@ function Clear-Trash {
 # ------------------------------------------------------- file security (ACL)
 
 function Get-Sddl([string]$Path) { return (Get-Acl -LiteralPath $Path).Sddl }
+
+# ---------------------------------------------- state directory security
+
+# Owners a standard user cannot be: Administrators, SYSTEM, TrustedInstaller.
+# The owner of a file can always rewrite its access list, so a file with any
+# other owner is one a user can change.
+$TrustedSids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+# The state directory: owner Administrators, and a protected access list
+# (nothing inherited from C:\ProgramData, whose own list lets every user
+# create files in a subdirectory): full control for SYSTEM and
+# Administrators, read for Users. Everything below inherits it.
+$RootSddl = 'O:BAG:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+# Rights that change a file or a directory, and the generic forms (write,
+# all) an inherit-only entry can carry.
+$ChangeMask = [int][Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership' -bor 0x50000000
+
+function Get-SidName([string]$Sid) {
+    try { return (New-Object Security.Principal.SecurityIdentifier($Sid)).Translate([Security.Principal.NTAccount]).Value } catch { return $Sid }
+}
+
+# Why a standard user could change $Path, or $null when none can.
+function Get-StateProblem([string]$Path) {
+    try { $acl = Get-Acl -LiteralPath $Path } catch { return ('{0} (its owner cannot be read: {1})' -f $Path, $_.Exception.Message) }
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -notcontains $owner) { return ('{0} (owner {1})' -f $Path, (Get-SidName $owner)) }
+    foreach ($r in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $r.IdentityReference.Value
+        if ($r.AccessControlType -eq 'Allow' -and $TrustedSids -notcontains $sid -and ([int]$r.FileSystemRights -band $ChangeMask)) {
+            return ('{0} ({1} may change it)' -f $Path, (Get-SidName $sid))
+        }
+    }
+    return $null
+}
+
+# Every entry below $Root that a standard user could change. Links are named
+# and not followed, and the walk does not enter a directory it names.
+function Get-StateTreeProblems {
+    $problems = @()
+    $dirs = New-Object Collections.Stack
+    $dirs.Push($Root)
+    while ($dirs.Count) {
+        foreach ($i in Get-ChildItem -LiteralPath $dirs.Pop() -Force) {
+            if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { $problems += ('{0} (a link)' -f $i.FullName); continue }
+            $p = Get-StateProblem $i.FullName
+            if ($p) { $problems += $p; continue }
+            if ($i.PSIsContainer) { $dirs.Push($i.FullName) }
+        }
+    }
+    return $problems
+}
+
+# Make $Root a directory only SYSTEM and Administrators can change, or throw
+# before anything in it is read, written or run. Runs first in every mode
+# that changes the machine.
+#   - No directory: it is created with $RootSddl in the one call, so it never
+#     exists with the access list of C:\ProgramData.
+#   - A directory whose owner is not in $TrustedSids: a standard user made it
+#     (C:\ProgramData lets every user create a directory) or took it, and
+#     kept the right to change its access list. Refused.
+#   - A directory an older package made: its owner is Administrators, but it
+#     has the inherited list, under which any user could add files and
+#     directories. It gets $RootSddl, which the entries below inherit, and
+#     then every entry is checked: one that a user owns is one the user
+#     created, and the user can still change it. Refused, by name.
+# The access list goes on before the walk, so that no entry can be added
+# behind it. Returns $true when it replaced an access list.
+function Protect-StateRoot {
+    $advice = 'Nothing was installed or changed. From an elevated prompt, look at what is there, delete what a standard user put there (or the whole directory, when nothing is installed), and run this again.'
+    if (-not (Test-Path -LiteralPath $Root)) {
+        $sd = New-Object Security.AccessControl.DirectorySecurity
+        $sd.SetSecurityDescriptorSddlForm($RootSddl, 'Owner, Group, Access')
+        [void][IO.Directory]::CreateDirectory($Root, $sd)
+    }
+    # Checked also for the directory just made: CreateDirectory succeeds on
+    # one that somebody else made in the meantime.
+    $item = Get-Item -LiteralPath $Root -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$Root is a file or a link, not a directory. $advice"
+    }
+    $acl = Get-Acl -LiteralPath $Root
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -notcontains $owner) {
+        throw "The state directory $Root is owned by $(Get-SidName $owner), not by Administrators or SYSTEM. A standard user made it, and nothing in it can be trusted. $advice"
+    }
+    $changed = $false
+    if (-not $acl.AreAccessRulesProtected -or (Get-StateProblem $Root)) {
+        $acl.SetSecurityDescriptorSddlForm($RootSddl, 'Owner, Group, Access')
+        Set-Acl -LiteralPath $Root -AclObject $acl
+        $changed = $true
+        $acl = Get-Acl -LiteralPath $Root
+    }
+    $problem = Get-StateProblem $Root
+    if ($problem -or -not $acl.AreAccessRulesProtected) {
+        throw "Could not protect the state directory $Root ($problem; access list $($acl.GetSecurityDescriptorSddlForm('Access'))). $advice"
+    }
+    $problems = @(Get-StateTreeProblems)
+    if ($problems.Count) {
+        throw "The state directory $Root holds entries that a standard user owns or can change: $($problems -join '; '). $advice"
+    }
+    return $changed
+}
 
 # Take ownership of a protected system file (owned by TrustedInstaller) so
 # Administrators and SYSTEM can rename and replace it.
@@ -1105,10 +1217,12 @@ if ($Mode -eq 'Status') {
 if (-not [Environment]::Is64BitProcess) { throw 'Run this script in 64-bit PowerShell (Install.cmd does).' }
 if (-not (Test-Admin)) { throw 'Run this from an elevated (administrator) prompt.' }
 
-New-Item -ItemType Directory -Path $Root -Force | Out-Null
 $mutex = New-Object Threading.Mutex($false, 'Global\vmlab-win3d-setup')
 [void]$mutex.WaitOne()
 try {
+    $relocked = Protect-StateRoot
+    $RootTrusted = $true
+    if ($relocked) { Write-Journal "state directory ${Root}: replaced the inherited access list with $RootSddl" }
     $state = Get-State
     $status = if ($state.Contains('status')) { $state['status'] } else { 'NotInstalled' }
     switch ($Mode) {
@@ -1174,7 +1288,7 @@ try {
     $msg = $_.Exception.Message
     Write-Journal "ERROR: $msg"
     Write-Journal ($_.ScriptStackTrace -replace "`r?`n", ' | ')
-    if (Test-Path -LiteralPath $Root) {
+    if ($RootTrusted) {
         $s = Get-State
         $keep = @{ last_error = $msg }
         if (-not $s.Contains('status') -or $s['status'] -notin 'Installed', 'Removed') { $keep['status'] = 'Failed' }
@@ -1182,6 +1296,8 @@ try {
     }
     if ($Mode -eq 'Resume') { Unregister-Task $ResumeTask }
     [Console]::Error.WriteLine("vmlab-win3d: $msg")
+    # 3: the state directory was refused and nothing was read or written.
+    if (-not $RootTrusted) { exit 3 }
     exit 1
 } finally {
     $mutex.ReleaseMutex()

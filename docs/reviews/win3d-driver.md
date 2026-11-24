@@ -152,6 +152,23 @@ for a guest that is not x86.
   without the pre-made directory: as `u`, create `state.json.tmp` before the
   install, and after it check with `icacls` who owns `state.json`.
 - Severity: security against a hostile guest user (standard user to SYSTEM).
+- Fixed: card #753. The installer creates the directory with a protected
+  access list (SYSTEM and Administrators full control, Users read), replaces
+  the inherited list of an older install, and stops with exit code 3,
+  before it reads or writes anything there, on a directory or an entry that
+  a standard user owns or can change (`Protect-StateRoot` in
+  `guest/win3d/installer/vmlab-win3d.ps1`). The proof is
+  `guest/win3d/tests/installer/statedir-probe.sh`, and
+  `guest/win3d/docs/acceptance/C753.md` has the runs on a Windows 11 guest:
+  with the installer of `next`, route 1 wrote `nt authority\system` into the
+  proof file and route 2 gave the user the ownership of
+  `state.json`. With the fix the install on the user's directory is
+  refused and every attempt of the user is denied. Two corrections to the
+  text above, from those runs. The statement about `C:\ProgramData` under
+  "How the review was done" is confirmed. Route 2 is narrower than stated:
+  the user owns `state.json` only until the next write of the state, which
+  makes a new file, so the fault shows after a run that writes the state
+  once (a failed run) or inside the window between two writes.
 
 ### F3. The capset id of the escape is not bounded before it indexes an array
 
@@ -220,6 +237,17 @@ for a guest that is not x86.
   a special-pool bugcheck or silent corruption of the VidPN object.
 - Severity: security against a hostile host (a write past a kernel object),
   and crash on a host with a legal configuration.
+- State: fixed by card #754 with
+  `guest/win3d/patches/kmd/kmd-bound-host-scanout-count.patch`. The driver
+  clamps the count to `MAX_CHILDREN` where it reads it, both loops stop at the
+  array, and the two readers refuse an id the response has no room for. The
+  proof ran on a Windows 11 guest against a vmlab-hv built to report two
+  scanouts (`guest/win3d/docs/acceptance/C754.md`): the probe fails with the
+  driver before the fix and passes with it. One part of the claim did not
+  hold: the true vmlab-hv is not such a host. The driver never acks
+  `VIRTIO_GPU_F_EDID`, and vmlab-hv refuses `GET_EDID` without the ack, so on
+  vmlab-hv no EDID is copied at all, whatever the count. QEMU answers
+  without the ack.
 
 ### F6. The capset size of the host wraps the response size, and the escape then copies the unwrapped size
 
@@ -271,6 +299,13 @@ for a guest that is not x86.
   probe's colour.
 - Severity: security against a hostile guest program (it replaces what the
   screen shows), and wrong result.
+- Status: fixed by card #755.
+  `guest/win3d/patches/kmd/kmd-scanout-only-for-its-owner.patch` refuses the
+  flip command in a render stream with `STATUS_PRIVILEGED_INSTRUCTION`, and
+  serves the escape only for the process that Windows gave the scanout
+  (`STATUS_ACCESS_DENIED` for every other). The escape was not removed: the
+  user-mode driver shows the frames of a fullscreen application with it.
+  `guest/win3d/docs/acceptance/C755.md` has the proof, before and after.
 
 ### F8. A present that a user can make fail is mapped in Patch, where a failure is a bugcheck
 
@@ -334,6 +369,24 @@ for a guest that is not x86.
 - Severity: crash of the helper. Security against a hostile guest user only
   if the test of the pipe's access list shows that a standard user can reach
   either end.
+- Fixed: card #757,
+  `guest/win3d/patches/kmd/kmd-read-helper-pipe-message-inside-buffer.patch`
+  (driver `100.6.101.58120`). Both helpers read a message through one
+  function that counts in bytes, keeps the buffer a terminated string and
+  drops a message that does not fit, and `DATA_BUFFER_SIZE` has its
+  parentheses. The proof is `guest/win3d/probes/pipe`, the two classes linked
+  with `pipe.cpp` before and after the patch and run as a standard user in a
+  Windows 11 guest (`guest/win3d/docs/acceptance/C757.md`): before, 7 of 7
+  cases fail, a message of 3000 bytes writes 952 bytes past the buffer of
+  `PipeServer`, and the thread the service runs dies with a heap corruption.
+  After, 7 of 7 pass. Three corrections to the text above, from those runs.
+  AddressSanitizer is not what shows the overflow: the kernel writes the
+  bytes, so the probe counts them in a guard region behind the buffer. The
+  overflow of `viogpuap.exe` needs a handle in message read mode, and
+  `viogpuap.exe` leaves its handle in byte read mode. What it had is a
+  string without an end. And the access question is answered: a standard
+  user is denied when it opens the pipe of the service for writing, and is
+  let in for reading.
 
 ### F10. A failed allocation in CreateAllocation is dereferenced
 
@@ -349,6 +402,23 @@ for a guest that is not x86.
   calls `D3DKMTCreateAllocation` with `NumAllocations = 2`, and the test
   passes when the call fails or both allocations work.
 - Severity: crash.
+- Fixed: card #757,
+  `guest/win3d/patches/kmd/kmd-check-create-allocation-memory.patch` (driver
+  `100.6.101.58120`). `DxgkCreateAllocation` returns
+  `STATUS_INSUFFICIENT_RESOURCES` for a NULL result, the pool `operator new`
+  of the driver is `noexcept`, and a `NumAllocations` other than 1 is
+  `STATUS_INVALID_PARAMETER`. The proof is `guest/win3d/probes/alloc` under
+  Driver Verifier's low resources simulation, as a standard user
+  (`guest/win3d/docs/acceptance/C757.md`): the old driver bugchecks the
+  guest with `0x3B` at the first failed pool allocation, after 602 calls
+  that succeeded. With the fix 200 calls fail, all with
+  `STATUS_INSUFFICIENT_RESOURCES`, and the guest stays up. Two corrections
+  to the text above, from those runs. The fault is not at the call of
+  `IsValid()`: clang runs the constructor on the NULL pointer first, at this
+  and at every other `new` of an object in the driver, so a NULL check alone
+  is no fix. And the second half is no crash: a call with
+  `NumAllocations = 2` fails with `STATUS_INVALID_PARAMETER` on the old
+  driver too.
 
 ## Notes
 
