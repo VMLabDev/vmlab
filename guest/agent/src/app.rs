@@ -1015,11 +1015,7 @@ mod parking {
     /// The name must not exist: `O_EXCL` refuses a symlink the session's
     /// account planted there instead of writing through it, and the chown
     /// is of the descriptor, never of the name (review guest-agents-2 G1).
-    fn write_private(
-        path: &Path,
-        bytes: &[u8],
-        owner: Option<(u32, u32)>,
-    ) -> std::io::Result<()> {
+    fn write_private(path: &Path, bytes: &[u8], owner: Option<(u32, u32)>) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()

@@ -1078,7 +1078,11 @@ fn a_sessions_socket_and_cookie_are_private_from_their_creation() {
 
     let wayland = home("wayland");
     let _bound = listen(&wayland, &Protocol::Waypipe).unwrap();
-    assert!(private(&wayland.dir.join("wp.sock")).file_type().is_socket());
+    assert!(
+        private(&wayland.dir.join("wp.sock"))
+            .file_type()
+            .is_socket()
+    );
 
     let x11 = home("x11");
     let _bound = listen(
