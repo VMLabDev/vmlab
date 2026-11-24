@@ -2479,6 +2479,7 @@ pub(crate) mod tests {
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,

@@ -730,7 +730,7 @@ fn install_built_variant(
         // The caller asked at the swap, with the build's own check
         // (`refuse_in_use`).
         &|_| None,
-        &|| {
+        &|_| {
             anyhow::ensure!(!cancel.is_cancelled(), "build cancelled");
             Ok(())
         },
@@ -776,6 +776,7 @@ fn variant_meta(v: &TemplateVariantDef, image: VariantImage) -> super::meta::Var
         sha256: image.sha256,
         base_sha256: image.base_sha256,
         description: v.description.clone(),
+        replace_fields: false,
         first_boot_script: image.first_boot_script,
         agent_version: image.agent_version,
         wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),
@@ -4105,6 +4106,7 @@ template "t" { arch = "x86_64" version = "1" disk = 10GiB source "scratch" {}
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
@@ -4540,6 +4542,7 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
                 sha256: "cd".repeat(32),
                 base_sha256: base_sha.clone(),
                 description: None,
+                replace_fields: false,
                 first_boot_script: Some(format!("{name} script")),
                 agent_version: None,
                 wscript_surface: Some(crate::scripting::WSCRIPT_SURFACE_VERSION),

@@ -1,4 +1,4 @@
-//! Crash cleanup for staging directories shared by multiple vmlab processes.
+//! Crash cleanup for staging directories and temporary files.
 
 use std::fs::{self, File, Permissions};
 use std::io;
@@ -59,6 +59,30 @@ pub(crate) fn sweep(root: &Path, prefix: &str) -> Result<usize> {
                 && reap(&entry.path())
         })
         .count())
+}
+
+/// Remove only regular files whose names match a writer's temporary format.
+/// The caller excludes concurrent writers.
+pub(crate) fn sweep_files(root: &Path, matches: impl Fn(&str) -> bool) -> Result<usize> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
+        if entry.file_name().to_str().is_some_and(&matches) && entry.file_type()?.is_file() {
+            let path = entry.path();
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), %err, "could not remove temporary file")
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn reap(path: &Path) -> bool {
