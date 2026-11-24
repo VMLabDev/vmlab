@@ -680,6 +680,18 @@ impl HostUsbDevice {
                     }
                 })
             }
+            // These three change state the host kernel tracks for the
+            // device. In any other shape (another recipient, the IN
+            // direction) they are not valid requests, and a device that
+            // decodes by bRequest alone would still act on them behind the
+            // kernel's back. They are refused here and never forwarded.
+            (
+                StandardControlRequest::SetAddress
+                | StandardControlRequest::SetConfiguration
+                | StandardControlRequest::SetInterface,
+                _,
+                _,
+            ) => Some(UsbTransfer::Stall),
             _ => None,
         }
     }
