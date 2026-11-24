@@ -134,6 +134,9 @@ pub struct NatEngine {
     /// is held under [`MAX_TCP_FLOWS`]. Engine-originated flows (port
     /// forwards) are in `tcp_flows` but not here: no guest opens them.
     tcp_passive: StdMutex<HashMap<Ipv4Addr, usize>>,
+    /// The slots of [`MAX_FORWARDED_TCP`]: one per connection a TCP port
+    /// forward holds, taken and given back by the forward's listener.
+    forwarded_tcp: Arc<tokio::sync::Semaphore>,
     /// Outbound UDP NAT flows.
     udp_flows: StdMutex<HashMap<FlowKey, udp::UdpFlow>>,
     /// Engine-bound UDP flows for [`Self::udp_bind_guest_flow`], keyed
@@ -174,6 +177,14 @@ pub(super) const MAX_TCP_FLOWS: usize = 256;
 /// How many of [`MAX_TCP_FLOWS`] one guest address may hold, so that one
 /// guest cannot take every slot of its segment.
 pub(super) const MAX_TCP_FLOWS_PER_GUEST: usize = 128;
+
+/// How many connections the TCP port forwards of one engine hold at once
+/// (review networking-2 F28). [`MAX_TCP_FLOWS`] counts what guests open and
+/// this counts the other side: a connection to a forwarded port is a host
+/// socket, a task and a vTCP flow too, opened by whoever reaches the
+/// listener. One forward takes at most `forward::MAX_TCP_PER_FORWARD` of
+/// them.
+pub(super) const MAX_FORWARDED_TCP: usize = 256;
 
 /// One guest-opened vTCP flow's place under [`MAX_TCP_FLOWS`], held by the
 /// flow task for as long as it runs.
@@ -222,6 +233,7 @@ impl NatEngine {
             output,
             tcp_flows: StdMutex::new(HashMap::new()),
             tcp_passive: StdMutex::new(HashMap::new()),
+            forwarded_tcp: Arc::new(tokio::sync::Semaphore::new(MAX_FORWARDED_TCP)),
             udp_flows: StdMutex::new(HashMap::new()),
             guest_udp: StdMutex::new(HashMap::new()),
             macs: StdMutex::new(GuestMacs {

@@ -45,6 +45,11 @@ impl Packet {
     pub fn for_port(&self, mode: FramingMode, mtu: u16) -> io::Result<Vec<Self>> {
         match mode {
             FramingMode::Vnet { queue_pairs } if queue_pairs != 0 => {
+                // What a vnet stream cannot carry is refused here, where the
+                // switch drops that one frame, and not in the port's writer
+                // (review networking-2 F24). A raw port accepts a longer
+                // frame than this.
+                self.header.validate(&self.frame)?;
                 let mut packet = self.clone();
                 packet.queue = (flow_hash(&packet.frame) % u32::from(queue_pairs)) as u16;
                 Ok(vec![packet])
@@ -96,13 +101,15 @@ pub(crate) async fn read_packet<R: AsyncRead + Unpin>(
     }))
 }
 
-pub(crate) async fn write_packet<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    packet: &Packet,
-    mode: FramingMode,
-) -> io::Result<()> {
+/// Whether `packet` can be written to a port in `mode` at all: what
+/// [`write_packet`] refuses before it writes a byte.
+pub(crate) fn check_packet(packet: &Packet, mode: FramingMode) -> io::Result<()> {
     match mode {
-        FramingMode::Raw => write_frame(w, &packet.frame).await,
+        FramingMode::Raw if packet.frame.len() > MAX_FRAME_LEN => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds maximum length",
+        )),
+        FramingMode::Raw => Ok(()),
         FramingMode::Vnet { queue_pairs } => {
             packet.header.validate(&packet.frame)?;
             if packet.queue >= queue_pairs {
@@ -111,6 +118,20 @@ pub(crate) async fn write_packet<W: AsyncWrite + Unpin>(
                     "invalid vnet queue id",
                 ));
             }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) async fn write_packet<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    packet: &Packet,
+    mode: FramingMode,
+) -> io::Result<()> {
+    check_packet(packet, mode)?;
+    match mode {
+        FramingMode::Raw => write_frame(w, &packet.frame).await,
+        FramingMode::Vnet { .. } => {
             let len = (METADATA_LEN + packet.frame.len()) as u32;
             w.write_all(&len.to_be_bytes()).await?;
             w.write_all(&packet.header.metadata(packet.queue)).await?;
