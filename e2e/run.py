@@ -42,6 +42,7 @@ SCENARIOS = [
     "macos",
     "network",
     "containers",
+    "container_workdir",
     "snapshots",
     "worktree",
     "scripting",
@@ -123,8 +124,8 @@ def main() -> int:
     registry = start_registry()
     try:
         if (h.hypervisor != "qemu" and "template" not in runnable
-                and any(n not in ("legacy", "macos") for n in runnable)):
-            # Every other scenario boots the e2e template; build it without
+                and any(n not in ("legacy", "macos", "container_workdir") for n in runnable)):
+            # Build the e2e template for scenarios that need it without
             # reporting on it.
             h.scenario = "base"
             print("== base template", flush=True)

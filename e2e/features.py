@@ -149,6 +149,7 @@ FEATURES: dict[str, str] = {
     "share.unmountable": "`vmlab up` warns, before saying the lab is up, about a share that will not mount",
     # -- containers --------------------------------------------------------
     "container.up": "an OCI container runs as a micro-VM",
+    "container.workdir": "a missing container `workdir` is created at launch",
     "container.idle": "`mode = :idle`",
     "container.env": "container `env`",
     "container.volume": "container `volume` (host path and named)",
@@ -250,7 +251,7 @@ _GROUPS: dict[str, list[str]] = {
     ],
     # Container micro-VMs.
     "1": [
-        "container.up", "container.idle", "container.env", "container.volume", "container.port",
+        "container.up", "container.workdir", "container.idle", "container.env", "container.volume", "container.port",
         "container.healthcheck", "container.exec", "container.logs", "container.shell", "container.power",
         "snapshot.container", "snapshot.clock.kept", "snapshot.clock.fixed",
         "dev.sync.host-to-guest", "dev.sync.guest-to-host", "dev.sync.modes", "dev.sync.status-flush",
