@@ -1079,7 +1079,7 @@ impl VmShared {
     /// BAR programmed over it does not take the access.
     fn in_pci_window(&self, addr: u64) -> bool {
         if self.mch.lock().is_some() {
-            return true;
+            return !self.mmio_bus.lock().covers(addr);
         }
         let ((b32, e32), (b64, e64)) = self.pci_windows;
         (b32 <= addr && addr < e32) || (b64 <= addr && addr < e64) || !self.vfio.lock().is_empty()
