@@ -46,6 +46,18 @@ endef
 
 $(foreach a,$(ARCHES),$(eval $(call tdr_rules,$(a))))
 
+# Explicit test-only target, like tdr: the command sizes of the submit
+# escape (card #752). A driver without the fix can bugcheck the guest.
+submit: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/submit_probe.exe)
+
+define submit_rules
+$(OUT)-extra/$(1)/submit_probe.exe: submit/submit_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call submit_rules,$(a))))
+
 $(BUILD)/gen/vulkan_shaders.h: vulkan/probe.vert vulkan/probe.frag
 	@mkdir -p $(dir $@)
 	glslangValidator -V --vn probe_vert_spv -o $(BUILD)/gen/vert.h vulkan/probe.vert
@@ -77,3 +89,4 @@ clean:
 	rm -rf $(BUILD) $(OUT)/deps $(foreach a,$(ARCHES),$(OUT)/$(a))
 
 .PHONY: all clean tdr
+.PHONY: submit
