@@ -2384,8 +2384,7 @@ impl LabRuntime {
         for skip in &plan.skipped {
             output(format!("{}: {}\n", skip.what, skip.why));
         }
-        // A global segment's DHCP is the supervisor's, and it may have had
-        // to refuse a static address or an MTU this lab declared (§9.2).
+        // Report attach failures and declarations the supervisor refused (§9.2).
         for warning in self.network.lock().await.global_warnings() {
             output(format!("warning: {warning}\n"));
         }
