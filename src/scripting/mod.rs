@@ -592,7 +592,10 @@ impl MachineHandle {
                     self.name()
                 ));
             }
-            cancel::sleep("interval_ms", Duration::from_millis(interval_ms.max(50) as u64))?;
+            cancel::sleep(
+                "interval_ms",
+                Duration::from_millis(interval_ms.max(50) as u64),
+            )?;
         }
     }
 }
@@ -624,7 +627,9 @@ fn script_duration(argument: &str, duration: Duration) -> Result<Duration, Strin
     // Bound the wait even when the platform's clock can represent it.
     const MAX_SCRIPT_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
     if duration > MAX_SCRIPT_DURATION {
-        return Err(format!("{argument} of {duration:?} exceeds the maximum of 365 days"));
+        return Err(format!(
+            "{argument} of {duration:?} exceeds the maximum of 365 days"
+        ));
     }
     Ok(duration)
 }
@@ -950,10 +955,10 @@ pub fn lab_module() -> Module {
         .method(
             "wait_shutdown",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
-                h.block(h.machine.wait_state(
-                    PowerState::Stopped,
-                    script_timeout(timeout_secs, 0)?,
-                ))
+                h.block(
+                    h.machine
+                        .wait_state(PowerState::Stopped, script_timeout(timeout_secs, 0)?),
+                )
                 .map_err(estr)
             },
         )
