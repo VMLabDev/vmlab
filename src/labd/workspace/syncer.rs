@@ -122,7 +122,9 @@ fn reconciliation_lock_dir() -> PathBuf {
 }
 
 fn reconciliation_lock_path(dir: &Path, root: &Path) -> PathBuf {
-    dir.join(hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes())))
+    dir.join(hex::encode(Sha256::digest(
+        root.as_os_str().as_encoded_bytes(),
+    )))
 }
 
 // Share ancestor locks and take the root lock exclusively. Acquiring from
