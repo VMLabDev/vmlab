@@ -756,7 +756,11 @@ fn a_name_that_is_not_utf8_is_refused_or_round_trips() {
     };
     ask(&mux, 9, 2, Op::ReadDir { handle });
     match cap.fileops(9).0.reply {
-        Reply::Error { msg, .. } => assert!(msg.contains("UTF-8"), "{msg}"),
+        Reply::Error { code, msg } => {
+            assert!(msg.contains("UTF-8"), "{msg}");
+            ask(&mux, 9, 3, Op::ReadDir { handle });
+            assert_eq!(cap.fileops(9).0.reply, Reply::Error { code, msg });
+        }
         Reply::Entries { entries, .. } => {
             assert_eq!(entries.len(), 1);
             ask(
@@ -771,6 +775,20 @@ fn a_name_that_is_not_utf8_is_refused_or_round_trips() {
             assert!(matches!(reply, Reply::Attrs { .. }), "{reply:?}");
         }
         other => panic!("expected entries or an encoding error, got {other:?}"),
+    }
+
+    std::os::unix::fs::symlink(OsStr::from_bytes(b"a\xffb"), dir.path().join("link")).unwrap();
+    ask(
+        &mux,
+        9,
+        4,
+        Op::Readlink {
+            path: format!("{root}/link"),
+        },
+    );
+    match cap.fileops(9).0.reply {
+        Reply::Error { msg, .. } => assert!(msg.contains("UTF-8"), "{msg}"),
+        other => panic!("expected a symlink target encoding error, got {other:?}"),
     }
 }
 
