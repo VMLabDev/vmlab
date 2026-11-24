@@ -9,7 +9,7 @@ use std::process::Command;
 
 use nix::mount::{MsFlags, mount};
 
-use crate::util::{Ctx, Result, in_root, write_in_root};
+use crate::util::{Ctx, Result, copy_in_root, in_root, write_in_root};
 
 /// Container rootfs mount point (overlay of squashfs + scratch).
 pub const ROOTFS: &str = "/rootfs";
@@ -245,35 +245,38 @@ pub fn mount_rootfs_runtime() -> Result<()> {
 /// the scratch upper layer, never the read-only image). Failures only cost
 /// the fallback.
 pub fn install_shell_fallback() {
-    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = install_shell_fallback_in(ROOTFS, "/bin/busybox") {
+        eprintln!("vmlab-cinit: warning: busybox shell fallback not installed: {e}");
+    }
+}
+
+/// [`install_shell_fallback`] for the container root `root`, from the
+/// busybox binary at `busybox`.
+fn install_shell_fallback_in(root: &str, busybox: &str) -> Result<()> {
     use std::os::unix::fs::symlink;
     // Paths resolved inside the rootfs (F56): an image's own `/.vmlab`
     // symlink must not aim this copy at the initramfs.
-    let result = (|| -> Result<()> {
-        rootfs_dir("/.vmlab")?;
-        let dest = in_root(ROOTFS, vmlab_agent_proto::BUSYBOX_FALLBACK)?;
-        fs::copy("/bin/busybox", &dest).ctx("copy busybox")?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).ctx("chmod busybox")?;
-        let bin_dir = rootfs_dir(vmlab_agent_proto::BUSYBOX_BIN_DIR)?;
-        let output = Command::new("/bin/busybox")
-            .arg("--list")
-            .output()
-            .ctx("run busybox --list")?;
-        if !output.status.success() {
-            return Err("busybox --list failed".into());
-        }
-        for applet in String::from_utf8_lossy(&output.stdout).lines() {
-            match symlink("../busybox", bin_dir.join(applet)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("link {applet}: {e}")),
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = result {
-        eprintln!("vmlab-cinit: warning: busybox shell fallback not installed: {e}");
+    ensure_dir(&in_root(root, "/.vmlab")?)?;
+    // Not `fs::copy` (F7): the image, or an earlier run's scratch layer, can
+    // hold a FIFO or a device node at this name.
+    copy_in_root(root, busybox, vmlab_agent_proto::BUSYBOX_FALLBACK, 0o755)?;
+    let bin_dir = in_root(root, vmlab_agent_proto::BUSYBOX_BIN_DIR)?;
+    ensure_dir(&bin_dir)?;
+    let output = Command::new(busybox)
+        .arg("--list")
+        .output()
+        .ctx("run busybox --list")?;
+    if !output.status.success() {
+        return Err("busybox --list failed".into());
     }
+    for applet in String::from_utf8_lossy(&output.stdout).lines() {
+        match symlink("../busybox", bin_dir.join(applet)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("link {applet}: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// Write /etc/hostname and /etc/hosts inside the rootfs and set the (shared —
@@ -325,5 +328,25 @@ mod tests {
         let short = dir.path().join("short");
         fs::write(&short, b"tiny").unwrap();
         assert!(!has_ext4_superblock(&short).unwrap());
+    }
+
+    /// F7: a FIFO where the fallback busybox goes, shipped in the image or
+    /// left in the scratch layer, is refused. Opening it for writing would
+    /// block PID 1 until a reader came, and none does.
+    #[test]
+    fn shell_fallback_refuses_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        let busybox = dir.path().join("busybox");
+        fs::write(&busybox, b"busybox bytes").unwrap();
+        let fifo = in_root(root.to_str().unwrap(), vmlab_agent_proto::BUSYBOX_FALLBACK).unwrap();
+        fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
+
+        let err = install_shell_fallback_in(root.to_str().unwrap(), busybox.to_str().unwrap())
+            .unwrap_err();
+        assert!(err.contains(vmlab_agent_proto::BUSYBOX_FALLBACK), "{err}");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
     }
 }
