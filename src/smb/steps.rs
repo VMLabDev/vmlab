@@ -109,6 +109,7 @@ impl MountPlan {
 /// and for which XP-versus-modern is irrelevant.
 pub fn guest_os_hint(profile: Option<&str>) -> OsHint {
     match profile {
+        Some("windows-9x") => OsHint::Windows9x,
         Some("windows-legacy" | "windows-xp") => OsHint::WindowsXp,
         Some(p) if p.starts_with("windows") => OsHint::Windows,
         Some(p) if p.starts_with("macos") => OsHint::Macos,
@@ -148,16 +149,20 @@ fn virtiofs_plan(os_hint: OsHint, mounts: &[VirtiofsMount]) -> MountPlan {
         secret: None,
     };
     match os_hint {
-        // XP-era guests have no vmlab agent to run commands through and no
-        // WinFsp to mount a vhost-user-fs device with. A virtiofs share on
-        // one is a declaration that cannot be honoured — say so rather than
-        // emitting Linux commands at a Windows guest, which is what fell out
-        // of the old orchestrator's `if windows` fork.
+        // These profiles have no WinFsp to mount a vhost-user-fs device.
         OsHint::WindowsXp => {
             for m in mounts {
                 unsupported.push(format!(
-                    "virtiofs share \"{}\": XP-era guests have neither the vmlab agent nor \
-                     WinFsp — mount it over smb instead (transport = \"smb\")",
+                    "virtiofs share \"{}\": XP-era guests lack WinFsp — mount it over smb \
+                     instead (transport = \"smb\")",
+                    m.tag
+                ));
+            }
+        }
+        OsHint::Windows9x => {
+            for m in mounts {
+                unsupported.push(format!(
+                    "virtiofs share \"{}\": the windows-9x profile has no virtiofs client",
                     m.tag
                 ));
             }
@@ -281,6 +286,7 @@ mod tests {
         assert_eq!(guest_os_hint(Some("windows-desktop")), OsHint::Windows);
         assert_eq!(guest_os_hint(Some("windows-legacy")), OsHint::WindowsXp);
         assert_eq!(guest_os_hint(Some("windows-xp")), OsHint::WindowsXp);
+        assert_eq!(guest_os_hint(Some("windows-9x")), OsHint::Windows9x);
         assert_eq!(guest_os_hint(Some("linux-modern")), OsHint::Linux);
         assert_eq!(guest_os_hint(Some("macos")), OsHint::Macos);
         assert_eq!(guest_os_hint(None), OsHint::Linux);
@@ -378,10 +384,7 @@ mod tests {
         );
     }
 
-    /// The divergence between the guest-OS classifications, made deliberate:
-    /// an XP-era guest has neither the agent to run commands through nor
-    /// WinFsp to mount with, so a virtiofs share on one is reported as
-    /// unmountable rather than issued as commands that cannot work.
+    /// XP-era guests lack WinFsp, so a virtiofs share is reported as unmountable.
     #[test]
     fn a_legacy_windows_guest_cannot_mount_virtiofs_and_says_so() {
         let plan = mount_plan(OsHint::WindowsXp, &mounts(), Vec::new());
