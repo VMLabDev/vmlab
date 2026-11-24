@@ -3607,7 +3607,7 @@ mod tests {
         let ManifestOrIndex::Index(index) = parse_manifest_or_index(&tagged.body).unwrap() else {
             panic!("expected the tag to hold an index");
         };
-        let preserved = index.select_arch("aarch64").unwrap();
+        let preserved = index.manifest_for_arch("aarch64").unwrap();
         assert_eq!(preserved.digest, digest_of(&original));
         assert_eq!(preserved.size, original.len() as u64);
     }
