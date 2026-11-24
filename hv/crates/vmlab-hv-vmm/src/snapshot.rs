@@ -425,6 +425,12 @@ fn capture_and_write(
     // vCPUs are parked on it and the chipset already latched the request, so
     // a snapshot without it restores a guest that waits for a reset forever.
     sections.push((RESET_PENDING.into(), to_json(&shared.reset_pending())?));
+    if let Some(pm) = shared
+        .save_direct_kernel_pm()
+        .map_err(SnapshotError::Internal)?
+    {
+        sections.push(pm);
+    }
     audit::write(shared, "save");
     let head = format::encode_header_sections(
         run_code(was),
@@ -986,6 +992,13 @@ fn restore(
         .transpose()?
         .unwrap_or(false);
     shared.restore_reset_pending(reset_pending);
+    // The guest enables the power button event once, at boot. A snapshot
+    // from before this section existed leaves the block as it is.
+    if let Some(pm) = sections.get(crate::pm::PM_STATE_ID) {
+        shared
+            .restore_direct_kernel_pm(pm)
+            .map_err(SnapshotError::Internal)?;
+    }
     Ok(header.run_state)
 }
 

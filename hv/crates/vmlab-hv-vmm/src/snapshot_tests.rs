@@ -496,6 +496,41 @@ fn save_carries_a_pending_guest_reset() {
     assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
 }
 
+/// vmm-core review F10: the direct-kernel ACPI PM block is machine state.
+/// The guest enables the power button event once at boot, so a load that
+/// keeps the loading process's PM1a_EN leaves `powerdown` with no SCI.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn snapshot_preserves_pm1_enable() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    m.handle.pause().expect("pause");
+    let shared = m.handle.shared();
+    let pm1 = |port: u16| {
+        let mut word = [0u8; 2];
+        shared.io_read(port, &mut word);
+        u16::from_le_bytes(word)
+    };
+    // PWRBTN_EN, and a sleep type in PM1a_CNT without SLP_EN.
+    shared.io_write(0x602, &[0, 1]);
+    shared.io_write(0x604, &[0, 0x04]);
+    m.handle.powerdown().expect("powerdown");
+    assert_eq!(pm1(0x600), 0x8100, "WAK and PWRBTN status before the save");
+    snapshot::save(&m.handle, "pm").expect("save");
+
+    // The process that loads: nothing enabled, the button status cleared.
+    shared.io_write(0x602, &[0, 0]);
+    shared.io_write(0x604, &[0, 0]);
+    shared.io_write(0x600, &[0, 1]);
+    assert_eq!(pm1(0x600), 0x8000);
+    snapshot::load(&m.handle, "pm").expect("load");
+
+    assert_eq!(pm1(0x602), 0x0100, "PM1a_EN after the load");
+    assert_eq!(pm1(0x600), 0x8100, "PM1a_STS after the load");
+    assert_eq!(pm1(0x604), 0x0400, "PM1a_CNT after the load");
+}
+
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn load_clears_pages_that_were_zero_at_save() {
