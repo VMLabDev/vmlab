@@ -7121,6 +7121,64 @@ lab "t" {
 
     const FIRST_BOOT: &str = "use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(300)\n}\n";
 
+    #[tokio::test(start_paused = true)]
+    async fn a_first_boot_past_its_timeout_stops_its_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(
+            dir.path(),
+            &sh,
+            r#"use vmlab
+fn main(lab: Lab) {
+    let m = lab.this_vm().expect("vm")
+    lab.log("at the gate")
+    let w = m.wait_shutdown(100000)
+    lab.log("still here")
+    let s = m.start()
+}
+"#,
+        );
+        lab.start_machine("win").await.unwrap();
+        let m = lab.machine("win").unwrap();
+        m.wait_agent_up(m.ready_timeout()).await.unwrap();
+
+        let (sink, said) = numbered(&sh);
+        let (entered, at_gate) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(Some((entered, held)));
+        let output: crate::scripting::OutputSink = Arc::new(move |line| {
+            if line == "at the gate\n" {
+                let (entered, held) = gate.lock().unwrap().take().unwrap();
+                entered.send(()).unwrap();
+                let _ = held.recv();
+            }
+            sink(line);
+        });
+        let mut run = std::pin::pin!(lab.run_first_boot(&m, &output));
+        assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        at_gate.await.unwrap();
+        // The output sink holds the blocking thread while Tokio delivers the deadline.
+        tokio::time::sleep(Duration::from_secs(1801)).await;
+        let at_deadline =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await;
+        let claimed = lab.first_boots.lock_recover().contains("win");
+        release.send(()).unwrap();
+
+        assert!(at_deadline.is_pending(), "timeout returned with a live script");
+        assert!(claimed, "first-boot claim released with a live script");
+        let err = run.await.unwrap_err();
+        assert_eq!(err.to_string(), "first-boot win: timed out after 1800s");
+        assert!(m.pending_first_boot().is_some());
+        assert!(lab.first_boots.lock_recover().is_empty());
+        assert!(!said.lock().unwrap().iter().any(|(_, s)| s == "still here\n"));
+        assert_eq!(
+            sh.log.lock().await.iter().filter(|s| s.ends_with(":win:start")).count(),
+            1
+        );
+    }
+
     /// A start outside `up` runs a first boot the clone still owes, as `up`
     /// would, and the machine ends ready; once run, it is not run again (V6).
     #[tokio::test]
