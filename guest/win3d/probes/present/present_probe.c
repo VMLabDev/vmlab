@@ -145,63 +145,6 @@ typedef struct {
     ULONG broadcast_context_count;
 } present_head;
 
-/* D3DKMT_QUERYRESOURCEINFO */
-typedef struct {
-    UINT device;
-    UINT global_share;
-    void *private_runtime_data;
-    UINT private_runtime_data_size;
-    UINT total_private_driver_data_size;
-    UINT resource_private_driver_data_size;
-    UINT num_allocations;
-} query_resource_info;
-
-/* D3DDDI_OPENALLOCATIONINFO2. Its first three members are
- * D3DDDI_OPENALLOCATIONINFO. */
-typedef struct {
-    UINT allocation; /* out */
-    const void *private_data;
-    UINT private_data_size;
-    uint64_t gpu_virtual_address;
-    ULONG_PTR reserved[6];
-} open_allocation_info;
-
-/* D3DKMT_OPENRESOURCE */
-typedef struct {
-    UINT device;
-    UINT global_share;
-    UINT num_allocations;
-    open_allocation_info *open_allocation_info;
-    void *private_runtime_data;
-    UINT private_runtime_data_size;
-    void *resource_private_driver_data;
-    UINT resource_private_driver_data_size;
-    void *total_private_driver_data_buffer;
-    UINT total_private_driver_data_buffer_size;
-    UINT resource; /* out */
-} open_resource;
-
-/* D3DKMT_PRESENT as far as its present history token for the Blt model
- * (D3DKMT_BLTMODEL_PRESENTHISTORYTOKEN), which is how a redirected Blt
- * tells the compositor what changed. */
-typedef struct {
-    present_head head;
-    UINT broadcast_context[64];
-    HANDLE present_limit_semaphore;
-    struct {
-        UINT model;
-        UINT token_size;
-        uint64_t composition_binding_id;
-        struct {
-            uint64_t logical_surface;
-            uint64_t physical_surface;
-            uint64_t event_id;
-            UINT num_rects;
-            RECT rects[16];
-        } blt;
-    } token;
-} present_request;
-
 typedef struct { UINT handle; } close_adapter;
 typedef LONG (WINAPI *enum_fn)(const enum_adapters *);
 typedef LONG (WINAPI *query_fn)(const query_adapter *);
@@ -212,14 +155,6 @@ typedef LONG (WINAPI *create_context_fn)(create_context *);
 typedef LONG (WINAPI *destroy_context_fn)(const destroy_context *);
 typedef LONG (WINAPI *create_allocation_fn)(create_allocation *);
 typedef LONG (WINAPI *present_fn)(void *);
-typedef LONG (WINAPI *query_resource_fn)(query_resource_info *);
-typedef LONG (WINAPI *open_resource_fn)(open_resource *);
-/* user32: the surface that the compositor reads a window from. The Direct3D
- * runtimes get the destination of a windowed Blt present this way. */
-typedef BOOL (WINAPI *dwm_surface_fn)(HWND, HANDLE *, LUID *, ULONG *, ULONG *, ULONGLONG *);
-/* dwmapi: the same for Windows 8 and later, where the compositor makes the
- * surface on the adapter that the caller names. */
-typedef HRESULT (WINAPI *dwm_dx_surface_fn)(HWND, LUID, HMONITOR, DWORD, ULONG *, HANDLE *, UINT64 *);
 typedef LONG (WINAPI *close_fn)(const close_adapter *);
 
 /* viogpu/shared/viogpum.h of the driver source. VIOGPU_ADAPTERINFO is not
@@ -275,9 +210,6 @@ _Static_assert(sizeof(viogpu_submit_cmd_req) == 12, "VIOGPU_SUBMIT_CMD_REQ ABI")
 _Static_assert(sizeof(create_context) == 96 && offsetof(create_context, context) == 32, "D3DKMT_CREATECONTEXT ABI");
 _Static_assert(sizeof(allocation_info) == 96 && offsetof(allocation_info, flags) == 32, "D3DDDI_ALLOCATIONINFO2 ABI");
 _Static_assert(sizeof(create_allocation) == 72 && offsetof(create_allocation, allocation_info) == 48, "D3DKMT_CREATEALLOCATION ABI");
-_Static_assert(sizeof(query_resource_info) == 32 && sizeof(open_resource) == 72 &&
-               offsetof(open_resource, resource) == 68 && sizeof(open_allocation_info) == 80, "D3DKMT_OPENRESOURCE ABI");
-_Static_assert(offsetof(present_request, token) == 360, "D3DKMT_PRESENT ABI");
 _Static_assert(offsetof(present_head, source) == 20 && offsetof(present_head, src_sub_rects) == 72 &&
                offsetof(present_head, flags) == 88, "D3DKMT_PRESENT ABI");
 #endif
@@ -299,9 +231,6 @@ enum {
     PRESENT_BLT = 1u << 0,
     PRESENT_DST_RECT_VALID = 1u << 6,
     PRESENT_SRC_RECT_VALID = 1u << 7,
-    PRESENT_REDIRECTED_BLT = 1u << 16,
-    PRESENT_MODEL_REDIRECTED_BLT = 3,
-    PRESENT_MODEL_REDIRECTED_VISTABLT = 4,
     IMAGE_WIDTH = 64,
     IMAGE_HEIGHT = 64,
 };
@@ -425,13 +354,6 @@ typedef struct {
     uint64_t supported;
     uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted;
     uint64_t blob_id;
-    /* The destination: the window's surface, opened in this device. */
-    int surface_found;
-    uint32_t surface_handle, surface_format, surface_allocations, destination, variant;
-    LONG surface_query_status, surface_open_status, dwm_hresult;
-    const char *surface_route;
-    LONG variant_status[8];
-    uint32_t variants;
     query_device_ids ids;
 } result;
 
@@ -443,9 +365,7 @@ static void emit(FILE *f, const result *r)
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
-            "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\","
-            "\"window_surface\":{\"found\":%s,\"route\":\"%s\",\"dwm_hresult\":\"0x%08lx\",\"handle\":\"0x%08x\",\"format\":%u,\"allocations\":%u,"
-            "\"query_status\":\"0x%08lx\",\"open_status\":\"0x%08lx\",\"opened\":%s},\"variant\":%u,\"adapter\":",
+            "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
             r->pass ? "true" : "false", (unsigned long)r->session,
             r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted,
@@ -453,18 +373,9 @@ static void emit(FILE *f, const result *r)
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
             (unsigned long)r->venus_status,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
-            (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id,
-            r->surface_found ? "true" : "false", r->surface_route ? r->surface_route : "none",
-            (unsigned long)r->dwm_hresult, r->surface_handle, r->surface_format, r->surface_allocations,
-            (unsigned long)r->surface_query_status, (unsigned long)r->surface_open_status,
-            r->destination ? "true" : "false", r->variant);
+            (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
     else fputs("null", f);
-    if (r->variants) {
-        fputs(",\"variant_status\":[", f);
-        for (uint32_t i = 0; i < r->variants; ++i) fprintf(f, "%s\"0x%08lx\"", i ? "," : "", (unsigned long)r->variant_status[i]);
-        fputs("]", f);
-    }
     fputs("}\n", f);
 }
 
@@ -492,42 +403,6 @@ static void pump(DWORD milliseconds)
     } while ((LONG)(end - GetTickCount()) > 0);
 }
 
-/* One D3DKMTPresent with Blt from `source`. The variants differ in how the
- * destination is named. */
-static LONG present_once(present_fn present, UINT context, HWND window, UINT source, UINT destination,
-                         uint32_t surface, uint32_t variant)
-{
-    /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
-    static uint64_t request[1024];
-    memset(request, 0, sizeof(request));
-    present_head *p = (present_head *)request;
-    p->context = context;
-    p->source = source;
-    p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
-    p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
-    p->flags = PRESENT_BLT | PRESENT_DST_RECT_VALID | PRESENT_SRC_RECT_VALID;
-    /* One sub-rectangle, the whole source: the runtimes pass the visible
-     * region of the window here, and a present without one is refused. */
-    static RECT sub_rect;
-    sub_rect = p->src_rect;
-    p->sub_rect_count = 1;
-    p->src_sub_rects = &sub_rect;
-    present_request *q = (present_request *)request;
-    p->window = window;
-    p->destination = destination;
-    q->token.blt.physical_surface = surface;
-    q->token.blt.num_rects = 1;
-    q->token.blt.rects[0] = p->dst_rect;
-    switch (variant) {
-    case 0: p->destination = 0; break;
-    case 1: p->flags |= PRESENT_REDIRECTED_BLT; q->token.model = PRESENT_MODEL_REDIRECTED_BLT; break;
-    case 2: p->flags |= PRESENT_REDIRECTED_BLT; q->token.model = PRESENT_MODEL_REDIRECTED_VISTABLT; break;
-    case 3: p->flags |= PRESENT_REDIRECTED_BLT; break;
-    default: q->token.model = PRESENT_MODEL_REDIRECTED_BLT; break;
-    }
-    return present(request);
-}
-
 int wmain(int argc, wchar_t **argv)
 {
     result r = {0};
@@ -535,14 +410,11 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "arguments";
     r.presents_asked = 1;
     const wchar_t *out = NULL;
-    int which = -1, exit_code = 1, explore = 0;
-    r.variant = 1;
+    int which = -1, exit_code = 1;
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
-        else if (!wcscmp(argv[i], L"--variant") && i + 1 < argc) r.variant = (uint32_t)wcstoul(argv[++i], NULL, 10);
-        else if (!wcscmp(argv[i], L"--explore")) explore = 1;
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
             for (int c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); ++c) {
@@ -582,13 +454,9 @@ int wmain(int argc, wchar_t **argv)
     destroy_context_fn context_destroy = (destroy_context_fn)GetProcAddress(gdi, "D3DKMTDestroyContext");
     create_allocation_fn allocate = (create_allocation_fn)GetProcAddress(gdi, "D3DKMTCreateAllocation");
     present_fn present = (present_fn)GetProcAddress(gdi, "D3DKMTPresent");
-    query_resource_fn resource_query = (query_resource_fn)GetProcAddress(gdi, "D3DKMTQueryResourceInfo");
-    open_resource_fn resource_open = (open_resource_fn)GetProcAddress(gdi, "D3DKMTOpenResource");
-    HMODULE user = GetModuleHandleW(L"user32.dll");
-    dwm_surface_fn dwm_surface = user ? (dwm_surface_fn)GetProcAddress(user, "DwmGetDxSharedSurface") : NULL;
     close_fn close = (close_fn)GetProcAddress(gdi, "D3DKMTCloseAdapter");
     if (!enumerate || !query || !create || !destroy || !escape || !context_create || !context_destroy ||
-        !allocate || !present || !close || !resource_query || !resource_open) {
+        !allocate || !present || !close) {
         r.win32_error = ERROR_PROC_NOT_FOUND; FreeLibrary(gdi); goto done;
     }
     enum_adapters adapters = {0};
@@ -601,14 +469,12 @@ int wmain(int argc, wchar_t **argv)
     r.last_status = enumerate(&adapters);
     if (r.last_status < 0) { free(adapters.adapters); FreeLibrary(gdi); goto done; }
     UINT matches = 0, adapter = 0;
-    LUID adapter_luid = {0};
     for (ULONG i = 0; i < adapters.count; ++i) {
         query_device_ids ids = {0};
         query_adapter q = {adapters.adapters[i].handle, QUERY_PHYSICAL_ADAPTER_DEVICE_IDS, &ids, sizeof(ids)};
         if (query(&q) >= 0 && ids.vendor_id == 0x1af4 && ids.device_id == 0x1050) {
             ++matches;
             adapter = adapters.adapters[i].handle;
-            adapter_luid = adapters.adapters[i].luid;
             r.ids = ids;
             r.selected = 1;
         }
@@ -704,87 +570,23 @@ int wmain(int argc, wchar_t **argv)
     }
     if (r.last_status < 0) goto destroy_context;
 
-    /* The destination of a windowed Blt present is the surface that the
-     * compositor reads the window from. Open it in this device, as the
-     * Direct3D runtimes do. */
-    {
-        HANDLE shared = NULL;
-        LUID luid = {0};
-        ULONG format = 0, flags = 0;
-        ULONGLONG update_id = 0;
-        r.stage = "window_surface";
-        if (dwm_surface && dwm_surface(window, &shared, &luid, &format, &flags, &update_id) && shared) {
-            r.surface_route = "user32";
-        } else {
-            HMODULE dwmapi = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            dwm_dx_surface_fn dx_surface =
-                dwmapi ? (dwm_dx_surface_fn)GetProcAddress(dwmapi, "DwmpDxGetWindowSharedSurface") : NULL;
-            UINT64 dx_update_id = 0;
-            shared = NULL;
-            format = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
-            r.dwm_hresult = dx_surface ? dx_surface(window, adapter_luid, MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY),
-                                                    0, &format, &shared, &dx_update_id)
-                                       : (LONG)0x80004001; /* E_NOTIMPL: no such export */
-            if (r.dwm_hresult >= 0 && shared) r.surface_route = "dwmapi";
-        }
-        if (r.surface_route) {
-            r.surface_found = 1;
-            r.surface_handle = (uint32_t)(ULONG_PTR)shared;
-            r.surface_format = format;
-            query_resource_info qr = {0};
-            qr.device = device.device;
-            qr.global_share = r.surface_handle;
-            r.surface_query_status = resource_query(&qr);
-            r.surface_allocations = qr.num_allocations;
-            if (r.surface_query_status >= 0 && qr.num_allocations >= 1 && qr.num_allocations <= 16) {
-                open_allocation_info *infos = calloc(qr.num_allocations, sizeof(*infos));
-                void *runtime_data = calloc(1, qr.private_runtime_data_size + 1);
-                void *resource_data = calloc(1, qr.resource_private_driver_data_size + 1);
-                void *total_data = calloc(1, qr.total_private_driver_data_size + 1);
-                if (infos && runtime_data && resource_data && total_data) {
-                    open_resource open = {0};
-                    open.device = device.device;
-                    open.global_share = r.surface_handle;
-                    open.num_allocations = qr.num_allocations;
-                    open.open_allocation_info = infos;
-                    open.private_runtime_data = runtime_data;
-                    open.private_runtime_data_size = qr.private_runtime_data_size;
-                    open.resource_private_driver_data = resource_data;
-                    open.resource_private_driver_data_size = qr.resource_private_driver_data_size;
-                    open.total_private_driver_data_buffer = total_data;
-                    open.total_private_driver_data_buffer_size = qr.total_private_driver_data_size;
-                    r.surface_open_status = resource_open(&open);
-                    if (r.surface_open_status >= 0) r.destination = infos[0].allocation;
-                }
-            }
-        }
-    }
-
-    /* --explore: one present per variant, with whatever blob the case has.
-     * It says which form of the request reaches the driver. */
-    if (explore) {
-        r.stage = "explore";
-        r.result = "present_pending";
-        save(out, &r);
-        for (r.variants = 0; r.variants < 5; ++r.variants) {
-            r.variant = r.variants;
-            r.variant_status[r.variants] = present_once(present, context.context, window, allocation.allocation,
-                                                        r.destination, r.surface_handle, r.variants);
-            pump(1500);
-        }
-        r.stage = "done";
-        r.result = "explored";
-        exit_code = 0;
-        goto destroy_context;
-    }
-
     /* A driver without the fix accepts the present, and the guest stops a
      * moment later: the file then says that a present was accepted. */
     r.stage = "present";
     r.result = "present_pending";
     if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
     for (uint32_t i = 0; i < r.presents_asked; ++i) {
-        LONG status = present_once(present, context.context, window, allocation.allocation, r.destination, r.surface_handle, r.variant);
+        /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
+        static uint64_t request[1024];
+        memset(request, 0, sizeof(request));
+        present_head *p = (present_head *)request;
+        p->context = context.context;
+        p->window = window;
+        p->source = allocation.allocation;
+        p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
+        p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
+        p->flags = PRESENT_BLT | PRESENT_DST_RECT_VALID | PRESENT_SRC_RECT_VALID;
+        LONG status = present(request);
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;
         ++r.presents_done;
