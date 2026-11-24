@@ -155,9 +155,7 @@ mod tests {
     }
 
     fn function_assigning(expr: &str) -> String {
-        format!(
-            "val f : (%unit) -> %unit\nfn f(x) {{ y : %unit; y = {expr}; return = (); end; }}"
-        )
+        format!("val f : (%unit) -> %unit\nfn f(x) {{ y : %unit; y = {expr}; return = (); end; }}")
     }
 
     /// Either the emitter refuses the model, or the generated crate can load
