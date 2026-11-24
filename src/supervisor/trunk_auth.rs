@@ -1,6 +1,9 @@
 //! Version 3 authenticates both endpoints without sending the PSK and
-//! requires the dialer's subnet before bringing the trunk up. Frames
-//! remain plaintext and unauthenticated. Use a trusted network or a VPN.
+//! requires the dialer's subnet before bringing the trunk up. Version 4 is
+//! the same handshake before frames that carry their origin tag
+//! (`net/switch.rs`): a peer that does not read the tag would deliver an
+//! isolated NIC's frames to its guests. Frames remain plaintext and
+//! unauthenticated. Use a trusted network or a VPN.
 use anyhow::{Result, ensure};
 use hmac::{Hmac, Mac};
 use ipnet::Ipv4Net;
@@ -8,7 +11,7 @@ use sha2_10::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub(super) const MAGIC: &[u8; 12] = b"VMLABTRUNK3\n";
+pub(super) const MAGIC: &[u8; 12] = b"VMLABTRUNK4\n";
 pub(super) const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn proof(
