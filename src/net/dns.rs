@@ -97,6 +97,8 @@ pub struct DnsZone {
     pub upstream: Option<SocketAddr>,
     /// Exact FQDN → address (auto-registrations and exact static entries).
     records: HashMap<String, RecordEntry>,
+    /// Lease-backed records overlaid on the lab segment's configured names.
+    lease_records: HashMap<String, Ipv4Addr>,
     /// `*.suffix` static entries.
     wildcards: Vec<WildcardRecord>,
     sinkholes: Vec<SinkholeEntry>,
@@ -133,6 +135,7 @@ impl DnsZone {
             suffix: normalize(&suffix.into()),
             upstream: None,
             records: HashMap::new(),
+            lease_records: HashMap::new(),
             wildcards: Vec::new(),
             sinkholes: Vec::new(),
             rule_names: HashMap::new(),
@@ -175,6 +178,18 @@ impl DnsZone {
     pub fn unregister(&mut self, name: &str) -> bool {
         let fqdn = self.fqdn(name);
         self.records.remove(&fqdn).is_some()
+    }
+
+    /// Replace the lab segment's lease-backed names with the current snapshot.
+    pub fn set_lease_records<'a>(
+        &mut self,
+        lab: &str,
+        machines: impl IntoIterator<Item = (&'a str, Ipv4Addr)>,
+    ) {
+        self.lease_records = machines
+            .into_iter()
+            .flat_map(|(vm, ip)| [(self.fqdn(&format!("{vm}.{lab}")), ip), (self.fqdn(vm), ip)])
+            .collect();
     }
 
     /// Add a static entry — exact name or `*.`-wildcard pattern, taken
@@ -246,6 +261,9 @@ impl DnsZone {
             };
         }
 
+        if let Some(&ip) = self.lease_records.get(&name) {
+            return DnsAnswer::A(ip);
+        }
         if let Some(entry) = self.records.get(&name) {
             return DnsAnswer::A(entry.ip);
         }
@@ -277,11 +295,17 @@ impl DnsZone {
         let mut records: Vec<DnsRecordEntry> = self
             .records
             .iter()
+            .filter(|(name, _)| !self.lease_records.contains_key(*name))
             .map(|(name, e)| DnsRecordEntry {
                 name: name.clone(),
                 ip: e.ip,
                 kind: e.kind,
             })
+            .chain(self.lease_records.iter().map(|(name, &ip)| DnsRecordEntry {
+                name: name.clone(),
+                ip,
+                kind: RecordKind::Dynamic,
+            }))
             .collect();
         records.sort_by(|a, b| a.name.cmp(&b.name));
         DnsZoneSnapshot {
@@ -722,6 +746,30 @@ mod tests {
     }
 
     // -- zone -----------------------------------------------------------------
+
+    #[test]
+    fn cleared_lease_records_reveal_configured_records() {
+        let mut zone = DnsZone::new("vmlab.internal");
+        let qualified = "web.demo.vmlab.internal";
+        let short = "web.vmlab.internal";
+        zone.register("web.demo", ip(10));
+        zone.set_static(short, ip(11));
+        zone.set_lease_records("demo", [("web", ip(20))]);
+        for name in [qualified, short] {
+            assert_eq!(zone.lookup(name), DnsAnswer::A(ip(20)));
+        }
+        let active = zone.snapshot().records;
+        assert_eq!(active.len(), 2);
+        assert!(
+            active
+                .iter()
+                .all(|r| r.ip == ip(20) && r.kind == RecordKind::Dynamic)
+        );
+
+        zone.set_lease_records("demo", []);
+        assert_eq!(zone.lookup(qualified), DnsAnswer::A(ip(10)));
+        assert_eq!(zone.lookup(short), DnsAnswer::A(ip(11)));
+    }
 
     #[test]
     fn register_appends_suffix_and_unregister_removes() {

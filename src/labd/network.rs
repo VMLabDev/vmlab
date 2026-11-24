@@ -804,23 +804,17 @@ fn spawn_lease_dns_sync(
     let leases_handle = gateway.leases_probe();
     let lab = lab_name.to_string();
     tokio::spawn(async move {
-        let mut known: HashMap<MacAddr, Ipv4Addr> = HashMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(leases) = leases_handle() else { break };
-            for (mac, ip) in leases {
-                if known.get(&mac) == Some(&ip) {
-                    continue;
-                }
-                let vm = mac_to_vm.read().ok().and_then(|n| n.get(&mac).cloned());
-                if let Some(vm) = vm
-                    && let Ok(mut z) = zone.lock()
-                {
-                    z.register(&format!("{vm}.{lab}"), ip);
-                    z.register(&vm, ip);
-                    known.insert(mac, ip);
-                }
-            }
+            let Ok(machines) = mac_to_vm.read() else { continue };
+            let Ok(mut zone) = zone.lock() else { continue };
+            zone.set_lease_records(
+                &lab,
+                leases
+                    .into_iter()
+                    .filter_map(|(mac, ip)| machines.get(&mac).map(|vm| (vm.as_str(), ip))),
+            );
         }
     });
 }
