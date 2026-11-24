@@ -3754,6 +3754,36 @@ lab "l" {{
         assert!(es.is_empty(), "{es:#?}");
     }
 
+    /// docs/reviews/smb-2.md F18: a container volume can ride CIFS, where
+    /// Samba expands a `%` in its host path, so validation refuses it as it
+    /// refuses one in a VM share's host path, rather than leaving the render
+    /// to refuse it at `up` and take every machine's shares down with it.
+    #[test]
+    fn a_percent_in_a_volume_host_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a%Ub")).unwrap();
+        let f = load_lab_source(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { }
+  container "c" { image = "nginx" nic { segment = "s" }
+    volume { host = "a%Ub" target = "/data" } }
+}"#,
+            "<test>",
+            root.path(),
+        )
+        .expect("source should parse");
+        let es: Vec<String> = validate(&f, &Permissive)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert!(
+            es.iter()
+                .any(|m| m.starts_with("volume ") && m.contains("contains %")),
+            "{es:#?}"
+        );
+    }
+
     #[test]
     fn virtiofs_shares_do_not_need_nics() {
         // vhost-user-fs is a local device — no segment involved (PRD §7.5).

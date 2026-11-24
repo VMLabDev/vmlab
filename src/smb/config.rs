@@ -636,6 +636,25 @@ mod tests {
         assert!(share_state_problem(&lab.join("src"), &lab.join("new/.vmlab"), "x").is_none());
     }
 
+    /// docs/reviews/smb-2.md F17: the lab's own directories are written into
+    /// `[global]` (`include`, `log file`, the state paths), where Samba
+    /// expands a `%` as it does in a share's path. The render refuses them.
+    #[test]
+    fn a_percent_in_the_lab_path_is_not_a_samba_variable() {
+        let mut c = cfg(true);
+        c.lab_dir = PathBuf::from("/home/u/100%Done/.vmlab/smb");
+        let refused = c.render_conf().expect_err("the lab path was rendered");
+        assert!(refused.reason.contains('%'), "{refused}");
+
+        let mut c = cfg(false);
+        c.run_dir = PathBuf::from("/run/vmlab/smb/a%Lb");
+        assert!(c.render_conf().is_err(), "the runtime path was rendered");
+
+        let mut c = cfg(false);
+        c.lab_dir = PathBuf::from("/home/u/x\n[global]/.vmlab/smb");
+        assert!(c.render_conf().is_err(), "a line break was rendered");
+    }
+
     #[test]
     fn conf_has_unprivileged_dirs() {
         let conf = cfg(false).render_conf().unwrap();
