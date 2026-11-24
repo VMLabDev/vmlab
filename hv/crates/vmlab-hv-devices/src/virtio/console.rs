@@ -33,6 +33,7 @@ use std::thread::{self, JoinHandle};
 
 use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
 
+use crate::virtio::used_needs_interrupt;
 use crate::{DeviceError, GuestMemory, Snapshot, VirtioDevice, VirtioInterrupt};
 
 /// Virtio device id 3, the console device.
@@ -558,6 +559,7 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
         else {
             return;
         };
+        let mut used_any = false;
         while !sh.ports[i].rx_stage.is_empty() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -573,9 +575,10 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
             if q.add_used(mem, head, written as u32).is_err() {
                 break;
             }
+            used_any = true;
             sh.ports[i].rx_stage.drain(..written);
         }
-        if q.needs_notification(mem).unwrap_or(false) {
+        if used_any && used_needs_interrupt(q, mem) {
             irq = sh.interrupt.clone().map(|irq| (irq, queue));
         }
     }
@@ -616,6 +619,7 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
             else {
                 return;
             };
+            let mut used_any = false;
             while let Some(chain) = q.pop_descriptor_chain(mem) {
                 if connected && pending + out.len() >= MAX_TX_STAGE {
                     q.go_to_previous_position();
@@ -644,8 +648,9 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                 if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
+                used_any = true;
             }
-            if q.needs_notification(mem).unwrap_or(false) {
+            if used_any && used_needs_interrupt(q, mem) {
                 irq = sh.interrupt.clone().map(|irq| (irq, queue));
             }
         }
@@ -723,6 +728,7 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
                 return;
             };
             let mut msgs = Vec::new();
+            let mut used_any = false;
             while let Some(chain) = q.pop_descriptor_chain(mem) {
                 if msgs.len() >= room / sh.ports.len().max(2) {
                     q.go_to_previous_position();
@@ -744,8 +750,9 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
                 if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
+                used_any = true;
             }
-            if q.needs_notification(mem).unwrap_or(false) {
+            if used_any && used_needs_interrupt(q, mem) {
                 irq = sh.interrupt.clone().map(|irq| (irq, 3));
             }
             msgs
@@ -833,6 +840,7 @@ fn flush_pending(sh: &mut Shared) {
         else {
             return;
         };
+        let mut used_any = false;
         while let Some(msg) = sh.pending.front().cloned() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -857,6 +865,7 @@ fn flush_pending(sh: &mut Shared) {
             if q.add_used(mem, head, written).is_err() {
                 break;
             }
+            used_any = true;
             if written == 0 {
                 // Buffer too small for this message; it stays queued and the
                 // next control-receiveq kick retries.
@@ -864,7 +873,7 @@ fn flush_pending(sh: &mut Shared) {
             }
             sh.pending.pop_front();
         }
-        if q.needs_notification(mem).unwrap_or(false) {
+        if used_any && used_needs_interrupt(q, mem) {
             irq = sh.interrupt.clone().map(|irq| (irq, 2));
         }
     }
@@ -2080,6 +2089,57 @@ mod tests {
         client.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"hello ctl");
         wait_for("tx buffer returned", || f.vqs[5].used_idx(&f.mem) == 1);
+    }
+
+    // Review virtio-devices-2, F10.
+    #[test]
+    fn completions_respect_avail_no_interrupt() {
+        let mut f = Fixture::new();
+        let mut client = UnixStream::connect(&f.ctl_sock).unwrap();
+        f.device_ready(8, 5);
+        assert!(
+            f.ctrl_delivered()
+                .contains(&(1, EV_PORT_OPEN, 1, Vec::new()))
+        );
+        f.settle();
+        f.irq.queues.lock().clear();
+
+        // VIRTQ_AVAIL_F_NO_INTERRUPT on the transmit queue of port 1.
+        f.mem
+            .write_obj(1u16.to_le(), GuestAddress(f.vqs[5].avail))
+            .unwrap();
+        let addr = f.data(1);
+        f.mem.write_slice(b"hello ctl", GuestAddress(addr)).unwrap();
+        f.vqs[5].add_chain(&f.mem, &[(addr, 9, false)]);
+        f.dev.queue_notify(5);
+
+        let mut got = [0u8; 9];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello ctl");
+        f.settle();
+        assert_eq!(f.vqs[5].used_idx(&f.mem), 1);
+        assert!(
+            !f.irq.queue_notified(5),
+            "the driver turned interrupts off on queue 5"
+        );
+    }
+
+    // Review virtio-devices-2, F10.
+    #[test]
+    fn a_kick_without_work_raises_no_interrupt() {
+        let mut f = Fixture::new();
+        let _client = UnixStream::connect(&f.ctl_sock).unwrap();
+        f.device_ready(8, 5);
+        f.settle();
+        f.irq.queues.lock().clear();
+
+        // A receive buffer for port 1, and no host bytes to put in it.
+        let addr = f.data(1);
+        f.vqs[4].add_chain(&f.mem, &[(addr, 64, true)]);
+        f.dev.queue_notify(4);
+        f.settle();
+        assert_eq!(f.vqs[4].used_idx(&f.mem), 0);
+        assert!(!f.irq.queue_notified(4), "no buffer was used on queue 4");
     }
 
     #[test]

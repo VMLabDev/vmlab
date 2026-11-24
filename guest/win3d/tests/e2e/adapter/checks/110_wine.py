@@ -1,3 +1,51 @@
+import re
+
+
+# Wine 11.0 (tests/e2e/PINS). Recheck these source locations when the pin moves.
+# C-number references are in docs/acceptance.md and docs/acceptance/C*.md.
+CONTROL_FAILURES = {
+    'd3d9_d3d9ex': ('d3d9ex.c', {
+        687, 705,  # C343: restricted depth-stencil creation
+        2949, 3007, 3100,  # C340: WM_DISPLAYCHANGE arrives after the assertion
+        # C412: session focus and mode changes, locations from #886 draft D6
+        2520, 2915, 2986, 2990, 3009, 3022, 3024, 3203, 3209,
+    }),
+    'd3d9_device': ('device.c', {
+        4248, 4319, 4410,  # C413/C414: WM_DISPLAYCHANGE timing (C340)
+        5179, 5184, 5215, 5220,  # C413: window styles reproduced without Win3D
+        15008, 15291,  # C412/C413: window rectangle and control refcount
+        4656, 4658, 4675, 4677, 4871, 15043, 15049,  # C412/C413/C414: session focus
+        3790, 4545, 4551, 4568,  # C414 and #886 draft D6: window messages
+    }),
+}
+ASSERTION_FAILURE = re.compile(
+    r"^([^:\n]+):(\d+): Test (?:failed|succeeded inside todo block): ",
+    re.MULTILINE,
+)
+
+
+def control_verdict(report, name, count):
+    """Compare each reported failure to the control locations."""
+    if not count or name not in CONTROL_FAILURES:
+        return not count, ''
+
+    filename, locations = CONTROL_FAILURES[name]
+    try:
+        log = (report.directory / f'wine-{name}.failures.txt').read_text(encoding='utf-8-sig')
+    except (OSError, UnicodeError):
+        return False, ', failure log unavailable'
+    failures = ASSERTION_FAILURE.findall(log)
+    if len(failures) != count:
+        return False, f', failure log has {len(failures)} assertion lines for {count} reported failures'
+    unexpected = dict.fromkeys(
+        f'{source}:{line}' for source, line in failures
+        if source != filename or int(line) not in locations
+    )
+    if unexpected:
+        return False, ', outside the control list: ' + ', '.join(list(unexpected)[:5])
+    return True, f', all {count} failures match the control list'
+
+
 def judge(report):
     # P10: Wine's Direct3D tests, one row per test program.
     why = report.status('wine')
@@ -32,7 +80,8 @@ def judge(report):
         elif d.get('completed'):
             note = (f"{d['executed']} tests executed, {d['failures']} failures, {d['todo']} todo, {d['skipped']} skipped "
                     f"in {d['duration_s']:.0f} s")
-            report.row(check, 'P10', what, 'pass' if not d['failures'] else 'fail', note, ev)
+            passed, control_note = control_verdict(report, name, d['failures'])
+            report.row(check, 'P10', what, 'pass' if passed else 'fail', note + control_note, ev)
         else:
             report.row(check, 'P10', what, 'fail',
                 f"ended with exit code {code} after {d['duration_s']:.0f} s, before its summary; {d['failed_lines']} "

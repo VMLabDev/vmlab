@@ -49,9 +49,8 @@ pub struct SegmentNet {
     /// This lab's NICs on a global segment, for the supervisor's DNS; filled
     /// by [`LabNetwork::wire_gateways`] once MACs are settled.
     pub global_members: Vec<GlobalMember>,
-    /// What the supervisor said it could not honour when this lab attached
-    /// to a global segment — a static address or an MTU (§9.2). `up` says
-    /// them again, since the attach happens before anyone is watching.
+    /// Attach failures and warnings about declarations the supervisor could
+    /// not honour. `up` repeats them because attach happens at daemon startup.
     pub global_warnings: Vec<String>,
     /// Attaches the global segment again whenever its trunk to the
     /// supervisor closes: a supervisor that dies and is replaced keeps its
@@ -373,16 +372,12 @@ impl LabNetwork {
     /// trunk socket. The supervisor runs the shared DHCP/DNS. Each attached
     /// segment then keeps itself attached: when its trunk closes it is
     /// attached again, under the subnet it had (F9).
-    pub async fn attach_globals(&mut self, lab: &str) -> anyhow::Result<()> {
+    pub async fn attach_globals(&mut self, lab: &str) {
         self.attach_globals_via(&crate::paths::supervisor_socket(), lab)
-            .await
+            .await;
     }
 
-    pub(crate) async fn attach_globals_via(
-        &mut self,
-        supervisor: &Path,
-        lab: &str,
-    ) -> anyhow::Result<()> {
+    pub(crate) async fn attach_globals_via(&mut self, supervisor: &Path, lab: &str) {
         for seg in self.segments.values_mut() {
             if !seg.global {
                 continue;
@@ -397,7 +392,18 @@ impl LabNetwork {
                 members: seg.global_members.clone(),
                 mtu: seg.effective_mtu(),
             };
-            let trunk = join_global(&join, &seg.switch).await?;
+            let trunk = match join_global(&join, &seg.switch).await {
+                Ok(trunk) => trunk,
+                Err(error) => {
+                    let warning = format!(
+                        "could not attach global segment {:?}: {error:#}",
+                        seg.global_name
+                    );
+                    tracing::warn!("{warning}");
+                    seg.global_warnings = vec![warning];
+                    continue;
+                }
+            };
             seg.global_warnings = trunk.warnings;
             join.subnet = declared.or(trunk.subnet);
             tracing::info!(
@@ -410,7 +416,6 @@ impl LabNetwork {
             }
             seg.global_keeper = Some(keep_global(join, seg.switch.clone(), trunk.closed));
         }
-        Ok(())
     }
 
     /// Everything the supervisor refused this lab's global segments.
