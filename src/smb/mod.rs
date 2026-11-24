@@ -179,11 +179,61 @@ impl LabSmb {
         self.servers.get(vm).map(SmbServer::listen_port)
     }
 
+    #[cfg(test)]
+    pub(crate) fn kill_for_test(&mut self, vm: &str) {
+        self.servers.get_mut(vm).unwrap().kill_for_test();
+    }
+
     /// Every running server's machine and port, by machine name.
     pub fn listen_ports(&self) -> Vec<(String, u16)> {
         self.servers
             .iter()
             .map(|(vm, server)| (vm.clone(), server.listen_port()))
+            .collect()
+    }
+
+    pub(crate) fn exited_servers(&mut self) -> Vec<(String, std::process::ExitStatus)> {
+        self.servers
+            .iter_mut()
+            .filter_map(|(machine, server)| match server.try_wait() {
+                Ok(status) => status.map(|status| (machine.clone(), status)),
+                Err(error) => {
+                    tracing::warn!(%machine, %error, "checking smbd child");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn remove_server(&mut self, machine: &str) {
+        self.servers.remove(machine);
+    }
+
+    pub(crate) fn has_missing_servers(&self) -> bool {
+        self.servers.len() < self.vms.len()
+    }
+
+    pub(crate) fn restart_missing(
+        &mut self,
+        ports: &[u16],
+    ) -> Vec<(String, Result<u16, SmbError>)> {
+        let missing: Vec<_> = self
+            .vms
+            .keys()
+            .filter(|machine| !self.servers.contains_key(*machine))
+            .cloned()
+            .collect();
+        let mut ports = ports.iter().copied();
+        missing
+            .into_iter()
+            .map(|machine| {
+                let result = self.start_one(&machine, &mut ports).map(|server| {
+                    let port = server.listen_port();
+                    self.servers.insert(machine.clone(), server);
+                    port
+                });
+                (machine, result)
+            })
             .collect()
     }
 
