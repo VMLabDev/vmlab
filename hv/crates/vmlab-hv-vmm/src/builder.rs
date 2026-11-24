@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use vmlab_hv_devices::{IrqLine, MsiSink};
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription,
-    NicModel, PciAddress,
+    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription, NicModel,
+    PciAddress,
 };
 
 use crate::acpi::{self, AcpiConfig};
@@ -1053,7 +1053,10 @@ pub fn build(
             let device = if display.device == DisplayDevice::VmwareSvga {
                 vmlab_hv_devices::display::StandardVga::new_vmware("vga", rom.as_deref())
             } else {
-                vmlab_hv_devices::display::StandardVga::new("vga", rom.as_deref().unwrap_or_default())
+                vmlab_hv_devices::display::StandardVga::new(
+                    "vga",
+                    rom.as_deref().unwrap_or_default(),
+                )
             }
             .map_err(|e| VmmError::Other(e.to_string()))?;
             let vga = Arc::new(Mutex::new(device));

@@ -200,7 +200,8 @@ impl StandardVga {
         rom: Option<&[u8]>,
         vram_size: usize,
     ) -> Result<Self, DeviceError> {
-        if rom.is_some_and(|rom| rom.len() < 3 || rom.len() > ROM_SIZE || rom[..2] != [0x55, 0xaa]) {
+        if rom.is_some_and(|rom| rom.len() < 3 || rom.len() > ROM_SIZE || rom[..2] != [0x55, 0xaa])
+        {
             return Err(DeviceError::Other("invalid VGA option ROM".into()));
         }
         let mut dev = Self {
