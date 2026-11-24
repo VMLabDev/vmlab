@@ -15,21 +15,22 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time (fixed in #386) |
-| F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot (fixed in #387) |
-| F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back |
-| F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails (fixed in #389) |
-| F5 | wrong result | A container whose online restore fails stays paused (fixed in #405) |
-| F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on (fixed in #406) |
-| F7 | wrong result | A capture that failed leaves a pending entry that a running vmlab-hv machine, or any container, cannot clear |
-| F8 | wrong result | A failed vmlab-hv save leaves the snapshot on the earlier disks and the vmstate clusters in the image (fixed in #407) |
-| F9 | wrong result | A vmlab-hv process killed during a load leaves its rollback checkpoint on every disk for good (fixed in #421) |
-| F10 | wrong result | An offline snapshot does not hold the UEFI variables or the TPM state (fixed in #437) |
-| F11 | wrong result | The micro-VM's ACPI PM1a block is in no snapshot section |
+| F1 | data loss | An offline snapshot operation and a start of the same machine can write one qcow2 at the same time (fixed in #386, `0b153aa6`) |
+| F2 | data loss | Snapshot lookup prefers the qcow2 id over the name, so an all-digit name can address another snapshot (fixed in #387, `b89f5735`) |
+| F3 | data loss | An offline restore of a multi-disk VM rewinds disk by disk with no check first and no way back (fixed in #388, `68bb5861`) |
+| F4 | data loss | A lab-wide restore rewinds machines one by one and stops at the first that fails (fixed in #389, `822afb52`) |
+| F5 | wrong result | A container whose online restore fails stays paused (fixed in #405, `b957a301`) |
+| F6 | wrong result | virtio-net restores the framing position of a host stream that has moved on (fixed in #406, `5666f55d`) |
+| F7 | wrong result | A capture that failed leaves a pending entry that a running vmlab-hv machine, or any container, cannot clear (fixed in #420, `dd3a985e`) |
+| F8 | wrong result | A failed vmlab-hv save leaves the snapshot on the earlier disks and the vmstate clusters in the image (fixed in #407, `d0fd2893`) |
+| F9 | wrong result | A vmlab-hv process killed during a load leaves its rollback checkpoint on every disk for good (fixed in #421, `96f0a8d9`) |
+| F10 | wrong result | An offline snapshot does not hold the UEFI variables or the TPM state (fixed in #437, `5b8a7932`) |
+| F11 | wrong result | The micro-VM's ACPI PM1a block is in no snapshot section (fixed in #794, `b5eb0308`) |
 
 ### F1. Offline snapshot operations do not exclude a start (data loss)
 
-- Fixed in #386. A per-machine reservation excludes boot during offline
+- Fixed in #386 (`0b153aa6`).
+  A per-machine reservation excludes boot during offline
   capture, restore and deletion for VMs and containers.
 - Where: `src/labd/vm.rs:1808-1829` (`take_snapshot`), `:1881-1891` (offline
   branch of `load_snapshot`), `:1896-1920` (`drop_snapshot`),
@@ -62,7 +63,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F2. Lookup by id before name (data loss)
 
-- Fixed in #387. Snapshot lookup and duplicate-name checks match exact names
+- Fixed in #387 (`b89f5735`).
+  Snapshot lookup and duplicate-name checks match exact names
   for apply, delete, export, creation and vmlab-hv restore preflight.
 - Where: `hv/crates/vmlab-disk/src/qcow2/snapshot.rs:147-151`
   (`load_snapshot_l1`), `:399-403` (`snapshot_apply_impl`), `:447-451`
@@ -99,7 +101,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F3. Offline restore of several disks has no check and no way back (data loss)
 
-- Fixed in card #388. Restore checks each disk before stopping the VM and
+- Fixed in card #388 (`68bb5861`).
+  Restore checks each disk before stopping the VM and
   saves the current disk states before applying the requested snapshot.
   If an apply fails, restore rolls back the disks it attempted and retains
   the recovery snapshot on any disk it cannot roll back.
@@ -122,7 +125,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F4. A lab-wide restore stops half way (data loss)
 
-- Fixed in #389. Lab-wide restore runs the same daemon preflight checks as
+- Fixed in #389 (`822afb52`).
+  Lab-wide restore runs the same daemon preflight checks as
   per-machine restore for every machine before any rewind begins.
 - Where: `src/labd/mod.rs:1226-1231`.
 - Why it is a fault: `snapshot.restore` with no machine loops over the
@@ -143,7 +147,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F5. A failed online restore leaves a container paused (wrong result)
 
-- Fixed in #405. A failed load attempts to resume the container and returns
+- Fixed in #405 (`b957a301`).
+  A failed load attempts to resume the container and returns
   the load error with the resume outcome.
 - Where: `src/labd/container.rs:1145-1149`.
 - Why it is a fault: `restore_online` pauses the micro-VM and then calls
@@ -160,7 +165,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F6. virtio-net restores the position of a stream that has moved (wrong result)
 
-- Fixed in #406. Restore keeps the live stream's partial reads and writes
+- Fixed in #406 (`5666f55d`).
+  Restore keeps the live stream's partial reads and writes
   and ignores saved stream cursors in older snapshots. Complete pending
   receive frames and virtqueue state still restore from the snapshot.
 - Where: `hv/crates/vmlab-hv-devices/src/virtio/net.rs:2021-2033` (save) and
@@ -188,7 +194,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F7. A pending capture that cannot be cleared (wrong result)
 
-- Fixed in #420. Preflight refusals clear the durable capture intent.
+- Fixed in #420 (`dd3a985e`).
+  Preflight refusals clear the durable capture intent.
   Pending cleanup accepts absent disk snapshots and keeps the intent if a
   deletion fails.
 - Where: `src/labd/lab.rs:3364-3386` (the intent, and it is kept on every
@@ -222,7 +229,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F8. A failed vmlab-hv save cleans nothing (wrong result)
 
-- Fixed in #407. Save checks for duplicate names before capture. Failed
+- Fixed in #407 (`d0fd2893`).
+  Save checks for duplicate names before capture. Failed
   capture deletes the snapshots it created and releases any active vmstate
   clusters written by the attempt. Cleanup errors identify the affected disk.
 - Where: `hv/crates/vmlab-hv-vmm/src/snapshot.rs:313-352` (`save`) and
@@ -254,7 +262,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F9. A rollback checkpoint outlives a killed load (wrong result)
 
-- Fixed in #421. Startup removes rollback checkpoints from each writable disk
+- Fixed in #421 (`96f0a8d9`).
+  Startup removes rollback checkpoints from each writable disk
   before starting the guest. New checkpoints use a reserved name prefix.
   Older checkpoints share the user snapshot namespace and are left in place.
 - Where: `hv/crates/vmlab-hv-vmm/src/snapshot.rs:627-664`
@@ -276,7 +285,8 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
 
 ### F10. An offline snapshot holds the disks only (wrong result)
 
-- Fixed in #437. An offline capture copies `OVMF_VARS.fd` and `tpm-state/`
+- Fixed in #437 (`5b8a7932`).
+  An offline capture copies `OVMF_VARS.fd` and `tpm-state/`
   into `snapshot-state/snap-<name>/` in the VM's directory, an offline restore
   puts them back after the disks, and a delete removes the copy. A snapshot
   taken before the fix has no copy, and a restore of it leaves both alone.
@@ -303,6 +313,9 @@ Severity words: **data loss**, **crash** (of the VM or a host process),
   stays. The same with a file under `tpm_state()`.
 
 ### F11. The micro-VM's PM1a block is in no section (wrong result)
+
+- Fixed in #794 (`b5eb0308`). Direct-kernel snapshots save the PM1a status,
+  enable and control registers and restore the SCI level.
 
 - Where: `hv/crates/vmlab-hv-vmm/src/pm.rs:47-53` (`sts`, `en`, `cnt`),
   `hv/crates/vmlab-hv-vmm/src/builder.rs:1399-1404` (registered on the I/O bus
