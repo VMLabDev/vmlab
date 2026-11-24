@@ -993,7 +993,8 @@ mod tests {
         z.add_sinkhole("*.telemetry.example.com", SinkholeMode::Nxdomain);
         let server = DnsServer::new(z);
 
-        let DnsAction::Reply(reply) = server.handle(&query_frame(1, "x.ads.example.com", QTYPE_A), SERVER_MAC)
+        let DnsAction::Reply(reply) =
+            server.handle(&query_frame(1, "x.ads.example.com", QTYPE_A), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -1001,9 +1002,10 @@ mod tests {
         assert_eq!(rcode, RCODE_NOERROR);
         assert_eq!(answer, Some((QTYPE_A, ANSWER_TTL, Ipv4Addr::UNSPECIFIED)));
 
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(2, "x.telemetry.example.com", QTYPE_A), SERVER_MAC)
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(2, "x.telemetry.example.com", QTYPE_A),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, ancount, _) = parse_reply(&reply);
@@ -1016,18 +1018,20 @@ mod tests {
         let mut z = DnsZone::new("vmlab.internal");
         z.register("web", ip(20));
         let server = DnsServer::new(z);
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(3, "web.vmlab.internal", QTYPE_AAAA), SERVER_MAC)
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(3, "web.vmlab.internal", QTYPE_AAAA),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, ancount, _) = parse_reply(&reply);
         assert_eq!(rcode, RCODE_NOERROR);
         assert_eq!(ancount, 0);
         // Unknown AAAA without upstream takes the A path: NXDOMAIN.
-        let DnsAction::Reply(reply) =
-            server.handle(&query_frame(4, "gone.vmlab.internal", QTYPE_AAAA), SERVER_MAC)
-        else {
+        let DnsAction::Reply(reply) = server.handle(
+            &query_frame(4, "gone.vmlab.internal", QTYPE_AAAA),
+            SERVER_MAC,
+        ) else {
             panic!("expected a reply");
         };
         let (_, rcode, _, _) = parse_reply(&reply);
@@ -1054,7 +1058,8 @@ mod tests {
         const QTYPE_MX: u16 = 15;
         // An unknown name without an upstream takes the A path: NXDOMAIN.
         let server = DnsServer::new(DnsZone::new("vmlab.internal"));
-        let DnsAction::Reply(reply) = server.handle(&query_frame(6, "example.com", QTYPE_MX), SERVER_MAC)
+        let DnsAction::Reply(reply) =
+            server.handle(&query_frame(6, "example.com", QTYPE_MX), SERVER_MAC)
         else {
             panic!("expected a reply");
         };
@@ -1287,12 +1292,18 @@ mod tests {
         // Label length claims 63 bytes but only 2 are present.
         let mut m = header(1);
         m.extend_from_slice(&[63, b'a', b'b']);
-        assert!(matches!(server.handle(&raw_frame(&m), SERVER_MAC), DnsAction::Ignore));
+        assert!(matches!(
+            server.handle(&raw_frame(&m), SERVER_MAC),
+            DnsAction::Ignore
+        ));
 
         // Compression pointer in the question (unsupported → ignored).
         let mut m = header(1);
         m.extend_from_slice(&[0xC0, 0x0C, 0, QTYPE_A as u8, 0, QCLASS_IN as u8]);
-        assert!(matches!(server.handle(&raw_frame(&m), SERVER_MAC), DnsAction::Ignore));
+        assert!(matches!(
+            server.handle(&raw_frame(&m), SERVER_MAC),
+            DnsAction::Ignore
+        ));
 
         // A maximal name: enough 63-byte labels to approach the UDP payload
         // limit. The echoed response would not fit an IPv4 packet; the server
