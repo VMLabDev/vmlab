@@ -1792,7 +1792,7 @@ impl Trace {
             // The two counters of the `Arc` and the header of its `Vec`.
             2 * size_of::<usize>()
                 + size_of::<Vec<Binding>>()
-                + bindings.len() * size_of::<Binding>()
+                + size_of_val(bindings)
                 + bindings
                     .iter()
                     .map(|binding| text(&binding.name))
@@ -1879,7 +1879,7 @@ impl Trace {
             if seen.insert(std::sync::Arc::as_ptr(&frame.local_names) as usize) {
                 shared += 2 * size_of::<usize>()
                     + size_of::<Vec<String>>()
-                    + frame.local_names.len() * size_of::<String>()
+                    + size_of_val(frame.local_names.as_slice())
                     + frame
                         .local_names
                         .iter()
