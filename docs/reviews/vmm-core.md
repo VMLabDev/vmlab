@@ -363,6 +363,15 @@ and the IDE, AHCI and USB devices on the same buses.
   `io_write(0x602, &[0, 0])`, load, and assert `io_read(0x602)` of two
   bytes returns `0x0100`. Today it returns 0.
 - Confidence: high.
+- Fixed by card #794. The block is machine state: a save of a direct-kernel
+  machine writes PM1a_STS, PM1a_EN and PM1a_CNT as the vmstate section
+  `acpi-pm`, and a load puts them back and drives the SCI from them. A
+  snapshot from before the section existed leaves the block as it is, and a
+  section with a bit the device cannot hold fails the load. A firmware
+  machine writes no section, because its block is the LPC's.
+  `legacy_reset_control` is still not saved. Test
+  `snapshot_preserves_pm1_enable` needs KVM, so the merge bar does not run
+  it. `pm::tests::state_round_trips_and_drives_the_sci` runs there.
 
 ### F11. I/O BARs placed below 0x1000 are never dispatched
 

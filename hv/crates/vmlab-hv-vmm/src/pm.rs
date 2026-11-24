@@ -85,6 +85,45 @@ impl vmlab_hv_devices::Resettable for PmDevice {
     }
 }
 
+/// The section the block is saved under.
+pub const PM_STATE_ID: &str = "acpi-pm";
+const PM_STATE_VERSION: u8 = 1;
+
+impl vmlab_hv_devices::Snapshot for PmDevice {
+    fn state_id(&self) -> String {
+        PM_STATE_ID.into()
+    }
+
+    /// The version, then PM1a_STS, PM1a_EN and PM1a_CNT, little-endian.
+    fn save_state(&self) -> Result<Vec<u8>, vmlab_hv_devices::DeviceError> {
+        let mut state = vec![PM_STATE_VERSION];
+        for register in [self.sts, self.en, self.cnt] {
+            state.extend_from_slice(&register.to_le_bytes());
+        }
+        Ok(state)
+    }
+
+    /// Takes only what a guest can have written: a bit the device never
+    /// holds is refused, and nothing changes then.
+    fn restore_state(&mut self, state: &[u8]) -> Result<(), vmlab_hv_devices::DeviceError> {
+        let invalid = || vmlab_hv_devices::DeviceError::State("invalid ACPI PM state".into());
+        let &[PM_STATE_VERSION, s0, s1, e0, e1, c0, c1] = state else {
+            return Err(invalid());
+        };
+        let sts = u16::from_le_bytes([s0, s1]);
+        let en = u16::from_le_bytes([e0, e1]);
+        let cnt = u16::from_le_bytes([c0, c1]);
+        if sts & !(STS_PWRBTN | STS_WAK) != 0 || en & !EN_PWRBTN != 0 || cnt & CNT_SLP_EN != 0 {
+            return Err(invalid());
+        }
+        self.sts = sts;
+        self.en = en;
+        self.cnt = cnt;
+        self.update_sci();
+        Ok(())
+    }
+}
+
 impl BusDevice for PmDevice {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         let value = match offset {
@@ -253,5 +292,46 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 3);
         pm.read(4, &mut cnt);
         assert_eq!(u16::from_le_bytes(cnt), 0);
+    }
+    /// vmm-core review F10: the block is snapshot state, and a restore
+    /// drives the SCI from what it restored.
+    #[test]
+    fn state_round_trips_and_drives_the_sci() {
+        use vmlab_hv_devices::Snapshot;
+        let device = || {
+            let irq = Arc::new(FakeIrq {
+                level: AtomicBool::new(false),
+            });
+            (PmDevice::new(irq.clone(), Arc::new(|_| {})), irq)
+        };
+        let (mut saved, _) = device();
+        saved.write(2, &[0x00, 0x01]);
+        saved.write(4, &0x0400u16.to_le_bytes());
+        saved.press_power_button();
+        let state = saved.save_state().unwrap();
+
+        let (mut loaded, irq) = device();
+        loaded.restore_state(&state).unwrap();
+        let mut word = [0u8; 2];
+        loaded.read(0, &mut word);
+        assert_eq!(u16::from_le_bytes(word), STS_PWRBTN | STS_WAK);
+        loaded.read(2, &mut word);
+        assert_eq!(u16::from_le_bytes(word), EN_PWRBTN);
+        loaded.read(4, &mut word);
+        assert_eq!(u16::from_le_bytes(word), 0x0400);
+        assert!(irq.level.load(Ordering::SeqCst), "the pending event");
+
+        // A state the device cannot hold is refused and changes nothing.
+        for bad in [
+            &[][..],
+            &[2, 0, 0x80, 0, 0, 0, 0],
+            &[1, 0, 0x80, 0, 0, 0],
+            &[1, 1, 0x80, 0, 0, 0, 0],
+            &[1, 0, 0x80, 1, 0, 0, 0],
+            &[1, 0, 0x80, 0, 0, 0, 0x20],
+        ] {
+            assert!(loaded.restore_state(bad).is_err(), "{bad:?}");
+            assert_eq!(loaded.save_state().unwrap(), state);
+        }
     }
 }
