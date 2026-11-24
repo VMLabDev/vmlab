@@ -48,6 +48,21 @@ impl MediaCache {
         src_folder: &Path,
         label: Option<&str>,
     ) -> Result<PathBuf> {
+        self.ensure_with(kind, src_folder, label, |src, out, label| match kind {
+            MediaKind::Iso => build_iso(src, out, label),
+            MediaKind::Floppy => build_floppy(src, out, label),
+        })
+    }
+
+    /// [`ensure`](Self::ensure) with the image tool as an argument: `build`
+    /// writes the image of a folder to a path.
+    fn ensure_with(
+        &self,
+        kind: MediaKind,
+        src_folder: &Path,
+        label: Option<&str>,
+        build: impl Fn(&Path, &Path, Option<&str>) -> Result<()>,
+    ) -> Result<PathBuf> {
         let digest = folder_digest(src_folder)?;
         let dest = self.cache_dir.join(entry_name(kind, label, &digest));
         let sealed = matches!(kind, MediaKind::Floppy);
@@ -65,11 +80,7 @@ impl MediaCache {
                 .to_string_lossy()
         ));
 
-        let built = match kind {
-            MediaKind::Iso => build_iso(src_folder, &tmp, label),
-            MediaKind::Floppy => build_floppy(src_folder, &tmp, label),
-        };
-        if let Err(err) = built {
+        if let Err(err) = build(src_folder, &tmp, label) {
             let _ = fs::remove_file(&tmp);
             return Err(err);
         }
@@ -341,6 +352,65 @@ mod tests {
         assert!(
             last_sector(&second) == last_sector(&fresh),
             "the cache handed back the sector its reader wrote"
+        );
+    }
+
+    /// F7 (docs/reviews/appshare-media.md): the folder is hashed, and then
+    /// the image tool reads it again. A file that changes between the two
+    /// reads must not go into an entry named after the content from before
+    /// the change: a folder put back to that content would get the changed
+    /// file from the cache from then on.
+    ///
+    /// The image tool here is the real one behind an edit of one source
+    /// file, made once. An ISO stores a file as it is and pads its last
+    /// sector with zeros, so the image is searched for the file's bytes and
+    /// what follows them.
+    #[test]
+    fn an_edit_during_the_build_is_not_cached_under_the_old_digest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const RESTORED: &[u8] = b"answer-file-as-the-folder-holds-it";
+        let holds = |image: &Path, bytes: &[u8]| {
+            let image = fs::read(image).unwrap();
+            image.windows(bytes.len()).any(|w| w == bytes)
+        };
+
+        let src = tempfile::tempdir().unwrap();
+        let file = src.path().join("answer.txt");
+        fs::write(&file, RESTORED).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+
+        let edited = AtomicBool::new(false);
+        let build = |src: &Path, out: &Path, label: Option<&str>| {
+            if !edited.swap(true, Ordering::SeqCst) {
+                let mut bytes = fs::read(src.join("answer.txt")).unwrap();
+                bytes.push(b'!');
+                fs::write(src.join("answer.txt"), bytes).unwrap();
+            }
+            build_iso(src, out, label)
+        };
+        cache
+            .ensure_with(MediaKind::Iso, src.path(), None, build)
+            .expect("the build with an edit in it");
+        assert!(edited.load(Ordering::SeqCst), "the build never ran");
+
+        fs::write(&file, RESTORED).unwrap();
+        let image = cache
+            .ensure_with(MediaKind::Iso, src.path(), None, build)
+            .expect("the build of the restored folder");
+
+        let (mut restored, mut changed) = (RESTORED.to_vec(), RESTORED.to_vec());
+        restored.push(0);
+        changed.push(b'!');
+        assert!(
+            !holds(&image, &changed),
+            "the image of the restored folder holds the file as it was edited during an \
+             earlier build"
+        );
+        assert!(
+            holds(&image, &restored),
+            "the image does not hold the file as the folder has it"
         );
     }
 
