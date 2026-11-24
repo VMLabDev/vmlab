@@ -1026,6 +1026,99 @@ mod tests {
         ));
     }
 
+    /// Review finding F17 (card #818): a sinkhole is a verdict on the name,
+    /// so no query type for it may reach the upstream resolver.
+    #[test]
+    fn a_sinkhole_covers_every_query_type() {
+        const QTYPE_CNAME: u16 = 5;
+        const QTYPE_TXT: u16 = 16;
+        const QTYPE_SRV: u16 = 33;
+        const QTYPE_SVCB: u16 = 64;
+        const QTYPE_HTTPS: u16 = 65;
+        let mut z = DnsZone::new("vmlab.internal");
+        z.upstream = Some(upstream());
+        z.add_sinkhole("*.blocked.test", SinkholeMode::Nxdomain);
+        z.add_sinkhole("*.zero.test", SinkholeMode::Zero);
+        z.register("dc01", ip(20));
+        let server = DnsServer::new(z);
+
+        for qtype in [QTYPE_HTTPS, QTYPE_SVCB, QTYPE_CNAME, QTYPE_TXT, QTYPE_SRV] {
+            // An NXDOMAIN sinkhole refuses the name whatever is asked of it.
+            match server.handle(&query_frame(1, "a.blocked.test", qtype)) {
+                DnsAction::Reply(reply) => {
+                    let (id, rcode, ancount, _) = parse_reply(&reply);
+                    assert_eq!(id, 1);
+                    assert_eq!(rcode, RCODE_NXDOMAIN, "qtype {qtype}");
+                    assert_eq!(ancount, 0, "qtype {qtype}");
+                }
+                other => panic!("qtype {qtype}: expected a reply, got {other:?}"),
+            }
+            // A 0.0.0.0 sinkhole and a name of the lab's own have an address
+            // and nothing else: an empty NOERROR, answered here.
+            for name in ["a.zero.test", "dc01.vmlab.internal"] {
+                match server.handle(&query_frame(2, name, qtype)) {
+                    DnsAction::Reply(reply) => {
+                        let (_, rcode, ancount, _) = parse_reply(&reply);
+                        assert_eq!(rcode, RCODE_NOERROR, "{name} qtype {qtype}");
+                        assert_eq!(ancount, 0, "{name} qtype {qtype}");
+                    }
+                    other => panic!("{name} qtype {qtype}: expected a reply, got {other:?}"),
+                }
+            }
+            // A name the zone has no verdict on still goes upstream.
+            assert!(matches!(
+                server.handle(&query_frame(3, "example.com", qtype)),
+                DnsAction::ForwardUpstream { .. }
+            ));
+        }
+    }
+
+    /// The other half of F17: a class other than IN or an opcode other than
+    /// QUERY, for a name the zone has a verdict on, stays off the upstream.
+    #[test]
+    fn a_sinkholed_name_is_not_forwarded_under_another_class_or_opcode() {
+        const QCLASS_CH: u16 = 3;
+        let mut z = DnsZone::new("vmlab.internal");
+        z.upstream = Some(upstream());
+        z.add_sinkhole("*.blocked.test", SinkholeMode::Nxdomain);
+        let server = DnsServer::new(z);
+
+        let frame_of = |q: &[u8]| {
+            let udp = udp_build(CLIENT_IP, SERVER_IP, CLIENT_PORT, DNS_PORT, q).unwrap();
+            let ipp = ipv4_build(CLIENT_IP, SERVER_IP, IPPROTO_UDP, 64, &udp, 3).unwrap();
+            eth_build(SERVER_MAC, CLIENT_MAC, ETHERTYPE_IPV4, &ipp)
+        };
+        let chaos = |name: &str| {
+            let mut q = build_query(4, name, QTYPE_A);
+            let n = q.len();
+            q[n - 2..].copy_from_slice(&QCLASS_CH.to_be_bytes());
+            frame_of(&q)
+        };
+        let status = |name: &str| {
+            let mut q = build_query(5, name, QTYPE_A);
+            q[2] |= 2 << 3; // opcode STATUS
+            frame_of(&q)
+        };
+
+        for frame in [chaos("a.blocked.test"), status("a.blocked.test")] {
+            match server.handle(&frame) {
+                DnsAction::Reply(reply) => {
+                    let (_, rcode, ancount, _) = parse_reply(&reply);
+                    assert_eq!(rcode, RCODE_NOTIMP);
+                    assert_eq!(ancount, 0);
+                }
+                other => panic!("expected a reply, got {other:?}"),
+            }
+        }
+        // Names the zone has no verdict on forward as before.
+        for frame in [chaos("example.com"), status("example.com")] {
+            assert!(matches!(
+                server.handle(&frame),
+                DnsAction::ForwardUpstream { .. }
+            ));
+        }
+    }
+
     #[test]
     fn respond_ctx_builds_client_frame() {
         let ctx = DnsRespondCtx {
