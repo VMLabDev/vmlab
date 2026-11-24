@@ -842,8 +842,7 @@ impl GlobalSegments {
         let mut segs = self.segs.lock().await;
         let subnet = subnet.trunc();
         if let Some((other, seg)) = segs.iter().find(|(other, seg)| {
-            other.as_str() != name
-                && (subnet.contains(&seg.subnet) || seg.subnet.contains(&subnet))
+            other.as_str() != name && (subnet.contains(&seg.subnet) || seg.subnet.contains(&subnet))
         }) {
             tracing::warn!(
                 "refusing trunk from {remote} for global segment {name:?}: subnet {subnet} overlaps segment {other:?} ({})",
@@ -1482,12 +1481,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_accepted_trunk_reserves_its_subnet_from_local_allocation() {
-        let b = instance("secret").await;
-        let subnet = "10.214.0.0/24".parse().unwrap();
-        let _trunk = dial_peer(b.addr, "wan", subnet, "secret").await.unwrap();
+        for (peer, expected) in [
+            ("10.214.0.0/24", "10.214.1.0/24"),
+            ("10.214.0.0/23", "10.214.2.0/24"),
+        ] {
+            let b = instance("secret").await;
+            let _trunk = dial_peer(b.addr, "wan", peer.parse().unwrap(), "secret")
+                .await
+                .unwrap();
 
-        let (_, _, local) = b.globals.attach("lan", None, None, None).await.unwrap();
-        assert_eq!(local, "10.214.1.0/24".parse::<Ipv4Net>().unwrap());
+            let (_, _, local) = b.globals.attach("lan", None, None, None).await.unwrap();
+            assert_eq!(local, expected.parse::<Ipv4Net>().unwrap());
+        }
     }
 
     #[tokio::test]
