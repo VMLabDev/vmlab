@@ -1408,7 +1408,9 @@ where
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     };
-    tokio::time::timeout(timeout, search).await.unwrap_or(Ok(None))
+    tokio::time::timeout(timeout, search)
+        .await
+        .unwrap_or(Ok(None))
 }
 
 #[cfg(test)]
