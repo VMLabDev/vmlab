@@ -1499,7 +1499,10 @@ async fn a_failed_second_virtiofsd_stops_the_first() {
         "{err:#}"
     );
     let live = hv.live_helpers().await;
-    assert!(live.is_empty(), "failed start left helpers running: {live:?}");
+    assert!(
+        live.is_empty(),
+        "failed start left helpers running: {live:?}"
+    );
 }
 
 #[tokio::test]
@@ -1523,7 +1526,10 @@ async fn a_failed_second_virtiofsd_stops_the_first_for_a_vm() {
         "{err:#}"
     );
     let live = hv.live_helpers().await;
-    assert!(live.is_empty(), "failed start left helpers running: {live:?}");
+    assert!(
+        live.is_empty(),
+        "failed start left helpers running: {live:?}"
+    );
 }
 
 /// A virtiofsd older than `--migration-mode` (Ubuntu 24.04 ships 1.10.0)
