@@ -120,6 +120,45 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / 'executed').exists())
 
+    def test_failed_cross_filesystem_copy_preserves_installed_binaries(self):
+        shared_memory = Path('/dev/shm')
+        if not shared_memory.is_dir() or shared_memory.stat().st_dev == self.root.stat().st_dev:
+            self.skipTest('requires /dev/shm on a separate filesystem')
+        with tempfile.TemporaryDirectory(dir=shared_memory) as downloads:
+            self.env['TMPDIR'] = downloads
+            self.env['LC_ALL'] = 'C'
+            # Allow the fixture downloads to finish. Only installation copies
+            # should hit the file size limit.
+            curl = self.bin / 'curl'
+            self.tool('curl', curl.read_text().replace('set -eu\n', 'set -eu\nulimit -Sf unlimited\n'))
+            old = b'#!/bin/sh\nexit 0\n'
+            binaries = {'vmlab': (self.asset, 0o755), 'vmlab-fastpath': (self.helper, 0o700)}
+            for name, (asset, _) in binaries.items():
+                with self.subTest(binary=name):
+                    installed = self.root / name
+                    installed.mkdir()
+                    for binary, (_, mode) in binaries.items():
+                        (installed / binary).write_bytes(old)
+                        (installed / binary).chmod(mode)
+                    fixture = self.dist / asset
+                    original = fixture.read_bytes()
+                    fixture.write_bytes(original + b'#' * 131072)
+                    self.prepare()
+                    result = subprocess.run(
+                        ['sh', '-c', 'set -eu\ntrap "" XFSZ\nulimit -Sf 64\nexec sh "$@"',
+                         'sh', str(INSTALL), '--version', '1.2.3', '--bin-dir', str(installed),
+                         '--no-guest', '--no-fastpath', '--skip-checks'],
+                        env=self.env, capture_output=True, text=True,
+                    )
+                    fixture.write_bytes(original)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('File too large', result.stderr)
+                    self.assertEqual(sorted(path.name for path in installed.iterdir()), sorted(binaries))
+                    for binary, (_, mode) in binaries.items():
+                        self.assertEqual((installed / binary).read_bytes(), old, binary)
+                        self.assertEqual((installed / binary).stat().st_mode & 0o777, mode, binary)
+                    self.assertEqual(list(Path(downloads).iterdir()), [])
+
     def guest_bundle(self):
         agent = self.root / 'agent'
         agent.mkdir()
