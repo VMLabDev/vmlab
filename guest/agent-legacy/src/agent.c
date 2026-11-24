@@ -79,27 +79,28 @@ static void begin(struct json_out *o, const char *event)
     jo_str(o, event);
 }
 
-static int send_simple(const char *event, long id)
+/* Zero is the control channel, so omit the id on unscoped replies. */
+static int send_simple(const char *event, unsigned long id)
 {
     struct json_out o;
     begin(&o, event);
-    if (id >= 0) {
+    if (id != 0) {
         jo_raw(&o, ",");
         jo_key(&o, "id");
-        jo_ulong(&o, (unsigned long)id);
+        jo_ulong(&o, id);
     }
     jo_raw(&o, "}");
     return send_ctrl(&o);
 }
 
-static int send_error(long id, const char *msg)
+static int send_error(unsigned long id, const char *msg)
 {
     struct json_out o;
     begin(&o, "error");
-    if (id >= 0) {
+    if (id != 0) {
         jo_raw(&o, ",");
         jo_key(&o, "id");
-        jo_ulong(&o, (unsigned long)id);
+        jo_ulong(&o, id);
     }
     jo_raw(&o, ",");
     jo_key(&o, "msg");
@@ -263,7 +264,7 @@ static void handle_set_time(const char *js, int ntok)
         send_time_set_failed(err[0] ? err : "set_time: the clock could not be set");
         return;
     }
-    send_simple("time_set", -1);
+    send_simple("time_set", 0);
 }
 
 /* ---- sessions ------------------------------------------------------- */
@@ -329,21 +330,25 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     char err[256];
     int i, t, argv_tok, env_tok, cwd_tok;
 
+    if (id == 0) {
+        send_error(0, "exec: a nonzero channel id is required");
+        return;
+    }
     if (find_session(id)) {
-        send_error((long)id, "channel id already open");
+        send_error(id, "channel id already open");
         return;
     }
     if (json_get(js, toks, ntok, 0, "logon") >= 0) {
         int lt = json_get(js, toks, ntok, 0, "logon");
         if (toks[lt].type == JSON_OBJECT) {
-            send_error((long)id, "legacy agent: cannot mint a logon; execs run as the "
-                                 "agent identity only");
+            send_error(id, "legacy agent: cannot mint a logon; execs run as the "
+                           "agent identity only");
             return;
         }
     }
     argv_tok = json_get(js, toks, ntok, 0, "argv");
     if (argv_tok < 0 || toks[argv_tok].type != JSON_ARRAY || toks[argv_tok].size == 0) {
-        send_error((long)id, "exec: empty argv");
+        send_error(id, "exec: empty argv");
         return;
     }
 
@@ -351,12 +356,12 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     t = argv_tok + 1;
     for (i = 0; i < toks[argv_tok].size; i++) {
         if (a.argc >= MAX_ARGV) {
-            send_error((long)id, "exec: too many arguments");
+            send_error(id, "exec: too many arguments");
             return;
         }
         a.argv[a.argc] = pool_str(&a, js, t);
         if (!a.argv[a.argc]) {
-            send_error((long)id, "exec: argument too long");
+            send_error(id, "exec: argument too long");
             return;
         }
         a.argc++;
@@ -372,17 +377,17 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
             char *k, *v;
             int klen;
             if (toks[t].type != JSON_ARRAY || toks[t].size != 2) {
-                send_error((long)id, "exec: malformed env entry");
+                send_error(id, "exec: malformed env entry");
                 return;
             }
             vt = json_skip(toks, ntok, kt);
             if (a.nenv >= MAX_ENV) {
-                send_error((long)id, "exec: too many env entries");
+                send_error(id, "exec: too many env entries");
                 return;
             }
             k = pool_str(&a, js, kt);
             if (!k) {
-                send_error((long)id, "exec: env entry too long");
+                send_error(id, "exec: env entry too long");
                 return;
             }
             klen = (int)strlen(k);
@@ -391,7 +396,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
             k[klen] = '=';
             v = pool_str(&a, js, vt);
             if (!v) {
-                send_error((long)id, "exec: env entry too long");
+                send_error(id, "exec: env entry too long");
                 return;
             }
             a.env[a.nenv++] = k;
@@ -403,7 +408,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     if (cwd_tok >= 0 && toks[cwd_tok].type == JSON_STRING) {
         a.cwd = pool_str(&a, js, cwd_tok);
         if (!a.cwd) {
-            send_error((long)id, "exec: cwd too long");
+            send_error(id, "exec: cwd too long");
             return;
         }
     }
@@ -415,7 +420,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
             break;
         }
     if (!s) {
-        send_error((long)id, "exec: too many open channels");
+        send_error(id, "exec: too many open channels");
         return;
     }
 
@@ -427,7 +432,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     err[0] = 0;
     proc = proc_start(&spec, err, (int)sizeof err);
     if (!proc) {
-        send_error((long)id, err[0] ? err : "exec: spawn failed");
+        send_error(id, err[0] ? err : "exec: spawn failed");
         return;
     }
     memset(s, 0, sizeof *s);
@@ -436,7 +441,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     s->proc = proc;
     s->credit = WIRE_INITIAL_WINDOW;
     s->out_remaining = s->err_remaining = -1;
-    send_simple("opened", (long)id);
+    send_simple("opened", id);
 }
 
 /* ---- dispatch ------------------------------------------------------- */
@@ -476,12 +481,12 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
 
     ntok = json_parse(js, (int)len, toks, MAX_TOKENS);
     if (ntok < 0 || toks[0].type != JSON_OBJECT) {
-        send_error(-1, "unparseable control message");
+        send_error(0, "unparseable control message");
         return 1;
     }
     cmd_tok = json_get(js, toks, ntok, 0, "cmd");
     if (cmd_tok < 0 || json_str(js, toks, cmd_tok, cmd, (int)sizeof cmd) < 0) {
-        send_error(-1, "control message without a cmd");
+        send_error(0, "control message without a cmd");
         return 0;
     }
     id = field_ulong(js, ntok, "id", 0);
@@ -509,7 +514,7 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
         if (s)
             s->credit += field_ulong(js, ntok, "bytes", 0);
     } else if (strcmp(cmd, "ping") == 0) {
-        send_simple("pong", -1);
+        send_simple("pong", 0);
     } else if (strcmp(cmd, "os_info") == 0) {
         send_os_info();
     } else if (strcmp(cmd, "net_info") == 0) {
@@ -523,30 +528,30 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
         send_shutting_down(mode);
         if (plat_shutdown(mode) == 0)
             return -1;
-        send_error(-1, "shutdown: not supported on this guest");
+        send_error(0, "shutdown: not supported on this guest");
     } else if (strcmp(cmd, "set_time") == 0) {
         handle_set_time(js, ntok);
     } else if (strcmp(cmd, "open_terminal") == 0) {
-        send_error((long)id, "legacy agent: no terminal (features: exec, set_time)");
+        send_error(id, "legacy agent: no terminal (features: exec, set_time)");
     } else if (strcmp(cmd, "open_file_ops") == 0 || strcmp(cmd, "open_fileops") == 0) {
-        send_error((long)id, "legacy agent: no fileops (features: exec, set_time)");
+        send_error(id, "legacy agent: no fileops (features: exec, set_time)");
     } else if (strcmp(cmd, "open_tail") == 0) {
-        send_error((long)id, "legacy agent: no tail (features: exec, set_time)");
+        send_error(id, "legacy agent: no tail (features: exec, set_time)");
     } else if (strcmp(cmd, "open_watch") == 0) {
-        send_error((long)id, "legacy agent: no watch (features: exec, set_time)");
+        send_error(id, "legacy agent: no watch (features: exec, set_time)");
     } else if (strcmp(cmd, "open_event_log") == 0 || strcmp(cmd, "open_eventlog") == 0) {
-        send_error((long)id, "legacy agent: no eventlog (features: exec, set_time)");
+        send_error(id, "legacy agent: no eventlog (features: exec, set_time)");
     } else if (strcmp(cmd, "open_app") == 0 || strcmp(cmd, "open_app_conn") == 0) {
-        send_error((long)id, "legacy agent: no apps (features: exec, set_time)");
+        send_error(id, "legacy agent: no apps (features: exec, set_time)");
     } else if (strcmp(cmd, "resize") == 0) {
         /* No terminals, so nothing to resize; silently fine. */
     } else if (strcmp(cmd, "subscribe_metrics") == 0 ||
                strcmp(cmd, "unsubscribe_metrics") == 0 ||
                strcmp(cmd, "get_clipboard") == 0 ||
                strcmp(cmd, "set_clipboard") == 0) {
-        send_error(-1, "legacy agent: not available (features: exec, set_time)");
+        send_error(0, "legacy agent: not available (features: exec, set_time)");
     } else {
-        send_error(-1, "legacy agent: unknown command");
+        send_error(0, "legacy agent: unknown command");
     }
     return 0;
 }
@@ -619,7 +624,7 @@ static int service_sessions(void)
         }
 
         if (s->exited && s->out_remaining == 0 && s->err_remaining == 0) {
-            send_simple("eof", (long)s->id);
+            send_simple("eof", s->id);
             send_exited(s->id, s->code);
             proc_free(s->proc);
             memset(s, 0, sizeof *s);
