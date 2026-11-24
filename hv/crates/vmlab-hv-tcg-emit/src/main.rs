@@ -8,6 +8,11 @@ fn generate(source: &str) -> Result<(String, Vec<u8>)> {
     let document = parse(source)?;
     let program = vmlab_hv_tcg_ir::lower(&document.definitions)?;
     let json = serde_json::to_vec(&program)?;
+    // Writing JSON has no depth limit and reading it has one, so a deep
+    // expression would give a payload that panics in the generated `model()`.
+    // Read it the way `model()` does and refuse here instead.
+    serde_json::from_slice::<vmlab_hv_tcg_ir::Program>(&json)
+        .context("the generated crate cannot load this model IR")?;
     let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
     gzip.write_all(&json)?;
     let packed = gzip.finish()?;
@@ -140,5 +145,61 @@ mod tests {
         assert!(a.0.contains(&format!("pub const IR_SHA256: &str = {digest:?};")));
         let program: vmlab_hv_tcg_ir::Program = serde_json::from_slice(&json).unwrap();
         assert_eq!(program.functions["zexecute"].code.len(), 2);
+    }
+
+    /// What the generated crate does with the payload in `model()`.
+    fn read_back(payload: &[u8]) -> serde_json::Result<vmlab_hv_tcg_ir::Program> {
+        let mut json = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(payload), &mut json).unwrap();
+        serde_json::from_slice(&json)
+    }
+
+    fn function_assigning(expr: &str) -> String {
+        format!("val f : (%unit) -> %unit\nfn f(x) {{ y : %unit; y = {expr}; return = (); end; }}")
+    }
+
+    /// Either the emitter refuses the model, or the generated crate can load
+    /// what it wrote.
+    fn loads_or_is_refused(source: &str) -> bool {
+        match generate(source) {
+            Ok((_, payload)) => {
+                if let Err(e) = read_back(&payload) {
+                    panic!("generate wrote a payload that does not read back: {e}");
+                }
+                true
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                assert!(
+                    message.contains("generated crate cannot load"),
+                    "unexpected refusal: {message}"
+                );
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn the_payload_reads_back_for_a_deep_expression() {
+        // One field access is two JSON levels, and the reader stops at 128.
+        let chain = |n: usize| function_assigning(&format!("x{}", ".a".repeat(n)));
+        loads_or_is_refused(&chain(64));
+        // A shallow expression is still emitted, and every depth the parser
+        // accepts is either loadable or refused.
+        assert!(loads_or_is_refused(&chain(8)));
+        for n in 1..=120 {
+            loads_or_is_refused(&chain(n));
+        }
+        let literals = |n: usize| {
+            let mut expr = "x".to_owned();
+            for _ in 0..n {
+                expr = format!("struct s {{ a = {expr} }}");
+            }
+            function_assigning(&expr)
+        };
+        assert!(loads_or_is_refused(&literals(4)));
+        for n in 1..=120 {
+            loads_or_is_refused(&literals(n));
+        }
     }
 }

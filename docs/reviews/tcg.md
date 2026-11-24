@@ -210,7 +210,7 @@ beyond the single random words of the first differential run, and
   `call_serves_every_function_the_model_does_not_define`, which calls every
   function the model calls and does not define.
 
-### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting
+### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting (fixed, card #774)
 
 - Where: `tcg/lib.rs:671` (`self.reservation = None` after every write) and
   `tcg/trace.rs:1460` (the same in a trace).
@@ -235,6 +235,20 @@ beyond the single random words of the first differential run, and
 - Confidence: medium. The value of the flag was read from the running model.
   That the Sail emulator succeeds in this case follows from the flag's
   meaning and was not run.
+- Fixed by card #774. The Jib of the model declares the setting and never
+  reads it: it is a setting for the platform, so the interpreter reads it.
+  `Interpreter::store` makes every ordinary store, from the interpreter and
+  from a trace. With the setting on it cancels the reservation. With it off,
+  or absent, the reservation stays as it was: where the store moved the write
+  generation of the reserved granules and the reservation was intact, it
+  takes the new generation, under the transaction lock of the memory, so a
+  store to the reserved page or to the reserved doubleword keeps it too. A
+  reservation that another hart's store broke stays broken. The proof tests
+  are in `vmlab-hv-tcg/tests/hardening.rs`:
+  `a_same_hart_store_keeps_the_reservation`,
+  `a_same_hart_store_in_a_trace_keeps_the_reservation`,
+  `a_same_hart_store_cancels_the_reservation_when_the_model_says_so` and
+  `a_same_hart_store_does_not_restore_a_broken_reservation`.
 
 ### F5. Jib text within the parser's nesting limits overflows the stack in `lower`
 
@@ -274,7 +288,7 @@ beyond the single random words of the first differential run, and
   all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
   generated again for this card.
 
-### F6. The emitter writes a model that the generated crate cannot load
+### F6. The emitter writes a model that the generated crate cannot load (fixed, card #775)
 
 - Where: `emit/main.rs:10` (`serde_json::to_vec`), `emit/main.rs:32` and
   `vmlab-hv-tcg-riscv64/src/lib.rs:176`
@@ -298,6 +312,16 @@ beyond the single random words of the first differential run, and
   test saw the limit between 60 and 62 field accesses, and between 30 and 40
   struct literals.
 - Confidence: high.
+- Fixed by card #775. `generate` reads the JSON it wrote back with
+  `serde_json::from_slice::<Program>`, the call the generated `model()`
+  makes, and returns the error `the generated crate cannot load this model
+  IR` when that fails. So neither a write nor `--check` passes for a model
+  the crate cannot load, and the fault shows when the model is generated,
+  not at the first `model()`. The reader's limit is unchanged: a model that
+  needs more than 128 JSON levels is refused, not loaded. Before the fix the
+  proof test failed with `recursion limit exceeded at line 1 column 760`.
+  The test also runs 1 to 120 field accesses and 1 to 120 nested struct
+  literals, and each is either loaded or refused.
 
 ### F7. A loop that stores into its own code page never reuses a trace (fixed, card #773)
 
