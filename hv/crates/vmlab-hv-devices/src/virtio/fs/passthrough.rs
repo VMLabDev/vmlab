@@ -3154,4 +3154,84 @@ mod tests {
         assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, hello);
         assert_eq!(lookup(&fs, b"twin").unwrap().inode, twin);
     }
+
+    #[test]
+    fn unlink_then_create_at_old_name_keeps_the_open_inode() {
+        let (dir, fs) = scratch();
+        let held = lookup(&fs, b"hello.txt").unwrap().inode;
+        let (handle, _, _) =
+            FileSystem::open(&fs, &ctx(), held, libc::O_RDONLY as u32, 0).unwrap();
+        FileSystem::unlink(&fs, &ctx(), ROOT_ID, &name(b"hello.txt")).unwrap();
+
+        let (created, _, _, _) =
+            FileSystem::create(&fs, &ctx(), ROOT_ID, &name(b"hello.txt"), create_in()).unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"new").unwrap();
+
+        // Two files, two node ids: the open handle keeps the removed file,
+        // and the name is a new inode.
+        assert_ne!(created.inode, held);
+        let (st, _) = FileSystem::getattr(&fs, &ctx(), held, None).unwrap();
+        assert_eq!(st.st_nlink, 0);
+        assert_eq!(st.st_size, b"hello share\n".len() as i64);
+        assert_eq!(read_all(&fs, created.inode), b"new");
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, created.inode);
+
+        // The removed inode leaves without taking the name's new owner.
+        FileSystem::release(&fs, &ctx(), held, 0, handle.unwrap(), false, false, None).unwrap();
+        FileSystem::forget(&fs, &ctx(), held, 1);
+        assert_eq!(lookup(&fs, b"hello.txt").unwrap().inode, created.inode);
+    }
+
+    #[test]
+    fn unlink_of_one_hard_link_then_create_keeps_the_linked_inode() {
+        let (_dir, fs) = scratch();
+        let held = lookup(&fs, b"hello.txt").unwrap().inode;
+        let twin = FileSystem::link(&fs, &ctx(), held, ROOT_ID, &name(b"twin"))
+            .unwrap()
+            .inode;
+        FileSystem::unlink(&fs, &ctx(), ROOT_ID, &name(b"hello.txt")).unwrap();
+
+        let (created, _, _, _) =
+            FileSystem::create(&fs, &ctx(), ROOT_ID, &name(b"hello.txt"), create_in()).unwrap();
+
+        // The file lives on through its second link: the node id the guest
+        // holds for it still reads the old content.
+        assert_ne!(created.inode, held);
+        assert_eq!(read_all(&fs, held), b"hello share\n");
+        assert_eq!(read_all(&fs, twin), b"hello share\n");
+        assert_eq!(read_all(&fs, created.inode), b"");
+    }
+
+    #[test]
+    fn rmdir_then_mkdir_keeps_the_held_directory() {
+        let (dir, fs) = scratch();
+        let held = lookup(&fs, b"sub").unwrap().inode;
+        let (handle, _) = FileSystem::opendir(&fs, &ctx(), held, libc::O_RDONLY as u32).unwrap();
+        let nested = FileSystem::lookup(&fs, &ctx(), held, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        FileSystem::unlink(&fs, &ctx(), held, &name(b"nested.txt")).unwrap();
+        FileSystem::rmdir(&fs, &ctx(), ROOT_ID, &name(b"sub")).unwrap();
+
+        let made = FileSystem::mkdir(&fs, &ctx(), ROOT_ID, &name(b"sub"), 0o755, 0o022)
+            .unwrap()
+            .inode;
+        std::fs::write(dir.path().join("sub/nested.txt"), b"new").unwrap();
+
+        // Two directories, two node ids: the open handle keeps the removed
+        // one, and nothing the guest held below it names the new one's files.
+        assert_ne!(made, held);
+        let (st, _) = FileSystem::getattr(&fs, &ctx(), held, None).unwrap();
+        assert_eq!(st.st_nlink, 0);
+        let renested = FileSystem::lookup(&fs, &ctx(), made, &name(b"nested.txt"))
+            .unwrap()
+            .inode;
+        assert_ne!(renested, nested);
+        assert_eq!(read_all(&fs, renested), b"new");
+        assert_eq!(lookup(&fs, b"sub").unwrap().inode, made);
+
+        FileSystem::releasedir(&fs, &ctx(), held, 0, handle.unwrap()).unwrap();
+        FileSystem::forget(&fs, &ctx(), held, 1);
+        assert_eq!(lookup(&fs, b"sub").unwrap().inode, made);
+    }
 }
