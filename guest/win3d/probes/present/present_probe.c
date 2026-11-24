@@ -149,6 +149,27 @@ typedef struct {
     ULONG broadcast_context_count;
 } present_head;
 
+/* D3DKMT_CREATEPAGINGQUEUE */
+typedef struct {
+    UINT device;
+    UINT priority;
+    UINT paging_queue; /* out */
+    UINT sync_object;  /* out */
+    void *fence_value; /* out: the paging fence, mapped for reading */
+    UINT physical_adapter_index;
+} create_paging_queue;
+
+/* D3DDDI_MAKERESIDENT */
+typedef struct {
+    UINT paging_queue;
+    UINT num_allocations;
+    const UINT *allocation_list;
+    const UINT *priority_list;
+    UINT flags;
+    uint64_t paging_fence_value; /* out */
+    uint64_t num_bytes_to_trim;  /* out */
+} make_resident;
+
 typedef struct { UINT handle; } close_adapter;
 typedef LONG (WINAPI *enum_fn)(const enum_adapters *);
 typedef LONG (WINAPI *query_fn)(const query_adapter *);
@@ -159,13 +180,9 @@ typedef LONG (WINAPI *create_context_fn)(create_context *);
 typedef LONG (WINAPI *destroy_context_fn)(const destroy_context *);
 typedef LONG (WINAPI *create_allocation_fn)(create_allocation *);
 typedef LONG (WINAPI *present_fn)(void *);
+typedef LONG (WINAPI *paging_queue_fn)(create_paging_queue *);
+typedef LONG (WINAPI *make_resident_fn)(make_resident *);
 typedef LONG (WINAPI *close_fn)(const close_adapter *);
-/* dwmapi, export 100: has the compositor make the surface of a window on
- * the adapter that the caller names. d3d9.dll calls it before the first
- * windowed present: without it Windows answers the present with
- * STATUS_GRAPHICS_PRESENT_OCCLUDED. */
-typedef HRESULT (WINAPI *dwm_surface_fn)(HWND, LUID, HMONITOR, DWORD, ULONG *, HANDLE *, UINT64 *);
-
 /* viogpu/shared/viogpum.h of the driver source. VIOGPU_ADAPTERINFO is not
  * packed there: four bytes of padding follow the flags. */
 typedef struct {
@@ -219,6 +236,8 @@ _Static_assert(sizeof(viogpu_submit_cmd_req) == 12, "VIOGPU_SUBMIT_CMD_REQ ABI")
 _Static_assert(sizeof(create_context) == 96 && offsetof(create_context, context) == 32, "D3DKMT_CREATECONTEXT ABI");
 _Static_assert(sizeof(allocation_info) == 96 && offsetof(allocation_info, flags) == 32, "D3DDDI_ALLOCATIONINFO2 ABI");
 _Static_assert(sizeof(create_allocation) == 72 && offsetof(create_allocation, allocation_info) == 48, "D3DKMT_CREATEALLOCATION ABI");
+_Static_assert(sizeof(create_paging_queue) == 32 && sizeof(make_resident) == 48 &&
+               offsetof(make_resident, paging_fence_value) == 32, "D3DDDI_MAKERESIDENT ABI");
 _Static_assert(offsetof(present_head, source) == 20 && offsetof(present_head, src_sub_rects) == 72 &&
                offsetof(present_head, flags) == 88, "D3DKMT_PRESENT ABI");
 #endif
@@ -359,7 +378,7 @@ typedef struct {
     const char *result, *stage, *name, *expect;
     int selected, pass;
     LONG last_status, ctx_init_status, venus_status, create_allocation_status, first_present_status, last_present_status;
-    LONG window_surface_hresult;
+    LONG paging_queue_status, make_resident_status;
     DWORD win32_error, session;
     uint64_t supported;
     uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted;
@@ -374,7 +393,7 @@ static void emit(FILE *f, const result *r)
             "\"presents_asked\":%u,\"presents_done\":%u,\"presents_failed\":%u,\"presents_accepted\":%u,"
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
-            "\"window_surface_hresult\":\"0x%08lx\","
+            "\"paging_queue_status\":\"0x%08lx\",\"make_resident_status\":\"0x%08lx\","
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
@@ -382,7 +401,8 @@ static void emit(FILE *f, const result *r)
             r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted,
             (unsigned long)r->first_present_status, (unsigned long)r->last_present_status,
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
-            (unsigned long)r->venus_status, (unsigned long)r->window_surface_hresult,
+            (unsigned long)r->venus_status,
+            (unsigned long)r->paging_queue_status, (unsigned long)r->make_resident_status,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
             (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
@@ -421,11 +441,12 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "arguments";
     r.presents_asked = 1;
     const wchar_t *out = NULL;
-    int which = -1, exit_code = 1, variant = 1;
+    int which = -1, exit_code = 1, variant = 1, wait_resident = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
+        else if (!wcscmp(argv[i], L"--wait-resident")) wait_resident = 1;
         else if (!wcscmp(argv[i], L"--variant") && i + 1 < argc) variant = (int)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
@@ -483,9 +504,11 @@ int wmain(int argc, wchar_t **argv)
     destroy_context_fn context_destroy = (destroy_context_fn)GetProcAddress(gdi, "D3DKMTDestroyContext");
     create_allocation_fn allocate = (create_allocation_fn)GetProcAddress(gdi, "D3DKMTCreateAllocation");
     present_fn present = (present_fn)GetProcAddress(gdi, "D3DKMTPresent");
+    paging_queue_fn paging_queue_create = (paging_queue_fn)GetProcAddress(gdi, "D3DKMTCreatePagingQueue");
+    make_resident_fn resident = (make_resident_fn)GetProcAddress(gdi, "D3DKMTMakeResident");
     close_fn close = (close_fn)GetProcAddress(gdi, "D3DKMTCloseAdapter");
     if (!enumerate || !query || !create || !destroy || !escape || !context_create || !context_destroy ||
-        !allocate || !present || !close) {
+        !allocate || !present || !close || !paging_queue_create || !resident) {
         r.win32_error = ERROR_PROC_NOT_FOUND; FreeLibrary(gdi); goto done;
     }
     enum_adapters adapters = {0};
@@ -498,14 +521,12 @@ int wmain(int argc, wchar_t **argv)
     r.last_status = enumerate(&adapters);
     if (r.last_status < 0) { free(adapters.adapters); FreeLibrary(gdi); goto done; }
     UINT matches = 0, adapter = 0;
-    LUID adapter_luid = {0};
     for (ULONG i = 0; i < adapters.count; ++i) {
         query_device_ids ids = {0};
         query_adapter q = {adapters.adapters[i].handle, QUERY_PHYSICAL_ADAPTER_DEVICE_IDS, &ids, sizeof(ids)};
         if (query(&q) >= 0 && ids.vendor_id == 0x1af4 && ids.device_id == 0x1050) {
             ++matches;
             adapter = adapters.adapters[i].handle;
-            adapter_luid = adapters.adapters[i].luid;
             r.ids = ids;
             r.selected = 1;
         }
@@ -606,21 +627,27 @@ int wmain(int argc, wchar_t **argv)
     }
     if (r.last_status < 0) goto destroy_context;
 
-    /* The surface of the window, on this adapter. Windows uses it as the
-     * destination of the present. */
+    /* The driver asks for explicit residency: Windows refuses a present
+     * whose source nobody asked to be resident. The request is not waited
+     * for, so the present can come while the allocation is on its way in:
+     * then Windows calls DxgkDdiPatch for it later. With --wait-resident
+     * the probe waits for the paging fence first. */
     {
-        HMODULE dwmapi = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        dwm_surface_fn dwm_surface = dwmapi ? (dwm_surface_fn)GetProcAddress(dwmapi, "DwmpDxGetWindowSharedSurface") : NULL;
-        ULONG format = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
-        HANDLE surface = NULL;
-        UINT64 update_id = 0;
-        r.stage = "window_surface";
-        r.window_surface_hresult = (LONG)0x80004001; /* E_NOTIMPL: no such export */
-        if (dwm_surface)
-            r.window_surface_hresult = dwm_surface(window, adapter_luid, MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY),
-                                                   0, &format, &surface, &update_id);
-        if (r.window_surface_hresult < 0) { r.last_status = r.window_surface_hresult; goto destroy_context; }
-        pump(200);
+        create_paging_queue pq = {0};
+        pq.device = device.device;
+        r.stage = "create_paging_queue";
+        r.paging_queue_status = r.last_status = paging_queue_create(&pq);
+        if (r.last_status < 0) goto destroy_context;
+        make_resident mr = {0};
+        mr.paging_queue = pq.paging_queue;
+        mr.num_allocations = 1;
+        mr.allocation_list = &allocation.allocation;
+        r.stage = "make_resident";
+        r.make_resident_status = r.last_status = resident(&mr);
+        if (r.last_status < 0) goto destroy_context;
+        if (wait_resident && pq.fence_value) {
+            for (int i = 0; i < 200 && *(volatile uint64_t *)pq.fence_value < mr.paging_fence_value; ++i) Sleep(10);
+        }
     }
 
     /* A driver without the fix accepts the present, and the guest stops a
