@@ -1787,7 +1787,7 @@ fn main(lab: Lab) {
 use vmlab
 fn main(vm: Machine) {{
     let found = {call}.expect("Continue")
-    vm.mouse_move(found.cx, found.cy)
+    let click = vm.mouse_move(found.cx, found.cy)
 }}
 "#
             );
