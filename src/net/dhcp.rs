@@ -132,6 +132,10 @@ struct Lease {
     expiry: Instant,
 }
 
+/// What the caller has seen of the segment: the MAC that last used an
+/// address there, if any ([`DhcpServer::handle_seen`]).
+pub type Seen<'a> = dyn Fn(Ipv4Addr) -> Option<MacAddr> + 'a;
+
 /// The DHCP server state machine: a lease table over a [`DhcpConfig`].
 #[derive(Debug)]
 pub struct DhcpServer {
@@ -171,7 +175,17 @@ impl DhcpServer {
     /// Process one ethernet frame. Returns the full ethernet reply frame for
     /// DISCOVER/REQUEST that warrant one (OFFER/ACK/NAK); `None` for
     /// non-DHCP traffic, RELEASE, DECLINE, and pool exhaustion.
+    #[cfg(test)]
     pub fn handle(&mut self, eth_frame: &[u8]) -> Option<Vec<u8>> {
+        self.handle_seen(eth_frame, &|_| None)
+    }
+
+    /// [`handle`](Self::handle), with what the caller has seen of the
+    /// segment: `seen(ip)` is the MAC that last used `ip` there, if any. A
+    /// lease makes the gateway drop every other MAC's frames from its
+    /// address, so an address seen at one MAC is not leased to another on
+    /// request, and is the last the pool offers (review F27).
+    pub fn handle_seen(&mut self, eth_frame: &[u8], seen: &Seen<'_>) -> Option<Vec<u8>> {
         let eth = EthView::parse(eth_frame)?;
         if eth.ethertype() != ETHERTYPE_IPV4 {
             return None;
@@ -199,8 +213,8 @@ impl DhcpServer {
         }
         self.purge_expired();
         match req.msg_type {
-            DHCP_DISCOVER => self.on_discover(&req),
-            DHCP_REQUEST => self.on_request(&req),
+            DHCP_DISCOVER => self.on_discover(&req, seen),
+            DHCP_REQUEST => self.on_request(&req, seen),
             DHCP_RELEASE => {
                 if self.leases.remove(&req.chaddr).is_some() {
                     debug!(mac = %req.chaddr, "DHCP release");
@@ -309,8 +323,8 @@ impl DhcpServer {
 
     // -- message handling -----------------------------------------------------
 
-    fn on_discover(&mut self, req: &BootpRequest) -> Option<Vec<u8>> {
-        let Some(ip) = self.ip_for(req.chaddr) else {
+    fn on_discover(&mut self, req: &BootpRequest, seen: &Seen<'_>) -> Option<Vec<u8>> {
+        let Some(ip) = self.ip_for(req.chaddr, seen) else {
             warn!(
                 subnet = %self.config.subnet,
                 mac = %req.chaddr,
@@ -327,7 +341,7 @@ impl DhcpServer {
         self.build_reply(req, DHCP_OFFER, Some(ip))
     }
 
-    fn on_request(&mut self, req: &BootpRequest) -> Option<Vec<u8>> {
+    fn on_request(&mut self, req: &BootpRequest, seen: &Seen<'_>) -> Option<Vec<u8>> {
         // SELECTING with a different server: the client chose someone else.
         if let Some(sid) = req.server_id
             && sid != self.config.gateway
@@ -348,7 +362,12 @@ impl DhcpServer {
         let granted = match (requested, entitled) {
             (None, Some(e)) => Some(e),
             (Some(r), Some(e)) => (r == e).then_some(e),
-            (Some(r), None) => self.requestable(r).then_some(r),
+            // An address another MAC was seen to use has a user, lease or
+            // not: granting it would make the gateway drop that user's
+            // frames (review F27).
+            (Some(r), None) => {
+                (self.requestable(r) && seen(r).is_none_or(|user| user == req.chaddr)).then_some(r)
+            }
             (None, None) => None,
         };
         match granted {
@@ -404,20 +423,23 @@ impl DhcpServer {
 
     /// The address this client should get: reservation, then existing valid
     /// lease, then a fresh allocation from the dynamic pool.
-    fn ip_for(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+    fn ip_for(&self, mac: MacAddr, seen: &Seen<'_>) -> Option<Ipv4Addr> {
         if let Some(&ip) = self.config.reservations.get(&mac) {
             return Some(ip);
         }
         if let Some(ip) = self.lease_of(mac) {
             return Some(ip);
         }
-        self.alloc()
+        self.alloc(mac, seen)
     }
 
     /// First free address in the dynamic pool: subnet hosts minus network/
     /// broadcast (already excluded by `hosts()`), gateway, reservations,
-    /// valid leases, and quarantined addresses.
-    fn alloc(&self) -> Option<Ipv4Addr> {
+    /// valid leases, and quarantined addresses. An address another MAC was
+    /// seen to use is passed over while any other is free (review F27): a
+    /// guest writes what the gateway sees, so it only orders the pool and
+    /// cannot empty it.
+    fn alloc(&self, mac: MacAddr, seen: &Seen<'_>) -> Option<Ipv4Addr> {
         let now = Instant::now();
         let taken: HashSet<Ipv4Addr> = self
             .leases
@@ -428,7 +450,10 @@ impl DhcpServer {
             .chain(std::iter::once(self.config.gateway))
             .chain(self.declined.keys().copied())
             .collect();
-        self.config.subnet.hosts().find(|h| !taken.contains(h))
+        let free = || self.config.subnet.hosts().filter(|h| !taken.contains(h));
+        free()
+            .find(|h| seen(*h).is_none_or(|user| user == mac))
+            .or_else(|| free().next())
     }
 
     /// Whether `ip` is an address of the subnet a client can hold.
@@ -811,6 +836,30 @@ mod tests {
             chaddr,
             opts,
         }
+    }
+
+    /// Review networking-2 F27: an address seen in use at another MAC is
+    /// refused on request and passed over by the pool, the user's own
+    /// request for it is granted, and a pool where every free address is
+    /// seen in use still offers one.
+    #[test]
+    fn an_address_seen_at_another_mac_is_not_handed_out() {
+        let first = Ipv4Addr::new(10, 213, 1, 2);
+        let user = mac(9);
+        let seen = move |ip: Ipv4Addr| (ip == first).then_some(user);
+        let mut s = DhcpServer::new(config());
+        let nak = parse_reply(&s.handle_seen(&request(mac(1), first), &seen).unwrap());
+        assert_eq!(nak.opts[&OPT_MSG_TYPE], vec![DHCP_NAK]);
+        let offer = parse_reply(&s.handle_seen(&discover(mac(1)), &seen).unwrap());
+        assert_eq!(offer.yiaddr, Ipv4Addr::new(10, 213, 1, 3));
+        let ack = parse_reply(&s.handle_seen(&request(user, first), &seen).unwrap());
+        assert_eq!(ack.opts[&OPT_MSG_TYPE], vec![DHCP_ACK]);
+        assert_eq!(ack.yiaddr, first);
+
+        let all = move |_: Ipv4Addr| Some(user);
+        let mut s = DhcpServer::new(config());
+        let offer = parse_reply(&s.handle_seen(&discover(mac(1)), &all).unwrap());
+        assert_eq!(offer.yiaddr, first);
     }
 
     #[test]

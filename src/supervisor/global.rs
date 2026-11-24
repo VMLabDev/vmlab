@@ -720,7 +720,7 @@ impl GlobalSegments {
         let sock = self.sock_dir.join(format!("{name}.sock"));
         let switch = Switch::new(format!("global/{name}"));
         let listener = switch
-            .listen_unix(&sock, PortClass::Service)
+            .listen_unix(&sock, PortClass::Trunk)
             .await
             .with_context(|| format!("listening on {}", sock.display()))?;
         Ok(GlobalSeg {
@@ -948,7 +948,7 @@ fn bridge_tcp_to_switch(
 ) -> impl Future<Output = ()> {
     use tokio::io::AsyncWriteExt;
 
-    let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Service);
+    let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Trunk);
     if let Some(gateway) = gateway {
         hold_gateway_behind(&switch, id, gateway);
     }
