@@ -302,6 +302,14 @@ Not read:
   call. Today the connection stays open and the count rises by one for each
   message.
 - Confidence: high.
+- Fixed by card #788. `native_input` in `display/core.rs` refuses a `CpuCopy`
+  while the connection's surface is 0, the state before its first configure,
+  so a connection without frames can send none. The connection is closed
+  with `InvalidData` before any capture. The proof test asserts the close,
+  the error and the unchanged `frame()` count. Not changed: a client that
+  holds a configured surface can still send `CpuCopy` for it without a rate
+  limit, and each one is a forced full frame for every client, as
+  `PROTOCOL.md` defines the message. `PROTOCOL.md` states the new refusal.
 
 ### F6. Input: one pointer report that the guest never takes blocks every later key
 
