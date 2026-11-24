@@ -339,11 +339,7 @@ mod tests {
         let root = dir.path().join("rootfs");
         let busybox = dir.path().join("busybox");
         fs::write(&busybox, b"busybox bytes").unwrap();
-        let fifo = in_root(
-            root.to_str().unwrap(),
-            vmlab_agent_proto::BUSYBOX_FALLBACK,
-        )
-        .unwrap();
+        let fifo = in_root(root.to_str().unwrap(), vmlab_agent_proto::BUSYBOX_FALLBACK).unwrap();
         fs::create_dir_all(fifo.parent().unwrap()).unwrap();
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
 
