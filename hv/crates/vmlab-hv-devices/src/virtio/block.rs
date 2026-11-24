@@ -53,6 +53,9 @@ const T_DISCARD: u32 = 11;
 /// Legacy barrier flag some older drivers set on IN/OUT; ignored.
 const T_BARRIER: u32 = 0x8000_0000;
 
+/// `max_discard_seg`: the ranges one `T_DISCARD` request may hold.
+const MAX_DISCARD_SEG: u32 = 1;
+
 /// The most one request stages in host memory at a time on the
 /// scatter-gather path. The guest picks the length of a descriptor chain,
 /// and descriptors may alias one region, so that length is no bound.
@@ -392,7 +395,8 @@ impl Block {
         config[OFF_WRITEBACK] = 1; // writes are flushed through the seam
         if !read_only {
             config[OFF_DISCARD..OFF_DISCARD + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            config[OFF_DISCARD + 4..OFF_DISCARD + 8].copy_from_slice(&1u32.to_le_bytes());
+            config[OFF_DISCARD + 4..OFF_DISCARD + 8]
+                .copy_from_slice(&MAX_DISCARD_SEG.to_le_bytes());
             // discard_sector_alignment 0; write-zeroes fields stay zero (the
             // feature is not advertised).
         }
@@ -1595,6 +1599,49 @@ mod tests {
         f.submit(0);
         assert_eq!(f.status(), S_OK);
         assert_eq!(*log.lock(), vec![(8 * 512, 1024), (16 * 512, 512)]);
+    }
+
+    /// virtio-devices-2 F2: the configuration says a discard holds one
+    /// range, and the guest picks the readable length of a chain —
+    /// descriptors may alias one buffer. What the device serves is bounded
+    /// by what it advertised, not by that length.
+    #[test]
+    fn discard_serves_at_most_the_advertised_segments() {
+        let disk = MemDisk::new(1 << 20);
+        let log = disk.discard_log();
+        let mut f = Fixture::new(Box::new(disk));
+        f.put_header(T_DISCARD, 0);
+        // One 4 KiB buffer of 256 ranges, each (sector 0, 1 sector).
+        let ranges = 0x8000u64;
+        for i in 0..256u64 {
+            f.mem
+                .write_obj(
+                    DiscardRange {
+                        sector: Le64::from(0),
+                        num_sectors: Le32::from(1),
+                        flags: Le32::from(0),
+                    },
+                    GuestAddress(ranges + i * 16),
+                )
+                .unwrap();
+        }
+        // Header -> 8 readable descriptors over that one buffer -> status.
+        f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+        for i in 1..=8u16 {
+            f.write_desc(i, desc(ranges, 4096, NEXT, i + 1));
+        }
+        f.write_desc(9, desc(f.buf + 0x800, 1, WRITE, 0));
+        f.mem
+            .write_obj(0xffu8, GuestAddress(f.buf + 0x800))
+            .unwrap();
+        f.submit(0);
+        let status = f.status();
+        let served = log.lock().len();
+        assert!(
+            status == S_IOERR || status == S_UNSUPP || served <= MAX_DISCARD_SEG as usize,
+            "status {status}, {served} ranges served"
+        );
+        assert_ne!(status, 0xff, "the request is answered");
     }
 
     #[test]
