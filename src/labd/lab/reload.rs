@@ -388,7 +388,7 @@ impl LabRuntime {
     /// mounts from keeps serving, and the reload says so.
     async fn reshare(&self, held: &BTreeMap<String, HeldMachine>) -> Vec<String> {
         let mut current = self.smb.lock().await;
-        let Some(smb) = current.as_ref() else {
+        let Some(smb) = current.as_mut() else {
             return Vec::new();
         };
         let now = match self.share_plan().await {
@@ -396,9 +396,11 @@ impl LabRuntime {
             Err(e) => format!("{e}"),
         };
         if smb.exports == now {
+            self.refresh_smb_routes(smb);
             return Vec::new();
         }
         if held.values().any(|h| h.live) {
+            self.refresh_smb_routes(smb);
             return vec![
                 "shares: the lab's SMB server keeps serving the shares it was started with \
                  while a machine runs; `vmlab down`, then `vmlab up`, serves the new ones"
