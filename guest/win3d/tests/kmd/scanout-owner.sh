@@ -100,7 +100,7 @@ rm -f "$EV"/owner.*.png "$EV/owner.json" "$EV/owner.share.txt" "$EV/owner.rc"
 in_lab vmlab vm screenshot "$VM" "$EV/owner.before.png" >/dev/null 2>&1
 (
     gfile 600 'C:\win3d\guest\Run-Probe.ps1' -Path 'C:\c755\owner\x64\scanout_owner.exe' -Seconds "$SECONDS_OF_PROGRAM" \
-        -OutDir 'C:\c755\owner\out' -Name owner -NoModules >"$EV/owner.run.json" 2>&1
+        -TimeoutSec "$((SECONDS_OF_PROGRAM + 60))" -OutDir 'C:\c755\owner\out' -Name owner -NoModules >"$EV/owner.run.json" 2>&1
     echo $? >"$EV/owner.rc"
 ) &
 best=0.0
