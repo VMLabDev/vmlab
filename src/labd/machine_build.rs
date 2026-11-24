@@ -74,6 +74,9 @@ pub(super) fn rooted_vm_config(vm_cfg: &Vm, root: &Path) -> Vm {
             d.from = Some(root.join(from));
         }
     }
+    for media in &mut cfg.media {
+        media.from = root.join(&media.from);
+    }
     cfg
 }
 
@@ -219,32 +222,6 @@ pub(super) async fn build_vm(
         .as_ref()
         .map(|f| crate::labd::vm::Floppy::Image(cx.root.join(f)));
 
-    // media {} blocks: ISO/floppy images built from folders,
-    // content-addressed in .vmlab/media (PRD §6.3). Nothing is built or
-    // hashed here: a lab loads whatever its folders hold, and each machine
-    // builds its own media when it starts.
-    let media_dir = cx.lab_local.join("media");
-    let mut media = Vec::new();
-    let mut has_floppy = vm_cfg.floppy.is_some();
-    for m in &vm_cfg.media {
-        if m.kind == crate::config::model::MediaKind::Floppy {
-            if has_floppy {
-                bail!(
-                    "vm \"{}\": both a floppy attachment and floppy media declared — \
-                     a VM has one floppy drive",
-                    vm_cfg.name
-                );
-            }
-            has_floppy = true;
-        }
-        media.push(crate::labd::vm::MediaSource {
-            kind: m.kind,
-            folder: cx.root.join(&m.from),
-            label: m.label.clone(),
-            cache: media_dir.clone(),
-        });
-    }
-
     let first_boot = meta.as_ref().and_then(|m| m.first_boot());
     let agent_version = meta.as_ref().and_then(|m| m.agent_version.clone());
     // Each NIC inherits its segment's effective MTU (jumbo on NAT/global
@@ -263,6 +240,7 @@ pub(super) async fn build_vm(
         nic_mtus,
         cdroms,
         floppy,
+        cx.lab_local.join("media"),
         share_hosts,
         crate::labd::vm::TemplateParts {
             resolved,
@@ -278,8 +256,23 @@ pub(super) async fn build_vm(
     .on_hypervisor(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, true),
-    )
-    .with_media(media);
+    );
+    // No media folder is hashed or built here: a folder that cannot be built
+    // fails the start of its machine, not the load of the lab. What the lab
+    // file alone shows is refused now.
+    let floppies = usize::from(vm_cfg.floppy.is_some())
+        + vm_cfg
+            .media
+            .iter()
+            .filter(|m| m.kind == crate::config::model::MediaKind::Floppy)
+            .count();
+    if floppies > 1 {
+        bail!(
+            "vm \"{}\": both a floppy attachment and floppy media declared — \
+             a VM has one floppy drive",
+            vm_cfg.name
+        );
+    }
     Ok((
         vm.with_hypervisor_fallback(selection.fallback_reason)
             .with_selection_source(selection.source)

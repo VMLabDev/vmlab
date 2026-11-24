@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -69,7 +69,8 @@ impl MediaCache {
         label: Option<&str>,
         build: impl Fn(&Path, &Path, Option<&str>) -> Result<()>,
     ) -> Result<PathBuf> {
-        let mut digest = folder_digest(src_folder)?;
+        let modes = matches!(kind, MediaKind::Iso);
+        let mut digest = folder_digest(src_folder, modes)?;
         for _ in 0..BUILD_ATTEMPTS {
             let dest = self.cache_dir.join(entry_name(kind, label, &digest));
             let sealed = matches!(kind, MediaKind::Floppy);
@@ -79,50 +80,35 @@ impl MediaCache {
 
             fs::create_dir_all(&self.cache_dir)
                 .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
-            // Two machines with one folder start at the same time: each build
-            // has its own temporary name.
-            let tmp = self.cache_dir.join(format!(
-                ".tmp-{}-{}-{}",
-                std::process::id(),
-                BUILD_SERIAL.fetch_add(1, Ordering::Relaxed),
-                dest.file_name()
-                    .expect("cache entry names are never empty")
-                    .to_string_lossy()
-            ));
+            // Starts of different VMs can build the same entry concurrently.
+            let tmp = tempfile::Builder::new()
+                .prefix(".tmp-")
+                .permissions(fs::Permissions::from_mode(0o666))
+                .tempfile_in(&self.cache_dir)
+                .with_context(|| {
+                    format!("creating a build file in {}", self.cache_dir.display())
+                })?;
 
             // The tool reads the folder after the hash did. The image is
             // installed only when the folder still has the content the entry
             // is named after. Otherwise it is built again from what the
             // folder holds now.
-            let built = build(src_folder, &tmp, label)
-                .and_then(|()| folder_digest(src_folder))
-                .and_then(|after| {
-                    if after == digest {
-                        sync_file(&tmp)?;
-                    }
-                    Ok(after)
-                });
-            let after = match built {
-                Ok(after) => after,
-                Err(err) => {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(err);
-                }
-            };
+            build(src_folder, tmp.path(), label)?;
+            let after = folder_digest(src_folder, modes)?;
             if after != digest {
-                let _ = fs::remove_file(&tmp);
                 digest = after;
                 continue;
             }
+            sync_file(tmp.path())?;
 
             // The seal follows the image: a crash between the two leaves an
             // entry that fails the check and is built again.
             let seal = if sealed {
-                Some(image_digest(&tmp)?)
+                Some(image_digest(tmp.path())?)
             } else {
                 None
             };
-            fs::rename(&tmp, &dest)
+            tmp.persist(&dest)
                 .with_context(|| format!("installing media cache entry {}", dest.display()))?;
             if let Some(seal) = seal {
                 write_seal(&dest, &seal)?;
@@ -175,9 +161,6 @@ impl MediaCache {
 /// How many times one `ensure` builds a folder that changes under the build
 /// before it gives up.
 const BUILD_ATTEMPTS: usize = 3;
-
-/// Makes the temporary name of each build in this process its own.
-static BUILD_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Flushes the file or directory at `path` to disk. A name that a rename
 /// installed must not outlive a host crash with less than the whole file
@@ -343,6 +326,38 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file());
         assert!(second.is_file());
+    }
+
+    /// F5 (docs/reviews/appshare-media.md): chmod alone updates the mode
+    /// a guest sees through Rock Ridge.
+    #[test]
+    fn a_mode_change_rebuilds_an_iso() {
+        use std::process::Command;
+
+        let src = tempfile::tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let first = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+        let extracted = cache_root.path().join("run.sh");
+        let output = Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(&second)
+            .args(["-extract", "/run.sh"])
+            .arg(&extracted)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_ne!(
+            fs::metadata(extracted).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

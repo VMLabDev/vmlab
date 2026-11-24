@@ -8557,6 +8557,72 @@ fn main(lab: Lab) {
 
     // ---- reload (PRD §7.1) ----------------------------------------------------
 
+    /// F4 (docs/reviews/appshare-media.md): folder edits reach the next boot
+    /// even when reloading the unchanged lab file leaves the VM in place.
+    #[tokio::test]
+    async fn a_changed_media_folder_reaches_the_next_start() {
+        use super::super::hypervisor::fake::{FakeHypervisor, Script};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+    vm "a" {
+        template = "scratch"
+        arch = "aarch64"
+        profile = "linux-generic"
+        hypervisor = "qemu"
+        firmware = "seabios"
+        disk = 1MiB
+        media { kind = "iso" from = "./payload" }
+    }
+}"#;
+        std::fs::write(root.join("vmlab.wcl"), src).unwrap();
+        let payload = root.join("payload");
+        std::fs::create_dir(&payload).unwrap();
+        let file = payload.join("data.txt");
+        std::fs::write(&file, b"before").unwrap();
+        let config = crate::config::load_lab_root(root).unwrap();
+        let (events, _rx) = EventLog::recording("t", root.join("events.jsonl"));
+        let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
+            .await
+            .unwrap();
+
+        let config = lab.config();
+        let (Built::Vm(mut vm), None) = lab
+            .build_machines(&[config.lab.machine("a").unwrap()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("expected a scratch VM");
+        };
+        let hv = FakeHypervisor::new(Script::healthy());
+        vm.set_hypervisor(hv.clone());
+        let dirs = &mut Arc::get_mut(&mut vm).unwrap().dirs;
+        dirs.run = root.join("run");
+        dirs.logs = root.join("logs");
+        std::fs::create_dir_all(&vm.dirs.local).unwrap();
+        std::fs::write(vm.dirs.primary_disk(), b"").unwrap();
+        lab.machines.write().unwrap().insert(Built::Vm(vm), config);
+
+        lab.start_machine("a").await.unwrap();
+        lab.stop_machine("a", true).await.unwrap();
+        std::fs::write(file, b"after").unwrap();
+        assert!(lab.reload().await.unwrap().machines.is_empty());
+        lab.start_machine("a").await.unwrap();
+        lab.stop_machine("a", true).await.unwrap();
+
+        let launches = hv.launched_cdroms();
+        let [before, after] = launches.as_slice() else {
+            panic!("expected two launches, got {launches:?}");
+        };
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_ne!(before, after);
+    }
+
     const RELOAD_BASE: &str = r#"import <vmlab.wcl>
 lab "t" {
   segment "corp" { }
