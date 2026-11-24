@@ -311,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn a_total_length_past_the_data_is_refused_at_parse() {
+        // Bytes 20 and 21 are the configuration's wTotalLength. Slicing the
+        // raw data by it at GET_DESCRIPTOR(Configuration) would panic.
+        let mut raw = MASS_STORAGE.to_vec();
+        raw[20] = 0xFF;
+        raw[21] = 0xFF;
+        assert!(parse_usbfs_descriptors(&raw).is_err());
+
+        // One byte past the end is refused too, and the exact length parses.
+        let mut raw = MASS_STORAGE.to_vec();
+        raw[20] += 1;
+        assert!(parse_usbfs_descriptors(&raw).is_err());
+        assert!(parse_usbfs_descriptors(MASS_STORAGE).is_ok());
+    }
+
+    #[test]
     fn parse_rejects_truncated_input() {
         assert!(parse_usbfs_descriptors(&[]).is_err());
         assert!(parse_usbfs_descriptors(MASS_STORAGE[..20].try_into().unwrap()).is_err());
