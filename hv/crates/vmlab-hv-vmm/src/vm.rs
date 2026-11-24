@@ -1983,8 +1983,9 @@ mod tests {
         use vmlab_hv_devices::{BarInfo, BarKind, PciDevice};
         struct Probe(Arc<AtomicUsize>);
         impl PciDevice for Probe {
-            fn config_read(&mut self, _: usize) -> u32 {
-                0x1001_1af4
+            // Register 1 is the command: memory decode stays enabled.
+            fn config_read(&mut self, reg: usize) -> u32 {
+                if reg == 1 { 2 } else { 0x1001_1af4 }
             }
             fn config_write(&mut self, _: usize, _: u64, _: &[u8]) {}
             fn bars(&self) -> Vec<BarInfo> {
@@ -2038,11 +2039,10 @@ mod tests {
             return;
         }
         let (shared, mch, _) = q35_with_function(MmioBus::new());
-        {
-            let mut root = shared.pci_root.lock();
-            root.config_write(0, 2, 0, 0x30, &0x000c_0001u32.to_le_bytes());
-            root.config_write(0, 2, 0, 4, &2u16.to_le_bytes());
-        }
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x30, &0x000c_0001u32.to_le_bytes());
         // PAM1 low nibble is bank 0 (0xc0000-0xc3fff): 2 is write-only.
         mch.lock().config_write(0x90 / 4, 1, &[0x02]);
         shared.mmio_write(0xc0000, &[0x42]);
@@ -2079,11 +2079,10 @@ mod tests {
             .register(0xfed0_0000, 0x400, Arc::new(Mutex::new(Fixed)))
             .unwrap();
         let (shared, _, accesses) = q35_with_function(mmio_bus);
-        {
-            let mut root = shared.pci_root.lock();
-            root.config_write(0, 2, 0, 0x10, &0xfed0_0000u32.to_le_bytes());
-            root.config_write(0, 2, 0, 4, &2u16.to_le_bytes());
-        }
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x10, &0xfed0_0000u32.to_le_bytes());
         let mut byte = [0];
         shared.mmio_read(0xfed0_0000, &mut byte);
         assert_eq!(byte, [0x5a], "the BAR answered for the chipset device");
