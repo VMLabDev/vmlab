@@ -6,9 +6,9 @@
 #   tests/kmd/scanout-probe.sh <lab-dir> <vm> <evidence-dir> <case>...
 #
 # The cases are render-flip and escape. Build the probe first:
-# build/probes/build.sh scanout. With LOCK=1 the console session is
-# disconnected first, so that the screen is the sign-in screen of Windows,
-# which is on the secure desktop. A case passes when the driver refused the
+# build/probes/build.sh scanout. The lab of the acceptance tests logs nobody
+# on, so its screen is the sign-in screen of Windows, which is on the secure
+# desktop: guest.txt has the answer of quser. A case passes when the driver refused the
 # probe and the screenshot taken meanwhile shows what Windows shows: none of
 # the probe's colour, and not one colour alone. A driver without the fix
 # shows the colour in place of the desktop, or the host's "Display output is
@@ -121,11 +121,6 @@ sha256sum "$PROBE" | sed "s|$REPO/||" >>"$EV/guest.txt"
 in_lab vmlab exec --user "$USER_NAME" --password "$USER_PASS" --timeout 60 "$VM" -- cmd.exe /c "whoami /user /groups /fo csv" 2>&1 | tr -d '\r' >"$EV/whoami.txt"
 grep -q 'S-1-5-32-545' "$EV/whoami.txt" || { note "no logon as the probe user: $(head -1 "$EV/whoami.txt")"; exit 1; }
 grep -q 'S-1-5-32-544' "$EV/whoami.txt" && { note "the probe user is an administrator"; exit 1; }
-if [ "${LOCK:-0}" = 1 ]; then
-    note "the console session is disconnected: the screen is the sign-in screen"
-    in_lab vmlab exec --user SYSTEM --timeout 60 "$VM" -- tsdiscon.exe console 2>&1 | tr -d '\r' | tee -a "$EV/guest.txt"
-    sleep 15
-fi
 gps 'quser.exe 2>&1 | Out-String' 60 >>"$EV/guest.txt"
 bugchecks >"$EV/bugchecks-before.txt" 2>/dev/null
 
