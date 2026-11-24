@@ -60,6 +60,9 @@ in_lab() { (cd "$LABDIR" && "$@"); }
 gps() { # gps 'powershell' [timeout]: run PowerShell as SYSTEM in the guest
     in_lab "$VMLAB" exec --user SYSTEM --timeout "${2:-120}" "$VM" -- powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$1" | tr -d '\r'
 }
+gcmd() { # gcmd 'command line': run it with cmd.exe as SYSTEM in the guest
+    in_lab "$VMLAB" exec --user SYSTEM --timeout 60 "$VM" -- cmd.exe /c "$1" 2>&1 | tr -d '\r'
+}
 agent_answers() { in_lab "$VMLAB" exec --user SYSTEM --timeout 20 "$VM" -- cmd.exe /c ver >/dev/null 2>&1; }
 wait_agent() {
     for _ in $(seq 1 90); do
@@ -125,11 +128,12 @@ for c in $CASES; do
         # Every pool allocation of viogpu3d.sys in alloc_probe.exe fails
         # (10000 of 10000), with any pool tag, from STARVE_DELAY minutes
         # after the boot. A boot that fails turns the verifier off again.
-        gps "verifier.exe /bootmode resetonbootfail | Out-Null
-            verifier.exe /flags 0x4 /faults 10000 '' alloc_probe.exe $STARVE_DELAY /driver viogpu3d.sys" 60 >"$OUT/verifier.txt" 2>&1
+        # cmd.exe, not PowerShell, which drops the empty pool tag argument.
+        gcmd "verifier /flags 0x4 /faults 10000 \"\" alloc_probe.exe $STARVE_DELAY /driver viogpu3d.sys" >"$OUT/verifier.txt"
+        gcmd 'verifier /bootmode resetonbootfail' >/dev/null
         note "restarting the guest with Driver Verifier on viogpu3d.sys"
         restart_guest || exit 1
-        gps 'verifier.exe /querysettings' 60 >>"$OUT/verifier.txt" 2>&1
+        gcmd 'verifier /query' >>"$OUT/verifier.txt"
         limit=$((STARVE_DELAY * 60 + 400))
         args=(--seconds $((STARVE_DELAY * 60 + 240)))
     fi
@@ -166,10 +170,11 @@ for c in $CASES; do
     note "$line"; echo "$line" >>"$OUT/summary.txt"
     if [ "$rc" != 0 ] || [ "$died" = yes ] || [ "$bug" != none ] || [ "$(field "$f" pass)" != True ]; then bad=1; fi
     if [ "$c" = starve ]; then
-        gps 'verifier.exe /reset' 60 >>"$OUT/verifier.txt" 2>&1
+        gcmd 'verifier /query' >"$OUT/verifier-after.txt"
+        gcmd 'verifier /reset' >/dev/null
         note "restarting the guest without Driver Verifier"
         restart_guest || exit 1
-        gps 'verifier.exe /querysettings' 60 >>"$OUT/verifier.txt" 2>&1
+        gcmd 'verifier /querysettings' | grep -i 'Verifier Flags' >>"$OUT/verifier-after.txt"
     fi
 done
 gps "Remove-LocalUser -Name '$ACCOUNT'" 60

@@ -153,7 +153,7 @@ _Static_assert(offsetof(create_allocation, num_allocations) == (sizeof(void *) =
 _Static_assert(sizeof(destroy_allocation) == (sizeof(void *) == 8 ? 24 : 16), "D3DKMT_DESTROYALLOCATION ABI");
 _Static_assert(sizeof(viogpu_create_allocation_exchange) == 72, "VIOGPU_CREATE_ALLOCATION_EXCHANGE ABI");
 
-enum { QUERY_PHYSICAL_ADAPTER_DEVICE_IDS = 31, MAX_STATUSES = 8 };
+enum { QUERY_PHYSICAL_ADAPTER_DEVICE_IDS = 31, MAX_STATUSES = 8, CREATE_RESOURCE = 1 /* D3DKMT_CREATEALLOCATIONFLAGS.CreateResource */ };
 #define NT_INSUFFICIENT_RESOURCES ((LONG)0xc000009au)
 #define NT_NO_MEMORY ((LONG)0xc0000017u)
 
@@ -167,9 +167,9 @@ typedef struct {
 static const test_case cases[] = {
     {"one", 1, 2, "one allocation is created and destroyed"},
     {"one-v1", 1, 1, "one allocation is created and destroyed through D3DKMTCreateAllocation"},
-    {"two", 2, 2, "NumAllocations = 2 fails, or both allocations exist and are destroyed"},
+    {"two", 2, 2, "NumAllocations = 2 with a resource fails, or both allocations exist and are destroyed"},
     {"two-v1", 2, 1, "the same through D3DKMTCreateAllocation"},
-    {"none", 0, 2, "NumAllocations = 0 fails, or succeeds with nothing made"},
+    {"none", 0, 2, "NumAllocations = 0 with a resource fails, or makes the resource alone"},
     {"starve", 1, 2, "every allocation that fails for want of pool memory fails with STATUS_INSUFFICIENT_RESOURCES or STATUS_NO_MEMORY"},
 };
 
@@ -178,7 +178,7 @@ typedef struct {
     int selected, completed, pass;
     LONG last_status, create_status, destroy_status;
     DWORD win32_error;
-    UINT count, handles[2];
+    UINT count, handles[2], resource;
     /* starve */
     unsigned long attempts, succeeded, failed, failed_in_a_row, seconds;
     unsigned n_statuses;
@@ -191,11 +191,11 @@ static void emit(FILE *f, const result *r)
 {
     fprintf(f, "{\"schema\":1,\"probe\":\"alloc\",\"case\":\"%s\",\"expect\":\"%s\",\"result\":\"%s\",\"stage\":\"%s\","
             "\"pass\":%s,\"request_completed\":%s,\"num_allocations\":%u,\"create_status\":\"0x%08lx\","
-            "\"allocation_handles\":[%u,%u],\"destroy_status\":\"0x%08lx\",\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,"
+            "\"allocation_handles\":[%u,%u],\"resource_handle\":%u,\"destroy_status\":\"0x%08lx\",\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,"
             "\"attempts\":%lu,\"succeeded\":%lu,\"failed\":%lu,\"seconds\":%lu,\"failure_statuses\":{",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
             r->pass ? "true" : "false", r->completed ? "true" : "false", r->count, (unsigned long)r->create_status,
-            r->handles[0], r->handles[1], (unsigned long)r->destroy_status, (unsigned long)r->last_status,
+            r->handles[0], r->handles[1], r->resource, (unsigned long)r->destroy_status, (unsigned long)r->last_status,
             (unsigned long)r->win32_error, r->attempts, r->succeeded, r->failed, r->seconds);
     for (unsigned i = 0; i < r->n_statuses; ++i)
         fprintf(f, "%s\"0x%08lx\":%lu", i ? "," : "", (unsigned long)r->statuses[i], r->status_counts[i]);
@@ -239,7 +239,7 @@ typedef struct {
 } kmt;
 
 /* One D3DKMTCreateAllocation call with `count` entries. */
-static LONG create(const kmt *k, int version, UINT count, UINT handles[2])
+static LONG create(const kmt *k, int version, UINT count, UINT handles[2], UINT *resource)
 {
     viogpu_create_allocation_exchange x[2];
     allocation_info v1[2];
@@ -256,14 +256,19 @@ static LONG create(const kmt *k, int version, UINT count, UINT handles[2])
     args.device = k->device;
     args.num_allocations = count;
     args.allocation_info = version == 1 ? (void *)v1 : (void *)v2;
+    /* Windows itself refuses a count other than one without a resource, and
+     * the driver is not called. So those requests ask for a resource. */
+    if (count != 1) args.flags = CREATE_RESOURCE;
     LONG status = k->create[version](&args);
+    *resource = args.resource;
     for (UINT i = 0; i < 2; ++i) handles[i] = version == 1 ? v1[i].allocation : v2[i].allocation;
     return status;
 }
 
-static LONG destroy(const kmt *k, int version, const UINT *handles, UINT count)
+/* With a resource, the resource and every allocation of it. */
+static LONG destroy(const kmt *k, int version, const UINT *handles, UINT count, UINT resource)
 {
-    destroy_allocation args = {k->device, 0, handles, count};
+    destroy_allocation args = {k->device, resource, resource ? NULL : handles, resource ? 0 : count};
     return k->destroy[version](&args);
 }
 
@@ -358,7 +363,7 @@ int wmain(int argc, wchar_t **argv)
     if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_device; }
 
     if (strcmp(tc->name, "starve")) {
-        r.create_status = r.last_status = create(&k, tc->version, tc->count, r.handles);
+        r.create_status = r.last_status = create(&k, tc->version, tc->count, r.handles, &r.resource);
         r.completed = 1;
         if (r.create_status >= 0) {
             /* The call succeeded: every entry has a handle, and the handles can be destroyed. */
@@ -366,7 +371,7 @@ int wmain(int argc, wchar_t **argv)
             for (UINT i = 0; i < tc->count && i < 2; ++i) made += r.handles[i] != 0;
             r.stage = "destroy_allocation";
             save(out, &r);
-            if (made) r.destroy_status = r.last_status = destroy(&k, tc->version, r.handles, made);
+            if (made || r.resource) r.destroy_status = r.last_status = destroy(&k, tc->version, r.handles, made, r.resource);
             r.pass = made == tc->count && r.destroy_status >= 0;
             r.result = r.pass ? "pass" : "allocations_missing";
         } else {
@@ -382,17 +387,17 @@ int wmain(int argc, wchar_t **argv)
         int bad = 0;
         r.result = "starving";
         while (r.failed < after_failures) {
-            UINT handles[2] = {0, 0};
+            UINT handles[2] = {0, 0}, resource = 0;
             const ULONGLONG now = GetTickCount64();
             r.seconds = (unsigned long)((now - start) / 1000);
             if (r.seconds >= seconds) break;
             if (now - saved >= 2000 || r.failed == 1) { save(out, &r); saved = now; }
             ++r.attempts;
-            r.create_status = r.last_status = create(&k, 2, 1, handles);
+            r.create_status = r.last_status = create(&k, 2, 1, handles, &resource);
             if (r.create_status >= 0) {
                 ++r.succeeded;
                 r.failed_in_a_row = 0;
-                r.destroy_status = destroy(&k, 2, handles, 1);
+                r.destroy_status = destroy(&k, 2, handles, 1, 0);
                 if (r.destroy_status < 0) { bad = 1; break; }
                 Sleep(r.failed ? 5 : 100);
             } else {
