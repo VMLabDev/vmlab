@@ -1979,11 +1979,13 @@ mod tests {
         assert_eq!(layout.low_ram_top(), 0xc000_0000);
         let ram = GuestRam::anonymous(layout.clone()).unwrap();
         crate::memory::register_memslots(&kvm.vm, &ram).unwrap();
-        let root = Arc::new(Mutex::new(PciRoot::new(layout.mmio64_base)));
+        // The root of a firmware machine, as the builder makes it for pc.
+        let root = Arc::new(Mutex::new(PciRoot::q35(layout.mmio64_base)));
         let device = Arc::new(Mutex::new(
             vmlab_hv_devices::display::StandardVga::new("vga", &[0x55, 0xaa, 0]).unwrap(),
         ));
-        let slot = root.lock().add_device(device.clone()).unwrap();
+        let slot = 2u8;
+        root.lock().add_device_at(slot, 0, device.clone()).unwrap();
         let vga = crate::display::Video::Standard(device);
         let mut io_bus = IoBus::new();
         io_bus
