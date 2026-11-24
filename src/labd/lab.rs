@@ -1554,6 +1554,12 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Whether a start, a destroy or a restore holds `name`'s start lock now.
+    #[cfg(test)]
+    pub(super) fn start_lock_held(&self, name: &str) -> bool {
+        self.starts.lock_of(name).try_lock().is_err()
+    }
+
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         self.start_machine_with_output(name, None).await
