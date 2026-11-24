@@ -124,7 +124,7 @@ fn on_small_ram(code: &[u32], x8: u64, specialize: bool) -> Riscv64<FlatMemory> 
 }
 
 /// Put the hart back at the start of RAM, in machine mode, with new code.
-fn restart(cpu: &mut Riscv64<FlatMemory>, code: &[u32], x8: u64) {
+fn restart<M: Memory>(cpu: &mut Riscv64<M>, code: &[u32], x8: u64) {
     for (index, instruction) in code.iter().enumerate() {
         cpu.interpreter
             .memory
@@ -235,4 +235,112 @@ fn a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault() {
         }
     }
     assert!(specialized.specialization_stats.hits > 0);
+}
+
+/// RAM whose upper quarter the host can take away.
+struct Hole {
+    ram: FlatMemory,
+    closed: bool,
+}
+
+impl Hole {
+    const START: u64 = RAM + 0xc00;
+
+    fn refuses(&self, address: u64, len: usize) -> bool {
+        self.closed && address.saturating_add(len as u64) > Self::START
+    }
+}
+
+impl Memory for Hole {
+    fn read(&mut self, address: u64, bytes: &mut [u8]) -> vmlab_hv_tcg::Result<()> {
+        if self.refuses(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        self.ram.read(address, bytes)
+    }
+    fn write(&mut self, address: u64, bytes: &[u8]) -> vmlab_hv_tcg::Result<()> {
+        if self.refuses(address, bytes.len()) {
+            return Err(Error::Memory(address));
+        }
+        self.ram.write(address, bytes)
+    }
+    fn generation(&self) -> u64 {
+        self.ram.generation()
+    }
+    fn code_stamp(&self, address: u64, len: usize) -> Option<vmlab_hv_tcg::CodeStamp> {
+        self.ram.code_stamp(address, len)
+    }
+    fn ram_bounds(&self, address: u64) -> Option<(u64, u64)> {
+        self.ram.ram_bounds(address)
+    }
+    fn reservation_generation(&self, address: u64, len: usize) -> u64 {
+        self.ram.reservation_generation(address, len)
+    }
+    fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> vmlab_hv_tcg::Result<u64> {
+        self.ram.load_reserved(address, bytes)
+    }
+    fn store_conditional(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        generation: u64,
+    ) -> vmlab_hv_tcg::Result<bool> {
+        self.ram.store_conditional(address, bytes, generation)
+    }
+    fn transaction_lock(&self) -> Option<std::sync::Arc<parking_lot::ReentrantMutex<()>>> {
+        None
+    }
+}
+
+/// The host refuses an address that a trace has read and written before, so
+/// no guard of the trace sees it coming: the access itself fails in the trace.
+#[test]
+fn a_trace_whose_own_access_is_refused_raises_the_same_guest_fault() {
+    let make = |specialize| {
+        let mut cpu = Riscv64::new(Hole {
+            ram: FlatMemory::new(RAM, vec![0; 4096]),
+            closed: false,
+        })
+        .unwrap();
+        cpu.write_csr(MTVEC, HANDLER).unwrap();
+        cpu.specialize = specialize;
+        cpu
+    };
+    let mut reference = make(false);
+    let mut specialized = make(true);
+    for (access, cause) in [(LD_X10_X8, 5), (SD_X10_X8, 7)] {
+        // loop: <access> 0(x8); jal x0, loop
+        let code = [access, 0xffdf_f06f];
+        for cpu in [&mut reference, &mut specialized] {
+            cpu.interpreter.memory.closed = false;
+            restart(cpu, &code, Hole::START);
+        }
+        for round in 0..4 {
+            assert_eq!(specialized.run(4).unwrap(), (4, false));
+            assert_eq!(reference.run(4).unwrap(), (4, false));
+            assert_eq!(
+                *specialized.interpreter.globals, *reference.interpreter.globals,
+                "{access:#010x} round {round}"
+            );
+        }
+        let trained = specialized.specialization_stats.hits;
+        assert!(trained > 0);
+
+        reference.interpreter.memory.closed = true;
+        specialized.interpreter.memory.closed = true;
+        let steps = specialized.steps;
+        specialized
+            .run(1)
+            .unwrap_or_else(|error| panic!("{access:#010x}: {error}"));
+        reference.run(1).unwrap();
+        assert_eq!(specialized.steps, steps + 1);
+        assert_eq!(specialized.pc().unwrap(), HANDLER);
+        assert_eq!(specialized.read_csr(MCAUSE).unwrap(), cause);
+        assert_eq!(specialized.read_csr(MEPC).unwrap(), RAM);
+        assert_eq!(
+            *specialized.interpreter.globals, *reference.interpreter.globals,
+            "{access:#010x} after the fault"
+        );
+        assert_eq!(specialized.steps, reference.steps);
+    }
 }
