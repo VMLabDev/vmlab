@@ -184,7 +184,15 @@ struct Parser<'a> {
     pos: usize,
     end: usize,
     depth: usize,
+    /// The height of the tallest expression finished so far inside the
+    /// expression being parsed: its operands, before its own level is added.
+    height: usize,
 }
+
+/// The most levels an expression tree can have. Nesting and suffixes each add
+/// levels, so the bound is on their sum: every later pass walks an expression
+/// by recursion (`lower`, `format`, a derived `Clone` or `Drop`).
+const MAX_EXPR_HEIGHT: usize = 128;
 
 impl Parser<'_> {
     fn error(&self, message: impl Into<String>) -> Error {
@@ -373,7 +381,19 @@ impl Parser<'_> {
     }
 
     fn expr(&mut self) -> Result<Expr, Error> {
-        self.nested(Self::expr_inner)
+        let siblings = std::mem::replace(&mut self.height, 0);
+        let result = self.nested(Self::expr_inner);
+        self.height = self.height.max(siblings);
+        result
+    }
+
+    /// Adds one level to the expression being parsed.
+    fn grow(&mut self) -> Result<(), Error> {
+        self.height += 1;
+        if self.height > MAX_EXPR_HEIGHT {
+            return Err(self.error("expression depth limit exceeded"));
+        }
+        Ok(())
     }
 
     fn expr_inner(&mut self) -> Result<Expr, Error> {
@@ -504,12 +524,10 @@ impl Parser<'_> {
             }
             _ => Expr::Id(self.ident()?),
         };
-        let mut suffixes = 0;
+        // `self.height` is the tallest operand here. The operand itself and
+        // each suffix put one more level on top of it.
+        self.grow()?;
         loop {
-            suffixes += 1;
-            if suffixes > 128 {
-                return Err(self.error("expression suffix nesting limit exceeded"));
-            }
             if self.eat(".") {
                 expr = Expr::Field(Box::new(expr), self.ident()?);
             } else if self.eat("is") {
@@ -519,6 +537,7 @@ impl Parser<'_> {
             } else {
                 break;
             }
+            self.grow()?;
         }
         Ok(expr)
     }
@@ -715,6 +734,7 @@ pub fn parse(source: &str) -> Result<Document<'_>, Error> {
         pos: 0,
         end: source.len(),
         depth: 0,
+        height: 0,
     };
     let mut definitions = Vec::new();
     while parser.pos < parser.tokens.len() {
