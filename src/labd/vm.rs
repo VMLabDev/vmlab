@@ -1092,12 +1092,7 @@ impl VmInstance {
                 .map(|d| (d.name.clone(), self.dirs.extra_disk(&d.name)))
                 .collect(),
             // The `cdrom =` attachment first, then the built media.
-            cdroms: self
-                .cdroms
-                .iter()
-                .chain(&media.cdroms)
-                .cloned()
-                .collect(),
+            cdroms: self.cdroms.iter().chain(&media.cdroms).cloned().collect(),
             install_cdrom: self.cfg.cdrom.is_some(),
             floppy: self.floppy_image(media.floppy.as_deref())?,
             nics,
