@@ -726,6 +726,32 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_9x_share_gets_no_modern_windows_step() {
+        let lab = sample();
+        let steps = lab.mount_plan("xp", guest_os_hint(Some("windows-9x")));
+        assert!(
+            steps.iter().all(|step| !matches!(
+                step.command.as_str(),
+                "cmdkey" | "powershell" | "reg"
+            )),
+            "Windows 9x plan contains a modern Windows command"
+        );
+    }
+
+    #[test]
+    fn every_mount_step_is_an_argv() {
+        let lab = sample();
+        for os_hint in [OsHint::Linux, OsHint::Windows, OsHint::WindowsXp, OsHint::Macos] {
+            assert!(
+                lab.mount_plan("xp", os_hint)
+                    .iter()
+                    .all(|step| !step.command.contains(char::is_whitespace)),
+                "{os_hint:?} plan must place only the executable in argv[0]"
+            );
+        }
+    }
+
+    #[test]
     fn xp_mount_plan_is_net_use_string() {
         let lab = sample();
         let steps = lab.mount_plan("xp", OsHint::WindowsXp);
