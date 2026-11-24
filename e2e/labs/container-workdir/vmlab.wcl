@@ -1,0 +1,12 @@
+import <vmlab.wcl>
+
+lab "e2e-container-workdir" {
+  container "pwd" {
+    image   = "alpine:3.22"
+    profile = "container"
+    cpus    = 1
+    memory  = 512MiB
+    workdir = "/srv/missing"
+    command = ["pwd"]
+  }
+}
