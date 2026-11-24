@@ -2398,6 +2398,9 @@ async fn pass(
         .iter()
         .filter(|action| action.direction() == Direction::ToHost)
         .map(Action::path)
+        // A removal without a guest copy brings no output across. It may
+        // also clear a child of a directory being replaced by a rule file.
+        .filter(|path| probe.tree.contains_key(*path))
         .filter(|path| {
             let own_dir = rule_dir(path);
             std::iter::once("")
