@@ -13,6 +13,28 @@ pub fn cache_dir() -> PathBuf {
     crate::paths::data_dir().join("cache").join("artefacts")
 }
 
+/// Called while the supervisor holds its singleton guard, before it can accept builds.
+pub(crate) fn sweep_abandoned_downloads(dir: &Path) -> Result<usize> {
+    crate::staging::sweep_files(dir, |name| {
+        let Some((digest, stamp)) = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".part"))
+            .and_then(|name| name.split_once('.'))
+        else {
+            return false;
+        };
+        let mut stamp = stamp.split('-');
+        digest.len() == 64
+            && digest.bytes().all(|b| b.is_ascii_hexdigit())
+            && stamp.next().is_some_and(|pid| pid.parse::<u32>().is_ok())
+            && stamp.next().is_some_and(|n| n.parse::<u64>().is_ok())
+            && stamp.next().is_some_and(|nanos| {
+                nanos.len() == 9 && nanos.bytes().all(|b| b.is_ascii_digit())
+            })
+            && stamp.next().is_none()
+    })
+}
+
 /// Resolve an artefact source to a local file path, downloading + verifying
 /// URL sources. Reports progress via `log`.
 pub async fn resolve(source: &ArtefactSource, log: impl Fn(String)) -> Result<PathBuf> {
