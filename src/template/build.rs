@@ -653,6 +653,7 @@ async fn build_variant(
     // store keeps it beside the base and must survive being moved, so the
     // reference becomes relative. `-u`: the bytes behind it are the same.
     super::qimg::rebase_unsafe(&disk0, super::store::VARIANT_BACKING).await?;
+    anyhow::ensure!(!control.cancel.is_cancelled(), "build cancelled");
     let sha = super::store::sha256_file(&disk0).context("hashing the variant overlay")?;
     let first_boot = v.first_boot.as_ref().or(def.first_boot.as_ref());
     let first_boot_script = match first_boot {
@@ -685,8 +686,16 @@ async fn build_variant(
     // merges the block — overlay first, block after. A default block takes
     // the default from whichever variant held it.
     meta.default = v.name == run.default;
-    install_built_variant(store, base, &disk0, &work.join("variant-staging"), &meta)
-        .context("installing the variant into the store")?;
+    anyhow::ensure!(!control.cancel.is_cancelled(), "build cancelled");
+    install_built_variant(
+        store,
+        base,
+        &disk0,
+        &work.join("variant-staging"),
+        &meta,
+        &control.cancel,
+    )
+    .context("installing the variant into the store")?;
     events.emit(
         "template.built",
         serde_json::json!({
@@ -707,11 +716,12 @@ fn install_built_variant(
     overlay: &Path,
     staging: &Path,
     meta: &super::meta::VariantMeta,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<TemplateMeta> {
     let staged = staging.join(super::meta::variant_disk_rel(&meta.name));
     std::fs::create_dir_all(staged.parent().expect("a disk has a parent"))?;
     std::fs::rename(overlay, &staged).with_context(|| format!("staging {}", overlay.display()))?;
-    store.add_variants(
+    store.add_variants_checked(
         &base.meta.arch,
         &base.meta.name,
         &base.meta.version,
@@ -720,6 +730,10 @@ fn install_built_variant(
         // The caller asked at the swap, with the build's own check
         // (`refuse_in_use`).
         &|_| None,
+        &|| {
+            anyhow::ensure!(!cancel.is_cancelled(), "build cancelled");
+            Ok(())
+        },
     )
 }
 
@@ -1507,14 +1521,18 @@ async fn seal_base(
     version: &str,
     agent_version: Option<String>,
     inherited_logins: Vec<crate::config::model::Login>,
-    _cancel: &tokio_util::sync::CancellationToken,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<TemplateMeta> {
     // Flatten the working disk into a staging dir, then install.
+    anyhow::ensure!(!cancel.is_cancelled(), "build cancelled");
     let staging = work.join("staging");
     std::fs::create_dir_all(&staging)?;
     let sealed = staging.join("disk.qcow2");
     log("flattening sealed image\n".to_string());
     super::qimg::convert_to_qcow2(disk0, &sealed).await?;
+    // The image operation runs on a blocking worker. Wait for it to release
+    // the working files before returning control to build cleanup.
+    anyhow::ensure!(!cancel.is_cancelled(), "build cancelled");
 
     let info = super::qimg::image_info(&sealed).await?;
     let sha = super::store::sha256_file(&sealed).context("hashing sealed image")?;
@@ -1554,8 +1572,9 @@ async fn seal_base(
         std::fs::copy(&from, staging.join(super::store::VARS_FILE))
             .with_context(|| format!("copying secure_boot_vars {}", from.display()))?;
     }
+    anyhow::ensure!(!cancel.is_cancelled(), "build cancelled");
     store
-        .install(&staging, &meta, false)
+        .install_build(&staging, &meta, cancel)
         .context("installing into the store")?;
     Ok(meta)
 }
@@ -4760,9 +4779,11 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
         let block = built_block("extra", &overlay, &base_sha, false);
         let digest = block.sha256.clone();
-        let meta =
-            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
-                .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let meta = super::install_built_variant(
+            &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+        )
+        .unwrap();
         let extra = meta.variant("extra").unwrap();
         assert_eq!(
             (extra.sha256.as_str(), extra.memory),
@@ -4791,9 +4812,10 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let w = work("third");
         let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
         let block = built_block("third", &overlay, &base_sha, true);
-        let meta =
-            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
-                .unwrap();
+        let meta = super::install_built_variant(
+            &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+        )
+        .unwrap();
         assert_eq!(meta.default_variant().unwrap().name, "third");
         assert!(!meta.variant("standard").unwrap().default);
 
@@ -4804,8 +4826,10 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
         let block = built_block("extra", &overlay, &"ef".repeat(32), false);
         assert!(
-            super::install_built_variant(&store, &base, &overlay, &w.join("staging"), &block)
-                .is_err()
+            super::install_built_variant(
+                &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read_to_string(&wcl_path).unwrap(), wcl);
         assert_eq!(sha256_file(&base.variant_disk("extra")).unwrap(), digest);

@@ -65,7 +65,7 @@ impl ValidationContext for HostContext {
         version: Option<&str>,
     ) -> Option<crate::template::TemplateMeta> {
         self.store
-            .resolve_version(arch, name, version)
+            .resolve_clone_version(arch, name, version)
             .ok()
             .map(|t| t.meta)
     }

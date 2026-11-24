@@ -356,8 +356,9 @@ pub async fn prune(
     answer(plan)
 }
 
-/// The builds a prune would drop: everything but the `keep` newest of each
-/// matching `<arch>/<name>` family.
+/// The builds a prune would drop: versions older than the `keep` newest
+/// usable versions of each matching family. Newer incomplete versions can
+/// still be under construction and do not consume a retention slot.
 ///
 /// `templates` arrives in the store's own order — arch, then name, then
 /// ascending version — so a family is a run of adjacent entries and "the
@@ -380,7 +381,13 @@ fn superseded(
     families
         .into_iter()
         .flat_map(|(_, metas)| {
-            let cut = metas.len().saturating_sub(keep);
+            let cut = metas
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, meta)| meta.has_usable_default())
+                .nth(keep - 1)
+                .map_or(0, |(index, _)| index);
             metas.into_iter().take(cut)
         })
         .collect()

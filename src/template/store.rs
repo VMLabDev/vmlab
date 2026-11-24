@@ -278,9 +278,9 @@ impl TemplateStore {
     }
 
     /// Resolve `<arch>/<name>[@version][#variant]` to the disk a clone or a
-    /// build is backed on, with its effective metadata (§6.6): the version by
-    /// [`Self::resolve_version`], then the variant by
-    /// [`TemplateVersion::select`].
+    /// build is backed on, with its effective metadata (§6.6). Unversioned
+    /// lab references and bare build references prefer a cloneable version.
+    /// Explicit build variants can still select the newest incomplete base.
     pub fn resolve(
         &self,
         arch: &str,
@@ -289,8 +289,39 @@ impl TemplateStore {
         variant: Option<&VariantRef>,
         purpose: Purpose,
     ) -> Result<ResolvedTemplate> {
-        self.resolve_version(arch, name, version)?
-            .select(variant, purpose)
+        let installed = if purpose == Purpose::Lab || variant.is_none() {
+            self.resolve_clone_version(arch, name, version)?
+        } else {
+            self.resolve_version(arch, name, version)?
+        };
+        installed.select(variant, purpose)
+    }
+
+    /// Prefer the newest cloneable version for an unpinned reference. If
+    /// none is cloneable, preserve the newest version's selection diagnostic.
+    pub(crate) fn resolve_clone_version(
+        &self,
+        arch: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<TemplateVersion> {
+        if version.is_some() {
+            return self.resolve_version(arch, name, version);
+        }
+        let mut versions = self.versions_of(arch, name)?;
+        versions.sort_unstable_by(|a, b| compare_versions(a, b));
+        let mut newest = None;
+        for version in versions.iter().rev() {
+            if let Some(installed) = self.installed_as_is(arch, name, version)? {
+                if installed.meta.has_usable_default() {
+                    return Ok(installed);
+                }
+                if newest.is_none() {
+                    newest = Some(installed);
+                }
+            }
+        }
+        newest.ok_or_else(|| anyhow!("template {arch}/{name} not found in the store"))
     }
 
     /// Resolve `<arch>/<name>[@version]` to a store version. `version`
@@ -421,6 +452,34 @@ impl TemplateStore {
         self.install_locked(staging_dir, meta, overwrite)
     }
 
+    /// Publish a new build only if it is still running at the final rename.
+    pub(crate) fn install_build(
+        &self,
+        staging: &Path,
+        meta: &TemplateMeta,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let rename = |from: &Path, to: &Path| {
+            if cancel.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "build cancelled",
+                ));
+            }
+            fs::rename(from, to)
+        };
+        self.install_with(
+            staging,
+            meta,
+            false,
+            &InstallOps {
+                rename: &rename,
+                ..InstallOps::REAL
+            },
+        )
+    }
+
     fn install_locked(&self, staging: &Path, meta: &TemplateMeta, overwrite: bool) -> Result<()> {
         self.install_with(staging, meta, overwrite, &InstallOps::REAL)
     }
@@ -432,7 +491,7 @@ impl TemplateStore {
         staging: &Path,
         meta: &TemplateMeta,
         overwrite: bool,
-        ops: &InstallOps,
+        ops: &InstallOps<'_>,
     ) -> Result<()> {
         super::trust::names(meta)?;
         ensure!(
@@ -484,7 +543,7 @@ impl TemplateStore {
         if dest.exists() {
             self.swap_in(staging, &dest, &needed, ops)
         } else {
-            self.move_in(staging, &dest, &ops.rename)?;
+            self.move_in(staging, &dest, ops.rename)?;
             // Once more where the remover's path no longer reaches.
             still_staged(&dest, &needed).inspect_err(|_| {
                 let _ = fs::remove_dir_all(&dest);
@@ -511,12 +570,12 @@ impl TemplateStore {
         staging: &Path,
         dest: &Path,
         needed: &[PathBuf],
-        ops: &InstallOps,
+        ops: &InstallOps<'_>,
     ) -> Result<()> {
         let (next, old) = swap_paths(dest);
         remove_if_present(&next)?;
         let moved = self
-            .move_in(staging, &next, &ops.rename)
+            .move_in(staging, &next, ops.rename)
             .and_then(|()| still_staged(&next, needed));
         if let Err(e) = moved {
             let _ = fs::remove_dir_all(&next);
@@ -847,6 +906,28 @@ impl TemplateStore {
         variants: &[super::meta::VariantMeta],
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<TemplateMeta> {
+        self.add_variants_checked(
+            arch,
+            name,
+            version,
+            staging_dir,
+            variants,
+            in_use,
+            &|| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_variants_checked(
+        &self,
+        arch: &str,
+        name: &str,
+        version: &str,
+        staging_dir: &Path,
+        variants: &[super::meta::VariantMeta],
+        in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
+        before_publish: &dyn Fn() -> Result<()>,
+    ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
             .installed_locked(arch, name, version)?
@@ -873,6 +954,7 @@ impl TemplateStore {
         }
 
         let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
+        before_publish()?;
         for v in variants {
             let vdir = found.dir.join(VARIANTS_DIR).join(&v.name);
             if vdir.exists() {
@@ -1440,13 +1522,16 @@ fn still_staged(dir: &Path, needed: &[PathBuf]) -> Result<()> {
 }
 
 /// The filesystem steps of an install. [`InstallOps::REAL`] outside tests.
-struct InstallOps {
+struct InstallOps<'a> {
     write_meta: fn(&TemplateMeta, &Path) -> Result<()>,
-    rename: fn(&Path, &Path) -> std::io::Result<()>,
+    rename: &'a dyn Fn(&Path, &Path) -> std::io::Result<()>,
 }
 
-impl InstallOps {
-    const REAL: Self = Self { write_meta, rename };
+impl InstallOps<'_> {
+    const REAL: Self = Self {
+        write_meta,
+        rename: &rename,
+    };
 }
 
 fn write_meta(meta: &TemplateMeta, path: &Path) -> Result<()> {
@@ -1985,7 +2070,7 @@ mod tests {
 
     /// Install the replacement with `ops`, expecting it to fail, and show the
     /// old version's disk and metadata are as they were.
-    fn overwrite_fails_and_keeps_old(ops: &InstallOps) -> anyhow::Error {
+    fn overwrite_fails_and_keeps_old(ops: &InstallOps<'_>) -> anyhow::Error {
         let (_tmp, store, staging) = store_with_old_version();
         let before = version_files(&store);
         let err = store
@@ -2014,7 +2099,7 @@ mod tests {
     #[test]
     fn a_failed_staging_move_keeps_the_old_version() {
         overwrite_fails_and_keeps_old(&InstallOps {
-            rename: |from, to| {
+            rename: &|from, to| {
                 if name_starts(to, ".next-") {
                     Err(std::io::Error::other("injected"))
                 } else {
@@ -2028,7 +2113,7 @@ mod tests {
     #[test]
     fn a_failed_set_aside_keeps_the_old_version() {
         overwrite_fails_and_keeps_old(&InstallOps {
-            rename: |from, to| {
+            rename: &|from, to| {
                 if name_starts(to, ".old-") {
                     Err(std::io::Error::other("injected"))
                 } else {
@@ -2043,7 +2128,7 @@ mod tests {
     #[test]
     fn a_failed_final_rename_restores_the_old_version() {
         let err = overwrite_fails_and_keeps_old(&InstallOps {
-            rename: |from, to| {
+            rename: &|from, to| {
                 if name_starts(from, ".next-") {
                     Err(std::io::Error::other("injected"))
                 } else {
@@ -2071,7 +2156,7 @@ mod tests {
                 &new_meta(),
                 true,
                 &InstallOps {
-                    rename: |from, to| {
+                    rename: &|from, to| {
                         if to.file_name().is_some_and(|n| n == "1") {
                             Err(std::io::Error::other("injected"))
                         } else {
@@ -2150,7 +2235,7 @@ mod tests {
                 &meta("x86_64", "t", "1"),
                 false,
                 &InstallOps {
-                    rename: |from, to| {
+                    rename: &|from, to| {
                         fs::remove_file(from.join(DISK_FILE))?;
                         fs::rename(from, to)
                     },
@@ -2647,6 +2732,15 @@ mod tests {
             .resolve("x86_64", "win", None, None, Purpose::Lab)
             .unwrap();
         assert_eq!(resolved.reference(), "x86_64/win@1#standard");
+
+        let err = store
+            .resolve("x86_64", "win", Some("2"), None, Purpose::Lab)
+            .unwrap_err();
+        assert!(err.to_string().contains("variants are not built yet"));
+        let base = store
+            .resolve("x86_64", "win", None, Some(&VariantRef::Base), Purpose::Build)
+            .unwrap();
+        assert_eq!(base.meta.version, "2");
     }
 
     on_both_tools!(adding_a_variant_that_replaces_one_asks_whether_it_is_in_use);
