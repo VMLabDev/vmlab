@@ -5842,7 +5842,7 @@ lab "t" {
         let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
         crate::scripting::run_script_source(
             lab,
-            "fn main(lab: Lab) { print(\"hello\") println(\" world\") }".into(),
+            "fn main(lab: Lab) {\n    print(\"hello\")\n    println(\" world\")\n}".into(),
             "print.ws",
             dir.path().to_path_buf(),
             None,
