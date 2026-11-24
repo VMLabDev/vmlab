@@ -3140,7 +3140,8 @@ impl LabRuntime {
             .await;
             (claim, result)
         });
-        let (_claim, result) = match tokio::time::timeout(Duration::from_secs(1800), &mut run).await {
+        let (_claim, result) = match tokio::time::timeout(Duration::from_secs(1800), &mut run).await
+        {
             Ok(joined) => joined?,
             Err(_) => {
                 cancel.cancel();
