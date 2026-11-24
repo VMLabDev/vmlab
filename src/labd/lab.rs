@@ -8511,12 +8511,12 @@ fn main(lab: Lab) {
 lab "t" {
     vm "a" {
         template = "scratch"
-        arch = "x86_64"
+        arch = "aarch64"
         profile = "linux-generic"
-        hypervisor = "vmlab"
+        hypervisor = "qemu"
         firmware = "seabios"
         disk = 1MiB
-        media { type = "iso" from = "./payload" }
+        media { kind = "iso" from = "./payload" }
     }
 }"#;
         std::fs::write(root.join("vmlab.wcl"), src).unwrap();
@@ -8543,10 +8543,9 @@ lab "t" {
         };
         let hv = FakeHypervisor::new(Script::healthy());
         vm.set_hypervisor(hv.clone());
-        vm.set_host_facts(crate::config::hypervisor::HostFacts {
-            arch: "x86_64".into(),
-            kvm: true,
-        });
+        let dirs = &mut Arc::get_mut(&mut vm).unwrap().dirs;
+        dirs.run = root.join("run");
+        dirs.logs = root.join("logs");
         std::fs::create_dir_all(&vm.dirs.local).unwrap();
         std::fs::write(vm.dirs.primary_disk(), b"").unwrap();
         lab.machines.write().unwrap().insert(Built::Vm(vm), config);
