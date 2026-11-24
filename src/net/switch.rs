@@ -746,8 +746,7 @@ impl Switch {
                 };
                 // Not a MAC that has moved to another port since, and not
                 // one bound to this port.
-                if inner.macs.get(&oldest) == Some(&port)
-                    && !inner.bound_macs.contains_key(&oldest)
+                if inner.macs.get(&oldest) == Some(&port) && !inner.bound_macs.contains_key(&oldest)
                 {
                     inner.macs.remove(&oldest);
                     if let Some(off) = &self.offload {
