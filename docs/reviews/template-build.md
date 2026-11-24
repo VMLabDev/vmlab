@@ -44,15 +44,15 @@ test does not reproduce is wrong and should be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691) |
-| F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692.** |
-| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697) |
-| F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one |
-| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process (fixed, card #699) |
-| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory **Fixed by card #698.** |
-| F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` |
-| F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered |
-| F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings **Fixed by card #778.** |
+| F1 | data loss | The build's working directory is named from an unchecked `name` and `version`, and is deleted recursively before any name check runs (fixed, card #691, `81c85657`) |
+| F2 | security (peer) | A `url` source is downloaded with no size limit, over plain HTTP if the definition or a redirect says so, and is checked only when it is complete **Fixed by card #692 (`952b8c6f`).** |
+| F3 | wrong result | The seal accepts a guest that was cut off: the stop ladder quits the emulator after about a minute and the build seals that disk (fixed, card #697, `13300ba5`, `da4baa9d`) |
+| F4 | wrong result | A version whose variants are not built hides the complete version below it, and `template prune` keeps the unusable one (fixed, card #860, `b8f635a8`) |
+| F5 | wrong result | A build VM outlives a killed supervisor: the next start deletes its working directory and leaves the process (fixed, card #699, `1d6116e7`) |
+| F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory **Fixed by card #698 (`102cc9bd`).** |
+| F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` (fixed, card #860, `b8f635a8`) |
+| F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered (fixed, card #860, `b8f635a8`) |
+| F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings **Fixed by card #778 (`6b7457f1`).** |
 
 ### F1. The working directory is named from an unchecked name and version (data loss)
 
@@ -172,6 +172,9 @@ seal for every profile.
 
 ### F4. A version without its variants hides the complete version below it (wrong result)
 
+**Fixed by card #860 (`b8f635a8`).** Unversioned references skip versions
+without the requested variant, and pruning keeps the newest usable version.
+
 - Where: `src/template/build.rs:156-184` (the base is installed, then the
   variants are built one at a time), `:379-427`.
   `src/template/store.rs:302-319` (`resolve_version`: the highest version).
@@ -269,6 +272,9 @@ the directory after the first releases it.
 
 ### F7. `template stop` during the seal is ignored (wrong result)
 
+**Fixed by card #860 (`b8f635a8`).** Base and variant seals check for
+cancellation before publishing the image.
+
 - Where: `src/template/build.rs:1316-1318` (the last cancel check of the
   base build), `:1392-1450` (flatten, hash, install), `:590-592` and
   `:600-634` (the same in a variant build).
@@ -289,6 +295,9 @@ the directory after the first releases it.
   afterwards. The seal has to be a function of its own for that test.
 
 ### F8. The sealed `agent_version` is not the version of the agent that answered (wrong result)
+
+**Fixed by card #860 (`b8f635a8`).** The seal records the agent version
+reported by the verification handshake.
 
 - Where: `src/template/agent_install.rs:96-108`.
   `src/labd/agent_repair.rs:602-640` (`installed_stamp`, `decide`).

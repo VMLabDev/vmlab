@@ -49,18 +49,18 @@ test does not reproduce is wrong and should be dropped.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
-| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666) |
-| F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (fixed, card #802) |
-| F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it (fixed, card #803) |
-| F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
-| F6 | security (hostile guest) | A terminal's buffer has no limit, and `expect` scans all of it again on every chunk |
-| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever (fixed, card #804) |
-| F8 | wrong result | `Term.expect` destroys a character that was split across two reads |
-| F9 | wrong result | `vmlab validate` accepts a script with no entry point, or with the wrong one |
-| F10 | wrong result | `print` and `println` write to the daemon's log file, not to the output of `up` |
-| F11 | cosmetic | A recursion fault prints 10,000 function names on one line |
-| F12 | cosmetic | A region number above 4,294,967,295 wraps instead of being refused |
+| F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665, `1aa68aaa`) |
+| F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666, `695049e2`) |
+| F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (fixed, card #802, `2813586c`) |
+| F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it (fixed, card #803, `5bfaa65f`) |
+| F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM (fixed, card #671, `5978ab78`) |
+| F6 | security (hostile guest) | A terminal's buffer has no limit, and `expect` scans all of it again on every chunk (fixed, card #667, `3a8bb33b`) |
+| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever (fixed, card #804, `84bb1eed`) |
+| F8 | wrong result | `Term.expect` destroys a character that was split across two reads (fixed, card #861, `26834845`) |
+| F9 | wrong result | `vmlab validate` accepts a script with no entry point, or with the wrong one (fixed, card #861, `26834845`) |
+| F10 | wrong result | `print` and `println` write to the daemon's log file, not to the output of `up` (fixed, card #861, `26834845`) |
+| F11 | cosmetic | A recursion fault prints 10,000 function names on one line (fixed, card #861, `26834845`) |
+| F12 | cosmetic | A region number above 4,294,967,295 wraps instead of being refused (fixed, card #861, `26834845`) |
 
 ### F1. A script forward follows the guest's claim, not the lease (security, peer)
 
@@ -319,6 +319,9 @@ host waits observe it while blocked.
 
 ### F8. `Term.expect` destroys a character split across two reads (wrong result)
 
+Fixed in #861 (`26834845`). `Term.expect` preserves the raw bytes after a
+match, including any partial UTF-8 character.
+
 - Where: `src/scripting/terminal.rs:93-97`.
 - Why it is a fault: `expect` matches on `String::from_utf8_lossy(&st.buf)`.
   On a match it writes the rest of that lossy text back as the new buffer
@@ -336,6 +339,9 @@ host waits observe it while blocked.
   Today: `"\u{fffd}\u{fffd}"`.
 
 ### F9. `vmlab validate` accepts a script with no entry point (wrong result)
+
+Fixed in #861 (`26834845`). Validation checks the required entry point and
+signature for the script's role.
 
 - Where: `src/scripting/mod.rs:1381-1390` (`check_script_source`),
   `src/cli/validate.rs:98-101`, `src/scripting/runner.rs:149` and `:203`
@@ -361,6 +367,9 @@ host waits observe it while blocked.
 
 ### F10. `print` and `println` go to the daemon's log file (wrong result)
 
+Fixed in #861 (`26834845`). `print` and `println` use the script's output
+sink.
+
 - Where: `src/scripting/runner.rs:140`, `:194` (`Vm::new`: `VmConfig::out`
   is `stdout_sink()`), `src/supervisor/mod.rs:597-605` (the lab daemon's
   stdout is `labd-<lab>.log`).
@@ -376,6 +385,9 @@ host waits observe it while blocked.
 
 ### F11. A recursion fault prints 10,000 function names (cosmetic)
 
+Fixed in #861 (`26834845`). Script errors show a bounded number of stack
+frames.
+
 - Where: `src/scripting/runner.rs:242-261` (`run_error` joins every trace
   frame with ` <- `).
 - Why it is a fault: a script that recurses without end stops at the VM's
@@ -389,6 +401,9 @@ host waits observe it while blocked.
   that the message is shorter than 1,000 bytes.
 
 ### F12. A region number above `u32::MAX` wraps (cosmetic)
+
+Fixed in #861 (`26834845`). Image match and OCR regions reject coordinates
+above `u32::MAX`.
 
 - Where: `src/scripting/mod.rs:546-558` (`match_opts`),
   `src/scripting/ocr.rs` (`parse_opts`, `let at = |v: i64| v.max(0) as u32`).
