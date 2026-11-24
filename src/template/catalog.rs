@@ -333,6 +333,9 @@ mod tests {
         assert!(row.is_none(), "the arch reached a row: {row:?}");
         let warning = warning.expect("a row that is left out is said");
         assert!(!unprintable(&warning), "{warning:?}");
-        assert!(warning.contains("registry.example/acme/ubuntu"), "{warning}");
+        assert!(
+            warning.contains("registry.example/acme/ubuntu"),
+            "{warning}"
+        );
     }
 }
