@@ -25,25 +25,25 @@ much as a Makefile is.
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed, #461) |
-| F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464) |
-| F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed, #480) |
-| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481) |
-| F5 | security | A template pull bounds each chunk but not the number of chunks or the total size (fixed, #482) |
-| F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop (fixed, #503) |
-| F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) |
-| F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed, #465) |
-| F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target |
-| F10 | wrong result | The registry HTTP client has no timeout (fixed, #505) |
-| F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest (fixed, #504) |
-| F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" (fixed, #522) |
-| F13 | wrong result | A cancelled pull removes the work directory under the install that is still running (fixed, #521) |
-| F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept |
-| F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked (fixed, #523) |
-| F16 | wrong result | A push onto a tag that holds a plain manifest drops that manifest's architecture |
-| F17 | wrong result | The flatten drops PAX extended attributes, so file capabilities are lost |
-| F18 | wrong result | A 404 on a later page of a tag list returns an empty list |
-| F19 | cosmetic | Strings from a registry reach the terminal unfiltered |
+| F1 | data loss | A pull that brings a changed variant deletes the old overlay under the clones that are backed by it (fixed in card #461, `551bddae`) |
+| F2 | data loss | `--overwrite` on pull and import replaces a version's disks with no in-use check (fixed in card #464, `0183472f`) |
+| F3 | security | The store slot comes from the config blob, the cache lookup from the repository name, so one repository can fill another reference's slot (fixed in card #480, `c8326757`) |
+| F4 | security, crash | The config blob's `secure_boot_vars` is decompressed with no limit, on every resolve of a registry reference (fixed in card #481, `27ab24d7`) |
+| F5 | security | A template pull bounds each chunk but not the number of chunks or the total size (fixed in card #482, `e4f4f0df`) |
+| F6 | security | The layer flatten is quadratic in the entry count, has no entry or size limit, and runs on a thread that a cancel cannot stop (fixed in card #503, `e71febef`) |
+| F7 | security | The store accepts a qcow2 with an external data file (reachable only with `VMLAB_IMAGE_TOOL=qemu-img`) (fixed in card #462, `532f337d`) |
+| F8 | data loss | `template login` replaces a docker config it cannot parse with an empty one, and panics on a non-object `auths` (fixed in card #465, `690c5baa`) |
+| F9 | wrong result | A hard link in a container layer loses its target when a higher layer deletes or replaces that target (fixed in card #524, `6ef7e3a7`) |
+| F10 | wrong result | The registry HTTP client has no timeout (fixed in card #505, `8c0238b0`) |
+| F11 | wrong result | A pull does not compare the config blob's `sha256` with the manifest's whole-image digest, and a push does not compare the disk with the recorded digest (fixed in card #504, `4747897b`) |
+| F12 | wrong result | Two pulls of one template at the same time: the second fails with "already exists" (fixed in card #522, `7fca84a9`) |
+| F13 | wrong result | A cancelled pull removes the work directory under the install that is still running (fixed in card #521, `b6b19159`) |
+| F14 | wrong result | Staging directories of the store, of pulls, of pushes and of the image cache are never swept (fixed in card #825, `0dfc9076`) |
+| F15 | wrong result | The artefact cache shares one `.part` file between concurrent downloads, and uses the declared `sha256` as a file name unchecked (fixed in card #523, `ad0a512f`) |
+| F16 | wrong result | A push onto a tag that holds a plain manifest drops that manifest's architecture (fixed in card #826, `0412d49f`) |
+| F17 | wrong result | The flatten drops PAX extended attributes, so file capabilities are lost (fixed in card #827, `2b477a8c`) |
+| F18 | wrong result | A 404 on a later page of a tag list returns an empty list (fixed in card #828, `3556f8a6`) |
+| F19 | cosmetic | Strings from a registry reach the terminal unfiltered (fixed in card #828, `3556f8a6`) |
 
 ### F1. A pull that brings a changed variant deletes the old overlay under its clones (data loss)
 
@@ -78,7 +78,7 @@ much as a Makefile is.
      pull, create a linked clone on `variants/v/disk.qcow2`, push a rebuilt
      `v` and a new variant `w`, pull `#w`. Assert the clone's backing file
      still hashes to digest A. Today it hashes to B.
-- Fixed in card #461. `add_variants` takes an in-use check, asks it under the
+- Fixed in card #461 (`551bddae`). `add_variants` takes an in-use check, asks it under the
   store lock about every overlay it would replace, and refuses with nothing
   moved. A pull asks the same check (`Registry::guarding`, every registered
   lab's clones) before it downloads a variant the store holds with another
@@ -108,7 +108,7 @@ much as a Makefile is.
   same version with another disk and `overwrite = true`. Expect a refusal
   that names the machine, as `backed_clones_reason` gives for `remove`. Today
   the import succeeds. The same test with `pull`.
-- Fixed in card #464. `store.import` and `store.pull` with `overwrite` scan
+- Fixed in card #464 (`0183472f`). `store.import` and `store.pull` with `overwrite` scan
   the registered labs with `clones_by_backing` and hand the store a replace
   guard (`TemplateStore::refusing_replace`). An install that would replace a
   version asks the guard about the base and every variant overlay in the
@@ -157,7 +157,7 @@ much as a Makefile is.
   `cached_registry_template("localhost:5000/good/ubuntu:24.04", "x86_64", &store)`.
   Expect `None`. Today it returns the entry whose `origin` is
   `localhost:5000/evil/x:1`.
-- Fixed in card #480. `origin` could not carry the check: a build writes its
+- Fixed in card #480 (`c8326757`). `origin` could not carry the check: a build writes its
   source there, and a source may be a URL or a reference. A pull now records
   the repository it was given, `host/owner/name`, as `pulled_from` in the
   version's `template.wcl`, from the reference and never from the config
@@ -214,7 +214,7 @@ much as a Makefile is.
 - The same code path reads the config blob with `get_blob`, so a 1 GiB JSON
   document is held in memory, then parsed. A test with the fake transport
   that serves a config blob of 16 MiB should see a refusal.
-- Fixed in card #481. `TemplateConfig::vars` reads the zstd frame through a
+- Fixed in card #481 (`27ab24d7`). `TemplateConfig::vars` reads the zstd frame through a
   reader that stops one byte past `MAX_VARS_BYTES` (64 MiB, the largest real
   VARS file) and refuses a payload that reaches it. `with_vars` refuses a
   larger file on push. Every read of a template's config blob (`index_arches`,
@@ -260,7 +260,7 @@ much as a Makefile is.
   more than the declared size (the fake transport counts `get_blob` calls).
   Today all 64 chunks are fetched and 64 MiB is assembled before
   `verify_whole` fails.
-- Fixed in card #482. A pull now takes what each part assembles to from the
+- Fixed in card #482 (`e4f4f0df`). A pull now takes what each part assembles to from the
   manifest and holds the registry to it. Before a chunk is fetched
   (`declared_chunk_sizes` in `src/oci/manifest.rs`): the chunk count
   annotation must equal the layer count, every layer must state its
@@ -313,7 +313,7 @@ much as a Makefile is.
   under ten seconds. Today it performs about 2 × 10^10 closure calls. A
   second test, `a_layer_with_too_many_entries_is_refused`, states the limit
   that the fix picks.
-- Fixed in card #503. The survey keeps the surviving paths as a tree of
+- Fixed in card #503 (`e71febef`). The survey keeps the surviving paths as a tree of
   path components (`Survivors` in `src/oci/image/flatten.rs`). A whiteout,
   an opaque marker and a file over a directory write one number on the root
   of the subtree they erase, and visit nothing beneath it. Folding one entry
@@ -369,7 +369,7 @@ much as a Makefile is.
   feature bit 2 set and a data-file extension (type `0x44415441`) naming
   `/etc/hostname`, and call `verify_base`. Expect an error. Today it returns
   `Ok`. The same for `verify_variants` with a correct backing name.
-- Fixed in card #462. `refuse_qcow2_data_file` in `src/template/store.rs`
+- Fixed in card #462 (`532f337d`). `refuse_qcow2_data_file` in `src/template/store.rs`
   refuses a qcow2 whose header has incompatible-feature bit 2 or a data-file
   header extension, with either image tool. `verify_base`, `verify_variants`
   and the variant pull in `src/oci/client.rs` call it. The variant case has
@@ -400,7 +400,7 @@ much as a Makefile is.
   succeeds and `a.example` is gone.
   `a_non_object_auths_is_an_error_not_a_panic`: write `{"auths":"x"}`. Today
   the call panics.
-- Fixed in card #465. `store_login_at` refuses a config that does not parse
+- Fixed in card #465 (`690c5baa`). `store_login_at` refuses a config that does not parse
   as JSON, one whose top level is not an object, and one whose `auths` is not
   an object. The error names the file and the file is left unchanged. A
   missing file, an empty file and a null `auths` still start from an empty
@@ -432,7 +432,7 @@ much as a Makefile is.
   `.wh.b`. Flatten, read the squashfs back, and expect `a` to exist with the
   content `one` and `b` to be absent. A second test replaces `b` in layer 2
   with content `two` and expects `a` = `one`, `b` = `two`.
-- Fixed in card #524. The survey records the original archive entry behind
+- Fixed in card #524 (`6ef7e3a7`). The survey records the original archive entry behind
   each hard link. If its original path is erased or replaced, the flatten
   writes that entry under a surviving alias and points any other aliases to it.
 
@@ -457,7 +457,7 @@ much as a Makefile is.
   and call `get_manifest` under `tokio::time::timeout` of the documented
   limit plus a margin. Expect an `Err` from the transport. Today the outer
   timeout fires.
-- Fixed in card #505. `HttpTransport` runs under `Limits`: 30 s to connect,
+- Fixed in card #505 (`8c0238b0`). `HttpTransport` runs under `Limits`: 30 s to connect,
   60 s from a request without a body to its response head, 60 s between two
   reads of a body, and 15 minutes for a request that carries a body. The
   transport keeps the waits itself, because reqwest's `read_timeout` also
@@ -501,7 +501,7 @@ much as a Makefile is.
   Today it installs, and a second `pull` of the same reference fails with
   "different disk". Push test `a_push_refuses_a_disk_that_is_not_the_recorded_one`:
   flip one byte of a stored `disk.qcow2`, push, expect an error.
-- Fixed in card #504: a pull refuses a config blob whose `sha256` is not
+- Fixed in card #504 (`4747897b`): a pull refuses a config blob whose `sha256` is not
   the manifest's whole-image digest, before it fetches a chunk, and records
   the verified digest. A push refuses a base disk or a variant overlay
   that does not hash to the digest its metadata records, before it uploads
@@ -523,7 +523,7 @@ much as a Makefile is.
   `src/oci/client.rs`: a fake transport whose `get_blob` waits on a barrier
   for two callers, two `ensure_registry_template` calls joined. Expect both
   `Ok` with the same version. Today one is `Err`.
-- Fixed in card #522. The store's refusal is a typed error,
+- Fixed in card #522 (`7fca84a9`). The store's refusal is a typed error,
   `AlreadyInstalled`, with the same text. `pull_with_progress` runs one more
   pass when a pull without `overwrite` gets it and the store now holds the
   version. That pass takes the path of a version already held: it refuses a
@@ -564,7 +564,7 @@ much as a Makefile is.
   use: a `write_meta` that deletes `staging/disk.qcow2` and then writes the
   metadata. Expect `install_with` to fail and the version to be absent.
   Today the rename succeeds and `installed()` returns the "corrupt" error.
-- Fixed in card #521: the blocking thread that installs holds the owner of
+- Fixed in card #521 (`b6b19159`): the blocking thread that installs holds the owner of
   the work directory (`Registry::holding`), so a cancelled pull removes it
   only when the install has ended (client test
   `a_cancelled_pull_keeps_its_work_directory_until_the_install_ends`).
@@ -593,6 +593,9 @@ much as a Makefile is.
   supervisor's start-up sweep, expect both gone. Today no code path removes
   them. The sweep must not take a directory that a live pull holds, which
   the test also states.
+- Fixed in card #825 (`0dfc9076`). Supervisor startup sweeps abandoned staging
+  directories in the template store, OCI pull and push work areas, and image
+  cache. Directory locks protect active operations using the updated code.
 
 ### F15. The artefact cache: a shared `.part` file and an unchecked file name (wrong result)
 
@@ -622,7 +625,7 @@ much as a Makefile is.
   `a_download_that_fails_its_hash_leaves_no_cache_entry`.
   `a_url_source_needs_a_64_digit_hex_sha256` in the config tests: a
   definition with `sha256 = "../x"` is a validation error.
-- Fixed in card #523. Each resolve downloads into a file of its own in the
+- Fixed in card #523 (`ad0a512f`). Each resolve downloads into a file of its own in the
   cache directory (`.<sha256>.<pid>-<n>-<nanos>.part`), verifies it there,
   and only then renames it to `<sha256>.artefact`. A compressed artefact is
   decompressed into a second file of that kind, so the shared `.download` and
@@ -657,6 +660,8 @@ much as a Makefile is.
   in `src/oci/client.rs`: put a plain aarch64 template manifest at tag `1.0`
   in the fake transport, push x86_64 to `1.0`, expect `index_arches("1.0")`
   to hold both. Today it holds `x86_64` only.
+- Fixed in card #826 (`0412d49f`). Promoting a plain manifest to an index
+  keeps its descriptor alongside the new architecture's descriptor.
 
 ### F17. The flatten drops PAX extended attributes (wrong result)
 
@@ -677,6 +682,10 @@ much as a Makefile is.
   `unsquashfs -lls -xattrs` or an equivalent reader. Expect the attribute.
   Today it is absent. Drop this finding if `sqfstar` on the gate host does
   not read PAX attributes at all. Then the fault is in the choice of tool.
+- Fixed in card #827 (`2b477a8c`). Flattening preserves `SCHILY.xattr.*` and
+  `LIBARCHIVE.xattr.*` PAX records for surviving entries. The capability
+  regression verifies the attribute in the squashfs. The separate concern
+  about non-UTF-8 names still applies.
 
 ### F18. A 404 on a later page of a tag list returns an empty list (wrong result)
 
@@ -692,6 +701,8 @@ much as a Makefile is.
   `src/oci/client.rs`, with the loopback HTTP server the transport tests
   use: page one returns two tags and a `Link` header, page two returns 404.
   Expect an error, or the two tags. Today the result is an empty list.
+- Fixed in card #828 (`3556f8a6`). A 404 on the first page still returns an
+  empty list. A 404 on a later page returns an error that names the page.
 
 ### F19. Strings from a registry reach the terminal unfiltered (cosmetic)
 
@@ -709,6 +720,9 @@ much as a Makefile is.
   `src/template/catalog.rs`: a fake registry whose tag list holds
   `"1.0\u001b[2J"`. Expect the row to be left out or the character to be
   escaped in `CatalogSearchRow`. Today it is passed through.
+- Fixed in card #828 (`3556f8a6`). `template search` filters tags and rows
+  with invalid display fields and escapes unprintable characters in row
+  warnings.
 
 ## Notes
 
