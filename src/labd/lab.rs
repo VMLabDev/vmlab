@@ -4639,7 +4639,7 @@ impl Drop for UpInFlight<'_> {
 mod tests {
     use super::*;
     use crate::labd::machine::{Capabilities, LabServices, MachineKind, MachineStatus};
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     /// The property ADR-0002 exists to hold, checked against the source rather
     /// than asserted in a comment.
@@ -4785,6 +4785,8 @@ mod tests {
         /// Host USB devices it holds, when it is a VM booted with
         /// `usb = true`; `None` keeps the trait's refusal.
         usb: Option<std::sync::Mutex<Vec<crate::usb::Attachment>>>,
+        /// The hypervisor refuses each detach and keeps the device.
+        usb_detach_fails: AtomicBool,
         /// A display whose VNC socket is a fake RFB server, for the console
         /// recording tests (§11.1); `None` is a machine with no display.
         display: Option<Arc<FakeDisplayHost>>,
@@ -4955,6 +4957,7 @@ mod tests {
                 snapshot_refused: false,
                 snapshot_cleanup_failure: false,
                 snapshot_missing: false,
+                usb_detach_fails: AtomicBool::new(false),
                 clock: crate::config::model::Clock::Host,
                 boot_ids: std::sync::Mutex::new(Vec::new()),
                 usb: None,
@@ -5372,6 +5375,9 @@ mod tests {
             Ok(a)
         }
         async fn usb_detach(&self, qdev_id: &str) -> Result<crate::usb::Attachment> {
+            if self.usb_detach_fails.load(Ordering::SeqCst) {
+                bail!("detaching {qdev_id}: the control connection closed");
+            }
             let gone = {
                 let mut held = self.usb.as_ref().unwrap().lock().unwrap();
                 let i = held
@@ -7900,6 +7906,30 @@ lab "t" {
         std::fs::write(sys.path().join("1-10").join("devnum"), "8\n").unwrap();
         assert!(!lab.usb_sweep().await, "nothing attached any more");
         assert!(lab.usb_attached(None).await.unwrap().is_empty());
+    }
+
+    /// An unplugged device the hypervisor will not let go of stays in the
+    /// tracking, unannounced, and the watch goes on until a pass detaches it
+    /// (usb review F10).
+    #[tokio::test]
+    async fn a_sweep_whose_detach_fails_keeps_the_device_and_the_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, sys, a) = usb_lab(dir.path());
+        let held = lab.usb_attach("a", "port:1-9", false).await.unwrap();
+        let mut events = lab.events.subscribe();
+        std::fs::remove_dir_all(sys.path().join("1-9")).unwrap();
+
+        a.usb_detach_fails.store(true, Ordering::SeqCst);
+        assert!(lab.usb_sweep().await, "the watch has a detach to ask again");
+        assert_eq!(a.usb_attached().await, vec![held]);
+        assert!(events.try_recv().is_err(), "nothing left, nothing said");
+
+        a.usb_detach_fails.store(false, Ordering::SeqCst);
+        assert!(!lab.usb_sweep().await, "nothing attached any more");
+        assert!(a.usb_attached().await.is_empty());
+        let ev = events.recv().await.unwrap();
+        assert_eq!(ev.event, "usb.detached");
+        assert_eq!(ev.data["reason"], "unplugged");
     }
 
     /// The wscript surface (§5.2.1) over the same runtime calls.

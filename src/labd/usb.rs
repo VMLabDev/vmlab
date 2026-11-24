@@ -271,13 +271,18 @@ impl LabRuntime {
                 .collect();
             remaining |= attached.len() > departed.len();
             for a in departed {
-                // The tracking goes whatever QEMU answers: the host device
-                // is gone either way.
-                if let Err(e) = m.usb_detach(&a.qdev_id).await {
-                    tracing::warn!("{}: removing unplugged {}: {e:#}", a.machine, a.qdev_id);
+                // A detach that failed may have left the hypervisor holding
+                // the device, so the attachment stays tracked, nothing is
+                // announced, and the next pass asks again.
+                match m.usb_detach(&a.qdev_id).await {
+                    Ok(gone) => self
+                        .events
+                        .emit("usb.detached", attachment_event(&gone, Some("unplugged"))),
+                    Err(e) => {
+                        remaining = true;
+                        tracing::warn!("{}: removing unplugged {}: {e:#}", a.machine, a.qdev_id);
+                    }
                 }
-                self.events
-                    .emit("usb.detached", attachment_event(&a, Some("unplugged")));
             }
         }
         remaining
