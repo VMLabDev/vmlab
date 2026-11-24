@@ -128,6 +128,42 @@ static bool write_all(HANDLE pipe, const std::string &m)
     return WriteFile(pipe, m.data(), (DWORD)m.size(), &n, NULL) && n == m.size();
 }
 
+/* The messages are written on a thread of their own, as a peer process
+ * writes them: a write that is longer than the quota of the pipe (2048
+ * bytes) does not return before the other end reads. */
+struct Writer
+{
+    HANDLE pipe = INVALID_HANDLE_VALUE, thread = NULL;
+    std::string first, second;
+    bool ok = false;
+
+    static DWORD WINAPI run(LPVOID p)
+    {
+        Writer *w = (Writer *)p;
+        w->ok = write_all(w->pipe, w->first) && (w->second.empty() || write_all(w->pipe, w->second));
+        return 0;
+    }
+    bool start(HANDLE to, const std::string &a, const std::string &b)
+    {
+        pipe = to;
+        first = a;
+        second = b;
+        thread = CreateThread(NULL, 0, run, this, 0, NULL);
+        return thread != NULL;
+    }
+    /* True when every byte was written. A writer that still waits is cancelled. */
+    bool finish()
+    {
+        if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0)
+        {
+            CancelIoEx(pipe, NULL);
+            WaitForSingleObject(thread, 5000);
+        }
+        CloseHandle(thread);
+        return ok;
+    }
+};
+
 /* The pipe as PipeServer::Init makes it (pipe.cpp:42-49). */
 static HANDLE make_server_end(const std::wstring &name)
 {
@@ -292,14 +328,16 @@ int wmain(int argc, wchar_t **argv)
             HANDLE peer = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
             r.stage = "connect";
             if (peer == INVALID_HANDLE_VALUE || !server.WaitForClient()) { r.win32_error = GetLastError(); server.m_buffer = own; r.result = "api_failure"; goto done; }
+            Writer writer;
             r.stage = "write";
-            if (!write_all(peer, first) || !write_all(peer, sent(CONNECTED))) { r.win32_error = GetLastError(); server.m_buffer = own; r.result = "api_failure"; goto done; }
+            if (!writer.start(peer, first, sent(CONNECTED))) { r.win32_error = GetLastError(); server.m_buffer = own; r.result = "api_failure"; goto done; }
             r.stage = "read";
             save(out, r);
             r.read_first = server.Read() ? 1 : 0;
             measure(server, arena, r);
             if (name == "server-command")
             {
+                writer.finish();
                 r.pass = r.read_first == 1 && r.text_units == wcslen(CONNECTED) && !wcscmp(arena.buffer, CONNECTED) && r.guard_changed == 0;
             }
             else
@@ -311,6 +349,7 @@ int wmain(int argc, wchar_t **argv)
                 std::wstring second;
                 server.GetData(second);
                 r.second_ok = r.read_second == 1 && second == CONNECTED;
+                writer.finish();
                 r.pass = r.guard_changed == 0 && r.text_units < DATA_BUFFER_LENGTH && r.second_ok &&
                          (name != "server-long" || (r.read_first == 1 && r.text_units == 0));
             }
@@ -338,12 +377,14 @@ int wmain(int argc, wchar_t **argv)
                 r.stage = "message_mode";
                 if (!SetNamedPipeHandleState(client.m_hPipe, &mode, NULL, NULL)) { r.win32_error = GetLastError(); client.m_buffer = own; r.result = "api_failure"; goto done; }
             }
+            Writer writer;
             r.stage = "write";
-            if (!write_all(server_end, first)) { r.win32_error = GetLastError(); client.m_buffer = own; r.result = "api_failure"; goto done; }
+            if (!writer.start(server_end, first, std::string())) { r.win32_error = GetLastError(); client.m_buffer = own; r.result = "api_failure"; goto done; }
             r.stage = "read";
             save(out, r);
             r.read_first = client.Read() ? 1 : 0;
             measure(client, arena, r);
+            writer.finish();
             if (name == "client-command")
                 r.pass = r.read_first == 1 && r.text_units == wcslen(CLOSE) && !wcscmp(arena.buffer, CLOSE) && r.guard_changed == 0;
             else
