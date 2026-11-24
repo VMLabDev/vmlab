@@ -264,7 +264,7 @@ fn answer(
     match msr_action(policy, index, reason, write) {
         MsrAction::Answer(entry) => (
             Some(0),
-            seen.insert(index).then(|| {
+            log_once(seen, index, || {
                 format!(
                     "kvm: macOS MSR {index:#010x} ({}) answered in user space",
                     entry.name
@@ -273,7 +273,7 @@ fn answer(
         ),
         MsrAction::Unhandled => (
             None,
-            seen.insert(index).then(|| {
+            log_once(seen, index, || {
                 let access = if write { "write" } else { "read" };
                 format!("kvm: macOS guest faulted on unhandled MSR {index:#010x} ({access})")
             }),
@@ -282,12 +282,38 @@ fn answer(
     }
 }
 
-/// Puts a snapshot's logged set into the live one.
+/// The line for `index` if the machine has not logged it and the set has
+/// room. The index that fills the set says so on its own line, and after it
+/// the set and the log take nothing more.
+fn log_once(
+    seen: &mut std::collections::BTreeSet<u32>,
+    index: u32,
+    line: impl FnOnce() -> String,
+) -> Option<String> {
+    if seen.len() >= MSR_LOG_LIMIT || !seen.insert(index) {
+        return None;
+    }
+    let mut line = line();
+    if seen.len() == MSR_LOG_LIMIT {
+        line.push_str(&format!(
+            "\nkvm: macOS guest touched {MSR_LOG_LIMIT} distinct MSRs, no further MSR is logged"
+        ));
+    }
+    Some(line)
+}
+
+/// Puts a snapshot's logged set into the live one, up to the same limit: the
+/// section is read from a file, so its size is not trusted either.
 pub(crate) fn merge_logged(
     seen: &mut std::collections::BTreeSet<u32>,
     saved: std::collections::BTreeSet<u32>,
 ) {
-    seen.extend(saved);
+    for index in saved {
+        if seen.len() >= MSR_LOG_LIMIT {
+            break;
+        }
+        seen.insert(index);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
