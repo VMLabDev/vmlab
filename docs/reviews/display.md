@@ -302,6 +302,14 @@ Not read:
   call. Today the connection stays open and the count rises by one for each
   message.
 - Confidence: high.
+- Fixed by card #788. `native_input` in `display/core.rs` refuses a `CpuCopy`
+  while the connection's surface is 0, the state before its first configure,
+  so a connection without frames can send none. The connection is closed
+  with `InvalidData` before any capture. The proof test asserts the close,
+  the error and the unchanged `frame()` count. Not changed: a client that
+  holds a configured surface can still send `CpuCopy` for it without a rate
+  limit, and each one is a forced full frame for every client, as
+  `PROTOCOL.md` defines the message. `PROTOCOL.md` states the new refusal.
 
 ### F6. Input: one pointer report that the guest never takes blocks every later key
 
@@ -333,6 +341,16 @@ Not read:
   retry loop of the last scroll, so the key stays in the queue.
 - Confidence: medium. The sink and the tablet queue were read. The xHCI and
   UHCI wrappers around `inject_pointer` were not.
+- Fixed by card #789. The sink in `vmm/display.rs` offers a pointer report
+  to the tablet once and no longer waits for the guest. When the tablet's
+  queue is full, the sink keeps the latest position and buttons and offers
+  them again with the next input message, ahead of a key. The wheel steps and
+  button changes refused in between are dropped, which `PROTOCOL.md` now
+  says. The sink reaches its devices through `InputDevices`, so the proof
+  test `a_full_tablet_queue_does_not_block_keys` builds a real `I8042` and
+  xHCI tablet without KVM and sends through a `DisplayServer`. It uses no
+  clock: it counts the machine-exit probe, which a waiting sink asks once
+  for each retry.
 
 ### F7. The display sockets get no mode and no peer check from vmlab-hv
 

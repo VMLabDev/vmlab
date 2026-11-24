@@ -41,7 +41,19 @@ fn display_survives_descriptor_exhaustion() {
         }
     }
     drop(fillers.pop());
-    let starved = UnixStream::connect(&path).unwrap();
+    // The accept loop polls the listener, and the kernel reserves a
+    // descriptor for each `accept` before it looks for a connection. A poll
+    // at this moment holds the one free descriptor for an instant, and the
+    // client's `socket` gets EMFILE. That is the same shortage: try again.
+    let starved = loop {
+        match UnixStream::connect(&path) {
+            Ok(stream) => break stream,
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                std::thread::yield_now();
+            }
+        }
+    };
     while server.accept_failures() == 0 {
         std::thread::yield_now();
     }

@@ -242,6 +242,44 @@ fn cpu_copy_captures_current_source_without_producer_publication() {
     h.join().unwrap().unwrap();
 }
 
+/// Review F5: a connection gets its first surface id, 1, with its first
+/// configure. Before that, and for ever without the frames capability, no id
+/// names a surface, 0 included.
+#[test]
+fn cpu_copy_without_a_configured_surface_is_refused() {
+    struct Counting(Source, std::sync::atomic::AtomicUsize);
+    impl vmlab_hv_display::FrameSource for Counting {
+        fn frame(&self) -> std::io::Result<vmlab_hv_display::Frame> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.frame()
+        }
+        fn readback(&self, frame: &vmlab_hv_display::Frame) -> std::io::Result<Vec<u8>> {
+            self.0.readback(frame)
+        }
+    }
+    let source = Arc::new(Counting(
+        Source(std::sync::Mutex::new(frame(1, 4, 3))),
+        Default::default(),
+    ));
+    let server =
+        vmlab_hv_display::DisplayServer::new(source.clone(), Arc::new(Sink::default())).unwrap();
+    let captures = || source.1.load(std::sync::atomic::Ordering::SeqCst);
+    let before = captures();
+    // No frames capability: this connection never receives a configure.
+    let (c, h) = client(&server, C::CPU_COPY);
+    c.cpu_copy(0).unwrap();
+    // The server closes the connection. It does not leave it open and silent.
+    assert_eq!(
+        c.receive().unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        h.join().unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(captures(), before, "a refused CpuCopy captured the source");
+}
+
 #[test]
 fn damage_resize_reconnect_and_real_memfds() {
     let (server, source, _) = server();

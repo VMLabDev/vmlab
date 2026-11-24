@@ -652,6 +652,12 @@ impl DisplayServer {
                 Message::CpuCopy { surface_id } if caps.has(Capabilities::CPU_COPY) => {
                     {
                         let mut s = local.lock().unwrap();
+                        // 0 is the state before the first configure and names no
+                        // surface: ids start at 1. Without this a connection with
+                        // no surface could force a capture for every client.
+                        if s.surface == 0 {
+                            return Err(invalid("CpuCopy before a configured surface"));
+                        }
                         if s.surface != surface_id {
                             return Err(invalid("CpuCopy names stale surface"));
                         }

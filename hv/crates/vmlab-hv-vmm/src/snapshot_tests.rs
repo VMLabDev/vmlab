@@ -414,6 +414,88 @@ fn save_load_rolls_back_counter_and_scratch() {
     );
 }
 
+/// Collect the events the machine emits from here on.
+fn record_events(m: &Machine) -> Arc<PlMutex<Vec<vmlab_hv_proto::control::Event>>> {
+    let events = Arc::new(PlMutex::new(Vec::new()));
+    let sink = events.clone();
+    m.handle
+        .shared()
+        .set_event_sink(Arc::new(move |event| sink.lock().push(event)));
+    events
+}
+
+fn resets(events: &PlMutex<Vec<vmlab_hv_proto::control::Event>>) -> usize {
+    events
+        .lock()
+        .iter()
+        .filter(|event| matches!(event, vmlab_hv_proto::control::Event::Reset))
+        .count()
+}
+
+/// vmm-core review F9. The guest asks for a reset and a load takes the
+/// snapshot-op lock before the events thread runs it. The test holds the lock
+/// itself, which is the same order without the race.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn load_clears_a_pending_guest_reset() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    m.handle.pause().expect("pause");
+    let shared = m.handle.shared();
+    let counter = GuestAddress(0x9000);
+    m.vm.ram.mem.write_slice(&[0x34, 0x12], counter).unwrap();
+    snapshot::save(&m.handle, "before-reset").expect("save");
+    m.vm.ram.mem.write_slice(&[0xcd, 0xab], counter).unwrap();
+    let events = record_events(&m);
+
+    let op = shared.begin_snapshot();
+    shared.restore_reset_pending(true);
+    snapshot::load_locked(&m.handle, "before-reset").expect("load");
+    assert!(
+        !shared.reset_pending(),
+        "the load kept the reset of the machine it replaced"
+    );
+    // What the events thread does once the load lets go of the lock.
+    shared.service_reset_locked();
+    drop(op);
+
+    assert_eq!(resets(&events), 0, "the restored machine was reset");
+    assert_eq!(m.counter(), 0x1234, "the restored state is intact");
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+}
+
+/// vmm-core review F9, the save side: a snapshot taken while a reset is
+/// pending carries the request, so the machine it restores is reset.
+#[test]
+#[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
+fn save_carries_a_pending_guest_reset() {
+    let Some(m) = machine(&counter_payload(), 16) else {
+        return;
+    };
+    m.handle.pause().expect("pause");
+    let shared = m.handle.shared();
+    let events = record_events(&m);
+
+    let op = shared.begin_snapshot();
+    shared.restore_reset_pending(true);
+    snapshot::save_locked(&m.handle, "reset-pending").expect("save");
+    assert!(shared.reset_pending(), "the save kept the request");
+    // The same machine with no request stands in for the process that loads.
+    shared.restore_reset_pending(false);
+    snapshot::load_locked(&m.handle, "reset-pending").expect("load");
+    assert!(
+        shared.reset_pending(),
+        "the snapshot lost the guest's reset request"
+    );
+    shared.service_reset_locked();
+    drop(op);
+
+    assert_eq!(resets(&events), 1, "the reset ran once after the load");
+    assert!(!shared.reset_pending());
+    assert_eq!(m.handle.status(), vmlab_hv_proto::control::RunState::Paused);
+}
+
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn load_clears_pages_that_were_zero_at_save() {

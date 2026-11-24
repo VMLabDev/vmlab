@@ -325,10 +325,28 @@ impl VmShared {
         self.state_cv.notify_all();
     }
 
+    /// Whether a guest reset waits for the events thread. It is machine
+    /// state: a snapshot records it and a load replaces it.
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.reset_pending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Replace the pending guest reset with the one a snapshot recorded. The
+    /// caller holds the snapshot-op lock and has every vCPU parked.
+    pub(crate) fn restore_reset_pending(&self, pending: bool) {
+        self.reset_pending
+            .store(pending, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn service_reset(&self) {
         let Some(_op) = self.snapshot_op.try_lock() else {
             return;
         };
+        self.service_reset_locked();
+    }
+
+    /// Run a pending guest reset. The caller holds the snapshot-op lock.
+    pub(crate) fn service_reset_locked(&self) {
         if !self.reset_pending.load(std::sync::atomic::Ordering::SeqCst) || self.exited() {
             return;
         }
