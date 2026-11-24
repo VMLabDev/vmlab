@@ -75,6 +75,7 @@ fn spawn_qmp(dir: &std::path::Path, answer: Screendump) -> (PathBuf, Arc<AtomicU
 struct FakeHost {
     dir: tempfile::TempDir,
     qmp: PathBuf,
+    frames: Option<Arc<dyn Frames>>,
     vnc: PathBuf,
     gl: bool,
     native: bool,
@@ -101,6 +102,9 @@ impl DisplayHost for FakeHost {
         Ok(Arc::new(self.qmp().await?))
     }
     async fn frames(&self) -> Result<Arc<dyn Frames>> {
+        if let Some(frames) = &self.frames {
+            return Ok(frames.clone());
+        }
         Ok(Arc::new(self.qmp().await?))
     }
     fn vnc_sock(&self) -> PathBuf {
@@ -142,6 +146,7 @@ fn display(
     let host = Arc::new(FakeHost {
         dir,
         qmp,
+        frames: None,
         vnc: rfb.path.clone(),
         gl,
         native: false,
@@ -156,6 +161,82 @@ fn display(
 /// path produced its result.
 fn qmp_image() -> RgbImage {
     RgbImage::from_pixel(6, 4, image::Rgb([200, 10, 10]))
+}
+
+#[derive(Default)]
+struct GatedFrames {
+    calls: AtomicUsize,
+    finish_second: tokio::sync::Notify,
+    return_from_dump: [tokio::sync::Notify; 2],
+}
+
+#[async_trait::async_trait]
+impl Frames for GatedFrames {
+    async fn screendump(&self, to: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let img = qmp_image();
+        let mut file = std::fs::File::create(to)?;
+        write!(file, "P6\n{} {}\n255\n", img.width(), img.height())?;
+        if call == 1 {
+            self.finish_second.notified().await;
+        }
+        file.write_all(img.as_raw())?;
+        drop(file);
+        self.return_from_dump[call].notified().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn two_captures_at_once_both_decode() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let mut captures = Vec::new();
+    for finish_second_before_first_reads in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let capture_dir = dir.path().to_path_buf();
+        let frames = Arc::new(GatedFrames::default());
+        let display = Display::new(Arc::new(FakeHost {
+            dir,
+            qmp: PathBuf::new(),
+            frames: Some(frames.clone()),
+            vnc: PathBuf::new(),
+            gl: false,
+            native: false,
+            transport: InputTransport::Qmp,
+            qmp_opens: Mutex::new(0),
+            tap: Arc::default(),
+        }));
+        let mut first = std::pin::pin!(display.grab());
+        let mut second = std::pin::pin!(display.grab());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        if finish_second_before_first_reads {
+            frames.finish_second.notify_one();
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+        }
+        frames.return_from_dump[0].notify_one();
+        let first = first.await;
+        frames.finish_second.notify_one();
+        frames.return_from_dump[1].notify_one();
+        let second = second.await;
+        let scratch_entries = std::fs::read_dir(capture_dir).unwrap().count();
+        captures.push((first, second, scratch_entries));
+    }
+    let expected = qmp_image();
+    assert!(
+        captures.iter().all(|(first, second, scratch_entries)| {
+            matches!(first, Ok(img) if *img == expected)
+                && matches!(second, Ok(img) if *img == expected)
+                && *scratch_entries == 0
+        }),
+        "{captures:?}"
+    );
 }
 
 /// A GL display is captured over VNC and never asks QMP for a screendump.
@@ -200,6 +281,7 @@ async fn grab_reports_no_surface_when_the_vnc_fallback_fails_too() {
     let d = Display::new(Arc::new(FakeHost {
         dir,
         qmp,
+        frames: None,
         vnc,
         gl: false,
         native: false,

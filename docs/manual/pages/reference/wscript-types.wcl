@@ -215,7 +215,7 @@ SRC
   }
 
   h2 "Match"
-  p "Where an image or text was found on the display, returned by the screen-matching methods."
+  p "Where a reference image was found on the display."
   code wscript { source = <<'SRC'
 struct Match {
     x: int,
@@ -231,23 +231,29 @@ SRC
   }
   table {
     rows:
-      | "Field" | "Type" | "Default" | "Meaning" |
-      | "`x`" | "int" | "0" | "Left edge of the match, in framebuffer pixels." |
-      | "`y`" | "int" | "0" | "Top edge of the match." |
-      | "`w`" | "int" | "0" | "Width of the matched region; the reference image's width." |
-      | "`h`" | "int" | "0" | "Height of the matched region." |
-      | "`score`" | "float" | "1.0" | "The similarity score, 0 to 1." |
-      | "`cx`" | "int" | "0" | "Horizontal centre, for `Machine.mouse_move`." |
-      | "`cy`" | "int" | "0" | "Vertical centre." |
-      | "`text`" | "string" | "empty" | "The matched text, set only by `Machine.wait_for_text`." |
+      | "Field" | "Type" | "Meaning" |
+      | "`x`" | "int" | "Left edge of the match, in framebuffer pixels." |
+      | "`y`" | "int" | "Top edge of the match." |
+      | "`w`" | "int" | "Width of the matched region in pixels." |
+      | "`h`" | "int" | "Height of the matched region in pixels." |
+      | "`score`" | "float" | "The similarity score, 0 to 1." |
+      | "`cx`" | "int" | "Horizontal centre, for `Machine.mouse_move`." |
+      | "`cy`" | "int" | "Vertical centre." |
+      | "`text`" | "string" | "Always empty for an image match." |
   }
   p <<DOC
     From `wait_for_image`, `wait_for_image_opts`, `wait_for_any` and
-    `find_image` the position fields describe the match and `text` is empty.
-    From `wait_for_text` only `text` is meaningful: the position fields are
-    0 and the score is 1, because OCR does not report a location. The
-    defaults column shows those filler values.
+    `find_image` the position fields describe the match.
   DOC
+
+  h2 "TextMatch"
+  p "The text matched by the regex in `Machine.wait_for_text` or `Machine.wait_for_text_opts`."
+  code wscript { source = <<'SRC'
+struct TextMatch {
+    text: string,
+}
+SRC
+  }
 
   h2 "ExecResult"
   p "What a guest command produced, returned by `Machine.exec` and `Machine.exec_timeout`."

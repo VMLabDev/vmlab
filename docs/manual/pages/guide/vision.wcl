@@ -132,7 +132,7 @@ timeout_secs, threshold, region)` exposes the two options the others fix:
 DOC
 
   list {
-    li "**threshold** is the minimum similarity score, default 0.9. The search returns the highest score in the region. The score is one minus the root mean square RGB channel difference divided by 255. Identical pixels score 1.0."
+    li "**threshold** is the minimum similarity score, from 0 to 1 inclusive, with a default of 0.9. The search returns the highest score in the region. The score is one minus the root mean square RGB channel difference divided by 255. Identical pixels score 1.0."
     li "**region** is `[x, y, w, h]` restricting the search to part of the screen, or an empty list for the whole screen. A list of any other length is an error. Coordinates in the returned `Match` are always absolute screen coordinates, even when a region was given."
   }
 
@@ -212,9 +212,8 @@ DOC
 OCR over the whole of it and returns as soon as the regex matches.
 `m.wait_for_text_opts(pattern, timeout_secs, opts)` reads each grab the way
 `ocr_opts` does; a region makes each attempt faster and keeps the rest of the
-screen from matching. The
-returned `Match` carries the matched text in `text` and zero for the position
-fields, because OCR does not report where on screen it read a line. OCR is
+screen from matching. The returned `TextMatch` carries only the matched
+text in `text`. OCR is
 fuzzy: different tesseract versions read edge glyphs differently, and a VGA
 text console's `w` and `~` still come back as `u` and `™`, so match a
 distinctive word rather than a whole sentence, and prefer image matching where
