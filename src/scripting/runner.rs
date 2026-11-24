@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use tokio_util::sync::CancellationToken;
-use wscript::Vm;
+use wscript::{Vm, VmConfig};
 
-use super::{EventData, LabHandle, SegmentHandle};
+use super::{EventData, LabHandle, ScriptEntry, SegmentHandle};
 use crate::labd::lab::LabRuntime;
 use crate::labd::record::RunId;
 
@@ -154,6 +154,7 @@ async fn run_main(
         finalise_on.script_shutdown.child_token(),
         token,
         move || {
+            let print = output.clone();
             let lab = LabHandle {
                 runtime,
                 rt,
@@ -162,7 +163,7 @@ async fn run_main(
                 owner,
                 run,
             };
-            execute(&source, &name, "main", (lab,))
+            execute(&source, &name, ScriptEntry::Main, (lab,), print)
         },
     )
     .await;
@@ -197,6 +198,7 @@ pub async fn run_event_handler(
     let run = runtime.recordings.new_run();
     let finalise_on = runtime.clone();
     let result = run_blocking(finalise_on.script_shutdown.child_token(), None, move || {
+        let print = output.clone();
         let lab = LabHandle {
             runtime,
             rt,
@@ -205,7 +207,7 @@ pub async fn run_event_handler(
             owner: None,
             run,
         };
-        execute(&source, &name, "handle", (event, lab))
+        execute(&source, &name, ScriptEntry::Handler, (event, lab), print)
     })
     .await;
     finalise_on.record_finalise_run(run).await;
@@ -239,15 +241,31 @@ async fn run_blocking(
     })?
 }
 
-fn execute(source: &str, name: &str, entry: &str, args: impl wscript::IntoArgs) -> Result<()> {
+fn execute(
+    source: &str,
+    name: &str,
+    entry: ScriptEntry,
+    args: impl wscript::IntoArgs,
+    output: OutputSink,
+) -> Result<()> {
     let ctx = super::context();
     let unit = ctx
         .compile(source)
         .map_err(|e| anyhow!("{name}: {}", compile_error(e)))?;
     super::cancel::check();
-    let mut vm = Vm::new(&ctx);
+    let config = VmConfig {
+        out: Box::new(move |text, newline| {
+            let mut chunk = text.to_owned();
+            if newline {
+                chunk.push('\n');
+            }
+            output(chunk);
+        }),
+        ..VmConfig::default()
+    };
+    let mut vm = Vm::with_config(&ctx, config);
     vm.set_fuel(Some(SCRIPT_FUEL));
-    vm.call_unit::<_, ()>(&unit, entry, args)
+    vm.call_unit::<_, ()>(&unit, entry.name(), args)
         .map_err(|e| anyhow!("{name}: {}", run_error(e)))
 }
 
@@ -261,7 +279,7 @@ fn script_dir(script: &Path) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-fn compile_error(e: wscript::Error) -> String {
+pub(super) fn compile_error(e: wscript::Error) -> String {
     match e {
         wscript::Error::Compile(diags) => {
             let msgs: Vec<String> = diags.iter().map(render_diag).collect();
@@ -271,7 +289,7 @@ fn compile_error(e: wscript::Error) -> String {
     }
 }
 
-pub(crate) fn render_diag(d: &wscript::Diagnostic) -> String {
+fn render_diag(d: &wscript::Diagnostic) -> String {
     match &d.help {
         Some(h) => format!("{} [{}] (help: {h})", d.message, d.code),
         None => format!("{} [{}]", d.message, d.code),
@@ -285,12 +303,17 @@ fn run_error(e: wscript::Error) -> String {
             // `Err` carrying a command's stderr); the trace stays on its line.
             let mut s = r.message.trim_end().to_string();
             if !r.trace.is_empty() {
-                let chain = r
+                const TRACE_FRAMES: usize = 12;
+                let mut chain = r
                     .trace
                     .iter()
+                    .take(TRACE_FRAMES)
                     .map(|f| f.function.as_str())
                     .collect::<Vec<_>>()
                     .join(" <- ");
+                if r.trace.len() > TRACE_FRAMES {
+                    chain.push_str(&format!(" <- … {} more", r.trace.len() - TRACE_FRAMES));
+                }
                 s.push_str(&format!(" (at {chain})"));
             }
             s
@@ -486,6 +509,13 @@ mod tests {
             .call_unit::<_, ()>(&unit, "main", ())
             .expect_err("script should fault");
         run_error(err)
+    }
+
+    #[test]
+    fn card_861_a_recursion_fault_has_a_short_trace() {
+        let msg = fault_of("fn f(n: int) -> int { f(n + 1) }\nfn main() { let x = f(0) }");
+        assert!(msg.contains("stack overflow"), "{msg}");
+        assert!(msg.len() < 1000, "fault length: {}", msg.len());
     }
 
     /// A provision that stops on `expect` names its own step and the `Err`

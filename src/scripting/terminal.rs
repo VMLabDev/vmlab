@@ -19,6 +19,7 @@
 //! than that with no `expect` matching and no `read` taking it ends the
 //! session, and the `expect` that waited fails naming the limit.
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -108,10 +109,13 @@ impl TerminalHandle {
                 // Borrowed, not copied, while the output is valid UTF-8.
                 let text = String::from_utf8_lossy(&st.buf);
                 if let Some(found) = re.find(&text) {
-                    let consumed = text[..found.end()].to_string();
-                    let rest = text.as_bytes()[found.end()..].to_vec();
-                    drop(text);
-                    st.buf = rest;
+                    let end = found.end();
+                    let raw_end = match text {
+                        Cow::Borrowed(_) => end,
+                        Cow::Owned(_) => raw_utf8_offset(&st.buf, end),
+                    };
+                    let consumed = text[..end].to_string();
+                    st.buf.drain(..raw_end);
                     return Ok(consumed);
                 }
                 scanned = Some(st.buf.len());
@@ -219,6 +223,21 @@ impl TerminalHandle {
     }
 }
 
+/// Translate a character boundary in the lossy view back to the original
+/// bytes. Each invalid chunk contributes exactly one replacement character.
+fn raw_utf8_offset(buf: &[u8], mut end: usize) -> usize {
+    let mut offset = 0;
+    for chunk in buf.utf8_chunks() {
+        let valid = chunk.valid().len();
+        if end <= valid {
+            return offset + end;
+        }
+        offset += valid + chunk.invalid().len();
+        end -= valid + char::REPLACEMENT_CHARACTER.len_utf8();
+    }
+    offset
+}
+
 /// The last few hundred bytes of output, for timeout diagnostics.
 fn tail(buf: &[u8]) -> String {
     const TAIL: usize = 300;
@@ -243,6 +262,22 @@ mod tests {
         AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
         PROTO_VERSION, encode_ctrl, encode_frame, features,
     };
+
+    #[tokio::test]
+    async fn card_861_expect_keeps_a_character_split_across_reads() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: b"\xffok\xe2\x82".to_vec(),
+                ended: Some("closed".into()),
+            })),
+        };
+        assert_eq!(term.expect("ok", 0).unwrap(), "�ok");
+        term.state.lock().unwrap().buf.push(0xac);
+        assert_eq!(term.read(), "€");
+    }
 
     #[tokio::test]
     async fn a_huge_timeout_is_an_error_not_a_panic() {
