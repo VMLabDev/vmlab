@@ -32,7 +32,9 @@
 //! creates a symlink to any host path inside a writable share
 //! (docs/reviews/smb.md F4).
 
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rand::RngExt;
@@ -74,40 +76,49 @@ impl SmbCredentials {
     }
 
     /// Load the persisted credential of the machine whose SMB state
-    /// directory is `smb_dir`, or mint and persist one.
+    /// directory is `smb_dir`, or mint and persist one. Read and write
+    /// failures are returned so the server only starts with a saved credential.
     ///
     /// Stability matters: guests remember mappings (`/persistent:yes`,
     /// fstab, credential manager). A password that rotated on every
     /// daemon start turned each remembered mapping into "user name or
     /// password is incorrect" on the next `up`. The file lives under
     /// `.vmlab/smb/` so `destroy` wipes it together with the clones.
-    pub fn load_or_create(smb_dir: &std::path::Path) -> SmbCredentials {
+    pub fn load_or_create(smb_dir: &Path) -> io::Result<SmbCredentials> {
+        fs::create_dir_all(smb_dir)?;
+        // Serialize the read and replacement across callers. Lock the
+        // directory since persisting the credential replaces its inode.
+        let dir = File::open(smb_dir)?;
+        dir.lock()?;
         let path = smb_dir.join("creds");
-        if let Ok(s) = std::fs::read_to_string(&path)
+        let saved = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => match fs::read_to_string(&path) {
+                Ok(saved) => Some(saved),
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
+                Err(error) => return Err(error),
+            },
+            Ok(metadata) if metadata.is_symlink() => None,
+            Ok(_) => return Err(io::Error::other("expected a regular SMB credential file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(s) = saved
             && let Some((u, p)) = s.trim().split_once(':')
             && u == current_unix_user()
             && !p.is_empty()
         {
-            return SmbCredentials {
+            return Ok(SmbCredentials {
                 username: u.to_string(),
                 password: p.to_string(),
-            };
+            });
         }
         let c = Self::generate();
-        let _ = std::fs::create_dir_all(smb_dir);
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        // Never truncate an existing file (or follow a pre-existing symlink).
-        if let Ok(mut file) = options.open(&path) {
-            let _ = write!(file, "{}:{}", c.username, c.password);
-        }
-        c
+        // Write the private file completely before replacing the old entry.
+        // A rename replaces a symlink itself without writing to its target.
+        let mut file = tempfile::NamedTempFile::new_in(smb_dir)?;
+        write!(file, "{}:{}", c.username, c.password)?;
+        file.persist(path).map_err(|error| error.error)?;
+        Ok(c)
     }
 }
 
@@ -204,8 +215,8 @@ impl SmbConfig {
     /// every socket under the short `run_dir`.
     ///
     /// Refuses a share whose name is not a plain share name
-    /// ([`share_name_problem`]) or whose host path holds a line break: each
-    /// would write configuration of its own into the file. Refuses a share
+    /// ([`share_name_problem`]) or whose host path could change the Samba
+    /// configuration or be expanded ([`share_host_problem`]). Refuses a share
     /// whose directory holds this file or lies beside it
     /// ([`share_state_problem`]): its guest would write the configuration
     /// outright. Validation refuses all three first; this keeps a config
@@ -218,7 +229,7 @@ impl SmbConfig {
                     reason,
                 });
             }
-            if let Some(reason) = share_host_problem(&s.host_path) {
+            if let Some(reason) = share_host_problem(&s.host_path, true) {
                 return Err(ShareRefused {
                     name: s.name.clone(),
                     reason,
@@ -431,11 +442,18 @@ pub fn share_name_problem(name: &str) -> Option<String> {
 }
 
 /// Why `host` cannot be a share's host path in `smb.conf`, or `None`. A line
-/// break would end the `path =` line and start a directive of its own.
-pub fn share_host_problem(host: &std::path::Path) -> Option<String> {
+/// break would end the `path =` line. Samba expands percent variables.
+pub fn share_host_problem(host: &Path, may_use_smb: bool) -> Option<String> {
     let text = host.to_string_lossy();
-    text.contains(['\n', '\r'])
-        .then(|| format!("the host path {text:?} holds a line break"))
+    if text.contains(['\n', '\r']) {
+        Some(format!("the host path {text:?} holds a line break"))
+    } else if may_use_smb && text.contains('%') {
+        Some(format!(
+            "the host path {text:?} contains %, which Samba uses for variable expansion"
+        ))
+    } else {
+        None
+    }
 }
 
 /// Why the directory `host` cannot be shared given that `state` is one of
@@ -804,6 +822,39 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_in_a_host_path_is_not_a_samba_variable() {
+        let mut config = cfg(false);
+        config.shares[0].host_path = PathBuf::from("/home/u/100%U");
+        let refusal = config
+            .render_conf()
+            .expect_err("Samba expands percent variables");
+        assert_eq!(refusal.name, "src");
+        assert!(refusal.reason.contains('%'));
+    }
+
+    #[test]
+    fn a_credential_file_that_cannot_be_parsed_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds");
+        std::fs::write(&path, "").unwrap();
+        let first = SmbCredentials::load_or_create(dir.path()).unwrap();
+        let second = SmbCredentials::load_or_create(dir.path()).unwrap();
+        assert!(first == second, "credential changed after restart");
+        assert!(
+            std::fs::read_to_string(path).unwrap()
+                == format!("{}:{}", first.username, first.password),
+            "the credential was not saved"
+        );
+    }
+
+    #[test]
+    fn a_credential_path_that_cannot_be_replaced_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("creds")).unwrap();
+        assert!(SmbCredentials::load_or_create(dir.path()).is_err());
+    }
+
+    #[test]
     fn credentials_username_is_unix_user_and_password_strong() {
         // Unprivileged passdb constraint: the SMB username must be a real Unix
         // account, so it is the invoking user (same for every VM in a lab).
@@ -828,7 +879,7 @@ mod tests {
     fn persisted_credentials_are_private_and_stable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let first = SmbCredentials::load_or_create(dir.path());
+        let first = SmbCredentials::load_or_create(dir.path()).unwrap();
         assert_eq!(
             std::fs::metadata(dir.path().join("creds"))
                 .unwrap()
@@ -837,7 +888,7 @@ mod tests {
                 & 0o777,
             0o600
         );
-        assert_eq!(SmbCredentials::load_or_create(dir.path()), first);
+        assert!(SmbCredentials::load_or_create(dir.path()).unwrap() == first);
     }
 
     #[cfg(unix)]
@@ -847,7 +898,7 @@ mod tests {
         let victim = dir.path().join("victim");
         std::fs::write(&victim, "do not overwrite").unwrap();
         std::os::unix::fs::symlink(&victim, dir.path().join("creds")).unwrap();
-        SmbCredentials::load_or_create(dir.path());
+        SmbCredentials::load_or_create(dir.path()).unwrap();
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
     }
 }

@@ -38,9 +38,11 @@ struct exec_spec {
 
 struct plat_proc; /* opaque, platform-owned */
 
-/* Spawn with piped stdio. NULL with a message in `err` on failure — which
- * on a single-tasking platform includes "one at a time". */
-struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap);
+/* Spawn with captured stdio. Call opened(id) once the channel is accepted.
+ * DOS calls it before entering its synchronous child process. On setup
+ * failure return NULL with a message in err without calling opened. */
+struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap,
+                            void (*opened)(unsigned long), unsigned long id);
 /* Read from stdout (`which` 0) or stderr (1): bytes, 0 for none right now,
  * -1 once that pipe is closed for good. */
 long proc_read(struct plat_proc *p, int which, void *buf, long cap);

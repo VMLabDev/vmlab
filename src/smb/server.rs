@@ -48,6 +48,11 @@ pub enum SmbError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to load or save SMB credentials at {path}: {source}")]
+    Credentials {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("refusing to write smb.conf: {0}")]
     Share(#[from] super::config::ShareRefused),
     #[error("failed to write smb.conf {path}: {source}")]
