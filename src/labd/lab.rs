@@ -8279,12 +8279,22 @@ lab "t" {
         let dir = tempfile::tempdir().unwrap();
         let Some(lab) = smb_lab(dir.path()).await else { return };
         let services = lab.network.lock().await.segments["corp"].services.clone().unwrap();
-        assert_eq!(services.rules.lock().unwrap().list().len(), 1);
-        assert_eq!(services.host_service_ports().len(), 1);
+        let ports = services.host_service_ports();
+        assert_eq!(ports.len(), 1);
+        let port = ports[0];
+        assert!(smb_redirects_to(&services, port));
         let renamed = SMB_LAB.replace("name = \"data\"", "name = \"renamed\"");
         lab.reload_with(edited(dir.path(), &renamed)).await.unwrap();
-        assert!(services.rules.lock().unwrap().list().is_empty());
+        assert!(!smb_redirects_to(&services, port));
         assert!(services.host_service_ports().is_empty());
+    }
+
+    fn smb_redirects_to(services: &super::super::netservices::SegmentServices, port: u16) -> bool {
+        services.rules.lock().unwrap().redirects_onto(
+            std::net::Ipv4Addr::LOCALHOST,
+            crate::config::model::L4Proto::Tcp,
+            Some(port),
+        )
     }
 
     #[tokio::test]
@@ -8305,9 +8315,8 @@ lab "t" {
         assert_ne!(new_port, unrelated.local_addr().unwrap().port());
         std::net::TcpStream::connect((loopback, new_port)).unwrap();
         let services = lab.network.lock().await.segments["corp"].services.clone().unwrap();
-        let rules = services.rules.lock().unwrap().list();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].to.as_deref(), Some(format!("127.0.0.1:{new_port}").as_str()));
+        assert!(!smb_redirects_to(&services, old_port));
+        assert!(smb_redirects_to(&services, new_port));
         assert_eq!(services.host_service_ports(), vec![new_port]);
     }
 
