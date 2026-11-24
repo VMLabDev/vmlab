@@ -60,7 +60,11 @@ async fn legacy_exec_names_a_missing_cwd_or_program() -> Result<()> {
     ] {
         let request = serde_json::json!({"cmd": "open_exec", "id": id, "argv": [argv], "cwd": cwd});
         stream
-            .write_all(&encode_frame(FrameKind::Ctrl, 0, &serde_json::to_vec(&request)?))
+            .write_all(&encode_frame(
+                FrameKind::Ctrl,
+                0,
+                &serde_json::to_vec(&request)?,
+            ))
             .await?;
         let mut stderr = Vec::new();
         let mut buf = [0; 4096];
@@ -86,7 +90,9 @@ async fn legacy_exec_names_a_missing_cwd_or_program() -> Result<()> {
         diagnostics.push((missing, String::from_utf8(stderr)?));
     }
     assert!(
-        diagnostics.iter().all(|(path, stderr)| stderr.contains(path)),
+        diagnostics
+            .iter()
+            .all(|(path, stderr)| stderr.contains(path)),
         "expected stderr to name each missing path: {diagnostics:?}"
     );
     Ok(())
