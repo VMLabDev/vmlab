@@ -899,17 +899,19 @@ mod parking {
         let (listeners, unlink, display) = match protocol {
             Protocol::Waypipe => {
                 let path = home.dir.join("wp.sock");
-                let listener = UnixListener::bind(&path)?;
-                give(&path, home.owner, 0o600)?;
+                let listener = bind_private(&path)?;
+                give(&path, home.owner)?;
                 (vec![listener], vec![], None)
             }
             Protocol::X11 { cookie } => {
                 let (n, listeners, path) = claim_display(&home.x11_unix, home.owner)?;
                 let claimed = (|| {
-                    give(&path, home.owner, 0o600)?;
-                    let file = home.dir.join("Xauthority");
-                    std::fs::write(&file, xauthority(&home.hostname, n, &cookie_bytes(cookie)))?;
-                    give(&file, home.owner, 0o600)
+                    give(&path, home.owner)?;
+                    write_private(
+                        &home.dir.join("Xauthority"),
+                        &xauthority(&home.hostname, n, &cookie_bytes(cookie)),
+                        home.owner,
+                    )
                 })();
                 if let Err(e) = claimed {
                     let _ = std::fs::remove_file(&path);
@@ -934,12 +936,103 @@ mod parking {
         })
     }
 
-    /// Hand `path` to the session's identity with `mode`.
-    pub(crate) fn give(path: &Path, owner: Option<(u32, u32)>, mode: u32) -> std::io::Result<()> {
-        if let Some((uid, gid)) = owner {
-            std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+    /// Bind a path socket that is mode 0600 from the moment it exists.
+    ///
+    /// The mode is set on the unbound socket, which Linux carries onto the
+    /// file `bind` creates, so no `chmod` of the name follows the bind. The
+    /// session's account owns the private directory (and may own the X
+    /// socket directory) and can put a link at the name at any moment after
+    /// the bind (review guest-agents-2 G1).
+    fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, listen, socket,
+        };
+        use std::os::fd::AsRawFd;
+        let sock = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        nix::sys::stat::fchmod(
+            sock.as_fd(),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )?;
+        bind(sock.as_raw_fd(), &UnixAddr::new(path)?)?;
+        listen(&sock, Backlog::MAXCONN)?;
+        Ok(UnixListener::from(sock))
+    }
+
+    /// Hand the socket the agent just bound at `path` to the session's
+    /// identity.
+    ///
+    /// The name is opened once, without following a link, and both the
+    /// check and the chown are of what was opened: a socket, the agent's
+    /// own, with no second name. A symlink or a file hard-linked to the name
+    /// since the bind is refused, so the agent never chowns a file it did
+    /// not make (review guest-agents-2 G1).
+    pub(crate) fn give(path: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        let Some((uid, gid)) = owner else {
+            return Ok(());
+        };
+        let pinned = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        let meta = pinned.metadata()?;
+        let agent = nix::unistd::geteuid().as_raw();
+        if !meta.file_type().is_socket() || meta.uid() != agent || meta.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not the socket the agent bound: it was replaced",
+                    path.display()
+                ),
+            ));
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        // SAFETY: `pinned` is an open descriptor for the length of the call,
+        // and the path is a NUL-terminated empty string, which with
+        // AT_EMPTY_PATH names the descriptor's own file.
+        let rc = unsafe {
+            libc::fchownat(
+                pinned.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Write a new file at `path`, mode 0600 and the session's own.
+    ///
+    /// The name must not exist: `O_EXCL` refuses a symlink the session's
+    /// account planted there instead of writing through it, and the chown
+    /// is of the descriptor, never of the name (review guest-agents-2 G1).
+    fn write_private(
+        path: &Path,
+        bytes: &[u8],
+        owner: Option<(u32, u32)>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(bytes)?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+        }
+        Ok(())
     }
 
     /// Claim the first display from [`FIRST_DISPLAY`] up whose abstract
@@ -960,7 +1053,7 @@ mod parking {
                 continue;
             };
             let path = x11_unix.join(format!("X{n}"));
-            if let Ok(listener) = UnixListener::bind(&path) {
+            if let Ok(listener) = bind_private(&path) {
                 return Ok((n, vec![abstract_, listener], path));
             }
         }

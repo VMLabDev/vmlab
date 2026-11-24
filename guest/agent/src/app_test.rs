@@ -1041,13 +1041,59 @@ fn a_session_socket_swapped_for_a_link_is_not_handed_over() {
 
     let soft = tmp.path().join("soft.sock");
     std::os::unix::fs::symlink(&target, &soft).unwrap();
-    let handed = give(&soft, Some(me()), 0o600);
+    let handed = give(&soft, Some(me()));
     assert_untouched(&target);
     assert!(handed.is_err(), "a symlink is refused");
 
     let hard = tmp.path().join("hard.sock");
     std::fs::hard_link(&target, &hard).unwrap();
-    let handed = give(&hard, Some(me()), 0o600);
+    let handed = give(&hard, Some(me()));
     assert_untouched(&target);
     assert!(handed.is_err(), "a file that is no socket is refused");
+}
+
+/// Review guest-agents-2 G1: a session's sockets are private from the bind
+/// on, with no `chmod` of the name after it, and an untouched private
+/// directory still gets its socket and its Xauthority file.
+#[test]
+fn a_sessions_socket_and_cookie_are_private_from_their_creation() {
+    use std::os::unix::fs::FileTypeExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        AppHome {
+            dir,
+            seen: format!("/run/vmlab-app/{name}"),
+            x11_unix: tmp.path().join(".X11-unix"),
+            owner: Some(me()),
+            hostname: "guest".into(),
+        }
+    };
+    let private = |path: &Path| {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{path:?}");
+        meta
+    };
+
+    let wayland = home("wayland");
+    let _bound = listen(&wayland, &Protocol::Waypipe).unwrap();
+    assert!(private(&wayland.dir.join("wp.sock")).file_type().is_socket());
+
+    let x11 = home("x11");
+    let _bound = listen(
+        &x11,
+        &Protocol::X11 {
+            cookie: COOKIE.into(),
+        },
+    )
+    .unwrap();
+    assert!(private(&x11.dir.join("Xauthority")).is_file());
+    let socket = std::fs::read_dir(&x11.x11_unix)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(private(&socket).file_type().is_socket());
 }
