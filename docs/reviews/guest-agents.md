@@ -104,7 +104,8 @@ Not read:
   Assert the error, and assert that the file still reads `keep me`. Repeat
   with the mock agent of
   `a_transfer_against_an_agent_without_the_feature_is_refused`.
-- Fixed in card #463. `pull_file_as` opens the file session first, pulls
+- Fixed in card #463 (`12cfd73e`).
+  `pull_file_as` opens the file session first, pulls
   into a new file beside the destination and renames it over the destination
   only after the digest matched. A failed pull removes that file. An existing
   destination keeps its mode and is written through a symlink. A destination
@@ -143,7 +144,8 @@ Not read:
   own bytes. Second test: create a symlink at the temp name that points to a
   file with known content, run one inline push, and assert that the target
   file did not change.
-- Fixed in card #469. An inline push no longer writes a host file: the
+- Fixed in card #469 (`fe8fde4d`).
+  An inline push no longer writes a host file: the
   daemon sends the decoded bytes from memory over the file session
   (`AgentHandle::push_bytes_as`), makes missing guest directories as a push
   from a file does, and verifies the guest's digest against the bytes. The
@@ -173,7 +175,8 @@ Not read:
   answers `open_exec` with `opened` and then sends 64 KiB `Data` frames
   without end. Assert that `exec` returns an error that names the limit
   after a bounded number of bytes, and does not run to the timeout.
-- Fixed in card #483. `AgentHandle::exec` holds at most `EXEC_OUTPUT_LIMIT`
+- Fixed in card #483 (`d4031d77`).
+  `AgentHandle::exec` holds at most `EXEC_OUTPUT_LIMIT`
   (64 MiB, stdout and stderr together). The event that would pass it makes
   the exec an error that names the limit, and the session is dropped, which
   closes the channel and ends the command in the guest. The limit covers
@@ -204,7 +207,8 @@ Not read:
   answers an open and sends 300 KiB on that channel while the test does not
   call `recv`. Assert that the session ends with an error that names the
   window, and that no more than `INITIAL_WINDOW` bytes sit in the queue.
-- Fixed in card #484. The host now counts the credit it granted on each
+- Fixed in card #484 (`cf46b55f`).
+  The host now counts the credit it granted on each
   channel (`RecvCredit` in `src/labd/vm_agent.rs`): the reader takes from it
   for every data frame, and the consumer adds each `window_adjust` before it
   sends it. A frame past the credit is dropped, the reader closes that one
@@ -241,7 +245,8 @@ Not read:
   channels, sends more than `SESSION_QUEUE` frames on the first while the
   test does not read it, and answers pings. Assert that `ping(2 s)` returns
   true while the first channel is full.
-- Fixed in card #506. The reader task no longer waits on a session. The
+- Fixed in card #506 (`2d06574f`, `2390ca00`).
+  The reader task no longer waits on a session. The
   queue of one channel is now `SessionQueue` in `src/labd/vm_agent.rs`, and
   `deliver` puts an event into it without a wait. Up to `SESSION_QUEUE`
   events each frame is its own event. At that depth the payload of a frame
@@ -292,7 +297,8 @@ Not read:
   From a second thread call `route_input(9, …)` 600 times with one byte
   each, then `handle_msg(Ping)`. Assert that the pong arrives within one
   second.
-- Fixed in card #507. A session's input queue is now bounded by the bytes
+- Fixed in card #507 (`d91d3887`).
+  A session's input queue is now bounded by the bytes
   it holds, the unit the window counts in, and `route_input` never waits on
   it. Small frames are joined in the queue, so a full window of one-byte
   frames costs a window of memory. A host that respects its window cannot
@@ -322,7 +328,8 @@ Not read:
   answers `stat` with `size: u64::MAX` and each `read` with 64 KiB. Assert
   that `pull_to` fails after a bounded number of bytes. The fix card must
   decide where the bound comes from (a caller's ceiling, or free space).
-- Fixed in card #468. The bound is free space: a pull into a host file may
+- Fixed in card #468 (`3115fcad`).
+  The bound is free space: a pull into a host file may
   write the free space of the destination's filesystem less a reserve (a
   twentieth of the filesystem, at most 1 GiB). The host measures it when the
   file is opened and again after every 64 MiB written. A `stat` size past
@@ -354,7 +361,8 @@ Not read:
   `guest/agent/src/sessions_test.rs`. Make a FIFO with `mkfifo`, send
   `Op::Digest` and `Op::Open` for it, and assert an error reply within one
   second for each.
-- Fixed in card #508. On Unix every open the file session makes for a path
+- Fixed in card #508 (`4a8a071e`).
+  On Unix every open the file session makes for a path
   (`Op::Open`, `Op::Digest`, and the open of a size or time `Op::Setstat`)
   refuses a FIFO, a character device and a socket with "not a regular
   file". It checks the path first, opens with `O_NONBLOCK`, and checks the
@@ -367,7 +375,8 @@ Not read:
 
 ### F9. An exec does not report its exit while a background child holds its output pipe
 
-- Status: fixed in card #526. The Rust agent gives both output pumps one
+- Status: fixed in card #526 (`5ca3154b`).
+  The Rust agent gives both output pumps one
   two-second drain window after process exit and stops forwarding before
   sending EOF and the exit code. The legacy agent drains the bytes buffered
   at exit, regardless of whether a descendant keeps the pipes open.
@@ -392,7 +401,8 @@ Not read:
 
 ### F10. An exec with stdin can deadlock, and the timeout does not cover it
 
-- Status: fixed in card #509. Collected exec drains output while sending
+- Status: fixed in card #509 (`ee4d737a`).
+  Collected exec drains output while sending
   stdin under the same deadline, and the agent credits discarded input.
 - Where: `src/labd/vm_agent.rs:811-815` and
   `guest/agent/src/exec.rs:66-78`.
@@ -436,7 +446,8 @@ Not read:
   `src/labd/container_ctl.rs`. The mock writes `b"\xff\n"`, then a `started`
   event. Assert that `wait_started` succeeds. The same with a line of
   70 000 bytes before the event.
-- Fixed in card #510. `read_ctl_line` no longer returns an error for a bad
+- Fixed in card #510 (`caa7042f`).
+  `read_ctl_line` no longer returns an error for a bad
   line. It reports the line as skipped, and the reader task warns and reads
   on, as it does for a line that is not JSON. A line past the 64 KiB cap is
   dropped through its newline without being held in memory. Only EOF and a
@@ -462,7 +473,8 @@ Not read:
   `sessions_test.rs` (Linux). Create a file named `b"a\xffb"`, list the
   directory, then `stat` the name from the listing. Assert that the listing
   reports an error for that entry, or that the `stat` succeeds.
-- Fixed in card #811. `ReadDir` reports an error when an entry name cannot
+- Fixed in card #811 (`67610fd7`).
+  `ReadDir` reports an error when an entry name cannot
   be represented as UTF-8. The directory handle keeps returning that error
   on retry. `Readlink` reports an error for targets with the same limitation.
 
@@ -483,7 +495,8 @@ Not read:
 - Test: in `guest/agent/src/unix/mod.rs`, next to the path resolver test at
   line 1453: open a file session on `container_platform`, send
   `Op::Realpath { path: "/srv/link" }`, and assert `/etc/sentinel`.
-- Fixed in card #525. `realpath` in a session whose paths are resolved inside
+- Fixed in card #525 (`53c726f1`).
+  `realpath` in a session whose paths are resolved inside
   a root answers the resolved path without that root in front
   (`seen_from` in `guest/agent/src/fileops.rs`), so the answer is good for a
   later request. The test is
@@ -504,7 +517,8 @@ Not read:
 - Test: `a_character_split_across_two_frames_survives`. A mock agent sends
   the two bytes of `é` in two `Data` frames on a tail channel. Assert that
   the streamed chunks join to `é`.
-- Fixed in card #812. The shared tail and event-log pump carries an incomplete
+- Fixed in card #812 (`57e36cc8`).
+  The shared tail and event-log pump carries an incomplete
   UTF-8 sequence into the next frame. It still replaces malformed bytes and an
   incomplete sequence left at the end of the stream.
 
@@ -520,7 +534,8 @@ Not read:
 - Test: `replies_to_nobody_do_not_renew_the_watchdog`. The mock answers no
   request and sends `{"id":999999,"reply":"ok"}` every 50 ms. With a stall
   time of 300 ms, assert that `stat` fails within one second.
-- Fixed in card #813. The pump sets `last_reply` only for a record whose id
+- Fixed in card #813 (`e3e3f3f0`).
+  The pump sets `last_reply` only for a record whose id
   a call waits for. A record that answers nobody leaves the watchdog's clock
   where it was. The proof test has no wall-clock limit: the mock sends
   `{"id":999999,"reply":"ok"}` in place of the answer to a `stat` and then
@@ -530,7 +545,8 @@ Not read:
 
 ### F16. A protocol version mismatch is reported as "no agent answered"
 
-- Fixed in card #814. A matching-token hello with an incompatible version
+- Fixed in card #814 (`6c4c027d`).
+  A matching-token hello with an incompatible version
   ends the handshake with both protocol versions in the error. Container
   startup checks cinit's boot protocol before sending the spec and refuses
   an incompatible version.
@@ -564,7 +580,8 @@ Not read:
 - Test: in `src/labd/legacy_agent_tests.rs`, send `open_exec` with
   `id: 0` and assert an error reply. On a 32-bit build, send
   `id: 3000000000` and assert that the `opened` names that id.
-- Fixed in card #815. Exec opens with a missing or zero ID return an error
+- Fixed in card #815 (`2b7ddd3a`).
+  Exec opens with a missing or zero ID return an error
   before creating a session. Reply serialization preserves unsigned channel
   IDs. The regression tests exercise the control channel on the POSIX build
   and large IDs in `opened` and `error` on the 32-bit Windows build.
