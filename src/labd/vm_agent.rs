@@ -5554,7 +5554,11 @@ mod tests {
     #[test]
     fn a_pull_temp_name_fits_the_name_limit() {
         assert_eq!(pull_temp_name("f", 7, 3), ".f.vmlab-pull.7.3");
-        for name in ["a".repeat(255), "\u{e9}".repeat(127), "\u{1f600}".repeat(63)] {
+        for name in [
+            "a".repeat(255),
+            "\u{e9}".repeat(127),
+            "\u{1f600}".repeat(63),
+        ] {
             let temp = pull_temp_name(&name, u32::MAX, u64::MAX);
             assert!(temp.len() <= NAME_MAX, "{}", temp.len());
             assert!(temp.ends_with(&format!(".vmlab-pull.{}.{}", u32::MAX, u64::MAX)));
@@ -5596,7 +5600,10 @@ mod tests {
 
         // A failed pull still costs the destination nothing.
         let err = agent.pull_file("/guest/typo", &dest).await.unwrap_err();
-        assert!(format!("{err:#}").starts_with("pull /guest/typo"), "{err:#}");
+        assert!(
+            format!("{err:#}").starts_with("pull /guest/typo"),
+            "{err:#}"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"keep me");
 
         let (_sha, len) = agent.pull_file("/guest/some-file", &dest).await.unwrap();

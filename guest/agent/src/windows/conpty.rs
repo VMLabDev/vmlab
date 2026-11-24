@@ -266,10 +266,7 @@ fn spawn_with_conpty(
             // inherits the agent's environment — a block is built only
             // when the open carried overrides, keeping the common case
             // a null pointer rather than a copy of our own environment.
-            None => match (!env.is_empty())
-                .then(|| agent_env_block(env))
-                .transpose()
-            {
+            None => match (!env.is_empty()).then(|| agent_env_block(env)).transpose() {
                 Err(e) => Err(e),
                 Ok(block) => {
                     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
