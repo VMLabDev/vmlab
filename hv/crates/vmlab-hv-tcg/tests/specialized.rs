@@ -455,3 +455,87 @@ fn native_addresses_cross_ram_chunks_without_entry_respecialization() {
     assert_eq!(specialized.specialization_stats.misses, 0);
     assert!(specialized.specialization_stats.hits > 0);
 }
+
+/// `sd xN, 0(x1)`, `addi x3, x3, 1`, `addi x16, x16, -1`, `bne x16, x0, -12`.
+fn storing_loop(store: u32) -> FlatMemory {
+    let mut memory = FlatMemory::new(0x8000_0000, vec![0; 8192]);
+    for (index, instruction) in [store, 0x00118193, 0xfff80813, 0xfe081ae3]
+        .iter()
+        .enumerate()
+    {
+        memory
+            .write(0x8000_0000 + index as u64 * 4, &instruction.to_le_bytes())
+            .unwrap();
+    }
+    memory
+}
+
+#[test]
+fn a_store_beside_the_code_keeps_the_trace() {
+    // The loop writes a variable in the 4 KiB page its own code is in. The
+    // store moves the page's write stamp and changes no fetched byte.
+    let make = || {
+        let mut cpu = Riscv64::new(storing_loop(0x0030b023)).unwrap();
+        cpu.set_pc(0x8000_0000);
+        cpu.set_gpr(1, 0x8000_0800).unwrap();
+        cpu.set_gpr(16, 2000).unwrap();
+        cpu
+    };
+    let mut reference = make();
+    let mut specialized = make();
+    specialized.specialize = true;
+    assert_eq!(specialized.run(6000).unwrap(), reference.run(6000).unwrap());
+    assert_eq!(
+        *specialized.interpreter.globals,
+        *reference.interpreter.globals
+    );
+    assert_eq!(
+        specialized.interpreter.memory.bytes(),
+        reference.interpreter.memory.bytes()
+    );
+    let stats = &specialized.specialization_stats;
+    assert!(stats.hits > 0, "hits {}", stats.hits);
+    assert!(stats.recordings < 100, "recordings {}", stats.recordings);
+}
+
+#[test]
+fn a_store_that_changes_its_own_loop_ends_the_trace() {
+    // The loop stores x4 over its second and third instructions. While x4
+    // holds the bytes that are there, the trace stays. When x4 holds another
+    // `addi`, the same store makes the trace stale in the middle of a run.
+    let same = 0xfff8_0813_0011_8193u64;
+    let other = 0xfff8_0813_0021_8193u64;
+    let make = || {
+        let mut cpu = Riscv64::new(storing_loop(0x0040b023)).unwrap();
+        cpu.set_pc(0x8000_0000);
+        cpu.set_gpr(1, 0x8000_0004).unwrap();
+        cpu.set_gpr(4, same).unwrap();
+        cpu.set_gpr(16, 2000).unwrap();
+        cpu
+    };
+    let mut reference = make();
+    let mut specialized = make();
+    specialized.specialize = true;
+    for (round, value) in [same, same, other, other, same, other]
+        .into_iter()
+        .enumerate()
+    {
+        for cpu in [&mut reference, &mut specialized] {
+            cpu.set_gpr(4, value).unwrap();
+        }
+        assert_eq!(specialized.run(402).unwrap(), reference.run(402).unwrap());
+        assert_eq!(
+            *specialized.interpreter.globals, *reference.interpreter.globals,
+            "round {round}"
+        );
+        assert_eq!(
+            specialized.interpreter.memory.bytes(),
+            reference.interpreter.memory.bytes(),
+            "round {round}"
+        );
+    }
+    // 2412 steps are 603 turns of the loop. More than 603 says that the
+    // other `addi`, which adds 2, ran.
+    assert!(specialized.gpr(3).unwrap() > 603);
+    assert!(specialized.specialization_stats.hits > 0);
+}
