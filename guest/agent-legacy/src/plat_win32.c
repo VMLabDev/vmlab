@@ -511,7 +511,8 @@ static int make_pipe(HANDLE *ours, HANDLE *theirs, int ours_is_read)
     return 0;
 }
 
-struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
+struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap,
+                            void (*opened)(unsigned long), unsigned long id)
 {
     static char cmdline[32768];
     static char cwd[1024];
@@ -660,6 +661,7 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         return NULL;
     }
     CloseHandle(pi.hThread);
+    opened(id);
     return p;
 }
 

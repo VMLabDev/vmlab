@@ -78,6 +78,9 @@ pub struct Run {
     pub ignores_quit: bool,
     /// The emulator never answers a `detach`: wedged with the device held.
     pub ignores_detach: bool,
+    /// The emulator answers a `detach` with this error and keeps the device:
+    /// a failure that is not "no such device".
+    pub detach_fails: Option<String>,
     /// The guest suspends itself to RAM this long after coming up — the
     /// idle-timeout sleep a Windows client edition takes. It stays asleep
     /// until something wakes it.
@@ -391,6 +394,7 @@ impl Hypervisor for FakeHypervisor {
         let machine = Arc::new(FakeProc {
             journal: self.journal.clone(),
             ignores_detach: run.ignores_detach,
+            detach_fails: run.detach_fails.clone(),
             ignores_agent_shutdown: run.ignores_agent_shutdown,
             ..FakeProc::new(spec.label.clone())
         });
@@ -503,6 +507,9 @@ pub(crate) struct FakeProc {
     journal: Journal,
     /// A `detach` is written down and then never answered.
     ignores_detach: bool,
+    /// A `detach` is written down, refused with this error, and the device
+    /// stays plugged.
+    detach_fails: Option<String>,
     ignores_agent_shutdown: bool,
 }
 
@@ -530,6 +537,7 @@ impl FakeProc {
             plugged: Default::default(),
             journal: Journal::default(),
             ignores_detach: false,
+            detach_fails: None,
             ignores_agent_shutdown: false,
         }
     }
@@ -775,6 +783,9 @@ impl Hotplug for FakeCapabilities {
         self.0.note(format!("detach {id}"));
         if self.0.ignores_detach {
             std::future::pending::<()>().await;
+        }
+        if let Some(msg) = &self.0.detach_fails {
+            bail!("{msg}");
         }
         self.0
             .plugged

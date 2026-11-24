@@ -3229,6 +3229,58 @@ async fn a_stop_that_ends_before_the_kill_leaves_the_detach_to_the_hypervisor() 
     assert!(m.usb_attached().await.is_empty());
 }
 
+/// A detach the hypervisor refuses, for a reason other than "no such
+/// device", leaves the device held by the hypervisor. So the attachment stays
+/// in the tracking: the device is not free, and a second `detach` can still
+/// name it (usb review F10).
+#[tokio::test]
+async fn a_failed_detach_keeps_the_attachment() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            runs: vec![Run {
+                detach_fails: Some("the control connection closed".into()),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let held = m.usb_attach(&usb_plan()).await.expect("attach");
+
+    let e = format!(
+        "{:#}",
+        m.usb_detach(&held.qdev_id)
+            .await
+            .expect_err("the hypervisor refused")
+    );
+    assert!(e.contains("the control connection closed"), "{e}");
+    assert_eq!(
+        m.usb_attached().await,
+        vec![held.clone()],
+        "the hypervisor still holds the device"
+    );
+
+    // The device can be named again, and the hypervisor is asked again.
+    m.usb_detach(&held.qdev_id)
+        .await
+        .expect_err("refused again, not \"holds no such device\"");
+    assert_eq!(
+        hv.journal(),
+        vec![
+            format!("attach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+            format!("detach {}", held.qdev_id),
+        ]
+    );
+    m.stop(true).await.expect("stop");
+}
+
 /// A VM with the hot-plug USB controller.
 const USB_VM: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB usb = true }"#;
 

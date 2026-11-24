@@ -8,8 +8,8 @@
  * DOS runs one program at a time, so an exec is synchronous: stdout and
  * stderr go to temp files through DOS handle redirection, the child runs to
  * completion, and the files are then streamed back as the channel's bytes.
- * The agent answers nothing while the child runs — a fact the host sees as
- * latency, never as a lost agent, because the frames are simply late.
+ * The agent acknowledges the channel before running the child. While it
+ * runs, the agent cannot answer any further messages.
  * Stdin is not delivered (there is no one to deliver it to); the bytes are
  * acknowledged so the host's credit never stalls.
  */
@@ -185,11 +185,51 @@ static int set_exec_cwd(const char *cwd)
     return chdir(cwd);
 }
 
-struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
+/* Borrow the inherited and override strings. Watcom compares DOS
+ * environment names case-insensitively and treats NAME= as removal. */
+static char **exec_environment(const struct exec_spec *spec)
+{
+    char **env;
+    size_t count = 0, j;
+    int i;
+
+    while (environ && environ[count])
+        count++;
+    env = calloc(count + spec->nenv + 1, sizeof *env);
+    if (!env)
+        return NULL;
+    if (count)
+        memcpy(env, environ, count * sizeof *env);
+    for (i = 0; i < spec->nenv; i++) {
+        char *entry = spec->env[i];
+        const char *eq = strchr(entry, '=');
+        size_t len;
+        if (!eq || eq == entry)
+            continue;
+        len = (size_t)(eq - entry);
+        for (j = 0; j < count; j++)
+            if (strnicmp(env[j], entry, len) == 0 && env[j][len] == '=')
+                break;
+        if (eq[1]) {
+            env[j] = entry;
+            if (j == count)
+                count++;
+        } else if (j < count) {
+            memmove(env + j, env + j + 1, (count - j) * sizeof *env);
+            count--;
+        }
+    }
+    return env;
+}
+
+struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap,
+                            void (*opened)(unsigned long), unsigned long id)
 {
     static char tail[1024];
     struct plat_proc *p;
-    int save0, save1, save2, in, out, errf, i, rc;
+    char **saved_env = environ;
+    char **child_env = NULL;
+    int save0, save1, save2, in, out, errf, rc;
     char save_cwd[260];
     unsigned save_drive, drives;
 
@@ -207,6 +247,14 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         fmt(err, (size_t)errcap, "exec: out of memory");
         return NULL;
     }
+    if (spec->nenv) {
+        child_env = exec_environment(spec);
+        if (!child_env) {
+            free(p);
+            fmt(err, (size_t)errcap, "exec: out of memory");
+            return NULL;
+        }
+    }
     temp_path(p->out_path, sizeof p->out_path, "VMLABOUT.TMP");
     temp_path(p->err_path, sizeof p->err_path, "VMLABERR.TMP");
 
@@ -221,6 +269,7 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
             close(out);
         if (errf >= 0)
             close(errf);
+        free(child_env);
         free(p);
         return NULL;
     }
@@ -233,13 +282,11 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         close(errf);
         unlink(p->out_path);
         unlink(p->err_path);
+        free(child_env);
         free(p);
         fmt(err, (size_t)errcap, "exec: cannot use directory %s", spec->cwd);
         return NULL;
     }
-    for (i = 0; i < spec->nenv; i++)
-        putenv(spec->env[i]);
-
     save0 = dup(0);
     save1 = dup(1);
     save2 = dup(2);
@@ -251,6 +298,12 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     close(errf);
 
     busy = 1;
+    opened(id);
+    /* Both spawnvp's PATH lookup and system's COMSPEC lookup read
+     * environ. The DOS process runs synchronously, so install the child
+     * table for those calls and restore the original pointer afterwards. */
+    if (child_env)
+        environ = child_env;
     /* A program on the path runs directly and reports its own exit code;
      * anything else (an internal command, a batch file) goes through
      * COMMAND.COM /C. */
@@ -261,6 +314,8 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
         else
             fprintf(stderr, "exec: command line too long for COMMAND.COM\n");
     }
+    environ = saved_env;
+    free(child_env);
     busy = 0;
 
     dup2(save0, 0);
@@ -272,22 +327,6 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
 
     _dos_setdrive(save_drive, &drives);
     chdir(save_cwd);
-    for (i = 0; i < spec->nenv; i++) {
-        char *eq = strchr(spec->env[i], '=');
-        if (eq) {
-            *eq = 0;
-            /* Watcom: "NAME=" with an empty value removes the variable. */
-            {
-                static char del[256];
-                if (strlen(spec->env[i]) + 2 <= sizeof del) {
-                    fmt(del, sizeof del, "%s=", spec->env[i]);
-                    putenv(del);
-                }
-            }
-            *eq = '=';
-        }
-    }
-
     p->code = rc < 0 ? 127 : rc;
     p->out_fd = open(p->out_path, O_RDONLY | O_BINARY);
     p->err_fd = open(p->err_path, O_RDONLY | O_BINARY);

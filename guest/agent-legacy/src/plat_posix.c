@@ -179,7 +179,8 @@ struct plat_proc {
     long code;
 };
 
-struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap)
+struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap,
+                            void (*opened)(unsigned long), unsigned long id)
 {
     int in[2] = {-1, -1}, out[2] = {-1, -1}, errp[2] = {-1, -1};
     struct plat_proc *p;
@@ -246,6 +247,7 @@ struct plat_proc *proc_start(const struct exec_spec *spec, char *err, int errcap
     set_nonblock(p->in_fd);
     set_nonblock(p->out_fd);
     set_nonblock(p->err_fd);
+    opened(id);
     return p;
 }
 

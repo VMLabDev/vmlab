@@ -93,6 +93,11 @@ static int send_simple(const char *event, unsigned long id)
     return send_ctrl(&o);
 }
 
+static void send_opened(unsigned long id)
+{
+    send_simple("opened", id);
+}
+
 static int send_error(unsigned long id, const char *msg)
 {
     struct json_out o;
@@ -439,7 +444,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     spec.nenv = a.nenv;
     spec.cwd = a.cwd;
     err[0] = 0;
-    proc = proc_start(&spec, err, (int)sizeof err);
+    proc = proc_start(&spec, err, (int)sizeof err, send_opened, id);
     if (!proc) {
         send_error(id, err[0] ? err : "exec: spawn failed");
         return;
@@ -450,7 +455,6 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     s->proc = proc;
     s->credit = WIRE_INITIAL_WINDOW;
     s->out_remaining = s->err_remaining = -1;
-    send_simple("opened", id);
 }
 
 /* ---- dispatch ------------------------------------------------------- */
