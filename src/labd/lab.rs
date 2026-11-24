@@ -1194,7 +1194,8 @@ impl LabRuntime {
                 continue;
             };
             if let Ok(m) = self.machine(name) {
-                m.smb_ready(*gateway, &creds.username, &creds.password).await;
+                m.smb_ready(*gateway, &creds.username, &creds.password)
+                    .await;
             }
         }
     }
