@@ -501,7 +501,11 @@ fn a_same_hart_store_keeps_the_reservation() {
                 assert!(!cpu.step().unwrap(), "{case}");
             }
             assert_eq!(cpu.gpr(11).unwrap(), 0, "{case}: the SC failed");
-            assert_eq!(doubleword(&mut cpu, RESERVED), 0x1122_3344_5566_7788, "{case}");
+            assert_eq!(
+                doubleword(&mut cpu, RESERVED),
+                0x1122_3344_5566_7788,
+                "{case}"
+            );
             assert_eq!(doubleword(&mut cpu, store), 0x1122_3344_5566_7788, "{case}");
         }
     }
@@ -535,7 +539,11 @@ fn a_same_hart_store_in_a_trace_keeps_the_reservation() {
                 "store to {store:#x} after {done} steps"
             );
         }
-        assert_eq!(reference.gpr(14).unwrap(), 0, "an SC failed, store to {store:#x}");
+        assert_eq!(
+            reference.gpr(14).unwrap(),
+            0,
+            "an SC failed, store to {store:#x}"
+        );
         assert_eq!(
             specialized.interpreter.memory.bytes(),
             reference.interpreter.memory.bytes()
