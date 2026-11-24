@@ -199,6 +199,13 @@ pub fn parse_usbfs_descriptors(data: &[u8]) -> Result<DeviceDescriptorTree> {
                 inner: raw_config_descriptor,
                 interface_descriptors: BTreeMap::new(),
             };
+            // `wTotalLength` comes from the device. GET_DESCRIPTOR(Configuration)
+            // slices the raw data by it, so it must stay inside the data.
+            if config_offset + usize::from(config_descriptor.total_length())
+                > device_descriptor.raw.len()
+            {
+                return Err(Error::DescriptorParse);
+            }
 
             while let Ok((raw_interface_descriptor, interface_offset)) =
                 next_descriptor::<InterfaceDescriptor>(&device_descriptor.raw, &mut offset)
@@ -308,6 +315,22 @@ mod tests {
             Some(super::super::types::EndpointType::Bulk)
         );
         assert_eq!(i.get_endpoint_descriptor(1).unwrap().bEndpointAddress, 0x02);
+    }
+
+    #[test]
+    fn a_total_length_past_the_data_is_refused_at_parse() {
+        // Bytes 20 and 21 are the configuration's wTotalLength. Slicing the
+        // raw data by it at GET_DESCRIPTOR(Configuration) would panic.
+        let mut raw = MASS_STORAGE.to_vec();
+        raw[20] = 0xFF;
+        raw[21] = 0xFF;
+        assert!(parse_usbfs_descriptors(&raw).is_err());
+
+        // One byte past the end is refused too, and the exact length parses.
+        let mut raw = MASS_STORAGE.to_vec();
+        raw[20] += 1;
+        assert!(parse_usbfs_descriptors(&raw).is_err());
+        assert!(parse_usbfs_descriptors(MASS_STORAGE).is_ok());
     }
 
     #[test]

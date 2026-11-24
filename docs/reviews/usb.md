@@ -452,6 +452,10 @@ hostile guest or peer, wrong result, cosmetic.
   device built from it panics.
 - How bad: crash of the VM, reachable only when the kernel hands out
   descriptors that disagree with themselves.
+- Status: fixed by card #786. `parse_usbfs_descriptors` now returns an error
+  when a configuration's `wTotalLength` reaches past the end of the data, so
+  no device is built from such descriptors and the slice in
+  `config_descriptor_filtered` stays inside them.
 
 ### F13. Alternate settings of an old configuration are applied to the new one
 
