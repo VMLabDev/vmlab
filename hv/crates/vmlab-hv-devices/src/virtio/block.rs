@@ -23,6 +23,9 @@ use crate::{
     DeviceError, GuestMemory, GuestRegion, GuestSlice, Snapshot, VirtioDevice, VirtioInterrupt,
 };
 
+/// The bitmap slice of a [`GuestSlice`].
+type Hook<'a> = vm_memory::bitmap::RefSlice<'a, crate::WriteDiscard>;
+
 /// Virtio device id for a block device.
 pub const VIRTIO_ID_BLOCK: u32 = 2;
 
@@ -666,7 +669,7 @@ impl Block {
 
     /// `VIRTIO_BLK_T_IN`: fill the driver-writable descriptors from the
     /// image.
-    fn read(&mut self, sector: u64, writer: &mut virtio_queue::Writer<'_, ()>) -> u8 {
+    fn read(&mut self, sector: u64, writer: &mut virtio_queue::Writer<'_, Hook<'_>>) -> u8 {
         let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
             return S_IOERR;
         };
@@ -702,8 +705,8 @@ impl Block {
     fn write(
         &mut self,
         sector: u64,
-        reader: &mut virtio_queue::Reader<'_, ()>,
-        writer: &mut virtio_queue::Writer<'_, ()>,
+        reader: &mut virtio_queue::Reader<'_, Hook<'_>>,
+        writer: &mut virtio_queue::Writer<'_, Hook<'_>>,
     ) -> u8 {
         if self.disk.read_only() {
             return S_IOERR;
@@ -738,7 +741,7 @@ impl Block {
 
     /// `VIRTIO_BLK_T_DISCARD`: one 16-byte range per segment, and no more
     /// segments than `max_discard_seg` advertises.
-    fn discard(&mut self, reader: &mut virtio_queue::Reader<'_, ()>) -> u8 {
+    fn discard(&mut self, reader: &mut virtio_queue::Reader<'_, Hook<'_>>) -> u8 {
         if self.features & self.acked_features & F_DISCARD == 0 {
             return S_UNSUPP;
         }

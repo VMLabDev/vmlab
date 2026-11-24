@@ -21,7 +21,7 @@ use crate::audio::{AudioClock, CaptureSource, HostAudio, PlaybackSink};
 use crate::virtio::pci::VirtioPciDevice;
 use crate::virtio::sound::SoundPci;
 use crate::virtio::testing::{RecIrq, RecMsi};
-use crate::{DeviceError, PciDevice, VirtioDevice};
+use crate::{DeviceError, GuestMemory, PciDevice, VirtioDevice};
 
 // Driver-side constants mirrored from the transport's BAR layout
 // (VIRTIO 1.2 §4.1.4-4.1.5): one 64-bit BAR carries everything.

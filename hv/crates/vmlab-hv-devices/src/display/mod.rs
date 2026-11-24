@@ -21,8 +21,8 @@ pub mod font;
 mod tests;
 pub mod virtio_vga;
 
-use crate::{BarInfo, BarKind, DeviceError, PciDevice, Snapshot};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use crate::{BarInfo, BarKind, DeviceError, GuestMemory, PciDevice, Snapshot};
+use vm_memory::{Bytes, GuestAddress};
 
 pub const VRAM_SIZE: usize = 16 * 1024 * 1024;
 pub const ROM_SIZE: usize = 128 * 1024;
@@ -147,7 +147,7 @@ pub struct StandardVga {
     config: [u8; 256],
     regs: [u8; REG_SIZE],
     dispi: [u16; 16],
-    vram: GuestMemoryMmap,
+    vram: GuestMemory,
     rom: Vec<u8>,
     seq_index: u8,
     gc_index: u8,
@@ -211,7 +211,7 @@ impl StandardVga {
             config: [0; 256],
             regs: [0; REG_SIZE],
             dispi: [0; 16],
-            vram: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), vram_size)])
+            vram: GuestMemory::from_ranges(&[(GuestAddress(0), vram_size)])
                 .map_err(|e| DeviceError::Memory(e.to_string()))?,
             rom: Vec::new(),
             seq_index: 0,
@@ -685,7 +685,7 @@ impl StandardVga {
 
     /// Page-aligned BAR0 storage, accessed with volatile guest-memory operations.
     /// The VMM may map this region directly while PCI memory decoding is enabled.
-    pub fn linear_framebuffer(&self) -> GuestMemoryMmap {
+    pub fn linear_framebuffer(&self) -> GuestMemory {
         self.vram.clone()
     }
 
