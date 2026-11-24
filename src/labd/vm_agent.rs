@@ -3365,6 +3365,13 @@ mod tests {
         answer_hello: bool,
         advertised: Vec<String>,
     ) -> (tempfile::TempDir, PathBuf) {
+        mock_agent_with_version(answer_hello.then_some(PROTO_VERSION), advertised).await
+    }
+
+    async fn mock_agent_with_version(
+        version: Option<u32>,
+        advertised: Vec<String>,
+    ) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&path).expect("bind mock agent socket");
@@ -3443,9 +3450,9 @@ mod tests {
                                         instance: Some("stale".into()),
                                     })
                                     .await;
-                                    if answer_hello {
+                                    if let Some(proto_version) = version {
                                         send(AgentMsg::Hello {
-                                            proto_version: PROTO_VERSION,
+                                            proto_version,
                                             agent_version: "0.1.0-mock".into(),
                                             os: "linux".into(),
                                             features: advertised.clone(),
@@ -4491,6 +4498,20 @@ mod tests {
             panic!("expected handshake timeout");
         };
         assert!(err.to_string().contains("no vmlab-agent answered"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_version_mismatch_is_named_in_the_error() {
+        let guest_version = PROTO_VERSION - 1;
+        let (_dir, path) = mock_agent_with_version(Some(guest_version), vec![]).await;
+        let before = tokio::time::Instant::now();
+        let Err(err) = AgentHandle::connect(&path, HANDSHAKE).await else {
+            panic!("expected the incompatible agent to be refused");
+        };
+        let error = err.to_string();
+        assert!(error.contains(&format!("agent speaks proto v{guest_version}")), "{error}");
+        assert!(error.contains(&format!("host expects v{PROTO_VERSION}")), "{error}");
+        assert_eq!(tokio::time::Instant::now(), before);
     }
 
     #[tokio::test]
