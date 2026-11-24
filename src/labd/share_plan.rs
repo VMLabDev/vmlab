@@ -521,22 +521,25 @@ fn check_collisions(
     virtiofs: &[VirtiofsShare],
     exports: &[SmbExport],
 ) -> Result<(), SharePlanError> {
-    let mut claims: BTreeMap<(Option<&str>, &str), Vec<String>> = BTreeMap::new();
+    let mut claims = BTreeMap::new();
     for v in virtiofs {
         claims
-            .entry((Some(v.machine.as_str()), v.name.as_str()))
-            .or_default()
+            .entry((Some(v.machine.as_str()), v.name.clone()))
+            .or_insert_with(|| (v.name.as_str(), Vec::new()))
+            .1
             .push(format!("\"{}\" virtiofs", v.machine));
     }
     for e in exports {
         for s in &e.shares {
             claims
-                .entry((None, s.name.as_str()))
-                .or_default()
+                // Samba compares section names without case.
+                .entry((None, s.name.to_ascii_lowercase()))
+                .or_insert_with(|| (s.name.as_str(), Vec::new()))
+                .1
                 .push(format!("\"{}\" smb", e.machine));
         }
     }
-    for ((_, name), claimants) in claims {
+    for (name, claimants) in claims.into_values() {
         if claimants.len() > 1 {
             return Err(SharePlanError::Collision {
                 name: name.to_string(),
@@ -1059,6 +1062,26 @@ lab "l" {
             }
         );
         assert!(err.to_string().contains("rename one"), "{err}");
+    }
+
+    #[test]
+    fn share_names_that_differ_only_in_case_collide() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" }
+  vm "web" {
+    template = "x86_64/t"
+    nic { segment = "lan" }
+    share { name = "Data" host = "keep" guest = "/keep" readonly = true transport = "smb" }
+    share { name = "data" host = "scratch" guest = "/scratch" transport = "smb" }
+  }
+}"#,
+        );
+        assert!(matches!(
+            plan_on(&lab, &Host::bare(), &AllFree),
+            Err(SharePlanError::Collision { .. })
+        ));
     }
 
     /// Within one machine two virtiofs shares would share a mount tag, which

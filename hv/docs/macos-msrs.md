@@ -41,6 +41,14 @@ The second line names an MSR outside the table. If a later macOS version
 panics early in boot, look for this line in the machine's vmlab-hv log: it
 gives the index to add here and to `MACOS_MSRS`.
 
+The guest chooses the indices, so the log has a limit: a machine names 256
+distinct indices (`MSR_LOG_LIMIT`) and then logs one last line. Later accesses
+get the same answers and no line.
+
+```text
+kvm: macOS guest touched 256 distinct MSRs, no further MSR is logged
+```
+
 ## The list
 
 Every read returns 0. That is the value QEMU's guests saw under

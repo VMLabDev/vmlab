@@ -245,6 +245,12 @@ pub(crate) fn user_msr(
     value
 }
 
+/// How many distinct MSR indices one machine names in its log. The guest
+/// picks the indices, so both the set and the log stop here: the table has 16
+/// entries and a macOS release adds a handful, while a guest sweeping the
+/// index space would otherwise fill host memory and the machine's log file.
+pub(crate) const MSR_LOG_LIMIT: usize = 256;
+
 /// The answer to one access, and the line to log the first time a macOS
 /// machine touches that index. `seen` rides the snapshot, so a rewind or a
 /// reset does not log an index again.
@@ -258,7 +264,7 @@ fn answer(
     match msr_action(policy, index, reason, write) {
         MsrAction::Answer(entry) => (
             Some(0),
-            seen.insert(index).then(|| {
+            log_once(seen, index, || {
                 format!(
                     "kvm: macOS MSR {index:#010x} ({}) answered in user space",
                     entry.name
@@ -267,12 +273,46 @@ fn answer(
         ),
         MsrAction::Unhandled => (
             None,
-            seen.insert(index).then(|| {
+            log_once(seen, index, || {
                 let access = if write { "write" } else { "read" };
                 format!("kvm: macOS guest faulted on unhandled MSR {index:#010x} ({access})")
             }),
         ),
         MsrAction::Strict => (None, None),
+    }
+}
+
+/// The line for `index` if the machine has not logged it and the set has
+/// room. The index that fills the set says so on its own line, and after it
+/// the set and the log take nothing more.
+fn log_once(
+    seen: &mut std::collections::BTreeSet<u32>,
+    index: u32,
+    line: impl FnOnce() -> String,
+) -> Option<String> {
+    if seen.len() >= MSR_LOG_LIMIT || !seen.insert(index) {
+        return None;
+    }
+    let mut line = line();
+    if seen.len() == MSR_LOG_LIMIT {
+        line.push_str(&format!(
+            "\nkvm: macOS guest touched {MSR_LOG_LIMIT} distinct MSRs, no further MSR is logged"
+        ));
+    }
+    Some(line)
+}
+
+/// Puts a snapshot's logged set into the live one, up to the same limit: the
+/// section is read from a file, so its size is not trusted either.
+pub(crate) fn merge_logged(
+    seen: &mut std::collections::BTreeSet<u32>,
+    saved: std::collections::BTreeSet<u32>,
+) {
+    for index in saved {
+        if seen.len() >= MSR_LOG_LIMIT {
+            break;
+        }
+        seen.insert(index);
     }
 }
 
@@ -500,6 +540,59 @@ mod tests {
             (None, None)
         );
         assert!(strict.is_empty());
+    }
+
+    /// vmm-core-2 F1: the guest chooses the indices, so neither the set nor
+    /// the number of log lines may follow how many it touches.
+    #[test]
+    fn unhandled_msr_log_is_bounded() {
+        let unknown = MsrExitReason::Unknown;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut lines = Vec::new();
+        for index in 0x1000_0000u32..0x1001_86a0 {
+            let (value, line) = answer(MsrPolicy::Macos, &mut seen, index, unknown, false);
+            assert_eq!(value, None, "{index:#x} is outside the table");
+            lines.extend(line);
+        }
+        assert!(
+            seen.len() <= MSR_LOG_LIMIT,
+            "the set holds {} indices",
+            seen.len()
+        );
+        assert!(
+            lines.len() <= MSR_LOG_LIMIT,
+            "{} log lines for one sweep",
+            lines.len()
+        );
+        // The log says that it stopped, once, on its last line.
+        let stops = |line: &&String| line.contains("no further MSR is logged");
+        assert_eq!(lines.iter().filter(stops).count(), 1);
+        assert!(stops(&lines.last().unwrap()));
+        // A full set changes no answer: the table still reads 0 and an
+        // unknown index still faults, both without a line.
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0xe7, unknown, false),
+            (Some(0), None)
+        );
+        assert_eq!(
+            answer(MsrPolicy::Macos, &mut seen, 0xdead_beef, unknown, true),
+            (None, None)
+        );
+        assert!(seen.len() <= MSR_LOG_LIMIT);
+    }
+
+    /// vmm-core-2 F1: a snapshot section is input too. A restore merges the
+    /// saved set into the live one, and the result keeps the bound.
+    #[test]
+    fn restored_msr_set_keeps_the_bound() {
+        let mut live: std::collections::BTreeSet<u32> = (0..200).collect();
+        let saved: std::collections::BTreeSet<u32> = (0x1000..0x2000).collect();
+        merge_logged(&mut live, saved);
+        assert_eq!(live.len(), MSR_LOG_LIMIT);
+        assert!((0..200).all(|index| live.contains(&index)));
+        let mut empty = std::collections::BTreeSet::new();
+        merge_logged(&mut empty, std::collections::BTreeSet::from([0x60d, 0x3f8]));
+        assert_eq!(empty, std::collections::BTreeSet::from([0x3f8, 0x60d]));
     }
 
     /// Real mode: `rdmsr` of ECX into [0x9000], `wrmsr` of 0x78563412, `rdmsr`
