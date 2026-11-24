@@ -68,8 +68,8 @@ pub fn folder_digest(src_folder: &Path, include_modes: bool) -> Result<[u8; 32]>
 }
 
 fn mode_bytes(path: &Path) -> Result<[u8; 4]> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("reading metadata of {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("reading metadata of {}", path.display()))?;
     Ok(metadata.permissions().mode().to_le_bytes())
 }
 

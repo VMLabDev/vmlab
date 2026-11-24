@@ -1560,8 +1560,15 @@ impl VmInstance {
                 lab: self.lab.clone(),
                 resolved: Box::new(t.resolved.clone()),
                 paths: Box::new(
-                    self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices, &render, tsc_hz)
-                        .await?,
+                    self.build_paths(
+                        &t,
+                        firmware.as_ref(),
+                        nic_specs,
+                        vfs_devices,
+                        &render,
+                        tsc_hz,
+                    )
+                    .await?,
                 ),
                 accel,
                 emulator: render.qemu_binary.clone(),
