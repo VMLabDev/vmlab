@@ -107,6 +107,15 @@ def clear_stale_objects(source, tools):
         stamp.write_text(object_inputs(tools))
 
 
+def install_configs(source, headers):
+    """Copy the local configuration headers into `src/config/local` of a
+    checkout. This commit is the extraction only."""
+    local = source / "src/config/local"
+    local.mkdir(exist_ok=True)
+    for header in headers:
+        shutil.copyfile(header, local / header.name)
+
+
 def parse_record(text):
     """A record as (toolchain lines, {name: sha256}). The toolchain is the
     `# ` lines at its head, which `sha256sum -c` skips."""
@@ -205,10 +214,7 @@ def main():
         ["git", "-C", str(source), "ls-files", "--others", "--exclude-standard"], text=True).strip():
         raise SystemExit(f"{source}: untracked source files; refusing an unpinned build")
     src = source / "src"
-    local = src / "config/local"
-    local.mkdir(exist_ok=True)
-    for config in configs(profile):
-        shutil.copyfile(config, local / config.name)
+    install_configs(source, configs(profile))
     env = dict(os.environ, SOURCE_DATE_EPOCH=pin["source_date_epoch"], LC_ALL="C", TZ="UTC")
     # make does not rebuild an object when a flag or the compiler changes.
     tools = toolchain()

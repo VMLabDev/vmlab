@@ -402,6 +402,37 @@ mod tests {
     }
 
     #[test]
+    fn an_initrd_larger_than_low_ram_is_refused_by_name() {
+        // docs/reviews/firmware.md, F7.
+        let dir = temp_dir("initrd-large");
+        let kernel = write_kernel(dir.path(), &tiny_bzimage());
+        let initrd = dir.path().join("initrd");
+        let file = File::create(&initrd).unwrap();
+        file.set_len(129 * MIB).unwrap();
+        drop(file);
+        let mem = self::mem();
+        let err = load(&mem, &kernel, Some(&initrd), "", &[], None, 128 * MIB).unwrap_err();
+        assert!(matches!(err, VmmError::Kernel(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("does not fit"), "{msg}");
+        assert!(msg.contains(&format!("{} bytes", 129 * MIB)), "{msg}");
+    }
+
+    #[test]
+    fn an_initrd_that_would_overlap_the_kernel_is_refused_by_name() {
+        let dir = temp_dir("initrd-overlap");
+        let kernel = write_kernel(dir.path(), &tiny_bzimage());
+        let initrd = dir.path().join("initrd");
+        let file = File::create(&initrd).unwrap();
+        file.set_len(127 * MIB).unwrap();
+        drop(file);
+        let mem = self::mem();
+        let err = load(&mem, &kernel, Some(&initrd), "", &[], None, 128 * MIB).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not fit"), "{msg}");
+    }
+
+    #[test]
     fn missing_kernel_is_a_clear_error() {
         let mem = self::mem();
         let err = load(
