@@ -328,6 +328,64 @@ async fn legacy_hello_that_straddles_the_end_of_a_truncated_frame_is_answered() 
     Ok(())
 }
 
+/// Review `legacy-agents.md` F9. The agent used to end its loop as soon as
+/// the platform said a shutdown was initiated. Where the guest then stays up
+/// (here: no capabilities and no init to ask, so `/sbin/shutdown` cannot
+/// act) the machine ran on with no agent. The agent now serves until the
+/// guest takes it down.
+///
+/// No time limit decides this. An agent that exits closes the connection,
+/// which ends the read. One that stays answers the ping.
+#[tokio::test]
+async fn legacy_agent_survives_a_shutdown_that_did_not_happen() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use vmlab_agent_proto::ShutdownMode;
+
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+
+    stream
+        .write_all(&encode_ctrl(&HostMsg::Shutdown {
+            mode: ShutdownMode::Reboot,
+        })?)
+        .await?;
+    stream.write_all(&encode_ctrl(&HostMsg::Ping)?).await?;
+
+    match first_hello_or_pong(&mut stream).await? {
+        AgentMsg::Pong { .. } => Ok(()),
+        other => panic!("expected a pong after the shutdown request, got {other:?}"),
+    }
+}
+
+/// Review `legacy-agents.md` F11. `\u0000` decodes to a NUL byte, and every
+/// string the agent hands a platform is NUL-terminated: the argument
+/// `one\0two` ran as `one`, and the env key `A\0B` with any value became
+/// `A=B`. Each is refused now, and so is a NUL in an env value or the cwd.
+#[tokio::test]
+async fn legacy_exec_refuses_a_nul_in_argv_and_env() -> Result<()> {
+    use serde_json::json;
+
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+    for request in [
+        json!({"cmd": "open_exec", "id": 1, "argv": ["echo", "one\u{0}two"]}),
+        json!({"cmd": "open_exec", "id": 2, "argv": ["true"], "env": [["A\u{0}B", "value"]]}),
+        json!({"cmd": "open_exec", "id": 3, "argv": ["true"], "env": [["A", "v\u{0}w"]]}),
+        json!({"cmd": "open_exec", "id": 4, "argv": ["true"], "cwd": "/\u{0}tmp"}),
+    ] {
+        let reply = open_reply(&mut stream, request.clone()).await?;
+        assert_eq!(reply["event"], "error", "request {request}: {reply}");
+        assert_eq!(reply["id"], request["id"], "{reply}");
+        let message = reply["message"].as_str().unwrap_or_default();
+        assert!(message.contains("NUL"), "request {request}: {reply}");
+    }
+    Ok(())
+}
+
 fn sh(script: &str) -> Vec<String> {
     vec!["sh".into(), "-c".into(), script.into()]
 }
