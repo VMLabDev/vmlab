@@ -274,6 +274,45 @@ fn exec_close_kills_the_process_and_stays_silent() {
 }
 
 #[test]
+fn exec_close_kills_what_the_command_started() {
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = dir.path().join("result");
+    let go = dir.path().join("go");
+    for path in [&result, &go] {
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 3,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "(read -r line; printf survived) > result < go & wait".into(),
+            ],
+            env: vec![],
+            cwd: Some(dir.path().to_str().unwrap().into()),
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 3 });
+    let mut result = std::fs::File::open(result).unwrap();
+    let mut go = std::fs::OpenOptions::new().write(true).open(go).unwrap();
+    open(&mux, &p, HostMsg::Close { id: 3 });
+    let _ = go.write_all(b"go\n");
+    drop(go);
+    let mut output = String::new();
+    result.read_to_string(&mut output).unwrap();
+    assert_eq!(output, "", "the descendant ran after close");
+}
+
+#[test]
 fn exec_streams_stdio_and_exit_code() {
     let (mux, mut cap) = capture_mux();
     let p = platform();
@@ -337,6 +376,40 @@ fn an_exec_reports_its_exit_while_a_background_child_holds_the_pipe() {
     assert_eq!(code, 3);
     assert_eq!(out, b"stdout");
     assert_eq!(err, b"stderr");
+}
+
+#[test]
+fn a_background_child_survives_its_execs_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = dir.path().join("result");
+    let go = dir.path().join("go");
+    for path in [&result, &go] {
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+    let (mux, mut cap) = capture_mux();
+    let p = platform();
+    open(
+        &mux,
+        &p,
+        HostMsg::OpenExec {
+            id: 4,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "(read -r line < go; head -c 1048576 /dev/zero && \
+                 head -c 1048576 /dev/zero >&2; echo $? > result) & exit 0"
+                    .into(),
+            ],
+            env: vec![],
+            cwd: Some(dir.path().to_str().unwrap().into()),
+            logon: None,
+            tree: None,
+        },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 4 });
+    assert_eq!(cap.until_exited(4), (vec![], vec![], 0));
+    std::fs::write(go, b"go\n").unwrap();
+    assert_eq!(std::fs::read_to_string(result).unwrap(), "0\n");
 }
 
 #[test]
