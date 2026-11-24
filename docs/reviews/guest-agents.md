@@ -530,6 +530,10 @@ Not read:
 
 ### F16. A protocol version mismatch is reported as "no agent answered"
 
+- Fixed in card #814. A matching-token hello with an incompatible version
+  ends the handshake with both protocol versions in the error. Container
+  startup checks cinit's boot protocol before sending the spec and refuses
+  an incompatible version.
 - Where: `src/labd/vm_agent.rs:2411-2417` and `392-400`. The same shape for
   cinit at `src/labd/container_ctl.rs:89-96`.
 - Fault: a `hello` with another `proto_version` is logged and dropped. The
