@@ -1671,10 +1671,7 @@ mod tests {
         assert_eq!(next(&mut service), Some(hello.clone()));
         // The trunk to another lab passes it on as an isolated guest's, so
         // that lab's switch keeps it from its guests too.
-        assert_eq!(
-            next(&mut other_lab),
-            Some(tagged(&hello, GUEST_ISOLATED))
-        );
+        assert_eq!(next(&mut other_lab), Some(tagged(&hello, GUEST_ISOLATED)));
         assert_eq!(next(&mut other_lab), Some(marker.clone()));
 
         // In: a far guest's frame for the isolated NIC stops at the lab's
