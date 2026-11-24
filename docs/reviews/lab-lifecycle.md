@@ -31,20 +31,20 @@ Two facts are used by several findings:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one (fixed, card #546) |
-| F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547) |
-| F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name (fixed, card #557) |
-| F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547) |
-| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559) |
-| F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down (fixed, card #560) |
-| F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon (fixed, card #561) |
-| F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab (fixed, card #571) |
-| F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again (fixed, card #571) |
-| F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first |
-| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown (fixed, card #572) |
-| F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started (fixed, card #573) |
-| F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses (fixed, card #574) |
-| F14 | wrong result | A `labs.json` that does not parse is read as an empty registry (fixed, card #574) |
+| F1 | data loss | Nothing makes a supervisor or a lab daemon the only one, and binding the socket unlinks a live one (fixed, card #546, `a8c722a7`) |
+| F2 | data loss | A teardown, a `down` and a `destroy` do not stop a start that is under way, so a machine boots after the last stop and is orphaned (fixed, card #547, `d624bcca`) |
+| F3 | data loss | With no supervisor running, `down` and `destroy` from a second checkout act on the first checkout's lab of the same name (fixed, card #557, `13643923`) |
+| F4 | data loss | `machine destroy` and `destroy` remove disks without excluding a start of the same machine (fixed, card #547, `d624bcca`) |
+| F5 | crash | The orphan reaper knows a QEMU by lab name alone, across every vmlab environment on the host (fixed, card #559, `5e910a24`) |
+| F6 | crash | The release deadline is shorter than one machine's graceful stop, so `vmlab daemon stop` kills guests that are shutting down (fixed, card #560, `41423c28`) |
+| F7 | crash | A release takes a daemon that does not answer for a dead one: it kills the lab's hypervisors and forgets a live daemon (fixed, card #561, `b956cf07`) |
+| F8 | wrong result | The reference count of a global segment is anonymous: a lab that never attached can destroy it under another lab (fixed, card #571, `361e53bd`) |
+| F9 | wrong result | After a supervisor restart the adopted labs' global segments are gone and nothing attaches them again (fixed, card #571, `361e53bd`) |
+| F10 | wrong result | Orphaned hypervisors are reaped only through a registry entry, and several exits drop the entry first (fixed, card #869, `59da9a3d`) |
+| F11 | wrong result | A termination signal does not close the supervisor to requests, so a lab daemon can be spawned during its teardown (fixed, card #572, `bc5a7954`) |
+| F12 | wrong result | Two `up` commands after an edit both restart the daemon, and the second stops what the first started (fixed, card #573, `338ac984`) |
+| F13 | wrong result | A `stopping` entry left by a killed supervisor is not adopted, and `up` waits 120 s and then refuses (fixed, card #574, `b478a50b`) |
+| F14 | wrong result | A `labs.json` that does not parse is read as an empty registry (fixed, card #574, `b478a50b`) |
 
 ### F1. No single-instance guard (data loss)
 
@@ -85,7 +85,8 @@ Two facts are used by several findings:
      registry entry in state `failed` whose pid and start time name a live
      helper process, then `ensure_lab`. It must refuse or stop the old
      daemon first. Today it spawns a second `__labd`.
-- Fixed in card #546. `SocketGuard` in `src/proto/server.rs` is an exclusive
+- Fixed in card #546 (`a8c722a7`).
+  `SocketGuard` in `src/proto/server.rs` is an exclusive
   `flock` on `<socket>.lock`, which the kernel drops when the holder dies.
   Taking it also refuses a path that still accepts a connection. A bind needs
   the guard and fails with `AddrInUse`, naming the holder's pid, when a live
@@ -127,7 +128,8 @@ Two facts are used by several findings:
   channel. Start `up`, run `down(&[], false)` to its end, then release the
   channel and await `up`. Assert that the fake launched nothing after `down`
   returned and that every machine is `Stopped`. Today `b` launches.
-- Fixed in card #547. `src/labd/start_gate.rs` is a gate that every start,
+- Fixed in card #547 (`d624bcca`).
+  `src/labd/start_gate.rs` is a gate that every start,
   `down` and destroy of the lab runtime goes through. A start carries a
   ticket from the moment it was asked for, and `up` takes one ticket for all
   its waves. A `down` refuses every older ticket for the machines it stops,
@@ -169,7 +171,8 @@ Two facts are used by several findings:
   with `mylab` registered from `/labs/first`, bind no supervisor socket,
   call `check_registration("mylab", "/labs/second")`. It must return the
   ADR-0011 conflict. Today it returns `Ok`.
-- Fixed in card #557. When no supervisor answers, `check_registration`
+- Fixed in card #557 (`13643923`).
+  When no supervisor answers, `check_registration`
   reads the registry the supervisor persisted (`Registry::load`, the
   `labs.json` the next supervisor adopts) and applies the same
   `LabEntry::claims` decision to it. The proof test (with a helper that runs
@@ -199,7 +202,8 @@ Two facts are used by several findings:
   release the channel. The start must be refused or must wait, and after
   both return either the machine is stopped with no directory or it runs
   with its disks present. Today it runs and its directory is gone.
-- Fixed in card #547, with the gate of F2. `destroy_machine` makes every
+- Fixed in card #547 (`d624bcca`).
+  Fixed with the gate of F2. `destroy_machine` makes every
   earlier start of the machine stale and holds the machine's start lock from
   before its stop until the directory and the state entry are gone. A start
   under way finishes first and is stopped, and a later start waits for the
@@ -236,7 +240,8 @@ Two facts are used by several findings:
   with one QEMU argv whose `-name` is `vmlab:demo/a` and whose QMP and
   serial socket paths lie under another runtime directory. `lab_orphans`
   with the identity of `demo` must return nothing. Today it returns the pid.
-- Fixed in card #559. `LabIdentity::started` in `src/qemu/process.rs` now
+- Fixed in card #559 (`5e910a24`).
+  `LabIdentity::started` in `src/qemu/process.rs` now
   knows a QEMU (by its name and by the argv form of a renamed host-GPU
   binary) by its `-name vmlab:<lab>/` marker **and** a `-qmp unix:<path>`
   under the lab's runtime directory, which `cmdline.rs` and `container.rs`
@@ -267,7 +272,8 @@ Two facts are used by several findings:
   sealed agent and `acpi_shutdown = true`, sum the waits of its rungs, and
   assert the sum is below `RELEASE_DEADLINE`. Today the sum is 150 s. No
   clock is needed: the test compares constants.
-- Fixed in card #560. `plan_wait` in `src/labd/stop_plan.rs` sums a stop
+- Fixed in card #560 (`41423c28`).
+  `plan_wait` in `src/labd/stop_plan.rs` sums a stop
   plan's waits. Each machine reports the stop wait of the ladder it would
   climb now (`Machine::stop_wait`, zero when nothing runs), and the lab
   daemon answers `shutdown` with the sum over its machines
@@ -309,7 +315,8 @@ Two facts are used by several findings:
   process, and no socket at the lab's path. Call `release_lab`. Afterwards
   either the process is gone or the entry is still there. Today the entry
   is gone and the process runs.
-- Fixed in card #561. `release_lab` takes the per-lab `ensure` lock, so a
+- Fixed in card #561 (`b956cf07`).
+  `release_lab` takes the per-lab `ensure` lock, so a
   release waits for a start under way and then stops the daemon through its
   socket. When the socket does not answer but the entry's pid and start time
   still name a running process, the release sends that daemon SIGTERM (its
@@ -344,7 +351,8 @@ Two facts are used by several findings:
   it is empty. `a_second_attach_by_one_lab_is_one_reference`: attach `corp`
   as lab `a` twice, detach once, assert `list()` is empty. Today the
   segment stays with count 1.
-- Fixed in card #571. A global segment holds its references by lab name,
+- Fixed in card #571 (`361e53bd`).
+  A global segment holds its references by lab name,
   plus a count of anonymous ones for inbound cross-host trunks. A lab that
   attaches again is still one reference, and a detach by a lab that holds
   none changes nothing, so it neither leaves the segment's DNS nor drops the
@@ -371,7 +379,8 @@ Two facts are used by several findings:
   and adopts). `global.list` must name the segment with both labs as
   members, and a machine of lab A must still resolve and reach a machine of
   lab B. Today `global.list` is empty.
-- Fixed in card #571. The lab daemon watches each global segment's trunk.
+- Fixed in card #571 (`361e53bd`).
+  The lab daemon watches each global segment's trunk.
   When the trunk closes, it attaches the segment again, retrying until a
   supervisor answers, and names the subnet the first attach answered with.
   The supervisor allocates its automatic pool past a subnet named this way,
@@ -388,6 +397,10 @@ Two facts are used by several findings:
   by renewing it on the same subnet.
 
 ### F10. Orphans are reaped only through a registry entry (wrong result)
+
+- Fixed in card #869 (`59da9a3d`). The supervisor reaps lab-owned orphans on release
+  even when the registry entry is absent, and before it replaces a failed
+  daemon.
 
 - Where: `src/supervisor/mod.rs:581-583` (`release_lab` returns when the
   name has no entry), `:364-382` (`daemon_exited`), `:641-654`
@@ -432,7 +445,8 @@ Two facts are used by several findings:
   while it waits on a lab release send `LabEnsure` for another name. The
   request must be refused with the "shutting down" conflict. Today it
   spawns `__labd`.
-- Fixed in card #572. `teardown` in `src/supervisor/mod.rs` sets
+- Fixed in card #572 (`bc5a7954`).
+  `teardown` in `src/supervisor/mod.rs` sets
   `shutting_down` itself, so the signal path closes the supervisor as the
   `shutdown` request does. For the smaller gap, `ensure_lab_locked` checks
   the flag under the name's lock, and `teardown` releases every name that
@@ -464,7 +478,8 @@ Two facts are used by several findings:
   successor between them. The second request must leave the successor in
   place (same pid) and must not stop the machine. Today it shuts the
   successor down.
-- Fixed in card #573. A lab daemon's status reports its pid
+- Fixed in card #573 (`338ac984`).
+  A lab daemon's status reports its pid
   (`LabStatus::daemon_pid`), and `lab.restart` carries the pid of the daemon
   the caller read its status from (`daemon`). Under the per-lab lock
   `restart_lab` in `src/supervisor/mod.rs` compares it with the registered
@@ -503,7 +518,8 @@ Two facts are used by several findings:
   that answers `ping`. After `adopt_existing_labs`, the entry must be
   `running` (or the daemon must have received `Shutdown`), and its exit
   must be watched. Today the entry is unchanged and nothing watches it.
-- Fixed in card #574. `adopt_stopping` in `src/supervisor/mod.rs` settles a
+- Fixed in card #574 (`b478a50b`).
+  `adopt_stopping` in `src/supervisor/mod.rs` settles a
   `stopping` entry before the other entries are judged. A daemon that runs
   and answers `ping` becomes `running` and is adopted like any other: its
   events are forwarded and its exit is watched. It is not sent `Shutdown`,
@@ -538,7 +554,8 @@ Two facts are used by several findings:
   `{ this is not json` to `labs.json` and call `Registry::load`. It must
   return an error, or keep the file aside and say so. Today it returns an
   empty registry and the next `save` replaces the file.
-- Fixed in card #574. `Registry::load` returns a `Result`, as
+- Fixed in card #574 (`b478a50b`).
+  `Registry::load` returns a `Result`, as
   `LabState::load` does: a missing file is an empty registry, a file that
   cannot be read or parsed is an error that names the file, and the file is
   left as it is. The supervisor refuses to start on that error, so it never
