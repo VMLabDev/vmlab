@@ -2413,7 +2413,10 @@ mod tests {
         crowd_out(&dir, &fs, "b", SESSION_LIMIT);
         assert_eq!(read_all(&fs, nested), b"nested\n");
         assert_eq!(lookup(&fs, b"moved").unwrap().inode, sub);
-        assert_eq!(FileSystem::readlink(&fs, &ctx(), link).unwrap(), b"hello.txt");
+        assert_eq!(
+            FileSystem::readlink(&fs, &ctx(), link).unwrap(),
+            b"hello.txt"
+        );
 
         // The host puts another file at the name: the idle inode is not
         // that file, and a lookup of the name gives the node id the file
@@ -2504,6 +2507,8 @@ mod tests {
 
         let restored = PassthroughFs::new(dir.path().to_path_buf(), false).unwrap();
         restored.restore_state(&state).unwrap();
+        // The same inodes and handles, whichever of them hold descriptors.
+        assert_eq!(restored.save_state(), state);
         {
             let session = restored.inner.lock();
             assert!(session.inodes.len() <= SESSION_LIMIT);
@@ -2530,7 +2535,6 @@ mod tests {
         assert_eq!(&served[..n], b"held");
         assert_eq!(read_all(&restored, hello), b"hello share\n");
         assert_eq!(lookup(&restored, b"hello.txt").unwrap().inode, hello);
-        assert_eq!(restored.save_state().len(), state.len());
     }
 
     #[test]
