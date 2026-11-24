@@ -799,6 +799,7 @@ impl Handler<LabRequest> for LabdHandler {
                 threshold,
                 region,
             } => {
+                crate::vision::validate_threshold(threshold).map_err(CommandError::invalid)?;
                 let opts = crate::vision::MatchOptions {
                     threshold,
                     region: region.map(Region::as_tuple),

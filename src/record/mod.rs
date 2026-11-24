@@ -204,24 +204,14 @@ impl Settings {
             return Err(format!("fps {fps}: must be between 1 and 120"));
         }
         let size = options.size.unwrap_or(DEFAULT_SIZE).validate()?;
-        let compress_idle = match options.compress_idle {
-            None => None,
-            Some(secs) if secs.is_finite() && secs > 0.0 => Some(Duration::from_secs_f64(secs)),
-            Some(secs) => {
-                return Err(format!(
-                    "compress_idle {secs}: the idle threshold must be a positive number of seconds"
-                ));
-            }
-        };
-        let max_duration = match options.max_duration {
-            None => None,
-            Some(secs) if secs.is_finite() && secs > 0.0 => Some(Duration::from_secs_f64(secs)),
-            Some(secs) => {
-                return Err(format!(
-                    "max_duration {secs}: must be a positive number of seconds"
-                ));
-            }
-        };
+        let compress_idle = options
+            .compress_idle
+            .map(|secs| resolve_duration("compress_idle", secs))
+            .transpose()?;
+        let max_duration = options
+            .max_duration
+            .map(|secs| resolve_duration("max_duration", secs))
+            .transpose()?;
         Ok(Settings {
             format,
             fps,
@@ -242,6 +232,15 @@ impl Settings {
             max_duration: self.max_duration.map(|d| d.as_secs_f64()),
         }
     }
+}
+
+fn resolve_duration(option: &str, secs: f64) -> Result<Duration, String> {
+    if !secs.is_finite() || secs <= 0.0 {
+        return Err(format!(
+            "{option} {secs}: must be a positive number of seconds"
+        ));
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| format!("{option} {secs}: duration is too large"))
 }
 
 /// One recording a request asks a lab daemon to start alongside what it is
@@ -434,6 +433,32 @@ mod tests {
                 size: Some(DEFAULT_SIZE),
                 ..opts
             }
+        );
+    }
+
+    #[test]
+    fn a_duration_too_large_for_a_clock_is_refused() {
+        let opts = RecordOptions {
+            max_duration: Some(1e20),
+            ..Default::default()
+        };
+        assert!(
+            Settings::resolve(Path::new("a.mp4"), &opts)
+                .unwrap_err()
+                .contains("max_duration")
+        );
+    }
+
+    #[test]
+    fn an_idle_threshold_too_large_for_a_clock_is_refused() {
+        let opts = RecordOptions {
+            compress_idle: Some(1e20),
+            ..Default::default()
+        };
+        assert!(
+            Settings::resolve(Path::new("a.mp4"), &opts)
+                .unwrap_err()
+                .contains("compress_idle")
         );
     }
 

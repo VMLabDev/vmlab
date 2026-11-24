@@ -78,14 +78,16 @@
 //! already match, and carrying out a resolution.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use nix::fcntl::{Flock, FlockArg};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, watch};
 
 use super::apply::{Target, apply};
@@ -106,11 +108,7 @@ use crate::labd::vm_agent::WatchReport;
 /// failure here is a blip rather than a state to poll through.
 const RETRY: Duration = Duration::from_secs(5);
 
-// Machines can share or nest canonical roots, including through symlinks.
-// Queue this daemon's syncers before taking the cross-daemon file lock.
-static RECONCILING: Mutex<()> = Mutex::const_new(());
-
-fn reconciliation_lock_path() -> PathBuf {
+fn reconciliation_lock_dir() -> PathBuf {
     #[cfg(not(test))]
     let root = crate::paths::runtime_dir();
     #[cfg(test)]
@@ -120,29 +118,59 @@ fn reconciliation_lock_path() -> PathBuf {
             .path()
             .to_path_buf()
     };
-    root.join("workspace-reconciliation.lock")
+    root.join("workspace-reconciliation")
 }
 
-// One lock covers overlapping roots and aliases across lab daemons using the
-// same runtime directory. This also serializes unrelated workspaces.
-fn lock_reconciliation(path: PathBuf) -> Result<nix::fcntl::Flock<std::fs::File>> {
-    if let Some(parent) = path.parent() {
-        crate::paths::ensure_private_dir(parent)?;
+fn reconciliation_lock_path(dir: &Path, root: &Path) -> PathBuf {
+    dir.join(hex::encode(Sha256::digest(
+        root.as_os_str().as_encoded_bytes(),
+    )))
+}
+
+// Share ancestor locks and take the root lock exclusively. Acquiring from
+// the top down lets sibling roots run together and excludes nested roots
+// across every daemon that uses this runtime directory.
+async fn lock_reconciliation(host_root: &Path) -> Result<Vec<Flock<std::fs::File>>> {
+    let root = host_root
+        .canonicalize()
+        .with_context(|| format!("resolving workspace root {}", host_root.display()))?;
+    let dir = reconciliation_lock_dir();
+    crate::paths::ensure_private_dir(&dir)?;
+    let ancestors = root.ancestors().collect::<Vec<_>>();
+    let mut held = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors.into_iter().rev() {
+        let path = reconciliation_lock_path(&dir, ancestor);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening the workspace lock for {}", ancestor.display()))?;
+        let mode = if ancestor == root.as_path() {
+            FlockArg::LockExclusiveNonblock
+        } else {
+            FlockArg::LockSharedNonblock
+        };
+        loop {
+            match Flock::lock(file, mode) {
+                Ok(guard) => {
+                    held.push(guard);
+                    break;
+                }
+                Err((retry, nix::errno::Errno::EWOULDBLOCK)) => {
+                    file = retry;
+                    // Wait without occupying a blocking worker while a guest
+                    // owns this lock.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err((_, error)) => {
+                    return Err(error)
+                        .with_context(|| format!("locking workspace path {}", ancestor.display()));
+                }
+            }
+        }
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening the workspace lock {}", path.display()))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, error)| anyhow::anyhow!("locking {}: {error}", path.display()))
-}
-
-async fn lock_other_daemons() -> Result<nix::fcntl::Flock<std::fs::File>> {
-    tokio::task::spawn_blocking(|| lock_reconciliation(reconciliation_lock_path()))
-        .await
-        .context("waiting for the workspace reconciliation lock")?
+    Ok(held)
 }
 
 /// How long a verb waits for the pass it asked for. Bounded so a machine whose
@@ -1653,8 +1681,6 @@ async fn ready_root(
     ledger: &Ledger,
     learned: &mut Learned,
 ) -> Result<()> {
-    let _reconciling = RECONCILING.lock().await;
-    let _other_daemons = lock_other_daemons().await?;
     let guest = sessions
         .open()
         .await
@@ -1908,8 +1934,7 @@ async fn pass(
     ledger: &mut Ledger,
     learned: &mut Learned,
 ) -> Result<Passed> {
-    let _reconciling = RECONCILING.lock().await;
-    let _other_daemons = lock_other_daemons().await?;
+    let _reconciling = lock_reconciliation(&workspace.host_root).await?;
     let guest = sessions
         .open()
         .await
@@ -2590,8 +2615,7 @@ async fn reconverge(
     ledger: &mut Ledger,
     learned: &mut Learned,
 ) -> Result<Report> {
-    let _reconciling = RECONCILING.lock().await;
-    let _other_daemons = lock_other_daemons().await?;
+    let _reconciling = lock_reconciliation(&workspace.host_root).await?;
     let guest = sessions
         .open()
         .await
@@ -2753,12 +2777,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn workspace_reconciliation_lock_excludes_other_processes() {
+    #[tokio::test]
+    async fn workspace_reconciliation_lock_excludes_other_processes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reconciliation.lock");
-        let guard = lock_reconciliation(path.clone()).unwrap();
-        let probe = |free: &str| {
+        let parent = dir.path().canonicalize().unwrap();
+        let child = parent.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let alias = parent.join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let guard = lock_reconciliation(&alias).await.unwrap();
+        let probe = |root: &Path, free: &str| {
+            let path = reconciliation_lock_path(&reconciliation_lock_dir(), root);
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -2776,9 +2805,11 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         };
-        probe("no");
+        probe(&child, "no");
+        probe(&parent, "no");
         drop(guard);
-        probe("yes");
+        probe(&child, "yes");
+        probe(&parent, "yes");
     }
 
     /// One shared fake guest behind every session, so each pass sees what
@@ -2934,6 +2965,61 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disjoint_workspace_opens_while_another_guest_is_silent() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let a = workspace(root_a.path(), state.path());
+        let b = Workspace {
+            machine: "dev02".into(),
+            ledger_path: Ledger::path(state.path(), "dev02"),
+            ..workspace(root_b.path(), state.path())
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let entered_a = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let pass_a = tokio::spawn(isolated_pass(
+            a,
+            Arc::new(PausedSession {
+                sessions: OneFake::new(Arc::new(FakeGuest::new())),
+                opened: entered_a.clone(),
+                release: Some(release.clone()),
+            }),
+            events.clone(),
+        ));
+        entered_a.notified().await;
+
+        let entered_b = Arc::new(Notify::new());
+        let pass_b = isolated_pass(
+            b,
+            Arc::new(PausedSession {
+                sessions: OneFake::new(Arc::new(FakeGuest::new())),
+                opened: entered_b.clone(),
+                release: None,
+            }),
+            events,
+        );
+        tokio::pin!(pass_b);
+        // Drive the second pass to its first wait while the first guest stays silent.
+        let done_b = tokio::select! {
+            biased;
+            done = &mut pass_b => Some(done),
+            () = std::future::ready(()) => None,
+        };
+        let opened = tokio::select! {
+            biased;
+            () = entered_b.notified() => true,
+            () = std::future::ready(()) => false,
+        };
+        release.notify_one();
+        pass_a.await.unwrap();
+        if done_b.is_none() {
+            pass_b.await;
+        }
+        assert!(opened, "the silent guest blocked a disjoint workspace");
     }
 
     #[tokio::test]

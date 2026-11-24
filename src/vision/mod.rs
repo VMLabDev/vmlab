@@ -18,6 +18,7 @@ mod matching;
 mod ocr;
 mod screenshot;
 
+pub(crate) use matching::validate_threshold;
 pub use matching::{Match, MatchOptions, find_template};
 pub use ocr::{Layout, OcrOptions, ocr};
 pub use screenshot::{load_screen, save_png};
