@@ -535,7 +535,7 @@ fi
         if not cosign:
             (self.bin / 'cosign').unlink()
         for name in ['sh', 'uname', 'cat', 'mktemp', 'awk', 'cut', 'chmod',
-                     'mkdir', 'mv', 'rm', 'id', 'sed', 'head']:
+                     'mkdir', 'cp', 'mv', 'rm', 'rmdir', 'id', 'sed', 'head']:
             (self.bin / name).symlink_to(shutil.which(name))
         if sha256sum:
             (self.bin / 'sha256sum').symlink_to(shutil.which('sha256sum'))
