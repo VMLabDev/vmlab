@@ -127,7 +127,11 @@ typedef struct {
 /* The start of D3DKMT_PRESENT, up to BroadcastContextCount. What follows
  * (the broadcast contexts, the present history token and the members
  * Windows added later) is zero: the request is a zeroed buffer larger than
- * any version of the structure. */
+ * any version of the structure. The request is the one of a windowed
+ * Direct3D 9 present, as a trace of Microsoft-Windows-DxgKrnl shows it:
+ * a window, a source, no destination, and the flags Blt, PresentCountValid
+ * and RedirectedBlt. Windows then names the surface of the window as the
+ * destination and calls DxgkDdiPresent. */
 typedef struct {
     UINT context;
     HWND window;
@@ -227,10 +231,10 @@ enum {
     BLOB_FLAG_SHAREABLE = 2,
     PIPE_TEXTURE_2D = 2,
     VIRGL_FORMAT_B8G8R8A8_UNORM = 1,
-    /* D3DKMT_PRESENTFLAGS: Blt, DstRectValid, SrcRectValid */
+    /* D3DKMT_PRESENTFLAGS */
     PRESENT_BLT = 1u << 0,
-    PRESENT_DST_RECT_VALID = 1u << 6,
-    PRESENT_SRC_RECT_VALID = 1u << 7,
+    PRESENT_COUNT_VALID = 1u << 12,
+    PRESENT_REDIRECTED_BLT = 1u << 16,
     IMAGE_WIDTH = 64,
     IMAGE_HEIGHT = 64,
 };
@@ -437,8 +441,9 @@ int wmain(int argc, wchar_t **argv)
 
     /* The destination of the present: a window of this process. */
     r.stage = "create_window";
-    HWND window = CreateWindowExW(0, L"STATIC", L"present_probe (card 756)", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                  40, 40, 320, 240, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    /* A window without a frame: its client area is the size of the source. */
+    HWND window = CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"present_probe (card 756)", WS_POPUP | WS_VISIBLE,
+                                  40, 40, IMAGE_WIDTH, IMAGE_HEIGHT, NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (!window) { r.win32_error = GetLastError(); goto done; }
     pump(1000);
 
@@ -585,7 +590,13 @@ int wmain(int argc, wchar_t **argv)
         p->source = allocation.allocation;
         p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
         p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
-        p->flags = PRESENT_BLT | PRESENT_DST_RECT_VALID | PRESENT_SRC_RECT_VALID;
+        /* One sub-rectangle, the whole source: a present without one is refused. */
+        static RECT sub_rect;
+        sub_rect = p->src_rect;
+        p->sub_rect_count = 1;
+        p->src_sub_rects = &sub_rect;
+        p->present_count = i + 1;
+        p->flags = PRESENT_BLT | PRESENT_COUNT_VALID | PRESENT_REDIRECTED_BLT;
         LONG status = present(request);
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;
