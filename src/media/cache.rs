@@ -14,9 +14,10 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::model::MediaKind;
@@ -41,52 +42,85 @@ impl MediaCache {
     ///
     /// Builds go to a temporary name in the cache directory and are renamed
     /// into place, so a crashed build never leaves a half-written entry
-    /// under a valid cache name.
+    /// under a valid cache name. The image is flushed to disk before the
+    /// rename, for the same reason across a host crash.
+    ///
+    /// The folder is hashed again after the build, and an image built while
+    /// the folder changed is thrown away: an entry holds the content it is
+    /// named after.
     pub fn ensure(
         &self,
         kind: MediaKind,
         src_folder: &Path,
         label: Option<&str>,
     ) -> Result<PathBuf> {
-        let digest = folder_digest(src_folder)?;
-        let dest = self.cache_dir.join(entry_name(kind, label, &digest));
-        let sealed = matches!(kind, MediaKind::Floppy);
-        if dest.is_file() && (!sealed || seal_holds(&dest)) {
+        self.ensure_with(kind, src_folder, label, |src, out, label| match kind {
+            MediaKind::Iso => build_iso(src, out, label),
+            MediaKind::Floppy => build_floppy(src, out, label),
+        })
+    }
+
+    /// [`ensure`](Self::ensure) with the image tool as an argument: `build`
+    /// writes the image of a folder to a path.
+    fn ensure_with(
+        &self,
+        kind: MediaKind,
+        src_folder: &Path,
+        label: Option<&str>,
+        build: impl Fn(&Path, &Path, Option<&str>) -> Result<()>,
+    ) -> Result<PathBuf> {
+        let modes = matches!(kind, MediaKind::Iso);
+        let mut digest = folder_digest(src_folder, modes)?;
+        for _ in 0..BUILD_ATTEMPTS {
+            let dest = self.cache_dir.join(entry_name(kind, label, &digest));
+            let sealed = matches!(kind, MediaKind::Floppy);
+            if dest.is_file() && (!sealed || seal_holds(&dest)) {
+                return Ok(dest);
+            }
+
+            fs::create_dir_all(&self.cache_dir)
+                .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
+            // Starts of different VMs can build the same entry concurrently.
+            let tmp = tempfile::Builder::new()
+                .prefix(".tmp-")
+                .permissions(fs::Permissions::from_mode(0o666))
+                .tempfile_in(&self.cache_dir)
+                .with_context(|| {
+                    format!("creating a build file in {}", self.cache_dir.display())
+                })?;
+
+            // The tool reads the folder after the hash did. The image is
+            // installed only when the folder still has the content the entry
+            // is named after. Otherwise it is built again from what the
+            // folder holds now.
+            build(src_folder, tmp.path(), label)?;
+            let after = folder_digest(src_folder, modes)?;
+            if after != digest {
+                digest = after;
+                continue;
+            }
+            sync_file(tmp.path())?;
+
+            // The seal follows the image: a crash between the two leaves an
+            // entry that fails the check and is built again.
+            let seal = if sealed {
+                Some(image_digest(tmp.path())?)
+            } else {
+                None
+            };
+            tmp.persist(&dest)
+                .with_context(|| format!("installing media cache entry {}", dest.display()))?;
+            if let Some(seal) = seal {
+                write_seal(&dest, &seal)?;
+            }
+            sync_file(&self.cache_dir)?;
             return Ok(dest);
         }
-
-        fs::create_dir_all(&self.cache_dir)
-            .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
-        let tmp = self.cache_dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            dest.file_name()
-                .expect("cache entry names are never empty")
-                .to_string_lossy()
-        ));
-
-        let built = match kind {
-            MediaKind::Iso => build_iso(src_folder, &tmp, label),
-            MediaKind::Floppy => build_floppy(src_folder, &tmp, label),
-        };
-        if let Err(err) = built {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
-
-        // The seal follows the image: a crash between the two leaves an entry
-        // that fails the check and is built again.
-        let seal = if sealed {
-            Some(image_digest(&tmp)?)
-        } else {
-            None
-        };
-        fs::rename(&tmp, &dest)
-            .with_context(|| format!("installing media cache entry {}", dest.display()))?;
-        if let Some(seal) = seal {
-            write_seal(&dest, &seal)?;
-        }
-        Ok(dest)
+        bail!(
+            "media source {} changed during each of {BUILD_ATTEMPTS} builds of its image: \
+             no image was made",
+            src_folder.display()
+        )
     }
 
     /// Deletes cache entries whose paths are not in `keep`. Stale temporary
@@ -124,6 +158,19 @@ impl MediaCache {
     }
 }
 
+/// How many times one `ensure` builds a folder that changes under the build
+/// before it gives up.
+const BUILD_ATTEMPTS: usize = 3;
+
+/// Flushes the file or directory at `path` to disk. A name that a rename
+/// installed must not outlive a host crash with less than the whole file
+/// behind it.
+fn sync_file(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("flushing {}", path.display()))
+}
+
 /// What a seal's file name adds to its entry's.
 const SEAL_SUFFIX: &str = ".sha256";
 
@@ -157,6 +204,9 @@ fn write_seal(entry: &Path, digest: &str) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("writing {}", seal.display()))?;
     std::io::Write::write_all(&mut tmp, digest.as_bytes())
+        .with_context(|| format!("writing {}", seal.display()))?;
+    tmp.as_file()
+        .sync_all()
         .with_context(|| format!("writing {}", seal.display()))?;
     tmp.persist(&seal)
         .with_context(|| format!("writing {}", seal.display()))?;
@@ -278,6 +328,38 @@ mod tests {
         assert!(second.is_file());
     }
 
+    /// F5 (docs/reviews/appshare-media.md): chmod alone updates the mode
+    /// a guest sees through Rock Ridge.
+    #[test]
+    fn a_mode_change_rebuilds_an_iso() {
+        use std::process::Command;
+
+        let src = tempfile::tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let first = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+        let extracted = cache_root.path().join("run.sh");
+        let output = Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(&second)
+            .args(["-extract", "/run.sh"])
+            .arg(&extracted)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_ne!(
+            fs::metadata(extracted).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn kind_and_label_are_part_of_the_key() {
         let src = unattend_folder();
@@ -341,6 +423,65 @@ mod tests {
         assert!(
             last_sector(&second) == last_sector(&fresh),
             "the cache handed back the sector its reader wrote"
+        );
+    }
+
+    /// F7 (docs/reviews/appshare-media.md): the folder is hashed, and then
+    /// the image tool reads it again. A file that changes between the two
+    /// reads must not go into an entry named after the content from before
+    /// the change: a folder put back to that content would get the changed
+    /// file from the cache from then on.
+    ///
+    /// The image tool here is the real one behind an edit of one source
+    /// file, made once. An ISO stores a file as it is and pads its last
+    /// sector with zeros, so the image is searched for the file's bytes and
+    /// what follows them.
+    #[test]
+    fn an_edit_during_the_build_is_not_cached_under_the_old_digest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const RESTORED: &[u8] = b"answer-file-as-the-folder-holds-it";
+        let holds = |image: &Path, bytes: &[u8]| {
+            let image = fs::read(image).unwrap();
+            image.windows(bytes.len()).any(|w| w == bytes)
+        };
+
+        let src = tempfile::tempdir().unwrap();
+        let file = src.path().join("answer.txt");
+        fs::write(&file, RESTORED).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+
+        let edited = AtomicBool::new(false);
+        let build = |src: &Path, out: &Path, label: Option<&str>| {
+            if !edited.swap(true, Ordering::SeqCst) {
+                let mut bytes = fs::read(src.join("answer.txt")).unwrap();
+                bytes.push(b'!');
+                fs::write(src.join("answer.txt"), bytes).unwrap();
+            }
+            build_iso(src, out, label)
+        };
+        cache
+            .ensure_with(MediaKind::Iso, src.path(), None, build)
+            .expect("the build with an edit in it");
+        assert!(edited.load(Ordering::SeqCst), "the build never ran");
+
+        fs::write(&file, RESTORED).unwrap();
+        let image = cache
+            .ensure_with(MediaKind::Iso, src.path(), None, build)
+            .expect("the build of the restored folder");
+
+        let (mut restored, mut changed) = (RESTORED.to_vec(), RESTORED.to_vec());
+        restored.push(0);
+        changed.push(b'!');
+        assert!(
+            !holds(&image, &changed),
+            "the image of the restored folder holds the file as it was edited during an \
+             earlier build"
+        );
+        assert!(
+            holds(&image, &restored),
+            "the image does not hold the file as the folder has it"
         );
     }
 

@@ -84,14 +84,18 @@ pub fn load(
         let bytes = std::fs::read(initrd_path).map_err(|e| {
             VmmError::Kernel(format!("reading initrd {}: {e}", initrd_path.display()))
         })?;
-        let addr = (low_ram_top - bytes.len() as u64) & !0xFFF;
         let kernel_end = loaded.kernel_end;
-        if addr < kernel_end {
-            return Err(VmmError::Kernel(format!(
-                "initrd ({} bytes) does not fit below {low_ram_top:#x} after the kernel ends at {kernel_end:#x}",
-                bytes.len()
-            )));
-        }
+        // An initrd larger than low RAM has no address at all.
+        let addr = low_ram_top
+            .checked_sub(bytes.len() as u64)
+            .map(|addr| addr & !0xFFF)
+            .filter(|addr| *addr >= kernel_end)
+            .ok_or_else(|| {
+                VmmError::Kernel(format!(
+                    "initrd ({} bytes) does not fit below {low_ram_top:#x} after the kernel ends at {kernel_end:#x}",
+                    bytes.len()
+                ))
+            })?;
         mem.write_slice(&bytes, GuestAddress(addr))
             .map_err(|e| VmmError::Kernel(format!("writing initrd: {e}")))?;
         hdr.ramdisk_image = addr as u32;
@@ -399,6 +403,37 @@ mod tests {
         let mut buf = [0u8; 3];
         mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
         assert_eq!(buf, [7, 7, 7]);
+    }
+
+    #[test]
+    fn an_initrd_larger_than_low_ram_is_refused_by_name() {
+        // docs/reviews/firmware.md, F7.
+        let dir = temp_dir("initrd-large");
+        let kernel = write_kernel(dir.path(), &tiny_bzimage());
+        let initrd = dir.path().join("initrd");
+        let file = File::create(&initrd).unwrap();
+        file.set_len(129 * MIB).unwrap();
+        drop(file);
+        let mem = self::mem();
+        let err = load(&mem, &kernel, Some(&initrd), "", &[], None, 128 * MIB).unwrap_err();
+        assert!(matches!(err, VmmError::Kernel(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("does not fit"), "{msg}");
+        assert!(msg.contains(&format!("{} bytes", 129 * MIB)), "{msg}");
+    }
+
+    #[test]
+    fn an_initrd_that_would_overlap_the_kernel_is_refused_by_name() {
+        let dir = temp_dir("initrd-overlap");
+        let kernel = write_kernel(dir.path(), &tiny_bzimage());
+        let initrd = dir.path().join("initrd");
+        let file = File::create(&initrd).unwrap();
+        file.set_len(127 * MIB).unwrap();
+        drop(file);
+        let mem = self::mem();
+        let err = load(&mem, &kernel, Some(&initrd), "", &[], None, 128 * MIB).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not fit"), "{msg}");
     }
 
     #[test]

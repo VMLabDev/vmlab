@@ -14,6 +14,7 @@ pub mod rdp;
 pub mod waypipe;
 pub mod x11;
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -350,7 +351,12 @@ async fn attempt(client: &LabClient, req: &Request, mode: Mode, host: &HostEnv) 
             let (cookie, adopt) = x11_end()?;
             HostEnd::X11 { cookie, adopt }
         }
-        Mode::Rdp => HostEnd::Rdp(rdp::Server::bind()?),
+        Mode::Rdp => {
+            // Before the open: the agent turns Remote Desktop on and leaves
+            // it on, so what the command line alone decides is refused first.
+            rdp::check_request(host.freerdp.as_deref(), req)?;
+            HostEnd::Rdp(rdp::Server::bind()?)
+        }
     };
     let (argv, cwd) = match mode {
         // The RDP client names the program; the agent starts nothing.
@@ -484,7 +490,7 @@ async fn drive(
                             }
                         }
                         AppRecord::Exited { code } => return Ok(code),
-                        AppRecord::Failed { msg } => bail!(msg),
+                        AppRecord::Failed { msg } => bail!(printable(&msg).into_owned()),
                     }
                 }
             }
@@ -501,11 +507,27 @@ async fn drive(
     }
 }
 
-fn log_text(record: &AppRecord, verbose: bool) -> Option<&str> {
+/// The text of a `log` or `diagnostic` record as the terminal is shown it:
+/// the guest wrote it, so it goes through [`printable`].
+fn log_text(record: &AppRecord, verbose: bool) -> Option<Cow<'_, str>> {
     match record {
-        AppRecord::Log { text } => Some(text),
-        AppRecord::Diagnostic { text } if verbose => Some(text),
+        AppRecord::Log { text } => Some(printable(text)),
+        AppRecord::Diagnostic { text } if verbose => Some(printable(text)),
         _ => None,
+    }
+}
+
+/// One line of text the guest had a hand in, made safe to print among
+/// vmlab's own lines: every control character but tab becomes U+FFFD, so an
+/// escape sequence cannot move the cursor, set the title or rewrite a line
+/// vmlab printed before. That takes the C1 range too, which some terminals
+/// read as the same sequences.
+pub(crate) fn printable(text: &str) -> Cow<'_, str> {
+    let unsafe_char = |c: char| c.is_control() && c != '\t';
+    if text.contains(unsafe_char) {
+        Cow::Owned(text.replace(unsafe_char, "\u{fffd}"))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -570,12 +592,120 @@ mod tests {
             text: "waypipe diagnostic".into(),
         };
         for verbose in [false, true] {
-            assert_eq!(log_text(&program, verbose), Some("waypipe diagnostic"));
             assert_eq!(
-                log_text(&diagnostic, verbose),
+                log_text(&program, verbose).as_deref(),
+                Some("waypipe diagnostic")
+            );
+            assert_eq!(
+                log_text(&diagnostic, verbose).as_deref(),
                 verbose.then_some("waypipe diagnostic")
             );
         }
+    }
+
+    /// The guest writes a record's text, and vmlab prints it among its own
+    /// status lines: no escape sequence or carriage return reaches the
+    /// terminal (review F13).
+    #[test]
+    fn log_text_has_no_control_characters() {
+        let hostile = "a\u{1b}]0;x\u{7}b\rc\td\u{9b}2Je\u{7f}";
+        for record in [
+            AppRecord::Log {
+                text: hostile.into(),
+            },
+            AppRecord::Diagnostic {
+                text: hostile.into(),
+            },
+        ] {
+            let text = log_text(&record, true).unwrap();
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\t'),
+                "{text:?}"
+            );
+            assert_eq!(
+                text,
+                "a\u{fffd}]0;x\u{fffd}b\u{fffd}c\td\u{fffd}2Je\u{fffd}"
+            );
+        }
+    }
+
+    /// A `failed` record's message becomes the CLI's error line, and may
+    /// quote the guest: it is cleaned the same way (review F13).
+    #[tokio::test]
+    async fn a_failed_message_has_no_control_characters() {
+        let (_dir, control, conns) = fake_daemon(vec![AppRecord::Failed {
+            msg: "gone\u{1b}[2K\rok".into(),
+        }])
+        .await;
+        let mut end = HostEnd::X11 {
+            cookie: String::new(),
+            adopt: Arc::new(|_| Box::pin(async { Ok(()) })),
+        };
+        let err = drive("web", &control, &conns, &mut end, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "gone\u{fffd}[2K\u{fffd}ok");
+    }
+
+    /// A lab daemon that counts the requests it is sent and refuses each.
+    struct CountingLab(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::proto::server::Handler<LabRequest> for CountingLab {
+        async fn handle(
+            &self,
+            _req: LabRequest,
+            _stream: &crate::proto::server::Streamer,
+        ) -> Result<serde_json::Value, CommandError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CommandError::failed("the fake lab opens nothing"))
+        }
+    }
+
+    /// FreeRDP's `/app` rules decide from the command line alone whether an
+    /// argv can be carried. `machine.app_open` turns Remote Desktop on in the
+    /// guest and leaves it on, so the refusal comes before it (review F11).
+    #[tokio::test]
+    async fn an_argv_freerdp_cannot_carry_is_refused_before_the_open() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("lab.sock");
+        let sent = Arc::new(AtomicUsize::new(0));
+        let _server =
+            crate::proto::server::Server::bind(&sock, Arc::new(CountingLab(sent.clone())))
+                .await
+                .unwrap();
+        let client = LabClient::connect(&sock).await.unwrap();
+        let req = Request {
+            machine: "win".into(),
+            argv: vec!["notepad".into(), "it's.txt".into()],
+            cwd: None,
+            user: None,
+            password: None,
+            verbose: false,
+            clipboard: false,
+        };
+        let host = host(true, true, false, true);
+
+        let refusal = match attempt(&client, &req, Mode::Rdp, &host).await {
+            Err(e) => e.to_string(),
+            Ok(Attempt::Refused(e)) => panic!("the daemon was asked and refused: {}", e.message),
+            Ok(Attempt::Ran(code)) => panic!("the session ran and exited {code}"),
+        };
+        assert!(refusal.contains("FreeRDP's `/app` option"), "{refusal}");
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "requests sent to the lab");
+
+        // An argv FreeRDP can carry does reach the daemon.
+        let req = Request {
+            argv: vec!["notepad".into()],
+            ..req
+        };
+        assert!(matches!(
+            attempt(&client, &req, Mode::Rdp, &host).await,
+            Ok(Attempt::Refused(_))
+        ));
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
     }
 
     fn host(wayland: bool, x11: bool, waypipe: bool, freerdp: bool) -> HostEnv {
