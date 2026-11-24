@@ -2732,16 +2732,22 @@ impl super::machine::Machine for VmInstance {
             .iter()
             .position(|a| a.qdev_id == qdev_id)
             .ok_or_else(|| anyhow!("\"{}\" holds no USB device {qdev_id}", self.cfg.name))?;
-        let gone = attached.remove(i);
-        // Removed from the tracking first: a QEMU that has already dropped
-        // the device, or exited, must not leave a phantom behind.
-        let hotplug = self.capability(|c| c.hotplug()).await?;
-        match hotplug.detach(qdev_id, USB_DETACH_WAIT).await {
-            Ok(()) => Ok(gone),
+        // The tracking follows the hypervisor. Both adapters answer a device
+        // the hypervisor no longer knows as success, so only a detach that
+        // may have left the device held comes back as an error, and then the
+        // attachment stays: the device is not free, and the next detach can
+        // name it. A machine that has exited loses its tracking in teardown.
+        let hotplug = self.capability(|c| c.hotplug()).await;
+        let outcome = match hotplug {
+            Ok(hotplug) => hotplug.detach(qdev_id, USB_DETACH_WAIT).await,
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => Ok(attached.remove(i)),
             Err(e) => Err(e).with_context(|| {
                 format!(
                     "detaching {} from {}",
-                    gone.device.describe(),
+                    attached[i].device.describe(),
                     self.cfg.name
                 )
             }),
