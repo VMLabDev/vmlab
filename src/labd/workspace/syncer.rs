@@ -3688,6 +3688,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rule_file_the_guest_wrote_is_applied_before_its_siblings_are_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let ws = workspace(dir.path(), state.path());
+        let guest = Arc::new(FakeGuest::new());
+        guest.file("/src/.gitignore", "target/\n", 60);
+        guest.dir("/src/target");
+        guest.file("/src/target/out.bin", "build output", 61);
+        guest.file("/src/main.rs", "source", 62);
+        let sessions = OneFake::new(guest);
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        isolated_pass(ws.clone(), sessions.clone(), events.clone()).await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "target/\n"
+        );
+        assert!(!dir.path().join("target").exists());
+        isolated_pass(ws, sessions, events).await;
+        assert!(!dir.path().join("target").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "source"
+        );
+    }
+
+    #[tokio::test]
     async fn rescan_rehash_keeps_discovered_conflicts_on_the_next_named_pass() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();

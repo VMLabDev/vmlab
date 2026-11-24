@@ -1143,6 +1143,103 @@ mod tests {
     use super::{daemon_running, process_running, process_start_time};
 
     #[test]
+    fn a_release_reaps_a_lab_that_has_no_entry() {
+        run_orphan_fixture("release");
+    }
+
+    #[test]
+    fn a_failed_lab_is_reaped_before_its_successor_starts() {
+        run_orphan_fixture("restart");
+    }
+
+    const ORPHAN_FIXTURE: &str = "VMLAB_TEST_ORPHAN_FIXTURE";
+
+    fn run_orphan_fixture(operation: &str) {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervisor::tests::orphan_fixture", "--ignored", "--nocapture"])
+            .env(ORPHAN_FIXTURE, operation)
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess fixture with isolated registry and sockets"]
+    async fn orphan_fixture() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let Ok(operation) = std::env::var(ORPHAN_FIXTURE) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let name = format!("f10-{}", root.path().file_name().unwrap().to_str().unwrap());
+        let qmp = crate::paths::lab_runtime_dir(&name).join("a/qmp.sock");
+        let mut orphan = tokio::process::Command::new("bash")
+            .args([
+                "-c",
+                "exec -a qemu-system-x86_64 bash -c 'printf R; read -r line' -- \"$@\"",
+                "--",
+                "-name",
+                &format!("vmlab:{name}/a"),
+                "-machine",
+                "virt",
+                "-qmp",
+                &format!("unix:{}", qmp.display()),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert_eq!(orphan.stdout.take().unwrap().read_u8().await.unwrap(), b'R');
+
+        let host = crate::config::host::HostConfig::default();
+        let (events, _) = tokio::sync::broadcast::channel(64);
+        let supervisor = Arc::new(super::Supervisor {
+            registry: tokio::sync::Mutex::new(super::registry::Registry::default()),
+            events: events.clone(),
+            globals: super::GlobalSegments::new(&host, events),
+            ensure_locks: tokio::sync::Mutex::default(),
+            template_ops: super::templates::TemplateOps::default(),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            keepers: super::keepawake::Keepers::default(),
+        });
+        if operation == "restart" {
+            supervisor
+                .registry
+                .lock()
+                .await
+                .upsert(super::registry::LabEntry {
+                    name: name.clone(),
+                    root: root.path().canonicalize().unwrap(),
+                    pid: 0,
+                    started: None,
+                    state: super::registry::LabState::Failed,
+                })
+                .unwrap();
+            // The test binary cannot run a lab daemon. Its exit still proves
+            // ensure got as far as spawning the replacement.
+            let _ = supervisor.ensure_lab(&name, root.path().into()).await;
+            let reg = supervisor.registry.lock().await;
+            assert!(reg.get(&name).is_none_or(|entry| entry.pid != 0));
+        } else {
+            supervisor.release_lab(&name).await.unwrap();
+        }
+        // wait closes stdin, letting the helper exit normally if it survived.
+        assert_eq!(orphan.wait().await.unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
     fn a_leftover_pull_work_dir_is_swept() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("templates");
