@@ -1445,7 +1445,10 @@ fn a_td_one_whole_poll_cannot_walk_is_refused() {
     let event = d.event(32);
     assert_eq!(event.parameter, ring);
     assert_eq!(event.status >> 24, 5, "TRB Error");
-    let state = d.mem.read_obj::<u32>(GuestAddress(0x5000 + 2 * 32)).unwrap();
+    let state = d
+        .mem
+        .read_obj::<u32>(GuestAddress(0x5000 + 2 * 32))
+        .unwrap();
     assert_eq!(u32::from_le(state) & 7, 2, "the endpoint is halted");
     assert_eq!(d.read(0x44) & 0x1001, 0, "the controller still runs");
 }

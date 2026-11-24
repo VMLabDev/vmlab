@@ -79,15 +79,10 @@ impl Ring {
     pub fn value(self) -> u64 {
         self.pointer | u64::from(self.cycle)
     }
-    /// Link-only loops are bounded, as are callers' command/TD walks.
-    pub fn pop(&mut self, mem: &GuestMemory) -> Result<Option<(u64, Trb)>, DeviceError> {
-        match self.pop_within(mem, &mut usize::MAX)? {
-            Pop::Trb(addr, trb) => Ok(Some((addr, trb))),
-            Pop::Empty | Pop::Spent => Ok(None),
-        }
-    }
-    /// `pop`, charging each TRB it reads, Link TRBs included, to `reads`.
-    /// With none left it reads nothing more and answers `Pop::Spent`.
+    /// Take the next TRB the guest has queued, following Link TRBs. Each TRB
+    /// read, Link TRBs included, is charged to `reads`: with none left this
+    /// reads nothing more and answers `Pop::Spent`. Link-only loops are
+    /// bounded, as are callers' command/TD walks.
     pub fn pop_within(&mut self, mem: &GuestMemory, reads: &mut usize) -> Result<Pop, DeviceError> {
         for _ in 0..256 {
             if *reads == 0 {
