@@ -949,16 +949,14 @@ fn withhold_bulk_delete(
     let unanswered = |action: &Action| {
         onto_host(action) && inputs.resolved.get(action.path()) != Some(&Winner::Guest)
     };
-    // BEFORE-FIX PROBE (card 952): the count and the hold are switched off, so
-    // this commit behaves as `next` does and the proof tests must fail on it.
-    let carried = 0 * inputs.deleting.carried;
+    let carried = inputs.deleting.carried;
     let mass = removals.iter().filter(|action| onto_host(action)).count() + carried;
     let agreed = inputs.ledger.entries.len() + carried;
     let withhold = BulkDelete::triggered(mass, agreed);
     // Under the proportion but past the floor: carried out only once the
     // guest has stopped adding to it.
     let hold = !withhold
-        && mass > usize::MAX - 1
+        && mass > BULK_DELETE_FLOOR
         && inputs.deleting.ripe.is_some_and(|ripe| {
             removals
                 .iter()
@@ -2473,7 +2471,15 @@ mod tests {
                 guest.remove(path);
             }
             // No hold: only the count is on trial here.
-            let plan = run_deleting(&host, &guest, &l, Deleting { carried, ripe: None });
+            let plan = run_deleting(
+                &host,
+                &guest,
+                &l,
+                Deleting {
+                    carried,
+                    ripe: None,
+                },
+            );
             if let Some(bulk) = plan.bulk_delete.clone() {
                 assert!(plan.actions.is_empty(), "{:?}", plan.actions);
                 caught = Some(bulk);
