@@ -357,6 +357,24 @@ for a guest that is not x86.
 - Severity: crash of the helper. Security against a hostile guest user only
   if the test of the pipe's access list shows that a standard user can reach
   either end.
+- Fixed: card #757,
+  `guest/win3d/patches/kmd/kmd-read-helper-pipe-message-inside-buffer.patch`
+  (driver `100.6.101.58120`). Both helpers read a message through one
+  function that counts in bytes, keeps the buffer a terminated string and
+  drops a message that does not fit, and `DATA_BUFFER_SIZE` has its
+  parentheses. The proof is `guest/win3d/probes/pipe`, the two classes linked
+  with `pipe.cpp` before and after the patch and run as a standard user in a
+  Windows 11 guest (`guest/win3d/docs/acceptance/C757.md`): before, 7 of 7
+  cases fail, a message of 3000 bytes writes 952 bytes past the buffer of
+  `PipeServer`, and the thread the service runs dies with a heap corruption.
+  After, 7 of 7 pass. Three corrections to the text above, from those runs.
+  AddressSanitizer is not what shows the overflow: the kernel writes the
+  bytes, so the probe counts them in a guard region behind the buffer. The
+  overflow of `viogpuap.exe` needs a handle in message read mode, and
+  `viogpuap.exe` leaves its handle in byte read mode. What it had is a
+  string without an end. And the access question is answered: a standard
+  user is denied when it opens the pipe of the service for writing, and is
+  let in for reading.
 
 ### F10. A failed allocation in CreateAllocation is dereferenced
 
@@ -372,6 +390,23 @@ for a guest that is not x86.
   calls `D3DKMTCreateAllocation` with `NumAllocations = 2`, and the test
   passes when the call fails or both allocations work.
 - Severity: crash.
+- Fixed: card #757,
+  `guest/win3d/patches/kmd/kmd-check-create-allocation-memory.patch` (driver
+  `100.6.101.58120`). `DxgkCreateAllocation` returns
+  `STATUS_INSUFFICIENT_RESOURCES` for a NULL result, the pool `operator new`
+  of the driver is `noexcept`, and a `NumAllocations` other than 1 is
+  `STATUS_INVALID_PARAMETER`. The proof is `guest/win3d/probes/alloc` under
+  Driver Verifier's low resources simulation, as a standard user
+  (`guest/win3d/docs/acceptance/C757.md`): the old driver bugchecks the
+  guest with `0x3B` at the first failed pool allocation, after 602 calls
+  that succeeded. With the fix 200 calls fail, all with
+  `STATUS_INSUFFICIENT_RESOURCES`, and the guest stays up. Two corrections
+  to the text above, from those runs. The fault is not at the call of
+  `IsValid()`: clang runs the constructor on the NULL pointer first, at this
+  and at every other `new` of an object in the driver, so a NULL check alone
+  is no fix. And the second half is no crash: a call with
+  `NumAllocations = 2` fails with `STATUS_INVALID_PARAMETER` on the old
+  driver too.
 
 ## Notes
 
