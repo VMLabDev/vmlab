@@ -220,17 +220,17 @@ index 7607584..52af271 100644
  
      NTSTATUS AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength);
 diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
-index 831529b..d42d0bf 100644
+index 831529b..76a361c 100644
 --- a/viogpu/viogpu3d/viogpu_device.cpp
 +++ b/viogpu/viogpu3d/viogpu_device.cpp
-@@ -7,6 +7,7 @@
+@@ -4,6 +4,7 @@
+  * 
+  */
+ 
++#include "viogpu_blt_map.h"
  #include "viogpu_device.h"
  #include "viogpu_adapter.h"
  #include "viogpu_format.h"
-+#include "viogpu_blt_map.h"
- #include "baseobj.h"
- #include "virgl_hw.h"
- 
 @@ -426,27 +427,34 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
                  delete cmd;
                  return stageStatus;
