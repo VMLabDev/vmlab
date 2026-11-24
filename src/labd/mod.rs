@@ -473,14 +473,40 @@ async fn pump_session(
     m: &dyn crate::labd::machine::Machine,
     stream: &Streamer,
 ) -> Result<Value, CommandError> {
-    loop {
+    let mut pending = Vec::new();
+    let result = loop {
         tokio::select! {
             ev = session.recv() => match ev {
                 Some(vm_agent::SessionEvent::Data(b)) => {
-                    stream.chunk(String::from_utf8_lossy(&b).into_owned()).await;
+                    let bytes = if pending.is_empty() {
+                        b
+                    } else {
+                        pending.extend_from_slice(&b);
+                        std::mem::take(&mut pending)
+                    };
+                    let mut text = String::with_capacity(bytes.len());
+                    let mut chunks = bytes.utf8_chunks().peekable();
+                    while let Some(chunk) = chunks.next() {
+                        text.push_str(chunk.valid());
+                        let invalid = chunk.invalid();
+                        if invalid.is_empty() {
+                            continue;
+                        }
+                        // Only an incomplete sequence at the end can continue in the next frame.
+                        if chunks.peek().is_none()
+                            && std::str::from_utf8(invalid).is_err_and(|e| e.error_len().is_none())
+                        {
+                            pending.extend_from_slice(invalid);
+                        } else {
+                            text.push('\u{fffd}');
+                        }
+                    }
+                    if !text.is_empty() {
+                        stream.chunk(text).await;
+                    }
                 }
-                Some(vm_agent::SessionEvent::Error(msg)) => return Err(CommandError::failed(msg)),
-                None => break,
+                Some(vm_agent::SessionEvent::Error(msg)) => break Err(CommandError::failed(msg)),
+                None => break Ok(()),
                 Some(_) => {}
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -489,11 +515,15 @@ async fn pump_session(
                     m.state().await,
                     vm::PowerState::Running | vm::PowerState::Suspended
                 ) {
-                    break;
+                    break Ok(());
                 }
             }
         }
+    };
+    if !pending.is_empty() {
+        stream.chunk("\u{fffd}").await;
     }
+    result?;
     session.close().await;
     Ok(json!(true))
 }

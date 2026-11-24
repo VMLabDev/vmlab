@@ -718,6 +718,35 @@ login "stock" { user = "dev" password = "never-in-status" default = true }
     assert!(status["logins"][0].get("password").is_none());
 }
 
+#[tokio::test]
+async fn a_character_split_across_two_frames_survives() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    let session = vm
+        .agent()
+        .await
+        .unwrap()
+        .open_tail("/var/log/test.log".into(), None)
+        .await
+        .unwrap();
+    let (stream, mut chunks) = crate::proto::server::Streamer::test_channel();
+    super::pump_session(session, vm.as_ref(), &stream)
+        .await
+        .unwrap();
+    drop(stream);
+
+    let mut text = String::new();
+    while let Some(message) = chunks.recv().await {
+        let crate::proto::Message::Stream { chunk, .. } = message else {
+            panic!("expected a stream chunk");
+        };
+        text.push_str(&chunk);
+    }
+    assert_eq!(text, "é");
+}
+
 /// A VM reports the hardware it resolved to (VM > template > profile), not
 /// what it declared: one that leaves its arch or size to its template must
 /// not show a dash for each.
@@ -2534,6 +2563,51 @@ fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
     crate::config::host::HostConfig {
         firmware_dir: Some(dirs.root.join("firmware")),
         ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_store_of_another_layout_is_refused_by_name() {
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let arch = dirs.root.join("firmware/x86_64");
+    std::fs::File::create(arch.join("OVMF_CODE_4M.fd"))
+        .unwrap()
+        .set_len(0x1e0000)
+        .unwrap();
+    let template = arch.join("OVMF_VARS_4M.fd");
+    let legacy_vars = vec![0; 131_072];
+    std::fs::write(&template, &legacy_vars).unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let (mut vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#,
+        on_vmlab_hv(Script::healthy()),
+    );
+    vm.set_host_config(firmware);
+    let store = vm.dirs.ovmf_vars();
+    let boot_record = vm.dirs.ovmf_vars_boot();
+    let machine: Arc<dyn Machine> = vm;
+
+    for (path, existing) in [(&store, true), (&template, false)] {
+        if existing {
+            std::fs::write(&store, &legacy_vars).unwrap();
+        }
+        let error = machine.clone().start(lab.clone(), None).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("dc01"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        assert!(message.contains("0x37c000-byte CODE"), "{message}");
+        assert!(message.contains("0x84000-byte VARS"), "{message}");
+        assert_eq!(hv.starts(), 0);
+        assert!(!boot_record.exists());
+        if existing {
+            assert_eq!(std::fs::read(&store).unwrap(), legacy_vars);
+            std::fs::remove_file(&store).unwrap();
+        }
+        assert!(!store.exists());
     }
 }
 

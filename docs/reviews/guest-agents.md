@@ -462,6 +462,9 @@ Not read:
   `sessions_test.rs` (Linux). Create a file named `b"a\xffb"`, list the
   directory, then `stat` the name from the listing. Assert that the listing
   reports an error for that entry, or that the `stat` succeeds.
+- Fixed in card #811. `ReadDir` reports an error when an entry name cannot
+  be represented as UTF-8. The directory handle keeps returning that error
+  on retry. `Readlink` reports an error for targets with the same limitation.
 
 ### F13. `realpath` in a container answers a path of the micro-VM, not of the container
 
@@ -501,6 +504,9 @@ Not read:
 - Test: `a_character_split_across_two_frames_survives`. A mock agent sends
   the two bytes of `é` in two `Data` frames on a tail channel. Assert that
   the streamed chunks join to `é`.
+- Fixed in card #812. The shared tail and event-log pump carries an incomplete
+  UTF-8 sequence into the next frame. It still replaces malformed bytes and an
+  incomplete sequence left at the end of the stream.
 
 ### F15. Any record on a file channel renews the watchdog, also one that answers nothing
 
