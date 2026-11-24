@@ -61,6 +61,28 @@ impl<M: Memory> Interpreter<'_, M> {
                 match step {
                     Ok(value) => returned = Some(value),
                     Err(mut error) => {
+                        // The host memory refused an access below a checked
+                        // access of the model: that function returns the
+                        // guest's access fault, and its caller goes on.
+                        let checked = if error.host_memory_fault().is_none() {
+                            None
+                        } else if crate::is_checked_access(&frame.function.name) {
+                            Some(frames.len())
+                        } else {
+                            frames.iter().rposition(|caller| {
+                                crate::is_checked_access(&caller.function.name)
+                            })
+                        };
+                        if let Some(index) = checked {
+                            let name = match frames.get(index) {
+                                Some(caller) => caller.function.name.clone(),
+                                None => frame.function.name.clone(),
+                            };
+                            frames.truncate(index);
+                            self.depth = base_depth + frames.len() as u32;
+                            returned = Some(self.guest_access_fault(&name, error)?);
+                            continue;
+                        }
                         for caller in frames.iter().rev() {
                             error = Error::At {
                                 function: caller.function.name.clone(),

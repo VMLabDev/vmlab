@@ -108,6 +108,8 @@ const HANDLER: u64 = 0x8000_0800;
 const LD_X10_X8: u32 = 0x0004_3503;
 const SD_X10_X8: u32 = 0x00a4_3023;
 const JALR_X8: u32 = 0x0004_0067;
+const LR_D_X10_X8: u32 = 0x1004_352f;
+const AMOADD_D_X10_X8: u32 = 0x00a4_352f;
 
 /// A hart on 4 KiB of RAM at 0x8000_0000 that holds `code`, with `mtvec` at
 /// 0x8000_0800 and `x8` set.
@@ -153,6 +155,19 @@ fn an_access_past_host_ram_raises_a_guest_fault() {
                 assert_eq!(cpu.read_csr(MCAUSE).unwrap(), cause, "{case}");
                 assert_eq!(cpu.read_csr(MEPC).unwrap(), RAM, "{case}");
                 assert_eq!(cpu.steps, 1, "{case}");
+            }
+        }
+
+        // The exclusive and the atomic accesses take the same way out.
+        for (instruction, cause) in [(LR_D_X10_X8, 5), (AMOADD_D_X10_X8, 7)] {
+            for address in [0x8000_1000, 0x8010_0000u64] {
+                let case = format!("{instruction:#010x} at {address:#x}, specialize {specialize}");
+                let mut cpu = on_small_ram(&[instruction], address, specialize);
+                cpu.step()
+                    .unwrap_or_else(|error| panic!("{case}: step failed: {error}"));
+                assert_eq!(cpu.pc().unwrap(), HANDLER, "{case}");
+                assert_eq!(cpu.read_csr(MCAUSE).unwrap(), cause, "{case}");
+                assert_eq!(cpu.read_csr(MEPC).unwrap(), RAM, "{case}");
             }
         }
 
