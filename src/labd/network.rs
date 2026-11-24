@@ -807,7 +807,9 @@ fn spawn_lease_dns_sync(
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(leases) = leases_handle() else { break };
-            let Ok(machines) = mac_to_vm.read() else { continue };
+            let Ok(machines) = mac_to_vm.read() else {
+                continue;
+            };
             let Ok(mut zone) = zone.lock() else { continue };
             zone.set_lease_records(
                 &lab,
@@ -926,7 +928,11 @@ lab "l" {
         assert!(gateway.dhcp_leases().is_empty());
         tokio::time::sleep(Duration::from_secs(4)).await;
         for name in &names {
-            assert_ne!(zone.lock().unwrap().lookup(name), DnsAnswer::A(ip), "{name}");
+            assert_ne!(
+                zone.lock().unwrap().lookup(name),
+                DnsAnswer::A(ip),
+                "{name}"
+            );
         }
     }
 
