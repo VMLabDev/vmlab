@@ -3172,8 +3172,7 @@ mod tests {
     fn unlink_then_create_at_old_name_keeps_the_open_inode() {
         let (dir, fs) = scratch();
         let held = lookup(&fs, b"hello.txt").unwrap().inode;
-        let (handle, _, _) =
-            FileSystem::open(&fs, &ctx(), held, libc::O_RDONLY as u32, 0).unwrap();
+        let (handle, _, _) = FileSystem::open(&fs, &ctx(), held, libc::O_RDONLY as u32, 0).unwrap();
         FileSystem::unlink(&fs, &ctx(), ROOT_ID, &name(b"hello.txt")).unwrap();
 
         let (created, _, _, _) =
