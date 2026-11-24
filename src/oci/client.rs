@@ -1496,9 +1496,10 @@ pub async fn ensure_registry_template(
     }
     // Its own staging directory, on the store's filesystem: two labs pulling
     // at once must not share (and then delete) one.
-    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(
-        &store.root().join(crate::template::oci_bridge::PULL_WORK_SUBDIR),
-    )?);
+    let pull_work = store
+        .root()
+        .join(crate::template::oci_bridge::PULL_WORK_SUBDIR);
+    let work = std::sync::Arc::new(crate::template::oci_bridge::fresh_work_dir(&pull_work)?);
     let meta = registry
         .guarding(in_use)
         .holding(work.clone())

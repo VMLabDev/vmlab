@@ -252,8 +252,12 @@ fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path) {
     ] {
         match sweep(root, prefix) {
             Ok(0) => {}
-            Ok(count) => tracing::info!(path = %root.display(), count, "cleared abandoned staging directories"),
-            Err(err) => tracing::warn!(path = %root.display(), %err, "could not sweep staging directories"),
+            Ok(count) => {
+                tracing::info!(path = %root.display(), count, "cleared abandoned staging directories")
+            }
+            Err(err) => {
+                tracing::warn!(path = %root.display(), %err, "could not sweep staging directories")
+            }
         }
     }
 }
@@ -1158,14 +1162,15 @@ mod tests {
             .staging_dir()
             .unwrap();
         let installed = store.join("x86_64/base/1.0");
+        let chunk = "chunks/base/chunk-0000.zst";
         for file in [
             staging.join("disk.qcow2"),
-            abandoned_pull.join("chunks/base/chunk-0000.zst"),
-            abandoned_push.join("chunks/base/chunk-0000.zst"),
+            abandoned_pull.join(chunk),
+            abandoned_push.join(chunk),
             abandoned_image.join("layer-0000"),
             live_store.path().join("disk.qcow2"),
-            live_pull.path().join("chunks/base/chunk-0000.zst"),
-            live_push.path().join("chunks/base/chunk-0000.zst"),
+            live_pull.path().join(chunk),
+            live_push.path().join(chunk),
             live_image.path().join("layer-0000"),
             installed.join("disk.qcow2"),
         ] {
@@ -1178,10 +1183,13 @@ mod tests {
         assert!(!staging.exists(), "abandoned template staging survived");
         assert!(!abandoned_pull.exists(), "abandoned pull survived");
         assert!(!abandoned_push.exists(), "abandoned push survived");
-        assert!(!abandoned_image.exists(), "abandoned image staging survived");
+        assert!(
+            !abandoned_image.exists(),
+            "abandoned image staging survived"
+        );
         assert!(live_store.path().join("disk.qcow2").is_file());
-        assert!(live_pull.path().join("chunks/base/chunk-0000.zst").is_file());
-        assert!(live_push.path().join("chunks/base/chunk-0000.zst").is_file());
+        assert!(live_pull.path().join(chunk).is_file());
+        assert!(live_push.path().join(chunk).is_file());
         assert!(live_image.path().join("layer-0000").is_file());
         assert!(installed.join("disk.qcow2").is_file());
     }
