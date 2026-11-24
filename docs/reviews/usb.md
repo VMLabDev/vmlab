@@ -319,6 +319,11 @@ hostile guest or peer, wrong result, cosmetic.
 - How bad: security against a hostile guest, of low weight: it needs a device
   that ignores the recipient bits, and the damage is the loss of that device
   for the host until a replug.
+- Status: fixed by card #785. `intercept_control` now answers SET_ADDRESS,
+  SET_CONFIGURATION and SET_INTERFACE with a stall when the recipient or the
+  direction is not the expected one, so no standard request with one of these
+  three `bRequest` values is sent to the device. The proof test is in
+  `usb/host/mod.rs` under the name given above.
 
 ### F8. Stopping the control endpoint does not cancel its transfer
 
@@ -402,6 +407,19 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F11. One poll does unbounded work for the guest
 
+- Status: fixed by card #787. One xHCI `poll` reads at most `POLL_READS`
+  (1024) TRBs of the command ring and as many of all the transfer rings
+  together, Link TRBs included, and what is left waits for the next poll. A
+  poll that runs out starts the next one behind the endpoint that took the
+  reads, so a ring that never runs dry does not starve the others, and a TD
+  that a whole poll's reads cannot walk ends as a TRB Error. One UHCI
+  `advance` visits at most `ADVANCE_ELEMENTS` (4096) queue heads and TDs
+  over all its frames, and a frame that finds none left runs no schedule.
+  The data buffers of a TD are outside both limits. Tests:
+  `one_poll_handles_a_bounded_number_of_tds`,
+  `a_looping_endpoint_does_not_starve_the_others` and
+  `a_td_one_whole_poll_cannot_walk_is_refused` in `usb/tests.rs`,
+  `one_advance_handles_a_bounded_number_of_elements` in `usb/uhci/tests.rs`.
 - Where: `usb/xhci.rs:569-595` (`poll`) and `847-893` (`transfers`);
   `usb/uhci.rs:330-409` (`advance`, `walk`, `queue`).
 - Why it is a fault: `usb/xhci.rs:567-568` says "No guest-controlled
@@ -447,6 +465,10 @@ hostile guest or peer, wrong result, cosmetic.
   device built from it panics.
 - How bad: crash of the VM, reachable only when the kernel hands out
   descriptors that disagree with themselves.
+- Status: fixed by card #786. `parse_usbfs_descriptors` now returns an error
+  when a configuration's `wTotalLength` reaches past the end of the data, so
+  no device is built from such descriptors and the slice in
+  `config_descriptor_filtered` stays inside them.
 
 ### F13. Alternate settings of an old configuration are applied to the new one
 

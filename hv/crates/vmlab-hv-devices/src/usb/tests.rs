@@ -1345,3 +1345,110 @@ fn every_endpoint_teardown_reaches_the_backend() {
         );
     }
 }
+
+/// Bulk endpoints on every DCI from 2 to 31 of the tablet's slot, each with
+/// its transfer ring at `hostile_ring(dci)`.
+fn configure_thirty_endpoints(d: &mut Driver) {
+    d.enumerate();
+    d.control([0, 9, 1, 0, 0, 0, 0, 0], 0);
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 0xffff_fffd);
+    d.mem32(0x6020, (3 << 20) | (31 << 27));
+    for dci in 2..32u64 {
+        let context = 0x6000 + (dci + 1) * 32;
+        let kind = if dci % 2 == 0 { 2 } else { 6 };
+        d.mem32(context + 4, (kind << 3) | (512 << 16));
+        d.mem64(context + 8, hostile_ring(dci) | 1);
+    }
+    assert_eq!(d.command(12, 0x6000, d.slot << 24).status >> 24, 1);
+}
+
+fn hostile_ring(dci: u64) -> u64 {
+    0x20000 + dci * 0x1000
+}
+
+/// A ring that never runs dry and never reports: one No Op TRB without IOC,
+/// then a Link TRB back to it without the toggle bit.
+fn endless_ring(d: &Driver, ring: u64) {
+    d.trb(ring, 0, 0, 8 << 10);
+    d.trb(ring + 16, ring, 0, 6 << 10);
+}
+
+/// F11 of docs/reviews/usb.md. Thirty endpoints whose rings never run dry
+/// and never raise an event: the per-endpoint limits let one poll walk 256
+/// TDs on each. One poll reads a fixed amount of guest memory for the whole
+/// controller, whatever the guest queued.
+#[test]
+fn one_poll_handles_a_bounded_number_of_tds() {
+    let mut d = Driver::new();
+    configure_thirty_endpoints(&mut d);
+    for dci in 2..32 {
+        endless_ring(&d, hostile_ring(dci));
+    }
+    for dci in 2..32 {
+        d.write(0x2000 + u64::from(d.slot) * 4, dci as u32);
+    }
+    super::dma_probe::take();
+    d.hc.poll();
+    let reads = super::dma_probe::take();
+    assert!(
+        reads <= 2048,
+        "one poll read guest memory {reads} times for 30 endless rings"
+    );
+    assert_eq!(d.read(0x44) & 0x1001, 0, "the controller still runs");
+}
+
+/// The other half of F11's limit: an endpoint whose ring never runs dry
+/// takes a whole poll's reads, so the poll after it starts behind it. Every
+/// endpoint but the last loops; the last has one TD, and it completes.
+#[test]
+fn a_looping_endpoint_does_not_starve_the_others() {
+    let mut d = Driver::new();
+    configure_thirty_endpoints(&mut d);
+    for dci in 2..31 {
+        endless_ring(&d, hostile_ring(dci));
+    }
+    // One No Op TRB with IOC on the last endpoint, and nothing behind it.
+    d.trb(hostile_ring(31), 0, 0, (8 << 10) | 32);
+    for dci in 2..32 {
+        d.write(0x2000 + u64::from(d.slot) * 4, dci as u32);
+    }
+    let served = |d: &Driver| Trb::read(&d.mem, d.event).unwrap().control & 1 != 0;
+    let mut polls = 0;
+    while !served(&d) {
+        polls += 1;
+        assert!(polls <= 64, "the last endpoint was never served");
+        d.hc.poll();
+    }
+    let event = d.event(32);
+    assert_eq!(event.parameter, hostile_ring(31));
+    assert_eq!(event.status >> 24, 1);
+}
+
+/// A TD that a whole poll's reads cannot walk gets no further by waiting:
+/// it ends as a TRB Error and halts its endpoint, as a TD of too many TRBs
+/// does. Here 200 chained TRBs sit five Link TRBs apart.
+#[test]
+fn a_td_one_whole_poll_cannot_walk_is_refused() {
+    let mut d = Driver::new();
+    configure_thirty_endpoints(&mut d);
+    let ring = hostile_ring(2);
+    for n in 0..200u64 {
+        let at = ring + n * 96;
+        d.trb(at, 0xa000, 8, (1 << 10) | 16);
+        for link in 1..6 {
+            d.trb(at + link * 16, at + (link + 1) * 16, 0, 6 << 10);
+        }
+    }
+    d.write(0x2000 + u64::from(d.slot) * 4, 2);
+    d.hc.poll();
+    let event = d.event(32);
+    assert_eq!(event.parameter, ring);
+    assert_eq!(event.status >> 24, 5, "TRB Error");
+    let state = d
+        .mem
+        .read_obj::<u32>(GuestAddress(0x5000 + 2 * 32))
+        .unwrap();
+    assert_eq!(u32::from_le(state) & 7, 2, "the endpoint is halted");
+    assert_eq!(d.read(0x44) & 0x1001, 0, "the controller still runs");
+}
