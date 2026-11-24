@@ -12,7 +12,9 @@
 //! forever — the switch floods broadcasts to all other ports, Service→Service
 //! included). The dialer stands down while an inbound trunk from the same IP
 //! is active, the listener refuses a second trunk from an IP it already has,
-//! and jittered retries break the simultaneous-dial tie. Known limitation:
+//! and jittered retries break the simultaneous-dial tie. The dialing side
+//! serves the subnet and the accepting side bridges to those services.
+//! Known limitation:
 //! a NAT'd or multi-homed peer can defeat the IP match, so one-sided
 //! `connect` remains the documented safe form for exotic topologies.
 
@@ -131,7 +133,15 @@ enum TrunkState {
 struct TrunkTable {
     segment: String,
     events: tokio::sync::broadcast::Sender<Event>,
-    slots: std::sync::Mutex<HashMap<IpAddr, TrunkState>>,
+    links: std::sync::Mutex<TrunkLinks>,
+}
+
+#[derive(Default)]
+struct TrunkLinks {
+    slots: HashMap<IpAddr, TrunkState>,
+    /// Keep the service owner across a disconnect so reciprocal dialers
+    /// cannot swap roles and lose the owner's leases on reconnect.
+    upstream: Option<IpAddr>,
 }
 
 impl TrunkTable {
@@ -139,29 +149,34 @@ impl TrunkTable {
         Arc::new(Self {
             segment: segment.to_string(),
             events,
-            slots: std::sync::Mutex::new(HashMap::new()),
+            links: std::sync::Mutex::default(),
         })
     }
 
     /// Reserve a dial slot for `ip`. `false` = a trunk to/from that host
     /// already exists (or is being dialed) — the caller stands down.
     fn try_reserve_dial(&self, ip: IpAddr) -> bool {
-        let mut slots = self.slots.lock().expect("trunk slots");
-        if slots.contains_key(&ip) {
+        let mut links = self.links.lock().expect("trunk links");
+        if links.upstream.is_some() || links.slots.contains_key(&ip) {
             return false;
         }
-        slots.insert(ip, TrunkState::Dialing);
+        links.slots.insert(ip, TrunkState::Dialing);
         true
     }
 
-    /// Whether an inbound trunk from `ip` may be accepted (no existing slot).
-    /// Reserves the slot on success so a racing second accept is refused.
-    fn try_reserve_accept(&self, addr: SocketAddr, task: tokio::task::AbortHandle) -> bool {
-        let mut slots = self.slots.lock().expect("trunk slots");
-        if slots.contains_key(&addr.ip()) {
+    /// Accept one upstream owner. A segment already serving an outbound
+    /// bridge must keep its services for that bridge.
+    fn claim_upstream(&self, ip: IpAddr) -> bool {
+        let mut links = self.links.lock().expect("trunk links");
+        if !links.slots.is_empty() || links.upstream.is_some_and(|owner| owner != ip) {
             return false;
         }
-        slots.insert(
+        links.upstream = Some(ip);
+        true
+    }
+
+    fn activate_accept(&self, addr: SocketAddr, task: tokio::task::AbortHandle) {
+        self.links.lock().expect("trunk links").slots.insert(
             addr.ip(),
             TrunkState::Active {
                 direction: "accept",
@@ -170,15 +185,12 @@ impl TrunkTable {
                 task: Some(task),
             },
         );
-        drop(slots);
         self.emit_up(addr, "accept");
-        true
     }
 
     /// Flip a reserved dial slot to active (handshake succeeded).
     fn activate_dial(&self, addr: SocketAddr) {
-        let mut slots = self.slots.lock().expect("trunk slots");
-        slots.insert(
+        self.links.lock().expect("trunk links").slots.insert(
             addr.ip(),
             TrunkState::Active {
                 direction: "dial",
@@ -187,13 +199,12 @@ impl TrunkTable {
                 task: None,
             },
         );
-        drop(slots);
         self.emit_up(addr, "dial");
     }
 
     /// Drop the slot for `ip`; emits `segment.peer.down` if it was active.
     fn clear(&self, ip: IpAddr) {
-        let removed = self.slots.lock().expect("trunk slots").remove(&ip);
+        let removed = self.links.lock().expect("trunk links").slots.remove(&ip);
         if let Some(TrunkState::Active {
             direction, addr, ..
         }) = removed
@@ -222,22 +233,20 @@ impl TrunkTable {
         );
     }
 
-    fn has(&self, ip: IpAddr) -> bool {
-        self.slots.lock().expect("trunk slots").contains_key(&ip)
-    }
-
     fn connected(&self) -> bool {
-        self.slots
+        self.links
             .lock()
-            .expect("trunk slots")
+            .expect("trunk links")
+            .slots
             .values()
             .any(|s| matches!(s, TrunkState::Active { .. }))
     }
 
     fn peers_json(&self) -> Vec<serde_json::Value> {
-        self.slots
+        self.links
             .lock()
-            .expect("trunk slots")
+            .expect("trunk links")
+            .slots
             .values()
             .filter_map(|s| match s {
                 TrunkState::Active {
@@ -259,8 +268,8 @@ impl TrunkTable {
     /// (segment teardown).
     fn teardown(&self) {
         let slots: Vec<(IpAddr, TrunkState)> = {
-            let mut map = self.slots.lock().expect("trunk slots");
-            map.drain().collect()
+            let mut links = self.links.lock().expect("trunk links");
+            links.slots.drain().collect()
         };
         for (_, state) in slots {
             if let TrunkState::Active {
@@ -448,10 +457,7 @@ impl Directory {
 
 struct GlobalSeg {
     switch: Arc<Switch>,
-    gateway: GatewayHandle,
-    directory: Arc<std::sync::Mutex<Directory>>,
-    /// Keeps the zone following the leases.
-    dns_sync: tokio::task::JoinHandle<()>,
+    services: Option<GlobalServices>,
     subnet: Ipv4Net,
     /// Who holds the segment (docs/reviews/lab-lifecycle.md F8). A lab is
     /// one reference however often it attaches, and only a lab that holds
@@ -463,6 +469,19 @@ struct GlobalSeg {
     dialer: Option<tokio::task::JoinHandle<()>>,
     /// Cross-host trunk slots (dialer + inbound accepts + list()).
     trunks: Arc<TrunkTable>,
+}
+
+struct GlobalServices {
+    gateway: GatewayHandle,
+    directory: Arc<std::sync::Mutex<Directory>>,
+    /// Keeps the zone following the leases.
+    dns_sync: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GlobalServices {
+    fn drop(&mut self) {
+        self.dns_sync.abort();
+    }
 }
 
 /// The references a global segment counts: each attached lab by name, and
@@ -501,18 +520,15 @@ impl Holders {
     }
 }
 
-impl GlobalSeg {
+impl GlobalServices {
     /// Put a lab's machines into the segment's DNS and their static
     /// addresses and MTU into its DHCP. Returns what [`Directory::admit`]
     /// refused, for the lab to say.
-    fn join(&self, name: &str, lab: Option<Joining>) -> Vec<String> {
-        let Some(joining) = lab else {
-            return Vec::new();
-        };
+    fn join(&self, name: &str, subnet: Ipv4Net, joining: Joining) -> Vec<String> {
         let leases = self.gateway.leases_probe()().unwrap_or_default();
         let gw = self.gateway.gw_ip();
         let mut dir = self.directory.lock().expect("global directory");
-        let warnings = dir.admit(name, self.subnet, gw, joining, &leases);
+        let warnings = dir.admit(name, subnet, gw, joining, &leases);
         self.sync_dhcp(&dir);
         self.sync_dns(&mut dir);
         warnings
@@ -544,6 +560,34 @@ impl GlobalSeg {
     }
 }
 
+impl GlobalSeg {
+    fn join(&mut self, name: &str, lab: Option<Joining>) -> Vec<String> {
+        self.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
+        match (lab, &self.services) {
+            (Some(joining), Some(services)) => services.join(name, self.subnet, joining),
+            (Some(_), None) => vec![format!(
+                "global segment {name:?}: the trunk peer serves DHCP and DNS; local reservations and names are unavailable"
+            )],
+            (None, _) => Vec::new(),
+        }
+    }
+
+    fn start_dialer(&mut self, peer: Option<(String, String)>) {
+        if let Some((peer, psk)) = peer
+            && self.services.is_some()
+            && self.dialer.is_none()
+        {
+            self.dialer = Some(spawn_tcp_peer_dialer(
+                self.switch.clone(),
+                self.subnet,
+                peer,
+                psk,
+                self.trunks.clone(),
+            ));
+        }
+    }
+}
+
 /// Keep the segment's DNS following its DHCP leases, as a lab segment's
 /// lease sync does (PRD §9.5 auto-registration).
 fn spawn_dns_sync(
@@ -566,7 +610,6 @@ fn spawn_dns_sync(
 
 pub struct GlobalSegments {
     segs: Mutex<HashMap<String, GlobalSeg>>,
-    next_index: Mutex<u32>,
     dns_suffix: String,
     /// Where the segments' DNS forwards names no attached lab answers to.
     upstream_dns: Option<SocketAddr>,
@@ -600,7 +643,6 @@ impl GlobalSegments {
     ) -> Arc<Self> {
         Arc::new(Self {
             segs: Mutex::new(HashMap::new()),
-            next_index: Mutex::new(0),
             dns_suffix,
             upstream_dns,
             psk,
@@ -616,8 +658,7 @@ impl GlobalSegments {
     ///
     /// `lab` is the attaching lab and the NICs it puts on the segment; their
     /// names join the segment's DNS, and their static addresses its DHCP
-    /// reservations, until that lab detaches. An inbound cross-host trunk
-    /// attaches with none.
+    /// reservations on the serving supervisor, until that lab detaches.
     pub async fn attach(
         self: &Arc<Self>,
         name: &str,
@@ -631,39 +672,50 @@ impl GlobalSegments {
             .transpose()?;
         let mut segs = self.segs.lock().await;
         if let Some(seg) = segs.get_mut(name) {
-            seg.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
             let warnings = seg.join(name, lab);
-            // A later lab may be the one declaring `connect` — start the
-            // dialer on an already-existing segment too.
-            if let Some((peer, psk)) = peer
-                && seg.dialer.is_none()
-            {
-                seg.dialer = Some(spawn_tcp_peer_dialer(
-                    seg.switch.clone(),
-                    peer,
-                    psk,
-                    seg.trunks.clone(),
-                ));
-            }
+            seg.start_dialer(peer);
             return Ok((seg.sock.clone(), warnings, seg.subnet));
         }
 
-        let mut next_index = self.next_index.lock().await;
-        let automatic_subnet = subnet.is_none();
-        // A subnet named explicitly may be one this pool handed out before:
-        // an adopted lab re-attaching after a supervisor restart (F9) names
-        // the subnet its guests hold leases in. Allocate past it.
-        let pool_index = subnet.and_then(pool_index);
+        // Live segments reserve their subnets, including subnets named by
+        // adopted labs re-attaching after a supervisor restart (F9).
         let subnet = match subnet {
-            Some(subnet) => subnet,
+            Some(subnet) => {
+                if let Some((other, seg)) = segs
+                    .iter()
+                    .find(|(_, seg)| subnets_overlap(subnet, seg.subnet))
+                {
+                    bail!(
+                        "global segment \"{name}\" subnet {subnet} overlaps \"{other}\" ({})",
+                        seg.subnet
+                    );
+                }
+                subnet
+            }
             None => {
                 let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
                 pool.subnets(24)
                     .expect("pool splits")
-                    .nth(*next_index as usize)
+                    .find(|&candidate| {
+                        !segs
+                            .values()
+                            .any(|seg| subnets_overlap(candidate, seg.subnet))
+                    })
                     .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?
             }
         };
+        let mut seg = self.create_segment(name, subnet).await?;
+
+        seg.services = Some(self.start_services(name, subnet, &seg.switch));
+        let warnings = seg.join(name, lab);
+        seg.start_dialer(peer);
+        let sock = seg.sock.clone();
+        segs.insert(name.to_string(), seg);
+        tracing::info!("global segment \"{name}\" created on {subnet}");
+        Ok((sock, warnings, subnet))
+    }
+
+    async fn create_segment(&self, name: &str, subnet: Ipv4Net) -> Result<GlobalSeg> {
         std::fs::create_dir_all(&self.sock_dir)?;
         let sock = self.sock_dir.join(format!("{name}.sock"));
         let switch = Switch::new(format!("global/{name}"));
@@ -671,14 +723,19 @@ impl GlobalSegments {
             .listen_unix(&sock, PortClass::Service)
             .await
             .with_context(|| format!("listening on {}", sock.display()))?;
+        Ok(GlobalSeg {
+            switch,
+            services: None,
+            subnet,
+            holders: Holders::default(),
+            sock,
+            listener,
+            dialer: None,
+            trunks: TrunkTable::new(name, self.events.clone()),
+        })
+    }
 
-        // Commit the allocation only after the last fallible setup step.
-        if automatic_subnet {
-            *next_index += 1;
-        } else if let Some(index) = pool_index {
-            *next_index = (*next_index).max(index + 1);
-        }
-
+    fn start_services(&self, name: &str, subnet: Ipv4Net, switch: &Arc<Switch>) -> GlobalServices {
         let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
         let gw_mac = gateway_mac("__global", name);
 
@@ -688,7 +745,7 @@ impl GlobalSegments {
         let zone = DnsZone::new(&self.dns_suffix);
 
         let gateway = Gateway::spawn(
-            &switch,
+            switch,
             GatewayConfig {
                 segment_name: name.to_string(),
                 lab_name: "__global".to_string(),
@@ -702,30 +759,11 @@ impl GlobalSegments {
         let directory: Arc<std::sync::Mutex<Directory>> = Arc::default();
         let dns_sync = spawn_dns_sync(&gateway, directory.clone());
 
-        let trunks = TrunkTable::new(name, self.events.clone());
-        let dialer = peer
-            .map(|(peer, psk)| spawn_tcp_peer_dialer(switch.clone(), peer, psk, trunks.clone()));
-
-        let seg = GlobalSeg {
-            switch,
+        GlobalServices {
             gateway,
             directory,
             dns_sync,
-            subnet,
-            holders: {
-                let mut holders = Holders::default();
-                holders.take(lab.as_ref().map(|j| j.lab.as_str()));
-                holders
-            },
-            sock: sock.clone(),
-            listener,
-            dialer,
-            trunks,
-        };
-        let warnings = seg.join(name, lab);
-        segs.insert(name.to_string(), seg);
-        tracing::info!("global segment \"{name}\" created on {subnet}");
-        Ok((sock, warnings, subnet))
+        }
     }
 
     fn require_psk(&self) -> Result<String> {
@@ -739,6 +777,10 @@ impl GlobalSegments {
     /// changes nothing: it cannot take the segment from the labs on it.
     pub async fn detach(self: &Arc<Self>, name: &str, lab: Option<&str>) {
         let mut segs = self.segs.lock().await;
+        Self::detach_locked(&mut segs, name, lab);
+    }
+
+    fn detach_locked(segs: &mut HashMap<String, GlobalSeg>, name: &str, lab: Option<&str>) {
         if let Some(seg) = segs.get_mut(name) {
             if !seg.holders.give_back(lab) {
                 tracing::debug!(
@@ -747,12 +789,13 @@ impl GlobalSegments {
                 );
                 return;
             }
-            seg.leave(lab);
+            if let Some(services) = &seg.services {
+                services.leave(lab);
+            }
             if seg.holders.count() == 0
                 && let Some(seg) = segs.remove(name)
             {
                 seg.listener.abort();
-                seg.dns_sync.abort();
                 if let Some(d) = seg.dialer {
                     d.abort();
                 }
@@ -777,7 +820,9 @@ impl GlobalSegments {
                     "subnet": s.subnet.to_string(),
                     "refcount": s.holders.count(),
                     "labs": s.holders.labs.iter().collect::<Vec<_>>(),
-                    "mtu": s.directory.lock().expect("global directory").mtu(),
+                    "mtu": s.services.as_ref().map_or(crate::labd::network::STANDARD_MTU, |services| {
+                        services.directory.lock().expect("global directory").mtu()
+                    }),
                     "peer_connected": s.trunks.connected(),
                     "peers": s.trunks.peers_json(),
                 })
@@ -785,52 +830,75 @@ impl GlobalSegments {
             .collect()
     }
 
-    /// Cheap pre-check for the listener: is there room for an inbound trunk
-    /// from `ip` on segment `name`? (A missing segment says yes — accepting
-    /// creates it.) The authoritative check is the atomic reserve inside
-    /// [`accept_peer`]; this just lets the listener answer `NO\n` up front.
-    pub async fn peer_slot_free(&self, name: &str, ip: IpAddr) -> bool {
-        match self.segs.lock().await.get(name) {
-            Some(seg) => !seg.trunks.has(ip),
-            None => true,
-        }
-    }
-
-    /// Accept an inbound cross-host peer trunk (after PSK auth) and bridge it
-    /// onto the named global segment, creating the segment if necessary.
-    /// Refuses (returns `false`) when a trunk to/from that remote host
-    /// already exists — the single-slot rule that stops mutual-connect from
-    /// creating a broadcast loop.
-    pub async fn accept_peer(
+    /// Bridge an authenticated peer onto a switch that uses the peer's subnet
+    /// and gateway. Commit the role before acknowledging the connection.
+    async fn accept_peer(
         self: &Arc<Self>,
         name: &str,
-        stream: tokio::net::TcpStream,
-    ) -> Result<bool> {
+        subnet: Ipv4Net,
+        mut stream: tokio::net::TcpStream,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
         let remote = stream.peer_addr().context("peer_addr")?;
-        // The inbound trunk counts as a segment reference until it dies.
-        let _ = self.attach(name, None, None, None).await?;
-        let (switch, trunks) = {
-            let segs = self.segs.lock().await;
-            let seg = segs.get(name).expect("just attached");
-            (seg.switch.clone(), seg.trunks.clone())
-        };
-        tune_trunk_socket(&stream);
-        let bridge = tokio::spawn(bridge_tcp_to_switch(switch, stream));
-        if !trunks.try_reserve_accept(remote, bridge.abort_handle()) {
-            bridge.abort();
-            self.detach(name, None).await;
-            return Ok(false);
+        let mut segs = self.segs.lock().await;
+        let subnet = subnet.trunc();
+        if let Some((other, seg)) = segs
+            .iter()
+            .find(|(other, seg)| other.as_str() != name && subnets_overlap(subnet, seg.subnet))
+        {
+            tracing::warn!(
+                "refusing trunk from {remote} for global segment {name:?}: subnet {subnet} overlaps segment {other:?} ({})",
+                seg.subnet
+            );
+            drop(segs);
+            stream.write_all(b"NO\n").await?;
+            return Ok(());
         }
+        let seg = match segs.entry(name.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(self.create_segment(name, subnet).await?)
+            }
+        };
+        if !seg.trunks.claim_upstream(remote.ip()) {
+            drop(segs);
+            stream.write_all(b"NO\n").await?;
+            return Ok(());
+        }
+        if let Some(services) = seg.services.take() {
+            seg.switch.remove_port(services.gateway.port_id());
+            if let Some(dialer) = seg.dialer.take() {
+                dialer.abort();
+            }
+            if !seg.holders.labs.is_empty() {
+                tracing::warn!(
+                    "global segment {name:?}: {remote} now serves DHCP and DNS on {subnet}; local reservations and names are unavailable"
+                );
+            }
+        }
+        seg.subnet = subnet;
+        seg.holders.take(None);
+        let trunks = seg.trunks.clone();
+        tune_trunk_socket(&stream);
+        let bridge = tokio::spawn(bridge_tcp_to_switch(seg.switch.clone(), stream, true));
+        trunks.activate_accept(remote, bridge.abort_handle());
         // Waiter: on bridge death clear the slot (emitting peer.down) and
         // release the segment reference.
         let me = self.clone();
         let name = name.to_string();
         tokio::spawn(async move {
             let _ = bridge.await;
-            trunks.clear(remote.ip());
-            me.detach(&name, None).await;
+            let mut segs = me.segs.lock().await;
+            if segs
+                .get(&name)
+                .is_some_and(|seg| Arc::ptr_eq(&seg.trunks, &trunks))
+            {
+                trunks.clear(remote.ip());
+                Self::detach_locked(&mut segs, &name, None);
+            }
         });
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -850,12 +918,18 @@ impl Drop for TrunkPort {
 fn bridge_tcp_to_switch(
     switch: Arc<Switch>,
     mut stream: tokio::net::TcpStream,
+    acknowledge: bool,
 ) -> impl Future<Output = ()> {
+    use tokio::io::AsyncWriteExt;
+
     let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Service);
     let port = TrunkPort { switch, id };
 
     async move {
         let _port = port;
+        if acknowledge && stream.write_all(b"OK\n").await.is_err() {
+            return;
+        }
         let (mut read_half, mut write_half) = stream.split();
         tokio::select! {
             () = async {
@@ -918,6 +992,7 @@ fn dial_jitter() -> Duration {
 /// trunk from the same host is active (see the module docs' storm guard).
 fn spawn_tcp_peer_dialer(
     switch: Arc<Switch>,
+    subnet: Ipv4Net,
     peer: String,
     psk: String,
     trunks: Arc<TrunkTable>,
@@ -948,10 +1023,10 @@ fn spawn_tcp_peer_dialer(
                 tokio::time::sleep(REDIAL_DELAY).await;
                 continue;
             }
-            match dial_peer(addr, &trunks.segment, &psk).await {
+            match dial_peer(addr, &trunks.segment, subnet, &psk).await {
                 Ok(stream) => {
                     tune_trunk_socket(&stream);
-                    let bridge = bridge_tcp_to_switch(switch.clone(), stream);
+                    let bridge = bridge_tcp_to_switch(switch.clone(), stream, false);
                     trunks.activate_dial(addr);
                     // Wait for the bridge to die, then loop around to redial.
                     bridge.await;
@@ -970,19 +1045,16 @@ fn spawn_tcp_peer_dialer(
     })
 }
 
+fn subnets_overlap(a: Ipv4Net, b: Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
 /// Refuse a global segment name that is not one file name. The name becomes
 /// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
 /// sends its own: a separator, `..` or an absolute path would aim that at
 /// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
 /// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
 /// refused here.
-/// Where `subnet` sits among the automatic pool's /24s, if it is one.
-fn pool_index(subnet: Ipv4Net) -> Option<u32> {
-    let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
-    (subnet.prefix_len() == 24 && pool.contains(&subnet))
-        .then(|| (u32::from(subnet.network()) - u32::from(pool.network())) >> 8)
-}
-
 fn check_segment_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -1008,13 +1080,18 @@ fn domain_label(name: &str) -> String {
         .collect()
 }
 
-async fn dial_peer(addr: SocketAddr, segment: &str, psk: &str) -> Result<tokio::net::TcpStream> {
+async fn dial_peer(
+    addr: SocketAddr,
+    segment: &str,
+    subnet: Ipv4Net,
+    psk: &str,
+) -> Result<tokio::net::TcpStream> {
     use tokio::io::AsyncReadExt;
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to peer {addr}"))?;
     tokio::time::timeout(super::trunk_auth::TIMEOUT, async {
-        super::trunk_auth::client(&mut stream, segment, psk).await?;
+        super::trunk_auth::client(&mut stream, segment, subnet, psk).await?;
         let mut buf = [0u8; 3];
         stream.read_exact(&mut buf).await?;
         if &buf != b"OK\n" {
@@ -1064,7 +1141,7 @@ pub async fn bind_peer_listener(
             let psk = psk.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
-                let Ok(Ok(segment)) = tokio::time::timeout(
+                let Ok(Ok((segment, subnet))) = tokio::time::timeout(
                     super::trunk_auth::TIMEOUT,
                     super::trunk_auth::server(&mut stream, &psk),
                 )
@@ -1072,7 +1149,6 @@ pub async fn bind_peer_listener(
                 else {
                     return;
                 };
-                // The peer holds the PSK: it no longer counts.
                 drop(slot);
                 // The peer chose this name, and it names a socket file.
                 if let Err(e) = check_segment_name(&segment) {
@@ -1080,26 +1156,8 @@ pub async fn bind_peer_listener(
                     let _ = stream.write_all(b"NO\n").await;
                     return;
                 }
-                // Single-slot rule: refuse up front when a trunk to/from this
-                // host already exists (mutual connect, duplicate dial). The
-                // atomic reserve inside accept_peer catches the race window.
-                if let Ok(remote) = stream.peer_addr()
-                    && !globals.peer_slot_free(&segment, remote.ip()).await
-                {
-                    let _ = stream.write_all(b"NO\n").await;
-                    return;
-                }
-                if stream.write_all(b"OK\n").await.is_err() {
-                    return;
-                }
-                match globals.accept_peer(&segment, stream).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::debug!(
-                            "refused duplicate trunk for \"{segment}\" (single-slot rule)"
-                        );
-                    }
-                    Err(e) => tracing::warn!("accepting peer trunk for {segment}: {e:#}"),
+                if let Err(e) = globals.accept_peer(&segment, subnet, stream).await {
+                    tracing::warn!("accepting peer trunk for {segment}: {e:#}");
                 }
             });
         }
@@ -1118,6 +1176,19 @@ mod tests {
     fn globals_without_psk(sock_dir: PathBuf) -> Arc<GlobalSegments> {
         let (events, _) = tokio::sync::broadcast::channel(64);
         GlobalSegments::new_at(sock_dir, "test.internal".into(), None, None, events)
+    }
+
+    #[tokio::test]
+    async fn a_destroyed_segment_gives_its_subnet_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        for creation in 1..=257 {
+            globals
+                .attach("s", None, None, None)
+                .await
+                .unwrap_or_else(|err| panic!("creation {creation}: {err:#}"));
+            globals.detach("s", None).await;
+        }
     }
 
     #[tokio::test]
@@ -1155,7 +1226,9 @@ mod tests {
             "refused attach left a socket"
         );
         assert!(globals.list().await.is_empty());
-        assert_eq!(*globals.next_index.lock().await, 0);
+        let (_, _, subnet) = globals.attach("wan", None, None, None).await.unwrap();
+        assert_eq!(subnet.to_string(), "10.214.0.0/24");
+        globals.detach("wan", None).await;
     }
 
     #[tokio::test]
@@ -1166,10 +1239,10 @@ mod tests {
         let globals = globals_without_psk(dir.path().to_path_buf());
         assert!(globals.attach("wan", None, None, None).await.is_err());
         assert!(globals.list().await.is_empty());
-        assert_eq!(*globals.next_index.lock().await, 0);
 
         std::fs::remove_dir(socket).unwrap();
-        globals.attach("wan", None, None, None).await.unwrap();
+        let (_, _, subnet) = globals.attach("wan", None, None, None).await.unwrap();
+        assert_eq!(subnet.to_string(), "10.214.0.0/24");
         globals.detach("wan", None).await;
     }
 
@@ -1226,6 +1299,49 @@ mod tests {
         };
         assert_eq!(subnet("corp"), "10.214.0.0/24");
         assert_eq!(subnet("lan"), "10.214.1.0/24");
+    }
+
+    #[tokio::test]
+    async fn automatic_subnets_skip_only_the_ranges_held_by_live_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let declared = "10.214.0.128/25".parse().unwrap();
+        let high = "10.214.255.0/24".parse().unwrap();
+        globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap();
+        globals
+            .attach("high", Some(high), None, None)
+            .await
+            .unwrap();
+        let (_, _, automatic) = globals.attach("auto", None, None, None).await.unwrap();
+        assert_eq!(automatic.to_string(), "10.214.1.0/24");
+        globals.detach("declared", None).await;
+        let (_, _, reused) = globals.attach("reused", None, None, None).await.unwrap();
+        assert_eq!(reused.to_string(), "10.214.0.0/24");
+        globals.detach("reused", None).await;
+        globals.detach("auto", None).await;
+        globals.detach("high", None).await;
+    }
+
+    #[tokio::test]
+    async fn a_declared_subnet_cannot_overlap_an_automatic_subnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let declared = "10.214.0.0/23".parse().unwrap();
+        globals.attach("auto", None, None, None).await.unwrap();
+        let err = globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("overlaps \"auto\""));
+        globals.detach("auto", None).await;
+        globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap();
+        globals.detach("declared", None).await;
     }
 
     struct Instance {
@@ -1321,7 +1437,7 @@ mod tests {
                 continue;
             }
             let mut s = tokio::net::TcpStream::connect(i.addr).await.unwrap();
-            crate::supervisor::trunk_auth::client(&mut s, name, "k")
+            crate::supervisor::trunk_auth::client(&mut s, name, Ipv4Net::default(), "k")
                 .await
                 .unwrap();
             let mut answer = [0u8; 3];
@@ -1370,6 +1486,79 @@ mod tests {
         ] {
             assert!(check_segment_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_bridged_segment_has_one_subnet() {
+        use crate::net::frame::{EthView, Ipv4View, UdpView};
+
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        b.globals.attach("other", None, None, None).await.unwrap();
+        b.globals.detach("other", None).await;
+        let (a_sock, _, subnet) = a
+            .globals
+            .attach("wan", None, Some(b.addr.to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(
+            a.globals.list().await[0]["subnet"],
+            b.globals.list().await[0]["subnet"]
+        );
+
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        // With no lab socket connected on B, its only port must be the
+        // trunk. There is no second gateway that could produce a late OFFER.
+        assert_eq!(b_switch.stats().ports, 1);
+        assert_eq!(a.globals.segs.lock().await["wan"].switch.stats().ports, 2);
+        let mut client = trunk_client(&a_sock).await;
+        let discover = crate::net::gateway::tests::discover_frame(MacAddr([2, 0, 0, 0, 0, 42]));
+        write_frame(&mut client, &discover).await.unwrap();
+        let offer = read_frame(&mut client).await.unwrap().unwrap();
+        let eth = EthView::parse(&offer).unwrap();
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        let udp = UdpView::parse(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (67, 68));
+        let bootp = udp.payload();
+        assert_eq!(bootp[0], 2);
+        assert_eq!(&bootp[240..243], &[53, 1, 2]);
+        assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_trunk_reserves_its_subnet_from_local_allocation() {
+        for (peer, expected) in [
+            ("10.214.0.0/24", "10.214.1.0/24"),
+            ("10.214.0.0/23", "10.214.2.0/24"),
+        ] {
+            let b = instance("secret").await;
+            let _trunk = dial_peer(b.addr, "wan", peer.parse().unwrap(), "secret")
+                .await
+                .unwrap();
+
+            let (_, _, local) = b.globals.attach("lan", None, None, None).await.unwrap();
+            assert_eq!(local, expected.parse::<Ipv4Net>().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inbound_trunk_is_refused_if_another_segment_uses_its_subnet() {
+        use tokio::io::AsyncReadExt;
+
+        let b = instance("secret").await;
+        let (_, _, subnet) = b.globals.attach("lan", None, None, None).await.unwrap();
+        let before = b.globals.list().await;
+        let mut trunk = tokio::net::TcpStream::connect(b.addr).await.unwrap();
+        super::super::trunk_auth::client(&mut trunk, "wan", subnet, "secret")
+            .await
+            .unwrap();
+        let mut reply = [0; 3];
+        trunk.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"NO\n");
+        assert_eq!(b.globals.list().await, before);
+        assert!(!b.globals.sock_dir.join("wan.sock").exists());
     }
 
     #[tokio::test]
@@ -1455,7 +1644,7 @@ mod tests {
             (
                 seg.switch.clone(),
                 seg.dialer.as_ref().unwrap().abort_handle(),
-                seg.gateway.sender(),
+                seg.services.as_ref().unwrap().gateway.sender(),
             )
         };
         assert_eq!(old_switch.stats().ports, 2);
@@ -1583,7 +1772,7 @@ mod tests {
         let mut stream = tokio::net::TcpStream::connect(host.addr).await.unwrap();
         let mut greeting = [0; 44];
         stream.read_exact(&mut greeting).await.unwrap();
-        assert_eq!(&greeting[..12], b"VMLABTRUNK2\n");
+        assert_eq!(&greeting[..12], super::super::trunk_auth::MAGIC);
         let mut byte = [0];
         assert_eq!(
             timeout(Duration::from_secs(7), stream.read(&mut byte))
@@ -1607,7 +1796,13 @@ mod tests {
 
     async fn lookup(g: &Arc<GlobalSegments>, seg: &str, name: &str) -> crate::net::dns::DnsAnswer {
         let segs = g.segs.lock().await;
-        let zone = segs[seg].gateway.dns_zone().expect("zone");
+        let zone = segs[seg]
+            .services
+            .as_ref()
+            .unwrap()
+            .gateway
+            .dns_zone()
+            .expect("zone");
         zone.lock().expect("zone lock").lookup(name)
     }
 
@@ -1779,6 +1974,9 @@ mod tests {
         let config = |g: Arc<GlobalSegments>| async move {
             let segs = g.segs.lock().await;
             segs["wan"]
+                .services
+                .as_ref()
+                .unwrap()
                 .gateway
                 .dhcp_config()
                 .expect("global segments serve DHCP")
@@ -2015,7 +2213,7 @@ mod tests {
             let mut s = connect_from([127, 0, 0, 1], i.addr).await;
             // A name the listener refuses after authentication, so that no
             // segment is made: the answer is `NO`, and it is an answer.
-            crate::supervisor::trunk_auth::client(&mut s, "a/b", "k")
+            crate::supervisor::trunk_auth::client(&mut s, "a/b", Ipv4Net::default(), "k")
                 .await
                 .unwrap_or_else(|e| panic!("handshake {n}: {e:#}"));
             let mut answer = [0u8; 3];
