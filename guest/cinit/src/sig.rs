@@ -36,6 +36,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_realtime_signals() {
+        let signals = ["SIGRTMIN+3", "RTMIN+3", "37"];
+        let parsed = signals.map(parse_signal);
+        assert!(parsed.iter().all(Result::is_ok), "{parsed:?}");
+    }
+
+    #[test]
     fn rejects_garbage() {
         assert!(parse_signal("SIGBOGUS").is_err());
         assert!(parse_signal("").is_err());
