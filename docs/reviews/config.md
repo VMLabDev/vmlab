@@ -33,22 +33,22 @@ The findings are ranked against these three facts, which the code states:
 
 | Code | Severity | Fault in one line |
 |------|----------|-------------------|
-| F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry (fixed, card #540) |
-| F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments (fixed, card #548) |
-| F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read. **Fixed by card #544.** |
-| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file (fixed, card #558) |
-| F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545) |
-| F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545) |
-| F7 | wrong result | `host.subnet_pool` is parsed and never read |
-| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564) |
-| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites (fixed, card #569) |
-| F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name (fixed, card #577) |
-| F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word |
-| F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header (fixed, card #570) |
-| F13 | wrong result | `@dev` arguments are not validated: a relative `workspace_guest`, a missing `workspace` (fixed, card #570) |
-| F14 | wrong result | Port 0 as a forward or redirect target, and an ICMP block rule with a port, pass validation |
-| F15 | wrong result | `oci_chunk_size` is bounded only when a push starts |
-| F16 | cosmetic | The lab digest blanks any text that looks like a span, also inside a declared string |
+| F1 | security | A pulled template's `display` string becomes a QEMU `-device` argument unchecked, from any registry (fixed, card #540, `8ced444b`) |
+| F2 | security | The trusted-repository check is a text prefix on a repository that may hold `..` segments (fixed, card #548, `6f6e4491`) |
+| F3 | security | The Apple SMC OSK is in QEMU's argv, which every local user can read (fixed, card #544, `c4432ccb`, `19fff0a2`) |
+| F4 | data loss | Two `disk` blocks with one name give a VM two drives on one image file (fixed, card #558, `6246d468`) |
+| F5 | security | A validation error prints login passwords and `secret = true` playbook values from the lab file (fixed, card #545, `b59bdc92`) |
+| F6 | security | `HostConfig`'s `Debug` output holds the trunk PSK in the clear (fixed, card #545, `b59bdc92`) |
+| F7 | wrong result | `host.subnet_pool` is parsed and never read (fixed, card #870, `3d188255`) |
+| F8 | crash, wrong result | A segment subnet of any prefix length is accepted, and `gateway_ip` overflows on the last address (fixed, card #564, `3aef3801`) |
+| F9 | wrong result | Paths in QEMU option values are not comma-escaped at most sites (fixed, card #569, `40979ddf`) |
+| F10 | wrong result | Machine and segment names that differ only in case pass, and share one DNS name (fixed, card #577, `797c8a37`) |
+| F11 | wrong result | A `dns_upstream` that does not parse falls back to the host resolver without a word (fixed, card #578, `a534ada9`) |
+| F12 | wrong result | An explicit share `name` is unchecked and is written into `smb.conf` as a section header (fixed, card #570, `04387024`) |
+| F13 | wrong result | `@dev` arguments are not validated: a relative `workspace_guest`, a missing `workspace` (fixed, card #570, `04387024`) |
+| F14 | wrong result | Port 0 as a forward or redirect target, and an ICMP block rule with a port, pass validation (fixed, card #578, `a534ada9`) |
+| F15 | wrong result | `oci_chunk_size` is bounded only when a push starts (fixed, card #870, `3d188255`) |
+| F16 | cosmetic | The lab digest blanks any text that looks like a span, also inside a declared string (fixed, card #870, `3d188255`) |
 
 ### F1. A pulled template's `display` becomes a QEMU `-device` (security)
 
@@ -287,6 +287,9 @@ is refused at launch, because the file format has no escape for one.
      signature, which is the fault.
   2. By hand: set `subnet_pool = "10.99.0.0/16"`, run `vmlab up` on such a
      lab, and read the segment's subnet in `vmlab status`. It is `10.213.x.0/24`.
+- Fixed in card #870. Lab-local segments and built-in NAT allocate `/24`s
+  from `host.subnet_pool`. Supervisor-owned global segments keep their own
+  pool.
 
 ### F8. Any subnet prefix is accepted, and `gateway_ip` overflows (crash, wrong result, fixed in #564)
 
@@ -465,6 +468,8 @@ redirect addresses and requires TCP or UDP for a block rule with a port.
   `src/config/host.rs`: `host_err("host { oci_chunk_size = 0 }\n")` and
   `host_err("host { oci_chunk_size = 2GiB }\n")` must name the field. Today
   both parse.
+- Fixed in card #870. Host config loading rejects `oci_chunk_size` outside
+  1 byte through 1 GiB and names the field in the error.
 
 ### F16. The digest blanks span-like text inside declared strings (cosmetic)
 
@@ -479,6 +484,8 @@ redirect addresses and requires TCP or UDP for a block rule with a port.
   `src/config/mod.rs`: `DIGEST_LAB` with `qemu_args = ["span: (1, 2)"]` and
   with `qemu_args = ["span: (3, 4)"]` must have different digests. Today they
   are equal.
+- Fixed in card #870. The digest ignores source offsets and preserves
+  span-like text inside quoted strings.
 
 ## Notes
 

@@ -86,7 +86,7 @@ Not read:
 
 ## Findings, worst first
 
-### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard (fixed, card #715)
+### F1. On Windows a character outside the ANSI code page becomes `?`, which is a wildcard (fixed, card #715, `dbf8f37a`)
 
 - Where: `guest/agent-legacy/src/plat_win32.c:97`
   (`WideCharToMultiByte(CP_ACP, 0, ..., NULL, NULL)`), used for every
@@ -122,7 +122,7 @@ Not read:
   runs it under Wine with COM1 on a pty, and it is skipped on a host that
   has neither. Not run on a real Windows guest.
 
-### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory (fixed, card #721)
+### F2. On DOS an exec with a `cwd` that does not exist runs in the agent's directory (fixed, card #721, `3ab917f0`)
 
 - Where: `guest/agent-legacy/src/plat_dos.c:211-215`. The results of
   `_dos_setdrive` and `chdir` are not looked at.
@@ -145,7 +145,7 @@ Not read:
   the original directory and returns an exec error naming the requested path
   when the directory change fails.
 
-### F3. The NT install puts a SYSTEM service binary in a directory with inherited permissions
+### F3. The NT install puts a SYSTEM service binary in a directory with inherited permissions (fixed, card #716, `ac289f11` and `5987f01e`)
 
 - Where: `src/template/bootstrap/install-nt.cmd:7-11` (`mkdir C:\vmlab`,
   copy, `--install`), `guest/agent-legacy/src/plat_win32.c:1062-1064` (the
@@ -179,7 +179,7 @@ Not read:
   Unix mode, so that run does not show the owner or inheritance. The test
   above on a Windows 2000 guest was not run.
 
-### F4. A second connect while a DOS or TempleOS command runs cuts the first command's session after 22 s
+### F4. A second connect while a DOS or TempleOS command runs cuts the first command's session after 22 s (fixed, card #758, `e9357942`)
 
 - Where: `src/labd/machine.rs:1297` (`dial` calls `check_cached` with
   `keep_slow = false`), `1549-1575` (`cached_verdict`: 2 s, then
@@ -205,7 +205,7 @@ Not read:
   while it carries an exec, including an exec still waiting for `opened`.
   The regression test covers both agents with a paused clock.
 
-### F5. On DOS `opened` is sent after the command has ended, so a command longer than 60 s is reported as not started
+### F5. On DOS `opened` is sent after the command has ended, so a command longer than 60 s is reported as not started (fixed, card #847, `de1f70f4`)
 
 - Where: `guest/agent-legacy/src/plat_dos.c:227-238` (`proc_start` runs the
   child to its end), `guest/agent-legacy/src/agent.c:428-439` (`opened` is
@@ -228,7 +228,7 @@ Not read:
   time with `opened`, one DATA frame, `eof` and `exited` code 0. Assert that
   `exec` returns that output and code 0.
 
-### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included (fixed, card #722)
+### F6. A host frame that is cut short makes the agent deaf for up to 64 KiB of later bytes, hellos included (fixed, card #722, `2548f148`)
 
 - Where: `guest/agent-legacy/src/wire.c:93-94` (`wire_next` waits for the
   whole claimed payload), `guest/agent-legacy/src/agent.c:473-480` (a hello
@@ -291,7 +291,7 @@ Not read:
   - Payload bytes that hold a complete, valid hello frame are taken for a
     new connection. No caller sends stdin to a legacy guest today.
 
-### F7. `VmlabAgentInstall` on a TempleOS guest that already runs the agent starts a second agent on the same UART
+### F7. `VmlabAgentInstall` on a TempleOS guest that already runs the agent starts a second agent on the same UART (fixed, card #759, `9fbe425f`)
 
 - Where: `guest/agent-templeos/VmlabAgt.HC:665-668` (`VmlabAgentStart`
   spawns a task each time), `673-692` (the install guards the write of
@@ -315,7 +315,7 @@ Not read:
   install defers loading the updated file until boot when COM1 already has
   an agent. The legacy guest scenario checks ten replies and one agent task.
 
-### F8. `close` and `hello` kill only the direct child of an exec; what it started keeps running
+### F8. `close` and `hello` kill only the direct child of an exec; what it started keeps running (fixed, card #723, `cd8fa3f6`)
 
 - Where: `guest/agent-legacy/src/plat_posix.c:379-383` (`kill` of one pid,
   and the child is not made a group leader at `216-233`),
@@ -338,7 +338,7 @@ Not read:
   POSIX and terminates its job on Windows with job-object support. NT4
   and Windows 9x retain direct-child cancellation because they lack jobs.
 
-### F9. A `shutdown` request ends the agent even when the guest does not shut down
+### F9. A `shutdown` request ends the agent even when the guest does not shut down (fixed, card #848, `fa2c773e`)
 
 - Where: `guest/agent-legacy/src/agent.c:506-510` (the ack goes out first,
   and a `plat_shutdown` that returns 0 ends the loop),
@@ -362,7 +362,7 @@ Not read:
   `shutdown_guest(Reboot)`, then `ping`. Assert a pong. Today the agent has
   exited and the connection is closed.
 
-### F10. On DOS an environment override deletes the variable for every later command
+### F10. On DOS an environment override deletes the variable for every later command (fixed, card #847, `de1f70f4`)
 
 - Where: `guest/agent-legacy/src/plat_dos.c:207-208` (`putenv` into the
   agent's own environment), `249-263` (after the command, `NAME=` is set,
@@ -382,7 +382,7 @@ Not read:
   FreeDOS guest: exec `SET`, exec `VER` with `env` `PATH=C:\`, exec `SET`
   again. Assert that the first and the third output are equal.
 
-### F11. A NUL in an argument or an environment key changes the command without an error
+### F11. A NUL in an argument or an environment key changes the command without an error (fixed, card #848, `fa2c773e`)
 
 - Where: `guest/agent-legacy/src/json.c:287` (`\u0000` is stored as a NUL
   byte), `guest/agent-legacy/src/agent.c:357` (the argument ends at the
@@ -400,7 +400,7 @@ Not read:
   `src/labd/legacy_agent_tests.rs`. Open an exec with such an argument, and
   one with such a key. Assert an error reply for each.
 
-### F12. The TempleOS agent cuts captured output at 65535 bytes without a sign
+### F12. The TempleOS agent cuts captured output at 65535 bytes without a sign (fixed, card #866, `56897f9b`)
 
 - Where: `guest/agent-templeos/VmlabAgt.HC:402-409` (`VaCapPut` drops what
   does not fit), `573-583` (the exit code is not changed).
@@ -412,7 +412,7 @@ Not read:
   `vmlab exec <vm> -- 'I64 i; for (i=0;i<70000;i++) "a";'`. Assert 70000
   bytes of output, or an error that names the limit.
 
-### F13. On old Linux a `cwd` that does not exist, or a missing program, gives `opened` and exit 127 with no text
+### F13. On old Linux a `cwd` that does not exist, or a missing program, gives `opened` and exit 127 with no text (fixed, card #866, `56897f9b`)
 
 - Where: `guest/agent-legacy/src/plat_posix.c:229-232`.
 - Fault: the child exits 127 for a failed `chdir` and for a failed `execvp`
