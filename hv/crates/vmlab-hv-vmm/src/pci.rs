@@ -917,10 +917,13 @@ impl BusDevice for PciConfigIo {
             }
             4..=7 if self.address & 0x8000_0000 != 0 => {
                 let (bus, slot, function, reg) = self.bdf();
-                let offset = reg * 4 + (offset - 4) as usize;
+                // CF8 selects one dword. An access that runs past it, at
+                // 0xcfd-0xcff, ends at the dword as the read does.
+                let within = (offset - 4) as usize;
+                let data = &data[..data.len().min(4 - within)];
                 self.root
                     .lock()
-                    .config_write(bus, slot, function, offset, data);
+                    .config_write(bus, slot, function, reg * 4 + within, data);
             }
             _ => {}
         }

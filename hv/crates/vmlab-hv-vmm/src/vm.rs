@@ -904,6 +904,14 @@ impl VmShared {
         self.dispatch_io_read(port, data);
     }
 
+    /// Whether an I/O BAR may answer `port`. The guest can place one
+    /// anywhere `PCI0._CRS` offers, which includes ports below the
+    /// allocator's base. There a fixed device on the port bus keeps its
+    /// ports, so a BAR moved over one does not take them.
+    fn pci_decodes_port(&self, port: u16) -> bool {
+        port >= IO_ALLOC_BASE || !self.io_bus.lock().covers(port)
+    }
+
     fn dispatch_io_read(&self, port: u16, data: &mut [u8]) {
         if matches!(port, 0x1f0 | 0x170) {
             self.io_bus.lock().read(port, data);
@@ -928,7 +936,7 @@ impl VmShared {
         {
             return;
         }
-        if port >= IO_ALLOC_BASE {
+        if self.pci_decodes_port(port) {
             let mut root = self.pci_root.lock();
             if root.dispatch_io_read(port, data) {
                 return;
@@ -994,7 +1002,7 @@ impl VmShared {
             self.poll_chipset();
             return;
         }
-        if port >= IO_ALLOC_BASE {
+        if self.pci_decodes_port(port) {
             let mut root = self.pci_root.lock();
             if root.dispatch_io_write(port, data) {
                 let error = if self.vfio.lock().is_empty() && self.virtual_display.lock().is_none()

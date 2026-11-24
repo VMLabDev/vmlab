@@ -51,6 +51,14 @@ impl IoBus {
         Ok(())
     }
 
+    /// Whether a registered device decodes `port`.
+    pub fn covers(&self, port: u16) -> bool {
+        let port = port as u64;
+        self.regions
+            .iter()
+            .any(|r| r.base <= port && port < r.base + r.len)
+    }
+
     pub fn read(&self, port: u16, data: &mut [u8]) {
         let port = port as u64;
         let Some(region) = self
