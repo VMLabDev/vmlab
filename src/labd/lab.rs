@@ -39,22 +39,27 @@ struct RunningSmb {
     // Drop access before stopping the children.
     routes: HashMap<String, SmbRoute>,
     servers: crate::smb::LabSmb,
+    volume_gateways: Vec<(String, std::net::Ipv4Addr)>,
     // Compare against the plan originally served, even after a child exits.
     exports: String,
 }
 
 struct SmbRoute {
     services: Arc<super::netservices::SegmentServices>,
+    segment: String,
     gateway: std::net::Ipv4Addr,
-    mac: crate::config::model::MacAddr,
+    mac: Option<crate::config::model::MacAddr>,
     active: Option<(crate::net::rules::RuleId, u16)>,
 }
 
 impl SmbRoute {
     fn install(&mut self, port: u16) {
         use crate::config::model::{HostPort, RedirectRule};
+        let Some(mac) = self.mac else {
+            return;
+        };
         let id = self.services.rules.lock_recover().add_redirect_from(
-            self.mac,
+            mac,
             RedirectRule {
                 from: HostPort {
                     ip: self.gateway,
@@ -1073,8 +1078,10 @@ impl LabRuntime {
     /// the lab still works. Called from `up` and individual machine starts
     /// that may need SMB.
     async fn ensure_smb(self: &Arc<Self>, output: &crate::scripting::OutputSink) {
-        let current = self.smb.clone().lock_owned().await;
-        if current.is_some() {
+        let mut current = self.smb.clone().lock_owned().await;
+        if let Some(smb) = current.as_mut() {
+            self.refresh_smb_routes(smb);
+            self.publish_smb_coordinates(smb).await;
             self.recover_smb(current, output).await;
             return;
         }
@@ -1148,60 +1155,77 @@ impl LabRuntime {
         // NIC, so a guest mounting \\<gateway>\<share> reaches its own
         // server and no other machine's. A segment without `nat` gets no
         // egress, but still gets this.
-        let mut routes = HashMap::new();
-        {
+        let routes = {
             let net = self.network.lock().await;
-            for export in &smb.exports {
-                let Some(port) = labsmb.listen_port(&export.machine) else {
-                    continue;
-                };
-                // The plan exports at the first NIC's segment gateway.
-                let mac = self
-                    .machine(&export.machine)
-                    .ok()
-                    .and_then(|m| m.macs().first().copied());
-                let Some(mac) = mac else {
-                    tracing::warn!(
-                        "smb: machine {} has no NIC address to serve its shares to",
-                        export.machine
-                    );
-                    continue;
-                };
-                if let Some(seg) = net.segments.get(&export.segment)
-                    && let Some(services) = &seg.services
-                {
-                    let mut route = SmbRoute {
-                        services: services.clone(),
+            smb.exports
+                .iter()
+                .filter_map(|export| {
+                    let seg = net.segments.get(&export.segment)?;
+                    let route = SmbRoute {
+                        services: seg.services.as_ref()?.clone(),
+                        segment: export.segment.clone(),
                         gateway: seg.service_ip,
-                        mac,
+                        mac: None,
                         active: None,
                     };
-                    route.install(port);
-                    routes.insert(export.machine.clone(), route);
+                    Some((export.machine.clone(), route))
+                })
+                .collect()
+        };
+        let mut running = RunningSmb {
+            routes,
+            servers: labsmb,
+            exports: reload::smb_exports(&smb),
+            volume_gateways: smb.volume_gateways,
+        };
+        self.refresh_smb_routes(&mut running);
+        for (machine, port) in running.servers.listen_ports() {
+            self.smb_started(&machine, port, output);
+        }
+        self.publish_smb_coordinates(&running).await;
+        *current = Some(running);
+    }
+
+    async fn publish_smb_coordinates(&self, smb: &RunningSmb) {
+        // CIFS mounts are driven by the container instance, including after
+        // a rebuild that keeps the same running server.
+        for (name, gateway) in &smb.volume_gateways {
+            let Some(creds) = smb.servers.credentials(name) else {
+                continue;
+            };
+            if let Ok(m) = self.machine(name) {
+                m.smb_ready(*gateway, &creds.username, &creds.password).await;
+            }
+        }
+    }
+
+    fn refresh_smb_routes(&self, smb: &mut RunningSmb) {
+        {
+            let machines = self.machines.read().expect("machine set lock");
+            // Withdraw every old binding before installing new ones. A
+            // reload can reassign one machine's old MAC to another machine.
+            for (name, route) in &mut smb.routes {
+                let mac = machines.get(name).and_then(|machine| {
+                    // A retained export is reachable on its original segment.
+                    let nic = machine.nics().first()?;
+                    if super::network::nic_segment_name(nic) != route.segment {
+                        return None;
+                    }
+                    machine.macs().first().copied()
+                });
+                if route.mac != mac {
+                    route.withdraw();
+                    route.mac = mac;
                 }
             }
         }
-        for (machine, port) in labsmb.listen_ports() {
-            self.smb_started(&machine, port, output);
-        }
-
-        // Hand each machine whose guest mounts for itself its coordinates.
-        // A machine driven from the host instead ignores this.
-        let exports = reload::smb_exports(&smb);
-        for (name, gateway) in smb.volume_gateways {
-            let Some(creds) = labsmb.credentials(&name) else {
-                continue;
-            };
-            if let Ok(m) = self.machine(&name) {
-                m.smb_ready(gateway, &creds.username, &creds.password).await;
+        for (name, route) in &mut smb.routes {
+            if route.active.is_none()
+                && let Some(port) = smb.servers.listen_port(name)
+            {
+                route.install(port);
             }
         }
-
-        *current = Some(RunningSmb {
-            routes,
-            servers: labsmb,
-            exports,
-        });
     }
 
     fn smb_started(&self, machine: &str, port: u16, output: &crate::scripting::OutputSink) {
@@ -8835,7 +8859,10 @@ lab "t" {
         let _ports = SMB_TEST_PORTS.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let source = SMB_LAB
-            .replace("  vm \"web\"", "  container \"keeper\" { image = \"alpine\" }\n  vm \"web\"")
+            .replace(
+                "  vm \"web\"",
+                "  container \"keeper\" { image = \"alpine\" }\n  vm \"web\"",
+            )
             .replace(
                 "segment = \"corp\"",
                 "segment = \"corp\" mac = \"02:00:00:00:00:01\"",
