@@ -84,14 +84,18 @@ pub fn load(
         let bytes = std::fs::read(initrd_path).map_err(|e| {
             VmmError::Kernel(format!("reading initrd {}: {e}", initrd_path.display()))
         })?;
-        let addr = (low_ram_top - bytes.len() as u64) & !0xFFF;
         let kernel_end = loaded.kernel_end;
-        if addr < kernel_end {
-            return Err(VmmError::Kernel(format!(
-                "initrd ({} bytes) does not fit below {low_ram_top:#x} after the kernel ends at {kernel_end:#x}",
-                bytes.len()
-            )));
-        }
+        // An initrd larger than low RAM has no address at all.
+        let addr = low_ram_top
+            .checked_sub(bytes.len() as u64)
+            .map(|addr| addr & !0xFFF)
+            .filter(|addr| *addr >= kernel_end)
+            .ok_or_else(|| {
+                VmmError::Kernel(format!(
+                    "initrd ({} bytes) does not fit below {low_ram_top:#x} after the kernel ends at {kernel_end:#x}",
+                    bytes.len()
+                ))
+            })?;
         mem.write_slice(&bytes, GuestAddress(addr))
             .map_err(|e| VmmError::Kernel(format!("writing initrd: {e}")))?;
         hdr.ramdisk_image = addr as u32;

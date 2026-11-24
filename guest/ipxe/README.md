@@ -13,7 +13,9 @@ outputs:
 The build requires Git, GCC with 32-bit freestanding support, binutils, make,
 Perl, Python and liblzma headers. The first build of a profile needs network
 access to GitHub. It verifies its source checkout and refuses a different
-commit, tracked changes or untracked files.
+commit, tracked changes or untracked files. Git ignores `src/config/local`
+there, so the build removes from it what `config/` no longer holds, and names
+each file it removes.
 
 `upstream.json` pins iPXE 2.0.0, commit
 `12798ec29aa8a64d8675c4378b99f5fe28447afb`, fixed epoch 1741276800, built with

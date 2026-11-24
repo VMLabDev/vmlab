@@ -108,12 +108,37 @@ def clear_stale_objects(source, tools):
 
 
 def install_configs(source, headers):
-    """Copy the local configuration headers into `src/config/local` of a
-    checkout. This commit is the extraction only."""
+    """Make `src/config/local` of a checkout hold the given headers and
+    nothing else that changes a build. Returns the names it removed.
+
+    Upstream ignores that directory in git, so the untracked-files check of
+    `main` does not see it, and a header that an earlier revision of
+    `config/` held would stay in a cached checkout and be compiled in. make
+    writes an empty header for each local one the build does not give. Those
+    stay: they change nothing, and writing them again would rebuild every
+    object. make rebuilds what included a removed header, because it writes
+    the empty one anew."""
     local = source / "src/config/local"
     local.mkdir(exist_ok=True)
+    tracked = set(subprocess.check_output(
+        ["git", "-C", str(source), "ls-files", "-z", "--", "src/config/local"],
+        text=True).split("\0"))
+    given = {header.name for header in headers}
+    removed = []
+    for path in sorted(local.iterdir()):
+        inside = f"src/config/local/{path.name}"
+        if path.name in given or any(name == inside or name.startswith(inside + "/") for name in tracked):
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.is_file() and not path.is_symlink() and path.stat().st_size == 0:
+            continue
+        else:
+            path.unlink()
+        removed.append(path.name)
     for header in headers:
         shutil.copyfile(header, local / header.name)
+    return removed
 
 
 def parse_record(text):
@@ -214,7 +239,8 @@ def main():
         ["git", "-C", str(source), "ls-files", "--others", "--exclude-standard"], text=True).strip():
         raise SystemExit(f"{source}: untracked source files; refusing an unpinned build")
     src = source / "src"
-    install_configs(source, configs(profile))
+    for name in install_configs(source, configs(profile)):
+        print(f"removed the stale {source / 'src/config/local' / name}")
     env = dict(os.environ, SOURCE_DATE_EPOCH=pin["source_date_epoch"], LC_ALL="C", TZ="UTC")
     # make does not rebuild an object when a flag or the compiler changes.
     tools = toolchain()
