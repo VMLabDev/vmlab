@@ -156,8 +156,8 @@ for a guest that is not x86.
   `guest/win3d/installer/vmlab-win3d.ps1`). The proof is
   `guest/win3d/tests/installer/statedir-probe.sh`, and
   `guest/win3d/docs/acceptance/C753.md` has the runs on a Windows 11 guest:
-  with the installer of `next`, route 1 gave `nt authority\system` in
-  `C:\proof.txt`'s place and route 2 gave the user the ownership of
+  with the installer of `next`, route 1 wrote `nt authority\system` into the
+  proof file and route 2 gave the user the ownership of
   `state.json`. With the fix the install on the user's directory is
   refused and every attempt of the user is denied. Two corrections to the
   text above, from those runs. The statement about `C:\ProgramData` under
