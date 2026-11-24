@@ -344,24 +344,26 @@ pub fn windows_logon_cred_cmd(gateway: Ipv4Addr, user: &str, pass: &str) -> (Str
     )
 }
 
-/// XP/2003-era `net use` string for screen-automation driving (PRD §7.5 XP-era
-/// caveat). These guests lack a guest agent, so the provision script types this
-/// at the console via the keystroke surface (§10.3). We always target a drive
-/// letter for these guests (mklink predates nothing useful on XP). Returns the
-/// full command as a single string ready to be typed.
-pub fn xp_net_use_string(
+/// XP/2003-era drive mapping through the legacy agent (PRD §7.5).
+pub(super) fn xp_net_use_cmd(
     gateway: Ipv4Addr,
     share: &str,
     drive_letter: &str,
     user: &str,
     pass: &str,
-) -> String {
-    let letter = if drive_letter.len() >= 2 {
-        &drive_letter[..2]
-    } else {
-        drive_letter
-    };
-    format!("net use {letter} \\\\{gateway}\\{share} /user:{user} {pass} /persistent:yes")
+) -> (String, Vec<String>) {
+    let letter = drive_letter.get(..2).unwrap_or(drive_letter);
+    (
+        "net".into(),
+        vec![
+            "use".into(),
+            letter.into(),
+            format!(r"\\{gateway}\{share}"),
+            pass.into(),
+            format!("/user:{user}"),
+            "/persistent:yes".into(),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -538,15 +540,6 @@ mod tests {
     fn the_link_script_quotes_the_path_for_powershell() {
         let script = windows_link_script(gw(), "data", "C:\\Bob's files");
         assert!(script.contains("$path = 'C:\\Bob''s files'"), "{script}");
-    }
-
-    #[test]
-    fn xp_string_form() {
-        let s = xp_net_use_string(gw(), "share", "Z:", "u", "p");
-        assert_eq!(
-            s,
-            "net use Z: \\\\10.0.0.1\\share /user:u p /persistent:yes"
-        );
     }
 
     /// `mount_smbfs` with the credentials in the URL, encoded, and `rdonly`
