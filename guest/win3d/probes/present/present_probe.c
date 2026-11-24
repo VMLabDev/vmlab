@@ -196,6 +196,9 @@ typedef LONG (WINAPI *open_resource_fn)(open_resource *);
 /* user32: the surface that the compositor reads a window from. The Direct3D
  * runtimes get the destination of a windowed Blt present this way. */
 typedef BOOL (WINAPI *dwm_surface_fn)(HWND, HANDLE *, LUID *, ULONG *, ULONG *, ULONGLONG *);
+/* dwmapi: the same for Windows 8 and later, where the compositor makes the
+ * surface on the adapter that the caller names. */
+typedef HRESULT (WINAPI *dwm_dx_surface_fn)(HWND, LUID, HMONITOR, DWORD, ULONG *, HANDLE *, UINT64 *);
 typedef LONG (WINAPI *close_fn)(const close_adapter *);
 
 /* viogpu/shared/viogpum.h of the driver source. VIOGPU_ADAPTERINFO is not
@@ -400,7 +403,8 @@ typedef struct {
     /* The destination: the window's surface, opened in this device. */
     int surface_found;
     uint32_t surface_handle, surface_format, surface_allocations, destination, variant;
-    LONG surface_query_status, surface_open_status;
+    LONG surface_query_status, surface_open_status, dwm_hresult;
+    const char *surface_route;
     LONG variant_status[8];
     uint32_t variants;
     query_device_ids ids;
@@ -415,7 +419,7 @@ static void emit(FILE *f, const result *r)
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\","
-            "\"window_surface\":{\"found\":%s,\"handle\":\"0x%08x\",\"format\":%u,\"allocations\":%u,"
+            "\"window_surface\":{\"found\":%s,\"route\":\"%s\",\"dwm_hresult\":\"0x%08lx\",\"handle\":\"0x%08x\",\"format\":%u,\"allocations\":%u,"
             "\"query_status\":\"0x%08lx\",\"open_status\":\"0x%08lx\",\"opened\":%s},\"variant\":%u,\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
             r->pass ? "true" : "false", (unsigned long)r->session,
@@ -425,7 +429,8 @@ static void emit(FILE *f, const result *r)
             (unsigned long)r->venus_status,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
             (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id,
-            r->surface_found ? "true" : "false", r->surface_handle, r->surface_format, r->surface_allocations,
+            r->surface_found ? "true" : "false", r->surface_route ? r->surface_route : "none",
+            (unsigned long)r->dwm_hresult, r->surface_handle, r->surface_format, r->surface_allocations,
             (unsigned long)r->surface_query_status, (unsigned long)r->surface_open_status,
             r->destination ? "true" : "false", r->variant);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
@@ -558,12 +563,14 @@ int wmain(int argc, wchar_t **argv)
     r.last_status = enumerate(&adapters);
     if (r.last_status < 0) { free(adapters.adapters); FreeLibrary(gdi); goto done; }
     UINT matches = 0, adapter = 0;
+    LUID adapter_luid = {0};
     for (ULONG i = 0; i < adapters.count; ++i) {
         query_device_ids ids = {0};
         query_adapter q = {adapters.adapters[i].handle, QUERY_PHYSICAL_ADAPTER_DEVICE_IDS, &ids, sizeof(ids)};
         if (query(&q) >= 0 && ids.vendor_id == 0x1af4 && ids.device_id == 0x1050) {
             ++matches;
             adapter = adapters.adapters[i].handle;
+            adapter_luid = adapters.adapters[i].luid;
             r.ids = ids;
             r.selected = 1;
         }
@@ -669,6 +676,20 @@ int wmain(int argc, wchar_t **argv)
         ULONGLONG update_id = 0;
         r.stage = "window_surface";
         if (dwm_surface && dwm_surface(window, &shared, &luid, &format, &flags, &update_id) && shared) {
+            r.surface_route = "user32";
+        } else {
+            HMODULE dwmapi = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            dwm_dx_surface_fn dx_surface =
+                dwmapi ? (dwm_dx_surface_fn)GetProcAddress(dwmapi, "DwmDxGetWindowSharedSurface") : NULL;
+            UINT64 dx_update_id = 0;
+            shared = NULL;
+            format = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
+            r.dwm_hresult = dx_surface ? dx_surface(window, adapter_luid, MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY),
+                                                    0, &format, &shared, &dx_update_id)
+                                       : (LONG)0x80004001; /* E_NOTIMPL: no such export */
+            if (r.dwm_hresult >= 0 && shared) r.surface_route = "dwmapi";
+        }
+        if (r.surface_route) {
             r.surface_found = 1;
             r.surface_handle = (uint32_t)(ULONG_PTR)shared;
             r.surface_format = format;
