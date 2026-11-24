@@ -1,0 +1,107 @@
+Subject: [PATCH] viogpu3d: check the command size of the submit escape without a wrap
+
+VIOGPU_SUBMIT_CMD added the caller's CmdSize to the size of the request
+header in 32 bits and compared the sum with the payload length. A CmdSize
+of 0xFFFFFFF4 or more wrapped the sum below the header size, so the check
+passed. The driver then asked for CmdSize bytes of nonpaged pool and
+copied CmdSize bytes out of an escape buffer of at most 64 KiB: a bugcheck
+0x50 when the allocation succeeded, and an allocation attempt of 4 GiB per
+call when it did not.
+
+Compare with a subtraction, which no CmdSize can wrap, and return
+STATUS_INVALID_BUFFER_SIZE. The check is in a header with no include:
+tests/kmd/submit_bounds_test.cpp of the package compiles it on the build
+host. CmdSize is read once and that value is used for the allocation, the
+copy and the command.
+
+Card #752, finding F4 of the win3d driver review. docs/acceptance/C752.md
+has the proof.
+---
+diff --git a/viogpu/common/viogpu_submit_bounds.h b/viogpu/common/viogpu_submit_bounds.h
+new file mode 100644
+index 0000000..e7a67ee
+--- /dev/null
++++ b/viogpu/common/viogpu_submit_bounds.h
+@@ -0,0 +1,18 @@
++/*
++ * The size check of the VIOGPU_SUBMIT_CMD escape.
++ *
++ * The request is a header followed by cmd_size command bytes, in an escape
++ * payload of data_length bytes. cmd_size is a value of the calling program.
++ * The check subtracts, so no value of cmd_size can wrap it: a sum of the
++ * header size and cmd_size in 32 bits wraps for a cmd_size near 2^32 and
++ * then passes a comparison with data_length.
++ *
++ * This header includes nothing and uses no kernel type, so that a test
++ * program on the build host can compile it.
++ */
++#pragma once
++
++static inline int VioGpuSubmitCmdFits(unsigned int data_length, unsigned int header_size, unsigned int cmd_size)
++{
++    return data_length >= header_size && cmd_size <= data_length - header_size;
++}
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 88ade7a..481e43c 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -33,6 +33,7 @@
+ #include "helper.h"
+ #include "driver.h"
+ #include "viogpu_adapter.h"
++#include "viogpu_submit_bounds.h"
+ #include "baseobj.h"
+ #include "bitops.h"
+ #include "viogpum.h"
+@@ -1861,14 +1862,16 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+ 
+                 PUINT8 payload = (PUINT8)(pVioGpuEscape + 1);
+                 VIOGPU_SUBMIT_CMD_REQ *req = (VIOGPU_SUBMIT_CMD_REQ *)payload;
+-                const UINT needed = (UINT)(sizeof(*req) + req->CmdSize);
+-                if (pVioGpuEscape->DataLength < needed)
++                // CmdSize is the caller's value. Read it once, and compare it
++                // with a subtraction: sizeof(*req) + CmdSize wraps in 32 bits.
++                const UINT cmd_size = req->CmdSize;
++                if (!VioGpuSubmitCmdFits(pVioGpuEscape->DataLength, (UINT)sizeof(*req), cmd_size))
+                 {
+                     DbgPrint(TRACE_LEVEL_ERROR,
+-                             ("%s escape payload too small %d, need %d\n",
++                             ("%s escape payload too small %u for a command of %u bytes\n",
+                               __FUNCTION__,
+                               pVioGpuEscape->DataLength,
+-                              needed));
++                              cmd_size));
+                     return STATUS_INVALID_BUFFER_SIZE;
+                 }
+ 
+@@ -1881,18 +1884,18 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+ 
+                 if (req->CmdType == VIOGPU_CMD_SUBMIT)
+                 {
+-                    if (req->CmdSize == 0)
++                    if (cmd_size == 0)
+                     {
+                         DbgPrint(TRACE_LEVEL_ERROR, ("%s invalid cmd_size=0\n", __FUNCTION__));
+                         return STATUS_INVALID_PARAMETER;
+                     }
+ 
+-                    PUINT8 cmd_copy = new (NonPagedPoolNx) BYTE[req->CmdSize];
++                    PUINT8 cmd_copy = new (NonPagedPoolNx) BYTE[cmd_size];
+                     if (!cmd_copy)
+                     {
+                         return STATUS_INSUFFICIENT_RESOURCES;
+                     }
+-                    RtlCopyMemory(cmd_copy, payload + sizeof(*req), req->CmdSize);
++                    RtlCopyMemory(cmd_copy, payload + sizeof(*req), cmd_size);
+ 
+                     PVIOGPU_SUBMIT_ESCAPE_CTX submit_ctx =
+                         new (NonPagedPoolNx) VIOGPU_SUBMIT_ESCAPE_CTX();
+@@ -1904,7 +1907,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     submit_ctx->cmd_buf = cmd_copy;
+ 
+                     ctrlQueue.SubmitCommand(cmd_copy,
+-                                            req->CmdSize,
++                                            cmd_size,
+                                             device->GetId(),
+                                             SubmitEscapeCompleteCB,
+                                             submit_ctx);
