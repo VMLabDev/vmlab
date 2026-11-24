@@ -136,6 +136,21 @@ pub struct Graph {
     aliases: HashMap<ScalarId, ScalarId>,
 }
 
+impl Graph {
+    /// The heap bytes this graph holds, from the capacity of its three
+    /// tables. A cache that keeps graphs is bounded by this, not by a count
+    /// of scalars.
+    pub fn heap_bytes(&self) -> usize {
+        // One control byte beside each bucket of a hash table.
+        fn table<K, V>(map: &HashMap<K, V>) -> usize {
+            map.capacity() * (std::mem::size_of::<(K, V)>() + 1)
+        }
+        self.scalars.capacity() * std::mem::size_of::<Scalar>()
+            + table(&self.interned)
+            + table(&self.aliases)
+    }
+}
+
 pub fn mask(width: u16) -> u128 {
     match width {
         0 => 0,
