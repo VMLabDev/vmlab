@@ -1,0 +1,94 @@
+Subject: [PATCH] viogpu3d: bound the host's scanout count
+
+num_scanouts comes from the device configuration and was used unchecked as
+the bound of two loops. GetEdids wrote 256 bytes to m_EDIDs[i], an array of
+MAX_CHILDREN (1) entries, so a host with two scanouts and
+VIRTIO_GPU_F_EDID (QEMU with max_outputs=2) wrote past it into the members
+that follow in VioGpuVidPN. GetEdidInfo read 256 bytes at edid + id * 128
+of a 1024-byte field, and GetDisplayInfo read pmodes[id], an array of 16.
+
+Clamp the count to MAX_CHILDREN where it is read, bound both loops at the
+array, and refuse an id that the response has no room for in the two
+readers (finding F5 of the driver review, card #754).
+
+diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
+index ef478b5..967a0cf 100644
+--- a/viogpu/common/viogpu_queue.cpp
++++ b/viogpu/common/viogpu_queue.cpp
+@@ -559,6 +559,12 @@ BOOLEAN CtrlQueue::GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG
+         DbgPrint(TRACE_LEVEL_VERBOSE, (" %s type = %x: disabled\n", __FUNCTION__, resp->hdr.type));
+         return FALSE;
+     }
++    if (id >= VIRTIO_GPU_MAX_SCANOUTS)
++    {
++        // The response has VIRTIO_GPU_MAX_SCANOUTS modes and no more.
++        DbgPrint(TRACE_LEVEL_WARNING, (" %s no mode for scanout %u\n", __FUNCTION__, id));
++        return FALSE;
++    }
+     if (resp->pmodes[id].enabled)
+     {
+         DbgPrint(TRACE_LEVEL_VERBOSE,
+@@ -676,7 +682,14 @@ BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid)
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+     PGPU_CMD_GET_EDID cmd = (PGPU_CMD_GET_EDID)buf->buf;
+     PGPU_RESP_EDID resp = (PGPU_RESP_EDID)buf->resp_buf;
+-    PUCHAR resp_edit = (PUCHAR)(resp->edid + (ULONGLONG)id * EDID_V1_BLOCK_SIZE);
++    PUCHAR resp_edit;
++    if ((ULONGLONG)id * EDID_V1_BLOCK_SIZE + EDID_RAW_BLOCK_SIZE > sizeof(resp->edid))
++    {
++        // The copy below would read past the EDID field of the response.
++        DbgPrint(TRACE_LEVEL_WARNING, (" %s no EDID block for scanout %u\n", __FUNCTION__, id));
++        return FALSE;
++    }
++    resp_edit = (PUCHAR)(resp->edid + (ULONGLONG)id * EDID_V1_BLOCK_SIZE);
+     if (resp->hdr.type != VIRTIO_GPU_RESP_OK_EDID)
+     {
+         DbgPrint(TRACE_LEVEL_VERBOSE, (" %s type = %x: disabled\n", __FUNCTION__, resp->hdr.type));
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 88ade7a..64cd344 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -3238,6 +3238,19 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
+                           FIELD_OFFSET(GPU_CONFIG, num_scanouts),
+                           &m_u32NumScanouts,
+                           sizeof(m_u32NumScanouts));
++        // The count is the host's and nothing has checked it. This driver has
++        // MAX_CHILDREN targets and one EDID buffer for each, so it uses no
++        // scanout past that, whatever the host has (QEMU with max_outputs=2
++        // reports 2).
++        if (m_u32NumScanouts > MAX_CHILDREN)
++        {
++            DbgPrint(TRACE_LEVEL_WARNING,
++                     ("%s the host has %u scanouts, the driver uses %u\n",
++                      __FUNCTION__,
++                      m_u32NumScanouts,
++                      MAX_CHILDREN));
++            m_u32NumScanouts = MAX_CHILDREN;
++        }
+ 
+         virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, num_capsets), &m_u32NumCapsets, sizeof(m_u32NumCapsets));
+ 
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 622c449..2c29848 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -1689,7 +1689,7 @@ BOOLEAN VioGpuVidPN::GetDisplayInfo(void)
+     ULONG xres = 0;
+     ULONG yres = 0;
+ 
+-    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
++    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts && i < MAX_CHILDREN; i++)
+     {
+         if (m_pAdapter->ctrlQueue.AskDisplayInfo(&vbuf))
+         {
+@@ -1788,7 +1788,9 @@ BOOLEAN VioGpuVidPN::GetEdids(void)
+ 
+     PGPU_VBUFFER vbuf = NULL;
+ 
+-    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
++    // m_EDIDs has MAX_CHILDREN entries. The adapter bounds the host's count
++    // when it reads it. The bound is here again, at the array.
++    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts && i < MAX_CHILDREN; i++)
+     {
+         vbuf = NULL;
+         if (m_pAdapter->ctrlQueue.AskEdidInfo(&vbuf, i) && m_pAdapter->ctrlQueue.GetEdidInfo(vbuf, i, m_EDIDs[i]))

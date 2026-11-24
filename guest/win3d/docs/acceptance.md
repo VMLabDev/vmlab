@@ -1160,6 +1160,11 @@ the guest proof before and after and the end-to-end run on the fixed driver.
 read of the helpers' pipe, which wrote past its buffer, and
 `DxgkCreateAllocation`, which used the result of a failed pool allocation.
 
+[C755](acceptance/C755.md) records the fix of finding F7, the two ways a
+program had to the scanout without Windows (a flip command in a render
+stream, and the scanout escape), with the guest proof before and after and
+the end-to-end run on the fixed driver.
+
 ## Evidence index
 
 Every directory under [docs/evidence/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/). "Historical" marks evidence from the
