@@ -131,8 +131,8 @@ enum {
     VIOGPU_CMD_SUBMIT = 1,
 };
 #define VIOGPU_IAM 0x56696f475055ull
-#define STATUS_INVALID_PARAMETER ((LONG)0xc000000du)
-#define STATUS_INVALID_BUFFER_SIZE ((LONG)0xc0000206u)
+#define NT_INVALID_PARAMETER ((LONG)0xc000000du)
+#define NT_INVALID_BUFFER_SIZE ((LONG)0xc0000206u)
 
 typedef struct {
     const char *name;
@@ -146,15 +146,15 @@ typedef struct {
  * of 0 is refused after the size check and nothing is allocated or sent, so
  * the status of a case with type 0 says what the size check did. */
 static const test_case cases[] = {
-    {"fits", 12 + 16, VIOGPU_CMD_NOP, 16, STATUS_INVALID_PARAMETER,
+    {"fits", 12 + 16, VIOGPU_CMD_NOP, 16, NT_INVALID_PARAMETER,
      "STATUS_INVALID_PARAMETER: the size check passes, command type 0 is refused"},
-    {"too-long", 12 + 16, VIOGPU_CMD_NOP, 17, STATUS_INVALID_BUFFER_SIZE,
+    {"too-long", 12 + 16, VIOGPU_CMD_NOP, 17, NT_INVALID_BUFFER_SIZE,
      "STATUS_INVALID_BUFFER_SIZE for a command one byte longer than the payload"},
-    {"wrap-type0", 12, VIOGPU_CMD_NOP, 0xfffffff8u, STATUS_INVALID_BUFFER_SIZE,
+    {"wrap-type0", 12, VIOGPU_CMD_NOP, 0xfffffff8u, NT_INVALID_BUFFER_SIZE,
      "STATUS_INVALID_BUFFER_SIZE for CmdSize 0xFFFFFFF8 (before the fix: STATUS_INVALID_PARAMETER, the size check passed)"},
-    {"wrap", 12, VIOGPU_CMD_SUBMIT, 0xfffffff8u, STATUS_INVALID_BUFFER_SIZE,
+    {"wrap", 12, VIOGPU_CMD_SUBMIT, 0xfffffff8u, NT_INVALID_BUFFER_SIZE,
      "STATUS_INVALID_BUFFER_SIZE for CmdSize 0xFFFFFFF8 (before the fix: bugcheck 0x50, or STATUS_INSUFFICIENT_RESOURCES)"},
-    {"wrap-first", 12, VIOGPU_CMD_SUBMIT, 0xfffffff4u, STATUS_INVALID_BUFFER_SIZE,
+    {"wrap-first", 12, VIOGPU_CMD_SUBMIT, 0xfffffff4u, NT_INVALID_BUFFER_SIZE,
      "STATUS_INVALID_BUFFER_SIZE for CmdSize 0xFFFFFFF4, the first size that wraps"},
 };
 
