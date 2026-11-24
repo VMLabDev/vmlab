@@ -7,7 +7,9 @@
 # started with VMLAB_HV_FORGE_SCANOUTS=<n> (and VMLAB_HV_FORGE_EDID_FILL=<hex
 # byte> to fill the forged EDID answers): its virtio-gpu reports n scanouts in
 # the device configuration, enables n modes in the display info and answers
-# GET_EDID for every scanout below n. The device still has one scanout.
+# GET_EDID for every scanout below n, also when the driver did not ack
+# VIRTIO_GPU_F_EDID: viogpu3d asks without the ack, QEMU answers such a
+# request and the true vmlab-hv refuses it. The device still has one scanout.
 #
 # The probe writes into <out-dir>:
 #   host.txt    the lines of the VM's vmlab-hv.log that the forged device wrote
@@ -19,7 +21,7 @@
 # Windows has one monitor on it, and the System log has no bugcheck event.
 # Exit 1 when a check fails, 2 on usage, 3 when the guest does not answer.
 set -u
-[ $# -eq 3 ] || { sed -n '2,19p' "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n '2,21p' "$0" >&2; exit 2; }
 LAB=$(cd "$1" && pwd) || exit 2
 VM=$2
 OUT=$3

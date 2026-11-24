@@ -1,8 +1,8 @@
 diff --git a/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs b/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
-index 1519bbe4..7ce2e3b0 100644
+index 1519bbe4..df5d9619 100644
 --- a/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
 +++ b/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
-@@ -896,20 +896,42 @@ impl State {
+@@ -896,20 +896,44 @@ impl State {
                  out[8..12].copy_from_slice(&self.preferred.0.to_le_bytes());
                  out[12..16].copy_from_slice(&self.preferred.1.to_le_bytes());
                  out[16..20].copy_from_slice(&1u32.to_le_bytes());
@@ -15,7 +15,10 @@ index 1519bbe4..7ce2e3b0 100644
                  0x1101
              }
              0x10a => {
-                 if self.acked & 2 == 0 {
+-                if self.acked & 2 == 0 {
++                // The driver under test asks without the ack of the EDID
++                // bit. QEMU answers such a request, and so does the forgery.
++                if self.acked & 2 == 0 && forged_scanouts() <= 1 {
                      return Err(INVALID);
                  }
 -                if d.u32()? != 0 {
@@ -47,7 +50,7 @@ index 1519bbe4..7ce2e3b0 100644
                  0x1104
              }
              0x101 => {
-@@ -1251,7 +1273,7 @@ impl VirtioDevice for Gpu {
+@@ -1251,7 +1275,7 @@ impl VirtioDevice for Gpu {
          let s = self.state.lock();
          let mut config = [0; 16];
          config[..4].copy_from_slice(&s.events.to_le_bytes());
@@ -56,7 +59,7 @@ index 1519bbe4..7ce2e3b0 100644
          if let Some(renderer) = &s.renderer {
              config[12..16].copy_from_slice(&renderer.capsets.to_le_bytes());
          }
-@@ -1500,6 +1522,20 @@ impl<'a> Decoder<'a> {
+@@ -1500,6 +1524,20 @@ impl<'a> Decoder<'a> {
  }
  
  /// QEMU's default monitor, captured through the Ubuntu guest's DRM connector.
