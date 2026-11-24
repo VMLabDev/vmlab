@@ -222,7 +222,10 @@ mod tests {
             lines[2],
             "A(\"U0 F(){ \\\"say \\\\\\\"hi\\\\\\\"\\\\n\\\"; }\");"
         );
-        assert_eq!(lines[3], "FileWrite(\"~/VmlabAgt.HC\",g_src,g_n);Free(g_src);");
+        assert_eq!(
+            lines[3],
+            "FileWrite(\"~/VmlabAgt.HC\",g_src,g_n);Free(g_src);"
+        );
         assert!(ts.ends_with("VaInstallIfStopped;\n"));
     }
 
