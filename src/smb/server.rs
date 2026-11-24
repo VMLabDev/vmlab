@@ -702,7 +702,7 @@ mod tests {
                 shares: vec![ShareDef {
                     name: "testshare".to_string(),
                     host_path: share_dir.clone(),
-                    readonly: true,
+                    readonly: false,
                     smb1: false,
                     allowed_user: user.to_string(),
                 }],
@@ -751,8 +751,9 @@ mod tests {
                 .arg(port.to_string())
                 .arg("-U")
                 .arg(format!("{user}%{pass}"))
+                .current_dir(&share_dir)
                 .arg("-c")
-                .arg("ls")
+                .arg(format!("ls; put hello.txt from-guest-{round}.txt"))
                 .output()
                 .expect("run smbclient");
 
@@ -761,13 +762,18 @@ mod tests {
             let run_dir = server.config.run_dir.clone();
             drop(server);
             assert!(!run_dir.exists(), "{} outlived smbd", run_dir.display());
-            if !stdout.contains("hello.txt") {
+            if !out.status.success() || !stdout.contains("hello.txt") {
                 let _ = std::fs::remove_dir_all(&tmp);
                 panic!(
                     "round {round}: smbclient ls did not list hello.txt.\n\
                      stdout:\n{stdout}\nstderr:\n{stderr}"
                 );
             }
+            use std::os::unix::fs::PermissionsExt;
+            let uploaded = share_dir.join(format!("from-guest-{round}.txt"));
+            assert_eq!(std::fs::read(&uploaded).unwrap(), b"hi");
+            let mode = std::fs::metadata(uploaded).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o111, 0, "guest upload has host mode {mode:o}");
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }
