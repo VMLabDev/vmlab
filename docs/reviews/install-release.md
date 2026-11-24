@@ -276,6 +276,17 @@ Test: in a clean checkout create `.cargo/config.toml` with
 a refusal of the untracked file. Observed: the build proceeds and the
 provenance names `HEAD`.
 
+Fixed in card #800. `scripts/release-local.sh` refuses, before any container
+runs, a checkout with an untracked file, and names the files. Only the
+`.gitignore` files count as excludes: they are tracked, so they are part of
+`HEAD`, and an untracked one is itself a refusal. `.git/info/exclude` and the
+user's `core.excludesFile` do not hide a file from the check. Paths that the
+committed `.gitignore` files ignore (`target/`, the staged display package)
+are still not compared with `HEAD`. Tests:
+`test_a_release_refuses_an_untracked_file` and
+`test_a_release_accepts_what_the_commit_ignores` in
+`scripts/test_release_workflow.py`.
+
 ### F8. Publishing does not check the signature it uploads (wrong result)
 
 `scripts/release-publish.sh:52-56` uploads `SHA256SUMS.key.bundle` when the

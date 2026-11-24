@@ -41,7 +41,8 @@
 #                 0.0.0-dry-run alone: the bundle has no catalog and no
 #                 certificate, and release-publish.sh refuses that version.
 #
-# The checkout must have no uncommitted change to a tracked file: the
+# The checkout must have no uncommitted change to a tracked file, and no
+# untracked file outside what the .gitignore files of the commit ignore: the
 # provenance names HEAD as the source of every asset.
 
 set -euo pipefail
@@ -74,7 +75,7 @@ while [ $# -gt 0 ]; do
         --display) display="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -84,6 +85,17 @@ case "$display" in staged|rebuild|unsigned) ;; *) die "--display is staged, rebu
 # ── 1. Version and commit ────────────────────────────────────────────────────
 [ -z "$(git status --porcelain --untracked-files=no)" ] \
   || die "tracked files have uncommitted changes: commit them, the provenance names HEAD"
+# The container builds from the whole checkout, so a file that HEAD does not
+# hold changes the assets too: an untracked .cargo/config.toml sets rustflags,
+# [env], [patch] or a source replacement. Only the .gitignore files count as
+# excludes here. They are tracked (an untracked one is listed itself), so they
+# are part of HEAD; .git/info/exclude and the user's core.excludesFile are not,
+# and must not hide a file from this check.
+untracked="$(git ls-files --others --directory --no-empty-directory --exclude-per-directory=.gitignore)"
+[ -z "$untracked" ] || die "the checkout has untracked files that the build would see:
+$(printf '%s\n' "$untracked" | sed -n '1,20s/^/  /p')
+Commit or remove them (an exclude outside the .gitignore files does not count):
+the provenance names HEAD"
 commit="$(git rev-parse HEAD)"
 if [ -n "$version" ]; then
   [ -z "$kind" ] && [ -z "$bump" ] || die "--version does not go with a kind or --bump"

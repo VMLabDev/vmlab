@@ -185,14 +185,15 @@ else:
 '''
 
 
-def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_path):
-    """Review install-release F3: a card build writes to the cargo home and the
-    target volumes; a release from the same checkout path must not read them."""
+def release_checkout(tmp_path):
+    """A committed checkout with the release scripts and a `.gitignore`, and the
+    environment in which `docker` is the stub. Returns (checkout, env, state)."""
     checkout = tmp_path / 'checkout'
     for name in ['build/run.sh', 'scripts/release-local.sh']:
         (checkout / name).parent.mkdir(parents=True, exist_ok=True)
         (checkout / name).write_bytes((ROOT / name).read_bytes())
         (checkout / name).chmod(0o755)
+    (checkout / '.gitignore').write_text('/target\n')
     git = ['git', '-C', str(checkout), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
     subprocess.run([*git, 'init', '-q'], check=True)
     subprocess.run([*git, 'add', '-A'], check=True)
@@ -204,7 +205,55 @@ def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_pat
     (bin_dir / 'docker').chmod(0o755)
     state = tmp_path / 'docker-state'
     env = {k: v for k, v in os.environ.items() if not k.startswith('VMLAB_')}
-    env.update(PATH=f"{bin_dir}:{env['PATH']}", STUB_DOCKER_STATE=str(state))
+    env.update(PATH=f"{bin_dir}:{env['PATH']}", STUB_DOCKER_STATE=str(state),
+               STUB_DOCKER_BUILD='release')
+    return checkout, env, state
+
+
+def release_dry_run(checkout, env):
+    return subprocess.run([str(checkout / 'scripts/release-local.sh'), '--version', '0.0.0-dry-run',
+                           '--display', 'unsigned', '--image-as-is'], capture_output=True, text=True,
+                          env=env)
+
+
+@pytest.mark.parametrize('hidden', [False, True])
+def test_a_release_refuses_an_untracked_file(tmp_path, hidden):
+    """Review install-release F7: the container builds from the whole checkout,
+    so a file that HEAD does not hold (a `.cargo/config.toml` with `[env]` or
+    `[patch]`) changes the assets while the provenance names HEAD. An exclude
+    that is not in the commit (`.git/info/exclude`) must not hide the file."""
+    checkout, env, state = release_checkout(tmp_path)
+    (checkout / '.cargo').mkdir()
+    (checkout / '.cargo/config.toml').write_text('[env]\nVMLAB_PROBE = "x"\n')
+    if hidden:
+        (checkout / '.git/info').mkdir(exist_ok=True)
+        (checkout / '.git/info/exclude').write_text('.cargo/\n')
+
+    release = release_dry_run(checkout, env)
+    assert release.returncode != 0
+    assert 'untracked' in release.stderr, release.stderr
+    assert '.cargo/' in release.stderr, release.stderr
+    # Refused before any container ran.
+    assert not (state / 'runs').exists()
+
+
+def test_a_release_accepts_what_the_commit_ignores(tmp_path):
+    """The build outputs under a path that a committed `.gitignore` names are
+    not a refusal: an earlier release leaves `target/` in the checkout."""
+    checkout, env, state = release_checkout(tmp_path)
+    (checkout / 'target/dist').mkdir(parents=True)
+    (checkout / 'target/dist/left-by-an-earlier-build').write_text('x')
+
+    release = release_dry_run(checkout, env)
+    # The stub builds nothing, so the release stops where it collects the assets.
+    assert 'the build left no' in release.stderr, release.stderr
+    assert (state / 'runs').exists()
+
+
+def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_path):
+    """Review install-release F3: a card build writes to the cargo home and the
+    target volumes; a release from the same checkout path must not read them."""
+    checkout, env, state = release_checkout(tmp_path)
 
     def runs():
         return [json.loads(line) for line in (state / 'runs').read_text().splitlines()]
@@ -218,9 +267,7 @@ def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_pat
 
     # The stub builds nothing, so the release stops where it collects the
     # assets. Both of its containers (display driver, dist) have run by then.
-    release = subprocess.run([str(checkout / 'scripts/release-local.sh'), '--version', '0.0.0-dry-run',
-                              '--display', 'unsigned', '--image-as-is'], capture_output=True, text=True,
-                             env={**env, 'STUB_DOCKER_BUILD': 'release'})
+    release = release_dry_run(checkout, env)
     assert 'the build left no' in release.stderr, release.stderr
     release_runs = [run for run in runs() if run['build'] == 'release']
     assert len(release_runs) == 2

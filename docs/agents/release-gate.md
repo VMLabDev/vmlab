@@ -96,8 +96,10 @@ release directory `target/release-local/v<version>/` (or `--out DIR`):
 The command ends with a check: every asset is there and not empty,
 `SHA256SUMS` and `provenance.json` describe the files, and the CLI reports the
 version. `just release::verify <dir>` runs the check again. The command refuses
-a checkout with uncommitted changes to tracked files, and a version whose tag
-exists. It uploads nothing. Start it like every heavy run on helios.
+a checkout with uncommitted changes to tracked files, a checkout with an
+untracked file that the committed `.gitignore` files do not ignore (an exclude
+in `.git/info/exclude` or in your own git configuration does not count), and a
+version whose tag exists. It uploads nothing. Start it like every heavy run on helios.
 
 The command rebuilds the `vmlab-build` image first, so the image has the
 toolchains that the commit pins. `--image-as-is` skips that for a test build.
