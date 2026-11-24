@@ -1,0 +1,79 @@
+diff --git a/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs b/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
+index 1519bbe4..7ce2e3b0 100644
+--- a/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
++++ b/hv/crates/vmlab-hv-devices/src/virtio/gpu/mod.rs
+@@ -896,20 +896,42 @@ impl State {
+                 out[8..12].copy_from_slice(&self.preferred.0.to_le_bytes());
+                 out[12..16].copy_from_slice(&self.preferred.1.to_le_bytes());
+                 out[16..20].copy_from_slice(&1u32.to_le_bytes());
++                for i in 1..forged_scanouts().min(16) as usize {
++                    let at = 24 * i;
++                    out[at + 8..at + 12].copy_from_slice(&self.preferred.0.to_le_bytes());
++                    out[at + 12..at + 16].copy_from_slice(&self.preferred.1.to_le_bytes());
++                    out[at + 16..at + 20].copy_from_slice(&1u32.to_le_bytes());
++                }
+                 0x1101
+             }
+             0x10a => {
+                 if self.acked & 2 == 0 {
+                     return Err(INVALID);
+                 }
+-                if d.u32()? != 0 {
++                let scanout = d.u32()?;
++                if scanout >= forged_scanouts() {
++                    log::warn!("forged host: GET_EDID for scanout {scanout} refused");
+                     return Err(SCANOUT);
+                 }
+                 d.u32()?;
+                 out.resize(1032, 0);
+                 let edid = edid(self.preferred.0, self.preferred.1);
+                 out[..4].copy_from_slice(&(edid.len() as u32).to_le_bytes());
+-                out[8..8 + edid.len()].copy_from_slice(&edid);
++                if scanout != 0 {
++                    // What the driver under test copies from is its to choose.
++                    // Fill the whole field, so that every byte it takes past
++                    // its own buffer is seen.
++                    let fill = std::env::var("VMLAB_HV_FORGE_EDID_FILL")
++                        .ok()
++                        .and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok());
++                    if let Some(fill) = fill {
++                        out[8..].fill(fill);
++                    }
++                }
++                if scanout == 0 || std::env::var_os("VMLAB_HV_FORGE_EDID_FILL").is_none() {
++                    out[8..8 + edid.len()].copy_from_slice(&edid);
++                }
++                log::warn!("forged host: GET_EDID for scanout {scanout} answered");
+                 0x1104
+             }
+             0x101 => {
+@@ -1251,7 +1273,7 @@ impl VirtioDevice for Gpu {
+         let s = self.state.lock();
+         let mut config = [0; 16];
+         config[..4].copy_from_slice(&s.events.to_le_bytes());
+-        config[8..12].copy_from_slice(&1u32.to_le_bytes());
++        config[8..12].copy_from_slice(&forged_scanouts().to_le_bytes());
+         if let Some(renderer) = &s.renderer {
+             config[12..16].copy_from_slice(&renderer.capsets.to_le_bytes());
+         }
+@@ -1500,6 +1522,20 @@ impl<'a> Decoder<'a> {
+ }
+ 
+ /// QEMU's default monitor, captured through the Ubuntu guest's DRM connector.
++/// TEST ONLY (guest/win3d/tests/kmd): the scanout count this device reports,
++/// from `VMLAB_HV_FORGE_SCANOUTS`. It still has one scanout.
++fn forged_scanouts() -> u32 {
++    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    *COUNT.get_or_init(|| {
++        let count = std::env::var("VMLAB_HV_FORGE_SCANOUTS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(1);
++        log::warn!("forged host: virtio-gpu reports num_scanouts = {count}");
++        count
++    })
++}
++
+ pub(crate) fn edid(w: u32, h: u32) -> [u8; 256] {
+     let mut e =
+         *include_bytes!("../../../../../docs/hwref/ubuntu-26.04-display/guest/drm/Virtual-1.edid");
