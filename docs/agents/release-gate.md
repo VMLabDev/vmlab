@@ -195,6 +195,11 @@ is the one signing step, with two ways (`--signing`, or
   `SHA256SUMS.key.bundle`, then verifies it with the public half. Nothing goes
   to a transparency log.
 
+`just release::publish` verifies a `SHA256SUMS.key.bundle` again before the
+upload, against the `SHA256SUMS` beside it and with the committed
+`build/release-signing.pub` only. It needs cosign for a signed release, and
+refuses a bundle that a test key made or that signs an earlier `SHA256SUMS`.
+
 `install.sh` picks the check by the signature file of the release.
 `SHA256SUMS.key.bundle` is verified with `cosign verify-blob --key` against
 `RELEASE_KEY`, a variable at the top of `install.sh`. That variable is the
