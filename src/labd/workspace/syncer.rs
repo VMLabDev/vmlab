@@ -5078,7 +5078,10 @@ mod tests {
             seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
         let ws = workspace(dir.path(), state.path());
         let on_disk = {
-            let (path, root) = (Ledger::path(state.path(), "dev01"), dir.path().to_path_buf());
+            let (path, root) = (
+                Ledger::path(state.path(), "dev01"),
+                dir.path().to_path_buf(),
+            );
             move || Ledger::load(&path, &root, "/src")
         };
         let recorded = {
