@@ -417,6 +417,21 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap(), CtlEvent::Exited { code: 0 });
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_version_mismatch_is_named_in_the_ctl_error() {
+        let guest_version = PROTO_VERSION - 1;
+        let (_dir, path) = spawn_mock(move |mut stream| async move {
+            write_line(&mut stream, &CtlEvent::Boot { proto_version: guest_version }).await;
+            write_line(&mut stream, &CtlEvent::Started { pid: 7 }).await;
+        })
+        .await;
+
+        let ctl = CtlHandle::connect(&path).await.unwrap();
+        let error = ctl.wait_started(LONG).await.unwrap_err().to_string();
+        assert!(error.contains(&format!("guest init speaks proto v{guest_version}")), "{error}");
+        assert!(error.contains(&format!("host expects v{PROTO_VERSION}")), "{error}");
+    }
+
     #[tokio::test]
     async fn garbage_lines_are_skipped() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
