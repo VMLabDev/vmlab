@@ -1169,8 +1169,12 @@ fn wait_for_child_event(pid: libc::pid_t, events: libc::c_int) -> bool {
     unsafe {
         let mut info = std::mem::MaybeUninit::uninit();
         loop {
-            if libc::waitid(libc::P_PID, pid as libc::id_t, info.as_mut_ptr(), events | libc::WNOWAIT)
-                == 0
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                events | libc::WNOWAIT,
+            ) == 0
             {
                 return true;
             }

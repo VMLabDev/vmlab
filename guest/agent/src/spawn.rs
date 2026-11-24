@@ -315,7 +315,10 @@ pub fn piped_command(
     let output = child.stdout.take().expect("piped stdout");
     let errors = child.stderr.take().expect("piped stderr");
     #[cfg(unix)]
-    let group = std::sync::Arc::new(crate::platform_impl::ExecGroup::new(child.id(), pam_wrapper));
+    let group = std::sync::Arc::new(crate::platform_impl::ExecGroup::new(
+        child.id(),
+        pam_wrapper,
+    ));
     #[cfg(unix)]
     let kill_group = group.clone();
     Ok(Spawned {
