@@ -680,6 +680,18 @@ impl HostUsbDevice {
                     }
                 })
             }
+            // These three change state the host kernel tracks for the
+            // device. In any other shape (another recipient, the IN
+            // direction) they are not valid requests, and a device that
+            // decodes by bRequest alone would still act on them behind the
+            // kernel's back. They are refused here and never forwarded.
+            (
+                StandardControlRequest::SetAddress
+                | StandardControlRequest::SetConfiguration
+                | StandardControlRequest::SetInterface,
+                _,
+                _,
+            ) => Some(UsbTransfer::Stall),
             _ => None,
         }
     }
@@ -1061,6 +1073,44 @@ mod tests {
             UsbTransfer::Ack(Vec::new())
         );
         assert!(fake.submitted_payloads().is_empty());
+    }
+
+    /// Review usb.md F7: SET_ADDRESS, SET_CONFIGURATION and SET_INTERFACE
+    /// change state the host kernel tracks. With another recipient or the IN
+    /// direction they are malformed, and a device that decodes by bRequest
+    /// alone would still obey them, so none may reach the device.
+    #[test]
+    fn standard_requests_with_odd_recipient_or_direction_never_reach_the_device() {
+        for request in [5u8, 9, 11] {
+            for request_type in (0x00u8..=0x03).chain(0x80..=0x83) {
+                let (mut host, fake) = device();
+                let before = fake.calls();
+                // A value that is valid for the well-formed request:
+                // address 1, configuration 1, alternate setting 0.
+                let value = if request == 11 { 0 } else { 1 };
+                let outcome = control(&mut host, setup(request_type, request, value, 0, 0));
+                let case = format!("bmRequestType {request_type:#04x} bRequest {request}");
+                assert!(
+                    fake.submitted_payloads().is_empty(),
+                    "{case} reached the device as a control URB"
+                );
+                let well_formed = matches!((request, request_type), (5 | 9, 0x00) | (11, 0x01));
+                if well_formed {
+                    assert_eq!(outcome, UsbTransfer::Ack(Vec::new()), "{case}");
+                    continue;
+                }
+                assert_eq!(outcome, UsbTransfer::Stall, "{case}");
+                let after = fake.calls();
+                assert_eq!(
+                    after.set_configurations, before.set_configurations,
+                    "{case} changed the configuration"
+                );
+                assert_eq!(
+                    after.set_interfaces, before.set_interfaces,
+                    "{case} changed an alternate setting"
+                );
+            }
+        }
     }
 
     /// Review usb.md F4: `UsbFs::control` is a synchronous transfer that

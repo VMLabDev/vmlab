@@ -319,6 +319,11 @@ hostile guest or peer, wrong result, cosmetic.
 - How bad: security against a hostile guest, of low weight: it needs a device
   that ignores the recipient bits, and the damage is the loss of that device
   for the host until a replug.
+- Status: fixed by card #785. `intercept_control` now answers SET_ADDRESS,
+  SET_CONFIGURATION and SET_INTERFACE with a stall when the recipient or the
+  direction is not the expected one, so no standard request with one of these
+  three `bRequest` values is sent to the device. The proof test is in
+  `usb/host/mod.rs` under the name given above.
 
 ### F8. Stopping the control endpoint does not cancel its transfer
 
@@ -460,6 +465,10 @@ hostile guest or peer, wrong result, cosmetic.
   device built from it panics.
 - How bad: crash of the VM, reachable only when the kernel hands out
   descriptors that disagree with themselves.
+- Status: fixed by card #786. `parse_usbfs_descriptors` now returns an error
+  when a configuration's `wTotalLength` reaches past the end of the data, so
+  no device is built from such descriptors and the slice in
+  `config_descriptor_filtered` stays inside them.
 
 ### F13. Alternate settings of an old configuration are applied to the new one
 
