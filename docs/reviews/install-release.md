@@ -300,6 +300,18 @@ it prints the command with the bundle. For the second way, run
 `release-assets.py prepare` again after signing and then `release::verify`:
 it passes, and `cosign verify-blob --key build/release-signing.pub` fails.
 
+Fixed in card #797. `scripts/release-publish.sh` verifies a
+`SHA256SUMS.key.bundle` before it prints or runs the upload command, with
+`cosign verify-blob --key build/release-signing.pub` against the `SHA256SUMS`
+beside it, the way `install.sh` does. It reads only the committed public
+half and never `VMLAB_RELEASE_PUBLIC_KEY`. It refuses a bundle that does not
+verify, an empty bundle, a bundle when no public half is committed, and a
+bundle when cosign is missing. `just release::verify` still does not look at
+the bundle. Tests: `test_publish_refuses_a_signature_of_a_test_key`,
+`test_publish_refuses_a_signature_of_an_earlier_manifest` and
+`test_publish_refuses_a_signature_it_cannot_check` in
+`scripts/test_release_workflow.py`.
+
 ### F9. Every release build drops `--locked` (wrong result)
 
 `build/dist.sh:63-69` drops `--locked` when the version differs from
@@ -313,6 +325,13 @@ Test: in a scratch checkout delete one `[[package]]` entry from `Cargo.lock`
 and run `build/dist.sh 9.9.9`. Expected: a failure. Observed: cargo
 resolves the crate again and the build passes. `cargo build --locked` on
 the same tree fails.
+
+Fixed in card #798. `build/dist.sh` stamps the version into the `vmlab` entry
+of `Cargo.lock` as well as into `Cargo.toml`, and always builds with
+`--locked`. Both files are put back afterwards, as before. The proof test is
+`build/test_dist.py`, which runs `dist.sh` on a scratch crate with real
+cargo: a lock that misses a package fails the stamped build, and a matching
+lock passes it.
 
 ### F10. `just guest-install` merges over an old guest directory (wrong result)
 

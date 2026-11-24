@@ -589,9 +589,18 @@ impl Floppy {
         let head = (execution.command[1] >> 2) & 1;
         let d = &self.drives[drive];
         let at = d.at;
+        // The next sector of the spinning track, as QEMU reports it. A data
+        // command leaves the guest's sector byte on the drive unclamped, so
+        // it can be past the end of the track, up to 255.
         let (st0, st1, sect) = match &d.media {
-            Some(media) if media.kind.rate() == self.rate => (0, 0, at.sect + 1),
-            Some(_) => (0x40, 0x01, at.sect + 1),
+            Some(media) => {
+                let sect = at.sect % media.kind.sectors() + 1;
+                if media.kind.rate() == self.rate {
+                    (0, 0, sect)
+                } else {
+                    (0x40, 0x01, sect)
+                }
+            }
             None => (0x40, 0x01, at.sect),
         };
         self.result(vec![

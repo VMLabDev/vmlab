@@ -662,6 +662,7 @@ impl PciRoot {
             let Some(rom) = &func.rom else { continue };
             let base = (rom.value & !0x7ff) as u64;
             if rom.value & 1 != 0
+                && base != 0
                 && !rom.sizing
                 && func.command & 2 != 0
                 && addr >= base
