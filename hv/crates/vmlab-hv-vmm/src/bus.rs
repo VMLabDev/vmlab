@@ -115,6 +115,13 @@ impl MmioBus {
         self.regions.retain(|r| !Arc::ptr_eq(&r.dev, dev));
     }
 
+    /// Whether a registered device decodes `addr`.
+    pub fn covers(&self, addr: u64) -> bool {
+        self.regions
+            .iter()
+            .any(|r| r.base <= addr && addr < r.base + r.len)
+    }
+
     fn check_overlap(&self, base: u64, len: u64) -> Result<(), String> {
         if self
             .regions
