@@ -92,12 +92,12 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
     // stdout / stderr pumps.
     let (pumped, pumps) = mpsc::channel::<()>();
     let accepting_output = Arc::new(Mutex::new(true));
-    let start_pump = |kind, pipe: Box<dyn Read + Send>| {
+    let start_pump = |kind, mut pipe: Box<dyn Read + Send>| {
         let (mux, credit) = (mux.clone(), credit.clone());
         let accepting_output = accepting_output.clone();
         let pumped = pumped.clone();
         thread::spawn(move || {
-            pump_out_with(&credit, pipe, |bytes| {
+            pump_out_with(&credit, &mut pipe, move |bytes| {
                 let accepting = accepting_output.lock().unwrap();
                 if *accepting {
                     mux.send_data(kind, id, bytes);
@@ -105,6 +105,9 @@ pub fn open(mux: &Mux, spawner: &dyn Spawner, identity: &Identity, id: u32, spec
                 *accepting
             });
             drop(pumped);
+            // Descendants may still write to these pipes after the session
+            // ends. Discard their output until they close the write ends.
+            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         });
     };
     start_pump(FrameKind::Data, output);

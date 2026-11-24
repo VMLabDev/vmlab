@@ -65,7 +65,7 @@ use windows as platform_impl;
 
 /// Platform functions the portable modules call directly.
 pub mod platform {
-    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, mem_sample, process_killer};
+    pub use crate::platform_impl::{cpu_pct, cpu_sample, disk_sample, mem_sample};
 }
 
 use std::io::Read;
