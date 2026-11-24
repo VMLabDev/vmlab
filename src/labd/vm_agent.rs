@@ -4846,10 +4846,7 @@ mod tests {
         ops.stat("/guest/some-file").await.unwrap();
         let answered = ops.inner.last_reply();
 
-        let err = format!(
-            "{:#}",
-            ops.stat("/guest/answers-nobody").await.unwrap_err()
-        );
+        let err = format!("{:#}", ops.stat("/guest/answers-nobody").await.unwrap_err());
         assert!(err.contains(NOBODY_ENDED), "{err}");
         assert_eq!(
             ops.inner.last_reply(),
