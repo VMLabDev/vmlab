@@ -199,6 +199,13 @@ pub fn parse_usbfs_descriptors(data: &[u8]) -> Result<DeviceDescriptorTree> {
                 inner: raw_config_descriptor,
                 interface_descriptors: BTreeMap::new(),
             };
+            // `wTotalLength` comes from the device. GET_DESCRIPTOR(Configuration)
+            // slices the raw data by it, so it must stay inside the data.
+            if config_offset + usize::from(config_descriptor.total_length())
+                > device_descriptor.raw.len()
+            {
+                return Err(Error::DescriptorParse);
+            }
 
             while let Ok((raw_interface_descriptor, interface_offset)) =
                 next_descriptor::<InterfaceDescriptor>(&device_descriptor.raw, &mut offset)
