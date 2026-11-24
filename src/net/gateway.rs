@@ -339,6 +339,12 @@ impl Gateway {
         // The gateway's MAC is its port's from the start: no guest frame
         // can claim it in the switch (review F9).
         switch.bind_mac(id, gw_mac);
+        // Nor can another port answer ARP for its address, or answer a DHCP
+        // client where the gateway is the segment's server (review F29).
+        switch.bind_ip(id, gw_ip);
+        if dhcp.is_some() {
+            switch.bind_dhcp_server(id);
+        }
 
         let dhcp = dhcp.map(|mut c| {
             c.gateway = gw_ip;
@@ -1247,5 +1253,27 @@ pub(crate) mod tests {
         a.tx.send(Bytes::from(offer)).await.unwrap();
         a.tx.send(marker.clone()).await.unwrap();
         assert_eq!(b.rx.recv().await.unwrap(), marker);
+    }
+
+    /// A segment whose gateway serves no DHCP (`dhcp = false`) keeps a
+    /// guest's own DHCP server: the lab said the gateway is not the server.
+    #[tokio::test]
+    async fn a_guest_serves_dhcp_where_the_gateway_does_not() {
+        const SERVER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 213, 1, 66);
+        let sw = Switch::new("seg".into());
+        let _gw = Gateway::spawn(
+            &sw,
+            GatewayConfig {
+                dhcp: None,
+                ..config()
+            },
+        );
+        let a = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut b = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        let offer = Bytes::from(forged_offer(SERVER_MAC, SERVER_IP));
+        a.tx.send(offer.clone()).await.unwrap();
+        assert_eq!(b.rx.recv().await.unwrap(), offer);
     }
 }
