@@ -383,6 +383,12 @@ fn default_button() -> String {
 fn default_threshold() -> f64 {
     0.9
 }
+fn deserialize_threshold<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    f64::deserialize(deserializer)
+        .map_err(|error| serde::de::Error::custom(format!("invalid match threshold: {error}")))
+}
 fn default_exec_timeout() -> u64 {
     120
 }
@@ -646,7 +652,8 @@ vocabulary! {
         MachineFindImage = "machine.find_image" {
             #[serde(alias = "vm", alias = "container")] machine: String,
             image: String,
-            #[serde(default = "default_threshold")] threshold: f64,
+            #[serde(default = "default_threshold", deserialize_with = "deserialize_threshold")]
+            threshold: f64,
             #[serde(default)] region: Option<Region>,
         },
 
@@ -1581,6 +1588,19 @@ mod tests {
     #[test]
     fn a_command_more_than_one_surface_reaches_asserts_nothing() {
         assert!(LabRequest::spec("up").unwrap().one_way.is_none());
+    }
+
+    #[test]
+    fn image_match_decode_error_names_the_threshold() {
+        let request = LabRequest::MachineFindImage {
+            machine: "box".into(),
+            image: "button.png".into(),
+            threshold: f64::NAN,
+            region: None,
+        };
+        let (cmd, args) = request.to_wire();
+        let error = LabRequest::from_wire(cmd, args).unwrap_err().to_string();
+        assert!(error.contains("invalid match threshold"), "{error}");
     }
 
     /// `template.list` and `template.build` grew a `file` (and `build` a

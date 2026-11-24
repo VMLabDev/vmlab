@@ -763,11 +763,11 @@ SRC
       | "Parameter" | "Type" | "Meaning" |
       | "`image`" | "string" | "The reference PNG." |
       | "`timeout_secs`" | "int" | "How long to keep looking, in seconds." |
-      | "`threshold`" | "float" | "The minimum similarity score, 0 to 1. The default elsewhere is 0.9." |
+      | "`threshold`" | "float" | "The minimum similarity score, from 0 to 1 inclusive. Other image waits use 0.9." |
       | "`region`" | "List[int]" | "`[x, y, w, h]` to search only part of the screen, or `[]` for the whole screen." |
   }
   p <<DOC
-    Behaves as `Machine.wait_for_image` otherwise. It also fails with
+    The threshold must be finite and in range. This call also fails with
     "region needs [x, y, w, h], got <n> elements" when `region` has any
     other length. Restricting the region makes a match faster and keeps a
     small crop from matching in the wrong place.
@@ -903,7 +903,7 @@ SRC
 
   h2 "Machine.wait_for_text"
   p "Wait until OCR of the display matches a regular expression."
-  code wscript { source = "fn wait_for_text(self, pattern: string, timeout_secs: int) -> Result[Match, string]" }
+  code wscript { source = "fn wait_for_text(self, pattern: string, timeout_secs: int) -> Result[TextMatch, string]" }
   table {
     rows:
       | "Parameter" | "Type" | "Meaning" |
@@ -912,10 +912,9 @@ SRC
   }
   p <<DOC
     Grabs and OCRs the whole screen once a second. On a match it returns a
-    [Match](ref_ws_types) whose `text` field is the matched text; the
-    position fields are 0 and the score is 1, because OCR does not report
-    where the words were. It fails with "bad pattern: <reason>" for an
-    invalid expression, with "timed out after <n>s waiting for /<pattern>/
+    [TextMatch](ref_ws_types) containing the matched text. It fails with
+    "bad pattern: <reason>" for an invalid expression, with
+    "timed out after <n>s waiting for /<pattern>/
     on <name>" at the deadline, and on a machine without a display.
   DOC
   code wscript { source = <<'SRC'
@@ -931,7 +930,7 @@ SRC
 
   h2 "Machine.wait_for_text_opts"
   p "Wait until OCR of the display matches, with a region, upscale and layout of your choosing (wscript surface 5)."
-  code wscript { source = "fn wait_for_text_opts(self, pattern: string, timeout_secs: int, opts: Map[string, string]) -> Result[Match, string]" }
+  code wscript { source = "fn wait_for_text_opts(self, pattern: string, timeout_secs: int, opts: Map[string, string]) -> Result[TextMatch, string]" }
   table {
     rows:
       | "Parameter" | "Type" | "Meaning" |

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use image::RgbImage;
 
 use super::hypervisor::{Frames, Input};
@@ -136,14 +136,13 @@ impl Display {
     /// The frames capability's screendump → decoded image.
     async fn grab_frames(&self) -> Result<RgbImage> {
         let frames = self.host.frames().await?;
-        let tmp = self
-            .host
-            .capture_dir()
-            .join(format!(".grab-{}.ppm", self.host.name()));
+        let scratch = tempfile::Builder::new()
+            .prefix(".grab-")
+            .tempdir_in(self.host.capture_dir())
+            .with_context(|| format!("create capture directory for {}", self.host.name()))?;
+        let tmp = scratch.path().join("screen.ppm");
         frames.screendump(&tmp).await?;
-        let img = vision::load_screen(&tmp)?;
-        let _ = std::fs::remove_file(&tmp);
-        Ok(img)
+        vision::load_screen(&tmp)
     }
 
     /// One full framebuffer update over RFB.
