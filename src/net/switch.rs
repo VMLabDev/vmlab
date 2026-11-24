@@ -1,10 +1,18 @@
 //! The per-segment userspace L2 switch (PRD §9.1).
 //!
 //! Every VM NIC attaches as a port over a QEMU stream-socket netdev; daemon
-//! services (DHCP/DNS/NAT, trunks) attach as channel ports. The switch does
-//! MAC-learning forwarding between ports, honours private-VLAN-style port
-//! isolation, and exposes an ingress hook seam for later L3 rule
-//! enforcement.
+//! services (DHCP/DNS/NAT) attach as channel ports, and so do trunks to
+//! another switch of the same segment. The switch does MAC-learning
+//! forwarding between ports, honours private-VLAN-style port isolation, and
+//! exposes an ingress hook seam for later L3 rule enforcement.
+//!
+//! Isolation holds across a trunk because a frame on a trunk says where it
+//! came from. A frame that leaves on a [`PortClass::Trunk`] port carries an
+//! origin tag after its MAC addresses: the ethertype [`TRUNK_TAG_ETHERTYPE`]
+//! and two bytes naming the class of the port it first entered a switch on.
+//! The switch at the far end removes the tag and applies the delivery rule
+//! of that class. A frame from a service port travels without a tag, unless
+//! its own ethertype is the tag's.
 
 use crate::sync::LockRecover;
 use std::collections::{HashMap, VecDeque};
@@ -48,13 +56,75 @@ impl std::fmt::Display for PortId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortClass {
     /// A VM NIC. `isolated` ports exchange frames only with [`Service`]
-    /// ports (gateway/NAT/trunk), never with other guests — the
-    /// private-VLAN model.
+    /// ports (gateway/NAT), never with other guests — the private-VLAN
+    /// model. Their frames cross a [`Trunk`] with their origin, so the rule
+    /// holds for the guests behind it too.
     ///
     /// [`Service`]: PortClass::Service
+    /// [`Trunk`]: PortClass::Trunk
     Guest { isolated: bool },
-    /// A daemon-side participant: DHCP/DNS/NAT, port-forward proxy, trunk.
+    /// A daemon-side participant: DHCP/DNS/NAT, port-forward proxy.
     Service,
+    /// A link to another switch of the same segment: a lab's trunk to the
+    /// supervisor's global switch, and every port of that switch. Behind it
+    /// are services and guests alike, so each frame on it carries the class
+    /// of the port it came from (the module doc has the format), and a MAC
+    /// learned on it is not held against a guest (review F22, F26).
+    Trunk,
+}
+
+/// The ethertype of the origin tag a frame carries on a trunk (IEEE 802
+/// Local Experimental Ethertype 2).
+pub const TRUNK_TAG_ETHERTYPE: u16 = 0x88B6;
+/// Length of the origin tag: the ethertype and the origin code.
+const TRUNK_TAG_LEN: usize = 4;
+const ORIGIN_SERVICE: u16 = 0;
+const ORIGIN_GUEST: u16 = 1;
+const ORIGIN_GUEST_ISOLATED: u16 = 2;
+
+/// Does `frame` carry the tag's ethertype where its own ethertype would be?
+fn has_trunk_tag(frame: &[u8]) -> bool {
+    frame.len() >= 12 + TRUNK_TAG_LEN
+        && u16::from_be_bytes([frame[12], frame[13]]) == TRUNK_TAG_ETHERTYPE
+}
+
+/// `frame` as it travels on a trunk, for a frame that entered a switch on a
+/// port of class `origin`. `None` where it travels as it is: a service's
+/// frame whose ethertype cannot be taken for a tag.
+fn trunk_tagged(frame: &[u8], origin: &PortClass) -> Option<Bytes> {
+    let code = match origin {
+        PortClass::Guest { isolated: true } => ORIGIN_GUEST_ISOLATED,
+        PortClass::Guest { isolated: false } => ORIGIN_GUEST,
+        PortClass::Service | PortClass::Trunk if has_trunk_tag(frame) => ORIGIN_SERVICE,
+        PortClass::Service | PortClass::Trunk => return None,
+    };
+    if frame.len() < 12 {
+        return None; // a runt: the far switch drops it as this one would
+    }
+    let mut tagged = Vec::with_capacity(frame.len() + TRUNK_TAG_LEN);
+    tagged.extend_from_slice(&frame[..12]);
+    tagged.extend_from_slice(&TRUNK_TAG_ETHERTYPE.to_be_bytes());
+    tagged.extend_from_slice(&code.to_be_bytes());
+    tagged.extend_from_slice(&frame[12..]);
+    Some(Bytes::from(tagged))
+}
+
+/// The origin of a frame read from a trunk, and the frame without its tag.
+/// A frame with no tag is a service's. An origin code this switch does not
+/// know is given the narrowest rule, an isolated guest's.
+fn trunk_untagged(frame: Bytes) -> (PortClass, Bytes) {
+    if !has_trunk_tag(&frame) {
+        return (PortClass::Service, frame);
+    }
+    let origin = match u16::from_be_bytes([frame[14], frame[15]]) {
+        ORIGIN_SERVICE => PortClass::Service,
+        ORIGIN_GUEST => PortClass::Guest { isolated: false },
+        _ => PortClass::Guest { isolated: true },
+    };
+    let mut plain = Vec::with_capacity(frame.len() - TRUNK_TAG_LEN);
+    plain.extend_from_slice(&frame[..12]);
+    plain.extend_from_slice(&frame[12 + TRUNK_TAG_LEN..]);
+    (origin, Bytes::from(plain))
 }
 
 /// Verdict of an [`IngressHook`] for one ingress frame.
@@ -100,8 +170,8 @@ pub struct SwitchStats {
     pub frames_flooded: u64,
     /// Frames that died: hook drops, isolation drops, runts, guest frames
     /// from a service port's MAC, frames that use what another port has
-    /// bound (a MAC, an address in ARP, the DHCP server role), full or
-    /// closed egress queues, and floods
+    /// bound (a MAC, an address in ARP, the DHCP server role), frames too
+    /// long for a trunk's tag, full or closed egress queues, and floods
     /// that reached nobody.
     pub frames_dropped: u64,
     /// Frames forwarded in-kernel by the fast path (already included in
@@ -124,14 +194,14 @@ struct PortEntry {
 /// replaces the oldest learned on that port. A frame for a MAC the switch
 /// no longer remembers is flooded, as for any unknown destination.
 const MAX_MACS_PER_GUEST_PORT: usize = 256;
-/// The same for a service port. A trunk is one: it carries every MAC of the
-/// segment's far side.
+/// The same for a service port and for a trunk, which carries every MAC of
+/// the segment's far side.
 const MAX_MACS_PER_SERVICE_PORT: usize = 4096;
 
 fn mac_limit(class: &PortClass) -> usize {
     match class {
         PortClass::Guest { .. } => MAX_MACS_PER_GUEST_PORT,
-        PortClass::Service => MAX_MACS_PER_SERVICE_PORT,
+        PortClass::Service | PortClass::Trunk => MAX_MACS_PER_SERVICE_PORT,
     }
 }
 
@@ -169,8 +239,12 @@ struct Inner {
 }
 
 impl Inner {
+    /// Is `port` one that may bind: a service port or a trunk?
     fn is_service(&self, port: PortId) -> bool {
-        matches!(self.ports.get(&port), Some(p) if p.class == PortClass::Service)
+        matches!(
+            self.ports.get(&port),
+            Some(p) if matches!(p.class, PortClass::Service | PortClass::Trunk)
+        )
     }
 
     /// Why a frame from `port` is not that port's to send, if it is not:
@@ -230,12 +304,14 @@ pub struct Switch {
     offload: Option<Arc<fastpath::SegmentOffload>>,
 }
 
-/// May a frame ingressing on a port of class `ingress` egress a port of
-/// class `egress`? Isolated guest ports exchange frames only with service
-/// ports.
-fn delivery_allowed(ingress: &PortClass, egress: &PortClass) -> bool {
+/// May a frame that entered the segment on a port of class `origin` egress
+/// a port of class `egress`? Isolated guest ports exchange frames only with
+/// service ports. `origin` is never a trunk: a frame from a trunk has the
+/// origin its tag names. Every frame may leave on a trunk, because the tag
+/// it gets there lets the far switch apply this same rule.
+fn delivery_allowed(origin: &PortClass, egress: &PortClass) -> bool {
     !matches!(
-        (ingress, egress),
+        (origin, egress),
         (PortClass::Guest { isolated: true }, PortClass::Guest { .. })
             | (PortClass::Guest { .. }, PortClass::Guest { isolated: true })
     )
@@ -461,7 +537,7 @@ impl Switch {
         }
     }
 
-    /// Put `mac` on the service port `port` before that port has sent a
+    /// Put `mac` on the service or trunk port `port` before that port has sent a
     /// frame, and hold it there: a frame from any other port, guest or
     /// service, with `mac` as its source is dropped and moves nothing
     /// (review F9, F30). The gateway binds its own MAC this way, and a
@@ -613,13 +689,23 @@ impl Switch {
         self.ingress_packet(port, Packet::raw(frame));
     }
 
-    fn ingress_packet(&self, port: PortId, packet: Packet) {
+    fn ingress_packet(&self, port: PortId, mut packet: Packet) {
         let (ingress_class, mtu) = {
             let inner = self.inner.lock_recover();
             match inner.ports.get(&port) {
                 Some(p) => (p.class, p.config.mtu),
                 None => return, // port already gone
             }
+        };
+
+        // Where the frame entered the segment: this port, or for a trunk
+        // the port its tag names. The hook and the rest see no tag.
+        let origin = if ingress_class == PortClass::Trunk {
+            let (origin, frame) = trunk_untagged(std::mem::take(&mut packet.frame));
+            packet.frame = frame;
+            origin
+        } else {
+            ingress_class
         };
 
         // Ingress hook (rule enforcement seam).
@@ -642,7 +728,7 @@ impl Switch {
                     let inner = self.inner.lock_recover();
                     if let Some(p) = inner.ports.get(&port) {
                         for r in reply {
-                            self.deliver(p, &Packet::raw(r));
+                            self.deliver(p, &Packet::raw(r), &PortClass::Service);
                         }
                     }
                 }
@@ -653,7 +739,7 @@ impl Switch {
         };
 
         for packet in forward {
-            self.forward_packet(port, ingress_class, packet);
+            self.forward_packet(port, origin, packet);
         }
     }
 
@@ -674,8 +760,17 @@ impl Switch {
         }
     }
 
-    fn deliver(&self, entry: &PortEntry, packet: &Packet) -> bool {
-        let Ok(packets) = packet.for_port(entry.config.framing, entry.config.mtu) else {
+    /// Queue `packet`, which entered the segment on a port of class
+    /// `origin`, on the port `entry`. A trunk gets it with its origin tag.
+    fn deliver(&self, entry: &PortEntry, packet: &Packet, origin: &PortClass) -> bool {
+        let packets = if entry.class == PortClass::Trunk {
+            self.for_trunk(entry, packet, origin)
+        } else {
+            packet
+                .for_port(entry.config.framing, entry.config.mtu)
+                .map_err(drop)
+        };
+        let Ok(packets) = packets else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -694,7 +789,43 @@ impl Switch {
         delivered
     }
 
-    fn forward_packet(&self, port: PortId, ingress_class: PortClass, packet: Packet) {
+    /// `packet` as the trunk port `entry` sends it: whole frames at the
+    /// port's MTU, each with its origin tag where it needs one. The tag is
+    /// added after segmentation, so it is no part of the MTU.
+    fn for_trunk(
+        &self,
+        entry: &PortEntry,
+        packet: &Packet,
+        origin: &PortClass,
+    ) -> Result<Vec<Packet>, ()> {
+        let mut out = Vec::new();
+        for plain in packet
+            .for_port(FramingMode::Raw, entry.config.mtu)
+            .map_err(drop)?
+        {
+            let Some(tagged) = trunk_tagged(&plain.frame, origin) else {
+                out.push(plain);
+                continue;
+            };
+            if tagged.len() > framing::MAX_FRAME_LEN {
+                return Err(());
+            }
+            out.push(Packet::raw(tagged));
+        }
+        let mut framed = Vec::with_capacity(out.len());
+        for packet in out {
+            framed.extend(
+                packet
+                    .for_port(entry.config.framing, entry.config.mtu)
+                    .map_err(drop)?,
+            );
+        }
+        Ok(framed)
+    }
+
+    /// Learn and forward one frame that came in on `port` and entered the
+    /// segment on a port of class `origin`.
+    fn forward_packet(&self, port: PortId, origin: PortClass, packet: Packet) {
         let frame = &packet.frame;
 
         if frame.len() < super::frame::ETH_HEADER_LEN {
@@ -721,12 +852,15 @@ impl Switch {
             return;
         }
 
-        // A MAC a service port holds (the gateway's, bound when it attached,
-        // or one learned behind a trunk) is not a guest's to send from: the
+        // A MAC a service port holds is not a guest's to send from: the
         // frame is dropped and the MAC stays where it is (review F9). A
         // guest that could move it would receive, or black-hole, every other
         // guest's traffic to the gateway.
-        if matches!(ingress_class, PortClass::Guest { .. })
+        // A MAC that a trunk only learned is not held (review F22): behind
+        // a trunk are the guests of other labs and hosts, and one frame of
+        // theirs with a local guest's source MAC would cut that guest off.
+        // The guest takes its MAC back with its next frame.
+        if matches!(origin, PortClass::Guest { .. })
             && !is_multicast(&src)
             && let Some(holder) = inner.macs.get(&src)
             && *holder != port
@@ -784,11 +918,11 @@ impl Switch {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                if !delivery_allowed(&ingress_class, &entry.class) {
+                if !delivery_allowed(&origin, &entry.class) {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                if self.deliver(entry, &packet) {
+                if self.deliver(entry, &packet, &origin) {
                     self.forwarded.fetch_add(1, Ordering::Relaxed);
                 } else {
                     debug!(switch = %self.name, egress = %target, "egress queue full, frame dropped");
@@ -802,10 +936,10 @@ impl Switch {
             None => {
                 let mut delivered = 0u64;
                 for (id, entry) in &inner.ports {
-                    if *id == port || !delivery_allowed(&ingress_class, &entry.class) {
+                    if *id == port || !delivery_allowed(&origin, &entry.class) {
                         continue;
                     }
-                    if self.deliver(entry, &packet) {
+                    if self.deliver(entry, &packet, &origin) {
                         delivered += 1;
                     } else {
                         debug!(switch = %self.name, egress = %id, "egress queue full, frame dropped");
@@ -1603,6 +1737,159 @@ mod tests {
         let again = frame(gateway, mac(2), b"to the gateway again");
         b.tx.send(again.clone()).await.unwrap();
         assert_eq!(recv(&mut trunk.rx).await, again);
+    }
+
+    /// The next frame queued for a port, without a wait: `Switch::ingress`
+    /// has queued every frame it delivers by the time it returns.
+    fn next(port: &mut ChannelPort) -> Option<Bytes> {
+        port.rx.try_recv().ok()
+    }
+
+    fn tagged(frame: &Bytes, origin: PortClass) -> Bytes {
+        trunk_tagged(frame, &origin).expect("a tagged frame")
+    }
+
+    /// Review F22: a frame from behind a trunk that carries a local guest's
+    /// source MAC moves the MAC to the trunk, and the guest takes it back
+    /// with its next frame.
+    #[tokio::test]
+    async fn a_trunk_does_not_keep_a_guests_mac() {
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let t = sw.add_channel_port(PortClass::Trunk);
+        let x = mac(0x21);
+
+        let first = frame(MAC_BROADCAST, x, b"first");
+        sw.ingress(a.id, first.clone());
+        // A guest of another lab sends from X.
+        let far = frame(MAC_BROADCAST, x, b"from behind the trunk");
+        sw.ingress(t.id, tagged(&far, GUEST));
+        let second = frame(MAC_BROADCAST, x, b"second");
+        sw.ingress(a.id, second.clone());
+        let marker = frame(MAC_BROADCAST, mac(0x22), b"marker");
+        sw.ingress(t.id, marker.clone());
+
+        assert_eq!(next(&mut b), Some(first));
+        assert_eq!(next(&mut b), Some(far));
+        assert_eq!(next(&mut b), Some(second), "A's frame after the trunk's");
+        assert_eq!(next(&mut b), Some(marker));
+        assert_eq!(sw.stats().frames_dropped, 0);
+        assert_eq!(sw.inner.lock_recover().macs.get(&x), Some(&a.id));
+    }
+
+    /// A MAC bound to a trunk (the gateway's of a global segment, in a
+    /// lab's switch) is held against the guests like one on a service port.
+    #[tokio::test]
+    async fn a_mac_bound_to_a_trunk_is_held() {
+        let sw = Switch::new("seg0".into());
+        let a = sw.add_channel_port(GUEST);
+        let mut b = sw.add_channel_port(GUEST);
+        let mut t = sw.add_channel_port(PortClass::Trunk);
+        let gateway = mac(0x47);
+        sw.bind_mac(t.id, gateway);
+
+        sw.ingress(a.id, frame(MAC_BROADCAST, gateway, b"spoof"));
+        assert_eq!(sw.stats().frames_dropped, 1);
+        assert_eq!(next(&mut b), None);
+
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        sw.ingress(b.id, to_gateway.clone());
+        assert_eq!(next(&mut t), Some(tagged(&to_gateway, GUEST)));
+
+        // The binding ends with the port.
+        sw.remove_port(t.id);
+        let taken = frame(MAC_BROADCAST, gateway, b"no trunk, no binding");
+        sw.ingress(a.id, taken.clone());
+        assert_eq!(next(&mut b), Some(taken));
+    }
+
+    /// Review F26: an isolated NIC exchanges no frame with a guest behind a
+    /// trunk, in either direction, and still reaches the services there.
+    /// `lab` is a lab's switch and `sup` the supervisor's; the test carries
+    /// each frame over the trunk between them by hand.
+    #[tokio::test]
+    async fn an_isolated_nic_reaches_no_guest_behind_a_trunk() {
+        let lab = Switch::new("lab".into());
+        let mut isolated = lab.add_channel_port(GUEST_ISOLATED);
+        let mut lab_trunk = lab.add_channel_port(PortClass::Trunk);
+        let sup = Switch::new("sup".into());
+        let mut sup_trunk = sup.add_channel_port(PortClass::Trunk);
+        let mut other_lab = sup.add_channel_port(PortClass::Trunk);
+        let mut far_guest = sup.add_channel_port(GUEST);
+        let mut service = sup.add_channel_port(PortClass::Service);
+
+        // Out: the isolated NIC's broadcast reaches the service and no guest.
+        let hello = frame(MAC_BROADCAST, mac(1), b"from the isolated nic");
+        lab.ingress(isolated.id, hello.clone());
+        let on_trunk = next(&mut lab_trunk).expect("the broadcast on the trunk");
+        sup.ingress(sup_trunk.id, on_trunk);
+        let marker = frame(MAC_BROADCAST, mac(0x47), b"marker");
+        sup.ingress(service.id, marker.clone());
+        assert_eq!(next(&mut far_guest), Some(marker.clone()));
+        assert_eq!(next(&mut service), Some(hello.clone()));
+        // The trunk to another lab passes it on as an isolated guest's, so
+        // that lab's switch keeps it from its guests too.
+        assert_eq!(next(&mut other_lab), Some(tagged(&hello, GUEST_ISOLATED)));
+        assert_eq!(next(&mut other_lab), Some(marker.clone()));
+
+        // In: a far guest's frame for the isolated NIC stops at the lab's
+        // switch, and the service's reply behind it arrives.
+        assert_eq!(next(&mut sup_trunk), Some(marker.clone()));
+        lab.ingress(lab_trunk.id, marker.clone());
+        assert_eq!(next(&mut isolated), Some(marker));
+        let knock = frame(mac(1), mac(9), b"from a far guest");
+        sup.ingress(far_guest.id, knock.clone());
+        let on_trunk = next(&mut sup_trunk).expect("the far guest's frame on the trunk");
+        assert_eq!(on_trunk, tagged(&knock, GUEST));
+        lab.ingress(lab_trunk.id, on_trunk);
+        let reply = frame(mac(1), mac(0x47), b"from the service");
+        sup.ingress(service.id, reply.clone());
+        let on_trunk = next(&mut sup_trunk).expect("the reply on the trunk");
+        lab.ingress(lab_trunk.id, on_trunk);
+        assert_eq!(next(&mut isolated), Some(reply));
+        assert_eq!(next(&mut isolated), None);
+    }
+
+    /// The origin on a trunk is the switch's word, not the guest's: a guest
+    /// frame that looks like a tag is tagged around it, and a service frame
+    /// that looks like one is tagged so that it is not taken for one.
+    #[tokio::test]
+    async fn a_guest_cannot_forge_a_trunk_tag() {
+        let sw = Switch::new("seg0".into());
+        let isolated = sw.add_channel_port(GUEST_ISOLATED);
+        let service = sw.add_channel_port(PortClass::Service);
+        let mut trunk = sw.add_channel_port(PortClass::Trunk);
+
+        let plain = frame(MAC_BROADCAST, mac(1), b"claims a service sent it");
+        let forged = tagged(&plain, GUEST);
+        let mut as_service = forged.to_vec();
+        as_service[14..16].copy_from_slice(&ORIGIN_SERVICE.to_be_bytes());
+        let forged = Bytes::from(as_service);
+        sw.ingress(isolated.id, forged.clone());
+        let on_trunk = next(&mut trunk).expect("the forged frame on the trunk");
+        assert_eq!(trunk_untagged(on_trunk), (GUEST_ISOLATED, forged.clone()));
+
+        sw.ingress(service.id, forged.clone());
+        let on_trunk = next(&mut trunk).expect("the service's frame on the trunk");
+        assert_eq!(trunk_untagged(on_trunk), (PortClass::Service, forged));
+
+        // A service's ordinary frame travels as it is, and reads back as a
+        // service's. An origin code from a later build is an isolated
+        // guest's.
+        let ordinary = frame(MAC_BROADCAST, mac(0x47), b"ordinary");
+        sw.ingress(service.id, ordinary.clone());
+        assert_eq!(next(&mut trunk), Some(ordinary.clone()));
+        assert_eq!(
+            trunk_untagged(ordinary.clone()),
+            (PortClass::Service, ordinary.clone())
+        );
+        let mut unknown = tagged(&ordinary, GUEST).to_vec();
+        unknown[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        assert_eq!(
+            trunk_untagged(Bytes::from(unknown)),
+            (GUEST_ISOLATED, ordinary)
+        );
     }
 
     /// Review F30: a bound MAC is held against a service port too. On a
