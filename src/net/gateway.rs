@@ -487,7 +487,11 @@ impl GatewayTask {
         {
             if udp.dst_port() == DHCP_SERVER_PORT {
                 if let Some(dhcp) = &self.dhcp {
-                    let reply = dhcp.lock_recover().handle(frame);
+                    // The neighbour table is who uses which address here,
+                    // lease or not: the server grants around it (review F27).
+                    let seen =
+                        |ip: Ipv4Addr| self.neighbours.lock_recover().table.get(&ip).copied();
+                    let reply = dhcp.lock_recover().handle_seen(frame, &seen);
                     if let Some(reply) = reply {
                         self.send(reply);
                     }

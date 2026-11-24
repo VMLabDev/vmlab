@@ -374,8 +374,18 @@ impl Switch {
                 });
             }
             None => {
+                let switch = Arc::clone(self);
                 tokio::spawn(async move {
                     while let Some(packet) = rx.recv().await {
+                        // A frame this port cannot be sent is dropped by
+                        // itself, before a byte of it is written. Only a
+                        // failed write ends the writer (review
+                        // networking-2 F24).
+                        if let Err(error) = framing::check_packet(&packet, config.framing) {
+                            switch.dropped.fetch_add(1, Ordering::Relaxed);
+                            debug!(switch = %name, %id, %error, "unsendable frame dropped");
+                            continue;
+                        }
                         if let Err(error) =
                             framing::write_packet(&mut write_half, &packet, config.framing).await
                         {
