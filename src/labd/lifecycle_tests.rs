@@ -2566,6 +2566,51 @@ fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
     }
 }
 
+#[tokio::test]
+async fn a_store_of_another_layout_is_refused_by_name() {
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let arch = dirs.root.join("firmware/x86_64");
+    std::fs::File::create(arch.join("OVMF_CODE_4M.fd"))
+        .unwrap()
+        .set_len(0x1e0000)
+        .unwrap();
+    let template = arch.join("OVMF_VARS_4M.fd");
+    let legacy_vars = vec![0; 131_072];
+    std::fs::write(&template, &legacy_vars).unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let (mut vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#,
+        on_vmlab_hv(Script::healthy()),
+    );
+    vm.set_host_config(firmware);
+    let store = vm.dirs.ovmf_vars();
+    let boot_record = vm.dirs.ovmf_vars_boot();
+    let machine: Arc<dyn Machine> = vm;
+
+    for (path, existing) in [(&store, true), (&template, false)] {
+        if existing {
+            std::fs::write(&store, &legacy_vars).unwrap();
+        }
+        let error = machine.clone().start(lab.clone(), None).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("dc01"), "{message}");
+        assert!(message.contains(path.to_str().unwrap()), "{message}");
+        assert!(message.contains("0x37c000-byte CODE"), "{message}");
+        assert!(message.contains("0x84000-byte VARS"), "{message}");
+        assert_eq!(hv.starts(), 0);
+        assert!(!boot_record.exists());
+        if existing {
+            assert_eq!(std::fs::read(&store).unwrap(), legacy_vars);
+            std::fs::remove_file(&store).unwrap();
+        }
+        assert!(!store.exists());
+    }
+}
+
 /// The flash device opens the VM's copy read-write even when its template is read-only.
 #[tokio::test]
 async fn the_vars_copy_is_writable_whatever_the_template_is() {

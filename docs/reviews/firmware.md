@@ -79,7 +79,7 @@ hostile guest or peer, wrong result, cosmetic.
 | F3 | security inside the guest | aarch64 secure boot keeps its variable store on flash the guest OS can write (fixed by card #735: said, not closed) |
 | F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start (fixed, card #805) |
 | F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start (fixed, card #740) |
-| F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses |
+| F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses (fixed, card #806) |
 | F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check |
 | F8 | wrong result | The iPXE build keeps stale headers in `config/local` of a cached checkout |
 | F9 | cosmetic | The recorded iPXE ROM hashes and the firmware build reports are never compared with a build (fixed for the iPXE record, card #737) |
@@ -267,6 +267,9 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
 
 ### F6. An x86 store of another layout is selected and then refused
 
+Fixed by card #806. The VM start checks the existing store and selected
+firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
+
 - Where: `src/qemu/firmware.rs:470-495`, against
   `hv/vmlab-hv-devices/src/pflash/mod.rs:52-57` and
   `hv/vmlab-hv-vmm/src/q35.rs:682`.
@@ -282,12 +285,11 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   2 MiB host pair for a new VM.
 - Severity: wrong result (a late, low-level refusal for a case the lookup
   was written to keep working).
-- Proof: unit test `a_store_of_another_layout_is_refused_by_name` beside the
-  describe tests: a fake layout with a 131,072-byte host VARS pair and a VM
-  directory with a 131,072-byte `OVMF_VARS.fd`, hypervisor `vmlab`. Assert
-  that validation or the start plan fails with a message that names the
-  store and the supported layout. Today `lookup_for_vars` returns the pair
-  and the description is composed.
+- Proof: lifecycle test `a_store_of_another_layout_is_refused_by_name`
+  starts a VM on the fake vmlab-hv backend with a 131,072-byte VARS template,
+  first with an existing store of that size and then without a store. Each
+  start must name the incompatible file and the supported layout, leave
+  VARS state untouched, and refuse before launching the backend.
 - Confidence: high.
 
 ### F7. Direct kernel boot does not check the initrd against low RAM
