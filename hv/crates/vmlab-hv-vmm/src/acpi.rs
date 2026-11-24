@@ -20,7 +20,7 @@ use acpi_tables::rsdp::Rsdp;
 use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
 use vm_memory::{Bytes, GuestAddress};
-use vmlab_hv_devices::{GuestMemory};
+use vmlab_hv_devices::GuestMemory;
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::error::VmmError;

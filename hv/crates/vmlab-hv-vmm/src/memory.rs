@@ -351,7 +351,8 @@ mod tests {
         let mut ram = GuestRam::anonymous(MemLayout::q35(8).unwrap()).unwrap();
         register_memslots(&kvm.vm, &ram).unwrap();
         let aperture = Arc::new(
-            vmlab_hv_devices::GuestRegion::from_range(GuestAddress(0xa0000), 0x20000, None).unwrap(),
+            vmlab_hv_devices::GuestRegion::from_range(GuestAddress(0xa0000), 0x20000, None)
+                .unwrap(),
         );
         let region = kvm_userspace_memory_region {
             slot: 128,

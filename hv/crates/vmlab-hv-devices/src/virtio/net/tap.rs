@@ -762,10 +762,10 @@ impl TapBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuestRegion;
     use std::collections::BTreeSet;
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::sync::{Mutex, Weak};
-    use crate::GuestRegion;
 
     type MmapRegion = vm_memory::MmapRegion<crate::WriteDiscard>;
 

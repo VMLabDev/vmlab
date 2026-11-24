@@ -97,8 +97,7 @@ impl vm_memory::bitmap::Bitmap for WriteDiscard {
         // given, whose pages are all file mappings. MADV_DONTNEED keeps the
         // mapping and drops only private copies, so a thread that reads or
         // writes there at the same time sees the old page or the new one.
-        if unsafe { libc::madvise((host + start) as *mut _, end - start, libc::MADV_DONTNEED) }
-            != 0
+        if unsafe { libc::madvise((host + start) as *mut _, end - start, libc::MADV_DONTNEED) } != 0
         {
             log::warn!(
                 "discarding a device write: {}",

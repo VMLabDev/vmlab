@@ -6,7 +6,7 @@ use kvm_ioctls::VmFd;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
-use vmlab_hv_devices::{GuestMemory};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_devices::{DeviceError, Snapshot};
 
 const MIB: u64 = 1 << 20;

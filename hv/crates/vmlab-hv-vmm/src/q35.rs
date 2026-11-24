@@ -6,7 +6,7 @@ use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
 use parking_lot::Mutex;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
-use vmlab_hv_devices::{GuestMemory};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_devices::{BarInfo, BusDevice, DeviceError, PciDevice, Snapshot};
 
 use crate::error::VmmError;
@@ -162,11 +162,7 @@ impl Pam {
         // `ALIAS_SIZE` long. `refresh_device_view` below maps every bank of
         // it from the memfd before the view leaves this function, and
         // `map_device_bank` is the only thing that maps there afterwards.
-        unsafe {
-            view.get_mmap()
-                .bitmap()
-                .arm(view.as_ptr(), ALIAS_SIZE)
-        };
+        unsafe { view.get_mmap().bitmap().arm(view.as_ptr(), ALIAS_SIZE) };
         crate::memory::dont_dump(&shadow)?;
         crate::memory::dont_dump(&smram)?;
         let pam = Self {

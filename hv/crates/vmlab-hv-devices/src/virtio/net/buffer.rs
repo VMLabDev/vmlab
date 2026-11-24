@@ -3,8 +3,8 @@
 use std::io::{self, Write};
 
 use virtio_queue::DescriptorChain;
-use vm_memory::bitmap::Bitmap;
 use vm_memory::GuestMemoryBackend;
+use vm_memory::bitmap::Bitmap;
 
 use crate::GuestMemory;
 

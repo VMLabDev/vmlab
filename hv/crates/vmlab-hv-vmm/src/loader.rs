@@ -15,7 +15,7 @@ use linux_loader::bootparam::boot_params;
 use linux_loader::loader::KernelLoader;
 use linux_loader::loader::bzimage::BzImage;
 use vm_memory::{ByteValued, Bytes, GuestAddress};
-use vmlab_hv_devices::{GuestMemory};
+use vmlab_hv_devices::GuestMemory;
 
 use crate::e820::E820Entry;
 use crate::error::VmmError;

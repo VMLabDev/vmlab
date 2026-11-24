@@ -5,8 +5,8 @@ use kvm_bindings::{
     kvm_msr_entry,
 };
 use vm_memory::{Bytes, GuestAddress};
-use vmlab_hv_devices::{GuestMemory};
 use vmlab_hv_devices::BusDevice;
+use vmlab_hv_devices::GuestMemory;
 
 use crate::vm::VmShared;
 

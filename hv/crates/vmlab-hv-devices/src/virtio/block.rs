@@ -15,8 +15,8 @@ use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion,
-    Le32, Le64, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion, Le32, Le64,
+    VolatileSlice,
 };
 
 use crate::{

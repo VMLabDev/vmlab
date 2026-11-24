@@ -8,7 +8,7 @@ use std::sync::Arc;
 use kvm_bindings::{kvm_userspace_memory_region, kvm_vcpu_events};
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
-use vmlab_hv_devices::{GuestMemory};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_devices::{BusDevice, DeviceError, Snapshot};
 
 use crate::VmmError;
