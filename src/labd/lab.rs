@@ -7160,7 +7160,14 @@ fn main(lab: Lab) {
             .is_pending());
         at_gate.await.unwrap();
         // The output sink holds the blocking thread while Tokio delivers the deadline.
-        tokio::time::sleep(Duration::from_secs(1801)).await;
+        let mut deadline = std::pin::pin!(tokio::time::sleep(Duration::from_secs(1800)));
+        std::future::poll_fn(|cx| {
+            assert!(deadline.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(1801)).await;
+        deadline.await;
         let at_deadline =
             std::future::poll_fn(|cx| std::task::Poll::Ready(run.as_mut().poll(cx))).await;
         let claimed = lab.first_boots.lock_recover().contains("win");
