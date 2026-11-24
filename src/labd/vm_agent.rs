@@ -339,7 +339,7 @@ struct Inner {
     open_waiters: std::sync::Mutex<HashMap<u32, OpenWaiter>>,
     next_id: AtomicU32,
     /// The handshake result (`None` until the token echo arrives).
-    hello: watch::Sender<Option<AgentInfo>>,
+    hello: watch::Sender<Option<Result<AgentInfo, u32>>>,
     /// Incremented per `pong`, with the agent instance that sent it.
     pong: watch::Sender<(u64, Option<String>)>,
     /// Latest metrics sample.
@@ -648,15 +648,17 @@ impl AgentHandle {
             .await
             .context("sending agent handshake")?;
 
-        loop {
-            if rx.borrow().is_some() {
-                return Ok(handle);
-            }
-            tokio::time::timeout_at(deadline, rx.changed())
-                .await
-                .map_err(|_| anyhow!("no vmlab-agent answered on the agent channel"))?
-                .map_err(|_| anyhow!("agent channel closed during handshake"))?;
+        let reply = tokio::time::timeout_at(deadline, rx.wait_for(Option::is_some))
+            .await
+            .map_err(|_| anyhow!("no vmlab-agent answered on the agent channel"))?
+            .map_err(|_| anyhow!("agent channel closed during handshake"))?;
+        if let Some(Err(proto_version)) = *reply {
+            bail!(
+                "agent speaks proto v{proto_version}, host expects v{PROTO_VERSION} — \
+                 rebuild the template to update its agent"
+            );
         }
+        Ok(handle)
     }
 
     /// The handshake info (always present after a successful `connect`).
@@ -672,6 +674,7 @@ impl AgentHandle {
             .borrow()
             .clone()
             .expect("connect completed the handshake")
+            .expect("connect accepted the agent protocol version")
     }
 
     pub fn has_feature(&self, feature: &str) -> bool {
@@ -779,6 +782,7 @@ impl AgentHandle {
             .hello
             .borrow()
             .as_ref()
+            .and_then(|reply| reply.as_ref().ok())
             .and_then(|info| info.instance.clone());
         if pong != handshook {
             tracing::debug!(
@@ -1698,10 +1702,11 @@ struct FileOpsInner {
     wire: Mutex<()>,
     pending: std::sync::Mutex<Pending>,
     next_id: AtomicU64,
-    /// When the guest last answered *anything* on this channel — the
+    /// When the guest last answered a request on this channel — the
     /// watchdog's notion of progress. A reply to any request counts: a
     /// pipelined transfer is judged by whether the channel moves, not by
-    /// whether one particular chunk has been acknowledged yet.
+    /// whether one particular chunk has been acknowledged yet. A record
+    /// with an id no call waits for does not count.
     last_reply: std::sync::Mutex<tokio::time::Instant>,
     /// How long the channel may stay silent before a call gives up, in
     /// milliseconds — [`FILEOPS_STALL`] unless a caller set otherwise.
@@ -2428,7 +2433,7 @@ impl FileOpsInner {
         Duration::from_millis(self.stall_ms.load(Ordering::SeqCst))
     }
 
-    /// When the guest last answered anything on this channel.
+    /// When the guest last answered a request on this channel.
     fn last_reply(&self) -> tokio::time::Instant {
         *self.last_reply.lock_recover()
     }
@@ -2597,9 +2602,13 @@ async fn fileops_pump(mut session: AgentSession, inner: Arc<FileOpsInner>) {
                 loop {
                     match decoder.next_record::<Response>() {
                         Ok(Some((response, payload))) => {
-                            *inner.last_reply.lock_recover() = tokio::time::Instant::now();
                             let waiter = inner.pending.lock_recover().waiters.remove(&response.id);
+                            // Only a record that answers a call is
+                            // progress. One with an id nobody waits for
+                            // leaves the watchdog's clock alone, or a guest
+                            // could hold every call open with such records.
                             if let Some(waiter) = waiter {
+                                *inner.last_reply.lock_recover() = tokio::time::Instant::now();
                                 let _ = waiter.send(Ok((response.reply, payload)));
                             }
                         }
@@ -2830,19 +2839,22 @@ async fn handle_ctrl(inner: &Arc<Inner>, msg: AgentMsg) {
                 // Stale reply from before a snapshot restore — not ours.
                 return;
             }
-            if proto_version != PROTO_VERSION {
-                tracing::error!(
-                    "agent speaks proto v{proto_version}, host expects v{PROTO_VERSION} — \
-                     rebuild the template to update its agent"
-                );
-                return;
-            }
-            let _ = inner.hello.send(Some(AgentInfo {
-                agent_version,
-                os,
-                features,
-                instance,
-            }));
+            inner.hello.send_if_modified(|reply| {
+                if reply.is_some() {
+                    return false;
+                }
+                *reply = Some(if proto_version == PROTO_VERSION {
+                    Ok(AgentInfo {
+                        agent_version,
+                        os,
+                        features,
+                        instance,
+                    })
+                } else {
+                    Err(proto_version)
+                });
+                true
+            });
         }
         AgentMsg::Opened { id } => {
             if let Some(w) = inner.open_waiters.lock_recover().remove(&id) {
@@ -3159,7 +3171,7 @@ mod tests {
             if legacy {
                 let mut info = handle.info();
                 info.agent_version = "agent-legacy=test".into();
-                handle.inner.hello.send_replace(Some(info));
+                handle.inner.hello.send_replace(Some(Ok(info)));
             }
             let before = tokio::time::Instant::now();
             let result = handle
@@ -3365,6 +3377,13 @@ mod tests {
         answer_hello: bool,
         advertised: Vec<String>,
     ) -> (tempfile::TempDir, PathBuf) {
+        mock_agent_with_version(answer_hello.then_some(PROTO_VERSION), advertised).await
+    }
+
+    async fn mock_agent_with_version(
+        version: Option<u32>,
+        advertised: Vec<String>,
+    ) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&path).expect("bind mock agent socket");
@@ -3435,7 +3454,7 @@ mod tests {
                                     // A stale hello first — the host must
                                     // ignore it (wrong token).
                                     send(AgentMsg::Hello {
-                                        proto_version: PROTO_VERSION,
+                                        proto_version: PROTO_VERSION - 1,
                                         agent_version: "stale".into(),
                                         os: "linux".into(),
                                         features: vec![],
@@ -3443,9 +3462,9 @@ mod tests {
                                         instance: Some("stale".into()),
                                     })
                                     .await;
-                                    if answer_hello {
+                                    if let Some(proto_version) = version {
                                         send(AgentMsg::Hello {
-                                            proto_version: PROTO_VERSION,
+                                            proto_version,
                                             agent_version: "0.1.0-mock".into(),
                                             os: "linux".into(),
                                             features: advertised.clone(),
@@ -3790,6 +3809,15 @@ mod tests {
                                         send_data(channel, chunk.to_vec()).await;
                                     }
                                 }
+                                // The channel fails on the guest's side,
+                                // behind whatever it had sent on it.
+                                if let Some(msg) = fs.ended.take() {
+                                    send(AgentMsg::Error {
+                                        id: Some(channel),
+                                        msg,
+                                    })
+                                    .await;
+                                }
                             } else if payload == b"exit\r" {
                                 // The shell exits, as `exit` at a prompt does.
                                 terminals.retain(|&id| id != channel);
@@ -3897,7 +3925,15 @@ mod tests {
         slow: bool,
         /// Bytes served so far from a file named `claims-everything`.
         endless_served: u64,
+        /// Set by a request that makes the mock fail the channel once its
+        /// replies are out: the reason the guest gives.
+        ended: Option<String>,
     }
+
+    /// The id of the reply the mock sends for a `stat` of a path named
+    /// `answers-nobody`: one no call of the host waits for.
+    const NOBODY_ID: u64 = 999_999;
+    const NOBODY_ENDED: &str = "the mock ended the channel behind a reply to nobody";
 
     /// Where the mock ends a file named `claims-everything` by an error.
     const ENDLESS_STOP: u64 = 16 * 1024 * 1024;
@@ -3933,6 +3969,7 @@ mod tests {
                     .unwrap_or_else(|| "as:agent".into()),
                 slow: false,
                 endless_served: 0,
+                ended: None,
             }
         }
 
@@ -3950,6 +3987,23 @@ mod tests {
                     && path.contains("slow")
                 {
                     self.slow = true;
+                }
+                // A `stat` of a path named `answers-nobody` gets no answer:
+                // a record with an id nobody waits for goes out in its
+                // place, and then the guest fails the channel, so the host
+                // has handled that record by the time its call returns.
+                if let Op::Stat { path } = &request.op
+                    && path.contains("answers-nobody")
+                {
+                    out.push((
+                        Response {
+                            id: NOBODY_ID,
+                            reply: Reply::Ok,
+                        },
+                        Vec::new(),
+                    ));
+                    self.ended = Some(NOBODY_ENDED.into());
+                    continue;
                 }
                 let (reply, bytes) = self.op(request.op, payload);
                 // The one reply a stalled peer never sends.
@@ -4493,6 +4547,24 @@ mod tests {
         assert!(err.to_string().contains("no vmlab-agent answered"), "{err}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_version_mismatch_is_named_in_the_error() {
+        let guest_version = PROTO_VERSION - 1;
+        let (_dir, path) = mock_agent_with_version(Some(guest_version), vec![]).await;
+        let Err(err) = AgentHandle::connect(&path, HANDSHAKE).await else {
+            panic!("expected the incompatible agent to be refused");
+        };
+        let error = err.to_string();
+        assert!(
+            error.contains(&format!("agent speaks proto v{guest_version}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("host expects v{PROTO_VERSION}")),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_serial_sends_nothing_until_guest_speaks() {
         let (_mock_dir, mock_path) = mock_agent(true).await;
@@ -4790,6 +4862,29 @@ mod tests {
 
         let next = format!("{:#}", ops.stat("/guest/some-file").await.unwrap_err());
         assert!(next.contains("answered nothing"), "{next}");
+    }
+
+    /// Only a record that answers a waiting call is progress (review
+    /// guest-agents F15): a record with an id nobody waits for leaves the
+    /// watchdog's clock where it was, so a guest cannot hold every call on
+    /// the channel open by sending such records. The mock sends one in place
+    /// of the answer and then fails the channel, which orders the host's
+    /// handling of that record before the call's return.
+    #[tokio::test]
+    async fn replies_to_nobody_do_not_renew_the_watchdog() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.stat("/guest/some-file").await.unwrap();
+        let answered = ops.inner.last_reply();
+
+        let err = format!("{:#}", ops.stat("/guest/answers-nobody").await.unwrap_err());
+        assert!(err.contains(NOBODY_ENDED), "{err}");
+        assert_eq!(
+            ops.inner.last_reply(),
+            answered,
+            "a record that answered no call counted as progress"
+        );
     }
 
     /// The watchdog measures silence, not elapsed time: a transfer that is

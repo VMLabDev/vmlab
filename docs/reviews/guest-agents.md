@@ -462,6 +462,9 @@ Not read:
   `sessions_test.rs` (Linux). Create a file named `b"a\xffb"`, list the
   directory, then `stat` the name from the listing. Assert that the listing
   reports an error for that entry, or that the `stat` succeeds.
+- Fixed in card #811. `ReadDir` reports an error when an entry name cannot
+  be represented as UTF-8. The directory handle keeps returning that error
+  on retry. `Readlink` reports an error for targets with the same limitation.
 
 ### F13. `realpath` in a container answers a path of the micro-VM, not of the container
 
@@ -501,6 +504,9 @@ Not read:
 - Test: `a_character_split_across_two_frames_survives`. A mock agent sends
   the two bytes of `é` in two `Data` frames on a tail channel. Assert that
   the streamed chunks join to `é`.
+- Fixed in card #812. The shared tail and event-log pump carries an incomplete
+  UTF-8 sequence into the next frame. It still replaces malformed bytes and an
+  incomplete sequence left at the end of the stream.
 
 ### F15. Any record on a file channel renews the watchdog, also one that answers nothing
 
@@ -514,9 +520,20 @@ Not read:
 - Test: `replies_to_nobody_do_not_renew_the_watchdog`. The mock answers no
   request and sends `{"id":999999,"reply":"ok"}` every 50 ms. With a stall
   time of 300 ms, assert that `stat` fails within one second.
+- Fixed in card #813. The pump sets `last_reply` only for a record whose id
+  a call waits for. A record that answers nobody leaves the watchdog's clock
+  where it was. The proof test has no wall-clock limit: the mock sends
+  `{"id":999999,"reply":"ok"}` in place of the answer to a `stat` and then
+  fails the channel, and the test asserts that `last_reply` did not move.
+  `replies_to_nobody_do_not_renew_the_watchdog` fails before the fix (the
+  record moved `last_reply`) and passes after it.
 
 ### F16. A protocol version mismatch is reported as "no agent answered"
 
+- Fixed in card #814. A matching-token hello with an incompatible version
+  ends the handshake with both protocol versions in the error. Container
+  startup checks cinit's boot protocol before sending the spec and refuses
+  an incompatible version.
 - Where: `src/labd/vm_agent.rs:2411-2417` and `392-400`. The same shape for
   cinit at `src/labd/container_ctl.rs:89-96`.
 - Fault: a `hello` with another `proto_version` is logged and dropped. The
@@ -547,6 +564,10 @@ Not read:
 - Test: in `src/labd/legacy_agent_tests.rs`, send `open_exec` with
   `id: 0` and assert an error reply. On a 32-bit build, send
   `id: 3000000000` and assert that the `opened` names that id.
+- Fixed in card #815. Exec opens with a missing or zero ID return an error
+  before creating a session. Reply serialization preserves unsigned channel
+  IDs. The regression tests exercise the control channel on the POSIX build
+  and large IDs in `opened` and `error` on the 32-bit Windows build.
 
 ## Notes
 

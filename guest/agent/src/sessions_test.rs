@@ -737,6 +737,65 @@ fn fileops_serves_the_directory_vocabulary() {
     assert!(!dir.path().join("src").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_is_refused_or_round_trips() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    std::fs::write(dir.path().join(OsStr::from_bytes(b"a\xffb")), b"").unwrap();
+
+    let (mux, mut cap) = capture_mux();
+    open(
+        &mux,
+        &platform(),
+        HostMsg::OpenFileOps { id: 9, logon: None },
+    );
+    assert_eq!(cap.ctrl(), AgentMsg::Opened { id: 9 });
+    ask(&mux, 9, 1, Op::OpenDir { path: root.into() });
+    let Reply::Handle { handle } = cap.fileops(9).0.reply else {
+        panic!("expected a directory handle");
+    };
+    ask(&mux, 9, 2, Op::ReadDir { handle });
+    match cap.fileops(9).0.reply {
+        Reply::Error { code, msg } => {
+            assert!(msg.contains("UTF-8"), "{msg}");
+            ask(&mux, 9, 3, Op::ReadDir { handle });
+            assert_eq!(cap.fileops(9).0.reply, Reply::Error { code, msg });
+        }
+        Reply::Entries { entries, .. } => {
+            assert_eq!(entries.len(), 1);
+            ask(
+                &mux,
+                9,
+                3,
+                Op::Stat {
+                    path: format!("{root}/{}", entries[0].name),
+                },
+            );
+            let reply = cap.fileops(9).0.reply;
+            assert!(matches!(reply, Reply::Attrs { .. }), "{reply:?}");
+        }
+        other => panic!("expected entries or an encoding error, got {other:?}"),
+    }
+
+    std::os::unix::fs::symlink(OsStr::from_bytes(b"a\xffb"), dir.path().join("link")).unwrap();
+    ask(
+        &mux,
+        9,
+        4,
+        Op::Readlink {
+            path: format!("{root}/link"),
+        },
+    );
+    match cap.fileops(9).0.reply {
+        Reply::Error { msg, .. } => assert!(msg.contains("UTF-8"), "{msg}"),
+        other => panic!("expected a symlink target encoding error, got {other:?}"),
+    }
+}
+
 /// Handles are scoped to the channel and die with it: after a `close` the
 /// session's files are released, so a guest is never left holding handles a
 /// host has forgotten.
