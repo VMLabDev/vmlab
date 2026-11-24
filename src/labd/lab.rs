@@ -1141,16 +1141,22 @@ impl LabRuntime {
         // One smbd per sharing machine, each with a password of its own
         // (§7.5). The servers work down the plan's free ports: one can be
         // taken between the probe and the bind.
-        let mut labsmb = crate::smb::LabSmb::plan(&self.lab_local, &sharing);
-        if let Err(e) = labsmb.start(&smb.host_ports) {
-            tracing::warn!("SMB server failed to start: {e}");
-            output(format!(
-                "WARNING: SMB server failed to start — shares will not mount: {e}\n"
-            ));
-            self.events
-                .emit("smb.failed", json!({"error": e.to_string()}));
-            return;
-        }
+        let started = crate::smb::LabSmb::plan(&self.lab_local, &sharing).and_then(|mut lab| {
+            lab.start(&smb.host_ports)?;
+            Ok(lab)
+        });
+        let labsmb = match started {
+            Ok(lab) => lab,
+            Err(e) => {
+                tracing::warn!("SMB server failed to start: {e}");
+                output(format!(
+                    "WARNING: SMB server failed to start — shares will not mount: {e}\n"
+                ));
+                self.events
+                    .emit("smb.failed", json!({"error": e.to_string()}));
+                return;
+            }
+        };
         // DNAT gateway:445 → 127.0.0.1:<its smbd> for each sharing machine's
         // NIC, so a guest mounting \\<gateway>\<share> reaches its own
         // server and no other machine's. A segment without `nat` gets no
