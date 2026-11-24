@@ -2041,7 +2041,11 @@ mod tests {
 
         place(0x8000_0000);
         assert_eq!(
-            shared.exit.lock().as_ref().map(|reason| format!("{reason:?}")),
+            shared
+                .exit
+                .lock()
+                .as_ref()
+                .map(|reason| format!("{reason:?}")),
             None,
             "a framebuffer BAR over low RAM ended the VM"
         );
