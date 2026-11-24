@@ -172,8 +172,8 @@ seal for every profile.
 
 ### F4. A version without its variants hides the complete version below it (wrong result)
 
-**Fixed by card #860 (`b8f635a8`).** Unversioned references skip versions
-without the requested variant, and pruning keeps the newest usable version.
+**Fixed by card #860 (`b8f635a8`).** Unversioned lab references prefer the
+newest version with a usable default, and pruning keeps that version.
 
 - Where: `src/template/build.rs:156-184` (the base is installed, then the
   variants are built one at a time), `:379-427`.
