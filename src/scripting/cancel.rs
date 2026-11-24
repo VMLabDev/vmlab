@@ -138,6 +138,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_huge_timeout_is_an_error_not_a_panic() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let _entered = enter(token, None);
+        let _ = sleep(Duration::from_millis(i64::MAX as u64));
+    }
+
+    #[test]
     fn without_a_token_nothing_changes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         assert_eq!(block_on(rt.handle(), async { 7 }), 7);

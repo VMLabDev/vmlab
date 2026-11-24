@@ -244,6 +244,21 @@ mod tests {
         PROTO_VERSION, encode_ctrl, encode_frame, features,
     };
 
+    #[tokio::test]
+    async fn a_huge_timeout_is_an_error_not_a_panic() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: Vec::new(),
+                ended: Some("closed".into()),
+            })),
+        };
+        let error = term.expect("x", i64::MAX).unwrap_err();
+        assert!(error.contains("timeout_secs"), "{error}");
+    }
+
     /// How the flooding agent's connection ended.
     #[derive(Debug, PartialEq)]
     enum FloodEnd {
