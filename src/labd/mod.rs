@@ -148,14 +148,13 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     let refusal = runtime.isolation.as_ref().and_then(|i| i.refusal());
     if let Some(why) = refusal {
         tracing::warn!("not attaching global segments: {why}");
-    } else if let Err(e) = runtime
-        .network
-        .lock()
-        .await
-        .attach_globals(&runtime.config().lab.name)
-        .await
-    {
-        tracing::warn!("attaching global segments: {e:#}");
+    } else {
+        runtime
+            .network
+            .lock()
+            .await
+            .attach_globals(&runtime.config().lab.name)
+            .await;
     }
 
     // Long-lived background tasks register here so the `shutdown` command

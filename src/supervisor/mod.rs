@@ -2489,8 +2489,10 @@ mod tests {
         .await
         .unwrap();
         let trunks = tokio::net::UnixListener::bind(&trunk).unwrap();
-        a.attach_globals_via(&sup_sock, "a").await.unwrap();
-        b.attach_globals_via(&sup_sock, "b").await.unwrap();
+        a.attach_globals_via(&sup_sock, "a").await;
+        b.attach_globals_via(&sup_sock, "b").await;
+        assert!(a.global_warnings().is_empty());
+        assert!(b.global_warnings().is_empty());
         let held = [
             trunks.accept().await.unwrap().0,
             trunks.accept().await.unwrap().0,
