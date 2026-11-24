@@ -109,17 +109,66 @@ async fn fetch_search_row(
     search_row_of(&registry, name, repo, containers).await
 }
 
-/// [`fetch_search_row`] over a client that is already built.
+/// Whether a string a registry sent may be shown: printable ASCII with no
+/// space, which every repository path, tag, version and architecture vmlab
+/// can use is. Anything else — an escape sequence, a line break, a
+/// bidirectional override — could redraw the table `template search` prints.
+fn showable(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// `text` with every character a terminal would act on, or that would hide
+/// in a line, written as its escape.
+fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c.to_string()
+            } else {
+                c.escape_default().to_string()
+            }
+        })
+        .collect()
+}
+
+/// [`fetch_search_row`] over a client that is already built, with what the
+/// registry sent checked before it can be printed: a row that holds a
+/// string that is not [`showable`] is left out with a warning, and a warning
+/// is [`escaped`].
 async fn search_row_of(
     registry: &crate::oci::Registry,
     name: String,
     repo: String,
     containers: bool,
 ) -> (Option<CatalogSearchRow>, Option<String>) {
-    let tags = match registry.list_tags().await {
+    let (row, warning) = resolve_search_row(registry, name, repo.clone(), containers).await;
+    let unshowable = row.as_ref().is_some_and(|row| {
+        ![&row.name, &row.repo, &row.version, &row.reference]
+            .into_iter()
+            .chain(&row.arches)
+            .all(|text| showable(text))
+    });
+    if unshowable {
+        let said =
+            format!("{repo}: left out, the registry sent a name with unprintable characters");
+        return (None, Some(escaped(&said)));
+    }
+    (row, warning.as_deref().map(escaped))
+}
+
+async fn resolve_search_row(
+    registry: &crate::oci::Registry,
+    name: String,
+    repo: String,
+    containers: bool,
+) -> (Option<CatalogSearchRow>, Option<String>) {
+    let mut tags = match registry.list_tags().await {
         Ok(t) => t,
         Err(e) => return (None, Some(format!("{repo}: {e:#}"))),
     };
+    // A tag that cannot be shown is not a version of anything vmlab
+    // published. The tags beside it are still listed.
+    tags.retain(|tag| showable(tag));
     if !containers
         && tags.iter().any(|t| t == "latest")
         && let Ok((version, mut arches)) = registry.tag_version("latest").await
@@ -240,7 +289,10 @@ mod tests {
         }
     }
 
-    async fn search_row(tags: &[&str], arches: &[&str]) -> (Option<CatalogSearchRow>, Option<String>) {
+    async fn search_row(
+        tags: &[&str],
+        arches: &[&str],
+    ) -> (Option<CatalogSearchRow>, Option<String>) {
         let repo = "registry.example/acme/ubuntu";
         let registry = crate::oci::Registry::with_transport(
             Reference::parse(repo).unwrap(),

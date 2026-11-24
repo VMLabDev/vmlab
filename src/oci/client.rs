@@ -2160,11 +2160,14 @@ impl Transport for HttpTransport {
                 .send_with_auth(&scope, || self.client.get(&url))
                 .await?;
             // A repository with nothing published yet 404s — treat as empty.
-            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // Only the first page can say that: a 404 on a later one is a
+            // cursor the registry has lost, and the tags already read are
+            // not the whole list.
+            if resp.status() == reqwest::StatusCode::NOT_FOUND && pages == 1 {
                 return Ok(Vec::new());
             }
             if !resp.status().is_success() {
-                bail!("GET tags/list returned {}", resp.status());
+                bail!("GET tags/list returned {} on page {pages}", resp.status());
             }
             let link = resp
                 .headers()
