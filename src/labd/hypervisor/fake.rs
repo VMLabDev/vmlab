@@ -243,6 +243,7 @@ pub struct FakeHypervisor {
     /// The extra disk images of every VM launch, in launch order, so a test
     /// can assert what a machine was given.
     launched_disks: std::sync::Mutex<Vec<Vec<PathBuf>>>,
+    launched_cdroms: std::sync::Mutex<Vec<Vec<PathBuf>>>,
     launched_floppies: std::sync::Mutex<Vec<Option<PathBuf>>>,
     /// What happened to every machine's hot-plugged devices and to the
     /// machine itself, in order: `attach <id>`, `detach <id>`, `kill`.
@@ -261,6 +262,7 @@ impl FakeHypervisor {
             virtiofsd_attempts: AtomicUsize::new(0),
             helpers: Mutex::new(Vec::new()),
             launched_disks: std::sync::Mutex::new(Vec::new()),
+            launched_cdroms: std::sync::Mutex::new(Vec::new()),
             launched_floppies: std::sync::Mutex::new(Vec::new()),
             journal: Journal::default(),
         })
@@ -283,6 +285,14 @@ impl FakeHypervisor {
     /// The floppy image of each VM launch so far.
     pub fn launched_floppies(&self) -> Vec<Option<PathBuf>> {
         self.launched_floppies
+            .lock()
+            .expect("fake launch lock")
+            .clone()
+    }
+
+    /// The CD-ROM images of each VM launch so far.
+    pub fn launched_cdroms(&self) -> Vec<Vec<PathBuf>> {
+        self.launched_cdroms
             .lock()
             .expect("fake launch lock")
             .clone()
@@ -378,6 +388,10 @@ impl Hypervisor for FakeHypervisor {
 
     async fn start_emulator(&self, spec: LaunchSpec) -> Result<Running> {
         if let super::Launch::Vm { paths, .. } = &spec.machine {
+            self.launched_cdroms
+                .lock()
+                .expect("fake launch lock")
+                .push(paths.cdroms.clone());
             self.launched_disks
                 .lock()
                 .expect("fake launch lock")

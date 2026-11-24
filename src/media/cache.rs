@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,7 +49,7 @@ impl MediaCache {
         src_folder: &Path,
         label: Option<&str>,
     ) -> Result<PathBuf> {
-        let digest = folder_digest(src_folder)?;
+        let digest = folder_digest(src_folder, matches!(kind, MediaKind::Iso))?;
         let dest = self.cache_dir.join(entry_name(kind, label, &digest));
         let sealed = matches!(kind, MediaKind::Floppy);
         if dest.is_file() && (!sealed || seal_holds(&dest)) {
@@ -57,31 +58,25 @@ impl MediaCache {
 
         fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
-        let tmp = self.cache_dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            dest.file_name()
-                .expect("cache entry names are never empty")
-                .to_string_lossy()
-        ));
-
-        let built = match kind {
-            MediaKind::Iso => build_iso(src_folder, &tmp, label),
-            MediaKind::Floppy => build_floppy(src_folder, &tmp, label),
-        };
-        if let Err(err) = built {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
+        // Starts of different VMs can build the same entry concurrently.
+        let tmp = tempfile::Builder::new()
+            .prefix(".tmp-")
+            .permissions(fs::Permissions::from_mode(0o666))
+            .tempfile_in(&self.cache_dir)
+            .with_context(|| format!("creating a build file in {}", self.cache_dir.display()))?;
+        match kind {
+            MediaKind::Iso => build_iso(src_folder, tmp.path(), label)?,
+            MediaKind::Floppy => build_floppy(src_folder, tmp.path(), label)?,
         }
 
         // The seal follows the image: a crash between the two leaves an entry
         // that fails the check and is built again.
         let seal = if sealed {
-            Some(image_digest(&tmp)?)
+            Some(image_digest(tmp.path())?)
         } else {
             None
         };
-        fs::rename(&tmp, &dest)
+        tmp.persist(&dest)
             .with_context(|| format!("installing media cache entry {}", dest.display()))?;
         if let Some(seal) = seal {
             write_seal(&dest, &seal)?;
@@ -276,6 +271,38 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file());
         assert!(second.is_file());
+    }
+
+    /// F5 (docs/reviews/appshare-media.md): chmod alone updates the mode
+    /// a guest sees through Rock Ridge.
+    #[test]
+    fn a_mode_change_rebuilds_an_iso() {
+        use std::process::Command;
+
+        let src = tempfile::tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let first = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+        let extracted = cache_root.path().join("run.sh");
+        let output = Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(&second)
+            .args(["-extract", "/run.sh"])
+            .arg(&extracted)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_ne!(
+            fs::metadata(extracted).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(first, second);
     }
 
     #[test]
