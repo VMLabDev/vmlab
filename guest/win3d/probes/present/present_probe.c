@@ -635,6 +635,12 @@ int wmain(int argc, wchar_t **argv)
      * then Windows calls DxgkDdiPatch for it later. With --wait-resident
      * the probe waits for the paging fence first. */
     {
+        /* The record of a pending present is written here, in front of the
+         * residency request: nothing slow stands between that request and
+         * the present. */
+        r.stage = "present";
+        r.result = "present_pending";
+        if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
         create_paging_queue pq = {0};
         pq.device = device.device;
         r.stage = "create_paging_queue";
@@ -687,8 +693,6 @@ int wmain(int argc, wchar_t **argv)
     /* A driver without the fix accepts the present, and the guest stops a
      * moment later: the file then says that a present was accepted. */
     r.stage = "present";
-    r.result = "present_pending";
-    if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
     for (uint32_t i = 0; i < r.presents_asked; ++i) {
         /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
         static uint64_t request[1024];
