@@ -3563,6 +3563,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_push_onto_a_plain_manifest_tag_keeps_its_architecture() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let repo = "owner/alpine";
+        let registry = registry_with_fake("ghcr.io/owner/alpine:1.0", fake.clone());
+        let config = registry
+            .put_config(repo, &TemplateConfig::from_meta(&meta("aarch64")))
+            .await
+            .unwrap();
+        let manifest = Manifest {
+            schema_version: 2,
+            media_type: media_types::OCI_MANIFEST.to_string(),
+            artifact_type: Some(media_types::ARTIFACT_TYPE_TEMPLATE.to_string()),
+            config,
+            layers: Vec::new(),
+            annotations: None,
+        };
+        let original = serde_json::to_vec_pretty(&manifest).unwrap();
+        fake.put_manifest(repo, "1.0", media_types::OCI_MANIFEST, original.clone())
+            .await
+            .unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let template = work.path().join("x86_64");
+        make_template(&template, &meta("x86_64"), b"x86_64 disk");
+        registry
+            .push(
+                &template,
+                1024 * 1024,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut arches = registry.index_arches("1.0").await.unwrap();
+        arches.sort();
+        assert_eq!(arches, ["aarch64", "x86_64"]);
+
+        let tagged = fake.get_manifest(repo, "1.0").await.unwrap().unwrap();
+        let ManifestOrIndex::Index(index) = parse_manifest_or_index(&tagged.body).unwrap() else {
+            panic!("expected the tag to hold an index");
+        };
+        let preserved = index.select_arch("aarch64").unwrap();
+        assert_eq!(preserved.digest, digest_of(&original));
+        assert_eq!(preserved.size, original.len() as u64);
+    }
+
+    #[tokio::test]
     async fn multi_arch_index_push_then_pull_each() {
         let fake = std::sync::Arc::new(FakeRegistry::default());
         let work = tempfile::tempdir().unwrap();
