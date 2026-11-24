@@ -3438,6 +3438,91 @@ async fn a_stale_agent_is_refreshed_and_a_failed_refresh_only_warns() {
     vm.stop(true).await.expect("stop");
 }
 
+/// **A push into a Windows guest secures the agent's directory first, and a
+/// directory it cannot secure refuses the push** (docs/reviews/guest-agents-2.md
+/// G2). `C:\ProgramData\vmlab` was made with a plain `mkdir`, so every local
+/// account could create the staging file ahead of the push and own the
+/// service executable after the swap. The plan's prepare step runs in the
+/// guest before the file session is opened; when it exits non-zero nothing is
+/// written — no file session, no swap, no restart — and the old agent goes
+/// on answering.
+#[tokio::test]
+async fn a_windows_push_prepares_the_directory_before_it_writes_and_stops_when_it_cannot() {
+    const WINDOWS_VM: &str = r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "windows-server" disk = 10GiB }"#;
+    let asset_in = |dirs: &Dirs| {
+        let path = dirs.root.join("vmlab-agent.exe");
+        std::fs::write(&path, b"a newer agent").expect("asset");
+        crate::agent_asset::AgentAsset {
+            path,
+            version: "agent=new".into(),
+        }
+    };
+    let prepare = super::agent_repair::plan(super::guest_os::GuestOs::Windows)
+        .prepare
+        .expect("the Windows plan has a prepare step")
+        .join(" ");
+
+    // The directory is secured: the prepare step ran, and only then was the
+    // file session asked for (which this fake refuses, ending the push).
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        WINDOWS_VM,
+        Script {
+            runs: vec![Run {
+                agent_journal: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let err = super::agent_repair::push(&m, &asset_in(&dirs))
+        .await
+        .expect_err("the fake agent serves no file session");
+    assert!(format!("{err:#}").contains("file session"), "{err:#}");
+    assert_eq!(
+        hv.journal(),
+        [format!("agent exec {prepare}"), "agent fileops".to_string()],
+        "prepare first, then the push"
+    );
+    vm.stop(true).await.expect("stop");
+
+    // The directory cannot be secured, or the staging name is taken and
+    // cannot be freed: the push is refused before anything is written.
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        WINDOWS_VM,
+        Script {
+            runs: vec![Run {
+                agent_journal: true,
+                agent_exec_fails: Some("vmlab-agent.new.exe".into()),
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let err = super::agent_repair::push(&m, &asset_in(&dirs))
+        .await
+        .expect_err("a directory that cannot be prepared refuses the push");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("nothing was pushed"), "{msg}");
+    assert!(msg.contains(r"C:\ProgramData\vmlab"), "{msg}");
+    assert_eq!(
+        hv.journal(),
+        [format!("agent exec {prepare}")],
+        "no file session, no swap and no restart after a refused prepare"
+    );
+    assert!(m.agent_answering().await, "the old agent is untouched");
+    vm.stop(true).await.expect("stop");
+}
+
 /// **A refresh cut short by a stop is said quietly and accurately.** The
 /// refresh waits for the agent; the machine is stopped before it answers.
 /// Nothing was pushed and nothing went wrong, so `up`'s output carries no
