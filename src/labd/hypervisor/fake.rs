@@ -101,6 +101,11 @@ pub struct Run {
     /// The guest resets in place this long after coming up, its agent gone
     /// for the second duration ([`Run::guest_resets`]).
     pub resets: Option<(Duration, Duration)>,
+    /// The agent writes each exec (`agent exec <argv>`) and each file
+    /// session it is asked for (`agent fileops`) into the journal.
+    pub agent_journal: bool,
+    /// An exec whose argv contains this exits 1 instead of 0.
+    pub agent_exec_fails: Option<String>,
 }
 
 impl Run {
@@ -410,6 +415,8 @@ impl Hypervisor for FakeHypervisor {
             ignores_detach: run.ignores_detach,
             detach_fails: run.detach_fails.clone(),
             ignores_agent_shutdown: run.ignores_agent_shutdown,
+            agent_journal: run.agent_journal,
+            agent_exec_fails: run.agent_exec_fails.clone(),
             ..FakeProc::new(spec.label.clone())
         });
         serve_guest(&spec.channels, &machine, &run, self.script.agent)?;
@@ -525,6 +532,8 @@ pub(crate) struct FakeProc {
     /// stays plugged.
     detach_fails: Option<String>,
     ignores_agent_shutdown: bool,
+    agent_journal: bool,
+    agent_exec_fails: Option<String>,
 }
 
 /// Which agent process answers, and what it calls itself.
@@ -553,6 +562,8 @@ impl FakeProc {
             ignores_detach: false,
             detach_fails: None,
             ignores_agent_shutdown: false,
+            agent_journal: false,
+            agent_exec_fails: None,
         }
     }
 
@@ -1140,12 +1151,22 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                 HostMsg::NetInfo => AgentMsg::NetInfo {
                     interfaces: Vec::new(),
                 },
-                HostMsg::OpenExec { id, .. } => {
+                HostMsg::OpenExec { id, argv, .. } => {
                     let opened = encode_ctrl(&AgentMsg::Opened { id }).unwrap();
                     if tx.write_all(&opened).await.is_err() {
                         return;
                     }
-                    AgentMsg::Exited { id, code: 0 }
+                    if machine.agent_journal {
+                        machine.note(format!("agent exec {}", argv.join(" ")));
+                    }
+                    let fails = machine
+                        .agent_exec_fails
+                        .as_deref()
+                        .is_some_and(|needle| argv.iter().any(|a| a.contains(needle)));
+                    AgentMsg::Exited {
+                        id,
+                        code: i32::from(fails),
+                    }
                 }
                 HostMsg::OpenTail { id, .. } => {
                     let opened = encode_ctrl(&AgentMsg::Opened { id }).unwrap();
@@ -1168,10 +1189,15 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                 }
                 // Advertised so a caller gets as far as asking, refused so
                 // the asking fails the way a real agent's refusal does.
-                HostMsg::OpenFileOps { id, .. } => AgentMsg::Error {
-                    id: Some(id),
-                    msg: "the fake agent serves no file session".into(),
-                },
+                HostMsg::OpenFileOps { id, .. } => {
+                    if machine.agent_journal {
+                        machine.note("agent fileops".into());
+                    }
+                    AgentMsg::Error {
+                        id: Some(id),
+                        msg: "the fake agent serves no file session".into(),
+                    }
+                }
                 _ => continue,
             };
             let shutting_down = matches!(reply, AgentMsg::ShuttingDown { .. });

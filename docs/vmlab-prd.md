@@ -1629,6 +1629,21 @@ machine* for a current agent by default; **`agent_update = false`** on the
 old behaviour, under which the template's sealed `agent_version` stays the
 truth about the clone.
 
+**On Windows the agent's directory belongs to the administrators.** The
+service runs as SYSTEM from `C:\ProgramData\vmlab`, and a directory made
+there with a plain `mkdir` inherits a list under which every local account
+may create files in it — a DLL beside the service executable, or the staging
+file ahead of a push. So the bootstrap `install.cmd` gives the directory to
+Administrators and sets its whole access list before the binary lands:
+nothing inherited, full control for SYSTEM and Administrators, read and
+execute for Users. A push sets the same list first, which repairs a machine
+whose template was built before the installer did. It then frees the staging
+name — a file already there is renamed aside, never deleted recursively — and
+refuses, with nothing written, when the directory cannot be secured or the
+name is still taken. After the transfer the staged file must be owned by
+Administrators or SYSTEM, or it is not put in place. A file that a local
+account put in the directory before the list was set is not removed.
+
 **Status reports the agent that is running, not the one that was sealed.** A
 VM's status projection carries one `agent_version`: the stamp its agent's last
 handshake since this start reported, falling back to the template's sealed
