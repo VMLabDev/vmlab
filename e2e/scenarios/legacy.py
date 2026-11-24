@@ -5,7 +5,7 @@ import os
 import pathlib
 import time
 
-from harness import RESULTS, ScenarioFailed
+from harness import E2E, RESULTS, ScenarioFailed
 
 GUESTS = [
     ("freedos", "vm.legacy.freedos", "x86/freedos-1.3/1.3.0"),
@@ -109,6 +109,28 @@ def stage_template(h, relative):
     h.run(["cp", "-a", "--reflink=auto", "--sparse=always", str(pathlib.Path(source) / relative), str(target)])
 
 
+def exercise_templeos_reinstall(h, lab):
+    machine = "temple"
+    # The sealed template supplies the boot disk. Boot the checkout's agent
+    # before the assertion so the test covers the source under test.
+    source = (E2E.parent / "guest/agent-templeos/VmlabAgt.HC").read_text()
+    source = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("//"))
+    h.vmlab("exec", machine, "--", f'FileWrite("~/VmlabAgt.HC",{json.dumps(source)},{len(source)});', cwd=lab)
+    h.vmlab("vm", "restart", machine, cwd=lab)
+    h.wait_ready(lab, machine, timeout=300)
+    wait_for_screen(h, lab, machine)
+    h.vmlab("script", "reinstall.ws", cwd=lab)
+    for attempt in range(1, 11):
+        result = h.vmlab("exec", machine, "--", r'if (FileFind("~/F7DONE.TXT")) "ok\n";', cwd=lab, check=False)
+        if result.code or result.out.strip() != "ok":
+            raise ScenarioFailed(f"TempleOS exec {attempt} after reinstall: {result.text}")
+    result = h.vmlab("exec", machine, "--",
+                     r'CTask *t=Fs; I64 n=0; do { if (!StrCmp(t->task_name,"VmlabAgent")) n++;'
+                     r' t=t->next_task; } while (t!=Fs); "%d\n",n;', cwd=lab)
+    if result.out.strip() != "1":
+        raise ScenarioFailed(f"TempleOS reinstall left {result.out.strip()} agent tasks")
+
+
 def exercise(h, lab, machine):
     h.wait_until(lambda: len(project_vms()) < 2, timeout=900, what="a host project VM slot")
     h.log.write(f"[legacy] host VM pids before boot: {project_vms()}\n")
@@ -139,6 +161,8 @@ def exercise(h, lab, machine):
             h.vmlab("exec", machine, "--", shell, "/c", "del", "C:\\P4CHECK.TXT", cwd=lab)
         if "PHASE4_DISK_OK" not in result.out:
             raise ScenarioFailed(f"{machine}: disk read did not return the written marker: {result.text}")
+        if machine == "temple":
+            exercise_templeos_reinstall(h, lab)
         h.vmlab("vm", "stop", machine, cwd=lab, timeout=300)
         if "state=stopped" not in h.machine_line(lab, machine):
             raise ScenarioFailed(f"{machine}: stop did not settle")
