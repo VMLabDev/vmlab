@@ -1,7 +1,8 @@
 //! Bounds on what a guest can make the interpreter spend or keep.
 
+use std::collections::BTreeSet;
 use vmlab_hv_tcg::{Error, FlatMemory, Interpreter, Memory, Riscv64, TERMINAL_LIMIT, Value};
-use vmlab_hv_tcg_ir::Program;
+use vmlab_hv_tcg_ir::{Op, Program, Target};
 
 /// A hart at 0x8000_0000 in an endless `jal x0, 0`.
 fn spinning() -> Riscv64<FlatMemory> {
@@ -98,4 +99,99 @@ fn the_terminal_keeps_only_the_newest_output() {
         .call("zplat_term_write", vec![Value::bits(8, 1u8)])
         .unwrap();
     assert!(interpreter.terminal.is_empty());
+}
+
+/// A machine-mode hart at 0x8000_0000 holding `csrrw x10, seed, x0`, the one
+/// legal access to the Zkr entropy source, twice.
+fn reading_seed() -> Riscv64<FlatMemory> {
+    let mut memory = FlatMemory::new(0x8000_0000, vec![0; 4096]);
+    for address in [0x8000_0000u64, 0x8000_0004] {
+        memory
+            .write(address, &0x0150_1573u32.to_le_bytes())
+            .unwrap();
+    }
+    let mut cpu = Riscv64::new(memory).unwrap();
+    cpu.set_pc(0x8000_0000);
+    cpu
+}
+
+#[test]
+fn the_seed_csr_returns_entropy() {
+    let mut cpu = reading_seed();
+    cpu.step().unwrap();
+    assert_eq!(cpu.pc().unwrap(), 0x8000_0004);
+    let first = cpu.gpr(10).unwrap();
+    // OPST is ES16: the low 16 bits are entropy, and nothing else is set.
+    assert_eq!(first >> 16, 0b10 << 14);
+    cpu.step().unwrap();
+    assert_eq!(cpu.pc().unwrap(), 0x8000_0008);
+    let second = cpu.gpr(10).unwrap();
+    assert_eq!(second >> 16, 0b10 << 14);
+    // No answer is kept for the next read: a memoised or folded call would
+    // hand the guest the same 16 bits again.
+    assert_ne!(first, second);
+
+    // The trace specialiser takes the same two instructions the same way.
+    let mut specialized = reading_seed();
+    specialized.specialize = true;
+    specialized.step().unwrap();
+    assert_eq!(specialized.gpr(10).unwrap(), first);
+    specialized.step().unwrap();
+    assert_eq!(specialized.pc().unwrap(), 0x8000_0008);
+    assert_eq!(specialized.gpr(10).unwrap(), second);
+}
+
+#[test]
+fn call_serves_every_function_the_model_does_not_define() {
+    let mut cpu = reading_seed();
+    let program = cpu.interpreter.program;
+    let missing: BTreeSet<&str> = program
+        .functions
+        .values()
+        .chain(&program.initializers)
+        .flat_map(|function| &function.code)
+        .filter_map(|op| match op {
+            Op::Call(_, Target::Function(name), _)
+                if !program.functions.contains_key(name) =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    // The model must still have the platform functions this test is about.
+    assert!(missing.contains("zplat_term_write"));
+    assert!(missing.contains("zget_16_random_bits"));
+    assert!(missing.iter().any(|name| name.starts_with("zriscv_")));
+
+    let mut unserved = Vec::new();
+    for name in missing {
+        let (types, _) = program
+            .declarations
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} has no declaration"));
+        let args = types
+            .iter()
+            .map(|ty| cpu.interpreter.default_value(ty, 0).unwrap())
+            .collect();
+        if let Err(error) = cpu.interpreter.call(name, args) {
+            unserved.push(format!("{name}: {error}"));
+        }
+    }
+    assert!(
+        unserved.is_empty(),
+        "the model calls functions it does not define and `call` does not serve: {unserved:#?}"
+    );
+}
+
+#[test]
+fn a_csr_index_past_twelve_bits_is_refused() {
+    let mut cpu = spinning();
+    assert!(cpu.read_csr(0x1300).is_err());
+    assert!(cpu.write_csr(0x1340, 7).is_err());
+    assert!(cpu.read_csr(0xffff).is_err());
+    assert_eq!(cpu.read_csr(0x340).unwrap(), 0);
+    // The whole 12-bit range is still an index: mscratch itself takes a write.
+    cpu.write_csr(0x340, 7).unwrap();
+    assert_eq!(cpu.read_csr(0x340).unwrap(), 7);
 }
