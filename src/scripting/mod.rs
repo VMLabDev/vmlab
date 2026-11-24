@@ -1418,7 +1418,9 @@ pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String
     let mut unit = context().compile(source).map_err(runner::compile_error)?;
     let name = entry.name();
     let Some((_, signature)) = unit.exports.get(name) else {
-        return Err(format!("the script must define a non-generic function named {name}"));
+        return Err(format!(
+            "the script must define a non-generic function named {name}"
+        ));
     };
     let lab = LabHandle::script_type(&mut unit.defs);
     let params = match entry {
@@ -1429,7 +1431,9 @@ pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String
     if *signature != expected {
         let expected = Type::Fn(Box::new(expected)).display(&unit.defs);
         let actual = Type::Fn(Box::new(signature.clone())).display(&unit.defs);
-        return Err(format!("{name} must have signature {expected}, got {actual}"));
+        return Err(format!(
+            "{name} must have signature {expected}, got {actual}"
+        ));
     }
     Ok(())
 }
@@ -1486,7 +1490,10 @@ mod tests {
             "fn main(n: int) {}",
             "fn main(lab: Lab) -> int { 1 }",
         ] {
-            assert!(check_script_entry(source, ScriptEntry::Main).is_err(), "{source}");
+            assert!(
+                check_script_entry(source, ScriptEntry::Main).is_err(),
+                "{source}"
+            );
         }
         check_script_entry("fn main(lab: Lab) {}", ScriptEntry::Main).unwrap();
         check_script_entry("fn handle(event: Event, lab: Lab) {}", ScriptEntry::Handler).unwrap();
@@ -1500,7 +1507,8 @@ mod tests {
     fn card_861_region_coordinates_do_not_wrap() {
         let coordinates = vec![4294967301, 0, 10, 10];
         let matches = MachineHandle::match_opts(0.9, coordinates).unwrap();
-        let ocr = ocr::parse_opts(&[("region".into(), "4294967301,0,10,10".into())].into()).unwrap();
+        let ocr =
+            ocr::parse_opts(&[("region".into(), "4294967301,0,10,10".into())].into()).unwrap();
         assert_eq!(
             (matches.region, ocr.region),
             (Some((u32::MAX, 0, 10, 10)), Some((u32::MAX, 0, 10, 10)))
