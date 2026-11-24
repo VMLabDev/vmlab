@@ -448,3 +448,132 @@ fn a_trace_whose_own_access_is_refused_raises_the_same_guest_fault() {
         assert_eq!(specialized.steps, reference.steps);
     }
 }
+
+const SD_X12_X13: u32 = 0x00c6_b023;
+const SC_D_X11_X12_X8: u32 = 0x18c4_35af;
+const ADD_X14_X14_X11: u32 = 0x00b7_0733;
+const SAME_HART_STORE_FLAG: &str = "zplat_reservation_invalidate_on_same_hart_store";
+/// The doubleword the LR reserves in the tests below.
+const RESERVED: u64 = 0x8000_1000;
+
+/// A hart on 16 KiB of RAM at `lr.d x10, (x8)`, `sd x12, 0(x13)`,
+/// `sc.d x11, x12, (x8)`, with `x8` at `RESERVED` and `x13` at `store`.
+fn between_lr_and_sc(store: u64, specialize: bool) -> Riscv64<FlatMemory> {
+    let mut cpu = Riscv64::new(FlatMemory::new(RAM, vec![0; 4 * 4096])).unwrap();
+    cpu.specialize = specialize;
+    restart(
+        &mut cpu,
+        &[LR_D_X10_X8, SD_X12_X13, SC_D_X11_X12_X8],
+        RESERVED,
+    );
+    cpu.set_gpr(11, 0xdead).unwrap();
+    cpu.set_gpr(12, 0x1122_3344_5566_7788).unwrap();
+    cpu.set_gpr(13, store).unwrap();
+    cpu
+}
+
+fn doubleword(cpu: &mut Riscv64<FlatMemory>, address: u64) -> u64 {
+    let mut bytes = [0; 8];
+    cpu.interpreter.memory.read(address, &mut bytes).unwrap();
+    u64::from_le_bytes(bytes)
+}
+
+/// The model's platform setting `plat_reservation_invalidate_on_same_hart_store`
+/// is `false`: a store by the hart that holds a reservation does not cancel
+/// it, wherever the store lands. Only the platform reads the setting, and
+/// here the interpreter is the platform.
+#[test]
+fn a_same_hart_store_keeps_the_reservation() {
+    assert_eq!(
+        between_lr_and_sc(0, false)
+            .interpreter
+            .globals
+            .get(SAME_HART_STORE_FLAG),
+        Some(&Value::Bool(false)),
+        "the committed model changed its setting"
+    );
+    // Another page, the reserved page, and the reserved doubleword itself.
+    for store in [0x8000_3000, 0x8000_1800, RESERVED] {
+        for specialize in [false, true] {
+            let case = format!("store to {store:#x}, specialize {specialize}");
+            let mut cpu = between_lr_and_sc(store, specialize);
+            for _ in 0..3 {
+                assert!(!cpu.step().unwrap(), "{case}");
+            }
+            assert_eq!(cpu.gpr(11).unwrap(), 0, "{case}: the SC failed");
+            assert_eq!(doubleword(&mut cpu, RESERVED), 0x1122_3344_5566_7788, "{case}");
+            assert_eq!(doubleword(&mut cpu, store), 0x1122_3344_5566_7788, "{case}");
+        }
+    }
+}
+
+/// The same sequence in a loop, so that the specialiser runs the store from a
+/// trace: no SC may fail, and the hart ends as under the plain interpreter.
+#[test]
+fn a_same_hart_store_in_a_trace_keeps_the_reservation() {
+    // loop: lr.d; sd; sc.d; add x14, x14, x11; jal x0, loop
+    let code = [
+        LR_D_X10_X8,
+        SD_X12_X13,
+        SC_D_X11_X12_X8,
+        ADD_X14_X14_X11,
+        0xff1f_f06f,
+    ];
+    for store in [0x8000_3000, 0x8000_1800u64] {
+        let mut reference = between_lr_and_sc(store, false);
+        let mut specialized = between_lr_and_sc(store, true);
+        restart(&mut reference, &code, RESERVED);
+        restart(&mut specialized, &code, RESERVED);
+        let mut done = 0;
+        while done < 2_000 {
+            let (ran, waiting) = specialized.run(7).unwrap();
+            assert!(ran > 0 && !waiting);
+            assert_eq!(reference.run(ran).unwrap(), (ran, false));
+            done += ran;
+            assert_eq!(
+                *specialized.interpreter.globals, *reference.interpreter.globals,
+                "store to {store:#x} after {done} steps"
+            );
+        }
+        assert_eq!(reference.gpr(14).unwrap(), 0, "an SC failed, store to {store:#x}");
+        assert_eq!(
+            specialized.interpreter.memory.bytes(),
+            reference.interpreter.memory.bytes()
+        );
+        assert!(specialized.specialization_stats.hits > 0);
+    }
+}
+
+/// With the setting on, the platform cancels the reservation at any store by
+/// the hart, as the Sail emulator does.
+#[test]
+fn a_same_hart_store_cancels_the_reservation_when_the_model_says_so() {
+    for specialize in [false, true] {
+        let mut cpu = between_lr_and_sc(0x8000_3000, specialize);
+        cpu.interpreter
+            .globals
+            .insert(SAME_HART_STORE_FLAG.into(), Value::Bool(true));
+        for _ in 0..3 {
+            assert!(!cpu.step().unwrap());
+        }
+        assert_eq!(cpu.gpr(11).unwrap(), 1, "specialize {specialize}");
+        assert_eq!(doubleword(&mut cpu, RESERVED), 0, "specialize {specialize}");
+    }
+}
+
+/// A store that did not come from the hart still breaks its reservation, and
+/// a later store by the hart to the same granule does not bring it back.
+#[test]
+fn a_same_hart_store_does_not_restore_a_broken_reservation() {
+    for specialize in [false, true] {
+        let mut cpu = between_lr_and_sc(0x8000_1800, specialize);
+        assert!(!cpu.step().unwrap());
+        // Another hart, or a device, writes into the reserved granule.
+        cpu.interpreter.memory.write(0x8000_1008, &[1]).unwrap();
+        for _ in 0..2 {
+            assert!(!cpu.step().unwrap());
+        }
+        assert_eq!(cpu.gpr(11).unwrap(), 1, "specialize {specialize}");
+        assert_eq!(doubleword(&mut cpu, RESERVED), 0, "specialize {specialize}");
+    }
+}
