@@ -377,6 +377,31 @@ impl VmShared {
         }
     }
 
+    /// The ACPI PM block of a direct-kernel machine as a snapshot section.
+    /// A firmware machine has none: its block is the LPC's, and `pm` is on no
+    /// bus there.
+    pub(crate) fn save_direct_kernel_pm(&self) -> Result<Option<(String, Vec<u8>)>, String> {
+        use vmlab_hv_devices::Snapshot;
+        if self.chipset.lock().is_some() {
+            return Ok(None);
+        }
+        let pm = self.pm.lock();
+        let state = pm.save_state().map_err(|e| e.to_string())?;
+        Ok(Some((pm.state_id(), state)))
+    }
+
+    /// Put a saved PM block back. A firmware machine ignores the section.
+    pub(crate) fn restore_direct_kernel_pm(&self, state: &[u8]) -> Result<(), String> {
+        use vmlab_hv_devices::Snapshot;
+        if self.chipset.lock().is_some() {
+            return Ok(());
+        }
+        self.pm
+            .lock()
+            .restore_state(state)
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn reset_platform(&self) {
         use vmlab_hv_devices::Resettable;
         let _ = self.pm.lock().reset();
