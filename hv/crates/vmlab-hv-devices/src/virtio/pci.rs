@@ -570,7 +570,9 @@ impl VirtioPciDevice {
     /// empty set. `activated` is the fact: the driver can clear DRIVER_OK
     /// in the status without a reset, and the device keeps running.
     fn features_fixed(&self) -> bool {
-        self.negotiated.is_some() || self.driver_status & device_status::DRIVER_OK != 0
+        self.negotiated.is_some()
+            || self.activated
+            || self.driver_status & device_status::DRIVER_OK != 0
     }
 
     /// Take the driver's feature set. Once the set is fixed a later write
