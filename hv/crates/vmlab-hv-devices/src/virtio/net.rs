@@ -4155,10 +4155,7 @@ mod tests {
         wait_for("indirect transmit completion", || {
             f.vqs[1].used_idx(&f.mem) == 1
         });
-        assert_eq!(
-            f.vqs[1].used_entry(&f.mem, 0),
-            (u32::from(head), 0)
-        );
+        assert_eq!(f.vqs[1].used_entry(&f.mem, 0), (u32::from(head), 0));
     }
 
     #[test]
