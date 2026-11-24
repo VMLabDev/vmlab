@@ -1777,6 +1777,25 @@ fn main(lab: Lab) {
     /// The OCR options surface (surface 5): `ocr_opts` and
     /// `wait_for_text_opts` beside the plain calls they extend.
     #[test]
+    fn a_text_match_has_no_click_point() {
+        for call in [
+            r#"vm.wait_for_text("Continue", 1)"#,
+            r#"vm.wait_for_text_opts("Continue", 1, #{})"#,
+        ] {
+            let source = format!(
+                r#"
+use vmlab
+fn main(vm: Machine) {{
+    let found = {call}.expect("Continue")
+    vm.mouse_move(found.cx, found.cy)
+}}
+"#
+            );
+            assert!(check_script_source(&source).is_err(), "{call} exposes a click point");
+        }
+    }
+
+    #[test]
     fn ocr_options_api_compiles() {
         let src = r#"
 use vmlab

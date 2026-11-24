@@ -277,6 +277,26 @@ mod tests {
     }
 
     #[test]
+    fn a_threshold_outside_zero_to_one_is_refused() {
+        let screen = test_screen(16, 16);
+        let template = RgbImage::from_fn(8, 8, |x, y| {
+            let value = (((x / 4) + (y / 4)) % 2 * 255) as u8;
+            Rgb([value, 255 - value, value])
+        });
+        let accepted: Vec<_> = [f64::NAN, -1.0, 1.5, f64::INFINITY]
+            .into_iter()
+            .filter(|&threshold| {
+                let opts = MatchOptions {
+                    threshold,
+                    ..Default::default()
+                };
+                find_template(&screen, &template, &opts).is_some()
+            })
+            .collect();
+        assert!(accepted.is_empty(), "accepted invalid thresholds: {accepted:?}");
+    }
+
+    #[test]
     fn threshold_is_respected() {
         let screen = test_screen(640, 480);
         let mut tmpl = cut(&screen, 160, 224, 60, 40);
