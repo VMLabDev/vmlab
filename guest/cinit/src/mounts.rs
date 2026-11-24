@@ -24,7 +24,7 @@ pub fn ensure_dir<P: AsRef<Path> + ?Sized>(path: &P) -> Result<()> {
 /// The directory `path` names inside the container rootfs, resolved there
 /// (F56: an image symlink cannot point a mount outside the rootfs) and
 /// created if absent.
-fn rootfs_dir(path: &str) -> Result<PathBuf> {
+pub(crate) fn rootfs_dir(path: &str) -> Result<PathBuf> {
     let dir = in_root(ROOTFS, path)?;
     ensure_dir(&dir)?;
     Ok(dir)
