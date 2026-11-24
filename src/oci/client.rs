@@ -714,6 +714,11 @@ impl Registry {
         // blob chooses the store name and version, so this is what keeps the
         // entry from standing for another repository's reference.
         meta.pulled_from = Some(self.reference.source());
+        // The repository it publishes to is the one it was pulled from, not
+        // the one its blob claims: `template list` shows this as its name,
+        // `--remote` asks it and a push with no target uploads there (F21 of
+        // docs/reviews/templates-registry-2.md).
+        meta.registry = Some(self.reference.source());
         crate::template::trust::names(&meta)?;
         let trusted = crate::template::trust::repository_trusted(
             &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
@@ -4971,6 +4976,7 @@ mod tests {
                 let mut e = m.effective(Some(v));
                 e.origin = pulled.origin.clone();
                 e.pulled_from = pulled.pulled_from.clone();
+                e.registry = pulled.registry.clone();
                 e
             });
             assert_eq!(got.description, v.description);
