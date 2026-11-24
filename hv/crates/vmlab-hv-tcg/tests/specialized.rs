@@ -516,7 +516,10 @@ fn a_store_that_changes_its_own_loop_ends_the_trace() {
     let mut reference = make();
     let mut specialized = make();
     specialized.specialize = true;
-    for (round, value) in [same, same, other, other, same, other].into_iter().enumerate() {
+    for (round, value) in [same, same, other, other, same, other]
+        .into_iter()
+        .enumerate()
+    {
         for cpu in [&mut reference, &mut specialized] {
             cpu.set_gpr(4, value).unwrap();
         }
