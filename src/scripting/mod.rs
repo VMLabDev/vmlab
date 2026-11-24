@@ -212,7 +212,7 @@ impl From<crate::labd::vm_agent::MetricsSnapshot> for GuestStats {
     }
 }
 
-/// An image/text match: location + score, usable to anchor a relative
+/// An image match: location + score, usable to anchor a relative
 /// mouse click (PRD §10.3).
 #[derive(Script, Clone)]
 #[script(name = "Match")]
@@ -225,7 +225,14 @@ pub struct ScriptMatch {
     /// Center point, for `vm.mouse_move(m.cx, m.cy)`.
     pub cx: i64,
     pub cy: i64,
-    /// For wait_for_text: the matched text.
+    /// Always empty for an image match.
+    pub text: String,
+}
+
+/// A regex match in OCR output. Plain-text OCR supplies only the matched text.
+#[derive(Script, Clone)]
+#[script(name = "TextMatch")]
+pub struct ScriptTextMatch {
     pub text: String,
 }
 
@@ -402,7 +409,7 @@ impl MachineHandle {
         pattern: &str,
         timeout_secs: i64,
         req: ocr::OcrRequest,
-    ) -> Result<ScriptMatch, String> {
+    ) -> Result<ScriptTextMatch, String> {
         let timeout = script_timeout(timeout_secs, 0)?;
         let display = self.display()?;
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
@@ -415,16 +422,7 @@ impl MachineHandle {
                 self.name()
             )
         })?;
-        Ok(ScriptMatch {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-            score: 1.0,
-            cx: 0,
-            cy: 0,
-            text,
-        })
+        Ok(ScriptTextMatch { text })
     }
 
     /// `m.record(path, opts)` (§11.1): start recording this machine's
@@ -539,15 +537,16 @@ impl MachineHandle {
     }
 
     fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
-        let region = match region.len() {
-            0 => None,
-            4 => Some((
-                region[0].max(0) as u32,
-                region[1].max(0) as u32,
-                region[2].max(0) as u32,
-                region[3].max(0) as u32,
-            )),
-            n => return Err(format!("region needs [x, y, w, h], got {n} elements")),
+        vision::validate_threshold(threshold)?;
+        let region = match region.as_slice() {
+            [] => None,
+            [x, y, w, h] => Some(region_coordinates([*x, *y, *w, *h])),
+            _ => {
+                return Err(format!(
+                    "region needs [x, y, w, h], got {} elements",
+                    region.len()
+                ));
+            }
         };
         Ok(vision::MatchOptions { threshold, region })
     }
@@ -1171,7 +1170,7 @@ pub fn lab_module() -> Module {
             |h: &MachineHandle,
              pattern: String,
              timeout_secs: i64|
-             -> Result<ScriptMatch, String> {
+             -> Result<ScriptTextMatch, String> {
                 h.wait_for_text(&pattern, timeout_secs, ocr::OcrRequest::default())
             },
         )
@@ -1181,7 +1180,7 @@ pub fn lab_module() -> Module {
              pattern: String,
              timeout_secs: i64,
              opts: std::collections::HashMap<String, String>|
-             -> Result<ScriptMatch, String> {
+             -> Result<ScriptTextMatch, String> {
                 h.wait_for_text(&pattern, timeout_secs, ocr::parse_opts(&opts)?)
             },
         )
@@ -1384,6 +1383,7 @@ pub fn context() -> Context {
         .module(lab_module())
         .register_type::<ExecResult>()
         .register_type::<ScriptMatch>()
+        .register_type::<ScriptTextMatch>()
         .register_type::<EventData>()
         .register_type::<GuestStats>()
         .register_type::<DiskStat>()
@@ -1398,16 +1398,57 @@ pub fn context() -> Context {
     Context::from_registry(registry)
 }
 
-/// Compile-check a script (used by `vmlab validate`, PRD §5.1).
-pub fn check_script_source(source: &str) -> Result<(), String> {
-    match context().compile(source) {
-        Ok(_) => Ok(()),
-        Err(wscript::Error::Compile(diags)) => {
-            let msgs: Vec<String> = diags.iter().map(runner::render_diag).collect();
-            Err(msgs.join("; "))
+#[derive(Clone, Copy)]
+pub enum ScriptEntry {
+    Main,
+    Handler,
+}
+
+impl ScriptEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Handler => "handle",
         }
-        Err(e) => Err(e.to_string()),
     }
+}
+
+/// Compile a script and check the signature vmlab will call (PRD §5.1).
+pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String> {
+    let mut unit = context().compile(source).map_err(runner::compile_error)?;
+    let name = entry.name();
+    let Some((_, signature)) = unit.exports.get(name) else {
+        return Err(format!(
+            "the script must define a non-generic function named {name}"
+        ));
+    };
+    let lab = LabHandle::script_type(&mut unit.defs);
+    let params = match entry {
+        ScriptEntry::Main => vec![lab],
+        ScriptEntry::Handler => vec![EventData::script_type(&mut unit.defs), lab],
+    };
+    let expected = wscript::FnSig::new(params, Type::Unit);
+    if *signature != expected {
+        let expected = Type::Fn(Box::new(expected)).display(&unit.defs);
+        let actual = Type::Fn(Box::new(signature.clone())).display(&unit.defs);
+        return Err(format!(
+            "{name} must have signature {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_script_source(source: &str) -> Result<(), String> {
+    context()
+        .compile(source)
+        .map(|_| ())
+        .map_err(runner::compile_error)
+}
+
+fn region_coordinates(values: [i64; 4]) -> (u32, u32, u32, u32) {
+    let [x, y, w, h] = values.map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    (x, y, w, h)
 }
 
 /// Write the `.wscripti` interface file for LSP support (PRD §10).
@@ -1440,6 +1481,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_861_a_script_without_its_entry_point_fails_validation() {
+        for source in [
+            "fn mian(lab: Lab) {}",
+            "fn main() {}",
+            "fn main(n: int) {}",
+            "fn main(lab: Lab) -> int { 1 }",
+        ] {
+            assert!(
+                check_script_entry(source, ScriptEntry::Main).is_err(),
+                "{source}"
+            );
+        }
+        check_script_entry("fn main(lab: Lab) {}", ScriptEntry::Main).unwrap();
+        check_script_entry("fn handle(event: Event, lab: Lab) {}", ScriptEntry::Handler).unwrap();
+        assert!(
+            check_script_entry("fn handle(lab: Lab, event: Event) {}", ScriptEntry::Handler)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn card_861_region_coordinates_do_not_wrap() {
+        let coordinates = vec![4294967301, 0, 10, 10];
+        let matches = MachineHandle::match_opts(0.9, coordinates).unwrap();
+        let ocr =
+            ocr::parse_opts(&[("region".into(), "4294967301,0,10,10".into())].into()).unwrap();
+        assert_eq!(
+            (matches.region, ocr.region),
+            (Some((u32::MAX, 0, 10, 10)), Some((u32::MAX, 0, 10, 10)))
+        );
+    }
 
     #[test]
     fn a_huge_sleep_ms_faults_without_a_cancellation_token() {
@@ -1774,6 +1848,37 @@ fn main(lab: Lab) {
         check_script_source(src).expect("record API surface should type-check");
     }
 
+    #[test]
+    fn a_text_match_has_no_click_point() {
+        for call in [
+            r#"vm.wait_for_text("Continue", 1)"#,
+            r#"vm.wait_for_text_opts("Continue", 1, #{})"#,
+        ] {
+            let source = format!(
+                r#"
+use vmlab
+fn main(vm: Machine) {{
+    let found = {call}.expect("Continue")
+    let click = vm.mouse_move(found.cx, found.cy)
+}}
+"#
+            );
+            let error = check_script_source(&source).expect_err("OCR exposes a click point");
+            assert!(error.contains("no field `cx`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn image_wait_options_reject_invalid_thresholds() {
+        for threshold in [f64::NAN, -1.0, 1.5] {
+            let error = MachineHandle::match_opts(threshold, vec![]).unwrap_err();
+            assert!(error.contains("match threshold"), "{error}");
+        }
+        for threshold in [0.0, 1.0] {
+            assert!(MachineHandle::match_opts(threshold, vec![]).is_ok());
+        }
+    }
+
     /// The OCR options surface (surface 5): `ocr_opts` and
     /// `wait_for_text_opts` beside the plain calls they extend.
     #[test]
@@ -1791,7 +1896,8 @@ fn main(lab: Lab) {
         Ok(m) => lab.log(m.text),
         Err(e) => lab.log(e),
     }
-    let plain = vm.wait_for_text("login:", 30)
+    let plain: TextMatch = vm.wait_for_text("login:", 30).expect("login prompt")
+    lab.log(plain.text)
 }
 "#;
         check_script_source(src).expect("OCR options surface should type-check");

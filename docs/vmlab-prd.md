@@ -878,7 +878,7 @@ m.wait_for_any([refs], opts) -> Match       #   region{x,y,w,h}, interval
 m.find_image(ref, opts) -> Match | None     # single-shot, no wait
 m.ocr(opts) -> string                       # Tesseract; opts: region, scale,
                                             #   layout
-m.wait_for_text(pattern, opts) -> Match     # OCR-based wait, regex pattern
+m.wait_for_text(pattern, opts) -> TextMatch # OCR-based wait, regex pattern
 m.record(path, opts) -> Recording           # console video (§11.1); opts: fps,
                                             #   size, compress_idle, timeline,
                                             #   max_duration; r.stop() -> path
@@ -886,7 +886,7 @@ m.record(path, opts) -> Recording           # console video (§11.1); opts: fps,
 
 OCR reads the frame (or the region) in greyscale, enlarged `scale` times (1–4, default 3) with a Lanczos3 filter and capped at 16.4 MP, because tesseract misreads console-sized fonts at their own size; `layout` picks tesseract's page segmentation: `block` (psm 6, the default), `sparse` (11), `line` (7) or `auto` (3).
 
-Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a similarity threshold (default ~0.9, overridable). `Match` carries location + score, so a found image can anchor a relative mouse click.
+Reference images are paths relative to the lab (convention: `images/` beside `vmlab.wcl`). Matching is normalised template matching with a finite similarity threshold from 0 to 1 inclusive (default 0.9). `Match` carries location + score, so a found image can anchor a relative mouse click. `TextMatch` carries only the matched text.
 
 Every capture — `screenshot`, `ocr`, `find_image` and the waits built on them, from wscript and the CLI alike — reads the framebuffer through QMP `screendump`, except on a GL display. When `gpu.mode` is `virgl` or `vulkan` the scanout is a host GL texture and `screendump` answers `no surface`, so the capture is one full, non-incremental RFB update (32 bpp, Raw) read from the VM's own VNC socket, which egl-headless already feeds. Any other VM whose `screendump` answers `no surface` falls back to that VNC read once; when it fails as well, the QMP error is reported with the VNC failure beside it.
 
