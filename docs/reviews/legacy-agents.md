@@ -201,6 +201,9 @@ Not read:
   session on the slot's handle, call `connect` again from a second task with
   a short grace (`with_grace`), and assert that the first handle is still
   open and that the mock accepted one connection.
+- Fixed by card #758. Connect reuses an open DOS or TempleOS connection
+  while it carries an exec, including an exec still waiting for `opened`.
+  The regression test covers both agents with a paused clock.
 
 ### F5. On DOS `opened` is sent after the command has ended, so a command longer than 60 s is reported as not started
 

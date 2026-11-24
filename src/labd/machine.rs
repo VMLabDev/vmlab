@@ -1116,7 +1116,7 @@ impl Default for AgentSlot {
 
 /// What [`AgentSlot::check_cached`] found.
 enum Checked<'a> {
-    /// The cached connection answered.
+    /// The cached connection can be reused.
     Live(AgentHandle),
     /// The cached connection is open but its agent has not answered yet; kept.
     Slow,
@@ -1285,8 +1285,8 @@ impl AgentSlot {
         self.dial(name, sock, hint, Backoff::Skip).await
     }
 
-    /// Reuse the cached handle if it still answers, else handshake afresh —
-    /// unless `backoff` honours a handshake that failed in the last 30 s.
+    /// Reuse the cached handle if it still answers or a synchronous exec
+    /// occupies it, else handshake afresh unless backoff applies.
     async fn dial(
         &self,
         name: &str,
@@ -1296,7 +1296,7 @@ impl AgentSlot {
     ) -> Result<AgentHandle> {
         let mut agent = match self.check_cached(name, self.grace, false).await {
             Checked::Live(handle) => return Ok(handle),
-            Checked::Slow => unreachable!("a connect never keeps a silent connection"),
+            Checked::Slow => unreachable!("only probes report a slow connection"),
             Checked::Empty(agent) => agent,
         };
         if let Some(handle) = agent.as_ref() {
@@ -1392,7 +1392,7 @@ impl AgentSlot {
                 continue;
             }
             match verdict {
-                Cached::Answers => return Checked::Live(handle),
+                Cached::Reuse => return Checked::Live(handle),
                 Cached::Slow => return Checked::Slow,
                 Cached::Gone => {
                     if let Some(dead) = agent.take() {
@@ -1525,27 +1525,28 @@ pub const PING_GRACE: Duration = Duration::from_secs(20);
 /// What a ping says about a cached agent connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cached {
-    /// Its agent answered: hand it out.
-    Answers,
+    /// The connection is usable: hand it out.
+    Reuse,
     /// Its agent has not answered yet, but the connection is open and no other
     /// agent instance answered on it, so a new one would do no better: keep it.
     Slow,
-    /// The socket ended, or another agent instance answered: replace it.
+    /// The connection must be replaced.
     Gone,
 }
 
-/// Ping a cached agent connection: 2 s, then up to `grace` more while it
-/// stays open. With `keep_slow` (a probe) an open connection that stays
-/// silent is kept as [`Cached::Slow`] rather than replaced.
-///
-/// A connection the agent stopped answering on is only worth replacing when
-/// that can help: when its socket has ended, or when another agent instance
-/// answers (the agent restarted). An open connection whose agent is merely
-/// slow — a loaded host, a micro-VM still catching up after an online restore
-/// — carries sessions (a running `exec`, the workspace watch), and replacing
-/// it gains nothing, because a fresh handshake needs the same agent to answer.
-/// Replacing it after one ping missed in 2 s cut every such session each time
-/// the guest paused for that long (VML-106).
+/// DOS and TempleOS run commands on the same thread that reads pings.
+/// A pending exec open counts too: DOS may send `opened` after the command.
+async fn synchronous_exec_in_flight(handle: &AgentHandle) -> bool {
+    matches!(handle.info().os.as_str(), "dos" | "templeos")
+        && handle.open_sessions().await != 0
+        && handle.is_open()
+}
+
+/// A connect reuses a busy DOS or TempleOS connection without pinging it.
+/// Otherwise ping for 2 s, then up to `grace` more while the socket stays
+/// open. The grace gives a slow guest time to answer and preserve its
+/// sessions (VML-106). A probe (`keep_slow`) reports an open but silent
+/// connection as [`Cached::Slow`], leaving it in the slot.
 async fn cached_verdict(
     handle: &AgentHandle,
     who: &str,
@@ -1553,6 +1554,9 @@ async fn cached_verdict(
     keep_slow: bool,
 ) -> Cached {
     use super::vm_agent::Pong;
+    if !keep_slow && synchronous_exec_in_flight(handle).await {
+        return Cached::Reuse;
+    }
     let asked = std::time::Instant::now();
     let mut outcome = handle.ping_outcome(Duration::from_secs(2)).await;
     let silent_ms = handle.silent_for().as_millis() as u64;
@@ -1568,8 +1572,10 @@ async fn cached_verdict(
         }
     }
     let verdict = match outcome {
-        Pong::Same => return Cached::Answers,
+        Pong::Same => return Cached::Reuse,
         Pong::Silent if handle.is_open() && keep_slow => Cached::Slow,
+        // Another caller can open an exec while this ping is in flight.
+        Pong::Silent if synchronous_exec_in_flight(handle).await => return Cached::Reuse,
         _ => Cached::Gone,
     };
     let sessions = handle.open_sessions().await;
@@ -1612,16 +1618,18 @@ mod tests {
         PathBuf,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        mock_agent(late, delay, restarted, false).await
+        mock_agent(late, delay, restarted, false, None).await
     }
 
     /// [`slow_agent`], and with `hang_up_first` the agent side closes the
-    /// first connection right after its hello.
+    /// first connection right after its hello. A synchronous agent opens
+    /// an exec session and then withholds pongs while it runs.
     async fn mock_agent(
         late: usize,
         delay: Duration,
         restarted: Arc<std::sync::atomic::AtomicBool>,
         hang_up_first: bool,
+        synchronous_agent: Option<(&'static str, &'static str)>,
     ) -> (
         tempfile::TempDir,
         PathBuf,
@@ -1665,14 +1673,19 @@ mod tests {
                                 Ok(HostMsg::Hello { token, .. }) => (
                                     AgentMsg::Hello {
                                         proto_version: PROTO_VERSION,
-                                        agent_version: "slow-mock".into(),
-                                        os: "linux".into(),
+                                        agent_version: synchronous_agent
+                                            .map_or("slow-mock", |(version, _)| version)
+                                            .into(),
+                                        os: synchronous_agent.map_or("linux", |(_, os)| os).into(),
                                         features: vec![],
                                         token,
                                         instance,
                                     },
                                     Duration::ZERO,
                                 ),
+                                Ok(HostMsg::OpenExec { id, .. }) if synchronous_agent.is_some() => {
+                                    (AgentMsg::Opened { id }, Duration::ZERO)
+                                }
                                 Ok(HostMsg::Ping) => {
                                     let nth = pings.fetch_add(1, Ordering::SeqCst);
                                     (
@@ -1833,13 +1846,57 @@ mod tests {
         assert!(!first.is_open() && second.is_open());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_keeps_a_legacy_connection_that_runs_a_command() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (version, os) in [
+            ("agent-legacy=test", "dos"),
+            ("agent-templeos=test", "templeos"),
+        ] {
+            let (_dir, sock, accepted) = mock_agent(
+                usize::MAX,
+                Duration::from_secs(600),
+                Arc::new(AtomicBool::new(false)),
+                false,
+                Some((version, os)),
+            )
+            .await;
+            let slot = Arc::new(AgentSlot::with_grace(Duration::from_secs(1)));
+            let first = slot
+                .connect("m1", &sock, "hint")
+                .await
+                .expect("first connect");
+            let _session = first
+                .open_exec(vec!["command".into()], vec![], None, None)
+                .await
+                .expect("open exec");
+            let second = tokio::spawn(async move { slot.connect("m1", &sock, "hint").await })
+                .await
+                .expect("connect task")
+                .expect("second connect");
+            assert!(
+                first.is_open(),
+                "{os}: the running command lost its connection"
+            );
+            assert!(second.same_connection(&first));
+            assert_eq!(first.open_sessions().await, 1);
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        }
+    }
+
     /// A connection whose socket ended is replaced at once: no grace for a
     /// connection that cannot answer.
     #[tokio::test]
     async fn a_closed_connection_is_replaced_without_a_grace() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let (_dir, sock, accepted) =
-            mock_agent(0, Duration::ZERO, Arc::new(AtomicBool::new(false)), true).await;
+        let (_dir, sock, accepted) = mock_agent(
+            0,
+            Duration::ZERO,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            None,
+        )
+        .await;
         let slot = AgentSlot::default();
         let first = slot
             .connect("m1", &sock, "hint")
