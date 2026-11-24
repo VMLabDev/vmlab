@@ -175,6 +175,46 @@ async fn sync_status(client: &LabClient, machine: &str) -> Result<WorkspaceSyncS
         })
 }
 
+/// Text a guest had a hand in, as a terminal is given it.
+///
+/// A guest decides its own file names and file contents, and a name may hold
+/// any byte but `/` and NUL. Printed raw, an escape sequence in one clears the
+/// screen, moves the cursor or writes the clipboard, and a newline prints a
+/// line that reads as vmlab's own — on the verbs where a developer decides
+/// which copy wins. So every control character is written out as the escape
+/// Rust would spell it with (`\u{1b}`, `\n`), and so are the format characters
+/// that reorder a line or end one. `keep` names the ones the caller lays out
+/// itself.
+fn shown(text: &str, keep: &[char]) -> std::borrow::Cow<'_, str> {
+    let steers = |c: char| {
+        !keep.contains(&c)
+            && (c.is_control()
+                || matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}')
+                || ('\u{2028}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c))
+    };
+    if !text.chars().any(steers) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            c if !steers(c) => out.push(c),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// A path, or one sentence of the daemon's that may quote a path or a guest's
+/// error: no control character at all, so it cannot leave its line.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    shown(text, &[])
+}
+
 /// What one machine's syncer says, in the order it matters.
 ///
 /// The halt first and whole, because a stopped workspace is the only state
@@ -188,10 +228,15 @@ pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
     let mut out = String::new();
     match &sync.halt {
         Some(halt) => {
-            let _ = writeln!(out, "{halt}");
+            let _ = writeln!(out, "{}", one_line(halt));
             let _ = writeln!(out);
             for conflict in &sync.conflicts {
-                let _ = writeln!(out, "  {}\n      {}", conflict.path, conflict.reason);
+                let _ = writeln!(
+                    out,
+                    "  {}\n      {}",
+                    one_line(&conflict.path),
+                    one_line(&conflict.reason)
+                );
             }
             if sync.conflicts_total > sync.conflicts.len() {
                 let _ = writeln!(
@@ -201,7 +246,7 @@ pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
                 );
             }
             if let Some(resolve) = &sync.resolve {
-                let _ = writeln!(out, "\n{resolve}");
+                let _ = writeln!(out, "\n{}", one_line(resolve));
             }
         }
         None if sync.passes == 0 => {
@@ -251,7 +296,7 @@ pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
         ("trouble", sync.trouble.as_ref()),
     ] {
         if let Some(said) = said {
-            let _ = writeln!(out, "\n{label}: {said}");
+            let _ = writeln!(out, "\n{label}: {}", one_line(said));
         }
     }
     if sync.rescans > 0 && sync.rescan.is_none() {
@@ -268,7 +313,7 @@ pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
             "\ndeferred while git holds a lock — timing, not a conflict, and it clears itself:"
         );
         for path in &sync.deferred {
-            let _ = writeln!(out, "  {path}");
+            let _ = writeln!(out, "  {}", one_line(path));
         }
     }
     if !sync.unsynced.is_empty() {
@@ -278,13 +323,18 @@ pub(crate) fn sync_report(machine: &str, sync: &WorkspaceSyncStatus) -> String {
              (§19.6):"
         );
         for path in &sync.unsynced {
-            let _ = writeln!(out, "  {path}");
+            let _ = writeln!(out, "  {}", one_line(path));
         }
     }
     if !sync.skipped.is_empty() {
         let _ = writeln!(out, "\nnot synced, by name:");
         for skip in &sync.skipped {
-            let _ = writeln!(out, "  {}\n      {}", skip.path, skip.reason);
+            let _ = writeln!(
+                out,
+                "  {}\n      {}",
+                one_line(&skip.path),
+                one_line(&skip.reason)
+            );
         }
     }
     out
@@ -306,7 +356,7 @@ fn render_diff(diff: &Diff) -> String {
         diff.host_root, diff.machine, diff.guest_root
     );
     for file in &diff.files {
-        let _ = writeln!(out, "\n=== {}", file.path);
+        let _ = writeln!(out, "\n=== {}", one_line(&file.path));
         if file.identical {
             let _ = writeln!(
                 out,
@@ -325,6 +375,18 @@ fn render_diff(diff: &Diff) -> String {
             }
             (Some(_), None) => {
                 let _ = writeln!(out, "  the guest does not hold it; the host does");
+            }
+            // Said before any content: with the same bytes on both sides
+            // the diff below has no changed line, and would read as agreement.
+            (Some(host), Some(guest)) if host.link != guest.link => {
+                let kind = |copy: &SideCopy| if copy.link { "a symlink" } else { "a file" };
+                let _ = writeln!(
+                    out,
+                    "  the host holds {} and the guest {} — the kinds differ, so this is a \
+                     conflict whatever the bytes; a symlink is shown as its target",
+                    kind(host),
+                    kind(guest),
+                );
             }
             (Some(_), Some(_)) => {}
         }
@@ -348,7 +410,7 @@ fn render_diff(diff: &Diff) -> String {
                     }
                     match &copy.omitted {
                         Some(why) => {
-                            let _ = writeln!(out, " — not shown: {why}");
+                            let _ = writeln!(out, " — not shown: {}", one_line(why));
                         }
                         None => {
                             let _ = writeln!(out);
@@ -376,7 +438,7 @@ const DIFF_LINES: usize = 2_000;
 /// the alternative is a dependency for one command's output. It is a longest-
 /// common-subsequence diff, which is what `diff -u` produces for files this
 /// size; the point is legibility, not minimality.
-fn unified(host: &str, guest: &str) -> String {
+fn unified<'a>(host: &'a str, guest: &'a str) -> String {
     use std::fmt::Write as _;
 
     let (a, b): (Vec<&str>, Vec<&str>) = (host.lines().collect(), guest.lines().collect());
@@ -401,26 +463,30 @@ fn unified(host: &str, guest: &str) -> String {
             };
         }
     }
+    // Lines are compared as they are and escaped as they are printed. "Is
+    // text" means valid UTF-8 with no NUL, and an escape sequence is both. A
+    // tab is the one control character source text is laid out with.
+    let content = |line: &'a str| shown(line, &['\t']);
     let mut out = String::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] == b[j] {
-            let _ = writeln!(out, "   {}", a[i]);
+            let _ = writeln!(out, "   {}", content(a[i]));
             i += 1;
             j += 1;
         } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            let _ = writeln!(out, "  -{}", a[i]);
+            let _ = writeln!(out, "  -{}", content(a[i]));
             i += 1;
         } else {
-            let _ = writeln!(out, "  +{}", b[j]);
+            let _ = writeln!(out, "  +{}", content(b[j]));
             j += 1;
         }
     }
-    for line in &a[i..] {
-        let _ = writeln!(out, "  -{line}");
+    for &line in &a[i..] {
+        let _ = writeln!(out, "  -{}", content(line));
     }
-    for line in &b[j..] {
-        let _ = writeln!(out, "  +{line}");
+    for &line in &b[j..] {
+        let _ = writeln!(out, "  +{}", content(line));
     }
     out
 }
@@ -678,6 +744,35 @@ mod tests {
         );
     }
 
+    /// Review dev-machines F9 (card 859): a link and a file with the same
+    /// bytes diff to no changed line, so the kinds are what the diff says.
+    #[test]
+    fn a_link_against_a_file_is_shown_as_a_conflict_of_kinds() {
+        let copy = |link| SideCopy {
+            size: 6,
+            digest: "c".repeat(64),
+            text: Some("target".into()),
+            omitted: None,
+            link,
+        };
+        let said = render_diff(&Diff {
+            machine: "dev01".into(),
+            host_root: "/lab/src".into(),
+            guest_root: "/src".into(),
+            files: vec![Sides {
+                path: "x".into(),
+                host: Some(copy(true)),
+                guest: Some(copy(false)),
+                identical: false,
+            }],
+        });
+        assert!(
+            said.contains("the host holds a symlink and the guest a file"),
+            "{said}"
+        );
+        assert!(!said.contains("identical"), "{said}");
+    }
+
     /// Review dev-machines F8 (card 859): valid UTF-8 with no NUL is taken as
     /// text, and an escape sequence is both. The diff shows the bytes that
     /// are there, as text a terminal does not act on. A tab stays a tab.
@@ -726,12 +821,14 @@ mod tests {
                     digest: "a".repeat(64),
                     text: Some("fn main() {\n    host();\n}\n".into()),
                     omitted: None,
+                    link: false,
                 }),
                 guest: Some(SideCopy {
                     size: 21,
                     digest: "b".repeat(64),
                     text: Some("fn main() {\n    guest();\n}\n".into()),
                     omitted: None,
+                    link: false,
                 }),
                 identical: false,
             }],
@@ -758,6 +855,7 @@ mod tests {
                     digest: String::new(),
                     text: None,
                     omitted: Some("it is 4000000000 bytes, over the inline cap".into()),
+                    link: false,
                 }),
                 guest: None,
                 identical: false,
@@ -784,12 +882,14 @@ mod tests {
                     digest: "c".repeat(64),
                     text: Some("same".into()),
                     omitted: None,
+                    link: false,
                 }),
                 guest: Some(SideCopy {
                     size: 4,
                     digest: "c".repeat(64),
                     text: Some("same".into()),
                     omitted: None,
+                    link: false,
                 }),
                 identical: true,
             }],

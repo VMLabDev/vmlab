@@ -309,10 +309,27 @@ impl std::fmt::Display for Outstanding {
         write!(
             f,
             ". There is no flag for this — a snapshot of a tree mid-transfer restores to \
-             somewhere meaningless. `vmlab dev sync status {}` says what is outstanding and \
-             `vmlab dev sync flush {}` waits for it; a halt has to be resolved first. {}",
-            self.machine, self.machine, NOT_A_BACKUP,
-        )
+             somewhere meaningless. "
+        )?;
+        if self.running {
+            write!(
+                f,
+                "`vmlab dev sync status {}` says what is outstanding and `vmlab dev sync flush \
+                 {}` waits for it; a halt has to be resolved first. ",
+                self.machine, self.machine,
+            )?;
+        } else {
+            // No `dev sync` verb answers for a machine that is down: each
+            // says there is no workspace syncer running.
+            write!(
+                f,
+                "Start it first with `vmlab up {}`: the workspace syncs only while the machine \
+                 runs, and a halt is shown by `vmlab dev sync status` and answered with `vmlab \
+                 dev sync resolve` only then. ",
+                self.machine,
+            )?;
+        }
+        write!(f, "{NOT_A_BACKUP}")
     }
 }
 

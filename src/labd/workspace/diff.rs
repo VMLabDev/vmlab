@@ -59,9 +59,9 @@ pub struct Sides {
     pub path: String,
     pub host: Option<SideCopy>,
     pub guest: Option<SideCopy>,
-    /// The two copies hold the same bytes. Worth saying outright: it is the
-    /// state a developer reaches by resolving a halt **by hand**, and the one
-    /// the next pass adopts as agreed.
+    /// The two copies are of one kind and hold the same bytes. Worth saying
+    /// outright: it is the state a developer reaches by resolving a halt **by
+    /// hand**, and the one the next pass adopts as agreed.
     pub identical: bool,
 }
 
@@ -78,6 +78,11 @@ pub struct SideCopy {
     pub text: Option<String>,
     /// Why the content is not here: too large, not text, or unreadable.
     pub omitted: Option<String>,
+    /// This side holds a symlink, and `size`, `digest` and `text` describe its
+    /// **target**. A link to `target` and a file that holds `target` have one
+    /// digest and are still a conflict of kinds, so the kind is said.
+    #[serde(default)]
+    pub link: bool,
 }
 
 impl SideCopy {
@@ -97,6 +102,15 @@ impl SideCopy {
             digest,
             omitted: text.is_none().then(|| "it is not text".to_string()),
             text,
+            link: false,
+        }
+    }
+
+    /// A symlink, described by its target.
+    fn link_to(target: &str) -> SideCopy {
+        SideCopy {
+            link: true,
+            ..SideCopy::of(target.as_bytes())
         }
     }
 
@@ -106,6 +120,7 @@ impl SideCopy {
             digest: String::new(),
             text: None,
             omitted: Some(why),
+            link: false,
         }
     }
 
@@ -120,6 +135,7 @@ impl SideCopy {
                 "it holds more than the {INLINE}-byte inline cap (the guest reported {reported} \
                  bytes) — `vmlab cp` moves the file itself"
             )),
+            link: false,
         }
     }
 
@@ -132,6 +148,7 @@ impl SideCopy {
                 "it is {size} bytes, over the {INLINE}-byte inline cap — `vmlab cp` moves the file \
                  itself"
             )),
+            link: false,
         }
     }
 }
@@ -158,7 +175,9 @@ pub async fn one(guest: &dyn GuestFs, workspace: &Workspace, rel: &str) -> Sides
     let host = host_side(&workspace.host_root.join(rel));
     let guest = guest_side(guest, &join_guest(&workspace.guest_root, rel)).await;
     let identical = match (&host, &guest) {
-        (Some(a), Some(b)) => !a.digest.is_empty() && a.digest == b.digest,
+        // The kind as well as the bytes: the plan holds a link and a file
+        // with the same bytes to be a conflict, and the halt stays.
+        (Some(a), Some(b)) => !a.digest.is_empty() && a.digest == b.digest && a.link == b.link,
         // Absent on both sides is not "the same": there is nothing to be the
         // same about, and saying otherwise would read as a resolved conflict.
         _ => false,
@@ -182,7 +201,7 @@ fn host_side(path: &Path) -> Option<SideCopy> {
     }
     if meta.is_symlink() {
         return Some(match std::fs::read_link(path) {
-            Ok(target) => SideCopy::of(target.to_string_lossy().as_bytes()),
+            Ok(target) => SideCopy::link_to(&target.to_string_lossy()),
             Err(e) => SideCopy::unreadable(format!("host: cannot read the link target ({e})")),
         });
     }
@@ -215,7 +234,7 @@ async fn guest_side(guest: &dyn GuestFs, path: &str) -> Option<SideCopy> {
         }
         EntryKind::Symlink => {
             return Some(match guest.readlink(path).await {
-                Ok(target) => SideCopy::of(target.as_bytes()),
+                Ok(target) => SideCopy::link_to(&target),
                 Err(e) => {
                     SideCopy::unreadable(format!("guest: cannot read the link target ({e:#})"))
                 }
