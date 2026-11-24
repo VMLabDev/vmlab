@@ -270,6 +270,63 @@ mod tests {
         }
     }
 
+    /// The Rust agent runs as a LocalSystem service from
+    /// `C:\ProgramData\vmlab`, and a directory made with `mkdir` under
+    /// `C:\ProgramData` inherits an access list in which every local account
+    /// may create files. A DLL dropped beside the service executable is
+    /// loaded into the service. So the script gives the directory to
+    /// Administrators and sets an explicit list — nothing inherited, SYSTEM
+    /// and Administrators full, Users read and execute — before the binary
+    /// is copied into it, and stops when that fails
+    /// (docs/reviews/guest-agents-2.md G2).
+    #[test]
+    fn the_windows_install_secures_its_directory_before_the_service_binary_lands() {
+        let lines: Vec<&str> = INSTALL_CMD.lines().map(str::trim).collect();
+        let at = |what: &str, wanted: &dyn Fn(&str) -> bool| {
+            lines
+                .iter()
+                .position(|l| !l.starts_with("rem ") && wanted(l))
+                .unwrap_or_else(|| panic!("install.cmd has no line that {what}"))
+        };
+        let mkdir = at("creates the directory", &|l| {
+            l.contains("mkdir \"%VMLAB_DIR%\"")
+        });
+        let owner = at("gives the directory to Administrators", &|l| {
+            l.starts_with("icacls \"%VMLAB_DIR%\" /setowner *S-1-5-32-544")
+        });
+        let acl = at("sets the access list", &|l| {
+            l.starts_with("icacls \"%VMLAB_DIR%\" /inheritance:r /grant:r ")
+        });
+        let copy = at("copies the binary", &|l| l.starts_with("copy "));
+        let create = at("registers the service", &|l| l.starts_with("sc create "));
+        assert!(
+            mkdir < owner && owner < acl && acl < copy && copy < create,
+            "order is mkdir, owner, access list, copy, sc create: {lines:#?}"
+        );
+        let granted: Vec<&str> = lines[acl]
+            .split_whitespace()
+            .skip_while(|w| *w != "/grant:r")
+            .skip(1)
+            .take_while(|w| !w.starts_with('/'))
+            .collect();
+        assert_eq!(
+            granted,
+            [
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX"
+            ],
+            "SYSTEM and Administrators full, Users read and execute, nobody else"
+        );
+        for at in [owner, acl] {
+            assert_eq!(
+                lines[at + 1],
+                "if errorlevel 1 exit /b 1",
+                "a directory that could not be secured stops the install"
+            );
+        }
+    }
+
     /// The legacy flavours ride along for an x86 guest at their 8.3-safe
     /// paths, and are left out of an arch no legacy guest has.
     #[test]
