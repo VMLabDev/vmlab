@@ -1061,6 +1061,26 @@ lab "l" {
         assert!(err.to_string().contains("rename one"), "{err}");
     }
 
+    #[test]
+    fn share_names_that_differ_only_in_case_collide() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" }
+  vm "web" {
+    template = "x86_64/t"
+    nic { segment = "lan" }
+    share { name = "Data" host = "keep" guest = "/keep" readonly = true transport = "smb" }
+    share { name = "data" host = "scratch" guest = "/scratch" transport = "smb" }
+  }
+}"#,
+        );
+        assert!(matches!(
+            plan_on(&lab, &Host::bare(), &AllFree),
+            Err(SharePlanError::Collision { .. })
+        ));
+    }
+
     /// Within one machine two virtiofs shares would share a mount tag, which
     /// is the same defect one layer down.
     #[test]

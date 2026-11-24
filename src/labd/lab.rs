@@ -4806,6 +4806,7 @@ mod tests {
         nics: Vec<crate::config::model::Nic>,
         macs: Vec<crate::config::model::MacAddr>,
         claims: Vec<Option<String>>,
+        smb_gateway: Mutex<Option<std::net::Ipv4Addr>>,
         /// A share "data" that takes this long to mount once the machine is
         /// ready, under the same wait for readiness a VM's mount task makes.
         mount: Option<Duration>,
@@ -4990,6 +4991,7 @@ mod tests {
                 nics: Vec::new(),
                 macs: Vec::new(),
                 claims: Vec::new(),
+                smb_gateway: Mutex::new(None),
                 mount: None,
                 failing_mount: None,
                 online_snapshots: false,
@@ -5137,6 +5139,9 @@ mod tests {
         }
         fn macs(&self) -> &[crate::config::model::MacAddr] {
             &self.macs
+        }
+        async fn smb_ready(&self, gateway: std::net::Ipv4Addr, _: &str, _: &str) {
+            *self.smb_gateway.lock().await = Some(gateway);
         }
         /// What the guest says its NICs carry. A double off the network
         /// answers as a machine with no agent does.
@@ -8724,6 +8729,15 @@ lab "t" {
 }"#;
 
     async fn smb_lab_unstarted(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+        Some(smb_test_lab(dir, SMB_LAB).await?.0)
+    }
+
+    type RebuiltSmbMachine = Arc<std::sync::Mutex<Option<Arc<FakeMachine>>>>;
+
+    async fn smb_test_lab(
+        dir: &std::path::Path,
+        source: &str,
+    ) -> Option<(Arc<LabRuntime>, Arc<FakeMachine>, RebuiltSmbMachine)> {
         if ["smbd", "pdbedit"].iter().any(|bin| {
             std::process::Command::new(bin)
                 .arg("--version")
@@ -8735,25 +8749,111 @@ lab "t" {
         }
         std::fs::create_dir(dir.join("data")).unwrap();
         let sh = shared(dir);
-        let mut web = Arc::into_inner(FakeMachine::new("web", MachineKind::Vm, &sh)).unwrap();
-        web.macs = vec![crate::labd::state::generate_mac("t", "web", 0)];
+        let build = move |cfg: crate::config::model::MachineCfg<'_>| {
+            let kind = match cfg {
+                crate::config::model::MachineCfg::Vm(_) => MachineKind::Vm,
+                crate::config::model::MachineCfg::Container(_) => MachineKind::Container,
+            };
+            let mut machine = Arc::into_inner(FakeMachine::new(cfg.name(), kind, &sh)).unwrap();
+            machine.macs = vec![cfg.nics()[0].mac.unwrap_or_else(|| {
+                crate::labd::state::generate_mac("t", cfg.name(), 0)
+            })];
+            Arc::new(machine)
+        };
+        let file = edited(dir, source);
+        let web = build(file.lab.machine("web").unwrap());
         let macs = HashMap::from([("web".to_string(), web.macs.clone())]);
-        let lab = lab_of(dir, SMB_LAB, vec![Arc::new(web)]);
+        let lab = lab_of(dir, source, vec![web.clone()]);
         lab.network.lock().await.wire_gateways(
             &lab.config().lab,
             &macs,
             &crate::config::host::HostConfig::default(),
         );
+        let rebuilt = Arc::new(std::sync::Mutex::new(None));
+        let record = rebuilt.clone();
         *lab.doubles.lock().unwrap() = Some(Arc::new(move |cfg| {
-            FakeMachine::new(cfg.name(), MachineKind::Vm, &sh) as Arc<dyn Machine>
+            let machine = build(cfg);
+            *record.lock().unwrap() = Some(machine.clone());
+            machine as Arc<dyn Machine>
         }));
-        Some(lab)
+        Some((lab, web, rebuilt))
     }
 
     async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
         let lab = smb_lab_unstarted(dir).await?;
         crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
         Some(lab)
+    }
+
+    #[tokio::test]
+    async fn smb_lifecycle_rebuilt_container_receives_coordinates() {
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { }
+  container "web" {
+    image = "alpine"
+    nic { segment = "corp" }
+    volume { host = "./data" target = "/data" }
+  }
+}"#;
+        let Some((lab, original, rebuilt)) = smb_test_lab(dir.path(), source).await else {
+            return;
+        };
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        let gateway = original.smb_gateway.lock().await.expect("initial SMB gateway");
+        let changed = source.replace("image = \"alpine\"", "image = \"alpine\" cpus = 2");
+        lab.reload_with(edited(dir.path(), &changed)).await.unwrap();
+        let new = rebuilt.lock().unwrap().clone().expect("rebuilt container");
+        assert!(new.smb_gateway.lock().await.is_none());
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        assert_eq!(*new.smb_gateway.lock().await, Some(gateway));
+    }
+
+    #[tokio::test]
+    async fn smb_lifecycle_reload_routes_the_rebuilt_machine_mac() {
+        use crate::net::frame::{self, TcpFields};
+        use crate::net::rules::Verdict;
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = SMB_LAB.replace(
+            "segment = \"corp\"",
+            "segment = \"corp\" mac = \"02:00:00:00:00:01\"",
+        );
+        let Some((lab, original, rebuilt)) = smb_test_lab(dir.path(), &source).await else {
+            return;
+        };
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        let (services, gateway) = {
+            let net = lab.network.lock().await;
+            let segment = &net.segments["corp"];
+            (segment.services.clone().unwrap(), segment.service_ip)
+        };
+        let changed = source.replace("02:00:00:00:00:01", "02:00:00:00:00:02");
+        lab.reload_with(edited(dir.path(), &changed)).await.unwrap();
+        let new = rebuilt.lock().unwrap().clone().expect("rebuilt VM");
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+
+        let guest = std::net::Ipv4Addr::new(10, 0, 0, 2);
+        let tcp = frame::tcp_build(
+            guest,
+            gateway,
+            TcpFields {
+                src_port: 12345,
+                dst_port: 445,
+                seq: 1,
+                ack: 0,
+                flags: frame::TCP_SYN,
+                window: 1024,
+                options: &[],
+            },
+            &[],
+        ).unwrap();
+        let packet = frame::ipv4_build(guest, gateway, frame::IPPROTO_TCP, 64, &tcp, 0).unwrap();
+        let rules = services.rules.lock().unwrap();
+        assert!(matches!(rules.eval_from(Some(new.macs[0]), &packet), Verdict::Rewrite(_)));
+        assert_eq!(rules.eval_from(Some(original.macs[0]), &packet), Verdict::Pass);
     }
 
     #[tokio::test(flavor = "current_thread")]
