@@ -71,7 +71,7 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F1. An attach takes a device away from another VM that holds it
 
-- Status: fixed by card #662. `claim_interface` now sends
+- Status: fixed by card #662 (`11d44d89`). `claim_interface` now sends
   `USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER` with the name `usbfs`, so the
   kernel answers EBUSY for an interface another usbdevfs user holds, and the
   attach fails with an error that says so. Proof tests:
@@ -138,7 +138,7 @@ hostile guest or peer, wrong result, cosmetic.
   `src/usb/tests.rs`, with a fake sysfs tree that gives the device a block
   child and a mount table that names it.
 - How bad: data loss on the host.
-- Fixed by card #663, for the mounted disk. `plan_attach` refuses a device
+- Fixed by card #663 (`519ca35c`), for the mounted disk. `plan_attach` refuses a device
   that carries a filesystem the host has mounted unless `--force` is given,
   and names each block device and mount point. `host_mounts` finds the block
   devices below the USB device in sysfs, with their partitions and the
@@ -150,7 +150,7 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F3. A guest stops its VMM with one UHCI queue head that nests itself
 
-- Status: fixed by card #664. `queue` no longer calls itself for a nested
+- Status: fixed by card #664 (`ec021030`). `queue` no longer calls itself for a nested
   queue head. It follows the element link in its own loop, so `MAX_ELEMENTS`
   bounds the nesting together with the TDs of one call. Proof test:
   `a_queue_head_nested_in_itself_stays_bounded` (`usb/uhci/tests.rs`), which
@@ -212,7 +212,7 @@ hostile guest or peer, wrong result, cosmetic.
   is released.
 - How bad: the VM hangs (the crash class), caused by a hostile guest or a
   hostile USB device. The host is not affected.
-- Status: fixed by card #668. A guest request makes no blocking usbdevfs
+- Status: fixed by card #668 (`f31eedaa`). A guest request makes no blocking usbdevfs
   call on its own thread. The backend reads the active configuration once
   at the open and follows it through SET_CONFIGURATION, so
   GET_DESCRIPTOR(Configuration) and SET_INTERFACE send no GET_CONFIGURATION.
@@ -234,7 +234,7 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F5. A forced stop leaves the host device without a driver
 
-- Status: fixed by card #669, for a stop the lab daemon makes. The Kill rung
+- Status: fixed by card #669 (`855e7536`), for a stop the lab daemon makes. The Kill rung
   of the stop ladder now asks the hypervisor to detach every held device
   before it kills the process (`usb_return_before_kill`, `src/labd/vm.rs`),
   so the backend is dropped and its `Drop` sends `USBDEVFS_CONNECT`. That
@@ -275,6 +275,10 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F6. A guest returns the device to the host without a configuration
 
+- Status: fixed by card #843 (`c36b0a87`). On detach, the backend restores
+  the nonzero configuration recorded at open if the guest changed it, then
+  reconnects its interfaces. The proof test
+  `detach_restores_the_configuration_found_at_open` uses fake usbdevfs.
 - Where: `usb/host/mod.rs:238-261` (`set_config`) and `216-227`
   (`release_and_reconnect`).
 - Why it is a fault: SET_CONFIGURATION with value 0 from the guest releases
@@ -319,7 +323,7 @@ hostile guest or peer, wrong result, cosmetic.
 - How bad: security against a hostile guest, of low weight: it needs a device
   that ignores the recipient bits, and the damage is the loss of that device
   for the host until a replug.
-- Status: fixed by card #785. `intercept_control` now answers SET_ADDRESS,
+- Status: fixed by card #785 (`100e8ef5`). `intercept_control` now answers SET_ADDRESS,
   SET_CONFIGURATION and SET_INTERFACE with a stall when the recipient or the
   direction is not the expected one, so no standard request with one of these
   three `bRequest` values is sent to the device. The proof test is in
@@ -327,6 +331,10 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F8. Stopping the control endpoint does not cancel its transfer
 
+- Status: fixed by card #844 (`2e057a20`). Stop Endpoint, Set TR Dequeue
+  Pointer and Reset Device now tell the backend to drop the control endpoint
+  at address 0. The controller tests cover Stop Endpoint and Reset Device,
+  and a backend test checks that the next request cannot get the old reply.
 - Where: `usb/xhci.rs:683` and `usb/xhci.rs:701-703`; the receiving side is
   `usb/host/mod.rs:565-570`.
 - Why it is a fault: the controller turns an endpoint context index into a
@@ -374,7 +382,7 @@ hostile guest or peer, wrong result, cosmetic.
   `run_irq`, then the next `transfer(0x81, ..)` must be `Nak` and not
   `Stall`.
 - How bad: wrong result in the guest.
-- Status: fixed by card #670. The controller now sends `endpoint_dropped`
+- Status: fixed by card #670 (`73e9a2e6`). The controller now sends `endpoint_dropped`
   on Disable Slot, on a Configure Endpoint that drops, replaces or
   deconfigures an endpoint, on a port reset, on HCRST and on a machine
   reset. The host backend discards its in-flight URBs and its uncollected
@@ -387,6 +395,9 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F10. A detach that fails drops the tracking while the device stays held
 
+- Status: fixed by card #845 (`7da93286`). A failed detach keeps the
+  attachment tracked. If the unplug sweep's detach fails, the sweep keeps
+  watching and retries on its next pass. It emits `usb.detached` on success.
 - Where: `src/labd/vm.rs:2571-2591` (`usb_detach`), with the wait at
   `src/labd/hypervisor/vmlab_hv/control.rs:429-438` and the sweep at
   `src/labd/usb.rs:261-268`.
@@ -407,7 +418,7 @@ hostile guest or peer, wrong result, cosmetic.
 
 ### F11. One poll does unbounded work for the guest
 
-- Status: fixed by card #787. One xHCI `poll` reads at most `POLL_READS`
+- Status: fixed by card #787 (`af91c06e`). One xHCI `poll` reads at most `POLL_READS`
   (1024) TRBs of the command ring and as many of all the transfer rings
   together, Link TRBs included, and what is left waits for the next poll. A
   poll that runs out starts the next one behind the endpoint that took the
@@ -465,13 +476,18 @@ hostile guest or peer, wrong result, cosmetic.
   device built from it panics.
 - How bad: crash of the VM, reachable only when the kernel hands out
   descriptors that disagree with themselves.
-- Status: fixed by card #786. `parse_usbfs_descriptors` now returns an error
+- Status: fixed by card #786 (`446f60ee`). `parse_usbfs_descriptors` now returns an error
   when a configuration's `wTotalLength` reaches past the end of the data, so
   no device is built from such descriptors and the slice in
   `config_descriptor_filtered` stays inside them.
 
 ### F13. Alternate settings of an old configuration are applied to the new one
 
+- Status: fixed by card #844 (`2e057a20`). Completing SET_CONFIGURATION
+  clears the old alternate settings before rebuilding the endpoint table.
+  If the guest chose an alternate setting first, the request goes to the
+  device even when it names the active configuration. The proof test is
+  `set_configuration_resets_alternate_settings`.
 - Where: `usb/host/mod.rs:238-261` (`set_config`), `279-310`
   (`rebuild_endpoints`), `325-347`.
 - Why it is a fault: `alt_settings` is filled by SET_INTERFACE and never
