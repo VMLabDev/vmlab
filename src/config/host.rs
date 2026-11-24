@@ -910,6 +910,16 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
     }
 
     #[test]
+    fn an_unusable_chunk_size_is_refused_at_load() {
+        for size in ["0", "2GiB"] {
+            assert!(
+                host_err(&format!("host {{ oci_chunk_size = {size} }}\n"))
+                    .contains("config.wcl:2:8: `oci_chunk_size`")
+            );
+        }
+    }
+
+    #[test]
     fn a_malformed_dns_upstream_is_refused() {
         for upstream in ["dns.corp", "10.0.0.1:"] {
             assert!(

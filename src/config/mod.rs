@@ -1206,6 +1206,13 @@ lab "web" {
         assert_ne!(digest_of(DIGEST_LAB), digest_of(&args));
     }
 
+    #[test]
+    fn a_string_that_looks_like_a_span_still_counts() {
+        let first = DIGEST_LAB.replace("-no-hpet", "span: (1, 2)");
+        let second = DIGEST_LAB.replace("-no-hpet", "span: (3, 4)");
+        assert_ne!(digest_of(&first), digest_of(&second));
+    }
+
     /// A load error renders against the source too (config review F5): the
     /// line of a mistake in a `login` block holds its password.
     #[test]

@@ -1027,6 +1027,19 @@ lab "rollback" {
     }
 
     #[test]
+    fn an_auto_subnet_comes_from_the_hosts_pool() {
+        let host = crate::config::host::HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { subnet_pool = \"10.99.0.0/16\" }",
+            "<test>",
+        )
+        .unwrap();
+        let config = lab(r#"import <vmlab.wcl>
+lab "l" { segment "lan" {} }"#);
+        let net = LabNetwork::build(&config).unwrap();
+        assert!(host.subnet_pool.contains(&net.segments["lan"].subnet));
+    }
+
+    #[test]
     fn declared_and_auto_subnets() {
         let l = lab(r#"import <vmlab.wcl>
 lab "l" {
