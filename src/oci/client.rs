@@ -3302,6 +3302,41 @@ mod tests {
             .unwrap();
     }
 
+    /// F21 of docs/reviews/templates-registry-2.md. The config blob states a
+    /// `registry`, and `template list`, `--remote` and a push with no target
+    /// all read it, so a pull of `evil/x` must not keep the blob's claim to
+    /// be the trusted repository: the pull records where it came from.
+    #[tokio::test]
+    async fn a_pull_records_the_repository_it_pulled_from_as_the_registry() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let tdir = work.path().join("tmpl");
+        let mut m = meta("x86_64");
+        m.name = "ubuntu".into();
+        m.version = "24.04.9".into();
+        m.registry = Some("ghcr.io/vmlabdev/vmlab-templates/ubuntu".into());
+        make_template(&tdir, &m, b"evil");
+        let reference = "localhost:5000/evil/x:1";
+        registry_with_fake(reference, fake.clone())
+            .push(&tdir, 1024, "x86_64", &work.path().join("push"), None, None)
+            .await
+            .unwrap();
+
+        let store = store_in(work.path(), "store");
+        let (pulled, _) = pull_want(&fake, reference, &store, &VariantWant::default())
+            .await
+            .unwrap();
+        assert_eq!(pulled.registry.as_deref(), Some("localhost:5000/evil/x"));
+        let installed = store
+            .installed("x86_64", "ubuntu", "24.04.9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            installed.meta.registry.as_deref(),
+            Some("localhost:5000/evil/x")
+        );
+    }
+
     /// F3 of docs/reviews/templates-registry.md. The store slot comes from
     /// the config blob, so `evil/x` can state `ubuntu` at a version under the
     /// pin `24.04`. The offline lookup of `good/ubuntu:24.04` must not take
