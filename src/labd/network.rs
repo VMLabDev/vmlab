@@ -23,9 +23,6 @@ use crate::proto::vocab::GlobalMember;
 /// Name of the built-in per-lab NAT segment (`nic { nat = true }`, §9.7).
 pub const NAT_SEGMENT: &str = "nat";
 
-/// Default auto-allocation pool (PRD §9.4); /24s carved out of it.
-pub const DEFAULT_POOL: &str = "10.213.0.0/16";
-
 pub struct SegmentNet {
     pub name: String,
     pub switch: Arc<Switch>,
@@ -215,21 +212,22 @@ impl LabNetwork {
 
     /// Build switches and allocate subnets for every declared segment, plus
     /// the built-in NAT segment when any NIC uses `nat = true`.
-    pub fn build(lab: &Lab) -> Result<LabNetwork> {
-        let pool: Ipv4Net = DEFAULT_POOL.parse().expect("valid pool");
+    pub fn build(lab: &Lab, pool: Ipv4Net) -> Result<LabNetwork> {
         let declared: Vec<Ipv4Net> = lab.segments.iter().filter_map(|s| s.subnet).collect();
 
         let mut auto = pool
             .subnets(24)
-            .expect("pool splits into /24s")
+            .into_iter()
+            .flatten()
             .filter(|c| {
-                !declared
-                    .iter()
-                    .any(|d| d.contains(&c.network()) || c.contains(&d.network()))
+                c.prefix_len() == 24
+                    && !declared
+                        .iter()
+                        .any(|d| d.contains(&c.network()) || c.contains(&d.network()))
             });
         let mut alloc_auto = || -> Result<Ipv4Net> {
             auto.next()
-                .ok_or_else(|| anyhow::anyhow!("auto-subnet pool exhausted"))
+                .ok_or_else(|| anyhow::anyhow!("auto-subnet pool {pool} has no available /24"))
         };
 
         let mut segments = HashMap::new();
@@ -879,6 +877,10 @@ mod tests {
         load_lab_source(src, "<t>", Path::new("/tmp")).unwrap().lab
     }
 
+    fn build(lab: &Lab) -> Result<LabNetwork> {
+        LabNetwork::build(lab, crate::config::host::HostConfig::default().subnet_pool)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_released_lease_leaves_dns() {
         use crate::net::dns::DnsAnswer;
@@ -894,7 +896,7 @@ lab "l" {
 }"#);
         let mac = MacAddr([2, 0, 0, 0, 0, 1]);
         let ip = Ipv4Addr::new(10, 50, 0, 10);
-        let mut net = LabNetwork::build(&config).unwrap();
+        let mut net = build(&config).unwrap();
         net.wire_gateways(
             &config,
             &HashMap::from([("a".into(), vec![mac])]),
@@ -941,7 +943,7 @@ lab "l" {
         use crate::net::framing::{self, Packet};
         use bytes::Bytes;
         use std::time::Duration;
-        let mut network = LabNetwork::build(&lab(r#"import <vmlab.wcl>
+        let mut network = build(&lab(r#"import <vmlab.wcl>
 lab "framing" { segment "lan" { mtu = 1500 } }"#))
         .unwrap();
         let segment = network.segment_mut("lan").unwrap();
@@ -981,7 +983,7 @@ lab "framing" { segment "lan" { mtu = 1500 } }"#))
 
     #[tokio::test]
     async fn a_second_attach_replaces_the_first_listener() {
-        let mut network = LabNetwork::build(&lab(r#"import <vmlab.wcl>
+        let mut network = build(&lab(r#"import <vmlab.wcl>
 lab "restart" { segment "lan" {} }"#))
         .unwrap();
         let segment = network.segment_mut("lan").unwrap();
@@ -1011,7 +1013,7 @@ lab "rollback" {
     nic { segment = "lan" }
   }
 }"#);
-        let mut network = LabNetwork::build(&config).unwrap();
+        let mut network = build(&config).unwrap();
         let nics = config.machines().next().unwrap().nics();
         let dir = tempfile::tempdir().unwrap();
         let socket = |i| dir.path().join(format!("nic{i}.sock"));
@@ -1034,9 +1036,21 @@ lab "rollback" {
         )
         .unwrap();
         let config = lab(r#"import <vmlab.wcl>
-lab "l" { segment "lan" {} }"#);
-        let net = LabNetwork::build(&config).unwrap();
+lab "l" {
+  segment "lan" {}
+  vm "a" { template = "x86_64/t" nic { nat = true } }
+}"#);
+        let net = LabNetwork::build(&config, host.subnet_pool).unwrap();
         assert!(host.subnet_pool.contains(&net.segments["lan"].subnet));
+        assert!(host.subnet_pool.contains(&net.segments[NAT_SEGMENT].subnet));
+    }
+
+    #[test]
+    fn a_pool_smaller_than_a_24_cannot_allocate_an_auto_subnet() {
+        let config = lab(r#"import <vmlab.wcl>
+lab "l" { segment "lan" {} }"#);
+        let pool = "10.99.0.0/25".parse().unwrap();
+        assert!(LabNetwork::build(&config, pool).is_err());
     }
 
     #[test]
@@ -1047,7 +1061,7 @@ lab "l" {
   segment "dmz" { }
   vm "a" { template = "x86_64/t" nic { nat = true } }
 }"#);
-        let net = LabNetwork::build(&l).unwrap();
+        let net = build(&l).unwrap();
         assert_eq!(net.segments["corp"].subnet.to_string(), "10.50.0.0/24");
         assert_eq!(net.segments["corp"].gateway_ip.to_string(), "10.50.0.1");
         assert_eq!(net.segments["corp"].service_ip.to_string(), "10.50.0.1");
@@ -1071,7 +1085,7 @@ lab "l" {
   }
   container "reserved" { image = "alpine" nic { segment = "lan" ip = "10.50.0.2" } }
 }"#);
-        let net = LabNetwork::build(&l).unwrap();
+        let net = build(&l).unwrap();
         let lan = &net.segments["lan"];
         assert_eq!(lan.gateway_ip.to_string(), "10.50.0.1");
         assert_eq!(lan.service_ip.to_string(), "10.50.0.3");
@@ -1085,7 +1099,7 @@ lab "l" {
   segment "b" { }
   vm "x" { template = "x86_64/t" nic { segment = "a" } }
 }"#);
-        let net = LabNetwork::build(&l).unwrap();
+        let net = build(&l).unwrap();
         assert_eq!(net.segments["a"].subnet.to_string(), "10.213.0.0/24");
         assert_ne!(net.segments["b"].subnet.to_string(), "10.213.0.0/24");
     }
@@ -1102,7 +1116,7 @@ lab "l" {
   segment "g" { subnet = "10.60.9.0/24" global = true }
   vm "x" { template = "x86_64/t" nic { segment = "a" } }
 }"#);
-        let mut net = LabNetwork::build(&l).unwrap();
+        let mut net = build(&l).unwrap();
         net.wire_gateways(
             &l,
             &HashMap::new(),
@@ -1140,6 +1154,6 @@ lab "l" {
   segment "nat" { }
   vm "a" { template = "x86_64/t" nic { nat = true } }
 }"#);
-        assert!(LabNetwork::build(&l).is_err());
+        assert!(build(&l).is_err());
     }
 }

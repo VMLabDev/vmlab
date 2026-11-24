@@ -273,11 +273,20 @@ pub fn declaration_digest(value: &impl std::fmt::Debug) -> String {
     use std::sync::OnceLock;
     static SPAN: OnceLock<regex::Regex> = OnceLock::new();
     let span = SPAN.get_or_init(|| {
-        regex::Regex::new(r"\b(\w*span): (?:\(\d+, \d+\)|Some\(\(\d+, \d+\)\)|None)")
-            .expect("valid span regex")
+        // Consume Debug string literals whole, including escaped quotes and
+        // backslashes, so their contents cannot be mistaken for span fields.
+        regex::Regex::new(
+            r#""(?:[^"\\]|\\.)*"|\b(\w*span): (?:\(\d+, \d+\)|Some\(\(\d+, \d+\)\)|None)"#,
+        )
+        .expect("valid span regex")
     });
     let rendered = format!("{value:?}");
-    let blanked = span.replace_all(&rendered, "$1: _");
+    let blanked = span.replace_all(&rendered, |matched: &regex::Captures<'_>| {
+        match matched.get(1) {
+            Some(field) => format!("{}: _", field.as_str()),
+            None => matched[0].to_owned(),
+        }
+    });
     hex::encode(Sha256::digest(blanked.as_bytes()))
 }
 

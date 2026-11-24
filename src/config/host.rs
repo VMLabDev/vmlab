@@ -332,8 +332,16 @@ impl HostConfig {
             if let Some(span) = r.field_span("gpu_address") {
                 moved.push(super::Issue::at(span, GPU_ADDRESS_MOVED));
             }
-            if let Some(v) = r.size("oci_chunk_size").unspan() {
-                cfg.oci_chunk_size = v;
+            if let Some(size) = r.size("oci_chunk_size") {
+                let max = crate::oci::chunking::MAX_CHUNK_SIZE;
+                if (1..=max).contains(&size.value) {
+                    cfg.oci_chunk_size = size.value;
+                } else {
+                    r.issue_at(
+                        size.span,
+                        format!("`oci_chunk_size` must be between 1 and {max} bytes"),
+                    );
+                }
             }
             if let Some(v) = r.size("workspace_max_file").unspan() {
                 cfg.workspace_max_file = v;
