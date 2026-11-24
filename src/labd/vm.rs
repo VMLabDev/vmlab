@@ -980,7 +980,7 @@ impl VmInstance {
 
     /// Resolve folder media against the current source contents (PRD §6.3).
     /// Hashing and building both do blocking I/O.
-    pub(super) async fn media_images(&self) -> Result<(Vec<PathBuf>, Option<Floppy>)> {
+    async fn media_images(&self) -> Result<(Vec<PathBuf>, Option<Floppy>)> {
         use model::MediaKind;
 
         let mut cdroms = self.cdroms.clone();
@@ -1030,14 +1030,14 @@ impl VmInstance {
         }
     }
 
-    async fn build_paths(
+    fn build_paths(
         &self,
         t: &TemplateParts,
         firmware: Option<&qemu::firmware::UefiFirmware>,
         nics: Vec<qemu::NicSpec>,
         (virtiofs_shares, hypervisor_shares): (Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>),
-        render: &qemu::hostgpu::RenderPlan,
-        tsc_hz: Option<u64>,
+        (render, tsc_hz): (&qemu::hostgpu::RenderPlan, Option<u64>),
+        (cdroms, floppy): (Vec<PathBuf>, Option<Floppy>),
     ) -> Result<VmPaths> {
         let firmware_features = firmware
             .map(|fw| fw.features())
@@ -1049,7 +1049,6 @@ impl VmInstance {
                 self.cfg.name
             );
         }
-        let (cdroms, floppy) = self.media_images().await?;
         Ok(VmPaths {
             apple_smc_osk: if t.resolved.apple_smc {
                 (self.host_config)()?.apple_smc_osk
@@ -1433,6 +1432,10 @@ impl VmInstance {
         // pull can't swap them mid-boot under us).
         let t = self.template();
         let run = async {
+            // Before anything is created or spawned, and before the checks
+            // of the host: a folder that cannot be built is refused the same
+            // way on every host. This is the one place that finds it.
+            let media = self.media_images().await?;
             self.check_apple_smc_osk()?;
             if self.hypervisor() == HypervisorKind::Qemu {
                 let why = crate::config::hypervisor::qemu_refusals(&self.cfg);
@@ -1559,17 +1562,14 @@ impl VmInstance {
             let machine = super::hypervisor::Launch::Vm {
                 lab: self.lab.clone(),
                 resolved: Box::new(t.resolved.clone()),
-                paths: Box::new(
-                    self.build_paths(
-                        &t,
-                        firmware.as_ref(),
-                        nic_specs,
-                        vfs_devices,
-                        &render,
-                        tsc_hz,
-                    )
-                    .await?,
-                ),
+                paths: Box::new(self.build_paths(
+                    &t,
+                    firmware.as_ref(),
+                    nic_specs,
+                    vfs_devices,
+                    (&render, tsc_hz),
+                    media,
+                )?),
                 accel,
                 emulator: render.qemu_binary.clone(),
             };
