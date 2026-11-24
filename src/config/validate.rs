@@ -341,9 +341,6 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     format!("share name \"{}\": {problem}", share.name.escape_debug()),
                 ));
             }
-            if let Some(problem) = crate::smb::config::share_host_problem(&share.host) {
-                issues.push(Issue::at(share.span, format!("share {problem}")));
-            }
             // Whatever the transport: `auto` can land on SMB, and a virtiofs
             // guest writes the same files (docs/reviews/smb.md F1).
             let served = crate::labd::share_plan::resolve_share_host(
@@ -351,6 +348,12 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 Some(&crate::paths::home()),
                 &share.host,
             );
+            if let Some(problem) = crate::smb::config::share_host_problem(
+                &served,
+                share.transport != ShareTransport::Virtiofs,
+            ) {
+                issues.push(Issue::at(share.span, format!("share {problem}")));
+            }
             if let Some(problem) = share_over_lab_state(&file.root, &served) {
                 issues.push(Issue::at(share.span, format!("share {problem}")));
             }

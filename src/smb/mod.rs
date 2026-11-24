@@ -133,11 +133,20 @@ impl LabSmb {
     ///
     /// Each machine's credential is read from its state directory, or minted
     /// and kept there, so it is stable from one start to the next.
-    pub fn plan(vmlab_dir: &Path, vms: &[(String, Ipv4Addr, Vec<Share>)]) -> LabSmb {
+    pub fn plan(
+        vmlab_dir: &Path,
+        vms: &[(String, Ipv4Addr, Vec<Share>)],
+    ) -> Result<LabSmb, SmbError> {
         let smb_dir = vmlab_dir.join("smb");
         let mut plans = BTreeMap::new();
         for (vm_name, gateway, shares) in vms {
-            let creds = SmbCredentials::load_or_create(&machine_dir(&smb_dir, vm_name));
+            let dir = machine_dir(&smb_dir, vm_name);
+            let creds = SmbCredentials::load_or_create(&dir).map_err(|source| {
+                SmbError::Credentials {
+                    path: dir.join("creds"),
+                    source,
+                }
+            })?;
             let share_tuples = shares
                 .iter()
                 .map(|s| {
@@ -159,11 +168,11 @@ impl LabSmb {
                 },
             );
         }
-        LabSmb {
+        Ok(LabSmb {
             smb_dir,
             vms: plans,
             servers: BTreeMap::new(),
-        }
+        })
     }
 
     /// The credential minted for a machine. `mount_plan` embeds it in VM
@@ -523,7 +532,7 @@ mod tests {
                 vec![share("data", "Z:", true, true)],
             ),
         ];
-        LabSmb::plan(Path::new("/lab/.vmlab"), &vms)
+        LabSmb::plan(tempfile::tempdir().unwrap().path(), &vms).unwrap()
     }
 
     #[test]
@@ -567,7 +576,7 @@ mod tests {
                 vec![share("data", "/mnt/data", false, false)],
             ),
         ];
-        let first = LabSmb::plan(&vmlab_dir, &vms);
+        let first = LabSmb::plan(&vmlab_dir, &vms).unwrap();
         let web = first.credentials("web").unwrap().clone();
         let db = first.credentials("db").unwrap().clone();
         assert_ne!(web.password, db.password);
@@ -576,7 +585,7 @@ mod tests {
             std::fs::read_to_string(vmlab_dir.join("smb/machines/web/creds")).unwrap(),
             format!("{user}:{}", web.password)
         );
-        let again = LabSmb::plan(&vmlab_dir, &vms);
+        let again = LabSmb::plan(&vmlab_dir, &vms).unwrap();
         assert_eq!(again.credentials("web"), Some(&web));
         assert_eq!(again.credentials("db"), Some(&db));
     }
@@ -591,11 +600,9 @@ mod tests {
         assert!(xp.any_smb1); // xp share is smb1
         assert_eq!(xp.listen_port, 14451);
         assert_eq!(xp.shares.len(), 1);
-        assert_eq!(xp.lab_dir, PathBuf::from("/lab/.vmlab/smb/machines/xp"));
-        assert_eq!(
-            xp.run_dir,
-            crate::paths::smb_runtime_dir(Path::new("/lab/.vmlab/smb/machines/xp"))
-        );
+        let state = lab.smb_dir.join("machines/xp");
+        assert_eq!(xp.lab_dir, state);
+        assert_eq!(xp.run_dir, crate::paths::smb_runtime_dir(&state));
         // the share scoped to the server's one authenticated account
         let data = &xp.shares[0];
         assert_eq!(data.name, "data");
@@ -630,7 +637,7 @@ mod tests {
                 vec![share("data", "/mnt/data", false, false)],
             ),
         ];
-        let mut lab = LabSmb::plan(&vmlab_dir, &vms);
+        let mut lab = LabSmb::plan(&vmlab_dir, &vms).unwrap();
         match lab.start(&[14450, 14451]) {
             Err(SmbError::Share(refused)) => assert_eq!(refused.name, "over"),
             other => panic!("expected the share to be refused, got {other:?}"),
@@ -748,7 +755,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             vec![share("data", "C:\\mnt\\data", false, false)],
         )];
-        let lab = LabSmb::plan(Path::new("/lab/.vmlab"), &vms);
+        let lab = LabSmb::plan(tempfile::tempdir().unwrap().path(), &vms).unwrap();
         let steps = lab.mount_plan("win", OsHint::Windows);
         assert_eq!(steps.len(), 4); // credential + net use auth + link + hook
         assert_eq!(steps[2].command, "powershell");
@@ -776,7 +783,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             vec![share("data", "Z:", false, false)],
         )];
-        let lab = LabSmb::plan(Path::new("/lab/.vmlab"), &vms);
+        let lab = LabSmb::plan(tempfile::tempdir().unwrap().path(), &vms).unwrap();
         let steps = lab.mount_plan("win", OsHint::Windows);
         assert_eq!(steps.len(), 5); // credential + cleanup + map + script + hook
         assert!(steps[3].args.join(" ").contains(mount::DESKTOP_SCRIPT));
@@ -857,7 +864,7 @@ mod tests {
         // next one, and a start that still fails is tried again.
         let mut started = None;
         for _ in 0..5 {
-            let mut lab = LabSmb::plan(&vmlab_dir, &vms);
+            let mut lab = LabSmb::plan(&vmlab_dir, &vms).unwrap();
             match lab.start(&free_ports(8)) {
                 Ok(()) => {
                     started = Some(lab);
