@@ -62,3 +62,4 @@ d3d9-report-yuy2-format-conversion.patch
 d3d10umd-back-nv12-with-two-texture-planes.patch
 d3d9-keep-bc4-layout-for-legacy-ati1-pitch.patch
 d3d9-indexed-draw-without-index-buffer-draws-nothing.patch
+d3d10umd-combined-texture-slots-above-32.patch

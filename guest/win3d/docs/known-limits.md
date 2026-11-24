@@ -714,21 +714,22 @@ in [`shaders2.md`](shaders2.md#what-remains): a range over a geometry
 shader's packed scalar system values is still rejected, and indexed reads of
 ordinary patch constants in a join phase were not run.
 
-### Direct3D 10 and 11: at most 32 texture and sampler pairs in one shader
+### Direct3D 10 and 11: at most 192 texture and sampler pairs in one shader
 
 The Yttrium UMD binds each pair of a shader resource and a sampler that a
-shader uses, and each buffer it loads, as one combined slot, and it has 32.
-Direct3D 11 allows 128 resources and 16 samplers in one stage. A pixel
-shader that needs more slots is created as a shader that writes zero to
-every colour output, and the UMD logs
-`pixel shader needs more than 32 combined texture slots` in
-`C:\ProgramData\Yttrium\yttrium-errors.log`. Before `patches/mesa/d3d10umd-keep-the-device-through-wine-d3d10core-and-d3d11-tests.patch`
-its creation removed the device. Wine's d3d11 test `test_high_resource_count`
-(50 textures sampled with two samplers, and 50 buffers) is such a shader, and
-its two checks fail. [C375](acceptance/C375.md) records the translation
-trace and the binding changes needed to support this shader.
-A vertex, geometry, hull, domain or compute shader that
-needs more slots still fails to create and removes the device.
+shader uses, and each buffer it loads, as one combined slot, and it has 192.
+Direct3D 11 allows 128 resources and 16 samplers in one stage, which is up
+to 2,048 pairs. A pixel shader that needs more than 192 slots is created as
+a shader that writes zero to every colour output, and the UMD logs
+`pixel shader needs more than 192 combined texture slots` in
+`C:\ProgramData\Yttrium\yttrium-errors.log`. A vertex, geometry, hull,
+domain or compute shader that needs more slots fails to create and removes
+the device. The limit was 32 before
+`patches/mesa/d3d10umd-combined-texture-slots-above-32.patch`.
+Wine's d3d11 test `test_high_resource_count` (50 textures sampled with two
+samplers, and 50 buffers) needs 150 slots and passes with it.
+[C375](acceptance/C375.md) records the trace of the old limit and
+[C909](acceptance/C909.md) the change and its costs.
 
 ### D3D12: ExecuteIndirect is emulated, and an NVIDIA first-boot dwm crash
 
