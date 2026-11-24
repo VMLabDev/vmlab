@@ -371,6 +371,50 @@ pub fn store_login_at(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn login_writes_through_a_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("config.json");
+        let other = serde_json::json!({ "auths": { "quay.io": { "auth": "eDp5" } } });
+        std::fs::write(&target, serde_json::to_string(&other).unwrap()).unwrap();
+        std::os::unix::fs::symlink("target.json", &link).unwrap();
+
+        store_login_at(&link, "ghcr.io", "me", "tok").unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link was replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("target.json"));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
+        assert_eq!(written["auths"]["quay.io"]["auth"], "eDp5");
+        assert_eq!(
+            resolve_from_file("ghcr.io", &link).unwrap(),
+            Credential::Basic {
+                username: "me".into(),
+                password: "tok".into()
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_through_a_dangling_symlink_creates_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.json");
+        let target = dir.path().join("dotfiles").join("docker.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        store_login_at(&link, "ghcr.io", "me", "tok").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
+    }
+
     #[test]
     fn parses_base64_auth_and_builds_header() {
         let dir = tempfile::tempdir().unwrap();

@@ -1122,6 +1122,18 @@ mod tests {
         assert!(warning.contains("template.wcl:variant/desktop/first_boot_script"));
         assert!(warning.contains("host and lab scripting rights"));
     }
+
+    #[test]
+    fn template_login_reads_the_password_from_stdin() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(subcommand)]
+            cmd: super::TemplateCmd,
+        }
+        let parsed = Args::try_parse_from(["template", "login", "ghcr.io", "-u", "me", "--password-stdin"]);
+        assert!(parsed.is_ok(), "{}", parsed.err().unwrap());
+    }
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;
