@@ -1215,6 +1215,7 @@ mod tests {
             keepers: super::keepawake::Keepers::default(),
         });
         if operation == "restart" {
+            std::fs::create_dir_all(crate::paths::state_dir()).unwrap();
             supervisor
                 .registry
                 .lock()
