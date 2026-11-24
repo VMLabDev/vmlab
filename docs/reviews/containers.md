@@ -79,14 +79,14 @@ Not read:
 
 | # | Severity | Finding |
 |---|----------|---------|
-| F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614) |
-| F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine (fixed, card #642) |
-| F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image (fixed, card #777) |
-| F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 (fixed, card #643) |
-| F5 | wrong result | A start that fails on its second virtiofsd leaves the first one running |
-| F6 | wrong result | An image `StopSignal` of a real-time signal powers the micro-VM off before the workload starts |
-| F7 | wrong result | A FIFO at `/.vmlab/busybox` hangs PID 1 at boot |
-| F8 | wrong result | A `workdir` the image lacks fails the launch, where Docker creates it |
+| F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614, `aa2f580b`) |
+| F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine (fixed, card #642, `c0eb1652`) |
+| F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image (fixed, card #777, `1934f22f`) |
+| F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 (fixed, card #643, `2aa410e5`) |
+| F5 | wrong result | A start that fails on its second virtiofsd leaves the first one running (fixed, card #829, `46984f5d`) |
+| F6 | wrong result | An image `StopSignal` of a real-time signal powers the micro-VM off before the workload starts (fixed, card #830, `6f020163`) |
+| F7 | wrong result | A FIFO at `/.vmlab/busybox` hangs PID 1 at boot (fixed, card #831, `1d193418`) |
+| F8 | wrong result | A `workdir` the image lacks fails the launch, where Docker creates it (fixed, card #832, `cb0eb481`) |
 
 ## Findings
 
@@ -136,7 +136,7 @@ Not read:
 - Open question for the fix: whether a claimed address equal to the
   segment's service address makes the engine originate toward its own
   redirect rules (the SMB DNAT to the host's loopback). Not followed.
-- Fixed in card #614. `forward_observations` asks the segment's DHCP server
+- Fixed in card #614 (`aa2f580b`). `forward_observations` asks the segment's DHCP server
   (`DhcpServer::vouched`, `src/net/dhcp.rs`) which address the NIC holds. A
   NIC with a valid lease is recorded with the leased address, whatever its
   guest reports. A NIC with no lease (a static address, or a lease table lost
@@ -182,7 +182,7 @@ Not read:
   `a_ctl_peer_that_never_reads_does_not_block_a_stop`. Assert that the second
   `send` returns an error. Today it never returns, and the test runner's own
   timeout ends the test.
-- Fixed in card #642. `CtlHandle::send` has one deadline (`SEND_TIMEOUT`,
+- Fixed in card #642 (`c0eb1652`). `CtlHandle::send` has one deadline (`SEND_TIMEOUT`,
   5 s) for the wait on the writer mutex and for the write and flush. A write
   that runs out of time marks the writer as cut short, because part of its
   line may be on the wire, and every later `send` on that handle fails at
@@ -220,7 +220,7 @@ Not read:
   `a_changed_image_does_not_reuse_the_old_scratch_layer`. Assert that the
   start either made a new scratch disk or refused with a message naming the
   change. Today the marker survives.
-- Fixed in card #777, by refusing, as a VM's clone of another template is
+- Fixed in card #777 (`1934f22f`), by refusing, as a VM's clone of another template is
   refused (PRD §7.1). The start writes the manifest digest the scratch layer
   was made over to `.vmlab/containers/<name>/scratch-image`
   (`ContainerDirs::scratch_image`). `ContainerInstance::check_scratch_image`
@@ -260,7 +260,7 @@ Not read:
   second test `tail_file_reads_only_the_end` over a sparse file of 8 GiB with
   three lines at its end, asserting the result: it shows the whole-file read
   as an allocation failure or a very long run.
-- Fixed in card #643. `tail_file` reads the end of the file through
+- Fixed in card #643 (`2aa410e5`). `tail_file` reads the end of the file through
   `logs::tail_with_len` (at most 4 MiB, bytes that are not UTF-8 replaced),
   and `logs --follow` reads what the file gained by offset
   (`read_log_since`, at most 1 MiB a poll) where it read the whole file every
@@ -296,6 +296,10 @@ Not read:
   that the helper process of the first is killed. Name it
   `a_failed_second_virtiofsd_stops_the_first`. The same test for a VM with
   two virtiofs shares.
+- Fixed in card #829 (`46984f5d`). Container and VM starts record each
+  virtiofsd as it starts, so teardown stops the recorded daemons if a later
+  start fails. Both cases have regression tests in
+  `src/labd/lifecycle_tests.rs`.
 
 ### F6. A real-time `StopSignal` powers the micro-VM off before the workload starts (wrong result)
 
@@ -314,6 +318,9 @@ Not read:
   `parse_signal("RTMIN+3")` and `parse_signal("37")` return a signal number
   (the type must change from `Signal` to a raw number for this). Today all
   three return `Err`.
+- Fixed in card #830 (`6f020163`). cinit parses Linux real-time signal
+  names and numbers and sends the resulting number to the workload on
+  shutdown. `parses_realtime_signals` checks the three forms above.
 
 ### F7. A FIFO at `/.vmlab/busybox` hangs PID 1 at boot (wrong result)
 
@@ -336,6 +343,10 @@ Not read:
   `/.vmlab/busybox` made by `mkfifo` and call it. Name it
   `shell_fallback_refuses_a_fifo`. Assert that it returns an error. Today it
   blocks, and the test runner's own timeout ends the test.
+- Fixed in card #831 (`1d193418`). The shell fallback uses `copy_in_root`,
+  which opens the target with nonblocking flags and writes only to a
+  regular file. Proof: `shell_fallback_refuses_a_fifo` in
+  `guest/cinit/src/mounts.rs`.
 
 ### F8. A `workdir` the image lacks fails the launch (wrong result)
 
@@ -354,6 +365,9 @@ Not read:
   `alpine` with `workdir = "/srv/missing"` and `command = ["pwd"]`. Assert
   that the console log shows `/srv/missing` and the exit code is 0. Today
   the log shows the launch failure and the container is reported crashed.
+- Fixed in card #832 (`cb0eb481`). cinit creates a missing workdir inside
+  the container root before launching the workload.
+  `e2e/scenarios/container_workdir.py` checks the output and exit status.
 
 ## Notes
 
