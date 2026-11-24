@@ -1168,7 +1168,15 @@ mod tests {
             cmd: super::TemplateCmd,
         }
         let parse = |args: &[&str]| Args::try_parse_from(args).map(|a| a.cmd);
-        let parsed = parse(&["template", "login", "ghcr.io", "-u", "me", "--password-stdin"]).unwrap();
+        let parsed = parse(&[
+            "template",
+            "login",
+            "ghcr.io",
+            "-u",
+            "me",
+            "--password-stdin",
+        ])
+        .unwrap();
         let super::TemplateCmd::Login {
             password,
             password_stdin,
@@ -1193,8 +1201,17 @@ mod tests {
         assert!(parse(&["template", "login", "ghcr.io", "-u", "me", "-p", "tok"]).is_ok());
         assert!(parse(&["template", "login", "ghcr.io", "-u", "me"]).is_err());
         assert!(
-            parse(&["template", "login", "ghcr.io", "-u", "me", "-p", "t", "--password-stdin"])
-                .is_err()
+            parse(&[
+                "template",
+                "login",
+                "ghcr.io",
+                "-u",
+                "me",
+                "-p",
+                "t",
+                "--password-stdin"
+            ])
+            .is_err()
         );
     }
     use std::sync::{Arc, Mutex};

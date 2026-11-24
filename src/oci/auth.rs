@@ -419,7 +419,10 @@ mod tests {
 
         let meta = std::fs::symlink_metadata(&link).unwrap();
         assert!(meta.file_type().is_symlink(), "the link was replaced");
-        assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("target.json"));
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("target.json")
+        );
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
@@ -443,7 +446,12 @@ mod tests {
 
         store_login_at(&link, "ghcr.io", "me", "tok").unwrap();
 
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
