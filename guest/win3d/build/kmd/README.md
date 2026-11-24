@@ -60,13 +60,14 @@ The time is `KeQueryInterruptTimePrecise`, in units of 100 ns.
 | 10 | vmlab-hv reported the host GPU lost (`0011`), once a boot | none |
 | 16, 22 | The copy of a Blt present begins, ends (with `0010` on vmlab-hv: the host command is queued) | context, flags = source resource, fence, response = destination resource |
 | 17 | A flip from a DMA buffer: `SET_SCANOUT` and `RESOURCE_FLUSH` are sent | context, flags = resource, fence |
-| 18 | `SetVidPnSourceAddress` | flags = resource |
+| 18 | `SetVidPnSourceAddress` | flags = resource, fence = the id of the process that made it |
 | 19 | The vsync timer, or with `0011` on vmlab-hv the completion of a host vblank, sends the recorded flip | flags = resource |
 | 20 | One packet of a DMA buffer goes to the control queue | context, flags = ring index, fence, response = command type (0 NOP, 1 SUBMIT, a timeline submit has a ring index) |
 | 21 | A host context was created | context, flags = capset, fence = process id |
 | 23 | The interrupt routine reported a vsync (`0008`) | flags = the reported address divided by 4096, response = 1 when the address came from the queue of flips |
 | 24 | A queued flip was not sent to the host yet when a vsync was reported (`0008`) | flags = the flips in the queue, response = 0 the address was held back, 1 it was reported (knob 2) |
 | 25 | The host answered a vblank wait (`0012`, interrupt routine) | flags = the host's tick (low 32 bits), fence = the host time of the tick in ns, response = 1 when this answer raised the vsync, 0 when the completion of the wait raises it after it sent the waiting flip |
+| 26 | The `VIOGPU_RES_SET_SCANOUT_BLOB` escape was decided | context = the id of the calling process, flags = resource, fence = the id of the process that has the scanout, response = 0 served, 1 no such scanout, 2 the caller did not make the allocation, 3 the caller does not have the scanout, pending = the id of the process that made the allocation |
 
 Events 1 to 10 are the records of the 256-record ring of `0004` and `0011`, without the
 bare interrupt (event 4). A release build has that small ring only.
@@ -215,6 +216,7 @@ Debian packages are pinned by version in `Dockerfile`: `python3`, `xz-utils`,
 | `kmd-host-vblank.patch` | With the same bit, starts no vsync timer: it keeps one `VIRTIO_GPU_CMD_VMLAB_VBLANK` (`0x0f02`) wait on the control queue, which vmlab-hv answers at each tick of its 60 Hz frame clock with the tick and its host time. The answer raises the vsync, or, when a flip is waiting, the completion of the wait does, right after it sent the flip. No empty command is sent per tick. Without the bit, or when the host refuses the wait, the timer and its NOP run as before ([`docs/vblank.md`](../../docs/vblank.md)). |
 | `kmd-check-capset-escape.patch` | Card #751, findings F1, F3 and F6 of [`docs/reviews/win3d-driver.md`](../../../../docs/reviews/win3d-driver.md). The `VIOGPU_GET_CAPS` escape probes the user address before it copies the capset there, and refuses a capset id outside 1 to 63. A capset whose host size is above 1 MiB is not supported, the response size is computed without a wrap, and the response buffer is zeroed. The bounds are in `viogpu/common/viogpu_capset_bounds.h`, which `tests/kmd/capset_bounds_test.cpp` compiles on the build host ([`docs/acceptance/C751.md`](../../docs/acceptance/C751.md)). |
 | `kmd-check-submit-escape-size.patch` | Checks the command size of the `VIOGPU_SUBMIT_CMD` escape with a subtraction. The sum the driver made before wrapped in 32 bits for a size of `0xFFFFFFF4` or more, and the driver then copied that many bytes out of the escape buffer. Such a request now fails with `STATUS_INVALID_BUFFER_SIZE` ([`docs/acceptance/C752.md`](../../docs/acceptance/C752.md)). |
+| `kmd-scanout-only-for-its-owner.patch` | Closes the two ways a program had to the scanout without Windows. `DxgkDdiRender` refuses `VIOGPU_CMD_PRESENT_FLIP` in the command stream of a program with `STATUS_PRIVILEGED_INSTRUCTION`: only `Present` writes that command. The `VIOGPU_RES_SET_SCANOUT_BLOB` escape is served only for the process that made the allocation Windows last set as the source of the scanout, for an allocation that this process made, on scanout 0. Every other caller gets `STATUS_ACCESS_DENIED` ([`docs/acceptance/C755.md`](../../docs/acceptance/C755.md)). |
 
 0001 has no mail header; 0002 has a short one, which `patch` skips. `PINS`
 records the sha256 and origin of 0001 and 0002.

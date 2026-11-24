@@ -299,6 +299,13 @@ for a guest that is not x86.
   probe's colour.
 - Severity: security against a hostile guest program (it replaces what the
   screen shows), and wrong result.
+- Status: fixed by card #755.
+  `guest/win3d/patches/kmd/kmd-scanout-only-for-its-owner.patch` refuses the
+  flip command in a render stream with `STATUS_PRIVILEGED_INSTRUCTION`, and
+  serves the escape only for the process that Windows gave the scanout
+  (`STATUS_ACCESS_DENIED` for every other). The escape was not removed: the
+  user-mode driver shows the frames of a fullscreen application with it.
+  `guest/win3d/docs/acceptance/C755.md` has the proof, before and after.
 
 ### F8. A present that a user can make fail is mapped in Patch, where a failure is a bugcheck
 
