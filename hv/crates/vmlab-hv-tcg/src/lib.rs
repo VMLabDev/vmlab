@@ -103,6 +103,9 @@ pub const STEP_OPERATION_BUDGET: u64 = 100_000_000;
 /// without end, so the oldest bytes are dropped past this many.
 pub const TERMINAL_LIMIT: usize = 1 << 20;
 
+/// The start of `Interpreter::entropy`, the same as the Sail oracle's.
+pub const ENTROPY_SEED: u64 = 0x5EED;
+
 /// What one hart reserved with LR: the address and length of the access, and
 /// the write generation of its reservation granules at the time of the read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +138,14 @@ pub struct Interpreter<'a, M> {
     pub terminal_limit: usize,
     /// Console bytes dropped from the front of `terminal` to stay in the limit.
     pub terminal_dropped: u64,
+    /// The state of the entropy source behind the `seed` CSR (Zkr): the
+    /// model's `get_16_random_bits`, which it declares and leaves to the
+    /// platform. It is the fixed generator of the Sail oracle
+    /// (`toolchain/sail/oracle/oracle.cpp`), so a run is reproducible and a
+    /// lockstep comparison agrees. It is not random: an embedder that gives
+    /// the hart to a guest that needs real entropy writes a fresh host
+    /// random value here before each run.
+    pub entropy: u64,
     pub profile: Option<Profile>,
     pub memoize: bool,
     pub indexed: bool,
@@ -171,6 +182,7 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             terminal: std::collections::VecDeque::new(),
             terminal_limit: TERMINAL_LIMIT,
             terminal_dropped: 0,
+            entropy: ENTROPY_SEED,
             profile: None,
             memoize: true,
             indexed: true,
@@ -454,6 +466,15 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             let byte = u8::try_from(byte).map_err(|_| Error::Type("terminal byte".into()))?;
             self.terminal_write(byte);
             return Ok(Value::Unit);
+        }
+        if name == "zget_16_random_bits" {
+            // A platform function like the two above: it has no body in the
+            // model, so it is never memoised and never folded into a trace.
+            self.entropy = self
+                .entropy
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            return Ok(Value::bits(16, (self.entropy >> 33) & 0xffff));
         }
         if name.starts_with("zriscv_") {
             return softfloat::execute(self.program, name, &args);

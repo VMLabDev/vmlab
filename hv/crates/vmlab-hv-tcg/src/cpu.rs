@@ -102,6 +102,15 @@ pub struct SpecializationStats {
     pub stop_reasons: BTreeMap<String, u64>,
 }
 
+/// A CSR number is 12 bits. A wider one would lose its high bits and name
+/// another CSR.
+fn csr_index(csr: u16) -> Result<()> {
+    if csr >= 1 << 12 {
+        return Err(crate::Error::Type("CSR index outside 0..4096".into()));
+    }
+    Ok(())
+}
+
 fn step_function() -> &'static Function {
     static FUNCTION: std::sync::OnceLock<Function> = std::sync::OnceLock::new();
     FUNCTION.get_or_init(|| Function {
@@ -222,11 +231,13 @@ impl<M: Memory> Riscv64<M> {
         );
     }
     pub fn read_csr(&mut self, csr: u16) -> Result<u64> {
+        csr_index(csr)?;
         self.interpreter
             .call("zread_CSR", vec![Value::bits(12, csr)])?
             .u64()
     }
     pub fn write_csr(&mut self, csr: u16, value: u64) -> Result<()> {
+        csr_index(csr)?;
         self.interpreter.call(
             "zwrite_CSR",
             vec![Value::bits(12, csr), Value::bits(64, value)],
