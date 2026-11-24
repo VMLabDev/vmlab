@@ -923,7 +923,9 @@ mod tests {
             .into_owned();
         assert!(script.contains(&staged), "{script}");
         let secured = script.find("/inheritance:r").expect("secured");
-        let freed = script.find("::Move(").expect("the name is freed by a rename");
+        let freed = script
+            .find("::Move(")
+            .expect("the name is freed by a rename");
         let refused = script
             .rfind("GetFileSystemEntries")
             .expect("a name still taken is looked for in the directory's listing");
