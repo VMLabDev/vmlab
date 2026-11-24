@@ -310,13 +310,22 @@ struct exec_args {
     char *cwd;
 };
 
-static char *pool_str(struct exec_args *a, const char *js, int tok)
+/* Decode string token `tok` into the pool. NULL when it does not fit, or
+ * when it holds a NUL (`\u0000` decodes to one): every platform takes these
+ * strings NUL-terminated, so such a string would reach the program cut
+ * short. `*nul` tells the two apart. */
+static char *pool_str(struct exec_args *a, const char *js, int tok, int *nul)
 {
     char *dst = a->pool + a->used;
     int cap = (int)sizeof a->pool - a->used;
     int n = json_str(js, toks, tok, dst, cap);
+    *nul = 0;
     if (n < 0)
         return NULL;
+    if (memchr(dst, 0, (size_t)n)) {
+        *nul = 1;
+        return NULL;
+    }
     a->used += n + 1;
     return dst;
 }
@@ -328,7 +337,7 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
     struct session *s;
     struct plat_proc *proc;
     char err[256];
-    int i, t, argv_tok, env_tok, cwd_tok;
+    int i, t, argv_tok, env_tok, cwd_tok, nul;
 
     if (id == 0) {
         send_error(0, "exec: a nonzero channel id is required");
@@ -359,9 +368,9 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
             send_error(id, "exec: too many arguments");
             return;
         }
-        a.argv[a.argc] = pool_str(&a, js, t);
+        a.argv[a.argc] = pool_str(&a, js, t, &nul);
         if (!a.argv[a.argc]) {
-            send_error(id, "exec: argument too long");
+            send_error(id, nul ? "exec: an argument holds a NUL" : "exec: argument too long");
             return;
         }
         a.argc++;
@@ -385,18 +394,18 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
                 send_error(id, "exec: too many env entries");
                 return;
             }
-            k = pool_str(&a, js, kt);
+            k = pool_str(&a, js, kt, &nul);
             if (!k) {
-                send_error(id, "exec: env entry too long");
+                send_error(id, nul ? "exec: an env entry holds a NUL" : "exec: env entry too long");
                 return;
             }
             klen = (int)strlen(k);
             /* Turn "KEY\0" into "KEY=VALUE\0" in place: the value is decoded
              * right after the key's terminator, which becomes the '='. */
             k[klen] = '=';
-            v = pool_str(&a, js, vt);
+            v = pool_str(&a, js, vt, &nul);
             if (!v) {
-                send_error(id, "exec: env entry too long");
+                send_error(id, nul ? "exec: an env entry holds a NUL" : "exec: env entry too long");
                 return;
             }
             a.env[a.nenv++] = k;
@@ -406,9 +415,9 @@ static void handle_open_exec(const char *js, int ntok, unsigned long id)
 
     cwd_tok = json_get(js, toks, ntok, 0, "cwd");
     if (cwd_tok >= 0 && toks[cwd_tok].type == JSON_STRING) {
-        a.cwd = pool_str(&a, js, cwd_tok);
+        a.cwd = pool_str(&a, js, cwd_tok, &nul);
         if (!a.cwd) {
-            send_error(id, "exec: cwd too long");
+            send_error(id, nul ? "exec: the cwd holds a NUL" : "exec: cwd too long");
             return;
         }
     }
@@ -470,8 +479,7 @@ static int is_hello(const unsigned char *payload, unsigned long len)
     return cmd_tok >= 0 && json_streq(js, toks, cmd_tok, "hello");
 }
 
-/* Returns -1 when the loop should stop (a shutdown was initiated), 1 when
- * the payload was no message at all. */
+/* Returns 1 when the payload was no message at all, else 0. */
 static int handle_ctrl(const unsigned char *payload, unsigned long len)
 {
     const char *js = (const char *)payload;
@@ -526,9 +534,11 @@ static int handle_ctrl(const unsigned char *payload, unsigned long len)
             strcpy(mode, "powerdown");
         /* The ack may be the last bytes on the wire; send it first. */
         send_shutting_down(mode);
-        if (plat_shutdown(mode) == 0)
-            return -1;
-        send_error(0, "shutdown: not supported on this guest");
+        /* "Initiated" is not "will happen": the guest may refuse or abort
+         * the shutdown. The loop goes on, and the guest going down is what
+         * ends the agent. */
+        if (plat_shutdown(mode) != 0)
+            send_error(0, "shutdown: not supported on this guest");
     } else if (strcmp(cmd, "set_time") == 0) {
         handle_set_time(js, ntok);
     } else if (strcmp(cmd, "open_terminal") == 0) {
@@ -667,13 +677,7 @@ int agent_run(void)
         while (wire_next(&dec, &kind, &channel, &payload, &len)) {
             active = 1;
             if (kind == WIRE_KIND_CTRL && channel == 0) {
-                int handled = handle_ctrl(payload, len);
-                if (handled < 0) {
-                    wire_consume(&dec);
-                    drop_all_sessions();
-                    return 0;
-                }
-                if (handled > 0) {
+                if (handle_ctrl(payload, len) > 0) {
                     /* A frame the host was cut off in, filled up by the
                      * start of the next one: keep what follows its magic. */
                     wire_reject(&dec);

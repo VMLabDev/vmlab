@@ -503,8 +503,7 @@ int main(int argc, char **argv)
             plat_log(err);
             return 1;
         }
-        if (agent_run() == 0)
-            return 0; /* shutdown initiated */
+        agent_run();
         plat_sleep_ms(500);
     }
 }

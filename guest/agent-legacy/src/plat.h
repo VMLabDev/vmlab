@@ -78,7 +78,8 @@ struct os_info {
 /* The `os` string in the hello: "windows", "dos" or "linux". */
 const char *plat_os_tag(void);
 void plat_os_info(struct os_info *info);
-/* `mode` is "powerdown", "reboot" or "halt". 0 when initiated. */
+/* `mode` is "powerdown", "reboot" or "halt". 0 when initiated, which is not
+ * a promise that the guest goes down: the agent keeps serving after it. */
 int plat_shutdown(const char *mode);
 
 /* A UTC instant to set the clock to, at whole-second resolution. The core
