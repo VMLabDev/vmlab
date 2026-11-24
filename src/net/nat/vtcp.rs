@@ -677,8 +677,7 @@ impl Flow {
     /// growing without bound. The entries nearest the hole are the ones that
     /// are stitched in first, so they are the ones worth keeping.
     fn queue_ooo(&mut self, seq: u32, payload: &[u8]) {
-        if payload.len() > OOO_MAX_BYTES
-            || seq.wrapping_sub(self.rcv_nxt) as usize >= OOO_MAX_BYTES
+        if payload.len() > OOO_MAX_BYTES || seq.wrapping_sub(self.rcv_nxt) as usize >= OOO_MAX_BYTES
         {
             return;
         }
