@@ -483,9 +483,16 @@ int plat_shutdown(const char *mode)
     if (pid < 0)
         return -1;
     if (pid == 0) {
-        execl(argv[0], argv[0], argv[1], "now", (char *)NULL);
-        _exit(127);
+        /* The agent serves on and never waits for this program, so a
+         * second fork hands it to init instead of leaving a zombie. */
+        if (fork() == 0) {
+            execl(argv[0], argv[0], argv[1], "now", (char *)NULL);
+            _exit(127);
+        }
+        _exit(0);
     }
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
     return 0;
 }
 
@@ -538,10 +545,7 @@ int main(int argc, char **argv)
             plat_sleep_ms(1000);
             continue;
         }
-        if (agent_run() == 0) {
-            port_close();
-            return 0; /* shutdown initiated */
-        }
+        agent_run();
         port_close();
     }
 }
