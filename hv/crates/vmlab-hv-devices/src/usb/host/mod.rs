@@ -529,9 +529,8 @@ impl HostUsbDevice {
         // reset the device for nothing.
         // A guest that chose an alt setting first has changed the device:
         // only setting the configuration puts its interfaces back at 0.
-        let set = self.initialized
-            || self.active_config != Some(config)
-            || !self.alt_settings.is_empty();
+        let set =
+            self.initialized || self.active_config != Some(config) || !self.alt_settings.is_empty();
         self.initialized = true;
         // The old configuration's endpoints end here. Their URBs are
         // discarded before the job releases the interfaces; left alone, the
