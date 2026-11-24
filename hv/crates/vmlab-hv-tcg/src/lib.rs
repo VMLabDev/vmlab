@@ -15,7 +15,7 @@ pub mod lockstep;
 mod memory;
 mod softfloat;
 mod value;
-pub use cpu::{Privilege, Riscv64, SpecializationStats, TraceProfile};
+pub use cpu::{Privilege, Riscv64, SpecializationStats, TRACE_CACHE_BYTES, TraceProfile};
 pub use memory::{CodeStamp, FlatMemory, Memory, RESERVATION_GRANULE, SharedMemory};
 use num_bigint::BigUint;
 use std::collections::BTreeMap;

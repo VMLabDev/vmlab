@@ -6,7 +6,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use vmlab_hv_tcg::{FlatMemory, Memory, Riscv64};
+use vmlab_hv_tcg::{FlatMemory, Memory, Riscv64, TRACE_CACHE_BYTES};
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -81,7 +81,11 @@ fn straight_run() -> Riscv64<FlatMemory> {
 
 #[test]
 fn the_trace_cache_stays_within_a_byte_budget() {
-    let budget = 64 * MIB;
+    // Twice the cache's own limit. The limit bounds what the cache counts,
+    // the count is an estimate, and a trace is recorded before an older one
+    // is evicted for it.
+    let budget = 2 * TRACE_CACHE_BYTES;
+    assert!(budget <= 64 * MIB, "the budget of one hart is {budget} bytes");
 
     let mut cpu = straight_run();
     // One step outside the measurement: the first step builds what every
@@ -91,6 +95,11 @@ fn the_trace_cache_stays_within_a_byte_budget() {
     let mut largest = 0usize;
     while cpu.steps < INSTRUCTIONS {
         cpu.run((INSTRUCTIONS - cpu.steps).min(64)).unwrap();
+        let counted = cpu.trace_cache_bytes();
+        assert!(
+            counted <= TRACE_CACHE_BYTES,
+            "the cache counts {counted} bytes, over its limit of {TRACE_CACHE_BYTES}"
+        );
         largest = largest.max(LIVE.load(Ordering::Relaxed).saturating_sub(before));
     }
     let stats = &cpu.specialization_stats;
@@ -101,16 +110,27 @@ fn the_trace_cache_stays_within_a_byte_budget() {
     );
     assert_eq!(cpu.gpr(10).unwrap(), cpu.steps);
     let held = LIVE.load(Ordering::Relaxed).saturating_sub(before);
+    let counted = cpu.trace_cache_bytes();
     println!(
-        "held {held} bytes, largest {largest}, recordings {}, evictions {}, largest trace {:?}",
-        stats.recordings, stats.evictions, stats.max_trace
+        "held {held} bytes, largest {largest}, counted {counted}, recordings {}, evictions {}",
+        stats.recordings, stats.evictions
     );
     assert!(
         largest <= budget,
         "{} guest steps made the hart hold {largest} bytes, over the budget of {budget} \
-         ({} recordings, {} evictions)",
+         ({} recordings, {} evictions, the cache counts {counted})",
         cpu.steps,
         stats.recordings,
         stats.evictions
+    );
+    assert!(
+        stats.evictions > 0,
+        "the run never filled the cache: it counts {counted} bytes"
+    );
+    // The count must be near what the host pays. A count far under the truth
+    // is the fault this test is for.
+    assert!(
+        counted >= held / 2 && counted <= held.saturating_mul(2),
+        "the cache counts {counted} bytes and the hart holds {held}"
     );
 }
