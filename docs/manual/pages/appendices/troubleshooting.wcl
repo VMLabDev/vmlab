@@ -405,6 +405,9 @@ MSG
     `vmlab dev sync flush <machine>` and take the snapshot again; if the
     reason is a halt, resolve it as above. The middle of the message says
     which of these it is and names up to twenty of the paths still owed.
+    For a machine that is stopped the message ends differently: it says to
+    start the machine with `vmlab up <machine>` first, because the `dev sync`
+    verbs answer only while the machine runs.
   DOC
   p <<DOC
     Restore has a matching refusal when the workspace is halted: `"{machine}"'s
