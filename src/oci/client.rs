@@ -5039,6 +5039,44 @@ mod tests {
 
     use crate::template::store::Purpose;
 
+    #[tokio::test]
+    async fn a_variant_pulled_into_a_held_version_keeps_its_published_metadata() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let published = work.path().join("tmpl");
+        let mut meta = variant_template(&published);
+        let staged = work.path().join("local");
+        let mut held = meta.clone();
+        held.variants.clear();
+        held.cpus = Some(2);
+        make_template(&staged, &held, &std::fs::read(published.join(DISK_FILE)).unwrap());
+        let store = store_in(work.path(), "store");
+        store.install(&staged, &held, false).unwrap();
+
+        meta.cpus = Some(4);
+        meta.write_to(&published.join(META_FILE)).unwrap();
+        let reference = "ghcr.io/owner/alpine:3.20";
+        registry_with_fake(reference, fake.clone())
+            .push(
+                &published,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let variant = VariantRefNamed("extra");
+        pull_want(&fake, reference, &store, &VariantWant::of(Some(&variant)))
+            .await
+            .unwrap();
+
+        let installed = store.installed(&meta.arch, &meta.name, &meta.version).unwrap().unwrap();
+        assert_eq!(installed.meta.cpus, Some(2));
+        assert_eq!(installed.select(Some(&variant), Purpose::Lab).unwrap().meta.cpus, Some(4));
+    }
+
     /// A variant pulled onto a version the store holds merges into its
     /// `template.wcl`, keeping the variant already there, and downloads only
     /// its overlay — never the base again.
