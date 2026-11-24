@@ -760,8 +760,12 @@ pub fn reconcile(inputs: &Inputs<'_>) -> Plan {
                 }
                 continue;
             }
+            // Held by name whether or not the host moved too. A host edit
+            // makes this pass call it the matrix's own conflict below, and
+            // taking that edit back must not leave an absence nothing saw
+            // looking like a deletion the guest made.
+            plan.withheld.insert(path.clone());
             if !host_moved.changed() {
-                plan.withheld.insert(path.clone());
                 plan.conflicts.push(Conflict {
                     path: path.clone(),
                     kind: ConflictKind::MissingUnseen,
