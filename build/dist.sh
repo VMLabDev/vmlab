@@ -17,8 +17,9 @@
 #                                             ebpf/ by `just ebpf-build`
 #
 # Tracked files are left exactly as they were. A version other than
-# Cargo.toml's is stamped into Cargo.toml (and so Cargo.lock) for the binary
-# build only, and put back afterwards. The BPF rebuild
+# Cargo.toml's is stamped into Cargo.toml and into the package's own entry of
+# Cargo.lock for the binary build only, and put back afterwards. The build is
+# always --locked: a lock that does not match Cargo.toml fails it. The BPF rebuild
 # writes over the committed objects, so the working copies are saved first and
 # restored after; a rebuilt object that differs from the committed one is
 # reported, and fails the build (`just ci::ebpf-verify` would reject it too).
@@ -59,16 +60,19 @@ restore() {
 trap restore EXIT
 
 build_binary() {
-  local version="$1" locked=(--locked)
+  local version="$1"
   if [[ "$version" != "$(cargo_version)" ]]; then
-    log "stamping $version into Cargo.toml for the binary build (restored after)"
+    log "stamping $version into Cargo.toml and Cargo.lock for the binary build (restored after)"
     cp -p Cargo.toml Cargo.lock "$SAVE/"
     sed -i '0,/^version = ".*"$/s//version = "'"$version"'"/' Cargo.toml
-    # The lock carries the package version, so a stamped build cannot be --locked.
-    locked=()
+    # The lock carries the package's own version. Stamp that one line too, so
+    # the build stays --locked and every other entry of the lock still binds.
+    sed -i '/^name = "vmlab"$/{n;s/^version = ".*"$/version = "'"$version"'"/}' Cargo.lock
+    grep -xF -A1 'name = "vmlab"' Cargo.lock | grep -qxF "version = \"$version\"" ||
+      die "could not stamp $version into the vmlab entry of Cargo.lock"
   fi
   log "building vmlab $version (release)"
-  cargo build --release "${locked[@]}" --bin vmlab --bin vmlab-fastpath
+  cargo build --release --locked --bin vmlab --bin vmlab-fastpath
   [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: OUT is empty or /" >&2; exit 1; }
   install -m 0755 target/release/vmlab "$OUT/vmlab-$version-linux-x86_64"
   install -m 0755 target/release/vmlab-fastpath "$OUT/vmlab-fastpath-$version-linux-x86_64"
