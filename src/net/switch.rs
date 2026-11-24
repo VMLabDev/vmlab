@@ -1441,6 +1441,9 @@ mod tests {
                 },
             )
             .await;
+        // A port that can carry the frame: the flood reaches it, so the one
+        // drop counted is the vnet port's.
+        let mut other = switch.add_channel_port(GUEST);
         let broadcast = |len: usize| {
             let mut frame = vec![0u8; len];
             frame[..6].copy_from_slice(&[0xff; 6]);
@@ -1459,6 +1462,7 @@ mod tests {
             .await
         });
         written.unwrap();
+        assert_eq!(recv(&mut other.rx).await, oversized);
 
         let small = broadcast(60);
         framing::write_frame(&mut qemu, &small).await.unwrap();
