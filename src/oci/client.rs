@@ -937,6 +937,8 @@ impl Registry {
 
         // The variants to fetch: each one's manifest and config blob, which
         // say what its overlay assembles to and the block it stands for.
+        // Compute overrides against the metadata they will be written beside.
+        let destination_base = local.as_ref().map_or(&meta, |held| &held.meta);
         let mut parts: Vec<(crate::template::meta::VariantMeta, Chunks, String)> = Vec::new();
         for entry in chosen {
             let vm = self.fetch_manifest(repo, &entry.manifest).await?;
@@ -993,10 +995,10 @@ impl Registry {
                 .config_blob(repo, &vm.config)
                 .await
                 .with_context(|| format!("downloading variant `{}`'s config blob", entry.name))?;
-            let variant = TemplateConfig::from_json(&config_bytes)?.into_variant(&meta)?;
+            let variant =
+                TemplateConfig::from_json(&config_bytes)?.into_variant(destination_base)?;
             crate::template::trust::component(&variant.name)?;
-            let mut checked = meta.clone();
-            checked.variants = vec![variant.clone()];
+            let checked = destination_base.effective(Some(&variant));
             let trusted = crate::template::trust::repository_trusted(
                 &crate::config::host::HostConfig::load_default()?.trusted_template_repositories,
                 &self.reference.host,
@@ -1105,7 +1107,7 @@ impl Registry {
                 variants.push(variant);
             }
             match local {
-                Some(held) => store.add_variants(
+                Some(held) => store.add_variants_checked(
                     &held.meta.arch,
                     &held.meta.name,
                     &held.meta.version,
@@ -1114,6 +1116,18 @@ impl Registry {
                     &|doomed| match &in_use {
                         Some(in_use) => runtime.block_on(in_use(doomed.to_vec())),
                         None => Some("a clone may be backed by it".to_string()),
+                    },
+                    &|current| {
+                        // The store lock is held here. Another writer may
+                        // have replaced the base while the pull downloaded.
+                        ensure!(
+                            variants.iter().all(|variant| {
+                                current.effective(Some(variant))
+                                    == held.meta.effective(Some(variant))
+                            }),
+                            "template {reference}'s base metadata changed during pull — pull again"
+                        );
+                        Ok(())
                     },
                 ),
                 None => {
@@ -4359,6 +4373,7 @@ mod tests {
             sha256,
             base_sha256: base_sha256.into(),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
@@ -5047,6 +5062,54 @@ mod tests {
     }
 
     use crate::template::store::Purpose;
+
+    #[tokio::test]
+    async fn a_variant_pulled_into_a_held_version_keeps_its_published_metadata() {
+        let fake = std::sync::Arc::new(FakeRegistry::default());
+        let work = tempfile::tempdir().unwrap();
+        let published = work.path().join("tmpl");
+        let mut meta = variant_template(&published);
+        let disk = std::fs::read(published.join(DISK_FILE)).unwrap();
+        meta.cpus = Some(4);
+        meta.write_to(&published.join(META_FILE)).unwrap();
+        let reference = "ghcr.io/owner/alpine:3.20";
+        registry_with_fake(reference, fake.clone())
+            .push(
+                &published,
+                SMALL_CHUNKS,
+                "x86_64",
+                &work.path().join("push"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let variant = VariantRefNamed("extra");
+        for (name, script) in [("plain", None), ("scripted", Some("fn main(lab) {}"))] {
+            let staged = work.path().join("local");
+            let mut held = meta.clone();
+            held.variants.clear();
+            held.cpus = Some(2);
+            held.first_boot_script = script.map(str::to_owned);
+            make_template(&staged, &held, &disk);
+            let store = store_in(work.path(), name);
+            store.install(&staged, &held, false).unwrap();
+
+            pull_want(&fake, reference, &store, &VariantWant::of(Some(&variant)))
+                .await
+                .unwrap();
+
+            let installed = store
+                .installed(&meta.arch, &meta.name, &meta.version)
+                .unwrap()
+                .unwrap();
+            assert_eq!(installed.meta.cpus, Some(2));
+            assert_eq!(installed.meta.first_boot_script.as_deref(), script);
+            let selected = installed.select(Some(&variant), Purpose::Lab).unwrap();
+            assert_eq!(selected.meta.cpus, Some(4));
+            assert_eq!(selected.meta.first_boot_script, None);
+        }
+    }
 
     /// A variant pulled onto a version the store holds merges into its
     /// `template.wcl`, keeping the variant already there, and downloads only

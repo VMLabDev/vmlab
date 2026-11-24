@@ -235,6 +235,20 @@ impl SmbConfig {
                     reason,
                 });
             }
+            // The server's own directories go into `[global]` (`include`,
+            // `log file`, the state paths), where Samba expands a `%` as it
+            // does in a share's path (docs/reviews/smb-2.md F17).
+            for (dir, what) in [
+                (&self.lab_dir, "vmlab's SMB state directory"),
+                (&self.run_dir, "vmlab's SMB runtime directory"),
+            ] {
+                if let Some(reason) = server_dir_problem(dir, what) {
+                    return Err(ShareRefused {
+                        name: s.name.clone(),
+                        reason,
+                    });
+                }
+            }
             // This file, the passdb and smbd's sockets: a share over any of
             // them hands the guest the server (docs/reviews/smb.md F1).
             for (state, what) in [
@@ -459,6 +473,24 @@ pub fn share_host_problem(host: &Path, may_use_smb: bool) -> Option<String> {
     }
 }
 
+/// Why `dir`, one of the server's own directories (`what` names it), cannot
+/// be written into `smb.conf`'s `[global]`, or `None`. The same two faults as
+/// [`share_host_problem`]: a line break ends the line, and Samba expands a
+/// `%` in `include`, `log file` and the state paths.
+fn server_dir_problem(dir: &Path, what: &str) -> Option<String> {
+    let text = dir.to_string_lossy();
+    if text.contains(['\n', '\r']) {
+        Some(format!("{what} {text:?} holds a line break"))
+    } else if text.contains('%') {
+        Some(format!(
+            "{what} {text:?} contains %, which Samba uses for variable expansion; \
+             move the lab to a path without one"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Why the directory `host` cannot be shared given that `state` is one of
 /// vmlab's own directories (`what` names it), or `None` when it can.
 ///
@@ -634,6 +666,25 @@ mod tests {
         // A state directory that does not exist yet is still protected.
         assert!(share_state_problem(&lab, &lab.join("new/.vmlab"), "x").is_some());
         assert!(share_state_problem(&lab.join("src"), &lab.join("new/.vmlab"), "x").is_none());
+    }
+
+    /// docs/reviews/smb-2.md F17: the lab's own directories are written into
+    /// `[global]` (`include`, `log file`, the state paths), where Samba
+    /// expands a `%` as it does in a share's path. The render refuses them.
+    #[test]
+    fn a_percent_in_the_lab_path_is_not_a_samba_variable() {
+        let mut c = cfg(true);
+        c.lab_dir = PathBuf::from("/home/u/100%Done/.vmlab/smb");
+        let refused = c.render_conf().expect_err("the lab path was rendered");
+        assert!(refused.reason.contains('%'), "{refused}");
+
+        let mut c = cfg(false);
+        c.run_dir = PathBuf::from("/run/vmlab/smb/a%Lb");
+        assert!(c.render_conf().is_err(), "the runtime path was rendered");
+
+        let mut c = cfg(false);
+        c.lab_dir = PathBuf::from("/home/u/x\n[global]/.vmlab/smb");
+        assert!(c.render_conf().is_err(), "a line break was rendered");
     }
 
     #[test]

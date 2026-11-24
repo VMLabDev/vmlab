@@ -906,7 +906,7 @@ impl TemplateStore {
         variants: &[super::meta::VariantMeta],
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<TemplateMeta> {
-        self.add_variants_checked(arch, name, version, staging_dir, variants, in_use, &|| {
+        self.add_variants_checked(arch, name, version, staging_dir, variants, in_use, &|_| {
             Ok(())
         })
     }
@@ -920,7 +920,7 @@ impl TemplateStore {
         staging_dir: &Path,
         variants: &[super::meta::VariantMeta],
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
-        before_publish: &dyn Fn() -> Result<()>,
+        before_publish: &dyn Fn(&TemplateMeta) -> Result<()>,
     ) -> Result<TemplateMeta> {
         let _lock = self.lock()?;
         let found = self
@@ -948,7 +948,7 @@ impl TemplateStore {
         }
 
         let mut on_disk = TemplateMeta::read_from(&found.dir.join(META_FILE))?;
-        before_publish()?;
+        before_publish(&found.meta)?;
         for v in variants {
             let vdir = found.dir.join(VARIANTS_DIR).join(&v.name);
             if vdir.exists() {
@@ -989,6 +989,37 @@ impl TemplateStore {
             .with_context(|| format!("cannot open lock file {}", path.display()))?;
         Flock::lock(file, FlockArg::LockExclusive)
             .map_err(|(_, errno)| anyhow!("cannot lock template store: {errno}"))
+    }
+
+    pub(crate) fn sweep_abandoned_metadata(&self) -> Result<usize> {
+        if !self.root.try_exists()? {
+            return Ok(0);
+        }
+        // A writer holds the same store lock through the rename.
+        let _lock = self.lock()?;
+        let prefix = format!(".{META_FILE}.");
+        let mut removed = 0;
+        for arch in subdirs(&self.root)?
+            .into_iter()
+            .filter(|path| !path.is_symlink())
+        {
+            for name in subdirs(&arch)?
+                .into_iter()
+                .filter(|path| !path.is_symlink())
+            {
+                for version in subdirs(&name)?
+                    .into_iter()
+                    .filter(|path| !path.is_symlink())
+                {
+                    removed += crate::staging::sweep_files(&version, |name| {
+                        name.strip_prefix(&prefix).is_some_and(|suffix| {
+                            suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                    })?;
+                }
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -2657,6 +2688,7 @@ mod tests {
             sha256: "cd".repeat(32),
             base_sha256: base_sha256.into(),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
