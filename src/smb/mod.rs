@@ -769,7 +769,10 @@ mod tests {
         let args = &steps[0].args;
         assert_eq!(args.len(), 6);
         assert_eq!(args[..3], ["use", "Z:", r"\\10.0.1.1\data"]);
-        assert!(args[3] == creds.password, "the password is its own argument");
+        assert!(
+            args[3] == creds.password,
+            "the password is its own argument"
+        );
         assert_eq!(args[4], format!("/user:{}", creds.username));
         assert_eq!(args[5], "/persistent:yes");
     }
