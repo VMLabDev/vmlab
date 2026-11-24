@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs the present probe (probes/present) in a Windows VM as a standard user
-# in the desktop session: a Blt present of a blob that cannot be mapped,
-# card #756 (docs/reviews/win3d-driver.md F8; docs/acceptance/C756.md).
+# in the desktop session: a Blt present of a blob that has no mappable flag,
+# and its two controls, card #756 (docs/reviews/win3d-driver.md F8;
+# docs/acceptance/C756.md).
 #
 #   tests/kmd/present-probe.sh <lab-dir> <vm> <out-dir> [case...]
 #
@@ -14,7 +15,9 @@
 # guest has none (one reboot), and refuses an administrator on the console.
 # PRESENT_COUNT is the number of presents per case (default 1).
 #
-# A driver without the fix accepts the present and bugchecks the guest.
+# With no case names it runs all four, the harmless ones first. A driver
+# without the fix accepts the present of the cases not-mappable and
+# shareable, and bugchecks the guest.
 # The script then waits for the guest to come back and records the bugcheck
 # event. Use a disposable VM: the script also turns off the recovery screen
 # that Windows shows after two bugchecks.
@@ -39,7 +42,7 @@ mkdir -p "$3"
 OUT=$(cd "$3" && pwd)
 [ -n "$OUT" ] && [ "$OUT" != / ] || { echo "VML-88: the output directory is empty or /" >&2; exit 2; }
 shift 3
-CASES=${*:-not-mappable unknown-blob}
+CASES=${*:-unknown-blob mappable not-mappable shareable}
 COUNT=${PRESENT_COUNT:-1}
 PROBE=$REPO/out/probes-extra/x64/present_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE; run build/probes/build.sh present" >&2; exit 2; }
@@ -148,9 +151,9 @@ for c in $CASES; do
         bug=$(grep -oE '0x[0-9a-fA-F]{8} \(0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+\)' "$OUT/$c.bugcheck.txt" | head -1)
         bug=${bug:-recorded}
     fi
-    line="$c: exit=$rc result=$(field "$OUT/$c.json" result) stage=$(field "$OUT/$c.json" stage) session=$(field "$OUT/$c.json" session) presents=$(field "$OUT/$c.json" presents_done) failed=$(field "$OUT/$c.json" presents_failed) accepted=$(field "$OUT/$c.json" presents_accepted) first_present_status=$(field "$OUT/$c.json" first_present_status) pass=$(field "$OUT/$c.json" pass) guest_died=$died bugcheck=$bug"
+    line="$c: exit=$rc result=$(field "$OUT/$c.json" result) stage=$(field "$OUT/$c.json" stage) session=$(field "$OUT/$c.json" session) presents=$(field "$OUT/$c.json" presents_done) failed=$(field "$OUT/$c.json" presents_failed) accepted=$(field "$OUT/$c.json" presents_accepted) create_allocation_status=$(field "$OUT/$c.json" create_allocation_status) first_present_status=$(field "$OUT/$c.json" first_present_status) pass=$(field "$OUT/$c.json" pass) guest_died=$died bugcheck=$bug"
     note "$line"; echo "$line" >>"$OUT/summary.txt"
     if [ "$rc" != 0 ] || [ "$died" = yes ] || [ "$bug" != none ] || [ "$(field "$OUT/$c.json" pass)" != True ]; then bad=1; fi
 done
-if [ "$bad" = 0 ]; then echo "PASS: every present was refused and the guest stayed up" | tee -a "$OUT/summary.txt"; else echo "FAIL" | tee -a "$OUT/summary.txt"; fi
+if [ "$bad" = 0 ]; then echo "PASS: every case did what a fixed driver does and the guest stayed up" | tee -a "$OUT/summary.txt"; else echo "FAIL" | tee -a "$OUT/summary.txt"; fi
 exit "$bad"

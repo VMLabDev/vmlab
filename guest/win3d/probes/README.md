@@ -243,3 +243,59 @@ API or adapter error, 3 a usage error.
 `tests/kmd/capset-probe.sh <lab-dir> <vm> <out-dir>` runs every case in a VM
 as a new standard user, and records a bugcheck of the guest
 ([`docs/acceptance/C751.md`](../docs/acceptance/C751.md)).
+
+## The present probe
+
+`present_probe.exe` is not a rendering probe either. It presents a blob
+allocation with a Blt to a window of its own, in a Venus context of the
+kernel driver: card #756, finding F8 of
+[`docs/reviews/win3d-driver.md`](../../../docs/reviews/win3d-driver.md).
+A driver without `patches/kmd/kmd-map-present-source-in-present.patch`
+accepts the present of a blob that has no mappable flag and bugchecks the
+guest with `0x119` a moment later, so run it in a disposable VM. Build it
+with:
+
+```sh
+build/probes/build.sh present
+```
+
+The executables are `out/probes-extra/x64/present_probe.exe` and
+`out/probes-extra/x86/present_probe.exe`.
+
+```text
+present_probe.exe --case NAME [--count N] [--out FILE]
+```
+
+It accepts only one PCI adapter with vendor `1af4` and device `1050`, makes
+a device, a Venus host context (`VIOGPU_CTX_INIT` with capset 4) and a
+context, and creates one allocation of 64 by 64 pixels with
+`D3DKMTCreateAllocation`. The private data of the allocation names host
+memory (`BlobMem` 2), a blob id and the blob flags. It then calls
+`D3DKMTPresent` N times (default 1) with `Blt`, that allocation as the
+source and its window as the destination.
+
+| Case | Blob id | `BlobFlags` | A fixed driver |
+| --- | --- | --- | --- |
+| `unknown-blob` | One that the host does not know | 1 (mappable) | `D3DKMTCreateAllocation` fails: the driver creates the blob when the allocation is opened. The same without the fix |
+| `mappable` | 0, shared memory of the Venus context | 1 | Every present is accepted and the guest stays up. The same without the fix |
+| `not-mappable` | Device memory of the host's Vulkan driver | 0 | Every present fails. Without the fix: bugcheck `0x119` |
+| `shareable` | The same | 2 (shareable) | Every present fails. Without the fix: bugcheck `0x119` |
+
+For the last two cases the host must know the blob id, so the probe first
+sends four Venus commands through the `VIOGPU_SUBMIT_CMD` escape:
+`vkCreateInstance`, `vkEnumeratePhysicalDevices`, `vkCreateDevice` and
+`vkAllocateMemory` of 64 KiB of memory type 0 with dma-buf export. It
+writes the wire format itself and asks for no reply.
+
+The window needs a surface, so the probe runs in the desktop session, not
+in session 0. It writes one JSON object to stdout and to `--out`. Before the
+first present it flushes a record with `result` `present_pending`, and after
+the first accepted present one with `present_accepted`, so a bugcheck leaves
+the state on disk. `pass` says whether the driver did what the table says.
+Exit 0 is a pass, 2 another outcome that the guest survived, 1 an API or
+adapter error, 3 a usage error.
+
+`tests/kmd/present-probe.sh <lab-dir> <vm> <out-dir>` runs the four cases
+in a VM as the standard user of the test desktop, through
+`tests/guest/Run-Probe.ps1`, and records a bugcheck of the guest
+([`docs/acceptance/C756.md`](../docs/acceptance/C756.md)).

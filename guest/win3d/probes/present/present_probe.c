@@ -1,9 +1,10 @@
-/* Presents a blob allocation that cannot be mapped, with a Blt to a window
- * of the process, in a Venus context of the viogpu3d kernel driver: card
- * #756 (docs/reviews/win3d-driver.md F8), as whatever user runs it. Run it
- * in the desktop session, where the window has a surface. One case per run:
- * a driver without the fix accepts the present and bugchecks the guest with
- * 0x119 when Windows calls DxgkDdiPatch. Run it in a disposable VM. */
+/* Presents a blob allocation with a Blt to a window of the process, in a
+ * Venus context of the viogpu3d kernel driver: card #756
+ * (docs/reviews/win3d-driver.md F8), as whatever user runs it. Run it in the
+ * desktop session, where the window has a surface. One case per run. For a
+ * blob that exists on the host and has no mappable flag, a driver without
+ * the fix accepts the present and bugchecks the guest with 0x119 when
+ * Windows calls DxgkDdiPatch. Run it in a disposable VM. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
@@ -175,6 +176,14 @@ typedef struct {
     } u;
 } viogpu_escape;
 
+/* VIOGPU_SUBMIT_CMD_REQ. The command bytes follow it, and it follows the
+ * whole VIOGPU_ESCAPE in the private data. */
+typedef struct {
+    uint32_t context; /* D3DKMT_HANDLE hContext, not read by the driver */
+    uint32_t cmd_type;
+    uint32_t cmd_size;
+} viogpu_submit_cmd_req;
+
 /* VIOGPU_CREATE_ALLOCATION_EXCHANGE: the private data of an allocation. */
 typedef struct {
     struct {
@@ -196,6 +205,7 @@ _Static_assert(sizeof(create_device) == (sizeof(void *) == 8 ? 64 : 36), "D3DKMT
 _Static_assert(sizeof(viogpu_adapterinfo) == 24 && offsetof(viogpu_adapterinfo, supported_capset_ids) == 16, "VIOGPU_ADAPTERINFO ABI");
 _Static_assert(sizeof(viogpu_escape) == 40, "VIOGPU_ESCAPE ABI");
 _Static_assert(sizeof(viogpu_allocation_exchange) == 72, "VIOGPU_CREATE_ALLOCATION_EXCHANGE ABI");
+_Static_assert(sizeof(viogpu_submit_cmd_req) == 12, "VIOGPU_SUBMIT_CMD_REQ ABI");
 #ifdef _WIN64
 _Static_assert(sizeof(create_context) == 96 && offsetof(create_context, context) == 32, "D3DKMT_CREATECONTEXT ABI");
 _Static_assert(sizeof(allocation_info) == 96 && offsetof(allocation_info, flags) == 32, "D3DDDI_ALLOCATIONINFO2 ABI");
@@ -209,9 +219,12 @@ enum {
     QUERY_PHYSICAL_ADAPTER_DEVICE_IDS = 31,
     ESCAPE_DRIVERPRIVATE = 0,
     VIOGPU_CTX_INIT = 0x200,
+    VIOGPU_SUBMIT_CMD = 0x300,
+    VIOGPU_CMD_SUBMIT = 1,
     CAPSET_VENUS = 4,
     BLOB_MEM_HOST3D = 2,
     BLOB_FLAG_MAPPABLE = 1,
+    BLOB_FLAG_SHAREABLE = 2,
     PIPE_TEXTURE_2D = 2,
     VIRGL_FORMAT_B8G8R8A8_UNORM = 1,
     /* D3DKMT_PRESENTFLAGS: Blt, DstRectValid, SrcRectValid */
@@ -224,29 +237,123 @@ enum {
 #define VIOGPU_IAM 0x56696f475055ull
 /* A blob id that no Venus context of this process made. */
 #define UNKNOWN_BLOB_ID 0x0000756c62373536ull
+/* The size of the device memory that the Venus commands allocate. */
+#define MEMORY_SIZE 65536u
+
+/* Where the blob of a case comes from. */
+enum { BLOB_UNKNOWN, BLOB_SHM, BLOB_DEVICE_MEMORY };
+/* What a fixed driver does with a case. */
+enum { CREATE_FAILS, PRESENT_FAILS, PRESENT_WORKS };
 
 typedef struct {
     const char *name;
+    int blob, outcome;
     uint32_t blob_flags;
     const char *expect;
 } test_case;
 
 static const test_case cases[] = {
-    {"not-mappable", 0,
-     "every present fails: a blob without VIRTGPU_BLOB_FLAG_USE_MAPPABLE cannot be the source of a present copy "
-     "(before the fix: the present is accepted and DxgkDdiPatch fails, bugcheck 0x119)"},
-    {"unknown-blob", BLOB_FLAG_MAPPABLE,
-     "every present fails: the host does not know the blob id, so the blob is not created "
+    {"unknown-blob", BLOB_UNKNOWN, CREATE_FAILS, BLOB_FLAG_MAPPABLE,
+     "D3DKMTCreateAllocation fails: the host does not know the blob id, and the driver creates the blob "
+     "when the allocation is opened (the same before the fix)"},
+    {"mappable", BLOB_SHM, PRESENT_WORKS, BLOB_FLAG_MAPPABLE,
+     "every present is accepted and the guest stays up: shared memory of the Venus context is a mappable "
+     "blob (the same before the fix)"},
+    {"not-mappable", BLOB_DEVICE_MEMORY, PRESENT_FAILS, 0,
+     "every present fails: a blob without VIRTGPU_BLOB_FLAG_USE_MAPPABLE cannot be the source of a present "
+     "copy (before the fix: the present is accepted and DxgkDdiPatch fails, bugcheck 0x119)"},
+    {"shareable", BLOB_DEVICE_MEMORY, PRESENT_FAILS, BLOB_FLAG_SHAREABLE,
+     "every present fails: the blob flags of exported device memory that is not host visible "
      "(before the fix: the present is accepted and DxgkDdiPatch fails, bugcheck 0x119)"},
 };
+
+/* The Venus wire format: a stream of 32-bit words. A 64-bit value is two
+ * words, low first. A pointer is a 64-bit count (0 for NULL), and a handle
+ * is a 64-bit object id that the guest chooses. */
+typedef struct {
+    uint32_t words[128];
+    uint32_t count;
+} venus_stream;
+
+static void v32(venus_stream *v, uint32_t value)
+{
+    if (v->count < sizeof(v->words) / sizeof(v->words[0])) v->words[v->count++] = value;
+}
+
+static void v64(venus_stream *v, uint64_t value)
+{
+    v32(v, (uint32_t)value);
+    v32(v, (uint32_t)(value >> 32));
+}
+
+enum { VENUS_INSTANCE = 1, VENUS_PHYSICAL_DEVICE, VENUS_DEVICE, VENUS_MEMORY };
+
+/* Four Venus commands, without a reply: vkCreateInstance,
+ * vkEnumeratePhysicalDevices for the first device, vkCreateDevice with one
+ * queue of family 0, and vkAllocateMemory of MEMORY_SIZE bytes of memory
+ * type 0 that the host can export as a dma-buf. The memory then has the
+ * object id VENUS_MEMORY, which is the blob id of the allocation. The
+ * layout is the one of Mesa's vn_protocol_driver_*.h encoders. */
+static void venus_device_memory(venus_stream *v)
+{
+    /* vkCreateInstance */
+    v32(v, 0); v32(v, 0);          /* command type, command flags */
+    v64(v, 1);                     /* pCreateInfo */
+    v32(v, 1); v64(v, 0);          /* VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, pNext */
+    v32(v, 0);                     /* flags */
+    v64(v, 1);                     /* pApplicationInfo */
+    v32(v, 0); v64(v, 0);          /* VK_STRUCTURE_TYPE_APPLICATION_INFO, pNext */
+    v64(v, 0); v32(v, 0);          /* pApplicationName, applicationVersion */
+    v64(v, 0); v32(v, 0);          /* pEngineName, engineVersion */
+    v32(v, 1u << 22 | 1u << 12);   /* apiVersion 1.1 */
+    v32(v, 0); v64(v, 0);          /* enabledLayerCount, ppEnabledLayerNames */
+    v32(v, 0); v64(v, 0);          /* enabledExtensionCount, ppEnabledExtensionNames */
+    v64(v, 0);                     /* pAllocator */
+    v64(v, 1); v64(v, VENUS_INSTANCE);
+
+    /* vkEnumeratePhysicalDevices */
+    v32(v, 2); v32(v, 0);
+    v64(v, VENUS_INSTANCE);
+    v64(v, 1); v32(v, 1);          /* pPhysicalDeviceCount: 1 */
+    v64(v, 1); v64(v, VENUS_PHYSICAL_DEVICE);
+
+    /* vkCreateDevice */
+    v32(v, 11); v32(v, 0);
+    v64(v, VENUS_PHYSICAL_DEVICE);
+    v64(v, 1);                     /* pCreateInfo */
+    v32(v, 3); v64(v, 0);          /* VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, pNext */
+    v32(v, 0);                     /* flags */
+    v32(v, 1); v64(v, 1);          /* queueCreateInfoCount, pQueueCreateInfos */
+    v32(v, 2); v64(v, 0);          /* VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, pNext */
+    v32(v, 0); v32(v, 0); v32(v, 1); /* flags, queueFamilyIndex, queueCount */
+    v64(v, 1); v32(v, 0x3f800000); /* pQueuePriorities: 1.0f */
+    v32(v, 0); v64(v, 0);          /* enabledLayerCount, ppEnabledLayerNames */
+    v32(v, 0); v64(v, 0);          /* enabledExtensionCount, ppEnabledExtensionNames */
+    v64(v, 0);                     /* pEnabledFeatures */
+    v64(v, 0);                     /* pAllocator */
+    v64(v, 1); v64(v, VENUS_DEVICE);
+
+    /* vkAllocateMemory */
+    v32(v, 21); v32(v, 0);
+    v64(v, VENUS_DEVICE);
+    v64(v, 1);                     /* pAllocateInfo */
+    v32(v, 5);                     /* VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO */
+    v64(v, 1);                     /* pNext */
+    v32(v, 1000072002); v64(v, 0); /* VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, pNext */
+    v32(v, 0x200);                 /* handleTypes: VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT */
+    v64(v, MEMORY_SIZE); v32(v, 0); /* allocationSize, memoryTypeIndex */
+    v64(v, 0);                     /* pAllocator */
+    v64(v, 1); v64(v, VENUS_MEMORY);
+}
 
 typedef struct {
     const char *result, *stage, *name, *expect;
     int selected, pass;
-    LONG last_status, ctx_init_status, create_allocation_status, first_present_status, last_present_status;
+    LONG last_status, ctx_init_status, venus_status, create_allocation_status, first_present_status, last_present_status;
     DWORD win32_error, session;
     uint64_t supported;
     uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted;
+    uint64_t blob_id;
     query_device_ids ids;
 } result;
 
@@ -256,7 +363,7 @@ static void emit(FILE *f, const result *r)
             "\"result\":\"%s\",\"stage\":\"%s\",\"pass\":%s,\"session\":%lu,"
             "\"presents_asked\":%u,\"presents_done\":%u,\"presents_failed\":%u,\"presents_accepted\":%u,"
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
-            "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\","
+            "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
@@ -264,8 +371,9 @@ static void emit(FILE *f, const result *r)
             r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted,
             (unsigned long)r->first_present_status, (unsigned long)r->last_present_status,
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
+            (unsigned long)r->venus_status,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
-            (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)UNKNOWN_BLOB_ID);
+            (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
     else fputs("null", f);
     fputs("}\n", f);
@@ -318,13 +426,14 @@ int wmain(int argc, wchar_t **argv)
         } else which = -2;
     }
     if (which < 0 || r.presents_asked < 1 || r.presents_asked > 100000) {
-        fputs("usage: present_probe.exe --case (not-mappable | unknown-blob) [--count N] [--out FILE]\n", stderr);
+        fputs("usage: present_probe.exe --case (unknown-blob | mappable | not-mappable | shareable) [--count N] [--out FILE]\n", stderr);
         r.result = "usage"; exit_code = 3; goto done;
     }
     const test_case *tc = &cases[which];
     r.name = tc->name;
     r.expect = tc->expect;
     r.blob_flags = tc->blob_flags;
+    r.blob_id = tc->blob == BLOB_UNKNOWN ? UNKNOWN_BLOB_ID : tc->blob == BLOB_SHM ? 0 : VENUS_MEMORY;
 
     /* The destination of the present: a window of this process. */
     r.stage = "create_window";
@@ -405,6 +514,30 @@ int wmain(int argc, wchar_t **argv)
     r.last_status = context_create(&context);
     if (r.last_status < 0) goto destroy_device;
 
+    /* Device memory of the host's Vulkan driver, for a blob that the host
+     * accepts. The commands go to the host context of this device, in
+     * front of the request that creates the blob. */
+    if (tc->blob == BLOB_DEVICE_MEMORY) {
+        static struct {
+            viogpu_escape escape;
+            viogpu_submit_cmd_req req;
+            venus_stream stream;
+        } submit;
+        venus_device_memory(&submit.stream);
+        const uint32_t cmd_size = submit.stream.count * 4;
+        submit.escape.type = VIOGPU_SUBMIT_CMD;
+        submit.escape.data_length = (uint16_t)(sizeof(submit.req) + cmd_size);
+        submit.req.cmd_type = VIOGPU_CMD_SUBMIT;
+        submit.req.cmd_size = cmd_size;
+        /* The words follow the request without padding. */
+        memmove((uint8_t *)&submit.req + sizeof(submit.req), submit.stream.words, cmd_size);
+        escape_args submit_args = {adapter, device.device, ESCAPE_DRIVERPRIVATE, 0, &submit,
+                                   (UINT)(sizeof(submit.escape) + sizeof(submit.req) + cmd_size), 0};
+        r.stage = "venus_commands";
+        r.venus_status = r.last_status = escape(&submit_args);
+        if (r.last_status < 0) goto destroy_context;
+    }
+
     /* The allocation of the review's proof. The driver takes all of this
      * from the calling program. */
     viogpu_allocation_exchange exchange = {0};
@@ -415,7 +548,7 @@ int wmain(int argc, wchar_t **argv)
     exchange.options.depth = 1;
     exchange.options.array_size = 1;
     exchange.size = IMAGE_WIDTH * IMAGE_HEIGHT * 4;
-    exchange.blob_id = UNKNOWN_BLOB_ID;
+    exchange.blob_id = r.blob_id;
     exchange.blob_mem = BLOB_MEM_HOST3D;
     exchange.blob_flags = tc->blob_flags;
     exchange.stride = IMAGE_WIDTH * 4;
@@ -428,6 +561,13 @@ int wmain(int argc, wchar_t **argv)
     ca.allocation_info = &allocation;
     r.stage = "create_allocation";
     r.create_allocation_status = r.last_status = allocate(&ca);
+    if (tc->outcome == CREATE_FAILS) {
+        r.stage = "done";
+        r.pass = r.last_status < 0;
+        r.result = r.pass ? "pass" : "allocation_created";
+        exit_code = r.pass ? 0 : 2;
+        goto destroy_context;
+    }
     if (r.last_status < 0) goto destroy_context;
 
     /* A driver without the fix accepts the present, and the guest stops a
@@ -454,15 +594,15 @@ int wmain(int argc, wchar_t **argv)
         else {
             ++r.presents_accepted;
             r.result = "present_accepted";
-            save(out, &r);
+            if (r.presents_accepted == 1) save(out, &r);
         }
     }
     /* Windows calls DxgkDdiPatch for an accepted present when it schedules
      * it. Give that time before the process says it survived. */
     pump(r.presents_accepted ? 5000 : 500);
     r.stage = "done";
-    r.pass = r.presents_failed == r.presents_asked;
-    r.result = r.pass ? "pass" : "present_accepted";
+    r.pass = (tc->outcome == PRESENT_FAILS ? r.presents_failed : r.presents_accepted) == r.presents_asked;
+    r.result = r.pass ? "pass" : r.presents_accepted ? "present_accepted" : "present_failed";
     exit_code = r.pass ? 0 : 2;
 
 destroy_context:
