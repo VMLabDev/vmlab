@@ -8,6 +8,11 @@ fn generate(source: &str) -> Result<(String, Vec<u8>)> {
     let document = parse(source)?;
     let program = vmlab_hv_tcg_ir::lower(&document.definitions)?;
     let json = serde_json::to_vec(&program)?;
+    // Writing JSON has no depth limit and reading it has one, so a deep
+    // expression would give a payload that panics in the generated `model()`.
+    // Read it the way `model()` does and refuse here instead.
+    serde_json::from_slice::<vmlab_hv_tcg_ir::Program>(&json)
+        .context("the generated crate cannot load this model IR")?;
     let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
     gzip.write_all(&json)?;
     let packed = gzip.finish()?;
