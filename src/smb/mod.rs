@@ -179,6 +179,11 @@ impl LabSmb {
         self.servers.get(vm).map(SmbServer::listen_port)
     }
 
+    #[cfg(test)]
+    pub(crate) fn kill_for_test(&mut self, vm: &str) {
+        self.servers.get_mut(vm).unwrap().kill_for_test();
+    }
+
     /// Every running server's machine and port, by machine name.
     pub fn listen_ports(&self) -> Vec<(String, u16)> {
         self.servers

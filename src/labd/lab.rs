@@ -8239,6 +8239,77 @@ lab "t" {
         crate::config::load_lab_source(src, "<test>", dir).expect("lab source")
     }
 
+    const SMB_LAB: &str = r#"import <vmlab.wcl>
+lab "t" {
+  segment "corp" { }
+  vm "web" {
+    template = "x86_64/t"
+    nic { segment = "corp" }
+    share { name = "data" host = "data" guest = "/mnt/data" transport = "smb" }
+  }
+}"#;
+
+    async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+        if ["smbd", "pdbedit"].iter().any(|bin| {
+            std::process::Command::new(bin).arg("--version").output().is_err()
+        }) {
+            eprintln!("SKIP: smbd or pdbedit not found");
+            return None;
+        }
+        std::fs::create_dir(dir.join("data")).unwrap();
+        let sh = shared(dir);
+        let mut web = Arc::into_inner(FakeMachine::new("web", MachineKind::Vm, &sh)).unwrap();
+        web.macs = vec![crate::labd::state::generate_mac("t", "web", 0)];
+        let macs = HashMap::from([("web".to_string(), web.macs.clone())]);
+        let lab = lab_of(dir, SMB_LAB, vec![Arc::new(web)]);
+        lab.network.lock().await.wire_gateways(
+            &lab.config().lab,
+            &macs,
+            &crate::config::host::HostConfig::default(),
+        );
+        *lab.doubles.lock().unwrap() = Some(Arc::new(move |cfg| {
+            FakeMachine::new(cfg.name(), MachineKind::Vm, &sh) as Arc<dyn Machine>
+        }));
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        Some(lab)
+    }
+
+    #[tokio::test]
+    async fn smb_lifecycle_reload_with_changed_shares_withdraws_gateway_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab(dir.path()).await else { return };
+        let services = lab.network.lock().await.segments["corp"].services.clone().unwrap();
+        assert_eq!(services.rules.lock().unwrap().list().len(), 1);
+        assert_eq!(services.host_service_ports().len(), 1);
+        let renamed = SMB_LAB.replace("name = \"data\"", "name = \"renamed\"");
+        lab.reload_with(edited(dir.path(), &renamed)).await.unwrap();
+        assert!(services.rules.lock().unwrap().list().is_empty());
+        assert!(services.host_service_ports().is_empty());
+    }
+
+    #[tokio::test]
+    async fn smb_lifecycle_ensure_shares_restarts_a_killed_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab(dir.path()).await else { return };
+        let old_port = {
+            let mut smb = lab.smb.lock().await;
+            let smb = smb.as_mut().unwrap();
+            let port = smb.listen_port("web").unwrap();
+            smb.kill_for_test("web");
+            port
+        };
+        let unrelated = std::net::TcpListener::bind(([127, 0, 0, 1], old_port)).unwrap();
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        let new_port = lab.smb.lock().await.as_ref().unwrap().listen_port("web").unwrap();
+        assert_ne!(new_port, unrelated.local_addr().unwrap().port());
+        std::net::TcpStream::connect(([127, 0, 0, 1], new_port)).unwrap();
+        let services = lab.network.lock().await.segments["corp"].services.clone().unwrap();
+        let rules = services.rules.lock().unwrap().list();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].to.as_deref(), Some(format!("127.0.0.1:{new_port}").as_str()));
+        assert_eq!(services.host_service_ports(), vec![new_port]);
+    }
+
     fn same(a: &Arc<dyn Machine>, b: &Arc<dyn Machine>) -> bool {
         std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
     }
