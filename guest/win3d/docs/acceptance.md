@@ -1150,6 +1150,12 @@ The 0.1.0-alpha NVIDIA evidence (vmlab 0.27 and 0.28, package built at
 [08ff884](https://github.com/VMLabDev/vmlab-win3d/commit/08ff8848dea6defa961a994cbfc7fed8a6d70656) and [99ad0c1](https://github.com/VMLabDev/vmlab-win3d/commit/99ad0c1faee68358bd423fa06548596989f1623c), the stock-QEMU Nvidia2 run with its black
 console) is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/commit/82d8e510c18cf4eaad92bef85ec1ccf14fdd0e75).
 
+## Kernel driver review
+
+[C752](acceptance/C752.md) records the fix of finding F4 of the win3d driver
+review, the command size of the submit escape that wrapped in 32 bits, with
+the guest proof before and after and the end-to-end run on the fixed driver.
+
 ## Evidence index
 
 Every directory under [docs/evidence/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/). "Historical" marks evidence from the
