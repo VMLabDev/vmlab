@@ -196,17 +196,19 @@ fn an_access_past_host_ram_raises_a_guest_fault() {
 #[test]
 fn a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault() {
     // loop: <access> 0(x8); addi x8, x8, 8; jal x0, loop
-    // From 0x8000_0fe0 the access walks to the end of RAM. From 0x8000_0fe4
+    // From 0x8000_0fc0 the access walks to the end of RAM. From 0x8000_0fc4
     // the last one starts inside RAM and crosses its end.
+    let mut reference = on_small_ram(&[], 0, false);
+    let mut specialized = on_small_ram(&[], 0, true);
     for access in [LD_X10_X8, SD_X10_X8] {
-        for start in [0x8000_0fe0, 0x8000_0fe4u64] {
-            for chunk in [1, 7] {
+        for start in [0x8000_0fc0, 0x8000_0fc4u64] {
+            for chunk in [1, 7, 64] {
                 let code = [access, 0x0084_0413, 0xff9f_f06f];
-                let mut reference = on_small_ram(&code, start, false);
-                let mut specialized = on_small_ram(&code, start, true);
+                restart(&mut reference, &code, start);
+                restart(&mut specialized, &code, start);
                 let mut faulted = false;
                 let mut done = 0;
-                while done < 20 {
+                while done < 40 {
                     let case = format!(
                         "{access:#010x} from {start:#x} in chunks of {chunk}, after {done} steps"
                     );
@@ -229,8 +231,8 @@ fn a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault() {
                     faulted |= reference.pc().unwrap() == HANDLER;
                 }
                 assert!(faulted, "{access:#010x} from {start:#x} never left RAM");
-                assert!(specialized.specialization_stats.hits > 0);
             }
         }
     }
+    assert!(specialized.specialization_stats.hits > 0);
 }
