@@ -245,7 +245,9 @@ beyond the single random words of the first differential run, and
   aborted with a stack overflow in its own process, because dropping the
   parsed tree is recursive too. A second test,
   `the_depth_limit_counts_nesting_and_suffixes_together`, holds the bound at
-  its edge for three shapes. The committed model parses unchanged.
+  its edge for three shapes. The committed model is far below the bound:
+  all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
+  generated again for this card.
 
 ### F6. The emitter writes a model that the generated crate cannot load
 
