@@ -526,7 +526,7 @@ A variant's overlay holds only its delta from the base. The backing path is rela
 
 `up`, `pull`, `vm start`/`restart` and their container spellings print one line per machine rebuilt, added, dropped or left pending. Quietly running an old declaration is still the failure this rule exists to prevent: every machine is either on the file as it is on disk now or named as pending. A download in flight for a machine the reload would rebuild makes that machine pending too. `vmlab validate` always reads the file afresh in the CLI and needs no daemon.
 
-**A clone cannot change template.** A linked clone is an overlay on the template image it was made from, so the template reference it was cloned from is recorded beside it (`.vmlab/vms/<vm>/clone-source`). When the lab file names a different template (compared as written: an unpinned `<arch>/<name>` keeps its clone across newer builds of that template; a changed reference, version pin, `#<variant>`, registry arch, or a switch to or from `scratch` does not) while the clone exists, `up` refuses before downloading or starting anything and `vm start` refuses to boot it; neither boots the old template nor deletes the clone. The refusal names both references and the way forward: `vmlab vm destroy <vm>` (or `vmlab destroy`), or putting the template line back. A container's `image =` line is not a clone and keeps its §18 rule: editing it clears the pin.
+**A clone cannot change template.** A linked clone is an overlay on the template image it was made from, so the template reference it was cloned from is recorded beside it (`.vmlab/vms/<vm>/clone-source`). When the lab file names a different template (compared as written: an unpinned `<arch>/<name>` keeps its clone across newer builds of that template; a changed reference, version pin, `#<variant>`, registry arch, or a switch to or from `scratch` does not) while the clone exists, `up` refuses before downloading or starting anything and `vm start` refuses to boot it; neither boots the old template nor deletes the clone. The refusal names both references and the way forward: `vmlab vm destroy <vm>` (or `vmlab destroy`), or putting the template line back. A container's `image =` line is not a clone and keeps its §18 rule: editing it clears the pin, and a writable layer made over another image is refused the same way.
 
 ### 7.2 Power operations
 
@@ -1113,7 +1113,19 @@ restarts while the lab daemon runs, shown by `vmlab status`.
 **Lifecycle.** Image references resolve like registry templates (§6.4): the
 digest resolved at first pull is pinned in lab state and never re-pulled
 implicitly; `vmlab container destroy` (or editing the `image =` line) clears
-the pin. The supervisor pre-pulls images with `container.pull.*` progress
+the pin. **A writable layer cannot change image.** The scratch qcow2 is an
+overlayfs upper layer, valid only over the rootfs it was made on, so the
+manifest digest it was made over is recorded beside it
+(`.vmlab/containers/<name>/scratch-image`). When the pinned digest differs
+while the layer exists (an edited `image =` line, or a tag pulled again to
+another digest), `up` and `container start` refuse to boot it. `up` refuses
+before starting anything when the new image is already cached, and at that
+container's start when it had to be pulled first. Neither boots the old
+layer over the new image nor deletes it. The refusal names both digests, the
+declared reference and the way forward: `vmlab container destroy <name>` (or
+`vmlab destroy`), or putting the image line back. A layer made before the
+record existed is taken to be of the image pinned at its next start. The
+supervisor pre-pulls images with `container.pull.*` progress
 events before spawning the lab daemon. Readiness is two-stage — process
 started, then the first passing healthcheck (when declared) — and gates
 `depends_on` waves. Events `container.starting/ready/stopped/crashed/unhealthy`

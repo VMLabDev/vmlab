@@ -38,9 +38,9 @@ be dropped.
 | F4 | security | One `smb1` share relaxes every share, and SMB1 clients can plant symlinks to any host path (fixed, card #610) |
 | F5 | security | Any guest can change the lab's SMB password over RPC and lock the other guests out (fixed, card #609) |
 | F6 | wrong result | A `%` in a share's host path is expanded by Samba, so the share serves another directory |
-| F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops |
+| F7 | wrong result | The gateway redirect and the exposed loopback port stay after `smbd` stops (fixed, card #776) |
 | F8 | wrong result | The start check takes any listener on the port for the lab's `smbd` |
-| F9 | wrong result | Nothing notices that `smbd` died, and nothing starts it again |
+| F9 | wrong result | Nothing notices that `smbd` died, and nothing starts it again (fixed, card #776) |
 | F10 | wrong result | A credential file that cannot be parsed gives a new password at every start |
 | F11 | cosmetic | Files a guest creates are executable on the host |
 

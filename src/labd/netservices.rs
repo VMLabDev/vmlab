@@ -262,6 +262,15 @@ impl SegmentServices {
         }
     }
 
+    pub fn withdraw_host_service(&self, port: u16) {
+        self.host_services.lock_recover().retain(|&p| p != port);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_service_ports(&self) -> Vec<u16> {
+        self.host_services.lock_recover().clone()
+    }
+
     /// Prime the NAT engine's IP → MAC table. Forwards to a guest that has
     /// never originated egress would otherwise send the SYN in a broadcast
     /// frame — which the guest's TCP stack discards (`pkt_type != HOST`).

@@ -195,6 +195,17 @@ impl SmbServer {
         self.config.listen_port
     }
 
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().map_or(Ok(None), Child::try_wait)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kill_for_test(&mut self) {
+        let child = self.child.as_mut().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     /// Kill the `smbd` child and reap it, then remove its socket directory
     /// from the runtime dir — nothing in it outlives the process.
     pub fn stop(&mut self) {

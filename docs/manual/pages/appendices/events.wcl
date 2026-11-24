@@ -134,7 +134,8 @@ SRC
     rows:
       | "Event" | "Payload fields" | "When" |
       | "`smb.started`" | "`machine`, `port`" | "The bundled smbd of that machine came up on that host port for the machine's shares. One event per machine that shares over SMB." |
-      | "`smb.failed`" | "`error`" | "The share plan could not be computed, or the smbd of a machine failed to start on every candidate port; no machine's shares are served then. A start failure carries smbd's own reason, which its log usually lacks." |
+      | "`smb.exited`" | "`machine`, `status`" | "A machine's smbd exited unexpectedly and its gateway redirect and host port access were withdrawn. The next share startup attempts to restart the server." |
+      | "`smb.failed`" | "`error`, optional `machine`" | "Initial share setup failed, or a machine's server could not be restarted. On a restart failure, the payload names the machine and other share servers keep running." |
       | "`forward.installed`" | "`what`, `bind`, `host_port`, `auto`, `declared_port`, `guest`" | "A forward is listening on that host address (`bind`, `0.0.0.0` for every interface) and port, the one bound (vmlab's pick when `auto` is true), and leads to `guest` (`ip:port`). `declared_port` is the fixed port the lab file or script declared when a [worktree lab's port slot](guide_worktrees) shifted it, and `null` otherwise. Emitted again each time it is re-installed: at readiness, at the end of `up`, and after a restart changes the lease." |
       | "`forward.skipped`" | "`what`, `reason`" | "The forward plan dropped a declared forward, or installing one failed at runtime." |
       | "`forward.conflict`" | "`host_port`, `claimants`" | "Two declarations claim the same host port." |

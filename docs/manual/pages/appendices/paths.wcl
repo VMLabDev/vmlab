@@ -109,7 +109,7 @@ page ref_paths {
       | "Path under `.vmlab/`" | "Holds" |
       | "`state.json`" | "Persisted lab state: snapshot records, pinned artefacts, agent repairs." |
       | "`vms/<vm>/`" | "`disk0.qcow2`, the linked clone; `OVMF_VARS.fd`; `OVMF_VARS.boot`, whether that store's last start had secure boot; `tpm-state/`; `tsc-hz`, the TSC frequency a `tsc = \"host\"` VM was pinned at its first start; `firstboot.done` once the first-boot provision has run." |
-      | "`containers/<name>/`" | "`scratch.qcow2`, the writable overlay, and `container.json`." |
+      | "`containers/<name>/`" | "`scratch.qcow2`, the writable overlay, `scratch-image`, the digest of the image it was made over, and `container.json`." |
       | "`media/`" | "ISO and floppy images built from `media {}` folders, content-addressed. See [Lab file: vm and its children](ref_vm)." |
       | "`volumes/`" | "Named container volumes." |
       | "`smb/`" | "The bundled smbd's configuration, passdb, log and persistent state; its sockets live under the runtime root's `smb/<hash>/`. See [Shared folders](guide_shares)." |
