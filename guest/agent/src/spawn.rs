@@ -280,6 +280,7 @@ fn render_command_line(argv: &[String], quote_all: bool) -> String {
 pub fn piped_command(
     spec: ProcessSpec,
     prepare: impl FnOnce(&mut Command),
+    #[cfg(unix)] pam_wrapper: bool,
 ) -> std::io::Result<Spawned> {
     if spec.argv.is_empty() {
         return Err(std::io::Error::new(
@@ -292,6 +293,11 @@ pub fn piped_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -308,22 +314,32 @@ pub fn piped_command(
     let input = child.stdin.take().expect("piped stdin");
     let output = child.stdout.take().expect("piped stdout");
     let errors = child.stderr.take().expect("piped stderr");
-    // The kill hook is resolved now, while the child cannot have been
-    // reaped, so it never reaches a later holder of the pid.
-    let kill = crate::platform::process_killer(child.id());
+    #[cfg(unix)]
+    let group = std::sync::Arc::new(crate::platform_impl::ExecGroup::new(
+        child.id(),
+        pam_wrapper,
+    ));
+    #[cfg(unix)]
+    let kill_group = group.clone();
     Ok(Spawned {
         input: Box::new(input),
         output: Box::new(output),
         errors: Some(Box::new(errors)),
         resize: None,
-        kill,
-        wait: Box::new(move || match child.wait() {
-            Ok(status) => exit_code(status),
-            Err(_) => 127,
-        }),
+        #[cfg(unix)]
+        kill: Box::new(move || kill_group.kill()),
+        #[cfg(windows)]
+        kill: crate::platform_impl::process_killer(child.id()),
+        #[cfg(unix)]
+        wait: Box::new(move || group.wait(child)),
+        #[cfg(windows)]
+        wait: Box::new(move || wait_for_exit(child)),
     })
 }
 
+pub(crate) fn wait_for_exit(mut child: std::process::Child) -> i32 {
+    child.wait().map_or(127, exit_code)
+}
 #[cfg(unix)]
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
