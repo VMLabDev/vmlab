@@ -1925,6 +1925,36 @@ mod tests {
     }
 
     #[test]
+    fn transmit_chains_complete_with_zero_used_length() {
+        let mut f = Fixture::new();
+        let mut client = UnixStream::connect(&f.ctl_sock).unwrap();
+        f.device_ready(8, 5);
+        assert!(
+            f.ctrl_delivered()
+                .contains(&(1, EV_PORT_OPEN, 1, Vec::new()))
+        );
+
+        let addr = f.data(1);
+        f.mem.write_slice(b"hello ctl", GuestAddress(addr)).unwrap();
+        f.vqs[5].add_chain(&f.mem, &[(addr, 9, false)]);
+        f.dev.queue_notify(5);
+        let mut got = [0u8; 9];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello ctl");
+        let sent = f.vqs[3].used_idx(&f.mem);
+        f.send_ctrl(1, EV_PORT_OPEN, 1);
+        // No deadline: the worker returns both chains, and a lost one shows
+        // as a hung test rather than a timing failure.
+        while f.vqs[5].used_idx(&f.mem) != 1 || f.vqs[3].used_idx(&f.mem) != sent + 1 {
+            thread::yield_now();
+        }
+        // The used length counts bytes the device wrote: none, on a
+        // transmit chain and on a control transmit chain.
+        assert_eq!(f.vqs[5].used_entry(&f.mem, 0).1, 0);
+        assert_eq!(f.vqs[3].used_entry(&f.mem, sent).1, 0);
+    }
+
+    #[test]
     fn host_input_waits_until_the_guest_opens_the_port() {
         let mut f = Fixture::new();
         let mut client = UnixStream::connect(&f.ctl_sock).unwrap();
