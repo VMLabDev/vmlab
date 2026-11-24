@@ -468,9 +468,17 @@ impl vmlab_hv_devices::virtio::gpu::DisplaySink for GpuSink {
     }
 }
 
+/// The pointer state the clients asked for, and whether the tablet still
+/// has to be told of it.
+#[derive(Default)]
+struct Pointer {
+    event: vmlab_hv_devices::usb::PointerEvent,
+    unsent: bool,
+}
+
 struct Input {
     shared: Weak<VmShared>,
-    pointer: Mutex<vmlab_hv_devices::usb::PointerEvent>,
+    pointer: Mutex<Pointer>,
     pointer_warning: Mutex<Option<std::time::Instant>>,
 }
 
@@ -517,9 +525,39 @@ struct InputDevices<'a> {
 }
 
 impl Input {
+    /// Offer the pointer state to the tablet once. This never waits: keys and
+    /// every client's reader share the one worker that calls it. A tablet
+    /// whose report queue is full gets the state again with the next input
+    /// message, so the position and the buttons catch up once the guest
+    /// reads. The wheel steps and button changes in between are lost.
+    fn report_pointer(&self, pointer: &mut Pointer, devices: &InputDevices) {
+        pointer.unsent = false;
+        if (devices.exited)() {
+            return;
+        }
+        let result = match (&devices.xhci, &devices.uhci) {
+            (Some(xhci), _) => xhci.lock().inject_pointer(pointer.event),
+            (None, Some(uhci)) => uhci.lock().inject_pointer(pointer.event),
+            (None, None) => return,
+        };
+        if let Err(error) = result {
+            pointer.unsent = matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock);
+            self.pointer_warning(&error);
+        }
+    }
+
     fn deliver(&self, message: Message, devices: &InputDevices) {
         match message {
             Message::Key { qcode, down } => {
+                {
+                    // A click the tablet refused goes in ahead of the key
+                    // when there is room now.
+                    let mut pointer = self.pointer.lock();
+                    if pointer.unsent {
+                        pointer.event.wheel = 0;
+                        self.report_pointer(&mut pointer, devices);
+                    }
+                }
                 if let Some(xhci) = &devices.xhci {
                     let mut xhci = xhci.lock();
                     if xhci.has_keyboard() {
@@ -539,30 +577,8 @@ impl Input {
             | Message::Buttons { .. }
             | Message::Scroll { .. }) => {
                 let mut pointer = self.pointer.lock();
-                pointer_message(&mut pointer, message);
-                loop {
-                    if (devices.exited)() {
-                        break;
-                    }
-                    let result = match (&devices.xhci, &devices.uhci) {
-                        (Some(xhci), _) => xhci.lock().inject_pointer(*pointer),
-                        (None, Some(uhci)) => uhci.lock().inject_pointer(*pointer),
-                        (None, None) => break,
-                    };
-                    match result {
-                        Ok(()) => break,
-                        Err(error @ vmlab_hv_devices::DeviceError::Io(_)) if matches!(&error, vmlab_hv_devices::DeviceError::Io(error) if error.kind() == io::ErrorKind::WouldBlock) =>
-                        {
-                            self.pointer_warning(&error);
-                            // Release all controller locks while the guest drains reports.
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                        Err(error) => {
-                            self.pointer_warning(&error);
-                            break;
-                        }
-                    }
-                }
+                pointer_message(&mut pointer.event, message);
+                self.report_pointer(&mut pointer, devices);
             }
             _ => {}
         }
@@ -656,12 +672,7 @@ pub(crate) fn serve(shared: &Arc<VmShared>, native: &Path, rfb: &Path) -> Result
             selected,
             Arc::new(Input {
                 shared: Arc::downgrade(shared),
-                pointer: Mutex::new(vmlab_hv_devices::usb::PointerEvent {
-                    x: 0,
-                    y: 0,
-                    buttons: 0,
-                    wheel: 0,
-                }),
+                pointer: Mutex::new(Pointer::default()),
                 pointer_warning: Mutex::new(None),
             }),
         )
@@ -1277,10 +1288,12 @@ mod tests {
         let _ = worker.join().unwrap();
 
         // No guest read a report, so the queue is still full.
-        let full = xhci.lock().inject_pointer(vmlab_hv_devices::usb::PointerEvent {
-            wheel: 1,
-            ..Default::default()
-        });
+        let full = xhci
+            .lock()
+            .inject_pointer(vmlab_hv_devices::usb::PointerEvent {
+                wheel: 1,
+                ..Default::default()
+            });
         assert!(
             matches!(&full, Err(DeviceError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock),
             "the tablet queue is not full: {full:?}"
