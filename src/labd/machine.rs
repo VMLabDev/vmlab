@@ -331,8 +331,8 @@ pub trait Machine: Send + Sync + 'static {
     /// Refuse when the disks this machine already has cannot boot under its
     /// declaration — a VM's clone of a template the lab file no longer names
     /// (§7.1). `up` asks every target before anything downloads or boots, so
-    /// the refusal is the whole of what it did. A container has no such rule
-    /// (an edited `image =` line just drops its pin, §18), hence the default.
+    /// the refusal is the whole of what it did. A container refuses a writable
+    /// layer made over another image than the one pinned now (§18).
     fn check_disks(&self) -> Result<()> {
         Ok(())
     }

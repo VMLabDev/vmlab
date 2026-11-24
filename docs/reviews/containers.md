@@ -81,7 +81,7 @@ Not read:
 |---|----------|---------|
 | F1 | security (peer) | A port forward and the NAT engine's MAC binding follow the address the guest claims, so a container takes over another machine's forwards (fixed, card #614) |
 | F2 | crash (hang) | A ctl write has no timeout, so a micro-VM that stops reading its ctl port hangs the stop of that machine (fixed, card #642) |
-| F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image |
+| F3 | wrong result | Changing `image =` keeps the old image's writable layer over the new image (fixed, card #777) |
 | F4 | wrong result, security | The console log grows without bound and `logs` reads all of it, and fails on one byte that is not UTF-8 (fixed, card #643) |
 | F5 | wrong result | A start that fails on its second virtiofsd leaves the first one running |
 | F6 | wrong result | An image `StopSignal` of a real-time signal powers the micro-VM off before the workload starts |
@@ -220,6 +220,20 @@ Not read:
   `a_changed_image_does_not_reuse_the_old_scratch_layer`. Assert that the
   start either made a new scratch disk or refused with a message naming the
   change. Today the marker survives.
+- Fixed in card #777, by refusing, as a VM's clone of another template is
+  refused (PRD §7.1). The start writes the manifest digest the scratch layer
+  was made over to `.vmlab/containers/<name>/scratch-image`
+  (`ContainerDirs::scratch_image`). `ContainerInstance::check_scratch_image`
+  compares it with the pinned digest and refuses when they differ. The
+  message names both digests, the declared reference and the way forward:
+  `vmlab container destroy <name>`, or putting the image line back. It runs
+  in every start, and in `up` before anything starts (`Machine::check_disks`)
+  when the new image is cached by then. The layer and its snapshots are kept.
+  Proof: `a_changed_image_does_not_reuse_the_old_scratch_layer` in
+  `src/labd/lifecycle_tests.rs`. Before the fix the start succeeded on the
+  old layer. Not covered: a layer made before the record existed is taken to
+  be of the image pinned at its next start, so an image changed in the same
+  step as the vmlab upgrade is not caught.
 
 ### F4. The console log grows without bound, and `logs` reads all of it (wrong result, security)
 

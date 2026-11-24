@@ -88,6 +88,18 @@ endef
 
 $(foreach a,$(ARCHES),$(eval $(call capset_rules,$(a))))
 
+# Explicit test-only target, like tdr: a present of a blob that cannot be
+# mapped (card #756). Run it in a disposable VM.
+present: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/present_probe.exe)
+
+define present_rules
+$(OUT)-extra/$(1)/present_probe.exe: present/present_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$< -luser32 -lgdi32
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call present_rules,$(a))))
+
 # Explicit test-only target, like tdr: the requests of card #757 to
 # D3DKMTCreateAllocation. A driver without the fix can bugcheck the guest.
 alloc: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/alloc_probe.exe)
@@ -148,3 +160,4 @@ clean:
 .PHONY: all clean tdr capset
 .PHONY: submit alloc pipe
 .PHONY: scanout
+.PHONY: present

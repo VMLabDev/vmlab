@@ -148,7 +148,11 @@ resolution with a warning.
 The digest resolved at first pull is pinned in the lab's state and never
 re-pulled implicitly, so an `nginx:1.27` that moves upstream does not change
 under a running lab. `vmlab container destroy`, or editing the `image =` line,
-clears the pin; the next `up` resolves afresh. Every snapshot records the pin it
+clears the pin; the next `up` resolves afresh. The writable layer does not move
+with the pin: vmlab records the digest it was made over in
+`.vmlab/containers/<name>/scratch-image` and refuses to start a container whose
+layer was made over another digest. `vmlab container destroy <name>` discards
+the layer and its snapshots, or put the image line back. Every snapshot records the pin it
 was taken against, because a scratch overlay means nothing without the same
 read-only root, and a restore under a different pin fails, naming both digests.
 
