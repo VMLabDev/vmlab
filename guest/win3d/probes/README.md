@@ -248,12 +248,9 @@ as a new standard user, and records a bugcheck of the guest
 
 `present_probe.exe` is not a rendering probe either. It presents a blob
 allocation with a Blt to a window of its own, in a Venus context of the
-kernel driver: card #756, finding F8 of
-[`docs/reviews/win3d-driver.md`](../../../docs/reviews/win3d-driver.md).
-A driver without `patches/kmd/kmd-map-present-source-in-present.patch`
-accepts the present of a blob that has no mappable flag and bugchecks the
-guest with `0x119` a moment later, so run it in a disposable VM. Build it
-with:
+kernel driver, as a windowed Direct3D 9 program does: card #756, finding F8
+of [`docs/reviews/win3d-driver.md`](../../../docs/reviews/win3d-driver.md).
+Build it with:
 
 ```sh
 build/probes/build.sh present
@@ -263,39 +260,56 @@ The executables are `out/probes-extra/x64/present_probe.exe` and
 `out/probes-extra/x86/present_probe.exe`.
 
 ```text
-present_probe.exe --case NAME [--count N] [--out FILE]
+present_probe.exe --case NAME [--count N] [--backlog N] [--out FILE]
 ```
 
 It accepts only one PCI adapter with vendor `1af4` and device `1050`, makes
 a device, a Venus host context (`VIOGPU_CTX_INIT` with capset 4) and a
-context, and creates one allocation of 64 by 64 pixels with
-`D3DKMTCreateAllocation`. The private data of the allocation names host
-memory (`BlobMem` 2), a blob id and the blob flags. It then calls
-`D3DKMTPresent` N times (default 1) with `Blt`, that allocation as the
-source and its window as the destination.
+context, and creates a resource with one allocation of 256 by 256 pixels
+with `D3DKMTCreateAllocation`. The private data of the allocation names
+host memory (`BlobMem` 2), a blob id and the blob flags. It asks for the
+residency of the allocation (`D3DKMTMakeResident`), waits for the paging
+fence, and calls `D3DKMTPresent` N times (default 1) with that allocation
+as the source, its window, no destination, and the flags `Blt`,
+`PresentCountValid` and `RedirectedBlt`. Windows then makes the surface of
+the window the destination and calls `DxgkDdiPresent`.
 
 | Case | Blob id | `BlobFlags` | A fixed driver |
 | --- | --- | --- | --- |
 | `unknown-blob` | One that the host does not know | 1 (mappable) | `D3DKMTCreateAllocation` fails: the driver creates the blob when the allocation is opened. The same without the fix |
 | `mappable` | 0, shared memory of the Venus context | 1 | Every present is accepted and the guest stays up. The same without the fix |
-| `not-mappable` | Device memory of the host's Vulkan driver | 0 | Every present fails. Without the fix: bugcheck `0x119` |
-| `shareable` | The same | 2 (shareable) | Every present fails. Without the fix: bugcheck `0x119` |
+| `not-mappable` | Device memory of the host's Vulkan driver | 0 | The driver refuses every present: `D3DKMTPresent` returns `0xC01E0006` |
+| `shareable` | The same | 2 (shareable) | The same |
 
 For the last two cases the host must know the blob id, so the probe first
 sends four Venus commands through the `VIOGPU_SUBMIT_CMD` escape:
 `vkCreateInstance`, `vkEnumeratePhysicalDevices`, `vkCreateDevice` and
-`vkAllocateMemory` of 64 KiB of memory type 0 with dma-buf export. It
+`vkAllocateMemory` of 1 MiB of memory type 0 with dma-buf export. It
 writes the wire format itself and asks for no reply.
+
+`--backlog N` is the state of the finding. The probe puts N allocations of
+guest memory, 16 MiB each, on the paging queue in front of the source and
+does not wait, so the source is not resident yet when the present comes.
+A driver without `patches/kmd/kmd-map-present-source-in-present.patch`
+accepts that present of `not-mappable` and `shareable` and leaves the
+mapping to `DxgkDdiPatch`. Windows 11 (26100) stops the DMA buffer before
+it calls `DxgkDdiPatch`: `D3DKMTPresent` returns `0xC01E0200`, and the case
+fails with the result `accepted_by_driver_stopped_by_windows`. A fixed
+driver refuses in `DxgkDdiPresent` (`0xC01E0006`). With `--backlog` the
+case `mappable` passes when Windows refuses the present. Run the probe in a
+disposable VM: a Windows that calls `DxgkDdiPatch` for such a buffer would
+bugcheck with `0x119` on a driver without the fix.
 
 The window needs a surface, so the probe runs in the desktop session, not
 in session 0. It writes one JSON object to stdout and to `--out`. Before the
-first present it flushes a record with `result` `present_pending`, and after
-the first accepted present one with `present_accepted`, so a bugcheck leaves
-the state on disk. `pass` says whether the driver did what the table says.
-Exit 0 is a pass, 2 another outcome that the guest survived, 1 an API or
-adapter error, 3 a usage error.
+residency request it flushes a record with `result` `present_pending`, and
+after the first accepted present one with `present_accepted`, so a bugcheck
+leaves the state on disk. `pass` says whether the driver did what the table
+says. Exit 0 is a pass, 2 another outcome that the guest survived, 1 an API
+or adapter error, 3 a usage error.
 
 `tests/kmd/present-probe.sh <lab-dir> <vm> <out-dir>` runs the four cases
 in a VM as the standard user of the test desktop, through
-`tests/guest/Run-Probe.ps1`, and records a bugcheck of the guest
+`tests/guest/Run-Probe.ps1`, and records a bugcheck of the guest.
+`PRESENT_BACKLOG=8` in its environment adds `--backlog 8`
 ([`docs/acceptance/C756.md`](../docs/acceptance/C756.md)).

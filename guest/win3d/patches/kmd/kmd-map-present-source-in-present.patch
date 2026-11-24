@@ -3,13 +3,19 @@ Subject: [PATCH] viogpu3d: map the source of a present copy in Present, and neve
 In a Venus context the driver copies a Blt present from a blob into a GDI
 surface. The mapping of the two surfaces was made in Present only when
 both allocations were resident or mapped already. Otherwise it was left to
-Patch, and Windows answers a failure of DxgkDdiPatch with bugcheck 0x119.
+Patch, which has no way to refuse one present: upstream's comment there
+says that Windows answers a failure of DxgkDdiPatch with bugcheck 0x119.
 
 Whether the source blob maps is decided by the private data of
 D3DKMTCreateAllocation, which the calling program writes: a blob without
-VIRTGPU_BLOB_FLAG_USE_MAPPABLE, a blob id the host does not know, a size
-the shared memory does not hold. A first present of such an allocation is
-not resident, so a standard user could stop the guest with one call.
+VIRTGPU_BLOB_FLAG_USE_MAPPABLE, a size the shared memory does not hold. So
+a standard user can have the driver accept a present that it cannot carry
+out: an allocation of Venus device memory with BlobFlags 0, presented
+while Windows still pages it in. On Windows 11 (26100) the scheduler stops
+that DMA buffer before it calls DxgkDdiPatch ("allocation has not been
+fully committed prior to being scheduled") and puts the device of the
+program into its error state, so the guest stays up. The driver must not
+depend on that.
 
 Three changes:
 
@@ -34,20 +40,21 @@ has the proof.
 ---
 diff --git a/viogpu/viogpu3d/viogpu_blt_map.h b/viogpu/viogpu3d/viogpu_blt_map.h
 new file mode 100644
-index 0000000..82144ac
+index 0000000..c38962c
 --- /dev/null
 +++ b/viogpu/viogpu3d/viogpu_blt_map.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +/*
 + * Where the copy of a Blt present gets its mappings.
 + *
 + * In a Venus context the driver copies a Blt present from a blob (a Venus
 + * image) into a GDI surface or another blob. The copy needs a kernel
 + * mapping of both. Present can refuse the call when a mapping fails.
-+ * Patch cannot: Windows answers a failure of DxgkDdiPatch with bugcheck
-+ * 0x119. Whether a blob can be mapped depends on values that the calling
-+ * program wrote into the private data of D3DKMTCreateAllocation (BlobMem,
-+ * BlobFlags, BlobId, Size), so no mapping of a blob may wait for Patch.
++ * Patch cannot: it has no status that Windows takes for "refuse this one
++ * present". Whether a blob can be mapped depends on values that the
++ * calling program wrote into the private data of D3DKMTCreateAllocation
++ * (BlobMem, BlobFlags, BlobId, Size), so no mapping of a blob may wait for
++ * Patch.
 + *
 + * This header includes nothing and uses no kernel type, so that a test
 + * program on the build host can compile it.
@@ -84,7 +91,7 @@ index 0000000..82144ac
 +    return (dst_is_blob || both_resident || both_mapped) ? VIOGPU_BLT_PRESENT_MAP_BOTH : VIOGPU_BLT_PRESENT_MAP_SOURCE;
 +}
 diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
-index 43d25b0..ce7bf0b 100644
+index 43d25b0..1771627 100644
 --- a/viogpu/viogpu3d/viogpu_command.cpp
 +++ b/viogpu/viogpu3d/viogpu_command.cpp
 @@ -7,6 +7,7 @@
@@ -132,7 +139,7 @@ index 43d25b0..ce7bf0b 100644
  }
  
  NTSTATUS VioGpuCommand::SetCpuCopyBlt(VioGpuAllocation *src,
-@@ -407,6 +401,42 @@ NTSTATUS VioGpuCommand::SetCpuCopyBlt(VioGpuAllocation *src,
+@@ -407,6 +401,41 @@ NTSTATUS VioGpuCommand::SetCpuCopyBlt(VioGpuAllocation *src,
      return STATUS_SUCCESS;
  }
  
@@ -140,9 +147,8 @@ index 43d25b0..ce7bf0b 100644
 +// The source is a blob, and what decides whether a blob maps is what the
 +// calling program wrote into the private data of its allocation: the blob
 +// flags, a blob id the host may not know, a size the shared memory may not
-+// hold. A failure here fails that one Present. The same failure in Patch
-+// is bugcheck 0x119. The mapping stays with the allocation, so Patch finds
-+// it made.
++// hold. A failure here fails that one Present, and Patch has no way to
++// refuse. The mapping stays with the allocation, so Patch finds it made.
 +NTSTATUS VioGpuCommand::MapCpuCopyBltSource(ULONG ctx_id)
 +{
 +    if (!m_cpuCopyBlt)
@@ -175,7 +181,7 @@ index 43d25b0..ce7bf0b 100644
  NTSTATUS VioGpuCommand::MapCpuCopyBlt(ULONG ctx_id)
  {
      if (!m_cpuCopyBlt)
-@@ -1421,16 +1451,20 @@ NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
+@@ -1421,16 +1450,20 @@ NTSTATUS VioGpuCommander::Patch(const DXGKARG_PATCH *pPatch)
      if (status != STATUS_NOT_FOUND && !NT_SUCCESS(status))
      {
          DbgPrint(TRACE_LEVEL_ERROR,
@@ -190,14 +196,14 @@ index 43d25b0..ce7bf0b 100644
 -        // Fail closed: this is not recoverable error reporting, and success
 -        // would retire an invalid CPU BLT as a successful NOP.
 -        return status;
-+        // WDDM treats any Patch failure as fatal (bugcheck 0x119/3), so
-+        // Patch does not fail. Present has mapped the source blob, and
-+        // refused the call when that failed. What can still fail here is
-+        // a mapping that was lost since (a device reset between Present
-+        // and Patch) or a destination without backing. MapCpuCopyBlt left
-+        // the command without mappings: Run() then skips the copy, logs
-+        // it, and retires the DMA buffer as the NOP it holds. One frame
-+        // of one window is not copied.
++        // Patch does not fail: upstream found that WDDM treats a Patch
++        // failure as fatal (bugcheck 0x119/3). Present has mapped the
++        // source blob, and refused the call when that failed. What can
++        // still fail here is a mapping that was lost since (a device reset
++        // between Present and Patch) or a destination without backing.
++        // MapCpuCopyBlt left the command without mappings: Run() then
++        // skips the copy, logs it, and retires the DMA buffer as the NOP
++        // it holds. One frame of one window is not copied.
      }
  
      return STATUS_SUCCESS;

@@ -71,7 +71,7 @@ endef
 $(foreach a,$(ARCHES),$(eval $(call capset_rules,$(a))))
 
 # Explicit test-only target, like tdr: a present of a blob that cannot be
-# mapped (card #756). A driver without the fix bugchecks the guest.
+# mapped (card #756). Run it in a disposable VM.
 present: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/present_probe.exe)
 
 define present_rules
