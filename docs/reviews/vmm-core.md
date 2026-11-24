@@ -86,8 +86,9 @@ and the IDE, AHCI and USB devices on the same buses.
 - Confidence: high for the code. Whether the allocation aborts or is
   granted lazily depends on the host's overcommit setting. The overflow and
   the `decode_msrs` path do not.
-- Fixed by card #612. `decode_ram_regions` refuses a region count that the
-  rest of the stream cannot hold, a region that ends past the address space,
+- Fixed by card #612 (`4d010783`). `decode_ram_regions` refuses a region count
+  that the rest of the stream cannot hold, a region that ends past the address
+  space,
   and a run that overflows or passes the end of its region. It refuses the
   run before it writes the pages. `decode_msrs` refuses a count that is not
   the section's length in 12-byte entries. `restore` bounds the snapshot
@@ -126,8 +127,9 @@ and the IDE, AHCI and USB devices on the same buses.
   Assert `restore_state` returns `Err`. Today it returns `Ok`, and the next
   `dma_ready()` or `io_read(5)` panics.
 - Confidence: high.
-- Fixed by card #612. `data_operation` is the one table from an opcode to
-  its operation. `execute` starts a command by it, and `restore_state`
+- Fixed by card #612 (`4d010783`). `data_operation` is the one table from an
+  opcode to its operation. `execute` starts a command by it, and
+  `restore_state`
   refuses a saved command whose operation is not the one its opcode starts.
   A sector in the PIO buffer is accepted only for a read, a write or a
   verify on a drive that holds a medium. Tests:
@@ -158,8 +160,8 @@ and the IDE, AHCI and USB devices on the same buses.
   `usize::MAX`), and assert `restore_state` returns `Err`. Today the first
   returns `Ok` and the second panics in the test build.
 - Confidence: high.
-- Fixed by card #640. `Blit::within_registers` holds the limits of the
-  registers `Blit::latch` reads: a width of 1 to 8192, a height of 1 to
+- Fixed by card #640 (`7a227be0`). `Blit::within_registers` holds the limits
+  of the registers `Blit::latch` reads: a width of 1 to 8192, a height of 1 to
   2048, 13-bit pitches, 22-bit addresses and a left clip of at most 7.
   `restore_state` refuses a waiting BitBLT outside them, before it computes
   `source_row_bytes`. Test:
@@ -190,8 +192,9 @@ and the IDE, AHCI and USB devices on the same buses.
   12 read-only and address 0xf0000 asserts the shadow is unchanged.
 - Confidence: high for the path. Whether SeaBIOS on this machine keeps live
   SMM code in that region was not checked.
-- Fixed by card #611. Device models get a second view of guest memory,
-  `GuestRam::device_mem`, and `ram.mem` stays the complete view for the
+- Fixed by card #611 (`eedbbb1a`). Device models get a second view of guest
+  memory, `GuestRam::device_mem` , and `ram.mem` stays the complete view for
+  the
   snapshot and the debugger. The device view holds no SMRAM, open or closed.
   Its 0xc0000-0xfffff is `Pam`'s device mapping, remapped per bank when a PAM
   attribute changes: the shadow shared while the bank's write enable is set,
@@ -227,8 +230,9 @@ and the IDE, AHCI and USB devices on the same buses.
   config 0x9d still has bit 4 set and bit 6 clear, and that
   `pam.smram_open` is false. The same for pc through 0x72.
 - Confidence: high.
-- Fixed by card #611. Once D_LCK is set, `Mch::config_write` drops writes to
-  SMRAMC (0x9d on q35, 0x72 on pc) and to ESMRAMC on q35, and setting D_LCK
+- Fixed by card #611 (`eedbbb1a`). Once D_LCK is set, `Mch::config_write`
+  drops writes to SMRAMC (0x9d on q35, 0x72 on pc) and to ESMRAMC on q35, and
+  setting D_LCK
   clears D_OPEN. `Pam::update` opens the alias only for D_OPEN without
   D_LCK, which also covers a restored state. A reset restores the power-on
   state and unlocks. QEMU's i440fx does not model the lock, so the pc byte
@@ -255,8 +259,9 @@ and the IDE, AHCI and USB devices on the same buses.
   `floppy/tests.rs`, with `Machine::new("floppy")` and `m.out(...)` as above.
   Today it panics with "attempt to add with overflow".
 - Confidence: high.
-- Fixed by card #793. `finish_read_id` reports `at.sect % sectors + 1`, the
-  next sector of the track as QEMU computes it, so no stored sector byte can
+- Fixed by card #793 (`883a802f`). `finish_read_id` reports
+  `at.sect % sectors + 1`, the next sector of the track as QEMU computes it,
+  so no stored sector byte can
   overflow it, from a command or from a restored state. A READ ID at the last
   sector of the track now reports sector 1, not one past the end. Test:
   `read_id_after_an_out_of_range_sector_does_not_overflow` in
@@ -285,8 +290,9 @@ and the IDE, AHCI and USB devices on the same buses.
   0x80, then assert `!read_port(0x0000, ..)`. Also, with PMBA = 0xb000,
   assert `!read_port(0xb040, ..)`.
 - Confidence: high.
-- Fixed by card #641. `Lpc::pm_offset` is the one test both port paths use:
-  the block is 64 ports on PIIX4 and 128 on ICH9, the same as the alignment
+- Fixed by card #641 (`a4e76a68`). `Lpc::pm_offset` is the one test both port
+  paths use: the block is 64 ports on PIIX4 and 128 on ICH9, the same as the
+  alignment
   of its base, and the offset comes from a checked subtraction, so a port
   below the base is never in the block. Tests:
   `piix4_pm_window_does_not_wrap_or_overclaim` and
@@ -315,8 +321,9 @@ and the IDE, AHCI and USB devices on the same buses.
   is served through the BAR callbacks. Today the VM exits with "mapping VGA
   framebuffer".
 - Confidence: high for the bound. The exit path was traced by reading.
-- Fixed by card #791. `sync_vga_mapping` maps the framebuffer only where it
-  overlaps no RAM region of the machine's layout, so the bound follows low
+- Fixed by card #791 (`733d0deb`). `sync_vga_mapping` maps the framebuffer
+  only where it overlaps no RAM region of the machine's layout, so the bound
+  follows low
   RAM on pc (up to 3 GiB) and on q35 (2 GiB). A BAR over RAM stays unmapped
   and the BAR callbacks serve it. Test:
   `pc_vga_bar_over_low_ram_is_not_mapped` in `vm.rs`, which failed before
@@ -347,8 +354,9 @@ and the IDE, AHCI and USB devices on the same buses.
   that the reset still happens or the save was refused.
 - Confidence: medium. The window is real in the code. The test needs a
   hook to set the flag, because driving it from the guest is a race.
-- Fixed by card #790. The pending reset is machine state: a save writes it
-  as the vmstate section `reset-pending`, and a load replaces the flag with
+- Fixed by card #790 (`38397089`). The pending reset is machine state: a save
+  writes it as the vmstate section `reset-pending` , and a load replaces the
+  flag with
   the recorded value (none in an older snapshot). So a load drops the reset
   of the machine it replaces, a failed load gets it back from the rollback
   checkpoint, and a snapshot saved with a reset pending restores to a
@@ -376,8 +384,9 @@ and the IDE, AHCI and USB devices on the same buses.
   `io_write(0x602, &[0, 0])`, load, and assert `io_read(0x602)` of two
   bytes returns `0x0100`. Today it returns 0.
 - Confidence: high.
-- Fixed by card #794. The block is machine state: a save of a direct-kernel
-  machine writes PM1a_STS, PM1a_EN and PM1a_CNT as the vmstate section
+- Fixed by card #794 (`b5eb0308`). The block is machine state: a save of a
+  direct-kernel machine writes PM1a_STS, PM1a_EN and PM1a_CNT as the vmstate
+  section
   `acpi-pm`, and a load puts them back and drives the SCI from them. A
   snapshot from before the section existed leaves the block as it is, and a
   section with a bit the device cannot hold fails the load. A firmware
@@ -404,6 +413,8 @@ and the IDE, AHCI and USB devices on the same buses.
   of 0x20 bytes, BAR = 0x0d01 and command = 1, then `shared.io_write(0x0d04,
   &[1])`. Assert the function's `bar_write` saw it.
 - Confidence: high.
+- Fixed by card #867 (`b91a09e0`). I/O BARs can answer below 0x1000 where
+  the port bus has no fixed device.
 
 ### F12. q35: an expansion ROM or BAR placed over chipset MMIO takes the access
 
@@ -422,8 +433,9 @@ and the IDE, AHCI and USB devices on the same buses.
   0x42.
 - Confidence: medium. The order was traced. That a firmware or OS places a
   ROM there was not seen.
-- Fixed by card #792. With an MCH, `VmShared::in_pci_window` refuses an
-  address that a device on `mmio_bus` decodes (`MmioBus::covers`), so the
+- Fixed by card #792 (`48a196f5`). With an MCH, `VmShared::in_pci_window`
+  refuses an address that a device on `mmio_bus` decodes (`MmioBus::covers`),
+  so the
   PAM range, the HPET, the TPM and the flash answer before a ROM or BAR
   placed over them. The ROM decode also needs a base other than 0, as BARs
   do. Tests `rom_bar_does_not_hide_pam_shadow_writes` and
@@ -450,6 +462,8 @@ and the IDE, AHCI and USB devices on the same buses.
   `[1, 0, ...]`, triggered with `write(8, &D.to_be_bytes())` alone. Read
   features-ok and assert `broadcast()`. Today it is false.
 - Confidence: high.
+- Fixed by card #867 (`b91a09e0`). `SmiFwCfg` clears its saved DMA high half
+  on each trigger, in step with the inner `FwCfg`.
 
 ### F14. A four-byte write at 0xcfd-0xcff spills into the next register, and past offset 255
 
@@ -466,6 +480,8 @@ and the IDE, AHCI and USB devices on the same buses.
   `cfg.write(7, &[1, 2, 3, 4])`, and assert the fake function's config log
   has no register 64 entry.
 - Confidence: high.
+- Fixed by card #867 (`b91a09e0`). `PciConfigIo::write` clips the data to
+  the dword selected by CF8.
 
 ### F15. The high dword of a 64-bit BAR is not aligned to the BAR size
 

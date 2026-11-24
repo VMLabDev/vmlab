@@ -126,8 +126,9 @@ Not read:
   with full damage. Assert that `NativeStream::next_update` returns an error.
   Today it returns a `Rect` with `w = 65535` and 280000 bytes.
 - Confidence: high.
-- Fixed by card #613. `Surface::configure` refuses a zero side, a side above
-  16384, a stride below `width * 4` computed in 64 bits, and a buffer above
+- Fixed by card #613 (`420059f0`). `Surface::configure` refuses a zero side, a
+  side above 16384, a stride below `width * 4` computed in 64 bits, and a
+  buffer above
   256 MiB, the limits of the server core and the viewer. Both proof tests are
   in `src/hvdisplay/tests.rs`. The socket test is
   `the_stream_refuses_a_configure_wider_than_the_limit`: it sends a valid
@@ -169,8 +170,9 @@ Not read:
   error that names the length.
 - Confidence: high for the code. The abort depends on the memory and the
   overcommit setting of the host.
-- Fixed by card #637. A `ServerInit` or a `DesktopSize` above 16384 a side
-  or 256 MiB of pixels is refused, the limits of F1. A Raw rectangle is
+- Fixed by card #637 (`54d8c671`). A `ServerInit` or a `DesktopSize` above
+  16384 a side or 256 MiB of pixels is refused, the limits of F1. A Raw
+  rectangle is
   checked against the screen from its header, in `capture` and in the stream,
   before its payload is allocated. A cursor above 512 a side is refused,
   which is the limit of QEMU's `cursor_alloc`. The rectangles of one streamed
@@ -220,8 +222,9 @@ Not read:
   (`Shared::sessions`, or the entries of `/proc/self/task`) stays below a
   fixed limit. Today it grows by one for each connection.
 - Confidence: high.
-- Fixed by card #638. The accept loop is now `DisplayServer::serve_while` in
-  `display/core.rs`, and both `vmm/display.rs` and `serve` run it. An
+- Fixed by card #638 (`818b0072`). The accept loop is now
+  `DisplayServer::serve_while` in `display/core.rs` , and both
+  `vmm/display.rs` and `serve` run it. An
   `accept` error ends it only when it says the listener is unusable (`EBADF`,
   `EINVAL`, `ENOTSOCK`, `EOPNOTSUPP`, `EFAULT`). Every other error is counted,
   warned about at most once per five seconds, and tried again. Threads are
@@ -269,8 +272,8 @@ Not read:
   client. Today it stays false until the client disconnects.
 - Confidence: high for the display crate. The GPU device was read at the
   `retire` sites only.
-- Fixed by card #639. `BufferLease::retire` waits `REVOKE_AFTER` (one
-  second) and then revokes the readers that a client holds
+- Fixed by card #639 (`cf32e91b`). `BufferLease::retire` waits `REVOKE_AFTER`
+  (one second) and then revokes the readers that a client holds
   (`acquire_revocable`). The revocation closes that client and drops all its
   held frames, so the wait of the GPU device ends. Readers that the server
   ends by itself (readback) are not revoked. The limit is on the wait, not on
@@ -302,8 +305,9 @@ Not read:
   call. Today the connection stays open and the count rises by one for each
   message.
 - Confidence: high.
-- Fixed by card #788. `native_input` in `display/core.rs` refuses a `CpuCopy`
-  while the connection's surface is 0, the state before its first configure,
+- Fixed by card #788 (`d3aed1b1`). `native_input` in `display/core.rs` refuses
+  a `CpuCopy` while the connection's surface is 0, the state before its first
+  configure,
   so a connection without frames can send none. The connection is closed
   with `InvalidData` before any capture. The proof test asserts the close,
   the error and the unchanged `frame()` count. Not changed: a client that
@@ -341,8 +345,9 @@ Not read:
   retry loop of the last scroll, so the key stays in the queue.
 - Confidence: medium. The sink and the tablet queue were read. The xHCI and
   UHCI wrappers around `inject_pointer` were not.
-- Fixed by card #789. The sink in `vmm/display.rs` offers a pointer report
-  to the tablet once and no longer waits for the guest. When the tablet's
+- Fixed by card #789 (`d97b310f`). The sink in `vmm/display.rs` offers a
+  pointer report to the tablet once and no longer waits for the guest. When
+  the tablet's
   queue is full, the sink keeps the latest position and buttons and offers
   them again with the next input message, ahead of a key. The wheel steps and
   button changes refused in between are dropped, which `PROTOCOL.md` now
@@ -374,8 +379,9 @@ Not read:
   The test must restore the umask and must not run in parallel with tests
   that create files.
 - Confidence: high.
-- Fixed by card #613. `bind_owner_only` in `vmm/display.rs` sets mode 0600
-  after the bind, and the accept loops refuse a peer whose `SO_PEERCRED` uid
+- Fixed by card #613 (`420059f0`). `bind_owner_only` in `vmm/display.rs` sets
+  mode 0600 after the bind, and the accept loops refuse a peer whose
+  `SO_PEERCRED` uid
   is neither the process's own nor root. The peer check also covers a
   connection made between the bind and the mode change. The proof test
   `display_sockets_are_owner_only` is in the test module of `vmm/display.rs`,
