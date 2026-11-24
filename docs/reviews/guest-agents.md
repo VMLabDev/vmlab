@@ -462,6 +462,9 @@ Not read:
   `sessions_test.rs` (Linux). Create a file named `b"a\xffb"`, list the
   directory, then `stat` the name from the listing. Assert that the listing
   reports an error for that entry, or that the `stat` succeeds.
+- Fixed in card #811. `ReadDir` reports an error when an entry name cannot
+  be represented as UTF-8. The directory handle keeps returning that error
+  on retry. `Readlink` reports an error for targets with the same limitation.
 
 ### F13. `realpath` in a container answers a path of the micro-VM, not of the container
 

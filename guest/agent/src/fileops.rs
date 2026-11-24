@@ -195,6 +195,7 @@ enum Handle {
 struct DirCursor {
     iter: std::fs::ReadDir,
     done: bool,
+    error: Option<OpError>,
 }
 
 impl Session {
@@ -380,6 +381,7 @@ impl Session {
                     handle: self.insert_handle(Handle::Dir(Box::new(Mutex::new(DirCursor {
                         iter,
                         done: false,
+                        error: None,
                     }))))?,
                 })
             }
@@ -389,6 +391,9 @@ impl Session {
                     return Err(bad_handle());
                 };
                 let mut cursor = cursor.lock().expect("dir cursor lock");
+                if let Some(error) = &cursor.error {
+                    return Err(error.clone());
+                }
                 let mut entries = Vec::new();
                 while entries.len() < READDIR_CHUNK {
                     match cursor.iter.next() {
@@ -401,9 +406,19 @@ impl Session {
                         // snapshot of something that keeps moving.
                         Some(Err(_)) => continue,
                         Some(Ok(entry)) => {
+                            let Ok(name) = entry.file_name().into_string() else {
+                                let error = OpError {
+                                    code: ErrorCode::Failure,
+                                    msg: format!("directory entry {:?} is not UTF-8", entry.path()),
+                                };
+                                // The iterator has advanced. Keep reporting the
+                                // error so a retry cannot return an incomplete listing.
+                                cursor.error = Some(error.clone());
+                                return Err(error);
+                            };
                             let Ok(meta) = entry.metadata() else { continue };
                             entries.push(DirEntry {
-                                name: entry.file_name().to_string_lossy().into_owned(),
+                                name,
                                 attrs: attrs_of(&meta),
                             });
                         }
@@ -468,12 +483,15 @@ impl Session {
             }
             Op::Readlink { path } => {
                 let path = self.path(&path, Last::Keep)?;
-                ok(Reply::Name {
-                    path: std::fs::read_link(&path)
-                        .context(&path)?
-                        .to_string_lossy()
-                        .into_owned(),
-                })
+                let target = std::fs::read_link(&path)
+                    .context(&path)?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| OpError {
+                        code: ErrorCode::Failure,
+                        msg: format!("{path}: symlink target is not UTF-8"),
+                    })?;
+                ok(Reply::Name { path: target })
             }
             // The guest's own digest of what is on its disk: the strongest
             // thing the whole-file transfer offered, kept when it retired.
@@ -487,6 +505,7 @@ impl Session {
 }
 
 /// A failed operation, in the vocabulary the reply carries.
+#[derive(Clone)]
 struct OpError {
     code: ErrorCode,
     msg: String,
