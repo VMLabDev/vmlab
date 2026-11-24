@@ -59,6 +59,16 @@ pub(super) struct Ring {
     pub cycle: bool,
 }
 
+/// What `Ring::pop_within` found.
+pub(super) enum Pop {
+    /// The TRB at this address, now consumed.
+    Trb(u64, Trb),
+    /// The next TRB is not the guest's to give yet.
+    Empty,
+    /// The caller's reads ran out first.
+    Spent,
+}
+
 impl Ring {
     pub fn new(value: u64) -> Self {
         Self {
@@ -71,10 +81,22 @@ impl Ring {
     }
     /// Link-only loops are bounded, as are callers' command/TD walks.
     pub fn pop(&mut self, mem: &GuestMemory) -> Result<Option<(u64, Trb)>, DeviceError> {
+        match self.pop_within(mem, &mut usize::MAX)? {
+            Pop::Trb(addr, trb) => Ok(Some((addr, trb))),
+            Pop::Empty | Pop::Spent => Ok(None),
+        }
+    }
+    /// `pop`, charging each TRB it reads, Link TRBs included, to `reads`.
+    /// With none left it reads nothing more and answers `Pop::Spent`.
+    pub fn pop_within(&mut self, mem: &GuestMemory, reads: &mut usize) -> Result<Pop, DeviceError> {
         for _ in 0..256 {
+            if *reads == 0 {
+                return Ok(Pop::Spent);
+            }
+            *reads -= 1;
             let trb = Trb::read(mem, self.pointer)?;
             if (trb.control & 1 != 0) != self.cycle {
-                return Ok(None);
+                return Ok(Pop::Empty);
             }
             let addr = self.pointer;
             if trb.kind() == 6 {
@@ -87,7 +109,7 @@ impl Ring {
                     .pointer
                     .checked_add(16)
                     .ok_or_else(|| DeviceError::Memory("USB ring overflow".into()))?;
-                return Ok(Some((addr, trb)));
+                return Ok(Pop::Trb(addr, trb));
             }
         }
         Err(DeviceError::Other("USB ring contains a link loop".into()))

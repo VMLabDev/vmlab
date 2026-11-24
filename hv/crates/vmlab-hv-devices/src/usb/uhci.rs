@@ -34,6 +34,11 @@ const FRAME_NS: u64 = 1_000_000;
 const MAX_FRAMES: u64 = 128;
 /// Schedule elements one frame visits at most (cycle guard).
 const MAX_ELEMENTS: usize = 2048;
+/// The schedule elements (queue heads and TDs) one `advance` visits over all
+/// its frames. `MAX_ELEMENTS` bounds one walk of one queue; this bounds the
+/// controller (usb review F11). A frame that finds none left runs no
+/// schedule and still counts.
+const ADVANCE_ELEMENTS: usize = 4096;
 
 const CMD_RS: u16 = 1;
 const CMD_HCRESET: u16 = 2;
@@ -137,6 +142,8 @@ pub struct UhciController {
     elapsed_ns: u64,
     /// Interrupt causes collected during a frame, raised at its end.
     frame_status: u16,
+    /// The schedule elements the running `advance` may still visit.
+    elements: usize,
 }
 
 fn power_on_config() -> [u8; 256] {
@@ -162,6 +169,7 @@ impl UhciController {
             ports: [Port::new(None), Port::new(None)],
             elapsed_ns: 0,
             frame_status: 0,
+            elements: 0,
         };
         controller.intx.set_level(false);
         controller
@@ -335,6 +343,7 @@ impl UhciController {
         self.elapsed_ns = self.elapsed_ns.saturating_add(ns);
         let frames = self.elapsed_ns / FRAME_NS;
         self.elapsed_ns %= FRAME_NS;
+        self.elements = ADVANCE_ELEMENTS;
         for _ in 0..frames.min(MAX_FRAMES) {
             self.frame();
             if self.registers.command & CMD_RS == 0 {
@@ -377,11 +386,12 @@ impl UhciController {
     /// Walk one frame's schedule from a frame-list or horizontal pointer.
     fn walk(&mut self, mut link: u32) {
         let mut visited = 0;
-        while link & 1 == 0 && visited < MAX_ELEMENTS {
+        while link & 1 == 0 && visited < MAX_ELEMENTS && self.elements > 0 {
             visited += 1;
             let address = link & !0xf;
             if link & 2 == 0 {
                 // A TD directly in the frame list (isochronous position).
+                self.elements -= 1;
                 self.transfer(address);
                 link = self.read32(address).unwrap_or(1);
                 continue;
@@ -401,6 +411,10 @@ impl UhciController {
     /// a guest that nests a queue head in itself costs one bounded walk.
     fn queue(&mut self, mut qh: u32) {
         for _ in 0..MAX_ELEMENTS {
+            if self.elements == 0 {
+                return;
+            }
+            self.elements -= 1;
             let Some(element) = self.read32(qh.wrapping_add(4)) else {
                 return;
             };
