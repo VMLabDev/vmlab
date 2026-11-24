@@ -326,6 +326,13 @@ and run `build/dist.sh 9.9.9`. Expected: a failure. Observed: cargo
 resolves the crate again and the build passes. `cargo build --locked` on
 the same tree fails.
 
+Fixed in card #798. `build/dist.sh` stamps the version into the `vmlab` entry
+of `Cargo.lock` as well as into `Cargo.toml`, and always builds with
+`--locked`. Both files are put back afterwards, as before. The proof test is
+`build/test_dist.py`, which runs `dist.sh` on a scratch crate with real
+cargo: a lock that misses a package fails the stamped build, and a matching
+lock passes it.
+
 ### F10. `just guest-install` merges over an old guest directory (wrong result)
 
 `justfile:85-87` runs `cp -r guest/dist/* ~/.local/share/vmlab/guest/`. Files
