@@ -726,13 +726,14 @@ async fn join_global(join: &GlobalJoin, switch: &Arc<Switch>) -> Result<GlobalTr
     let (port, closed) = switch
         .add_stream_port_watched(stream, crate::net::switch::PortClass::Trunk)
         .await;
-    // The segment's gateway is behind the trunk. Its MAC is the trunk's
-    // from the start, so no guest of this lab sends from it (review F9),
-    // while a MAC the trunk only learns stays a guest's to take back (F22).
-    switch.bind_mac(
-        port,
-        crate::net::gateway::gateway_mac("__global", &join.name),
-    );
+    // The segment's gateway is the supervisor's, behind this trunk: no NIC
+    // of this lab speaks as it (review F29, F30), while a MAC the trunk only
+    // learns stays a guest's to take back (F22). The supervisor's answer
+    // names the subnet the segment runs on.
+    if let Some(subnet) = subnet.or(join.subnet) {
+        use crate::supervisor::global::{global_gateway, hold_gateway_behind};
+        hold_gateway_behind(switch, port, global_gateway(&join.name, subnet));
+    }
     Ok(GlobalTrunk {
         warnings,
         subnet,

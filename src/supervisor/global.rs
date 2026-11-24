@@ -736,8 +736,7 @@ impl GlobalSegments {
     }
 
     fn start_services(&self, name: &str, subnet: Ipv4Net, switch: &Arc<Switch>) -> GlobalServices {
-        let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
-        let gw_mac = gateway_mac("__global", name);
+        let (gw_mac, gw_ip) = global_gateway(name, subnet);
 
         let mut dhcp = DhcpConfig::new(subnet, gw_ip, gw_mac);
         dhcp.dns_server = Some(gw_ip);
@@ -881,7 +880,14 @@ impl GlobalSegments {
         seg.holders.take(None);
         let trunks = seg.trunks.clone();
         tune_trunk_socket(&stream);
-        let bridge = tokio::spawn(bridge_tcp_to_switch(seg.switch.clone(), stream, true));
+        // The dialling host serves the segment, so its gateway is behind
+        // this trunk and nowhere else on this switch.
+        let bridge = tokio::spawn(bridge_tcp_to_switch(
+            seg.switch.clone(),
+            stream,
+            true,
+            Some(global_gateway(name, subnet)),
+        ));
         trunks.activate_accept(remote, bridge.abort_handle());
         // Waiter: on bridge death clear the slot (emitting peer.down) and
         // release the segment reference.
@@ -913,16 +919,39 @@ impl Drop for TrunkPort {
     }
 }
 
+/// The MAC and the address of the gateway of the global segment `name` on
+/// `subnet`, on whichever host serves it.
+pub(crate) fn global_gateway(name: &str, subnet: Ipv4Net) -> (MacAddr, Ipv4Addr) {
+    (
+        gateway_mac("__global", name),
+        Ipv4Addr::from(u32::from(subnet.network()) + 1),
+    )
+}
+
+/// Hold a global segment's gateway on `port`, the trunk it is reached
+/// through: its MAC, its address in ARP and the DHCP server role are that
+/// port's on `switch`, and no other port can use them (review F29, F30).
+pub(crate) fn hold_gateway_behind(switch: &Switch, port: PortId, gateway: (MacAddr, Ipv4Addr)) {
+    switch.bind_mac(port, gateway.0);
+    switch.bind_ip(port, gateway.1);
+    switch.bind_dhcp_server(port);
+}
+
 /// Bridge a TCP stream onto a switch. Both directions and the port belong to
 /// the returned future, so dropping it closes the trunk and removes the port.
+/// `gateway` is the segment's gateway where it is behind this trunk.
 fn bridge_tcp_to_switch(
     switch: Arc<Switch>,
     mut stream: tokio::net::TcpStream,
     acknowledge: bool,
+    gateway: Option<(MacAddr, Ipv4Addr)>,
 ) -> impl Future<Output = ()> {
     use tokio::io::AsyncWriteExt;
 
     let ChannelPort { id, tx, mut rx } = switch.add_channel_port(PortClass::Trunk);
+    if let Some(gateway) = gateway {
+        hold_gateway_behind(&switch, id, gateway);
+    }
     let port = TrunkPort { switch, id };
 
     async move {
@@ -1026,7 +1055,7 @@ fn spawn_tcp_peer_dialer(
             match dial_peer(addr, &trunks.segment, subnet, &psk).await {
                 Ok(stream) => {
                     tune_trunk_socket(&stream);
-                    let bridge = bridge_tcp_to_switch(switch.clone(), stream, false);
+                    let bridge = bridge_tcp_to_switch(switch.clone(), stream, false, None);
                     trunks.activate_dial(addr);
                     // Wait for the bridge to die, then loop around to redial.
                     bridge.await;
@@ -1525,6 +1554,40 @@ mod tests {
         assert_eq!(bootp[0], 2);
         assert_eq!(&bootp[240..243], &[53, 1, 2]);
         assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
+    }
+
+    /// Review F29, F30: on the host that does not serve the segment the
+    /// gateway is behind the trunk to the host that does. A lab's trunk
+    /// there cannot send from the gateway's MAC, answer ARP for its
+    /// address, or answer DHCP.
+    #[tokio::test]
+    async fn the_gateway_is_held_behind_the_trunk_to_the_serving_host() {
+        use crate::net::frame::{MAC_BROADCAST, arp_reply_build, eth_build};
+
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        let (_, _, subnet) = a
+            .globals
+            .attach("wan", None, Some(b.addr.to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+
+        let b_switch = b.globals.segs.lock().await["wan"].switch.clone();
+        let lab1 = b_switch.add_channel_port(PortClass::Service);
+        let mut lab2 = b_switch.add_channel_port(PortClass::Service);
+        let (gw_mac, gw_ip) = global_gateway("wan", subnet);
+        let attacker = MacAddr([2, 0, 0, 0, 0, 0x66]);
+
+        let from_gw_mac = eth_build(MAC_BROADCAST, gw_mac, 0x88b5, b"spoof");
+        let arp = arp_reply_build(attacker, gw_ip, MAC_BROADCAST, gw_ip);
+        for frame in [from_gw_mac, arp] {
+            lab1.tx.send(bytes::Bytes::from(frame)).await.unwrap();
+        }
+        let marker = bytes::Bytes::from(eth_build(MAC_BROADCAST, attacker, 0x88b5, b"marker"));
+        lab1.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(lab2.rx.recv().await.unwrap(), marker);
     }
 
     #[tokio::test]

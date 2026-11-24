@@ -339,6 +339,12 @@ impl Gateway {
         // The gateway's MAC is its port's from the start: no guest frame
         // can claim it in the switch (review F9).
         switch.bind_mac(id, gw_mac);
+        // Nor can another port answer ARP for its address, or answer a DHCP
+        // client where the gateway is the segment's server (review F29).
+        switch.bind_ip(id, gw_ip);
+        if dhcp.is_some() {
+            switch.bind_dhcp_server(id);
+        }
 
         let dhcp = dhcp.map(|mut c| {
             c.gateway = gw_ip;
@@ -1249,5 +1255,90 @@ pub(crate) mod tests {
             .expect("timed out waiting for uplink frame")
             .expect("uplink channel closed");
         assert_eq!(got, honest);
+    }
+
+    /// Review F29: a guest's ARP that names the gateway's address at its own
+    /// MAC reaches no other guest. The marker frame that follows it is the
+    /// first frame the other guest reads.
+    #[tokio::test]
+    async fn a_guest_cannot_answer_arp_for_the_gateway_address() {
+        use crate::net::frame::arp_reply_build;
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let a = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut b = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        // A broadcast reply and a broadcast request both teach a guest's
+        // ARP cache the sender's address.
+        let reply = arp_reply_build(ATTACKER_MAC, gw.gw_ip(), MAC_BROADCAST, gw.gw_ip());
+        let request = arp_request_build(ATTACKER_MAC, gw.gw_ip(), GUEST_IP);
+        let marker = Bytes::from(arp_request_build(ATTACKER_MAC, GUEST_IP, GUEST_IP));
+        for frame in [reply, request] {
+            a.tx.send(Bytes::from(frame)).await.unwrap();
+        }
+        a.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(b.rx.recv().await.unwrap(), marker);
+    }
+
+    /// A DHCP server reply (BOOTREPLY, UDP 67 to 68) from `eth_src` that
+    /// offers `router` as router and DNS server.
+    fn forged_offer(eth_src: MacAddr, router: Ipv4Addr) -> Vec<u8> {
+        let mut b = vec![0u8; 240];
+        b[0] = 2; // BOOTREPLY
+        b[1] = 1;
+        b[2] = 6;
+        b[16..20].copy_from_slice(&GUEST_IP.octets());
+        b[28..34].copy_from_slice(&GUEST_MAC.0);
+        b[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        b.extend_from_slice(&[53, 1, 2]);
+        b.extend_from_slice(&[3, 4]);
+        b.extend_from_slice(&router.octets());
+        b.extend_from_slice(&[6, 4]);
+        b.extend_from_slice(&router.octets());
+        b.push(255);
+        let udp = udp_build(router, Ipv4Addr::BROADCAST, 67, 68, &b).unwrap();
+        let ip = ipv4_build(router, Ipv4Addr::BROADCAST, IPPROTO_UDP, 64, &udp, 1).unwrap();
+        crate::net::frame::eth_build(MAC_BROADCAST, eth_src, ETHERTYPE_IPV4, &ip)
+    }
+
+    /// Review F29: where the gateway serves DHCP, a guest's DHCP OFFER
+    /// reaches no other guest.
+    #[tokio::test]
+    async fn a_guest_cannot_answer_dhcp_where_the_gateway_serves_it() {
+        const ATTACKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        const ATTACKER_IP: Ipv4Addr = Ipv4Addr::new(10, 213, 1, 66);
+        let sw = Switch::new("seg".into());
+        let _gw = Gateway::spawn(&sw, config());
+        let a = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut b = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        let offer = forged_offer(ATTACKER_MAC, ATTACKER_IP);
+        let marker = Bytes::from(arp_request_build(ATTACKER_MAC, ATTACKER_IP, GUEST_IP));
+        a.tx.send(Bytes::from(offer)).await.unwrap();
+        a.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(b.rx.recv().await.unwrap(), marker);
+    }
+
+    /// A segment whose gateway serves no DHCP (`dhcp = false`) keeps a
+    /// guest's own DHCP server: the lab said the gateway is not the server.
+    #[tokio::test]
+    async fn a_guest_serves_dhcp_where_the_gateway_does_not() {
+        const SERVER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 213, 1, 66);
+        let sw = Switch::new("seg".into());
+        let _gw = Gateway::spawn(
+            &sw,
+            GatewayConfig {
+                dhcp: None,
+                ..config()
+            },
+        );
+        let a = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut b = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        let offer = Bytes::from(forged_offer(SERVER_MAC, SERVER_IP));
+        a.tx.send(offer.clone()).await.unwrap();
+        assert_eq!(b.rx.recv().await.unwrap(), offer);
     }
 }
