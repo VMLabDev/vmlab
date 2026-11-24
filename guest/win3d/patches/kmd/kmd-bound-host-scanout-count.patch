@@ -9,7 +9,7 @@ of a 1024-byte field, and GetDisplayInfo read pmodes[id], an array of 16.
 
 Clamp the count to MAX_CHILDREN where it is read, bound both loops at the
 array, and refuse an id that the response has no room for in the two
-readers (review docs/reviews/win3d-driver.md F5, card #754).
+readers (finding F5 of the driver review, card #754).
 
 diff --git a/viogpu/common/viogpu_queue.cpp b/viogpu/common/viogpu_queue.cpp
 index ef478b5..967a0cf 100644

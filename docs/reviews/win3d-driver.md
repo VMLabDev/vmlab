@@ -209,6 +209,17 @@ for a guest that is not x86.
   a special-pool bugcheck or silent corruption of the VidPN object.
 - Severity: security against a hostile host (a write past a kernel object),
   and crash on a host with a legal configuration.
+- State: fixed by card #754 with
+  `guest/win3d/patches/kmd/kmd-bound-host-scanout-count.patch`. The driver
+  clamps the count to `MAX_CHILDREN` where it reads it, both loops stop at the
+  array, and the two readers refuse an id the response has no room for. The
+  proof ran on a Windows 11 guest against a vmlab-hv built to report two
+  scanouts (`guest/win3d/docs/acceptance/C754.md`): the probe fails with the
+  driver before the fix and passes with it. One part of the claim did not
+  hold: the true vmlab-hv is not such a host. The driver never acks
+  `VIRTIO_GPU_F_EDID`, and vmlab-hv refuses `GET_EDID` without the ack, so on
+  vmlab-hv no EDID is copied at all, whatever the count. QEMU answers
+  without the ack.
 
 ### F6. The capset size of the host wraps the response size, and the escape then copies the unwrapped size
 
