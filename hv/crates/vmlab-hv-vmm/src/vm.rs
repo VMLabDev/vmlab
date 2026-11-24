@@ -1104,6 +1104,16 @@ impl VmShared {
         let Some(vga) = self.vga.lock().clone() else {
             return Ok(());
         };
+        // The PCI hole starts where this machine's low RAM stops: at 2 GiB
+        // on q35, and at up to 3 GiB on pc. A framebuffer BAR that the guest
+        // places over RAM is not mapped: KVM refuses overlapping slots, and
+        // the BAR callbacks serve it as they serve any unmapped placement.
+        let ram_regions = self
+            .ram
+            .lock()
+            .as_ref()
+            .map(|ram| ram.layout().regions.clone())
+            .unwrap_or_default();
         let mut root = self.pci_root.lock();
         let address = root
             .addresses()
@@ -1120,6 +1130,10 @@ impl VmShared {
                         && !sizing
                         && *base >= 0x80000000
                         && *base + vga.framebuffer_size() as u64 <= 0xfec00000
+                        && ram_regions.iter().all(|&(ram_base, ram_size)| {
+                            *base + vga.framebuffer_size() as u64 <= ram_base
+                                || *base >= ram_base + ram_size
+                        })
                 })
                 .map(|(base, _)| base)
         });
@@ -1981,6 +1995,98 @@ mod tests {
             without_parking,
             "virtio configuration I/O waited for another vCPU"
         );
+    }
+
+    /// Review finding F8 of `docs/reviews/vmm-core.md`: low RAM of a pc
+    /// machine reaches 3 GiB, so a framebuffer BAR at 2 GiB lies over RAM.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn pc_vga_bar_over_low_ram_is_not_mapped() {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP VGA BAR over low RAM: /dev/kvm absent");
+            return;
+        }
+        let kvm = KvmVm::new().unwrap();
+        let layout = crate::layout::MemLayout::pc(3072).unwrap();
+        assert_eq!(layout.low_ram_top(), 0xc000_0000);
+        let ram = GuestRam::anonymous(layout.clone()).unwrap();
+        crate::memory::register_memslots(&kvm.vm, &ram).unwrap();
+        // The root of a firmware machine, as the builder makes it for pc.
+        let root = Arc::new(Mutex::new(PciRoot::q35(layout.mmio64_base)));
+        let device = Arc::new(Mutex::new(
+            vmlab_hv_devices::display::StandardVga::new("vga", &[0x55, 0xaa, 0]).unwrap(),
+        ));
+        let slot = 2u8;
+        root.lock().add_device_at(slot, 0, device.clone()).unwrap();
+        let vga = crate::display::Video::Standard(device);
+        let mut io_bus = IoBus::new();
+        io_bus
+            .register(
+                0xcf8,
+                8,
+                Arc::new(Mutex::new(crate::pci::PciConfigIo::new(root.clone()))),
+            )
+            .unwrap();
+        let signal = Arc::new(SleepSignal::default());
+        let shared = VmShared::new(
+            kvm,
+            io_bus,
+            MmioBus::new(),
+            root,
+            Arc::new(Mutex::new(PmDevice::new(Arc::new(NullIrq), signal.sink()))),
+            signal,
+            layout.mmio64_base,
+        );
+        let pam = crate::q35::Pam::new(&vec![0xff; 0x40000], None, 0).unwrap();
+        *shared.mch.lock() = Some(Arc::new(Mutex::new(crate::q35::Mch::i440fx(
+            Arc::new(Mutex::new(pam)),
+            layout.ram,
+        ))));
+        let bar = 0x10 + 4 * vga.framebuffer_bar() as u32;
+        *shared.vga.lock() = Some(vga.clone());
+        *shared.ram.lock() = Some(Arc::new(ram));
+        // What the guest does: BAR = `base`, then memory decode, through
+        // the configuration ports.
+        let place = |base: u32| {
+            let address = 0x8000_0000 | u32::from(slot) << 11;
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &0u16.to_le_bytes());
+            shared.io_write(0xcf8, &(address | bar).to_le_bytes());
+            shared.io_write(0xcfc, &base.to_le_bytes());
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &2u16.to_le_bytes());
+        };
+
+        place(0x8000_0000);
+        assert_eq!(
+            shared
+                .exit
+                .lock()
+                .as_ref()
+                .map(|reason| format!("{reason:?}")),
+            None,
+            "a framebuffer BAR over low RAM ended the VM"
+        );
+        assert_eq!(*shared.vga_mapping.lock(), None);
+        // The BAR callbacks still serve the framebuffer.
+        shared.mmio_write(0x8000_0040, &[0x12, 0x34, 0x56, 0x78]);
+        let mut stored = [0u8; 4];
+        vga.linear_framebuffer()
+            .read_slice(&mut stored, GuestAddress(0x40))
+            .unwrap();
+        assert_eq!(stored, [0x12, 0x34, 0x56, 0x78]);
+        let mut read = [0u8; 4];
+        shared.mmio_read(0x8000_0040, &mut read);
+        assert_eq!(read, stored);
+
+        // A placement in the PCI hole of this machine is mapped directly.
+        place(0xc000_0000);
+        assert!(shared.exit.lock().is_none());
+        assert_eq!(*shared.vga_mapping.lock(), Some(0xc000_0000));
+        // One that straddles the top of low RAM is not.
+        place(0xbf00_0000 + (8 << 20));
+        assert!(shared.exit.lock().is_none());
+        assert_eq!(*shared.vga_mapping.lock(), None);
     }
 
     #[test]
