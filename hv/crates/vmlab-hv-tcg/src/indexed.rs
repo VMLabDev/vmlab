@@ -286,7 +286,7 @@ impl<M: Memory> Interpreter<'_, M> {
                                 if *fetch && self.fetch_address.is_none() {
                                     self.fetch_address = Some(args[2].u64()?);
                                 }
-                                self.memory_operation(&args, *write, *exclusive)?
+                                self.memory_call(&args, *write, *exclusive)?
                             }
                         };
                         self.assign_slot(compiled, slots, place, value)?;
