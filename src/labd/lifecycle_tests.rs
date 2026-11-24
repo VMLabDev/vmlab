@@ -2537,6 +2537,39 @@ fn fake_firmware(dirs: &Dirs) -> crate::config::host::HostConfig {
     }
 }
 
+/// The flash device opens the VM's copy read-write even when its template is read-only.
+#[tokio::test]
+async fn the_vars_copy_is_writable_whatever_the_template_is() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dirs = Dirs::new();
+    let firmware = fake_firmware(&dirs);
+    let template = dirs.root.join("firmware/x86_64/OVMF_VARS_4M.fd");
+    std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let (events, _) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab: Arc<dyn LabServices> = Arc::new(TestLab::new(events));
+    let (mut vm, _) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB firmware = "ovmf" secure_boot = false }"#,
+        Script::healthy(),
+    );
+    vm.set_host_config(firmware);
+    let store = vm.dirs.ovmf_vars();
+    let machine: Arc<dyn Machine> = vm;
+
+    machine.clone().start(lab, None).await.unwrap();
+    machine.stop(true).await.unwrap();
+
+    let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+    assert_ne!(mode & 0o200, 0, "VARS store mode is {mode:o}");
+    assert_eq!(std::fs::read(&store).unwrap(), b"vars:blank");
+    assert_eq!(
+        std::fs::metadata(&template).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+}
+
 /// A failed first copy must leave the next start free to copy a good template
 /// (firmware review F5). Linux exposes /proc/self/mem as a regular file, but a
 /// read at offset zero fails after the destination has been opened.
