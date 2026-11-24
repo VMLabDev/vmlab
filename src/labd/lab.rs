@@ -8497,7 +8497,131 @@ fn main(lab: Lab) {
         lab.clone_from_freeze("dc01").await.unwrap();
     }
 
+    /// F6 (docs/reviews/appshare-media.md): a `media {}` folder that cannot
+    /// be built is the fault of the one machine that has it, found when that
+    /// machine starts. The lab loads, so every verb that needs the daemon
+    /// still works on it and on the other machines.
+    #[tokio::test]
+    async fn a_lab_loads_with_an_unbuildable_media_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // More than a 1.44 MB floppy holds: refused before any tool runs. A
+        // floppy needs a profile on the pc machine.
+        std::fs::create_dir_all(root.join("answers")).unwrap();
+        std::fs::write(root.join("answers/big.bin"), vec![0u8; 2 << 20]).unwrap();
+        let src = r#"import <vmlab.wcl>
+            lab "l" {
+                vm "plain" {
+                    template = "scratch"
+                    arch = "x86_64"
+                    disk = 1MiB
+                }
+                vm "answered" {
+                    template = "scratch"
+                    arch = "x86_64"
+                    profile = "windows-xp"
+                    disk = 1MiB
+                    media { kind = "floppy" from = "answers" }
+                }
+            }"#;
+        std::fs::write(root.join("vmlab.wcl"), src).unwrap();
+        let config = crate::config::load_lab_source(src, "<test>", &root).expect("lab source");
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let events = Arc::new(super::super::events::EventLog::new("l-media", tx).unwrap());
+
+        let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
+            .await
+            .expect("the lab loads");
+        assert!(lab.vm("plain").is_ok());
+
+        let err = lab
+            .vm("answered")
+            .unwrap()
+            .boot(
+                |_, _| {},
+                || {},
+                std::future::ready(()),
+                std::future::ready(Ok(())),
+                |_| {},
+            )
+            .await
+            .expect_err("the machine with the folder does not start");
+        let err = format!("{err:#}");
+        assert!(err.contains("over capacity"), "{err}");
+        assert!(err.contains("answered"), "{err}");
+        assert_eq!(
+            lab.machine("answered").unwrap().state().await,
+            PowerState::Stopped
+        );
+    }
+
     // ---- reload (PRD §7.1) ----------------------------------------------------
+
+    /// F4 (docs/reviews/appshare-media.md): folder edits reach the next boot
+    /// even when reloading the unchanged lab file leaves the VM in place.
+    #[tokio::test]
+    async fn a_changed_media_folder_reaches_the_next_start() {
+        use super::super::hypervisor::fake::{FakeHypervisor, Script};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = r#"import <vmlab.wcl>
+lab "t" {
+    vm "a" {
+        template = "scratch"
+        arch = "aarch64"
+        profile = "linux-generic"
+        hypervisor = "qemu"
+        firmware = "seabios"
+        disk = 1MiB
+        media { kind = "iso" from = "./payload" }
+    }
+}"#;
+        std::fs::write(root.join("vmlab.wcl"), src).unwrap();
+        let payload = root.join("payload");
+        std::fs::create_dir(&payload).unwrap();
+        let file = payload.join("data.txt");
+        std::fs::write(&file, b"before").unwrap();
+        let config = crate::config::load_lab_root(root).unwrap();
+        let (events, _rx) = EventLog::recording("t", root.join("events.jsonl"));
+        let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
+            .await
+            .unwrap();
+
+        let config = lab.config();
+        let (Built::Vm(mut vm), None) = lab
+            .build_machines(&[config.lab.machine("a").unwrap()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("expected a scratch VM");
+        };
+        let hv = FakeHypervisor::new(Script::healthy());
+        vm.set_hypervisor(hv.clone());
+        let dirs = &mut Arc::get_mut(&mut vm).unwrap().dirs;
+        dirs.run = root.join("run");
+        dirs.logs = root.join("logs");
+        std::fs::create_dir_all(&vm.dirs.local).unwrap();
+        std::fs::write(vm.dirs.primary_disk(), b"").unwrap();
+        lab.machines.write().unwrap().insert(Built::Vm(vm), config);
+
+        lab.start_machine("a").await.unwrap();
+        lab.stop_machine("a", true).await.unwrap();
+        std::fs::write(file, b"after").unwrap();
+        assert!(lab.reload().await.unwrap().machines.is_empty());
+        lab.start_machine("a").await.unwrap();
+        lab.stop_machine("a", true).await.unwrap();
+
+        let launches = hv.launched_cdroms();
+        let [before, after] = launches.as_slice() else {
+            panic!("expected two launches, got {launches:?}");
+        };
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_ne!(before, after);
+    }
 
     const RELOAD_BASE: &str = r#"import <vmlab.wcl>
 lab "t" {
