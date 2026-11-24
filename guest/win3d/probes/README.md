@@ -243,3 +243,97 @@ API or adapter error, 3 a usage error.
 `tests/kmd/capset-probe.sh <lab-dir> <vm> <out-dir>` runs every case in a VM
 as a new standard user, and records a bugcheck of the guest
 ([`docs/acceptance/C751.md`](../docs/acceptance/C751.md)).
+
+## The pipe probe
+
+`pipe_probe_before.exe` and `pipe_probe_after.exe` are not rendering probes.
+They drive the pipe classes of the two helpers the kernel driver package
+installs, `vgpusrv.exe` (`PipeServer`) and `viogpuap.exe` (`PipeClient`), with
+the messages of card #757 (finding F9 of
+[`docs/reviews/win3d-driver.md`](../../../docs/reviews/win3d-driver.md)).
+Both are the same program, `probes/pipe/pipe_probe.cpp`, linked with
+`viogpu/shared/pipe.cpp` of the driver source: "before" without
+`patches/kmd/kmd-read-helper-pipe-message-inside-buffer.patch`, "after" with
+it. Build them with:
+
+```sh
+build/kmd/build.sh          # unpacks the driver source
+build/probes/build.sh pipe
+```
+
+`build/probes/pipe-source.sh` writes the two source copies. The executables
+are in `out/probes-extra/x64/`. The helpers are x64 only.
+
+```text
+pipe_probe_after.exe --case NAME [--out FILE]
+```
+
+The probe makes a pipe of its own name with the parameters of
+`PipeServer::Init`. It is all user mode and cannot harm the guest. In every
+case but `service-thread` it puts the 2048 bytes of the object's buffer at
+the end of a page, in front of two guard pages with a known pattern, so it
+counts the bytes written past the buffer and measures a string that runs
+past it.
+
+| Case | What it does | The patched source |
+| --- | --- | --- |
+| `server-command` | The server reads `\CONNECTED` as a helper sends it, into a buffer that held other data | A terminated string |
+| `server-long` | The server reads one message of 3000 bytes, then a command | Nothing past the buffer, the message is dropped, the command is read |
+| `server-full` | The server reads a message of 2048 bytes with no zero in it | A string that ends inside the buffer |
+| `service-thread` | `Init()` as the service calls it: its thread reads 3000 bytes into the heap buffer. The probe then asks `HeapValidate` | The heap is whole |
+| `client-command` | The client reads `\CLOSE` | A terminated string |
+| `client-long` | The client reads 3000 bytes on the handle `CreateFile` gives, which is in byte read mode | A string that ends inside the buffer |
+| `client-long-message-mode` | The same with the handle set to message read mode, which `viogpuap.exe` does not do | Nothing past the buffer |
+| `access` | Tries to open each pipe named `viogpupipe*` for reading and writing, and for reading | Informational: the two error codes per pipe |
+
+The program writes one JSON object to stdout and to `--out`:
+`bytes_written_past_buffer`, `text_units` (the length of the string
+`GetData()` returns, 1024 or more when it runs past the buffer),
+`read_returned`, `second_message_ok`, `heap_valid` and `pass`. Exit 0 is a
+pass, 2 a fail, 1 an API error, 3 a usage error.
+
+`tests/kmd/pipe-probe.sh <lab-dir> <vm> <out-dir> <before|after>` runs every
+case in a VM as a new standard user
+([`docs/acceptance/C757.md`](../docs/acceptance/C757.md)).
+
+## The allocation probe
+
+`alloc_probe.exe` is not a rendering probe. It calls
+`D3DKMTCreateAllocation` on the kernel driver with the requests of card #757
+(finding F10 of the same review). A driver without
+`patches/kmd/kmd-check-create-allocation-memory.patch` can bugcheck the guest, so run it
+in a disposable VM. Build it with:
+
+```sh
+build/probes/build.sh alloc
+```
+
+```text
+alloc_probe.exe --case NAME [--seconds N] [--out FILE]
+```
+
+It accepts only one PCI adapter with vendor `1af4` and device `1050` and
+makes a device on it. An allocation is a 64 by 64 texture in guest memory.
+
+| Case | Request | A fixed driver |
+| --- | --- | --- |
+| `one`, `one-v1` | One allocation through `D3DKMTCreateAllocation2`, or `D3DKMTCreateAllocation` | Created and destroyed |
+| `two`, `two-v1` | `NumAllocations = 2` | Fails with `STATUS_INVALID_PARAMETER` |
+| `none` | `NumAllocations = 0` | Fails |
+| `starve` | Creates and destroys one allocation again and again, for at most `--seconds`, until 200 calls have failed | Every failure is `STATUS_INSUFFICIENT_RESOURCES` or `STATUS_NO_MEMORY` |
+
+`starve` needs a guest where Driver Verifier fails the pool allocations of
+`viogpu3d.sys` in the process `alloc_probe.exe` after a delay. The probe
+makes its device before the delay is over. Without injected failures it
+exits 4.
+
+The program writes one JSON object to stdout and to `--out`. Before the call
+it flushes a record with `result` `request_did_not_return` (`starving` in
+`starve`, with the counts so far) to the file, so a bugcheck leaves the
+request on disk. Exit 0 is a pass, 2 a fail, 1 an API or adapter error, 3 a
+usage error.
+
+`tests/kmd/alloc-probe.sh <lab-dir> <vm> <out-dir> [case...]` runs the cases
+in a VM as a new standard user, sets Driver Verifier up and resets it for
+`starve`, and records a bugcheck of the guest
+([`docs/acceptance/C757.md`](../docs/acceptance/C757.md)).

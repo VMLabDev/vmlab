@@ -27,6 +27,7 @@ mkdir -p "$dest"
 for state in before after; do
     work=$dest/$state
     mkdir -p "$work/viogpu"
+    [ -n "$work" ] && [ -d "$work" ] || exit 1
     cp -a "$tree/viogpu/shared" "$work/viogpu/shared"
     chmod -R u+w "$work"
     while IFS= read -r p; do
