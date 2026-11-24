@@ -446,6 +446,25 @@ fn stream_survivors(
                     None => continue,
                 },
             };
+            // Paths and link targets are rebuilt below. Forward only xattrs,
+            // keeping their values as bytes (file capabilities are binary).
+            if let Some(extensions) = entry
+                .pax_extensions()
+                .with_context(|| format!("layer {i}: cannot read PAX metadata for `{name}`"))?
+            {
+                let mut xattrs = Vec::new();
+                for extension in extensions {
+                    let extension = extension
+                        .with_context(|| format!("layer {i}: invalid PAX metadata for `{name}`"))?;
+                    let key = extension.key_bytes();
+                    if key.starts_with(b"SCHILY.xattr.") || key.starts_with(b"LIBARCHIVE.xattr.") {
+                        xattrs.push((key, extension.value_bytes()));
+                    }
+                }
+                builder
+                    .append_pax_extensions(xattrs)
+                    .with_context(|| format!("cannot append xattrs for `{name}`"))?;
+            }
             // Preserve the original header; append via `append_data`/
             // `append_link` (rather than raw `append`) purely so paths and
             // link targets longer than the ustar fields survive — the crate
@@ -702,7 +721,8 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         // VFS_CAP_REVISION_2, effective, with CAP_NET_RAW permitted.
-        let capability = b"\x01\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let capability =
+            b"\x01\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
         let mut layer = Layer::new();
         layer
             .tar
@@ -713,8 +733,7 @@ mod tests {
             .file("plain", 0o755, 0, b"plain")
             .build(tmp.path(), "layer.tar", false);
         let dest = tmp.path().join("out.sqfs");
-        flatten_to_squashfs(&[(path, media)], &[diff_id], &dest, &AtomicBool::new(false))
-            .unwrap();
+        flatten_to_squashfs(&[(path, media)], &[diff_id], &dest, &AtomicBool::new(false)).unwrap();
 
         // Read the xattrs from the image without needing privileges to set
         // security.capability on an extracted file.
@@ -724,7 +743,10 @@ mod tests {
             .filter(|line| line.contains(" x security.capability="))
             .collect();
         assert_eq!(xattrs.len(), 1, "{listing}");
-        assert!(xattrs[0].starts_with("ping x security.capability="), "{listing}");
+        assert!(
+            xattrs[0].starts_with("ping x security.capability="),
+            "{listing}"
+        );
     }
 
     #[test]
