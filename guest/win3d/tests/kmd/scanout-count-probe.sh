@@ -20,6 +20,7 @@
 # newest start of the VM, the driver asked for the EDID of scanout 0 only, the display device has problem code 0,
 # Windows has one monitor on it, and the System log has no bugcheck event.
 # Exit 1 when a check fails, 2 on usage, 3 when the guest does not answer.
+# check-shell-paths: no-errexit a failed check or a guest that does not answer is a verdict line, and the probe goes on.
 set -u
 [ $# -eq 3 ] || { sed -n '2,21p' "$0" >&2; exit 2; }
 LAB=$(cd "$1" && pwd) || exit 2
