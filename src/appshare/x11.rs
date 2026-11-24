@@ -132,27 +132,42 @@ enum CookieKey<'a> {
     /// A local display: `FamilyLocal` with this host's name.
     Local { hostname: &'a str },
     /// A TCP display: an Internet entry carrying one of the host's addresses.
-    Tcp { addresses: &'a [IpAddr] },
+    /// A loopback address among them makes the display this host's own, and
+    /// `xauth` files such a display (`localhost:10`, what `ssh -X` sets)
+    /// under `FamilyLocal` with the host's name, where libxcb and Xlib look
+    /// for a loopback peer. So `hostname` is tried too.
+    Tcp {
+        addresses: &'a [IpAddr],
+        hostname: &'a str,
+    },
 }
 
 /// The first `MIT-MAGIC-COOKIE-1` entry for display `number` filed under
-/// `key` or `FamilyWild` — the first match wins, as in libXau.
+/// `key` or `FamilyWild` — the first match wins, as in libXau. An entry with
+/// an empty display number stands for every display, as it does there.
 fn pick_cookie(entries: &[XauthEntry], number: u32, key: &CookieKey) -> Option<Vec<u8>> {
     let number = number.to_string();
     entries
         .iter()
         .find(|e| {
             e.name == MIT_MAGIC_COOKIE
-                && e.number == number.as_bytes()
+                && (e.number.is_empty() || e.number == number.as_bytes())
                 && match (e.family, key) {
                     (FAMILY_WILD, _) => true,
                     (FAMILY_LOCAL, CookieKey::Local { hostname }) => {
                         e.address == hostname.as_bytes()
                     }
-                    (FAMILY_INTERNET, CookieKey::Tcp { addresses }) => addresses
+                    (
+                        FAMILY_LOCAL,
+                        CookieKey::Tcp {
+                            addresses,
+                            hostname,
+                        },
+                    ) => addresses.iter().any(IpAddr::is_loopback) && e.address == hostname.as_bytes(),
+                    (FAMILY_INTERNET, CookieKey::Tcp { addresses, .. }) => addresses
                         .iter()
                         .any(|a| matches!(a, IpAddr::V4(v4) if e.address == v4.octets())),
-                    (FAMILY_INTERNET6, CookieKey::Tcp { addresses }) => addresses
+                    (FAMILY_INTERNET6, CookieKey::Tcp { addresses, .. }) => addresses
                         .iter()
                         .any(|a| matches!(a, IpAddr::V6(v6) if e.address == v6.octets())),
                     _ => false,
@@ -208,9 +223,9 @@ impl HostDisplay {
             },
             None => Vec::new(),
         };
+        let hostname = hostname();
         let cookie = match &parsed.endpoint {
             Endpoint::Local { .. } => {
-                let hostname = hostname();
                 pick_cookie(
                     &entries,
                     parsed.number,
@@ -231,6 +246,7 @@ impl HostDisplay {
                     parsed.number,
                     &CookieKey::Tcp {
                         addresses: &addresses,
+                        hostname: &hostname,
                     },
                 )
             }
@@ -677,7 +693,10 @@ mod tests {
             Some(HOST.to_vec())
         );
         assert_eq!(
-            pick_cookie(&entries, 7, &CookieKey::Tcp { addresses: &[] }),
+            pick_cookie(&entries, 7, &CookieKey::Tcp {
+                    addresses: &[],
+                    hostname: "me"
+                }),
             Some(HOST.to_vec())
         );
     }
@@ -708,7 +727,8 @@ mod tests {
                 &entries,
                 2,
                 &CookieKey::Tcp {
-                    addresses: &addresses
+                    addresses: &addresses,
+                    hostname: "me"
                 }
             ),
             Some(HOST.to_vec())
@@ -735,6 +755,26 @@ mod tests {
         .unwrap();
         let d = HostDisplay::resolve("localhost:10", Some(&path)).unwrap();
         assert_eq!(d.cookie, Some(HOST.to_vec()));
+    }
+
+    /// A TCP display on another machine does not take this host's
+    /// `FamilyLocal` entry.
+    #[test]
+    fn a_remote_tcp_display_does_not_use_the_local_entry() {
+        let file = xauth_record(FAMILY_LOCAL, b"me", "10", MIT_MAGIC_COOKIE, &HOST);
+        let entries = parse_xauthority(&file);
+        let addresses = ["10.0.0.1".parse().unwrap()];
+        assert_eq!(
+            pick_cookie(
+                &entries,
+                10,
+                &CookieKey::Tcp {
+                    addresses: &addresses,
+                    hostname: "me"
+                }
+            ),
+            None
+        );
     }
 
     /// An entry whose display number is empty stands for every display, as

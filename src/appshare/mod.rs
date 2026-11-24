@@ -14,6 +14,7 @@ pub mod rdp;
 pub mod waypipe;
 pub mod x11;
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -350,7 +351,12 @@ async fn attempt(client: &LabClient, req: &Request, mode: Mode, host: &HostEnv) 
             let (cookie, adopt) = x11_end()?;
             HostEnd::X11 { cookie, adopt }
         }
-        Mode::Rdp => HostEnd::Rdp(rdp::Server::bind()?),
+        Mode::Rdp => {
+            // Before the open: the agent turns Remote Desktop on and leaves
+            // it on, so what the command line alone decides is refused first.
+            rdp::check_request(host.freerdp.as_deref(), req)?;
+            HostEnd::Rdp(rdp::Server::bind()?)
+        }
     };
     let (argv, cwd) = match mode {
         // The RDP client names the program; the agent starts nothing.
@@ -484,7 +490,7 @@ async fn drive(
                             }
                         }
                         AppRecord::Exited { code } => return Ok(code),
-                        AppRecord::Failed { msg } => bail!(msg),
+                        AppRecord::Failed { msg } => bail!(printable(&msg).into_owned()),
                     }
                 }
             }
@@ -501,11 +507,27 @@ async fn drive(
     }
 }
 
-fn log_text(record: &AppRecord, verbose: bool) -> Option<&str> {
+/// The text of a `log` or `diagnostic` record as the terminal is shown it:
+/// the guest wrote it, so it goes through [`printable`].
+fn log_text(record: &AppRecord, verbose: bool) -> Option<Cow<'_, str>> {
     match record {
-        AppRecord::Log { text } => Some(text),
-        AppRecord::Diagnostic { text } if verbose => Some(text),
+        AppRecord::Log { text } => Some(printable(text)),
+        AppRecord::Diagnostic { text } if verbose => Some(printable(text)),
         _ => None,
+    }
+}
+
+/// One line of text the guest had a hand in, made safe to print among
+/// vmlab's own lines: every control character but tab becomes U+FFFD, so an
+/// escape sequence cannot move the cursor, set the title or rewrite a line
+/// vmlab printed before. That takes the C1 range too, which some terminals
+/// read as the same sequences.
+pub(crate) fn printable(text: &str) -> Cow<'_, str> {
+    let unsafe_char = |c: char| c.is_control() && c != '\t';
+    if text.contains(unsafe_char) {
+        Cow::Owned(text.replace(unsafe_char, "\u{fffd}"))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -570,9 +592,12 @@ mod tests {
             text: "waypipe diagnostic".into(),
         };
         for verbose in [false, true] {
-            assert_eq!(log_text(&program, verbose), Some("waypipe diagnostic"));
             assert_eq!(
-                log_text(&diagnostic, verbose),
+                log_text(&program, verbose).as_deref(),
+                Some("waypipe diagnostic")
+            );
+            assert_eq!(
+                log_text(&diagnostic, verbose).as_deref(),
                 verbose.then_some("waypipe diagnostic")
             );
         }
@@ -599,6 +624,24 @@ mod tests {
             );
             assert_eq!(text, "a\u{fffd}]0;x\u{fffd}b\u{fffd}c\td\u{fffd}2Je\u{fffd}");
         }
+    }
+
+    /// A `failed` record's message becomes the CLI's error line, and may
+    /// quote the guest: it is cleaned the same way (review F13).
+    #[tokio::test]
+    async fn a_failed_message_has_no_control_characters() {
+        let (_dir, control, conns) = fake_daemon(vec![AppRecord::Failed {
+            msg: "gone\u{1b}[2K\rok".into(),
+        }])
+        .await;
+        let mut end = HostEnd::X11 {
+            cookie: String::new(),
+            adopt: Arc::new(|_| Box::pin(async { Ok(()) })),
+        };
+        let err = drive("web", &control, &conns, &mut end, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "gone\u{fffd}[2K\u{fffd}ok");
     }
 
     /// A lab daemon that counts the requests it is sent and refuses each.
