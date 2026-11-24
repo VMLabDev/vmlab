@@ -3982,7 +3982,32 @@ impl LabRuntime {
     /// throw away pending guest work.
     /// Restore `snap` on machine `name` (§7.3). Answers with what the
     /// restore could not do but did not fail over: the warnings to show.
+    ///
+    /// **A restore runs to its end, whoever stops waiting for it.** A
+    /// cancelled provision stops at its host call by dropping that call's
+    /// future (`scripting/cancel.rs`), and a restore dropped between taking
+    /// the syncer off and putting it back leaves the workspace with none,
+    /// and the machine between two steps of its rewind. So the restore is a
+    /// task of its own: a caller that goes away stops waiting and nothing
+    /// else.
     pub async fn restore(
+        self: &Arc<Self>,
+        name: &str,
+        snap: &str,
+        discard: bool,
+    ) -> Result<Vec<String>> {
+        let lab = Arc::clone(self);
+        let (name, snap) = (name.to_string(), snap.to_string());
+        let restore =
+            tokio::spawn(async move { lab.restore_to_its_end(&name, &snap, discard).await });
+        match restore.await {
+            Ok(restored) => restored,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(anyhow!("the restore did not run to its end: {e}")),
+        }
+    }
+
+    async fn restore_to_its_end(
         self: &Arc<Self>,
         name: &str,
         snap: &str,
@@ -4752,6 +4777,8 @@ mod tests {
         /// Stop inside `wait_state`, once the machine has settled, until the
         /// test lets it go: the gap between a destroy's stop and its removal.
         hold_settle: Option<Hold>,
+        /// Stop inside `restore` until the test lets it go.
+        hold_restore: Option<HeldRestore>,
         /// `start` makes `disk0.qcow2`, as a real machine makes its clone.
         makes_disk: bool,
     }
@@ -4782,6 +4809,43 @@ mod tests {
         }
         fn release(&self) {
             self.go.add_permits(1);
+        }
+    }
+
+    /// A [`Hold`] inside a double's `restore`, which also says how the
+    /// restore left it: by returning, or by being dropped where it waited.
+    #[derive(Clone)]
+    struct HeldRestore {
+        hold: Hold,
+        returned: Arc<std::sync::atomic::AtomicBool>,
+        left: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl HeldRestore {
+        fn new() -> Self {
+            Self {
+                hold: Hold::new(),
+                returned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                left: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+        /// The double's side.
+        async fn pass(&self) {
+            struct Left(Arc<tokio::sync::Semaphore>);
+            impl Drop for Left {
+                fn drop(&mut self) {
+                    self.0.add_permits(1);
+                }
+            }
+            let _left = Left(self.left.clone());
+            self.hold.pass().await;
+            self.returned.store(true, Ordering::SeqCst);
+        }
+        /// The test's side: wait until the restore is over, and say whether
+        /// it ran to its end.
+        async fn returned(&self) -> bool {
+            self.left.acquire().await.expect("hold").forget();
+            self.returned.load(Ordering::SeqCst)
         }
     }
 
@@ -4879,6 +4943,7 @@ mod tests {
                 display: None,
                 hold_start: None,
                 hold_settle: None,
+                hold_restore: None,
                 makes_disk: false,
             })
         }
@@ -5206,6 +5271,9 @@ mod tests {
             _online: bool,
         ) -> Result<()> {
             self.note(&format!("restore:{snap}")).await;
+            if let Some(held) = &self.hold_restore {
+                held.pass().await;
+            }
             Ok(())
         }
 
@@ -9095,6 +9163,63 @@ lab "t" {
             .expect("discarding");
         assert!(lab.workspaces.get("dev01").await.is_none());
         assert!(!ws.ledger_path.exists());
+    }
+
+    /// Review wscript F3: `up` cancels a provision by dropping the future of
+    /// the host call it waits in. A restore dropped there had taken the
+    /// syncer off the workspace and never put it back, and nothing said so.
+    /// The restore runs to its end whoever stops waiting for it.
+    #[tokio::test]
+    async fn a_cancelled_restore_puts_the_syncer_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "agreed").unwrap();
+        let sh = shared(dir.path());
+        let held = HeldRestore::new();
+        let mut m =
+            Arc::into_inner(FakeMachine::new("dev01", MachineKind::Vm, &sh)).expect("sole owner");
+        m.hold_restore = Some(held.clone());
+        let lab = lab_of(dir.path(), DEV_LAB, vec![Arc::new(m)]);
+        dev_lab_syncing(&lab).await;
+        lab.snapshot("dev01", "s").await.expect("snapshot");
+        assert!(lab.workspaces.get("dev01").await.is_some());
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let run = tokio::spawn(crate::scripting::run_script_source(
+            lab.clone(),
+            r#"use vmlab
+fn main(lab: Lab) { let r = lab.this_vm().expect("vm").restore("s") }
+"#
+            .into(),
+            "restore.ws",
+            dir.path().to_path_buf(),
+            Some(crate::scripting::ScriptOwner::provision("dev01").cancelled_by(token.clone())),
+            None,
+            Arc::new(|_| {}),
+        ));
+        held.hold.reached().await;
+        assert!(
+            lab.workspaces.get("dev01").await.is_none(),
+            "the restore rewinds under a running syncer"
+        );
+        token.cancel();
+        let err = run
+            .await
+            .expect("the script run")
+            .expect_err("the cancelled script completed");
+        assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
+
+        held.hold.release();
+        assert!(
+            held.returned().await,
+            "the restore was dropped at the machine's restore, between suspend and resume"
+        );
+        run_until_stalled().await;
+        assert!(
+            lab.workspaces.get("dev01").await.is_some(),
+            "the cancelled restore left the workspace with no syncer"
+        );
+        lab.workspaces.stop_all().await;
     }
 
     /// Review dev-machines F4 and F5 together: a `down` leaves work owed, and

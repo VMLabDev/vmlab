@@ -3,7 +3,8 @@
 # only step that touches GitHub, and it only uploads: it builds nothing, signs
 # nothing, and changes no file (card 423; docs/agents/release-gate.md).
 #
-# It checks the directory again (every asset, SHA256SUMS, provenance.json),
+# It checks the directory again (every asset, SHA256SUMS, provenance.json, and
+# SHA256SUMS.key.bundle against build/release-signing.pub when there is one),
 # takes the version and the commit from provenance.json, and runs
 #
 #   gh release create v<version> --repo VMLabDev/vmlab --target <commit> \
@@ -15,6 +16,7 @@
 # Usage: release-publish.sh <release-dir> [--print]
 #   --print  print the command and upload nothing
 # Env: VMLAB_RELEASE_REPO (default VMLabDev/vmlab), and the GitHub login of gh.
+#      COSIGN  the cosign binary that checks a signature (default: cosign on PATH)
 
 set -euo pipefail
 
@@ -49,8 +51,20 @@ files=("$dir/vmlab-$version-linux-x86_64" "$dir/vmlab-fastpath-$version-linux-x8
 for file in "${files[@]}"; do
   [ -s "$file" ] || die "missing release file: $file"
 done
-if [ -s "$dir/SHA256SUMS.key.bundle" ]; then
-  files+=("$dir/SHA256SUMS.key.bundle")
+bundle="$dir/SHA256SUMS.key.bundle"
+if [ -e "$bundle" ]; then
+  # Check the signature the way install.sh does, and only with the committed
+  # public half: release-sign.sh also takes a test key, and a later `prepare`
+  # leaves the signature of an earlier SHA256SUMS (review install-release F8).
+  [ -s "$bundle" ] || die "$bundle is empty: sign again, or remove it for an unsigned release"
+  public="$ROOT/build/release-signing.pub"
+  [ -s "$public" ] || die "no public half at $public to check $bundle with: see docs/agents/release-gate.md"
+  cosign="${COSIGN:-cosign}"
+  command -v "$cosign" >/dev/null 2>&1 || die "need cosign (v2.6.1 or newer) to check $bundle"
+  "$cosign" verify-blob --key "$public" --bundle "$bundle" \
+    --insecure-ignore-tlog=true "$dir/SHA256SUMS" >/dev/null 2>&1 \
+    || die "$bundle does not verify with $public and this SHA256SUMS: sign again with the release key (just release::sign <dir> key)"
+  files+=("$bundle")
 else
   echo "release-publish: UNSIGNED release: install.sh will need --insecure-skip-signature" >&2
 fi

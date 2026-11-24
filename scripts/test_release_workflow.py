@@ -62,11 +62,77 @@ def publish(dist, *args, env=None):
                           capture_output=True, text=True, env=env)
 
 
+# A cosign that signs and verifies by contract. A private half is the text
+# `private of <public half>`, and a bundle names the public half that verifies
+# it and the manifest it signs. It proves no cryptography.
+STUB_COSIGN = r"""#!/bin/sh
+set -eu
+case "$1" in
+  sign-blob)
+    printf '%s %s\n' "${VMLAB_RELEASE_COSIGN_KEY#private of }" "$(sha256sum < "$8")" > "$7" ;;
+  verify-blob)
+    [ "$2" = --key ] && [ "$4" = --bundle ] && [ "$6" = --insecure-ignore-tlog=true ]
+    [ "$(cat "$5")" = "$(cat "$3") $(sha256sum < "$7")" ] ;;
+  *) exit 1 ;;
+esac
+"""
+
+
+class Signing:
+    """A checkout with the release scripts, a committed public half and stub tools."""
+
+    def __init__(self, tmp_path, committed='release-key'):
+        self.tmp = tmp_path
+        self.checkout = tmp_path / 'checkout'
+        for name in ['scripts/release-publish.sh', 'scripts/release-sign.sh', 'scripts/release-assets.py']:
+            (self.checkout / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.checkout / name).write_bytes((ROOT / name).read_bytes())
+        if committed is not None:
+            (self.checkout / 'build').mkdir()
+            (self.checkout / 'build/release-signing.pub').write_text(committed + '\n')
+        tools = tmp_path / 'tools'
+        tools.mkdir()
+        (tools / 'cosign').write_text(STUB_COSIGN)
+        (tools / 'gh').write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$GH_LOG"\n')
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        self.gh_log = tmp_path / 'gh.log'
+        self.env = {k: v for k, v in os.environ.items()
+                    if k != 'COSIGN' and not k.startswith('VMLAB_')}
+        self.env.update(PATH=f"{tools}:{os.environ['PATH']}", GH_LOG=str(self.gh_log))
+
+    def sign(self, dist, key, public=None):
+        """Sign with the private half of `key`; `public` is the test override of release-sign.sh."""
+        env = dict(self.env, VMLAB_RELEASE_COSIGN_KEY=f'private of {key}')
+        if public is not None:
+            other = self.tmp / 'test.pub'
+            other.write_text(public + '\n')
+            env['VMLAB_RELEASE_PUBLIC_KEY'] = str(other)
+        result = subprocess.run(['bash', str(self.checkout / 'scripts/release-sign.sh'), str(dist), 'key'],
+                                capture_output=True, text=True, env=env)
+        assert result.returncode == 0, result.stderr
+        assert (dist / 'SHA256SUMS.key.bundle').is_file()
+
+    def publish(self, dist, *args, **env):
+        return subprocess.run(['bash', str(self.checkout / 'scripts/release-publish.sh'), str(dist), *args],
+                              capture_output=True, text=True, env=dict(self.env, **env))
+
+    def refused(self, dist, reason, **env):
+        """Neither --print nor the upload goes on, and gh never runs."""
+        for args in (['--print'], []):
+            result = self.publish(dist, *args, **env)
+            assert result.returncode != 0, result.stdout
+            assert reason in result.stderr, result.stderr
+            assert result.stdout == ''
+            assert not self.gh_log.exists()
+
+
 @pytest.mark.parametrize('version,prerelease', [('1.2.3-alpha', True), ('1.2.3', False)])
 def test_publish_prints_the_one_upload_command(tmp_path, version, prerelease):
+    signing = Signing(tmp_path)
     dist = release_dir(tmp_path, version)
-    (dist / 'SHA256SUMS.key.bundle').write_text('signature fixture')
-    result = publish(dist, '--print')
+    signing.sign(dist, 'release-key')
+    result = signing.publish(dist, '--print')
     assert result.returncode == 0, result.stderr
     words = result.stdout.split()
     assert words[:9] == ['gh', 'release', 'create', f'v{version}', '--repo', 'VMLabDev/vmlab',
@@ -74,7 +140,51 @@ def test_publish_prints_the_one_upload_command(tmp_path, version, prerelease):
     assert ('--prerelease' in words) == prerelease
     uploaded = sorted(Path(word).name for word in words if word.startswith(str(dist)))
     assert uploaded == sorted(path.name for path in dist.iterdir())
+    assert 'SHA256SUMS.key.bundle' in uploaded
     assert 'UNSIGNED' not in result.stderr
+    # The upload itself takes the same bundle.
+    result = signing.publish(dist)
+    assert result.returncode == 0, result.stderr
+    assert str(dist / 'SHA256SUMS.key.bundle') in signing.gh_log.read_text().splitlines()
+
+
+def test_publish_refuses_a_signature_of_a_test_key(tmp_path):
+    """Review install-release F8, first way: release-sign.sh verifies with
+    VMLAB_RELEASE_PUBLIC_KEY when it is set, so a test pair passes signing."""
+    signing = Signing(tmp_path)
+    dist = release_dir(tmp_path, '1.2.3')
+    signing.sign(dist, 'test-key', public='test-key')
+    signing.refused(dist, 'does not verify')
+    # The override of the signing step is no way around the check.
+    signing.refused(dist, 'does not verify', VMLAB_RELEASE_PUBLIC_KEY=str(tmp_path / 'test.pub'))
+
+
+def test_publish_refuses_a_signature_of_an_earlier_manifest(tmp_path):
+    """Review install-release F8, second way: `prepare` writes a new
+    provenance.json and SHA256SUMS and leaves the bundle of the earlier one."""
+    signing = Signing(tmp_path)
+    dist = release_dir(tmp_path, '1.2.3')
+    signing.sign(dist, 'release-key')
+    assert signing.publish(dist, '--print').returncode == 0
+    # A build of another commit into the same directory: a new manifest.
+    subprocess.run(['python3', str(ROOT / 'scripts/release-assets.py'), 'prepare', str(dist),
+                    '1.2.3', '--commit', 'd' * 40, '--builder', 'helios'], check=True)
+    signing.refused(dist, 'does not verify')
+
+
+def test_publish_refuses_a_signature_it_cannot_check(tmp_path):
+    signing = Signing(tmp_path, committed=None)
+    dist = release_dir(tmp_path, '1.2.3')
+    signing.sign(dist, 'test-key', public='test-key')
+    signing.refused(dist, 'no public half')
+    # An empty bundle is not an unsigned release.
+    (dist / 'SHA256SUMS.key.bundle').write_text('')
+    signing.refused(dist, 'is empty')
+    with_key = tmp_path / 'with-key'
+    with_key.mkdir()
+    signing = Signing(with_key)
+    signing.sign(dist, 'release-key')
+    signing.refused(dist, 'need cosign', COSIGN=str(tmp_path / 'no-cosign'))
 
 
 def test_publish_only_uploads(tmp_path):
