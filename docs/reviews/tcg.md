@@ -113,8 +113,17 @@ beyond the single random words of the first differential run, and
   No time is measured.
 - Confidence: high for the measurement. The split of the bytes between
   bindings, frames and constants was read from the code and not measured.
+- Fixed by card #769. The cache keeps a count of bytes beside the count of
+  units (`Trace::cache_bytes`, from the capacity of every table a trace
+  owns), and a hart keeps at most `TRACE_CACHE_BYTES` (32 MiB) of it. One
+  trace takes no further fragment past a quarter of that. The proof test is
+  in its own file, `vmlab-hv-tcg/tests/trace_cache_bytes.rs`, because it
+  counts live heap bytes through a global allocator and not resident pages.
+  Over 3200 steps of the straight run the hart held 72.6 MB before the fix
+  and holds under 48 MiB after it, and the cache's own count is within a
+  factor of two of the heap the run holds.
 
-### F2. A guest access outside the host's RAM is a host error and the hart cannot pass it
+### F2. A guest access outside the host's RAM is a host error and the hart cannot pass it (fixed, card #770)
 
 - Where: `tcg/lib.rs:647-696` (`memory_operation`: the `?` at `668`, `685`
   and `692`), `tcg/memory.rs:86-96` (`FlatMemory::range` returns
@@ -151,6 +160,22 @@ beyond the single random words of the first differential run, and
 - Confidence: high. The fix has two possible places, and the card should
   choose: build the model's region table from `Memory::ram_bounds`, or map
   `Error::Memory` to the model's access fault at the memory call.
+- Fixed by card #770, at the memory call. The model reports an access fault
+  as the `Err` of `checked_mem_read` and `checked_mem_write`, so
+  `Interpreter::call` turns an `Error::Memory` from below either function
+  into that `Err`, with the fault of `accessFaultFromAccessType` for the
+  access type of the refused request. A recording stops before a refused
+  access, and a trace that meets one resumes the interpreter at it, so both
+  modes take the same path. The region table was not rebuilt from
+  `ram_bounds`: that would have dropped the IO region that holds the model's
+  CLINT, and any MMIO a `Memory` serves. A misaligned store that crosses the
+  end of host RAM writes its bytes inside RAM before it faults, which the
+  architecture allows. Only `Error::Memory` is the guest's fault. Every other
+  error of a `Memory` is still a host error. Tests
+  `an_access_past_host_ram_raises_a_guest_fault`,
+  `a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault` and
+  `a_trace_whose_own_access_is_refused_raises_the_same_guest_fault` in
+  `vmlab-hv-tcg/tests/hardening.rs`.
 
 ### F3. Writing the `seed` CSR is a host error (fixed, card #771)
 

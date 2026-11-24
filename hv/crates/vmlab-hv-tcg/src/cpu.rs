@@ -4,6 +4,54 @@ use vmlab_hv_tcg_ir::{Expr, Function, Location, Op, Target, Type};
 
 const TRACE_CACHE_LIMIT: usize = 8_000_000;
 
+/// The most host heap the trace cache of one hart keeps, as the cache counts
+/// it ([`Riscv64::trace_cache_bytes`]). The count of units above does not
+/// bound memory: one unit is some hundred bytes, and a guest chooses how many
+/// entry PCs it runs through.
+pub const TRACE_CACHE_BYTES: usize = 32 << 20;
+
+/// What the cache holds, in the units the recorder's heuristics use and in
+/// bytes of host heap. Both are bounded.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Cost {
+    units: usize,
+    bytes: usize,
+}
+
+impl Cost {
+    fn of(trace: &crate::trace::Trace) -> Self {
+        Self {
+            units: trace.cache_units(),
+            bytes: trace.cache_bytes(),
+        }
+    }
+
+    fn sum(variants: &[crate::trace::Trace]) -> Self {
+        variants
+            .iter()
+            .map(Self::of)
+            .fold(Self::default(), |sum, cost| sum.plus(cost))
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            units: self.units + other.units,
+            bytes: self.bytes + other.bytes,
+        }
+    }
+
+    fn minus(self, other: Self) -> Self {
+        Self {
+            units: self.units - other.units,
+            bytes: self.bytes - other.bytes,
+        }
+    }
+
+    fn fits(self) -> bool {
+        self.units <= TRACE_CACHE_LIMIT && self.bytes <= TRACE_CACHE_BYTES
+    }
+}
+
 #[derive(Debug)]
 pub struct TraceProfile {
     pub pc: u64,
@@ -101,11 +149,17 @@ pub struct Riscv64<M> {
     pub specialize: bool,
     pub specialization_stats: SpecializationStats,
     traces: BTreeMap<u64, Vec<crate::trace::Trace>>,
-    cache_units: usize,
+    cache: Cost,
     cache_clock: u64,
 }
 
 impl<M: Memory> Riscv64<M> {
+    /// The host heap bytes the trace cache of this hart holds, as the cache
+    /// counts them. Never more than [`TRACE_CACHE_BYTES`].
+    pub fn trace_cache_bytes(&self) -> usize {
+        self.cache.bytes
+    }
+
     pub fn trace_profile(&self) -> Vec<TraceProfile> {
         let mut profiles: Vec<_> = self
             .traces
@@ -127,7 +181,7 @@ impl<M: Memory> Riscv64<M> {
             specialize: false,
             specialization_stats: SpecializationStats::default(),
             traces: BTreeMap::new(),
-            cache_units: 0,
+            cache: Cost::default(),
             cache_clock: 0,
         })
     }
@@ -282,18 +336,16 @@ impl<M: Memory> Riscv64<M> {
             .and_then(|variants| variants.last_mut())
             && !trace.promote(limit)
         {
-            let before = trace.cache_units();
+            let before = Cost::of(trace);
             let outcome = trace.run_step(&mut self.interpreter, self.steps, limit);
             trace.last_used = self.cache_clock;
-            let after = trace.cache_units();
+            let after = Cost::of(trace);
             if before != after {
+                // The total still holds this trace at its cost before the run.
                 let variants = self.traces.remove(&pc).expect("cached variants");
-                self.cache_units -= variants
-                    .iter()
-                    .map(crate::trace::Trace::cache_units)
-                    .sum::<usize>()
-                    - after
-                    + before;
+                self.cache = self
+                    .cache
+                    .minus(Cost::sum(&variants).plus(before).minus(after));
                 self.cache_variants(pc, variants);
             }
             if !matches!(outcome, Ok(crate::trace::Outcome::Miss)) {
@@ -309,10 +361,7 @@ impl<M: Memory> Riscv64<M> {
             unbounded_globals.extend(trace.unbounded_globals().iter().cloned());
             unbounded_globals.extend(trace.failed_ranges(&self.interpreter));
         }
-        self.cache_units -= variants
-            .iter()
-            .map(crate::trace::Trace::cache_units)
-            .sum::<usize>();
+        self.cache = self.cache.minus(Cost::sum(&variants));
         let mut promotion = None;
         for index in (0..variants.len()).rev() {
             if variants[index].promote(limit)
@@ -408,18 +457,18 @@ impl<M: Memory> Riscv64<M> {
                     Some((pc, trace.cache_units(), trace.cache_breakdown()));
             }
         }
-        variants.retain(|trace| trace.cache_units() <= TRACE_CACHE_LIMIT);
+        variants.retain(|trace| Cost::of(trace).fits());
         if variants.is_empty() {
             return;
         }
-        let mut cache_units: usize = variants.iter().map(crate::trace::Trace::cache_units).sum();
-        while cache_units > TRACE_CACHE_LIMIT {
-            cache_units -= variants.remove(0).cache_units();
+        // Every variant left fits alone, so this stops with one or more.
+        let mut cost = Cost::sum(&variants);
+        while !cost.fits() {
+            cost = cost.minus(Cost::of(&variants.remove(0)));
             self.specialization_stats.evictions += 1;
         }
-        while cache_units <= TRACE_CACHE_LIMIT
-            && !self.traces.is_empty()
-            && (self.traces.len() >= 4096 || self.cache_units + cache_units > TRACE_CACHE_LIMIT)
+        while !self.traces.is_empty()
+            && (self.traces.len() >= 4096 || !self.cache.plus(cost).fits())
         {
             let oldest = *self
                 .traces
@@ -430,16 +479,11 @@ impl<M: Memory> Riscv64<M> {
                 .expect("nonempty cache")
                 .0;
             let evicted = self.traces.remove(&oldest).expect("cached trace");
-            self.cache_units -= evicted
-                .iter()
-                .map(crate::trace::Trace::cache_units)
-                .sum::<usize>();
+            self.cache = self.cache.minus(Cost::sum(&evicted));
             self.specialization_stats.evictions += evicted.len() as u64;
         }
-        if !variants.is_empty() {
-            self.cache_units += cache_units;
-            self.traces.insert(pc, variants);
-        }
+        self.cache = self.cache.plus(cost);
+        self.traces.insert(pc, variants);
     }
 
     fn account_outcome(
