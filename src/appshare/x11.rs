@@ -163,7 +163,10 @@ fn pick_cookie(entries: &[XauthEntry], number: u32, key: &CookieKey) -> Option<V
                             addresses,
                             hostname,
                         },
-                    ) => addresses.iter().any(IpAddr::is_loopback) && e.address == hostname.as_bytes(),
+                    ) => {
+                        addresses.iter().any(IpAddr::is_loopback)
+                            && e.address == hostname.as_bytes()
+                    }
                     (FAMILY_INTERNET, CookieKey::Tcp { addresses, .. }) => addresses
                         .iter()
                         .any(|a| matches!(a, IpAddr::V4(v4) if e.address == v4.octets())),
@@ -225,15 +228,13 @@ impl HostDisplay {
         };
         let hostname = hostname();
         let cookie = match &parsed.endpoint {
-            Endpoint::Local { .. } => {
-                pick_cookie(
-                    &entries,
-                    parsed.number,
-                    &CookieKey::Local {
-                        hostname: &hostname,
-                    },
-                )
-            }
+            Endpoint::Local { .. } => pick_cookie(
+                &entries,
+                parsed.number,
+                &CookieKey::Local {
+                    hostname: &hostname,
+                },
+            ),
             Endpoint::Tcp { host, port } => {
                 // An unresolvable host fails at connect; here it only means no
                 // Internet entry can match, leaving a Wild one.
@@ -693,10 +694,14 @@ mod tests {
             Some(HOST.to_vec())
         );
         assert_eq!(
-            pick_cookie(&entries, 7, &CookieKey::Tcp {
+            pick_cookie(
+                &entries,
+                7,
+                &CookieKey::Tcp {
                     addresses: &[],
                     hostname: "me"
-                }),
+                }
+            ),
             Some(HOST.to_vec())
         );
     }

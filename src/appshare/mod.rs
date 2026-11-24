@@ -622,7 +622,10 @@ mod tests {
                 !text.chars().any(|c| c.is_control() && c != '\t'),
                 "{text:?}"
             );
-            assert_eq!(text, "a\u{fffd}]0;x\u{fffd}b\u{fffd}c\td\u{fffd}2Je\u{fffd}");
+            assert_eq!(
+                text,
+                "a\u{fffd}]0;x\u{fffd}b\u{fffd}c\td\u{fffd}2Je\u{fffd}"
+            );
         }
     }
 
