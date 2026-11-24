@@ -365,9 +365,9 @@ impl DhcpServer {
             // An address another MAC was seen to use has a user, lease or
             // not: granting it would make the gateway drop that user's
             // frames (review F27).
-            (Some(r), None) => (self.requestable(r)
-                && seen(r).is_none_or(|user| user == req.chaddr))
-            .then_some(r),
+            (Some(r), None) => {
+                (self.requestable(r) && seen(r).is_none_or(|user| user == req.chaddr)).then_some(r)
+            }
             (None, None) => None,
         };
         match granted {
