@@ -2563,10 +2563,8 @@ mod tests {
         let disk = work.join("working.qcow2");
         qimg::create_blank(&disk, 16 << 20).await.unwrap();
         let store = TemplateStore::new(work.join("templates"));
-        let def = def(
-            r#"import <vmlab.wcl>
-template "t" { arch = "x86_64" version = "1" disk = 16MiB source "scratch" {} }"#,
-        );
+        let def = def(r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" disk = 16MiB source "scratch" {} }"#);
         let hw = hw(&def);
         let cancel = CancellationToken::new();
         let log: crate::scripting::OutputSink = std::sync::Arc::new(|_| {});
@@ -2578,7 +2576,17 @@ template "t" { arch = "x86_64" version = "1" disk = 16MiB source "scratch" {} }"
         };
         let (result, ()) = tokio::join!(
             super::seal_base(
-                &def, &hw, work, work, &disk, &store, &log, "1", None, Vec::new(), &cancel,
+                &def,
+                &hw,
+                work,
+                work,
+                &disk,
+                &store,
+                &log,
+                "1",
+                None,
+                Vec::new(),
+                &cancel,
             ),
             stop
         );
@@ -4781,7 +4789,12 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let digest = block.sha256.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let meta = super::install_built_variant(
-            &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+            &store,
+            &base,
+            &overlay,
+            &w.join("staging"),
+            &block,
+            &cancel,
         )
         .unwrap();
         let extra = meta.variant("extra").unwrap();
@@ -4813,7 +4826,12 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let overlay = built_overlay(&base.disk_path, &w, "disk0.qcow2");
         let block = built_block("third", &overlay, &base_sha, true);
         let meta = super::install_built_variant(
-            &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+            &store,
+            &base,
+            &overlay,
+            &w.join("staging"),
+            &block,
+            &cancel,
         )
         .unwrap();
         assert_eq!(meta.default_variant().unwrap().name, "third");
@@ -4827,7 +4845,12 @@ gpu "Nvidia1" { address = "0000:01:00.0"  default = true }
         let block = built_block("extra", &overlay, &"ef".repeat(32), false);
         assert!(
             super::install_built_variant(
-                &store, &base, &overlay, &w.join("staging"), &block, &cancel,
+                &store,
+                &base,
+                &overlay,
+                &w.join("staging"),
+                &block,
+                &cancel,
             )
             .is_err()
         );

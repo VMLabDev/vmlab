@@ -906,15 +906,9 @@ impl TemplateStore {
         variants: &[super::meta::VariantMeta],
         in_use: &dyn Fn(&[PathBuf]) -> Option<String>,
     ) -> Result<TemplateMeta> {
-        self.add_variants_checked(
-            arch,
-            name,
-            version,
-            staging_dir,
-            variants,
-            in_use,
-            &|| Ok(()),
-        )
+        self.add_variants_checked(arch, name, version, staging_dir, variants, in_use, &|| {
+            Ok(())
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2738,7 +2732,13 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("variants are not built yet"));
         let base = store
-            .resolve("x86_64", "win", None, Some(&VariantRef::Base), Purpose::Build)
+            .resolve(
+                "x86_64",
+                "win",
+                None,
+                Some(&VariantRef::Base),
+                Purpose::Build,
+            )
             .unwrap();
         assert_eq!(base.meta.version, "2");
     }
