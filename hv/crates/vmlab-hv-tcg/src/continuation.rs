@@ -69,9 +69,9 @@ impl<M: Memory> Interpreter<'_, M> {
                         } else if crate::is_checked_access(&frame.function.name) {
                             Some(frames.len())
                         } else {
-                            frames.iter().rposition(|caller| {
-                                crate::is_checked_access(&caller.function.name)
-                            })
+                            frames
+                                .iter()
+                                .rposition(|caller| crate::is_checked_access(&caller.function.name))
                         };
                         if let Some(index) = checked {
                             let name = match frames.get(index) {

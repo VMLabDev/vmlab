@@ -412,7 +412,8 @@ impl<'a, M: Memory> Interpreter<'a, M> {
     /// without this a guest access outside host RAM is a host error and the
     /// hart can never pass the instruction. Any other error is returned as is.
     pub(crate) fn guest_access_fault(&mut self, function: &str, error: Error) -> Result<Value> {
-        let (Some(address), Some(tag)) = (error.host_memory_fault(), checked_access_error(function))
+        let (Some(address), Some(tag)) =
+            (error.host_memory_fault(), checked_access_error(function))
         else {
             return Err(error);
         };
