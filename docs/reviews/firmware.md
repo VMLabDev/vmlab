@@ -283,12 +283,11 @@ firmware sizes before copying VARS, recording a boot, or launching vmlab-hv.
   2 MiB host pair for a new VM.
 - Severity: wrong result (a late, low-level refusal for a case the lookup
   was written to keep working).
-- Proof: unit test `a_store_of_another_layout_is_refused_by_name` beside the
-  describe tests: a fake layout with a 131,072-byte host VARS pair and a VM
-  directory with a 131,072-byte `OVMF_VARS.fd`, hypervisor `vmlab`. Assert
-  that validation or the start plan fails with a message that names the
-  store and the supported layout. Today `lookup_for_vars` returns the pair
-  and the description is composed.
+- Proof: lifecycle test `a_store_of_another_layout_is_refused_by_name`
+  starts a VM on the fake vmlab-hv backend with a 131,072-byte VARS template,
+  first with an existing store of that size and then without a store. Each
+  start must name the incompatible file and the supported layout, leave
+  VARS state untouched, and refuse before launching the backend.
 - Confidence: high.
 
 ### F7. Direct kernel boot does not check the initrd against low RAM

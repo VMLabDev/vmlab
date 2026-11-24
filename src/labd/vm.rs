@@ -3209,7 +3209,6 @@ const OVMF_CODE_SIZE: u64 = 0x37c000;
 const OVMF_VARS_SIZE: u64 = 0x84000;
 
 fn check_vmlab_ovmf_layout(fw: &qemu::firmware::UefiFirmware) -> Result<()> {
-
     let size = |path: &Path| {
         std::fs::metadata(path)
             .with_context(|| format!("reading firmware size for {}", path.display()))
