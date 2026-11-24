@@ -1114,6 +1114,19 @@ async fn agent_session(stream: UnixStream, machine: Arc<FakeProc>) {
                     }
                     AgentMsg::Exited { id, code: 0 }
                 }
+                HostMsg::OpenTail { id, .. } => {
+                    let opened = encode_ctrl(&AgentMsg::Opened { id }).unwrap();
+                    if tx.write_all(&opened).await.is_err() {
+                        return;
+                    }
+                    for byte in "é".as_bytes() {
+                        let frame = vmlab_agent_proto::encode_frame(FrameKind::Data, id, &[*byte]);
+                        if tx.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    AgentMsg::Exited { id, code: 0 }
+                }
                 HostMsg::Shutdown { mode } => {
                     if machine.ignores_agent_shutdown {
                         machine.note("agent shutdown ignored".into());
