@@ -903,13 +903,22 @@ impl VmInstance {
         let sources = qemu::firmware::Sources::installed(firmware_dir);
         let pairing = qemu::firmware::Pairing::of(t.resolved.secure_boot, &t.resolved.key_store);
         let context = || format!("{}: UEFI firmware", self.cfg.name);
-        if let Ok(m) = std::fs::metadata(self.dirs.ovmf_vars()) {
+        let vmlab = self.hypervisor() == HypervisorKind::Vmlab;
+        let store = self.dirs.ovmf_vars();
+        if let Ok(m) = std::fs::metadata(&store) {
+            if vmlab && m.len() != OVMF_VARS_SIZE {
+                bail!(
+                    "{}: OVMF variable store {} is {:#x} bytes. vmlab-hv requires +                     {OVMF_CODE_SIZE:#x}-byte CODE and {OVMF_VARS_SIZE:#x}-byte VARS. Back up this +                     store and move it aside to create a fresh one with compatible firmware. +                     The fresh store will lack the old UEFI boot entries and enrolled keys.",
+                    self.cfg.name,
+                    store.display(),
+                    m.len(),
+                );
+            }
             // The VM's own store exists: it is never replaced, whatever the
             // key store says now — it holds what the guest enrolled. Which
             // is why secure boot does not start on one that was booted
             // without it: its size says nothing of what it holds.
             if t.resolved.secure_boot {
-                let store = self.dirs.ovmf_vars();
                 let blank = (pairing == qemu::firmware::Pairing::Enrolled)
                     .then(|| sources.lookup_for_vars(arch, qemu::firmware::Pairing::Plain, m.len()))
                     .and_then(Result::ok)
@@ -921,19 +930,24 @@ impl VmInstance {
                     bail!("{why}");
                 }
             }
-            return Ok(Some(
-                sources
-                    .lookup_for_vars(arch, pairing, m.len())
-                    .with_context(context)?
-                    .with_network_stack(self.cfg.firmware_network_stack)?
-                    .with_debug(self.cfg.firmware_debug)?,
-            ));
+            let fw = sources
+                .lookup_for_vars(arch, pairing, m.len())
+                .with_context(context)?
+                .with_network_stack(self.cfg.firmware_network_stack)?
+                .with_debug(self.cfg.firmware_debug)?;
+            if vmlab {
+                check_vmlab_ovmf_layout(&fw).with_context(context)?;
+            }
+            return Ok(Some(fw));
         }
         let fw = sources
             .lookup(arch, pairing)
             .with_context(context)?
             .with_network_stack(self.cfg.firmware_network_stack)?
             .with_debug(self.cfg.firmware_debug)?;
+        if vmlab {
+            check_vmlab_ovmf_layout(&fw).with_context(context)?;
+        }
         // A pre-enrolled store replaces the VARS template at the first start.
         let vars_file = match (&t.resolved.key_store, t.resolved.secure_boot) {
             (_, false) => None,
@@ -3188,6 +3202,29 @@ impl KeepAwake {
             Self::Failed => "failed",
         }
     }
+}
+
+// The x86 flash layout enforced by vmlab-hv-devices' pflash.
+const OVMF_CODE_SIZE: u64 = 0x37c000;
+const OVMF_VARS_SIZE: u64 = 0x84000;
+
+fn check_vmlab_ovmf_layout(fw: &qemu::firmware::UefiFirmware) -> Result<()> {
+
+    let size = |path: &Path| {
+        std::fs::metadata(path)
+            .with_context(|| format!("reading firmware size for {}", path.display()))
+            .map(|metadata| metadata.len())
+    };
+    let code = size(&fw.code)?;
+    let vars = size(&fw.vars_template)?;
+    if code != OVMF_CODE_SIZE || vars != OVMF_VARS_SIZE {
+        bail!(
+            "OVMF CODE {} is {code:#x} bytes and VARS template {} is {vars:#x} bytes. +             vmlab-hv requires {OVMF_CODE_SIZE:#x}-byte CODE and {OVMF_VARS_SIZE:#x}-byte VARS. +             Install the vmlab firmware bundle or point the host's firmware_dir at a compatible pair.",
+            fw.code.display(),
+            fw.vars_template.display(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
