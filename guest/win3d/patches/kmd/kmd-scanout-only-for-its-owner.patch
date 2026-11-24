@@ -1,0 +1,362 @@
+Subject: [PATCH] viogpu3d: change the scanout only for Windows and for the process it gave the scanout
+
+A program had two ways to the scanout that Windows does not know about.
+
+DxgkDdiRender accepted VIOGPU_CMD_PRESENT_FLIP in the command stream of a
+program and checked only its size and format. The command then sent
+SET_SCANOUT or SET_SCANOUT_BLOB and a flush with the resource id, the
+scanout id, the size and the offset of the stream, and the resource id was
+not checked against anything. Only Present writes this command, into a DMA
+buffer of its own, so Render now refuses it with
+STATUS_PRIVILEGED_INSTRUCTION.
+
+The VIOGPU_RES_SET_SCANOUT_BLOB escape showed a blob allocation of any
+process that asked. The user-mode driver needs it for a fullscreen
+application, which Windows gave the scanout with a mode set
+(DxgkDdiSetVidPnSourceAddress with an allocation of that application). The
+escape is now served only for the process that made the allocation Windows
+last set as the source, for an allocation that this process made, on
+scanout 0. Every other caller gets STATUS_ACCESS_DENIED, and a scanout id
+that is not 0 gets STATUS_INVALID_PARAMETER. Each allocation records the
+process that made it (id and creation time), and SetVidPnSourceAddress
+records the one of the source under the sequence it already has. When
+Windows takes the scanout back between the check and the commands of the
+escape, the timer sends the source of Windows once more.
+
+The decisions are in a header with no include:
+tests/kmd/scanout_owner_test.cpp of the package compiles it on the build
+host.
+
+Card #755, finding F7 of the win3d driver review. docs/acceptance/C755.md
+has the proof.
+---
+diff --git a/viogpu/common/viogpu_scanout_owner.h b/viogpu/common/viogpu_scanout_owner.h
+new file mode 100644
+index 0000000..9e51438
+--- /dev/null
++++ b/viogpu/common/viogpu_scanout_owner.h
+@@ -0,0 +1,76 @@
++/*
++ * Who may change what the scanout shows.
++ *
++ * Windows changes it through DxgkDdiPresent and DxgkDdiSetVidPnSourceAddress,
++ * and the driver builds the flip command for those itself. Two ways are open
++ * to a program, and both are decided here.
++ *
++ * The command stream of DxgkDdiRender comes from a program. The flip command
++ * is one that only the driver writes, so a program may not put it there.
++ *
++ * The VIOGPU_RES_SET_SCANOUT_BLOB escape is how the user-mode driver of a
++ * fullscreen application shows a frame without a present. Windows gave such
++ * an application the scanout with a mode set, which names an allocation
++ * that this application made. So the escape is for the process that made
++ * the allocation Windows last set as the source, for an allocation that this
++ * same process made, on the one scanout the adapter has. When Windows takes
++ * the scanout back (another desktop, the secure desktop, the end of the
++ * fullscreen mode) it sets an allocation of another process, and the escape
++ * of the application is refused from then on.
++ *
++ * A process is named by its id and its creation time: an id alone can be
++ * given to a new process after the first one ended.
++ *
++ * This header includes nothing and uses no kernel type, so that a test
++ * program on the build host can compile it.
++ */
++#pragma once
++
++typedef struct _VIOGPU_PROCESS_IDENTITY
++{
++    unsigned long long pid;  /* 0: no process */
++    long long create_time;
++} VIOGPU_PROCESS_IDENTITY;
++
++static inline int VioGpuSameProcess(const VIOGPU_PROCESS_IDENTITY *a, const VIOGPU_PROCESS_IDENTITY *b)
++{
++    return a->pid != 0 && a->pid == b->pid && a->create_time == b->create_time;
++}
++
++/* command_type is VIOGPU_COMMAND_HDR.type of a command in the stream of
++ * DxgkDdiRender. 4 is VIOGPU_CMD_PRESENT_FLIP. */
++static inline int VioGpuUserStreamCommandAllowed(unsigned int command_type)
++{
++    return command_type != 4;
++}
++
++enum
++{
++    VIOGPU_SCANOUT_ESCAPE_ALLOWED = 0,
++    VIOGPU_SCANOUT_ESCAPE_NO_SUCH_SCANOUT,
++    VIOGPU_SCANOUT_ESCAPE_NOT_THE_CREATOR,
++    VIOGPU_SCANOUT_ESCAPE_NOT_THE_OWNER,
++};
++
++/* caller: the process in the escape. creator: the process that made the
++ * allocation of the escape. owner: the process that made the allocation
++ * Windows last set as the source of the scanout. */
++static inline int VioGpuScanoutEscapeCheck(unsigned int scanout_id,
++                                           const VIOGPU_PROCESS_IDENTITY *caller,
++                                           const VIOGPU_PROCESS_IDENTITY *creator,
++                                           const VIOGPU_PROCESS_IDENTITY *owner)
++{
++    if (scanout_id != 0)
++    {
++        return VIOGPU_SCANOUT_ESCAPE_NO_SUCH_SCANOUT;
++    }
++    if (!VioGpuSameProcess(caller, creator))
++    {
++        return VIOGPU_SCANOUT_ESCAPE_NOT_THE_CREATOR;
++    }
++    if (!VioGpuSameProcess(caller, owner))
++    {
++        return VIOGPU_SCANOUT_ESCAPE_NOT_THE_OWNER;
++    }
++    return VIOGPU_SCANOUT_ESCAPE_ALLOWED;
++}
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 481e43c..b7ca180 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -1812,7 +1812,40 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+                     return STATUS_INVALID_PARAMETER;
+                 }
+ 
++                // Only the process that Windows gave the scanout may show
++                // an allocation, and only one that it made itself.
++                VIOGPU_PROCESS_IDENTITY caller;
++                VIOGPU_PROCESS_IDENTITY owner;
++                VioGpuCurrentProcessIdentity(&caller);
++                vidpn.GetSourceOwner(&owner);
++                const int refusal = VioGpuScanoutEscapeCheck(pVioGpuEscape->ResourceSetScanoutBlob.ScanoutId,
++                                                             &caller,
++                                                             allocation->GetCreator(),
++                                                             &owner);
++                if (refusal != VIOGPU_SCANOUT_ESCAPE_ALLOWED)
++                {
++                    DbgPrint(TRACE_LEVEL_ERROR,
++                             ("%s ERROR owner=viogpu3d component=blob-scanout reason=%d action=reject res_id=0x%x scanout=%u pid=%llu owner_pid=%llu\n",
++                              __FUNCTION__,
++                              refusal,
++                              allocation->GetId(),
++                              pVioGpuEscape->ResourceSetScanoutBlob.ScanoutId,
++                              caller.pid,
++                              owner.pid));
++                    return refusal == VIOGPU_SCANOUT_ESCAPE_NO_SUCH_SCANOUT ? STATUS_INVALID_PARAMETER
++                                                                            : STATUS_ACCESS_DENIED;
++                }
++
+                 status = allocation->EscapeResourceSetScanoutBlob(&pVioGpuEscape->ResourceSetScanoutBlob);
++
++                // Windows can take the scanout back between the check and
++                // the commands above. Its flip may then be on the queue
++                // ahead of them, so the timer sends it once more.
++                vidpn.GetSourceOwner(&owner);
++                if (!VioGpuSameProcess(&caller, &owner))
++                {
++                    vidpn.ResendSourceFlip();
++                }
+                 break;
+             }
+         case VIOGPU_CTX_INIT:
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index a46f0b7..02046d2 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -44,6 +44,12 @@ static void VioGpuGetTargetProcess(VioGpuDevice *device, PEPROCESS *out_process,
+     }
+ }
+ 
++void VioGpuCurrentProcessIdentity(VIOGPU_PROCESS_IDENTITY *identity)
++{
++    identity->pid = (ULONG_PTR)PsGetCurrentProcessId();
++    identity->create_time = PsGetProcessCreateTimeQuadPart(PsGetCurrentProcess());
++}
++
+ void VioGpuAllocation::BlobCreateCompleteCB(void *ctx_void)
+ {
+     PVIOGPU_COMPLETE_CTX ctx = (PVIOGPU_COMPLETE_CTX)ctx_void;
+@@ -89,6 +95,8 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_CREATE_ALLOCAT
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+ 
+     m_adapter = adapter;
++    // DxgkDdiCreateAllocation runs in the process that asked for the allocation.
++    VioGpuCurrentProcessIdentity(&m_creator);
+     m_Id = m_adapter->resourceIdr.GetId();
+     memcpy(&m_options, &exchange->ResourceOptions, sizeof(VIOGPU_RESOURCE_OPTIONS));
+     m_options.bind = VIRGL_BIND_FOR_TARGET(m_options.target, m_options.bind);
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index 1ef2bc9..8b8a3ba 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -9,10 +9,14 @@
+ #include "virgl_hw.h"
+ #include "viogpum.h"
+ #include "viogpu_blob_user_view.h"
++#include "viogpu_scanout_owner.h"
+ 
+ class VioGpuAdapter;
+ class VioGpuDevice;
+ 
++// The calling process, at PASSIVE_LEVEL.
++void VioGpuCurrentProcessIdentity(VIOGPU_PROCESS_IDENTITY *identity);
++
+ class VioGpuResource
+ {
+   public:
+@@ -51,6 +55,12 @@ class VioGpuAllocation
+     {
+         return m_scanout_offset;
+     }
++    // The process that made the allocation. It does not change, and
++    // SetVidPnSourceAddress reads it at any IRQL.
++    const VIOGPU_PROCESS_IDENTITY *GetCreator(void) const
++    {
++        return &m_creator;
++    }
+ 
+     void MarkBusy();
+     void UnmarkBusy();
+@@ -155,6 +165,7 @@ class VioGpuAllocation
+     BlobUserMapping *FindBlobMappingLocked(HANDLE process_id, PEPROCESS process);
+ 
+     VioGpuAdapter *m_adapter;
++    VIOGPU_PROCESS_IDENTITY m_creator;
+ 
+     VIOGPU_RESOURCE_OPTIONS m_options;
+     UINT m_Id;
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 831529b..6a453fd 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -7,6 +7,7 @@
+ #include "viogpu_device.h"
+ #include "viogpu_adapter.h"
+ #include "viogpu_format.h"
++#include "viogpu_scanout_owner.h"
+ #include "baseobj.h"
+ #include "virgl_hw.h"
+ 
+@@ -567,6 +568,17 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
+                 return STATUS_INVALID_USER_BUFFER;
+             }
+ 
++            // The flip of Windows comes through Present, which writes this
++            // command itself. From a program it would point the scanout at
++            // any resource, of any process, without Windows knowing.
++            if (!VioGpuUserStreamCommandAllowed(cmdHdr.type))
++            {
++                DbgPrint(TRACE_LEVEL_ERROR,
++                         ("%s ERROR owner=viogpu3d component=Render reason=flip_command_in_user_stream action=reject ctx_id=%u\n",
++                          __FUNCTION__, m_id));
++                return STATUS_PRIVILEGED_INSTRUCTION;
++            }
++
+             memcpy(dmaBuf, cmdBuf, commandBytes);
+             // Use the header snapshot that bounded this copy. The user-mode
+             // header may have changed while the command body was copied.
+@@ -592,22 +604,6 @@ NTSTATUS VioGpuDevice::Render(DXGKARG_RENDER *pRender)
+                 return STATUS_NOT_SUPPORTED;
+ #endif
+             }
+-            if (cmdHdr.type == VIOGPU_CMD_PRESENT_FLIP)
+-            {
+-                if (cmdHdr.size < sizeof(VIOGPU_PRESENT_FLIP_CMD))
+-                {
+-                    return STATUS_INVALID_USER_BUFFER;
+-                }
+-                const VIOGPU_PRESENT_FLIP_CMD *flipCmd =
+-                    reinterpret_cast<const VIOGPU_PRESENT_FLIP_CMD *>(dmaBuf + sizeof(cmdHdr));
+-                if (flipCmd->is_blob && !VioGpuVirglFormatToScanout(flipCmd->format))
+-                {
+-                    DbgPrint(TRACE_LEVEL_ERROR,
+-                             ("%s ERROR owner=viogpu3d component=Render reason=unsupported_blob_scanout_format action=reject format=%u res_id=0x%x\n",
+-                              __FUNCTION__, flipCmd->format, flipCmd->res_id));
+-                    return STATUS_NOT_SUPPORTED;
+-                }
+-            }
+             dmaBuf += commandBytes;
+             cmdBuf += commandBytes;
+             dmaBytesLeft -= commandBytes;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index 622c449..a404c70 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -2124,6 +2124,25 @@ void VioGpuVidPN::Flip()
+     }
+ }
+ 
++void VioGpuVidPN::GetSourceOwner(VIOGPU_PROCESS_IDENTITY *owner)
++{
++    for (ULONG tries = 0; tries < 1000; ++tries)
++    {
++        const LONG sequence = InterlockedCompareExchange(&m_sourceSequence, 0, 0);
++        if (!(sequence & 1))
++        {
++            *owner = m_sourceOwner;
++            if (InterlockedCompareExchange(&m_sourceSequence, 0, 0) == sequence)
++            {
++                return;
++            }
++        }
++        YieldProcessor();
++    }
++    owner->pid = 0;
++    owner->create_time = 0;
++}
++
+ BOOLEAN VioGpuVidPN::QueueSourceAddress(PHYSICAL_ADDRESS address)
+ {
+     LONG head = InterlockedCompareExchange(&m_sourceAddressQueueHead, 0, 0);
+@@ -2392,6 +2411,15 @@ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS
+     InterlockedIncrement(&m_sourceSequence);
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+     m_sourceRes = sourceRes;
++    if (sourceRes)
++    {
++        m_sourceOwner = *sourceRes->GetCreator();
++    }
++    else
++    {
++        m_sourceOwner.pid = 0;
++        m_sourceOwner.create_time = 0;
++    }
+     const BOOLEAN queued = QueueSourceAddress(m_sourceAddress);
+     InterlockedOr(&m_shouldFlip, 1);
+     InterlockedIncrement(&m_sourceSequence);
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 34b0d27..f6e7390 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -8,6 +8,7 @@
+ 
+ #include "helper.h"
+ #include "viogpu.h"
++#include "viogpu_scanout_owner.h"
+ 
+ class VioGpuAdapter;
+ class VioGpuAllocation;
+@@ -125,6 +126,16 @@ class VioGpuVidPN
+     volatile LONG m_vsync = 0;
+ 
+     NTSTATUS SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress);
++    // The process that made the allocation Windows last set as the source:
++    // the one process whose scanout escape is served. No process when
++    // Windows set none, or when the writer did not finish in time.
++    void GetSourceOwner(VIOGPU_PROCESS_IDENTITY *owner);
++    // Makes the timer send the source of Windows again, over what a
++    // scanout escape sent in between.
++    void ResendSourceFlip(void)
++    {
++        InterlockedOr(&m_shouldFlip, 1);
++    }
+ 
+   private:
+     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
+@@ -160,6 +171,8 @@ class VioGpuVidPN
+ 
+     PHYSICAL_ADDRESS m_sourceAddress = {0};
+     VioGpuAllocation *m_sourceRes = NULL;
++    // Changes with m_sourceRes, under m_sourceSequence.
++    VIOGPU_PROCESS_IDENTITY m_sourceOwner = {};
+     volatile LONG m_shouldFlip = 0;
+ 
+ 
