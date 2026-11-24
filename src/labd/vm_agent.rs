@@ -3235,9 +3235,9 @@ mod tests {
         assert!(handle.ping(Duration::from_secs(2)).await);
     }
 
-    /// What `mock:small-frames` and `mock:mixed-frames` send: more frames
-    /// than one session queue holds, of one byte each. The first then ends
-    /// with `Eof` and an exit code of 3.
+    /// What `mock:small-frames`, `mock:mixed-frames` and `mock:past-eof`
+    /// send: more frames than one session queue holds, of one byte each.
+    /// The first two then end with `Eof` and an exit code of 3.
     const SMALL_FRAMES: usize = SESSION_QUEUE + 500;
 
     /// One channel holds more frames than its queue while nobody reads it.
@@ -3304,15 +3304,15 @@ mod tests {
         );
     }
 
-    /// Frames the queue cannot merge (stdout and stderr in turn) pass its
-    /// depth while nobody reads: the reader closes that one channel at once,
-    /// with an error that says why, and the connection goes on (F5).
+    /// Payload the queue cannot take (behind an `Eof`, past its depth)
+    /// arrives while nobody reads: the reader closes that one channel at
+    /// once, with an error that says why, and the connection goes on (F5).
     #[tokio::test]
     async fn a_channel_that_overfills_its_queue_is_closed_without_a_wait() {
         let (_dir, path) = mock_agent(true).await;
         let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
         let mut session = handle
-            .open_exec(vec!["mock:mixed-frames".into()], vec![], None, None)
+            .open_exec(vec!["mock:past-eof".into()], vec![], None, None)
             .await
             .unwrap();
         assert!(
@@ -3329,13 +3329,175 @@ mod tests {
                 .await
                 .expect("the session did not end");
             match ev {
-                Some(SessionEvent::Data(_) | SessionEvent::Stderr(_)) => events += 1,
+                Some(SessionEvent::Data(_) | SessionEvent::Eof) => events += 1,
                 Some(SessionEvent::Error(msg)) => break msg,
                 other => panic!("the session ended without an error: {other:?}"),
             }
         };
         assert!(error.contains("queue"), "{error}");
-        assert!(events <= SESSION_QUEUE, "{events} events sat in one queue");
+        assert!(events <= SESSION_QUEUE + 1, "{events} events sat in one queue");
+    }
+
+    /// Wait, without reading the session, until the reader has queued the
+    /// end of its channel or closed its queue. There is no time limit: each
+    /// pass lets the reader task run.
+    async fn queue_settled(session: &AgentSession) {
+        loop {
+            {
+                let st = session.rx.state.lock_recover();
+                let ended = matches!(
+                    st.events.back(),
+                    Some(SessionEvent::Exited(_) | SessionEvent::Error(_))
+                );
+                if ended || st.closed {
+                    return;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A guest that writes stdout and stderr in turn, a byte a frame, stays
+    /// far inside its window while it passes the depth of the queue of a
+    /// consumer that is behind. It broke no rule, so the channel is kept:
+    /// every byte of each stream arrives, then the end of the command
+    /// (second review of the guest agents, G6).
+    #[tokio::test]
+    async fn interleaved_streams_inside_the_window_keep_the_channel() {
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:mixed-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // Nobody reads the channel until all of it has arrived.
+        queue_settled(&session).await;
+        let queued = session.rx.state.lock_recover().events.len();
+        assert!(
+            queued <= SESSION_QUEUE + 4,
+            "{queued} events sat in one queue"
+        );
+
+        let (mut out, mut err, mut eof) = (0usize, 0usize, false);
+        let code = loop {
+            match session.recv().await {
+                Some(SessionEvent::Data(b)) => {
+                    assert!(!eof && b.iter().all(|&c| c == b's'));
+                    out += b.len();
+                }
+                Some(SessionEvent::Stderr(b)) => {
+                    assert!(!eof && b.iter().all(|&c| c == b'e'));
+                    err += b.len();
+                }
+                Some(SessionEvent::Eof) => eof = true,
+                Some(SessionEvent::Exited(code)) => break code,
+                other => panic!("the channel of an honest guest ended early: {other:?}"),
+            }
+        };
+        assert_eq!(
+            (out, err),
+            (SMALL_FRAMES.div_ceil(2), SMALL_FRAMES / 2),
+            "bytes of stdout and of stderr"
+        );
+        assert!(eof, "the end of the output was lost");
+        assert_eq!(code, 3);
+    }
+
+    /// The queue at its depth: each stream's payload joins the newest event
+    /// of that stream, in order, and the queue passes the depth by one event
+    /// per stream, the `Eof` and the exit at most. Payload behind the `Eof`
+    /// is refused (G6).
+    #[test]
+    fn a_full_queue_joins_each_stream_and_stays_bounded() {
+        let queue = SessionQueue::new();
+        for _ in 0..SESSION_QUEUE {
+            assert!(queue.push(SessionEvent::Data(vec![0])));
+        }
+        // Stderr has no event in the queue yet: it gets one.
+        for n in 1..=200u8 {
+            assert!(queue.push(SessionEvent::Stderr(vec![n])));
+            assert!(queue.push(SessionEvent::Data(vec![n])));
+            assert!(queue.push(SessionEvent::Data(vec![])));
+        }
+        assert!(queue.push(SessionEvent::Eof));
+        assert!(queue.push(SessionEvent::Eof));
+        assert!(!queue.push(SessionEvent::Data(vec![1])));
+        assert!(!queue.push(SessionEvent::Stderr(vec![1])));
+        assert!(queue.push(SessionEvent::Exited(0)));
+
+        let st = queue.state.lock_recover();
+        assert_eq!(st.events.len(), SESSION_QUEUE + 3);
+        let order: Vec<u8> = (1..=200).collect();
+        let Some(SessionEvent::Data(last_out)) = st.events.get(SESSION_QUEUE - 1) else {
+            panic!("the last stdout event is not where it was queued");
+        };
+        assert_eq!(last_out[1..], order[..]);
+        let Some(SessionEvent::Stderr(all_err)) = st.events.get(SESSION_QUEUE) else {
+            panic!("stderr got no event of its own");
+        };
+        assert_eq!(all_err[..], order[..]);
+    }
+
+    /// What `mock:indexed-frames` sends: this many full frames, each filled
+    /// with its index.
+    const INDEXED_FRAMES: u8 = 3;
+
+    /// A `recv` whose `window_adjust` cannot be written yet (another task
+    /// holds the writer) still returns the event it took, and the grant
+    /// reaches the agent once the writer is free. A `select!` that drops a
+    /// `recv` at that point loses neither (second review of the guest
+    /// agents, G4).
+    #[tokio::test]
+    async fn a_cancelled_recv_loses_neither_bytes_nor_credit() {
+        use futures::FutureExt;
+
+        let (_dir, path) = mock_agent(true).await;
+        let handle = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let mut session = handle
+            .open_exec(vec!["mock:indexed-frames".into()], vec![], None, None)
+            .await
+            .unwrap();
+        // All three frames are queued before the first is read. No time
+        // limit: each pass lets the reader task run.
+        while session.rx.state.lock_recover().events.len() < INDEXED_FRAMES as usize {
+            tokio::task::yield_now().await;
+        }
+
+        // Another task holds the writer, as a file push does. Each `recv`
+        // is polled once and dropped, which is what a `select!` does to it
+        // when another branch is ready. The second frame crosses the
+        // replenish point.
+        let writer = handle.inner.writer.lock().await;
+        let mut frames = Vec::new();
+        for _ in 0..INDEXED_FRAMES {
+            match session.recv().now_or_never() {
+                Some(Some(SessionEvent::Data(b))) => {
+                    assert_eq!(b.len(), MAX_PAYLOAD);
+                    assert!(b.iter().all(|&c| c == b[0]), "a frame was torn");
+                    frames.push(b[0]);
+                }
+                // The `recv` waited: what it had taken is gone with it.
+                None => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        drop(writer);
+        assert_eq!(
+            frames,
+            (0..INDEXED_FRAMES).collect::<Vec<u8>>(),
+            "a recv that was dropped took a frame with it"
+        );
+
+        // The agent answers the `window_adjust` it gets, then exits.
+        let granted = match session.recv().await {
+            Some(SessionEvent::Data(b)) => String::from_utf8(b).unwrap(),
+            other => panic!("no grant reached the agent: {other:?}"),
+        };
+        assert_eq!(granted, format!("granted:{}", 2 * MAX_PAYLOAD));
+        assert!(matches!(
+            session.recv().await,
+            Some(SessionEvent::Exited(0))
+        ));
     }
 
     /// A minimal in-process agent speaking the real frame protocol over a
@@ -3415,6 +3577,8 @@ mod tests {
             // `mock:flood` execs: channel -> (send credit, bytes still to
             // send). The flood spends only the credit the host granted.
             let mut floods: HashMap<u32, (u64, u64)> = HashMap::new();
+            // `mock:indexed-frames` execs.
+            let mut indexed: Vec<u32> = Vec::new();
             // File sessions: channel -> the in-memory filesystem it serves,
             // its record decoder and its handle table.
             let mut files: HashMap<u32, MockFiles> = HashMap::new();
@@ -3528,34 +3692,54 @@ mod tests {
                                         }
                                         continue;
                                     }
-                                    // `mock:small-frames` and
-                                    // `mock:mixed-frames`: more frames than
-                                    // one session queue holds, one byte
-                                    // each, so far inside the window. The
-                                    // first is all stdout; the second
-                                    // alternates stdout and stderr.
-                                    if let Some(mixed) = match argv.first().map(String::as_str) {
-                                        Some("mock:small-frames") => Some(false),
-                                        Some("mock:mixed-frames") => Some(true),
-                                        _ => None,
-                                    } {
+                                    // `mock:small-frames`,
+                                    // `mock:mixed-frames` and
+                                    // `mock:past-eof`: more frames than one
+                                    // session queue holds, one byte each,
+                                    // so far inside the window. The first
+                                    // is all stdout (`s`). The second sends
+                                    // stdout and stderr (`e`) in turn. Both
+                                    // end as the agent's exec does. The
+                                    // third is all stdout, and sends
+                                    // payload behind its `Eof`.
+                                    let small = argv.first().map(String::as_str);
+                                    if let Some("mock:small-frames")
+                                    | Some("mock:mixed-frames")
+                                    | Some("mock:past-eof") = small
+                                    {
+                                        let mixed = small == Some("mock:mixed-frames");
                                         let mut w = tx.lock().await;
                                         for n in 0..SMALL_FRAMES {
-                                            let kind = if mixed && n % 2 == 1 {
-                                                FrameKind::DataErr
+                                            let frame = if mixed && n % 2 == 1 {
+                                                encode_frame(FrameKind::DataErr, id, b"e")
                                             } else {
-                                                FrameKind::Data
+                                                encode_frame(FrameKind::Data, id, b"s")
                                             };
-                                            let _ =
-                                                w.write_all(&encode_frame(kind, id, b"s")).await;
+                                            let _ = w.write_all(&frame).await;
                                         }
                                         drop(w);
-                                        // The all-stdout command ends as
-                                        // the agent's exec does.
-                                        if !mixed {
-                                            send(AgentMsg::Eof { id }).await;
+                                        send(AgentMsg::Eof { id }).await;
+                                        if small == Some("mock:past-eof") {
+                                            let _ = tx
+                                                .lock()
+                                                .await
+                                                .write_all(&encode_frame(FrameKind::Data, id, b"s"))
+                                                .await;
+                                        } else {
                                             send(AgentMsg::Exited { id, code: 3 }).await;
                                         }
+                                        continue;
+                                    }
+                                    // `mock:indexed-frames`: three full
+                                    // frames, each filled with its index.
+                                    // Every `window_adjust` the host then
+                                    // sends for the channel is answered
+                                    // with `granted:<bytes>` and the exit.
+                                    if small == Some("mock:indexed-frames") {
+                                        for n in 0..INDEXED_FRAMES {
+                                            send_data(id, vec![n; MAX_PAYLOAD]).await;
+                                        }
+                                        indexed.push(id);
                                         continue;
                                     }
                                     // A command that never stops writing
@@ -3618,6 +3802,11 @@ mod tests {
                                         pump_flood(&tx, id, flood).await;
                                     } else {
                                         out.grant(id, bytes).await;
+                                    }
+                                    if indexed.contains(&id) {
+                                        send_data(id, format!("granted:{bytes}").into_bytes())
+                                            .await;
+                                        send(AgentMsg::Exited { id, code: 0 }).await;
                                     }
                                 }
                                 HostMsg::Close { id } => {
