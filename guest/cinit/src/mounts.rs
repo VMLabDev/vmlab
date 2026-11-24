@@ -9,7 +9,7 @@ use std::process::Command;
 
 use nix::mount::{MsFlags, mount};
 
-use crate::util::{Ctx, Result, in_root, write_in_root};
+use crate::util::{Ctx, Result, copy_in_root, in_root, write_in_root};
 
 /// Container rootfs mount point (overlay of squashfs + scratch).
 pub const ROOTFS: &str = "/rootfs";
@@ -253,14 +253,13 @@ pub fn install_shell_fallback() {
 /// [`install_shell_fallback`] for the container root `root`, from the
 /// busybox binary at `busybox`.
 fn install_shell_fallback_in(root: &str, busybox: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     // Paths resolved inside the rootfs (F56): an image's own `/.vmlab`
     // symlink must not aim this copy at the initramfs.
     ensure_dir(&in_root(root, "/.vmlab")?)?;
-    let dest = in_root(root, vmlab_agent_proto::BUSYBOX_FALLBACK)?;
-    fs::copy(busybox, &dest).ctx("copy busybox")?;
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).ctx("chmod busybox")?;
+    // Not `fs::copy` (F7): the image, or an earlier run's scratch layer, can
+    // hold a FIFO or a device node at this name.
+    copy_in_root(root, busybox, vmlab_agent_proto::BUSYBOX_FALLBACK, 0o755)?;
     let bin_dir = in_root(root, vmlab_agent_proto::BUSYBOX_BIN_DIR)?;
     ensure_dir(&bin_dir)?;
     let output = Command::new(busybox)
@@ -350,6 +349,8 @@ mod tests {
 
         let err = install_shell_fallback_in(root.to_str().unwrap(), busybox.to_str().unwrap())
             .unwrap_err();
-        assert!(err.contains("not a regular file"), "{err}");
+        assert!(err.contains(vmlab_agent_proto::BUSYBOX_FALLBACK), "{err}");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
     }
 }

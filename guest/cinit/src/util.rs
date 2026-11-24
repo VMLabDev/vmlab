@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -146,6 +146,29 @@ pub fn write_in_root(root: &str, path: &str, contents: &str) -> Result<()> {
         .ctx(&format!("write {path}"))
 }
 
+/// Copy the file `source` of the micro-VM to the image file `path` (resolved
+/// by [`in_root`]) with the permission bits `mode`, creating it when absent.
+/// Only a regular file is written, as in [`write_in_root`]: a FIFO there
+/// would block PID 1 in `open`, and a device node would take the bytes.
+pub fn copy_in_root(root: &str, source: &str, path: &str, mode: u32) -> Result<()> {
+    let mut from = std::fs::File::open(source).ctx(&format!("open {source}"))?;
+    let full = in_root(root, path)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&full)
+        .ctx(&format!("open {path}"))?;
+    if !file.metadata().ctx(&format!("stat {path}"))?.is_file() {
+        return Err(format!("{path}: not a regular file"));
+    }
+    file.set_len(0).ctx(&format!("truncate {path}"))?;
+    std::io::copy(&mut from, &mut file).ctx(&format!("write {path}"))?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .ctx(&format!("chmod {path}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +248,25 @@ mod tests {
         // warns) rather than escaping.
         symlink("/nowhere/x", r.join("etc/hostname")).unwrap();
         assert!(write_in_root(&root, "/etc/hostname", "x").is_err());
+    }
+
+    #[test]
+    fn copy_writes_a_regular_file_with_its_mode_and_nothing_else() {
+        let (dir, root) = fixture();
+        let r = Path::new(&root);
+        let source = dir.path().join("source");
+        let source = source.to_str().unwrap();
+        fs::write(source, "new bytes").unwrap();
+        // An existing file is replaced whole, and takes the mode.
+        fs::write(r.join("run/tool"), "older and longer bytes").unwrap();
+        copy_in_root(&root, source, "/run/tool", 0o755).unwrap();
+        assert_eq!(fs::read_to_string(r.join("run/tool")).unwrap(), "new bytes");
+        let mode = fs::metadata(r.join("run/tool")).unwrap().permissions();
+        assert_eq!(mode.mode() & 0o777, 0o755);
+        // A directory and a link onto one are refused.
+        assert!(copy_in_root(&root, source, "/etc", 0o755).is_err());
+        symlink("/run", r.join("etc/tool")).unwrap();
+        assert!(copy_in_root(&root, source, "/etc/tool", 0o755).is_err());
     }
 
     #[test]
