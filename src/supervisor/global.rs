@@ -566,7 +566,6 @@ fn spawn_dns_sync(
 
 pub struct GlobalSegments {
     segs: Mutex<HashMap<String, GlobalSeg>>,
-    next_index: Mutex<u32>,
     dns_suffix: String,
     /// Where the segments' DNS forwards names no attached lab answers to.
     upstream_dns: Option<SocketAddr>,
@@ -600,7 +599,6 @@ impl GlobalSegments {
     ) -> Arc<Self> {
         Arc::new(Self {
             segs: Mutex::new(HashMap::new()),
-            next_index: Mutex::new(0),
             dns_suffix,
             upstream_dns,
             psk,
@@ -648,19 +646,30 @@ impl GlobalSegments {
             return Ok((seg.sock.clone(), warnings, seg.subnet));
         }
 
-        let mut next_index = self.next_index.lock().await;
-        let automatic_subnet = subnet.is_none();
-        // A subnet named explicitly may be one this pool handed out before:
-        // an adopted lab re-attaching after a supervisor restart (F9) names
-        // the subnet its guests hold leases in. Allocate past it.
-        let pool_index = subnet.and_then(pool_index);
+        // Live segments reserve their subnets, including subnets named by
+        // adopted labs re-attaching after a supervisor restart (F9).
         let subnet = match subnet {
-            Some(subnet) => subnet,
+            Some(subnet) => {
+                if let Some((other, seg)) = segs
+                    .iter()
+                    .find(|(_, seg)| subnets_overlap(subnet, seg.subnet))
+                {
+                    bail!(
+                        "global segment \"{name}\" subnet {subnet} overlaps \"{other}\" ({})",
+                        seg.subnet
+                    );
+                }
+                subnet
+            }
             None => {
                 let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
                 pool.subnets(24)
                     .expect("pool splits")
-                    .nth(*next_index as usize)
+                    .find(|&candidate| {
+                        !segs
+                            .values()
+                            .any(|seg| subnets_overlap(candidate, seg.subnet))
+                    })
                     .ok_or_else(|| anyhow::anyhow!("global subnet pool exhausted"))?
             }
         };
@@ -671,13 +680,6 @@ impl GlobalSegments {
             .listen_unix(&sock, PortClass::Service)
             .await
             .with_context(|| format!("listening on {}", sock.display()))?;
-
-        // Commit the allocation only after the last fallible setup step.
-        if automatic_subnet {
-            *next_index += 1;
-        } else if let Some(index) = pool_index {
-            *next_index = (*next_index).max(index + 1);
-        }
 
         let gw_ip = Ipv4Addr::from(u32::from(subnet.network()) + 1);
         let gw_mac = gateway_mac("__global", name);
@@ -970,19 +972,16 @@ fn spawn_tcp_peer_dialer(
     })
 }
 
+fn subnets_overlap(a: Ipv4Net, b: Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
 /// Refuse a global segment name that is not one file name. The name becomes
 /// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
 /// sends its own: a separator, `..` or an absolute path would aim that at
 /// another file. A lab's name is a DNS label, or `<label>@<worktree>` with a
 /// directory's name after the `@` (PRD §21.4), so nothing a lab sends is
 /// refused here.
-/// Where `subnet` sits among the automatic pool's /24s, if it is one.
-fn pool_index(subnet: Ipv4Net) -> Option<u32> {
-    let pool: Ipv4Net = GLOBAL_POOL.parse().expect("valid global pool");
-    (subnet.prefix_len() == 24 && pool.contains(&subnet))
-        .then(|| (u32::from(subnet.network()) - u32::from(pool.network())) >> 8)
-}
-
 fn check_segment_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -1168,7 +1167,9 @@ mod tests {
             "refused attach left a socket"
         );
         assert!(globals.list().await.is_empty());
-        assert_eq!(*globals.next_index.lock().await, 0);
+        let (_, _, subnet) = globals.attach("wan", None, None, None).await.unwrap();
+        assert_eq!(subnet.to_string(), "10.214.0.0/24");
+        globals.detach("wan", None).await;
     }
 
     #[tokio::test]
@@ -1179,10 +1180,10 @@ mod tests {
         let globals = globals_without_psk(dir.path().to_path_buf());
         assert!(globals.attach("wan", None, None, None).await.is_err());
         assert!(globals.list().await.is_empty());
-        assert_eq!(*globals.next_index.lock().await, 0);
 
         std::fs::remove_dir(socket).unwrap();
-        globals.attach("wan", None, None, None).await.unwrap();
+        let (_, _, subnet) = globals.attach("wan", None, None, None).await.unwrap();
+        assert_eq!(subnet.to_string(), "10.214.0.0/24");
         globals.detach("wan", None).await;
     }
 
@@ -1239,6 +1240,49 @@ mod tests {
         };
         assert_eq!(subnet("corp"), "10.214.0.0/24");
         assert_eq!(subnet("lan"), "10.214.1.0/24");
+    }
+
+    #[tokio::test]
+    async fn automatic_subnets_skip_only_the_ranges_held_by_live_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let declared = "10.214.0.128/25".parse().unwrap();
+        let high = "10.214.255.0/24".parse().unwrap();
+        globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap();
+        globals
+            .attach("high", Some(high), None, None)
+            .await
+            .unwrap();
+        let (_, _, automatic) = globals.attach("auto", None, None, None).await.unwrap();
+        assert_eq!(automatic.to_string(), "10.214.1.0/24");
+        globals.detach("declared", None).await;
+        let (_, _, reused) = globals.attach("reused", None, None, None).await.unwrap();
+        assert_eq!(reused.to_string(), "10.214.0.0/24");
+        globals.detach("reused", None).await;
+        globals.detach("auto", None).await;
+        globals.detach("high", None).await;
+    }
+
+    #[tokio::test]
+    async fn a_declared_subnet_cannot_overlap_an_automatic_subnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let declared = "10.214.0.0/23".parse().unwrap();
+        globals.attach("auto", None, None, None).await.unwrap();
+        let err = globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("overlaps \"auto\""));
+        globals.detach("auto", None).await;
+        globals
+            .attach("declared", Some(declared), None, None)
+            .await
+            .unwrap();
+        globals.detach("declared", None).await;
     }
 
     struct Instance {
