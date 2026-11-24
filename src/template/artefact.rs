@@ -38,10 +38,13 @@ async fn resolve_in(
             // for a source that did not come through the lab file.
             let sha256 = &digest_name(sha256)?;
             std::fs::create_dir_all(dir)?;
-            // Cache key = the expected digest, so a re-download is skipped
-            // when the verified artefact is already present.
-            let cached = dir.join(format!("{sha256}.artefact"));
             let comp = Compression::from_url(url);
+            // The same digest can name a raw download or an image decoded
+            // according to the URL suffix. Each representation has its own file.
+            let cached = match comp {
+                None => dir.join(format!("{sha256}.artefact")),
+                Some(c) => dir.join(format!("{sha256}.{}.artefact", c.name())),
+            };
             match comp {
                 // Uncompressed: the cached artefact's own hash is the key, so
                 // we can re-verify it directly on a cache hit.
@@ -59,13 +62,10 @@ async fn resolve_in(
                     dl.publish(&cached)?;
                     log(format!("verified sha256 {sha256}"));
                 }
-                // Compressed: sha256 verifies the *download*, then we
-                // decompress. The cached artefact is the decompressed image,
-                // so its hash differs from the key — an `.ok` marker records
-                // that a verified decompression already happened.
+                // The codec-specific file is published only after the
+                // download is verified and decompression succeeds.
                 Some(c) => {
-                    let marker = dir.join(format!("{sha256}.ok"));
-                    if cached.is_file() && marker.is_file() {
+                    if cached.is_file() {
                         log(format!("using cached artefact {sha256}"));
                         return Ok(cached);
                     }
@@ -82,7 +82,6 @@ async fn resolve_in(
                     let image = Scratch::new(dir, sha256);
                     c.decompress(dl.path(), image.path()).await?;
                     image.publish(&cached)?;
-                    std::fs::write(&marker, [])?;
                 }
             }
             Ok(cached)
@@ -556,8 +555,8 @@ mod tests {
         let image = b"disk image";
         // Fixture generated with `printf 'disk image' | gzip -n`.
         let gzip = vec![
-            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 75, 201, 44, 206, 86, 200, 204, 77, 76, 79, 5, 0,
-            155, 131, 155, 100, 10, 0, 0, 0,
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 75, 201, 44, 206, 86, 200, 204, 77, 76, 79, 5, 0, 155,
+            131, 155, 100, 10, 0, 0, 0,
         ];
         let digest = sha256_hex(&gzip);
         let mut mirror = mirror(gzip.clone()).await;
@@ -586,7 +585,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read(&hit).unwrap(), image);
-        assert_eq!(logs.into_inner(), [format!("using cached artefact {digest}")]);
+        assert_eq!(
+            logs.into_inner(),
+            [format!("using cached artefact {digest}")]
+        );
         assert_eq!(hit, first);
         assert_ne!(hit, raw);
     }

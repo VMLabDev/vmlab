@@ -52,7 +52,7 @@ test does not reproduce is wrong and should be dropped.
 | F6 | wrong result (hang) | Two builds of one `<arch>/<name>` with different declared versions share one runtime directory **Fixed by card #698.** |
 | F7 | wrong result | `template stop` during the seal is ignored: the version is installed and the build reports `done` |
 | F8 | wrong result | The sealed `agent_version` is the stamp of the staged agent, not the version of the agent that answered |
-| F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings |
+| F9 | wrong result | The artefact cache serves a compressed file as the decompressed image after one digest was fetched under two URL spellings **Fixed by card #778.** |
 
 ### F1. The working directory is named from an unchecked name and version (data loss)
 
@@ -309,6 +309,11 @@ the directory after the first releases it.
   `Some("agent=new")`. It should fail the build or record `agent=old`.
 
 ### F9. The cache serves a compressed file as the decompressed image (wrong result)
+
+**Fixed by card #778.** The cache gives raw downloads and decompressed
+images separate paths for the same digest. A codec-specific path is
+published after verification and successful decompression. The old
+shared path is used only for raw downloads that pass digest verification.
 
 - Where: `src/template/artefact.rs:37-90`.
 - Why it is a fault: the cache file is `<sha256>.artefact` in both
