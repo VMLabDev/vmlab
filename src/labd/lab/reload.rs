@@ -387,14 +387,15 @@ impl LabRuntime {
     /// so the next boot starts it from the new file; one a running machine
     /// mounts from keeps serving, and the reload says so.
     async fn reshare(&self, held: &BTreeMap<String, HeldMachine>) -> Vec<String> {
-        if self.smb.lock().await.is_none() {
+        let mut current = self.smb.lock().await;
+        let Some(smb) = current.as_ref() else {
             return Vec::new();
-        }
+        };
         let now = match self.share_plan().await {
             Ok(plan) => plan.smb.map(|smb| smb_exports(&smb)).unwrap_or_default(),
             Err(e) => format!("{e}"),
         };
-        if *self.smb_served.lock_recover() == now {
+        if smb.exports == now {
             return Vec::new();
         }
         if held.values().any(|h| h.live) {
@@ -404,9 +405,7 @@ impl LabRuntime {
                     .to_string(),
             ];
         }
-        if let Some(mut smb) = self.smb.lock().await.take() {
-            smb.stop();
-        }
+        *current = None;
         Vec::new()
     }
 }

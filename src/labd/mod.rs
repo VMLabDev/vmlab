@@ -194,6 +194,12 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
     );
     tasks.adopt("disk-watchdog", watchdog);
 
+    let smb_lab = runtime.clone();
+    let smb_cancel = tasks.cancel_token();
+    tasks.spawn("smb-watchdog", async move {
+        smb_lab.watch_smb(smb_cancel).await;
+    });
+
     // Event → wscript handler bindings (PRD §8.2). Failures are logged, never
     // fatal. Running even for a lab that declares none, since a reload can
     // add them (§7.1): each event is matched against the handlers declared
@@ -267,9 +273,6 @@ async fn announce_exit(lab: &str) {
 /// mid-flight.
 async fn teardown(lab: &Arc<LabRuntime>, tasks: &crate::lifecycle::TaskGroup) {
     lab.stop_for_exit().await;
-    if let Some(mut smb) = lab.smb.lock().await.take() {
-        smb.stop();
-    }
     lab.network
         .lock()
         .await

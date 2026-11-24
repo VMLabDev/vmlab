@@ -49,7 +49,7 @@ Other events reach the stream and the history but cannot be bound: the
 workspace syncer's `workspace.halted`, `workspace.synced`, `workspace.rescan`,
 `workspace.deferred`, `workspace.skipped`, `workspace.refused`,
 `workspace.volume` and their siblings, the per-step `playbook.op.*` progress,
-and `smb.started` and `smb.failed` from the shared-folder service. They exist
+and `smb.started`, `smb.exited` and `smb.failed` from the shared-folder service. They exist
 so that a refusal or a skip is visible somewhere other than one developer's
 terminal, and `vmlab logs` shows them.
 DOC

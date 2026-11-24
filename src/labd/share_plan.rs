@@ -552,9 +552,7 @@ fn check_collisions(
 /// taking an ephemeral port keeps the number predictable for anyone reading
 /// the smb.conf.
 fn free_ports(ports: &dyn PortProbe, servers: usize) -> Result<Vec<u16>, SharePlanError> {
-    let free: Vec<u16> = (SMB_PORT_BASE..SMB_PORT_BASE + SMB_PORT_TRIES)
-        .filter(|p| ports.is_free(*p))
-        .collect();
+    let free = available_smb_ports(ports);
     if free.len() < servers.max(1) {
         return Err(SharePlanError::NoFreePort {
             base: SMB_PORT_BASE,
@@ -562,6 +560,12 @@ fn free_ports(ports: &dyn PortProbe, servers: usize) -> Result<Vec<u16>, SharePl
         });
     }
     Ok(free)
+}
+
+pub(super) fn available_smb_ports(ports: &dyn PortProbe) -> Vec<u16> {
+    (SMB_PORT_BASE..SMB_PORT_BASE + SMB_PORT_TRIES)
+        .filter(|p| ports.is_free(*p))
+        .collect()
 }
 
 #[cfg(test)]

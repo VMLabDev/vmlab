@@ -2462,6 +2462,9 @@ impl super::machine::Machine for VmInstance {
         }
         lab.record_hypervisor(&self.cfg.name, selection.kind, migrating, output)
             .await?;
+        if !self.cfg.shares.is_empty() {
+            lab.ensure_shares().await;
+        }
         let events = lab.events().clone();
         events.emit("vm.starting", serde_json::json!({"vm": self.cfg.name}));
         self.agent.set_handshake_hook(super::boot_clock::lab_hook(
