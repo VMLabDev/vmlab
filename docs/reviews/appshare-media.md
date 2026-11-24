@@ -97,7 +97,7 @@ Not read:
 
 ## Findings
 
-### F1. A guest writes into the shared media cache through its floppy (fixed, card #731)
+### F1. A guest writes into the shared media cache through its floppy (fixed, card #731, `a98e6edf`)
 
 - Where: `src/media/cache.rs:44-48` and `:69-71`,
   `src/labd/machine_build.rs:221-243`,
@@ -149,7 +149,7 @@ Not read:
   `two_machines_do_not_share_a_writable_floppy` is in
   `src/labd/lifecycle_tests.rs`.
 
-### F2. The guest decides that the session falls back from waypipe to X11 (fixed, card #739)
+### F2. The guest decides that the session falls back from waypipe to X11 (fixed, card #739, `41652ddf`)
 
 - Where: `src/appshare/mod.rs:243-251` and `:278-290`,
   `src/labd/app_share.rs:226-244`.
@@ -181,7 +181,7 @@ Not read:
   proof test `a_guest_refusal_does_not_select_x11_unasked` failed before the
   fix and passes after it.
 
-### F3. An RDP session shares the host clipboard with the guest, both ways, with no way to turn it off (fixed, card #738)
+### F3. An RDP session shares the host clipboard with the guest, both ways, with no way to turn it off (fixed, card #738, `78b9d8fe`)
 
 - Where: `src/appshare/rdp.rs:71`.
 - Fault: `freerdp_args` always passes `+clipboard`. While the session runs,
@@ -212,7 +212,7 @@ Not read:
   `-clipboard` is from its documentation, from memory: helios has no FreeRDP
   binary, so no live session checked it.
 
-### F4. A changed media folder is not used while the lab daemon runs
+### F4. A changed media folder is not used while the lab daemon runs (fixed, card #852, `13c4d70c`)
 
 - Where: `src/labd/machine_build.rs:221-229`,
   `src/labd/lab/reload.rs:249-256`, `src/labd/reload_plan.rs:40-58`.
@@ -232,7 +232,7 @@ Not read:
 - Confidence: medium. `reload_plan.rs` has no mention of media, but the
   review did not read how it compares two blocks.
 
-### F5. A change of a file's mode does not rebuild an ISO that records modes
+### F5. A change of a file's mode does not rebuild an ISO that records modes (fixed, card #852, `13c4d70c`)
 
 - Where: `src/media/hash.rs:3-6` and `:41-58`, `src/media/iso.rs:46`.
 - Fault: the digest covers paths and bytes only. The ISO is built with
@@ -249,7 +249,7 @@ Not read:
 - Severity: wrong result.
 - Confidence: high.
 
-### F6. One media folder that cannot be built stops the whole lab from loading
+### F6. One media folder that cannot be built stops the whole lab from loading (fixed, card #853, `395f21aa`, `a8467dc8`)
 
 - Where: `src/labd/lab.rs:540-541`, `src/labd/machine_build.rs:227-232`,
   `src/config/validate.rs:1993-2000`.
@@ -271,7 +271,7 @@ Not read:
 - Confidence: medium. The review did not check each verb for a path that
   works without the daemon.
 
-### F7. An edit during a build is stored under the digest of the old content
+### F7. An edit during a build is stored under the digest of the old content (fixed, card #853, `395f21aa`)
 
 - Where: `src/media/cache.rs:44-71`.
 - Fault: `ensure` hashes the folder, then the ISO or floppy tool reads the
@@ -291,7 +291,7 @@ Not read:
 - Severity: wrong result.
 - Confidence: high.
 
-### F8. The detached helper carries the password on its command line
+### F8. The detached helper carries the password on its command line (fixed, card #733, `d1853016`)
 
 - Where: `src/cli/app.rs:60-65` and `:139-158`.
 - Fault: `vmlab app run --detach --password <pw>` starts the helper
@@ -312,7 +312,7 @@ Not read:
   proof test `the_detached_helper_argv_holds_no_password` failed before the
   fix and passes after it.
 
-### F9. The X11 proxy sends the host's real cookie to whoever holds the abstract socket name
+### F9. The X11 proxy sends the host's real cookie to whoever holds the abstract socket name (fixed, card #732, `b60bcc9d`)
 
 - Where: `src/appshare/x11.rs:59-64`, `:417-421`, `:466`.
 - Fault: for a local display the proxy tries the abstract socket
@@ -336,7 +336,7 @@ Not read:
   the abstract name only when the path socket refuses, and only when
   `SO_PEERCRED` says that this user or root listens on it.
 
-### F10. The host cookie is not found for two common Xauthority shapes
+### F10. The host cookie is not found for two common Xauthority shapes (fixed, card #854, `d370872c`)
 
 - Where: `src/appshare/x11.rs:139-161` and `:221-235`.
 - Fault: two cases where an X client on the host finds its cookie and the
@@ -358,7 +358,7 @@ Not read:
 - Severity: wrong result.
 - Confidence: medium. Both depend on what libxcb and libXau do.
 
-### F11. An RDP request is refused only after the guest was changed
+### F11. An RDP request is refused only after the guest was changed (fixed, card #854, `d370872c`)
 
 - Where: `src/appshare/mod.rs:314-349`, `src/appshare/rdp.rs:108-127`.
 - Fault: `attempt` sends `machine.app_open` first, and builds FreeRDP's
@@ -377,7 +377,7 @@ Not read:
 - Severity: wrong result.
 - Confidence: high.
 
-### F12. The guest can write the two records that only the daemon may write (fixed, card #739)
+### F12. The guest can write the two records that only the daemon may write (fixed, card #739, `41652ddf`)
 
 - Where: `src/labd/app_share.rs:293-311`, `src/appshare/mod.rs:431-449`,
   `guest/agent-proto/src/app.rs:65-72`.
@@ -406,7 +406,7 @@ Not read:
   the fix and passes after it, with two more beside it for `failed` and for
   an unknown record.
 
-### F13. Guest text reaches the terminal with its control characters
+### F13. Guest text reaches the terminal with its control characters (fixed, card #854, `d370872c`)
 
 - Where: `src/appshare/mod.rs:442-448`, `src/appshare/rdp.rs:444-446`.
 - Fault: the text of a `log`, `diagnostic` and (through F12) `failed`
