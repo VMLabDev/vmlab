@@ -413,6 +413,14 @@ and the IDE, AHCI and USB devices on the same buses.
   0x42.
 - Confidence: medium. The order was traced. That a firmware or OS places a
   ROM there was not seen.
+- Fixed by card #792. With an MCH, `VmShared::in_pci_window` refuses an
+  address that a device on `mmio_bus` decodes (`MmioBus::covers`), so the
+  PAM range, the HPET, the TPM and the flash answer before a ROM or BAR
+  placed over them. The ROM decode also needs a base other than 0, as BARs
+  do. Tests `rom_bar_does_not_hide_pam_shadow_writes` and
+  `bar_over_chipset_mmio_does_not_hide_the_chipset_device` in `vm.rs`. Both
+  need KVM, so the merge bar ignores them, as it does the other `vm.rs`
+  dispatch tests.
 
 ### F13. fw_cfg SMI negotiation keeps a stale DMA high address
 
