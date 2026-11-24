@@ -421,11 +421,14 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "arguments";
     r.presents_asked = 1;
     const wchar_t *out = NULL;
-    int which = -1, exit_code = 1;
+    int which = -1, exit_code = 1, explore = 0;
+    static LONG explore_status[6];
+    static uint32_t explore_count[6];
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
+        else if (!wcscmp(argv[i], L"--explore")) explore = 1;
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
             for (int c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); ++c) {
@@ -606,6 +609,50 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "present";
     r.result = "present_pending";
     if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
+    if (explore) {
+        /* One present per form of the request, to find the one that reaches the driver. */
+        typedef ULONG (WINAPI *uniq_fn)(void);
+        uniq_fn uniqueness = (uniq_fn)GetProcAddress(gdi, "GdiEntry13"); /* DdQueryVisRgnUniqueness */
+        r.stage = "explore";
+        save(out, &r);
+        for (uint32_t v = 0; v < 6; ++v) {
+            static uint64_t request[1024];
+            static RECT sub_rect;
+            memset(request, 0, sizeof(request));
+            present_head *p = (present_head *)request;
+            p->context = context.context;
+            p->window = window;
+            p->source = allocation.allocation;
+            p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
+            p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
+            sub_rect = p->src_rect;
+            p->sub_rect_count = 1;
+            p->src_sub_rects = &sub_rect;
+            p->flags = PRESENT_BLT | PRESENT_REDIRECTED_BLT;
+            switch (v) {
+            case 0: break;
+            case 1: p->flags |= PRESENT_COUNT_VALID; p->present_count = uniqueness ? uniqueness() : 0; break;
+            case 2: p->flags |= 1u << 6 | 1u << 7; break;
+            case 3: SetForegroundWindow(window); UpdateWindow(window); pump(500); break;
+            case 4: p->flags |= PRESENT_COUNT_VALID; p->present_count = 0; break;
+            default: p->flags = PRESENT_BLT; break;
+            }
+            explore_status[v] = present(request);
+            explore_count[v] = p->present_count;
+            pump(1000);
+        }
+        printf("{\"explore\":[");
+        for (int v = 0; v < 6; ++v) printf("%s\"0x%08lx/%u\"", v ? "," : "", (unsigned long)explore_status[v], explore_count[v]);
+        printf("]}\n");
+        FILE *f = out ? _wfopen(out, L"wb") : NULL;
+        if (f) {
+            fprintf(f, "{\"result\":\"explored\",\"stage\":\"done\",\"explore\":[");
+            for (int v = 0; v < 6; ++v) fprintf(f, "%s\"0x%08lx/%u\"", v ? "," : "", (unsigned long)explore_status[v], explore_count[v]);
+            fprintf(f, "]}\n");
+            fclose(f);
+        }
+        ExitProcess(0);
+    }
     for (uint32_t i = 0; i < r.presents_asked; ++i) {
         /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
         static uint64_t request[1024];
