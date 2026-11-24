@@ -680,7 +680,7 @@ int wmain(int argc, wchar_t **argv)
         } else {
             HMODULE dwmapi = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
             dwm_dx_surface_fn dx_surface =
-                dwmapi ? (dwm_dx_surface_fn)GetProcAddress(dwmapi, "DwmDxGetWindowSharedSurface") : NULL;
+                dwmapi ? (dwm_dx_surface_fn)GetProcAddress(dwmapi, "DwmpDxGetWindowSharedSurface") : NULL;
             UINT64 dx_update_id = 0;
             shared = NULL;
             format = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
