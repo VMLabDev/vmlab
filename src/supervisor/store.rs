@@ -536,15 +536,9 @@ pub async fn import(
     overwrite: bool,
     trust_scripts: bool,
 ) -> Result<Value, CommandError> {
-    let meta = import_into(
-        store(),
-        registered_labs,
-        archive,
-        overwrite,
-        trust_scripts,
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))?;
+    let meta = import_into(store(), registered_labs, archive, overwrite, trust_scripts)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
     let mut result = answer(InstalledVersion::of(&meta))?;
     result["script_paths"] = serde_json::json!(crate::template::trust::script_paths(&meta));
     Ok(result)
