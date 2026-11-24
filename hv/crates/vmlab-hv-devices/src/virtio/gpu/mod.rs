@@ -547,7 +547,7 @@ impl State {
         for fence in fences {
             let queue = &mut self.queues[fence.queue as usize];
             if queue.add_used(mem, fence.head, fence.len).is_ok()
-                && queue.needs_notification(mem).unwrap_or(false)
+                && crate::virtio::used_needs_interrupt(queue, mem)
             {
                 notify.insert(fence.queue);
             }
@@ -811,7 +811,7 @@ impl State {
             }
             let queue = &mut self.queues[fence.queue as usize];
             if queue.add_used(mem, fence.head, fence.len).is_ok()
-                && queue.needs_notification(mem).unwrap_or(false)
+                && crate::virtio::used_needs_interrupt(queue, mem)
                 && let Some(irq) = &self.interrupt
             {
                 irq.notify_queue(fence.queue);
@@ -1375,7 +1375,7 @@ impl VirtioDevice for Gpu {
             }
         }
         if used
-            && s.queues[index].needs_notification(&mem).unwrap_or(false)
+            && crate::virtio::used_needs_interrupt(&mut s.queues[index], &mem)
             && let Some(irq) = &s.interrupt
         {
             irq.notify_queue(index as u16);

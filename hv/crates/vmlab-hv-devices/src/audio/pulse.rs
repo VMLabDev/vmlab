@@ -120,6 +120,13 @@ impl PlaybackSink for Endpoint {
         }
     }
 
+    fn room_bytes(&self) -> Option<usize> {
+        self.shared
+            .alive
+            .load(Ordering::Acquire)
+            .then(|| self.shared.ring.free_bytes())
+    }
+
     fn write_period(&mut self, pcm: &[u8]) {
         if self.shared.alive.load(Ordering::Acquire) {
             self.shared.ring.push_drop_oldest(pcm);

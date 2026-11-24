@@ -89,6 +89,12 @@ pub trait PlaybackSink: Send {
     fn queue_limit_bytes(&self) -> Option<usize> {
         None
     }
+    /// The PCM this sink takes now without dropping what it already holds,
+    /// when its queue has a fixed size. A device that moves a message
+    /// larger than this holds the rest until the host has consumed.
+    fn room_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Where a device pulls capture periods from.
