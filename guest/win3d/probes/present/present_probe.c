@@ -240,14 +240,14 @@ enum {
     PRESENT_BLT = 1u << 0,
     PRESENT_COUNT_VALID = 1u << 12,
     PRESENT_REDIRECTED_BLT = 1u << 16,
-    IMAGE_WIDTH = 64,
-    IMAGE_HEIGHT = 64,
+    IMAGE_WIDTH = 256,
+    IMAGE_HEIGHT = 256,
 };
 #define VIOGPU_IAM 0x56696f475055ull
 /* A blob id that no Venus context of this process made. */
 #define UNKNOWN_BLOB_ID 0x0000756c62373536ull
 /* The size of the device memory that the Venus commands allocate. */
-#define MEMORY_SIZE 65536u
+#define MEMORY_SIZE (1024u * 1024u)
 
 /* Where the blob of a case comes from. */
 enum { BLOB_UNKNOWN, BLOB_SHM, BLOB_DEVICE_MEMORY };
@@ -421,14 +421,12 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "arguments";
     r.presents_asked = 1;
     const wchar_t *out = NULL;
-    int which = -1, exit_code = 1, explore = 0;
-    static LONG explore_status[6];
-    static uint32_t explore_count[6];
+    int which = -1, exit_code = 1, variant = 1;
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
-        else if (!wcscmp(argv[i], L"--explore")) explore = 1;
+        else if (!wcscmp(argv[i], L"--variant") && i + 1 < argc) variant = (int)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
             for (int c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); ++c) {
@@ -451,10 +449,26 @@ int wmain(int argc, wchar_t **argv)
 
     /* The destination of the present: a window of this process. */
     r.stage = "create_window";
-    /* A window without a frame: its client area is the size of the source. */
-    HWND window = CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"present_probe (card 756)", WS_POPUP | WS_VISIBLE,
-                                  40, 40, IMAGE_WIDTH, IMAGE_HEIGHT, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    /* A window as the rendering probes make it. Its client area is the
+     * size of the source. */
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = L"vmlab-win3d-present-probe";
+    RegisterClassExW(&wc);
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT frame = {0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
+    AdjustWindowRect(&frame, style, FALSE);
+    HWND window = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName, L"present_probe (card 756)", style, 40, 40,
+                                  frame.right - frame.left, frame.bottom - frame.top, NULL, NULL, wc.hInstance, NULL);
     if (!window) { r.win32_error = GetLastError(); goto done; }
+    ShowWindow(window, SW_SHOWNORMAL);
+    SetForegroundWindow(window);
+    UpdateWindow(window);
     pump(1000);
 
     HMODULE gdi = LoadLibraryExW(L"gdi32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -609,50 +623,6 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "present";
     r.result = "present_pending";
     if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
-    if (explore) {
-        /* One present per form of the request, to find the one that reaches the driver. */
-        typedef ULONG (WINAPI *uniq_fn)(void);
-        uniq_fn uniqueness = (uniq_fn)GetProcAddress(gdi, "GdiEntry13"); /* DdQueryVisRgnUniqueness */
-        r.stage = "explore";
-        save(out, &r);
-        for (uint32_t v = 0; v < 6; ++v) {
-            static uint64_t request[1024];
-            static RECT sub_rect;
-            memset(request, 0, sizeof(request));
-            present_head *p = (present_head *)request;
-            p->context = context.context;
-            p->window = window;
-            p->source = allocation.allocation;
-            p->dst_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
-            p->src_rect = (RECT){0, 0, IMAGE_WIDTH, IMAGE_HEIGHT};
-            sub_rect = p->src_rect;
-            p->sub_rect_count = 1;
-            p->src_sub_rects = &sub_rect;
-            p->flags = PRESENT_BLT | PRESENT_REDIRECTED_BLT;
-            switch (v) {
-            case 0: break;
-            case 1: p->flags |= PRESENT_COUNT_VALID; p->present_count = uniqueness ? uniqueness() : 0; break;
-            case 2: p->flags |= 1u << 6 | 1u << 7; break;
-            case 3: SetForegroundWindow(window); UpdateWindow(window); pump(500); break;
-            case 4: p->flags |= PRESENT_COUNT_VALID; p->present_count = 0; break;
-            default: p->flags = PRESENT_BLT; break;
-            }
-            explore_status[v] = present(request);
-            explore_count[v] = p->present_count;
-            pump(1000);
-        }
-        printf("{\"explore\":[");
-        for (int v = 0; v < 6; ++v) printf("%s\"0x%08lx/%u\"", v ? "," : "", (unsigned long)explore_status[v], explore_count[v]);
-        printf("]}\n");
-        FILE *f = out ? _wfopen(out, L"wb") : NULL;
-        if (f) {
-            fprintf(f, "{\"result\":\"explored\",\"stage\":\"done\",\"explore\":[");
-            for (int v = 0; v < 6; ++v) fprintf(f, "%s\"0x%08lx/%u\"", v ? "," : "", (unsigned long)explore_status[v], explore_count[v]);
-            fprintf(f, "]}\n");
-            fclose(f);
-        }
-        ExitProcess(0);
-    }
     for (uint32_t i = 0; i < r.presents_asked; ++i) {
         /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
         static uint64_t request[1024];
@@ -668,8 +638,17 @@ int wmain(int argc, wchar_t **argv)
         sub_rect = p->src_rect;
         p->sub_rect_count = 1;
         p->src_sub_rects = &sub_rect;
-        p->present_count = i + 1;
-        p->flags = PRESENT_BLT | PRESENT_COUNT_VALID | PRESENT_REDIRECTED_BLT;
+        p->flags = PRESENT_BLT | PRESENT_REDIRECTED_BLT;
+        /* The count is the one of the visible region of the screen, which
+         * GDI gives (DdQueryVisRgnUniqueness). */
+        typedef ULONG (WINAPI *uniqueness_fn)(void);
+        uniqueness_fn uniqueness = (uniqueness_fn)GetProcAddress(gdi, "GdiEntry13");
+        switch (variant) {
+        case 0: break;
+        case 1: p->flags |= PRESENT_COUNT_VALID; p->present_count = uniqueness ? uniqueness() : 0; break;
+        case 2: p->flags |= PRESENT_COUNT_VALID; p->present_count = i + 1; break;
+        default: p->flags |= PRESENT_COUNT_VALID; break;
+        }
         LONG status = present(request);
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;

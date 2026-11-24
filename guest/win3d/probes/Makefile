@@ -77,7 +77,7 @@ present: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/present_probe.exe)
 define present_rules
 $(OUT)-extra/$(1)/present_probe.exe: present/present_probe.c
 	@mkdir -p $$(dir $$@)
-	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$< -luser32
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$< -luser32 -lgdi32
 endef
 
 $(foreach a,$(ARCHES),$(eval $(call present_rules,$(a))))
