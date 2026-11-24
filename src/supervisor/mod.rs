@@ -553,23 +553,25 @@ impl Supervisor {
     /// An exit nobody asked for is a crash (PRD §3 — no silent restart; mark
     /// failed + event).
     async fn daemon_exited(&self, lab: &str, pid: u32, clean: bool, how: &str) {
-        let expected = clean || {
-            let reg = self.registry.lock().await;
-            // Only this daemon's own entry says whether its exit was asked
-            // for: the name may already belong to a successor.
-            reg.get(lab)
-                .filter(|e| e.pid == pid)
-                .map(|e| e.state == LabState::Stopping)
-                .unwrap_or(true)
+        let mut reg = self.registry.lock().await;
+        let Some(entry) = reg.get(lab).filter(|entry| entry.pid == pid) else {
+            return;
         };
-        if expected {
-            let mut reg = self.registry.lock().await;
-            reg.remove_daemon(lab, pid);
-            reg.save();
-        } else {
-            tracing::warn!("lab daemon {lab} exited unexpectedly: {how}");
-            self.mark_crashed(lab).await;
+        if clean || entry.state == LabState::Stopping {
+            match crate::qemu::process::reap_lab_orphans(lab, Some(&entry.root)).await {
+                Ok(()) => {
+                    reg.remove_daemon(lab, pid);
+                    reg.save();
+                    return;
+                }
+                Err(error) => tracing::warn!("{error}"),
+            }
         }
+        tracing::warn!("lab daemon {lab} exited: {how}; marked failed");
+        reg.set_state(lab, LabState::Failed);
+        reg.save();
+        drop(reg);
+        self.emit(Event::new("lab.daemon_crashed", lab, Value::Null));
     }
 
     async fn mark_crashed(&self, lab: &str) {
@@ -660,8 +662,8 @@ impl Supervisor {
         // machines. A successor beside it would start each of them a second
         // time on the same disks, so ask the socket's guard, which a live
         // daemon holds, and refuse rather than spawn.
-        match crate::proto::server::SocketGuard::acquire(&sock) {
-            Ok(free) => drop(free),
+        let guard = match crate::proto::server::SocketGuard::acquire(&sock) {
+            Ok(free) => free,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(CommandError::conflict(format!(
                     "lab `{name}` still has a daemon the supervisor lost track of, and a second \
@@ -675,7 +677,10 @@ impl Supervisor {
                     sock.display()
                 )));
             }
-        }
+        };
+        crate::qemu::process::reap_lab_orphans(name, Some(&root))
+            .await
+            .map_err(CommandError::failed)?;
 
         // Note: templates are NOT pre-pulled here. The daemon's build binds
         // cached templates offline and defers missing ones; the lab daemon
@@ -694,6 +699,7 @@ impl Supervisor {
             .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
         let log_err = log.try_clone().map_err(|e| e.to_string())?;
 
+        drop(guard);
         let child = tokio::process::Command::new(&exe)
             .arg("__labd")
             .arg("--lab")
@@ -803,89 +809,55 @@ impl Supervisor {
     /// restart that holds the name lock across release and start.
     async fn release_lab_locked(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let sock = crate::paths::lab_socket(name);
-        // Captured before the entry can be removed — the orphan reaper needs it
-        // to recognise this lab's smbd.
-        let (root, pid, started);
-        {
+        // Keep the root even if the daemon's exit removes its registry entry.
+        let entry = {
             let mut reg = self.registry.lock().await;
-            let Some(entry) = reg.get(name) else {
-                return Ok(());
+            let entry = reg.get(name).cloned();
+            if entry.is_some() {
+                reg.set_state(name, LabState::Stopping);
+                reg.save();
+            }
+            entry
+        };
+        if let Some(entry) = &entry {
+            let (pid, started) = (entry.pid, entry.started);
+            let deadline = if let Ok(client) = LabClient::connect(&sock).await {
+                let reply = client.send(LabRequest::Shutdown {}).await.ok();
+                release_deadline(reply.as_ref())
+            } else {
+                // A daemon can still own machines after losing its socket.
+                if daemon_running(pid, started) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    );
+                }
+                RELEASE_DEADLINE
             };
-            root = entry.root.clone();
-            pid = entry.pid;
-            started = entry.started;
-            reg.set_state(name, LabState::Stopping);
-            reg.save();
-        }
-        // A live daemon shuts down gracefully; its reaper drops the entry on
-        // exit. A daemon that's already gone (e.g. a crashed/Failed lab) has no
-        // reaper watching it, so remove the entry here — otherwise it would be
-        // stuck in Stopping forever.
-        if let Ok(client) = LabClient::connect(&sock).await {
-            let reply = client.send(LabRequest::Shutdown {}).await.ok();
-            let deadline = release_deadline(reply.as_ref());
-            // The release is not done until the daemon is: `Shutdown` answers
-            // before its teardown runs, and a daemon still tearing down holds
-            // the clone disks, the QMP socket and the smbd port that the
-            // next `up` of this lab needs.
             if !self.wait_daemon_gone(name, pid, deadline).await {
                 tracing::warn!(
                     "lab daemon for {name} did not stop within {}s; killing it",
                     deadline.as_secs()
                 );
-                // Only the daemon itself: its pid may name another process
-                // by now.
                 if daemon_running(pid, started) {
                     let _ = nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(pid as i32),
                         nix::sys::signal::Signal::SIGKILL,
                     );
                 }
-                crate::qemu::process::kill_lab_orphans(name, Some(&root));
-                let mut reg = self.registry.lock().await;
-                reg.remove_daemon(name, pid);
-                reg.save();
-            }
-        } else if daemon_running(pid, started) {
-            // The daemon runs but its socket does not answer: the socket file
-            // is gone or replaced. Its machines are its own, so ask it to
-            // stop them the way `Shutdown` would — a termination signal runs
-            // the same teardown — and kill it only past the deadline.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-            if !self.wait_daemon_gone(name, pid, RELEASE_DEADLINE).await {
-                tracing::warn!(
-                    "lab daemon for {name} does not answer and did not stop within {}s; \
-                     killing it",
-                    RELEASE_DEADLINE.as_secs()
-                );
-                if daemon_running(pid, started) {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                if !self
+                    .wait_daemon_gone(name, pid, std::time::Duration::from_secs(5))
+                    .await
+                {
+                    return Err(format!("lab daemon for {name} did not exit after SIGKILL"));
                 }
-                crate::qemu::process::kill_lab_orphans(name, Some(&root));
-                let mut reg = self.registry.lock().await;
-                reg.remove_daemon(name, pid);
-                reg.save();
             }
-        } else {
-            // The daemon is gone and can't have stopped anything it owned. Reap
-            // the QEMU processes AND the helpers it orphaned (swtpm, virtiofsd,
-            // smbd — an orphaned smbd holds its port against the next `up`),
-            // then drop the registry entry.
-            let killed = crate::qemu::process::kill_lab_orphans(name, Some(&root));
-            if killed > 0 {
-                tracing::warn!("reaped {killed} orphaned process(es) for lab {name}");
-            }
-            let mut reg = self.registry.lock().await;
-            reg.remove(name);
-            reg.save();
         }
-        Ok(())
+        // A missing entry can also mean the supervisor lost track of a live
+        // daemon. Only reap once we can exclude a current owner of the socket.
+        let _guard = crate::proto::server::SocketGuard::acquire(&sock)
+            .map_err(|e| format!("cannot reap processes for lab {name}: {e}"))?;
+        crate::qemu::process::reap_lab_orphans(name, entry.as_ref().map(|e| e.root.as_path())).await
     }
 
     /// Wait until the daemon `pid` no longer runs `name`, up to `deadline`.
@@ -1157,7 +1129,12 @@ mod tests {
     fn run_orphan_fixture(operation: &str) {
         let scratch = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "supervisor::tests::orphan_fixture", "--ignored", "--nocapture"])
+            .args([
+                "--exact",
+                "supervisor::tests::orphan_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
             .env(ORPHAN_FIXTURE, operation)
             .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
             .env("XDG_STATE_HOME", scratch.path().join("state"))
