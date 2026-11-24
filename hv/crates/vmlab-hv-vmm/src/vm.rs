@@ -1086,6 +1086,16 @@ impl VmShared {
         let Some(vga) = self.vga.lock().clone() else {
             return Ok(());
         };
+        // The PCI hole starts where this machine's low RAM stops: at 2 GiB
+        // on q35, and at up to 3 GiB on pc. A framebuffer BAR that the guest
+        // places over RAM is not mapped: KVM refuses overlapping slots, and
+        // the BAR callbacks serve it as they serve any unmapped placement.
+        let ram_regions = self
+            .ram
+            .lock()
+            .as_ref()
+            .map(|ram| ram.layout().regions.clone())
+            .unwrap_or_default();
         let mut root = self.pci_root.lock();
         let address = root
             .addresses()
@@ -1102,6 +1112,10 @@ impl VmShared {
                         && !sizing
                         && *base >= 0x80000000
                         && *base + vga.framebuffer_size() as u64 <= 0xfec00000
+                        && ram_regions.iter().all(|&(ram_base, ram_size)| {
+                            *base + vga.framebuffer_size() as u64 <= ram_base
+                                || *base >= ram_base + ram_size
+                        })
                 })
                 .map(|(base, _)| base)
         });

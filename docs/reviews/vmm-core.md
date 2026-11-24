@@ -308,6 +308,12 @@ and the IDE, AHCI and USB devices on the same buses.
   is served through the BAR callbacks. Today the VM exits with "mapping VGA
   framebuffer".
 - Confidence: high for the bound. The exit path was traced by reading.
+- Fixed by card #791. `sync_vga_mapping` maps the framebuffer only where it
+  overlaps no RAM region of the machine's layout, so the bound follows low
+  RAM on pc (up to 3 GiB) and on q35 (2 GiB). A BAR over RAM stays unmapped
+  and the BAR callbacks serve it. Test:
+  `pc_vga_bar_over_low_ram_is_not_mapped` in `vm.rs`, which failed before
+  the fix with "mapping VGA framebuffer: File exists".
 
 ### F9. A guest reset that is pending when a snapshot load starts runs after the load
 
