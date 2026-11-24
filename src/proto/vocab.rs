@@ -383,7 +383,9 @@ fn default_button() -> String {
 fn default_threshold() -> f64 {
     0.9
 }
-fn deserialize_threshold<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+fn deserialize_threshold<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
     f64::deserialize(deserializer)
         .map_err(|error| serde::de::Error::custom(format!("invalid match threshold: {error}")))
 }
