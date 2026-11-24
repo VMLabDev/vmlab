@@ -841,7 +841,8 @@ mod tests {
         let second = SmbCredentials::load_or_create(dir.path()).unwrap();
         assert!(first == second, "credential changed after restart");
         assert!(
-            std::fs::read_to_string(path).unwrap() == format!("{}:{}", first.username, first.password),
+            std::fs::read_to_string(path).unwrap()
+                == format!("{}:{}", first.username, first.password),
             "the credential was not saved"
         );
     }

@@ -141,12 +141,11 @@ impl LabSmb {
         let mut plans = BTreeMap::new();
         for (vm_name, gateway, shares) in vms {
             let dir = machine_dir(&smb_dir, vm_name);
-            let creds = SmbCredentials::load_or_create(&dir).map_err(|source| {
-                SmbError::Credentials {
+            let creds =
+                SmbCredentials::load_or_create(&dir).map_err(|source| SmbError::Credentials {
                     path: dir.join("creds"),
                     source,
-                }
-            })?;
+                })?;
             let share_tuples = shares
                 .iter()
                 .map(|s| {
