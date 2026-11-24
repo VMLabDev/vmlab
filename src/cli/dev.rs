@@ -185,7 +185,7 @@ async fn sync_status(client: &LabClient, machine: &str) -> Result<WorkspaceSyncS
 /// Rust would spell it with (`\u{1b}`, `\n`), and so are the format characters
 /// that reorder a line or end one. `keep` names the ones the caller lays out
 /// itself.
-fn shown(text: &str, keep: &[char]) -> std::borrow::Cow<'_, str> {
+fn shown<'a>(text: &'a str, keep: &[char]) -> std::borrow::Cow<'a, str> {
     let steers = |c: char| {
         !keep.contains(&c)
             && (c.is_control()
