@@ -567,7 +567,8 @@ impl VirtioPciDevice {
     /// Whether the feature set is fixed until the next reset: a set was
     /// accepted (FEATURES_OK, or DRIVER_OK from a legacy driver), or the
     /// driver reached DRIVER_OK without one and the device runs on the
-    /// empty set.
+    /// empty set. `activated` is the fact: the driver can clear DRIVER_OK
+    /// in the status without a reset, and the device keeps running.
     fn features_fixed(&self) -> bool {
         self.negotiated.is_some() || self.driver_status & device_status::DRIVER_OK != 0
     }
@@ -608,9 +609,10 @@ impl VirtioPciDevice {
                 // The set is fixed until the next reset (VIRTIO 1.2
                 // §3.1.1): the device is not told again.
                 status |= device_status::FEATURES_OK;
-            } else if self.driver_status & device_status::DRIVER_OK != 0 {
+            } else if self.features_fixed() {
                 // DRIVER_OK came without FEATURES_OK: the device and its
-                // queues run on the empty set, and FEATURES_OK stays clear.
+                // queues run on the empty set, and FEATURES_OK stays clear
+                // until the next reset, whatever the status says since.
             } else if self.driver_features & !self.offered_features() == 0 {
                 status |= device_status::FEATURES_OK;
                 let negotiated = self.driver_features;
@@ -2091,6 +2093,25 @@ mod tests {
         assert_eq!(acked(&g), [0u8; 8]);
         // The driver reads back the set that is in force.
         assert_eq!(g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE), 0);
+
+        // Clearing DRIVER_OK in the status is not a reset: the device still
+        // runs, and the set stays fixed.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x03);
+        assert_eq!(acked(&g), [0u8; 8]);
+        assert_eq!(g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE), 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+
+        // A reset reopens negotiation.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x0B);
+        assert_eq!(acked(&g), (1u64 << 28).to_le_bytes());
     }
 
     /// Second review F9: the low byte of the message control holds only the
