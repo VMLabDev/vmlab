@@ -203,8 +203,9 @@ impl Drop for SessionEntry {
 
 /// Per-session event queue depth. The reader enforces the receive window
 /// ([`RecvCredit`]), which caps the queued bytes, but a window's worth of
-/// tiny frames can outnumber a byte-sized bound. This caps the count; see
-/// [`SessionQueue::push`] for what happens at it.
+/// tiny frames can outnumber a byte-sized bound. This caps the count, to
+/// within one event per stream; see [`SessionQueue::push`] for what happens
+/// at it.
 const SESSION_QUEUE: usize = 2048;
 
 /// How long the reader's `close` for one session may wait for the writer.
@@ -235,15 +236,18 @@ impl SessionQueue {
     }
 
     /// Queue one event without waiting. Below [`SESSION_QUEUE`] events each
-    /// frame is its own event. At the depth, payload joins the last event
-    /// when that is the same stream (every consumer reads a channel as a
-    /// byte stream, and the receive window bounds the bytes). One `Eof` is
-    /// taken past the depth and a repeated one is dropped: an exec ends with
-    /// `Eof` and then its exit, and no payload can join behind an `Eof`, so
-    /// the queue grows by that one event. The event that ends the session
-    /// is always taken, as only one can arrive. `false` is an event the
-    /// full queue cannot take: the guest sent more frames than a consumer
-    /// this far behind can be kept for.
+    /// frame is its own event. At the depth, payload joins the newest queued
+    /// event of its own stream, which need not be the last event: a guest
+    /// that writes stdout and stderr in turn stays inside its window and
+    /// must keep its channel. The bytes of each stream stay in order. What
+    /// is given up, that far behind, is the order between the two streams,
+    /// which the guest's two pipes never promised. A stream with no event in
+    /// the queue gets one, so the queue passes the depth by one event per
+    /// stream at most. One `Eof` is taken past the depth and a repeated one
+    /// is dropped: an exec ends with `Eof` and then its exit, and no payload
+    /// joins behind an `Eof`. The event that ends the session is always
+    /// taken, as only one can arrive. `false` is an event the full queue
+    /// cannot take: payload behind an `Eof`, which no agent sends.
     fn push(&self, ev: SessionEvent) -> bool {
         let mut st = self.state.lock_recover();
         let terminal = matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_));
@@ -254,14 +258,30 @@ impl SessionQueue {
                 st.events.push_back(ev);
             }
         } else {
-            match (st.events.back_mut(), ev) {
-                (Some(SessionEvent::Data(tail)), SessionEvent::Data(more))
-                | (Some(SessionEvent::Stderr(tail)), SessionEvent::Stderr(more)) => {
-                    tail.extend_from_slice(&more)
-                }
-                // An empty frame carries nothing a consumer acts on.
-                (_, SessionEvent::Data(more) | SessionEvent::Stderr(more)) if more.is_empty() => {}
+            let more = match &ev {
+                SessionEvent::Data(more) | SessionEvent::Stderr(more) => more,
                 _ => return false,
+            };
+            // An empty frame carries nothing a consumer acts on.
+            if !more.is_empty() {
+                let stderr = matches!(ev, SessionEvent::Stderr(_));
+                // The newest event of this stream. It is one of the last
+                // two payload events once both streams are queued, so the
+                // search is short.
+                let mut tail = None;
+                for queued in st.events.iter_mut().rev() {
+                    match queued {
+                        SessionEvent::Stderr(bytes) if stderr => tail = Some(bytes),
+                        SessionEvent::Data(bytes) if !stderr => tail = Some(bytes),
+                        SessionEvent::Data(_) | SessionEvent::Stderr(_) => continue,
+                        _ => return false,
+                    }
+                    break;
+                }
+                match tail {
+                    Some(tail) => tail.extend_from_slice(more),
+                    None => st.events.push_back(ev),
+                }
             }
         }
         drop(st);
@@ -1552,6 +1572,11 @@ pub struct AgentSession {
 impl AgentSession {
     /// Next event; grants receive window back as data is consumed. `None`
     /// once the channel (or connection) is gone.
+    ///
+    /// Safe to cancel, so it can be a branch of a `select!`: the only wait
+    /// is for the queue, which loses nothing, and an event that was taken
+    /// is returned without another wait. The `window_adjust` is written by
+    /// a task of its own (see [`Self::grant`]).
     pub async fn recv(&mut self) -> Option<SessionEvent> {
         let Some(ev) = self.rx.recv().await else {
             // The reader ended the channel (the guest sent past its window,
@@ -1563,21 +1588,32 @@ impl AgentSession {
         if let SessionEvent::Data(b) | SessionEvent::Stderr(b) = &ev
             && let Some(grant) = self.window.recv(b.len())
         {
-            // Counted before it is sent: the guest may use the grant as
-            // soon as it reads it.
-            self.recv_credit.grant(grant);
-            let _ = self
-                .handle
-                .send_msg(&HostMsg::WindowAdjust {
-                    id: self.id,
-                    bytes: grant,
-                })
-                .await;
+            self.grant(grant);
         }
         if matches!(ev, SessionEvent::Exited(_) | SessionEvent::Error(_)) {
             self.closed = true; // agent already tore its side down
         }
         Some(ev)
+    }
+
+    /// Give the guest `bytes` of receive window back. The grant is counted
+    /// at once and its `window_adjust` is written by a task on the
+    /// connection's runtime, not by [`Self::recv`]: the write waits for the
+    /// writer lock and for room in the socket, and a `recv` dropped in that
+    /// wait would lose the event it had taken and the grant, and could cut
+    /// the frame in the middle, which tears the stream for every channel.
+    /// The window bounds how many of these tasks one channel has waiting:
+    /// the guest sends nothing more until a grant reaches it.
+    fn grant(&self, bytes: u64) {
+        // Counted before it is sent: the guest may use the grant as soon as
+        // it reads it.
+        self.recv_credit.grant(bytes);
+        let handle = self.handle.clone();
+        let id = self.id;
+        let rt = handle.inner.rt.clone();
+        rt.spawn(async move {
+            let _ = handle.send_msg(&HostMsg::WindowAdjust { id, bytes }).await;
+        });
     }
 
     /// Send host→guest bytes (terminal input, exec stdin, pushed file data),
