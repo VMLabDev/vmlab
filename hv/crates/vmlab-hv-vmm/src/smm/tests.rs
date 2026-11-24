@@ -288,7 +288,10 @@ fn fw_cfg_low_half_dma_after_a_64_bit_one() {
     };
     // A 64-bit transfer in two halves: read the signature into high memory.
     memory
-        .write_slice(&descriptor(8 | 2, 4, HIGH + 0x2000), GuestAddress(HIGH + 0x1000))
+        .write_slice(
+            &descriptor(8 | 2, 4, HIGH + 0x2000),
+            GuestAddress(HIGH + 0x1000),
+        )
         .unwrap();
     fw.write(4, &1u32.to_be_bytes());
     fw.write(8, &0x1000u32.to_be_bytes());

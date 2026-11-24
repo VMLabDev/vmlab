@@ -2311,7 +2311,11 @@ mod tests {
         let root = Arc::new(Mutex::new(PciRoot::q35(1 << 32)));
         let slot = 3u8;
         root.lock()
-            .add_device_at(slot, 0, Arc::new(Mutex::new(Function(bar_log.clone(), [0; 4]))))
+            .add_device_at(
+                slot,
+                0,
+                Arc::new(Mutex::new(Function(bar_log.clone(), [0; 4]))),
+            )
             .unwrap();
         let mut io_bus = IoBus::new();
         io_bus
