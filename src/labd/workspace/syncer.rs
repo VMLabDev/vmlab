@@ -2937,6 +2937,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disjoint_workspace_opens_while_another_guest_is_silent() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let a = workspace(root_a.path(), state.path());
+        let b = Workspace {
+            machine: "dev02".into(),
+            ledger_path: Ledger::path(state.path(), "dev02"),
+            ..workspace(root_b.path(), state.path())
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let entered_a = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let pass_a = tokio::spawn(isolated_pass(
+            a,
+            Arc::new(PausedSession {
+                sessions: OneFake::new(Arc::new(FakeGuest::new())),
+                opened: entered_a.clone(),
+                release: Some(release.clone()),
+            }),
+            events.clone(),
+        ));
+        entered_a.notified().await;
+
+        let entered_b = Arc::new(Notify::new());
+        let pass_b = isolated_pass(
+            b,
+            Arc::new(PausedSession {
+                sessions: OneFake::new(Arc::new(FakeGuest::new())),
+                opened: entered_b.clone(),
+                release: None,
+            }),
+            events,
+        );
+        tokio::pin!(pass_b);
+        // Drive the second pass to its first wait while the first guest stays silent.
+        let done_b = tokio::select! {
+            biased;
+            done = &mut pass_b => Some(done),
+            () = std::future::ready(()) => None,
+        };
+        let opened = tokio::select! {
+            biased;
+            () = entered_b.notified() => true,
+            () = std::future::ready(()) => false,
+        };
+        release.notify_one();
+        pass_a.await.unwrap();
+        if done_b.is_none() {
+            pass_b.await;
+        }
+        assert!(opened, "the silent guest blocked a disjoint workspace");
+    }
+
+    #[tokio::test]
     async fn competing_guest_edits_sharing_a_host_root_are_serialized() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
