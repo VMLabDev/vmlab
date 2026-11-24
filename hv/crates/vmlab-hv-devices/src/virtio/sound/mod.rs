@@ -31,9 +31,10 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use virtio_queue::{Queue, QueueState, QueueT};
+use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
 
 use crate::audio::{AudioClock, AudioFormat, CaptureSource, HostAudio, PlaybackSink, SampleFormat};
+use crate::virtio::used_needs_interrupt;
 use crate::{DeviceError, GuestMemory, Snapshot, VirtioDevice, VirtioInterrupt};
 
 /// VIRTIO_ID_SOUND.
@@ -103,7 +104,8 @@ fn queued_target(period_bytes: usize, frame_bytes: usize) -> usize {
 
 /// The largest PCM push given to the host sink at once. A push larger
 /// than a backend's whole ring would be dropped, so a message's PCM goes
-/// in 512-frame pieces.
+/// in 512-frame pieces, and no further than the room the sink reports
+/// (`PlaybackSink::room_bytes`): the rest of the message waits in the queue.
 const PUSH_FRAMES: usize = 512;
 
 /// Frames the tx drain may move per call, bounding catch-up work after a
@@ -177,6 +179,10 @@ struct Stream {
     /// elapsed-period notifications, so they may only advance at the rate
     /// the machine clock banks, never faster than real playback.
     tx_credit: u64,
+    /// Playback only: bytes of the PCM of the message at the head of the tx
+    /// queue that the host sink already took. Not zero only while the sink
+    /// had no room for the rest of that message.
+    tx_offset: usize,
     /// Sub-frame remainder of the frame accumulator, in ns × rate units.
     fraction: u64,
 }
@@ -388,6 +394,7 @@ impl VirtioSnd {
         stream.due_frames = 0;
         stream.fraction = 0;
         stream.tx_credit = 0;
+        stream.tx_offset = 0;
         stream.params = Some(PcmParams {
             buffer_bytes,
             period_bytes,
@@ -455,6 +462,8 @@ impl VirtioSnd {
                 stream.due_frames = 0;
                 stream.fraction = 0;
                 stream.tx_credit = 0;
+                // The new host stream holds none of the head message.
+                stream.tx_offset = 0;
                 stream.state = PcmState::Prepared;
             }
             R_PCM_START => self.streams[index].state = PcmState::Started,
@@ -490,7 +499,10 @@ impl VirtioSnd {
     /// Drain the tx queue of the playback stream (§5.14.6.8.1). Paced by
     /// the host sink: a message is taken only while the sink's queued PCM
     /// is below the watermark, so the guest's own `buffer_bytes` bounds
-    /// the data in flight and completions follow real playback. With
+    /// the data in flight and completions follow real playback. A message
+    /// the sink has no room for is moved in parts: it stays at the head of
+    /// the queue, `tx_offset` counts what the sink took, and it completes
+    /// when the sink has all of it. With
     /// `all`, everything waiting completes as cancelled (RELEASE), which
     /// a started stream never reaches.
     fn drain_tx(&mut self, all: bool) {
@@ -517,13 +529,18 @@ impl VirtioSnd {
                 if !started || budget == 0 {
                     break;
                 }
+                // A message the sink took a part of already passed both
+                // gates below and paid its credit: only the sink's room
+                // paces the rest of it.
+                let resumed = self.streams.first().is_some_and(|s| s.tx_offset != 0);
                 // A period of machine time must be banked before the next
                 // message may play: completions are elapsed-period
                 // notifications, never faster than real time.
-                if self
-                    .streams
-                    .first()
-                    .is_none_or(|s| s.tx_credit < period_frames)
+                if !resumed
+                    && self
+                        .streams
+                        .first()
+                        .is_none_or(|s| s.tx_credit < period_frames)
                 {
                     break;
                 }
@@ -531,7 +548,7 @@ impl VirtioSnd {
                     Some(HostStream::Playback(sink)) => sink.queued_bytes(),
                     _ => break, // no host stream: hold the queue
                 };
-                if queued >= target {
+                if !resumed && queued >= target {
                     break; // paced: the rest waits for the host
                 }
             }
@@ -550,6 +567,7 @@ impl VirtioSnd {
                         .queues
                         .get_mut(VQ_TX)
                         .map(|q| q.add_used(&mem, head, 0));
+                    self.streams[0].tx_offset = 0;
                     used_any = true;
                     continue;
                 }
@@ -567,28 +585,60 @@ impl VirtioSnd {
                 && params.is_some_and(|p| {
                     reader.available_bytes() <= (p.buffer_bytes as usize).min(PCM_MESSAGE_MAX)
                 });
-            let mut pcm = Vec::new();
-            let deliver = deliver && reader.read_to_end(&mut pcm).is_ok();
+            let mut held = false;
             let (code, latency) = if deliver {
                 let frame_bytes = params.unwrap().format.frame_bytes();
+                let total = reader.available_bytes();
                 let mut outcome = (S_IO_ERR, 0);
                 if let Some(stream) = self.streams.first_mut()
                     && let Some(HostStream::Playback(sink)) = stream.host.as_mut()
                 {
-                    for part in pcm.chunks(PUSH_FRAMES * frame_bytes) {
-                        sink.write_period(part);
+                    // The guest owns the chain and may have shortened it
+                    // since the sink took the first part.
+                    let offset = stream.tx_offset.min(total);
+                    let rest = total - offset;
+                    // A sink with a queue of fixed size takes whole frames
+                    // up to its room. More than that would push out PCM
+                    // it has not played.
+                    let take = match sink.room_bytes() {
+                        Some(room) if room < rest => room - room % frame_bytes,
+                        _ => rest,
+                    };
+                    let mut pcm = vec![0; take];
+                    let read = reader
+                        .split_at(offset)
+                        .is_ok_and(|mut tail| tail.read_exact(&mut pcm).is_ok());
+                    if read {
+                        for part in pcm.chunks(PUSH_FRAMES * frame_bytes) {
+                            sink.write_period(part);
+                        }
+                        if offset == 0 && take != 0 {
+                            // The message pays for all of its frames when
+                            // its first part plays. Only delivered audio
+                            // spends the credit; a cancelled message never
+                            // reaches the speaker.
+                            let frames = (total / frame_bytes) as u64;
+                            stream.tx_credit = stream.tx_credit.saturating_sub(frames);
+                        }
+                        budget = budget.saturating_sub(take / frame_bytes);
+                        held = take < rest;
+                        stream.tx_offset = offset + take;
+                        outcome = (S_OK, sink.latency_bytes());
                     }
-                    let frames = (pcm.len() / frame_bytes) as u64;
-                    budget = budget.saturating_sub(frames as usize);
-                    // Only delivered audio spends the credit; a cancelled
-                    // message never reaches the speaker.
-                    stream.tx_credit = stream.tx_credit.saturating_sub(frames);
-                    outcome = (S_OK, sink.latency_bytes());
                 }
                 outcome
             } else {
                 (S_IO_ERR, 0)
             };
+            if held {
+                // The sink is full. The message keeps its place at the
+                // head of the queue, and the next drain moves more of it.
+                if let Some(queue) = self.queues.get_mut(VQ_TX) {
+                    queue.go_to_previous_position();
+                }
+                break;
+            }
+            self.streams[0].tx_offset = 0;
             let written = complete_message(&mem, &chain, code, latency, None);
             let _ = self
                 .queues
@@ -624,7 +674,7 @@ impl VirtioSnd {
             && self
                 .queues
                 .get_mut(VQ_TX)
-                .is_some_and(|q| q.needs_notification(&mem).unwrap_or(false));
+                .is_some_and(|q| used_needs_interrupt(q, &mem));
         if want {
             interrupt.notify_queue(VQ_TX as u16);
         }
@@ -773,7 +823,7 @@ impl VirtioSnd {
             && self
                 .queues
                 .get_mut(VQ_RX)
-                .is_some_and(|q| q.needs_notification(&mem).unwrap_or(false))
+                .is_some_and(|q| used_needs_interrupt(q, &mem))
         {
             interrupt.notify_queue(VQ_RX as u16);
         }
@@ -831,7 +881,7 @@ impl VirtioSnd {
             && self
                 .queues
                 .get_mut(VQ_CONTROL)
-                .is_some_and(|q| q.needs_notification(&mem).unwrap_or(false))
+                .is_some_and(|q| used_needs_interrupt(q, &mem))
         {
             interrupt.notify_queue(VQ_CONTROL as u16);
         }
@@ -1025,7 +1075,8 @@ const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"VSND");
 /// audio plan's snapshot rule: at most one period glitches). In-flight
 /// buffers need no section of their own: a message is only ever completed
 /// whole, so the un-consumed ones are exactly the queue states saved
-/// here.
+/// here. A message the sink took a part of is still in the queue, and a
+/// restored device plays it from its start into the reopened stream.
 impl Snapshot for VirtioSnd {
     fn state_id(&self) -> String {
         self.id.clone()

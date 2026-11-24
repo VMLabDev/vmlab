@@ -58,6 +58,11 @@ impl SpscRing {
         tail.wrapping_sub(head).min(self.capacity())
     }
 
+    /// Bytes a push can add now without dropping buffered PCM.
+    pub fn free_bytes(&self) -> usize {
+        self.capacity() - self.used_bytes()
+    }
+
     /// Push `data` as the newest period, dropping the oldest buffered periods
     /// first when there is not enough room. A period larger than the whole
     /// ring is dropped: the ring is sized for whole periods. Returns the
