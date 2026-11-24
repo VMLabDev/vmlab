@@ -490,7 +490,7 @@ impl GatewayTask {
             }
             if udp.dst_port() == DNS_PORT && ip.dst() == self.gw_ip {
                 if let Some(dns) = &self.dns {
-                    self.handle_dns(dns.handle(frame));
+                    self.handle_dns(dns.handle(frame, self.gw_mac));
                 }
                 return;
             }
