@@ -25,6 +25,16 @@ if [ ! -f "$headers/include/vulkan/vulkan.h" ]; then
   rm -f "$tarball"
 fi
 
+# The pipe probe is linked with pipe.cpp of the kernel driver source, in a
+# directory of this run.
+case " $* " in *" pipe "*)
+  mkdir -p "$out/deps"
+  pipe_src=$(mktemp -d "$out/deps/pipe-src.XXXXXX")
+  "$here/pipe-source.sh" "$pipe_src"
+  set -- "$@" "PIPE_SRC=/src/out/probes/deps/$(basename "$pipe_src")"
+  ;;
+esac
+
 docker run --rm --user "$(id -u):$(id -g)" \
   -v "$repo:/src" -w /src/probes \
   "$image" bash -c 'make OUT=/src/out/probes BUILD=/src/out/probes/obj \
