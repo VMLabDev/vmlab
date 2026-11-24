@@ -173,6 +173,7 @@ async fn run_async() -> Result<()> {
         &crate::paths::template_store_dir(),
         &crate::paths::data_dir().join(crate::template::oci_bridge::PUSH_WORK_SUBDIR),
         &crate::paths::oci_cache_dir(),
+        &crate::template::artefact::cache_dir(),
     );
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(registry),
@@ -240,7 +241,12 @@ async fn run_async() -> Result<()> {
     Ok(())
 }
 
-fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path) {
+fn sweep_leftover_staging(
+    store: &Path,
+    push_work: &Path,
+    image_cache: &Path,
+    artefact_cache: &Path,
+) {
     use crate::staging::{STAGING_PREFIX, sweep};
     use crate::template::oci_bridge::{PULL_WORK_SUBDIR, WORK_PREFIX};
 
@@ -257,6 +263,26 @@ fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path) {
             }
             Err(err) => {
                 tracing::warn!(path = %root.display(), %err, "could not sweep staging directories")
+            }
+        }
+    }
+    for (root, result) in [
+        (
+            artefact_cache,
+            crate::template::artefact::sweep_abandoned_downloads(artefact_cache),
+        ),
+        (
+            store,
+            crate::template::store::TemplateStore::new(store.to_owned()).sweep_abandoned_metadata(),
+        ),
+    ] {
+        match result {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(path = %root.display(), count, "cleared abandoned temporary files")
+            }
+            Err(err) => {
+                tracing::warn!(path = %root.display(), %err, "could not sweep temporary files")
             }
         }
     }
@@ -1264,7 +1290,12 @@ mod tests {
             std::fs::write(file, b"partial").unwrap();
         }
 
-        super::sweep_leftover_staging(&store, &push_work, &image_cache);
+        super::sweep_leftover_staging(
+            &store,
+            &push_work,
+            &image_cache,
+            &dir.path().join("artefacts"),
+        );
 
         assert!(!staging.exists(), "abandoned template staging survived");
         assert!(!abandoned_pull.exists(), "abandoned pull survived");
@@ -1278,6 +1309,56 @@ mod tests {
         assert!(live_push.path().join(chunk).is_file());
         assert!(live_image.path().join("layer-0000").is_file());
         assert!(installed.join("disk.qcow2").is_file());
+    }
+
+    #[test]
+    fn the_startup_sweep_removes_abandoned_artefact_downloads() {
+        let data = tempfile::tempdir().unwrap();
+        let cache = data.path().join("cache/artefacts");
+        let digest = "ab".repeat(32);
+        let partial = cache.join(format!(".{digest}.1-0-000000000.part"));
+        let published = cache.join(format!("{digest}.artefact"));
+        let unrelated = cache.join(".unrelated.part");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&partial, b"partial").unwrap();
+        std::fs::write(&published, b"published").unwrap();
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+
+        super::sweep_leftover_staging(
+            &data.path().join("templates"),
+            &data.path().join("oci-push"),
+            &data.path().join("oci"),
+            &cache,
+        );
+
+        assert!(!partial.exists(), "abandoned artefact download survived");
+        assert_eq!(std::fs::read(published).unwrap(), b"published");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn the_startup_sweep_removes_abandoned_template_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let store = data.path().join("templates");
+        let version = store.join("x86_64/base/1.0");
+        let partial = version.join(".template.wcl.deadbeef");
+        let published = version.join("template.wcl");
+        let unrelated = version.join(".template.wcl.backup");
+        std::fs::create_dir_all(&version).unwrap();
+        std::fs::write(&partial, b"partial").unwrap();
+        std::fs::write(&published, b"published").unwrap();
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+
+        super::sweep_leftover_staging(
+            &store,
+            &data.path().join("oci-push"),
+            &data.path().join("oci"),
+            &data.path().join("artefacts"),
+        );
+
+        assert!(!partial.exists(), "abandoned template metadata survived");
+        assert_eq!(std::fs::read(published).unwrap(), b"published");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
     }
 
     #[test]

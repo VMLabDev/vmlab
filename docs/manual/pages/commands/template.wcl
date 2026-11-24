@@ -545,26 +545,29 @@ SRC
 
   h2 "vmlab template login"
 
-  code sh { source = "vmlab template login --username <USERNAME> --password <PASSWORD> <REGISTRY>" }
+  code sh { source = "vmlab template login --username <USERNAME> <--password-stdin|--password <PASSWORD>> <REGISTRY>" }
 
   table {
     rows:
       | "Option" | "Meaning" |
       | "`<REGISTRY>`" | "The registry host, for example `ghcr.io`." |
       | "`-u`, `--username <USERNAME>`" | "The account name." |
-      | "`-p`, `--password <PASSWORD>`" | "The password or token." |
+      | "`--password-stdin`" | "Read the password or token from standard input. One trailing newline is dropped." |
+      | "`-p`, `--password <PASSWORD>`" | "The password or token on the command line. Give this or `--password-stdin`, not both." |
       | "`-h`, `--help`" | "Print help." |
   }
 
   p <<DOC
     `login` stores credentials for a registry host with the supervisor, which
     uses them for every later push and pull against that host. It prints
-    `logged in to <REGISTRY>`. The password is taken from the command line,
-    so on a shared machine pass a token with limited scope rather than an
-    account password.
+    `logged in to <REGISTRY>`. Pass the password on standard input with
+    `--password-stdin`: every local user can read a command line while it
+    runs, and the shell keeps it in its history. Prefer a token with limited
+    scope to an account password. When `~/.docker/config.json` is a symlink,
+    the credential is written to the file it names and the link stays.
   DOC
 
-  code sh { source = "vmlab template login ghcr.io -u wil -p \"$GHCR_TOKEN\"" }
+  code sh { source = "printf '%s' \"$GHCR_TOKEN\" | vmlab template login ghcr.io -u wil --password-stdin" }
 
   p "Exit status is 0 on success and `failed` (1) when the credentials cannot be stored."
 
