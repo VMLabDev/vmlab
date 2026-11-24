@@ -9176,8 +9176,8 @@ lab "t" {
         std::fs::write(dir.path().join("src/main.rs"), "agreed").unwrap();
         let sh = shared(dir.path());
         let held = HeldRestore::new();
-        let mut m = Arc::into_inner(FakeMachine::new("dev01", MachineKind::Vm, &sh))
-            .expect("sole owner");
+        let mut m =
+            Arc::into_inner(FakeMachine::new("dev01", MachineKind::Vm, &sh)).expect("sole owner");
         m.hold_restore = Some(held.clone());
         let lab = lab_of(dir.path(), DEV_LAB, vec![Arc::new(m)]);
         dev_lab_syncing(&lab).await;
