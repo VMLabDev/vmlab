@@ -394,14 +394,18 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&path).expect("bind");
             rt.spawn(flooding_agent(listener, bound))
         };
-        let session = rt.block_on(async {
+        // The connection outlives the terminal, as a machine's does: were the
+        // session its last handle, the limit would close the socket behind
+        // the `close`, and the agent could see the hang-up first.
+        let (_agent, session) = rt.block_on(async {
             let agent = AgentHandle::connect(&path, Duration::from_secs(5))
                 .await
                 .unwrap();
-            agent
+            let session = agent
                 .open_terminal(SCRIPT_COLS, SCRIPT_ROWS, None, vec![], None)
                 .await
-                .unwrap()
+                .unwrap();
+            (agent, session)
         });
         let t = TerminalHandle::new("box".into(), rt.handle().clone(), session);
 
