@@ -278,6 +278,36 @@ mod tests {
         assert!(second.is_file());
     }
 
+    /// F5 (docs/reviews/appshare-media.md): chmod alone updates the mode
+    /// a guest sees through Rock Ridge.
+    #[test]
+    fn a_mode_change_rebuilds_an_iso() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let src = tempfile::tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = MediaCache::new(cache_root.path().join("media"));
+        let first = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let second = cache.ensure(MediaKind::Iso, src.path(), None).unwrap();
+        let extracted = cache_root.path().join("run.sh");
+        let output = Command::new("xorriso")
+            .args(["-osirrox", "on", "-indev"])
+            .arg(&second)
+            .args(["-extract", "/run.sh"])
+            .arg(&extracted)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_ne!(fs::metadata(extracted).unwrap().permissions().mode() & 0o111, 0);
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn kind_and_label_are_part_of_the_key() {
         let src = unattend_folder();
