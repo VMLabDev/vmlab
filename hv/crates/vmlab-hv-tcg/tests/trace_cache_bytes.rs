@@ -90,7 +90,7 @@ fn the_trace_cache_stays_within_a_byte_budget() {
     let before = LIVE.load(Ordering::Relaxed);
     let mut largest = 0usize;
     while cpu.steps < INSTRUCTIONS {
-        cpu.run(64).unwrap();
+        cpu.run((INSTRUCTIONS - cpu.steps).min(64)).unwrap();
         largest = largest.max(LIVE.load(Ordering::Relaxed).saturating_sub(before));
     }
     let stats = &cpu.specialization_stats;
