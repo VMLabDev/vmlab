@@ -804,6 +804,29 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_in_a_host_path_is_not_a_samba_variable() {
+        let mut config = cfg(false);
+        config.shares[0].host_path = PathBuf::from("/home/u/100%U");
+        let refusal = config.render_conf().expect_err("Samba expands percent variables");
+        assert_eq!(refusal.name, "src");
+        assert!(refusal.reason.contains('%'));
+    }
+
+    #[test]
+    fn a_credential_file_that_cannot_be_parsed_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds");
+        std::fs::write(&path, "").unwrap();
+        let first = SmbCredentials::load_or_create(dir.path());
+        let second = SmbCredentials::load_or_create(dir.path());
+        assert!(first == second, "credential changed after restart");
+        assert!(
+            std::fs::read_to_string(path).unwrap() == format!("{}:{}", first.username, first.password),
+            "the credential was not saved"
+        );
+    }
+
+    #[test]
     fn credentials_username_is_unix_user_and_password_strong() {
         // Unprivileged passdb constraint: the SMB username must be a real Unix
         // account, so it is the invoking user (same for every VM in a lab).
