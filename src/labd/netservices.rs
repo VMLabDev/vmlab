@@ -262,6 +262,10 @@ impl SegmentServices {
         }
     }
 
+    pub fn withdraw_host_service(&self, port: u16) {
+        self.host_services.lock_recover().retain(|&p| p != port);
+    }
+
     #[cfg(test)]
     pub(crate) fn host_service_ports(&self) -> Vec<u16> {
         self.host_services.lock_recover().clone()

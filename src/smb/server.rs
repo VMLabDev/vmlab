@@ -195,6 +195,10 @@ impl SmbServer {
         self.config.listen_port
     }
 
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().map_or(Ok(None), Child::try_wait)
+    }
+
     #[cfg(test)]
     pub(crate) fn kill_for_test(&mut self) {
         let child = self.child.as_mut().unwrap();
