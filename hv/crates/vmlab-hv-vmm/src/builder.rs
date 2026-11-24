@@ -1,11 +1,13 @@
 //! Building a [`Vm`] from a [`MachineDescription`] and a [`DeviceFactory`].
 
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 
 use vmlab_hv_devices::{IrqLine, MsiSink};
 use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, NicModel, PciAddress,
+    Accel, Arch, Boot, DiskBus, DisplayDevice, FirmwareKind, Machine, MachineDescription,
+    NicModel, PciAddress,
 };
 
 use crate::acpi::{self, AcpiConfig};
@@ -991,26 +993,13 @@ pub fn build(
         None
     };
     let vga = if let Some(display) = &desc.display {
-        let virtio = display.device == vmlab_hv_proto::machine::DisplayDevice::VirtioVga;
-        let path = display.rom.as_deref().unwrap_or(std::path::Path::new(
-            if display.device == vmlab_hv_proto::machine::DisplayDevice::VmwareSvga {
-                "/usr/share/qemu/vgabios-vmware.bin"
-            } else if display.device == vmlab_hv_proto::machine::DisplayDevice::CirrusVga {
-                "/usr/share/qemu/vgabios-cirrus.bin"
-            } else if virtio {
-                "/usr/share/qemu/vgabios-virtio.bin"
-            } else {
-                "/usr/share/qemu/vgabios-stdvga.bin"
-            },
-        ));
-        let rom = std::fs::read(path)
-            .map_err(|e| VmmError::Other(format!("reading VGA ROM {}: {e}", path.display())))?;
-        Some(if virtio {
+        let rom = load_vga_rom(display.device, display.rom.as_deref())?;
+        Some(if display.device == DisplayDevice::VirtioVga {
             let transport = wiring(Some(display.pci), 3, false)?;
             let vga = Arc::new(Mutex::new(
                 vmlab_hv_devices::display::virtio_vga::VirtioVga::new(
                     "vga",
-                    &rom,
+                    rom.as_deref().unwrap_or_default(),
                     ram.device_mem.clone(),
                     Some(transport.msi),
                     transport.intx,
@@ -1049,20 +1038,24 @@ pub fn build(
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
             crate::display::Video::Virtio(vga)
-        } else if display.device == vmlab_hv_proto::machine::DisplayDevice::CirrusVga {
+        } else if display.device == DisplayDevice::CirrusVga {
             let vga = Arc::new(Mutex::new(
-                vmlab_hv_devices::display::cirrus::CirrusVga::new("vga", &rom)
-                    .map_err(|e| VmmError::Other(e.to_string()))?,
+                vmlab_hv_devices::display::cirrus::CirrusVga::new(
+                    "vga",
+                    rom.as_deref().unwrap_or_default(),
+                )
+                .map_err(|e| VmmError::Other(e.to_string()))?,
             ));
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
             crate::display::Video::Cirrus(vga)
         } else {
-            let mut device = vmlab_hv_devices::display::StandardVga::new("vga", &rom)
-                .map_err(|e| VmmError::Other(e.to_string()))?;
-            if display.device == vmlab_hv_proto::machine::DisplayDevice::VmwareSvga {
-                device.enable_vmware();
+            let device = if display.device == DisplayDevice::VmwareSvga {
+                vmlab_hv_devices::display::StandardVga::new_vmware("vga", rom.as_deref())
+            } else {
+                vmlab_hv_devices::display::StandardVga::new("vga", rom.as_deref().unwrap_or_default())
             }
+            .map_err(|e| VmmError::Other(e.to_string()))?;
             let vga = Arc::new(Mutex::new(device));
             place(vga.clone(), Some(display.pci))?;
             snap_nodes.push(DeviceNode::Resettable(vga.clone()));
@@ -1806,8 +1799,51 @@ fn parse_nic_mac(text: &str) -> Result<[u8; 6], VmmError> {
         .map_err(|_| VmmError::InvalidMachine(format!("invalid NIC MAC `{text}`")))
 }
 
+fn load_vga_rom(device: DisplayDevice, path: Option<&Path>) -> Result<Option<Vec<u8>>, VmmError> {
+    let path = match (device, path) {
+        (_, Some(path)) => path,
+        (DisplayDevice::VmwareSvga, None) => return Ok(None),
+        (DisplayDevice::StdVga, None) => Path::new("/usr/share/qemu/vgabios-stdvga.bin"),
+        (DisplayDevice::CirrusVga, None) => Path::new("/usr/share/qemu/vgabios-cirrus.bin"),
+        (DisplayDevice::VirtioVga, None) => Path::new("/usr/share/qemu/vgabios-virtio.bin"),
+    };
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|e| VmmError::Other(format!("reading VGA ROM {}: {e}", path.display())))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vmware_svga_without_a_rom_has_no_expansion_bar_and_can_reset() {
+        use vmlab_hv_devices::display::{ROM_BAR, StandardVga};
+        use vmlab_hv_devices::{PciDevice, Resettable};
+
+        let rom = load_vga_rom(DisplayDevice::VmwareSvga, None).unwrap();
+        assert!(rom.is_none());
+        let mut device = StandardVga::new_vmware("vga", rom.as_deref()).unwrap();
+        assert_eq!(device.pci_identity(), 0x0405_15ad);
+        assert!(device.bars().iter().all(|bar| bar.index != ROM_BAR));
+        device.config_write(0x30 / 4, 0, &u32::MAX.to_le_bytes());
+        assert_eq!(device.config_read(0x30 / 4), 0);
+        device.reset().unwrap();
+        assert_eq!(device.pci_identity(), 0x0405_15ad);
+        assert!(device.bars().iter().all(|bar| bar.index != ROM_BAR));
+    }
+
+    #[test]
+    fn vmware_svga_loads_an_explicit_rom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vmware.bin");
+        assert!(load_vga_rom(DisplayDevice::VmwareSvga, Some(&path)).is_err());
+        let rom = [0x55, 0xaa, 1];
+        std::fs::write(&path, rom).unwrap();
+        assert_eq!(
+            load_vga_rom(DisplayDevice::VmwareSvga, Some(&path)).unwrap(),
+            Some(rom.to_vec())
+        );
+    }
+
     #[test]
     fn fw_cfg_validates_and_loads_immutable_launch_inputs() {
         use vmlab_hv_proto::machine::{FwCfgFile, FwCfgSource};
