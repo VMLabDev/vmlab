@@ -2474,7 +2474,8 @@ mod tests {
             let lab = crate::config::load_lab_source(&src, "<t>", std::path::Path::new("/tmp"))
                 .unwrap()
                 .lab;
-            crate::labd::network::LabNetwork::build(&lab).unwrap()
+            let host = crate::config::host::HostConfig::default();
+            crate::labd::network::LabNetwork::build(&lab, host.subnet_pool).unwrap()
         };
         let (mut a, mut b) = (network("a"), network("b"));
 

@@ -271,6 +271,62 @@ fn dma(
 }
 
 #[test]
+fn fw_cfg_low_half_dma_after_a_64_bit_one() {
+    const HIGH: u64 = 1 << 32;
+    let memory =
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000), (GuestAddress(HIGH), 0x10000)])
+            .unwrap();
+    let mut fw = SmiFwCfg::new(FwCfg::new(memory.clone()), memory.clone()).unwrap();
+    let request = selector(&mut fw, "etc/smi/requested-features");
+    let ok = selector(&mut fw, "etc/smi/features-ok");
+    let descriptor = |control: u32, length: u32, address: u64| {
+        let mut bytes = Vec::new();
+        bytes.extend(control.to_be_bytes());
+        bytes.extend(length.to_be_bytes());
+        bytes.extend(address.to_be_bytes());
+        bytes
+    };
+    // A 64-bit transfer in two halves: read the signature into high memory.
+    memory
+        .write_slice(
+            &descriptor(8 | 2, 4, HIGH + 0x2000),
+            GuestAddress(HIGH + 0x1000),
+        )
+        .unwrap();
+    fw.write(4, &1u32.to_be_bytes());
+    fw.write(8, &0x1000u32.to_be_bytes());
+    let mut signature = [0; 4];
+    memory
+        .read_slice(&mut signature, GuestAddress(HIGH + 0x2000))
+        .unwrap();
+    assert_eq!(&signature, b"QEMU");
+    // Then the low half alone: the descriptor is at 0:0x3000.
+    memory
+        .write_slice(&1u64.to_le_bytes(), GuestAddress(0x2000))
+        .unwrap();
+    memory
+        .write_slice(
+            &descriptor((u32::from(request) << 16) | 8 | 16, 8, 0x2000),
+            GuestAddress(0x3000),
+        )
+        .unwrap();
+    fw.write(8, &0x3000u32.to_be_bytes());
+    let mut completion = [0xff; 4];
+    memory
+        .read_slice(&mut completion, GuestAddress(0x3000))
+        .unwrap();
+    assert_eq!(completion, [0; 4]);
+    fw.write(0, &ok.to_le_bytes());
+    let mut result = [0];
+    fw.read(1, &mut result);
+    assert_eq!(result, [1]);
+    assert!(
+        fw.broadcast(),
+        "the request written through 0:0x3000 was not seen"
+    );
+}
+
+#[test]
 fn edk2_dma_negotiation() {
     let (mut fw, memory) = firmware();
     let request = selector(&mut fw, "etc/smi/requested-features");

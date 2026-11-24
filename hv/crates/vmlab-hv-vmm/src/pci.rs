@@ -917,10 +917,13 @@ impl BusDevice for PciConfigIo {
             }
             4..=7 if self.address & 0x8000_0000 != 0 => {
                 let (bus, slot, function, reg) = self.bdf();
-                let offset = reg * 4 + (offset - 4) as usize;
+                // CF8 selects one dword. An access that runs past it, at
+                // 0xcfd-0xcff, ends at the dword as the read does.
+                let within = (offset - 4) as usize;
+                let data = &data[..data.len().min(4 - within)];
                 self.root
                     .lock()
-                    .config_write(bus, slot, function, offset, data);
+                    .config_write(bus, slot, function, reg * 4 + within, data);
             }
             _ => {}
         }
@@ -1429,6 +1432,25 @@ mod tests {
         root.config_write(0, 31, 3, 16, &0xc002_0000u32.to_le_bytes());
         root.restore_bar_states(&saved).unwrap();
         assert_eq!(root.config_read(0, 31, 3, 4), 0xc001_f000);
+    }
+
+    #[test]
+    fn cfc_write_does_not_cross_the_dword() {
+        let (root, dev) = root_with_fake();
+        let mut cfg = PciConfigIo::new(root);
+        // Slot 1, register 63: the last dword CF8 can address.
+        cfg.write(0, &0x8000_08fcu32.to_le_bytes());
+        cfg.write(7, &[1, 2, 3, 4]);
+        let log = dev.lock().config_log.lock().clone();
+        assert_eq!(log, vec![(63, 3, vec![1])]);
+        // Register 4 is a BAR of the fake function. A write that starts in
+        // register 3 leaves it alone.
+        let bar = cfg.root.lock().config_read(0, 1, 0, 4);
+        cfg.write(0, &0x8000_080cu32.to_le_bytes());
+        cfg.write(6, &[0xff; 4]);
+        let log = dev.lock().config_log.lock().clone();
+        assert_eq!(log[1..], [(3, 2, vec![0xff; 2])]);
+        assert_eq!(cfg.root.lock().config_read(0, 1, 0, 4), bar);
     }
 
     #[test]
