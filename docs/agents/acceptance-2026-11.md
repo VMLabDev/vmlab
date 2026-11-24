@@ -129,8 +129,23 @@ again: the missing file is a property of the image.
 | `app.waypipe` | `apps` | No Wayland compositor in the e2e container |
 | `app.rdp` | `apps` | No Windows guest in the e2e suite |
 
-The four playbook features are the only skips that a change on helios would
-remove. They are open: see O1 in [Open points](#open-points).
+### Playbook follow-up (card #917)
+
+With config-weave 0.12.2-alpha installed for the `vmlab` account on helios,
+`just e2e::run --only playbooks --hypervisor vmlab` ran at commit
+`47b55d5a5edbe5c07fe792793573b2766192b843`. It exited 0 with 4 pass,
+0 fail and 0 skip. The table above retains the original acceptance run's skips.
+
+| Feature | Result | Evidence |
+| --- | --- | --- |
+| `playbook.up` | Pass | `up` applied the play and wrote the configured value to `/etc/e2e-weave.txt`. |
+| `playbook.list` | Pass | The list showed both plays for `vm01` and the configured marker variable. |
+| `playbook.check-apply` | Pass | Check reported drift and preserved the tampered file. Apply restored the configured value, and check then reported it as configured. |
+| `playbook.timeout` | Pass | The five-second timeout identified processes still running in the guest. An immediate retry was refused. Once those processes finished, a new run converged and cleared the timeout record. |
+
+The run log is at `/home/vmlab/src/stc/logs/card-917-playbooks-verified.log`
+on helios. The JSON and JUnit reports are under
+`/home/vmlab/src/stc/co/card-917/e2e/results/`.
 
 ## Scenarios on QEMU (R2)
 
@@ -411,7 +426,6 @@ the cause. A first reading is not a diagnosis.
 
 | Code | Point |
 | --- | --- |
-| O1 | The four `playbook.*` features did not run. They need config-weave in `~/.local/share/config-weave/bin` of the account that runs the suite on helios. |
 | O2 | The win3d suite did not run on Nvidia2. It needs Nvidia2 on the host (vulkan mode), which the overseer switches. |
 | O3 | The `audio` row should be repeated on a host with no other heavy job before D3 is sized. |
 | O4 | The win3d baseline tables in `guest/win3d/docs/acceptance.md` are from 2026-11-20 and no longer match: seven rows that fail there pass now. This card did not change them. |
