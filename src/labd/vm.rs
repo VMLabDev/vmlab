@@ -332,9 +332,10 @@ pub struct VmInstance {
     /// Effective MTU of each NIC's segment, in declaration order. Drives
     /// `host_mtu=` on virtio NICs so the guest matches a jumbo segment.
     pub nic_mtus: Vec<u16>,
-    /// CD-ROM image paths (config cdrom + built media), resolved absolute.
-    pub cdroms: Vec<PathBuf>,
-    pub floppy: Option<Floppy>,
+    /// Direct CD-ROM attachments precede any ISO built from a folder.
+    cdroms: Vec<PathBuf>,
+    floppy: Option<Floppy>,
+    media_cache_dir: PathBuf,
     /// Absolute host dir per `cfg.shares` entry (relative paths resolved
     /// against the lab root by the lab builder).
     pub share_hosts: Vec<PathBuf>,
@@ -460,6 +461,7 @@ impl VmInstance {
         nic_mtus: Vec<u16>,
         cdroms: Vec<PathBuf>,
         floppy: Option<Floppy>,
+        media_cache_dir: PathBuf,
         share_hosts: Vec<PathBuf>,
         template: TemplateParts,
     ) -> Arc<Self> {
@@ -471,6 +473,7 @@ impl VmInstance {
             nic_mtus,
             cdroms,
             floppy,
+            media_cache_dir,
             share_hosts,
             agent: super::machine::AgentSlot::for_transport(template.resolved.agent_transport),
             template: std::sync::RwLock::new(Arc::new(template)),
@@ -975,21 +978,59 @@ impl VmInstance {
         }))
     }
 
+    /// Resolve folder media against the current source contents (PRD §6.3).
+    /// Hashing and building both do blocking I/O.
+    pub(super) async fn media_images(&self) -> Result<(Vec<PathBuf>, Option<Floppy>)> {
+        use model::MediaKind;
+
+        let mut cdroms = self.cdroms.clone();
+        let mut floppy = self.floppy.clone();
+        if self.cfg.media.is_empty() {
+            return Ok((cdroms, floppy));
+        }
+        let media = self.cfg.media.clone();
+        let cache_dir = self.media_cache_dir.clone();
+        let name = self.cfg.name.clone();
+        tokio::task::spawn_blocking(move || {
+            let cache = crate::media::MediaCache::new(cache_dir);
+            for source in media {
+                let built = cache
+                    .ensure(source.kind, &source.from, source.label.as_deref())
+                    .with_context(|| format!("building media for vm \"{name}\""))?;
+                match source.kind {
+                    MediaKind::Iso => cdroms.push(built),
+                    MediaKind::Floppy => {
+                        if floppy.is_some() {
+                            bail!(
+                                "vm \"{name}\": both a floppy attachment and floppy media declared — \
+                                 a VM has one floppy drive"
+                            );
+                        }
+                        floppy = Some(Floppy::Built(built));
+                    }
+                }
+            }
+            Ok((cdroms, floppy))
+        })
+        .await
+        .context("media build task")?
+    }
+
     /// The image this start puts in drive A. A built floppy is the machine's
     /// own copy of the cache entry, beside its disks: a guest write reaches
     /// neither the cache nor another machine, and `destroy` takes the copy
     /// with the disks.
-    fn floppy_image(&self) -> Result<Option<PathBuf>> {
-        match &self.floppy {
+    fn floppy_image(&self, floppy: Option<Floppy>) -> Result<Option<PathBuf>> {
+        match floppy {
             None => Ok(None),
-            Some(Floppy::Image(path)) => Ok(Some(path.clone())),
-            Some(Floppy::Built(entry)) => crate::media::private_floppy(entry, &self.dirs.local)
+            Some(Floppy::Image(path)) => Ok(Some(path)),
+            Some(Floppy::Built(entry)) => crate::media::private_floppy(&entry, &self.dirs.local)
                 .with_context(|| format!("{}: floppy media", self.cfg.name))
                 .map(Some),
         }
     }
 
-    fn build_paths(
+    async fn build_paths(
         &self,
         t: &TemplateParts,
         firmware: Option<&qemu::firmware::UefiFirmware>,
@@ -1008,6 +1049,7 @@ impl VmInstance {
                 self.cfg.name
             );
         }
+        let (cdroms, floppy) = self.media_images().await?;
         Ok(VmPaths {
             apple_smc_osk: if t.resolved.apple_smc {
                 (self.host_config)()?.apple_smc_osk
@@ -1025,10 +1067,10 @@ impl VmInstance {
                 .iter()
                 .map(|d| (d.name.clone(), self.dirs.extra_disk(&d.name)))
                 .collect(),
-            cdroms: self.cdroms.clone(),
+            cdroms,
             // The lab builder puts the `cdrom =` attachment first.
             install_cdrom: self.cfg.cdrom.is_some(),
-            floppy: self.floppy_image()?,
+            floppy: self.floppy_image(floppy)?,
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
@@ -1517,14 +1559,10 @@ impl VmInstance {
             let machine = super::hypervisor::Launch::Vm {
                 lab: self.lab.clone(),
                 resolved: Box::new(t.resolved.clone()),
-                paths: Box::new(self.build_paths(
-                    &t,
-                    firmware.as_ref(),
-                    nic_specs,
-                    vfs_devices,
-                    &render,
-                    tsc_hz,
-                )?),
+                paths: Box::new(
+                    self.build_paths(&t, firmware.as_ref(), nic_specs, vfs_devices, &render, tsc_hz)
+                        .await?,
+                ),
                 accel,
                 emulator: render.qemu_binary.clone(),
             };

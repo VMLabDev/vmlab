@@ -1,11 +1,12 @@
 //! Content digest of a media source folder.
 //!
 //! The digest covers each entry's relative path and, for files, its length
-//! and bytes. Paths are sorted so the result is deterministic; mtimes,
-//! ownership, and permissions are deliberately excluded so that touching a
-//! file without changing it does not invalidate the cache (PRD §6.3).
+//! and bytes. ISO digests also cover modes because Rock Ridge records them.
+//! Paths are sorted for a deterministic result. Timestamps and ownership
+//! are excluded (PRD §6.3).
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -20,10 +21,8 @@ struct Entry {
 
 /// Computes the sha256 content digest of `src_folder`.
 ///
-/// Two folders with the same tree of relative paths and file contents hash
-/// identically regardless of timestamps; renaming a file or nesting it
-/// differently changes the digest.
-pub fn folder_digest(src_folder: &Path) -> Result<[u8; 32]> {
+/// Pass `include_modes` for images that preserve Unix permissions.
+pub fn folder_digest(src_folder: &Path, include_modes: bool) -> Result<[u8; 32]> {
     ensure!(
         src_folder.is_dir(),
         "media source {} is not a directory",
@@ -36,28 +35,42 @@ pub fn folder_digest(src_folder: &Path) -> Result<[u8; 32]> {
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));
 
     let mut hasher = Sha256::new();
+    if include_modes {
+        hasher.update(mode_bytes(src_folder)?);
+    }
     for entry in &entries {
         let abs = src_folder.join(&entry.rel);
         if entry.is_dir {
             hasher.update(b"D");
             hasher.update(entry.rel.as_bytes());
             hasher.update([0u8]);
+            if include_modes {
+                hasher.update(mode_bytes(&abs)?);
+            }
         } else {
             let mut file = fs::File::open(&abs)
                 .with_context(|| format!("opening {} for hashing", abs.display()))?;
-            let len = file
+            let metadata = file
                 .metadata()
-                .with_context(|| format!("reading metadata of {}", abs.display()))?
-                .len();
+                .with_context(|| format!("reading metadata of {}", abs.display()))?;
             hasher.update(b"F");
             hasher.update(entry.rel.as_bytes());
             hasher.update([0u8]);
-            hasher.update(len.to_le_bytes());
+            if include_modes {
+                hasher.update(metadata.permissions().mode().to_le_bytes());
+            }
+            hasher.update(metadata.len().to_le_bytes());
             crate::hashing::feed(&mut file, &mut hasher)
                 .with_context(|| format!("hashing contents of {}", abs.display()))?;
         }
     }
     Ok(hasher.finalize().into())
+}
+
+fn mode_bytes(path: &Path) -> Result<[u8; 4]> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading metadata of {}", path.display()))?;
+    Ok(metadata.permissions().mode().to_le_bytes())
 }
 
 /// Recursively collects entries under `root`, recording paths relative to
@@ -93,7 +106,7 @@ mod tests {
     use super::*;
 
     fn digest(dir: &Path) -> [u8; 32] {
-        folder_digest(dir).expect("digest should succeed")
+        folder_digest(dir, false).expect("digest should succeed")
     }
 
     #[test]
@@ -163,6 +176,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not-a-dir");
         fs::write(&file, b"x").unwrap();
-        assert!(folder_digest(&file).is_err());
+        assert!(folder_digest(&file, false).is_err());
     }
 }

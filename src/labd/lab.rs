@@ -8525,8 +8525,7 @@ lab "t" {
         let file = payload.join("data.txt");
         std::fs::write(&file, b"before").unwrap();
         let config = crate::config::load_lab_root(root).unwrap();
-        let (tx, _rx) = tokio::sync::broadcast::channel(64);
-        let events = Arc::new(super::super::events::EventLog::new("t", tx).unwrap());
+        let (events, _rx) = EventLog::recording("t", root.join("events.jsonl"));
         let lab = LabRuntime::build(config, events, &ProfileSet::shipped().unwrap())
             .await
             .unwrap();

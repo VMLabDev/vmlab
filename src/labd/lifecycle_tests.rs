@@ -280,6 +280,7 @@ fn vm_with_floppy(
         Vec::new(),
         Vec::new(),
         floppy,
+        dirs.root.join("media"),
         share_hosts,
         TemplateParts {
             resolved,
