@@ -558,7 +558,8 @@ impl LabRuntime {
             &freeze_clone::observe(&root, &lab_local, &freeze_declared)?,
         );
         let store = TemplateStore::new(crate::paths::template_store_dir());
-        let mut network = LabNetwork::build(&config.lab)?;
+        let host_cfg = crate::config::host::HostConfig::load_default()?;
+        let mut network = LabNetwork::build(&config.lab, host_cfg.subnet_pool)?;
         // Before any gateway is wired: isolation changes what each NAT
         // engine admits and which global segments the lab joins (§21.4).
         let isolation = super::isolation::decide(&root, &config.lab)?;
@@ -567,8 +568,6 @@ impl LabRuntime {
         }
         let mut pending: BTreeMap<String, PullJob> = BTreeMap::new();
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let host_cfg = crate::config::host::HostConfig::load_default()?;
-
         let config = Arc::new(config);
         let mtus = network.mtus();
         let mut set = MachineSet::default();
@@ -700,7 +699,8 @@ impl LabRuntime {
         let root = config.root.clone();
         let lab_local = crate::paths::lab_local_dir(&root);
         std::fs::create_dir_all(&lab_local)?;
-        let mut network = LabNetwork::build(&config.lab)?;
+        let host_cfg = crate::config::host::HostConfig::default();
+        let mut network = LabNetwork::build(&config.lab, host_cfg.subnet_pool)?;
         let isolation = super::isolation::decide(&root, &config.lab)?;
         if let Some(plan) = &isolation {
             network.isolate(plan);
@@ -744,7 +744,7 @@ impl LabRuntime {
             active_captures: std::sync::Mutex::default(),
             mount_tasks: std::sync::Mutex::default(),
             shipped_agent: std::sync::RwLock::new(Arc::new(super::agent_repair::shipped_asset)),
-            host_cfg: crate::config::host::HostConfig::default(),
+            host_cfg,
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
             ups: std::sync::Mutex::default(),
