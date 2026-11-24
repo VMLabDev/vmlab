@@ -39,11 +39,11 @@ Who the attacker is, per finding:
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again (fixed in card #529) |
-| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
+| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC (fixed in card #816) |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused (fixed in card #817) |
 | F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
-| F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
+| F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY (fixed in card #818) |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
 | F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length |
 | F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended (fixed in card #820) |
@@ -618,6 +618,10 @@ Who the attacker is, per finding:
   b.globals.list()[0]["subnet"]`. Today A has `10.214.0.0/24` and B has
   `10.214.1.0/24`. Second assertion: a DHCP DISCOVER written on A's trunk
   socket gets exactly one OFFER. Today it gets two.
+- Fixed in card #816. The dialer's subnet is part of the authenticated trunk
+  handshake. The accepting supervisor bridges to the dialer's gateway,
+  DHCP and DNS. The proof checks both subnet listings, counts the service
+  ports and verifies the DHCP OFFER on the trunk socket.
 
 ### F14. A global subnet index is never reused (wrong result)
 
@@ -717,6 +721,19 @@ created for that start.
   zone with an upstream and `add_sinkhole("*.blocked.test", Nxdomain)`. Send
   a query of type 65 for `a.blocked.test`. Assert the action is a `Reply`
   with rcode NXDOMAIN. Today it is `ForwardUpstream`.
+- Fixed in card #818. `DnsServer::handle` applies the zone's answer to every
+  query type. A name under an NXDOMAIN sinkhole gets NXDOMAIN. A name under
+  a 0.0.0.0 sinkhole, and a name the zone holds a record for, get an empty
+  NOERROR for every type but A and ANY, because the zone has an address for
+  them and no other record. Only a name the zone has no verdict on is
+  forwarded. The same holds for a non-query opcode and a class other than
+  IN: the reply is NOTIMP unless the zone has no verdict on the name. One
+  result changes without an upstream: another type for an unknown name now
+  gets NXDOMAIN, as A and AAAA do, where it got NOTIMP. The zone lookup does
+  not say whether an NXDOMAIN comes from a sinkhole, and the sinkhole has to
+  hold there too. A second test,
+  `a_sinkholed_name_is_not_forwarded_under_another_class_or_opcode`, covers
+  the `:479-484` branch.
 
 ### F18. A connection to the gateway address is dialed on the host's network (wrong result)
 
