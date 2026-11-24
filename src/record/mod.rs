@@ -438,6 +438,32 @@ mod tests {
     }
 
     #[test]
+    fn a_duration_too_large_for_a_clock_is_refused() {
+        let opts = RecordOptions {
+            max_duration: Some(1e20),
+            ..Default::default()
+        };
+        assert!(
+            Settings::resolve(Path::new("a.mp4"), &opts)
+                .unwrap_err()
+                .contains("max_duration")
+        );
+    }
+
+    #[test]
+    fn an_idle_threshold_too_large_for_a_clock_is_refused() {
+        let opts = RecordOptions {
+            compress_idle: Some(1e20),
+            ..Default::default()
+        };
+        assert!(
+            Settings::resolve(Path::new("a.mp4"), &opts)
+                .unwrap_err()
+                .contains("compress_idle")
+        );
+    }
+
+    #[test]
     fn options_omit_what_was_not_asked_on_the_wire() {
         let json = serde_json::to_value(RecordOptions::default()).unwrap();
         assert_eq!(json, serde_json::json!({}));
