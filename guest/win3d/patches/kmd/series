@@ -14,3 +14,4 @@ kmd-host-scan-line.patch
 kmd-allow-180-degree-display-rotation.patch
 kmd-rotate-hardware-pointer.patch
 kmd-check-capset-escape.patch
+kmd-check-submit-escape-size.patch

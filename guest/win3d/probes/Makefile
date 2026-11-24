@@ -46,6 +46,18 @@ endef
 
 $(foreach a,$(ARCHES),$(eval $(call tdr_rules,$(a))))
 
+# Explicit test-only target, like tdr: the command sizes of the submit
+# escape (card #752). A driver without the fix can bugcheck the guest.
+submit: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/submit_probe.exe)
+
+define submit_rules
+$(OUT)-extra/$(1)/submit_probe.exe: submit/submit_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call submit_rules,$(a))))
+
 # Explicit test-only target, like tdr: the hostile arguments of the capset
 # escape (card #751). A driver without the fix bugchecks the guest.
 capset: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/capset_probe.exe)
@@ -89,3 +101,4 @@ clean:
 	rm -rf $(BUILD) $(OUT)/deps $(foreach a,$(ARCHES),$(OUT)/$(a))
 
 .PHONY: all clean tdr capset
+.PHONY: submit

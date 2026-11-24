@@ -78,7 +78,7 @@ hostile guest or peer, wrong result, cosmetic.
 | F2 | security, wrong result | `secure_boot = true` on a VM that already has a variable store boots the secure-boot firmware on that store, blank or guest-written (fixed, card #734) |
 | F3 | security inside the guest | aarch64 secure boot keeps its variable store on flash the guest OS can write (fixed by card #735: said, not closed) |
 | F4 | wrong result | A read-only VARS template gives a read-only per-VM store, and the VM cannot start |
-| F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start |
+| F5 | wrong result | A first-start VARS copy that fails leaves a partial store that blocks every later start (fixed, card #740) |
 | F6 | wrong result | An x86 VM whose store is not the 4 MiB layout is selected a firmware vmlab-hv then refuses |
 | F7 | crash (debug builds), cosmetic | Direct kernel boot subtracts the initrd size from the top of low RAM without a check |
 | F8 | wrong result | The iPXE build keeps stale headers in `config/local` of a cached checkout |
@@ -241,6 +241,9 @@ fw_cfg back to its power-on state (`hv/vmlab-hv-vmm/src/reset.rs:12-24`).
   reach is an override directory or a user file.
 
 ### F5. A failed first copy leaves a partial store
+
+- Fixed in card #740. First start stages the copy in the VM directory and
+  publishes it only after the copy succeeds, without replacing an existing store.
 
 - Where: `src/labd/vm.rs:1369-1374` and `:886-896`.
 - Fault: `std::fs::copy` writes the destination in place. When it fails part

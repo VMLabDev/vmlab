@@ -192,6 +192,10 @@ for a guest that is not x86.
   host) shows the wrap without a guest.
 - Severity: crash. On a small guest: a 4 GiB nonpaged allocation attempt per
   call.
+- Status: fixed by card #752.
+  `guest/win3d/patches/kmd/kmd-check-submit-escape-size.patch` compares the
+  size with a subtraction and returns `STATUS_INVALID_BUFFER_SIZE`.
+  `guest/win3d/docs/acceptance/C752.md` has the proof, before and after.
 
 ### F5. The scanout count of the host is used as a loop bound over arrays of one and sixteen
 
