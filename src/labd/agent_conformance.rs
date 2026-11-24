@@ -1728,14 +1728,9 @@ async fn dos_exec_opens_before_the_child_runs() -> Result<()> {
         .context("set VMLAB_CONFORMANCE_SOCKET to a FreeDOS agent socket")?;
     let mut stream = UnixStream::connect(Path::new(&socket)).await?;
     let token = "dos-exec-order";
-    stream
-        .write_all(&encode_ctrl(&HostMsg::Hello {
-            proto_version: PROTO_VERSION,
-            token: token.into(),
-        })?)
-        .await?;
     let mut decoder = FrameDecoder::new();
     let mut buf = [0; 4096];
+    let mut sent_hello = false;
     'handshake: loop {
         let n = stream.read(&mut buf).await?;
         ensure(n > 0, "DOS agent socket closed during handshake")?;
@@ -1744,10 +1739,20 @@ async fn dos_exec_opens_before_the_child_runs() -> Result<()> {
             if let AgentMsg::Hello {
                 token: reply, os, ..
             } = serde_json::from_slice(&frame.payload)?
-                && reply == token
             {
                 ensure(os == "dos", "expected a DOS agent")?;
-                break 'handshake;
+                if reply == token {
+                    break 'handshake;
+                }
+                if !sent_hello {
+                    stream
+                        .write_all(&encode_ctrl(&HostMsg::Hello {
+                            proto_version: PROTO_VERSION,
+                            token: token.into(),
+                        })?)
+                        .await?;
+                    sent_hello = true;
+                }
             }
         }
     }
