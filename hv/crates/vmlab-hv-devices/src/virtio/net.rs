@@ -617,6 +617,11 @@ fn drop_link_and_release_tx(
     negotiated: &AtomicU64,
 ) {
     drop_link(stream, shared);
+    // With a TAP attached the TAP worker owns the transmit queues, and
+    // the switch staging never held them back.
+    if lock(shared).tap_mode {
+        return;
+    }
     let features = negotiated.load(Ordering::Acquire);
     process_tx(shared, stream, hdr_len(features), features & F_CSUM != 0);
 }

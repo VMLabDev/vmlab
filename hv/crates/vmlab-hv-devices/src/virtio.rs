@@ -75,9 +75,7 @@ mod interrupt_tests {
         queue
             .try_set_avail_ring_address(GuestAddress(AVAIL))
             .unwrap();
-        queue
-            .try_set_used_ring_address(GuestAddress(USED))
-            .unwrap();
+        queue.try_set_used_ring_address(GuestAddress(USED)).unwrap();
         queue.set_event_idx(event_idx);
         queue.set_ready(true);
         queue
