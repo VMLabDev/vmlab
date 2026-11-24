@@ -618,7 +618,18 @@ impl Registry {
         let mut index = match self.transport.get_manifest(repo, tag).await? {
             Some(f) => match parse_manifest_or_index(&f.body)? {
                 ManifestOrIndex::Index(i) => i,
-                ManifestOrIndex::Manifest(_) => ImageIndex::new(),
+                ManifestOrIndex::Manifest(m) => {
+                    let config_bytes = self.config_blob(repo, &m.config).await?;
+                    let config = TemplateConfig::from_json(&config_bytes)
+                        .with_context(|| format!("reading the existing template at tag {tag}"))?;
+                    let mut index = ImageIndex::new();
+                    // The index references the exact bytes already held by the registry.
+                    index.upsert_arch(
+                        &config.arch,
+                        Descriptor::new(&m.media_type, &digest_of(&f.body), f.body.len() as u64),
+                    );
+                    index
+                }
             },
             None => ImageIndex::new(),
         };
