@@ -2545,7 +2545,8 @@ mod tests {
         qimg::create_blank(&disk, 16 << 20).await.unwrap();
         let store = TemplateStore::new(work.join("templates"));
         let def = def(
-            r#"template "t" { arch = "x86_64" version = "1" source "scratch" {} }"#,
+            r#"import <vmlab.wcl>
+template "t" { arch = "x86_64" version = "1" disk = 16MiB source "scratch" {} }"#,
         );
         let hw = hw(&def);
         let cancel = CancellationToken::new();

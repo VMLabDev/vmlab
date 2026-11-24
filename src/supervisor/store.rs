@@ -843,15 +843,19 @@ mod tests {
 
     #[test]
     fn prune_keeps_the_newest_usable_version() {
-        let mut pending = meta("x86_64", "win", "1.0.1");
+        let mut pending = meta("x86_64", "win", "1.0.2");
         pending.variants_expected = true;
         assert_eq!(
             refs(&superseded(
-                vec![meta("x86_64", "win", "1.0.0"), pending],
+                vec![
+                    meta("x86_64", "win", "1.0.0"),
+                    meta("x86_64", "win", "1.0.1"),
+                    pending,
+                ],
                 None,
                 1,
             )),
-            ["x86_64/win@1.0.1"]
+            ["x86_64/win@1.0.0"]
         );
     }
 
