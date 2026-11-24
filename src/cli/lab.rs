@@ -482,11 +482,10 @@ pub fn cmd_down(vms: Vec<String>, force: bool) -> Result<()> {
             // leaves QEMU (and swtpm/virtiofsd/smbd) running with the guest
             // disks open, and `down` is exactly where a user asks for that to
             // stop. Releasing the lab makes the supervisor reap them.
-            if let Ok(sup) = daemon::ensure_supervisor().await {
-                let _ = sup
-                    .send(SupRequest::LabRelease { name: name.clone() })
-                    .await;
-            }
+            let sup = daemon::ensure_supervisor().await?;
+            sup.send(SupRequest::LabRelease { name: name.clone() })
+                .await
+                .map_err(remote)?;
             println!("lab \"{name}\" is not running (any orphaned processes were reaped)");
             return Ok(());
         };
