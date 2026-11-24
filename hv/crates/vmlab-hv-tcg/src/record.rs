@@ -647,7 +647,7 @@ impl Recorder {
         })
     }
 
-    fn stop(&mut self, reason: impl Into<String>) {
+    pub(crate) fn stop(&mut self, reason: impl Into<String>) {
         if self.stopped.is_none() {
             let exit = self.snapshot(None, None);
             self.block

@@ -46,6 +46,54 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// The address of the physical access the host memory refused, when that
+    /// is what this error is.
+    pub(crate) fn host_memory_fault(&self) -> Option<u64> {
+        match self {
+            Self::Memory(address) => Some(*address),
+            Self::At { source, .. } => source.host_memory_fault(),
+            _ => None,
+        }
+    }
+}
+
+/// The two-field struct `(physical address, ExceptionType)` in the `Err` of a
+/// checked access. The field names are this prefix and the field number.
+const ACCESS_ERROR_TUPLE: &str = "ztuplez3z5bv_z5unionz0zzExceptionType";
+
+/// The `Err` constructor of the model function that performs a physical
+/// access after its PMP and PMA checks, for the two functions that do.
+fn checked_access_error(function: &str) -> Option<&'static str> {
+    match function {
+        "zchecked_mem_read" => Some("zErrzIz8bzCuz9zCz8bzCUExceptionTypez9zK"),
+        "zchecked_mem_write" => Some("zErrzIozCz8bzCUExceptionTypez9zK"),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_checked_access(function: &str) -> bool {
+    checked_access_error(function).is_some()
+}
+
+/// The `MemoryAccessType` in a model `Mem_request`: its `access_kind` is
+/// `AK_Read` or `AK_Write` of a `(kind, access type)` pair, and the kind is
+/// an enum, so the access type is the pair's one union.
+fn requested_access(request: &Value) -> Option<Value> {
+    let Value::Struct(request) = request else {
+        return None;
+    };
+    let Value::Union(_, pair) = request.get("zaccess_kind")? else {
+        return None;
+    };
+    let Value::Struct(pair) = pair.as_ref() else {
+        return None;
+    };
+    pair.values()
+        .find(|value| matches!(value, Value::Union(..)))
+        .cloned()
+}
+
 type Frame = BTreeMap<String, Value>;
 
 /// The IR operations one guest instruction may take before `Error::Limit`.
@@ -54,6 +102,9 @@ pub const STEP_OPERATION_BUDGET: u64 = 100_000_000;
 /// The most guest console output an interpreter keeps. A guest can print
 /// without end, so the oldest bytes are dropped past this many.
 pub const TERMINAL_LIMIT: usize = 1 << 20;
+
+/// The start of `Interpreter::entropy`, the same as the Sail oracle's.
+pub const ENTROPY_SEED: u64 = 0x5EED;
 
 /// What one hart reserved with LR: the address and length of the access, and
 /// the write generation of its reservation granules at the time of the read.
@@ -87,6 +138,14 @@ pub struct Interpreter<'a, M> {
     pub terminal_limit: usize,
     /// Console bytes dropped from the front of `terminal` to stay in the limit.
     pub terminal_dropped: u64,
+    /// The state of the entropy source behind the `seed` CSR (Zkr): the
+    /// model's `get_16_random_bits`, which it declares and leaves to the
+    /// platform. It is the fixed generator of the Sail oracle
+    /// (`toolchain/sail/oracle/oracle.cpp`), so a run is reproducible and a
+    /// lockstep comparison agrees. It is not random: an embedder that gives
+    /// the hart to a guest that needs real entropy writes a fresh host
+    /// random value here before each run.
+    pub entropy: u64,
     pub profile: Option<Profile>,
     pub memoize: bool,
     pub indexed: bool,
@@ -95,6 +154,9 @@ pub struct Interpreter<'a, M> {
     depth: u32,
     reservation: Option<Reservation>,
     fetch_address: Option<u64>,
+    /// The request of a physical access the host memory refused, kept until
+    /// the model function that reports access faults turns it into one.
+    host_fault: Option<Value>,
     decode_cache: BTreeMap<decode::CacheKey, Value>,
     decode_dependencies: decode::Dependencies,
     instruction_cache: BTreeMap<String, std::sync::Arc<Function>>,
@@ -120,6 +182,7 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             terminal: std::collections::VecDeque::new(),
             terminal_limit: TERMINAL_LIMIT,
             terminal_dropped: 0,
+            entropy: ENTROPY_SEED,
             profile: None,
             memoize: true,
             indexed: true,
@@ -128,6 +191,7 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             depth: 0,
             reservation: None,
             fetch_address: None,
+            host_fault: None,
             decode_cache: BTreeMap::new(),
             decode_dependencies: decode::Dependencies::new(program),
             instruction_cache: BTreeMap::new(),
@@ -344,6 +408,56 @@ impl<'a, M: Memory> Interpreter<'a, M> {
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
+        if !is_checked_access(name) {
+            return self.call_model(name, args);
+        }
+        match self.call_model(name, args) {
+            Err(error) => self.guest_access_fault(name, error),
+            value => value,
+        }
+    }
+
+    /// The result a checked physical access returns to the model when the host
+    /// memory refused it: the model's own access fault for that kind of
+    /// access, at the refused address. The model accepts an address from its
+    /// region table, which knows nothing of what the host `Memory` holds, so
+    /// without this a guest access outside host RAM is a host error and the
+    /// hart can never pass the instruction. Any other error is returned as is.
+    pub(crate) fn guest_access_fault(&mut self, function: &str, error: Error) -> Result<Value> {
+        let (Some(address), Some(tag)) =
+            (error.host_memory_fault(), checked_access_error(function))
+        else {
+            return Err(error);
+        };
+        let Some(access) = self.host_fault.take().as_ref().and_then(requested_access) else {
+            return Err(error);
+        };
+        let exception = self.call_model("zaccessFaultFromAccessType", vec![access])?;
+        Ok(Value::Union(
+            tag.into(),
+            Box::new(Value::Struct(BTreeMap::from([
+                (format!("{ACCESS_ERROR_TUPLE}0"), Value::bits(64, address)),
+                (format!("{ACCESS_ERROR_TUPLE}1"), exception),
+            ]))),
+        ))
+    }
+
+    /// One physical access of the model. A refusal by the host memory is
+    /// remembered for `guest_access_fault`, and a recording ends before the
+    /// access: its trace hands the access back to the interpreter.
+    fn memory_call(&mut self, args: &[Value], write: bool, exclusive: bool) -> Result<Value> {
+        let result = self.memory_operation(args, write, exclusive);
+        if matches!(result, Err(Error::Memory(_))) {
+            self.host_fault = args.first().cloned();
+            if let Some(mut recorder) = self.recorder.take() {
+                recorder.stop("host memory refused the access");
+                self.recorder = Some(recorder);
+            }
+        }
+        result
+    }
+
+    fn call_model(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
         if name == "zplat_term_write" {
             let byte = args
                 .first()
@@ -352,6 +466,15 @@ impl<'a, M: Memory> Interpreter<'a, M> {
             let byte = u8::try_from(byte).map_err(|_| Error::Type("terminal byte".into()))?;
             self.terminal_write(byte);
             return Ok(Value::Unit);
+        }
+        if name == "zget_16_random_bits" {
+            // A platform function like the two above: it has no body in the
+            // model, so it is never memoised and never folded into a trace.
+            self.entropy = self
+                .entropy
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            return Ok(Value::bits(16, (self.entropy >> 33) & 0xffff));
         }
         if name.starts_with("zriscv_") {
             return softfloat::execute(self.program, name, &args);
@@ -603,7 +726,7 @@ impl<'a, M: Memory> Interpreter<'a, M> {
                                 if *fetch && self.fetch_address.is_none() {
                                     self.fetch_address = Some(args[2].u64()?);
                                 }
-                                self.memory_operation(&args, *write, *exclusive)?
+                                self.memory_call(&args, *write, *exclusive)?
                             }
                         };
                         self.assign(frame, loc, value)?;

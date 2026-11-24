@@ -1450,6 +1450,16 @@ impl Trace {
                         .memory
                         .read(address, &mut data[..bytes as usize])
                     {
+                        if matches!(source, Error::Memory(_)) {
+                            // The interpreter repeats the access and gives the
+                            // guest its access fault.
+                            return evaluation.resume(interpreter, error).map(|value| {
+                                Outcome::Resumed(
+                                    value,
+                                    self.recorded.block.exits[error].completed_steps + 1,
+                                )
+                            });
+                        }
                         evaluation
                             .bindings(interpreter, &self.recorded.block.exits[error].globals)?;
                         return Err(evaluation.error(error, source));
@@ -1471,6 +1481,16 @@ impl Trace {
                     let data = evaluation.scalar(value)?.to_le_bytes();
                     if let Err(source) = interpreter.memory.write(address, &data[..bytes as usize])
                     {
+                        if matches!(source, Error::Memory(_)) {
+                            // The interpreter repeats the access and gives the
+                            // guest its access fault.
+                            return evaluation.resume(interpreter, error).map(|value| {
+                                Outcome::Resumed(
+                                    value,
+                                    self.recorded.block.exits[error].completed_steps + 1,
+                                )
+                            });
+                        }
                         evaluation
                             .bindings(interpreter, &self.recorded.block.exits[error].globals)?;
                         return Err(evaluation.error(error, source));
