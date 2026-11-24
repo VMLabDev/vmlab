@@ -218,7 +218,7 @@ fn run() -> Result<()> {
     let env = container::build_env(&spec, user.as_ref());
     let stop_signal = match &spec.stop_signal {
         Some(name) => sig::parse_signal(name)?,
-        None => Signal::SIGTERM,
+        None => libc::SIGTERM,
     };
 
     let reaper = Arc::new(reap::Reaper::default());
@@ -263,7 +263,9 @@ fn run() -> Result<()> {
         ctl.spawn_dispatcher(move |cmd| match cmd {
             CtlCommand::Stop { grace_secs } => {
                 println!("vmlab-cinit: stop requested (grace {grace_secs}s)");
-                let _ = kill(child, stop_signal);
+                // SAFETY: child supplies the workload PID and stop_signal is
+                // a validated Linux signal number.
+                unsafe { libc::kill(child.as_raw(), stop_signal) };
                 let exited = exited.clone();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_secs(grace_secs));
