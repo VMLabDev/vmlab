@@ -39,13 +39,13 @@ Who the attacker is, per finding:
 | F10 | security (guest) | IP fragments evade port-specific `block` and `redirect` rules on routed traffic (fixed in card #478) |
 | F11 | security (peer) | The trunk listener takes unlimited unauthenticated connections and spins on an `accept` error (fixed in card #479) |
 | F12 | wrong result | A dialed trunk bridge outlives its segment, and the trunk never forms again (fixed in card #529) |
-| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC |
+| F13 | wrong result | A cross-host segment gets a second subnet, DHCP server and gateway on the accepting host, with the same gateway MAC (fixed in card #816) |
 | F14 | wrong result | A global subnet index is never reused: the 257th global segment of a supervisor's life is refused (fixed in card #817) |
 | F15 | wrong result | A global attach that fails on the PSK leaves a reference, a gateway and a listener behind (fixed in card #528) |
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY (fixed in card #818) |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
-| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length |
+| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length (fixed in card #819) |
 | F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended |
 
 ### F1. A trunk segment name is a filesystem path (security, peer)
@@ -618,6 +618,10 @@ Who the attacker is, per finding:
   b.globals.list()[0]["subnet"]`. Today A has `10.214.0.0/24` and B has
   `10.214.1.0/24`. Second assertion: a DHCP DISCOVER written on A's trunk
   socket gets exactly one OFFER. Today it gets two.
+- Fixed in card #816. The dialer's subnet is part of the authenticated trunk
+  handshake. The accepting supervisor bridges to the dialer's gateway,
+  DHCP and DNS. The proof checks both subnet listings, counts the service
+  ports and verifies the DHCP OFFER on the trunk socket.
 
 ### F14. A global subnet index is never reused (wrong result)
 
@@ -776,6 +780,20 @@ created for that start.
   a config with 40 /32 routes, one DISCOVER. Parse the reply's options and
   assert the walk ends exactly at option 255 and finds option 53. Today a
   debug build panics, and a release build fails the walk.
+- Fixed in card #819. `opt` in `src/net/dhcp.rs` never writes a length
+  that differs from the value after it: a value longer than 255 bytes goes
+  out as several options of the same code, which a client joins in order
+  (RFC 3396). Option 121 is split on route boundaries by
+  `classless_route_options`, so each option 121 is a valid route list by
+  itself and the joined value is every route with the default route last.
+  RFC 3442 requires a client of option 121 to join them. A domain longer
+  than 255 bytes is no DNS name and option 15 is not an option a client
+  must join, so it is not sent, and the server warns when it is given one.
+  The proof test also asserts the joined routes. A second test,
+  `a_domain_longer_than_one_option_is_left_out`, covers option 15. Not
+  changed: nothing limits the number of routes, so a reply can still pass
+  the 576 bytes a client accepts without option 57, and the segment's MTU
+  at about 130 routes.
 
 ### F20. A lab segment's DNS keeps the name of an ended lease (wrong result)
 

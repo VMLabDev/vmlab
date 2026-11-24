@@ -108,6 +108,7 @@ pub struct GatewayConfig {
 pub struct GatewayHandle {
     gw_ip: Ipv4Addr,
     gw_mac: MacAddr,
+    port_id: crate::net::switch::PortId,
     tx: mpsc::Sender<Bytes>,
     dhcp: Option<Arc<Mutex<DhcpServer>>>,
     dns: Option<Arc<Mutex<DnsZone>>>,
@@ -117,6 +118,10 @@ pub struct GatewayHandle {
 }
 
 impl GatewayHandle {
+    pub(crate) fn port_id(&self) -> crate::net::switch::PortId {
+        self.port_id
+    }
+
     pub fn gw_ip(&self) -> Ipv4Addr {
         self.gw_ip
     }
@@ -366,6 +371,7 @@ impl Gateway {
         GatewayHandle {
             gw_ip,
             gw_mac,
+            port_id: id,
             tx,
             dhcp,
             dns: dns_zone,
@@ -569,7 +575,7 @@ impl GatewayTask {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use ipnet::Ipv4Net;
@@ -613,7 +619,7 @@ mod tests {
     }
 
     /// A minimal DHCP DISCOVER broadcast frame from `mac`.
-    fn discover_frame(mac: MacAddr) -> Vec<u8> {
+    pub(crate) fn discover_frame(mac: MacAddr) -> Vec<u8> {
         dhcp_frame(mac, mac, 1)
     }
 
