@@ -2,8 +2,9 @@
 
 This page records one acceptance pass of `next` after the review round: the
 full end-to-end suite on vmlab-hv, the scenarios QEMU still runs, and the
-win3d Done checks and adapter suite on AMD1. Every failure has a draft fix
-card in [Draft fix cards](#draft-fix-cards). The lead files the drafts.
+win3d Done checks and adapter suite on AMD1. Card #916 added the same win3d
+runs on Nvidia2 (R7 to R9). Every failure has a draft fix card in
+[Draft fix cards](#draft-fix-cards). The lead files the drafts.
 
 ## Summary
 
@@ -15,9 +16,13 @@ card in [Draft fix cards](#draft-fix-cards). The lead files the drafts.
 | R4 | win3d Done checks, `windows-11` and `windows-10`, AMD1 | 12 of 12 pass on each |
 | R5 | win3d adapter suite, `windows-11`, AMD1 | 25 pass, 4 fail, 0 not-run. Fails: `audio` (D3), three Wine programs (D4 to D6) |
 | R6 | win3d adapter suite, `windows-10`, AMD1 | 25 pass, 4 fail, 0 not-run. The same four rows |
+| R7 | win3d Done checks, `windows-11` and `windows-10`, Nvidia2 (card #916) | 12 of 12 pass on each |
+| R8 | win3d adapter suite, `windows-11`, Nvidia2 | 24 pass, 5 fail, 0 not-run. Fails: the four rows of R5, and `wine-d3d9_visual` (D7) |
+| R9 | win3d adapter suite, `windows-10`, Nvidia2 | 23 pass, 6 fail, 0 not-run. Fails: the five rows of R8, and `tear-blt` (D8) |
 
-Not run: the win3d suite on Nvidia2. The card asks for AMD1, and Nvidia2 was
-bound to `vfio-pci` for passthrough during the pass.
+Card #886 did not run the win3d suite on Nvidia2, because Nvidia2 was bound
+to `vfio-pci` for passthrough during its pass. Card #916 ran it on
+`next` at a later commit, when the overseer had switched Nvidia2 to the host.
 
 ## What was tested
 
@@ -266,6 +271,133 @@ Against the baseline in `guest/win3d/docs/acceptance.md` (2026-11-20, AMD1):
 - `latency` and `audio` are not in that baseline. Their first numbers are in
   `guest/win3d/docs/acceptance/C447.md`.
 
+## win3d on Nvidia2 (R7 to R9, card #916)
+
+The same Done checks and adapter suite as R4 to R6, on the second RTX 5090.
+
+What ran, all built on helios from `ab017e1b08ccd2db0e9529b09174aacafbd0d7e7`,
+the head of `next` on 2026-11-24 (51 commits after the commit of R4 to R6,
+among them the vmlab-hv sound and virtio fixes `22977ea1` and `1e59f81f`):
+
+- vmlab (`cargo build --release`), the vmlab-hv bundle (`just
+  ci::hv-package`, SHA256 `38f5df0c693a...`), run through its launcher
+  `hv/bin/vmlab-hv`, and the Windows and Linux agents
+  (`guest/build-agent.sh`).
+- The package `vmlab-win3d-0.1.3`, built by `scripts/build.sh`.
+- A host config that declares only `gpu "Nvidia2" { address =
+  "0000:05:00.0" }`, so no lab could land on another GPU. `vmlab status -v`
+  showed `host_gpu=Nvidia2`, `VK_LOADER_DRIVERS_SELECT=*nvidia*` and
+  `VMLAB_VK_PCI_ADDRESS=0000:05:00.0` for every lab.
+- The firmware came from the operator's install, as in R4 to R6.
+
+GPU and host:
+
+- Nvidia2 is the RTX 5090 at `0000:05:00.0`, driver `nvidia` 615.78.08. It
+  was `/dev/dri/renderD130` during this pass, not `renderD129` as card #916
+  says: `renderD129` is AMD1 (`0000:72:00.0`) when Nvidia2 is on the host.
+  `renderD128` (Nvidia1) was not used, and no device was bound or unbound.
+- Every GPU run held `/home/vmlab/src/stc/win3d-gpu-Nvidia2.lock`. The
+  longest hold was 25 minutes. At the end every lab of the pass was
+  destroyed, the pass's supervisor was stopped, and `nvidia-smi` listed no
+  process on `0000:05:00.0`.
+- Xid: the kernel log is closed to the accounts `vmlab` and `meta` on
+  helios (`journalctl -k` returns no line, `dmesg` fails with `Operation not
+  permitted`). An Xid was therefore watched by its symptom only: no VM log
+  of a lab had `Xid`, `DEVICE_LOST` or `device lost`, every Done check and
+  adapter row ran to its verdict, and `nvidia-smi` answered after every hold.
+  The same limit applies to the statement in "What was tested" that the
+  kernel logged no Xid during the AMD1 holds.
+- Host: helios, account `vmlab`, 2026-11-25 05:25 to 07:39 local time
+  (UTC+10).
+- Logs and evidence are on helios under `/home/vmlab/src/stc/card-916/`:
+  `logs/done-<template>.log`, `logs/adapter-<template>-<1|2>.log`,
+  `logs/gpu-*.txt` (`nvidia-smi` after each run), `ev/<template>/done/`,
+  `ev/<template>/adapter-<1|2>/adapter/`, and the repeat of D8 in
+  `logs/rerun-windows-10.log` and `ev/windows-10/rerun-<1|2|3>/adapter/`.
+
+The holds were the three of R4 to R6, with `--host-gpu Nvidia2`:
+
+| Template | Hold 1 (Done checks) | Hold 2 (adapter, all but `chromium` and `wine`) | Hold 3 (`chromium`, `wine`) |
+| --- | --- | --- | --- |
+| `x86_64/windows-11@26100.1742.11` | 16 min | 15 min | 25 min |
+| `x86_64/windows-10@19045.2006.10` | 14 min | 11 min | 24 min |
+
+A fourth hold of 21 minutes repeated `tear-blt` on `windows-10` (D8). The
+scripts of the pass are in `card-916/bin/`.
+
+### Done checks (R7)
+
+All 20 rows of the R4 table pass on both templates, the extra rows
+included. Both runs end with `PASS: 12 of 12 Done checks pass` and exit 0.
+
+### Adapter suite (R8, R9)
+
+`adapter.sh` exited 1 in every hold, because a check failed in each. The
+AMD1 columns are R5 and R6.
+
+| Property | Row | windows-11, Nvidia2 | windows-10, Nvidia2 | AMD1 | Draft |
+| --- | --- | --- | --- | --- | --- |
+| P1 | `pointer` | pass | pass | pass | |
+| P1 | `pointer-shapes` | pass | pass | pass | |
+| P2 | `vblank-interval` | pass, mean 16.665 ms | pass, mean 16.661 ms | pass | |
+| P2 | `present-rate` | pass, 60.11 frames per second | pass, 59.83 frames per second | pass | |
+| P2 | `flip-timestamps` | pass, 59.99 Hz | pass, 59.80 Hz | pass | |
+| P2 | `scan-line` | pass, 768 lines | pass, 768 lines | pass | |
+| P3-P5 | `tear-flip` | pass, 0 torn of 1260 frames | pass, 0 torn of 1260 frames | pass | |
+| P3-P5 | `tear-blt` | pass, 0 torn of 1264 frames | **fail**, 1 torn of 1261 frames | pass | D8 |
+| P7 | `duplication` | pass | pass | pass | |
+| P7 | `shared-texture` | pass | pass | pass | |
+| P10 | `d2d` | pass | pass | pass | |
+| P10 | `d2d-tir` | pass | pass | pass | |
+| P10 | `draws` | pass | pass | pass | |
+| P10 | `svb-chrome` | pass | pass | pass | |
+| P8 | `venc-chrome` | pass, 5 of 5 tries, 0 crash dumps | pass, 5 of 5 tries, 0 crash dumps | pass | |
+| P10 | `svb-edge` | pass | pass | pass | |
+| P8 | `venc-edge` | pass, 5 of 5 tries, 0 crash dumps | pass, 5 of 5 tries, 0 crash dumps | pass | |
+| P8 | `chromium` | pass | pass | pass | |
+| P10 | `wine-d3d10_1_d3d10_1` | pass, 580 tests | pass, 580 tests | pass | |
+| P10 | `wine-d3d10core_d3d10core` | pass, 195912 tests | pass, 195912 tests | pass | |
+| P10 | `wine-d3d10_device` | pass, 206 tests | pass, 206 tests | pass | |
+| P10 | `wine-d3d10_effect` | pass, 5041 tests | pass, 5041 tests | pass | |
+| P10 | `wine-d3d11_d3d11` | **fail**, 2 failures of 5561777 | **fail**, 2 failures of 5561777 | fail, the same 2 lines | D4 |
+| P10 | `wine-d3d9_d3d9ex` | **fail**, 8 failures of 2387 | **fail**, 17 failures of 2399 | fail | D5, D6 |
+| P10 | `wine-d3d9_device` | **fail**, 14 failures of 56034 | **fail**, 32 failures of 56065 | fail | D6 |
+| P10 | `wine-d3d9_stateblock` | pass, 14738 tests | pass, 14738 tests | pass | |
+| P10 | `wine-d3d9_visual` | **fail**, 2 failures of 207441 | **fail**, 2 failures of 207441 | pass | D7 |
+| U1 | `latency` | pass, p50 24 ms, p90 34 ms | pass, p50 35 ms, p90 44 ms | pass | |
+| S1 | `audio` | **fail**, 3 discontinuities, 0 gaps | **fail**, 1 discontinuity, 0 gaps | fail | D3 |
+
+Failures that AMD1 does not have, compared by file and line against the
+failure lists of R5 and R6:
+
+- `wine-d3d9_visual`, both templates: the two ATI1 readbacks at
+  `visual.c:15668`. Draft D7.
+- `tear-blt`, `windows-10` only: one torn frame. Draft D8.
+- `wine-d3d9_device`, both templates: the focus and foreground checks at
+  `device.c:4656`, `4658`, `4675` and `4677`. These are the
+  session-dependent failures of run 6 of
+  [C414](../../guest/win3d/docs/acceptance/C414.md), which has the same four
+  lines on AMD1 without Win3D's fix. They belong to D6 and have no draft of
+  their own.
+- `wine-d3d9_d3d9ex`, `windows-10`: `d3d9ex.c:3132` (message 0x46 not
+  received), two more unexpected messages at `d3d9ex.c:2520` (0x7c and
+  0x7d), and the mode check at `3022` and `3024` twice. R6 instead failed
+  `2986`, `2990` and `3009`. These are the message and mode failures of
+  the `windows-10` session that D6 describes, and they also have no draft
+  of their own.
+
+The other failed lines are those of R5 and R6. `wine-d3d9_device` on
+`windows-10` failed `device.c:3790` 24 times here and 30 times in R6.
+
+Audio (D3): both templates have fewer breaks than R5 and R6, and vmlab-hv
+logged 0 underruns, 0 frames of silence and 0 late callbacks in both. The
+judge counts, on `windows-11`, 3 discontinuities with 1 stretch of a guest
+period, 0 shifts of a host quantum and 1 other, and on `windows-10` 1
+discontinuity of the other kind. The tone ran with 16 busy
+host processes, as in R5 and R6. The row still fails its limit of no
+break. The commit includes `22977ea1` (the sound device holds what a full
+sink cannot take), which R5 and R6 did not have.
+
 ## Draft fix cards
 
 Each draft has the title, the failing step, the log, and a first reading of
@@ -407,11 +539,59 @@ the cause. A first reading is not a diagnosis.
   failure of the session or of the Windows runtime does not fail the row.
 - Known card: none open. #253 (done) grouped these failures.
 
+### D7. win3d: Wine's d3d9 `visual` ATI1 readbacks fail on Nvidia2 (NVIDIA BC4 decoding)
+
+- Failure: row `wine-d3d9_visual`, both templates on Nvidia2 (R8, R9), 2
+  failures each. AMD1 passes the row (R5, R6).
+- Failing step: `visual.c:15668`, `Test FFP on ATI1` and `Test texld on
+  ATI1`: both read `0x70707070` at (360, 30). Wine expects red `0x6d` with
+  a tolerance of 2.
+- Log: `card-916/ev/<template>/adapter-2/adapter/wine-d3d9_visual.failures.txt`.
+- First reading: the same two lines and the same value as
+  [C359](../../guest/win3d/docs/acceptance/C359.md) on Nvidia2 in
+  2026-11. ATI1 becomes `VK_FORMAT_BC4_UNORM_BLOCK` on the host, and
+  NVIDIA's BC4 decoder gives 112 for this texel where the reference
+  decoding gives 109. The Direct3D 11.3 BC error rule allows the
+  difference. The driver does not change the value, so a driver fix is
+  not likely.
+- Fix to consider: one of the two that C359 leaves open. Accept the
+  readback in the judge of the row on an NVIDIA host (for example a list
+  of known host-precision lines for each host GPU vendor), or decode ATI1
+  in a shader and not through the host's BC4 decoder. Done when the row
+  passes on Nvidia2 and still passes on AMD1.
+- Known card: none open on the board. The draft "Match Nvidia2 ATI1 Fetch4
+  sampling" in `guest/win3d/docs/acceptance.md` is the same failure.
+
+### D8. win3d: one torn frame in `tear-blt` on Nvidia2, windows-10
+
+- Failure: row `tear-blt`, `windows-10` on Nvidia2 (R9). `windows-11` on
+  Nvidia2 and both templates on AMD1 pass.
+- Failing step: `tests/e2e/adapter.sh <lab> win <dir>` in hold 2: 1 torn
+  of 1261 console frames, 35.6 grabs per second. The probe presented 1229
+  frames at 58.6 per second.
+- Log: `card-916/ev/windows-10/adapter-1/adapter/tear-blt.json`,
+  `tear-blt.grab.json` and the frame `tear-blt-torn.png`, and the same files
+  in `card-916/ev/windows-10/rerun-3/adapter/`.
+- Repeat: a fourth hold (`card-916/bin/rerun.sh`) made a fresh
+  `windows-10` lab (its Done checks passed 12 of 12 again) and ran the row
+  alone three times. Runs 1 and 2 passed with 0 torn of 1260 frames. Run 3
+  failed with 1 torn of 1260 frames. So the row fails in 2 of 4 runs on
+  `windows-10` on Nvidia2, each time with one frame.
+- First reading: the KMD carries a Blt present out as a CPU copy into the
+  scanout allocation ([present.md](../../guest/win3d/docs/present.md)), not
+  as a flip, so a console grab during the copy can see parts of two
+  frames. present.md records 0 torn frames for this row on both GPUs. One
+  torn frame in about 1260 is too few to find a cause from these runs alone.
+- Fix to consider: run the row 10 times on Nvidia2 with `windows-11` and
+  `windows-10`, and on AMD1, to get a rate. If it repeats only on Nvidia2, look at what in the copy path
+  depends on the host GPU.
+- Known card: none open on the board.
+
 ## Open points
 
 | Code | Point |
 | --- | --- |
 | O1 | The four `playbook.*` features did not run. They need config-weave in `~/.local/share/config-weave/bin` of the account that runs the suite on helios. |
-| O2 | The win3d suite did not run on Nvidia2. It needs Nvidia2 on the host (vulkan mode), which the overseer switches. |
+| O2 | Done by card #916: the win3d suite ran on Nvidia2 in vulkan mode (R7 to R9). |
 | O3 | The `audio` row should be repeated on a host with no other heavy job before D3 is sized. |
 | O4 | The win3d baseline tables in `guest/win3d/docs/acceptance.md` are from 2026-11-20 and no longer match: seven rows that fail there pass now. This card did not change them. |
