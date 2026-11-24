@@ -44,6 +44,54 @@ async fn legacy_agent_conformance() -> Result<()> {
 }
 
 #[tokio::test]
+async fn legacy_exec_names_a_missing_cwd_or_program() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir()?;
+    let bin = build(dir.path())?;
+    let fixture = Fixture::process(&bin, "listen", vec![]).await?;
+    let mut stream = tokio::net::UnixStream::connect(fixture.socket()).await?;
+    let mut decoder = FrameDecoder::new();
+    let mut diagnostics = Vec::new();
+
+    for (id, argv, cwd, missing) in [
+        (1, "pwd", Some("/nonexistent-dir"), "/nonexistent-dir"),
+        (2, "/nonexistent-program", None, "/nonexistent-program"),
+    ] {
+        let request = serde_json::json!({"cmd": "open_exec", "id": id, "argv": [argv], "cwd": cwd});
+        stream
+            .write_all(&encode_frame(FrameKind::Ctrl, 0, &serde_json::to_vec(&request)?))
+            .await?;
+        let mut stderr = Vec::new();
+        let mut buf = [0; 4096];
+        'reply: loop {
+            while let Some(frame) = decoder.next_frame() {
+                match frame.kind {
+                    FrameKind::Stderr => stderr.extend(frame.payload),
+                    FrameKind::Ctrl => match serde_json::from_slice(&frame.payload)? {
+                        AgentMsg::Exited { code, .. } => {
+                            assert_eq!(code, 127);
+                            break 'reply;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            let n = stream.read(&mut buf).await?;
+            ensure!(n > 0, "agent disconnected while running {argv}");
+            decoder.push(&buf[..n]);
+        }
+        diagnostics.push((missing, String::from_utf8(stderr)?));
+    }
+    assert!(
+        diagnostics.iter().all(|(path, stderr)| stderr.contains(path)),
+        "expected stderr to name each missing path: {diagnostics:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_close_ends_what_the_exec_started() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let bin = build(dir.path())?;

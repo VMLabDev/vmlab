@@ -134,6 +134,18 @@ def exercise_templeos_reinstall(h, lab):
         raise ScenarioFailed(f"TempleOS reinstall left {result.out.strip()} agent tasks")
 
 
+def exercise_templeos_capture_limit(h, lab):
+    for count in (65535, 70000, 1):
+        result = h.vmlab("exec", "temple", "--", f'I64 i; for (i=0;i<{count};i++) "a";',
+                         cwd=lab, check=False)
+        if result.code == 0 and result.out == "a" * count:
+            continue
+        if count > 65535 and result.code and "65535" in result.err and "capture limit" in result.err:
+            continue
+        raise ScenarioFailed(f"TempleOS exec requesting {count} bytes returned "
+                             f"{len(result.out)} bytes, exit {result.code}, stderr {result.err!r}")
+
+
 def exercise(h, lab, machine):
     h.wait_until(lambda: len(project_vms()) < 2, timeout=900, what="a host project VM slot")
     h.log.write(f"[legacy] host VM pids before boot: {project_vms()}\n")
@@ -166,6 +178,7 @@ def exercise(h, lab, machine):
             raise ScenarioFailed(f"{machine}: disk read did not return the written marker: {result.text}")
         if machine == "temple":
             exercise_templeos_reinstall(h, lab)
+            exercise_templeos_capture_limit(h, lab)
         h.vmlab("vm", "stop", machine, cwd=lab, timeout=300)
         if "state=stopped" not in h.machine_line(lab, machine):
             raise ScenarioFailed(f"{machine}: stop did not settle")
