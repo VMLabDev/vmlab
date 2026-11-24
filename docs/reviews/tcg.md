@@ -113,7 +113,8 @@ beyond the single random words of the first differential run, and
   No time is measured.
 - Confidence: high for the measurement. The split of the bytes between
   bindings, frames and constants was read from the code and not measured.
-- Fixed by card #769. The cache keeps a count of bytes beside the count of
+- Fixed by card #769 (`12e3c2a5`). The cache keeps a count of bytes beside the
+  count of
   units (`Trace::cache_bytes`, from the capacity of every table a trace
   owns), and a hart keeps at most `TRACE_CACHE_BYTES` (32 MiB) of it. One
   trace takes no further fragment past a quarter of that. The proof test is
@@ -160,7 +161,8 @@ beyond the single random words of the first differential run, and
 - Confidence: high. The fix has two possible places, and the card should
   choose: build the model's region table from `Memory::ram_bounds`, or map
   `Error::Memory` to the model's access fault at the memory call.
-- Fixed by card #770, at the memory call. The model reports an access fault
+- Fixed by card #770 (`9d2732e3`), at the memory call. The model reports an
+  access fault
   as the `Err` of `checked_mem_read` and `checked_mem_write`, so
   `Interpreter::call` turns an `Error::Memory` from below either function
   into that `Err`, with the fault of `accessFaultFromAccessType` for the
@@ -200,7 +202,7 @@ beyond the single random words of the first differential run, and
   serves each one, so a model upgrade cannot add another silently. The list
   today is the SoftFloat names, `zplat_term_write` and `zget_16_random_bits`.
 - Confidence: high.
-- Fixed by card #771. `call` serves `zget_16_random_bits` from
+- Fixed by card #771 (`cba5f43c`). `call` serves `zget_16_random_bits` from
   `Interpreter::entropy`, the fixed generator of the Sail oracle with the
   same start value, so a lockstep run agrees. It is reproducible and not
   random: the embedder writes a host random value into `entropy` when the
@@ -235,7 +237,8 @@ beyond the single random words of the first differential run, and
 - Confidence: medium. The value of the flag was read from the running model.
   That the Sail emulator succeeds in this case follows from the flag's
   meaning and was not run.
-- Fixed by card #774. The Jib of the model declares the setting and never
+- Fixed by card #774 (`2e799aee`). The Jib of the model declares the setting
+  and never
   reads it: it is a setting for the platform, so the interpreter reads it.
   `Interpreter::store` makes every ordinary store, from the interpreter and
   from a trace. With the setting on it cancels the reservation. With it off,
@@ -275,7 +278,8 @@ beyond the single random words of the first differential run, and
   `vmlab_hv_tcg_ir::lower` on the result aborts the test process (seen:
   `thread ... has overflowed its stack`, SIGABRT).
 - Confidence: high.
-- Fixed by card #772. The parser counts the levels of the expression tree
+- Fixed by card #772 (`e925f15a`). The parser counts the levels of the
+  expression tree
   itself: nesting and suffixes add to one height, and `parse` refuses a tree
   of more than 128 levels (`MAX_EXPR_HEIGHT`) with `expression depth limit
   exceeded`. That replaces the separate count of suffixes on one operand, so
@@ -312,7 +316,7 @@ beyond the single random words of the first differential run, and
   test saw the limit between 60 and 62 field accesses, and between 30 and 40
   struct literals.
 - Confidence: high.
-- Fixed by card #775. `generate` reads the JSON it wrote back with
+- Fixed by card #775 (`ff402dd5`). `generate` reads the JSON it wrote back with
   `serde_json::from_slice::<Program>`, the call the generated `model()`
   makes, and returns the error `the generated crate cannot load this model
   IR` when that fails. So neither a write nor `--check` passes for a model
@@ -354,7 +358,7 @@ beyond the single random words of the first differential run, and
   1501. No time is measured.
 - Confidence: high. A fix needs a finer stamp (the bytes a trace fetched)
   or a fallback that stops recording a PC that keeps invalidating itself.
-- Fixed by card #773. A recording keeps the bytes of each fetch
+- Fixed by card #773 (`e241bcbc`). A recording keeps the bytes of each fetch
   (`Recorded::code`). The page stamp stays the first check. When only its
   generation moved, the trace compares those bytes with memory through the
   new `Memory::code_bytes` (`Trace::code_unchanged`), and when they are as
@@ -381,7 +385,8 @@ beyond the single random words of the first differential run, and
   be 0. Today the first returns the value of `mstatus`, the second returns
   `Ok`, and `mscratch` reads 7.
 - Confidence: high.
-- Fixed by card #771. Both return `Error::Type` for an index of 4096 or
+- Fixed by card #771 (`cba5f43c`). Both return `Error::Type` for an index of
+  4096 or
   more, before the model is called. The proof test is
   `a_csr_index_past_twelve_bits_is_refused`.
 

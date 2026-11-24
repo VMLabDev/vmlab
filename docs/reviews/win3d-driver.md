@@ -113,9 +113,11 @@ for a guest that is not x86.
   0x50, because `__try` does not catch an invalid kernel address.
 - Severity: security against a hostile guest program (a write into kernel
   memory from an unprivileged process, which is a path to SYSTEM), and crash.
-- Fixed: card #751, `guest/win3d/patches/kmd/kmd-check-capset-escape.patch`
-  (driver `100.6.101.58117`). The copy probes the range with `ProbeForWrite`
-  inside the `__try`, and the escape fails with `STATUS_ACCESS_VIOLATION`.
+- Fixed: card #751 (`5126a560`, `7e95f35c`),
+  `guest/win3d/patches/kmd/kmd-check-capset-escape.patch`
+  (driver `100.6.101.58117`). The driver validates and locks the destination
+  pages before copying through a system mapping. An invalid destination
+  returns `STATUS_ACCESS_VIOLATION`.
   The proof and its runs are in `guest/win3d/docs/acceptance/C751.md`.
 
 ### F2. The installer's state directory can be owned or written by a standard user, and a SYSTEM task runs a script from it
@@ -152,7 +154,8 @@ for a guest that is not x86.
   without the pre-made directory: as `u`, create `state.json.tmp` before the
   install, and after it check with `icacls` who owns `state.json`.
 - Severity: security against a hostile guest user (standard user to SYSTEM).
-- Fixed: card #753. The installer creates the directory with a protected
+- Fixed: card #753 (`8fafc0f4`). The installer creates the directory with a
+  protected
   access list (SYSTEM and Administrators full control, Users read), replaces
   the inherited list of an older install, and stops with exit code 3,
   before it reads or writes anything there, on a directory or an entry that
@@ -186,7 +189,8 @@ for a guest that is not x86.
   escape returns `STATUS_INVALID_PARAMETER_1`. Today the claim is a bugcheck
   0x50 in `viogpu3d.sys`.
 - Severity: crash (the whole guest, from an unprivileged process).
-- Fixed: card #751, the same patch. An id outside 1 to 63 is refused with
+- Fixed: card #751 (`5126a560`), the same patch. An id outside 1 to 63 is
+  refused with
   `STATUS_INVALID_PARAMETER_1` before the shift and the index
   (`guest/win3d/docs/acceptance/C751.md`).
 
@@ -209,7 +213,7 @@ for a guest that is not x86.
   host) shows the wrap without a guest.
 - Severity: crash. On a small guest: a 4 GiB nonpaged allocation attempt per
   call.
-- Status: fixed by card #752.
+- Status: fixed by card #752 (`ec5ea9c4`).
   `guest/win3d/patches/kmd/kmd-check-submit-escape-size.patch` compares the
   size with a subtraction and returns `STATUS_INVALID_BUFFER_SIZE`.
   `guest/win3d/docs/acceptance/C752.md` has the proof, before and after.
@@ -237,7 +241,7 @@ for a guest that is not x86.
   a special-pool bugcheck or silent corruption of the VidPN object.
 - Severity: security against a hostile host (a write past a kernel object),
   and crash on a host with a legal configuration.
-- State: fixed by card #754 with
+- State: fixed by card #754 (`a9fbc0cd`) with
   `guest/win3d/patches/kmd/kmd-bound-host-scanout-count.patch`. The driver
   clamps the count to `MAX_CHILDREN` where it reads it, both loops stop at the
   array, and the two readers refuse an id the response has no room for. The
@@ -268,7 +272,8 @@ for a guest that is not x86.
   that the probe's buffer holds pool memory, or the guest bugchecks.
 - Severity: security against a hostile host together with a guest user
   (kernel memory to user mode), and crash.
-- Fixed: card #751, the same patch. A capset whose `capset_max_size` is above
+- Fixed: card #751 (`5126a560`), the same patch. A capset whose
+  `capset_max_size` is above
   1 MiB is not supported, the response size is computed in 64 bits, the
   escape copies nothing for a refused size, and the response buffer is
   zeroed before the request. The proof is a unit test of the driver's bounds
@@ -299,7 +304,7 @@ for a guest that is not x86.
   probe's colour.
 - Severity: security against a hostile guest program (it replaces what the
   screen shows), and wrong result.
-- Status: fixed by card #755.
+- Status: fixed by card #755 (`a48f0eac`).
   `guest/win3d/patches/kmd/kmd-scanout-only-for-its-owner.patch` refuses the
   flip command in a render stream with `STATUS_PRIVILEGED_INSTRUCTION`, and
   serves the escape only for the process that Windows gave the scanout
@@ -330,7 +335,7 @@ for a guest that is not x86.
   The reviewer did not work out how often `Patch` is reached with the source
   not resident: the test decides whether this is real.
 - Severity: crash.
-- Fixed: card #756,
+- Fixed: card #756 (`53b92a70`, `e136a7a3`),
   `guest/win3d/patches/kmd/kmd-map-present-source-in-present.patch` (driver
   `100.6.101.58119`). A blob source without the mappable flag is refused
   when the copy is staged, `Present` maps the source blob in every case, and
@@ -369,7 +374,7 @@ for a guest that is not x86.
 - Severity: crash of the helper. Security against a hostile guest user only
   if the test of the pipe's access list shows that a standard user can reach
   either end.
-- Fixed: card #757,
+- Fixed: card #757 (`8c037645`),
   `guest/win3d/patches/kmd/kmd-read-helper-pipe-message-inside-buffer.patch`
   (driver `100.6.101.58120`). Both helpers read a message through one
   function that counts in bytes, keeps the buffer a terminated string and
@@ -402,7 +407,7 @@ for a guest that is not x86.
   calls `D3DKMTCreateAllocation` with `NumAllocations = 2`, and the test
   passes when the call fails or both allocations work.
 - Severity: crash.
-- Fixed: card #757,
+- Fixed: card #757 (`8c037645`),
   `guest/win3d/patches/kmd/kmd-check-create-allocation-memory.patch` (driver
   `100.6.101.58120`). `DxgkCreateAllocation` returns
   `STATUS_INSUFFICIENT_RESOURCES` for a NULL result, the pool `operator new`
