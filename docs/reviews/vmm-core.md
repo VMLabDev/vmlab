@@ -308,6 +308,12 @@ and the IDE, AHCI and USB devices on the same buses.
   is served through the BAR callbacks. Today the VM exits with "mapping VGA
   framebuffer".
 - Confidence: high for the bound. The exit path was traced by reading.
+- Fixed by card #791. `sync_vga_mapping` maps the framebuffer only where it
+  overlaps no RAM region of the machine's layout, so the bound follows low
+  RAM on pc (up to 3 GiB) and on q35 (2 GiB). A BAR over RAM stays unmapped
+  and the BAR callbacks serve it. Test:
+  `pc_vga_bar_over_low_ram_is_not_mapped` in `vm.rs`, which failed before
+  the fix with "mapping VGA framebuffer: File exists".
 
 ### F9. A guest reset that is pending when a snapshot load starts runs after the load
 
@@ -334,6 +340,14 @@ and the IDE, AHCI and USB devices on the same buses.
   that the reset still happens or the save was refused.
 - Confidence: medium. The window is real in the code. The test needs a
   hook to set the flag, because driving it from the guest is a race.
+- Fixed by card #790. The pending reset is machine state: a save writes it
+  as the vmstate section `reset-pending`, and a load replaces the flag with
+  the recorded value (none in an older snapshot). So a load drops the reset
+  of the machine it replaces, a failed load gets it back from the rollback
+  checkpoint, and a snapshot saved with a reset pending restores to a
+  machine that is reset. Tests `load_clears_a_pending_guest_reset` and
+  `save_carries_a_pending_guest_reset` hold the snapshot-op lock themselves
+  to fix the order. They need KVM, so the merge bar does not run them.
 
 ### F10. The direct-kernel ACPI PM block is not in snapshots
 

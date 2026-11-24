@@ -341,6 +341,16 @@ Not read:
   retry loop of the last scroll, so the key stays in the queue.
 - Confidence: medium. The sink and the tablet queue were read. The xHCI and
   UHCI wrappers around `inject_pointer` were not.
+- Fixed by card #789. The sink in `vmm/display.rs` offers a pointer report
+  to the tablet once and no longer waits for the guest. When the tablet's
+  queue is full, the sink keeps the latest position and buttons and offers
+  them again with the next input message, ahead of a key. The wheel steps and
+  button changes refused in between are dropped, which `PROTOCOL.md` now
+  says. The sink reaches its devices through `InputDevices`, so the proof
+  test `a_full_tablet_queue_does_not_block_keys` builds a real `I8042` and
+  xHCI tablet without KVM and sends through a `DisplayServer`. It uses no
+  clock: it counts the machine-exit probe, which a waiting sink asks once
+  for each retry.
 
 ### F7. The display sockets get no mode and no peer check from vmlab-hv
 
