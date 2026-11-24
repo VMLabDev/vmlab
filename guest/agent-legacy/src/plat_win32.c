@@ -1058,7 +1058,8 @@ static void stop_enumerating_port(void)
     }
 }
 
-/* Serve forever: reopen the port when it fails, exit on a shutdown. */
+/* Serve forever: reopen the port when it fails. A shutdown request does not
+ * end it; the guest going down does. */
 static void serve(void)
 {
     char err[256];
@@ -1071,10 +1072,7 @@ static void serve(void)
             continue;
         }
         plat_log("serving");
-        if (agent_run() == 0) {
-            port_close();
-            return;
-        }
+        agent_run();
         port_close();
         Sleep(500);
     }
