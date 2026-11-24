@@ -160,12 +160,19 @@ async fn run_async() -> Result<()> {
 
     // Reap abandoned build labs before listening, so a new build cannot
     // start in the runtime directory being reaped.
-    sweep_startup_workdirs(
+    let swept = sweep_leftover_builds(
         &crate::template::build::builds_dir(),
-        &crate::paths::template_store_dir(),
         &runtime_dir,
         &registry,
         crate::qemu::process::kill_build_orphans,
+    );
+    if swept != 0 {
+        tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
+    }
+    sweep_leftover_staging(
+        &crate::paths::template_store_dir(),
+        &crate::paths::data_dir().join(crate::template::oci_bridge::PUSH_WORK_SUBDIR),
+        &crate::paths::oci_cache_dir(),
     );
     let supervisor = Arc::new(Supervisor {
         registry: Mutex::new(registry),
@@ -233,16 +240,21 @@ async fn run_async() -> Result<()> {
     Ok(())
 }
 
-fn sweep_startup_workdirs(
-    builds: &Path,
-    _store: &Path,
-    runtime: &Path,
-    registry: &Registry,
-    kill: impl Fn(&str, &Path) -> bool,
-) {
-    let swept = sweep_leftover_builds(builds, runtime, registry, kill);
-    if swept != 0 {
-        tracing::info!("cleared {swept} build working director(y|ies) left by a previous run");
+fn sweep_leftover_staging(store: &Path, push_work: &Path, image_cache: &Path) {
+    use crate::staging::{STAGING_PREFIX, sweep};
+    use crate::template::oci_bridge::{PULL_WORK_SUBDIR, WORK_PREFIX};
+
+    for (root, prefix) in [
+        (store, STAGING_PREFIX),
+        (&store.join(PULL_WORK_SUBDIR), WORK_PREFIX),
+        (push_work, WORK_PREFIX),
+        (image_cache, STAGING_PREFIX),
+    ] {
+        match sweep(root, prefix) {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(path = %root.display(), count, "cleared abandoned staging directories"),
+            Err(err) => tracing::warn!(path = %root.display(), %err, "could not sweep staging directories"),
+        }
     }
 }
 
@@ -1131,29 +1143,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("templates");
         let pull_work = store.join(".oci-pull");
-        let live = crate::template::oci_bridge::fresh_work_dir(&pull_work).unwrap();
+        let push_work = dir.path().join("cache/oci-push");
+        let image_cache = dir.path().join("oci");
         let staging = store.join(".staging-deadbeef");
         let abandoned_pull = pull_work.join("op-dead");
+        let abandoned_push = push_work.join("op-dead");
+        let abandoned_image = image_cache.join(".staging-deadbeef");
+        let live_store =
+            crate::staging::StagingDir::create(&store, crate::staging::STAGING_PREFIX, 0o777)
+                .unwrap();
+        let live_pull = crate::template::oci_bridge::fresh_work_dir(&pull_work).unwrap();
+        let live_push = crate::template::oci_bridge::fresh_work_dir(&push_work).unwrap();
+        let live_image = crate::oci::image::cache::ImageCache::new(image_cache.clone())
+            .staging_dir()
+            .unwrap();
+        let installed = store.join("x86_64/base/1.0");
         for file in [
             staging.join("disk.qcow2"),
             abandoned_pull.join("chunks/base/chunk-0000.zst"),
-            live.path().join("chunks/base/chunk-0000.zst"),
+            abandoned_push.join("chunks/base/chunk-0000.zst"),
+            abandoned_image.join("layer-0000"),
+            live_store.path().join("disk.qcow2"),
+            live_pull.path().join("chunks/base/chunk-0000.zst"),
+            live_push.path().join("chunks/base/chunk-0000.zst"),
+            live_image.path().join("layer-0000"),
+            installed.join("disk.qcow2"),
         ] {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, b"partial").unwrap();
         }
 
-        super::sweep_startup_workdirs(
-            &dir.path().join("builds"),
-            &store,
-            dir.path(),
-            &super::Registry::default(),
-            |_, _| unreachable!(),
-        );
+        super::sweep_leftover_staging(&store, &push_work, &image_cache);
 
         assert!(!staging.exists(), "abandoned template staging survived");
         assert!(!abandoned_pull.exists(), "abandoned pull survived");
-        assert!(live.path().join("chunks/base/chunk-0000.zst").is_file());
+        assert!(!abandoned_push.exists(), "abandoned push survived");
+        assert!(!abandoned_image.exists(), "abandoned image staging survived");
+        assert!(live_store.path().join("disk.qcow2").is_file());
+        assert!(live_pull.path().join("chunks/base/chunk-0000.zst").is_file());
+        assert!(live_push.path().join("chunks/base/chunk-0000.zst").is_file());
+        assert!(live_image.path().join("layer-0000").is_file());
+        assert!(installed.join("disk.qcow2").is_file());
     }
 
     #[test]
