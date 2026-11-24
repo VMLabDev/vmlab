@@ -547,6 +547,10 @@ Not read:
 - Test: in `src/labd/legacy_agent_tests.rs`, send `open_exec` with
   `id: 0` and assert an error reply. On a 32-bit build, send
   `id: 3000000000` and assert that the `opened` names that id.
+- Fixed in card #815. Exec opens with a missing or zero ID return an error
+  before creating a session. Reply serialization preserves unsigned channel
+  IDs. The regression tests exercise the control channel on the POSIX build
+  and large IDs in `opened` and `error` on the 32-bit Windows build.
 
 ## Notes
 
