@@ -210,7 +210,7 @@ beyond the single random words of the first differential run, and
   `call_serves_every_function_the_model_does_not_define`, which calls every
   function the model calls and does not define.
 
-### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting
+### F4. An ordinary store by the same hart cancels its LR reservation, against the model's setting (fixed, card #774)
 
 - Where: `tcg/lib.rs:671` (`self.reservation = None` after every write) and
   `tcg/trace.rs:1460` (the same in a trace).
@@ -235,6 +235,20 @@ beyond the single random words of the first differential run, and
 - Confidence: medium. The value of the flag was read from the running model.
   That the Sail emulator succeeds in this case follows from the flag's
   meaning and was not run.
+- Fixed by card #774. The Jib of the model declares the setting and never
+  reads it: it is a setting for the platform, so the interpreter reads it.
+  `Interpreter::store` makes every ordinary store, from the interpreter and
+  from a trace. With the setting on it cancels the reservation. With it off,
+  or absent, the reservation stays as it was: where the store moved the write
+  generation of the reserved granules and the reservation was intact, it
+  takes the new generation, under the transaction lock of the memory, so a
+  store to the reserved page or to the reserved doubleword keeps it too. A
+  reservation that another hart's store broke stays broken. The proof tests
+  are in `vmlab-hv-tcg/tests/hardening.rs`:
+  `a_same_hart_store_keeps_the_reservation`,
+  `a_same_hart_store_in_a_trace_keeps_the_reservation`,
+  `a_same_hart_store_cancels_the_reservation_when_the_model_says_so` and
+  `a_same_hart_store_does_not_restore_a_broken_reservation`.
 
 ### F5. Jib text within the parser's nesting limits overflows the stack in `lower`
 

@@ -1479,8 +1479,7 @@ impl Trace {
                     let address = u64::try_from(evaluation.scalar(address)?)
                         .map_err(|_| Error::Type("native physical address".into()))?;
                     let data = evaluation.scalar(value)?.to_le_bytes();
-                    if let Err(source) = interpreter.memory.write(address, &data[..bytes as usize])
-                    {
+                    if let Err(source) = interpreter.store(address, &data[..bytes as usize]) {
                         if matches!(source, Error::Memory(_)) {
                             // The interpreter repeats the access and gives the
                             // guest its access fault.
@@ -1495,7 +1494,6 @@ impl Trace {
                             .bindings(interpreter, &self.recorded.block.exits[error].globals)?;
                         return Err(evaluation.error(error, source));
                     }
-                    interpreter.reservation = None;
                     if interpreter.watch_store.is_some_and(|watch| {
                         watch
                             .checked_sub(address)

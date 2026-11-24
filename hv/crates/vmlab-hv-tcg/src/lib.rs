@@ -407,6 +407,45 @@ impl<'a, M: Memory> Interpreter<'a, M> {
         })
     }
 
+    /// An ordinary store by this hart. The model leaves what it does to the
+    /// hart's own reservation to the platform, under its setting
+    /// `plat_reservation_invalidate_on_same_hart_store`: on, the store cancels
+    /// the reservation, and off, which is the committed model's value and the
+    /// one for a model without the setting, the reservation stays as it was.
+    pub(crate) fn store(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+        let Some(reservation) = self.reservation else {
+            return self.memory.write(address, bytes);
+        };
+        const SETTING: &str = "zplat_reservation_invalidate_on_same_hart_store";
+        let invalidates = match self.globals.native_word(SETTING) {
+            Some((_, raw)) => raw != 0,
+            None => matches!(self.globals.get(SETTING), Some(Value::Bool(true))),
+        };
+        if invalidates {
+            self.memory.write(address, bytes)?;
+            self.reservation = None;
+            return Ok(());
+        }
+        // The store moves the write generation of its granules, and those can
+        // be the reserved ones. A reservation that was intact takes the new
+        // generation. The transaction lock keeps another hart's store from
+        // landing between the check and the new generation, where it would be
+        // taken for this hart's own.
+        let transaction = self.memory.transaction_lock();
+        let _atomic = transaction.as_ref().map(|lock| lock.lock());
+        let intact = self.reservation_intact().is_some();
+        self.memory.write(address, bytes)?;
+        if intact {
+            self.reservation = Some(Reservation {
+                generation: self
+                    .memory
+                    .reservation_generation(reservation.address, reservation.len),
+                ..reservation
+            });
+        }
+        Ok(())
+    }
+
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
         if !is_checked_access(name) {
             return self.call_model(name, args);
@@ -788,10 +827,9 @@ impl<'a, M: Memory> Interpreter<'a, M> {
                     _ => false,
                 }
             } else {
-                self.memory.write(address, &bytes[..len])?;
+                self.store(address, &bytes[..len])?;
                 true
             };
-            self.reservation = None;
             if result
                 && self.watch_store.is_some_and(|watch| {
                     watch
