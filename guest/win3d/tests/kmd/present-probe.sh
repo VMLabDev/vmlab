@@ -44,7 +44,7 @@ OUT=$(cd "$3" && pwd)
 shift 3
 CASES=${*:-unknown-blob mappable not-mappable shareable}
 COUNT=${PRESENT_COUNT:-1}
-EXTRA=; [ -z "${PRESENT_VARIANT:-}" ] || EXTRA=",'--variant','$PRESENT_VARIANT'"
+EXTRA=; [ -z "${PRESENT_BACKLOG:-}" ] || EXTRA=",'--backlog','$PRESENT_BACKLOG'"
 PROBE=$REPO/out/probes-extra/x64/present_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE; run build/probes/build.sh present" >&2; exit 2; }
 VMLAB=${VMLAB:-vmlab}
@@ -152,7 +152,7 @@ for c in $CASES; do
         bug=$(grep -oE '0x[0-9a-fA-F]{8} \(0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+\)' "$OUT/$c.bugcheck.txt" | head -1)
         bug=${bug:-recorded}
     fi
-    line="$c: exit=$rc result=$(field "$OUT/$c.json" result) stage=$(field "$OUT/$c.json" stage) session=$(field "$OUT/$c.json" session) presents=$(field "$OUT/$c.json" presents_done) failed=$(field "$OUT/$c.json" presents_failed) accepted=$(field "$OUT/$c.json" presents_accepted) create_allocation_status=$(field "$OUT/$c.json" create_allocation_status) first_present_status=$(field "$OUT/$c.json" first_present_status) pass=$(field "$OUT/$c.json" pass) guest_died=$died bugcheck=$bug"
+    line="$c: exit=$rc result=$(field "$OUT/$c.json" result) stage=$(field "$OUT/$c.json" stage) session=$(field "$OUT/$c.json" session) presents=$(field "$OUT/$c.json" presents_done) failed=$(field "$OUT/$c.json" presents_failed) accepted=$(field "$OUT/$c.json" presents_accepted) create_allocation_status=$(field "$OUT/$c.json" create_allocation_status) first_present_status=$(field "$OUT/$c.json" first_present_status) make_resident_status=$(field "$OUT/$c.json" make_resident_status) backlog=$(field "$OUT/$c.json" backlog) pass=$(field "$OUT/$c.json" pass) guest_died=$died bugcheck=$bug"
     note "$line"; echo "$line" >>"$OUT/summary.txt"
     if [ "$rc" != 0 ] || [ "$died" = yes ] || [ "$bug" != none ] || [ "$(field "$OUT/$c.json" pass)" != True ]; then bad=1; fi
 done

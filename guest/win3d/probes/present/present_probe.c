@@ -381,7 +381,7 @@ typedef struct {
     LONG paging_queue_status, make_resident_status;
     DWORD win32_error, session;
     uint64_t supported;
-    uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted;
+    uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted, backlog;
     uint64_t blob_id;
     query_device_ids ids;
 } result;
@@ -393,7 +393,7 @@ static void emit(FILE *f, const result *r)
             "\"presents_asked\":%u,\"presents_done\":%u,\"presents_failed\":%u,\"presents_accepted\":%u,"
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
-            "\"paging_queue_status\":\"0x%08lx\",\"make_resident_status\":\"0x%08lx\","
+            "\"paging_queue_status\":\"0x%08lx\",\"make_resident_status\":\"0x%08lx\",\"backlog\":%u,"
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
@@ -402,7 +402,7 @@ static void emit(FILE *f, const result *r)
             (unsigned long)r->first_present_status, (unsigned long)r->last_present_status,
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
             (unsigned long)r->venus_status,
-            (unsigned long)r->paging_queue_status, (unsigned long)r->make_resident_status,
+            (unsigned long)r->paging_queue_status, (unsigned long)r->make_resident_status, r->backlog,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
             (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
@@ -442,11 +442,13 @@ int wmain(int argc, wchar_t **argv)
     r.presents_asked = 1;
     const wchar_t *out = NULL;
     int which = -1, exit_code = 1, variant = 1, wait_resident = 0;
+    uint32_t backlog = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--wait-resident")) wait_resident = 1;
+        else if (!wcscmp(argv[i], L"--backlog") && i + 1 < argc) backlog = (uint32_t)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--variant") && i + 1 < argc) variant = (int)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
@@ -638,10 +640,42 @@ int wmain(int argc, wchar_t **argv)
         r.stage = "create_paging_queue";
         r.paging_queue_status = r.last_status = paging_queue_create(&pq);
         if (r.last_status < 0) goto destroy_context;
+        /* --backlog N: N allocations of guest memory, 16 MiB each, go to
+         * the paging queue in front of the source. Windows pages them in one
+         * after the other, so the source is still on its way in when the
+         * present comes. */
+        static UINT list[257];
+        UINT listed = 0;
+        for (uint32_t i = 0; i < backlog && i < 256; ++i) {
+            viogpu_allocation_exchange big = {0};
+            big.options.target = PIPE_TEXTURE_2D;
+            big.options.format = VIRGL_FORMAT_B8G8R8A8_UNORM;
+            big.options.width = 2048;
+            big.options.height = 2048;
+            big.options.depth = 1;
+            big.options.array_size = 1;
+            big.size = 2048u * 2048u * 4u;
+            allocation_info big_info = {0};
+            big_info.private_data = &big;
+            big_info.private_data_size = sizeof(big);
+            create_allocation big_ca = {0};
+            big_ca.device = device.device;
+            big_ca.private_data = &resource_exchange;
+            big_ca.private_data_size = sizeof(resource_exchange);
+            big_ca.num_allocations = 1;
+            big_ca.allocation_info = &big_info;
+            big_ca.flags = 1;
+            r.stage = "create_backlog";
+            r.last_status = allocate(&big_ca);
+            if (r.last_status < 0) goto destroy_context;
+            list[listed++] = big_info.allocation;
+        }
+        r.backlog = listed;
+        list[listed++] = allocation.allocation;
         make_resident mr = {0};
         mr.paging_queue = pq.paging_queue;
-        mr.num_allocations = 1;
-        mr.allocation_list = &allocation.allocation;
+        mr.num_allocations = listed;
+        mr.allocation_list = list;
         r.stage = "make_resident";
         r.make_resident_status = r.last_status = resident(&mr);
         if (r.last_status < 0) goto destroy_context;
