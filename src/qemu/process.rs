@@ -584,7 +584,31 @@ fn cmdline_mentions(cmdline: &[u8], markers: &[String]) -> bool {
 /// the lab's `smbd` is covered too — an orphaned smbd holds its port against
 /// the next `up`.
 pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
-    signal_lab_orphans(LabIdentity::new(lab, root)).0
+    signal_lab_orphans(LabIdentity::new(lab, root)).0.len()
+}
+
+/// Wait for the signalled processes to exit before a successor opens the
+/// same disks or a release reports success.
+pub(crate) async fn reap_lab_orphans(lab: &str, root: Option<&Path>) -> Result<(), String> {
+    let (mut processes, all_signalled) = signal_lab_orphans(LabIdentity::new(lab, root));
+    if !all_signalled {
+        return Err(format!(
+            "could not kill all orphaned processes for lab {lab}"
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        processes.retain(|&(pid, started)| crate::supervisor::daemon_running(pid, Some(started)));
+        if processes.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "orphaned processes for lab {lab} did not exit after SIGKILL"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// Reap a build in the runtime where it started. A failed signal leaves the
@@ -593,20 +617,33 @@ pub(crate) fn kill_build_orphans(lab: &str, runtime: &Path) -> bool {
     signal_lab_orphans(LabIdentity::in_runtime(lab, None, runtime)).1
 }
 
-fn signal_lab_orphans(identity: LabIdentity) -> (usize, bool) {
+fn signal_lab_orphans(identity: LabIdentity) -> (Vec<(u32, u64)>, bool) {
     let pids = lab_orphans(&process_table(), &identity);
+    let mut processes = Vec::new();
     let mut all_signalled = true;
-    for pid in &pids {
+    for pid in pids {
+        let Some(started) = crate::supervisor::process_start_time(pid as u32) else {
+            continue;
+        };
+        // A process from the scan may have exited and its PID been reused.
+        if !std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| identity.started(&cmdline))
+            || !crate::supervisor::daemon_running(pid as u32, Some(started))
+        {
+            continue;
+        }
         if let Err(error) = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(*pid),
+            nix::unistd::Pid::from_raw(pid),
             nix::sys::signal::Signal::SIGKILL,
         ) && error != nix::errno::Errno::ESRCH
         {
             tracing::warn!("could not kill orphaned process {pid}: {error}");
             all_signalled = false;
+        } else {
+            processes.push((pid as u32, started));
         }
     }
-    (pids.len(), all_signalled)
+    (processes, all_signalled)
 }
 
 /// The pids in `table` that vmlab started for the lab `identity` names.
