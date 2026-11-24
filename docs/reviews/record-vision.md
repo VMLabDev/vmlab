@@ -392,6 +392,10 @@ Not read:
   `src/scripting`: the same script, `timeout_secs` 1. Assert that the call
   returns the timeout error. Today it never returns.
 - Confidence: high.
+- Fixed by card #760. Dropping OCR kills the tesseract child and drops the
+  scratch PNG and its directory. The text wait applies one deadline to
+  capture, OCR and polling, and the OCR plan resamples oversized crops to
+  fit the pixel budget.
 
 ### F9. A large duration panics `Settings::resolve`
 
