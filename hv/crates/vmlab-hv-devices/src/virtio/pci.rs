@@ -2050,6 +2050,51 @@ mod tests {
         assert_eq!(acked(&g), (one as u64).to_le_bytes());
     }
 
+    /// Second review F8: a driver that reached DRIVER_OK without
+    /// FEATURES_OK runs on the empty set, and a later FEATURES_OK must not
+    /// give the live device another one.
+    #[test]
+    fn features_cannot_be_accepted_after_driver_ok() {
+        let mut g = Guest::new();
+        let acked = |g: &Guest| g.pci.device().save_state().unwrap()[5..13].to_vec();
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03); // ACK|DRIVER
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_SELECT, 0);
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_SIZE, QUEUE_SIZE);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_DESC, DESC as u32);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_AVAIL, AVAIL as u32);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_USED, USED as u32);
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_ENABLE, 1);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x07); // |DRIVER_OK
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+
+        // The bit is one the device offers, so only the order refuses it.
+        assert_ne!(g.pci.device().features() & (1 << 28), 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F); // |FEATURES_OK
+
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+        // The driver reads back the set that is in force.
+        assert_eq!(g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE), 0);
+    }
+
+    /// Second review F9: the low byte of the message control holds only the
+    /// read-only table size, so a write of that byte alone changes nothing.
+    #[test]
+    fn a_byte_write_to_msix_control_keeps_the_enable_bit() {
+        let mut g = Guest::new();
+        g.cfg16_write(0x42, 0xC000); // enable + function mask
+        g.pci.config_write(16, 2, &[0]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0b11);
+        // The high byte alone still clears and sets both bits.
+        g.pci.config_write(16, 3, &[0x80]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0b10);
+        g.pci.config_write(16, 3, &[0]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0);
+    }
+
     #[test]
     fn features_ok_rejects_unknown_bits() {
         let mut g = Guest::new();
