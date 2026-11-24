@@ -8548,7 +8548,7 @@ fn main(lab: Lab) {
         assert!(err.contains("over capacity"), "{err}");
         assert!(err.contains("answered"), "{err}");
         assert_eq!(
-            lab.vm("answered").unwrap().power_state().await,
+            lab.machine("answered").unwrap().state().await,
             PowerState::Stopped
         );
     }
