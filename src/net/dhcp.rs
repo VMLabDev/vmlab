@@ -1221,7 +1221,12 @@ mod tests {
         let via = Ipv4Addr::new(10, 213, 1, 254);
         let mut cfg = config();
         cfg.routes = (0..40u8)
-            .map(|n| (Ipv4Net::new(Ipv4Addr::new(192, 168, 7, n), 32).unwrap(), via))
+            .map(|n| {
+                (
+                    Ipv4Net::new(Ipv4Addr::new(192, 168, 7, n), 32).unwrap(),
+                    via,
+                )
+            })
             .collect();
         let mut expected = cfg.routes.clone();
         expected.push((Ipv4Net::default(), GW));
@@ -1265,7 +1270,14 @@ mod tests {
         // Each option is whole routes: 1 length byte, 4 of a /32, 4 router.
         for part in &parts {
             assert!(!part.is_empty());
-            assert_eq!(part.len() % 9, if part.ends_with(&[0, 10, 213, 1, 1]) { 5 } else { 0 });
+            assert_eq!(
+                part.len() % 9,
+                if part.ends_with(&[0, 10, 213, 1, 1]) {
+                    5
+                } else {
+                    0
+                }
+            );
         }
         let joined: Vec<u8> = parts.into_iter().flatten().copied().collect();
         assert_eq!(joined, expected);
@@ -1280,7 +1292,10 @@ mod tests {
         let mut s = DhcpServer::new(cfg);
         let reply = s.handle(&discover(mac(1))).expect("offer expected");
         let opts = walk_options(&reply);
-        assert!(opts.iter().any(|(c, v)| *c == OPT_MSG_TYPE && v == &[DHCP_OFFER]));
+        assert!(
+            opts.iter()
+                .any(|(c, v)| *c == OPT_MSG_TYPE && v == &[DHCP_OFFER])
+        );
         assert!(opts.iter().all(|(c, _)| *c != OPT_DOMAIN));
         assert!(opts.iter().any(|(c, _)| *c == OPT_ROUTER));
     }
