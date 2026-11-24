@@ -3,7 +3,9 @@
  * user-mode driver shows its frames with the VIOGPU_RES_SET_SCANOUT_BLOB
  * escape or a present. The check of card #755 must go on serving it:
  * tests/kmd/scanout-owner.sh takes a screenshot from the host meanwhile.
- * It must run in the session of the console. */
+ * It must run in the session of the console. Windows 11 composes such a
+ * program like a window unless the compatibility layer
+ * DISABLEDXMAXIMIZEDWINDOWEDMODE is set for it, which the script does. */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
@@ -82,10 +84,10 @@ done:
         FILE *files[2] = {stdout, out ? _wfopen(out, L"wb") : NULL};
         for (int i = 0; i < 2; ++i) {
             if (!files[i]) continue;
-            fprintf(files[i], "{\"schema\":1,\"probe\":\"scanout-owner\",\"stage\":\"%s\",\"pass\":%s,\"hresult\":\"0x%08lx\","
+            fprintf(files[i], "{\"schema\":1,\"probe\":\"scanout-owner\",\"result\":\"%s\",\"stage\":\"%s\",\"pass\":%s,\"hresult\":\"0x%08lx\","
                     "\"presented\":%u,\"failed\":%u,\"first_failure\":\"0x%08lx\",\"seconds\":%u,\"session\":%lu,"
                     "\"width\":1024,\"height\":768,\"colour_bgra\":\"ff00ffff\"}\n",
-                    stage, pass ? "true" : "false", (unsigned long)hr, presented, failed,
+                    pass ? "pass" : "fail", stage, pass ? "true" : "false", (unsigned long)hr, presented, failed,
                     (unsigned long)first_failure, seconds, (unsigned long)session);
             if (i) fclose(files[i]);
         }

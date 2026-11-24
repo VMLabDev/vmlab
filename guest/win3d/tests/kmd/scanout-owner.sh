@@ -92,6 +92,10 @@ in_lab vmlab exec --user SYSTEM --timeout 60 "$VM" -- quser.exe 2>&1 | tr -d '\r
 in_lab vmlab exec --user SYSTEM --timeout 120 "$VM" -- powershell.exe -NoProfile -NonInteractive -Command \
     "Get-CimInstance Win32_PnPSignedDriver | Where-Object DeviceID -like 'PCI\\VEN_1AF4&DEV_1050*' | ForEach-Object { 'driver: {0} {1}' -f \$_.DeviceName, \$_.DriverVersion }" 2>&1 | tr -d '\r' >>"$EV/guest.txt"
 
+# Without this layer Windows 11 composes the program like a window ("fullscreen
+# optimizations"), and its frames do not come through the exclusive path.
+in_lab vmlab exec --user SYSTEM --timeout 60 "$VM" -- reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' \
+    /v 'C:\c755\owner\x64\scanout_owner.exe' /t REG_SZ /d '~ DISABLEDXMAXIMIZEDWINDOWEDMODE' /f 2>&1 | tr -d '\r' >>"$EV/guest.txt"
 rm -f "$EV"/owner.*.png "$EV/owner.json" "$EV/owner.share.txt" "$EV/owner.rc"
 in_lab vmlab vm screenshot "$VM" "$EV/owner.before.png" >/dev/null 2>&1
 (
