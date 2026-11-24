@@ -1013,6 +1013,58 @@ mod tests {
         assert_eq!(calls.connects, vec![0, 1]);
     }
 
+    /// Review usb.md F6: a guest that unconfigures the device does not
+    /// hand it back to the host without a configuration.
+    #[test]
+    fn detach_restores_the_configuration_found_at_open() {
+        let (mut host, fake) = device();
+        assert_eq!(
+            control(&mut host, set_config(0)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        assert_eq!(fake.calls().set_configurations, vec![0]);
+        assert_eq!(fake.calls().connects, Vec::<u8>::new());
+        drop(host);
+        let calls = fake.calls();
+        assert_eq!(calls.set_configurations, vec![0, 1]);
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// Review usb.md F6, second half: the host does not get the device
+    /// back in another configuration the guest chose.
+    #[test]
+    fn detach_restores_the_configuration_the_guest_replaced() {
+        let fake = FakeUsbFs::with_two_configurations();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(
+            control(&mut host, set_config(2)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        assert_eq!(fake.calls().set_configurations, vec![2]);
+        drop(host);
+        let calls = fake.calls();
+        // The guest's claims are released before the configuration is set:
+        // the kernel refuses SETCONFIGURATION on a claimed interface.
+        assert_eq!(calls.releases, vec![0, 1, 0, 1]);
+        assert_eq!(calls.set_configurations, vec![2, 1]);
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
+    /// A guest that leaves the device in the configuration it had makes
+    /// the detach set none: SETCONFIGURATION would reset the device.
+    #[test]
+    fn detach_sets_no_configuration_the_device_still_has() {
+        let (mut host, fake) = device();
+        assert_eq!(
+            control(&mut host, set_config(1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        drop(host);
+        let calls = fake.calls();
+        assert_eq!(calls.set_configurations, Vec::<u8>::new());
+        assert_eq!(calls.connects, vec![0, 1]);
+    }
+
     #[test]
     fn claim_failure_releases_and_reconnects() {
         let fake = FakeUsbFs::new();
