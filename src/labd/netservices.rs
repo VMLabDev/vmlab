@@ -50,6 +50,8 @@ impl SegmentServices {
     /// refuses every host address but the services this segment exposes.
     /// Otherwise it refuses the host's loopback alone (§9.7), but for those
     /// services and the targets of the segment's `redirect` rules.
+    /// `lab_subnets` are the subnets of the lab's segments, which the engine
+    /// never dials (review networking-2 F31).
     pub fn install(
         switch: &Arc<Switch>,
         gateway: &GatewayHandle,
@@ -57,6 +59,7 @@ impl SegmentServices {
         isolated: bool,
         mtu: u16,
         router: (&Arc<Router>, &str),
+        lab_subnets: Vec<ipnet::Ipv4Net>,
     ) -> Arc<SegmentServices> {
         let rules = Arc::new(Mutex::new(RuleSet::new()));
         let gw_mac = gateway.gw_mac();
@@ -127,6 +130,7 @@ impl SegmentServices {
             )
         };
         engine.set_guard(Arc::new(guard));
+        engine.set_lab_subnets(lab_subnets);
         let nat = nat_enabled.then_some(engine);
 
         Arc::new(SegmentServices {
@@ -399,8 +403,15 @@ mod tests {
                 upstream_dns: None,
             },
         );
-        let services =
-            SegmentServices::install(&sw, &gw, nat, isolated, 1500, (&Router::new(), "seg"));
+        let services = SegmentServices::install(
+            &sw,
+            &gw,
+            nat,
+            isolated,
+            1500,
+            (&Router::new(), "seg"),
+            Vec::new(),
+        );
         let guest = sw.add_channel_port(PortClass::Guest { isolated: false });
         (services, gw, guest)
     }

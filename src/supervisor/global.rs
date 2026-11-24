@@ -469,6 +469,10 @@ struct GlobalSeg {
     dialer: Option<tokio::task::JoinHandle<()>>,
     /// Cross-host trunk slots (dialer + inbound accepts + list()).
     trunks: Arc<TrunkTable>,
+    /// The attached labs' members while an upstream peer serves the segment
+    /// and `services` is `None`, kept for the services this host starts
+    /// again when that peer leaves (review networking-2 F25).
+    parked: Directory,
 }
 
 struct GlobalServices {
@@ -565,11 +569,48 @@ impl GlobalSeg {
         self.holders.take(lab.as_ref().map(|j| j.lab.as_str()));
         match (lab, &self.services) {
             (Some(joining), Some(services)) => services.join(name, self.subnet, joining),
-            (Some(_), None) => vec![format!(
-                "global segment {name:?}: the trunk peer serves DHCP and DNS; local reservations and names are unavailable"
-            )],
+            (Some(joining), None) => {
+                // Kept for when this host serves again; what it refuses is
+                // said then by nobody, so it is not said now either.
+                let gw = global_gateway(name, self.subnet).1;
+                self.parked.admit(name, self.subnet, gw, joining, &[]);
+                vec![format!(
+                    "global segment {name:?}: the trunk peer serves DHCP and DNS; local reservations and names are unavailable"
+                )]
+            }
             (None, _) => Vec::new(),
         }
+    }
+
+    /// Take an upstream peer's services away from this host: the segment's
+    /// own gateway goes, its dialer stops, and the attached labs' members
+    /// are kept for [`Self::serve_again`].
+    fn yield_services(&mut self) -> bool {
+        let Some(services) = self.services.take() else {
+            return false;
+        };
+        self.switch.remove_port(services.gateway.port_id());
+        if let Some(dialer) = self.dialer.take() {
+            dialer.abort();
+        }
+        let mut dir = services.directory.lock().expect("global directory");
+        self.parked = std::mem::take(&mut *dir);
+        self.parked.registered.clear();
+        true
+    }
+
+    /// Serve the segment from this host again once its upstream peer has
+    /// left (review networking-2 F25): a gateway, DHCP and DNS on the
+    /// subnet the peer served, with the gateway's address and MAC the
+    /// guests already know, and the attached labs' members back in them.
+    fn serve_again(&mut self, services: GlobalServices) {
+        {
+            let mut dir = services.directory.lock().expect("global directory");
+            *dir = std::mem::take(&mut self.parked);
+            services.sync_dhcp(&dir);
+            services.sync_dns(&mut dir);
+        }
+        self.services = Some(services);
     }
 
     fn start_dialer(&mut self, peer: Option<(String, String)>) {
@@ -735,6 +776,7 @@ impl GlobalSegments {
             listener,
             dialer: None,
             trunks: TrunkTable::new(name, self.events.clone()),
+            parked: Directory::default(),
         })
     }
 
@@ -791,8 +833,12 @@ impl GlobalSegments {
                 );
                 return;
             }
-            if let Some(services) = &seg.services {
-                services.leave(lab);
+            match (&seg.services, lab) {
+                (Some(services), _) => services.leave(lab),
+                (None, Some(lab)) => {
+                    seg.parked.members.remove(lab);
+                }
+                (None, None) => {}
             }
             if seg.holders.count() == 0
                 && let Some(seg) = segs.remove(name)
@@ -867,16 +913,10 @@ impl GlobalSegments {
             stream.write_all(b"NO\n").await?;
             return Ok(());
         }
-        if let Some(services) = seg.services.take() {
-            seg.switch.remove_port(services.gateway.port_id());
-            if let Some(dialer) = seg.dialer.take() {
-                dialer.abort();
-            }
-            if !seg.holders.labs.is_empty() {
-                tracing::warn!(
-                    "global segment {name:?}: {remote} now serves DHCP and DNS on {subnet}; local reservations and names are unavailable"
-                );
-            }
+        if seg.yield_services() && !seg.holders.labs.is_empty() {
+            tracing::warn!(
+                "global segment {name:?}: {remote} now serves DHCP and DNS on {subnet}; local reservations and names are unavailable"
+            );
         }
         seg.subnet = subnet;
         seg.holders.take(None);
@@ -891,8 +931,11 @@ impl GlobalSegments {
             Some(global_gateway(name, subnet)),
         ));
         trunks.activate_accept(remote, bridge.abort_handle());
-        // Waiter: on bridge death clear the slot (emitting peer.down) and
-        // release the segment reference.
+        // Waiter: on bridge death release the segment reference, serve the
+        // segment from this host again if labs here still hold it (review
+        // networking-2 F25), then clear the slot (emitting peer.down). The
+        // owner stays recorded, so the same peer can take the segment over
+        // again when it comes back.
         let me = self.clone();
         let name = name.to_string();
         tokio::spawn(async move {
@@ -902,8 +945,19 @@ impl GlobalSegments {
                 .get(&name)
                 .is_some_and(|seg| Arc::ptr_eq(&seg.trunks, &trunks))
             {
-                trunks.clear(remote.ip());
                 Self::detach_locked(&mut segs, &name, None);
+                if let Some(seg) = segs.get_mut(&name)
+                    && seg.services.is_none()
+                    && Arc::ptr_eq(&seg.trunks, &trunks)
+                {
+                    let services = me.start_services(&name, seg.subnet, &seg.switch);
+                    seg.serve_again(services);
+                    tracing::info!(
+                        "global segment {name:?}: {remote} left, this host serves DHCP and DNS on {} again",
+                        seg.subnet
+                    );
+                }
+                trunks.clear(remote.ip());
             }
         });
         Ok(())
@@ -1610,6 +1664,83 @@ mod tests {
         let bootp = udp.payload();
         assert_eq!(bootp[0], 2);
         assert_eq!(&bootp[240..243], &[53, 1, 2]);
+        assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
+    }
+
+    /// Review networking-2 F25: the host that accepted a trunk gave its
+    /// own gateway, DHCP and DNS up to the dialing host. When that host
+    /// leaves while a lab here still holds the segment, this host serves
+    /// the segment again, before it says the peer is down.
+    #[tokio::test]
+    async fn a_segment_serves_again_after_its_upstream_peer_leaves() {
+        use crate::net::frame::{EthView, Ipv4View, UdpView};
+
+        let mut a = instance("secret").await;
+        let mut b = instance("secret").await;
+        let joining = Joining {
+            lab: "lab1".into(),
+            members: vec![GlobalMember {
+                machine: "web".into(),
+                mac: MacAddr([2, 0, 0, 0, 0, 7]),
+                ip: None,
+            }],
+            mtu: None,
+        };
+        let (b_sock, _, _) = b
+            .globals
+            .attach("wan", None, None, Some(joining))
+            .await
+            .unwrap();
+        a.globals
+            .attach("wan", None, Some(b.addr.to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(a.events.recv().await.unwrap().event, "segment.peer.up");
+        assert_eq!(b.events.recv().await.unwrap().event, "segment.peer.up");
+        assert!(b.globals.segs.lock().await["wan"].services.is_none());
+
+        a.globals.detach("wan", None).await;
+        let down = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = b.events.recv().await.unwrap();
+                if event.event == "segment.peer.down" {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(down.is_ok(), "B never saw the peer leave");
+        let subnet = {
+            let segs = b.globals.segs.lock().await;
+            let seg = &segs["wan"];
+            assert!(
+                seg.services.is_some(),
+                "B serves no DHCP and DNS after its upstream peer left"
+            );
+            let services = seg.services.as_ref().unwrap();
+            let dir = services.directory.lock().unwrap();
+            assert!(
+                dir.members.contains_key("lab1"),
+                "the attached lab is back in the segment's directory"
+            );
+            seg.subnet
+        };
+
+        let mut client = trunk_client(&b_sock).await;
+        let discover = crate::net::gateway::tests::discover_frame(MacAddr([2, 0, 0, 0, 0, 43]));
+        write_frame(&mut client, &discover).await.unwrap();
+        let offer = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .expect("no OFFER from B")
+            .unwrap()
+            .unwrap();
+        let eth = EthView::parse(&offer).unwrap();
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        let udp = UdpView::parse(ip.payload()).unwrap();
+        assert_eq!((udp.src_port(), udp.dst_port()), (67, 68));
+        let bootp = udp.payload();
+        assert_eq!(bootp[0], 2);
+        assert_eq!(&bootp[240..243], &[53, 1, 2], "an OFFER");
         assert!(subnet.contains(&Ipv4Addr::new(bootp[16], bootp[17], bootp[18], bootp[19])));
     }
 

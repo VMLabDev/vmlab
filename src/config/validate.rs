@@ -540,6 +540,12 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                         format!("volume host path {} is not a directory", host.display()),
                     ));
                 }
+                // A volume can ride CIFS, where smb.conf takes the path as
+                // a line and Samba expands a `%` in it (docs/reviews/smb-2.md
+                // F18): refuse it here, not at `up`.
+                if let Some(problem) = crate::smb::config::share_host_problem(&path, true) {
+                    issues.push(Issue::at(v.span, format!("volume {problem}")));
+                }
                 // A named volume lives under the state directory by vmlab's
                 // own hand; a host bind over it is the guest's way in.
                 if let Some(problem) = share_over_lab_state(&file.root, &path) {
@@ -2479,6 +2485,7 @@ pub(crate) mod tests {
             sha256: "cd".repeat(32),
             base_sha256: "ab".repeat(32),
             description: None,
+            replace_fields: false,
             first_boot_script: None,
             agent_version: None,
             wscript_surface: None,
@@ -3752,6 +3759,36 @@ lab "l" {{
     volume { name = "data" target = "/named" } }"#,
         );
         assert!(es.is_empty(), "{es:#?}");
+    }
+
+    /// docs/reviews/smb-2.md F18: a container volume can ride CIFS, where
+    /// Samba expands a `%` in its host path, so validation refuses it as it
+    /// refuses one in a VM share's host path, rather than leaving the render
+    /// to refuse it at `up` and take every machine's shares down with it.
+    #[test]
+    fn a_percent_in_a_volume_host_path_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a%Ub")).unwrap();
+        let f = load_lab_source(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { }
+  container "c" { image = "nginx" nic { segment = "s" }
+    volume { host = "a%Ub" target = "/data" } }
+}"#,
+            "<test>",
+            root.path(),
+        )
+        .expect("source should parse");
+        let es: Vec<String> = validate(&f, &Permissive)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert!(
+            es.iter()
+                .any(|m| m.starts_with("volume ") && m.contains("contains %")),
+            "{es:#?}"
+        );
     }
 
     #[test]

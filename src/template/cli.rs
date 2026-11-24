@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -176,12 +176,20 @@ pub enum TemplateCmd {
         all_variants: bool,
     },
     /// Log in to an OCI registry
+    #[command(group(clap::ArgGroup::new("secret").required(true).args(["password", "password_stdin"])))]
     Login {
         registry: String,
         #[arg(short, long)]
         username: String,
+        /// The password or token. Every local user can read a command line
+        /// while it runs, and the shell keeps it in its history: prefer
+        /// `--password-stdin`.
         #[arg(short, long)]
-        password: String,
+        password: Option<String>,
+        /// Read the password or token from standard input (one trailing
+        /// newline is dropped)
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Manage OCI namespaces shared by CLI and web search
     Registry {
@@ -277,7 +285,11 @@ pub fn cmd_template(cmd: TemplateCmd) -> Result<()> {
                 registry,
                 username,
                 password,
-            } => login(&sup, registry, username, password).await,
+                password_stdin,
+            } => {
+                let password = login_password(password, password_stdin, std::io::stdin().lock())?;
+                login(&sup, registry, username, password).await
+            }
             TemplateCmd::Registry { command } => registry_command(&sup, command).await,
         }
     })
@@ -989,6 +1001,30 @@ async fn search(
     Ok(())
 }
 
+/// The password `template login` sends: the one on the command line, or
+/// the whole of `stdin` less one trailing newline (`echo "$TOKEN" |` and a
+/// here-string both add one) when `--password-stdin` asks for it.
+fn login_password(
+    password: Option<String>,
+    from_stdin: bool,
+    mut stdin: impl std::io::Read,
+) -> Result<String> {
+    if !from_stdin {
+        return password.ok_or_else(|| anyhow!("give --password or --password-stdin"));
+    }
+    let mut text = String::new();
+    stdin
+        .read_to_string(&mut text)
+        .context("reading the password from stdin")?;
+    if let Some(rest) = text.strip_suffix('\n') {
+        text = rest.strip_suffix('\r').unwrap_or(rest).to_string();
+    }
+    if text.is_empty() {
+        bail!("--password-stdin read an empty password");
+    }
+    Ok(text)
+}
+
 async fn login(
     sup: &SupClient,
     registry: String,
@@ -1121,6 +1157,62 @@ mod tests {
         let warning = super::script_trust_warning("template.wcl:variant/desktop/first_boot_script");
         assert!(warning.contains("template.wcl:variant/desktop/first_boot_script"));
         assert!(warning.contains("host and lab scripting rights"));
+    }
+
+    #[test]
+    fn template_login_reads_the_password_from_stdin() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Args {
+            #[command(subcommand)]
+            cmd: super::TemplateCmd,
+        }
+        let parse = |args: &[&str]| Args::try_parse_from(args).map(|a| a.cmd);
+        let parsed = parse(&[
+            "template",
+            "login",
+            "ghcr.io",
+            "-u",
+            "me",
+            "--password-stdin",
+        ])
+        .unwrap();
+        let super::TemplateCmd::Login {
+            password,
+            password_stdin,
+            ..
+        } = parsed
+        else {
+            panic!("not a login");
+        };
+        assert!(password_stdin);
+        assert_eq!(password, None);
+        assert_eq!(
+            super::login_password(password, password_stdin, &b"tok\n"[..]).unwrap(),
+            "tok"
+        );
+        // Only one trailing newline is the shell's; the rest is the secret's.
+        assert_eq!(
+            super::login_password(None, true, &b" a b\r\n\n"[..]).unwrap(),
+            " a b\r\n"
+        );
+        assert!(super::login_password(None, true, &b"\n"[..]).is_err());
+        // The argv form still parses; neither form, or both, is refused.
+        assert!(parse(&["template", "login", "ghcr.io", "-u", "me", "-p", "tok"]).is_ok());
+        assert!(parse(&["template", "login", "ghcr.io", "-u", "me"]).is_err());
+        assert!(
+            parse(&[
+                "template",
+                "login",
+                "ghcr.io",
+                "-u",
+                "me",
+                "-p",
+                "t",
+                "--password-stdin"
+            ])
+            .is_err()
+        );
     }
     use std::sync::{Arc, Mutex};
 

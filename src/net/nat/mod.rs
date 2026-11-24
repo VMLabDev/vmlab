@@ -83,6 +83,7 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use ipnet::Ipv4Net;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -150,6 +151,10 @@ pub struct NatEngine {
     /// worktree isolation's (§21.4). Unset, the engine refuses the host's
     /// loopback outright.
     guard: std::sync::OnceLock<Arc<HostGuard>>,
+    /// The subnets of the lab's own segments (review networking-2 F31).
+    /// Those addresses exist in the lab daemon only, so the host would dial
+    /// them on its own network: a new flow to one is refused. Set once.
+    lab_subnets: std::sync::OnceLock<Vec<Ipv4Net>>,
     ip_id: AtomicU16,
     eph_counter: AtomicU32,
     /// How many ports of the ephemeral range are handed out: all of it,
@@ -243,6 +248,7 @@ impl NatEngine {
             icmp: icmp::IcmpState::new(),
             pinger,
             guard: std::sync::OnceLock::new(),
+            lab_subnets: std::sync::OnceLock::new(),
             ip_id: AtomicU16::new(1),
             eph_counter: AtomicU32::new(0),
             eph_span: AtomicU32::new(EPHEMERAL_PORTS),
@@ -260,9 +266,26 @@ impl NatEngine {
         let _ = self.guard.set(guard);
     }
 
-    /// Whether a new flow to `dst` is refused: by the guard, and with none
-    /// set, whenever `dst` is the host's loopback.
+    /// Give the engine the subnets of the lab's segments: from now on a new
+    /// flow to an address in one is reset or dropped, since the host does
+    /// not own it and would dial it by its default route (review
+    /// networking-2 F31). What the lab routes between its segments never
+    /// reaches the engine. Set once; a second call is ignored.
+    pub fn set_lab_subnets(&self, subnets: Vec<Ipv4Net>) {
+        let _ = self.lab_subnets.set(subnets);
+    }
+
+    /// Whether a new flow to `dst` is refused: when `dst` is an address of
+    /// the lab, by the guard, and with none set, whenever `dst` is the
+    /// host's loopback.
     fn refused(&self, dst: Ipv4Addr, kind: guard::FlowKind) -> bool {
+        if self
+            .lab_subnets
+            .get()
+            .is_some_and(|nets| nets.iter().any(|n| n.contains(&dst)))
+        {
+            return true;
+        }
         match self.guard.get() {
             Some(guard) => guard.refuses(dst, kind),
             None => guard::is_loopback(dst),

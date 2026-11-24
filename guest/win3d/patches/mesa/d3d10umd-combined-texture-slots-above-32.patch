@@ -1,0 +1,1472 @@
+Subject: [PATCH] d3d10umd, yttrium: allow 192 combined texture slots in a shader
+
+A Direct3D 10 or 11 shader names a texture and a sampler state apart. The
+frontend gives every pair that a shader uses one combined slot, and a typed
+buffer load takes a slot from the same range. The range had 32 slots, the
+value of PIPE_MAX_SAMPLERS. A pixel shader that needed more was replaced by
+one that writes zero, so its draws left the render target black. Wine's
+test_high_resource_count needs 150 slots.
+
+The range has PIPE_MAX_SHADER_SAMPLER_SLOTS entries now, 192. The 32 came
+from five places, and each of them changes:
+
+- The frontend's slot table and the sampler binding map it hands to the
+  driver. The masks of the map are word arrays.
+- TGSI. ureg, tgsi_scan and tgsi_to_nir declare and index sampler and
+  sampler-view registers up to the new limit. The 32-bit masks of
+  tgsi_shader_info and the bitsets of shader_info keep their size and have
+  no bit for a higher register.
+- nir_to_spirv, whose table of sampler variables is indexed by the slot.
+- The Yttrium shader state. Its slot masks are struct
+  yttrium_sampler_slot_mask, and the slots a shader uses are read from its
+  tokens and from its sampler variables, not from shader_info alone.
+- The Yttrium pipeline. A pipeline holds up to 192 sampled images. The
+  descriptor bindings of the slots below 32 are unchanged, and the slots
+  from 32 up get a second binding range behind the storage images, so a
+  shader that fits the old range compiles to the same SPIR-V as before.
+
+Three per-draw costs would have grown with the arrays, so they are bounded
+by the number of sampled bindings in use: the pipeline key is cleared and
+compared up to that number, a deferred draw record is cleared up to it, and
+the search for a sampler object stops at it.
+
+A shader that needs more than 192 slots still gets the zero shader and the
+same log line, which now names 192.
+
+diff --git a/src/gallium/auxiliary/nir/tgsi_to_nir.c b/src/gallium/auxiliary/nir/tgsi_to_nir.c
+--- a/src/gallium/auxiliary/nir/tgsi_to_nir.c
++++ b/src/gallium/auxiliary/nir/tgsi_to_nir.c
+@@ -85,7 +85,7 @@ struct ttn_compile {
+ 
+    nir_variable **inputs;
+    nir_variable **outputs;
+-   nir_variable *samplers[PIPE_MAX_SAMPLERS];
++   nir_variable *samplers[PIPE_MAX_SHADER_SAMPLER_SLOTS];
+    nir_variable *images[PIPE_MAX_SHADER_IMAGES];
+    nir_variable *ssbo[PIPE_MAX_SHADER_BUFFERS];
+    uint32_t ubo_sizes[PIPE_MAX_CONSTANT_BUFFERS];
+@@ -1595,11 +1595,16 @@ get_sampler_var(struct ttn_compile *c, int binding,
+       c->samplers[binding] = var;
+       c->num_samplers = MAX2(c->num_samplers, binding + 1);
+ 
+-      /* Record textures used */
+-      BITSET_SET(c->build.shader->info.textures_used, binding);
+-      if (op == nir_texop_txf || op == nir_texop_txf_ms)
+-         BITSET_SET(c->build.shader->info.textures_used_by_txf, binding);
+-      BITSET_SET(c->build.shader->info.samplers_used, binding);
++      /* Record textures used.  shader_info has 128 texture bits and 32
++       * sampler bits; a binding above them is found through its variable.
++       */
++      if (binding < 128) {
++         BITSET_SET(c->build.shader->info.textures_used, binding);
++         if (op == nir_texop_txf || op == nir_texop_txf_ms)
++            BITSET_SET(c->build.shader->info.textures_used_by_txf, binding);
++      }
++      if (binding < 32)
++         BITSET_SET(c->build.shader->info.samplers_used, binding);
+    }
+ 
+    return var;
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_scan.c b/src/gallium/auxiliary/tgsi/tgsi_scan.c
+--- a/src/gallium/auxiliary/tgsi/tgsi_scan.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_scan.c
+@@ -160,7 +160,7 @@ scan_src_operand(struct tgsi_shader_info *info,
+       const unsigned index = src->Register.Index;
+ 
+       assert(fullinst->Instruction.Texture);
+-      assert(index < PIPE_MAX_SAMPLERS);
++      assert(index < PIPE_MAX_SHADER_SAMPLER_SLOTS);
+ 
+       if (is_texture_inst(fullinst->Instruction.Opcode)) {
+          const unsigned target = fullinst->Texture.Texture;
+@@ -169,7 +169,9 @@ scan_src_operand(struct tgsi_shader_info *info,
+           * target matches the previous sampler view declaration (if there
+           * was one.)
+           */
+-         if (info->sampler_targets[index] == TGSI_TEXTURE_UNKNOWN) {
++         if (index >= ARRAY_SIZE(info->sampler_targets)) {
++            /* no room to record the target */
++         } else if (info->sampler_targets[index] == TGSI_TEXTURE_UNKNOWN) {
+             /* probably no sampler view declaration */
+             info->sampler_targets[index] = target;
+          } else {
+@@ -519,7 +521,9 @@ scan_declaration(struct tgsi_shader_info *info,
+ 
+       case TGSI_FILE_SAMPLER:
+          STATIC_ASSERT(sizeof(info->samplers_declared) * 8 >= PIPE_MAX_SAMPLERS);
+-         info->samplers_declared |= 1u << reg;
++         /* Registers from PIPE_MAX_SAMPLERS up have no bit in this mask. */
++         if (reg < PIPE_MAX_SAMPLERS)
++            info->samplers_declared |= 1u << reg;
+          break;
+ 
+       case TGSI_FILE_SAMPLER_VIEW:
+@@ -527,6 +531,8 @@ scan_declaration(struct tgsi_shader_info *info,
+          type = fulldecl->SamplerView.ReturnTypeX;
+ 
+          assert(target < TGSI_TEXTURE_UNKNOWN);
++         if (reg >= ARRAY_SIZE(info->sampler_targets))
++            break;
+          if (info->sampler_targets[reg] == TGSI_TEXTURE_UNKNOWN) {
+             /* Save sampler target for this sampler index */
+             info->sampler_targets[reg] = target;
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_scan.h b/src/gallium/auxiliary/tgsi/tgsi_scan.h
+--- a/src/gallium/auxiliary/tgsi/tgsi_scan.h
++++ b/src/gallium/auxiliary/tgsi/tgsi_scan.h
+@@ -65,8 +65,8 @@ struct tgsi_shader_info
+    int const_file_max[PIPE_MAX_CONSTANT_BUFFERS];
+    unsigned const_buffers_declared; /**< bitmask of declared const buffers */
+    unsigned samplers_declared; /**< bitmask of declared samplers */
+-   uint8_t sampler_targets[PIPE_MAX_SHADER_SAMPLER_VIEWS];  /**< TGSI_TEXTURE_x values */
+-   uint8_t sampler_type[PIPE_MAX_SHADER_SAMPLER_VIEWS]; /**< TGSI_RETURN_TYPE_x */
++   uint8_t sampler_targets[PIPE_MAX_SHADER_SAMPLER_SLOTS];  /**< TGSI_TEXTURE_x values */
++   uint8_t sampler_type[PIPE_MAX_SHADER_SAMPLER_SLOTS]; /**< TGSI_RETURN_TYPE_x */
+    uint8_t num_stream_output_components[4];
+ 
+    uint8_t input_array_first[PIPE_MAX_SHADER_INPUTS];
+diff --git a/src/gallium/auxiliary/tgsi/tgsi_ureg.c b/src/gallium/auxiliary/tgsi/tgsi_ureg.c
+--- a/src/gallium/auxiliary/tgsi/tgsi_ureg.c
++++ b/src/gallium/auxiliary/tgsi/tgsi_ureg.c
+@@ -158,7 +158,7 @@ struct ureg_program
+    } immediate[UREG_MAX_IMMEDIATE];
+    unsigned nr_immediates;
+ 
+-   struct ureg_src sampler[PIPE_MAX_SAMPLERS];
++   struct ureg_src sampler[PIPE_MAX_SHADER_SAMPLER_SLOTS];
+    unsigned nr_samplers;
+ 
+    struct {
+@@ -168,7 +168,7 @@ struct ureg_program
+       enum tgsi_return_type return_type_y;
+       enum tgsi_return_type return_type_z;
+       enum tgsi_return_type return_type_w;
+-   } sampler_view[PIPE_MAX_SHADER_SAMPLER_VIEWS];
++   } sampler_view[PIPE_MAX_SHADER_SAMPLER_SLOTS];
+    unsigned nr_sampler_views;
+ 
+    struct {
+@@ -730,7 +730,7 @@ struct ureg_src ureg_DECL_sampler( struct ureg_program *ureg,
+       if (ureg->sampler[i].Index == (int)nr)
+          return ureg->sampler[i];
+ 
+-   if (i < PIPE_MAX_SAMPLERS) {
++   if (i < PIPE_MAX_SHADER_SAMPLER_SLOTS) {
+       ureg->sampler[i] = ureg_src_register( TGSI_FILE_SAMPLER, nr );
+       ureg->nr_samplers++;
+       return ureg->sampler[i];
+@@ -761,7 +761,7 @@ ureg_DECL_sampler_view(struct ureg_program *ureg,
+       }
+    }
+ 
+-   if (i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
++   if (i < PIPE_MAX_SHADER_SAMPLER_SLOTS) {
+       ureg->sampler_view[i].index = index;
+       ureg->sampler_view[i].target = target;
+       ureg->sampler_view[i].return_type_x = return_type_x;
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+--- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -70,7 +70,7 @@ struct ntv_context {
+    nir_variable *ssbo_vars;
+ 
+    struct hash_table image_types;
+-   nir_variable *sampler_var[PIPE_MAX_SHADER_SAMPLER_VIEWS]; /* driver_location -> variable */
++   nir_variable *sampler_var[PIPE_MAX_SHADER_SAMPLER_SLOTS]; /* driver_location -> variable */
+    nir_variable *bindless_sampler_var[2];
+    unsigned last_sampler;
+    unsigned bindless_set_idx;
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -2591,7 +2591,7 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
+    if (!pShader->state.tokens && sampler_binding_map &&
+        sampler_binding_map->slot_limit_exceeded) {
+       YTTRIUM_WARN("yttrium: ERROR pixel shader needs more than %u combined texture slots owner=d3d10umd shader=%p action=draw-zero\n",
+-                   (unsigned)PIPE_MAX_SAMPLERS, (void *)pShader);
++                   (unsigned)PIPE_MAX_SHADER_SAMPLER_SLOTS, (void *)pShader);
+       memset(sampler_binding_map, 0, sizeof(*sampler_binding_map));
+       pShader->state.typed_buffer_image_mask = 0;
+       pShader->state.tokens = Shader_tgsi_zero_fs();
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -339,6 +339,10 @@ static struct dx10_opcode_xlate opcode_xlate[D3D10_SB_NUM_OPCODES] = {
+ #define SHADER_MAX_CONSTS 4096
+ #define SHADER_MAX_RESOURCES PIPE_MAX_SHADER_SAMPLER_VIEWS
+ #define SHADER_MAX_SAMPLERS PIPE_MAX_SAMPLERS
++/* Combined texture slots of the sampler binding map.  A slot indexes the
++ * TGSI sampler and sampler-view registers, so both arrays have this size.
++ */
++#define SHADER_MAX_SAMPLER_SLOTS PIPE_MAX_SHADER_SAMPLER_SLOTS
+ #define SHADER_MAX_IMAGES PIPE_MAX_SHADER_IMAGES
+ #define SHADER_MAX_TGSM 32
+ #define SHADER_MAX_INDEXABLE_TEMPS 4096
+@@ -401,11 +405,11 @@ struct Shader_xlate {
+    struct ureg_src shared_memory;
+    bool shared_memory_declared;
+    unsigned shared_memory_size;
+-   struct ureg_src sv[SHADER_MAX_RESOURCES];
+-   struct ureg_src samplers[SHADER_MAX_SAMPLERS];
++   struct ureg_src sv[SHADER_MAX_SAMPLER_SLOTS];
++   struct ureg_src samplers[SHADER_MAX_SAMPLER_SLOTS];
+    struct pipe_shader_sampler_binding_map *sampler_binding_map;
+    struct Shader_sampler_binding_slot
+-      sampler_binding_slots[SHADER_MAX_SAMPLERS];
++      sampler_binding_slots[SHADER_MAX_SAMPLER_SLOTS];
+    unsigned sampler_binding_count;
+    struct ureg_src imms;
+    struct ureg_src prim_id;
+@@ -2693,7 +2697,7 @@ declare_sampler_view_for_resource(struct Shader_xlate *sx,
+                                   unsigned resource,
+                                   enum tgsi_texture_type target)
+ {
+-   assert(view_index < SHADER_MAX_RESOURCES);
++   assert(view_index < SHADER_MAX_SAMPLER_SLOTS);
+    assert(resource < SHADER_MAX_RESOURCES);
+ 
+    if (ureg_src_is_undef(sx->sv[view_index])) {
+@@ -3045,7 +3049,8 @@ declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+                                      unsigned *binding_slot)
+ {
+    const unsigned sampler_none = PIPE_MAX_SAMPLERS;
+-   unsigned slot = PIPE_MAX_SAMPLERS;
++   const unsigned slot_none = SHADER_MAX_SAMPLER_SLOTS;
++   unsigned slot = slot_none;
+ 
+    assert(sx->sampler_binding_map);
+    assert(resource < SHADER_MAX_RESOURCES);
+@@ -3075,8 +3080,8 @@ declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+       }
+    }
+ 
+-   if (slot == PIPE_MAX_SAMPLERS) {
+-      if (sx->sampler_binding_count >= PIPE_MAX_SAMPLERS) {
++   if (slot == slot_none) {
++      if (sx->sampler_binding_count >= SHADER_MAX_SAMPLER_SLOTS) {
+          YTTRIUM_WARN("yttrium: shader TGSI translation failed "
+                       "owner=d3d10umd-shader component=sampler-binding-map "
+                       "reason=combined-slot-limit resource=%u sampler=%u "
+@@ -3096,7 +3101,8 @@ declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+          memcpy(binding->return_type, sx->resources[resource].return_type,
+                 sizeof(binding->return_type));
+ 
+-         sx->sampler_binding_map->valid_mask |= 1u << slot;
++         sx->sampler_binding_map->valid_mask[slot / 32] |=
++            1u << (slot % 32);
+          sx->sampler_binding_map->sampler_view_index[slot] =
+             (uint8_t)resource;
+          sx->sampler_binding_map->sampler_state_index[slot] =
+@@ -3107,7 +3113,8 @@ declare_compact_sampler_for_resource(struct Shader_xlate *sx,
+    if (target == TGSI_TEXTURE_BUFFER &&
+        sx->resources[resource].mixed_return_component_mask ==
+           TGSI_WRITEMASK_XYZW)
+-      sx->sampler_binding_map->mixed_return_mask |= 1u << slot;
++      sx->sampler_binding_map->mixed_return_mask[slot / 32] |=
++         1u << (slot % 32);
+ 
+    if (ureg_src_is_undef(sx->samplers[slot]))
+       sx->samplers[slot] = ureg_DECL_sampler(sx->ureg, slot);
+@@ -3122,7 +3129,7 @@ compact_sampler_view_src(struct Shader_xlate *sx,
+                          unsigned slot,
+                          const struct Shader_src_operand *operand)
+ {
+-   assert(slot < SHADER_MAX_SAMPLERS);
++   assert(slot < SHADER_MAX_SAMPLER_SLOTS);
+    assert(!ureg_src_is_undef(sx->sv[slot]));
+ 
+    struct ureg_src view = sx->sv[slot];
+@@ -3193,7 +3200,7 @@ translate_old_tex_sampler_for_resource(struct Shader_xlate *sx, unsigned resourc
+     * when those registers differ (for example t127 sampled through s15).
+     */
+    if (translated_sampler.File == TGSI_FILE_SAMPLER &&
+-       translated_sampler.Index < SHADER_MAX_RESOURCES)
++       translated_sampler.Index < SHADER_MAX_SAMPLER_SLOTS)
+       declare_sampler_view_for_resource(
+          sx, translated_sampler.Index, resource,
+          sx->resources[resource].target);
+diff --git a/src/gallium/include/pipe/p_state.h b/src/gallium/include/pipe/p_state.h
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -69,6 +69,13 @@ struct nir_shader;
+ #define PIPE_MAX_SHADER_INPUTS    80 /* 32 GENERIC + 32 PATCH + 16 others */
+ #define PIPE_MAX_SHADER_OUTPUTS   80 /* 32 GENERIC + 32 PATCH + 16 others */
+ #define PIPE_MAX_SHADER_SAMPLER_VIEWS 128
++/* Combined texture slots of one shader, for state trackers which compact
++ * independent texture and sampler registers (see
++ * pipe_shader_sampler_binding_map).  TGSI sampler and sampler-view registers
++ * are declared up to this index, which is above PIPE_MAX_SAMPLERS.
++ */
++#define PIPE_MAX_SHADER_SAMPLER_SLOTS 192
++#define PIPE_SHADER_SAMPLER_SLOT_WORDS (PIPE_MAX_SHADER_SAMPLER_SLOTS / 32)
+ #define PIPE_MAX_SHADER_BUFFERS   32
+ #define PIPE_MAX_SHADER_IMAGES    64
+ #define PIPE_MAX_TEXTURE_LEVELS   16
+@@ -313,15 +320,17 @@ struct pipe_stream_output_info
+  */
+ struct pipe_shader_sampler_binding_map
+ {
+-   uint32_t valid_mask;
++   /* One bit per compact slot: word slot / 32, bit slot % 32. */
++   uint32_t valid_mask[PIPE_SHADER_SAMPLER_SLOT_WORDS];
+    /* Compact slots whose typed BUFFER declaration used MIXED for all four
+     * return components and was lowered to TGSI float.
+     */
+-   uint32_t mixed_return_mask;
+-   uint8_t sampler_view_index[PIPE_MAX_SAMPLERS];
+-   uint8_t sampler_state_index[PIPE_MAX_SAMPLERS];
+-   /* The shader needs more combined texture slots than PIPE_MAX_SAMPLERS;
+-    * set by a translation that failed for that reason only. */
++   uint32_t mixed_return_mask[PIPE_SHADER_SAMPLER_SLOT_WORDS];
++   uint8_t sampler_view_index[PIPE_MAX_SHADER_SAMPLER_SLOTS];
++   uint8_t sampler_state_index[PIPE_MAX_SHADER_SAMPLER_SLOTS];
++   /* The shader needs more combined texture slots than
++    * PIPE_MAX_SHADER_SAMPLER_SLOTS; set by a translation that failed for
++    * that reason only. */
+    bool slot_limit_exceeded;
+ };
+ 
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.c
+@@ -72,7 +72,17 @@ static bool
+ yttrium_pipeline_key_equal(const struct yttrium_pipeline_key *a,
+                            const struct yttrium_pipeline_key *b)
+ {
+-   return memcmp(a, b, sizeof(*a)) == 0;
++   const size_t head_size =
++      offsetof(struct yttrium_pipeline_key, sampled_bindings);
++
++   /* sampled_binding_count is in the head, so the two counts are equal when
++    * the entries are compared.
++    */
++   return memcmp(a, b, head_size) == 0 &&
++          a->sampled_binding_count <= ARRAY_SIZE(a->sampled_bindings) &&
++          memcmp(a->sampled_bindings, b->sampled_bindings,
++                 a->sampled_binding_count *
++                    sizeof(a->sampled_bindings[0])) == 0;
+ }
+ 
+ static uint32_t
+@@ -780,7 +790,8 @@ yttrium_pipeline_sampled_buffer_format(
+       return view_format;
+ 
+    const bool mixed_return =
+-      slot < 32 && (shader->sampler_mixed_return_mask & (1u << slot)) &&
++      yttrium_sampler_slot_mask_test(&shader->sampler_mixed_return_mask,
++                                     slot) &&
+       slot < ARRAY_SIZE(shader->info.sampler_targets) &&
+       shader->info.sampler_targets[slot] == TGSI_TEXTURE_BUFFER &&
+       shader->info.sampler_type[slot] == TGSI_RETURN_TYPE_FLOAT;
+@@ -1111,11 +1122,15 @@ yttrium_pipeline_trace_sampled_texture_fail(
+    const char *reason,
+    uint32_t slot,
+    uint32_t binding,
+-   uint32_t sampler_mask,
++   const struct yttrium_sampler_slot_mask *sampler_slot_mask,
+    const struct yttrium_resource *dst,
+    const struct pipe_sampler_view *view,
+    const struct yttrium_resource *src)
+ {
++   /* The trace line has the first 32 slots of the mask. */
++   const uint32_t sampler_mask =
++      yttrium_sampler_slot_mask_low(sampler_slot_mask);
++
+    yttrium_trace_debug_stringf(
+       "yttrium: shader_draw_probe sampled texture collect fail reason=%s slot=%u binding=%u sampler_mask=0x%x view=%p texture=%p view_format=%u view_target=%u view_buf_offset=%u view_buf_size=%u dst_res_id=%u dst_image_id=%llu dst_display=%u dst_primary=%u dst_classic=%u dst_init=%u dst_buffer=%u dst_image=0x%llx dst_layout=%u src_res_id=%u src_image_id=%llu src_display=%u src_primary=%u src_classic=%u src_owned=%u src_imported=%u src_init=%u src_contents=%u src_buffer=%u src_image=0x%llx src_layout=%u src_usage=0x%x src_vk_format=%u src_alloc=0x%lx src_resource=%p src_mem=0x%llx src_data=%p src_map=%p src_map_blob=%u src_size=0x%llx src_stride=%u src_extent=%ux%u src_target=%u src_format=%u",
+       reason ? reason : "<null>",
+@@ -1515,20 +1530,19 @@ yttrium_pipeline_shader_supported(const struct yttrium_shader_state *shader)
+    }
+ 
+    if (yttrium_shader_state_is_sampled_texture_only(shader)) {
+-      const uint32_t sampler_mask =
++      const struct yttrium_sampler_slot_mask *sampler_mask =
+          yttrium_shader_state_sampler_used_mask(shader);
+       if (yttrium_shader_pipeline_enabled() &&
+           yttrium_pipeline_vk_shader_stage(shader->stage) &&
+-          sampler_mask &&
+-          !(sampler_mask & ~YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK))
++          !yttrium_sampler_slot_mask_empty(sampler_mask))
+          return true;
+ 
+-      YTTRIUM_WARN("yttrium: shader_draw_probe pipeline shader skipped reason=texture_pipeline_unsupported stage=%s id=%u enabled=%u sampler_mask=0x%x supported=0x%x\n",
++      YTTRIUM_WARN("yttrium: shader_draw_probe pipeline shader skipped reason=texture_pipeline_unsupported stage=%s id=%u enabled=%u sampler_mask=0x%x slots=%u\n",
+                    yttrium_shader_stage_name(shader->stage),
+                    shader->id,
+                    yttrium_shader_pipeline_enabled(),
+-                   sampler_mask,
+-                   YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK);
++                   yttrium_sampler_slot_mask_low(sampler_mask),
++                   (unsigned)YTTRIUM_SHADER_MAX_SAMPLER_SLOTS);
+    }
+ 
+    if (yttrium_shader_state_is_storage_image_only(shader)) {
+@@ -1540,14 +1554,13 @@ yttrium_pipeline_shader_supported(const struct yttrium_shader_state *shader)
+    }
+ 
+    if (yttrium_shader_state_is_sampled_storage_image_only(shader)) {
+-      const uint32_t sampler_mask =
++      const struct yttrium_sampler_slot_mask *sampler_mask =
+          yttrium_shader_state_sampler_used_mask(shader);
+       const uint64_t image_mask =
+          yttrium_shader_state_image_used_mask(shader);
+       if (yttrium_shader_pipeline_enabled() &&
+           yttrium_pipeline_vk_shader_stage(shader->stage) &&
+-          sampler_mask && image_mask &&
+-          !(sampler_mask & ~YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK) &&
++          !yttrium_sampler_slot_mask_empty(sampler_mask) && image_mask &&
+           !(image_mask & ~YTTRIUM_VENUS_PIPELINE_STORAGE_IMAGE_MASK))
+          return true;
+    }
+@@ -1564,7 +1577,8 @@ yttrium_pipeline_fragment_shader_absent(
+            !yttrium_shader_state_has_module(fs) &&
+            yttrium_shader_state_is_resource_free(fs) &&
+            !fs->ubo_used_mask &&
+-           !yttrium_shader_state_sampler_used_mask(fs) &&
++           yttrium_sampler_slot_mask_empty(
++              yttrium_shader_state_sampler_used_mask(fs)) &&
+            !fs->info.num_inputs &&
+            !fs->info.num_outputs);
+ }
+@@ -1739,12 +1753,12 @@ yttrium_pipeline_resolve_sampler_view_slot(
+    const struct yttrium_context *yctx,
+    const struct yttrium_shader_state *shader,
+    mesa_shader_stage stage,
+-   uint32_t sampler_mask,
++   const struct yttrium_sampler_slot_mask *sampler_mask,
+    uint32_t sampler_slot,
+    unsigned *view_slot_out)
+ {
+    if (!yctx || !shader || stage >= MESA_SHADER_STAGES ||
+-       sampler_slot >= PIPE_MAX_SAMPLERS || !view_slot_out)
++       sampler_slot >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS || !view_slot_out)
+       return false;
+ 
+    unsigned view_slot =
+@@ -1759,7 +1773,7 @@ yttrium_pipeline_resolve_sampler_view_slot(
+                                                           sampler_slot))
+       return false;
+ 
+-   if (util_bitcount(sampler_mask) != 1)
++   if (yttrium_sampler_slot_mask_count(sampler_mask) != 1)
+       return false;
+ 
+    unsigned single_bound_slot = PIPE_MAX_SHADER_SAMPLER_VIEWS;
+@@ -1885,34 +1899,26 @@ yttrium_pipeline_build_sampled_resource_masks(
+    const struct yttrium_shader_state *shader,
+    mesa_shader_stage stage,
+    const struct yttrium_resource *dst,
+-   uint32_t *sampled_image_mask,
+-   uint32_t *sampled_buffer_mask)
++   struct yttrium_sampler_slot_mask *sampled_image_mask,
++   struct yttrium_sampler_slot_mask *sampled_buffer_mask)
+ {
+    if (!sampled_image_mask || !sampled_buffer_mask)
+       return false;
+ 
+-   *sampled_image_mask = 0;
+-   *sampled_buffer_mask = 0;
++   memset(sampled_image_mask, 0, sizeof(*sampled_image_mask));
++   memset(sampled_buffer_mask, 0, sizeof(*sampled_buffer_mask));
+ 
+    if (!yttrium_shader_state_is_sampled_texture_only(shader) &&
+        !yttrium_shader_state_is_sampled_storage_image_only(shader))
+       return true;
+ 
+-   const uint32_t sampler_mask =
++   const struct yttrium_sampler_slot_mask *sampler_mask =
+       yttrium_shader_state_sampler_used_mask(shader);
+-   if (!sampler_mask)
++   if (yttrium_sampler_slot_mask_empty(sampler_mask))
+       return true;
+ 
+-   if (sampler_mask & ~YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK) {
+-      yttrium_pipeline_trace_sampled_texture_fail(
+-         "key_unsupported_sampler_mask", UINT32_MAX, UINT32_MAX,
+-         sampler_mask, dst, NULL, NULL);
+-      return false;
+-   }
+-
+-   for (uint32_t slot = 0;
+-        slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; slot++) {
+-      if (!(sampler_mask & (1u << slot)))
++   for (uint32_t slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (!yttrium_sampler_slot_mask_test(sampler_mask, slot))
+          continue;
+ 
+       const uint32_t binding =
+@@ -1921,9 +1927,9 @@ yttrium_pipeline_build_sampled_resource_masks(
+       if (!yttrium_pipeline_resolve_sampler_view_slot(
+              yctx, shader, stage, sampler_mask, slot, &view_slot)) {
+          if (yttrium_pipeline_sampler_slot_targets_buffer(shader, slot))
+-            *sampled_buffer_mask |= 1u << slot;
++            yttrium_sampler_slot_mask_set(sampled_buffer_mask, slot);
+          else
+-            *sampled_image_mask |= 1u << slot;
++            yttrium_sampler_slot_mask_set(sampled_image_mask, slot);
+          continue;
+       }
+       struct pipe_sampler_view *view =
+@@ -1941,9 +1947,9 @@ yttrium_pipeline_build_sampled_resource_masks(
+ 
+       if (!src) {
+          if (yttrium_pipeline_sampler_slot_targets_buffer(shader, slot))
+-            *sampled_buffer_mask |= 1u << slot;
++            yttrium_sampler_slot_mask_set(sampled_buffer_mask, slot);
+          else
+-            *sampled_image_mask |= 1u << slot;
++            yttrium_sampler_slot_mask_set(sampled_image_mask, slot);
+          continue;
+       }
+ 
+@@ -1964,12 +1970,15 @@ yttrium_pipeline_build_sampled_resource_masks(
+       }
+ 
+       if (buffer)
+-         *sampled_buffer_mask |= 1u << slot;
++         yttrium_sampler_slot_mask_set(sampled_buffer_mask, slot);
+       else
+-         *sampled_image_mask |= 1u << slot;
++         yttrium_sampler_slot_mask_set(sampled_image_mask, slot);
+    }
+ 
+-   return ((*sampled_image_mask | *sampled_buffer_mask) == sampler_mask);
++   struct yttrium_sampler_slot_mask collected = *sampled_image_mask;
++   for (unsigned word = 0; word < ARRAY_SIZE(collected.words); word++)
++      collected.words[word] |= sampled_buffer_mask->words[word];
++   return yttrium_sampler_slot_mask_equal(&collected, sampler_mask);
+ }
+ 
+ static void
+@@ -1979,15 +1988,15 @@ yttrium_pipeline_build_feedback_loop_masks(
+    mesa_shader_stage stage,
+    const struct yttrium_resource *dst,
+    const struct yttrium_resource *zs,
+-   uint32_t sampled_image_mask,
++   const struct yttrium_sampler_slot_mask *sampled_image_mask,
+    struct yttrium_pipeline_key *key)
+ {
+-   if (!shader || stage == MESA_SHADER_NONE || !sampled_image_mask)
++   if (!shader || stage == MESA_SHADER_NONE ||
++       yttrium_sampler_slot_mask_empty(sampled_image_mask))
+       return;
+ 
+-   for (uint32_t slot = 0;
+-        slot < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; slot++) {
+-      if (!(sampled_image_mask & (1u << slot)))
++   for (uint32_t slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (!yttrium_sampler_slot_mask_test(sampled_image_mask, slot))
+          continue;
+ 
+       unsigned view_slot = slot;
+@@ -2028,17 +2037,16 @@ static bool
+ yttrium_pipeline_add_sampled_layouts(
+    const struct yttrium_context *yctx,
+    const struct yttrium_shader_state *sampled_shader,
+-   uint32_t sampled_image_mask,
+-   uint32_t sampled_buffer_mask,
++   const struct yttrium_sampler_slot_mask *sampled_image_mask,
++   const struct yttrium_sampler_slot_mask *sampled_buffer_mask,
+    struct yttrium_pipeline_key *key)
+ {
+    const mesa_shader_stage sampled_stage = sampled_shader->stage;
+-   const uint32_t sampler_mask =
++   const struct yttrium_sampler_slot_mask *sampler_mask =
+       yttrium_shader_state_sampler_used_mask(sampled_shader);
+ 
+-   for (uint32_t slot = 0; slot < PIPE_MAX_SAMPLERS; slot++) {
+-      const uint32_t slot_mask = 1u << slot;
+-      if (!(sampler_mask & slot_mask))
++   for (uint32_t slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (!yttrium_sampler_slot_mask_test(sampler_mask, slot))
+          continue;
+       if (key->sampled_binding_count >=
+           YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES) {
+@@ -2046,7 +2054,8 @@ yttrium_pipeline_add_sampled_layouts(
+                       key->sampled_stage_mask,
+                       key->sampled_binding_count + 1,
+                       YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES,
+-                      sampled_stage, sampler_mask);
++                      sampled_stage,
++                      yttrium_sampler_slot_mask_low(sampler_mask));
+          return false;
+       }
+ 
+@@ -2062,10 +2071,10 @@ yttrium_pipeline_add_sampled_layouts(
+          .stage = sampled_stage,
+          .raw_slot = slot,
+          .stage_flags = yttrium_pipeline_vk_shader_stage(sampled_stage),
+-         .buffer = (sampled_buffer_mask & slot_mask) != 0,
++         .buffer = yttrium_sampler_slot_mask_test(sampled_buffer_mask, slot),
+       };
+ 
+-      if (sampled_image_mask & slot_mask) {
++      if (yttrium_sampler_slot_mask_test(sampled_image_mask, slot)) {
+          const unsigned state_slot =
+             yttrium_shader_state_sampler_state_index(sampled_shader, slot);
+          const struct yttrium_sampler_state *sampler =
+@@ -2147,7 +2156,7 @@ yttrium_pipeline_sampled_depth_read_only(
+          &key->sampled_bindings[i];
+       const mesa_shader_stage stage = (mesa_shader_stage)layout->stage;
+       if (stage < MESA_SHADER_VERTEX || stage > MESA_SHADER_FRAGMENT ||
+-          layout->raw_slot >= PIPE_MAX_SAMPLERS)
++          layout->raw_slot >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+          return false;
+ 
+       const struct yttrium_shader_state *shader = yctx->shaders[stage];
+@@ -2220,7 +2229,8 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
+                    fs_raw ? yttrium_shader_state_is_resource_free(fs_raw) : 0,
+                    fs_raw ? yttrium_shader_state_is_uniform_buffer_only(fs_raw) : 0,
+                    fs_raw ? yttrium_shader_state_is_sampled_texture_only(fs_raw) : 0,
+-                   fs_raw ? yttrium_shader_state_sampler_used_mask(fs_raw) : 0);
++                   yttrium_sampler_slot_mask_low(
++                      yttrium_shader_state_sampler_used_mask(fs_raw)));
+       return false;
+    }
+ 
+@@ -2356,7 +2366,8 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
+       return false;
+    }
+ 
+-   memset(key, 0, sizeof(*key));
++   /* The sampled bindings behind the head are set entry by entry. */
++   memset(key, 0, offsetof(struct yttrium_pipeline_key, sampled_bindings));
+    key->vs_id = vs->id;
+    key->tcs_id = tcs ? tcs->id : 0;
+    key->tes_id = tes ? tes->id : 0;
+@@ -2561,32 +2572,36 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
+       if ((!yttrium_shader_state_is_sampled_texture_only(sampled_shader) &&
+            !yttrium_shader_state_is_sampled_storage_image_only(
+               sampled_shader)) ||
+-          !yttrium_shader_state_sampler_used_mask(sampled_shader))
++          yttrium_sampler_slot_mask_empty(
++             yttrium_shader_state_sampler_used_mask(sampled_shader)))
+          continue;
+ 
+       const mesa_shader_stage sampled_stage = sampled_shader->stage;
+-      const uint32_t sampler_mask =
++      const struct yttrium_sampler_slot_mask *sampler_mask =
+          yttrium_shader_state_sampler_used_mask(sampled_shader);
+-      uint32_t sampled_image_mask = 0;
+-      uint32_t sampled_buffer_mask = 0;
++      struct yttrium_sampler_slot_mask sampled_image_mask;
++      struct yttrium_sampler_slot_mask sampled_buffer_mask;
+       if (sampled_stage < MESA_SHADER_VERTEX ||
+           sampled_stage > MESA_SHADER_FRAGMENT ||
+           !yttrium_pipeline_build_sampled_resource_masks(
+              yctx, sampled_shader, sampled_stage, dst, &sampled_image_mask,
+              &sampled_buffer_mask)) {
+          YTTRIUM_WARN("yttrium: shader_draw_probe pipeline key skipped sampled resource masks stage=%u sampler=0x%x image_mask=0x%x buffer_mask=0x%x\n",
+-                      sampled_stage, sampler_mask, sampled_image_mask,
+-                      sampled_buffer_mask);
++                      sampled_stage,
++                      yttrium_sampler_slot_mask_low(sampler_mask),
++                      yttrium_sampler_slot_mask_low(&sampled_image_mask),
++                      yttrium_sampler_slot_mask_low(&sampled_buffer_mask));
+          return false;
+       }
+ 
+       key->sampled_stage_mask |= 1u << sampled_stage;
+       yttrium_pipeline_build_feedback_loop_masks(
+          yctx, sampled_shader, sampled_stage, dst, zs,
+-         sampled_image_mask, key);
++         &sampled_image_mask, key);
+ 
+       if (!yttrium_pipeline_add_sampled_layouts(
+-             yctx, sampled_shader, sampled_image_mask, sampled_buffer_mask, key))
++             yctx, sampled_shader, &sampled_image_mask, &sampled_buffer_mask,
++             key))
+          return false;
+    }
+ 
+@@ -5240,7 +5255,7 @@ yttrium_pipeline_collect_sampled_textures(
+ {
+    if (!sampled_images || !sampled_image_count) {
+       yttrium_pipeline_trace_sampled_texture_fail(
+-         "bad_output_args", UINT32_MAX, UINT32_MAX, 0, dst, NULL, NULL);
++         "bad_output_args", UINT32_MAX, UINT32_MAX, NULL, dst, NULL, NULL);
+       return false;
+    }
+    *sampled_image_count = 0;
+@@ -5269,18 +5284,18 @@ yttrium_pipeline_collect_sampled_textures(
+          sampled_stage >= MESA_SHADER_VERTEX &&
+          sampled_stage <= MESA_SHADER_COMPUTE ?
+          yctx->shaders[sampled_stage] : NULL;
+-      const uint32_t sampler_mask =
++      const struct yttrium_sampler_slot_mask *sampler_mask =
+          yttrium_shader_state_sampler_used_mask(shader);
+ 
+-      if (!shader || slot >= PIPE_MAX_SAMPLERS ||
+-          !(sampler_mask & (1u << slot)) ||
++      if (!shader || slot >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS ||
++          !yttrium_sampler_slot_mask_test(sampler_mask, slot) ||
+           binding != yttrium_shader_sampler_binding(sampled_stage, slot)) {
+          yttrium_pipeline_trace_sampled_texture_fail(
+             "bad_sampler_binding", slot, binding, sampler_mask, dst, NULL,
+             NULL);
+          YTTRIUM_WARN("yttrium: shader_draw_probe try_draw skipped sampled binding mismatch descriptor=%u stage=%u slot=%u binding=%u sampler_mask=0x%x\n",
+                       descriptor_index, sampled_stage, slot, binding,
+-                      sampler_mask);
++                      yttrium_sampler_slot_mask_low(sampler_mask));
+          return false;
+       }
+ 
+@@ -5394,8 +5409,9 @@ yttrium_pipeline_collect_sampled_textures(
+          yttrium_pipeline_sampled_buffer_format(shader, slot, view->format) :
+          view->format;
+       const bool sampled_mixed_return =
+-         sampled_buffer && slot < 32 &&
+-         (shader->sampler_mixed_return_mask & (1u << slot));
++         sampled_buffer &&
++         yttrium_sampler_slot_mask_test(&shader->sampler_mixed_return_mask,
++                                        slot);
+       if (sampled_mixed_return &&
+           util_format_is_pure_integer(view->format) &&
+           sampled_format == view->format) {
+@@ -6073,7 +6089,7 @@ yttrium_launch_grid(struct pipe_context *ctx,
+    }
+    if (cs->info.shader_buffers_declared) {
+       YTTRIUM_WARN("yttrium: compute dispatch skipped unsupported resources shader=%p samplers=0x%x ssbos=0x%x\n",
+-                   cs, cs->sampler_used_mask,
++                   cs, yttrium_sampler_slot_mask_low(&cs->sampler_used_mask),
+                    cs->info.shader_buffers_declared);
+       return;
+    }
+@@ -6120,23 +6136,31 @@ yttrium_launch_grid(struct pipe_context *ctx,
+    pipeline.has_storage_image = storage_image_mask != 0;
+    pipeline.has_storage_buffer = storage_buffer_mask != 0;
+ 
+-   uint32_t sampled_image_mask = 0;
+-   uint32_t sampled_buffer_mask = 0;
++   struct yttrium_sampler_slot_mask sampled_image_mask;
++   struct yttrium_sampler_slot_mask sampled_buffer_mask;
++   /* The build succeeds only when the two masks together are every slot the
++    * shader uses, or when the shader is not one that samples.
++    */
+    if (!yttrium_pipeline_build_sampled_resource_masks(
+           yctx, cs, MESA_SHADER_COMPUTE, NULL, &sampled_image_mask,
+           &sampled_buffer_mask) ||
+-       (sampled_image_mask | sampled_buffer_mask) != cs->sampler_used_mask) {
++       (yttrium_sampler_slot_mask_empty(&sampled_image_mask) &&
++        yttrium_sampler_slot_mask_empty(&sampled_buffer_mask) &&
++        !yttrium_sampler_slot_mask_empty(&cs->sampler_used_mask))) {
+       YTTRIUM_WARN("yttrium: compute dispatch skipped owner=yttrium-pipeline reason=sampled_resource_masks_unsupported shader=%p samplers=0x%x images=0x%x buffers=0x%x\n",
+-                   cs, cs->sampler_used_mask, sampled_image_mask,
+-                   sampled_buffer_mask);
++                   cs, yttrium_sampler_slot_mask_low(&cs->sampler_used_mask),
++                   yttrium_sampler_slot_mask_low(&sampled_image_mask),
++                   yttrium_sampler_slot_mask_low(&sampled_buffer_mask));
+       return;
+    }
+-   if (sampled_image_mask | sampled_buffer_mask)
++   if (!yttrium_sampler_slot_mask_empty(&sampled_image_mask) ||
++       !yttrium_sampler_slot_mask_empty(&sampled_buffer_mask))
+       pipeline.key.sampled_stage_mask = 1u << MESA_SHADER_COMPUTE;
+    if (!yttrium_pipeline_add_sampled_layouts(
+-          yctx, cs, sampled_image_mask, sampled_buffer_mask, &pipeline.key)) {
++          yctx, cs, &sampled_image_mask, &sampled_buffer_mask,
++          &pipeline.key)) {
+       YTTRIUM_WARN("yttrium: compute dispatch skipped sampled layout failed shader=%p samplers=0x%x\n",
+-                   cs, cs->sampler_used_mask);
++                   cs, yttrium_sampler_slot_mask_low(&cs->sampler_used_mask));
+       return;
+    }
+ 
+@@ -6148,7 +6172,7 @@ yttrium_launch_grid(struct pipe_context *ctx,
+           ctx, yctx, NULL, &pipeline, sampled_images, &sampled_image_count,
+           NULL)) {
+       YTTRIUM_WARN("yttrium: compute dispatch skipped sampled collect failed shader=%p samplers=0x%x\n",
+-                   cs, cs->sampler_used_mask);
++                   cs, yttrium_sampler_slot_mask_low(&cs->sampler_used_mask));
+       return;
+    }
+ 
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_pipeline.h
+@@ -111,8 +111,6 @@ struct yttrium_pipeline_key {
+    uint32_t gs_ubo_used_mask;
+    uint32_t sampled_stage_mask;
+    uint32_t sampled_binding_count;
+-   struct yttrium_venus_sampled_binding_layout
+-      sampled_bindings[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+    uint32_t color_feedback_loop_mask;
+    VkBool32 depth_feedback_loop;
+    /* Whole-image, depth-only sampled attachment with no effective writes.
+@@ -142,6 +140,13 @@ struct yttrium_pipeline_key {
+    VkVertexInputBindingDescription bindings[PIPE_MAX_ATTRIBS];
+    uint32_t binding_divisors[PIPE_MAX_ATTRIBS];
+    VkVertexInputAttributeDescription attribs[PIPE_MAX_ATTRIBS];
++   /* Last, and only the first sampled_binding_count entries are set: the
++    * key is built and compared on every draw, and the whole array is large.
++    * yttrium_pipeline_key_equal() compares the members before it and those
++    * entries.
++    */
++   struct yttrium_venus_sampled_binding_layout
++      sampled_bindings[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+ };
+ 
+ struct yttrium_pipeline {
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_shader.c
+@@ -115,9 +115,14 @@ yttrium_shader_sampler_binding(mesa_shader_stage stage, unsigned raw_index)
+ {
+    if (stage < MESA_SHADER_VERTEX ||
+        stage >= YTTRIUM_VENUS_SAMPLED_STAGE_COUNT ||
+-       raw_index >= PIPE_MAX_SAMPLERS)
++       raw_index >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+       return UINT32_MAX;
+ 
++   if (raw_index >= PIPE_MAX_SAMPLERS)
++      return YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_BASE +
++             (uint32_t)stage * YTTRIUM_SHADER_HIGH_SAMPLER_SLOTS +
++             (raw_index - PIPE_MAX_SAMPLERS);
++
+    return YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE +
+           (uint32_t)stage * PIPE_MAX_SAMPLERS + raw_index;
+ }
+@@ -127,6 +132,20 @@ yttrium_shader_sampler_binding_decode(uint32_t binding,
+                                       mesa_shader_stage *stage,
+                                       unsigned *raw_index)
+ {
++   if (binding >= YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_BASE &&
++       binding < YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_END) {
++      const uint32_t high_offset =
++         binding - YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_BASE;
++
++      if (stage)
++         *stage = (mesa_shader_stage)
++            (high_offset / YTTRIUM_SHADER_HIGH_SAMPLER_SLOTS);
++      if (raw_index)
++         *raw_index = PIPE_MAX_SAMPLERS +
++                      high_offset % YTTRIUM_SHADER_HIGH_SAMPLER_SLOTS;
++      return true;
++   }
++
+    if (binding < YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE ||
+        binding >= YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE)
+       return false;
+@@ -175,34 +194,54 @@ yttrium_shader_info_sampled_texture_mask(const struct tgsi_shader_info *info)
+           info->file_mask[TGSI_FILE_SAMPLER_VIEW];
+ }
+ 
+-static uint32_t
+-yttrium_nir_sampled_texture_mask32(const struct nir_shader *nir)
+-{
+-   uint32_t mask = 0;
++static bool
++yttrium_shader_sampler_var_raw_slot(mesa_shader_stage shader_stage,
++                                    const nir_variable *var,
++                                    uint32_t *raw_slot);
+ 
++static void
++yttrium_nir_sampled_texture_mask(struct nir_shader *nir,
++                                 mesa_shader_stage stage,
++                                 struct yttrium_sampler_slot_mask *mask)
++{
+    if (!nir)
+-      return 0;
++      return;
+ 
+-   for (unsigned i = 0; i < 32; i++) {
++   const unsigned texture_bits =
++      MIN2((unsigned)(sizeof(nir->info.textures_used) * 8),
++           (unsigned)YTTRIUM_SHADER_MAX_SAMPLER_SLOTS);
++   for (unsigned i = 0; i < texture_bits; i++) {
+       if (BITSET_TEST(nir->info.textures_used, i))
+-         mask |= 1u << i;
++         yttrium_sampler_slot_mask_set(mask, i);
+    }
+ 
+-   return mask;
++   /* shader_info has no bit for a slot above its texture bitset.  Such a
++    * slot is found through the sampler variable tgsi_to_nir made for it.
++    */
++   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
++      const struct glsl_type *type = glsl_without_array(var->type);
++      uint32_t raw_slot = 0;
++
++      if (!glsl_type_is_sampler(type) ||
++          !yttrium_shader_sampler_var_raw_slot(stage, var, &raw_slot))
++         continue;
++      if (raw_slot >= texture_bits)
++         yttrium_sampler_slot_mask_set(mask, raw_slot);
++   }
+ }
+ 
+-static uint32_t
++static void
+ yttrium_shader_tgsi_sampled_texture_mask(
+-   const struct yttrium_shader_state *shader)
++   const struct yttrium_shader_state *shader,
++   struct yttrium_sampler_slot_mask *mask)
+ {
+    struct tgsi_parse_context parse;
+-   uint32_t mask = 0;
+ 
+    if (!shader || !shader->tokens)
+-      return 0;
++      return;
+ 
+    if (tgsi_parse_init(&parse, shader->tokens) != TGSI_PARSE_OK)
+-      return 0;
++      return;
+ 
+    while (!tgsi_parse_end_of_tokens(&parse)) {
+       tgsi_parse_token(&parse);
+@@ -219,27 +258,26 @@ yttrium_shader_tgsi_sampled_texture_mask(
+             continue;
+ 
+          if (src->Register.Indirect) {
+-            mask |= shader->info.samplers_declared |
+-                    shader->info.file_mask[TGSI_FILE_SAMPLER] |
+-                    shader->info.file_mask[TGSI_FILE_SAMPLER_VIEW];
+-         } else if (src->Register.Index < 32) {
+-            mask |= 1u << src->Register.Index;
++            mask->words[0] |= shader->info.samplers_declared |
++                              shader->info.file_mask[TGSI_FILE_SAMPLER] |
++                              shader->info.file_mask[TGSI_FILE_SAMPLER_VIEW];
++         } else if (src->Register.Index >= 0) {
++            yttrium_sampler_slot_mask_set(mask, src->Register.Index);
+          }
+       }
+    }
+ 
+    tgsi_parse_free(&parse);
+-   return mask;
+ }
+ 
+-static uint32_t
++static void
+ yttrium_shader_sampled_texture_mask(
+-   const struct yttrium_shader_state *shader)
++   const struct yttrium_shader_state *shader,
++   struct yttrium_sampler_slot_mask *used_mask)
+ {
+-   uint32_t used_mask;
+-
++   memset(used_mask, 0, sizeof(*used_mask));
+    if (!shader)
+-      return 0;
++      return;
+ 
+    /* Sampler-view declarations describe resource metadata and may use D3D
+     * resource slots that differ from the sampler index carried by legacy TGSI
+@@ -249,10 +287,11 @@ yttrium_shader_sampled_texture_mask(
+     * the declarations so resource-query shaders still take the resource-aware
+     * pipeline path.
+     */
+-   used_mask = yttrium_shader_tgsi_sampled_texture_mask(shader) |
+-               yttrium_nir_sampled_texture_mask32(shader->nir);
+-   return used_mask ? used_mask :
+-                      yttrium_shader_info_sampled_texture_mask(&shader->info);
++   yttrium_shader_tgsi_sampled_texture_mask(shader, used_mask);
++   yttrium_nir_sampled_texture_mask(shader->nir, shader->stage, used_mask);
++   if (yttrium_sampler_slot_mask_empty(used_mask))
++      used_mask->words[0] =
++         yttrium_shader_info_sampled_texture_mask(&shader->info);
+ }
+ 
+ static void
+@@ -261,9 +300,11 @@ yttrium_shader_init_sampler_binding_map(struct yttrium_shader_state *shader)
+    if (!shader)
+       return;
+ 
+-   shader->sampler_binding_valid_mask = 0;
+-   shader->sampler_mixed_return_mask = 0;
+-   for (unsigned i = 0; i < PIPE_MAX_SAMPLERS; i++) {
++   memset(&shader->sampler_binding_valid_mask, 0,
++          sizeof(shader->sampler_binding_valid_mask));
++   memset(&shader->sampler_mixed_return_mask, 0,
++          sizeof(shader->sampler_mixed_return_mask));
++   for (unsigned i = 0; i < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; i++) {
+       shader->sampler_view_index[i] = i;
+       shader->sampler_state_index[i] = i;
+    }
+@@ -277,30 +318,41 @@ yttrium_shader_apply_sampler_binding_map(
+    if (!shader || !map)
+       return true;
+ 
++   /* The scan has bits for the first 32 registers only. */
+    const uint32_t declared =
+       yttrium_shader_info_sampled_texture_mask(&shader->info);
+-   if (map->mixed_return_mask & ~map->valid_mask) {
++   STATIC_ASSERT(sizeof(map->valid_mask) ==
++                 sizeof(shader->sampler_binding_valid_mask));
++   STATIC_ASSERT(ARRAY_SIZE(map->sampler_view_index) ==
++                 YTTRIUM_SHADER_MAX_SAMPLER_SLOTS);
++   for (unsigned word = 0; word < ARRAY_SIZE(map->valid_mask); word++) {
++      if (!(map->mixed_return_mask[word] & ~map->valid_mask[word]))
++         continue;
+       YTTRIUM_WARN("yttrium: shader state creation failed "
+                    "owner=yttrium-shader component=sampler-binding-map "
+                    "reason=mixed-mask-outside-valid-map stage=%s id=%u "
+-                   "mixed=0x%x mapped=0x%x action=reject-shader\n",
++                   "word=%u mixed=0x%x mapped=0x%x action=reject-shader\n",
+                    yttrium_shader_stage_name(shader->stage), shader->id,
+-                   map->mixed_return_mask, map->valid_mask);
++                   word, map->mixed_return_mask[word],
++                   map->valid_mask[word]);
+       return false;
+    }
+-   if (declared & ~map->valid_mask) {
++   if (declared & ~map->valid_mask[0]) {
+       YTTRIUM_WARN("yttrium: shader state creation failed "
+                    "owner=yttrium-shader component=sampler-binding-map "
+                    "reason=unmapped-compact-slot stage=%s id=%u "
+                    "declared=0x%x mapped=0x%x action=reject-shader\n",
+                    yttrium_shader_stage_name(shader->stage), shader->id,
+-                   declared, map->valid_mask);
++                   declared, map->valid_mask[0]);
+       return false;
+    }
+ 
+-   uint32_t remaining = map->valid_mask;
+-   while (remaining) {
+-      const unsigned slot = u_bit_scan(&remaining);
++   for (unsigned slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (!(map->valid_mask[slot / 32] & (1u << (slot % 32))))
++         continue;
++
++      const bool mixed_return =
++         (map->mixed_return_mask[slot / 32] & (1u << (slot % 32))) != 0;
+       const unsigned view = map->sampler_view_index[slot];
+       const unsigned state = map->sampler_state_index[slot];
+       if (view >= PIPE_MAX_SHADER_SAMPLER_VIEWS ||
+@@ -314,7 +366,7 @@ yttrium_shader_apply_sampler_binding_map(
+          return false;
+       }
+ 
+-      if ((map->mixed_return_mask & (1u << slot)) &&
++      if (mixed_return &&
+           (slot >= ARRAY_SIZE(shader->info.sampler_targets) ||
+            slot >= ARRAY_SIZE(shader->info.sampler_type) ||
+            shader->info.sampler_targets[slot] != TGSI_TEXTURE_BUFFER ||
+@@ -337,8 +389,10 @@ yttrium_shader_apply_sampler_binding_map(
+       shader->sampler_view_index[slot] = (uint16_t)view;
+       shader->sampler_state_index[slot] = (uint8_t)state;
+    }
+-   shader->sampler_binding_valid_mask = map->valid_mask;
+-   shader->sampler_mixed_return_mask = map->mixed_return_mask;
++   memcpy(shader->sampler_binding_valid_mask.words, map->valid_mask,
++          sizeof(map->valid_mask));
++   memcpy(shader->sampler_mixed_return_mask.words, map->mixed_return_mask,
++          sizeof(map->mixed_return_mask));
+    return true;
+ }
+ 
+@@ -387,7 +441,7 @@ yttrium_shader_scan_sampler_view_map(struct yttrium_shader_state *shader)
+             continue;
+ 
+          if (src->Register.File == TGSI_FILE_SAMPLER &&
+-             src->Register.Index < PIPE_MAX_SAMPLERS)
++             src->Register.Index < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+             sampler_slot = src->Register.Index;
+          else if (src->Register.File == TGSI_FILE_SAMPLER_VIEW &&
+                   src->Register.Index < PIPE_MAX_SHADER_SAMPLER_VIEWS)
+@@ -1912,7 +1966,7 @@ yttrium_shader_sampler_var_raw_slot(mesa_shader_stage shader_stage,
+       binding = decoded_slot;
+    }
+ 
+-   if (binding >= PIPE_MAX_SAMPLERS)
++   if (binding >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+       return false;
+ 
+    *raw_slot = binding;
+@@ -1932,7 +1986,7 @@ yttrium_shader_sampler_slot_is_unorm_buffer(
+ }
+ 
+ struct yttrium_unorm_buffer_lower_state {
+-   uint32_t slot_mask;
++   struct yttrium_sampler_slot_mask slot_mask;
+    mesa_shader_stage stage;
+ };
+ 
+@@ -1956,7 +2010,7 @@ yttrium_shader_lower_unorm_buffer_sampler_tex(nir_builder *b,
+    nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+    uint32_t raw_slot = 0;
+    if (!yttrium_shader_sampler_var_raw_slot(state->stage, var, &raw_slot) ||
+-       raw_slot >= 32 || !(state->slot_mask & BITFIELD_BIT(raw_slot)))
++       !yttrium_sampler_slot_mask_test(&state->slot_mask, raw_slot))
+       return false;
+ 
+    tex->dest_type = nir_type_uint32;
+@@ -1975,19 +2029,14 @@ yttrium_shader_lower_unorm_buffer_samplers(
+       return false;
+ 
+    struct yttrium_unorm_buffer_lower_state state = {
+-      .slot_mask = 0,
+       .stage = shader->stage,
+    };
+ 
+-   for (uint32_t slot = 0;
+-        slot < MIN2(PIPE_MAX_SHADER_SAMPLER_VIEWS,
+-                    ARRAY_SIZE(shader->info.sampler_targets));
+-        slot++) {
+-      if (yttrium_shader_sampler_slot_is_unorm_buffer(shader, slot) &&
+-          slot < 32)
+-         state.slot_mask |= BITFIELD_BIT(slot);
++   for (uint32_t slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (yttrium_shader_sampler_slot_is_unorm_buffer(shader, slot))
++         yttrium_sampler_slot_mask_set(&state.slot_mask, slot);
+    }
+-   if (!state.slot_mask)
++   if (yttrium_sampler_slot_mask_empty(&state.slot_mask))
+       return false;
+ 
+    nir_foreach_variable_with_modes(var, shader->nir, nir_var_uniform) {
+@@ -1999,7 +2048,7 @@ yttrium_shader_lower_unorm_buffer_samplers(
+       uint32_t raw_slot = 0;
+       if (!yttrium_shader_sampler_var_raw_slot(shader->stage, var,
+                                                &raw_slot) ||
+-          raw_slot >= 32 || !(state.slot_mask & BITFIELD_BIT(raw_slot)))
++          !yttrium_sampler_slot_mask_test(&state.slot_mask, raw_slot))
+          continue;
+ 
+       var->type = glsl_sampler_type(GLSL_SAMPLER_DIM_BUF, false, false,
+@@ -2017,11 +2066,10 @@ yttrium_shader_lower_unorm_buffer_samplers(
+                           nir_shader_get_entrypoint(shader->nir));
+    nir_tgsi_scan_shader(shader->nir, &shader->info, true);
+ 
+-   for (uint32_t slot = 0;
+-        slot < MIN2(PIPE_MAX_SHADER_SAMPLER_VIEWS,
+-                    ARRAY_SIZE(shader->info.sampler_targets));
+-        slot++) {
+-      if (slot < 32 && (state.slot_mask & BITFIELD_BIT(slot)))
++   STATIC_ASSERT(ARRAY_SIZE(shader->info.sampler_type) >=
++                 YTTRIUM_SHADER_MAX_SAMPLER_SLOTS);
++   for (uint32_t slot = 0; slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS; slot++) {
++      if (yttrium_sampler_slot_mask_test(&state.slot_mask, slot))
+          shader->info.sampler_type[slot] = TGSI_RETURN_TYPE_UINT;
+    }
+ 
+@@ -2724,7 +2772,7 @@ yttrium_shader_compact_ntv_descriptor_locations(
+          if (stage != shader->stage)
+             return false;
+       } else {
+-         if (var->data.binding >= PIPE_MAX_SHADER_SAMPLER_VIEWS)
++         if (var->data.binding >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+             return false;
+          raw_slot = var->data.binding;
+       }
+@@ -4958,7 +5006,7 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
+       (uint8_t)yttrium_first_set_bit(lowered_explicit_mask) : 0;
+    shader->ubo_count = lowered_explicit_mask ?
+       (uint8_t)yttrium_bit_count32(lowered_explicit_mask) : 0;
+-   shader->sampler_used_mask = yttrium_shader_sampled_texture_mask(shader);
++   yttrium_shader_sampled_texture_mask(shader, &shader->sampler_used_mask);
+    shader->image_used_mask = shader->info.images_declared;
+ 
+    shader->resource_free =
+@@ -4984,7 +5032,7 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
+                    yttrium_shader_stage_name(shader->stage),
+                    shader->id,
+                    (unsigned long long)shader->token_hash,
+-                   shader->sampler_used_mask);
++                   yttrium_sampler_slot_mask_low(&shader->sampler_used_mask));
+       return false;
+    }
+    if (shader->sampled_texture_only || shader->sampled_storage_image_only)
+@@ -5464,7 +5512,7 @@ yttrium_shader_state_log_bind(const struct yttrium_shader_state *shader,
+       shader ? shader->resource_free : 0,
+       shader ? shader->uniform_buffer_only : 0,
+       shader ? shader->sampled_texture_only : 0,
+-      shader ? shader->sampler_used_mask : 0,
++      shader ? yttrium_sampler_slot_mask_low(&shader->sampler_used_mask) : 0,
+       shader ? shader->ubo_used_mask : 0,
+       shader ? shader->ubo_default : 0,
+       shader ? shader->ubo_first : 0,
+@@ -5538,11 +5586,13 @@ yttrium_shader_state_is_sampled_storage_image_only(
+    return shader && shader->sampled_storage_image_only;
+ }
+ 
+-uint32_t
++const struct yttrium_sampler_slot_mask *
+ yttrium_shader_state_sampler_used_mask(
+    const struct yttrium_shader_state *shader)
+ {
+-   return shader ? shader->sampler_used_mask : 0;
++   static const struct yttrium_sampler_slot_mask empty_mask;
++
++   return shader ? &shader->sampler_used_mask : &empty_mask;
+ }
+ 
+ uint64_t
+@@ -5557,7 +5607,7 @@ yttrium_shader_state_sampler_view_index(
+    const struct yttrium_shader_state *shader,
+    unsigned sampler_slot)
+ {
+-   if (!shader || sampler_slot >= PIPE_MAX_SAMPLERS)
++   if (!shader || sampler_slot >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+       return sampler_slot;
+ 
+    const unsigned view_slot = shader->sampler_view_index[sampler_slot];
+@@ -5572,7 +5622,7 @@ yttrium_shader_state_sampler_state_index(
+    const struct yttrium_shader_state *shader,
+    unsigned sampler_slot)
+ {
+-   if (!shader || sampler_slot >= PIPE_MAX_SAMPLERS)
++   if (!shader || sampler_slot >= YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
+       return sampler_slot;
+ 
+    const unsigned state_slot = shader->sampler_state_index[sampler_slot];
+@@ -5587,8 +5637,9 @@ yttrium_shader_state_has_explicit_sampler_binding(
+    const struct yttrium_shader_state *shader,
+    unsigned sampler_slot)
+ {
+-   return shader && sampler_slot < PIPE_MAX_SAMPLERS &&
+-          (shader->sampler_binding_valid_mask & (1u << sampler_slot));
++   return shader &&
++          yttrium_sampler_slot_mask_test(&shader->sampler_binding_valid_mask,
++                                         sampler_slot);
+ }
+ 
+ void
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_shader.h b/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_shader.h
+@@ -31,6 +31,88 @@ struct yttrium_screen;
+ #define YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE \
+    (YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE + \
+     YTTRIUM_VENUS_SAMPLED_STAGE_COUNT * PIPE_MAX_SAMPLERS)
++/* Combined texture slots of one shader.  Slots below PIPE_MAX_SAMPLERS keep
++ * the bindings from YTTRIUM_SHADER_SAMPLED_IMAGE_BINDING_BASE.  The slots
++ * from PIPE_MAX_SAMPLERS up have a second range behind the storage images,
++ * so a shader that fits the first range has the same bindings as before.
++ * A raw slot is below the first sampled-image binding, so one number is
++ * never both a raw slot and a binding.
++ */
++#define YTTRIUM_SHADER_MAX_SAMPLER_SLOTS PIPE_MAX_SHADER_SAMPLER_SLOTS
++#define YTTRIUM_SHADER_HIGH_SAMPLER_SLOTS \
++   (YTTRIUM_SHADER_MAX_SAMPLER_SLOTS - PIPE_MAX_SAMPLERS)
++#define YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_BASE \
++   (YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE + PIPE_MAX_SHADER_IMAGES)
++#define YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_END \
++   (YTTRIUM_SHADER_HIGH_SAMPLED_IMAGE_BINDING_BASE + \
++    YTTRIUM_VENUS_SAMPLED_STAGE_COUNT * YTTRIUM_SHADER_HIGH_SAMPLER_SLOTS)
++
++/* One bit per combined texture slot. */
++struct yttrium_sampler_slot_mask {
++   uint32_t words[PIPE_SHADER_SAMPLER_SLOT_WORDS];
++};
++
++static inline bool
++yttrium_sampler_slot_mask_test(const struct yttrium_sampler_slot_mask *mask,
++                               unsigned slot)
++{
++   return mask && slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS &&
++          (mask->words[slot / 32] & (1u << (slot % 32))) != 0;
++}
++
++static inline void
++yttrium_sampler_slot_mask_set(struct yttrium_sampler_slot_mask *mask,
++                              unsigned slot)
++{
++   if (slot < YTTRIUM_SHADER_MAX_SAMPLER_SLOTS)
++      mask->words[slot / 32] |= 1u << (slot % 32);
++}
++
++static inline bool
++yttrium_sampler_slot_mask_empty(const struct yttrium_sampler_slot_mask *mask)
++{
++   if (!mask)
++      return true;
++   for (unsigned i = 0; i < PIPE_SHADER_SAMPLER_SLOT_WORDS; i++) {
++      if (mask->words[i])
++         return false;
++   }
++   return true;
++}
++
++static inline unsigned
++yttrium_sampler_slot_mask_count(const struct yttrium_sampler_slot_mask *mask)
++{
++   unsigned count = 0;
++   if (!mask)
++      return 0;
++   for (unsigned i = 0; i < PIPE_SHADER_SAMPLER_SLOT_WORDS; i++) {
++      uint32_t word = mask->words[i];
++      while (word) {
++         word &= word - 1;
++         count++;
++      }
++   }
++   return count;
++}
++
++static inline bool
++yttrium_sampler_slot_mask_equal(const struct yttrium_sampler_slot_mask *a,
++                                const struct yttrium_sampler_slot_mask *b)
++{
++   for (unsigned i = 0; i < PIPE_SHADER_SAMPLER_SLOT_WORDS; i++) {
++      if (a->words[i] != b->words[i])
++         return false;
++   }
++   return true;
++}
++
++/* The first 32 slots, for a trace line. */
++static inline uint32_t
++yttrium_sampler_slot_mask_low(const struct yttrium_sampler_slot_mask *mask)
++{
++   return mask ? mask->words[0] : 0;
++}
+ #define YTTRIUM_SHADER_MAX_UBO_BYTES (64 * 1024)
+ #define YTTRIUM_SHADER_MAX_UBO_DWORDS (YTTRIUM_SHADER_MAX_UBO_BYTES / 4)
+ #define YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS \
+@@ -75,13 +157,13 @@ struct yttrium_shader_state {
+    uint8_t push_constant_word_count;
+    uint8_t push_constant_source_slots[YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS];
+    uint16_t push_constant_source_words[YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS];
+-   uint32_t sampler_used_mask;
++   struct yttrium_sampler_slot_mask sampler_used_mask;
+    uint64_t image_used_mask;
+    uint64_t typed_buffer_image_mask;
+-   uint32_t sampler_binding_valid_mask;
+-   uint32_t sampler_mixed_return_mask;
+-   uint16_t sampler_view_index[PIPE_MAX_SAMPLERS];
+-   uint8_t sampler_state_index[PIPE_MAX_SAMPLERS];
++   struct yttrium_sampler_slot_mask sampler_binding_valid_mask;
++   struct yttrium_sampler_slot_mask sampler_mixed_return_mask;
++   uint16_t sampler_view_index[YTTRIUM_SHADER_MAX_SAMPLER_SLOTS];
++   uint8_t sampler_state_index[YTTRIUM_SHADER_MAX_SAMPLER_SLOTS];
+    struct pipe_stream_output_info stream_output;
+    struct tgsi_shader_info info;
+    /* Typed texture UAVs take their channel layout from the bound view. */
+@@ -208,7 +290,8 @@ yttrium_shader_create_forced_sample_pass_fs(
+    struct pipe_context *ctx,
+    const struct yttrium_shader_state *fs);
+ 
+-uint32_t
++/* Never NULL: a NULL shader gives the empty mask. */
++const struct yttrium_sampler_slot_mask *
+ yttrium_shader_state_sampler_used_mask(
+    const struct yttrium_shader_state *shader);
+ 
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus.h
+@@ -50,8 +50,10 @@ struct yttrium_venus_present_publication {
+  * shader stage so (for example) VS s0 and FS s0 cannot alias.
+  */
+ #define YTTRIUM_VENUS_SAMPLED_STAGE_COUNT MESA_SHADER_STAGES
+-#define YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES PIPE_MAX_SAMPLERS
+-#define YTTRIUM_VENUS_PIPELINE_SAMPLED_IMAGE_MASK UINT32_MAX
++/* Sampled images of one pipeline, all stages together.  It is the number of
++ * combined texture slots of one shader, so one stage can use all of them.
++ */
++#define YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES PIPE_MAX_SHADER_SAMPLER_SLOTS
+ #define YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES PIPE_MAX_SHADER_IMAGES
+ #define YTTRIUM_VENUS_PIPELINE_STORAGE_IMAGE_MASK \
+    UINT64_MAX
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_impl.c
+@@ -7970,6 +7970,31 @@ yttrium_venus_deferred_draw_fixup_handles(
+ 
+ }
+ 
++/* Clears a draw record for a draw with that many sampled descriptor writes.
++ * The record is large because of its per-descriptor arrays, and a draw
++ * reads only the entries its counts name.
++ */
++static void
++yttrium_venus_deferred_draw_clear(struct yttrium_venus_deferred_draw *draw,
++                                  uint32_t sampled_count)
++{
++   const uint32_t sampled =
++      MIN2(sampled_count, (uint32_t)ARRAY_SIZE(draw->sampled_image_infos));
++   const uint32_t writes =
++      MIN2(YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS + sampled,
++           (uint32_t)ARRAY_SIZE(draw->push_writes));
++
++   memset(draw, 0,
++          offsetof(struct yttrium_venus_deferred_draw, sampled_sampler_objs));
++   memset(draw->sampled_sampler_objs, 0,
++          sampled * sizeof(draw->sampled_sampler_objs[0]));
++   memset(draw->sampled_image_infos, 0,
++          sampled * sizeof(draw->sampled_image_infos[0]));
++   memset(draw->sampled_buffer_views, 0,
++          sampled * sizeof(draw->sampled_buffer_views[0]));
++   memset(draw->push_writes, 0, writes * sizeof(draw->push_writes[0]));
++}
++
+ static bool
+ yttrium_venus_deferred_draw_ensure_capacity(struct yttrium_venus *venus)
+ {
+@@ -8700,8 +8725,10 @@ yttrium_venus_cmd_batch_append_compact_draw(
+          write->kind = YTTRIUM_VENUS_COMPACT_DESCRIPTOR_IMAGE;
+          write->info.image = sampled_image_infos[i];
+          if (write->info.image.sampler) {
++            /* A pipeline has one sampler for each sampled binding. */
+             for (uint32_t j = 0;
+-                 j < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; j++) {
++                 j < MIN2(pipeline->key.sampled_binding_count,
++                          YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES); j++) {
+                if (write->info.image.sampler == pipeline->samplers[j]) {
+                   write->sampler_obj = pipeline->sampler_objs[j];
+                   break;
+@@ -8784,7 +8811,7 @@ yttrium_venus_cmd_batch_append_deferred_draw(
+    struct yttrium_venus_deferred_draw *draw =
+       &venus->cmd_batch_deferred_draws
+          [venus->cmd_batch_deferred_draw_count++];
+-   memset(draw, 0, sizeof(*draw));
++   yttrium_venus_deferred_draw_clear(draw, sampled_update_count);
+ 
+    draw->render_pass_obj = pipeline->render_pass_obj;
+    draw->framebuffer_obj = pipeline->framebuffer_obj;
+@@ -8840,8 +8867,10 @@ yttrium_venus_cmd_batch_append_deferred_draw(
+          draw->sampled_buffer_views[i] = sampled_buffer_views[i];
+          if (sampled_writes[i].pImageInfo &&
+              draw->sampled_image_infos[i].sampler) {
++            /* A pipeline has one sampler for each sampled binding. */
+             for (uint32_t j = 0;
+-                 j < YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES; j++) {
++                 j < MIN2(pipeline->key.sampled_binding_count,
++                          YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES); j++) {
+                if (draw->sampled_image_infos[i].sampler ==
+                    pipeline->samplers[j]) {
+                   draw->sampled_sampler_objs[i] =
+diff --git a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
+--- a/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
++++ b/src/gallium/winsys/yttrium/gdi/yttrium_venus2_private.h
+@@ -525,8 +525,6 @@ struct yttrium_venus_deferred_draw {
+    struct yttrium_venus_object pipeline_obj;
+    struct yttrium_venus_object pipeline_layout_obj;
+    struct yttrium_venus_object descriptor_set_obj;
+-   struct yttrium_venus_object
+-      sampled_sampler_objs[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+    VkRenderPass render_pass;
+    VkFramebuffer framebuffer;
+    VkPipeline pipeline;
+@@ -541,12 +539,6 @@ struct yttrium_venus_deferred_draw {
+    VkRect2D scissors[PIPE_MAX_VIEWPORTS];
+    float blend_constants[4];
+    VkDescriptorBufferInfo ubo_infos[YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS];
+-   VkDescriptorImageInfo
+-      sampled_image_infos[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+-   VkBufferView
+-      sampled_buffer_views[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+-   VkWriteDescriptorSet
+-      push_writes[YTTRIUM_VENUS_DEFERRED_DRAW_PUSH_WRITE_LIMIT];
+    struct yttrium_venus_render_pass_group_key render_key;
+    uint8_t push_constant_data[YTTRIUM_SHADER_PUSH_CONSTANT_BYTES];
+    uint32_t render_width;
+@@ -565,6 +557,17 @@ struct yttrium_venus_deferred_draw {
+    uint16_t push_constant_fs_size;
+    bool indexed;
+    bool use_push_descriptors;
++   /* The four arrays below are last.  A draw is cleared up to here, and then
++    * only the entries it uses: yttrium_venus_deferred_draw_clear().
++    */
++   struct yttrium_venus_object
++      sampled_sampler_objs[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
++   VkDescriptorImageInfo
++      sampled_image_infos[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
++   VkBufferView
++      sampled_buffer_views[YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
++   VkWriteDescriptorSet
++      push_writes[YTTRIUM_VENUS_DEFERRED_DRAW_PUSH_WRITE_LIMIT];
+ };
+ 
+ enum yttrium_venus_compact_descriptor_kind {

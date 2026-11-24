@@ -608,6 +608,18 @@ impl Flow {
             debug!(key = ?self.key, "nat: guest RST");
             return false;
         }
+        if seg.is_syn() {
+            // A SYN on a synchronised flow is answered with an ACK of what
+            // the flow expects and otherwise ignored (RFC 5961 §4, review
+            // networking-2 F32). A guest that lost its side (a reset or a
+            // restored VM) and reuses the port pair answers that ACK with a
+            // RST, which ends this flow, and its next SYN opens a new one.
+            // A guest whose side is alive takes it as a duplicate ACK; a
+            // retransmitted SYN-ACK of an active open gets its lost ACK.
+            trace!(key = ?self.key, "nat: SYN on a live flow, challenge ACK");
+            self.send_ack().await;
+            return true;
+        }
         self.last_activity = Instant::now();
         self.on_ack(&seg);
 
