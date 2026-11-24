@@ -718,6 +718,39 @@ login "stock" { user = "dev" password = "never-in-status" default = true }
     assert!(status["logins"][0].get("password").is_none());
 }
 
+#[tokio::test]
+async fn a_character_split_across_two_frames_survives() {
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(
+        &dirs,
+        r#"vm "tail" { template = "scratch" profile = "linux-generic" disk = 10GiB }"#,
+        Script::healthy(),
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    let session = vm
+        .agent()
+        .await
+        .unwrap()
+        .open_tail("/var/log/test.log".into(), None)
+        .await
+        .unwrap();
+    let (stream, mut chunks) = crate::proto::server::Streamer::test_channel();
+    super::pump_session(session, vm.as_ref(), &stream)
+        .await
+        .unwrap();
+    drop(stream);
+
+    let mut text = String::new();
+    while let Some(message) = chunks.recv().await {
+        let crate::proto::Message::Stream { chunk, .. } = message else {
+            panic!("expected a stream chunk");
+        };
+        text.push_str(&chunk);
+    }
+    assert_eq!(text, "é");
+}
+
 /// A VM reports the hardware it resolved to (VM > template > profile), not
 /// what it declared: one that leaves its arch or size to its template must
 /// not show a dash for each.
