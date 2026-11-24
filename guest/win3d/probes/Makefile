@@ -60,12 +60,18 @@ $(foreach a,$(ARCHES),$(eval $(call submit_rules,$(a))))
 
 # Explicit test-only target, like tdr: the two ways of a program to the
 # scanout (card #755). A driver without the fix shows the probe's colour.
-scanout: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/scanout_probe.exe)
+scanout: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/scanout_probe.exe $(OUT)-extra/$(a)/scanout_owner.exe)
 
 define scanout_rules
 $(OUT)-extra/$(1)/scanout_probe.exe: scanout/scanout_probe.c
 	@mkdir -p $$(dir $$@)
 	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+
+# The other side of the check: the fullscreen program that Windows gives
+# the scanout is still served.
+$(OUT)-extra/$(1)/scanout_owner.exe: scanout/scanout_owner.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$< -ld3d9
 endef
 
 $(foreach a,$(ARCHES),$(eval $(call scanout_rules,$(a))))
