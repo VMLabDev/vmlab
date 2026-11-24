@@ -564,11 +564,21 @@ impl VirtioPciDevice {
         }
     }
 
-    /// Take the driver's feature set. Once a set is accepted (FEATURES_OK,
-    /// or DRIVER_OK from a legacy driver) it is fixed until the next reset,
-    /// and a later write is ignored: the queues and the device run on it.
+    /// Whether the feature set is fixed until the next reset: a set was
+    /// accepted (FEATURES_OK, or DRIVER_OK from a legacy driver), or the
+    /// driver reached DRIVER_OK without one and the device runs on the
+    /// empty set. `activated` is the fact: the driver can clear DRIVER_OK
+    /// in the status without a reset, and the device keeps running.
+    fn features_fixed(&self) -> bool {
+        self.negotiated.is_some()
+            || self.activated
+            || self.driver_status & device_status::DRIVER_OK != 0
+    }
+
+    /// Take the driver's feature set. Once the set is fixed a later write
+    /// is ignored: the queues and the device run on it.
     fn set_driver_features(&mut self, features: u64) {
-        if self.negotiated.is_none() {
+        if !self.features_fixed() {
             self.driver_features = features;
         }
     }
@@ -601,6 +611,10 @@ impl VirtioPciDevice {
                 // The set is fixed until the next reset (VIRTIO 1.2
                 // §3.1.1): the device is not told again.
                 status |= device_status::FEATURES_OK;
+            } else if self.features_fixed() {
+                // DRIVER_OK came without FEATURES_OK: the device and its
+                // queues run on the empty set, and FEATURES_OK stays clear
+                // until the next reset, whatever the status says since.
             } else if self.driver_features & !self.offered_features() == 0 {
                 status |= device_status::FEATURES_OK;
                 let negotiated = self.driver_features;
@@ -926,6 +940,9 @@ impl PciDevice for VirtioPciDevice {
             self.transitional_config_write(reg, offset, data);
             return;
         }
+        // A partial write starts from the current word: the enable bit and
+        // the function mask live in the high byte.
+        let current = self.msix_control().to_le_bytes();
         let mut msix_control: Option<[u8; 2]> = None;
         for (i, byte) in data.iter().enumerate() {
             let addr = reg as u64 * 4 + offset + i as u64;
@@ -940,8 +957,8 @@ impl PciDevice for VirtioPciDevice {
                     self.bar4 = (self.bar4 & !(0xFF << shift)) | (*byte as u64) << shift;
                 }
                 0x3C => self.interrupt_line = *byte,
-                0x42 => msix_control.get_or_insert([0; 2])[0] = *byte,
-                0x43 => msix_control.get_or_insert([0; 2])[1] = *byte,
+                0x42 => msix_control.get_or_insert(current)[0] = *byte,
+                0x43 => msix_control.get_or_insert(current)[1] = *byte,
                 _ => {}
             }
         }
@@ -2048,6 +2065,70 @@ mod tests {
         g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1); // VERSION_1
         g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
         assert_eq!(acked(&g), (one as u64).to_le_bytes());
+    }
+
+    /// Second review F8: a driver that reached DRIVER_OK without
+    /// FEATURES_OK runs on the empty set, and a later FEATURES_OK must not
+    /// give the live device another one.
+    #[test]
+    fn features_cannot_be_accepted_after_driver_ok() {
+        let mut g = Guest::new();
+        let acked = |g: &Guest| g.pci.device().save_state().unwrap()[5..13].to_vec();
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03); // ACK|DRIVER
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_SELECT, 0);
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_SIZE, QUEUE_SIZE);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_DESC, DESC as u32);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_AVAIL, AVAIL as u32);
+        g.bar32_write(COMMON_CFG_OFF + common::QUEUE_USED, USED as u32);
+        g.bar16_write(COMMON_CFG_OFF + common::QUEUE_ENABLE, 1);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x07); // |DRIVER_OK
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+
+        // The bit is one the device offers, so only the order refuses it.
+        assert_ne!(g.pci.device().features() & (1 << 28), 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE_SELECT, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F); // |FEATURES_OK
+
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+        // The driver reads back the set that is in force.
+        assert_eq!(g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE), 0);
+
+        // Clearing DRIVER_OK in the status is not a reset: the device still
+        // runs, and the set stays fixed.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x03);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x03);
+        assert_eq!(acked(&g), [0u8; 8]);
+        assert_eq!(g.bar32_read(COMMON_CFG_OFF + common::GUEST_FEATURE), 0);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0F);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x07);
+        assert_eq!(acked(&g), [0u8; 8]);
+
+        // A reset reopens negotiation.
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0);
+        g.bar32_write(COMMON_CFG_OFF + common::GUEST_FEATURE, 1 << 28);
+        g.bar8_write(COMMON_CFG_OFF + common::DEVICE_STATUS, 0x0B);
+        assert_eq!(g.bar8_read(COMMON_CFG_OFF + common::DEVICE_STATUS), 0x0B);
+        assert_eq!(acked(&g), (1u64 << 28).to_le_bytes());
+    }
+
+    /// Second review F9: the low byte of the message control holds only the
+    /// read-only table size, so a write of that byte alone changes nothing.
+    #[test]
+    fn a_byte_write_to_msix_control_keeps_the_enable_bit() {
+        let mut g = Guest::new();
+        g.cfg16_write(0x42, 0xC000); // enable + function mask
+        g.pci.config_write(16, 2, &[0]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0b11);
+        // The high byte alone still clears and sets both bits.
+        g.pci.config_write(16, 3, &[0x80]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0b10);
+        g.pci.config_write(16, 3, &[0]);
+        assert_eq!(g.pci.config_read(16) >> 30, 0);
     }
 
     #[test]

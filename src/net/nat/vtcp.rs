@@ -91,6 +91,13 @@ const DUPLEX_CAPACITY: usize = 64 * 1024;
 /// window's worth: past that the guest cannot legally have more in flight, so a
 /// bigger buffer would only hold data we will never be able to stitch up.
 const OOO_MAX_BYTES: usize = WINDOW as usize;
+/// Segments held per flow while waiting for a missing segment (review
+/// networking-2 F23). The byte limit alone let a guest queue one window of
+/// one-byte segments, 65 535 map entries with an allocation each. A guest
+/// inside its window has at most one window in segments of the smallest MSS
+/// in flight (65535 / 536 = 123), so this is twice that. Past it the segment
+/// farthest ahead is dropped, and the guest sends it again.
+const OOO_MAX_SEGMENTS: usize = 256;
 
 /// Identity of a vTCP flow as seen from the guest side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -343,6 +350,10 @@ struct Flow {
     ooo: BTreeMap<u32, Vec<u8>>,
     /// Bytes currently held in `ooo`, capped at [`OOO_MAX_BYTES`].
     ooo_bytes: usize,
+    /// Queue entries [`Flow::drain_ooo`] has looked at, for the test of its
+    /// cost.
+    #[cfg(test)]
+    ooo_visits: usize,
     retries: u32,
     rto_at: Option<Instant>,
     last_activity: Instant,
@@ -375,6 +386,8 @@ impl Flow {
             unacked: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
+            #[cfg(test)]
+            ooo_visits: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -402,6 +415,8 @@ impl Flow {
             unacked: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
+            #[cfg(test)]
+            ooo_visits: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -653,11 +668,17 @@ impl Flow {
     }
 
     /// Hold a segment that arrived ahead of `rcv_nxt`. Overlapping or duplicate
-    /// entries are replaced by the longer one; the oldest entry is dropped when
-    /// the buffer is full, degrading to the previous drop-and-dup-ACK behaviour
-    /// rather than growing without bound.
+    /// entries are replaced by the longer one. A segment that starts past the
+    /// largest window is not held: the guest cannot legally have sent it, and
+    /// the queue's order relies on every entry being that near `rcv_nxt`.
+    /// When the queue is over [`OOO_MAX_BYTES`] or [`OOO_MAX_SEGMENTS`] the
+    /// entry farthest ahead is dropped (the new one, if that is it),
+    /// degrading to the previous drop-and-dup-ACK behaviour rather than
+    /// growing without bound. The entries nearest the hole are the ones that
+    /// are stitched in first, so they are the ones worth keeping.
     fn queue_ooo(&mut self, seq: u32, payload: &[u8]) {
-        if payload.len() > OOO_MAX_BYTES {
+        if payload.len() > OOO_MAX_BYTES || seq.wrapping_sub(self.rcv_nxt) as usize >= OOO_MAX_BYTES
+        {
             return;
         }
         match self.ooo.get(&seq) {
@@ -667,14 +688,42 @@ impl Flow {
         }
         self.ooo.insert(seq, payload.to_vec());
         self.ooo_bytes += payload.len();
-        while self.ooo_bytes > OOO_MAX_BYTES {
-            let Some((&oldest, _)) = self.ooo.iter().next() else {
+        while self.ooo_bytes > OOO_MAX_BYTES || self.ooo.len() > OOO_MAX_SEGMENTS {
+            let Some(farthest) = self.ooo_farthest() else {
                 break;
             };
-            if let Some(dropped) = self.ooo.remove(&oldest) {
+            if let Some(dropped) = self.ooo.remove(&farthest) {
                 self.ooo_bytes -= dropped.len();
             }
         }
+    }
+
+    /// The queued segment to drop when the queue is over a limit: the one
+    /// farthest ahead of `rcv_nxt`. The map is ordered by the plain number,
+    /// so that is the largest key, or across the wrap of the sequence number
+    /// the largest key below `rcv_nxt`. An entry left at or behind `rcv_nxt`
+    /// (one that waits for room in the window) is dropped only when nothing
+    /// is ahead of it. One or two lookups, whatever the queue holds.
+    fn ooo_farthest(&self) -> Option<u32> {
+        let wrapped = self
+            .ooo
+            .range(..self.rcv_nxt)
+            .next_back()
+            .map(|(seq, _)| *seq)
+            .filter(|&seq| !seq_le(seq, self.rcv_nxt));
+        wrapped.or_else(|| self.ooo.keys().next_back().copied())
+    }
+
+    /// The queued segment that starts at or before `rcv_nxt` and nearest to
+    /// it, if there is one: the largest key up to `rcv_nxt`, or across the
+    /// wrap the largest key of all. One lookup, whatever the queue holds.
+    fn ooo_at_or_before_rcv_nxt(&self) -> Option<u32> {
+        self.ooo
+            .range(..=self.rcv_nxt)
+            .next_back()
+            .or_else(|| self.ooo.iter().next_back())
+            .map(|(seq, _)| *seq)
+            .filter(|&seq| seq_le(seq, self.rcv_nxt))
     }
 
     /// Take in-order guest bytes: as many as the advertised window has room
@@ -696,30 +745,25 @@ impl Flow {
     /// Take every queued segment that is now contiguous with `rcv_nxt`,
     /// trimming any overlap, for as long as the window has room. A segment
     /// that does not fit whole stays queued for the next call.
+    ///
+    /// Each turn looks up one entry and removes it, so a call costs the
+    /// entries it takes and not the queue's length for each of them (review
+    /// networking-2 F23).
     fn drain_ooo(&mut self, wr_open: bool) {
-        loop {
-            // Forget anything that ends at or before rcv_nxt — already taken.
-            let stale: Vec<u32> = self
-                .ooo
-                .iter()
-                .filter(|(seq, payload)| {
-                    seq_le(seq.wrapping_add(payload.len() as u32), self.rcv_nxt)
-                })
-                .map(|(seq, _)| *seq)
-                .collect();
-            for seq in stale {
-                if let Some(payload) = self.ooo.remove(&seq) {
-                    self.ooo_bytes -= payload.len();
-                }
+        while let Some(seq) = self.ooo_at_or_before_rcv_nxt() {
+            #[cfg(test)]
+            {
+                self.ooo_visits += 1;
             }
-            // What's left starting at or before rcv_nxt therefore extends past
-            // it: it continues the stream.
-            let Some(&seq) = self.ooo.keys().find(|&&seq| seq_le(seq, self.rcv_nxt)) else {
-                return;
-            };
             let payload = self.ooo.remove(&seq).expect("key just found");
             self.ooo_bytes -= payload.len();
-            let fresh = &payload[self.rcv_nxt.wrapping_sub(seq) as usize..];
+            let behind = self.rcv_nxt.wrapping_sub(seq) as usize;
+            if behind >= payload.len() {
+                // It ends at or before rcv_nxt: already taken. Forget it.
+                continue;
+            }
+            // It extends past rcv_nxt: it continues the stream.
+            let fresh = &payload[behind..];
             if self.accept(fresh, wr_open) < fresh.len() {
                 // No room for all of it: keep it for when the host has
                 // taken some of the buffer.
@@ -1028,5 +1072,112 @@ mod unit {
         assert!(!seq_le(3, 2));
         assert!(seq_le(u32::MAX, 5), "wraparound");
         assert!(!seq_le(5, u32::MAX));
+    }
+
+    /// A passive flow whose guest's next byte is `rcv_nxt`, on an engine
+    /// nobody reads from.
+    fn flow_at(rcv_nxt: u32) -> Flow {
+        let gw_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let (tx, _rx) = mpsc::channel(1);
+        let engine = NatEngine::new(
+            super::super::NatConfig::new(gw_ip, MacAddr([2, 0, 0, 0, 0, 1])),
+            tx,
+        );
+        let key = FlowKey {
+            guest_ip: Ipv4Addr::new(10, 0, 0, 2),
+            guest_port: 40000,
+            dst_ip: Ipv4Addr::new(192, 0, 2, 1),
+            dst_port: 80,
+        };
+        let syn = Segment {
+            seq: rcv_nxt.wrapping_sub(1),
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+            mss: None,
+        };
+        Flow::new(engine, key, MacAddr([2, 0, 0, 0, 0, 2]), &syn)
+    }
+
+    /// Review networking-2 F23. A guest that sends one window of one-byte
+    /// segments ahead of the hole made the queue hold one entry for each,
+    /// and the byte that filled the hole then cost a scan of the whole queue
+    /// per entry taken.
+    #[tokio::test]
+    async fn the_out_of_order_queue_is_bounded_in_segments() {
+        let rcv_nxt = 1000;
+        let mut flow = flow_at(rcv_nxt);
+        for i in 0..60_000u32 {
+            flow.queue_ooo(rcv_nxt + 1 + i, &[0]);
+            assert!(
+                flow.ooo.len() <= OOO_MAX_SEGMENTS,
+                "the queue holds {} segments, over its limit of {OOO_MAX_SEGMENTS}",
+                flow.ooo.len()
+            );
+        }
+        // What is kept is what is stitched in first: the segments nearest
+        // the hole.
+        let queued = flow.ooo.len();
+        assert_eq!(queued, OOO_MAX_SEGMENTS);
+        assert_eq!(flow.ooo.keys().next(), Some(&(rcv_nxt + 1)));
+        assert_eq!(flow.ooo_bytes, queued);
+
+        // The byte at rcv_nxt arrives, as `on_segment` takes it.
+        assert_eq!(flow.accept(&[0], true), 1);
+        flow.drain_ooo(true);
+        assert_eq!(flow.rcv_nxt, rcv_nxt + 1 + queued as u32);
+        assert!(flow.ooo.is_empty());
+        assert_eq!(flow.ooo_bytes, 0);
+        assert_eq!(flow.to_host.len(), 1 + queued);
+        assert!(
+            flow.ooo_visits <= queued + 1,
+            "taking {queued} segments looked at {} queue entries",
+            flow.ooo_visits
+        );
+    }
+
+    /// The same cost for a queue of entries that are behind `rcv_nxt` when
+    /// the hole fills: one large segment covers every small one, and each is
+    /// forgotten at one look.
+    #[tokio::test]
+    async fn stale_out_of_order_segments_are_forgotten_at_one_look_each() {
+        let rcv_nxt = 1000;
+        let mut flow = flow_at(rcv_nxt);
+        for i in 0..100u32 {
+            flow.queue_ooo(rcv_nxt + 1 + 2 * i, &[0]);
+        }
+        flow.queue_ooo(rcv_nxt + 300, b"tail");
+        assert_eq!(flow.accept(&[7; 300], true), 300);
+        flow.drain_ooo(true);
+        assert_eq!(flow.rcv_nxt, rcv_nxt + 304);
+        assert!(flow.ooo.is_empty());
+        assert_eq!(flow.ooo_bytes, 0);
+        assert_eq!(flow.to_host.len(), 304);
+        assert!(flow.ooo_visits <= 101, "{} looks", flow.ooo_visits);
+    }
+
+    /// The queue's order is sequence order from `rcv_nxt`, across the wrap
+    /// of the sequence number too.
+    #[tokio::test]
+    async fn the_out_of_order_queue_is_stitched_across_the_sequence_wrap() {
+        let rcv_nxt = u32::MAX - 2;
+        let mut flow = flow_at(rcv_nxt);
+        // Ahead of the hole on both sides of the wrap, queued last first.
+        flow.queue_ooo(rcv_nxt.wrapping_add(7), b"hi");
+        flow.queue_ooo(rcv_nxt.wrapping_add(4), b"def");
+        flow.queue_ooo(rcv_nxt.wrapping_add(1), b"abc");
+        // The farthest ahead is the one past the wrap, not the largest key.
+        assert_eq!(flow.ooo_farthest(), Some(rcv_nxt.wrapping_add(7)));
+        // Far past the largest window: not held.
+        flow.queue_ooo(rcv_nxt.wrapping_add(70_000), b"x");
+        assert_eq!(flow.ooo.len(), 3);
+
+        assert_eq!(flow.accept(b"_", true), 1);
+        flow.drain_ooo(true);
+        assert_eq!(flow.rcv_nxt, rcv_nxt.wrapping_add(9));
+        assert!(flow.ooo.is_empty());
+        let taken: Vec<u8> = flow.to_host.iter().copied().collect();
+        assert_eq!(taken, b"_abcdefhi");
     }
 }
