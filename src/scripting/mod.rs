@@ -1399,17 +1399,16 @@ async fn wait_for_text_match<F>(
 where
     F: std::future::Future<Output = anyhow::Result<String>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let text = read_text().await?;
-        if let Some(found) = re.find(&text) {
-            return Ok(Some(found.as_str().to_owned()));
+    let search = async {
+        loop {
+            let text = read_text().await?;
+            if let Some(found) = re.find(&text) {
+                return Ok(Some(found.as_str().to_owned()));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    };
+    tokio::time::timeout(timeout, search).await.unwrap_or(Ok(None))
 }
 
 #[cfg(test)]
@@ -1429,7 +1428,10 @@ mod tests {
         )
         .await;
         assert!(started.get());
-        assert_eq!(result.expect("OCR exceeded the wait deadline").unwrap(), None);
+        assert_eq!(
+            result.expect("OCR exceeded the wait deadline").unwrap(),
+            None
+        );
     }
 
     #[test]

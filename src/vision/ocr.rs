@@ -30,9 +30,8 @@ pub const DEFAULT_SCALE: u32 = 3;
 /// grows with the area and its accuracy no longer does.
 pub const MAX_SCALE: u32 = 4;
 /// The most pixels an upscaled image may have: a 1280x800 frame at
-/// [`MAX_SCALE`]. A frame whose requested scale would exceed it is scaled
-/// less — never below its own size — so a 4K display costs about what a
-/// 1280x800 one does.
+/// [`MAX_SCALE`]. Larger crops are resampled to fit, including when the
+/// original crop already exceeds the budget.
 pub const MAX_SCALED_PIXELS: u64 = 1280 * 800 * 16;
 
 /// How tesseract segments the page: its `--psm`, by what the text looks like.
@@ -126,7 +125,7 @@ pub struct OcrPlan {
 /// Decide one OCR of a `width` x `height` frame. A region whose origin lies
 /// outside the frame is an error; one that runs past the edge is clipped. A
 /// scale outside 1 to [`MAX_SCALE`] is an error; one that would take the
-/// image past [`MAX_SCALED_PIXELS`] is lowered to fit, never below 1.
+/// image past [`MAX_SCALED_PIXELS`] is lowered to fit.
 pub fn plan(
     width: u32,
     height: u32,
@@ -148,15 +147,13 @@ pub fn plan(
     }
     let (w, h) = (crop.2, crop.3);
     let area = u64::from(w) * u64::from(h);
-    let factor = if area * u64::from(scale * scale) <= MAX_SCALED_PIXELS {
+    let factor = if area <= MAX_SCALED_PIXELS / u64::from(scale * scale) {
         f64::from(scale)
     } else {
-        (MAX_SCALED_PIXELS as f64 / area as f64).sqrt().max(1.0)
+        (MAX_SCALED_PIXELS as f64 / area as f64).sqrt()
     };
-    let scaled = (
-        (f64::from(w) * factor).floor().max(1.0) as u32,
-        (f64::from(h) * factor).floor().max(1.0) as u32,
-    );
+    let scaled_side = |side| (f64::from(side) * factor).clamp(1.0, MAX_SCALED_PIXELS as f64) as u32;
+    let scaled = (scaled_side(w), scaled_side(h));
     Ok(OcrPlan {
         crop,
         scaled,
@@ -258,6 +255,7 @@ async fn run_tesseract(
         .args(["--psm", &psm.to_string()])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await;
 
@@ -324,9 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_already_past_the_budget_is_never_shrunk() {
-        let p = plan(7680, 4320, None, &OcrOptions::default()).unwrap();
-        assert_eq!(p.scaled, (7680, 4320));
+    fn a_frame_already_past_the_budget_is_shrunk_to_fit() {
+        let p = plan(7680, 4320, None, &opts(Some(1), None)).unwrap();
+        let (w, h) = p.scaled;
+        assert!(w < 7680 && h < 4320);
+        assert!(u64::from(w) * u64::from(h) <= MAX_SCALED_PIXELS);
     }
 
     #[test]
@@ -474,16 +474,31 @@ mod tests {
         let fifo = root.path().join("release");
         let report = root.path().join("report");
         let survived = root.path().join("survived");
-        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
         // Keep both ends open so releasing a surviving child cannot block.
-        let mut release = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
-        let mut command = stand_in(r#"
+        let mut release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let mut command = stand_in(
+            r#"
             set -eu
             printf '%s\n%s\n' "$$" "$1" > "$REPORT"
             read -r line < "$RELEASE"
             : > "$SURVIVED"
-        "#);
-        command.env("REPORT", &report).env("RELEASE", fifo).env("SURVIVED", &survived);
+        "#,
+        );
+        command
+            .env("REPORT", &report)
+            .env("RELEASE", fifo)
+            .env("SURVIVED", &survived);
         let img = RgbImage::new(8, 8);
         let options = OcrOptions::default();
         let mut ocr = Box::pin(ocr_with(&img, None, &options, root.path(), command));
@@ -513,7 +528,10 @@ mod tests {
         while process.exists() {
             tokio::task::yield_now().await;
         }
-        assert!(!Path::new(scratch).exists(), "scratch PNG survived cancellation");
+        assert!(
+            !Path::new(scratch).exists(),
+            "scratch PNG survived cancellation"
+        );
         assert!(!survived.exists(), "tesseract survived cancellation");
     }
 
