@@ -33,6 +33,7 @@ use std::thread::{self, JoinHandle};
 
 use virtio_queue::{Queue, QueueOwnedT, QueueState, QueueT};
 
+use crate::virtio::used_needs_interrupt;
 use crate::{DeviceError, GuestMemory, Snapshot, VirtioDevice, VirtioInterrupt};
 
 /// Virtio device id 3, the console device.
@@ -558,6 +559,7 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
         else {
             return;
         };
+        let mut used_any = false;
         while !sh.ports[i].rx_stage.is_empty() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -573,9 +575,10 @@ fn drain_rx_stage(sh: &mut Shared, i: usize) {
             if q.add_used(mem, head, written as u32).is_err() {
                 break;
             }
+            used_any = true;
             sh.ports[i].rx_stage.drain(..written);
         }
-        if q.needs_notification(mem).unwrap_or(false) {
+        if used_any && used_needs_interrupt(q, mem) {
             irq = sh.interrupt.clone().map(|irq| (irq, queue));
         }
     }
@@ -616,6 +619,7 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
             else {
                 return;
             };
+            let mut used_any = false;
             while let Some(chain) = q.pop_descriptor_chain(mem) {
                 if connected && pending + out.len() >= MAX_TX_STAGE {
                     q.go_to_previous_position();
@@ -644,8 +648,9 @@ fn process_tx(shared: &Arc<Mutex<Shared>>, clients: &mut [Option<UnixStream>], p
                 if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
+                used_any = true;
             }
-            if q.needs_notification(mem).unwrap_or(false) {
+            if used_any && used_needs_interrupt(q, mem) {
                 irq = sh.interrupt.clone().map(|irq| (irq, queue));
             }
         }
@@ -723,6 +728,7 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
                 return;
             };
             let mut msgs = Vec::new();
+            let mut used_any = false;
             while let Some(chain) = q.pop_descriptor_chain(mem) {
                 if msgs.len() >= room / sh.ports.len().max(2) {
                     q.go_to_previous_position();
@@ -744,8 +750,9 @@ fn process_ctrl_tx(shared: &Arc<Mutex<Shared>>) {
                 if q.add_used(mem, head, 0).is_err() {
                     break;
                 }
+                used_any = true;
             }
-            if q.needs_notification(mem).unwrap_or(false) {
+            if used_any && used_needs_interrupt(q, mem) {
                 irq = sh.interrupt.clone().map(|irq| (irq, 3));
             }
             msgs
@@ -833,6 +840,7 @@ fn flush_pending(sh: &mut Shared) {
         else {
             return;
         };
+        let mut used_any = false;
         while let Some(msg) = sh.pending.front().cloned() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -857,6 +865,7 @@ fn flush_pending(sh: &mut Shared) {
             if q.add_used(mem, head, written).is_err() {
                 break;
             }
+            used_any = true;
             if written == 0 {
                 // Buffer too small for this message; it stays queued and the
                 // next control-receiveq kick retries.
@@ -864,7 +873,7 @@ fn flush_pending(sh: &mut Shared) {
             }
             sh.pending.pop_front();
         }
-        if q.needs_notification(mem).unwrap_or(false) {
+        if used_any && used_needs_interrupt(q, mem) {
             irq = sh.interrupt.clone().map(|irq| (irq, 2));
         }
     }
@@ -2130,10 +2139,7 @@ mod tests {
         f.dev.queue_notify(4);
         f.settle();
         assert_eq!(f.vqs[4].used_idx(&f.mem), 0);
-        assert!(
-            !f.irq.queue_notified(4),
-            "no buffer was used on queue 4"
-        );
+        assert!(!f.irq.queue_notified(4), "no buffer was used on queue 4");
     }
 
     #[test]

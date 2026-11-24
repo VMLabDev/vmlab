@@ -173,8 +173,7 @@ impl InProcessFs {
         let notified = inner
             .queues
             .get_mut(index)
-            .and_then(|q| q.needs_notification(&mem).ok())
-            .unwrap_or(false);
+            .is_some_and(|q| crate::virtio::used_needs_interrupt(q, &mem));
         if used_any && notified {
             interrupt.notify_queue(index as u16);
         }

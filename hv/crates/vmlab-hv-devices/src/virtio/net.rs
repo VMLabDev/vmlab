@@ -478,7 +478,7 @@ fn run(
                         );
                     }
                     Err(()) => {
-                        drop_link(&mut stream, &shared);
+                        drop_link_and_release_tx(&mut stream, &shared, &negotiated);
                         continue;
                     }
                 }
@@ -487,7 +487,7 @@ fn run(
                 && let Some(s) = stream.as_mut()
                 && flush_tx(&shared, s).is_err()
             {
-                drop_link(&mut stream, &shared);
+                drop_link_and_release_tx(&mut stream, &shared, &negotiated);
                 continue;
             }
             if revents & libc::POLLOUT != 0 {
@@ -500,7 +500,7 @@ fn run(
                 );
             }
             if dead {
-                drop_link(&mut stream, &shared);
+                drop_link_and_release_tx(&mut stream, &shared, &negotiated);
             }
         }
 
@@ -604,6 +604,21 @@ fn drop_link(stream: &mut Option<UnixStream>, shared: &Arc<Mutex<Shared>>) {
     if was_up {
         fire_config(shared);
     }
+}
+
+/// Drop the switch connection from the worker loop, then serve the transmit
+/// queues once with the link down. A queue that stopped behind full staging
+/// left its kick suppressed and waited for `POLLOUT`, which the dead
+/// connection never delivers: without this pass its chains are never
+/// completed and the guest never kicks again.
+fn drop_link_and_release_tx(
+    stream: &mut Option<UnixStream>,
+    shared: &Arc<Mutex<Shared>>,
+    negotiated: &AtomicU64,
+) {
+    drop_link(stream, shared);
+    let features = negotiated.load(Ordering::Acquire);
+    process_tx(shared, stream, hdr_len(features), features & F_CSUM != 0);
 }
 
 /// True while no complete frame is waiting for a receiveq buffer — the worker
