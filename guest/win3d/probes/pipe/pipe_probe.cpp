@@ -35,7 +35,7 @@ void PrintMessage(LPCWSTR, ...) {}
 
 static const unsigned BUFFER_BYTES = DATA_BUFFER_LENGTH * sizeof(wchar_t); /* 2048 */
 static const unsigned GUARD_BYTES = 2 * 4096;
-static const unsigned char PATTERN = 0xA5;
+static const unsigned char GUARD_FILL = 0xA5;
 
 struct Arena
 {
@@ -51,7 +51,7 @@ struct Arena
         guard = base + 4096;
         /* A buffer from new wchar_t[] is not zeroed. */
         for (unsigned i = 0; i < DATA_BUFFER_LENGTH; ++i) buffer[i] = 0x4141;
-        memset(guard, PATTERN, GUARD_BYTES);
+        memset(guard, GUARD_FILL, GUARD_BYTES);
         /* The last unit of the guard ends a string that runs through all of it. */
         guard[GUARD_BYTES - 2] = guard[GUARD_BYTES - 1] = 0;
         return true;
@@ -59,13 +59,13 @@ struct Arena
     unsigned changed() const
     {
         unsigned n = 0;
-        for (unsigned i = 0; i < GUARD_BYTES - 2; ++i) n += guard[i] != PATTERN;
+        for (unsigned i = 0; i < GUARD_BYTES - 2; ++i) n += guard[i] != GUARD_FILL;
         return n;
     }
     int first_changed() const
     {
         for (unsigned i = 0; i < GUARD_BYTES - 2; ++i)
-            if (guard[i] != PATTERN) return (int)i;
+            if (guard[i] != GUARD_FILL) return (int)i;
         return -1;
     }
 };
@@ -306,7 +306,7 @@ int wmain(int argc, wchar_t **argv)
             {
                 /* The message behind the long one. A read that took the long
                  * message in pieces finds the rest of it here instead. */
-                memset(arena.guard, PATTERN, GUARD_BYTES - 2);
+                memset(arena.guard, GUARD_FILL, GUARD_BYTES - 2);
                 r.read_second = server.Read() ? 1 : 0;
                 std::wstring second;
                 server.GetData(second);
