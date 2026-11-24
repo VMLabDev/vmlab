@@ -425,7 +425,10 @@ fn capture_and_write(
     // vCPUs are parked on it and the chipset already latched the request, so
     // a snapshot without it restores a guest that waits for a reset forever.
     sections.push((RESET_PENDING.into(), to_json(&shared.reset_pending())?));
-    if let Some(pm) = shared.save_direct_kernel_pm().map_err(SnapshotError::Internal)? {
+    if let Some(pm) = shared
+        .save_direct_kernel_pm()
+        .map_err(SnapshotError::Internal)?
+    {
         sections.push(pm);
     }
     audit::write(shared, "save");
