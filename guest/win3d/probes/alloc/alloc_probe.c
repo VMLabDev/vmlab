@@ -256,8 +256,7 @@ static LONG create(const kmt *k, int version, UINT count, UINT handles[2], UINT 
     args.device = k->device;
     args.num_allocations = count;
     args.allocation_info = version == 1 ? (void *)v1 : (void *)v2;
-    /* Windows itself refuses a count other than one without a resource, and
-     * the driver is not called. So those requests ask for a resource. */
+    /* More than one allocation, or none, belongs to a resource. */
     if (count != 1) args.flags = CREATE_RESOURCE;
     LONG status = k->create[version](&args);
     *resource = args.resource;
