@@ -4042,6 +4042,64 @@ mod tests {
         );
     }
 
+    /// Review F18: a 404 on the first page is a repository with nothing
+    /// published. A 404 on a later page is a lost cursor, and must not turn
+    /// the tags already read into "no tags".
+    #[tokio::test]
+    async fn a_404_on_a_later_tag_page_is_an_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let reply = if head.starts_with("GET /v2/acme/empty/") {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else if head.contains("last=") {
+                            // The cursor of page two has expired.
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+                        } else {
+                            let body = r#"{"name":"acme/ubuntu","tags":["1.0.0","1.0.1"]}"#;
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Link: </v2/acme/ubuntu/tags/list?n=1000&last=1.0.1>; rel=\"next\"\r\n\
+                                 Content-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                        };
+                        if sock.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let transport = HttpTransport::new(addr.to_string(), Credential::Anonymous).unwrap();
+        let err = transport
+            .list_tags("acme/ubuntu")
+            .await
+            .expect_err("a 404 past page one is not an empty repository");
+        assert!(
+            format!("{err:#}").contains("404"),
+            "the error names the status: {err:#}"
+        );
+        // The first page keeps its meaning: nothing is published yet.
+        assert!(
+            transport.list_tags("acme/empty").await.unwrap().is_empty(),
+            "a repository that does not exist has no tags"
+        );
+    }
+
     /// A registry that takes connections and holds them without a byte:
     /// the stand-in for a silent registry, token realm or mirror.
     async fn silent_registry() -> std::net::SocketAddr {

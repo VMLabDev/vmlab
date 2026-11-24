@@ -106,6 +106,16 @@ async fn fetch_search_row(
     let Ok(registry) = crate::oci::Registry::new(&repo) else {
         return (None, None);
     };
+    search_row_of(&registry, name, repo, containers).await
+}
+
+/// [`fetch_search_row`] over a client that is already built.
+async fn search_row_of(
+    registry: &crate::oci::Registry,
+    name: String,
+    repo: String,
+    containers: bool,
+) -> (Option<CatalogSearchRow>, Option<String>) {
     let tags = match registry.list_tags().await {
         Ok(t) => t,
         Err(e) => return (None, Some(format!("{repo}: {e:#}"))),
@@ -165,5 +175,112 @@ fn row(name: String, repo: String, version: String, arches: Vec<String>) -> Cata
         reference: format!("{repo}:{version}"),
         version,
         repo,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oci::client::{Fetched, Transport};
+    use crate::oci::reference::Reference;
+    use std::path::Path;
+
+    /// A registry with one repository: its tag list is `tags`, and every tag
+    /// resolves to an index of `arches`.
+    struct FakeRegistry {
+        tags: Vec<String>,
+        arches: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FakeRegistry {
+        async fn blob_exists(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn get_blob(&self, _: &str, digest: &str) -> Result<Vec<u8>> {
+            anyhow::bail!("no blob {digest}")
+        }
+        async fn put_blob(&self, _: &str, _: &str, _: Vec<u8>) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        async fn put_blob_file(&self, _: &str, _: &str, _: &Path) -> Result<()> {
+            anyhow::bail!("read-only")
+        }
+        async fn get_manifest(&self, _: &str, _: &str) -> Result<Option<Fetched>> {
+            let manifests: Vec<serde_json::Value> = self
+                .arches
+                .iter()
+                .map(|arch| {
+                    serde_json::json!({
+                        "mediaType": crate::oci::media_types::OCI_MANIFEST,
+                        "digest": format!("sha256:{}", "0".repeat(64)),
+                        "size": 2,
+                        "platform": {"architecture": arch, "os": "vmlab"},
+                    })
+                })
+                .collect();
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": crate::oci::media_types::OCI_INDEX,
+                "manifests": manifests,
+            });
+            Ok(Some(Fetched {
+                media_type: crate::oci::media_types::OCI_INDEX.to_string(),
+                body: serde_json::to_vec(&index)?,
+            }))
+        }
+        async fn put_manifest(&self, _: &str, _: &str, _: &str, _: Vec<u8>) -> Result<String> {
+            anyhow::bail!("read-only")
+        }
+        async fn list_tags(&self, _: &str) -> Result<Vec<String>> {
+            Ok(self.tags.clone())
+        }
+        async fn list_catalog(&self) -> Result<Vec<String>> {
+            Ok(vec!["acme/ubuntu".into()])
+        }
+    }
+
+    async fn search_row(tags: &[&str], arches: &[&str]) -> (Option<CatalogSearchRow>, Option<String>) {
+        let repo = "registry.example/acme/ubuntu";
+        let registry = crate::oci::Registry::with_transport(
+            Reference::parse(repo).unwrap(),
+            Box::new(FakeRegistry {
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                arches: arches.iter().map(|a| a.to_string()).collect(),
+            }),
+        );
+        search_row_of(&registry, "ubuntu".into(), repo.into(), false).await
+    }
+
+    fn unprintable(text: &str) -> bool {
+        text.chars().any(char::is_control)
+    }
+
+    /// Review F19: a tag is any string JSON can carry. One with an escape
+    /// sequence must not become the version of a row.
+    #[tokio::test]
+    async fn a_tag_with_a_control_character_is_not_listed() {
+        let (row, warning) = search_row(&["1.0\u{1b}[2J"], &["x86_64"]).await;
+        assert!(row.is_none(), "the tag reached a row: {row:?}");
+        assert!(
+            !warning.as_deref().is_some_and(unprintable),
+            "the warning carries the character: {warning:?}"
+        );
+
+        // The tags beside it are still listed.
+        let (row, _) = search_row(&["1.0\u{1b}[2J", "0.9"], &["x86_64"]).await;
+        let row = row.expect("the printable tag is a row");
+        assert_eq!(row.version, "0.9");
+        assert_eq!(row.reference, "registry.example/acme/ubuntu:0.9");
+    }
+
+    /// The architectures of a row are the registry's strings too.
+    #[tokio::test]
+    async fn an_arch_with_a_control_character_is_not_listed() {
+        let (row, warning) = search_row(&["1.0"], &["x86_64\u{1b}[1A"]).await;
+        assert!(row.is_none(), "the arch reached a row: {row:?}");
+        let warning = warning.expect("a row that is left out is said");
+        assert!(!unprintable(&warning), "{warning:?}");
+        assert!(warning.contains("registry.example/acme/ubuntu"), "{warning}");
     }
 }
