@@ -45,7 +45,7 @@ Who the attacker is, per finding:
 | F16 | wrong result | Every machine start leaves one NIC listener task and its descriptor behind (fixed in card #527) |
 | F17 | wrong result | A DNS sinkhole does not cover HTTPS, SVCB, CNAME or any type but A, AAAA and ANY |
 | F18 | wrong result | A guest's TCP connection to its gateway address on an unserved port is dialed out on the host's own network (fixed in card #520) |
-| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length |
+| F19 | wrong result | A DHCP option longer than 255 bytes is written with a truncated length (fixed in card #819) |
 | F20 | wrong result | A lab segment's DNS never drops the name of a lease that ended |
 
 ### F1. A trunk segment name is a filesystem path (security, peer)
@@ -759,6 +759,20 @@ created for that start.
   a config with 40 /32 routes, one DISCOVER. Parse the reply's options and
   assert the walk ends exactly at option 255 and finds option 53. Today a
   debug build panics, and a release build fails the walk.
+- Fixed in card #819. `opt` in `src/net/dhcp.rs` never writes a length
+  that differs from the value after it: a value longer than 255 bytes goes
+  out as several options of the same code, which a client joins in order
+  (RFC 3396). Option 121 is split on route boundaries by
+  `classless_route_options`, so each option 121 is a valid route list by
+  itself and the joined value is every route with the default route last.
+  RFC 3442 requires a client of option 121 to join them. A domain longer
+  than 255 bytes is no DNS name and option 15 is not an option a client
+  must join, so it is not sent, and the server warns when it is given one.
+  The proof test also asserts the joined routes. A second test,
+  `a_domain_longer_than_one_option_is_left_out`, covers option 15. Not
+  changed: nothing limits the number of routes, so a reply can still pass
+  the 576 bytes a client accepts without option 57, and the segment's MTU
+  at about 130 routes.
 
 ### F20. A lab segment's DNS keeps the name of an ended lease (wrong result)
 

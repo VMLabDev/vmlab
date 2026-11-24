@@ -9,7 +9,10 @@
 //! unconfigured), domain (15), lease time (51), message type (53), server
 //! identifier (54), and RFC 3442 classless static routes (121) when the
 //! segment declares `routes {}` — with the default route through the router
-//! appended, since a client given option 121 ignores option 3.
+//! appended, since a client given option 121 ignores option 3. An option's
+//! length field is one byte: routes past 255 bytes go out as several options
+//! 121 split on route boundaries, which a client joins (RFC 3396), and a
+//! domain past 255 bytes is not sent.
 //!
 //! A guest writes every byte of its frames, so the server takes a client's
 //! identity from the frame and not from the payload alone: a message whose
@@ -157,6 +160,7 @@ struct BootpRequest {
 
 impl DhcpServer {
     pub fn new(config: DhcpConfig) -> Self {
+        warn_on_long_domain(&config);
         Self {
             config,
             leases: HashMap::new(),
@@ -218,7 +222,11 @@ impl DhcpServer {
     /// a supervisor-owned global segment learns its reservations and MTU as
     /// labs attach and detach, long after the server started (PRD §9.2).
     pub fn reconfigure(&mut self, f: impl FnOnce(&mut DhcpConfig)) {
+        let domain = self.config.domain.clone();
         f(&mut self.config);
+        if self.config.domain != domain {
+            warn_on_long_domain(&self.config);
+        }
     }
 
     /// The configuration being served.
@@ -505,7 +513,9 @@ impl DhcpServer {
             if let Some(dns) = cfg.dns_server {
                 opt(&mut b, OPT_DNS, &dns.octets());
             }
-            if let Some(domain) = &cfg.domain {
+            // A domain that does not fit one option is not a DNS name: it
+            // is left out (review F19; `new` and `reconfigure` say so).
+            if let Some(domain) = cfg.domain.as_deref().filter(|d| domain_fits(d)) {
                 opt(&mut b, OPT_DOMAIN, domain.as_bytes());
             }
             if cfg.mtu != 1500 {
@@ -519,11 +529,7 @@ impl DhcpServer {
                 if !routes.iter().any(|(net, _)| net.prefix_len() == 0) {
                     routes.push((Ipv4Net::default(), cfg.router));
                 }
-                opt(
-                    &mut b,
-                    OPT_CLASSLESS_ROUTES,
-                    &encode_classless_routes(&routes),
-                );
+                classless_route_options(&mut b, &routes);
             }
         }
         b.push(OPT_END);
@@ -550,12 +556,60 @@ impl DhcpServer {
     }
 }
 
-/// Append a TLV option.
+/// The longest value one option carries: its length field is one byte.
+const OPT_MAX_LEN: usize = 255;
+
+/// Append a TLV option. A value longer than [`OPT_MAX_LEN`] is written as
+/// several options of the same code, which a client joins in order
+/// (RFC 3396), so the length byte is always the length of what follows it.
 fn opt(out: &mut Vec<u8>, code: u8, val: &[u8]) {
-    debug_assert!(val.len() <= 255, "DHCP option too long");
-    out.push(code);
-    out.push(val.len() as u8);
-    out.extend_from_slice(val);
+    if val.is_empty() {
+        out.extend_from_slice(&[code, 0]);
+        return;
+    }
+    for part in val.chunks(OPT_MAX_LEN) {
+        out.push(code);
+        // `chunks` yields at most `OPT_MAX_LEN` bytes, which fits the byte.
+        out.push(part.len() as u8);
+        out.extend_from_slice(part);
+    }
+}
+
+/// Whether `domain` fits the one option 15 a client reads. A DNS name is at
+/// most 253 bytes, so a longer one is no domain a client could use.
+fn domain_fits(domain: &str) -> bool {
+    domain.len() <= OPT_MAX_LEN
+}
+
+/// Warn about a domain that option 15 cannot carry (review F19).
+fn warn_on_long_domain(config: &DhcpConfig) {
+    if let Some(domain) = config.domain.as_deref().filter(|d| !domain_fits(d)) {
+        warn!(
+            subnet = %config.subnet,
+            len = domain.len(),
+            "DHCP domain is longer than {OPT_MAX_LEN} bytes, option 15 is not sent"
+        );
+    }
+}
+
+/// Append option 121 for `routes`. More routes than one option holds go out
+/// as several options 121, which a client joins in order (RFC 3396; RFC 3442
+/// makes this option one a client must join). Each one ends on a route
+/// boundary, so every option is a valid route list by itself too.
+fn classless_route_options(out: &mut Vec<u8>, routes: &[(Ipv4Net, Ipv4Addr)]) {
+    let mut part: Vec<u8> = Vec::new();
+    for route in routes {
+        // One route is at most 9 bytes, so it always fits an empty option.
+        let encoded = encode_classless_routes(std::slice::from_ref(route));
+        if part.len() + encoded.len() > OPT_MAX_LEN {
+            opt(out, OPT_CLASSLESS_ROUTES, &part);
+            part.clear();
+        }
+        part.extend_from_slice(&encoded);
+    }
+    if !part.is_empty() {
+        opt(out, OPT_CLASSLESS_ROUTES, &part);
+    }
 }
 
 /// RFC 3442 classless-static-routes encoding: for each route, the prefix
