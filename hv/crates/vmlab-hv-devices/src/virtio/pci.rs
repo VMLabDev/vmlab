@@ -564,11 +564,18 @@ impl VirtioPciDevice {
         }
     }
 
-    /// Take the driver's feature set. Once a set is accepted (FEATURES_OK,
-    /// or DRIVER_OK from a legacy driver) it is fixed until the next reset,
-    /// and a later write is ignored: the queues and the device run on it.
+    /// Whether the feature set is fixed until the next reset: a set was
+    /// accepted (FEATURES_OK, or DRIVER_OK from a legacy driver), or the
+    /// driver reached DRIVER_OK without one and the device runs on the
+    /// empty set.
+    fn features_fixed(&self) -> bool {
+        self.negotiated.is_some() || self.driver_status & device_status::DRIVER_OK != 0
+    }
+
+    /// Take the driver's feature set. Once the set is fixed a later write
+    /// is ignored: the queues and the device run on it.
     fn set_driver_features(&mut self, features: u64) {
-        if self.negotiated.is_none() {
+        if !self.features_fixed() {
             self.driver_features = features;
         }
     }
@@ -601,6 +608,9 @@ impl VirtioPciDevice {
                 // The set is fixed until the next reset (VIRTIO 1.2
                 // §3.1.1): the device is not told again.
                 status |= device_status::FEATURES_OK;
+            } else if self.driver_status & device_status::DRIVER_OK != 0 {
+                // DRIVER_OK came without FEATURES_OK: the device and its
+                // queues run on the empty set, and FEATURES_OK stays clear.
             } else if self.driver_features & !self.offered_features() == 0 {
                 status |= device_status::FEATURES_OK;
                 let negotiated = self.driver_features;
@@ -926,6 +936,9 @@ impl PciDevice for VirtioPciDevice {
             self.transitional_config_write(reg, offset, data);
             return;
         }
+        // A partial write starts from the current word: the enable bit and
+        // the function mask live in the high byte.
+        let current = self.msix_control().to_le_bytes();
         let mut msix_control: Option<[u8; 2]> = None;
         for (i, byte) in data.iter().enumerate() {
             let addr = reg as u64 * 4 + offset + i as u64;
@@ -940,8 +953,8 @@ impl PciDevice for VirtioPciDevice {
                     self.bar4 = (self.bar4 & !(0xFF << shift)) | (*byte as u64) << shift;
                 }
                 0x3C => self.interrupt_line = *byte,
-                0x42 => msix_control.get_or_insert([0; 2])[0] = *byte,
-                0x43 => msix_control.get_or_insert([0; 2])[1] = *byte,
+                0x42 => msix_control.get_or_insert(current)[0] = *byte,
+                0x43 => msix_control.get_or_insert(current)[1] = *byte,
                 _ => {}
             }
         }
