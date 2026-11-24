@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
@@ -116,7 +116,7 @@ pub struct LabRuntime {
     pub state: Mutex<LabState>,
     pub events: Arc<EventLog>,
     /// SMB servers and their gateway access (PRD §7.5), when the lab serves shares.
-    smb: Mutex<Option<RunningSmb>>,
+    smb: Arc<Mutex<Option<RunningSmb>>>,
     /// Forwards installed for each machine — segment `forward {}` blocks
     /// and container `port {}` blocks alike — removed and re-installed when
     /// a restart brings a new lease, so a forward never points at a stale IP.
@@ -649,7 +649,7 @@ impl LabRuntime {
             network: Mutex::new(network),
             state: Mutex::new(state),
             events,
-            smb: Mutex::new(None),
+            smb: Arc::new(Mutex::new(None)),
             machine_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles: profiles.clone(),
             pulls: std::sync::Mutex::new(PullLedger::new(pending)),
@@ -727,7 +727,7 @@ impl LabRuntime {
             network: Mutex::new(network),
             state: Mutex::new(LabState::load(&lab_local).unwrap_or_default()),
             events,
-            smb: Mutex::new(None),
+            smb: Arc::new(Mutex::new(None)),
             machine_forwards: Mutex::new(std::collections::HashMap::new()),
             profiles,
             pulls: std::sync::Mutex::new(PullLedger::new(BTreeMap::new())),
@@ -1073,32 +1073,9 @@ impl LabRuntime {
     /// the lab still works. Called from `up` and individual machine starts
     /// that may need SMB.
     async fn ensure_smb(self: &Arc<Self>, output: &crate::scripting::OutputSink) {
-        let mut current = self.smb.lock().await;
-        if let Some(smb) = current.as_mut() {
-            self.reap_smb(smb);
-            if smb.servers.has_missing_servers() {
-                let ports = share_plan::available_smb_ports(&share_plan::BindProbe);
-                for (machine, result) in smb.servers.restart_missing(&ports) {
-                    match result {
-                        Ok(port) => {
-                            if let Some(route) = smb.routes.get_mut(&machine) {
-                                route.install(port);
-                            }
-                            self.smb_started(&machine, port, output);
-                        }
-                        Err(error) => {
-                            tracing::warn!(%machine, %error, "SMB server failed to restart");
-                            output(format!(
-                                "WARNING: SMB server for {machine} failed to restart: {error}\n"
-                            ));
-                            self.events.emit(
-                                "smb.failed",
-                                json!({"machine": machine, "error": error.to_string()}),
-                            );
-                        }
-                    }
-                }
-            }
+        let current = self.smb.clone().lock_owned().await;
+        if current.is_some() {
+            self.recover_smb(current, output).await;
             return;
         }
         let plan = match self.share_plan().await {
@@ -1141,12 +1118,22 @@ impl LabRuntime {
         // One smbd per sharing machine, each with a password of its own
         // (§7.5). The servers work down the plan's free ports: one can be
         // taken between the probe and the bind.
-        let started = crate::smb::LabSmb::plan(&self.lab_local, &sharing).and_then(|mut lab| {
-            lab.start(&smb.host_ports)?;
-            Ok(lab)
-        });
-        let labsmb = match started {
-            Ok(lab) => lab,
+        let lab_local = self.lab_local.clone();
+        let host_ports = smb.host_ports.clone();
+        // Keep the guard with the job so cancellation cannot race another
+        // start or shutdown against the child processes it is creating.
+        let started = tokio::task::spawn_blocking(move || {
+            let started = crate::smb::LabSmb::plan(&lab_local, &sharing).and_then(|mut lab| {
+                lab.start(&host_ports)?;
+                Ok(lab)
+            });
+            (started, current)
+        })
+        .await
+        .context("SMB startup task")
+        .and_then(|(started, current)| Ok((started?, current)));
+        let (labsmb, mut current) = match started {
+            Ok(started) => started,
             Err(e) => {
                 tracing::warn!("SMB server failed to start: {e}");
                 output(format!(
@@ -1244,15 +1231,63 @@ impl LabRuntime {
         }
     }
 
-    pub(super) async fn watch_smb(&self, cancel: tokio_util::sync::CancellationToken) {
+    async fn recover_smb(
+        self: &Arc<Self>,
+        mut current: OwnedMutexGuard<Option<RunningSmb>>,
+        output: &crate::scripting::OutputSink,
+    ) {
+        let Some(smb) = current.as_mut() else {
+            return;
+        };
+        self.reap_smb(smb);
+        if !smb.servers.has_missing_servers() {
+            return;
+        }
+        let lab = self.clone();
+        let output = output.clone();
+        // Commit the replacement routes before releasing the guard, even if
+        // the caller stops waiting for the blocking task.
+        let result = tokio::task::spawn_blocking(move || {
+            let smb = current.as_mut().expect("SMB state is locked");
+            let ports = share_plan::available_smb_ports(&share_plan::BindProbe);
+            for (machine, result) in smb.servers.restart_missing(&ports) {
+                match result {
+                    Ok(port) => {
+                        if let Some(route) = smb.routes.get_mut(&machine) {
+                            route.install(port);
+                        }
+                        lab.smb_started(&machine, port, &output);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%machine, %error, "SMB server failed to restart");
+                        output(format!(
+                            "WARNING: SMB server for {machine} failed to restart: {error}\n"
+                        ));
+                        lab.events.emit(
+                            "smb.failed",
+                            json!({"machine": machine, "error": error.to_string()}),
+                        );
+                    }
+                }
+            }
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::error!(%error, "SMB recovery task failed");
+        }
+    }
+
+    pub(super) async fn watch_smb(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let quiet: crate::scripting::OutputSink = Arc::new(|_| {});
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => break,
                 _ = tick.tick() => {
-                    if let Some(smb) = self.smb.lock().await.as_mut() {
-                        self.reap_smb(smb);
-                    }
+                    let current = self.smb.clone().lock_owned().await;
+                    self.recover_smb(current, &quiet).await;
                 }
             }
         }
@@ -8688,7 +8723,7 @@ lab "t" {
   }
 }"#;
 
-    async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+    async fn smb_lab_unstarted(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
         if ["smbd", "pdbedit"].iter().any(|bin| {
             std::process::Command::new(bin)
                 .arg("--version")
@@ -8712,8 +8747,41 @@ lab "t" {
         *lab.doubles.lock().unwrap() = Some(Arc::new(move |cfg| {
             FakeMachine::new(cfg.name(), MachineKind::Vm, &sh) as Arc<dyn Machine>
         }));
+        Some(lab)
+    }
+
+    async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+        let lab = smb_lab_unstarted(dir).await?;
         crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
         Some(lab)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn smb_lifecycle_start_yields_while_holding_the_smb_lock() {
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab_unstarted(dir.path()).await else {
+            return;
+        };
+        let observer = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.smb.try_lock().is_err() }
+        });
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        assert!(
+            observer.await.unwrap(),
+            "startup did not yield with the SMB lock held"
+        );
+        assert!(
+            lab.smb
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .servers
+                .listen_port("web")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -8803,6 +8871,9 @@ lab "t" {
             smb.kill_for_test("web");
             port
         };
+        // Keep the freed port occupied so a restart cannot reinstall it.
+        let _unrelated =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
         let mut events = lab.events.subscribe();
         let cancel = tokio_util::sync::CancellationToken::new();
         let watch = tokio::spawn({
@@ -8814,9 +8885,54 @@ lab "t" {
         assert_eq!(event.event, "smb.exited");
         assert_eq!(event.data["machine"], "web");
         assert!(!smb_redirects_to(&services, port));
-        assert!(services.host_service_ports().is_empty());
+        assert!(!services.host_service_ports().contains(&port));
         cancel.cancel();
         watch.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn smb_lifecycle_watchdog_restarts_without_a_machine_start() {
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab(dir.path()).await else {
+            return;
+        };
+        let old_port = {
+            let mut smb = lab.smb.lock().await;
+            let servers = &mut smb.as_mut().unwrap().servers;
+            let port = servers.listen_port("web").unwrap();
+            servers.kill_for_test("web");
+            port
+        };
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        let _unrelated = std::net::TcpListener::bind((loopback, old_port)).unwrap();
+        let services = lab.network.lock().await.segments["corp"]
+            .services
+            .clone()
+            .unwrap();
+        let mut events = lab.events.subscribe();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let watch = tokio::spawn({
+            let lab = lab.clone();
+            let cancel = cancel.clone();
+            async move { lab.watch_smb(cancel).await }
+        });
+        assert_eq!(events.recv().await.unwrap().event, "smb.exited");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        cancel.cancel();
+        watch.await.unwrap();
+
+        let smb = lab.smb.lock().await;
+        let port = smb
+            .as_ref()
+            .unwrap()
+            .servers
+            .listen_port("web")
+            .expect("watchdog restarted smbd");
+        std::net::TcpStream::connect((loopback, port)).unwrap();
+        assert!(smb_redirects_to(&services, port));
+        assert_eq!(services.host_service_ports(), vec![port]);
+        assert!(!smb_redirects_to(&services, old_port));
     }
 
     fn same(a: &Arc<dyn Machine>, b: &Arc<dyn Machine>) -> bool {
