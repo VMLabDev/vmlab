@@ -312,6 +312,26 @@ enum AgentGate {
     Bypass,
 }
 
+/// One `media {}` block of a VM: a folder that an image is built from when
+/// the VM starts (PRD §6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaSource {
+    pub kind: model::MediaKind,
+    /// The source folder, resolved absolute.
+    pub folder: PathBuf,
+    pub label: Option<String>,
+    /// The media cache the image is kept in.
+    pub cache: PathBuf,
+}
+
+/// The images of a VM's `media {}` blocks, as one start built them: entries
+/// of the media cache.
+#[derive(Debug, Default)]
+struct BuiltMedia {
+    cdroms: Vec<PathBuf>,
+    floppy: Option<PathBuf>,
+}
+
 /// What a VM has in drive A. vmlab-hv opens it writable and takes no lock
 /// on it, so which file that is matters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,9 +352,14 @@ pub struct VmInstance {
     /// Effective MTU of each NIC's segment, in declaration order. Drives
     /// `host_mtu=` on virtio NICs so the guest matches a jumbo segment.
     pub nic_mtus: Vec<u16>,
-    /// CD-ROM image paths (config cdrom + built media), resolved absolute.
+    /// CD-ROM image paths the lab file names (`cdrom =`), resolved absolute.
+    /// The ISOs of [`Self::media`] follow them at a start.
     pub cdroms: Vec<PathBuf>,
     pub floppy: Option<Floppy>,
+    /// The `media {}` folders, in declaration order. Each start builds them:
+    /// a folder that cannot be built fails the start of this VM, not the
+    /// load of the lab.
+    pub media: Vec<MediaSource>,
     /// Absolute host dir per `cfg.shares` entry (relative paths resolved
     /// against the lab root by the lab builder).
     pub share_hosts: Vec<PathBuf>,
@@ -471,6 +496,7 @@ impl VmInstance {
             nic_mtus,
             cdroms,
             floppy,
+            media: Vec::new(),
             share_hosts,
             agent: super::machine::AgentSlot::for_transport(template.resolved.agent_transport),
             template: std::sync::RwLock::new(Arc::new(template)),
@@ -514,6 +540,15 @@ impl VmInstance {
         let me = Arc::get_mut(&mut self).expect("a freshly built VM has one owner");
         me.hypervisor = kind;
         me.hv = hv;
+        self
+    }
+
+    /// The `media {}` folders this VM builds at each start. Called once by
+    /// the lab builder, before anything else holds the machine.
+    pub(super) fn with_media(mut self: Arc<Self>, media: Vec<MediaSource>) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("a freshly built VM has one owner")
+            .media = media;
         self
     }
 
@@ -975,18 +1010,48 @@ impl VmInstance {
         }))
     }
 
+    /// Builds the image of each `media {}` folder, or finds it in the media
+    /// cache. This is where a folder that cannot be built is found: one too
+    /// big for a floppy, a bad label, a host without the image tool.
+    async fn build_media(&self) -> Result<BuiltMedia> {
+        let mut built = BuiltMedia::default();
+        for m in &self.media {
+            let source = m.clone();
+            // xorriso/mtools under a blocking task: building an ISO from a
+            // folder takes seconds, and this runs on the daemon's runtime.
+            let image = tokio::task::spawn_blocking(move || {
+                crate::media::MediaCache::new(source.cache).ensure(
+                    source.kind,
+                    &source.folder,
+                    source.label.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("media build task: {e}"))?
+            .with_context(|| format!("building media for vm \"{}\"", self.cfg.name))?;
+            match m.kind {
+                model::MediaKind::Iso => built.cdroms.push(image),
+                // The lab builder refuses a second floppy.
+                model::MediaKind::Floppy => built.floppy = Some(image),
+            }
+        }
+        Ok(built)
+    }
+
     /// The image this start puts in drive A. A built floppy is the machine's
     /// own copy of the cache entry, beside its disks: a guest write reaches
     /// neither the cache nor another machine, and `destroy` takes the copy
     /// with the disks.
-    fn floppy_image(&self) -> Result<Option<PathBuf>> {
-        match &self.floppy {
-            None => Ok(None),
-            Some(Floppy::Image(path)) => Ok(Some(path.clone())),
-            Some(Floppy::Built(entry)) => crate::media::private_floppy(entry, &self.dirs.local)
-                .with_context(|| format!("{}: floppy media", self.cfg.name))
-                .map(Some),
-        }
+    fn floppy_image(&self, built: Option<&Path>) -> Result<Option<PathBuf>> {
+        let entry = match (&self.floppy, built) {
+            (Some(Floppy::Image(path)), _) => return Ok(Some(path.clone())),
+            (Some(Floppy::Built(entry)), _) => entry.as_path(),
+            (None, Some(entry)) => entry,
+            (None, None) => return Ok(None),
+        };
+        crate::media::private_floppy(entry, &self.dirs.local)
+            .with_context(|| format!("{}: floppy media", self.cfg.name))
+            .map(Some)
     }
 
     fn build_paths(
@@ -997,6 +1062,7 @@ impl VmInstance {
         (virtiofs_shares, hypervisor_shares): (Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>),
         render: &qemu::hostgpu::RenderPlan,
         tsc_hz: Option<u64>,
+        media: &BuiltMedia,
     ) -> Result<VmPaths> {
         let firmware_features = firmware
             .map(|fw| fw.features())
@@ -1025,10 +1091,15 @@ impl VmInstance {
                 .iter()
                 .map(|d| (d.name.clone(), self.dirs.extra_disk(&d.name)))
                 .collect(),
-            cdroms: self.cdroms.clone(),
-            // The lab builder puts the `cdrom =` attachment first.
+            // The `cdrom =` attachment first, then the built media.
+            cdroms: self
+                .cdroms
+                .iter()
+                .chain(&media.cdroms)
+                .cloned()
+                .collect(),
             install_cdrom: self.cfg.cdrom.is_some(),
-            floppy: self.floppy_image()?,
+            floppy: self.floppy_image(media.floppy.as_deref())?,
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
@@ -1391,6 +1462,10 @@ impl VmInstance {
         // pull can't swap them mid-boot under us).
         let t = self.template();
         let run = async {
+            // Before anything is created or spawned, and before the checks
+            // of the host: a folder that cannot be built is refused the same
+            // way on every host.
+            let media = self.build_media().await?;
             self.check_apple_smc_osk()?;
             if self.hypervisor() == HypervisorKind::Qemu {
                 let why = crate::config::hypervisor::qemu_refusals(&self.cfg);
@@ -1524,6 +1599,7 @@ impl VmInstance {
                     vfs_devices,
                     &render,
                     tsc_hz,
+                    &media,
                 )?),
                 accel,
                 emulator: render.qemu_binary.clone(),

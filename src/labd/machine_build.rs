@@ -214,38 +214,35 @@ pub(super) async fn build_vm(
     if let Some(c) = &vm_cfg.cdrom {
         cdroms.push(cx.root.join(c));
     }
-    let mut floppy = vm_cfg
+    let floppy = vm_cfg
         .floppy
         .as_ref()
         .map(|f| crate::labd::vm::Floppy::Image(cx.root.join(f)));
 
     // media {} blocks: ISO/floppy images built from folders,
-    // content-addressed in .vmlab/media (PRD §6.3).
+    // content-addressed in .vmlab/media (PRD §6.3). Nothing is built or
+    // hashed here: a lab loads whatever its folders hold, and each machine
+    // builds its own media when it starts.
     let media_dir = cx.lab_local.join("media");
+    let mut media = Vec::new();
+    let mut has_floppy = vm_cfg.floppy.is_some();
     for m in &vm_cfg.media {
-        let src = cx.root.join(&m.from);
-        // xorriso/mtools under a blocking task: building an ISO from a
-        // folder takes seconds, and this runs on the daemon's runtime.
-        let (kind, label, dir) = (m.kind, m.label.clone(), media_dir.clone());
-        let built = tokio::task::spawn_blocking(move || {
-            crate::media::MediaCache::new(dir).ensure(kind, &src, label.as_deref())
-        })
-        .await
-        .map_err(|e| anyhow!("media build task: {e}"))?
-        .with_context(|| format!("building media for vm \"{}\"", vm_cfg.name))?;
-        match m.kind {
-            crate::config::model::MediaKind::Iso => cdroms.push(built),
-            crate::config::model::MediaKind::Floppy => {
-                if floppy.is_some() {
-                    bail!(
-                        "vm \"{}\": both a floppy attachment and floppy media declared — \
-                         a VM has one floppy drive",
-                        vm_cfg.name
-                    );
-                }
-                floppy = Some(crate::labd::vm::Floppy::Built(built));
+        if m.kind == crate::config::model::MediaKind::Floppy {
+            if has_floppy {
+                bail!(
+                    "vm \"{}\": both a floppy attachment and floppy media declared — \
+                     a VM has one floppy drive",
+                    vm_cfg.name
+                );
             }
+            has_floppy = true;
         }
+        media.push(crate::labd::vm::MediaSource {
+            kind: m.kind,
+            folder: cx.root.join(&m.from),
+            label: m.label.clone(),
+            cache: media_dir.clone(),
+        });
     }
 
     let first_boot = meta.as_ref().and_then(|m| m.first_boot());
@@ -281,7 +278,8 @@ pub(super) async fn build_vm(
     .on_hypervisor(
         hypervisor,
         super::hypervisor::for_machine(hypervisor, cx.host, true),
-    );
+    )
+    .with_media(media);
     Ok((
         vm.with_hypervisor_fallback(selection.fallback_reason)
             .with_selection_source(selection.source)

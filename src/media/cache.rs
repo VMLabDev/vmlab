@@ -15,8 +15,9 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::model::MediaKind;
@@ -41,7 +42,12 @@ impl MediaCache {
     ///
     /// Builds go to a temporary name in the cache directory and are renamed
     /// into place, so a crashed build never leaves a half-written entry
-    /// under a valid cache name.
+    /// under a valid cache name. The image is flushed to disk before the
+    /// rename, for the same reason across a host crash.
+    ///
+    /// The folder is hashed again after the build, and an image built while
+    /// the folder changed is thrown away: an entry holds the content it is
+    /// named after.
     pub fn ensure(
         &self,
         kind: MediaKind,
@@ -63,41 +69,72 @@ impl MediaCache {
         label: Option<&str>,
         build: impl Fn(&Path, &Path, Option<&str>) -> Result<()>,
     ) -> Result<PathBuf> {
-        let digest = folder_digest(src_folder)?;
-        let dest = self.cache_dir.join(entry_name(kind, label, &digest));
-        let sealed = matches!(kind, MediaKind::Floppy);
-        if dest.is_file() && (!sealed || seal_holds(&dest)) {
+        let mut digest = folder_digest(src_folder)?;
+        for _ in 0..BUILD_ATTEMPTS {
+            let dest = self.cache_dir.join(entry_name(kind, label, &digest));
+            let sealed = matches!(kind, MediaKind::Floppy);
+            if dest.is_file() && (!sealed || seal_holds(&dest)) {
+                return Ok(dest);
+            }
+
+            fs::create_dir_all(&self.cache_dir)
+                .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
+            // Two machines with one folder start at the same time: each build
+            // has its own temporary name.
+            let tmp = self.cache_dir.join(format!(
+                ".tmp-{}-{}-{}",
+                std::process::id(),
+                BUILD_SERIAL.fetch_add(1, Ordering::Relaxed),
+                dest.file_name()
+                    .expect("cache entry names are never empty")
+                    .to_string_lossy()
+            ));
+
+            // The tool reads the folder after the hash did. The image is
+            // installed only when the folder still has the content the entry
+            // is named after. Otherwise it is built again from what the
+            // folder holds now.
+            let built = build(src_folder, &tmp, label)
+                .and_then(|()| folder_digest(src_folder))
+                .and_then(|after| {
+                    if after == digest {
+                        sync_file(&tmp)?;
+                    }
+                    Ok(after)
+                });
+            let after = match built {
+                Ok(after) => after,
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(err);
+                }
+            };
+            if after != digest {
+                let _ = fs::remove_file(&tmp);
+                digest = after;
+                continue;
+            }
+
+            // The seal follows the image: a crash between the two leaves an
+            // entry that fails the check and is built again.
+            let seal = if sealed {
+                Some(image_digest(&tmp)?)
+            } else {
+                None
+            };
+            fs::rename(&tmp, &dest)
+                .with_context(|| format!("installing media cache entry {}", dest.display()))?;
+            if let Some(seal) = seal {
+                write_seal(&dest, &seal)?;
+            }
+            sync_file(&self.cache_dir)?;
             return Ok(dest);
         }
-
-        fs::create_dir_all(&self.cache_dir)
-            .with_context(|| format!("creating media cache {}", self.cache_dir.display()))?;
-        let tmp = self.cache_dir.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            dest.file_name()
-                .expect("cache entry names are never empty")
-                .to_string_lossy()
-        ));
-
-        if let Err(err) = build(src_folder, &tmp, label) {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
-
-        // The seal follows the image: a crash between the two leaves an entry
-        // that fails the check and is built again.
-        let seal = if sealed {
-            Some(image_digest(&tmp)?)
-        } else {
-            None
-        };
-        fs::rename(&tmp, &dest)
-            .with_context(|| format!("installing media cache entry {}", dest.display()))?;
-        if let Some(seal) = seal {
-            write_seal(&dest, &seal)?;
-        }
-        Ok(dest)
+        bail!(
+            "media source {} changed during each of {BUILD_ATTEMPTS} builds of its image: \
+             no image was made",
+            src_folder.display()
+        )
     }
 
     /// Deletes cache entries whose paths are not in `keep`. Stale temporary
@@ -135,6 +172,22 @@ impl MediaCache {
     }
 }
 
+/// How many times one `ensure` builds a folder that changes under the build
+/// before it gives up.
+const BUILD_ATTEMPTS: usize = 3;
+
+/// Makes the temporary name of each build in this process its own.
+static BUILD_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Flushes the file or directory at `path` to disk. A name that a rename
+/// installed must not outlive a host crash with less than the whole file
+/// behind it.
+fn sync_file(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("flushing {}", path.display()))
+}
+
 /// What a seal's file name adds to its entry's.
 const SEAL_SUFFIX: &str = ".sha256";
 
@@ -168,6 +221,9 @@ fn write_seal(entry: &Path, digest: &str) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("writing {}", seal.display()))?;
     std::io::Write::write_all(&mut tmp, digest.as_bytes())
+        .with_context(|| format!("writing {}", seal.display()))?;
+    tmp.as_file()
+        .sync_all()
         .with_context(|| format!("writing {}", seal.display()))?;
     tmp.persist(&seal)
         .with_context(|| format!("writing {}", seal.display()))?;

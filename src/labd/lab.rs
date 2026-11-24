@@ -8505,7 +8505,8 @@ fn main(lab: Lab) {
     async fn a_lab_loads_with_an_unbuildable_media_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        // More than a 1.44 MB floppy holds: refused before any tool runs.
+        // More than a 1.44 MB floppy holds: refused before any tool runs. A
+        // floppy needs a profile on the pc machine.
         std::fs::create_dir_all(root.join("answers")).unwrap();
         std::fs::write(root.join("answers/big.bin"), vec![0u8; 2 << 20]).unwrap();
         let src = r#"import <vmlab.wcl>
@@ -8518,6 +8519,7 @@ fn main(lab: Lab) {
                 vm "answered" {
                     template = "scratch"
                     arch = "x86_64"
+                    profile = "windows-xp"
                     disk = 1MiB
                     media { kind = "floppy" from = "answers" }
                 }
