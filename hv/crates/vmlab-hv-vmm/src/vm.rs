@@ -2165,6 +2165,69 @@ mod tests {
         assert_eq!(accesses.load(Ordering::SeqCst), 2);
     }
 
+    /// Review vmm-core-2 F2: a chipset MMIO device call (a TPM command
+    /// waiting for swtpm) must not stop another vCPU's access to a PCI BAR.
+    /// The chipset device here stays inside its write until the BAR read of
+    /// the second thread has come back. A dispatch that holds a bus lock
+    /// across the device call never gets there, and the test does not finish.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn chipset_mmio_device_call_does_not_block_pci_bar_access() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use vmlab_hv_devices::BusDevice;
+        struct Busy {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl BusDevice for Busy {
+            fn read(&mut self, _: u64, _: &mut [u8]) {}
+            fn write(&mut self, _: u64, _: &[u8]) {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+        }
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP PCI BAR access during a chipset device call: /dev/kvm absent");
+            return;
+        }
+        let (entered, has_entered) = channel();
+        let (release, released) = channel();
+        let mut mmio_bus = MmioBus::new();
+        // The TPM TIS address.
+        mmio_bus
+            .register(
+                0xfed4_0000,
+                0x5000,
+                Arc::new(Mutex::new(Busy {
+                    entered,
+                    release: released,
+                })),
+            )
+            .unwrap();
+        let (shared, _, accesses) = q35_with_function(mmio_bus);
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x10, &0xc000_0000u32.to_le_bytes());
+        let tpm_vcpu = shared.clone();
+        let command = std::thread::spawn(move || tpm_vcpu.mmio_write(0xfed4_0018, &[0x20]));
+        has_entered.recv().unwrap();
+        let other_vcpu = shared.clone();
+        let (sent, received) = channel();
+        let bar = std::thread::spawn(move || {
+            let mut byte = [0];
+            other_vcpu.mmio_read(0xc000_0000, &mut byte);
+            sent.send(byte).unwrap();
+        });
+        // The chipset device is still inside its write here.
+        assert_eq!(received.recv().unwrap(), [0xee]);
+        assert_eq!(accesses.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        command.join().unwrap();
+        bar.join().unwrap();
+    }
+
     /// Review finding F8 of `docs/reviews/vmm-core.md`: low RAM of a pc
     /// machine reaches 3 GiB, so a framebuffer BAR at 2 GiB lies over RAM.
     #[test]

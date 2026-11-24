@@ -948,6 +948,36 @@ mod tests {
         assert_eq!(backing(&device, 0xf0000), [0x22; 512]);
     }
 
+    /// Review vmm-core-2 F3: the chipset stores a device write to a
+    /// write-protected bank nowhere, so the next device read of that address
+    /// returns the shadow, as a CPU read does.
+    #[test]
+    fn device_write_to_read_only_shadow_is_not_read_back() {
+        let (ram, mut mch, _isa) = pc_with_isa_dma();
+        mch.config_write(0x58 / 4, 1, &[0x30]);
+        ram.device_mem
+            .write_slice(&[0x22; 512], GuestAddress(0xf0000))
+            .unwrap();
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        // The chipset drops the write: whether the access reports an error
+        // is the device's concern, the content is the guest's.
+        let _ = ram
+            .device_mem
+            .write_slice(&[0x44; 512], GuestAddress(0xf0000));
+        assert_eq!(
+            backing(&ram.device_mem, 0xf0000),
+            [0x22; 512],
+            "a device read back its write to a read-only bank"
+        );
+        assert_eq!(backing(&mch.pam.lock().shadow, 0xf0000), [0x22; 512]);
+        // The same for a bank that reads the ROM.
+        mch.config_write(0x58 / 4, 1, &[0]);
+        let _ = ram
+            .device_mem
+            .write_slice(&[0x44; 512], GuestAddress(0xf0000));
+        assert_eq!(backing(&ram.device_mem, 0xf0000), [0x5a; 512]);
+    }
+
     #[test]
     fn smram_lock_holds_until_reset() {
         for pc in [false, true] {
