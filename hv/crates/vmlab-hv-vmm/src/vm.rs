@@ -1116,9 +1116,13 @@ impl VmShared {
         }
     }
 
+    /// Whether PCI decode may claim `addr`. With an MCH the guest places BARs
+    /// anywhere, but the chipset's fixed MMIO (the PAM range, the HPET, the
+    /// TPM, the flash) decodes first, as it does on the real board: a ROM or
+    /// BAR programmed over it does not take the access.
     fn in_pci_window(&self, addr: u64) -> bool {
         if self.mch.lock().is_some() {
-            return true;
+            return !self.mmio_bus.lock().covers(addr);
         }
         let ((b32, e32), (b64, e64)) = self.pci_windows;
         (b32 <= addr && addr < e32) || (b64 <= addr && addr < e64) || !self.vfio.lock().is_empty()
@@ -1129,6 +1133,16 @@ impl VmShared {
         let Some(vga) = self.vga.lock().clone() else {
             return Ok(());
         };
+        // The PCI hole starts where this machine's low RAM stops: at 2 GiB
+        // on q35, and at up to 3 GiB on pc. A framebuffer BAR that the guest
+        // places over RAM is not mapped: KVM refuses overlapping slots, and
+        // the BAR callbacks serve it as they serve any unmapped placement.
+        let ram_regions = self
+            .ram
+            .lock()
+            .as_ref()
+            .map(|ram| ram.layout().regions.clone())
+            .unwrap_or_default();
         let mut root = self.pci_root.lock();
         let address = root
             .addresses()
@@ -1145,6 +1159,10 @@ impl VmShared {
                         && !sizing
                         && *base >= 0x80000000
                         && *base + vga.framebuffer_size() as u64 <= 0xfec00000
+                        && ram_regions.iter().all(|&(ram_base, ram_size)| {
+                            *base + vga.framebuffer_size() as u64 <= ram_base
+                                || *base >= ram_base + ram_size
+                        })
                 })
                 .map(|(base, _)| base)
         });
@@ -2006,6 +2024,229 @@ mod tests {
             without_parking,
             "virtio configuration I/O waited for another vCPU"
         );
+    }
+
+    /// A `VmShared` with an MCH, the PAM on the MMIO bus, and one PCI
+    /// function at 00:02.0 with a 4 KiB memory BAR and an option ROM. Returns
+    /// the PAM and the count of accesses the function's BAR saw.
+    fn q35_with_function(
+        mut mmio_bus: MmioBus,
+    ) -> (
+        Arc<VmShared>,
+        Arc<Mutex<crate::q35::Mch>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use vmlab_hv_devices::{BarInfo, BarKind, PciDevice};
+        struct Probe(Arc<AtomicUsize>);
+        impl PciDevice for Probe {
+            // Register 1 is the command: memory decode stays enabled.
+            fn config_read(&mut self, reg: usize) -> u32 {
+                if reg == 1 { 2 } else { 0x1001_1af4 }
+            }
+            fn config_write(&mut self, _: usize, _: u64, _: &[u8]) {}
+            fn bars(&self) -> Vec<BarInfo> {
+                vec![BarInfo {
+                    index: 0,
+                    size: 4096,
+                    kind: BarKind::Mmio32,
+                }]
+            }
+            fn bar_read(&mut self, _: u8, _: u64, data: &mut [u8]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                data.fill(0xee);
+            }
+            fn bar_write(&mut self, _: u8, _: u64, _: &[u8]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let accesses = Arc::new(AtomicUsize::new(0));
+        let mut root = PciRoot::q35(1 << 32);
+        root.add_device_at(2, 0, Arc::new(Mutex::new(Probe(accesses.clone()))))
+            .unwrap();
+        root.attach_option_rom(2, 0, &[0x55, 0xaa, 0x01]).unwrap();
+        let pam = Arc::new(Mutex::new(
+            crate::q35::Pam::new(&vec![0xff; 0x40000], None, 0).unwrap(),
+        ));
+        mmio_bus.register(0xc0000, 0x40000, pam.clone()).unwrap();
+        let signal = Arc::new(SleepSignal::default());
+        let shared = VmShared::new(
+            KvmVm::new().unwrap(),
+            IoBus::new(),
+            mmio_bus,
+            Arc::new(Mutex::new(root)),
+            Arc::new(Mutex::new(PmDevice::new(Arc::new(NullIrq), signal.sink()))),
+            signal,
+            1 << 32,
+        );
+        let mch = Arc::new(Mutex::new(crate::q35::Mch::new(pam)));
+        *shared.mch.lock() = Some(mch.clone());
+        (shared, mch, accesses)
+    }
+
+    /// Review vmm-core F12: PCI decode ran before the chipset's MMIO, so an
+    /// expansion ROM enabled at 0xc0000 took the writes meant for a PAM
+    /// shadow bank in write-only mode.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn rom_bar_does_not_hide_pam_shadow_writes() {
+        use vmlab_hv_devices::{BusDevice, PciDevice};
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP ROM over the PAM range: /dev/kvm absent");
+            return;
+        }
+        let (shared, mch, _) = q35_with_function(MmioBus::new());
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x30, &0x000c_0001u32.to_le_bytes());
+        // PAM1 low nibble is bank 0 (0xc0000-0xc3fff): 2 is write-only.
+        mch.lock().config_write(0x90 / 4, 1, &[0x02]);
+        shared.mmio_write(0xc0000, &[0x42]);
+        // Read the shadow back: 1 is read-only, served from the shadow.
+        mch.lock().config_write(0x90 / 4, 1, &[0x01]);
+        let mut byte = [0];
+        mch.lock().pam.lock().read(0, &mut byte);
+        assert_eq!(byte, [0x42], "the ROM took the PAM shadow write");
+        shared.mmio_read(0xc0000, &mut byte);
+        assert_eq!(byte, [0x42], "the ROM answered a PAM shadow read");
+    }
+
+    /// Review vmm-core F12, the BAR half: a memory BAR programmed over a
+    /// chipset device (the HPET's address here) must not hide it, and the
+    /// same BAR inside the PCI hole still reaches its function.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn bar_over_chipset_mmio_does_not_hide_the_chipset_device() {
+        use std::sync::atomic::Ordering;
+        use vmlab_hv_devices::BusDevice;
+        struct Fixed;
+        impl BusDevice for Fixed {
+            fn read(&mut self, _: u64, data: &mut [u8]) {
+                data.fill(0x5a);
+            }
+            fn write(&mut self, _: u64, _: &[u8]) {}
+        }
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP BAR over chipset MMIO: /dev/kvm absent");
+            return;
+        }
+        let mut mmio_bus = MmioBus::new();
+        mmio_bus
+            .register(0xfed0_0000, 0x400, Arc::new(Mutex::new(Fixed)))
+            .unwrap();
+        let (shared, _, accesses) = q35_with_function(mmio_bus);
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x10, &0xfed0_0000u32.to_le_bytes());
+        let mut byte = [0];
+        shared.mmio_read(0xfed0_0000, &mut byte);
+        assert_eq!(byte, [0x5a], "the BAR answered for the chipset device");
+        shared.mmio_write(0xfed0_0000, &[1]);
+        assert_eq!(accesses.load(Ordering::SeqCst), 0);
+        // Past the chipset device's 0x400 bytes the BAR still decodes.
+        shared.mmio_read(0xfed0_0800, &mut byte);
+        assert_eq!(byte, [0xee]);
+        assert_eq!(accesses.load(Ordering::SeqCst), 1);
+        shared
+            .pci_root
+            .lock()
+            .config_write(0, 2, 0, 0x10, &0xc000_0000u32.to_le_bytes());
+        shared.mmio_write(0xc000_0000, &[1]);
+        assert_eq!(accesses.load(Ordering::SeqCst), 2);
+    }
+
+    /// Review finding F8 of `docs/reviews/vmm-core.md`: low RAM of a pc
+    /// machine reaches 3 GiB, so a framebuffer BAR at 2 GiB lies over RAM.
+    #[test]
+    #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM")]
+    fn pc_vga_bar_over_low_ram_is_not_mapped() {
+        if !std::path::Path::new("/dev/kvm").exists() {
+            eprintln!("SKIP VGA BAR over low RAM: /dev/kvm absent");
+            return;
+        }
+        let kvm = KvmVm::new().unwrap();
+        let layout = crate::layout::MemLayout::pc(3072).unwrap();
+        assert_eq!(layout.low_ram_top(), 0xc000_0000);
+        let ram = GuestRam::anonymous(layout.clone()).unwrap();
+        crate::memory::register_memslots(&kvm.vm, &ram).unwrap();
+        // The root of a firmware machine, as the builder makes it for pc.
+        let root = Arc::new(Mutex::new(PciRoot::q35(layout.mmio64_base)));
+        let device = Arc::new(Mutex::new(
+            vmlab_hv_devices::display::StandardVga::new("vga", &[0x55, 0xaa, 0]).unwrap(),
+        ));
+        let slot = 2u8;
+        root.lock().add_device_at(slot, 0, device.clone()).unwrap();
+        let vga = crate::display::Video::Standard(device);
+        let mut io_bus = IoBus::new();
+        io_bus
+            .register(
+                0xcf8,
+                8,
+                Arc::new(Mutex::new(crate::pci::PciConfigIo::new(root.clone()))),
+            )
+            .unwrap();
+        let signal = Arc::new(SleepSignal::default());
+        let shared = VmShared::new(
+            kvm,
+            io_bus,
+            MmioBus::new(),
+            root,
+            Arc::new(Mutex::new(PmDevice::new(Arc::new(NullIrq), signal.sink()))),
+            signal,
+            layout.mmio64_base,
+        );
+        let pam = crate::q35::Pam::new(&vec![0xff; 0x40000], None, 0).unwrap();
+        *shared.mch.lock() = Some(Arc::new(Mutex::new(crate::q35::Mch::i440fx(
+            Arc::new(Mutex::new(pam)),
+            layout.ram,
+        ))));
+        let bar = 0x10 + 4 * vga.framebuffer_bar() as u32;
+        *shared.vga.lock() = Some(vga.clone());
+        *shared.ram.lock() = Some(Arc::new(ram));
+        // What the guest does: BAR = `base`, then memory decode, through
+        // the configuration ports.
+        let place = |base: u32| {
+            let address = 0x8000_0000 | u32::from(slot) << 11;
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &0u16.to_le_bytes());
+            shared.io_write(0xcf8, &(address | bar).to_le_bytes());
+            shared.io_write(0xcfc, &base.to_le_bytes());
+            shared.io_write(0xcf8, &(address | 4).to_le_bytes());
+            shared.io_write(0xcfc, &2u16.to_le_bytes());
+        };
+
+        place(0x8000_0000);
+        assert_eq!(
+            shared
+                .exit
+                .lock()
+                .as_ref()
+                .map(|reason| format!("{reason:?}")),
+            None,
+            "a framebuffer BAR over low RAM ended the VM"
+        );
+        assert_eq!(*shared.vga_mapping.lock(), None);
+        // The BAR callbacks still serve the framebuffer.
+        shared.mmio_write(0x8000_0040, &[0x12, 0x34, 0x56, 0x78]);
+        let mut stored = [0u8; 4];
+        vga.linear_framebuffer()
+            .read_slice(&mut stored, GuestAddress(0x40))
+            .unwrap();
+        assert_eq!(stored, [0x12, 0x34, 0x56, 0x78]);
+        let mut read = [0u8; 4];
+        shared.mmio_read(0x8000_0040, &mut read);
+        assert_eq!(read, stored);
+
+        // A placement in the PCI hole of this machine is mapped directly.
+        place(0xc000_0000);
+        assert!(shared.exit.lock().is_none());
+        assert_eq!(*shared.vga_mapping.lock(), Some(0xc000_0000));
+        // One that straddles the top of low RAM is not.
+        place(0xbf00_0000 + (8 << 20));
+        assert!(shared.exit.lock().is_none());
+        assert_eq!(*shared.vga_mapping.lock(), None);
     }
 
     #[test]

@@ -255,6 +255,13 @@ and the IDE, AHCI and USB devices on the same buses.
   `floppy/tests.rs`, with `Machine::new("floppy")` and `m.out(...)` as above.
   Today it panics with "attempt to add with overflow".
 - Confidence: high.
+- Fixed by card #793. `finish_read_id` reports `at.sect % sectors + 1`, the
+  next sector of the track as QEMU computes it, so no stored sector byte can
+  overflow it, from a command or from a restored state. A READ ID at the last
+  sector of the track now reports sector 1, not one past the end. Test:
+  `read_id_after_an_out_of_range_sector_does_not_overflow` in
+  `floppy/tests.rs`, which failed before the fix with "attempt to add with
+  overflow" at `floppy/mod.rs:593`.
 
 ### F7. PIIX4 PM window: 128 ports over a 64-aligned base, and a subtraction that wraps at 0xffff
 
@@ -308,6 +315,12 @@ and the IDE, AHCI and USB devices on the same buses.
   is served through the BAR callbacks. Today the VM exits with "mapping VGA
   framebuffer".
 - Confidence: high for the bound. The exit path was traced by reading.
+- Fixed by card #791. `sync_vga_mapping` maps the framebuffer only where it
+  overlaps no RAM region of the machine's layout, so the bound follows low
+  RAM on pc (up to 3 GiB) and on q35 (2 GiB). A BAR over RAM stays unmapped
+  and the BAR callbacks serve it. Test:
+  `pc_vga_bar_over_low_ram_is_not_mapped` in `vm.rs`, which failed before
+  the fix with "mapping VGA framebuffer: File exists".
 
 ### F9. A guest reset that is pending when a snapshot load starts runs after the load
 
@@ -409,6 +422,14 @@ and the IDE, AHCI and USB devices on the same buses.
   0x42.
 - Confidence: medium. The order was traced. That a firmware or OS places a
   ROM there was not seen.
+- Fixed by card #792. With an MCH, `VmShared::in_pci_window` refuses an
+  address that a device on `mmio_bus` decodes (`MmioBus::covers`), so the
+  PAM range, the HPET, the TPM and the flash answer before a ROM or BAR
+  placed over them. The ROM decode also needs a base other than 0, as BARs
+  do. Tests `rom_bar_does_not_hide_pam_shadow_writes` and
+  `bar_over_chipset_mmio_does_not_hide_the_chipset_device` in `vm.rs`. Both
+  need KVM, so the merge bar ignores them, as it does the other `vm.rs`
+  dispatch tests.
 
 ### F13. fw_cfg SMI negotiation keeps a stale DMA high address
 
