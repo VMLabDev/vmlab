@@ -1130,6 +1130,107 @@ mod tests {
         assert_eq!(r.opts[&OPT_CLASSLESS_ROUTES], expected);
     }
 
+    /// Every option of a reply in wire order, walked strictly: each length
+    /// has to stay inside the payload, and the walk has to end on the END
+    /// option as the payload's last byte.
+    fn walk_options(frame: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let eth = EthView::parse(frame).unwrap();
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        let udp = UdpView::parse(ip.payload()).unwrap();
+        let p = udp.payload();
+        let mut opts = Vec::new();
+        let mut i = BOOTP_MIN_LEN;
+        loop {
+            let code = *p.get(i).expect("the options end without an END option");
+            if code == OPT_END {
+                assert_eq!(i, p.len() - 1, "bytes follow the END option");
+                return opts;
+            }
+            if code == OPT_PAD {
+                i += 1;
+                continue;
+            }
+            let len = usize::from(*p.get(i + 1).expect("an option has no length byte"));
+            let val = p
+                .get(i + 2..i + 2 + len)
+                .expect("an option's length passes the end of the reply");
+            opts.push((code, val.to_vec()));
+            i += 2 + len;
+        }
+    }
+
+    /// Review F19: option 121 for more routes than one option holds. The
+    /// reply stays a well-formed option list, and the options 121 joined in
+    /// order (RFC 3396) are every route with the default route last.
+    #[test]
+    fn many_routes_make_a_well_formed_reply() {
+        let via = Ipv4Addr::new(10, 213, 1, 254);
+        let mut cfg = config();
+        cfg.routes = (0..40u8)
+            .map(|n| (Ipv4Net::new(Ipv4Addr::new(192, 168, 7, n), 32).unwrap(), via))
+            .collect();
+        let mut expected = cfg.routes.clone();
+        expected.push((Ipv4Net::default(), GW));
+        let expected = encode_classless_routes(&expected);
+        assert!(expected.len() > 255, "the routes have to pass one option");
+
+        let mut s = DhcpServer::new(cfg);
+        let reply = s.handle(&discover(mac(1))).expect("offer expected");
+        let opts = walk_options(&reply);
+
+        let of = |code: u8| -> Vec<&Vec<u8>> {
+            opts.iter()
+                .filter(|(c, _)| *c == code)
+                .map(|(_, v)| v)
+                .collect()
+        };
+        assert_eq!(of(OPT_MSG_TYPE), vec![&vec![DHCP_OFFER]]);
+        // Nothing but the routes is in the reply twice, and no code appears
+        // that the server does not serve.
+        for (code, _) in &opts {
+            assert!(
+                [
+                    OPT_MSG_TYPE,
+                    OPT_SERVER_ID,
+                    OPT_LEASE_TIME,
+                    OPT_SUBNET_MASK,
+                    OPT_ROUTER,
+                    OPT_DNS,
+                    OPT_DOMAIN,
+                    OPT_CLASSLESS_ROUTES,
+                ]
+                .contains(code),
+                "the reply has an option {code} the server does not serve"
+            );
+            if *code != OPT_CLASSLESS_ROUTES {
+                assert_eq!(of(*code).len(), 1, "option {code} is in the reply twice");
+            }
+        }
+        let parts = of(OPT_CLASSLESS_ROUTES);
+        assert!(parts.len() > 1);
+        // Each option is whole routes: 1 length byte, 4 of a /32, 4 router.
+        for part in &parts {
+            assert!(!part.is_empty());
+            assert_eq!(part.len() % 9, if part.ends_with(&[0, 10, 213, 1, 1]) { 5 } else { 0 });
+        }
+        let joined: Vec<u8> = parts.into_iter().flatten().copied().collect();
+        assert_eq!(joined, expected);
+    }
+
+    /// Review F19: a domain that does not fit option 15 is left out, and the
+    /// reply stays a well-formed option list.
+    #[test]
+    fn a_domain_longer_than_one_option_is_left_out() {
+        let mut cfg = config();
+        cfg.domain = Some("a".repeat(300));
+        let mut s = DhcpServer::new(cfg);
+        let reply = s.handle(&discover(mac(1))).expect("offer expected");
+        let opts = walk_options(&reply);
+        assert!(opts.iter().any(|(c, v)| *c == OPT_MSG_TYPE && v == &[DHCP_OFFER]));
+        assert!(opts.iter().all(|(c, _)| *c != OPT_DOMAIN));
+        assert!(opts.iter().any(|(c, _)| *c == OPT_ROUTER));
+    }
+
     /// RFC 3442: a client that receives option 121 ignores option 3, so the
     /// default route has to ride option 121 too or the guest loses it.
     #[test]
