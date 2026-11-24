@@ -16,7 +16,7 @@
 # The case "starve" is the failed pool allocation. For it the script turns on
 # Driver Verifier for viogpu3d.sys with the randomized low resources
 # simulation, set to fail every pool allocation the driver makes in the
-# process alloc_probe.exe from STARVE_DELAY minutes (default 3) after the
+# process alloc_probe.exe from STARVE_DELAY minutes (default 2) after the
 # boot, and restarts the guest. The probe starts right after the boot, makes
 # its device while allocations still succeed, and creates allocations until
 # they fail. Afterwards the script resets Driver Verifier and restarts the
@@ -52,7 +52,7 @@ PROBE=$REPO/out/probes-extra/x64/alloc_probe.exe
 VMLAB=${VMLAB:-vmlab}
 ACCOUNT=alloc-probe
 GUEST='C:\win3d\alloc'
-STARVE_DELAY=${STARVE_DELAY:-3}
+STARVE_DELAY=${STARVE_DELAY:-2}
 [[ $STARVE_DELAY =~ ^[1-9][0-9]?$ ]] || { echo "STARVE_DELAY is a number of minutes" >&2; exit 2; }
 
 note() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -128,8 +128,9 @@ for c in $CASES; do
         # Every pool allocation of viogpu3d.sys in alloc_probe.exe fails
         # (10000 of 10000), with any pool tag, from STARVE_DELAY minutes
         # after the boot. A boot that fails turns the verifier off again.
-        # cmd.exe, not PowerShell, which drops the empty pool tag argument.
-        gcmd "verifier /flags 0x4 /faults 10000 \"\" alloc_probe.exe $STARVE_DELAY /driver viogpu3d.sys" >"$OUT/verifier.txt"
+        # The pool tag filter is "*", every tag: an empty argument is stored
+        # as a tag of two quotation marks, which no allocation has.
+        gcmd "verifier /flags 0x4 /faults 10000 * alloc_probe.exe $STARVE_DELAY /driver viogpu3d.sys" >"$OUT/verifier.txt"
         gcmd 'verifier /bootmode resetonbootfail' >/dev/null
         note "restarting the guest with Driver Verifier on viogpu3d.sys"
         restart_guest || exit 1
