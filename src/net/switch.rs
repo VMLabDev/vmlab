@@ -1436,4 +1436,84 @@ mod tests {
         b.tx.send(again.clone()).await.unwrap();
         assert_eq!(recv(&mut trunk.rx).await, again);
     }
+
+    /// Review F30: a bound MAC is held against a service port too. On a
+    /// global segment every port of the supervisor's switch is one, and a
+    /// frame from a trunk with the gateway's MAC as its source must not
+    /// move the gateway behind that trunk.
+    #[tokio::test]
+    async fn a_bound_mac_is_held_against_a_service_port() {
+        let sw = Switch::new("global/seg0".into());
+        let mut g = sw.add_channel_port(PortClass::Service);
+        let mut t1 = sw.add_channel_port(PortClass::Service);
+        let t2 = sw.add_channel_port(PortClass::Service);
+        let gateway = mac(0x47);
+        sw.bind_mac(g.id, gateway);
+
+        t1.tx
+            .send(frame(MAC_BROADCAST, gateway, b"spoof"))
+            .await
+            .unwrap();
+        // T2's frame follows the spoofed one into the switch only by
+        // chance of scheduling, so wait until the switch has dealt with
+        // the spoofed one, whichever way.
+        while {
+            let s = sw.stats();
+            s.frames_flooded + s.frames_dropped == 0
+        } {
+            tokio::task::yield_now().await;
+        }
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        t2.tx.send(to_gateway.clone()).await.unwrap();
+
+        // The first frame G reads is T2's: the spoofed one was not flooded
+        // to it, and the gateway's MAC is still on G.
+        assert_eq!(g.rx.recv().await.unwrap(), to_gateway);
+        // The marker reaches T1 after anything the switch gave it before.
+        let marker = frame(MAC_BROADCAST, mac(2), b"marker");
+        t2.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(t1.rx.recv().await.unwrap(), marker);
+    }
+
+    /// A bound MAC stays when its port learns more MACs than it may hold:
+    /// a trunk that carries the gateway also carries a far side a guest
+    /// there can fill with forged sources (review F21's way around F9).
+    #[tokio::test]
+    async fn a_bound_mac_outlives_the_limit_of_its_port() {
+        let sw = Switch::new("seg0".into());
+        let mut trunk = sw.add_channel_port(PortClass::Service);
+        let mut a = sw.add_channel_port(GUEST);
+        let b = sw.add_channel_port(GUEST);
+        let gateway = mac(0x47);
+        // Learned first, then bound: the MAC is the oldest of the port.
+        trunk
+            .tx
+            .send(frame(MAC_BROADCAST, gateway, b"hello"))
+            .await
+            .unwrap();
+        assert_eq!(a.rx.recv().await.unwrap().len(), 14 + 5);
+        sw.bind_mac(trunk.id, gateway);
+
+        for i in 0..MAX_MACS_PER_SERVICE_PORT as u32 {
+            let b4 = i.to_be_bytes();
+            let src = MacAddr([2, 9, b4[0], b4[1], b4[2], b4[3]]);
+            trunk
+                .tx
+                .send(frame(MAC_BROADCAST, src, b"x"))
+                .await
+                .unwrap();
+            // Keep A's queue empty, so nothing is dropped for a full one.
+            a.rx.recv().await.unwrap();
+        }
+
+        // A frame to the gateway is still unicast to the trunk: A, a
+        // third port, does not see it flooded before the marker.
+        while trunk.rx.try_recv().is_ok() {}
+        let to_gateway = frame(gateway, mac(2), b"to the gateway");
+        b.tx.send(to_gateway.clone()).await.unwrap();
+        let marker = frame(MAC_BROADCAST, mac(2), b"marker");
+        b.tx.send(marker.clone()).await.unwrap();
+        assert_eq!(a.rx.recv().await.unwrap(), marker);
+        assert_eq!(trunk.rx.recv().await.unwrap(), to_gateway);
+    }
 }
