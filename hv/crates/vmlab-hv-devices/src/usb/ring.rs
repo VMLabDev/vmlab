@@ -7,6 +7,8 @@ use super::state::{Reader, Writer};
 pub(super) fn read<const N: usize>(mem: &GuestMemory, addr: u64) -> Result<[u8; N], DeviceError> {
     addr.checked_add(N as u64)
         .ok_or_else(|| DeviceError::Memory("USB DMA overflow".into()))?;
+    #[cfg(test)]
+    super::dma_probe::count();
     let mut bytes = [0; N];
     mem.read_slice(&mut bytes, GuestAddress(addr))
         .map_err(|e| DeviceError::Memory(e.to_string()))?;
@@ -57,6 +59,16 @@ pub(super) struct Ring {
     pub cycle: bool,
 }
 
+/// What `Ring::pop_within` found.
+pub(super) enum Pop {
+    /// The TRB at this address, now consumed.
+    Trb(u64, Trb),
+    /// The next TRB is not the guest's to give yet.
+    Empty,
+    /// The caller's reads ran out first.
+    Spent,
+}
+
 impl Ring {
     pub fn new(value: u64) -> Self {
         Self {
@@ -67,12 +79,19 @@ impl Ring {
     pub fn value(self) -> u64 {
         self.pointer | u64::from(self.cycle)
     }
-    /// Link-only loops are bounded, as are callers' command/TD walks.
-    pub fn pop(&mut self, mem: &GuestMemory) -> Result<Option<(u64, Trb)>, DeviceError> {
+    /// Take the next TRB the guest has queued, following Link TRBs. Each TRB
+    /// read, Link TRBs included, is charged to `reads`: with none left this
+    /// reads nothing more and answers `Pop::Spent`. Link-only loops are
+    /// bounded, as are callers' command/TD walks.
+    pub fn pop_within(&mut self, mem: &GuestMemory, reads: &mut usize) -> Result<Pop, DeviceError> {
         for _ in 0..256 {
+            if *reads == 0 {
+                return Ok(Pop::Spent);
+            }
+            *reads -= 1;
             let trb = Trb::read(mem, self.pointer)?;
             if (trb.control & 1 != 0) != self.cycle {
-                return Ok(None);
+                return Ok(Pop::Empty);
             }
             let addr = self.pointer;
             if trb.kind() == 6 {
@@ -85,7 +104,7 @@ impl Ring {
                     .pointer
                     .checked_add(16)
                     .ok_or_else(|| DeviceError::Memory("USB ring overflow".into()))?;
-                return Ok(Some((addr, trb)));
+                return Ok(Pop::Trb(addr, trb));
             }
         }
         Err(DeviceError::Other("USB ring contains a link loop".into()))

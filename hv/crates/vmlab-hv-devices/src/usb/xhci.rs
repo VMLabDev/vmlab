@@ -7,7 +7,7 @@ use crate::{
 
 use super::{
     PointerEvent, SetupPacket, Tablet, UsbDevice, UsbSpeed, UsbTransfer,
-    ring::{Ring, Trb, read, write},
+    ring::{Pop, Ring, Trb, read, write},
     state::{Reader, Writer, invalid},
 };
 
@@ -36,6 +36,22 @@ const TRB_ERROR: u32 = 5;
 const STALL: u32 = 6;
 const CONTEXT_ERROR: u32 = 19;
 const BUDGET: usize = 256;
+/// The TRBs one `poll` reads from the command ring, and again from all the
+/// transfer rings together, Link TRBs included. The per-ring limits bound
+/// one ring; this bounds the controller (usb review F11).
+const POLL_READS: usize = 1024;
+/// The endpoints `poll` serves, in order: 31 on each slot.
+const ENDPOINTS: usize = SLOTS * 31;
+
+/// How `transfers` left an endpoint.
+enum Served {
+    /// The endpoint has nothing more to do in this poll.
+    Idle,
+    /// The poll's reads ran out between two TDs.
+    Spent,
+    /// The poll's reads ran out inside a TD, which is not consumed.
+    Cut,
+}
 
 #[derive(Clone)]
 struct Endpoint {
@@ -138,6 +154,12 @@ pub struct XhciController {
     clock: Instant,
     // Runtime-register and event operations select a bank for their duration.
     interrupter: usize,
+    /// The transfer-ring reads the running `poll` has left.
+    reads: usize,
+    /// The endpoint the next `poll` serves first, as an index into
+    /// `ENDPOINTS`. It moves only when a poll runs out of reads, so that an
+    /// endpoint whose ring never runs dry cannot starve the ones behind it.
+    first: usize,
 }
 
 impl XhciController {
@@ -160,6 +182,8 @@ impl XhciController {
             state: Self::initial_state(),
             clock: Instant::now(),
             interrupter: 0,
+            reads: 0,
+            first: 0,
         };
         this.reset_ports();
         this
@@ -569,7 +593,9 @@ impl XhciController {
         self.state.interrupters[self.interrupter].moderation_clock = Instant::now();
     }
     /// Resume NAKed transfers and bounded ring work. No guest-controlled
-    /// traversal can monopolize the VMM thread.
+    /// traversal can monopolize the VMM thread: one call reads at most
+    /// `POLL_READS` TRBs of the command ring and as many of all the transfer
+    /// rings together, and what is left waits for the next call.
     pub fn poll(&mut self) {
         if !self.running() {
             return;
@@ -583,15 +609,38 @@ impl XhciController {
             }
         }
         self.interrupter = 0;
+        self.reads = POLL_READS;
         if self.state.command_running && self.commands().is_err() {
             self.dma_error();
             return;
         }
-        for slot in 1..=SLOTS {
-            for ep in 1..32 {
-                if self.state.slots[slot].endpoints[ep].kicked && self.transfers(slot, ep).is_err()
-                {
+        self.reads = POLL_READS;
+        for n in 0..ENDPOINTS {
+            let index = (self.first + n) % ENDPOINTS;
+            let (slot, ep) = (index / 31 + 1, index % 31 + 1);
+            if !self.state.slots[slot].endpoints[ep].kicked {
+                continue;
+            }
+            if self.reads == 0 {
+                // Not served at all: it goes first next time.
+                self.first = index;
+                return;
+            }
+            match self.transfers(slot, ep) {
+                Err(_) => {
                     self.dma_error();
+                    return;
+                }
+                Ok(Served::Idle) => {}
+                // This endpoint had its turn: the next poll starts behind it.
+                Ok(Served::Spent) => {
+                    self.first = (index + 1) % ENDPOINTS;
+                    return;
+                }
+                // Its TD needs more than was left: it goes first next time,
+                // with a whole poll's reads.
+                Ok(Served::Cut) => {
+                    self.first = index;
                     return;
                 }
             }
@@ -613,7 +662,9 @@ impl XhciController {
             if self.state.interrupters[self.interrupter].pending.len() >= BUDGET {
                 break;
             }
-            let Some((addr, t)) = self.state.command.pop(&self.mem)? else {
+            // A command ring out of reads keeps its place for the next poll.
+            let Pop::Trb(addr, t) = self.state.command.pop_within(&self.mem, &mut self.reads)?
+            else {
                 break;
             };
             let (cc, slot) = self.command(t)?;
@@ -670,7 +721,10 @@ impl XhciController {
                 }
                 let stopped = if kind == 15 && e.kicked && e.context[0] & 7 == 1 {
                     let mut ring = e.ring;
-                    ring.pop(&self.mem)?
+                    match ring.pop_within(&self.mem, &mut self.reads)? {
+                        Pop::Trb(addr, trb) => Some((addr, trb)),
+                        Pop::Empty | Pop::Spent => None,
+                    }
                 } else {
                     None
                 };
@@ -866,11 +920,17 @@ impl XhciController {
         self.store_slot(slot)?;
         Ok(SUCCESS)
     }
-    fn transfers(&mut self, slot: usize, ep: usize) -> Result<(), DeviceError> {
+    fn transfers(&mut self, slot: usize, ep: usize) -> Result<Served, DeviceError> {
         for _ in 0..BUDGET {
             if self.state.interrupters[self.interrupter].pending.len() >= BUDGET {
                 break;
             }
+            if self.reads == 0 {
+                return Ok(Served::Spent);
+            }
+            // A TD walked from a whole poll's reads gets no more by waiting.
+            let whole = self.reads == POLL_READS;
+            let mut cut = false;
             let endpoint = &self.state.slots[slot].endpoints[ep];
             if !self.state.slots[slot].enabled || !matches!(endpoint.context[0] & 7, 1 | 3) {
                 break;
@@ -882,8 +942,13 @@ impl XhciController {
             let control = ep == 1;
             let mut finished = false;
             for _ in 0..BUDGET {
-                let Some((addr, t)) = ring.pop(&self.mem)? else {
-                    break;
+                let (addr, t) = match ring.pop_within(&self.mem, &mut self.reads)? {
+                    Pop::Trb(addr, t) => (addr, t),
+                    Pop::Empty => break,
+                    Pop::Spent => {
+                        cut = true;
+                        break;
+                    }
                 };
                 td.push((addr, t));
                 if (control && t.kind() == 4 && t.control & 16 == 0)
@@ -894,11 +959,17 @@ impl XhciController {
                     break;
                 }
             }
+            if cut && !(whole && !td.is_empty()) {
+                return Ok(Served::Cut);
+            }
             if td.is_empty() {
                 break;
             }
             if !finished {
-                if td.len() < BUDGET {
+                // An unfinished TD waits for the guest to queue the rest,
+                // unless it is longer than the controller walks at all: in
+                // TRBs, or in the reads of one whole poll.
+                if td.len() < BUDGET && !cut {
                     break;
                 }
                 let context = endpoint.context[0];
@@ -1089,7 +1160,7 @@ impl XhciController {
                 break;
             }
         }
-        Ok(())
+        Ok(Served::Idle)
     }
     fn transfer_event(
         &mut self,

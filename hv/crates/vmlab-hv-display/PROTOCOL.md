@@ -155,7 +155,9 @@ framebuffer pixels and may be negative.
 ### CpuCopy, kind 7
 
 Payload: `surface_id: u64 @0`. Total length 16. No fds. Client to server.
-The ID must name the latest configure. The server captures the current source,
+The ID must name the latest configure. Surface IDs start at 1, so before the
+first configure, and on a connection without frames, every CpuCopy closes the
+connection and captures nothing. The server captures the current source,
 performs synchronized CPU readback through `FrameSource::readback` for dma-buf,
 sends a shm configure when needed, and publishes
 a full frame. The connection then remains in CPU mode. Other clients retain
