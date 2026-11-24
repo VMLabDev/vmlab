@@ -44,6 +44,8 @@ OUT=$(cd "$3" && pwd)
 shift 3
 CASES=${*:-unknown-blob mappable not-mappable shareable}
 COUNT=${PRESENT_COUNT:-1}
+# PRESENT_EXPLORE=1 tries each form of the present request once and records the statuses.
+EXTRA=; [ -z "${PRESENT_EXPLORE:-}" ] || EXTRA=",'--explore'"
 PROBE=$REPO/out/probes-extra/x64/present_probe.exe
 [ -f "$PROBE" ] || { echo "no $PROBE; run build/probes/build.sh present" >&2; exit 2; }
 VMLAB=${VMLAB:-vmlab}
@@ -125,7 +127,7 @@ for c in $CASES; do
     before=$(last_bugcheck); before=${before:-0}
     gps "Remove-Item '$GUEST\\out\\$c.json' -ErrorAction SilentlyContinue" 60
     rc=0
-    gps "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path '$GUEST\\present_probe.exe' -Raw -NoModules -Name 'present-$c' -OutDir '$GUEST\\run' -TimeoutSec 120 -ArgumentList '--case','$c','--count','$COUNT','--out','$GUEST\\out\\$c.json'; exit \$LASTEXITCODE" 420 >"$OUT/$c.run.txt" 2>&1 || rc=$?
+    gps "& 'C:\\win3d\\guest\\Run-Probe.ps1' -Path '$GUEST\\present_probe.exe' -Raw -NoModules -Name 'present-$c' -OutDir '$GUEST\\run' -TimeoutSec 120 -ArgumentList '--case','$c','--count','$COUNT','--out','$GUEST\\out\\$c.json'$EXTRA; exit \$LASTEXITCODE" 420 >"$OUT/$c.run.txt" 2>&1 || rc=$?
     sleep 5
     if ! in_lab "$VMLAB" exec --user SYSTEM --timeout 20 "$VM" -- cmd.exe /c ver >/dev/null 2>&1; then
         note "$c: the guest went away; waiting for it to come back"
