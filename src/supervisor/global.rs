@@ -775,6 +775,10 @@ impl GlobalSegments {
     /// changes nothing: it cannot take the segment from the labs on it.
     pub async fn detach(self: &Arc<Self>, name: &str, lab: Option<&str>) {
         let mut segs = self.segs.lock().await;
+        Self::detach_locked(&mut segs, name, lab);
+    }
+
+    fn detach_locked(segs: &mut HashMap<String, GlobalSeg>, name: &str, lab: Option<&str>) {
         if let Some(seg) = segs.get_mut(name) {
             if !seg.holders.give_back(lab) {
                 tracing::debug!(
@@ -870,8 +874,14 @@ impl GlobalSegments {
         let name = name.to_string();
         tokio::spawn(async move {
             let _ = bridge.await;
-            trunks.clear(remote.ip());
-            me.detach(&name, None).await;
+            let mut segs = me.segs.lock().await;
+            if segs
+                .get(&name)
+                .is_some_and(|seg| Arc::ptr_eq(&seg.trunks, &trunks))
+            {
+                trunks.clear(remote.ip());
+                Self::detach_locked(&mut segs, &name, None);
+            }
         });
         Ok(())
     }
@@ -1683,7 +1693,13 @@ mod tests {
 
     async fn lookup(g: &Arc<GlobalSegments>, seg: &str, name: &str) -> crate::net::dns::DnsAnswer {
         let segs = g.segs.lock().await;
-        let zone = segs[seg].services.as_ref().unwrap().gateway.dns_zone().expect("zone");
+        let zone = segs[seg]
+            .services
+            .as_ref()
+            .unwrap()
+            .gateway
+            .dns_zone()
+            .expect("zone");
         zone.lock().expect("zone lock").lookup(name)
     }
 
