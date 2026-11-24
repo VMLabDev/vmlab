@@ -1242,6 +1242,11 @@ impl super::UsbDevice for Recorder {
         match (setup.request_type & 0x60, setup.request) {
             // SET_ADDRESS and SET_CONFIGURATION.
             (0x00, 5 | 9) => super::UsbTransfer::Ack(Vec::new()),
+            // GET_DESCRIPTOR stays in flight, on endpoint 0.
+            (0x00, 6) => {
+                self.transfers.lock().unwrap().push(0);
+                super::UsbTransfer::Nak
+            }
             _ => super::UsbTransfer::Stall,
         }
     }
@@ -1344,6 +1349,100 @@ fn every_endpoint_teardown_reaches_the_backend() {
             dropped.lock().unwrap()
         );
     }
+}
+
+/// A [`Recorder`] on root port 6, addressed, with a GET_DESCRIPTOR on its
+/// control endpoint (DCI 1) that the backend keeps in flight. Returns what
+/// the backend was told was dropped, emptied of what the setup reported.
+fn control_transfer_in_flight(d: &mut Driver) -> Arc<Mutex<Vec<u8>>> {
+    let transfers = Arc::new(Mutex::new(Vec::new()));
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    d.hc.attach(
+        6,
+        Box::new(Recorder {
+            transfers: transfers.clone(),
+            dropped: dropped.clone(),
+        }),
+    )
+    .unwrap();
+    d.start();
+    d.write(0x490, 0x210);
+    assert_eq!(d.event(34).parameter, 6 << 24);
+    let t = d.command(9, 0, 0);
+    assert_eq!(t.status >> 24, 1);
+    d.slot = t.control >> 24;
+    d.mem64(0x4000 + u64::from(d.slot) * 8, 0x5000);
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 3);
+    d.mem32(0x6020, (3 << 20) | (1 << 27));
+    d.mem32(0x6024, 6 << 16);
+    d.mem32(0x6044, (4 << 3) | (64 << 16));
+    d.mem64(0x6048, 0x7001);
+    assert_eq!(d.command(11, 0x6000, d.slot << 24).status >> 24, 1);
+    // GET_DESCRIPTOR(Device): Setup, Data IN, Status.
+    d.trb(
+        0x7000,
+        u64::from_le_bytes([0x80, 6, 0, 1, 0, 0, 18, 0]),
+        8,
+        (2 << 10) | 64 | (3 << 16),
+    );
+    d.trb(0x7010, 0x9000, 18, (3 << 10) | (1 << 16));
+    d.trb(0x7020, 0, 0, (4 << 10) | 32);
+    d.write(0x2000 + u64::from(d.slot) * 4, 1);
+    d.hc.poll();
+    assert!(
+        transfers.lock().unwrap().contains(&0),
+        "the control transfer never reached the backend"
+    );
+    dropped.lock().unwrap().clear();
+    dropped
+}
+
+/// F8 of docs/reviews/usb.md. A backend keeps the control transfer under
+/// endpoint address 0. Stop Endpoint and Set TR Dequeue Pointer on the
+/// control endpoint (DCI 1), which is what a Linux guest does after a
+/// control timeout, must reach the backend as `endpoint_dropped(0)`: under
+/// any other address the old URB stays and answers the next request.
+#[test]
+fn stopping_the_control_endpoint_discards_its_transfer() {
+    let mut d = Driver::new();
+    let dropped = control_transfer_in_flight(&mut d);
+
+    // Stop Endpoint. The TD in flight is reported stopped first.
+    d.trb(d.command, 0, 0, (15 << 10) | (d.slot << 24) | (1 << 16));
+    d.command += 16;
+    d.write(0x2000, 0);
+    assert_eq!(d.event(32).status >> 24, 26);
+    assert_eq!(d.event(33).status >> 24, 1);
+    assert_eq!(
+        *dropped.lock().unwrap(),
+        [0],
+        "Stop Endpoint on the control endpoint"
+    );
+
+    dropped.lock().unwrap().clear();
+    assert_eq!(
+        d.command(16, 0x7101, (d.slot << 24) | (1 << 16)).status >> 24,
+        1
+    );
+    assert_eq!(
+        *dropped.lock().unwrap(),
+        [0],
+        "Set TR Dequeue Pointer on the control endpoint"
+    );
+}
+
+/// F8: Reset Device ends the control endpoint's transfer too.
+#[test]
+fn resetting_the_device_discards_the_control_transfer() {
+    let mut d = Driver::new();
+    let dropped = control_transfer_in_flight(&mut d);
+    assert_eq!(d.command(17, 0, d.slot << 24).status >> 24, 1);
+    assert!(
+        dropped.lock().unwrap().contains(&0),
+        "Reset Device left the control transfer in flight: saw {:02x?}",
+        dropped.lock().unwrap()
+    );
 }
 
 /// Bulk endpoints on every DCI from 2 to 31 of the tablet's slot, each with

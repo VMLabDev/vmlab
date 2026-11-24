@@ -1268,6 +1268,64 @@ mod tests {
         assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Nak);
     }
 
+    /// F13 of docs/reviews/usb.md: SET_CONFIGURATION puts every interface
+    /// of the device back at alt setting 0, so the endpoint table is that
+    /// of alt setting 0 and not of the alt setting the guest chose before.
+    #[test]
+    fn set_configuration_resets_alternate_settings() {
+        let fake = FakeUsbFs::with_distinct_alt_setting();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(
+            control(&mut host, set_interface(0, 1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        // Alt setting 1 has endpoint 0x05 and lacks 0x02.
+        assert_eq!(host.transfer(0x02, b"ping", 64), UsbTransfer::Stall);
+        assert_eq!(host.transfer(0x05, b"ping", 64), UsbTransfer::Nak);
+
+        assert_eq!(
+            control(&mut host, set_config(1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        // The device was told, or its interface is still at alt setting 1.
+        assert_eq!(fake.calls().set_configurations, vec![1]);
+        assert!(host.alt_settings.is_empty());
+        assert_eq!(
+            host.transfer(0x05, b"ping", 64),
+            UsbTransfer::Stall,
+            "an endpoint only alt setting 1 has"
+        );
+        assert_eq!(
+            host.transfer(0x02, b"ping", 64),
+            UsbTransfer::Nak,
+            "an endpoint only alt setting 0 has"
+        );
+        assert_eq!(
+            fake.submitted_payloads().last(),
+            Some(&(0x02, b"ping".to_vec()))
+        );
+    }
+
+    /// F8 of docs/reviews/usb.md, the backend's half: the control transfer
+    /// is kept under endpoint 0, which is what the controller reports when
+    /// the guest stops the control endpoint. The old URB's answer, already
+    /// complete, does not answer the next, different request.
+    #[test]
+    fn a_dropped_control_transfer_does_not_answer_the_next_request() {
+        let (mut host, fake) = device();
+        // GET_STATUS, completed by the device but not collected.
+        fake.complete_with(Completion::Data(b"old".to_vec()));
+        assert_eq!(host.control(setup(0x80, 0, 0, 0, 2), &[]), UsbTransfer::Nak);
+        fake.run_irq();
+        host.endpoint_dropped(0);
+        // GET_DESCRIPTOR(String) is a URB of its own.
+        assert_eq!(
+            host.control(setup(0x80, 6, 3 << 8, 0, 255), &[]),
+            UsbTransfer::Nak
+        );
+        assert_eq!(fake.submitted_payloads().len(), 2);
+    }
+
     #[test]
     fn clear_feature_halt_clears_the_endpoint() {
         let (mut host, fake) = device();
