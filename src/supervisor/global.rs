@@ -667,6 +667,9 @@ impl GlobalSegments {
         lab: Option<Joining>,
     ) -> Result<(PathBuf, Vec<String>, Ipv4Net)> {
         check_segment_name(name)?;
+        if peer.is_some() && worktree_segment_base(name).is_some() {
+            bail!("worktree global segment {name:?} cannot connect to a peer");
+        }
         let peer = peer
             .map(|peer| self.require_psk().map(|psk| (peer, psk)))
             .transpose()?;
@@ -683,7 +686,7 @@ impl GlobalSegments {
             Some(subnet) => {
                 if let Some((other, seg)) = segs
                     .iter()
-                    .find(|(_, seg)| subnets_overlap(subnet, seg.subnet))
+                    .find(|(other, seg)| global_subnets_conflict(name, subnet, other, seg.subnet))
                 {
                     bail!(
                         "global segment \"{name}\" subnet {subnet} overlaps \"{other}\" ({})",
@@ -844,7 +847,9 @@ impl GlobalSegments {
         let subnet = subnet.trunc();
         if let Some((other, seg)) = segs
             .iter()
-            .find(|(other, seg)| other.as_str() != name && subnets_overlap(subnet, seg.subnet))
+            .find(|(other, seg)| {
+                other.as_str() != name && global_subnets_conflict(name, subnet, other, seg.subnet)
+            })
         {
             tracing::warn!(
                 "refusing trunk from {remote} for global segment {name:?}: subnet {subnet} overlaps segment {other:?} ({})",
@@ -1078,6 +1083,20 @@ fn subnets_overlap(a: Ipv4Net, b: Ipv4Net) -> bool {
     a.contains(&b.network()) || b.contains(&a.network())
 }
 
+fn worktree_segment_base(name: &str) -> Option<&str> {
+    let (base, worktree) = name.split_once('@')?;
+    (!base.is_empty() && !worktree.is_empty()).then_some(base)
+}
+
+/// Worktree copies of the same global segment have separate switches and
+/// may use the same declared subnet (§21.4).
+fn global_subnets_conflict(name: &str, subnet: Ipv4Net, other: &str, other_subnet: Ipv4Net) -> bool {
+    let base = worktree_segment_base(name).unwrap_or(name);
+    let other_base = worktree_segment_base(other).unwrap_or(other);
+    subnets_overlap(subnet, other_subnet)
+        && (base != other_base || subnet.trunc() != other_subnet.trunc())
+}
+
 /// Refuse a global segment name that is not one file name. The name becomes
 /// `<sock_dir>/<name>.sock`, which is unlinked and bound, and a trunk peer
 /// sends its own: a separator, `..` or an absolute path would aim that at
@@ -1180,7 +1199,13 @@ pub async fn bind_peer_listener(
                 };
                 drop(slot);
                 // The peer chose this name, and it names a socket file.
-                if let Err(e) = check_segment_name(&segment) {
+                if let Err(e) = check_segment_name(&segment).and_then(|()| {
+                    anyhow::ensure!(
+                        worktree_segment_base(&segment).is_none(),
+                        "worktree global segment {segment:?} cannot accept a peer"
+                    );
+                    Ok(())
+                }) {
                     tracing::warn!("refusing a peer trunk: {e:#}");
                     let _ = stream.write_all(b"NO\n").await;
                     return;
@@ -1352,6 +1377,36 @@ mod tests {
         globals.detach("reused", None).await;
         globals.detach("auto", None).await;
         globals.detach("high", None).await;
+    }
+
+    #[tokio::test]
+    async fn worktree_globals_share_the_declared_subnet_on_separate_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let globals = globals_without_psk(dir.path().join("global"));
+        let declared = "10.214.0.0/24".parse().unwrap();
+        let mut sockets = std::collections::HashSet::new();
+        // A worktree may reconnect before the main lab after a restart.
+        for name in ["shared@first", "shared", "shared@second"] {
+            let (socket, warnings, subnet) = globals
+                .attach(name, Some(declared), None, None)
+                .await
+                .unwrap();
+            assert_eq!(subnet, declared);
+            assert!(warnings.is_empty());
+            assert!(sockets.insert(socket));
+        }
+        for (name, subnet) in [
+            ("unrelated@first", declared),
+            ("shared@third", "10.214.0.0/25".parse().unwrap()),
+        ] {
+            let error = globals
+                .attach(name, Some(subnet), None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("overlaps"));
+        }
+        let (_, _, automatic) = globals.attach("auto", None, None, None).await.unwrap();
+        assert_eq!(automatic.to_string(), "10.214.1.0/24");
     }
 
     #[tokio::test]
