@@ -578,6 +578,90 @@ mod tests {
         }
     }
 
+    /// The guest writes a record's text, and vmlab prints it among its own
+    /// status lines: no escape sequence or carriage return reaches the
+    /// terminal (review F13).
+    #[test]
+    fn log_text_has_no_control_characters() {
+        let hostile = "a\u{1b}]0;x\u{7}b\rc\td\u{9b}2Je\u{7f}";
+        for record in [
+            AppRecord::Log {
+                text: hostile.into(),
+            },
+            AppRecord::Diagnostic {
+                text: hostile.into(),
+            },
+        ] {
+            let text = log_text(&record, true).unwrap();
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\t'),
+                "{text:?}"
+            );
+            assert_eq!(text, "a\u{fffd}]0;x\u{fffd}b\u{fffd}c\td\u{fffd}2Je\u{fffd}");
+        }
+    }
+
+    /// A lab daemon that counts the requests it is sent and refuses each.
+    struct CountingLab(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::proto::server::Handler<LabRequest> for CountingLab {
+        async fn handle(
+            &self,
+            _req: LabRequest,
+            _stream: &crate::proto::server::Streamer,
+        ) -> Result<serde_json::Value, CommandError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CommandError::failed("the fake lab opens nothing"))
+        }
+    }
+
+    /// FreeRDP's `/app` rules decide from the command line alone whether an
+    /// argv can be carried. `machine.app_open` turns Remote Desktop on in the
+    /// guest and leaves it on, so the refusal comes before it (review F11).
+    #[tokio::test]
+    async fn an_argv_freerdp_cannot_carry_is_refused_before_the_open() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("lab.sock");
+        let sent = Arc::new(AtomicUsize::new(0));
+        let _server =
+            crate::proto::server::Server::bind(&sock, Arc::new(CountingLab(sent.clone())))
+                .await
+                .unwrap();
+        let client = LabClient::connect(&sock).await.unwrap();
+        let req = Request {
+            machine: "win".into(),
+            argv: vec!["notepad".into(), "it's.txt".into()],
+            cwd: None,
+            user: None,
+            password: None,
+            verbose: false,
+            clipboard: false,
+        };
+        let host = host(true, true, false, true);
+
+        let refusal = match attempt(&client, &req, Mode::Rdp, &host).await {
+            Err(e) => e.to_string(),
+            Ok(Attempt::Refused(e)) => panic!("the daemon was asked and refused: {}", e.message),
+            Ok(Attempt::Ran(code)) => panic!("the session ran and exited {code}"),
+        };
+        assert!(refusal.contains("FreeRDP's `/app` option"), "{refusal}");
+        assert_eq!(sent.load(Ordering::SeqCst), 0, "requests sent to the lab");
+
+        // An argv FreeRDP can carry does reach the daemon.
+        let req = Request {
+            argv: vec!["notepad".into()],
+            ..req
+        };
+        assert!(matches!(
+            attempt(&client, &req, Mode::Rdp, &host).await,
+            Ok(Attempt::Refused(_))
+        ));
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+    }
+
     fn host(wayland: bool, x11: bool, waypipe: bool, freerdp: bool) -> HostEnv {
         HostEnv {
             wayland,

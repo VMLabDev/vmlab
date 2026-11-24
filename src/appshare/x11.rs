@@ -715,6 +715,39 @@ mod tests {
         );
     }
 
+    /// `DISPLAY=localhost:10` is what an `ssh -X` login sets. `xauth` files
+    /// its cookie under `FamilyLocal` with the host's name, and that is where
+    /// an X client looks for a loopback peer (review F10).
+    #[test]
+    fn a_loopback_tcp_display_uses_the_local_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Xauthority");
+        std::fs::write(
+            &path,
+            xauth_record(
+                FAMILY_LOCAL,
+                hostname().as_bytes(),
+                "10",
+                MIT_MAGIC_COOKIE,
+                &HOST,
+            ),
+        )
+        .unwrap();
+        let d = HostDisplay::resolve("localhost:10", Some(&path)).unwrap();
+        assert_eq!(d.cookie, Some(HOST.to_vec()));
+    }
+
+    /// An entry whose display number is empty stands for every display, as
+    /// in libXau (review F10).
+    #[test]
+    fn an_entry_without_a_number_matches_every_display() {
+        let file = xauth_record(FAMILY_LOCAL, b"me", "", MIT_MAGIC_COOKIE, &HOST);
+        let entries = parse_xauthority(&file);
+        let key = CookieKey::Local { hostname: "me" };
+        assert_eq!(pick_cookie(&entries, 0, &key), Some(HOST.to_vec()));
+        assert_eq!(pick_cookie(&entries, 42, &key), Some(HOST.to_vec()));
+    }
+
     /// A missing Xauthority file is no cookie, so the connection is forwarded
     /// with empty auth for the server's host access to judge.
     #[test]
