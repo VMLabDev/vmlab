@@ -1760,6 +1760,7 @@ async fn dos_exec_opens_before_the_child_runs() -> Result<()> {
             env: vec![],
             cwd: None,
             logon: None,
+            tree: None,
         })?)
         .await?;
     let mut opened = false;
@@ -1798,7 +1799,9 @@ async fn dos_exec_environment_override_does_not_outlive_the_child() -> Result<()
     ensure(handle.info().os == "dos", "expected a DOS agent")?;
 
     async fn list(handle: &AgentHandle, env: Vec<(String, String)>) -> Result<Vec<u8>> {
-        let mut session = handle.open_exec(vec!["SET".into()], env, None, None).await?;
+        let mut session = handle
+            .open_exec(vec!["SET".into()], env, None, None)
+            .await?;
         let mut stdout = Vec::new();
         while let Some(event) = session.recv().await {
             match event {
@@ -1836,6 +1839,10 @@ async fn dos_exec_environment_override_does_not_outlive_the_child() -> Result<()
             && during.iter().any(|line| line == "VML847=set"),
         "DOS child did not receive both overrides",
     )?;
-    assert_eq!(lines(&after), lines(&before), "DOS agent environment changed");
+    assert_eq!(
+        lines(&after),
+        lines(&before),
+        "DOS agent environment changed"
+    );
     Ok(())
 }
