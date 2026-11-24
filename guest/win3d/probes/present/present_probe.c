@@ -160,6 +160,11 @@ typedef LONG (WINAPI *destroy_context_fn)(const destroy_context *);
 typedef LONG (WINAPI *create_allocation_fn)(create_allocation *);
 typedef LONG (WINAPI *present_fn)(void *);
 typedef LONG (WINAPI *close_fn)(const close_adapter *);
+/* dwmapi, export 100: has the compositor make the surface of a window on
+ * the adapter that the caller names. d3d9.dll calls it before the first
+ * windowed present: without it Windows answers the present with
+ * STATUS_GRAPHICS_PRESENT_OCCLUDED. */
+typedef HRESULT (WINAPI *dwm_surface_fn)(HWND, LUID, HMONITOR, DWORD, ULONG *, HANDLE *, UINT64 *);
 
 /* viogpu/shared/viogpum.h of the driver source. VIOGPU_ADAPTERINFO is not
  * packed there: four bytes of padding follow the flags. */
@@ -354,6 +359,7 @@ typedef struct {
     const char *result, *stage, *name, *expect;
     int selected, pass;
     LONG last_status, ctx_init_status, venus_status, create_allocation_status, first_present_status, last_present_status;
+    LONG window_surface_hresult;
     DWORD win32_error, session;
     uint64_t supported;
     uint32_t blob_flags, presents_asked, presents_done, presents_failed, presents_accepted;
@@ -368,6 +374,7 @@ static void emit(FILE *f, const result *r)
             "\"presents_asked\":%u,\"presents_done\":%u,\"presents_failed\":%u,\"presents_accepted\":%u,"
             "\"first_present_status\":\"0x%08lx\",\"last_present_status\":\"0x%08lx\","
             "\"create_allocation_status\":\"0x%08lx\",\"ctx_init_status\":\"0x%08lx\",\"venus_status\":\"0x%08lx\","
+            "\"window_surface_hresult\":\"0x%08lx\","
             "\"last_ntstatus\":\"0x%08lx\",\"win32_error\":%lu,\"supported_capset_ids\":\"0x%016llx\","
             "\"blob_mem\":%u,\"blob_flags\":%u,\"blob_id\":\"0x%016llx\",\"adapter\":",
             r->name ? r->name : "", r->expect ? r->expect : "", r->result, r->stage,
@@ -375,7 +382,7 @@ static void emit(FILE *f, const result *r)
             r->presents_asked, r->presents_done, r->presents_failed, r->presents_accepted,
             (unsigned long)r->first_present_status, (unsigned long)r->last_present_status,
             (unsigned long)r->create_allocation_status, (unsigned long)r->ctx_init_status,
-            (unsigned long)r->venus_status,
+            (unsigned long)r->venus_status, (unsigned long)r->window_surface_hresult,
             (unsigned long)r->last_status, (unsigned long)r->win32_error, (unsigned long long)r->supported,
             (unsigned)BLOB_MEM_HOST3D, r->blob_flags, (unsigned long long)r->blob_id);
     if (r->selected) fprintf(f, "{\"vendor_id\":\"0x%04x\",\"device_id\":\"0x%04x\"}", r->ids.vendor_id, r->ids.device_id);
@@ -474,12 +481,14 @@ int wmain(int argc, wchar_t **argv)
     r.last_status = enumerate(&adapters);
     if (r.last_status < 0) { free(adapters.adapters); FreeLibrary(gdi); goto done; }
     UINT matches = 0, adapter = 0;
+    LUID adapter_luid = {0};
     for (ULONG i = 0; i < adapters.count; ++i) {
         query_device_ids ids = {0};
         query_adapter q = {adapters.adapters[i].handle, QUERY_PHYSICAL_ADAPTER_DEVICE_IDS, &ids, sizeof(ids)};
         if (query(&q) >= 0 && ids.vendor_id == 0x1af4 && ids.device_id == 0x1050) {
             ++matches;
             adapter = adapters.adapters[i].handle;
+            adapter_luid = adapters.adapters[i].luid;
             r.ids = ids;
             r.selected = 1;
         }
@@ -574,6 +583,23 @@ int wmain(int argc, wchar_t **argv)
         goto destroy_context;
     }
     if (r.last_status < 0) goto destroy_context;
+
+    /* The surface of the window, on this adapter. Windows uses it as the
+     * destination of the present. */
+    {
+        HMODULE dwmapi = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        dwm_surface_fn dwm_surface = dwmapi ? (dwm_surface_fn)GetProcAddress(dwmapi, "DwmpDxGetWindowSharedSurface") : NULL;
+        ULONG format = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
+        HANDLE surface = NULL;
+        UINT64 update_id = 0;
+        r.stage = "window_surface";
+        r.window_surface_hresult = (LONG)0x80004001; /* E_NOTIMPL: no such export */
+        if (dwm_surface)
+            r.window_surface_hresult = dwm_surface(window, adapter_luid, MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY),
+                                                   0, &format, &surface, &update_id);
+        if (r.window_surface_hresult < 0) { r.last_status = r.window_surface_hresult; goto destroy_context; }
+        pump(200);
+    }
 
     /* A driver without the fix accepts the present, and the guest stops a
      * moment later: the file then says that a present was accepted. */
