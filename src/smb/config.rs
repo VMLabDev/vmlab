@@ -352,6 +352,9 @@ impl SmbConfig {
                 "    read only = {}\n",
                 if s.readonly { "yes" } else { "no" }
             ));
+            // Keep DOS archive attributes out of the host file's execute bits.
+            out.push_str("    create mask = 0644\n");
+            out.push_str("    map archive = no\n");
             // Scope the share to exactly its owning VM's account.
             out.push_str(&format!("    valid users = {}\n", s.allowed_user));
             out.push_str("    browseable = yes\n");

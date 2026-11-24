@@ -1866,7 +1866,7 @@ impl Backend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1910,7 +1910,7 @@ mod tests {
         assert_eq!(resource_budget(RESERVED_DESCRIPTORS), 0);
     }
 
-    struct TestMapper;
+    pub(in crate::virtio::gpu) struct TestMapper;
     impl BlobMapper for TestMapper {
         fn size(&self) -> u64 {
             APERTURE_SIZE
