@@ -19,6 +19,14 @@ use super::{CpuSample, Port};
 /// What the handshake calls this kernel.
 pub(super) const NAME: &str = "linux";
 
+pub(super) fn child_pids(pid: libc::pid_t) -> Vec<libc::pid_t> {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
 /// What a Linux agent serves beyond every Unix agent's set.
 pub(super) const FEATURES: &[&str] = &[
     features::WATCH,

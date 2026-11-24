@@ -28,6 +28,26 @@ use crate::darwin;
 /// What the handshake calls this kernel.
 pub(super) const NAME: &str = "macos";
 
+pub(super) fn child_pids(pid: libc::pid_t) -> Vec<libc::pid_t> {
+    // SAFETY: a null buffer queries the count. With a buffer, libproc
+    // writes at most the supplied byte length and returns a PID count.
+    let count = unsafe { libc::proc_listchildpids(pid, std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut children = vec![0; count as usize];
+    let count = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            children.as_mut_ptr().cast(),
+            std::mem::size_of_val(children.as_slice()) as libc::c_int,
+        )
+    };
+    children.truncate(count.max(0) as usize);
+    children.retain(|&child| child > 0);
+    children
+}
+
 /// Nothing beyond every Unix agent's set (see the module docs for why).
 pub(super) const FEATURES: &[&str] = &[];
 

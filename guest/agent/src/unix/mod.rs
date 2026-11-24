@@ -49,7 +49,7 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -662,34 +662,42 @@ struct ExecPlan {
 }
 
 /// Carry out an [`ExecPlan`].
-fn spawn_piped(plan: ExecPlan) -> std::io::Result<Spawned> {
-    spawn_piped_with(plan, |_| {})
+fn spawn_piped(plan: ExecPlan, pam_wrapper: bool) -> std::io::Result<Spawned> {
+    spawn_piped_with(plan, pam_wrapper, |_| {})
 }
 
 /// Carry out an [`ExecPlan`], with `extra` preparing the command last.
-fn spawn_piped_with(plan: ExecPlan, extra: impl FnOnce(&mut Command)) -> std::io::Result<Spawned> {
+fn spawn_piped_with(
+    plan: ExecPlan,
+    pam_wrapper: bool,
+    extra: impl FnOnce(&mut Command),
+) -> std::io::Result<Spawned> {
     let ExecPlan {
         spec,
         credentials,
         fresh_env,
     } = plan;
-    piped_command(spec, |cmd| {
-        if fresh_env {
-            cmd.env_clear();
-        }
-        if let Some(credentials) = credentials {
-            // SAFETY: `pre_exec` runs between fork and exec, which is exactly
-            // `apply`'s contract; its group list was allocated here, before
-            // the fork.
-            unsafe {
-                cmd.pre_exec(move || match credentials.apply() {
-                    true => Ok(()),
-                    false => Err(std::io::Error::last_os_error()),
-                })
-            };
-        }
-        extra(cmd);
-    })
+    piped_command(
+        spec,
+        |cmd| {
+            if fresh_env {
+                cmd.env_clear();
+            }
+            if let Some(credentials) = credentials {
+                // SAFETY: `pre_exec` runs between fork and exec, which is exactly
+                // `apply`'s contract; its group list was allocated here, before
+                // the fork.
+                unsafe {
+                    cmd.pre_exec(move || match credentials.apply() {
+                        true => Ok(()),
+                        false => Err(std::io::Error::last_os_error()),
+                    })
+                };
+            }
+            extra(cmd);
+        },
+        pam_wrapper,
+    )
 }
 
 /// The shell spawn, resolved: what to run, as whom, and where. `argv` is
@@ -748,7 +756,8 @@ impl Spawner for UnixSpawner {
 
     fn exec(&self, identity: &Identity, spec: ProcessSpec) -> std::io::Result<Spawned> {
         let held = self.logins.resolve(identity)?;
-        let mut plan = self.exec_plan(&self.route(&held), spec)?;
+        let route = self.route(&held);
+        let mut plan = self.exec_plan(&route, spec)?;
         // The shepherd wraps the whole plan, `su` and the container
         // trampoline included, so whatever they start is in the tree too.
         let spawned = match plan.spec.tree.take() {
@@ -763,7 +772,7 @@ impl Spawner for UnixSpawner {
                     format!("process tree {tree}: process trees need a Linux or Windows guest"),
                 ));
             }
-            None => spawn_piped(plan)?,
+            None => spawn_piped(plan, matches!(route, Route::Pam(..)))?,
         };
         Ok(hold_until_it_exits(spawned, held))
     }
@@ -1105,13 +1114,75 @@ fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
     Some(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as libc::c_int) })
 }
 
-/// The kill hook for a child that has not been reaped yet: resolved now,
-/// so it can never reach a later holder of the pid.
-pub fn process_killer(pid: u32) -> Box<dyn Fn() + Send + Sync> {
-    let process = ProcessRef::open(pid);
-    Box::new(move || {
-        process.signal(Signal::SIGKILL);
-    })
+/// An exec starts in its own process group, including across the container
+/// trampoline's fork into the PID namespace.
+pub(crate) struct ExecGroup {
+    leader: libc::pid_t,
+    pam_wrapper: bool,
+    reaped: Mutex<bool>,
+}
+
+impl ExecGroup {
+    pub(crate) fn new(pid: u32, pam_wrapper: bool) -> Self {
+        Self {
+            leader: pid as libc::pid_t,
+            pam_wrapper,
+            reaped: Mutex::new(false),
+        }
+    }
+
+    pub(crate) fn kill(&self) {
+        let reaped = self.reaped.lock().unwrap();
+        if *reaped {
+            return;
+        }
+
+        // su can put the login shell in a new session or process group.
+        // Stop su while looking up that child so it cannot fork or reap
+        // it between discovery and signalling.
+        if self.pam_wrapper
+            && kill(Pid::from_raw(self.leader), Signal::SIGSTOP).is_ok()
+            && wait_for_child_event(self.leader, libc::WSTOPPED | libc::WEXITED)
+        {
+            for child in os::child_pids(self.leader) {
+                let _ = kill(Pid::from_raw(child), Signal::SIGKILL);
+                let _ = kill(Pid::from_raw(-child), Signal::SIGKILL);
+            }
+        }
+        let _ = kill(Pid::from_raw(-self.leader), Signal::SIGKILL);
+    }
+
+    pub(crate) fn wait(&self, child: std::process::Child) -> i32 {
+        // Observe exit without reaping first, so close can safely signal
+        // the group while we wait. Reap under the same lock as kill.
+        wait_for_child_event(self.leader, libc::WEXITED);
+        let mut reaped = self.reaped.lock().unwrap();
+        let code = crate::spawn::wait_for_exit(child);
+        *reaped = true;
+        code
+    }
+}
+
+fn wait_for_child_event(pid: libc::pid_t, events: libc::c_int) -> bool {
+    // SAFETY: waitid initializes siginfo on success. WNOWAIT leaves the
+    // child waitable for Child::wait, which owns the final reap.
+    unsafe {
+        let mut info = std::mem::MaybeUninit::uninit();
+        loop {
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                events | libc::WNOWAIT,
+            ) == 0
+            {
+                return true;
+            }
+            if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
+                return false;
+            }
+        }
+    }
 }
 
 /// Utilisation between two cumulative (busy, total) samples, in percent.
@@ -1659,7 +1730,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut spawned = spawn_piped(plan).unwrap();
+        let mut spawned = spawn_piped(plan, false).unwrap();
         let mut out = String::new();
         spawned.output.read_to_string(&mut out).unwrap();
         assert_eq!((spawned.wait)(), 0);
