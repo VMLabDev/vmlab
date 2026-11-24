@@ -8755,15 +8755,28 @@ lab "t" {
                 crate::config::model::MachineCfg::Container(_) => MachineKind::Container,
             };
             let mut machine = Arc::into_inner(FakeMachine::new(cfg.name(), kind, &sh)).unwrap();
-            machine.macs = vec![cfg.nics()[0].mac.unwrap_or_else(|| {
-                crate::labd::state::generate_mac("t", cfg.name(), 0)
-            })];
+            machine.nics = cfg.nics().to_vec();
+            machine.macs = cfg
+                .nics()
+                .iter()
+                .enumerate()
+                .map(|(index, nic)| {
+                    nic.mac
+                        .unwrap_or_else(|| crate::labd::state::generate_mac("t", cfg.name(), index))
+                })
+                .collect();
             Arc::new(machine)
         };
         let file = edited(dir, source);
         let web = build(file.lab.machine("web").unwrap());
         let macs = HashMap::from([("web".to_string(), web.macs.clone())]);
-        let lab = lab_of(dir, source, vec![web.clone()]);
+        let mut machines: Vec<Arc<dyn Machine>> = vec![web.clone()];
+        if let Some(cfg) = file.lab.machine("keeper") {
+            let mut machine = Arc::into_inner(build(cfg)).unwrap();
+            *machine.state.get_mut() = PowerState::Running;
+            machines.push(Arc::new(machine));
+        }
+        let lab = lab_of(dir, source, machines);
         lab.network.lock().await.wire_gateways(
             &lab.config().lab,
             &macs,
@@ -8802,7 +8815,11 @@ lab "t" {
             return;
         };
         crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
-        let gateway = original.smb_gateway.lock().await.expect("initial SMB gateway");
+        let gateway = original
+            .smb_gateway
+            .lock()
+            .await
+            .expect("initial SMB gateway");
         let changed = source.replace("image = \"alpine\"", "image = \"alpine\" cpus = 2");
         lab.reload_with(edited(dir.path(), &changed)).await.unwrap();
         let new = rebuilt.lock().unwrap().clone().expect("rebuilt container");
@@ -8817,10 +8834,12 @@ lab "t" {
         use crate::net::rules::Verdict;
         let _ports = SMB_TEST_PORTS.lock().await;
         let dir = tempfile::tempdir().unwrap();
-        let source = SMB_LAB.replace(
-            "segment = \"corp\"",
-            "segment = \"corp\" mac = \"02:00:00:00:00:01\"",
-        );
+        let source = SMB_LAB
+            .replace("  vm \"web\"", "  container \"keeper\" { image = \"alpine\" }\n  vm \"web\"")
+            .replace(
+                "segment = \"corp\"",
+                "segment = \"corp\" mac = \"02:00:00:00:00:01\"",
+            );
         let Some((lab, original, rebuilt)) = smb_test_lab(dir.path(), &source).await else {
             return;
         };
@@ -8830,6 +8849,12 @@ lab "t" {
             let segment = &net.segments["corp"];
             (segment.services.clone().unwrap(), segment.service_ip)
         };
+        // Direct NIC edits require a fresh daemon. Removing and re-adding
+        // this stopped VM is allowed, and the running keeper retains SMB.
+        let (without_web, _) = source.split_once("  vm \"web\"").unwrap();
+        lab.reload_with(edited(dir.path(), &format!("{without_web}}}")))
+            .await
+            .unwrap();
         let changed = source.replace("02:00:00:00:00:01", "02:00:00:00:00:02");
         lab.reload_with(edited(dir.path(), &changed)).await.unwrap();
         let new = rebuilt.lock().unwrap().clone().expect("rebuilt VM");
@@ -8849,11 +8874,18 @@ lab "t" {
                 options: &[],
             },
             &[],
-        ).unwrap();
+        )
+        .unwrap();
         let packet = frame::ipv4_build(guest, gateway, frame::IPPROTO_TCP, 64, &tcp, 0).unwrap();
         let rules = services.rules.lock().unwrap();
-        assert!(matches!(rules.eval_from(Some(new.macs[0]), &packet), Verdict::Rewrite(_)));
-        assert_eq!(rules.eval_from(Some(original.macs[0]), &packet), Verdict::Pass);
+        assert!(matches!(
+            rules.eval_from(Some(new.macs[0]), &packet),
+            Verdict::Rewrite(_)
+        ));
+        assert_eq!(
+            rules.eval_from(Some(original.macs[0]), &packet),
+            Verdict::Pass
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
