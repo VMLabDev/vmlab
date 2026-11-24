@@ -767,4 +767,35 @@ mod tests {
         );
         assert!(parse(&s).is_err());
     }
+
+    /// The text of review finding F5 (`docs/reviews/tcg.md`): `levels` nested
+    /// struct literals whose operands each carry `suffixes` field accesses.
+    fn suffixed_structs(levels: usize, suffixes: usize) -> String {
+        let mut expr = String::from("x");
+        for _ in 0..levels {
+            expr = format!("struct s {{ a = {expr}{} }}", ".a".repeat(suffixes));
+        }
+        format!("val f : (%unit) -> %unit\nfn f(x) {{ y : %unit; y = {expr}; return = (); end; }}")
+    }
+
+    #[test]
+    fn deep_suffix_chains_are_refused() {
+        // Each count is inside its own limit, and the tree is about 14,000
+        // levels deep: every pass that walks an expression by recursion
+        // would overflow its stack on it.
+        let error = parse(&suffixed_structs(120, 120)).unwrap_err();
+        assert_eq!(error.message, "expression depth limit exceeded");
+    }
+
+    #[test]
+    fn the_depth_limit_counts_nesting_and_suffixes_together() {
+        // Level `n` from the inside is `n * (1 + suffixes)` levels above the
+        // innermost operand, which is itself one level.
+        assert!(parse(&suffixed_structs(1, 126)).is_ok());
+        assert!(parse(&suffixed_structs(1, 127)).is_err());
+        assert!(parse(&suffixed_structs(63, 1)).is_ok());
+        assert!(parse(&suffixed_structs(64, 1)).is_err());
+        assert!(parse(&suffixed_structs(127, 0)).is_ok());
+        assert!(parse(&suffixed_structs(128, 0)).is_err());
+    }
 }
