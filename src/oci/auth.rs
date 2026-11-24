@@ -308,6 +308,13 @@ pub fn store_login_at(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
+    // A config that is a symlink (a dotfile manager's) is written through:
+    // the rename below replaces the file the link names, and the link stays.
+    let target = follow_symlinks(path)?;
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
     // The file is Docker's and the user's: other registries' credentials,
     // `credHelpers`, proxies. One this cannot read as a JSON object is left
     // exactly as it is and the login refused, never replaced by an empty one.
@@ -347,7 +354,7 @@ pub fn store_login_at(
     // A temporary file of its own name, private (0600) from its creation:
     // two logins at once do not share it, and the password is at no moment
     // readable by another local user, whatever mode the old file had.
-    let parent = match path.parent() {
+    let parent = match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => std::path::Path::new("."),
     };
@@ -361,15 +368,94 @@ pub fn store_login_at(
         let written = temp.write_all(format!("{text}\n").as_bytes());
         written.with_context(|| format!("cannot write {}", temp.path().display()))?;
     }
-    temp.persist(path)
+    temp.persist(&target)
         .map_err(|error| error.error)
-        .with_context(|| format!("cannot replace {}", path.display()))?;
+        .with_context(|| format!("cannot replace {}", target.display()))?;
     Ok(())
+}
+
+/// The file `path` names once every symlink on it is followed, a link at a
+/// time so that one whose target does not exist yet still resolves (the
+/// login then creates that target). A relative target is read from the
+/// link's own directory.
+fn follow_symlinks(path: &std::path::Path) -> Result<PathBuf> {
+    // The kernel's own limit on a chain of links (`MAXSYMLINKS`).
+    const MAX_LINKS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = std::fs::read_link(&current)
+                    .with_context(|| format!("cannot read the link {}", current.display()))?;
+                current = match current.parent() {
+                    Some(dir) if link.is_relative() => dir.join(link),
+                    _ => link,
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    bail!(
+        "{} is a chain of more than {MAX_LINKS} symlinks; the login was not stored",
+        path.display()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn login_writes_through_a_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("config.json");
+        let other = serde_json::json!({ "auths": { "quay.io": { "auth": "eDp5" } } });
+        std::fs::write(&target, serde_json::to_string(&other).unwrap()).unwrap();
+        std::os::unix::fs::symlink("target.json", &link).unwrap();
+
+        store_login_at(&link, "ghcr.io", "me", "tok").unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "the link was replaced");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("target.json")
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
+        assert_eq!(written["auths"]["quay.io"]["auth"], "eDp5");
+        assert_eq!(
+            resolve_from_file("ghcr.io", &link).unwrap(),
+            Credential::Basic {
+                username: "me".into(),
+                password: "tok".into()
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_through_a_dangling_symlink_creates_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.json");
+        let target = dir.path().join("dotfiles").join("docker.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        store_login_at(&link, "ghcr.io", "me", "tok").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written["auths"]["ghcr.io"]["auth"], BASE64.encode("me:tok"));
+    }
 
     #[test]
     fn parses_base64_auth_and_builds_header() {

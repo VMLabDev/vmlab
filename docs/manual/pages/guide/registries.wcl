@@ -217,8 +217,9 @@ page guide_registries {
 
   p <<DOC
     For a machine with no Docker tooling, `vmlab template login <registry>
-    --username <user> --password <secret>` validates the credential against
-    the registry and stores it in the same Docker config file, so a later
+    --username <user> --password-stdin` reads the secret from standard input,
+    validates the credential against the registry and stores it in the same
+    Docker config file (through the symlink when the file is one), so a later
     push or pull finds it.
   DOC
 
