@@ -131,6 +131,16 @@ fn the_seed_csr_returns_entropy() {
     // hand the guest the same 16 bits again.
     assert_ne!(first, second);
 
+    // The embedder owns the source: the same state gives the same reads.
+    let mut again = reading_seed();
+    again.interpreter.entropy = 7;
+    again.step().unwrap();
+    let mut reference = reading_seed();
+    reference.interpreter.entropy = 7;
+    reference.step().unwrap();
+    assert_eq!(again.gpr(10).unwrap(), reference.gpr(10).unwrap());
+    assert_ne!(again.gpr(10).unwrap(), first);
+
     // The trace specialiser takes the same two instructions the same way.
     let mut specialized = reading_seed();
     specialized.specialize = true;
@@ -151,9 +161,7 @@ fn call_serves_every_function_the_model_does_not_define() {
         .chain(&program.initializers)
         .flat_map(|function| &function.code)
         .filter_map(|op| match op {
-            Op::Call(_, Target::Function(name), _)
-                if !program.functions.contains_key(name) =>
-            {
+            Op::Call(_, Target::Function(name), _) if !program.functions.contains_key(name) => {
                 Some(name.as_str())
             }
             _ => None,
