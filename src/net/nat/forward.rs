@@ -22,6 +22,11 @@ pub struct PortForwarder;
 /// expiry as an outbound UDP flow.
 const UDP_PEER_IDLE: Duration = Duration::from_secs(60);
 
+/// How many connections one TCP forward holds at once (review networking-2
+/// F28): the limit the proof test states. Nothing holds a forward to it yet.
+#[cfg(test)]
+pub(super) const MAX_TCP_PER_FORWARD: usize = 128;
+
 /// A non-blocking TCP listener on `listen`, bound the way
 /// [`TcpListener::bind`] binds one (`SO_REUSEADDR`, so a port whose last
 /// connections sit in `TIME_WAIT` can be listened on again) but

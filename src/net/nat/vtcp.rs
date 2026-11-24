@@ -91,6 +91,11 @@ const DUPLEX_CAPACITY: usize = 64 * 1024;
 /// window's worth: past that the guest cannot legally have more in flight, so a
 /// bigger buffer would only hold data we will never be able to stitch up.
 const OOO_MAX_BYTES: usize = WINDOW as usize;
+/// Segments held per flow while waiting for a missing segment (review
+/// networking-2 F23): the limit the proof test states. Nothing holds the
+/// queue to it yet.
+#[cfg(test)]
+const OOO_MAX_SEGMENTS: usize = 256;
 
 /// Identity of a vTCP flow as seen from the guest side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -343,6 +348,10 @@ struct Flow {
     ooo: BTreeMap<u32, Vec<u8>>,
     /// Bytes currently held in `ooo`, capped at [`OOO_MAX_BYTES`].
     ooo_bytes: usize,
+    /// Queue entries [`Flow::drain_ooo`] has looked at, for the test of its
+    /// cost.
+    #[cfg(test)]
+    ooo_visits: usize,
     retries: u32,
     rto_at: Option<Instant>,
     last_activity: Instant,
@@ -375,6 +384,8 @@ impl Flow {
             unacked: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
+            #[cfg(test)]
+            ooo_visits: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -402,6 +413,8 @@ impl Flow {
             unacked: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
+            #[cfg(test)]
+            ooo_visits: 0,
             retries: 0,
             rto_at: None,
             last_activity: Instant::now(),
@@ -698,6 +711,10 @@ impl Flow {
     /// that does not fit whole stays queued for the next call.
     fn drain_ooo(&mut self, wr_open: bool) {
         loop {
+            #[cfg(test)]
+            {
+                self.ooo_visits += self.ooo.len();
+            }
             // Forget anything that ends at or before rcv_nxt — already taken.
             let stale: Vec<u32> = self
                 .ooo
@@ -1028,5 +1045,68 @@ mod unit {
         assert!(!seq_le(3, 2));
         assert!(seq_le(u32::MAX, 5), "wraparound");
         assert!(!seq_le(5, u32::MAX));
+    }
+
+    /// A passive flow whose guest's next byte is `rcv_nxt`, on an engine
+    /// nobody reads from.
+    fn flow_at(rcv_nxt: u32) -> Flow {
+        let gw_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let (tx, _rx) = mpsc::channel(1);
+        let engine = NatEngine::new(
+            super::super::NatConfig::new(gw_ip, MacAddr([2, 0, 0, 0, 0, 1])),
+            tx,
+        );
+        let key = FlowKey {
+            guest_ip: Ipv4Addr::new(10, 0, 0, 2),
+            guest_port: 40000,
+            dst_ip: Ipv4Addr::new(192, 0, 2, 1),
+            dst_port: 80,
+        };
+        let syn = Segment {
+            seq: rcv_nxt.wrapping_sub(1),
+            ack: 0,
+            flags: TCP_SYN,
+            window: 65535,
+            payload: Vec::new(),
+            mss: None,
+        };
+        Flow::new(engine, key, MacAddr([2, 0, 0, 0, 0, 2]), &syn)
+    }
+
+    /// Review networking-2 F23. A guest that sends one window of one-byte
+    /// segments ahead of the hole made the queue hold one entry for each,
+    /// and the byte that filled the hole then cost a scan of the whole queue
+    /// per entry taken.
+    #[tokio::test]
+    async fn the_out_of_order_queue_is_bounded_in_segments() {
+        let rcv_nxt = 1000;
+        let mut flow = flow_at(rcv_nxt);
+        for i in 0..60_000u32 {
+            flow.queue_ooo(rcv_nxt + 1 + i, &[0]);
+            assert!(
+                flow.ooo.len() <= OOO_MAX_SEGMENTS,
+                "the queue holds {} segments, over its limit of {OOO_MAX_SEGMENTS}",
+                flow.ooo.len()
+            );
+        }
+        // What is kept is what is stitched in first: the segments nearest
+        // the hole.
+        let queued = flow.ooo.len();
+        assert_eq!(queued, OOO_MAX_SEGMENTS);
+        assert_eq!(flow.ooo.keys().next(), Some(&(rcv_nxt + 1)));
+        assert_eq!(flow.ooo_bytes, queued);
+
+        // The byte at rcv_nxt arrives, as `on_segment` takes it.
+        assert_eq!(flow.accept(&[0], true), 1);
+        flow.drain_ooo(true);
+        assert_eq!(flow.rcv_nxt, rcv_nxt + 1 + queued as u32);
+        assert!(flow.ooo.is_empty());
+        assert_eq!(flow.ooo_bytes, 0);
+        assert_eq!(flow.to_host.len(), 1 + queued);
+        assert!(
+            flow.ooo_visits <= queued + 1,
+            "taking {queued} segments looked at {} queue entries",
+            flow.ooo_visits
+        );
     }
 }

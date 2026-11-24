@@ -1006,6 +1006,46 @@ async fn tcp_port_forward_end_to_end() {
     guest.await.unwrap();
 }
 
+/// Review networking-2 F28. Every connection to a forwarded port is a host
+/// socket, a task and a vTCP flow of the lab daemon, and whoever reaches the
+/// listener opens them: a forward holds no more than its share at once, and
+/// closes the rest.
+#[tokio::test]
+async fn forwarded_connections_are_bounded() {
+    use super::forward::MAX_TCP_PER_FORWARD;
+    use crate::sync::LockRecover;
+
+    let (engine, mut rx) = engine();
+    engine.learn_mac(GUEST_IP, GUEST_MAC);
+    // The guest never answers: read its SYNs away, so that each flow lasts
+    // for as long as the engine keeps trying.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fwd_addr = listener.local_addr().unwrap();
+    tokio::spawn(PortForwarder::serve_tcp(
+        listener,
+        engine.clone(),
+        GUEST_IP,
+        80,
+    ));
+
+    let mut peak = 0;
+    for _ in 0..2_000 {
+        // The client end is closed at once, which keeps this process under
+        // its own descriptor limit. The forward does not look at the host
+        // socket before the guest has answered, so its flow stays.
+        drop(TcpStream::connect(fwd_addr).await.unwrap());
+        tokio::task::yield_now().await;
+        peak = peak.max(engine.tcp_flows.lock_recover().len());
+    }
+    assert!(
+        peak <= MAX_TCP_PER_FORWARD,
+        "one forward held {peak} connections, over its limit of {MAX_TCP_PER_FORWARD}"
+    );
+    assert!(peak > 0, "the forward took no connection at all");
+}
+
 #[tokio::test]
 async fn udp_port_forward_end_to_end() {
     let (engine, mut rx) = engine();
