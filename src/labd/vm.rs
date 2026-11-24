@@ -1198,7 +1198,6 @@ impl VmInstance {
     ) -> Result<(Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>)> {
         let in_process = self.emulator().virtiofs_in_process();
         let mut served = Vec::new();
-        let mut procs = Vec::new();
         let mut devices = Vec::new();
         let mut mounts = Vec::new();
         let vfsd = self.emulator().virtiofsd();
@@ -1253,10 +1252,10 @@ impl VmInstance {
                     &self.dirs.logs.join(format!("virtiofsd{i}.log")),
                 )
                 .await?;
-            procs.push(proc);
+            // Register each daemon so teardown can stop it if a later share fails.
+            self.virtiofsd.lock().await.push(proc);
             devices.push((tag, sock));
         }
-        *self.virtiofsd.lock().await = procs;
         *self.virtiofs_mounts.lock().await = mounts;
         Ok((devices, served))
     }
@@ -1568,8 +1567,8 @@ impl VmInstance {
         let (proc, control) = match run.await {
             Ok(v) => v,
             Err(e) => {
-                *self.state.write().await = PowerState::Stopped;
                 self.teardown().await;
+                *self.state.write().await = PowerState::Stopped;
                 return Err(e);
             }
         };

@@ -1471,6 +1471,69 @@ async fn a_virtiofsd_that_dies_fails_the_start() {
     );
 }
 
+#[tokio::test]
+async fn a_failed_second_virtiofsd_stops_the_first() {
+    let dirs = Dirs::new();
+    let volumes = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let host = dirs.root.join(name);
+            std::fs::create_dir(&host).expect("volume dir");
+            (name.into(), host, false)
+        })
+        .collect();
+    let (ctr, hv) = container_with_volumes(
+        &dirs,
+        WORKLOAD,
+        Script {
+            virtiofsd_fails_on: Some(2),
+            ..Script::healthy()
+        },
+        volumes,
+    );
+    let (cbs, _observed) = callbacks();
+
+    let err = start_container(&ctr, cbs)
+        .await
+        .expect_err("start must fail");
+    assert!(
+        format!("{err:#}").contains("/second: virtiofsd failed on start 2"),
+        "{err:#}"
+    );
+    let live = hv.live_helpers().await;
+    assert!(
+        live.is_empty(),
+        "failed start left helpers running: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_second_virtiofsd_stops_the_first_for_a_vm() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+             share "first" { host = "./first" guest = "/mnt/first" transport = "virtiofs" }
+             share "second" { host = "./second" guest = "/mnt/second" transport = "virtiofs" } }"#,
+        Script {
+            virtiofsd_fails_on: Some(2),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, _observed) = callbacks();
+
+    let err = start_vm(&vm, cbs).await.expect_err("start must fail");
+    assert!(
+        format!("{err:#}").contains("virtiofsd failed on start 2"),
+        "{err:#}"
+    );
+    let live = hv.live_helpers().await;
+    assert!(
+        live.is_empty(),
+        "failed start left helpers running: {live:?}"
+    );
+}
+
 /// A virtiofsd older than `--migration-mode` (Ubuntu 24.04 ships 1.10.0)
 /// still serves a share: the VM starts, and only an online snapshot — which
 /// would need the daemon's state — is refused, naming the release that has
