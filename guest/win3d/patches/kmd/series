@@ -16,3 +16,4 @@ kmd-rotate-hardware-pointer.patch
 kmd-bound-host-scanout-count.patch
 kmd-check-capset-escape.patch
 kmd-check-submit-escape-size.patch
+kmd-scanout-only-for-its-owner.patch
