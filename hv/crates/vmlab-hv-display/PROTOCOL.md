@@ -282,9 +282,12 @@ messages on that connection, including Release.
 The built-in tablet also coalesces consecutive motion-only reports, retaining
 the position at each button or wheel transition. Its queue holds at most
 1024 reports. A full transition queue returns DeviceError::Io(WouldBlock)
-without consuming the event. The machine adapter retries that event outside
-controller locks until interrupt IN drains space or the machine exits.
-Tablet warnings occur at most once per five seconds.
+without consuming the event. The machine adapter offers each pointer event
+once and never waits for the guest, so a guest that does not read the tablet
+cannot hold back keys or the readers of other clients. The adapter keeps the
+latest position and buttons, and offers them again with the next input
+message of any kind. The wheel steps and button transitions refused in
+between are dropped. Tablet warnings occur at most once per five seconds.
 
 `serve_native(UnixStream)` and `serve_rfb(UnixStream)` run one connection until
 disconnect or error. Each uses a separate input reader. The caller controls
