@@ -58,6 +58,18 @@ endef
 
 $(foreach a,$(ARCHES),$(eval $(call submit_rules,$(a))))
 
+# Explicit test-only target, like tdr: the two ways of a program to the
+# scanout (card #755). A driver without the fix shows the probe's colour.
+scanout: $(foreach a,$(ARCHES),$(OUT)-extra/$(a)/scanout_probe.exe)
+
+define scanout_rules
+$(OUT)-extra/$(1)/scanout_probe.exe: scanout/scanout_probe.c
+	@mkdir -p $$(dir $$@)
+	$(triple_$(1))-clang $(CFLAGS) -mconsole -static -s -Wl,--no-insert-timestamp -o $$@ $$<
+endef
+
+$(foreach a,$(ARCHES),$(eval $(call scanout_rules,$(a))))
+
 $(BUILD)/gen/vulkan_shaders.h: vulkan/probe.vert vulkan/probe.frag
 	@mkdir -p $(dir $@)
 	glslangValidator -V --vn probe_vert_spv -o $(BUILD)/gen/vert.h vulkan/probe.vert
@@ -90,3 +102,4 @@ clean:
 
 .PHONY: all clean tdr
 .PHONY: submit
+.PHONY: scanout
