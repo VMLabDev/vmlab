@@ -16,8 +16,8 @@
 #   guest.txt   the display device, its driver version and problem code, the
 #               monitors Windows has, and the bugcheck events of the System log
 #   verdict.txt one line for each check
-# It passes (exit 0) when the host reported more than one scanout, the driver
-# asked for the EDID of scanout 0 only, the display device has problem code 0,
+# It passes (exit 0) when the host reported more than one scanout in the
+# newest start of the VM, the driver asked for the EDID of scanout 0 only, the display device has problem code 0,
 # Windows has one monitor on it, and the System log has no bugcheck event.
 # Exit 1 when a check fails, 2 on usage, 3 when the guest does not answer.
 set -u
@@ -31,11 +31,6 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 NAME=$(sed -n 's/^lab "\([^"]*\)".*/\1/p' "$LAB/vmlab.wcl" | head -1)
 HVLOG=${XDG_STATE_HOME:-$HOME/.local/state}/vmlab/labs/$NAME/vms/$VM/vmlab-hv.log
-
-grep 'forged host' "$HVLOG" > "$OUT/host.txt" 2>/dev/null
-reported=$(sed -n 's/.*num_scanouts = \([0-9]*\).*/\1/p' "$OUT/host.txt" | tail -1)
-asked_past=$(grep -c 'GET_EDID for scanout [1-9][0-9]* ' "$OUT/host.txt")
-answered_past=$(grep -c 'GET_EDID for scanout [1-9][0-9]* answered' "$OUT/host.txt")
 
 PS='$ErrorActionPreference = "Continue"
 $d = @(Get-PnpDevice -Class Display -PresentOnly | Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_1050*" })
@@ -61,6 +56,14 @@ for _ in 1 2 3 4 5 6; do
     fi
     sleep 20
 done
+
+# The host's lines of the newest start of the VM, read after the guest
+# answered: the driver has started by then.
+awk '/building machine/ { n = 0 } /forged host/ { line[n++] = $0 } END { for (i = 0; i < n; i++) print line[i] }' \
+    "$HVLOG" > "$OUT/host.txt" 2>/dev/null
+reported=$(sed -n 's/.*num_scanouts = \([0-9]*\).*/\1/p' "$OUT/host.txt" | tail -1)
+asked_past=$(grep -c 'GET_EDID for scanout [1-9][0-9]* ' "$OUT/host.txt")
+answered_past=$(grep -c 'GET_EDID for scanout [1-9][0-9]* answered' "$OUT/host.txt")
 
 check() { # check NAME STATUS DETAIL: one verdict line, PASS when STATUS is 0
     if [ "$2" = 0 ]; then echo "PASS $1: $3"; else echo "FAIL $1: $3"; fi
