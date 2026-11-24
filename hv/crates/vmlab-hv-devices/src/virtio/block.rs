@@ -174,6 +174,17 @@ impl<'a> GuestAccess<'a> {
     }
 }
 
+/// Marks the spans as written when the kernel has filled them.
+struct Written<'s, 'a>(&'s [Option<GuestSlice<'a>>]);
+
+impl Drop for Written<'_, '_> {
+    fn drop(&mut self) {
+        for slice in self.0.iter().flatten() {
+            slice.bitmap().mark_dirty(0, slice.len());
+        }
+    }
+}
+
 struct GuestReadTarget<'a, 'b> {
     access: GuestAccess<'a>,
     ranges: &'b [(GuestAddress, usize)],
@@ -242,11 +253,13 @@ impl vmlab_disk::ReadTarget for GuestReadTarget<'_, '_> {
             let mut bytes = 0;
             while count < BATCH && bytes < len {
                 let slice = self.next_span(len - bytes)?;
-                slice.bitmap().mark_dirty(0, slice.len());
                 bytes += slice.len();
                 slices[count] = Some(slice);
                 count += 1;
             }
+            // Told of the write after it, also when the read fails part way:
+            // a region that discards writes must see every one of them.
+            let _written = Written(&slices[..count]);
             let guards: [_; BATCH] =
                 std::array::from_fn(|i| slices[i].as_ref().map(|slice| slice.ptr_guard_mut()));
             let mut vectors: [_; BATCH] = std::array::from_fn(|i| libc::iovec {
