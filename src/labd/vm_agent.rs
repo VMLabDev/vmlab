@@ -3790,6 +3790,15 @@ mod tests {
                                         send_data(channel, chunk.to_vec()).await;
                                     }
                                 }
+                                // The channel fails on the guest's side,
+                                // behind whatever it had sent on it.
+                                if let Some(msg) = fs.ended.take() {
+                                    send(AgentMsg::Error {
+                                        id: Some(channel),
+                                        msg,
+                                    })
+                                    .await;
+                                }
                             } else if payload == b"exit\r" {
                                 // The shell exits, as `exit` at a prompt does.
                                 terminals.retain(|&id| id != channel);
@@ -3897,7 +3906,15 @@ mod tests {
         slow: bool,
         /// Bytes served so far from a file named `claims-everything`.
         endless_served: u64,
+        /// Set by a request that makes the mock fail the channel once its
+        /// replies are out: the reason the guest gives.
+        ended: Option<String>,
     }
+
+    /// The id of the reply the mock sends for a `stat` of a path named
+    /// `answers-nobody`: one no call of the host waits for.
+    const NOBODY_ID: u64 = 999_999;
+    const NOBODY_ENDED: &str = "the mock ended the channel behind a reply to nobody";
 
     /// Where the mock ends a file named `claims-everything` by an error.
     const ENDLESS_STOP: u64 = 16 * 1024 * 1024;
@@ -3933,6 +3950,7 @@ mod tests {
                     .unwrap_or_else(|| "as:agent".into()),
                 slow: false,
                 endless_served: 0,
+                ended: None,
             }
         }
 
@@ -3950,6 +3968,23 @@ mod tests {
                     && path.contains("slow")
                 {
                     self.slow = true;
+                }
+                // A `stat` of a path named `answers-nobody` gets no answer:
+                // a record with an id nobody waits for goes out in its
+                // place, and then the guest fails the channel, so the host
+                // has handled that record by the time its call returns.
+                if let Op::Stat { path } = &request.op
+                    && path.contains("answers-nobody")
+                {
+                    out.push((
+                        Response {
+                            id: NOBODY_ID,
+                            reply: Reply::Ok,
+                        },
+                        Vec::new(),
+                    ));
+                    self.ended = Some(NOBODY_ENDED.into());
+                    continue;
                 }
                 let (reply, bytes) = self.op(request.op, payload);
                 // The one reply a stalled peer never sends.
@@ -4790,6 +4825,32 @@ mod tests {
 
         let next = format!("{:#}", ops.stat("/guest/some-file").await.unwrap_err());
         assert!(next.contains("answered nothing"), "{next}");
+    }
+
+    /// Only a record that answers a waiting call is progress (review
+    /// guest-agents F15): a record with an id nobody waits for leaves the
+    /// watchdog's clock where it was, so a guest cannot hold every call on
+    /// the channel open by sending such records. The mock sends one in place
+    /// of the answer and then fails the channel, which orders the host's
+    /// handling of that record before the call's return.
+    #[tokio::test]
+    async fn replies_to_nobody_do_not_renew_the_watchdog() {
+        let (_dir, path) = mock_agent(true).await;
+        let agent = AgentHandle::connect(&path, HANDSHAKE).await.unwrap();
+        let ops = agent.open_fileops(None).await.unwrap();
+        ops.stat("/guest/some-file").await.unwrap();
+        let answered = ops.inner.last_reply();
+
+        let err = format!(
+            "{:#}",
+            ops.stat("/guest/answers-nobody").await.unwrap_err()
+        );
+        assert!(err.contains(NOBODY_ENDED), "{err}");
+        assert_eq!(
+            ops.inner.last_reply(),
+            answered,
+            "a record that answered no call counted as progress"
+        );
     }
 
     /// The watchdog measures silence, not elapsed time: a transfer that is
