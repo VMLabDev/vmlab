@@ -329,7 +329,7 @@ pub struct MediaSource {
 #[derive(Debug, Default)]
 struct BuiltMedia {
     cdroms: Vec<PathBuf>,
-    floppy: Option<PathBuf>,
+    floppy: Option<Floppy>,
 }
 
 /// What a VM has in drive A. vmlab-hv opens it writable and takes no lock
@@ -1032,7 +1032,7 @@ impl VmInstance {
             match m.kind {
                 model::MediaKind::Iso => built.cdroms.push(image),
                 // The lab builder refuses a second floppy.
-                model::MediaKind::Floppy => built.floppy = Some(image),
+                model::MediaKind::Floppy => built.floppy = Some(Floppy::Built(image)),
             }
         }
         Ok(built)
@@ -1042,16 +1042,24 @@ impl VmInstance {
     /// own copy of the cache entry, beside its disks: a guest write reaches
     /// neither the cache nor another machine, and `destroy` takes the copy
     /// with the disks.
-    fn floppy_image(&self, built: Option<&Path>) -> Result<Option<PathBuf>> {
-        let entry = match (&self.floppy, built) {
-            (Some(Floppy::Image(path)), _) => return Ok(Some(path.clone())),
-            (Some(Floppy::Built(entry)), _) => entry.as_path(),
-            (None, Some(entry)) => entry,
-            (None, None) => return Ok(None),
-        };
-        crate::media::private_floppy(entry, &self.dirs.local)
-            .with_context(|| format!("{}: floppy media", self.cfg.name))
-            .map(Some)
+    fn floppy_image(&self, floppy: Option<&Floppy>) -> Result<Option<PathBuf>> {
+        match floppy {
+            None => Ok(None),
+            Some(Floppy::Image(path)) => Ok(Some(path.clone())),
+            Some(Floppy::Built(entry)) => crate::media::private_floppy(entry, &self.dirs.local)
+                .with_context(|| format!("{}: floppy media", self.cfg.name))
+                .map(Some),
+        }
+    }
+
+    /// Puts the images this start built into what it launches with: the ISOs
+    /// after the `cdrom =` attachment, the floppy in drive A.
+    fn attach_media(&self, paths: &mut VmPaths, media: BuiltMedia) -> Result<()> {
+        paths.cdroms.extend(media.cdroms);
+        if media.floppy.is_some() {
+            paths.floppy = self.floppy_image(media.floppy.as_ref())?;
+        }
+        Ok(())
     }
 
     fn build_paths(
@@ -1062,7 +1070,6 @@ impl VmInstance {
         (virtiofs_shares, hypervisor_shares): (Vec<(String, PathBuf)>, Vec<qemu::HypervisorShare>),
         render: &qemu::hostgpu::RenderPlan,
         tsc_hz: Option<u64>,
-        media: &BuiltMedia,
     ) -> Result<VmPaths> {
         let firmware_features = firmware
             .map(|fw| fw.features())
@@ -1091,10 +1098,10 @@ impl VmInstance {
                 .iter()
                 .map(|d| (d.name.clone(), self.dirs.extra_disk(&d.name)))
                 .collect(),
-            // The `cdrom =` attachment first, then the built media.
-            cdroms: self.cdroms.iter().chain(&media.cdroms).cloned().collect(),
+            cdroms: self.cdroms.clone(),
+            // The `cdrom =` attachment is first: built media follow it.
             install_cdrom: self.cfg.cdrom.is_some(),
-            floppy: self.floppy_image(media.floppy.as_deref())?,
+            floppy: self.floppy_image(self.floppy.as_ref())?,
             nics,
             firmware_code: firmware.map(|fw| fw.code.clone()),
             firmware_resolution: self.cfg.firmware_width.zip(self.cfg.firmware_height),
@@ -1584,18 +1591,19 @@ impl VmInstance {
                     .unwrap_or_else(|| qemu::emulator_binary(&t.resolved.arch)),
             };
             let tsc_hz = self.pinned_tsc_hz(&t, accel, &emulator).await?;
+            let mut paths = self.build_paths(
+                &t,
+                firmware.as_ref(),
+                nic_specs,
+                vfs_devices,
+                &render,
+                tsc_hz,
+            )?;
+            self.attach_media(&mut paths, media)?;
             let machine = super::hypervisor::Launch::Vm {
                 lab: self.lab.clone(),
                 resolved: Box::new(t.resolved.clone()),
-                paths: Box::new(self.build_paths(
-                    &t,
-                    firmware.as_ref(),
-                    nic_specs,
-                    vfs_devices,
-                    &render,
-                    tsc_hz,
-                    &media,
-                )?),
+                paths: Box::new(paths),
                 accel,
                 emulator: render.qemu_binary.clone(),
             };
