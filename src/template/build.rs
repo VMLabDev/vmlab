@@ -2544,7 +2544,9 @@ mod tests {
         let disk = work.join("working.qcow2");
         qimg::create_blank(&disk, 16 << 20).await.unwrap();
         let store = TemplateStore::new(work.join("templates"));
-        let def = def("scratch {}");
+        let def = def(
+            r#"template "t" { arch = "x86_64" version = "1" source "scratch" {} }"#,
+        );
         let hw = hw(&def);
         let cancel = CancellationToken::new();
         let log: crate::scripting::OutputSink = std::sync::Arc::new(|_| {});
