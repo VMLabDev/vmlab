@@ -96,7 +96,7 @@ pub fn net_frame(data: &[u8]) {
         if let Some(reply) = dhcp.handle(frame) {
             assert_reply(&reply);
         }
-        match dns.handle(frame) {
+        match dns.handle(frame, GW_MAC) {
             DnsAction::Reply(reply) => assert_reply(&reply),
             DnsAction::ForwardUpstream {
                 raw_query, respond, ..
