@@ -8298,11 +8298,12 @@ lab "t" {
             smb.kill_for_test("web");
             port
         };
-        let unrelated = std::net::TcpListener::bind(([127, 0, 0, 1], old_port)).unwrap();
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        let unrelated = std::net::TcpListener::bind((loopback, old_port)).unwrap();
         crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
         let new_port = lab.smb.lock().await.as_ref().unwrap().listen_port("web").unwrap();
         assert_ne!(new_port, unrelated.local_addr().unwrap().port());
-        std::net::TcpStream::connect(([127, 0, 0, 1], new_port)).unwrap();
+        std::net::TcpStream::connect((loopback, new_port)).unwrap();
         let services = lab.network.lock().await.segments["corp"].services.clone().unwrap();
         let rules = services.rules.lock().unwrap().list();
         assert_eq!(rules.len(), 1);
