@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::meta::{META_FILE, TemplateMeta, VARIANTS_DIR, variant_disk_rel};
 use crate::config::model::{BASE_VARIANT, VariantRef};
+use crate::staging::{STAGING_PREFIX, StagingDir};
 
 /// Disk image file name inside a version directory.
 pub const DISK_FILE: &str = "disk.qcow2";
@@ -35,7 +36,6 @@ pub fn template_vars(dir: &Path, meta: &TemplateMeta) -> Option<PathBuf> {
         .then(|| dir.join(VARS_FILE))
 }
 const LOCK_FILE: &str = ".lock";
-use crate::staging::{STAGING_PREFIX, StagingDir};
 
 /// One installed template version, as stored: its directory, its base disk,
 /// and its metadata as the file records it — base fields and the variant
