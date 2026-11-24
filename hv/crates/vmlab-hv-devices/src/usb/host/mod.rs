@@ -324,6 +324,10 @@ impl HostUsbDevice {
             Job::SetConfig { config, .. } => {
                 self.claimed_interfaces = done.claimed;
                 self.endpoints.clear();
+                // SET_CONFIGURATION puts every interface of the device at
+                // alt setting 0; what SET_INTERFACE chose before belongs to
+                // the old configuration.
+                self.alt_settings.clear();
                 self.active_config = match &result {
                     // The device may be at its old configuration or at
                     // none; nothing here can tell which.
@@ -523,7 +527,11 @@ impl HostUsbDevice {
         // The guest's first SET_CONFIGURATION usually names the
         // configuration the device is in already; setting it again would
         // reset the device for nothing.
-        let set = self.initialized || self.active_config != Some(config);
+        // A guest that chose an alt setting first has changed the device:
+        // only setting the configuration puts its interfaces back at 0.
+        let set = self.initialized
+            || self.active_config != Some(config)
+            || !self.alt_settings.is_empty();
         self.initialized = true;
         // The old configuration's endpoints end here. Their URBs are
         // discarded before the job releases the interfaces; left alone, the
@@ -1323,7 +1331,9 @@ mod tests {
             host.control(setup(0x80, 6, 3 << 8, 0, 255), &[]),
             UsbTransfer::Nak
         );
-        assert_eq!(fake.submitted_payloads().len(), 2);
+        let in_flight = fake.submitted_payloads();
+        assert_eq!(in_flight.len(), 1, "the old URB was reaped and dropped");
+        assert_eq!(in_flight[0].1[..8], [0x80, 6, 0, 3, 0, 0, 255, 0]);
     }
 
     #[test]
