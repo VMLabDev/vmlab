@@ -1612,16 +1612,18 @@ mod tests {
         PathBuf,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        mock_agent(late, delay, restarted, false).await
+        mock_agent(late, delay, restarted, false, None).await
     }
 
     /// [`slow_agent`], and with `hang_up_first` the agent side closes the
-    /// first connection right after its hello.
+    /// first connection right after its hello. A synchronous agent opens
+    /// an exec session and then withholds pongs while it runs.
     async fn mock_agent(
         late: usize,
         delay: Duration,
         restarted: Arc<std::sync::atomic::AtomicBool>,
         hang_up_first: bool,
+        synchronous_agent: Option<(&'static str, &'static str)>,
     ) -> (
         tempfile::TempDir,
         PathBuf,
@@ -1665,14 +1667,19 @@ mod tests {
                                 Ok(HostMsg::Hello { token, .. }) => (
                                     AgentMsg::Hello {
                                         proto_version: PROTO_VERSION,
-                                        agent_version: "slow-mock".into(),
-                                        os: "linux".into(),
+                                        agent_version: synchronous_agent
+                                            .map_or("slow-mock", |(version, _)| version)
+                                            .into(),
+                                        os: synchronous_agent.map_or("linux", |(_, os)| os).into(),
                                         features: vec![],
                                         token,
                                         instance,
                                     },
                                     Duration::ZERO,
                                 ),
+                                Ok(HostMsg::OpenExec { id, .. }) if synchronous_agent.is_some() => {
+                                    (AgentMsg::Opened { id }, Duration::ZERO)
+                                }
                                 Ok(HostMsg::Ping) => {
                                     let nth = pings.fetch_add(1, Ordering::SeqCst);
                                     (
@@ -1833,13 +1840,42 @@ mod tests {
         assert!(!first.is_open() && second.is_open());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_keeps_a_legacy_connection_that_runs_a_command() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for (version, os) in [("agent-legacy=test", "dos"), ("agent-templeos=test", "templeos")] {
+            let (_dir, sock, accepted) = mock_agent(
+                usize::MAX,
+                Duration::from_secs(600),
+                Arc::new(AtomicBool::new(false)),
+                false,
+                Some((version, os)),
+            )
+            .await;
+            let slot = Arc::new(AgentSlot::with_grace(Duration::from_secs(1)));
+            let first = slot.connect("m1", &sock, "hint").await.expect("first connect");
+            let _session = first
+                .open_exec(vec!["command".into()], vec![], None, None)
+                .await
+                .expect("open exec");
+            let second = tokio::spawn(async move { slot.connect("m1", &sock, "hint").await })
+                .await
+                .expect("connect task")
+                .expect("second connect");
+            assert!(first.is_open(), "{os}: the running command lost its connection");
+            assert!(second.same_connection(&first));
+            assert_eq!(first.open_sessions().await, 1);
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        }
+    }
+
     /// A connection whose socket ended is replaced at once: no grace for a
     /// connection that cannot answer.
     #[tokio::test]
     async fn a_closed_connection_is_replaced_without_a_grace() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (_dir, sock, accepted) =
-            mock_agent(0, Duration::ZERO, Arc::new(AtomicBool::new(false)), true).await;
+            mock_agent(0, Duration::ZERO, Arc::new(AtomicBool::new(false)), true, None).await;
         let slot = AgentSlot::default();
         let first = slot
             .connect("m1", &sock, "hint")
