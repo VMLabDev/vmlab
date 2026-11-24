@@ -261,6 +261,12 @@ nearly full filesystem), and run the installer. Expected: the old `vmlab`
 is intact. Observed: a 0600 partial file. A `vmlab` started during the copy
 also sees a partial file.
 
+Fixed in card #799. The installer copies and sets permissions on both verified
+executables in a private directory under the bin directory before replacing
+either one by rename. The regression test limits file writes after downloads
+and checks that a failed copy of either executable preserves both installed
+files and their modes.
+
 ### F7. The provenance names HEAD while untracked files change the build (wrong result)
 
 `scripts/release-local.sh:81-82` refuses changes to tracked files only
@@ -275,6 +281,22 @@ Test: in a clean checkout create `.cargo/config.toml` with
 `just release::local --version 0.0.0-dry-run --display unsigned`. Expected:
 a refusal of the untracked file. Observed: the build proceeds and the
 provenance names `HEAD`.
+
+Fixed in card #800. `scripts/release-local.sh` refuses, before any container
+runs, a checkout with an untracked file, and names the files. Only the
+tracked `.gitignore` files count as excludes: they are part of `HEAD`.
+`.git/info/exclude` and the user's `core.excludesFile` do not hide a file
+from the check. An untracked `.gitignore` could: one that ignores itself
+(`*`) hides its whole directory from the listing. So the script also lists
+every untracked `.gitignore` with no exclude at all, asks git which rule
+ignores it (`git check-ignore -v`), and refuses it unless that rule is in a
+tracked file. A `.gitignore` under `target/` passes, one in `.cargo/` does
+not. The root `.gitignore` now names `.pytest_cache/`, whose own `.gitignore`
+would be refused otherwise. Paths that the tracked `.gitignore` files ignore
+(`target/`, the staged display package) are still not compared with `HEAD`.
+Tests: `test_a_release_refuses_an_untracked_file` (five cases) and
+`test_a_release_accepts_what_the_commit_ignores` in
+`scripts/test_release_workflow.py`.
 
 ### F8. Publishing does not check the signature it uploads (wrong result)
 

@@ -232,7 +232,11 @@ url="$BASE_URL/$tag/$asset"
 
 verify_dir="$(mktemp -d)"
 [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || err "unsafe verification directory"
+bin_stage=""
 cleanup_release() {
+  if [ -n "$bin_stage" ] && [ "$bin_stage" != / ]; then
+    rm -rf -- "$bin_stage"
+  fi
   [ -n "$verify_dir" ] && [ "$verify_dir" != / ] || return 1
   rm -rf "$verify_dir"
 }
@@ -322,10 +326,22 @@ if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
   HELPER="$BIN_DIR/vmlab-fastpath"
 fi
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-chmod +x "$tmp"
-mkdir -p "$BIN_DIR"
 [ -n "$BIN_DIR" ] && [ "$BIN_DIR" != / ] || err "BIN_DIR is empty or /"
+mkdir -p -- "$BIN_DIR"
+
+# Finish both copies before touching the installed binaries. The final
+# renames stay on the destination filesystem even when TMPDIR is elsewhere.
+bin_stage="$(mktemp -d -- "$BIN_DIR/.vmlab-install.XXXXXX")"
+[ -n "$bin_stage" ] && [ "$bin_stage" != / ] || err "unsafe binary staging directory"
+[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
+cp -- "$tmp" "$bin_stage/vmlab"
+chmod +x "$bin_stage/vmlab"
+if [ -n "$HELPER" ]; then
+  [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
+  cp -- "$helper_tmp" "$bin_stage/vmlab-fastpath"
+  # Only the owner may execute a helper that holds file capabilities.
+  chmod 0700 "$bin_stage/vmlab-fastpath"
+fi
 
 # No helper from this release: the helper of an earlier install, which may
 # still hold file capabilities, goes away before the new vmlab arrives. Its
@@ -342,17 +358,12 @@ if [ -z "$HELPER" ]; then
   fi
 fi
 
-[ -n "$tmp" ] && [ "$tmp" != / ] || err "tmp is empty or /"
-mv "$tmp" "$BIN_DIR/vmlab"
-
+mv -fT -- "$bin_stage/vmlab" "$BIN_DIR/vmlab"
 if [ -n "$HELPER" ]; then
-  [ -n "$helper_tmp" ] && [ "$helper_tmp" != / ] || err "helper_tmp is empty or /"
-  # File capabilities go to whoever executes the file, so no other account
-  # may execute it. The helper checks the caller too: this mode is the half
-  # that holds for a helper older than that check.
-  chmod 0700 "$helper_tmp"
-  mv "$helper_tmp" "$HELPER"
+  mv -fT -- "$bin_stage/vmlab-fastpath" "$HELPER"
 fi
+rmdir -- "$bin_stage"
+bin_stage=""
 
 printf 'Installed: %s\n' "$("$BIN_DIR/vmlab" --version 2>/dev/null || echo "$BIN_DIR/vmlab")"
 
