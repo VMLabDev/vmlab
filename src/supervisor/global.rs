@@ -1090,7 +1090,12 @@ fn worktree_segment_base(name: &str) -> Option<&str> {
 
 /// Worktree copies of the same global segment have separate switches and
 /// may use the same declared subnet (§21.4).
-fn global_subnets_conflict(name: &str, subnet: Ipv4Net, other: &str, other_subnet: Ipv4Net) -> bool {
+fn global_subnets_conflict(
+    name: &str,
+    subnet: Ipv4Net,
+    other: &str,
+    other_subnet: Ipv4Net,
+) -> bool {
     let base = worktree_segment_base(name).unwrap_or(name);
     let other_base = worktree_segment_base(other).unwrap_or(other);
     subnets_overlap(subnet, other_subnet)
