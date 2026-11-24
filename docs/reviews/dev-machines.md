@@ -65,16 +65,16 @@ says "read, not run".
 
 | Code | Fault | How bad |
 |---|---|---|
-| F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690) | Security against a hostile guest |
-| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note (fixed, card #693) | Data loss (canonical copy) |
-| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush (fixed, card #694) | Data loss (guest work) |
-| F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag (fixed, card #695) | Data loss (guest work) |
-| F5 | `destroy` does not ask about a halted or unsynced workspace (fixed, card #695) | Data loss (guest work) |
-| F6 | One machine's pass holds a host-wide lock across its guest I/O | Security against a hostile guest or peer, and wrong result |
-| F7 | `dev sync diff` reads a guest file of any size into the lab daemon's memory (fixed, card #696) | Security against a hostile guest, and crash |
-| F8 | Guest file names and guest file text reach the developer's terminal with their escape sequences | Security against a hostile guest |
-| F9 | `dev sync diff` calls a symlink and a file identical | Wrong result |
-| F10 | The refusal for a stopped machine names two verbs that cannot answer for a stopped machine | Cosmetic |
+| F1 | A workspace may hold the lab's state directory, and a rule the guest writes brings it into the sync (fixed, card #690, `136bf6cd`) | Security against a hostile guest |
+| F2 | A restore while the host workspace directory is away skips the halt check and leaves no re-seed note (fixed, card #693, `7b8537a7`) | Data loss (canonical copy) |
+| F3 | A running dev machine with no syncer is treated as stopped, so capture and restore pass without a flush (fixed, card #694, `294c5dc1`) | Data loss (guest work) |
+| F4 | A stop takes no last pass and records nothing about owed work, so an offline restore discards it without the flag (fixed, card #695, `ecb8873d`) | Data loss (guest work) |
+| F5 | `destroy` does not ask about a halted or unsynced workspace (fixed, card #695, `ecb8873d`) | Data loss (guest work) |
+| F6 | One machine's pass holds a host-wide lock across its guest I/O (fixed, card #858, `fa5667d2`) | Security against a hostile guest or peer, and wrong result |
+| F7 | `dev sync diff` reads a guest file of any size into the lab daemon's memory (fixed, card #696, `224495e5`, `750012f2`) | Security against a hostile guest, and crash |
+| F8 | Guest file names and guest file text reach the developer's terminal with their escape sequences (fixed, card #859, `f2e64b51`, `7b43f5a8`) | Security against a hostile guest |
+| F9 | `dev sync diff` calls a symlink and a file identical (fixed, card #859, `f2e64b51`) | Wrong result |
+| F10 | The refusal for a stopped machine names two verbs that cannot answer for a stopped machine (fixed, card #859, `f2e64b51`) | Cosmetic |
 
 F1 is first because it needs only a common declaration (`workspace = "."`).
 F2 loses more, the canonical copy, but needs the host directory to be away at
@@ -409,6 +409,11 @@ still held. It needs no clock.
 capture and restore to other machines), and wrong result for a slow honest
 one.
 
+**Fixed by card #858.** Workspace reconciliation takes an exclusive lock on
+the canonical workspace root and shared locks on its ancestors. Disjoint
+roots can reconcile concurrently. Shared and nested roots still serialize
+across lab daemons, including when reached through symlinks.
+
 ### F7. `dev sync diff` reads a guest file of any size into memory
 
 **Where.** `src/labd/workspace/diff.rs:213-224`.
@@ -482,6 +487,9 @@ and `guest_text_with_control_bytes_is_not_shown_raw`.
 
 **How bad.** Security against a hostile guest.
 
+**Fixed by card #859.** Sync status and diff escape control characters in
+displayed paths, and diff escapes them in displayed file text.
+
 ### F9. `dev sync diff` calls a symlink and a file identical
 
 **Where.** `src/labd/workspace/diff.rs:147-152`, `diff.rs:170-174`,
@@ -506,6 +514,9 @@ file `x` that holds `target`. Result: `identical` is true.
 **How bad.** Wrong result: the developer is told a halt will clear, and it
 does not.
 
+**Fixed by card #859.** The diff compares entry kinds as well as digests
+before saying the copies are identical.
+
 ### F10. The refusal for a stopped machine names verbs that cannot answer
 
 **Where.** `src/labd/workspace/bracket.rs:137-166` and `bracket.rs:198-214`,
@@ -525,6 +536,9 @@ share one `Display`.
 `a_refusal_for_a_stopped_machine_says_to_start_it_first`.
 
 **How bad.** Cosmetic.
+
+**Fixed by card #859.** A refusal based on a stopped machine's ledger tells
+the developer to start the machine with `vmlab up` before using the sync verbs.
 
 ## Notes
 
