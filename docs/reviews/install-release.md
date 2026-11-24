@@ -261,6 +261,12 @@ nearly full filesystem), and run the installer. Expected: the old `vmlab`
 is intact. Observed: a 0600 partial file. A `vmlab` started during the copy
 also sees a partial file.
 
+Fixed in card #799. The installer copies and sets permissions on both verified
+executables in a private directory under the bin directory before replacing
+either one by rename. The regression test limits file writes after downloads
+and checks that a failed copy of either executable preserves both installed
+files and their modes.
+
 ### F7. The provenance names HEAD while untracked files change the build (wrong result)
 
 `scripts/release-local.sh:81-82` refuses changes to tracked files only
