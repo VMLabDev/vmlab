@@ -298,12 +298,12 @@ SRC
 
   p <<DOC
     The installer places them for you. Every release carries
-    `vmlab-guest-<version>.tar.gz`, built by CI with every target: the
+    `vmlab-guest-<version>.tar.gz`, built on helios with every target: the
     micro-VM asset for x86_64 and aarch64, the Rust agent for Linux x86_64,
     aarch64, riscv64 and x86, for Windows x86_64 and x86 and for Intel macOS, and the legacy
     agents for Windows NT, Windows 9x, DOS, old 32-bit Linux and TempleOS.
     The installer downloads it from the same release as the binary, checks it
-    against the `.sha256` published beside it, unpacks it next to the target
+    against the signed `SHA256SUMS` manifest, unpacks it next to the target
     directory and renames it into place. The previous contents move aside
     whole and are deleted, so nothing from an older version survives an
     upgrade.
