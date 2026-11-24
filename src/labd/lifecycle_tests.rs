@@ -721,11 +721,7 @@ login "stock" { user = "dev" password = "never-in-status" default = true }
 #[tokio::test]
 async fn a_character_split_across_two_frames_survives() {
     let dirs = Dirs::new();
-    let (vm, _hv) = vm(
-        &dirs,
-        r#"vm "tail" { template = "scratch" profile = "linux-generic" disk = 10GiB }"#,
-        Script::healthy(),
-    );
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
     let (cbs, _observed) = callbacks();
     start_vm(&vm, cbs).await.unwrap();
     let session = vm
