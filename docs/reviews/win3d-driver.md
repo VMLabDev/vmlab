@@ -113,6 +113,10 @@ for a guest that is not x86.
   0x50, because `__try` does not catch an invalid kernel address.
 - Severity: security against a hostile guest program (a write into kernel
   memory from an unprivileged process, which is a path to SYSTEM), and crash.
+- Fixed: card #751, `guest/win3d/patches/kmd/kmd-check-capset-escape.patch`
+  (driver `100.6.101.58117`). The copy probes the range with `ProbeForWrite`
+  inside the `__try`, and the escape fails with `STATUS_ACCESS_VIOLATION`.
+  The proof and its runs are in `guest/win3d/docs/acceptance/C751.md`.
 
 ### F2. The installer's state directory can be owned or written by a standard user, and a SYSTEM task runs a script from it
 
@@ -148,6 +152,23 @@ for a guest that is not x86.
   without the pre-made directory: as `u`, create `state.json.tmp` before the
   install, and after it check with `icacls` who owns `state.json`.
 - Severity: security against a hostile guest user (standard user to SYSTEM).
+- Fixed: card #753. The installer creates the directory with a protected
+  access list (SYSTEM and Administrators full control, Users read), replaces
+  the inherited list of an older install, and stops with exit code 3,
+  before it reads or writes anything there, on a directory or an entry that
+  a standard user owns or can change (`Protect-StateRoot` in
+  `guest/win3d/installer/vmlab-win3d.ps1`). The proof is
+  `guest/win3d/tests/installer/statedir-probe.sh`, and
+  `guest/win3d/docs/acceptance/C753.md` has the runs on a Windows 11 guest:
+  with the installer of `next`, route 1 wrote `nt authority\system` into the
+  proof file and route 2 gave the user the ownership of
+  `state.json`. With the fix the install on the user's directory is
+  refused and every attempt of the user is denied. Two corrections to the
+  text above, from those runs. The statement about `C:\ProgramData` under
+  "How the review was done" is confirmed. Route 2 is narrower than stated:
+  the user owns `state.json` only until the next write of the state, which
+  makes a new file, so the fault shows after a run that writes the state
+  once (a failed run) or inside the window between two writes.
 
 ### F3. The capset id of the escape is not bounded before it indexes an array
 
@@ -165,6 +186,9 @@ for a guest that is not x86.
   escape returns `STATUS_INVALID_PARAMETER_1`. Today the claim is a bugcheck
   0x50 in `viogpu3d.sys`.
 - Severity: crash (the whole guest, from an unprivileged process).
+- Fixed: card #751, the same patch. An id outside 1 to 63 is refused with
+  `STATUS_INVALID_PARAMETER_1` before the shift and the index
+  (`guest/win3d/docs/acceptance/C751.md`).
 
 ### F4. The submit escape adds a user length in 32 bits and then copies that length
 
@@ -213,6 +237,17 @@ for a guest that is not x86.
   a special-pool bugcheck or silent corruption of the VidPN object.
 - Severity: security against a hostile host (a write past a kernel object),
   and crash on a host with a legal configuration.
+- State: fixed by card #754 with
+  `guest/win3d/patches/kmd/kmd-bound-host-scanout-count.patch`. The driver
+  clamps the count to `MAX_CHILDREN` where it reads it, both loops stop at the
+  array, and the two readers refuse an id the response has no room for. The
+  proof ran on a Windows 11 guest against a vmlab-hv built to report two
+  scanouts (`guest/win3d/docs/acceptance/C754.md`): the probe fails with the
+  driver before the fix and passes with it. One part of the claim did not
+  hold: the true vmlab-hv is not such a host. The driver never acks
+  `VIRTIO_GPU_F_EDID`, and vmlab-hv refuses `GET_EDID` without the ack, so on
+  vmlab-hv no EDID is copied at all, whatever the count. QEMU answers
+  without the ack.
 
 ### F6. The capset size of the host wraps the response size, and the escape then copies the unwrapped size
 
@@ -233,6 +268,12 @@ for a guest that is not x86.
   that the probe's buffer holds pool memory, or the guest bugchecks.
 - Severity: security against a hostile host together with a guest user
   (kernel memory to user mode), and crash.
+- Fixed: card #751, the same patch. A capset whose `capset_max_size` is above
+  1 MiB is not supported, the response size is computed in 64 bits, the
+  escape copies nothing for a refused size, and the response buffer is
+  zeroed before the request. The proof is a unit test of the driver's bounds
+  header on the build host, with the forged size of this finding. No device
+  model forged the answer to a guest (`guest/win3d/docs/acceptance/C751.md`).
 
 ### F7. Any process can point the scanout at any resource
 
