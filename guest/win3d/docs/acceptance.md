@@ -1156,6 +1156,10 @@ console) is in git history at [82d8e51](https://github.com/VMLabDev/vmlab-win3d/
 review, the command size of the submit escape that wrapped in 32 bits, with
 the guest proof before and after and the end-to-end run on the fixed driver.
 
+[C757](acceptance/C757.md) records the fixes of findings F9 and F10: the
+read of the helpers' pipe, which wrote past its buffer, and
+`DxgkCreateAllocation`, which used the result of a failed pool allocation.
+
 ## Evidence index
 
 Every directory under [docs/evidence/](https://github.com/VMLabDev/vmlab-win3d/blob/229203dd8d82c261f4a7a676afb3259fc30ad9ff/docs/evidence/). "Historical" marks evidence from the
