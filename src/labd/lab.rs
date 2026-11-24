@@ -8688,7 +8688,7 @@ lab "t" {
   }
 }"#;
 
-    async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+    async fn smb_lab_unstarted(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
         if ["smbd", "pdbedit"].iter().any(|bin| {
             std::process::Command::new(bin)
                 .arg("--version")
@@ -8712,8 +8712,29 @@ lab "t" {
         *lab.doubles.lock().unwrap() = Some(Arc::new(move |cfg| {
             FakeMachine::new(cfg.name(), MachineKind::Vm, &sh) as Arc<dyn Machine>
         }));
+        Some(lab)
+    }
+
+    async fn smb_lab(dir: &std::path::Path) -> Option<Arc<LabRuntime>> {
+        let lab = smb_lab_unstarted(dir).await?;
         crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
         Some(lab)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn smb_lifecycle_start_yields_while_holding_the_smb_lock() {
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab_unstarted(dir.path()).await else {
+            return;
+        };
+        let observer = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.smb.try_lock().is_err() }
+        });
+        crate::labd::machine::LabServices::ensure_shares(lab.as_ref()).await;
+        assert!(observer.await.unwrap(), "startup did not yield with the SMB lock held");
+        assert!(lab.smb.lock().await.as_ref().unwrap().servers.listen_port("web").is_some());
     }
 
     #[tokio::test]
@@ -8817,6 +8838,45 @@ lab "t" {
         assert!(services.host_service_ports().is_empty());
         cancel.cancel();
         watch.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn smb_lifecycle_watchdog_restarts_without_a_machine_start() {
+        let _ports = SMB_TEST_PORTS.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(lab) = smb_lab(dir.path()).await else {
+            return;
+        };
+        let old_port = {
+            let mut smb = lab.smb.lock().await;
+            let servers = &mut smb.as_mut().unwrap().servers;
+            let port = servers.listen_port("web").unwrap();
+            servers.kill_for_test("web");
+            port
+        };
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        let _unrelated = std::net::TcpListener::bind((loopback, old_port)).unwrap();
+        let services = lab.network.lock().await.segments["corp"]
+            .services
+            .clone()
+            .unwrap();
+        let mut events = lab.events.subscribe();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let watch = tokio::spawn({
+            let lab = lab.clone();
+            let cancel = cancel.clone();
+            async move { lab.watch_smb(cancel).await }
+        });
+        assert_eq!(events.recv().await.unwrap().event, "smb.exited");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        cancel.cancel();
+        watch.await.unwrap();
+
+        let smb = lab.smb.lock().await;
+        let port = smb.as_ref().unwrap().servers.listen_port("web").expect("watchdog restarted smbd");
+        std::net::TcpStream::connect((loopback, port)).unwrap();
+        assert_eq!(services.host_service_ports(), vec![port]);
+        assert!(!smb_redirects_to(&services, old_port));
     }
 
     fn same(a: &Arc<dyn Machine>, b: &Arc<dyn Machine>) -> bool {
