@@ -367,6 +367,10 @@ symlinked guest directory, which `install.sh:409-412` refuses.
 Test: create `~/.local/share/vmlab/guest/agent/old-target/vmlab-agent` and
 run `just guest-install`. Expected: the file is gone. Observed: it stays.
 
+Fixed in card #801. The recipe stages the new files beside the destination,
+replaces the old directory as a whole, and refuses symlink destinations.
+`just ci::guest-install-test` covers stale assets and symlink refusal.
+
 ### F11. The manual describes the guest bundle check and its builder wrongly (cosmetic)
 
 `docs/manual/pages/getting-started/install.wcl:287` says the bundle is

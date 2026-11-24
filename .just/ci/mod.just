@@ -31,7 +31,7 @@ main:
 
 # Everything a change must pass before it can merge
 [group('ci')]
-check: path-check shell-paths release-version release-dry-run kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
+check: path-check shell-paths release-version release-dry-run guest-install-test kvm-policy-test lint fmt-check test tap-test wscript-test guest-check guest-windows-check guest-macos-check ebpf-verify agent-conformance hv-desktop-test hv-fmt-check hv-lint hv-test win3d-check
 	@python3 -c 'import pathlib, sys; root = pathlib.Path(sys.argv[1]); [print("Test results:", root / "test-results" / (name + ".json")) for name in sys.argv[2:]]' {{quote(test_result_root)}} main hv tap wscript guest-cinit-proto guest-cinit guest-agent-proto guest-agent agent-conformance
 
 # Prove absent-device skip and required-device failure without booting a guest
@@ -70,6 +70,11 @@ release-version:
 [group('ci')]
 release-dry-run: require-uv
 	uv run --no-project --with pytest==8.4.2 --with PyYAML==6.0.3 python -m pytest -p no:cacheprovider scripts/test_release_assets.py scripts/test_release_workflow.py scripts/test_release_display.py --junitxml={{quote(release_report)}}
+
+# Test source installation with prebuilt guest assets
+[group('ci')]
+guest-install-test:
+	python3 -m unittest discover -s scripts -p 'test_guest_install.py'
 
 # Run clippy with warnings as errors
 [group('ci')]
