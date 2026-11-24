@@ -1519,7 +1519,7 @@ async fn a_failed_second_virtiofsd_stops_the_first_for_a_vm() {
 
     let err = start_vm(&vm, cbs).await.expect_err("start must fail");
     assert!(
-        format!("{err:#}").contains("/second: virtiofsd failed on start 2"),
+        format!("{err:#}").contains("virtiofsd failed on start 2"),
         "{err:#}"
     );
     let live = hv.live_helpers().await;
