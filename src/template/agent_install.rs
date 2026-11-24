@@ -4,7 +4,7 @@
 //! (cloud-init runcmd / subiquity late-commands / autounattend
 //! FirstLogonCommands) runs its install script. This side only proves the
 //! channel end-to-end — wait for the agent's handshake on `vmlab.agent.0` —
-//! and returns the staged asset's version stamp for the sealed metadata.
+//! and returns the answering agent's version for the sealed metadata.
 //!
 //! Skips are non-fatal (logged loudly): templates opting out (`agent =
 //! false`) and vintage guests without an agent channel. The sealed metadata
@@ -48,8 +48,8 @@ fn agent_flavour(os: &str, legacy: bool, profile: Option<&str>) -> AgentOs {
     }
 }
 
-/// Wait for the agent handshake; returns the staged asset's version stamp
-/// (by the handshake's OS flavour), or `None` when verification was skipped
+/// Wait for the agent handshake; returns the answering agent's version,
+/// or `None` when verification was skipped
 /// (reason already logged). `wait` is how long to keep probing: a
 /// layered/qcow2 source starts the agent within its first boot, but a fresh
 /// install from ISO only gets one once the unattended installer has laid
@@ -92,26 +92,34 @@ pub async fn verify(
          install script?)",
     )?;
 
-    let info = handle.info();
+    Ok(Some(verified_version(
+        handle.info(),
+        staged,
+        machine.profile().as_deref(),
+        log,
+    )))
+}
+
+fn verified_version(
+    info: crate::labd::vm_agent::AgentInfo,
+    staged: &StagedGuestIso,
+    profile: Option<&str>,
+    log: &(dyn Fn(String) + Sync),
+) -> String {
     let legacy = is_legacy_agent(&info.agent_version);
-    let os = agent_flavour(&info.os, legacy, machine.profile().as_deref());
-    // The staged stamp identifies what the ISO carried; the handshake's own
-    // version is the fallback if the flavour somehow wasn't staged — and is
-    // the answer for the legacy agent, whose stamp *is* its version string.
-    let version = if legacy {
-        info.agent_version
-    } else {
-        staged
-            .version_for(os)
-            .map(str::to_string)
-            .unwrap_or(info.agent_version)
-    };
+    let os = agent_flavour(&info.os, legacy, profile);
+    let version = info.agent_version;
+    if let Some(staged_version) = staged.version_for(os)
+        && staged_version != version
+    {
+        log(format!("agent: bootstrap ISO staged {staged_version}\n"));
+    }
     log(format!(
         "agent: verified ({} {}, agent answering)\n",
         os.key(),
         version
     ));
-    Ok(Some(version))
+    version
 }
 
 /// Try `attempt` every five seconds until it succeeds or `wait` has passed
@@ -134,6 +142,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sealed_version_is_the_one_the_agent_reports() {
+        let info = crate::labd::vm_agent::AgentInfo {
+            agent_version: "agent=old".into(),
+            os: "linux".into(),
+            features: Vec::new(),
+            instance: None,
+        };
+        let staged = StagedGuestIso {
+            dir: "guest-iso".into(),
+            versions: vec![(AgentOs::Linux, "agent=new".into())],
+        };
+        assert_eq!(verified_version(info, &staged, None, &|_| {}), "agent=old");
+    }
 
     /// The Rust agent answers with its crate version, and must not be mistaken
     /// for the exec-only tier — the mistake that sealed a Windows 7 template

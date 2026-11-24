@@ -5836,6 +5836,29 @@ lab "t" {
     }
 
     #[tokio::test]
+    async fn card_861_println_reaches_the_script_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        crate::scripting::run_script_source(
+            lab,
+            "fn main(lab: Lab) {\n    print(\"hello\")\n    println(\" world\")\n}".into(),
+            "print.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| output.send(line).unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut text = String::new();
+        while let Ok(chunk) = lines.try_recv() {
+            text.push_str(&chunk);
+        }
+        assert_eq!(text, "hello world\n");
+    }
+
+    #[tokio::test]
     async fn a_cancelled_script_stops_without_a_host_call() {
         let dir = tempfile::tempdir().unwrap();
         let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);

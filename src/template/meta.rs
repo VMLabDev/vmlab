@@ -149,6 +149,14 @@ pub fn variant_disk_rel(name: &str) -> std::path::PathBuf {
 pub const VARIANTS_DIR: &str = "variants";
 
 impl TemplateMeta {
+    /// Whether this version can serve an unqualified clone reference.
+    pub(crate) fn has_usable_default(&self) -> bool {
+        match self.default_variant() {
+            Some(default) => !self.is_stale(default),
+            None => !self.variants_expected && self.variants.is_empty(),
+        }
+    }
+
     /// The repository this version was pulled from, when that is not
     /// `source` (`host/owner/[group/]name`). `None` for a pull from `source`
     /// and for a version no pull installed: a build or an import is the

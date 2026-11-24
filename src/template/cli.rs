@@ -111,13 +111,13 @@ pub enum TemplateCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Prune superseded builds, keeping the latest per template. Dry-run
+    /// Prune superseded builds, keeping the latest usable builds. Dry-run
     /// unless `--yes`; builds still backing a clone are skipped unless `--force`.
     Clean {
         /// Limit to a family: `<arch>/<name>`, `<arch>/` (all names in an arch),
         /// or `<name>` (that name in any arch). Default: every template.
         filter: Option<String>,
-        /// Most-recent builds to keep per template (by version order)
+        /// Most-recent usable builds to keep per template (by version order)
         #[arg(long, default_value_t = 1)]
         keep: usize,
         /// Actually delete; without this, only prints what would be removed
@@ -814,8 +814,8 @@ async fn rm(sup: &SupClient, reference: String, force: bool) -> Result<()> {
 }
 
 /// `vmlab template clean`: per `<arch>/<name>` family, keep the `keep` newest
-/// builds (by version order) and remove the rest. Dry-run unless `yes`; a build
-/// still backing a clone is skipped unless `force`.
+/// usable builds (by version order) and remove older ones. Dry-run unless
+/// `yes`; a build still backing a clone is skipped unless `force`.
 async fn clean(
     sup: &SupClient,
     filter: Option<String>,

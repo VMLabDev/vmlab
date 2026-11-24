@@ -538,15 +538,15 @@ impl MachineHandle {
 
     fn match_opts(threshold: f64, region: Vec<i64>) -> Result<vision::MatchOptions, String> {
         vision::validate_threshold(threshold)?;
-        let region = match region.len() {
-            0 => None,
-            4 => Some((
-                region[0].max(0) as u32,
-                region[1].max(0) as u32,
-                region[2].max(0) as u32,
-                region[3].max(0) as u32,
-            )),
-            n => return Err(format!("region needs [x, y, w, h], got {n} elements")),
+        let region = match region.as_slice() {
+            [] => None,
+            [x, y, w, h] => Some(region_coordinates([*x, *y, *w, *h])),
+            _ => {
+                return Err(format!(
+                    "region needs [x, y, w, h], got {} elements",
+                    region.len()
+                ));
+            }
         };
         Ok(vision::MatchOptions { threshold, region })
     }
@@ -1398,16 +1398,57 @@ pub fn context() -> Context {
     Context::from_registry(registry)
 }
 
-/// Compile-check a script (used by `vmlab validate`, PRD §5.1).
-pub fn check_script_source(source: &str) -> Result<(), String> {
-    match context().compile(source) {
-        Ok(_) => Ok(()),
-        Err(wscript::Error::Compile(diags)) => {
-            let msgs: Vec<String> = diags.iter().map(runner::render_diag).collect();
-            Err(msgs.join("; "))
+#[derive(Clone, Copy)]
+pub enum ScriptEntry {
+    Main,
+    Handler,
+}
+
+impl ScriptEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Handler => "handle",
         }
-        Err(e) => Err(e.to_string()),
     }
+}
+
+/// Compile a script and check the signature vmlab will call (PRD §5.1).
+pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String> {
+    let mut unit = context().compile(source).map_err(runner::compile_error)?;
+    let name = entry.name();
+    let Some((_, signature)) = unit.exports.get(name) else {
+        return Err(format!(
+            "the script must define a non-generic function named {name}"
+        ));
+    };
+    let lab = LabHandle::script_type(&mut unit.defs);
+    let params = match entry {
+        ScriptEntry::Main => vec![lab],
+        ScriptEntry::Handler => vec![EventData::script_type(&mut unit.defs), lab],
+    };
+    let expected = wscript::FnSig::new(params, Type::Unit);
+    if *signature != expected {
+        let expected = Type::Fn(Box::new(expected)).display(&unit.defs);
+        let actual = Type::Fn(Box::new(signature.clone())).display(&unit.defs);
+        return Err(format!(
+            "{name} must have signature {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_script_source(source: &str) -> Result<(), String> {
+    context()
+        .compile(source)
+        .map(|_| ())
+        .map_err(runner::compile_error)
+}
+
+fn region_coordinates(values: [i64; 4]) -> (u32, u32, u32, u32) {
+    let [x, y, w, h] = values.map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    (x, y, w, h)
 }
 
 /// Write the `.wscripti` interface file for LSP support (PRD §10).
@@ -1440,6 +1481,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_861_a_script_without_its_entry_point_fails_validation() {
+        for source in [
+            "fn mian(lab: Lab) {}",
+            "fn main() {}",
+            "fn main(n: int) {}",
+            "fn main(lab: Lab) -> int { 1 }",
+        ] {
+            assert!(
+                check_script_entry(source, ScriptEntry::Main).is_err(),
+                "{source}"
+            );
+        }
+        check_script_entry("fn main(lab: Lab) {}", ScriptEntry::Main).unwrap();
+        check_script_entry("fn handle(event: Event, lab: Lab) {}", ScriptEntry::Handler).unwrap();
+        assert!(
+            check_script_entry("fn handle(lab: Lab, event: Event) {}", ScriptEntry::Handler)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn card_861_region_coordinates_do_not_wrap() {
+        let coordinates = vec![4294967301, 0, 10, 10];
+        let matches = MachineHandle::match_opts(0.9, coordinates).unwrap();
+        let ocr =
+            ocr::parse_opts(&[("region".into(), "4294967301,0,10,10".into())].into()).unwrap();
+        assert_eq!(
+            (matches.region, ocr.region),
+            (Some((u32::MAX, 0, 10, 10)), Some((u32::MAX, 0, 10, 10)))
+        );
+    }
 
     #[test]
     fn a_huge_sleep_ms_faults_without_a_cancellation_token() {

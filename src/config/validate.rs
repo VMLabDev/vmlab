@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::hypervisor::{
     HostFacts, HypervisorDefaults, HypervisorKind, qemu_refusals, qemu_x86_refusals, vmlab_refusals,
@@ -16,6 +16,7 @@ use crate::qemu::resolve::{
     nested_tcg_conflict, resolve_accel, resolve_cpu_model, resolve_firmware, resolve_key_store,
     vm_arch,
 };
+use crate::scripting::ScriptEntry;
 use crate::template::TemplateMeta;
 use crate::template::meta::Purpose;
 
@@ -42,8 +43,8 @@ pub trait ValidationContext {
     /// missing layer produces is the message the user should read
     /// (ADR-0008). A permissive context may answer `Ok`.
     fn check_container_hardware(&self, container: &Container) -> Result<(), String>;
-    /// Compile-check a wscript script at an absolute path.
-    fn check_script(&self, path: &Path) -> Result<(), String>;
+    /// Check a wscript script and its required entry point at an absolute path.
+    fn check_script(&self, path: &Path, entry: ScriptEntry) -> Result<(), String>;
     /// Can the host's virtiofsd serve this `transport = "virtiofs"` share?
     /// A virtiofsd vmlab cannot drive, or one with no `--readonly` for a
     /// read-only share, would fail the machine's start; this says so first.
@@ -564,10 +565,10 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // `provision`/`playbook` blocks live inside the vm/container they
     // configure; the machine is the target, so there is nothing to
     // cross-reference here beyond the folders and scripts themselves.
-    let mut scripts: Vec<(&PathBuf, Span)> = Vec::new();
+    let mut scripts = Vec::new();
     for vm in &lab.vms {
         for p in &vm.provisions {
-            scripts.push((&p.script, p.span));
+            scripts.push((&p.script, p.span, ScriptEntry::Main));
         }
         // config-weave ships guest binaries only for x86_64; reject machines
         // whose arch is statically known to differ. Unknown archs (registry
@@ -599,7 +600,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
     for c in &lab.containers {
         for p in &c.provisions {
-            scripts.push((&p.script, p.span));
+            scripts.push((&p.script, p.span, ScriptEntry::Main));
         }
         // A container always runs vmlab's own Linux guest (§18).
         for p in &c.playbooks {
@@ -608,7 +609,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
 
     for h in &lab.handlers {
-        scripts.push((&h.run, h.span));
+        scripts.push((&h.run, h.span, ScriptEntry::Handler));
         if !EVENT_NAMES.contains(&h.event.as_str()) {
             issues.push(Issue::at(
                 h.span,
@@ -669,28 +670,28 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     }
     for t in &file.templates {
         for p in &t.provisions {
-            scripts.push((&p.script, p.span));
+            scripts.push((&p.script, p.span, ScriptEntry::Main));
         }
         if let Some(fb) = &t.first_boot {
-            scripts.push((fb, t.span));
+            scripts.push((fb, t.span, ScriptEntry::Main));
         }
         for v in &t.variants {
             for p in &v.provisions {
-                scripts.push((&p.script, p.span));
+                scripts.push((&p.script, p.span, ScriptEntry::Main));
             }
             if let Some(fb) = &v.first_boot {
-                scripts.push((fb, v.span));
+                scripts.push((fb, v.span, ScriptEntry::Main));
             }
         }
     }
-    for (script, span) in scripts {
+    for (script, span, entry) in scripts {
         let path = file.root.join(script);
         if !path.is_file() {
             issues.push(Issue::at(
                 span,
                 format!("script {} does not exist", script.display()),
             ));
-        } else if let Err(e) = ctx.check_script(&path) {
+        } else if let Err(e) = ctx.check_script(&path, entry) {
             issues.push(Issue::at(span, format!("{}: {e}", script.display())));
         }
     }
@@ -2318,7 +2319,7 @@ pub(crate) mod tests {
         fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
             Ok(())
         }
-        fn check_script(&self, _: &Path) -> Result<(), String> {
+        fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
             Ok(())
         }
     }
@@ -2373,7 +2374,7 @@ pub(crate) mod tests {
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
-        fn check_script(&self, _: &Path) -> Result<(), String> {
+        fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
             Ok(())
         }
     }
@@ -3626,7 +3627,7 @@ lab "l" { vm "a" { template = "scratch" } }"#,
             fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
                 Ok(())
             }
-            fn check_script(&self, _: &Path) -> Result<(), String> {
+            fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
                 Ok(())
             }
         }
@@ -3785,7 +3786,7 @@ lab "l" {
             fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
                 Ok(())
             }
-            fn check_script(&self, _: &Path) -> Result<(), String> {
+            fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
                 Ok(())
             }
             fn check_virtiofs_share(&self, share: &Share) -> Result<(), String> {
@@ -3821,7 +3822,7 @@ lab "l" {
         fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
             Ok(())
         }
-        fn check_script(&self, _: &Path) -> Result<(), String> {
+        fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
             Ok(())
         }
         fn check_host_gpu(
@@ -5089,7 +5090,7 @@ lab "l" {
         fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
             Ok(())
         }
-        fn check_script(&self, _: &Path) -> Result<(), String> {
+        fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
             Ok(())
         }
         fn hypervisor_defaults(&self) -> HypervisorDefaults {
@@ -5220,7 +5221,7 @@ lab "l" {
             fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
                 Ok(())
             }
-            fn check_script(&self, _: &Path) -> Result<(), String> {
+            fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
                 Ok(())
             }
             fn check_virtiofs_share(&self, share: &Share) -> Result<(), String> {
