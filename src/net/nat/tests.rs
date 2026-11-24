@@ -1579,6 +1579,115 @@ async fn a_syn_to_the_gateway_itself_is_reset() {
     assert_eq!((t.src_port(), t.dst_port()), (22, 40300));
 }
 
+// ---------------------------------------------------------------------------
+// A SYN on a live flow (networking review 2, F32)
+// ---------------------------------------------------------------------------
+
+/// A guest that lost its side of a connection and reuses the port pair gets
+/// an answer to its new SYN: an ACK of what the old flow expects. Its RST to
+/// that ACK ends the old flow, and its next SYN opens a new one. Before the
+/// fix the SYN met silence until the idle reset, 300 seconds later.
+#[tokio::test]
+async fn a_syn_on_a_live_flow_is_answered() {
+    let addr = tcp_echo_server().await;
+    let dst = (Ipv4Addr::LOCALHOST, addr.port());
+    let (engine, mut rx) = engine();
+    let sport = 40500;
+    let isn = 7000u32;
+
+    guest_tcp(&engine, sport, dst, isn, 0, TCP_SYN, b"", &[]).await;
+    let synack = recv_tcp(&mut rx).await;
+    assert_eq!(synack.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+    let s_next = synack.seq.wrapping_add(1);
+    guest_tcp(&engine, sport, dst, isn + 1, s_next, TCP_ACK, b"", &[]).await;
+
+    // The guest restarts and sends a SYN on the same four values.
+    let new_isn = 900_000u32;
+    guest_tcp(&engine, sport, dst, new_isn, 0, TCP_SYN, b"", &[]).await;
+    let answer = recv_tcp(&mut rx).await;
+    assert_eq!(answer.dst, (GUEST_IP, sport));
+    assert_eq!(answer.src, dst);
+    assert_eq!(answer.flags & (TCP_SYN | TCP_RST), 0, "a challenge ACK, not {answer:?}");
+    assert_ne!(answer.flags & TCP_ACK, 0, "the SYN is answered with an ACK");
+    assert_eq!(answer.ack, isn + 1, "the ACK names what the old flow expects");
+    assert_eq!(answer.seq, s_next);
+
+    // The guest knows no such connection and resets it.
+    guest_tcp(&engine, sport, dst, answer.ack, 0, TCP_RST, b"", &[]).await;
+    timeout(WAIT, async {
+        while !engine.tcp_flows.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the old flow did not end on the guest's RST");
+
+    // Its retransmitted SYN opens a new flow.
+    guest_tcp(&engine, sport, dst, new_isn, 0, TCP_SYN, b"", &[]).await;
+    let synack = recv_tcp(&mut rx).await;
+    assert_eq!(synack.flags & (TCP_SYN | TCP_ACK), TCP_SYN | TCP_ACK);
+    assert_eq!(synack.ack, new_isn + 1, "the new flow answers the new SYN");
+}
+
+// ---------------------------------------------------------------------------
+// Addresses of the lab itself (networking review 2, F31)
+// ---------------------------------------------------------------------------
+
+/// A guest's SYN to an address of its own segment, or of another segment of
+/// the lab that is not connected to it, opens no flow: the host does not own
+/// that address and would dial it on its own network. The engine resets it
+/// at once, as it resets a SYN to the gateway address. UDP and an echo
+/// request to such an address are dropped: no flow and no probe.
+#[tokio::test]
+async fn nat_does_not_dial_an_address_of_the_lab() {
+    let pinger = stub_pinger();
+    let (engine, mut rx) = engine_with_pinger(pinger.clone());
+    engine.set_lab_subnets(vec![
+        "10.213.0.0/24".parse().unwrap(),
+        "10.214.0.0/24".parse().unwrap(),
+    ]);
+    let own = Ipv4Addr::new(10, 213, 0, 20);
+    let other = Ipv4Addr::new(10, 214, 0, 20);
+    for (i, dst) in [own, other].into_iter().enumerate() {
+        let sport = 40400 + i as u16;
+        guest_tcp(&engine, sport, (dst, 22), 500, 0, TCP_SYN, &[], &[]).await;
+        assert!(
+            engine.tcp_flows.lock().unwrap().is_empty(),
+            "a flow was opened for the lab address {dst}: the host dials it"
+        );
+        let f = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("no reset for a SYN to the lab address {dst}"));
+        let eth = EthView::parse(&f).unwrap();
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        assert_eq!((ip.src(), ip.dst()), (dst, GUEST_IP));
+        let t = TcpView::parse(ip.payload()).unwrap();
+        assert_ne!(t.flags() & TCP_RST, 0, "the SYN is reset");
+        assert_eq!(t.ack(), 501, "the reset acks the SYN");
+        assert_eq!((t.src_port(), t.dst_port()), (22, sport));
+
+        guest_udp(&engine, sport, (dst, 53), b"q").await;
+        assert!(
+            engine.udp_flows.lock().unwrap().is_empty(),
+            "a UDP flow was opened for the lab address {dst}"
+        );
+        guest_icmp_echo(&engine, dst, 7, b"ping").await;
+    }
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err(), "UDP or ICMP to a lab address was answered");
+    assert_eq!(
+        pinger.calls.load(Ordering::SeqCst),
+        0,
+        "the host probed a lab address"
+    );
+
+    // An address outside the lab is still dialed.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    guest_tcp(&engine, 40410, (Ipv4Addr::LOCALHOST, port), 1, 0, TCP_SYN, &[], &[]).await;
+    assert_eq!(engine.tcp_flows.lock().unwrap().len(), 1, "egress still opens a flow");
+}
+
 /// The same for the rest of `127.0.0.0/8`, for `0.0.0.0`, and for UDP and
 /// ICMP, which are dropped: no flow, no probe, no reply.
 #[tokio::test]

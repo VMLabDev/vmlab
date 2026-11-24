@@ -554,11 +554,22 @@ impl GatewayTask {
                 };
                 let tx = self.tx.clone();
                 let segment = self.segment.clone();
+                let dns = self.dns.clone();
                 tokio::spawn(async move {
                     // Given back when the forward ends.
                     let _permit = permit;
                     match forward_upstream(upstream, &raw_query, UPSTREAM_DNS_TIMEOUT).await {
                         Some(resp) => {
+                            // A sinkhole holds for every name of the answer,
+                            // not only the question (review networking-2 F33).
+                            let resp = match &dns {
+                                Some(dns) => dns.screen_upstream(&raw_query, &resp),
+                                None => Some(resp),
+                            };
+                            let Some(resp) = resp else {
+                                debug!(segment = %segment, %upstream, "unreadable upstream DNS answer dropped");
+                                return;
+                            };
                             if let Some(frame) = respond.build_frame(&resp) {
                                 let _ = tx.send(Bytes::from(frame)).await;
                             }
@@ -950,6 +961,89 @@ pub(crate) mod tests {
             forwarded <= MAX_DNS_FORWARDS,
             "{forwarded} queries waited on the upstream at once, over the limit of {MAX_DNS_FORWARDS}"
         );
+    }
+
+    /// An upstream answer whose CNAME chain leads into a sinkhole reaches
+    /// the guest as the sinkholed name would: NXDOMAIN, with no address of
+    /// the alias's target in it (review networking-2 F33). An answer that
+    /// touches no sinkhole is relayed as received.
+    #[tokio::test]
+    async fn an_upstream_answer_through_a_sinkholed_name_is_not_relayed() {
+        use crate::config::model::SinkholeMode;
+        use crate::net::dns::encode_qname;
+
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut zone = DnsZone::new("vmlab.internal");
+        zone.add_sinkhole("*.blocked.test", SinkholeMode::Nxdomain);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(
+            &sw,
+            GatewayConfig {
+                dns: Some(zone),
+                upstream_dns: Some(upstream.local_addr().unwrap()),
+                ..config()
+            },
+        );
+        let mut guest = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        // The upstream answers `<name> CNAME a.blocked.test` and
+        // `a.blocked.test A 192.0.2.1` for whatever is asked, unless the
+        // name is `plain.open.test`, which gets an A record of its own.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = upstream.recv_from(&mut buf).await {
+                let q = &buf[..n];
+                let qend = 12 + q[12..].iter().position(|&b| b == 0).unwrap() + 1 + 4;
+                let plain = q[12..qend - 4] == encode_qname("plain.open.test")[..];
+                let mut r = q[..qend].to_vec();
+                r[2] |= 0x80;
+                r[3] = 0x80;
+                r[6..8].copy_from_slice(&(if plain { 1u16 } else { 2 }).to_be_bytes());
+                r.extend_from_slice(&[0xC0, 0x0C]);
+                if plain {
+                    r.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 2]);
+                } else {
+                    let target = encode_qname("a.blocked.test");
+                    r.extend_from_slice(&[0, 5, 0, 1, 0, 0, 0, 60]);
+                    r.extend_from_slice(&(target.len() as u16).to_be_bytes());
+                    let target_at = r.len() as u16;
+                    r.extend_from_slice(&target);
+                    r.extend_from_slice(&(0xC000 | target_at).to_be_bytes());
+                    r.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+                }
+                upstream.send_to(&r, from).await.unwrap();
+            }
+        });
+
+        let ask = |id: u16, name: &str| {
+            let mut q = vec![(id >> 8) as u8, id as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            q.extend_from_slice(&encode_qname(name));
+            q.extend_from_slice(&[0, 1, 0, 1]); // A IN
+            let udp = udp_build(GUEST_IP, gw.gw_ip(), 33001, 53, &q).unwrap();
+            let ipp = ipv4_build(GUEST_IP, gw.gw_ip(), IPPROTO_UDP, 64, &udp, 9).unwrap();
+            Bytes::from(eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp))
+        };
+        let answer = |frame: &Bytes| {
+            let eth = EthView::parse(frame).unwrap();
+            let ip = Ipv4View::parse(eth.payload()).unwrap();
+            UdpView::parse(ip.payload()).unwrap().payload().to_vec()
+        };
+
+        guest.tx.send(ask(0x0101, "alias.open.test")).await.unwrap();
+        let got = answer(&recv(&mut guest.rx).await);
+        assert_eq!(&got[..2], &[0x01, 0x01], "the reply answers the query");
+        assert!(
+            !got.windows(4).any(|w| w == [192, 0, 2, 1]),
+            "the sinkholed target's address reached the guest: {got:?}"
+        );
+        assert_eq!(got[3] & 0x0F, crate::net::dns::RCODE_NXDOMAIN);
+        assert_eq!(&got[6..8], &[0, 0], "no answer records");
+
+        guest.tx.send(ask(0x0202, "plain.open.test")).await.unwrap();
+        let got = answer(&recv(&mut guest.rx).await);
+        assert_eq!(&got[..2], &[0x02, 0x02]);
+        assert_eq!(got[3] & 0x0F, crate::net::dns::RCODE_NOERROR);
+        assert!(got.ends_with(&[192, 0, 2, 2]), "a clean answer is relayed");
     }
 
     #[tokio::test]
