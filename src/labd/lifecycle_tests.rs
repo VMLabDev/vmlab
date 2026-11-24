@@ -506,6 +506,19 @@ fn container_with_volumes(
     script: Script,
     volumes: Vec<(String, PathBuf, bool)>,
 ) -> (Arc<ContainerInstance>, Arc<FakeHypervisor>) {
+    container_on_image(dirs, decl, script, volumes, "sha256:00")
+}
+
+/// [`container_with_volumes`] bound to the image with this manifest digest.
+/// A scratch overlay `dirs` already holds is kept as it is, so a second
+/// call over the same `dirs` is the machine rebuilt.
+fn container_on_image(
+    dirs: &Dirs,
+    decl: &str,
+    script: Script,
+    volumes: Vec<(String, PathBuf, bool)>,
+    digest: &str,
+) -> (Arc<ContainerInstance>, Arc<FakeHypervisor>) {
     let cfg = testing::container(decl);
     let profiles = ProfileSet::shipped().expect("shipped profiles");
     let resolved = crate::qemu::resolve_container(&cfg, "x86_64", &profiles).expect("resolve");
@@ -517,10 +530,12 @@ fn container_with_volumes(
     std::fs::create_dir_all(&ctr_dirs.local).expect("local dir");
     // As with the VM's disk: the scratch overlay already exists, so no
     // `qemu-img` runs.
-    std::fs::write(ctr_dirs.scratch_disk(), b"").expect("scratch");
+    if !ctr_dirs.scratch_disk().exists() {
+        std::fs::write(ctr_dirs.scratch_disk(), b"").expect("scratch");
+    }
 
     let image = PulledImage {
-        manifest_digest: "sha256:00".into(),
+        manifest_digest: digest.into(),
         config: ImageConfig {
             architecture: "amd64".into(),
             os: "linux".into(),
@@ -1307,6 +1322,77 @@ async fn a_clone_of_another_template_refuses_to_boot() {
         std::fs::read_to_string(vm.dirs.clone_source()).expect("record"),
         "x86_64/alpine-3.23\n"
     );
+}
+
+/// A container's writable layer is never booted over another image than the
+/// one it was made on (§18, docs/reviews/containers.md F3): after the
+/// `image =` line and the pin change, the start refuses, names both images
+/// and the way out, and leaves the layer alone.
+#[tokio::test]
+async fn a_changed_image_does_not_reuse_the_old_scratch_layer() {
+    let dirs = Dirs::new();
+    let (old, _hv) =
+        container_on_image(&dirs, WORKLOAD, Script::healthy(), Vec::new(), "sha256:aa");
+    let (cbs, _observed) = callbacks();
+    start_container(&old, cbs)
+        .await
+        .expect("start on the old image");
+    old.stop(true).await.expect("stop");
+    let scratch = old.dirs.scratch_disk();
+    let marker = b"written while nginx:1 ran";
+    std::fs::write(&scratch, marker).expect("marker");
+    drop(old);
+
+    let (new, hv) = container_on_image(
+        &dirs,
+        r#"container "web" { image = "nginx:2" profile = "container" }"#,
+        Script::healthy(),
+        Vec::new(),
+        "sha256:bb",
+    );
+    let (cbs, _observed) = callbacks();
+    let err = start_container(&new, cbs)
+        .await
+        .expect_err("the old layer must not boot over the new image");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("sha256:aa"), "names the old image: {msg}");
+    assert!(msg.contains("sha256:bb"), "names the new image: {msg}");
+    assert!(msg.contains("nginx:2"), "names the declared image: {msg}");
+    assert!(
+        msg.contains("vmlab container destroy web"),
+        "says the way out: {msg}"
+    );
+    assert_eq!(new.state().await, PowerState::Stopped);
+    assert_eq!(hv.starts(), 0, "nothing was launched");
+    assert_eq!(
+        std::fs::read(&scratch).expect("scratch"),
+        marker,
+        "the layer is kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(new.dirs.scratch_image()).expect("record"),
+        "sha256:aa",
+        "and so is the record of its image"
+    );
+}
+
+/// The same image keeps its writable layer across a rebuild of the machine,
+/// and a layer made before its image was recorded is taken to be of the
+/// image pinned now.
+#[tokio::test]
+async fn an_unchanged_image_keeps_its_scratch_layer() {
+    let dirs = Dirs::new();
+    for _ in 0..2 {
+        let (ctr, _hv) =
+            container_on_image(&dirs, WORKLOAD, Script::healthy(), Vec::new(), "sha256:aa");
+        let (cbs, _observed) = callbacks();
+        start_container(&ctr, cbs).await.expect("start");
+        ctr.stop(true).await.expect("stop");
+        assert_eq!(
+            std::fs::read_to_string(ctr.dirs.scratch_image()).expect("record"),
+            "sha256:aa"
+        );
+    }
 }
 
 /// A clone made before its source was recorded boots, and is taken to be of

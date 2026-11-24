@@ -157,7 +157,8 @@ vm "web": its disk is a clone of "x86_64/alpine-3.23", but vmlab.wcl now declare
 ```
 
 `vmlab vm destroy <vm>` (or `vmlab destroy`) recreates it, or put the template line
-back. A container's edited `image` line just drops its pin.
+back. A container's edited `image` line drops its pin, and a writable layer made
+over the old image is refused until `vmlab container destroy <name>`.
 
 A lab daemon also decides, when it starts, whether the lab runs under worktree
 isolation and, in a worktree lab, which machines clone from the main checkout's

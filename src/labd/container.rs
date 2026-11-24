@@ -119,6 +119,13 @@ impl ContainerDirs {
     pub fn scratch_disk(&self) -> PathBuf {
         self.local.join("scratch.qcow2")
     }
+
+    /// The manifest digest of the image the scratch layer was made over (see
+    /// [`scratch_image_refusal`]). Kept beside the layer, so it goes wherever
+    /// the layer goes and is deleted with it.
+    pub fn scratch_image(&self) -> PathBuf {
+        self.local.join("scratch-image")
+    }
     /// Debug copy of the merged spec. The guest receives the spec over the
     /// ctl channel (plus the SMB credential, which this copy omits) — this
     /// file exists purely for humans troubleshooting a container.
@@ -169,6 +176,33 @@ pub fn resolve_volume_hosts(
             (volume_share_name(&cfg.name, i), host, v.read_only)
         })
         .collect()
+}
+
+/// Why `container` cannot start on the scratch layer it has: the layer was
+/// made over the image `recorded`, and the image pinned now is `pinned`
+/// (both manifest digests). `None` when they agree.
+///
+/// The layer is an overlayfs upper directory (§18). Its files shadow the
+/// image's and its whiteouts hide them, so over another image the container
+/// would run a mix of the two, and replacing the layer would silently
+/// destroy what the container wrote. As for a VM's clone (§7.1), the way
+/// forward is to say so. Compared by digest, not by the `image =` line, so a
+/// tag that was pulled again to another digest is refused too.
+pub fn scratch_image_refusal(
+    container: &str,
+    recorded: &str,
+    declared: &str,
+    pinned: &str,
+) -> Option<String> {
+    (recorded != pinned).then(|| {
+        format!(
+            "container \"{container}\": its writable layer was made over image {recorded}, \
+             but vmlab.wcl now declares \"{declared}\", pinned at {pinned} — a writable \
+             layer is only valid over the image it was made on. Run `vmlab container \
+             destroy {container}` (or `vmlab destroy`) to discard the layer and its \
+             snapshots and start from \"{declared}\", or put the image line back"
+        )
+    })
 }
 
 /// Merge the image config with the lab overrides into the `container.json`
@@ -494,6 +528,34 @@ impl ContainerInstance {
             .map(|p| p.image.manifest_digest.clone())
     }
 
+    /// Refuse when the scratch layer this container already has was made over
+    /// another image than the one pinned now (see [`scratch_image_refusal`]).
+    ///
+    /// Checked by `up` before it starts anything, for a container whose image
+    /// is bound by then, and again by every start, which is the first point a
+    /// freshly pulled image's digest is known.
+    pub fn check_scratch_image(&self) -> Result<()> {
+        let Some(pinned) = self.image_digest() else {
+            return Ok(());
+        };
+        if !self.dirs.scratch_disk().exists() {
+            return Ok(());
+        }
+        let recorded = match std::fs::read_to_string(self.dirs.scratch_image()) {
+            Ok(recorded) => recorded,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("reading {}", self.dirs.scratch_image().display()));
+            }
+        };
+        let declared = self.cfg.image.reference.as_str();
+        match scratch_image_refusal(&self.cfg.name, recorded.trim(), declared, &pinned) {
+            Some(why) => bail!(why),
+            None => Ok(()),
+        }
+    }
+
     /// Bind the image resolved by a deferred pull (re-merges the spec).
     pub fn set_image(&self, image: PulledImage) {
         let spec = build_spec(&self.cfg, &image.config, &self.cfg.name);
@@ -790,9 +852,16 @@ impl ContainerInstance {
             // the ctl channel.
             write_json_atomic(&self.dirs.container_json(), &parts.spec)?;
 
+            self.check_scratch_image()?;
+            let digest = &parts.image.manifest_digest;
             if !self.dirs.scratch_disk().exists() {
                 crate::template::qimg::create_blank(&self.dirs.scratch_disk(), SCRATCH_SIZE)
                     .await?;
+                std::fs::write(self.dirs.scratch_image(), digest)?;
+            } else if !self.dirs.scratch_image().exists() {
+                // A layer made before its image was recorded is taken to be
+                // of the image pinned now: nothing on disk says otherwise.
+                std::fs::write(self.dirs.scratch_image(), digest)?;
             }
 
             // virtiofsd daemons must be listening before QEMU spawns (its
@@ -1589,6 +1658,11 @@ impl super::machine::Machine for ContainerInstance {
 
     fn snapshot_pin(&self) -> Option<String> {
         self.image_digest()
+    }
+
+    /// A writable layer made over another image than the one pinned now (§18).
+    fn check_disks(&self) -> Result<()> {
+        self.check_scratch_image()
     }
 
     fn console_log(&self, lines: usize) -> Option<Result<String>> {

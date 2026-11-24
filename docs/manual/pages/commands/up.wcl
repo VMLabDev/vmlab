@@ -264,9 +264,10 @@ TXT
     The reference is compared as written. An unpinned `<arch>/<name>` keeps
     its clone when a newer version of the same template is built, while
     pinning a different `@<version>` counts as a different template. A
-    container's `image` line is different: changing it drops the image pin,
-    and the next `up` pulls the new image (see
-    [Containers](guide_containers)).
+    container's `image` line is compared by digest instead: changing it drops
+    the image pin, the next `up` pulls the new image, and a writable layer
+    made over the old image is refused in the same way, with `vmlab container
+    destroy <name>` as the way forward (see [Containers](guide_containers)).
   DOC
 
   p <<DOC
