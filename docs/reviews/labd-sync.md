@@ -43,21 +43,21 @@ depends on what a real guest or agent does, the finding says so.
 
 | Code | Fault | How bad |
 |---|---|---|
-| F1 | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed (fixed in #384) | Data loss (host) |
+| F1 (fixed, card #384) | A guest directory that cannot be listed during a walk reads as deleted files, and the host copies are removed | Data loss (host) |
 | F2 (fixed, card #385) | The host follows a guest-planted symlink named like a rule file, and sends the lines of the target back to the guest | Security against a hostile guest, and crash of the host process |
 | F3 (fixed, card #390) | A restore does not flush and does not refuse on unsynced guest work | Data loss (guest work) |
-| F4 | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
+| F4 (fixed, card #403) | A re-seed never completes while the tree holds a socket, an unreadable path or an oversize file | Wrong result (sync stops for good) |
 | F5 (fixed, card #404) | A halted workspace keeps every path the guest reports, without a bound and without checking it is a path | Security against a hostile guest (host memory and CPU) |
 | F6 (fixed, card #418) | A guest or host file that changed without a settled event is carried anyway, so the quiet period and the git lock deferral are bypassed | Wrong result (torn copy on the host) |
-| F7 | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
-| F8 | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
+| F7 (fixed, card #419) | A guest delete made while the watch reopens for a new prune list is undone | Wrong result |
+| F8 (fixed, card #869) | An ignore rule written in the guest applies one pass late, so the output it ignores is copied to the host and stays | Wrong result |
 | F9 (fixed, card #434) | A directory named `.gitignore` or `.vmlabignore` fails every pass | Wrong result (sync stops) |
-| F10 | A host file name that is not UTF-8 is trouble on every pass, and refuses every capture | Wrong result |
+| F10 (fixed, card #436) | A host file name that is not UTF-8 is trouble on every pass, and refuses every capture | Wrong result |
 | F11 (fixed, card #435) | A directory one side deleted comes back when the other side keeps ignored content in it | Cosmetic |
 
 ### F1. A failed guest `readdir` during a walk deletes host files
 
-**Fixed in #384.** Reconciliation defers the descendants of a guest
+**Fixed in #384 (`f6bbf02e`).** Reconciliation defers the descendants of a guest
 directory it could not list. A failed root listing or a channel failure
 aborts the walk.
 
@@ -109,7 +109,7 @@ walk.
 
 ### F2. A guest-planted rule-file symlink discloses host files to the guest
 
-**Status.** Fixed by card #385. `read_dir_rules` opens a rule file with
+**Status.** Fixed by card #385 (`370f535a`). `read_dir_rules` opens a rule file with
 `O_NOFOLLOW` and never reads one that is a symlink. The decision on a
 legitimate in-tree link: it is refused too, because its target can be a
 guest-owned path (`.env`) the guest was never given, and a rule about which
@@ -159,7 +159,7 @@ crash of the host process.
 
 ### F3. A restore neither flushes nor refuses on unsynced guest work
 
-**Fixed in #390.** Restore checks a fresh flush report for a running workspace
+**Fixed in #390 (`4458fcbb`).** Restore checks a fresh flush report for a running workspace
 and refuses when guest work remains outstanding or the flush cannot account
 for it. The explicit discard flag bypasses this check.
 
@@ -191,7 +191,7 @@ where the flag is given.
 
 ### F4. A re-seed never completes while the tree holds a path it skips
 
-**Fixed in #403.** Skipped paths and size refusals are reported as warnings
+**Fixed in #403 (`c39af645` and `5219d098`).** Skipped paths and size refusals are reported as warnings
 while the re-seed completes for the rest of the tree. Apply failures and case
 collisions still hold the re-seed barrier.
 
@@ -228,7 +228,7 @@ and the guest hash the whole tree every 5 s.
 
 ### F5. A halted workspace keeps every path the guest reports
 
-**Fixed in #404.** Both watch batch handlers validate relative paths before
+**Fixed in #404 (`957aa2df`).** Both watch batch handlers validate relative paths before
 debouncing. A halted pass drops reported paths that are absent on both sides
 and keeps paths with an agreement or an observation still pending.
 
@@ -263,7 +263,7 @@ process.
 
 ### F6. A change with no settled event is carried, so the debounce is bypassed
 
-**Fixed in #418.** A steady-state pass defers a path that moved on either side
+**Fixed in #418 (`978a4aca` and `0f961275`).** A steady-state pass defers a path that moved on either side
 with no settled event, and starts its quiet period. The path is decided once
 that period is over, or once a pass sees it in the same state a quiet period
 later. A pass that sees `.git`'s mutable set moved asks the guest for the lock
@@ -308,7 +308,7 @@ on the canonical copy for a time.
 
 ### F7. A guest delete across a prune-list reopen is undone
 
-**Fixed in #419.** The stat-walk after an immediate prune-list reopen
+**Fixed in #419 (`0b0500a3`).** The stat-walk after an immediate prune-list reopen
 recovers guest deletions. A failed reopen keeps the unwitnessed-absence
 policy on retry.
 
@@ -337,6 +337,9 @@ halts on a file the developer removed.
 
 ### F8. An ignore rule written in the guest applies one pass late
 
+**Fixed in #869 (`59da9a3d` and `ee405497`).** Guest-authored ignore files are
+installed before other guest-to-host copies in their scope resume.
+
 **Where.** `src/labd/workspace/syncer.rs:1637-1640` (rules come from the host
 scan only), `syncer.rs:1672-1676`, `syncer.rs:1815-1824`.
 
@@ -360,7 +363,7 @@ and the ledger no longer has it.
 
 ### F9. A directory named like a rule file fails every pass
 
-**Fixed in #434.** `read_rule_file` reads a regular file only. A rule-file name
+**Fixed in #434 (`53431d66`).** `read_rule_file` reads a regular file only. A rule-file name
 that is a directory, a FIFO, a socket or a device is refused by name, like the
 symlink of F2: its rules do not apply, the pass names it in the skipped list
 and in a `workspace.skipped` event, and the scan goes on. A directory still
@@ -392,7 +395,7 @@ hand.
 
 ### F10. A host file name that is not UTF-8 is trouble on every pass
 
-**Fixed in #436.** The host scan reports the escaped filename as a
+**Fixed in #436 (`3c263408`).** The host scan reports the escaped filename as a
 skip and leaves the entry out of reconciliation.
 
 **Where.** `src/labd/workspace/scan.rs:125`.
@@ -415,7 +418,7 @@ a row report `1 workspace actions failed: caf�.txt: No such file or directory`
 
 ### F11. A directory left standing comes back on the side that deleted it
 
-**Fixed in #435.** The ledger records each directory a removal left standing,
+**Fixed in #435 (`7a52843d`).** The ledger records each directory a removal left standing,
 with the side that kept it (`left_standing`). Reconciliation does not read such
 a directory as created: it makes it again only when a synced path has to land
 under it. The record ends when the keeping side drops the directory too, or

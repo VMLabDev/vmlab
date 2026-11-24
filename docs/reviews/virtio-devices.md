@@ -91,7 +91,7 @@ Not read:
   and `fs.read` return the old content and that the created entry has a node
   id other than X. Today the read returns `new` and the id is X.
 - Confidence: high.
-- Fixed in card #391. `rename` moves the inode, and every known inode below
+- Fixed in card #391 (`1a37fb61`). `rename` moves the inode, and every known inode below
   it, to the new path in `by_path`, and gives the moved inode its new parent
   descriptor and name. A replaced destination loses the name, and
   `RENAME_EXCHANGE` swaps both subtrees. The proposed test failed before the
@@ -101,7 +101,7 @@ Not read:
 
 ### F2. virtio-fs: after a restore, a handle whose file is gone accepts writes and reports success
 
-- Fixed in #392. Restored file handles without a reopened file return
+- Fixed in #392 (`0cdc2d6a`). Restored file handles without a reopened file return
   `ESTALE` on read, write and fsync.
 - Where: `devices/virtio/fs/passthrough.rs:352-357`, `1285-1298`
   (`reopen_dead`), `1124-1138` (`file_handle`).
@@ -143,7 +143,7 @@ Not read:
 - Confidence: high for the server side. Medium that a Linux guest sends the
   second write for `echo a >> f; echo b >> f`. An end-to-end run in a guest
   settles it.
-- Fixed in card #398. OPEN and CREATE clear host `O_APPEND` when writeback
+- Fixed in card #398 (`85d6eb37`). OPEN and CREATE clear host `O_APPEND` when writeback
   is negotiated, so writes honor the guest offset. Snapshots now record
   the negotiated setting.
 
@@ -165,7 +165,7 @@ Not read:
   that `guest.device.lock().control(&request)` returns at most
   `4 + 2 * PCM_INFO_LEN` bytes. Today it returns more than 512 MiB.
 - Confidence: high.
-- Fixed in card #393. A `size` above `PCM_INFO_SIZE_MAX` (256) is answered
+- Fixed in card #393 (`51b718c3`). A `size` above `PCM_INFO_SIZE_MAX` (256) is answered
   `S_BAD_MSG` before anything is allocated. A smaller `size` above the
   structure's 32 bytes is still zero-padded. The proposed test failed before
   the fix (a 512 MiB reply) and passes after it.
@@ -206,7 +206,7 @@ Not read:
   - Twins `rx_message_larger_than_a_period_pulls_one_period` and
     `control_request_longer_than_any_request_is_bad_msg`.
 - Confidence: high.
-- Fixed in card #393.
+- Fixed in card #393 (`51b718c3`).
   - Block: `VIRTIO_BLK_T_OUT` checks the range against the disk before it
     copies anything. Both scatter-gather paths then move a request through
     `io_buffer` in pieces of at most `IO_CHUNK` (1 MiB), so the buffer no
@@ -226,7 +226,7 @@ Not read:
 
 ### F6. An `avail.idx` far ahead makes the queue drain loop spin forever (block, virtio-fs, GPU)
 
-- Fixed in #399. The three drain loops check `avail_idx_in_range`
+- Fixed in #399 (`314a1c4e`). The three drain loops check `avail_idx_in_range`
   (`devices/virtio.rs`) before each pass and stop on an index more than the
   queue size ahead. The test `avail_idx_far_ahead_does_not_spin` in the
   block, virtio-fs and GPU tests fails before the fix (`queue_notify` does
@@ -281,7 +281,7 @@ Not read:
   Today the sum is 32 x 2000.
 - Confidence: high for the mechanism. The effect depends on the memory limit
   of the process.
-- Fixed in card #400. A directory handle holds no entries: it holds one
+- Fixed in card #400 (`b4b2a2d7`). A directory handle holds no entries: it holds one
   directory descriptor, opened by the first `READDIR`, and the cookie the
   stream stands at. Each request reads bounded batches with `getdents64`
   (at most 64 KiB per call) and serves the host's `d_off` as the cookie, so
@@ -321,7 +321,7 @@ Not read:
   buffer. Assert that the 60-byte frame arrives. Today each buffer comes
   back with used length 0 and nothing arrives.
 - Confidence: high.
-- Fixed in card #401. Both paths place a frame through `receive_single`.
+- Fixed in card #401 (`50402cd6`). Both paths place a frame through `receive_single`.
   A chain that holds the header but not the frame is returned with length 0
   and the frame is dropped, as the mergeable path does. The tests
   `oversized_frame_without_mergeable_buffers_is_dropped` and
@@ -354,7 +354,7 @@ Not read:
   does.
 - Confidence: high that the limit is missing. Medium that it grows to an
   out-of-memory state in practice.
-- Fixed in card #415. A queue holds at most its own size of chains, vblank
+- Fixed in card #415 (`5e2b0a2c`). A queue holds at most its own size of chains, vblank
   waits and fences counted together. A surplus vblank wait is answered at
   once with `ERR_OUT_OF_MEMORY`, and a surplus fenced chain is answered at
   once without waiting for its fence. The tests
@@ -382,7 +382,7 @@ Not read:
   succeeds. The test needs a render node, so it does not run in
   `just ci::check`.
 - Confidence: high.
-- Fixed in card #415. Attach-backing and blob create refuse entries above a
+- Fixed in card #415 (`5e2b0a2c`). Attach-backing and blob create refuse entries above a
   total over all resources. The total is `MAX_TOTAL_ENTRIES`, 16 times
   `MAX_ENTRIES` (262144 entries, about 12 MiB of host memory), not the
   `MAX_ENTRIES` of the 2D path: a 3D guest backs every texture, and a total
@@ -408,7 +408,7 @@ Not read:
   Call `f.fs.reset()`, activate again as `Fixture::over` does, send `INIT`,
   then `LOOKUP` a new file and expect `error == 0`. Today it is `-ENFILE`.
 - Confidence: high.
-- Fixed in card #402. Device reset ends the FUSE session, releases its inodes
+- Fixed in card #402 (`cdd7f065`). Device reset ends the FUSE session, releases its inodes
   and handles, and keeps the pinned share root for the next guest session.
 
 ### F12. vhost-user-fs: a completion interrupt can be lost across a snapshot
@@ -433,7 +433,7 @@ Not read:
   recorded before `save_state` returns.
 - Confidence: medium. Both code facts are confirmed. Where the VMM saves the
   transport's interrupt state relative to this section was not read.
-- Fixed in card #416. `save_state` delivers the calls that are readable
+- Fixed in card #416 (`d58e9f78`). `save_state` delivers the calls that are readable
   after `GET_VRING_BASE` before it re-arms the rings, and a restore of an
   active section notifies every armed queue (also when the section is applied
   by the next `activate`). The two proof tests and
@@ -461,7 +461,7 @@ Not read:
   `readdirplus_reports_a_full_inode_table`: create 40 files and assert that
   the call returns `ENFILE` or lists all 40.
 - Confidence: high.
-- Fixed in card #417. An entry that `add_entry` does not take (`Ok(0)` or an
+- Fixed in card #417 (`1814e2bd`). An entry that `add_entry` does not take (`Ok(0)` or an
   error) gives its lookup back at once, and a request that fails gives back
   the lookups of every entry it had already placed, because the guest gets
   the error alone. A full inode table is no longer skipped: a request that
@@ -500,7 +500,7 @@ Not read:
   `tap_integration_tests.rs` with a real TAP: transmit one frame with
   `hdr_len = 0xFFFF` and `gso_type = 0`.
 - Confidence: high that the error latches. Medium for the guest trigger.
-- Fixed in card #431. `reset` clears `tap_error` before it pauses the
+- Fixed in card #431 (`0ea58b40`). `reset` clears `tap_error` before it pauses the
   backend, so the error ends with the negotiation it happened in and a
   guest reboot recovers the link and the snapshot. A pause that fails in
   that reset still sets it. Test
@@ -511,6 +511,8 @@ Not read:
     run on a real TAP.
 
 ### F15. virtio-console: an in-place restore does not tell the guest the live host connection state
+
+- Fixed in card #833 (`a105f17a`). Restore queues a `PORT_OPEN` event when the live host connection differs from the saved state.
 
 - Where: `devices/virtio/console.rs:1072-1095` (`restore_state`) and `312`.
 - Fault: `restore_state` replaces `pending` with the snapshot's content. The
@@ -542,7 +544,7 @@ Not read:
   `host_open`, read the worker thread's CPU clock (`pthread_getcpuclockid`)
   across a 300 ms sleep, and assert less than 50 ms.
 - Confidence: high.
-- Fixed in card #432. The worker polls a port's listener only while the port
+- Fixed in card #432 (`bc51f6c5`). The worker polls a port's listener only while the port
   has no client, so a connection in the backlog wakes it only when the port
   is free again. The proof test fails before the fix (the worker used 299 ms
   of CPU in 300 ms) and passes after it. It also checks that the waiting
@@ -562,13 +564,15 @@ Not read:
   `restore_state` must return `Err`. Today it returns `Ok` and
   `guest.advance(period_time())` panics.
 - Confidence: high.
-- Fixed in card #430. `restore_state` holds the stored buffer size, period
+- Fixed in card #430 (`6b3d66c8`). `restore_state` holds the stored buffer size, period
   size and channel count to the bounds of `SET_PARAMS`, through one shared
   check, and answers `Err` otherwise. The proof test also covers a period
   below one frame, a period of part frames, a zero buffer, a buffer of part
   periods and three channels.
 
 ### F18. virtio-console: control traffic stalls or is lost when `pending` is full
+
+- Fixed in card #833 (`a105f17a`). Receive buffers let control transmit processing resume, and each port can retain its latest `PORT_OPEN` event when the pending queue is full.
 
 - Where: `devices/virtio/console.rs:690-693` with `473-477` and `127-135`.
 - Fault: `process_ctrl_tx` stops when the room in `pending` is below
@@ -600,7 +604,7 @@ Not read:
   then `fs.setattr(ino, attr { st_size: 0 }, Some(handle), SetattrValid::SIZE)`
   must be `Ok`. Skip the test when it runs as root.
 - Confidence: high.
-- Fixed in card #433. A `SETATTR` with a size truncates through the supplied
+- Fixed in card #433 (`11c407da`). A `SETATTR` with a size truncates through the supplied
   handle when that descriptor is open for writing, and through the
   `O_WRONLY` reopen otherwise (no handle, or a read-only one), where the
   mode of the file decides as it does for `truncate(2)`. The proof test
@@ -628,7 +632,7 @@ Not read:
   `save_state()` bytes 5..13, the acknowledged features, are unchanged).
   Today they change.
 - Confidence: high.
-- Fixed in card #428. The set accepted at `FEATURES_OK` (or at `DRIVER_OK`
+- Fixed in card #428 (`0073572a`). The set accepted at `FEATURES_OK` (or at `DRIVER_OK`
   from a legacy driver) is fixed until the next reset: a later
   `GUEST_FEATURE` write, modern or legacy, is ignored, and a status write
   does not call `ack_features` again. The driver reads back the set in
@@ -653,7 +657,7 @@ Not read:
   Program BAR 0, set command bit 1, then clear it. Assert that the last
   entry of `placements` for the BAR is `None`. Today it is `Some(addr)`.
 - Confidence: high.
-- Fixed in card #429. On a q35 root the address given to `set_bar_address`
+- Fixed in card #429 (`e34eb648`). On a q35 root the address given to `set_bar_address`
   is `None` while the BAR's decode bit of the command register is clear
   (bit 1 for a memory BAR, bit 0 for an I/O BAR), on a config write and on a
   restore of the BAR state, as `decode_mmio` and `find_bar` already decide.
@@ -666,6 +670,8 @@ Not read:
     changes by itself, without a config write, moves no placement.
 
 ### F22. virtio-gpu: a fenced release after the loss of the host GPU is answered with an error
+
+- Fixed in card #868 (`f4706593`). Fenced requests retain the command response and fence header after host GPU loss.
 
 - Where: `devices/virtio/gpu/mod.rs:1124-1135`.
 - Fault: `gpu/lost.rs:8-11` and `renderer.rs:460-469` say that a release
@@ -685,6 +691,8 @@ Not read:
 
 ### F23. virtio-console: used length is reported for chains the device only read
 
+- Fixed in card #834 (`ea995a94`). Console transmit and control transmit chains, and net transmit chains, complete with used length zero.
+
 - Where: `devices/virtio/console.rs:601`, `615`, `714`.
 - Fault: transmit and control transmit chains are completed with the number
   of bytes read. The used length counts bytes the device wrote (VIRTIO 1.2
@@ -698,6 +706,8 @@ Not read:
 - Confidence: high.
 
 ### F24. virtio-gpu: a response buffer too small for the payload gets no error header
+
+- Fixed in card #834 (`ea995a94`). A short response buffer that can hold the header receives a GPU error header.
 
 - Where: `devices/virtio/gpu/mod.rs:1138-1140`.
 - Fault: the command has run. When the writable part holds the 24-byte
