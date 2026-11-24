@@ -51,7 +51,7 @@ test does not reproduce is wrong and should be dropped.
 |------|----------|-------------------|
 | F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
 | F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666) |
-| F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped |
+| F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (fixed, card #802) |
 | F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it |
 | F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
 | F6 | security (hostile guest) | A terminal's buffer has no limit, and `expect` scans all of it again on every chunk |
@@ -174,6 +174,15 @@ test does not reproduce is wrong and should be dropped.
   has reached the gate, cancel the token and await the run
   (`ScriptCancelled`). Expected: `lab.workspaces.get("dev")` is `Some`.
   Today: `None`.
+- Fixed in card #802. `LabRuntime::restore` runs its body in a task of its
+  own and waits for that task. A caller that is dropped stops waiting, and
+  the restore runs to its end: the machine's restore finishes its steps and
+  the syncer goes back on, owing the re-seed. This holds for every caller of
+  `restore`, not only for a script. The cancelled script still stops at once.
+  The proof test holds the double's restore at a gate, cancels the script,
+  opens the gate and then looks. Before the fix the restore was dropped at
+  the gate and the syncer stayed off. After the fix the restore returns and
+  the syncer is back. The other host calls named above are not changed.
 
 ### F4. A first-boot script outlives its timeout (wrong result)
 
