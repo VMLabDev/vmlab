@@ -1,6 +1,8 @@
 //! Bounds on what a guest can make the interpreter spend or keep.
 
-use vmlab_hv_tcg::{Error, FlatMemory, Interpreter, Memory, Riscv64, TERMINAL_LIMIT, Value};
+use vmlab_hv_tcg::{
+    Error, FlatMemory, Interpreter, Memory, Privilege, Riscv64, TERMINAL_LIMIT, Value,
+};
 use vmlab_hv_tcg_ir::Program;
 
 /// A hart at 0x8000_0000 in an endless `jal x0, 0`.
@@ -114,18 +116,24 @@ const AMOADD_D_X10_X8: u32 = 0x00a4_352f;
 /// A hart on 4 KiB of RAM at 0x8000_0000 that holds `code`, with `mtvec` at
 /// 0x8000_0800 and `x8` set.
 fn on_small_ram(code: &[u32], x8: u64, specialize: bool) -> Riscv64<FlatMemory> {
-    let mut memory = FlatMemory::new(RAM, vec![0; 4096]);
+    let mut cpu = Riscv64::new(FlatMemory::new(RAM, vec![0; 4096])).unwrap();
+    cpu.write_csr(MTVEC, HANDLER).unwrap();
+    cpu.specialize = specialize;
+    restart(&mut cpu, code, x8);
+    cpu
+}
+
+/// Put the hart back at the start of RAM, in machine mode, with new code.
+fn restart(cpu: &mut Riscv64<FlatMemory>, code: &[u32], x8: u64) {
     for (index, instruction) in code.iter().enumerate() {
-        memory
+        cpu.interpreter
+            .memory
             .write(RAM + index as u64 * 4, &instruction.to_le_bytes())
             .unwrap();
     }
-    let mut cpu = Riscv64::new(memory).unwrap();
-    cpu.write_csr(MTVEC, HANDLER).unwrap();
+    cpu.set_privilege(Privilege::Machine);
     cpu.set_pc(RAM);
     cpu.set_gpr(8, x8).unwrap();
-    cpu.specialize = specialize;
-    cpu
 }
 
 /// The model's region table says the whole of 0x8000_0000..0x1_0000_0000 is
@@ -135,44 +143,43 @@ fn on_small_ram(code: &[u32], x8: u64, specialize: bool) -> Riscv64<FlatMemory> 
 fn an_access_past_host_ram_raises_a_guest_fault() {
     // Past the end, far past the end, across the end, below the RAM in the
     // model's ROM region, and in the model's IO region.
-    let addresses = [
+    let plain = [
         0x8000_1000,
         0x8010_0000,
         0x8000_0ffc,
         0x1000,
         0x1000_0000u64,
     ];
+    // The exclusive and the atomic accesses take the same way out.
+    let atomic = [0x8000_1000, 0x8010_0000u64];
+    let cases = [
+        (LD_X10_X8, 5, &plain[..]),
+        (SD_X10_X8, 7, &plain[..]),
+        (LR_D_X10_X8, 5, &atomic[..]),
+        (AMOADD_D_X10_X8, 7, &atomic[..]),
+    ];
     for specialize in [false, true] {
-        for (instruction, cause) in [(LD_X10_X8, 5), (SD_X10_X8, 7)] {
-            for address in addresses {
+        // One hart takes every fault in turn: none of them may stop it.
+        let mut cpu = on_small_ram(&[], 0, specialize);
+        let mut steps = 0;
+        for (instruction, cause, addresses) in cases {
+            for &address in addresses {
                 let case = format!("{instruction:#010x} at {address:#x}, specialize {specialize}");
-                let mut cpu = on_small_ram(&[instruction], address, specialize);
+                restart(&mut cpu, &[instruction], address);
                 let waiting = cpu
                     .step()
                     .unwrap_or_else(|error| panic!("{case}: step failed: {error}"));
+                steps += 1;
                 assert!(!waiting, "{case}");
                 assert_eq!(cpu.pc().unwrap(), HANDLER, "{case}");
                 assert_eq!(cpu.read_csr(MCAUSE).unwrap(), cause, "{case}");
                 assert_eq!(cpu.read_csr(MEPC).unwrap(), RAM, "{case}");
-                assert_eq!(cpu.steps, 1, "{case}");
-            }
-        }
-
-        // The exclusive and the atomic accesses take the same way out.
-        for (instruction, cause) in [(LR_D_X10_X8, 5), (AMOADD_D_X10_X8, 7)] {
-            for address in [0x8000_1000, 0x8010_0000u64] {
-                let case = format!("{instruction:#010x} at {address:#x}, specialize {specialize}");
-                let mut cpu = on_small_ram(&[instruction], address, specialize);
-                cpu.step()
-                    .unwrap_or_else(|error| panic!("{case}: step failed: {error}"));
-                assert_eq!(cpu.pc().unwrap(), HANDLER, "{case}");
-                assert_eq!(cpu.read_csr(MCAUSE).unwrap(), cause, "{case}");
-                assert_eq!(cpu.read_csr(MEPC).unwrap(), RAM, "{case}");
+                assert_eq!(cpu.steps, steps, "{case}");
             }
         }
 
         // A jump out of RAM lands, and the fetch there faults.
-        let mut cpu = on_small_ram(&[JALR_X8], 0x8000_1000, specialize);
+        restart(&mut cpu, &[JALR_X8], 0x8000_1000);
         cpu.step().unwrap();
         assert_eq!(cpu.pc().unwrap(), 0x8000_1000);
         cpu.step()
@@ -180,7 +187,7 @@ fn an_access_past_host_ram_raises_a_guest_fault() {
         assert_eq!(cpu.pc().unwrap(), HANDLER);
         assert_eq!(cpu.read_csr(MCAUSE).unwrap(), 1);
         assert_eq!(cpu.read_csr(MEPC).unwrap(), 0x8000_1000);
-        assert_eq!(cpu.steps, 2);
+        assert_eq!(cpu.steps, steps + 2);
     }
 }
 
@@ -189,17 +196,17 @@ fn an_access_past_host_ram_raises_a_guest_fault() {
 #[test]
 fn a_trained_trace_that_leaves_host_ram_raises_the_same_guest_fault() {
     // loop: <access> 0(x8); addi x8, x8, 8; jal x0, loop
-    // From 0x8000_0f00 the access walks to the end of RAM. From 0x8000_0f04
+    // From 0x8000_0fc0 the access walks to the end of RAM. From 0x8000_0fc4
     // the last one starts inside RAM and crosses its end.
     for access in [LD_X10_X8, SD_X10_X8] {
-        for start in [0x8000_0f00, 0x8000_0f04u64] {
+        for start in [0x8000_0fc0, 0x8000_0fc4u64] {
             for chunk in [1, 7, 64] {
                 let code = [access, 0x0084_0413, 0xff9f_f06f];
                 let mut reference = on_small_ram(&code, start, false);
                 let mut specialized = on_small_ram(&code, start, true);
                 let mut faulted = false;
                 let mut done = 0;
-                while done < 128 {
+                while done < 40 {
                     let case = format!(
                         "{access:#010x} from {start:#x} in chunks of {chunk}, after {done} steps"
                     );

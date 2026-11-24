@@ -25,6 +25,9 @@ pub struct CodeStamp {
 
 /// Physical accesses, including page table accesses, arrive here from Sail.
 /// Implementations may dispatch MMIO, share RAM across harts, and track writes.
+/// An access the implementation does not hold fails with `Error::Memory` and
+/// must change nothing: the interpreter gives the guest the access fault for
+/// it. Any other error stops the hart as a host error.
 pub trait Memory {
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<()>;
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()>;

@@ -122,7 +122,10 @@ fn a_batch_fault_keeps_the_completed_instruction_count() {
         fn write(&mut self, address: u64, bytes: &[u8]) -> vmlab_hv_tcg::Result<()> {
             self.stores += 1;
             if self.fail {
-                return Err(vmlab_hv_tcg::Error::Memory(address));
+                // Not `Error::Memory`: that one is the guest's access fault.
+                return Err(vmlab_hv_tcg::Error::Type(format!(
+                    "injected store failure at {address:#x}"
+                )));
             }
             self.ram.write(address, bytes)
         }
@@ -175,7 +178,7 @@ fn a_batch_fault_keeps_the_completed_instruction_count() {
         cpu.interpreter.memory.fail = true;
         cpu.interpreter.memory.stores = 0;
         let error = cpu.run(2).unwrap_err().to_string();
-        assert!(error.contains("physical access fault"), "{error}");
+        assert!(error.contains("injected store failure"), "{error}");
         assert_eq!(cpu.steps, before + 1);
         assert_eq!(cpu.gpr(3).unwrap(), 1);
         assert_eq!(cpu.interpreter.memory.stores, 1);
