@@ -118,5 +118,24 @@ pub trait UsbDevice: Snapshot {
     }
 }
 
+/// Counts the controller's reads of guest memory on the calling thread, so
+/// a test can measure the work one poll or one frame run does (usb review
+/// F11). Data buffers of a transfer are not counted.
+#[cfg(test)]
+pub(crate) mod dma_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn count() {
+        READS.with(|reads| reads.set(reads.get() + 1));
+    }
+    /// The reads since the last call, and zero from here.
+    pub fn take() -> u64 {
+        READS.with(|reads| reads.replace(0))
+    }
+}
+
 #[cfg(test)]
 mod tests;

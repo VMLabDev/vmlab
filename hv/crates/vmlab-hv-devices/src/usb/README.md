@@ -30,6 +30,10 @@ work. The machine calls it periodically while running and when an asynchronous
 backend becomes ready. A cadence of 1 ms services the tablet's HID idle timer;
 input injection also polls immediately. Each command or endpoint pass handles
 at most 256 work items. Link walks and TD walks are independently bounded.
+One call reads at most 1024 TRBs of the command ring and 1024 of all the
+transfer rings together, Link TRBs included. A call that runs out leaves the
+rest for the next one, which starts behind the endpoint that took the reads.
+A TD that needs more than 1024 reads ends as a TRB Error.
 
 The controller implements `Snapshot` and `PciSnapshot`. Its function section
 includes registers, PCI configuration, interrupt state, ring positions, slots,

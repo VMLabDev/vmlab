@@ -340,13 +340,18 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
             "snapshot name is reserved for internal rollback checkpoints".into(),
         ));
     }
+    let _op = handle.shared().begin_snapshot();
+    save_locked(handle, name)
+}
+
+/// [`save`] for a caller that holds the snapshot-op lock.
+pub(crate) fn save_locked(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
             "online snapshots are unavailable with assigned VFIO devices".into(),
         ));
     }
-    let _op = shared.begin_snapshot();
     if let Some(xhci) = shared.xhci.lock().as_ref()
         && xhci.lock().has_host_devices()
     {
@@ -398,6 +403,9 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     captured
 }
 
+/// The section that records a guest reset waiting for the events thread.
+const RESET_PENDING: &str = "reset-pending";
+
 /// The stopped part of a save: sections, RAM stream, disk snapshots.
 fn capture_and_write(
     shared: &crate::vm::VmShared,
@@ -413,6 +421,10 @@ fn capture_and_write(
         sections.extend(node.save().map_err(SnapshotError::Internal)?);
     }
     save_kernel_state(shared, &mut sections)?;
+    // A guest reset the events thread has not run yet is machine state. The
+    // vCPUs are parked on it and the chipset already latched the request, so
+    // a snapshot without it restores a guest that waits for a reset forever.
+    sections.push((RESET_PENDING.into(), to_json(&shared.reset_pending())?));
     audit::write(shared, "save");
     let head = format::encode_header_sections(
         run_code(was),
@@ -656,13 +668,18 @@ pub(crate) fn save_kernel_state(
 /// kernel then devices, and leave the machine in the run state the snapshot
 /// recorded.
 pub fn load(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
+    let _op = handle.shared().begin_snapshot();
+    load_locked(handle, name)
+}
+
+/// [`load`] for a caller that holds the snapshot-op lock.
+pub(crate) fn load_locked(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     let shared = handle.shared();
     if !shared.vfio.lock().is_empty() {
         return Err(SnapshotError::Unsupported(
             "online snapshots are unavailable with assigned VFIO devices".into(),
         ));
     }
-    let _op = shared.begin_snapshot();
     if let Some(xhci) = shared.xhci.lock().as_ref()
         && xhci.lock().has_host_devices()
     {
@@ -960,6 +977,15 @@ fn restore(
     // then refresh it at the resume boundary so restore work is not charged
     // to the guest. This also clears timer interrupts raised while stopped.
     restore_kernel_state(shared, &sections)?;
+    // The loaded machine replaces the running one, and with it any reset the
+    // running guest had asked for. A snapshot from before this section
+    // existed recorded none.
+    let reset_pending = sections
+        .get(RESET_PENDING)
+        .map(|bytes| from_json(bytes, RESET_PENDING))
+        .transpose()?
+        .unwrap_or(false);
+    shared.restore_reset_pending(reset_pending);
     Ok(header.run_state)
 }
 

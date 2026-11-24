@@ -334,6 +334,14 @@ and the IDE, AHCI and USB devices on the same buses.
   that the reset still happens or the save was refused.
 - Confidence: medium. The window is real in the code. The test needs a
   hook to set the flag, because driving it from the guest is a race.
+- Fixed by card #790. The pending reset is machine state: a save writes it
+  as the vmstate section `reset-pending`, and a load replaces the flag with
+  the recorded value (none in an older snapshot). So a load drops the reset
+  of the machine it replaces, a failed load gets it back from the rollback
+  checkpoint, and a snapshot saved with a reset pending restores to a
+  machine that is reset. Tests `load_clears_a_pending_guest_reset` and
+  `save_carries_a_pending_guest_reset` hold the snapshot-op lock themselves
+  to fix the order. They need KVM, so the merge bar does not run them.
 
 ### F10. The direct-kernel ACPI PM block is not in snapshots
 
