@@ -723,9 +723,16 @@ async fn join_global(join: &GlobalJoin, switch: &Arc<Switch>) -> Result<GlobalTr
     let stream = tokio::net::UnixStream::connect(&trunk_sock)
         .await
         .with_context(|| format!("connecting global trunk {}", trunk_sock.display()))?;
-    let (_port, closed) = switch
-        .add_stream_port_watched(stream, crate::net::switch::PortClass::Service)
+    let (port, closed) = switch
+        .add_stream_port_watched(stream, crate::net::switch::PortClass::Trunk)
         .await;
+    // The segment's gateway is behind the trunk. Its MAC is the trunk's
+    // from the start, so no guest of this lab sends from it (review F9),
+    // while a MAC the trunk only learns stays a guest's to take back (F22).
+    switch.bind_mac(
+        port,
+        crate::net::gateway::gateway_mac("__global", &join.name),
+    );
     Ok(GlobalTrunk {
         warnings,
         subnet,
