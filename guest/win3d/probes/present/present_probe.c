@@ -441,15 +441,13 @@ int wmain(int argc, wchar_t **argv)
     r.stage = "arguments";
     r.presents_asked = 1;
     const wchar_t *out = NULL;
-    int which = -1, exit_code = 1, variant = 1, wait_resident = 0;
+    int which = -1, exit_code = 1;
     uint32_t backlog = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &r.session);
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--out") && i + 1 < argc) out = argv[++i];
         else if (!wcscmp(argv[i], L"--count") && i + 1 < argc) r.presents_asked = (uint32_t)wcstoul(argv[++i], NULL, 10);
-        else if (!wcscmp(argv[i], L"--wait-resident")) wait_resident = 1;
         else if (!wcscmp(argv[i], L"--backlog") && i + 1 < argc) backlog = (uint32_t)wcstoul(argv[++i], NULL, 10);
-        else if (!wcscmp(argv[i], L"--variant") && i + 1 < argc) variant = (int)wcstoul(argv[++i], NULL, 10);
         else if (!wcscmp(argv[i], L"--case") && i + 1 < argc) {
             ++i;
             for (int c = 0; c < (int)(sizeof(cases) / sizeof(cases[0])); ++c) {
@@ -461,7 +459,7 @@ int wmain(int argc, wchar_t **argv)
         } else which = -2;
     }
     if (which < 0 || r.presents_asked < 1 || r.presents_asked > 100000) {
-        fputs("usage: present_probe.exe --case (unknown-blob | mappable | not-mappable | shareable) [--count N] [--out FILE]\n", stderr);
+        fputs("usage: present_probe.exe --case (unknown-blob | mappable | not-mappable | shareable) [--count N] [--backlog N] [--out FILE]\n", stderr);
         r.result = "usage"; exit_code = 3; goto done;
     }
     const test_case *tc = &cases[which];
@@ -630,10 +628,10 @@ int wmain(int argc, wchar_t **argv)
     if (r.last_status < 0) goto destroy_context;
 
     /* The driver asks for explicit residency: Windows refuses a present
-     * whose source nobody asked to be resident. The request is not waited
-     * for, so the present can come while the allocation is on its way in:
-     * then Windows calls DxgkDdiPatch for it later. With --wait-resident
-     * the probe waits for the paging fence first. */
+     * whose source nobody asked to be resident. The probe asks, and waits
+     * until Windows has paged the source in, so that the present reaches
+     * the driver. With --backlog it does not wait: the present then comes
+     * while the source is on its way in. */
     {
         /* The record of a pending present is written here, in front of the
          * residency request: nothing slow stands between that request and
@@ -685,7 +683,7 @@ int wmain(int argc, wchar_t **argv)
         r.stage = "make_resident";
         r.make_resident_status = r.last_status = resident(&mr);
         if (r.last_status < 0) goto destroy_context;
-        if (wait_resident && pq.fence_value) {
+        if (!backlog && pq.fence_value) {
             for (int i = 0; i < 200 && *(volatile uint64_t *)pq.fence_value < mr.paging_fence_value; ++i) Sleep(10);
         }
     }
@@ -708,17 +706,12 @@ int wmain(int argc, wchar_t **argv)
         sub_rect = p->src_rect;
         p->sub_rect_count = 1;
         p->src_sub_rects = &sub_rect;
-        p->flags = PRESENT_BLT | PRESENT_REDIRECTED_BLT;
         /* The count is the one of the visible region of the screen, which
          * GDI gives (DdQueryVisRgnUniqueness). */
         typedef ULONG (WINAPI *uniqueness_fn)(void);
         uniqueness_fn uniqueness = (uniqueness_fn)GetProcAddress(gdi, "GdiEntry13");
-        switch (variant) {
-        case 0: break;
-        case 1: p->flags |= PRESENT_COUNT_VALID; p->present_count = uniqueness ? uniqueness() : 0; break;
-        case 2: p->flags |= PRESENT_COUNT_VALID; p->present_count = i + 1; break;
-        default: p->flags |= PRESENT_COUNT_VALID; break;
-        }
+        p->present_count = uniqueness ? uniqueness() : 0;
+        p->flags = PRESENT_BLT | PRESENT_COUNT_VALID | PRESENT_REDIRECTED_BLT;
         LONG status = present(request);
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;
@@ -734,7 +727,9 @@ int wmain(int argc, wchar_t **argv)
      * it. Give that time before the process says it survived. */
     pump(r.presents_accepted ? 5000 : 500);
     r.stage = "done";
-    r.pass = (tc->outcome == PRESENT_FAILS ? r.presents_failed : r.presents_accepted) == r.presents_asked;
+    /* Windows refuses a present whose source is not resident yet, whatever the blob is. */
+    const int expect_failure = tc->outcome == PRESENT_FAILS || r.backlog;
+    r.pass = (expect_failure ? r.presents_failed : r.presents_accepted) == r.presents_asked;
     r.result = r.pass ? "pass" : r.presents_accepted ? "present_accepted" : "present_failed";
     exit_code = r.pass ? 0 : 2;
 
