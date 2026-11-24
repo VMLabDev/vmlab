@@ -308,6 +308,13 @@ impl PlaybackSink for Endpoint {
         }
     }
 
+    fn room_bytes(&self) -> Option<usize> {
+        self.shared
+            .alive
+            .load(Ordering::Acquire)
+            .then(|| self.shared.ring.free_bytes())
+    }
+
     fn write_period(&mut self, pcm: &[u8]) {
         if self.shared.alive.load(Ordering::Acquire) {
             let available = self.shared.ring.used_bytes();

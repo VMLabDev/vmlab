@@ -2082,6 +2082,60 @@ mod tests {
         wait_for("tx buffer returned", || f.vqs[5].used_idx(&f.mem) == 1);
     }
 
+    // Review virtio-devices-2, F10.
+    #[test]
+    fn completions_respect_avail_no_interrupt() {
+        let mut f = Fixture::new();
+        let mut client = UnixStream::connect(&f.ctl_sock).unwrap();
+        f.device_ready(8, 5);
+        assert!(
+            f.ctrl_delivered()
+                .contains(&(1, EV_PORT_OPEN, 1, Vec::new()))
+        );
+        f.settle();
+        f.irq.queues.lock().clear();
+
+        // VIRTQ_AVAIL_F_NO_INTERRUPT on the transmit queue of port 1.
+        f.mem
+            .write_obj(1u16.to_le(), GuestAddress(f.vqs[5].avail))
+            .unwrap();
+        let addr = f.data(1);
+        f.mem.write_slice(b"hello ctl", GuestAddress(addr)).unwrap();
+        f.vqs[5].add_chain(&f.mem, &[(addr, 9, false)]);
+        f.dev.queue_notify(5);
+
+        let mut got = [0u8; 9];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hello ctl");
+        f.settle();
+        assert_eq!(f.vqs[5].used_idx(&f.mem), 1);
+        assert!(
+            !f.irq.queue_notified(5),
+            "the driver turned interrupts off on queue 5"
+        );
+    }
+
+    // Review virtio-devices-2, F10.
+    #[test]
+    fn a_kick_without_work_raises_no_interrupt() {
+        let mut f = Fixture::new();
+        let _client = UnixStream::connect(&f.ctl_sock).unwrap();
+        f.device_ready(8, 5);
+        f.settle();
+        f.irq.queues.lock().clear();
+
+        // A receive buffer for port 1, and no host bytes to put in it.
+        let addr = f.data(1);
+        f.vqs[4].add_chain(&f.mem, &[(addr, 64, true)]);
+        f.dev.queue_notify(4);
+        f.settle();
+        assert_eq!(f.vqs[4].used_idx(&f.mem), 0);
+        assert!(
+            !f.irq.queue_notified(4),
+            "no buffer was used on queue 4"
+        );
+    }
+
     #[test]
     fn transmit_chains_complete_with_zero_used_length() {
         let mut f = Fixture::new();
