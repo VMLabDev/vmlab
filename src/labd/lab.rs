@@ -3982,7 +3982,32 @@ impl LabRuntime {
     /// throw away pending guest work.
     /// Restore `snap` on machine `name` (§7.3). Answers with what the
     /// restore could not do but did not fail over: the warnings to show.
+    ///
+    /// **A restore runs to its end, whoever stops waiting for it.** A
+    /// cancelled provision stops at its host call by dropping that call's
+    /// future (`scripting/cancel.rs`), and a restore dropped between taking
+    /// the syncer off and putting it back leaves the workspace with none,
+    /// and the machine between two steps of its rewind. So the restore is a
+    /// task of its own: a caller that goes away stops waiting and nothing
+    /// else.
     pub async fn restore(
+        self: &Arc<Self>,
+        name: &str,
+        snap: &str,
+        discard: bool,
+    ) -> Result<Vec<String>> {
+        let lab = Arc::clone(self);
+        let (name, snap) = (name.to_string(), snap.to_string());
+        let restore =
+            tokio::spawn(async move { lab.restore_to_its_end(&name, &snap, discard).await });
+        match restore.await {
+            Ok(restored) => restored,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(anyhow!("the restore did not run to its end: {e}")),
+        }
+    }
+
+    async fn restore_to_its_end(
         self: &Arc<Self>,
         name: &str,
         snap: &str,
