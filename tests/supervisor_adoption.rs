@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -58,6 +58,7 @@ struct FakeLab {
     name: &'static str,
     daemon: Arc<Mutex<Process>>,
     supervisor: PathBuf,
+    server: Weak<Mutex<Option<Server<LabRequest>>>>,
 }
 
 impl FakeLab {
@@ -73,6 +74,9 @@ impl FakeLab {
             })
             .await
             .unwrap();
+        // The real daemon's exit releases its control socket guard. The
+        // fixture serves that socket in this process, apart from the PID.
+        self.server.upgrade().unwrap().lock().unwrap().take();
         self.daemon.lock().unwrap().kill();
     }
 }
@@ -237,12 +241,16 @@ async fn an_adopted_daemon_is_watched_across_restart_shutdown_destroy_and_crash(
     ] {
         let sock = host.lab_socket(name);
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let server = Arc::new(Mutex::new(None));
         let lab = FakeLab {
             name,
             daemon,
             supervisor: host.runtime().join("vmlabd.sock"),
+            server: Arc::downgrade(&server),
         };
-        servers.push(Server::bind(&sock, Arc::new(lab)).await.unwrap());
+        let bound = Server::bind(&sock, Arc::new(lab)).await.unwrap();
+        *server.lock().unwrap() = Some(bound);
+        servers.push(server);
     }
     let lab_root = host.path().join("lab");
     std::fs::create_dir_all(&lab_root).unwrap();
