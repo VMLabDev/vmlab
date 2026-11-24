@@ -87,14 +87,31 @@ case "$display" in staged|rebuild|unsigned) ;; *) die "--display is staged, rebu
   || die "tracked files have uncommitted changes: commit them, the provenance names HEAD"
 # The container builds from the whole checkout, so a file that HEAD does not
 # hold changes the assets too: an untracked .cargo/config.toml sets rustflags,
-# [env], [patch] or a source replacement. Only the .gitignore files count as
-# excludes here. They are tracked (an untracked one is listed itself), so they
-# are part of HEAD; .git/info/exclude and the user's core.excludesFile are not,
-# and must not hide a file from this check.
+# [env], [patch] or a source replacement. Only the tracked .gitignore files
+# count as excludes: they are part of HEAD. .git/info/exclude and the user's
+# core.excludesFile are not read here. An untracked .gitignore is read by this
+# listing, and one that ignores itself (`*`) hides its whole directory, so the
+# loop below refuses every untracked .gitignore that a tracked one does not
+# ignore.
 untracked="$(git ls-files --others --directory --no-empty-directory --exclude-per-directory=.gitignore)"
+while IFS= read -r -d '' ignore_file; do
+  # The rule that ignores the file, with the file that holds the rule. Git
+  # stops at the first ignored parent directory, so a file under target/ names
+  # the tracked .gitignore of the root, whatever the file itself says.
+  source=""
+  IFS= read -r -d '' source < <(printf '%s\0' "$ignore_file" | git check-ignore -v -z --stdin || true) || true
+  if [ -n "$source" ] && git ls-files --error-unmatch -- "$source" >/dev/null 2>&1; then
+    continue
+  fi
+  case $'\n'"$untracked"$'\n' in
+    *$'\n'"$ignore_file"$'\n'*) ;;
+    *) untracked="${untracked:+$untracked$'\n'}$ignore_file" ;;
+  esac
+done < <(git ls-files --others -z -- ':(glob)**/.gitignore')
 [ -z "$untracked" ] || die "the checkout has untracked files that the build would see:
 $(printf '%s\n' "$untracked" | sed -n '1,20s/^/  /p')
-Commit or remove them (an exclude outside the .gitignore files does not count):
+Commit or remove them (an exclude outside the tracked .gitignore files does not
+count, and an untracked .gitignore is refused with the directory it hides):
 the provenance names HEAD"
 commit="$(git rev-parse HEAD)"
 if [ -n "$version" ]; then

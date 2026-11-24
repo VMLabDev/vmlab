@@ -98,7 +98,8 @@ The command ends with a check: every asset is there and not empty,
 version. `just release::verify <dir>` runs the check again. The command refuses
 a checkout with uncommitted changes to tracked files, a checkout with an
 untracked file that the committed `.gitignore` files do not ignore (an exclude
-in `.git/info/exclude` or in your own git configuration does not count), and a
+in `.git/info/exclude`, in your own git configuration or in an untracked
+`.gitignore` does not count), and a
 version whose tag exists. It uploads nothing. Start it like every heavy run on helios.
 
 The command rebuilds the `vmlab-build` image first, so the image has the

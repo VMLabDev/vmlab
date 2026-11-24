@@ -216,33 +216,54 @@ def release_dry_run(checkout, env):
                           env=env)
 
 
-@pytest.mark.parametrize('hidden', [False, True])
+@pytest.mark.parametrize('hidden', ['', 'info-exclude', 'own-gitignore', 'parent-gitignore',
+                                    'global-exclude'])
 def test_a_release_refuses_an_untracked_file(tmp_path, hidden):
     """Review install-release F7: the container builds from the whole checkout,
     so a file that HEAD does not hold (a `.cargo/config.toml` with `[env]` or
-    `[patch]`) changes the assets while the provenance names HEAD. An exclude
-    that is not in the commit (`.git/info/exclude`) must not hide the file."""
+    `[patch]`) changes the assets while the provenance names HEAD. No exclude
+    that is not in the commit may hide the file: `.git/info/exclude`, the
+    user's `core.excludesFile`, or an untracked `.gitignore` that ignores
+    itself with the directory."""
     checkout, env, state = release_checkout(tmp_path)
     (checkout / '.cargo').mkdir()
     (checkout / '.cargo/config.toml').write_text('[env]\nVMLAB_PROBE = "x"\n')
-    if hidden:
+    if hidden == 'info-exclude':
         (checkout / '.git/info').mkdir(exist_ok=True)
         (checkout / '.git/info/exclude').write_text('.cargo/\n')
+    elif hidden == 'own-gitignore':
+        (checkout / '.cargo/.gitignore').write_text('*\n')
+    elif hidden == 'parent-gitignore':
+        # The tracked root .gitignore is unchanged: a second one, one level
+        # down, hides itself and the config below it.
+        (checkout / '.cargo').rename(checkout / 'cfg')
+        (checkout / 'build/.cargo').mkdir()
+        (checkout / 'cfg/config.toml').rename(checkout / 'build/.cargo/config.toml')
+        (checkout / 'cfg').rmdir()
+        (checkout / 'build/.gitignore').write_text('.gitignore\n.cargo/\n')
+    elif hidden == 'global-exclude':
+        excludes = tmp_path / 'global-excludes'
+        excludes.write_text('.cargo/\n')
+        env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.excludesFile',
+                   GIT_CONFIG_VALUE_0=str(excludes))
 
     release = release_dry_run(checkout, env)
     assert release.returncode != 0
     assert 'untracked' in release.stderr, release.stderr
-    assert '.cargo/' in release.stderr, release.stderr
+    named = 'build/.gitignore' if hidden == 'parent-gitignore' else '.cargo/'
+    assert f'\n  {named}' in release.stderr, release.stderr
     # Refused before any container ran.
     assert not (state / 'runs').exists()
 
 
 def test_a_release_accepts_what_the_commit_ignores(tmp_path):
     """The build outputs under a path that a committed `.gitignore` names are
-    not a refusal: an earlier release leaves `target/` in the checkout."""
+    not a refusal: an earlier release leaves `target/` in the checkout. A
+    `.gitignore` there is no refusal either, the tracked one covers it."""
     checkout, env, state = release_checkout(tmp_path)
     (checkout / 'target/dist').mkdir(parents=True)
     (checkout / 'target/dist/left-by-an-earlier-build').write_text('x')
+    (checkout / 'target/dist/.gitignore').write_text('*\n')
 
     release = release_dry_run(checkout, env)
     # The stub builds nothing, so the release stops where it collects the assets.

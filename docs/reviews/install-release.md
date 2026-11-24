@@ -278,12 +278,17 @@ provenance names `HEAD`.
 
 Fixed in card #800. `scripts/release-local.sh` refuses, before any container
 runs, a checkout with an untracked file, and names the files. Only the
-`.gitignore` files count as excludes: they are tracked, so they are part of
-`HEAD`, and an untracked one is itself a refusal. `.git/info/exclude` and the
-user's `core.excludesFile` do not hide a file from the check. Paths that the
-committed `.gitignore` files ignore (`target/`, the staged display package)
-are still not compared with `HEAD`. Tests:
-`test_a_release_refuses_an_untracked_file` and
+tracked `.gitignore` files count as excludes: they are part of `HEAD`.
+`.git/info/exclude` and the user's `core.excludesFile` do not hide a file
+from the check. An untracked `.gitignore` could: one that ignores itself
+(`*`) hides its whole directory from the listing. So the script also lists
+every untracked `.gitignore` with no exclude at all, asks git which rule
+ignores it (`git check-ignore -v`), and refuses it unless that rule is in a
+tracked file. A `.gitignore` under `target/` passes, one in `.cargo/` does
+not. The root `.gitignore` now names `.pytest_cache/`, whose own `.gitignore`
+would be refused otherwise. Paths that the tracked `.gitignore` files ignore
+(`target/`, the staged display package) are still not compared with `HEAD`.
+Tests: `test_a_release_refuses_an_untracked_file` (five cases) and
 `test_a_release_accepts_what_the_commit_ignores` in
 `scripts/test_release_workflow.py`.
 

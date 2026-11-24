@@ -23,6 +23,10 @@ examples/**/.vmlab/
 # Python bytecode from the e2e harness.
 __pycache__/
 
+# pytest's cache. It holds a .gitignore of its own, which a release would
+# refuse as untracked if this line did not cover it (scripts/release-local.sh).
+.pytest_cache/
+
 # Session scratch (plans, handoffs, prototypes); never part of the tree.
 .scratch/
 /.ci-cache/
