@@ -1331,9 +1331,12 @@ async fn a_clone_of_another_template_refuses_to_boot() {
 #[tokio::test]
 async fn a_changed_image_does_not_reuse_the_old_scratch_layer() {
     let dirs = Dirs::new();
-    let (old, _hv) = container_on_image(&dirs, WORKLOAD, Script::healthy(), Vec::new(), "sha256:aa");
+    let (old, _hv) =
+        container_on_image(&dirs, WORKLOAD, Script::healthy(), Vec::new(), "sha256:aa");
     let (cbs, _observed) = callbacks();
-    start_container(&old, cbs).await.expect("start on the old image");
+    start_container(&old, cbs)
+        .await
+        .expect("start on the old image");
     old.stop(true).await.expect("stop");
     let scratch = old.dirs.scratch_disk();
     let marker = b"written while nginx:1 ran";
@@ -1366,6 +1369,11 @@ async fn a_changed_image_does_not_reuse_the_old_scratch_layer() {
         marker,
         "the layer is kept"
     );
+    assert_eq!(
+        std::fs::read_to_string(new.dirs.scratch_image()).expect("record"),
+        "sha256:aa",
+        "and so is the record of its image"
+    );
 }
 
 /// The same image keeps its writable layer across a rebuild of the machine,
@@ -1380,6 +1388,10 @@ async fn an_unchanged_image_keeps_its_scratch_layer() {
         let (cbs, _observed) = callbacks();
         start_container(&ctr, cbs).await.expect("start");
         ctr.stop(true).await.expect("stop");
+        assert_eq!(
+            std::fs::read_to_string(ctr.dirs.scratch_image()).expect("record"),
+            "sha256:aa"
+        );
     }
 }
 
