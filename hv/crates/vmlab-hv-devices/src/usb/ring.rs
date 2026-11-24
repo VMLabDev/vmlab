@@ -7,6 +7,8 @@ use super::state::{Reader, Writer};
 pub(super) fn read<const N: usize>(mem: &GuestMemory, addr: u64) -> Result<[u8; N], DeviceError> {
     addr.checked_add(N as u64)
         .ok_or_else(|| DeviceError::Memory("USB DMA overflow".into()))?;
+    #[cfg(test)]
+    super::dma_probe::count();
     let mut bytes = [0; N];
     mem.read_slice(&mut bytes, GuestAddress(addr))
         .map_err(|e| DeviceError::Memory(e.to_string()))?;

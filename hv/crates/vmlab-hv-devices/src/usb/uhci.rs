@@ -344,6 +344,8 @@ impl UhciController {
     }
 
     fn read32(&self, address: u32) -> Option<u32> {
+        #[cfg(test)]
+        super::dma_probe::count();
         self.memory
             .read_obj::<u32>(GuestAddress(u64::from(address)))
             .ok()
