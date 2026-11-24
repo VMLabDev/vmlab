@@ -181,6 +181,27 @@ typedef struct {
     UINT resource; /* out */
 } open_resource;
 
+/* D3DKMT_PRESENT as far as its present history token for the Blt model
+ * (D3DKMT_BLTMODEL_PRESENTHISTORYTOKEN), which is how a redirected Blt
+ * tells the compositor what changed. */
+typedef struct {
+    present_head head;
+    UINT broadcast_context[64];
+    HANDLE present_limit_semaphore;
+    struct {
+        UINT model;
+        UINT token_size;
+        uint64_t composition_binding_id;
+        struct {
+            uint64_t logical_surface;
+            uint64_t physical_surface;
+            uint64_t event_id;
+            UINT num_rects;
+            RECT rects[16];
+        } blt;
+    } token;
+} present_request;
+
 typedef struct { UINT handle; } close_adapter;
 typedef LONG (WINAPI *enum_fn)(const enum_adapters *);
 typedef LONG (WINAPI *query_fn)(const query_adapter *);
@@ -256,6 +277,7 @@ _Static_assert(sizeof(allocation_info) == 96 && offsetof(allocation_info, flags)
 _Static_assert(sizeof(create_allocation) == 72 && offsetof(create_allocation, allocation_info) == 48, "D3DKMT_CREATEALLOCATION ABI");
 _Static_assert(sizeof(query_resource_info) == 32 && sizeof(open_resource) == 72 &&
                offsetof(open_resource, resource) == 68 && sizeof(open_allocation_info) == 80, "D3DKMT_OPENRESOURCE ABI");
+_Static_assert(offsetof(present_request, token) == 360, "D3DKMT_PRESENT ABI");
 _Static_assert(offsetof(present_head, source) == 20 && offsetof(present_head, src_sub_rects) == 72 &&
                offsetof(present_head, flags) == 88, "D3DKMT_PRESENT ABI");
 #endif
@@ -277,6 +299,9 @@ enum {
     PRESENT_BLT = 1u << 0,
     PRESENT_DST_RECT_VALID = 1u << 6,
     PRESENT_SRC_RECT_VALID = 1u << 7,
+    PRESENT_REDIRECTED_BLT = 1u << 16,
+    PRESENT_MODEL_REDIRECTED_BLT = 3,
+    PRESENT_MODEL_REDIRECTED_VISTABLT = 4,
     IMAGE_WIDTH = 64,
     IMAGE_HEIGHT = 64,
 };
@@ -469,7 +494,8 @@ static void pump(DWORD milliseconds)
 
 /* One D3DKMTPresent with Blt from `source`. The variants differ in how the
  * destination is named. */
-static LONG present_once(present_fn present, UINT context, HWND window, UINT source, UINT destination, uint32_t variant)
+static LONG present_once(present_fn present, UINT context, HWND window, UINT source, UINT destination,
+                         uint32_t surface, uint32_t variant)
 {
     /* Larger than any D3DKMT_PRESENT, and 8-byte aligned. */
     static uint64_t request[1024];
@@ -486,12 +512,18 @@ static LONG present_once(present_fn present, UINT context, HWND window, UINT sou
     sub_rect = p->src_rect;
     p->sub_rect_count = 1;
     p->src_sub_rects = &sub_rect;
+    present_request *q = (present_request *)request;
+    p->window = window;
+    p->destination = destination;
+    q->token.blt.physical_surface = surface;
+    q->token.blt.num_rects = 1;
+    q->token.blt.rects[0] = p->dst_rect;
     switch (variant) {
-    case 0: p->window = window; break;
-    case 1: p->window = window; p->destination = destination; break;
-    case 2: p->destination = destination; break;
-    case 3: p->window = window; p->destination = destination; p->sub_rect_count = 0; p->src_sub_rects = NULL; break;
-    default: p->window = window; p->destination = destination; p->flags = PRESENT_BLT; break;
+    case 0: p->destination = 0; break;
+    case 1: p->flags |= PRESENT_REDIRECTED_BLT; q->token.model = PRESENT_MODEL_REDIRECTED_BLT; break;
+    case 2: p->flags |= PRESENT_REDIRECTED_BLT; q->token.model = PRESENT_MODEL_REDIRECTED_VISTABLT; break;
+    case 3: p->flags |= PRESENT_REDIRECTED_BLT; break;
+    default: q->token.model = PRESENT_MODEL_REDIRECTED_BLT; break;
     }
     return present(request);
 }
@@ -737,7 +769,7 @@ int wmain(int argc, wchar_t **argv)
         for (r.variants = 0; r.variants < 5; ++r.variants) {
             r.variant = r.variants;
             r.variant_status[r.variants] = present_once(present, context.context, window, allocation.allocation,
-                                                        r.destination, r.variants);
+                                                        r.destination, r.surface_handle, r.variants);
             pump(1500);
         }
         r.stage = "done";
@@ -752,7 +784,7 @@ int wmain(int argc, wchar_t **argv)
     r.result = "present_pending";
     if (!save(out, &r)) { r.result = "api_failure"; r.stage = "write_pending_result"; r.win32_error = ERROR_WRITE_FAULT; goto destroy_context; }
     for (uint32_t i = 0; i < r.presents_asked; ++i) {
-        LONG status = present_once(present, context.context, window, allocation.allocation, r.destination, r.variant);
+        LONG status = present_once(present, context.context, window, allocation.allocation, r.destination, r.surface_handle, r.variant);
         r.last_present_status = r.last_status = status;
         if (i == 0) r.first_present_status = status;
         ++r.presents_done;
