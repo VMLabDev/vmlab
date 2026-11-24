@@ -819,6 +819,11 @@ impl Supervisor {
             }
             entry
         };
+        if entry.is_none() && self.template_ops.owns_build_lab(name) {
+            return Err(format!(
+                "lab `{name}` belongs to an active template build; use `vmlab template stop`"
+            ));
+        }
         if let Some(entry) = &entry {
             let (pid, started) = (entry.pid, entry.started);
             let deadline = if let Ok(client) = LabClient::connect(&sock).await {
