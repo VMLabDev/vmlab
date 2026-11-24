@@ -94,8 +94,8 @@ From nothing, with no manual step:
 | 3. `docs/` explains install, uninstall, the stack and pins, signing, known limits and the evidence | Not checked by the script; see "Done item 3" below |
 
 Rows marked "extra" are reported but do not decide the result: the x86
-vulkaninfo, exactly one Venus device in the x64 vulkaninfo (added for the
-NVIDIA runs, so the AMD tables below predate it), the LunarG cross-check, the Vulkan probes, the device state after
+vulkaninfo, exactly one Venus device in the x64 vulkaninfo, the LunarG
+cross-check, the Vulkan probes, the device state after
 install, and dxdiag's Direct3D status on its own.
 
 ## Host stack
@@ -665,6 +665,82 @@ to P14.
 
 ### Baseline
 
+The AMD1 baseline comes from the [2026-11-25 acceptance pass on helios
+(UTC+10), card #886, R4–R6](../../../docs/agents/acceptance-2026-11.md#win3d-on-amd1-r4-to-r6).
+The run used vmlab commit `edd01cfe2b9b91139f2a7dbbc7cfcd60f9442c6b`
+and package `vmlab-win3d-0.1.3` (driver `100.6.101.58123`, manifest
+commit `e136a7a3`). AMD1 was the Radeon 610M at `0000:72:00.0` with
+render node `/dev/dri/renderD129`. The templates were
+`x86_64/windows-11@26100.1742.11` and `x86_64/windows-10@19045.2006.10`.
+
+#### Done checks (R4)
+
+Both templates passed **12 of 12** Done checks and exited 0. Rows marked `+` are extra and do not count towards the 12.
+
+| Item | Check | windows-11 | windows-10 |
+| --- | --- | --- | --- |
+| 1 | `scripts/build.sh` builds the package | pass | pass |
+| 2 | documented install command (`scripts/install-into-vm.sh`) | pass | pass |
+| 2+ | display device on our driver, problem code 0 | pass | pass |
+| 2 | `vulkaninfo --summary` (x64) lists the Venus device | pass | pass |
+| 2+ | `vulkaninfo --summary` (x86) lists the Venus device | pass | pass |
+| 2+ | `vulkaninfo --summary` (x64) lists exactly one Venus device | pass | pass |
+| 2+ | LunarG vulkaninfo 1.4.363 (x64, pinned) lists Venus through the installed loader | pass | pass |
+| 2+ | LunarG vulkaninfo 1.4.363 (x86, pinned) lists Venus through the installed loader | pass | pass |
+| 2 | Direct3D 9 (x64) renders on the GPU and shows on the console | pass | pass |
+| 2 | Direct3D 9 (x86) renders on the GPU and shows on the console | pass | pass |
+| 2 | Direct3D 11 (x64) renders on the GPU and shows on the console | pass | pass |
+| 2 | Direct3D 11 (x86) renders on the GPU and shows on the console | pass | pass |
+| 2 | Direct3D 12 (x64) renders on the GPU and shows on the console | pass | pass |
+| 2 | Direct3D 12 (x86) renders on the GPU and shows on the console | pass | pass |
+| 2 | OpenGL (x64) renders on the GPU and shows on the console | pass | pass |
+| 2 | OpenGL (x86) renders on the GPU and shows on the console | pass | pass |
+| 2+ | Vulkan (x64) renders on the GPU and shows on the console | pass | pass |
+| 2+ | Vulkan (x86) renders on the GPU and shows on the console | pass | pass |
+| 2 | dxdiag reports hardware acceleration on our driver | pass | pass |
+| 2+ | dxdiag: Direct3D acceleration on our full WDDM device | pass | pass |
+
+#### Adapter suite (R5, R6)
+
+Both templates recorded **25 pass, 4 fail, 0 not-run**. The four failures
+were `audio` and three Wine programs. Both `wine-d3d11_d3d11` and
+`wine-d3d9_device` reached their test summaries.
+
+| Property | Check | windows-11 | windows-10 |
+| --- | --- | --- | --- |
+| P1 | `pointer` | pass | pass |
+| P1 | `pointer-shapes` | pass | pass |
+| P2 | `vblank-interval` | pass, mean 16.667 ms | pass, mean 16.665 ms |
+| P2 | `present-rate` | pass, 60.21 frames per second | pass, 60.21 frames per second |
+| P2 | `flip-timestamps` | pass, 59.99 Hz | pass, 60.00 Hz |
+| P2 | `scan-line` | pass, 768 lines | pass, 768 lines |
+| P3-P5 | `tear-flip` | pass, 0 torn of 1260 frames | pass |
+| P3-P5 | `tear-blt` | pass, 0 torn of 1259 frames | pass |
+| P7 | `duplication` | pass | pass |
+| P7 | `shared-texture` | pass | pass |
+| P10 | `d2d` | pass | pass |
+| P10 | `d2d-tir` | pass | pass |
+| P10 | `draws` | pass | pass |
+| P10 | `svb-chrome` | pass | pass |
+| P8 | `venc-chrome` | pass, 5 of 5 tries, 0 crash dumps | pass, 5 of 5 tries, 0 crash dumps |
+| P10 | `svb-edge` | pass | pass |
+| P8 | `venc-edge` | pass, 5 of 5 tries, 0 crash dumps | pass, 5 of 5 tries, 0 crash dumps |
+| P8 | `chromium` | pass | pass |
+| P10 | `wine-d3d10_1_d3d10_1` | pass, 580 tests | pass, 580 tests |
+| P10 | `wine-d3d10core_d3d10core` | pass, 195912 tests | pass, 195912 tests |
+| P10 | `wine-d3d10_device` | pass, 206 tests | pass, 206 tests |
+| P10 | `wine-d3d10_effect` | pass, 5041 tests | pass, 5041 tests |
+| P10 | `wine-d3d11_d3d11` | **fail**, 2 failures of 5561777 | **fail**, 2 failures of 5561777 |
+| P10 | `wine-d3d9_d3d9ex` | **fail**, 8 failures of 2387 | **fail**, 15 failures of 2398 |
+| P10 | `wine-d3d9_device` | **fail**, 10 failures of 56034 | **fail**, 34 failures of 56071 |
+| P10 | `wine-d3d9_stateblock` | pass, 14738 tests | pass, 14738 tests |
+| P10 | `wine-d3d9_visual` | pass, 207441 tests | pass, 207441 tests |
+| U1 | `latency` | pass, p50 21 ms, p90 31 ms | pass, p50 31 ms, p90 41 ms |
+| S1 | `audio` | **fail**, 22 discontinuities, 1 silent gap of 5 ms | **fail**, 2 discontinuities, 0 gaps |
+
+### Historical adapter runs (2026-11-20)
+
+
 The runs of 2026-11-20 on the package that has the hardware pointer
 ([pointer.md](pointer.md)) and the coverage patch
 ([d2d-coverage.md](d2d-coverage.md)): the `windows-11` template with the
@@ -682,7 +758,7 @@ both GPUs. `pointer` failed there: Windows drew the pointer into the frame,
 144 pointer pixels at each place (GitHub #235). The checks `pointer-shapes`
 and `d2d-tir` were not in the suite.
 
-What the baseline says:
+Findings from the November 20 runs and follow-ups:
 
 - B1. Both GPUs give the same result: the same 14 checks pass and the same
   10 fail.
@@ -740,7 +816,7 @@ What the baseline says:
   frames of eight, and the new check `shared-texture` passes
   ([present.md](present.md#desktop-duplication)). Those runs selected
   `duplication`, `shared-texture` and `tear-blt` only.
-- B9. The tables below are not the baseline's. They are the runs of
+- B9. The historical tables below record the later runs of
   2026-11-20 at commit `d88304f2eab7`, with the Mesa series 0001 to 0096
   (driver `100.6.101.58107`, the Chromium preload of
   [chromium.md](chromium.md) added), each with `tests/e2e/run.sh --template
@@ -769,7 +845,9 @@ What the baseline says:
   - A pixel shader that needs more than 32 combined texture slots set
     `E_FAIL` at its creation (`test_high_resource_count`), and the test then
     released the NULL shader. It is created as a shader that writes zero
-    ([known-limits.md](known-limits.md#direct3d-10-and-11-at-most-32-texture-and-sampler-pairs-in-one-shader)).
+    ([known-limits.md](known-limits.md#direct3d-10-and-11-at-most-192-texture-and-sampler-pairs-in-one-shader)).
+    [C909](acceptance/C909.md) raised the limit to 192 slots, and the two
+    checks of the test pass.
 
   The runs of 2026-11-21 at commit `022cd405`, each a fresh lab with
   `tests/e2e/run.sh --template windows-11 --host-gpu <gpu> --keep` and
