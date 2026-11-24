@@ -1411,6 +1411,58 @@ mod tests {
         assert_no_frame(&mut raw.rx).await;
     }
 
+    /// Review networking-2 F24: a raw port accepts a frame four bytes
+    /// longer than a vnet stream carries. That frame is dropped for the vnet
+    /// port, by itself, and the port's writer lives to send the next one.
+    #[tokio::test]
+    async fn an_oversized_frame_does_not_end_a_vnet_ports_writer() {
+        let switch = Switch::new("oversized".into());
+        let mode = FramingMode::Vnet { queue_pairs: 2 };
+        let (raw, mut qemu) = UnixStream::pair().unwrap();
+        switch.add_stream_port(raw, GUEST).await;
+        let (vnet, mut peer) = UnixStream::pair().unwrap();
+        switch
+            .add_stream_port_with_config(
+                vnet,
+                GUEST,
+                PortConfig {
+                    framing: mode,
+                    mtu: 1500,
+                },
+            )
+            .await;
+        let broadcast = |len: usize| {
+            let mut frame = vec![0u8; len];
+            frame[..6].copy_from_slice(&[0xff; 6]);
+            frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x24]);
+            frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+            frame
+        };
+        let oversized = broadcast(vmlab_hv_proto::net::MAX_FRAME_LEN + 2);
+        assert!(oversized.len() <= framing::MAX_FRAME_LEN);
+        // The reader of the raw port takes the frame while this writes it.
+        let (written, ()) = tokio::join!(framing::write_frame(&mut qemu, &oversized), async {
+            wait_for(
+                || switch.stats().frames_dropped == 1,
+                "the oversized frame dropped for the vnet port",
+            )
+            .await
+        });
+        written.unwrap();
+
+        let small = broadcast(60);
+        framing::write_frame(&mut qemu, &small).await.unwrap();
+        let received = timeout(
+            Duration::from_secs(2),
+            framing::read_packet(&mut peer, mode),
+        )
+        .await
+        .expect("the vnet port's writer is gone")
+        .unwrap()
+        .unwrap();
+        assert_eq!(received.frame, small);
+    }
+
     /// Review F6: a guest that sends from 100 000 source MACs leaves no more
     /// than its port's limit in the table, the newest of them is the one
     /// kept, and what another port taught the switch stays.

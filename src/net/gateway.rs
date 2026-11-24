@@ -1220,6 +1220,136 @@ pub(crate) mod tests {
         );
     }
 
+    /// A DHCP REQUEST broadcast from `mac` that names `want` (option 50).
+    fn request_frame(mac: MacAddr, want: Ipv4Addr) -> Vec<u8> {
+        let mut b = vec![0u8; 240];
+        b[0] = 1; // BOOTREQUEST
+        b[1] = 1;
+        b[2] = 6;
+        b[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        b[28..34].copy_from_slice(&mac.0);
+        b[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        b.extend_from_slice(&[53, 1, 3]);
+        b.extend_from_slice(&[50, 4]);
+        b.extend_from_slice(&want.octets());
+        b.push(255);
+        let udp = udp_build(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, &b).unwrap();
+        let ip = ipv4_build(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            IPPROTO_UDP,
+            64,
+            &udp,
+            1,
+        )
+        .unwrap();
+        eth_build(MAC_BROADCAST, mac, ETHERTYPE_IPV4, &ip)
+    }
+
+    /// The DHCP message type (option 53) of `frame`, when it is a reply
+    /// from the DHCP server port.
+    fn dhcp_reply_type(frame: &[u8]) -> Option<u8> {
+        let eth = EthView::parse(frame)?;
+        if eth.ethertype() != ETHERTYPE_IPV4 {
+            return None;
+        }
+        let ip = Ipv4View::parse(eth.payload())?;
+        let udp = UdpView::parse(ip.payload()).filter(|_| ip.proto() == IPPROTO_UDP)?;
+        if udp.src_port() != 67 {
+            return None;
+        }
+        let p = udp.payload();
+        let mut i = 240;
+        while i + 1 < p.len() && p[i] != 255 {
+            if p[i] == 0 {
+                i += 1;
+                continue;
+            }
+            let len = usize::from(p[i + 1]);
+            if p[i] == 53 {
+                return p.get(i + 2).copied();
+            }
+            i += 2 + len;
+        }
+        None
+    }
+
+    /// Review networking-2 F27: an address a machine uses without a lease
+    /// is not leased to another MAC on request, so the gateway keeps
+    /// serving its user.
+    #[tokio::test]
+    async fn a_request_cannot_take_an_address_another_mac_uses() {
+        const TAKER_MAC: MacAddr = MacAddr([0x02, 0, 0, 0, 0, 0x66]);
+        let sw = Switch::new("seg".into());
+        let gw = Gateway::spawn(&sw, config());
+        let mut user = sw.add_channel_port(PortClass::Guest { isolated: false });
+        let mut taker = sw.add_channel_port(PortClass::Guest { isolated: false });
+
+        // The user's ARP for the gateway puts its address, which has no
+        // lease, in the neighbour table. The answer says it was handled.
+        let req = arp_request_build(GUEST_MAC, GUEST_IP, gw.gw_ip());
+        user.tx.send(Bytes::from(req)).await.unwrap();
+        loop {
+            let f = recv(&mut user.rx).await;
+            let eth = EthView::parse(&f).unwrap();
+            if eth.ethertype() == ETHERTYPE_ARP && eth.dst_mac() == GUEST_MAC {
+                break;
+            }
+        }
+
+        // Another machine asks for that address by name.
+        taker
+            .tx
+            .send(Bytes::from(request_frame(TAKER_MAC, GUEST_IP)))
+            .await
+            .unwrap();
+        let kind = loop {
+            if let Some(kind) = dhcp_reply_type(&recv(&mut taker.rx).await) {
+                break kind;
+            }
+        };
+        assert_eq!(kind, 6, "the request for an address in use is not refused");
+        assert_eq!(gw.dhcp_leases(), vec![]);
+
+        // The gateway still serves the user: its echo is answered. The
+        // user's port then sends a request the server refuses, and the
+        // gateway answers one port's frames in order, so an echo that was
+        // dropped shows as the NAK arriving first.
+        let echo = icmp_build(ICMP_ECHO_REQUEST, 0, [0xAB, 0xCD, 0, 1], b"ping!");
+        let ipp = ipv4_build(GUEST_IP, gw.gw_ip(), IPPROTO_ICMP, 64, &echo, 7).unwrap();
+        let echo = eth_build(gw.gw_mac(), GUEST_MAC, ETHERTYPE_IPV4, &ipp);
+        user.tx.send(Bytes::from(echo)).await.unwrap();
+        let outside = Ipv4Addr::new(172, 16, 0, 5);
+        user.tx
+            .send(Bytes::from(request_frame(GUEST_MAC, outside)))
+            .await
+            .unwrap();
+        // The NAK the taker got was broadcast, and is on this port too.
+        let reply = loop {
+            let f = recv(&mut user.rx).await;
+            if dhcp_reply_type(&f).is_some() {
+                // BOOTP's chaddr, after ethernet, IPv4 and UDP headers.
+                let chaddr = &f[14 + 20 + 8 + 28..][..6];
+                assert_ne!(chaddr, GUEST_MAC.0, "the gateway dropped the user's echo");
+                continue;
+            }
+            let eth = EthView::parse(&f).unwrap();
+            if eth.ethertype() == ETHERTYPE_IPV4
+                && Ipv4View::parse(eth.payload()).unwrap().proto() == IPPROTO_ICMP
+            {
+                break f;
+            }
+        };
+        let eth = EthView::parse(&reply).unwrap();
+        assert_eq!(eth.dst_mac(), GUEST_MAC);
+        let ip = Ipv4View::parse(eth.payload()).unwrap();
+        assert_eq!(ip.dst(), GUEST_IP);
+        assert_eq!(
+            IcmpView::parse(ip.payload()).unwrap().icmp_type(),
+            ICMP_ECHO_REPLY
+        );
+    }
+
     /// Review F9: an IPv4 frame whose source is a leased address reaches the
     /// uplink (NAT, routing) only from the MAC that holds the lease.
     #[tokio::test]
