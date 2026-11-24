@@ -3246,4 +3246,145 @@ mod tests {
         FileSystem::forget(&fs, &ctx(), held, 1);
         assert_eq!(lookup(&fs, b"sub").unwrap().inode, made);
     }
+
+    /// The umask of this process, from `/proc/self/status`.
+    fn process_umask() -> u32 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))
+            .expect("the kernel reports the umask");
+        u32::from_str_radix(line.trim(), 8).unwrap()
+    }
+
+    #[test]
+    fn write_only_handle_under_writeback_serves_reads() {
+        let (_dir, fs) = scratch();
+        let enabled = fs.init(FsOptions::all()).unwrap();
+        assert!(enabled.contains(FsOptions::WRITEBACK_CACHE));
+        let ino = lookup(&fs, b"hello.txt").unwrap().inode;
+        // With the writeback cache the guest fills a page before it writes
+        // part of it, through the handle of the file being written.
+        for flags in [libc::O_WRONLY, libc::O_WRONLY | libc::O_APPEND] {
+            let (handle, _, _) = FileSystem::open(&fs, &ctx(), ino, flags as u32, 0).unwrap();
+            let handle = handle.unwrap();
+            let mut served = Vec::new();
+            let read = FileSystem::read(
+                &fs,
+                &ctx(),
+                ino,
+                handle,
+                &mut SinkWriter(&mut served),
+                64,
+                0,
+                None,
+                0,
+            );
+            let n = read.unwrap_or_else(|e| panic!("READ on a write-only handle: {e}"));
+            assert_eq!(&served[..n], b"hello share\n");
+            FileSystem::release(&fs, &ctx(), ino, 0, handle, false, false, None).unwrap();
+        }
+        // A file created write-only is read through its handle as well.
+        let (entry, handle, _, _) = FileSystem::create(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"made.txt"),
+            CreateIn {
+                flags: libc::O_WRONLY as u32,
+                mode: 0o200,
+                fuse_flags: 0,
+                umask: 0,
+            },
+        )
+        .unwrap();
+        let mut served = Vec::new();
+        let read = FileSystem::read(
+            &fs,
+            &ctx(),
+            entry.inode,
+            handle.unwrap(),
+            &mut SinkWriter(&mut served),
+            64,
+            0,
+            None,
+            0,
+        );
+        assert_eq!(read.map_err(|e| e.raw_os_error()), Ok(0));
+    }
+
+    #[test]
+    fn a_tree_larger_than_the_inode_table_can_be_walked() {
+        const FILES: usize = 40;
+        const { assert!(FILES > SESSION_LIMIT) };
+        let (dir, fs) = scratch();
+        let mut inodes = Vec::new();
+        for n in 0..FILES {
+            let file = format!("f{n:02}");
+            std::fs::write(dir.path().join(&file), file.as_bytes()).unwrap();
+            // No FORGET: the guest keeps every inode in its own caches.
+            let entry = lookup(&fs, file.as_bytes())
+                .unwrap_or_else(|e| panic!("lookup of file {n} of {FILES}: {e}"));
+            inodes.push(entry.inode);
+        }
+        // The descriptors stay bounded while the guest holds more inodes.
+        assert!(fs.inner.lock().inodes.len() <= SESSION_LIMIT);
+        // Every inode the guest holds still answers, the first one too.
+        for (n, ino) in inodes.iter().enumerate() {
+            let (st, _) = FileSystem::getattr(&fs, &ctx(), *ino, None)
+                .unwrap_or_else(|e| panic!("getattr of file {n}: {e}"));
+            assert_eq!(st.st_ino, *ino);
+            assert_eq!(st.st_size, 3);
+        }
+        assert_eq!(read_all(&fs, inodes[0]), b"f00");
+        // A repeat lookup gives the node id the guest already has.
+        assert_eq!(lookup(&fs, b"f00").unwrap().inode, inodes[0]);
+        assert!(fs.inner.lock().inodes.len() <= SESSION_LIMIT);
+    }
+
+    #[test]
+    fn created_nodes_keep_the_mode_the_guest_sent() {
+        if process_umask() == 0 {
+            // Nothing to prove: no host umask to apply a second time.
+            return;
+        }
+        let (_dir, fs) = scratch();
+        // The guest kernel applied the guest's umask already (the server
+        // does not negotiate DONT_MASK), so `mode` is final.
+        let (entry, _, _, _) = FileSystem::create(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"shared.txt"),
+            CreateIn {
+                flags: libc::O_RDWR as u32,
+                mode: 0o666,
+                fuse_flags: 0,
+                umask: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(entry.attr.st_mode & 0o7777, 0o666);
+        let made = FileSystem::mkdir(&fs, &ctx(), ROOT_ID, &name(b"shared"), 0o777, 0).unwrap();
+        assert_eq!(made.attr.st_mode & 0o7777, 0o777);
+        let node = FileSystem::mknod(
+            &fs,
+            &ctx(),
+            ROOT_ID,
+            &name(b"node"),
+            libc::S_IFREG | 0o666,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(node.attr.st_mode & 0o7777, 0o666);
+        // The umask of the process, and of this thread, is as it was.
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::write(probe.path().join("probe"), []).unwrap();
+        let mode = std::fs::metadata(probe.path().join("probe"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o666 & !process_umask());
+    }
 }
