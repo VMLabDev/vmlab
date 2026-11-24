@@ -261,6 +261,18 @@ beyond the single random words of the first differential run, and
   `vmlab_hv_tcg_ir::lower` on the result aborts the test process (seen:
   `thread ... has overflowed its stack`, SIGABRT).
 - Confidence: high.
+- Fixed by card #772. The parser counts the levels of the expression tree
+  itself: nesting and suffixes add to one height, and `parse` refuses a tree
+  of more than 128 levels (`MAX_EXPR_HEIGHT`) with `expression depth limit
+  exceeded`. That replaces the separate count of suffixes on one operand, so
+  the tallest tree `lower`, `fold` and `format` can be given has 128 levels.
+  The fuzz target is covered by the same bound. Before the fix the proof test
+  aborted with a stack overflow in its own process, because dropping the
+  parsed tree is recursive too. A second test,
+  `the_depth_limit_counts_nesting_and_suffixes_together`, holds the bound at
+  its edge for three shapes. The committed model is far below the bound:
+  all of `model.json.gz` is 20 JSON levels deep. The Jib text itself was not
+  generated again for this card.
 
 ### F6. The emitter writes a model that the generated crate cannot load
 
