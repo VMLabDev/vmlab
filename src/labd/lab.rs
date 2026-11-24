@@ -3098,7 +3098,7 @@ impl LabRuntime {
         let name = m.name();
         // Claimed before it is asked for, so a run that has just finished
         // is seen to have.
-        let Some(_claim) = FirstBootClaim::take(self, name) else {
+        let Some(claim) = FirstBootClaim::take(self, name) else {
             return Ok(());
         };
         let Some(first_boot) = m.pending_first_boot() else {
@@ -3116,22 +3116,40 @@ impl LabRuntime {
             .await
             .with_context(|| format!("first-boot {name}: agent did not come up"))?;
 
-        // Hard ceiling: Windows specialize/OOBE can be slow, but a hung guest
-        // must not wedge `up` forever.
+        // Windows specialize/OOBE can be slow. At the deadline, cancel the
+        // script and wait for it and its recordings to finish.
         let label = format!("first-boot:{name}");
-        let run = crate::scripting::run_script_source(
-            self.clone(),
-            first_boot.script.source,
-            &label,
-            m.local_dir().to_path_buf(),
-            Some(crate::scripting::ScriptOwner::first_boot(name)),
-            None,
-            output.clone(),
-        );
-        tokio::time::timeout(Duration::from_secs(1800), run)
-            .await
-            .map_err(|_| anyhow!("first-boot {name}: timed out after 1800s"))?
-            .with_context(|| format!("first-boot provision for {name}"))?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let owner = crate::scripting::ScriptOwner::first_boot(name).cancelled_by(cancel.clone());
+        let runtime = self.clone();
+        let ref_base = m.local_dir().to_path_buf();
+        let script_output = output.clone();
+        // If up abandons this start, the task still owns the claim while
+        // cancellation unwinds the script and the runner finalises recordings.
+        let mut run = tokio::spawn(async move {
+            let result = crate::scripting::run_script_source(
+                runtime,
+                first_boot.script.source,
+                &label,
+                ref_base,
+                Some(owner),
+                None,
+                script_output,
+            )
+            .await;
+            (claim, result)
+        });
+        let (_claim, result) = match tokio::time::timeout(Duration::from_secs(1800), &mut run).await
+        {
+            Ok(joined) => joined?,
+            Err(_) => {
+                cancel.cancel();
+                let _ = run.await?;
+                bail!("first-boot {name}: timed out after 1800s");
+            }
+        };
+        result.with_context(|| format!("first-boot provision for {name}"))?;
 
         // The refresh `up` owes a machine it waits on (§19.4), here so the
         // machine is not reported ready while it restarts the agent. Never
@@ -4356,26 +4374,26 @@ impl Drop for ActiveCapture<'_> {
 
 /// A machine's place in [`LabRuntime::first_boots`], held for as long as its
 /// first boot runs and given back on drop, however that run ends.
-struct FirstBootClaim<'a> {
-    lab: &'a LabRuntime,
+struct FirstBootClaim {
+    lab: Arc<LabRuntime>,
     machine: String,
 }
 
-impl<'a> FirstBootClaim<'a> {
+impl FirstBootClaim {
     /// The claim on `machine`'s first boot, or `None` when a run already
     /// holds it.
-    fn take(lab: &'a LabRuntime, machine: &str) -> Option<Self> {
+    fn take(lab: &Arc<LabRuntime>, machine: &str) -> Option<Self> {
         lab.first_boots
             .lock_recover()
             .insert(machine.to_string())
             .then(|| Self {
-                lab,
+                lab: lab.clone(),
                 machine: machine.to_string(),
             })
     }
 }
 
-impl Drop for FirstBootClaim<'_> {
+impl Drop for FirstBootClaim {
     fn drop(&mut self) {
         self.lab.first_boots.lock_recover().remove(&self.machine);
     }
@@ -7188,6 +7206,80 @@ lab "t" {
     }
 
     const FIRST_BOOT: &str = "use vmlab\n\nfn main(lab: Lab) {\n    vmlab::sleep_ms(300)\n}\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_first_boot_past_its_timeout_stops_its_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = owing_first_boot(
+            dir.path(),
+            &sh,
+            r#"use vmlab
+fn main(lab: Lab) {
+    let m = lab.this_vm().expect("vm")
+    lab.log("at the gate")
+    let w = m.wait_shutdown(100000)
+    lab.log("still here")
+    let s = m.start()
+}
+"#,
+        );
+        lab.start_machine("win").await.unwrap();
+        let m = lab.machine("win").unwrap();
+        m.wait_agent_up(m.ready_timeout()).await.unwrap();
+
+        let (sink, said) = numbered(&sh);
+        let (entered, at_gate) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(Some((entered, held)));
+        let output: crate::scripting::OutputSink = Arc::new(move |line| {
+            if line == "at the gate\n" {
+                let (entered, held) = gate.lock().unwrap().take().unwrap();
+                entered.send(()).unwrap();
+                let _ = held.recv();
+            }
+            sink(line);
+        });
+        let mut run = std::pin::pin!(lab.run_first_boot(&m, &output));
+        tokio::select! {
+            result = &mut run => panic!("first boot finished before reaching the gate: {result:?}"),
+            entered = at_gate => entered.unwrap(),
+        }
+        // The output sink holds the blocking thread while Tokio delivers the deadline.
+        let mut deadline = std::pin::pin!(tokio::time::sleep(Duration::from_secs(1800)));
+        assert!(futures::poll!(&mut deadline).is_pending());
+        tokio::time::advance(Duration::from_secs(1801)).await;
+        deadline.await;
+        let at_deadline = futures::poll!(&mut run);
+        let claimed = lab.first_boots.lock_recover().contains("win");
+        release.send(()).unwrap();
+
+        assert!(
+            at_deadline.is_pending(),
+            "timeout returned with a live script"
+        );
+        assert!(claimed, "first-boot claim released with a live script");
+        let err = run.await.unwrap_err();
+        assert_eq!(err.to_string(), "first-boot win: timed out after 1800s");
+        assert!(m.pending_first_boot().is_some());
+        assert!(lab.first_boots.lock_recover().is_empty());
+        assert!(
+            !said
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, s)| s == "still here\n")
+        );
+        assert_eq!(
+            sh.log
+                .lock()
+                .await
+                .iter()
+                .filter(|s| s.ends_with(":win:start"))
+                .count(),
+            1
+        );
+    }
 
     /// A start outside `up` runs a first boot the clone still owes, as `up`
     /// would, and the machine ends ready; once run, it is not run again (V6).

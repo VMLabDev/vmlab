@@ -52,10 +52,10 @@ test does not reproduce is wrong and should be dropped.
 | F1 | security (peer) | `seg.forward()` aims the host port at the address the guest reports, not at its DHCP lease (fixed, card #665) |
 | F2 | crash | A script value nested deep enough overflows the native stack when it is dropped and aborts the lab daemon (fixed, card #666) |
 | F3 | wrong result | A provision cancelled inside `m.restore()` leaves the workspace syncer stopped (fixed, card #802) |
-| F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it |
+| F4 | wrong result | A first-boot script runs on after its 1800 s timeout, and the next start runs a second one beside it (fixed, card #803) |
 | F5 | wrong result (hang) | A script that does not call the host cannot be stopped: `up` waits on it for ever, and so does a daemon that got SIGTERM |
 | F6 | security (hostile guest) | A terminal's buffer has no limit, and `expect` scans all of it again on every chunk |
-| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever |
+| F7 | crash (the script run) | A very large timeout or `sleep_ms` panics the script thread, or sleeps for ever (fixed, card #804) |
 | F8 | wrong result | `Term.expect` destroys a character that was split across two reads |
 | F9 | wrong result | `vmlab validate` accepts a script with no entry point, or with the wrong one |
 | F10 | wrong result | `print` and `println` write to the daemon's log file, not to the output of `up` |
@@ -186,6 +186,10 @@ test does not reproduce is wrong and should be dropped.
 
 ### F4. A first-boot script outlives its timeout (wrong result)
 
+Fixed in #803. A timeout or an abandoned start cancels the script. The
+first-boot claim stays held until the script exits and its recordings are
+finalised.
+
 - Where: `src/labd/lab.rs:2909-2922` (`run_first_boot`: the script future
   under `tokio::time::timeout(1800 s)`), `:3986-4009` (`FirstBootClaim`),
   `src/scripting/runner.rs:52-59` (`ScriptOwner::first_boot` has no cancel
@@ -206,13 +210,13 @@ test does not reproduce is wrong and should be dropped.
 - The same happens when `up` aborts a machine that is in its first boot
   because another machine failed (`abandon_up`, `src/labd/lab.rs:354-370`,
   `starting.abort_all()`).
-- Proof: test `a_first_boot_past_its_timeout_stops_its_script` in
-  `src/labd/lab.rs`, with the tokio clock paused: a machine double with a
-  pending first boot whose script is
-  `fn main(lab: Lab) { let m = lab.this_vm().expect("vm")  let w = m.wait_shutdown(100000)  lab.log("still here")  let s = m.start() }`.
-  Advance the clock past 1800 s. `run_first_boot` returns the timeout error.
-  Advance past 100,000 s. Expected: no `still here` line and no `start` on
-  the double. Today: both happen.
+- Proof: `a_first_boot_past_its_timeout_stops_its_script` in
+  `src/labd/lab.rs` holds the script thread at a log call and advances the
+  paused Tokio clock past 1800 s. The timeout keeps the first-boot claim and
+  waits for the thread. Releasing the log call lets cancellation stop the
+  script at its next host wait. The caller gets the timeout error, the
+  pending marker stays owed, and the script logs no later line and issues no
+  start.
 
 ### F5. A script that does not call the host cannot be stopped (wrong result, hang)
 
@@ -309,6 +313,9 @@ host waits observe it while blocked.
   `t.expect("x", i64::MAX)`. Expected: `Err`. Today: a panic. The same test
   for `cancel::sleep(Duration::from_millis(i64::MAX as u64))` inside
   `enter(Some(token))`.
+- Fixed in card #804. Script waits and sleeps over 365 days report an
+  argument error before reaching a clock or blocking. `sleep_ms` raises a
+  script fault and keeps its existing unit return type.
 
 ### F8. `Term.expect` destroys a character split across two reads (wrong result)
 
