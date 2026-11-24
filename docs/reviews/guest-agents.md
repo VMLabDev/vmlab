@@ -501,6 +501,9 @@ Not read:
 - Test: `a_character_split_across_two_frames_survives`. A mock agent sends
   the two bytes of `é` in two `Data` frames on a tail channel. Assert that
   the streamed chunks join to `é`.
+- Fixed in card #812. The shared tail and event-log pump carries an incomplete
+  UTF-8 sequence into the next frame. It still replaces malformed bytes and an
+  incomplete sequence left at the end of the stream.
 
 ### F15. Any record on a file channel renews the watchdog, also one that answers nothing
 
