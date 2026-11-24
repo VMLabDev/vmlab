@@ -745,13 +745,7 @@ impl XhciController {
                 self.store_endpoint(slot, ep)?;
                 // The endpoint's transfer state is gone; a backend with
                 // in-flight work must not attribute it to the next TD.
-                if let Some(device) = self.state.slots[slot]
-                    .port
-                    .checked_sub(1)
-                    .and_then(|p| self.devices[p].as_mut())
-                {
-                    device.endpoint_dropped((ep / 2) as u8 | if ep & 1 == 1 { 0x80 } else { 0 });
-                }
+                self.drop_endpoints(self.state.slots[slot].port, ep as u8..ep as u8 + 1);
                 if let Some((addr, trb)) = stopped {
                     self.transfer_event(
                         (slot, ep),
@@ -768,10 +762,10 @@ impl XhciController {
                 let port = self.state.slots[slot].port;
                 if let Some(device) = port.checked_sub(1).and_then(|p| self.devices[p].as_mut()) {
                     device.reset();
-                    for ep in 2..32u8 {
-                        device.endpoint_dropped((ep / 2) | if ep & 1 == 1 { 0x80 } else { 0 });
-                    }
                 }
+                // The control endpoint keeps its context, but the request
+                // in flight on it is aborted with the rest.
+                self.drop_endpoints(port, 1..32);
                 for e in &mut self.state.slots[slot].endpoints[2..] {
                     *e = Endpoint::default();
                 }
