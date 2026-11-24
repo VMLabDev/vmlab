@@ -1477,7 +1477,7 @@ fn place_rx_frames(shared: &Arc<Mutex<Shared>>, hdr_len: usize, mergeable: bool,
 struct TxPacket<'a> {
     head: u16,
     prefix: Option<[u8; 4]>,
-    slices: Vec<VolatileSlice<'a>>,
+    slices: Vec<crate::GuestSlice<'a>>,
     owned: Option<Vec<u8>>,
 }
 

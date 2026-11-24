@@ -11,7 +11,7 @@ use crate::GuestMemory;
 use super::checksum::CopyChecksum;
 
 pub(super) struct ReceiveWriter<'a> {
-    slices: Vec<VolatileSlice<'a>>,
+    slices: Vec<crate::GuestSlice<'a>>,
     index: usize,
     offset: usize,
     remaining: usize,

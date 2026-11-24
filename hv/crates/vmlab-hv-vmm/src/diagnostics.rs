@@ -4,7 +4,8 @@ use kvm_bindings::{
     KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, Msrs, kvm_irqchip,
     kvm_msr_entry,
 };
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
+use vmlab_hv_devices::{GuestMemory};
 use vmlab_hv_devices::BusDevice;
 
 use crate::vm::VmShared;
@@ -99,7 +100,7 @@ fn lapic_u32(regs: &[std::os::raw::c_char], offset: usize) -> u32 {
     u32::from_le_bytes(std::array::from_fn(|i| regs[offset + i] as u8))
 }
 
-pub(crate) fn timer_state(shared: &VmShared, mem: &GuestMemoryMmap) -> Vec<String> {
+pub(crate) fn timer_state(shared: &VmShared, mem: &GuestMemory) -> Vec<String> {
     let mut lines = Vec::new();
     macro_rules! record {
         ($($args:tt)*) => { lines.push(format!($($args)*)) };

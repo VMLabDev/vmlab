@@ -14,7 +14,8 @@ use kvm_ioctls::VcpuFd;
 use linux_loader::bootparam::boot_params;
 use linux_loader::loader::KernelLoader;
 use linux_loader::loader::bzimage::BzImage;
-use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestAddress};
+use vmlab_hv_devices::{GuestMemory};
 
 use crate::e820::E820Entry;
 use crate::error::VmmError;
@@ -43,7 +44,7 @@ pub struct KernelBoot {
 
 /// Load a kernel, optional initrd and the cmdline into guest memory.
 pub fn load(
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemory,
     kernel: &Path,
     initrd: Option<&Path>,
     cmdline: &str,
@@ -132,7 +133,7 @@ pub fn load(
 /// Write the identity page tables and GDT the 64-bit entry needs. Maps every
 /// 1 GiB page up to `top` (the hole included, which the guest never touches
 /// before building its own tables).
-fn setup_long_mode(mem: &GuestMemoryMmap, top: u64) -> Result<(), VmmError> {
+fn setup_long_mode(mem: &GuestMemory, top: u64) -> Result<(), VmmError> {
     const PTE_P: u64 = 0x1;
     const PTE_RW: u64 = 0x2;
     const PTE_PS: u64 = 0x80;
@@ -306,8 +307,8 @@ mod tests {
         image
     }
 
-    fn mem() -> GuestMemoryMmap {
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 128 * MIB as usize)]).unwrap()
+    fn mem() -> GuestMemory {
+        GuestMemory::from_ranges(&[(GuestAddress(0), 128 * MIB as usize)]).unwrap()
     }
 
     fn temp_dir(tag: &str) -> tempfile::TempDir {

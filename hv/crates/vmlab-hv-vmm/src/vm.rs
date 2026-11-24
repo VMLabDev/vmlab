@@ -138,7 +138,10 @@ pub struct VmShared {
     memory_writer: Mutex<()>,
     pub(crate) kvm: Arc<KvmVm>,
     io_bus: Mutex<IoBus>,
-    mmio_bus: Mutex<MmioBus>,
+    /// The chipset's fixed MMIO. Its regions do not change after the build,
+    /// so the dispatch takes no bus lock: a device call that waits (a TPM
+    /// command) holds only its own device.
+    mmio_bus: MmioBus,
     pub(crate) pci_root: Arc<Mutex<PciRoot>>,
     pm: Arc<Mutex<PmDevice>>,
     sleep_signal: Arc<SleepSignal>,
@@ -222,7 +225,7 @@ impl VmShared {
             memory_writer: Mutex::new(()),
             kvm: Arc::new(kvm),
             io_bus: Mutex::new(io_bus),
-            mmio_bus: Mutex::new(mmio_bus),
+            mmio_bus,
             pci_root,
             pm,
             sleep_signal,
@@ -1061,7 +1064,7 @@ impl VmShared {
         if self.in_pci_window(addr) && PciRoot::read_mmio(&self.pci_root, addr, data) {
             return;
         }
-        self.mmio_bus.lock().read(addr, data);
+        self.mmio_bus.read(addr, data);
     }
     pub(crate) fn mmio_write(&self, addr: u64, data: &[u8]) {
         let addr = self.cpu_address(addr);
@@ -1106,7 +1109,7 @@ impl VmShared {
             }
             return;
         }
-        self.mmio_bus.lock().write(addr, data);
+        self.mmio_bus.write(addr, data);
     }
 
     pub(crate) fn flash_address(&self, addr: u64) -> bool {
@@ -1130,7 +1133,7 @@ impl VmShared {
     /// BAR programmed over it does not take the access.
     fn in_pci_window(&self, addr: u64) -> bool {
         if self.mch.lock().is_some() {
-            return !self.mmio_bus.lock().covers(addr);
+            return !self.mmio_bus.covers(addr);
         }
         let ((b32, e32), (b64, e64)) = self.pci_windows;
         (b32 <= addr && addr < e32) || (b64 <= addr && addr < e64) || !self.vfio.lock().is_empty()

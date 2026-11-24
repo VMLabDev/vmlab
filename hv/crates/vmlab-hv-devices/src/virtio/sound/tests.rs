@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32};
+use vm_memory::{Bytes, GuestAddress, Le16, Le32};
 
 use super::VirtioSnd;
 use crate::Snapshot;
@@ -193,7 +193,7 @@ impl HostAudio for PacedHost {
 /// drives it: PCI config, BAR4 common configuration, queue kicks.
 struct Guest {
     pci: VirtioPciDevice,
-    mem: GuestMemoryMmap<()>,
+    mem: GuestMemory,
     device: Arc<Mutex<VirtioSnd>>,
     msi: Arc<RecMsi>,
     irq: Arc<RecIrq>,
@@ -205,7 +205,7 @@ struct Guest {
 impl Guest {
     /// A machine with `host`'s audio; `microphone` adds the capture stream.
     fn new(host: Arc<dyn HostAudio>, microphone: bool) -> Self {
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         let msi = Arc::new(RecMsi::default());
         let irq = Arc::new(RecIrq::default());
         let (device, sound) = VirtioSnd::new_shared("virtio-snd@guest", host, microphone);

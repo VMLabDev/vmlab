@@ -5,7 +5,8 @@ use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VmFd;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
+use vmlab_hv_devices::{GuestMemory};
 use vmlab_hv_devices::{DeviceError, Snapshot};
 
 const MIB: u64 = 1 << 20;
@@ -14,12 +15,12 @@ const UPPER_SLOT: u32 = 201;
 
 pub struct A20 {
     file: std::fs::File,
-    cpu: GuestMemoryMmap,
+    cpu: GuestMemory,
     vm: Arc<VmFd>,
     regions: Vec<(u64, u64)>,
     enabled: bool,
     pam: Option<Arc<Mutex<Pam>>>,
-    rom: Option<(GuestMemoryMmap, GuestMemoryMmap, u32)>,
+    rom: Option<(GuestMemory, GuestMemory, u32)>,
 }
 
 impl A20 {
@@ -39,7 +40,7 @@ impl A20 {
             })
             .collect::<Result<Vec<_>, std::io::Error>>()
             .map_err(|e| VmmError::Memory(e.to_string()))?;
-        let cpu = GuestMemoryMmap::from_ranges_with_files(ranges)
+        let cpu = GuestMemory::from_ranges_with_files(ranges)
             .map_err(|e| VmmError::Memory(e.to_string()))?;
         crate::memory::dont_dump(&cpu)?;
         Ok(Self {
@@ -56,10 +57,10 @@ impl A20 {
     pub fn attach_pam(&mut self, pam: Arc<Mutex<Pam>>) {
         self.pam = Some(pam);
     }
-    pub fn attach_rom(&mut self, rom: GuestMemoryMmap, slot: u32) -> Result<(), VmmError> {
+    pub fn attach_rom(&mut self, rom: GuestMemory, slot: u32) -> Result<(), VmmError> {
         let region = rom.iter().next().unwrap();
         let base = region.start_addr().0;
-        let alias = GuestMemoryMmap::from_ranges(&[(GuestAddress(base), region.len() as usize)])
+        let alias = GuestMemory::from_ranges(&[(GuestAddress(base), region.len() as usize)])
             .map_err(|e| VmmError::Memory(e.to_string()))?;
         crate::memory::dont_dump(&alias)?;
         let mut bytes = vec![0xff; region.len() as usize];
@@ -305,7 +306,7 @@ mod tests {
             crate::memory::GuestRam::pc(crate::layout::MemLayout::pc(8).unwrap(), kvm.vm.clone())
                 .unwrap();
         let base = 0xffe8_0000;
-        let rom = GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 0x180000)]).unwrap();
+        let rom = GuestMemory::from_ranges(&[(GuestAddress(base), 0x180000)]).unwrap();
         rom.write_slice(&vec![0x5a; 0x180000], GuestAddress(base))
             .unwrap();
         let mut a20 = ram.a20.as_ref().unwrap().lock();

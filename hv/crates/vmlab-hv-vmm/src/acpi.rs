@@ -19,7 +19,8 @@ use acpi_tables::mcfg::MCFG;
 use acpi_tables::rsdp::Rsdp;
 use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
+use vmlab_hv_devices::{GuestMemory};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::error::VmmError;
@@ -46,7 +47,7 @@ pub struct AcpiPlacement {
 }
 
 /// Build the tables and write them into guest memory.
-pub fn install(mem: &GuestMemoryMmap, cfg: &AcpiConfig) -> Result<AcpiPlacement, VmmError> {
+pub fn install(mem: &GuestMemory, cfg: &AcpiConfig) -> Result<AcpiPlacement, VmmError> {
     let mut cursor = TableArea::new();
 
     let dsdt = dsdt(cfg.layout);
@@ -134,14 +135,14 @@ impl TableArea {
         Ok(addr)
     }
 
-    fn push(&mut self, mem: &GuestMemoryMmap, table: &Sdt) -> Result<u64, VmmError> {
+    fn push(&mut self, mem: &GuestMemory, table: &Sdt) -> Result<u64, VmmError> {
         let addr = self.place(table.len())?;
         mem.write_slice(table.as_slice(), GuestAddress(addr))
             .map_err(|e| VmmError::Acpi(format!("writing table at {addr:#x}: {e}")))?;
         Ok(addr)
     }
 
-    fn push_aml(&mut self, mem: &GuestMemoryMmap, table: &impl Aml) -> Result<u64, VmmError> {
+    fn push_aml(&mut self, mem: &GuestMemory, table: &impl Aml) -> Result<u64, VmmError> {
         let mut bytes = Vec::new();
         table.to_aml_bytes(&mut bytes);
         let addr = self.place(bytes.len())?;
@@ -283,12 +284,12 @@ fn _static_assert(_: Arc<AcpiConfig<'static>>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vm_memory::GuestMemoryMmap;
+    use vmlab_hv_devices::GuestMemory;
 
     const MIB: u64 = 1 << 20;
 
-    fn mem() -> GuestMemoryMmap {
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 16 * MIB as usize)]).unwrap()
+    fn mem() -> GuestMemory {
+        GuestMemory::from_ranges(&[(GuestAddress(0), 16 * MIB as usize)]).unwrap()
     }
 
     fn sum_zero(bytes: &[u8]) -> bool {
@@ -481,7 +482,7 @@ mod tests {
         assert_eq!((segment, start, end), (0, 0, 255));
     }
 
-    fn read_entry(mem: &GuestMemoryMmap, rsdp: u64, index: usize) -> u64 {
+    fn read_entry(mem: &GuestMemory, rsdp: u64, index: usize) -> u64 {
         let mut buf = [0u8; 36];
         mem.read_slice(&mut buf, GuestAddress(rsdp)).unwrap();
         let xsdt = u64::from_le_bytes(buf[24..32].try_into().unwrap());
@@ -491,7 +492,7 @@ mod tests {
         u64::from_le_bytes(entry)
     }
 
-    fn read_table(mem: &GuestMemoryMmap, addr: u64) -> Vec<u8> {
+    fn read_table(mem: &GuestMemory, addr: u64) -> Vec<u8> {
         let mut header = [0u8; 36];
         mem.read_slice(&mut header, GuestAddress(addr)).unwrap();
         let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;

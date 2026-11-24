@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use kvm_bindings::{kvm_userspace_memory_region, kvm_vcpu_events};
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
-use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
+use vmlab_hv_devices::{GuestMemory};
 use vmlab_hv_devices::{BusDevice, DeviceError, Snapshot};
 
 use crate::VmmError;
@@ -182,7 +181,7 @@ impl Snapshot for SmramControl {
 /// both address spaces. Ordinary RAM must not overlap these ranges.
 pub struct Smram {
     vm: Arc<VmFd>,
-    memory: GuestMemoryMmap,
+    memory: GuestMemory,
     first_slot: u32,
     open: Vec<bool>,
 }
@@ -204,7 +203,7 @@ impl Smram {
             .map(|(base, size)| (GuestAddress(*base), *size))
             .collect();
         let memory =
-            GuestMemoryMmap::from_ranges(&ranges).map_err(|e| VmmError::Memory(e.to_string()))?;
+            GuestMemory::from_ranges(&ranges).map_err(|e| VmmError::Memory(e.to_string()))?;
         crate::memory::dont_dump(&memory)?;
         let smram = Self {
             vm,
@@ -260,7 +259,7 @@ impl Smram {
 
     /// Host-only backing access for loading handlers and snapshot orchestration.
     /// Never merge this memory into a bus-master device's DMA memory view.
-    pub fn memory(&self) -> &GuestMemoryMmap {
+    pub fn memory(&self) -> &GuestMemory {
         &self.memory
     }
 }
