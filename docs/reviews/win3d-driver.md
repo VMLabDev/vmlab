@@ -148,6 +148,23 @@ for a guest that is not x86.
   without the pre-made directory: as `u`, create `state.json.tmp` before the
   install, and after it check with `icacls` who owns `state.json`.
 - Severity: security against a hostile guest user (standard user to SYSTEM).
+- Fixed: card #753. The installer creates the directory with a protected
+  access list (SYSTEM and Administrators full control, Users read), replaces
+  the inherited list of an older install, and stops with exit code 3,
+  before it reads or writes anything there, on a directory or an entry that
+  a standard user owns or can change (`Protect-StateRoot` in
+  `guest/win3d/installer/vmlab-win3d.ps1`). The proof is
+  `guest/win3d/tests/installer/statedir-probe.sh`, and
+  `guest/win3d/docs/acceptance/C753.md` has the runs on a Windows 11 guest:
+  with the installer of `next`, route 1 gave `nt authority\system` in
+  `C:\proof.txt`'s place and route 2 gave the user the ownership of
+  `state.json`. With the fix the install on the user's directory is
+  refused and every attempt of the user is denied. Two corrections to the
+  text above, from those runs. The statement about `C:\ProgramData` under
+  "How the review was done" is confirmed. Route 2 is narrower than stated:
+  the user owns `state.json` only until the next write of the state, which
+  makes a new file, so the fault shows after a run that writes the state
+  once (a failed run) or inside the window between two writes.
 
 ### F3. The capset id of the escape is not bounded before it indexes an array
 
