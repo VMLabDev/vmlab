@@ -78,7 +78,10 @@ SRC
     checkout has been frozen, frozen again or thawed since, or a machine
     has lost its disk. `daemon_pid` is the pid of the lab daemon that
     answered, which a daemon restart names so that it replaces that daemon
-    and no other.
+    and no other. `working` lists what the daemon is doing now that a
+    restart would cut off, one phrase each (a snapshot, a restore, a freeze,
+    a thaw, an `up`, a script). A boot verb replaces a daemon only while the
+    list is empty.
   DOC
 
   h3 "Pending machines"

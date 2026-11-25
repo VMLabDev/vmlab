@@ -149,7 +149,10 @@ page cmd_lab {
     the old one was running, and the old daemon's own shutdown stops them, so
     a lab with machines still running is refused with `lab "<name>" still has
     machines running — stop them first; a restarted daemon cannot re-adopt
-    them`. A daemon that cannot answer a status request at all is not a
+    them`. A daemon that is at work on stopped machines (an offline snapshot
+    or restore, a `worktree freeze` or `thaw`, an `up`, a script) is refused
+    as well, with `the lab daemon is busy with` and the work, because the
+    restart would cut that work off where it stands. A daemon that cannot answer a status request at all is not a
     veto, because a lab whose file no longer loads is exactly what this verb
     exists to recover.
   DOC

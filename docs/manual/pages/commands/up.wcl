@@ -185,6 +185,15 @@ SRC
   DOC
   code text { source = "lab \"ad-lab\": vmlab.wcl changed — restarting the lab daemon to load it" }
   p <<DOC
+    A daemon also works on stopped machines: an offline snapshot or restore,
+    a `worktree freeze` or `thaw`, another `up` that has not booted its
+    first machine yet, a `vmlab script` between two boots. Replacing the
+    daemon would cut that work off where it stands, so while every machine
+    is stopped and such work is under way `up` refuses, names the work and
+    changes nothing. Run it again once the work has finished:
+  DOC
+  code text { source = "lab \"ad-lab\": vmlab.wcl changed, but the lab daemon is busy with the restore of dc01 to snapshot `clean` — replacing the daemon now would cut that off where it stands. Wait for it to finish, then run this command again" }
+  p <<DOC
     Only what the file declares counts: an edit to a comment or to blank
     lines does not replace the daemon. Replacing the daemon keeps everything
     on disk: clones, snapshots, `.vmlab/state.json` (generated MACs and image
