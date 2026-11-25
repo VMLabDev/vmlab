@@ -5770,6 +5770,36 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
         assert!(lab.snapshot("a", "interrupted").await.is_ok());
     }
 
+    /// F15: vmlab-hv answers `snapshot_not_found` for a snapshot its disks
+    /// do not hold. With a record that answer used to be returned and the
+    /// record kept, so the snapshot stayed listed and no delete could clear it.
+    #[tokio::test]
+    async fn a_delete_that_finds_no_snapshot_on_one_disk_removes_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.snapshot_missing = true;
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        lab.snapshot("a", "s").await.unwrap();
+        assert!(lab.state.lock().await.machines["a"].snapshots.contains_key("s"));
+        lab.delete_snapshot("a", "s").await.unwrap();
+        assert!(
+            lab.snapshots("a")
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let disk = std::fs::read_to_string(lab.lab_local.join("state.json")).unwrap();
+        assert!(!disk.contains("\"s\""), "{disk}");
+    }
+
     fn quiet() -> crate::scripting::OutputSink {
         Arc::new(|_| {})
     }
@@ -8514,6 +8544,80 @@ fn main(lab: Lab) {
         let err = lab.record_arm(&[req.clone(), bad], None).await.unwrap_err();
         assert_eq!(code_of(&err), Some(ErrorCode::Unsupported));
         assert!(!lab.recordings.is_pending("a"));
+    }
+
+    /// F16: a freeze copies the UEFI variables, their boot record and the TPM
+    /// state beside the frozen disks, and a freeze-point restore used to
+    /// rewind the disks alone. Real disks, so the real plan runs.
+    #[tokio::test]
+    async fn a_freeze_point_restore_returns_the_firmware_variables() {
+        let have = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("qemu-img").is_file())
+        });
+        if !have {
+            eprintln!("skipping: qemu-img not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let frozen = crate::freeze::machine_dir(&dir.join(".vmlab"), 1, "a");
+        std::fs::create_dir_all(&frozen).unwrap();
+        crate::template::qimg::create_blank(&frozen.join("disk0.qcow2"), 1 << 20)
+            .await
+            .unwrap();
+        crate::template::qimg::create_linked_clone(
+            &frozen.join("disk0.qcow2"),
+            &dir.join("disk0.qcow2"),
+        )
+        .await
+        .unwrap();
+        // The freeze's copy, and the machine's own as the guest has left it
+        // since: a changed store, a record of another boot, a TPM with one
+        // file changed and one added.
+        for (at, word, boot) in [(&frozen, "then", "secure\n"), (&dir, "now", "plain\n")] {
+            std::fs::write(at.join("OVMF_VARS.fd"), word).unwrap();
+            std::fs::write(at.join("OVMF_VARS.boot"), boot).unwrap();
+            std::fs::create_dir(at.join("tpm-state")).unwrap();
+            std::fs::write(at.join("tpm-state/tpm2-00.permall"), word).unwrap();
+        }
+        std::fs::write(dir.join("tpm-state/sealed-since"), "now").unwrap();
+
+        let sh = shared(&dir);
+        let lab = lab_of(
+            &dir,
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+        let m = lab.machine("a").unwrap();
+        lab.restore_freeze_point(&m, "base", 1).await.unwrap();
+
+        let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
+        assert_eq!(read("OVMF_VARS.fd"), "then");
+        assert_eq!(read("OVMF_VARS.boot"), "secure\n");
+        assert_eq!(read("tpm-state/tpm2-00.permall"), "then");
+        assert!(!dir.join("tpm-state/sealed-since").exists());
+        // The freeze keeps its copy, and nothing is left staged or set aside.
+        assert_eq!(
+            std::fs::read_to_string(frozen.join("OVMF_VARS.fd")).unwrap(),
+            "then"
+        );
+        let litter: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".old") || name.ends_with(".restore"))
+            .collect();
+        assert!(litter.is_empty(), "{litter:?}");
+
+        // A machine that had none at the freeze loses what it has made since.
+        for name in ["OVMF_VARS.fd", "OVMF_VARS.boot"] {
+            std::fs::remove_file(frozen.join(name)).unwrap();
+        }
+        std::fs::remove_dir_all(frozen.join("tpm-state")).unwrap();
+        lab.restore_freeze_point(&m, "base", 1).await.unwrap();
+        for name in ["OVMF_VARS.fd", "OVMF_VARS.boot", "tpm-state"] {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
     }
 
     /// A worktree lab of a frozen main checkout (§21.2), built for real: the
