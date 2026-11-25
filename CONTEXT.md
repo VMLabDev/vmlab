@@ -703,7 +703,9 @@ and no action it produces can flow guest→host, so a rolled-back copy cannot re
 the canonical one. **By digest, never by mtime** — a restored guest's clock runs
 behind the host, so a same-size in-place write compares identical on
 `(size, mtime)`. It completes **before the watch reopens**, and it replaces the
-**stat-walk** rather than following one. That it is owed rides the **sync
+**stat-walk** rather than following one. The first pass under the reopened watch
+lists the guest tree by name, which finds what the guest made while the re-seed
+ran, and hashes nothing the re-seed's ledger vouches for. That it is owed rides the **sync
 ledger**, because a restore does not need a running machine.
 _Avoid_: resync, re-sync, reseed pass, full push (a wipe-and-re-transfer is
 legal, not required)

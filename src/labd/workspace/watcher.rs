@@ -22,6 +22,13 @@
 //! the directory list the scan already produced, which has every guest-owned
 //! subtree pruned out of it by construction.
 //!
+//! **A name is not a directory.** The kernel drops a watch with its directory,
+//! and a directory deleted and made again between two scans is listed under
+//! the same name as before. So registration asks the kernel about every
+//! directory of every scan — a watch already placed answers with the
+//! descriptor it has, a new directory with a new one — and an `IN_IGNORED`
+//! takes the name out of the registry and asks for a walk.
+//!
 //! **Everything that loses coverage collapses to one value.** A queue
 //! overflow, a new directory nobody is watching yet, a watch that could not be
 //! placed: all of them are [`HostEvent::Rescan`], and the syncer answers every
@@ -174,20 +181,52 @@ impl HostWatch {
         }
         let mut failed = Vec::new();
         for dir in dirs {
-            if registry.by_dir.contains_key(dir) {
-                continue;
-            }
             let path = if dir.is_empty() {
                 root.to_path_buf()
             } else {
                 root.join(dir)
             };
-            match self.inotify.add_watch(&path, FLAGS) {
-                Ok(wd) => {
-                    registry.by_dir.insert(dir.clone(), wd);
-                    registry.by_wd.insert(wd, dir.clone());
+            // Asked for every directory, every time, and not only for a name
+            // the map lacks: the kernel drops a watch with its directory, so a
+            // name that was deleted and made again between two scans is in the
+            // map on a descriptor that reports nothing. Adding a watch that
+            // is already placed costs one call and returns the descriptor it
+            // has, so a different answer is what says the name now belongs to
+            // another directory.
+            let wd = match self.inotify.add_watch(&path, FLAGS) {
+                Ok(wd) => wd,
+                Err(e) => {
+                    // The watch this name had, if any, is on a directory that
+                    // is no longer here.
+                    if let Some(old) = registry.by_dir.remove(dir)
+                        && registry.by_wd.get(&old) == Some(dir)
+                    {
+                        registry.by_wd.remove(&old);
+                        let _ = self.inotify.rm_watch(old);
+                    }
+                    failed.push(format!("{}: {e}", path.display()));
+                    continue;
                 }
-                Err(e) => failed.push(format!("{}: {e}", path.display())),
+            };
+            if registry.by_dir.get(dir) == Some(&wd) {
+                continue;
+            }
+            // The directory this name had before, where it still exists, was
+            // moved: it is watched again under its new name if the scan
+            // listed it there, and not at all otherwise.
+            if let Some(old) = registry.by_dir.insert(dir.clone(), wd)
+                && registry.by_wd.get(&old) == Some(dir)
+            {
+                registry.by_wd.remove(&old);
+                let _ = self.inotify.rm_watch(old);
+            }
+            // The directory was known under another name: a rename. That name
+            // gets its own answer when its turn comes, or on the next scan.
+            if let Some(was) = registry.by_wd.insert(wd, dir.clone())
+                && was != *dir
+                && registry.by_dir.get(&was) == Some(&wd)
+            {
+                registry.by_dir.remove(&was);
             }
         }
         failed
@@ -267,6 +306,22 @@ fn decode(
         // is the only thing that can place a watch inside it.
         if event.mask.contains(F::IN_ISDIR) {
             out.push(HostEvent::Rescan);
+        }
+        // The kernel took this watch away: its directory was deleted, or the
+        // registrar removed it. Where the registry still holds it the
+        // directory went by itself, and the name must not keep a descriptor
+        // that reports nothing — a directory made again under it would never
+        // be watched. Forgetting it is what makes the walk that answers this
+        // place a new one.
+        if event.mask.contains(F::IN_IGNORED) {
+            let mut registry = registry.lock_recover();
+            if let Some(dir) = registry.by_wd.remove(&event.wd) {
+                if registry.by_dir.get(&dir) == Some(&event.wd) {
+                    registry.by_dir.remove(&dir);
+                }
+                out.push(HostEvent::Rescan);
+            }
+            continue;
         }
         let dir = registry.lock_recover().by_wd.get(&event.wd).cloned();
         let Some(dir) = dir else {

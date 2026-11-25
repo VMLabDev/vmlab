@@ -1027,6 +1027,14 @@ async fn run(
     // The re-seed has just completed, so the watch about to open is the one
     // (re)open that is **not** a discontinuity — see below.
     let mut seeded = false;
+    // The watch has opened behind a re-seed, and the guest tree has not been
+    // listed under it yet. The re-seed read the guest with no watch open, and
+    // the guest kept running: a file it made after the re-seed listed its
+    // directory is in no dirty set, on no ledger and not on the host, so no
+    // steady pass would ever ask about it. The first pass under the new watch
+    // lists the tree once ([`Pending::listing`]), and until that pass
+    // completes no verb is answered.
+    let mut listing = false;
     // The bracket's second half, read off the ledger rather than passed in:
     // a snapshot restore notes the rewind there precisely so that a machine
     // restored while it was *down* owes the same re-seed as one restored while
@@ -1095,7 +1103,12 @@ async fn run(
                         passes,
                         ..report
                     });
-                    let _ = syncer.served.send(serving);
+                    // **No verb is answered here.** The guest ran while the
+                    // re-seed did, with no watch open, so what it made in that
+                    // time is not known yet: a `flush` answered now would say
+                    // "in step" over it, and a capture or a `destroy` would
+                    // go ahead. The pass under the watch that opens next lists
+                    // the guest tree, and that pass is the answer.
                 }
                 Err(e) => {
                     // The barrier **stays**. A re-seed that failed leaves a
@@ -1153,7 +1166,13 @@ async fn run(
                     // there was no watch is exactly what the walk is for. The
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
-                    rescan = !std::mem::take(&mut seeded);
+                    //
+                    // That open still leaves one question the re-seed could
+                    // not answer — what the guest made while it ran — so the
+                    // first pass under it lists the guest tree.
+                    let after_reseed = std::mem::take(&mut seeded);
+                    rescan = !after_reseed;
+                    listing |= after_reseed;
                     let changed_prune = std::mem::take(&mut prune_reopen);
                     unwitnessed = rescan && !changed_prune;
                     due = true;
@@ -1269,6 +1288,7 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
+                    listing,
                     unwitnessed: rescan && unwitnessed,
                     flush,
                     lock_candidates: &lock_candidates,
@@ -1306,6 +1326,7 @@ async fn run(
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
+                    listing = false;
                     unwitnessed = false;
                     // Nothing the pass declined to decide is forgotten.
                     owed.extend(done.deferred);
@@ -1775,6 +1796,13 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
+    /// List the guest tree by name, against the ledger as it stands, rather
+    /// than probing named paths: the first pass under the watch that opens
+    /// behind a re-seed. It finds what the guest made between the re-seed's
+    /// own look at a directory and that open. **Not the stat-walk**: nothing
+    /// the ledger vouches for is hashed again, nothing is unwitnessed, and a
+    /// name it finds waits out a quiet period like any change no event named.
+    listing: bool,
     /// The walk follows startup or a channel failure. Agreements it finds
     /// present are confirmed, and missing paths get the unwitnessed-absence
     /// policy ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
@@ -1971,7 +1999,11 @@ async fn pass(
         );
     }
 
-    let mut probe = if pending.rescan {
+    // A listing is the same descent as the walk, asked against the ledger as
+    // it stands, since only a rescan cleared the scan cache above: the guest is asked for a digest only where its
+    // own `(size, mtime)` no longer matches what the re-seed recorded, and
+    // every name the ledger does not hold comes back with the rest.
+    let mut probe = if pending.rescan || pending.listing {
         guest_walk(
             guest.as_ref(),
             &workspace.guest_root,
@@ -3002,6 +3034,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan: true,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
@@ -3383,6 +3416,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
@@ -3797,6 +3831,7 @@ mod tests {
             host_dirty: &BTreeSet::new(),
             in_flight: BTreeSet::new(),
             rescan: true,
+            listing: false,
             unwitnessed: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
