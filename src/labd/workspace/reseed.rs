@@ -464,14 +464,20 @@ mod tests {
         assert!(!host.path().join("old.rs").exists());
     }
 
+    /// Review labd-sync-2 F19 (card 957): a case collision is refused by name
+    /// and does not hold the barrier. The rolled-back copy the guest holds at
+    /// one of the colliding names is removed, so nothing of it is left for a
+    /// later pass to carry to the host.
     #[tokio::test]
-    async fn a_reseed_collision_keeps_the_durable_barrier() {
+    async fn a_reseed_collision_is_refused_by_name_and_does_not_hold_the_barrier() {
         let host = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let guest = FakeGuest::new();
+        guest.folding();
         guest.dir("/src");
         std::fs::write(host.path().join("file.rs"), "host truth").unwrap();
         std::fs::write(host.path().join("FILE.rs"), "other host file").unwrap();
+        std::fs::write(host.path().join("ok.rs"), "fine").unwrap();
         guest.file("/src/file.rs", "restored content", 10);
         let workspace = Workspace {
             machine: "dev01".into(),
@@ -486,13 +492,68 @@ mod tests {
         let done = reconverge(&guest, &workspace, false, true, &mut ledger)
             .await
             .unwrap();
-        assert!(!done.collisions.is_empty());
-        assert!(!done.complete());
-        ledger.save(&workspace.ledger_path).unwrap();
-        assert!(Ledger::load(&workspace.ledger_path, host.path(), "/src").reseed_owed);
+        assert_eq!(done.collisions.len(), 1, "{:?}", done.collisions);
+        assert_eq!(done.collisions[0].paths, ["FILE.rs", "file.rs"]);
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert!(done.complete());
+        assert!(!ledger.reseed_owed);
+        assert_eq!(guest.text("/src/ok.rs").as_deref(), Some("fine"));
+        assert!(
+            guest.get("/src/file.rs").is_none() && guest.get("/src/FILE.rs").is_none(),
+            "the rolled-back copy stayed at a colliding name: {:?}",
+            guest.paths()
+        );
+        assert!(
+            !ledger.entries.contains_key("file.rs") && !ledger.entries.contains_key("FILE.rs"),
+            "a colliding name was agreed"
+        );
         assert_eq!(
             std::fs::read_to_string(host.path().join("file.rs")).unwrap(),
             "host truth"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("FILE.rs")).unwrap(),
+            "other host file"
+        );
+    }
+
+    /// The same for a symlink the guest refuses (§19.4): reported by name,
+    /// nothing left at its path, and no barrier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reseed_symlink_the_guest_refuses_does_not_hold_the_barrier() {
+        let host = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let guest = FakeGuest::new();
+        guest.refuse_symlinks();
+        guest.dir("/src");
+        std::fs::write(host.path().join("main.rs"), "host truth").unwrap();
+        std::os::unix::fs::symlink("main.rs", host.path().join("link.rs")).unwrap();
+        guest.file("/src/link.rs", "restored content", 10);
+        let workspace = Workspace {
+            machine: "dev01".into(),
+            host_root: host.path().to_path_buf(),
+            guest_root: "/src".into(),
+            ledger_path: state.path().join("ledger.json"),
+            max_file_bytes: NO_CAP,
+            preconditions: Preconditions::default(),
+        };
+        let mut ledger = Ledger::new(host.path(), "/src");
+        ledger.reseed_owed = true;
+        let done = reconverge(&guest, &workspace, false, false, &mut ledger)
+            .await
+            .unwrap();
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert!(done.complete());
+        assert!(!ledger.reseed_owed);
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("host truth"));
+        assert!(guest.get("/src/link.rs").is_none(), "{:?}", guest.paths());
+        assert!(!ledger.entries.contains_key("link.rs"));
+        assert!(
+            std::fs::symlink_metadata(host.path().join("link.rs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

@@ -5742,6 +5742,250 @@ mod tests {
         }
     }
 
+    /// A lab whose size cap is 64 bytes, seeded, with a 128-byte `dump.sql`
+    /// the guest has just made and the watch has reported: the size guard
+    /// has refused it once.
+    async fn lab_with_a_refused_guest_file(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>, Workspace) {
+        std::fs::write(dir.join("main.rs"), "seed").unwrap();
+        let ws = Workspace {
+            max_file_bytes: 64,
+            ..workspace(dir, state)
+        };
+        let guest = Arc::new(FakeGuest::new());
+        let (events, _rx) = EventLog::recording("lab", state.join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        let sessions = OneFake::new(guest.clone());
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+
+        guest.file("/src/dump.sql", &"x".repeat(128), 900);
+        sessions.watcher.mark("dump.sql");
+        let syncer = syncers.get("dev01").await.unwrap();
+        let refused = eventually(move || names_dump(&syncer.report())).await;
+        assert!(refused, "the size guard never refused the guest file");
+        (syncers, guest, sessions, ws)
+    }
+
+    fn names_dump(report: &Report) -> bool {
+        report
+            .oversize
+            .iter()
+            .any(|refusal| refusal.path == "dump.sql" && refusal.direction == Direction::ToHost)
+    }
+
+    /// Review labd-sync-2 F16 (card 957): a guest file the size guard
+    /// refused is in no agreement and not on the host, so nothing asked the
+    /// guest about it again and the next report forgot it. It stays reported
+    /// for as long as the guest holds it, and no longer.
+    #[tokio::test]
+    async fn a_refused_guest_file_stays_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions, _ws) =
+            lab_with_a_refused_guest_file(dir.path(), state.path()).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+
+        for pass in 1..=3 {
+            let report = syncer.pass_now().await.unwrap();
+            assert!(
+                names_dump(&report),
+                "pass {pass} after the refusal forgot the file: {report:?}"
+            );
+            let status = report.project();
+            assert!(
+                status.skipped.iter().any(|skip| skip.path == "dump.sql"),
+                "`dev sync status` does not name it: {:?}",
+                status.skipped
+            );
+        }
+        // Refused is not owed: once the path is still, nothing waits on it.
+        let settled = {
+            let syncer = syncer.clone();
+            eventually(move || {
+                let report = syncer.report();
+                names_dump(&report) && report.unsynced.is_empty() && report.trouble.is_none()
+            })
+            .await
+        };
+        assert!(settled, "{:?}", syncer.report());
+        assert!(!dir.path().join("dump.sql").exists());
+        assert!(guest.get("/src/dump.sql").is_some());
+
+        // Gone from the guest: the refusal goes with it.
+        guest.unlink("/src/dump.sql");
+        sessions.watcher.mark("dump.sql");
+        let cleared = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().oversize.is_empty()).await
+        };
+        assert!(cleared, "{:?}", syncer.report());
+        let report = syncer.pass_now().await.unwrap();
+        assert!(report.oversize.is_empty(), "{report:?}");
+        syncers.stop("dev01").await;
+    }
+
+    /// The other half of F16: the guest's copy of a refused file is the only
+    /// one, so a restore and a `destroy` refuse on it and name the flag,
+    /// running or stopped. A capture keeps the file and goes ahead.
+    #[tokio::test]
+    async fn a_restore_and_a_destroy_refuse_on_a_guest_file_the_size_guard_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, _sessions, ws) =
+            lab_with_a_refused_guest_file(dir.path(), state.path()).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        let said_by = |refused: anyhow::Error| {
+            let said = format!("{refused:#}");
+            assert!(said.contains("dump.sql"), "{said}");
+            assert!(said.contains("size guard"), "{said}");
+            assert!(
+                said.contains(super::super::bracket::DISCARD_FLAG),
+                "{said}"
+            );
+        };
+        said_by(
+            syncers
+                .before_restore("dev01", false, None, true)
+                .await
+                .expect_err("a restore deletes the only copy of the refused file"),
+        );
+        said_by(
+            syncers
+                .before_destroy("dev01", false, None)
+                .await
+                .expect_err("a destroy deletes the only copy of the refused file"),
+        );
+        syncers
+            .before_restore("dev01", true, None, true)
+            .await
+            .unwrap();
+        syncers.before_destroy("dev01", true, None).await.unwrap();
+        // A capture holds the guest's copy, so the file is no reason to
+        // refuse one once the path is still.
+        let asked = &syncers;
+        let captured =
+            eventually_async(|| async { asked.before_capture("dev01", None, true).await.is_ok() })
+                .await;
+        assert!(captured, "{:?}", syncer.report());
+
+        // Stopped, the syncer that knew is gone: the stop wrote it down.
+        syncers.stop_before_machine("dev01", true).await;
+        said_by(
+            syncers
+                .before_restore("dev01", false, Some(&ws), false)
+                .await
+                .expect_err("a restore of the stopped machine deletes the file too"),
+        );
+        said_by(
+            syncers
+                .before_destroy("dev01", false, Some(&ws))
+                .await
+                .expect_err("a destroy of the stopped machine deletes the file too"),
+        );
+        assert!(guest.get("/src/dump.sql").is_some());
+        assert!(!dir.path().join("dump.sql").exists());
+    }
+
+    /// Review labd-sync-2 F19 (card 957): the two degradations a Windows
+    /// login with `elevated = false` brings do not hold the re-seed. A refused
+    /// symlink and a case collision are both said by name, the barrier lifts
+    /// and the watch opens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_seed_completes_beside_a_refused_symlink_and_a_case_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let degraded = Preconditions {
+            windows: true,
+            case_sensitive_dirs: false,
+            symlinks: false,
+        };
+        let ws = windows_workspace(dir.path(), state.path(), degraded);
+        let guest = Arc::new(FakeGuest::new());
+        guest.folding().refuse_symlinks();
+        let sessions = OneFake::new(guest.clone());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+
+        let opens = sessions.opens().len();
+        restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            // The rolled-back tree holds a copy at one of the colliding
+            // names, which must not outlive the re-seed.
+            guest.file("/src/foo.cs", "the version in the snapshot", 1);
+            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
+            std::fs::write(dir.path().join("Foo.cs"), "upper").unwrap();
+            std::fs::write(dir.path().join("foo.cs"), "lower").unwrap();
+        })
+        .await;
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        let lifted = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().passes > 0 && syncer.report().reseed.is_none()).await
+        };
+        assert!(
+            lifted,
+            "the re-seed barrier never lifted: {:?}",
+            syncer.report()
+        );
+        assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        let reopened = {
+            let sessions = sessions.clone();
+            eventually(move || sessions.opens().len() > opens).await
+        };
+        assert!(reopened, "the watch never came back");
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(guest.get("/src/foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/Foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/link.rs").is_none(), "{:?}", guest.paths());
+        syncers.stop("dev01").await;
+
+        // Nothing of the rolled-back tree reached the canonical copy.
+        assert!(!dir.path().join("experiment.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo.cs")).unwrap(),
+            "lower"
+        );
+        let events = events_of(state.path());
+        assert!(
+            events
+                .iter()
+                .any(|(name, _)| name == "workspace.reconverged"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.symlink_refused" && data["path"] == "link.rs"
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.case_collision"
+                    && data["paths"] == serde_json::json!(["Foo.cs", "foo.cs"])
+            }),
+            "{events:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incomplete_reseed_keeps_the_loop_and_restart_behind_the_barrier() {
@@ -5751,10 +5995,11 @@ mod tests {
         let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
         let ws = workspace(dir.path(), state.path());
         let opens = sessions.opens().len();
+        // A failure that can end, and has not: a refused symlink is not one
+        // (docs/reviews/labd-sync-2.md F19).
         restore_bracket(&syncers, &ws, || {
             rewind(&guest);
-            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
-            guest.refuse_symlinks();
+            guest.fail_pushes();
         })
         .await;
         for restart in [false, true] {
