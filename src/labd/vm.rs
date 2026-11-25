@@ -2585,6 +2585,30 @@ impl super::machine::Machine for VmInstance {
         .await
     }
 
+    /// The refusals [`restore`](Self::restore) makes that need nothing to
+    /// have moved: the online refusal, an offline snapshot operation in
+    /// progress, and a disk that lacks the snapshot. The disks of a machine
+    /// that runs are asked for an offline snapshot only, as the restore
+    /// itself asks them; an online one is then in the hypervisor's hands,
+    /// and what it refuses at the load (a changed machine description) only
+    /// the load finds out.
+    async fn check_restore(&self, snap: &str, online: bool) -> Result<()> {
+        if online {
+            if let Some(why) = self.online_snapshot_refusal().await {
+                bail!("{why}");
+            }
+            if self.power_state().await != PowerState::Stopped {
+                return Ok(());
+            }
+        } else {
+            drop(super::machine::snapshot_guard(
+                &self.snapshot_gate,
+                &self.cfg.name,
+            )?);
+        }
+        check_disks_hold_snapshot(&self.all_disk_paths(), snap).await
+    }
+
     /// An online snapshot boots the VM (through the normal start path, so the
     /// NIC wiring and event callbacks are the usual ones) and loads into it;
     /// an offline one reverts the qcow2 chain and leaves it stopped.
@@ -3080,21 +3104,26 @@ async fn restore_offline(
     }
 }
 
-async fn restore_offline_disks(
-    disks: &[PathBuf],
-    name: &str,
-    stop: impl Future<Output = Result<()>>,
-) -> Result<()> {
-    use crate::template::qimg;
-
+/// Refuse unless every one of `disks` holds the snapshot `name`. It reads the
+/// image headers only, so it may run on a running machine's disks.
+pub(super) async fn check_disks_hold_snapshot(disks: &[PathBuf], name: &str) -> Result<()> {
     for disk in disks {
-        let info = qimg::image_info(disk)
+        let info = crate::template::qimg::image_info(disk)
             .await
             .with_context(|| format!("checking {} for snapshot {name:?}", disk.display()))?;
         if !info.snapshots.iter().any(|snapshot| snapshot.name == name) {
             bail!("{}: snapshot {name:?} is missing", disk.display());
         }
     }
+    Ok(())
+}
+
+async fn restore_offline_disks(
+    disks: &[PathBuf],
+    name: &str,
+    stop: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    check_disks_hold_snapshot(disks, name).await?;
 
     stop.await?;
     let backup = format!("vmlab-restore-{:032x}", rand::random::<u128>());
