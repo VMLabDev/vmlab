@@ -2082,18 +2082,34 @@ impl VmInstance {
                 snapshots
                     .save(name, "disk0", &refs)
                     .await
-                    .map_err(Attempted)?;
+                    .map_err(super::machine::SnapshotCaptureError::of_save)?;
                 Ok(true)
             }
             PowerState::Stopped => {
                 let disks = self.all_disk_paths();
+                // The disks are made at the first start, so before it there
+                // is nothing to capture, and nothing was written.
+                if let Some(missing) = disks.iter().find(|disk| !disk.exists()) {
+                    return Err(anyhow!(
+                        "{}: no disk {} yet — the VM has never started",
+                        self.cfg.name,
+                        missing.display()
+                    )
+                    .into());
+                }
                 let state = self.dirs.firmware_state();
                 let name = name.to_owned();
                 super::machine::finish_offline_snapshot(guard, async move {
-                    capture_offline(&disks, &state, &name).await
+                    // Read-only, so what it refuses is no attempt: a pending
+                    // entry would ask for a delete, and the delete of a name
+                    // a disk already holds removes that older snapshot.
+                    if let Err(refusal) = refuse_held_name(&disks, &name).await {
+                        return Ok(Err(refusal));
+                    }
+                    capture_offline(&disks, &state, &name).await.map(Ok)
                 })
                 .await
-                .map_err(Attempted)?;
+                .map_err(Attempted)??;
                 Ok(false)
             }
             // Capturing must not change the guest, and waking it would.
@@ -3183,9 +3199,8 @@ async fn apply_offline_snapshot(disks: &[PathBuf], name: &str, backup: &str) -> 
     Ok(())
 }
 
-async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
-    // Refuse duplicate names before changing any disk, so rollback never
-    // removes a snapshot that predates this operation.
+/// Refuse `name` while any of `disks` holds a snapshot of it. Reads only.
+async fn refuse_held_name(disks: &[PathBuf], name: &str) -> Result<()> {
     for disk in disks {
         if crate::template::qimg::image_info(disk)
             .await?
@@ -3196,6 +3211,13 @@ async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
             bail!("{}: snapshot {name:?} already exists", disk.display());
         }
     }
+    Ok(())
+}
+
+async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+    // Refuse duplicate names before changing any disk, so rollback never
+    // removes a snapshot that predates this operation.
+    refuse_held_name(disks, name).await?;
     for (index, disk) in disks.iter().enumerate() {
         if let Err(error) = crate::template::qimg::snapshot_create(disk, name).await {
             let mut failures = Vec::new();

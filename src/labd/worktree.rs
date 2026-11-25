@@ -267,6 +267,9 @@ impl LabRuntime {
     /// stop it like any offline restore, then empty its overlays down to the
     /// frozen files they back onto, and put back the UEFI variables and the
     /// TPM state the freeze copied. The same in the main lab and a worktree.
+    ///
+    /// The caller has asked [`Self::plan_freeze_point_restore`] already. It
+    /// is asked again here, ahead of the stop, for a caller that did not.
     pub(crate) async fn restore_freeze_point(
         &self,
         m: &Arc<dyn Machine>,
@@ -274,9 +277,12 @@ impl LabRuntime {
         generation: u32,
     ) -> Result<()> {
         if m.state().await != PowerState::Stopped {
+            self.plan_freeze_point_restore(m.as_ref(), snap, generation)
+                .await?;
             m.stop(false).await?;
             m.wait_state(PowerState::Stopped, STOP_WAIT).await?;
         }
+        // Planned from the disks as the stop left them.
         let plan = self
             .plan_freeze_point_restore(m.as_ref(), snap, generation)
             .await?;

@@ -4124,6 +4124,23 @@ impl LabRuntime {
         // Suspending is a real stop, waited for, which closes both.
         let bracket = self.workspaces.suspend(name).await;
 
+        // **Every refusal that needs nothing to have moved comes here**,
+        // ahead of the unplug and the note below (review snapshots-2 F14,
+        // F17). A restore refused at this point rewound nothing, so it owes
+        // no re-seed: one would carry the host's tree over guest work the
+        // developer gave up for a snapshot that was never restored.
+        let reserved = match self.reserve_restore(&m, snap, &record).await {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                // Only what was taken off goes back. No syncer is started
+                // for a restore that did not happen.
+                if let Some(bracket) = bracket {
+                    self.workspaces.resume(bracket).await;
+                }
+                return Err(refusal);
+            }
+        };
+
         // An online restore rewinds the guest to a moment it held none of
         // the host USB devices it holds now (capture refuses while any are
         // attached), so they are unplugged first rather than left on a bus
@@ -4154,35 +4171,16 @@ impl LabRuntime {
             // A freeze point is no internal snapshot of the machine's own
             // disks but the state of the frozen files under them (§21.3).
             Ok(()) => match record.freeze_point {
-                Some(generation) => {
-                    // It replaces the machine's disks, so it holds the
-                    // machine's start lock from before its stop to its last
-                    // rename: a start waits and boots on the restored disks,
-                    // and a destroy waits rather than removing the directory
-                    // under the plan. It boots nothing, so it takes no
-                    // ticket.
-                    let _no_start = self.starts.hold(m.name()).await;
-                    self.restore_freeze_point(&m, snap, generation).await
-                }
+                Some(generation) => self.restore_freeze_point(&m, snap, generation).await,
                 None => {
-                    // An online restore boots a stopped machine, so it is a
-                    // start: refused in a lab that is going away, and held
-                    // against a destroy of this machine.
-                    match self.starts.ticket() {
-                        Ok(ticket) => match self.starts.admit(m.name(), ticket).await {
-                            Ok(_admitted) => {
-                                Arc::clone(&m)
-                                    .restore(self.services(), snap, record.online)
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    }
+                    Arc::clone(&m)
+                        .restore(self.services(), snap, record.online)
+                        .await
                 }
             },
             Err(e) => Err(e),
         };
+        drop(reserved);
         // Put back on **both** paths. A workspace whose syncer quietly never
         // came back looks exactly like a machine with nothing to sync, which
         // is the silent-divergence failure ADR-0014 exists to rule out.
@@ -4229,6 +4227,42 @@ impl LabRuntime {
         }
         self.events.emit("snapshot.restored", event);
         Ok(warnings)
+    }
+
+    /// Take what a restore of `m` runs under, and ask everything that can
+    /// refuse it while nothing has moved. The guard is the machine's start
+    /// lock.
+    async fn reserve_restore(
+        &self,
+        m: &Arc<dyn Machine>,
+        snap: &str,
+        record: &SnapshotRecord,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        match record.freeze_point {
+            Some(generation) => {
+                // It replaces the machine's disks, so it holds the
+                // machine's start lock from before its stop to its last
+                // rename: a start waits and boots on the restored disks,
+                // and a destroy waits rather than removing the directory
+                // under the plan. It boots nothing, so it takes no
+                // ticket.
+                let no_start = self.starts.hold(m.name()).await;
+                // What the plan refuses, it refuses before the stop.
+                self.plan_freeze_point_restore(m.as_ref(), snap, generation)
+                    .await?;
+                Ok(no_start)
+            }
+            None => {
+                // An online restore boots a stopped machine, so it is a
+                // start: refused in a lab that is going away, and held
+                // against a destroy of this machine.
+                let admitted = self.starts.admit(m.name(), self.starts.ticket()?).await?;
+                // Asked again under the lock, for what changed since the
+                // first answer.
+                m.check_restore(snap, record.online).await?;
+                Ok(admitted)
+            }
+        }
     }
 
     async fn check_restore(
@@ -8031,6 +8065,155 @@ lab "t" {
         )
         .expect("runtime");
         (lab, sys, a)
+    }
+
+    /// A lab whose running dev machine `dev01` declares the workspace
+    /// `./src`, holds the host USB device on port 1-10 and has the online
+    /// record `s`. `refusal` is what the machine refuses an online restore
+    /// with.
+    async fn usb_dev_lab_with_an_online_record(
+        dir: &std::path::Path,
+        refusal: Option<&'static str>,
+    ) -> (Arc<LabRuntime>, tempfile::TempDir, Arc<FakeMachine>) {
+        std::fs::create_dir(dir.join("src")).unwrap();
+        let sh = shared(dir);
+        let sys = crate::usb::tests::fake_sysfs();
+        let dev = dir.join("dev");
+        std::fs::create_dir_all(dev.join("001")).unwrap();
+        for n in ["006", "007", "015"] {
+            std::fs::write(dev.join("001").join(n), b"").unwrap();
+        }
+        let mut machine = Arc::into_inner(FakeMachine::usb_vm("dev01", &sh)).unwrap();
+        machine.restore_refused = refusal;
+        let machine = Arc::new(machine);
+        let config = crate::config::load_lab_source(
+            "import <vmlab.wcl>\nlab \"t\" {\n  @dev(default = true, workspace = \"./src\") \
+             vm \"dev01\" { template = \"x86_64/t\" usb = true }\n}\n",
+            "<test>",
+            dir,
+        )
+        .expect("lab source");
+        let lab = LabRuntime::with_machines_on(
+            config,
+            vec![machine.clone()],
+            super::super::usb::UsbHost::fake(sys.path().to_path_buf(), dev),
+        )
+        .expect("runtime");
+        lab.state
+            .lock()
+            .await
+            .machine_mut("dev01")
+            .snapshots
+            .insert(
+                "s".into(),
+                SnapshotRecord {
+                    online: true,
+                    taken_at: chrono::Utc::now(),
+                    image_digest: None,
+                    freeze_point: None,
+                    frozen_in: None,
+                    hypervisor: Machine::hypervisor(&*machine),
+                },
+            );
+        lab.usb_attach("dev01", "port:1-10", false).await.unwrap();
+        (lab, sys, machine)
+    }
+
+    /// What a refused online restore must have left alone: the USB device on
+    /// the machine, the workspace ledger without a re-seed note, no syncer
+    /// started, and the machine's `restore` never reached.
+    async fn assert_the_refused_restore_changed_nothing(lab: &Arc<LabRuntime>, sh_log: &[String]) {
+        use crate::labd::workspace::ledger::Ledger;
+        assert_eq!(
+            lab.usb_attached(Some("dev01")).await.unwrap().len(),
+            1,
+            "a refused restore unplugged the machine's USB device"
+        );
+        let started = lab.workspaces.is_running("dev01").await;
+        lab.workspaces.stop_all().await;
+        let ws = lab.workspace_of("dev01").expect("the workspace resolves");
+        let ledger = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+        assert!(
+            !ledger.reseed_owed,
+            "a refused restore rewound nothing, and still ordered a re-seed"
+        );
+        assert!(!started, "a refused restore started a syncer");
+        assert!(
+            !sh_log.iter().any(|line| line.contains("restore:")),
+            "{sh_log:?}"
+        );
+    }
+
+    /// Review snapshots-2 F14: an online restore the machine refuses has
+    /// moved nothing, so the lab must have moved nothing either. It used to
+    /// unplug every host USB device and mark the workspace as rewound first,
+    /// and with `--discard-guest-changes` the re-seed that followed
+    /// overwrote guest work for a snapshot that was never restored.
+    #[tokio::test]
+    async fn a_refused_online_restore_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sys, machine) =
+            usb_dev_lab_with_an_online_record(dir.path(), Some("injected online refusal")).await;
+
+        let error = lab.restore("dev01", "s", true).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected online refusal"),
+            "{error:#}"
+        );
+        let log = machine.log.lock().await.clone();
+        assert_the_refused_restore_changed_nothing(&lab, &log).await;
+    }
+
+    /// Review snapshots-2 F14, the start gate: an online restore boots a
+    /// stopped machine, so a lab that is going away refuses it. That refusal
+    /// moves nothing either.
+    #[tokio::test]
+    async fn an_online_restore_the_start_gate_refuses_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sys, machine) = usb_dev_lab_with_an_online_record(dir.path(), None).await;
+        lab.starts.close("shutting down");
+
+        let error = lab.restore("dev01", "s", true).await.unwrap_err();
+        assert!(format!("{error:#}").contains("shutting down"), "{error:#}");
+        let log = machine.log.lock().await.clone();
+        assert_the_refused_restore_changed_nothing(&lab, &log).await;
+    }
+
+    /// Review snapshots-2 F17, the freeze point: a restore of a freeze point
+    /// that must refuse leaves a running machine running. It used to stop
+    /// the machine first and read the disks second.
+    #[tokio::test]
+    async fn a_freeze_point_restore_that_must_refuse_does_not_stop_the_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        // Running, and with no disk file: the plan has nothing to restore.
+        let machine = FakeMachine::usb_vm("a", &sh);
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![machine.clone()],
+        );
+        lab.state.lock().await.machine_mut("a").snapshots.insert(
+            "base".into(),
+            SnapshotRecord {
+                online: false,
+                taken_at: chrono::Utc::now(),
+                image_digest: None,
+                freeze_point: Some(1),
+                frozen_in: None,
+                hypervisor: Machine::hypervisor(&*machine),
+            },
+        );
+
+        let error = lab.restore("a", "base", false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("has no disk"), "{error:#}");
+        assert_eq!(
+            machine.stops.load(Ordering::SeqCst),
+            0,
+            "the machine was stopped for a restore that was then refused"
+        );
+        assert_eq!(machine.state().await, PowerState::Running);
     }
 
     #[tokio::test]
