@@ -968,6 +968,44 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
     }
 
     #[test]
+    fn a_zero_workspace_cap_is_refused_at_load() {
+        assert!(
+            host_err("host { workspace_max_file = 0 }\n")
+                .contains("config.wcl:2:8: `workspace_max_file`")
+        );
+    }
+
+    #[test]
+    fn an_unusable_subnet_pool_is_refused_at_load() {
+        for pool in [
+            "10.0.0.0/28",
+            "0.0.0.0/0",
+            "224.0.0.0/4",
+            "0.0.0.0/8",
+            "192.0.0.0/2",
+        ] {
+            let err = host_err(&format!("host {{ subnet_pool = \"{pool}\" }}\n"));
+            assert!(err.contains("config.wcl:2:8: `subnet_pool`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_dns_setting_is_refused() {
+        for (field, value) in [
+            ("dns_upstream", "10.0.0.1:0"),
+            ("dns_upstream", "0.0.0.0"),
+            ("dns_upstream", "::"),
+            ("dns_suffix", ""),
+            ("dns_suffix", "has space"),
+            ("dns_suffix", "lab..local"),
+            ("dns_suffix", "-lab.local"),
+        ] {
+            let err = host_err(&format!("host {{ {field} = \"{value}\" }}\n"));
+            assert!(err.contains(&format!("config.wcl:2:8: `{field}`")), "{err}");
+        }
+    }
+
+    #[test]
     fn a_malformed_dns_upstream_is_refused() {
         for upstream in ["dns.corp", "10.0.0.1:"] {
             assert!(
