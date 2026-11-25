@@ -750,6 +750,14 @@ pub struct LabStatus {
     /// a daemon that predates the field.
     #[serde(default)]
     pub pending: Vec<PendingMachine>,
+    /// What the daemon is doing now that ends wrong if the daemon is ended:
+    /// a snapshot capture, a restore, a freeze or a thaw, an `up`, a script.
+    /// One phrase each, to follow "is busy with". Most of it happens on
+    /// stopped machines, where no machine state shows it, so a daemon is
+    /// replaced only while this is empty. Empty from a daemon that predates
+    /// the field.
+    #[serde(default)]
+    pub working: Vec<String>,
 }
 
 /// One machine a reload could not rebuild yet (PRD §7.1).
@@ -985,6 +993,7 @@ pub(crate) mod fixtures {
             isolation: None,
             freeze_stale: false,
             daemon_pid: 0,
+            working: Vec::new(),
             pending: Vec::new(),
         }
     }

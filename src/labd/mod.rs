@@ -606,6 +606,9 @@ impl Handler<LabRequest> for LabdHandler {
             LabRequest::PullCancel { machine } => Ok(json!(lab.cancel_pull(&machine))),
             // Ad-hoc script against the lab (PRD §12: vmlab script).
             LabRequest::Run { script, record } => {
+                // A script stops and starts machines as it goes, and is in
+                // the middle of its work while all of them are stopped.
+                let _working = lab.working(format!("the script {script}"));
                 let path = lab.root.join(script);
                 // `--record` lasts exactly the run (D8): the recordings are
                 // the run's own, so the finalise that ends every recording a

@@ -111,6 +111,12 @@ pub(crate) enum DaemonFreshness {
 /// load the new file; otherwise the daemon reloads it in place, since a
 /// fresh one cannot adopt a running machine or carry on a download.
 ///
+/// "Nothing running" is not "nothing would be lost": a daemon also works on
+/// stopped machines — an offline snapshot or restore, a freeze or a thaw, a
+/// clone, a script between two boots — and a replacement cuts that where it
+/// stands. A daemon that reports such work with every machine stopped is
+/// neither replaced nor reloaded over; the verb refuses and names the work.
+///
 /// A moved freeze is the exception (§21.2, §21.4): what it changes — which
 /// machines clone from the main checkout, and worktree isolation — is decided
 /// when the network is assembled, so it needs a fresh daemon and refuses
@@ -130,7 +136,20 @@ pub(crate) fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> 
     pulling.sort_unstable();
     pulling.dedup();
     if running.is_empty() && pulling.is_empty() {
-        return DaemonFreshness::Restart;
+        if status.working.is_empty() {
+            return DaemonFreshness::Restart;
+        }
+        return DaemonFreshness::Refuse(format!(
+            "lab \"{name}\": {changed}, but the lab daemon is busy with {work} — replacing the \
+             daemon now would cut that off where it stands. Wait for it to finish, then run \
+             this command again",
+            changed = if edited {
+                "vmlab.wcl changed"
+            } else {
+                "the main checkout's freeze (or a machine's disk) changed"
+            },
+            work = status.working.join(", "),
+        ));
     }
     if !status.freeze_stale {
         return DaemonFreshness::Reload;
@@ -1331,6 +1350,16 @@ fn cmd_lab_restart(name: &str, json: bool) -> Result<()> {
                 bail!(
                     "lab \"{name}\" still has machines running — stop them first; \
                      a restarted daemon cannot re-adopt them"
+                );
+            }
+            // Work on stopped machines is cut off by the restart just the
+            // same: a restore with some disks rewound, a freeze half made.
+            if !status.working.is_empty() {
+                bail!(
+                    "lab \"{name}\": the lab daemon is busy with {} — a restart now would \
+                     cut that off where it stands. Wait for it to finish, then run this \
+                     command again",
+                    status.working.join(", ")
                 );
             }
             checked = named_daemon(&status);
@@ -2597,6 +2626,28 @@ mod tests {
         assert_eq!(
             daemon_freshness("demo", &running, "loaded"),
             DaemonFreshness::Current
+        );
+        // Work on the stopped machine is not "nothing running": the daemon
+        // stays, and the refusal names the work. Unchanged, it is used.
+        status.working = vec!["the restore of web to snapshot `clean`".into()];
+        let DaemonFreshness::Refuse(why) = daemon_freshness("demo", &status, "edited") else {
+            panic!("a daemon at work on stopped machines was not kept");
+        };
+        assert!(why.contains("vmlab.wcl changed"), "{why}");
+        assert!(
+            why.contains("busy with the restore of web to snapshot `clean`"),
+            "{why}"
+        );
+        assert_eq!(
+            daemon_freshness("demo", &status, "loaded"),
+            DaemonFreshness::Current
+        );
+        // With a machine running the daemon is not replaced anyway, and the
+        // reload stays what it was.
+        running.working = status.working.clone();
+        assert_eq!(
+            daemon_freshness("demo", &running, "edited"),
+            DaemonFreshness::Reload
         );
     }
 

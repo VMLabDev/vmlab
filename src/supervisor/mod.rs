@@ -72,6 +72,38 @@ fn release_deadline(reply: Option<&serde_json::Value>) -> std::time::Duration {
     RELEASE_DEADLINE.max(reported.saturating_add(RELEASE_MARGIN))
 }
 
+/// How long a lab daemon has to answer a `Ping`. Its handler answers from a
+/// task of its own, whatever else the daemon does, so one that has accepted
+/// the connection and is still silent after this is stopped, held or hung.
+const PING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a lab daemon did with a `Ping`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pinged {
+    Answered,
+    /// Nothing accepts on the socket, or the connection closed unanswered.
+    Unreachable,
+    /// The connection stood for [`PING_DEADLINE`] without an answer.
+    Silent,
+}
+
+/// Ask the lab daemon on `sock` whether it is there, for at most
+/// [`PING_DEADLINE`]. A request has no deadline of its own
+/// ([`crate::proto::client::Client::send`]), and a daemon stopped with
+/// SIGSTOP, frozen with its cgroup or hung still accepts connections: the
+/// kernel does that for it.
+async fn ping_daemon(sock: &Path) -> Pinged {
+    let ping = async {
+        let client = LabClient::connect(sock).await.ok()?;
+        client.send(LabRequest::Ping {}).await.ok()
+    };
+    match tokio::time::timeout(PING_DEADLINE, ping).await {
+        Ok(Some(_)) => Pinged::Answered,
+        Ok(None) => Pinged::Unreachable,
+        Err(_) => Pinged::Silent,
+    }
+}
+
 /// How often an adopted lab daemon's process is checked. It is not this
 /// supervisor's child, so there is no exit to wait on.
 const ADOPTED_POLL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -454,8 +486,26 @@ impl Supervisor {
     /// entry is only noise in `vmlab status` and the web lab list — those
     /// accumulate forever otherwise.
     async fn adopt_existing_labs(self: &Arc<Self>) {
-        let entries: Vec<LabEntry> = self.registry.lock().await.labs().to_vec();
-        for entry in entries {
+        // The server answers requests already, so the entries change while
+        // this runs: a `lab.ensure` finds a daemon dead and registers its
+        // successor. The list is therefore only which daemons to look at.
+        // Each is judged from its entry as it is now, under its name's lock,
+        // and only while that entry still names the daemon of the list. An
+        // entry that names another one was written by this supervisor, which
+        // watches what it starts.
+        let listed: Vec<LabEntry> = self.registry.lock().await.labs().to_vec();
+        for listed in listed {
+            let lock = self.ensure_lock(&listed.name).await;
+            let _guard = lock.lock().await;
+            let entry = {
+                let reg = self.registry.lock().await;
+                reg.get(&listed.name)
+                    .filter(|e| e.pid == listed.pid && e.started == listed.started)
+                    .cloned()
+            };
+            let Some(entry) = entry else {
+                continue;
+            };
             if entry.state == LabState::Stopping && self.adopt_stopping(&entry).await {
                 continue;
             }
@@ -467,19 +517,28 @@ impl Supervisor {
                         entry.root.display()
                     );
                     let mut reg = self.registry.lock().await;
-                    reg.remove(&entry.name);
+                    reg.remove_daemon(&entry.name, entry.pid);
                     reg.save();
                 }
                 continue;
             }
             let sock = crate::paths::lab_socket(&entry.name);
-            let answers = match LabClient::connect(&sock).await {
-                Ok(client) => client.send(LabRequest::Ping {}).await.is_ok(),
-                Err(_) => false,
-            };
-            if !answers {
-                self.mark_crashed(&entry.name).await;
-                continue;
+            match ping_daemon(&sock).await {
+                Pinged::Answered => {}
+                // A daemon that runs and holds its socket open is not gone.
+                // It stays `running` and watched: `lab.ensure` says that it
+                // does not answer, and a release ends it at its deadline.
+                Pinged::Silent if daemon_running(entry.pid, entry.started) => {
+                    tracing::warn!(
+                        "lab {}: its daemon {} runs and does not answer",
+                        entry.name,
+                        entry.pid
+                    );
+                }
+                Pinged::Silent | Pinged::Unreachable => {
+                    self.mark_crashed(&entry.name, entry.pid).await;
+                    continue;
+                }
             }
             if !daemon_running(entry.pid, entry.started) {
                 tracing::warn!(
@@ -488,7 +547,7 @@ impl Supervisor {
                     entry.name,
                     entry.pid
                 );
-                self.mark_crashed(&entry.name).await;
+                self.mark_crashed(&entry.name, entry.pid).await;
                 continue;
             }
             // An entry from before start times were recorded gets the one
@@ -527,11 +586,8 @@ impl Supervisor {
             reg.save();
             return true;
         }
-        let answers = match LabClient::connect(&crate::paths::lab_socket(&entry.name)).await {
-            Ok(client) => client.send(LabRequest::Ping {}).await.is_ok(),
-            Err(_) => false,
-        };
-        if !answers {
+        let answers = ping_daemon(&crate::paths::lab_socket(&entry.name)).await;
+        if answers != Pinged::Answered {
             self.watch_adopted_exit(entry.name.clone(), entry.pid, entry.started);
             return true;
         }
@@ -606,8 +662,13 @@ impl Supervisor {
         self.emit(Event::new("lab.daemon_crashed", lab, Value::Null));
     }
 
-    async fn mark_crashed(&self, lab: &str) {
+    /// Mark the entry of lab daemon `pid` failed. An entry that names
+    /// another daemon by now is a successor's, and is left alone.
+    async fn mark_crashed(&self, lab: &str, pid: u32) {
         let mut reg = self.registry.lock().await;
+        if reg.get(lab).is_none_or(|entry| entry.pid != pid) {
+            return;
+        }
         reg.set_state(lab, LabState::Failed);
         reg.save();
         drop(reg);
@@ -671,7 +732,7 @@ impl Supervisor {
                  longer shows it"
             )));
         }
-        {
+        let running = {
             let reg = self.registry.lock().await;
             reg.check_name(name, &root)?;
             if self.template_ops.owns_build_lab(name) {
@@ -680,12 +741,25 @@ impl Supervisor {
                      input only; use `vmlab template stop` to stop the build"
                 )));
             }
-            if let Some(entry) = reg.get(name)
-                && entry.state == LabState::Running
-                && let Ok(c) = LabClient::connect(&sock).await
-                && c.send(LabRequest::Ping {}).await.is_ok()
-            {
-                return Ok(sock);
+            reg.get(name)
+                .filter(|entry| entry.state == LabState::Running)
+                .map(|entry| (entry.pid, entry.started))
+        };
+        // Asked with the registry free: every request reads it, for every
+        // lab, and this daemon may never answer. The name's lock keeps the
+        // entry this daemon's meanwhile.
+        if let Some((pid, started)) = running {
+            match ping_daemon(&sock).await {
+                Pinged::Answered => return Ok(sock),
+                Pinged::Silent if daemon_running(pid, started) => {
+                    return Err(CommandError::conflict(format!(
+                        "lab daemon for {name} (pid {pid}) runs and does not answer: it is \
+                         stopped, held by a debugger or hung, and it still owns the lab's \
+                         machines, so no second daemon is started beside it. Let it continue, \
+                         or end that process, and try again"
+                    )));
+                }
+                Pinged::Silent | Pinged::Unreachable => {}
             }
         }
 
@@ -777,11 +851,9 @@ impl Supervisor {
         // deadline only covers slow hosts. Bail immediately if the reaper
         // marks the daemon Failed (or it vanishes), so a genuine startup
         // crash still reports fast.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            if let Ok(c) = LabClient::connect(&sock).await
-                && c.send(LabRequest::Ping {}).await.is_ok()
-            {
+            if ping_daemon(&sock).await == Pinged::Answered {
                 self.watch_lab_events(name.to_string()).await;
                 return Ok(sock);
             }
@@ -801,7 +873,7 @@ impl Supervisor {
                     _ => {}
                 }
             }
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(CommandError::failed(format!(
                     "lab daemon for {name} did not come up"
                 )));
@@ -861,23 +933,37 @@ impl Supervisor {
         }
         if let Some(entry) = &entry {
             let (pid, started) = (entry.pid, entry.started);
-            let deadline = if let Ok(client) = LabClient::connect(&sock).await {
-                let reply = client.send(LabRequest::Shutdown {}).await.ok();
-                release_deadline(reply.as_ref())
-            } else {
-                // A daemon can still own machines after losing its socket.
-                if daemon_running(pid, started) {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGTERM,
-                    );
+            // The deadline starts with the request, not with its answer: a
+            // daemon that accepts and never answers is the one the deadline
+            // is for. A daemon that works answers at once, with how long its
+            // machines may take, and is given that long from then.
+            let asked = tokio::time::timeout(RELEASE_DEADLINE, async {
+                let client = LabClient::connect(&sock).await.ok()?;
+                Some(client.send(LabRequest::Shutdown {}).await.ok())
+            })
+            .await;
+            let (deadline, waited) = match asked {
+                Ok(Some(reply)) => {
+                    let deadline = release_deadline(reply.as_ref());
+                    (deadline, deadline)
                 }
-                RELEASE_DEADLINE
+                Ok(None) => {
+                    // A daemon can still own machines after losing its socket.
+                    if daemon_running(pid, started) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                    (RELEASE_DEADLINE, RELEASE_DEADLINE)
+                }
+                // Silent for the whole floor already.
+                Err(_) => (std::time::Duration::ZERO, RELEASE_DEADLINE),
             };
             if !self.wait_daemon_gone(name, pid, deadline).await {
                 tracing::warn!(
                     "lab daemon for {name} did not stop within {}s; killing it",
-                    deadline.as_secs()
+                    waited.as_secs()
                 );
                 if daemon_running(pid, started) {
                     let _ = nix::sys::signal::kill(
@@ -908,7 +994,7 @@ impl Supervisor {
     /// earlier supervisor has no reaper, so its exit is noticed here and its
     /// entry dropped here.
     async fn wait_daemon_gone(&self, name: &str, pid: u32, deadline: std::time::Duration) -> bool {
-        let until = std::time::Instant::now() + deadline;
+        let until = tokio::time::Instant::now() + deadline;
         loop {
             {
                 let mut reg = self.registry.lock().await;
@@ -922,7 +1008,7 @@ impl Supervisor {
                     return true;
                 }
             }
-            if std::time::Instant::now() >= until {
+            if tokio::time::Instant::now() >= until {
                 return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
