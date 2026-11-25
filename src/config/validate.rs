@@ -315,9 +315,17 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ),
             ));
         }
+        let share_family =
+            login_family(effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref());
         for share in &vm.shares {
-            let host = file.root.join(&share.host);
-            if !host.is_dir() {
+            // The path the server is given: `~` is the home directory there,
+            // so it is here too (docs/reviews/config-2.md F19).
+            let served = crate::labd::share_plan::resolve_share_host(
+                &file.root,
+                Some(&crate::paths::home()),
+                &share.host,
+            );
+            if !served.is_dir() {
                 issues.push(Issue::at(
                     share.span,
                     format!(
@@ -342,13 +350,11 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                     format!("share name \"{}\": {problem}", share.name.escape_debug()),
                 ));
             }
+            if let Some(problem) = share_guest_problem(&share.guest, share_family) {
+                issues.push(Issue::at(share.span, format!("share guest path {problem}")));
+            }
             // Whatever the transport: `auto` can land on SMB, and a virtiofs
             // guest writes the same files (docs/reviews/smb.md F1).
-            let served = crate::labd::share_plan::resolve_share_host(
-                &file.root,
-                Some(&crate::paths::home()),
-                &share.host,
-            );
             if let Some(problem) = crate::smb::config::share_host_problem(
                 &served,
                 share.transport != ShareTransport::Virtiofs,
@@ -378,12 +384,12 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             &mut issues,
         );
         if let Some(dev) = &vm.dev {
+            let profile = effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta());
             check_dev_arguments(
                 dev,
                 &file.root,
-                login_family(
-                    effective_profile_name(vm, TemplateLayer::of(vm, ctx).meta()).as_deref(),
-                ),
+                login_family(profile.as_deref()),
+                profile.and_then(|name| ctx.profile(&name)).as_ref(),
                 &mut issues,
             );
         }
@@ -528,7 +534,16 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
             &mut issues,
         );
         if let Some(dev) = &c.dev {
-            check_dev_arguments(dev, &file.root, LoginFamily::Linux, &mut issues);
+            check_dev_arguments(
+                dev,
+                &file.root,
+                LoginFamily::Linux,
+                c.profile
+                    .as_deref()
+                    .and_then(|name| ctx.profile(name))
+                    .as_ref(),
+                &mut issues,
+            );
         }
 
         for v in &c.volumes {
@@ -1667,6 +1682,31 @@ fn guest_path_problem(path: &str, family: LoginFamily) -> Option<String> {
     })
 }
 
+/// Why `guest` is not somewhere `family` can mount a share, or `None` when it
+/// is: an absolute path, or on Windows a drive letter (`S:`), which is mapped
+/// with `net use` (§7.5). A relative path would be made and mounted under the
+/// agent's working directory.
+fn share_guest_problem(guest: &str, family: LoginFamily) -> Option<String> {
+    let drive = crate::smb::mount::is_drive_letter(guest);
+    match family {
+        LoginFamily::Windows if drive => None,
+        LoginFamily::Windows => guest_path_problem(guest, family).map(|_| {
+            format!(
+                "must be a drive letter (`S:`) or an absolute drive-letter path (`C:\\…`), got \
+                 \"{guest}\""
+            )
+        }),
+        LoginFamily::Unknown if drive => None,
+        LoginFamily::Unknown => guest_path_problem(guest, family).map(|_| {
+            format!(
+                "must be an absolute guest path (`/…` or `C:\\…`) or a drive letter (`S:`), got \
+                 \"{guest}\""
+            )
+        }),
+        LoginFamily::Linux | LoginFamily::Macos => guest_path_problem(guest, family),
+    }
+}
+
 /// Mirrors config-weave's own `is_identifier` gate on `--var` keys.
 fn is_wcl_identifier(name: &str) -> bool {
     let mut chars = name.chars();
@@ -2184,7 +2224,17 @@ fn share_over_lab_state(root: &Path, served: &Path) -> Option<String> {
 /// to the lab's own files; and `workspace_guest` must be an absolute path for
 /// the guest's family, and not the root of its file system, which would make
 /// the whole guest the workspace.
-fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: &mut IssueList) {
+///
+/// `profile` is the machine's effective profile. Its `workspace_guest` is what
+/// a declaration without one resolves to (`dev::resolve`), so it is held to
+/// the same two rules, and the issue names the profile.
+fn check_dev_arguments(
+    dev: &DevDecl,
+    root: &Path,
+    family: LoginFamily,
+    profile: Option<&Profile>,
+    issues: &mut IssueList,
+) {
     if let Some(workspace) = &dev.workspace {
         let host = root.join(workspace);
         if !host.is_dir() {
@@ -2196,32 +2246,50 @@ fn check_dev_arguments(dev: &DevDecl, root: &Path, family: LoginFamily, issues: 
             issues.push(Issue::at(dev.span, format!("@dev workspace: {problem}")));
         }
     }
-    let Some(guest) = &dev.workspace_guest else {
-        return;
+    let (guest, what) = match (&dev.workspace_guest, profile) {
+        (Some(guest), _) => (guest, "@dev workspace_guest".to_string()),
+        (None, Some(profile)) => match &profile.workspace_guest {
+            Some(guest) => (
+                guest,
+                format!("profile \"{}\" workspace_guest", profile.name),
+            ),
+            None => return,
+        },
+        (None, None) => return,
     };
     if let Some(problem) = guest_path_problem(guest, family) {
-        issues.push(Issue::at(
-            dev.span,
-            format!("@dev workspace_guest {problem}"),
-        ));
+        issues.push(Issue::at(dev.span, format!("{what} {problem}")));
     } else if is_guest_root(guest) {
         issues.push(Issue::at(
             dev.span,
             format!(
-                "@dev workspace_guest \"{guest}\" is the root of the guest's file system — the \
-                 workspace syncer would own the whole guest; name a directory below it"
+                "{what} \"{guest}\" is the root of the guest's file system — the workspace \
+                 syncer would own the whole guest; name a directory below it"
             ),
         ));
     }
 }
 
-/// `/`, `C:\` and the like: an absolute guest path with nothing below the root.
+/// `/`, `C:\` and the like: an absolute guest path with nothing below the
+/// root once `.` and `..` are taken out of it, so `/.`, `/tmp/..` and
+/// `C:\Users\..` are roots too (docs/reviews/config-2.md F20). The reading is
+/// of the text alone: a link in the guest is not something validation sees.
+/// A drive-letter path separates on `\` and `/`, any other on `/` only, where
+/// `\` is a character of a name.
 fn is_guest_root(path: &str) -> bool {
-    let rest = match path.as_bytes() {
-        [d, b':', rest @ ..] if d.is_ascii_alphabetic() => rest,
-        rest => rest,
+    let (rest, windows) = match path.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => (&path[2..], true),
+        _ => (path, false),
     };
-    rest.iter().all(|&b| b == b'/' || b == b'\\')
+    let mut depth = 0usize;
+    for part in rest.split(|c| c == '/' || (windows && c == '\\')) {
+        match part {
+            "" | "." => {}
+            ".." => depth = depth.saturating_sub(1),
+            _ => depth += 1,
+        }
+    }
+    depth == 0
 }
 
 fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
@@ -3360,6 +3428,12 @@ lab "l" {
             (r#"workspace_guest = "C:\\""#, windows),
             (r#"workspace_guest = "/src""#, windows),
             (r#"workspace_guest = "C:\\src""#, container),
+            // Review config-2 F20: a root is a root however it is spelled.
+            (r#"workspace_guest = "/.""#, linux),
+            (r#"workspace_guest = "/..""#, linux),
+            (r#"workspace_guest = "/tmp/..""#, linux),
+            (r#"workspace_guest = "C:\\.""#, windows),
+            (r#"workspace_guest = "C:\\Users\\..""#, windows),
         ] {
             let es = dev_errs(dev, machine);
             assert_eq!(es.len(), 1, "{dev} on {machine} → {es:#?}");
@@ -3371,6 +3445,140 @@ lab "l" {
         ] {
             let es = dev_errs(dev, machine);
             assert!(es.is_empty(), "{dev} on {machine} → {es:#?}");
+        }
+    }
+
+    /// Review config-2 F20: a profile's `workspace_guest` is the path a
+    /// machine that names none syncs into (§19.1), so it is held to the same
+    /// rule as the argument, and the issue names the profile.
+    #[test]
+    fn a_profile_workspace_guest_is_checked_like_the_argument() {
+        struct ProfileGuest(&'static str);
+        impl ValidationContext for ProfileGuest {
+            fn template_meta(&self, a: &str, n: &str, v: Option<&str>) -> Option<TemplateMeta> {
+                Permissive.template_meta(a, n, v)
+            }
+            fn profile(&self, name: &str) -> Option<Profile> {
+                Some(Profile {
+                    name: name.to_string(),
+                    workspace_guest: Some(self.0.to_string()),
+                    ..Profile::default()
+                })
+            }
+            fn check_container_hardware(&self, _: &Container) -> Result<(), String> {
+                Ok(())
+            }
+            fn check_script(&self, _: &Path, _: ScriptEntry) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let errs_with = |profile_guest: &'static str, dev: &str| -> Vec<String> {
+            let src = format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n@dev({dev}) vm \"dev01\" \
+                 {{ template = \"x86_64/t\" profile = \"linux\" }}\n}}"
+            );
+            validate(&lab(&src), &ProfileGuest(profile_guest))
+                .into_iter()
+                .map(|i| i.message)
+                .collect()
+        };
+        for bad in ["/", "/tmp/..", "src", "C:\\src"] {
+            let es = errs_with(bad, "default = true");
+            assert_eq!(es.len(), 1, "{bad} → {es:#?}");
+            assert!(es[0].contains("profile \"linux\""), "{bad} → {es:#?}");
+        }
+        assert!(errs_with("/src", "default = true").is_empty());
+        // The argument wins (§19.1), so the profile's value is not what runs.
+        let es = errs_with("/", r#"workspace_guest = "/src""#);
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
+    /// Review config-2 F19: a share's host path is tested where it is served.
+    /// `~` is the home directory at run time (`resolve_share_host`), so the
+    /// existence check reads it there and not as a directory named `~` under
+    /// the lab root.
+    #[test]
+    fn a_tilde_share_is_checked_where_it_is_served() {
+        let root = tempfile::tempdir().unwrap();
+        let share_errs = |host: &str| -> Vec<String> {
+            let src = format!(
+                "import <vmlab.wcl>\nlab \"l\" {{\n segment \"s\" {{ }}\n vm \"a\" {{ template = \
+                 \"x86_64/t\" nic {{ segment = \"s\" }}\n share {{ host = \"{host}\" guest = \
+                 \"/mnt/h\" }} }}\n}}"
+            );
+            let f = load_lab_source(&src, "<test>", root.path()).expect("source should parse");
+            validate(&f, &Permissive)
+                .into_iter()
+                .map(|i| i.message)
+                .collect()
+        };
+        assert!(crate::paths::home().is_dir(), "the test needs a home");
+        let es = share_errs("~");
+        assert!(
+            !es.iter().any(|m| m.contains("is not a directory")),
+            "{es:#?}"
+        );
+
+        // The other way round: a directory under `<root>/~` does not stand in
+        // for one the home directory lacks.
+        let name = format!(
+            "vmlab-card-977-{}",
+            root.path().file_name().unwrap().to_string_lossy()
+        );
+        assert!(!crate::paths::home().join(&name).exists());
+        std::fs::create_dir_all(root.path().join("~").join(&name)).unwrap();
+        let es = share_errs(&format!("~/{name}"));
+        assert!(
+            es.iter().any(|m| m.contains("is not a directory")),
+            "{es:#?}"
+        );
+    }
+
+    /// Review config-2 F24: a share's `guest` is where the guest mounts it, so
+    /// it is an absolute path for the guest's family, as a playbook's
+    /// `guest_dir` and `workspace_guest` are. A relative one would be made
+    /// under the agent's working directory. On Windows a drive letter is the
+    /// other form (`net use S:`).
+    #[test]
+    fn a_share_guest_path_is_absolute_for_the_family() {
+        let share_errs = |guest: &str, profile: &str| {
+            errs(&format!(
+                r#"import <vmlab.wcl>
+lab "l" {{
+  segment "s" {{ }}
+  vm "a" {{ template = "x86_64/t" {profile} nic {{ segment = "s" }}
+    share {{ host = "/usr" guest = "{guest}" name = "n" }} }}
+}}"#
+            ))
+        };
+        let linux = r#"profile = "linux""#;
+        let windows = r#"profile = "windows-11""#;
+        for (guest, profile) in [
+            ("mnt/src", linux),
+            ("", linux),
+            ("S:", linux),
+            ("/mnt/x", windows),
+            ("data", windows),
+            ("", windows),
+            ("mnt/src", ""),
+            ("", ""),
+        ] {
+            let es = share_errs(guest, profile);
+            assert_eq!(es.len(), 1, "{guest:?} with {profile:?} → {es:#?}");
+            assert!(es[0].contains("share guest path"), "{es:#?}");
+        }
+        for (guest, profile) in [
+            ("/mnt/x", linux),
+            ("S:", windows),
+            (r"S:\\", windows),
+            (r"C:\\data", windows),
+            ("C:/data", windows),
+            ("/mnt/x", ""),
+            ("S:", ""),
+            (r"C:\\data", ""),
+        ] {
+            let es = share_errs(guest, profile);
+            assert!(es.is_empty(), "{guest:?} with {profile:?} → {es:#?}");
         }
     }
 
