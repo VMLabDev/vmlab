@@ -165,13 +165,35 @@ impl FsProbe for HostFs {
 /// The plan for `dir` under this host's config and filesystems, or the
 /// warning line to say instead when the probe fails: NOCOW is a performance
 /// measure, and the disks work without it, so nothing is refused over it.
+///
+/// So does a host config that does not load: `btrfs_nocow = false` beside a
+/// mistake elsewhere in the file is not `true`, and the directory is left as
+/// it is.
 pub fn decide_on_host(machine: &str, dir: &Path) -> Result<Plan, String> {
-    let enabled = crate::config::host::HostConfig::load_default()
-        .map(|h| h.btrfs_nocow)
-        .unwrap_or(true);
+    let enabled = enabled_by(
+        crate::config::host::HostConfig::load_default(),
+        machine,
+        dir,
+    )?;
     plan(&HostFs, dir, enabled).map_err(|e| {
         format!(
             "warning: {machine}: cannot tell whether {} needs NOCOW: {e}",
+            dir.display()
+        )
+    })
+}
+
+/// `btrfs_nocow` of the host config as it loaded, or the warning line for
+/// one that did not.
+fn enabled_by(
+    loaded: anyhow::Result<crate::config::host::HostConfig>,
+    machine: &str,
+    dir: &Path,
+) -> Result<bool, String> {
+    loaded.map(|host| host.btrfs_nocow).map_err(|e| {
+        format!(
+            "warning: {machine}: the host config is unreadable, so {} is left as it is \
+             (`btrfs_nocow` is not known): {e:#}",
             dir.display()
         )
     })
@@ -338,5 +360,29 @@ mod tests {
             HostFs.is_btrfs(&missing).unwrap(),
             HostFs.is_btrfs(tmp.path()).unwrap()
         );
+    }
+
+    /// Review finding F17: `btrfs_nocow = false` beside a mistake elsewhere
+    /// in the host config is not `true`. A file that does not load decides
+    /// nothing, and says so.
+    #[test]
+    fn an_unreadable_host_config_is_not_the_defaults() {
+        let dir = Path::new("/lab/.vmlab/vms/a");
+        let unreadable = crate::config::host::HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { btrfs_nocow = false trunk_port = 0 }\n",
+            "config.wcl",
+        );
+        let warning = enabled_by(unreadable, "a", dir).unwrap_err();
+        assert!(warning.starts_with("warning: a: "), "{warning}");
+        assert!(warning.contains("/lab/.vmlab/vms/a"), "{warning}");
+        assert!(warning.contains("trunk_port"), "{warning}");
+
+        let off = crate::config::host::HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { btrfs_nocow = false }\n",
+            "config.wcl",
+        );
+        assert_eq!(enabled_by(off, "a", dir), Ok(false));
+        let unset = crate::config::host::HostConfig::parse("import <vmlab-host.wcl>\n", "c");
+        assert_eq!(enabled_by(unset, "a", dir), Ok(true));
     }
 }

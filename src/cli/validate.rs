@@ -2,8 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
-use miette::NamedSource;
+use anyhow::{Context, Result};
 
 use crate::config::{self, ConfigErrors, ValidationContext};
 use crate::scripting::ScriptEntry;
@@ -15,6 +14,10 @@ pub struct HostContext {
     store: crate::template::TemplateStore,
     state: crate::labd::state::LabState,
     lab_local: std::path::PathBuf,
+    /// The host config, read one time. A file that does not load fails the
+    /// context, for every lab: each check below would else run on defaults
+    /// the file does not state.
+    host: crate::config::host::HostConfig,
 }
 
 impl HostContext {
@@ -31,8 +34,17 @@ impl HostContext {
             store: crate::template::TemplateStore::new(crate::paths::template_store_dir()),
             state: crate::labd::state::LabState::load(&lab_local)?,
             lab_local,
+            host: host_config(crate::config::host::HostConfig::load_default())?,
         })
     }
+}
+
+/// The host config as it loaded, or the error validation gives for one that
+/// did not.
+pub(crate) fn host_config(
+    loaded: Result<crate::config::host::HostConfig>,
+) -> Result<crate::config::host::HostConfig> {
+    loaded.context("the host config is unreadable")
 }
 
 impl ValidationContext for HostContext {
@@ -49,8 +61,9 @@ impl ValidationContext for HostContext {
     }
 
     fn check_apple_smc_osk(&self) -> Result<(), String> {
-        let host = crate::config::host::HostConfig::load_default().map_err(|e| e.to_string())?;
-        host.apple_smc_osk
+        self.host
+            .apple_smc_osk
+            .as_ref()
             .ok_or_else(|| crate::config::host::APPLE_SMC_OSK_REQUIRED.to_string())
             .map(|_| ())
     }
@@ -87,9 +100,7 @@ impl ValidationContext for HostContext {
     }
 
     fn hypervisor_defaults(&self) -> crate::config::hypervisor::HypervisorDefaults {
-        crate::config::host::HostConfig::load_default()
-            .map(|h| h.hypervisor)
-            .unwrap_or_default()
+        self.host.hypervisor
     }
 
     fn host_facts(&self) -> crate::config::hypervisor::HostFacts {
@@ -107,11 +118,10 @@ impl ValidationContext for HostContext {
         arch: Option<&str>,
         hypervisor: crate::config::hypervisor::HypervisorKind,
     ) -> Result<(), String> {
-        let host = crate::config::host::HostConfig::load_default().map_err(|e| format!("{e:#}"))?;
         crate::qemu::hostgpu::render_plan(
             Some(gpu),
             arch,
-            &host,
+            &self.host,
             &crate::qemu::hostgpu::Sysfs::host(),
             &crate::paths::data_dir(),
             hypervisor,
@@ -146,10 +156,18 @@ pub struct SourceIssue {
 
 impl SourceIssue {
     pub fn from_issue(source: &str, issue: &config::Issue) -> Self {
-        let line = issue.span.map(|s| {
-            let off = s.offset().min(source.len());
-            source[..off].bytes().filter(|&b| b == b'\n').count() + 1
-        });
+        // A line of `source` only for an issue in it: not for one in a file
+        // it imports, and not for a span that is in no text at hand.
+        let line = issue
+            .span
+            .filter(|s| issue.origin.is_none() && s.offset() <= source.len())
+            .map(|s| {
+                source.as_bytes()[..s.offset()]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+                    + 1
+            });
         Self {
             message: issue.message.clone(),
             line,
@@ -303,13 +321,10 @@ fn validation_error(root: &Path, issues: config::IssueList) -> ConfigErrors {
     let path = root.join(crate::paths::LAB_FILE);
     let name = path.display().to_string();
     let source = std::fs::read_to_string(&path).unwrap_or_default();
-    // The excerpts a report prints hold no password and no secret value.
-    let shown = config::diagnostic_source(&source, &name, root);
-    ConfigErrors {
-        src: NamedSource::new(&name, shown),
-        name,
-        issues,
-    }
+    // The excerpts a report prints hold no password and no secret value, and
+    // an issue about something an imported file declares is shown in that
+    // file.
+    config::diagnostic(&source, &name, root, issues)
 }
 
 fn miette_to_anyhow(e: ConfigErrors) -> anyhow::Error {
