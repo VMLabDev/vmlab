@@ -1376,7 +1376,7 @@ fn snapshot_stops_console_dma_before_saving_ram() {
             // Restore must retain the saved empty buffer and used ring, even
             // if a broken device resumes DMA before this callback begins.
             let before = if restoring {
-                (0, 0)
+                (0, 1)
             } else {
                 (
                     self.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
@@ -1445,13 +1445,36 @@ fn snapshot_stops_console_dma_before_saving_ram() {
         })
         .collect();
     let mem = m.vm.ram.mem.clone();
-    mem.write_obj(0x9000u64, GuestAddress(0x30000)).unwrap();
+    // The control receive queue has two buffers: 0xb000 takes the PORT_ADD
+    // that answers DEVICE_READY, and 0x9000 stays free for the PORT_OPEN of
+    // the host connection the snapshot must hold back.
+    mem.write_obj(0xb000u64, GuestAddress(0x30000)).unwrap();
     mem.write_obj(64u32, GuestAddress(0x30008)).unwrap();
     mem.write_obj(2u16, GuestAddress(0x3000c)).unwrap();
-    mem.write_obj(1u16, GuestAddress(0x31002)).unwrap();
+    mem.write_obj(0x9000u64, GuestAddress(0x30010)).unwrap();
+    mem.write_obj(64u32, GuestAddress(0x30018)).unwrap();
+    mem.write_obj(2u16, GuestAddress(0x3001c)).unwrap();
+    mem.write_obj(1u16, GuestAddress(0x31006)).unwrap();
+    mem.write_obj(2u16, GuestAddress(0x31002)).unwrap();
+    // The device reports a host connection only to a ready driver, so the
+    // control transmit queue carries DEVICE_READY (id 0, event 0, value 1).
+    mem.write_obj(1u16, GuestAddress(0xa006)).unwrap();
+    mem.write_obj(0xa000u64, GuestAddress(0x40000)).unwrap();
+    mem.write_obj(8u32, GuestAddress(0x40008)).unwrap();
+    mem.write_obj(1u16, GuestAddress(0x41002)).unwrap();
     console
         .activate(mem.clone(), Arc::new(Interrupt), queues)
         .unwrap();
+    console.queue_notify(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap() != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "console did not answer DEVICE_READY"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(), 0);
     let wrote = Arc::new(AtomicBool::new(false));
     let original = m.handle.shared().snapshot_registry().unwrap();
     m.handle
