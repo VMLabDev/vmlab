@@ -479,6 +479,7 @@ impl TemplateMeta {
             Some(block) => extract(&block, &mut issues),
             None => bail!("{name}: no `template_meta` block found"),
         };
+        crate::config::block::place(&doc, &mut issues, true);
         let meta = finish(name, source, issues, meta)?;
         meta.ensure_login_surface()?;
         Ok(meta)

@@ -2449,6 +2449,7 @@ impl super::machine::Machine for VmInstance {
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
     fn check_host_config(&self) -> Result<()> {
+        (self.host_config)().context("the host config is unreadable")?;
         if self.selection().source == SelectionSource::QemuMigration {
             let why = crate::config::hypervisor::vmlab_refusals(
                 model::MachineCfg::Vm(&self.cfg),
@@ -2470,7 +2471,9 @@ impl super::machine::Machine for VmInstance {
             .into_iter()
             .collect();
         let own_qemu = t.resolved.gpu.as_ref().is_some_and(|gpu| {
-            crate::config::host::HostConfig::load_default().is_ok_and(|host| {
+            // An unreadable host config is refused by `check_host_config`,
+            // which the pre-flight runs ahead of this.
+            (self.host_config)().is_ok_and(|host| {
                 qemu::hostgpu::pick(gpu, &host)
                     .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
             })

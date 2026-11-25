@@ -72,7 +72,7 @@ const NATIVE_VIEWER_MISSING: &str = "vmlab-hv-viewer not found; install it from 
 
 /// Select a machine's viewer. `tcp` explicitly requests the VNC bridge.
 pub fn detect_for(hypervisor: HypervisorKind, tcp: bool) -> ConsoleViewer {
-    let host = HostConfig::load_default().unwrap_or_default();
+    let host = HostConfig::load_default_or_warn();
     let viewer = select_for(hypervisor, tcp, &host, &find_binary, || {
         detect_vnc(&host, &on_path)
     });
@@ -153,7 +153,7 @@ fn on_path(bin: &str) -> bool {
 /// Resolve a viewer: host config first, then known clients on `PATH`.
 /// `remote-viewer` is preferred because it dials the unix socket directly.
 pub fn detect() -> Option<Viewer> {
-    let host = HostConfig::load_default().unwrap_or_default();
+    let host = HostConfig::load_default_or_warn();
     detect_vnc(&host, &on_path)
 }
 

@@ -639,16 +639,22 @@ pub async fn push(
     let log = op_sink(sup.clone(), lab.clone(), arch.clone(), name.clone(), "push");
     tokio::spawn(async move {
         let _guard = guard;
-        let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
         log(format!("pushing {arch}/{name}@{version} to {target}\n"));
-        let upload = crate::template::oci_bridge::push(
-            &resolved.dir,
-            &target,
-            host_cfg.oci_chunk_size,
-            &arch,
-            source.as_deref(),
-            Some(moving_tag),
-        );
+        let upload = async {
+            // The file's `oci_chunk_size`, not the default one, so a host
+            // config that does not load fails the push.
+            let host_cfg = crate::config::host::HostConfig::load_default()
+                .context("the host config is unreadable")?;
+            crate::template::oci_bridge::push(
+                &resolved.dir,
+                &target,
+                host_cfg.oci_chunk_size,
+                &arch,
+                source.as_deref(),
+                Some(moving_tag),
+            )
+            .await
+        };
         let done = json!({"template": name, "arch": arch, "kind": "push", "version": version});
         // Cancelling drops the upload future, which drops the connection
         // mid-body. There is no partial state to unwind: an OCI blob is not
