@@ -406,6 +406,18 @@ pub trait Machine: Send + Sync + 'static {
         online: bool,
     ) -> Result<()>;
 
+    /// Whether a restore of `snap` can run on this machine as it is now,
+    /// asked before anything moves (PRD §7.3). `online` is the record's, as
+    /// for [`restore`](Machine::restore). It reads and changes nothing: no
+    /// stop, no boot, no write to a disk.
+    ///
+    /// A lab-wide restore asks every machine before it rewinds the first, so
+    /// that one machine's refusal does not leave the lab at two points in
+    /// time. What only the rewind itself can find out is not asked here.
+    async fn check_restore(&self, _snap: &str, _online: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Wait for the exit monitor to settle the power state.
     async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
