@@ -28,4 +28,5 @@ def judge(report):
         f"underruns with {hv.get('silence_frames', '?')} frames of silence and {hv.get('late_callbacks', '?')} late "
         f"callbacks; the guest's player woke late {d.get('late_wakes')} times and found the buffer empty "
         f"{d.get('empty_wakes')} times ({d.get('rate')} Hz, {d.get('sample_type')}); host load "
-        f"{host.get('host_load', 0)} busy processes on {host.get('host_cpus', '?')} CPUs", ev)
+        f"{host.get('host_load', 0)} busy processes on {host.get('host_cpus', '?')} CPUs; capture file on "
+        f"{host.get('capture_fs') or '?'}", ev)

@@ -91,6 +91,22 @@ map. Nonempty context-zero submissions and submissions to unknown nonzero
 contexts still fail. Submitted command storage is dword-aligned, including
 empty streams, as required by virglrenderer.
 
+A control command runs on the vCPU thread that kicked the queue, with one
+exception: `CTX_CREATE` on a device with a renderer. After the renderer has
+made the context, the device looks for the render worker that serves it, so
+that a later reset can wait for that worker (`renderer-reset.md`). The look
+reads the `stat` file of every process of the host, 5 to 17 ms on a host with
+a few thousand, and a guest sends two creates for each process that opens the
+adapter. A vCPU that stays in the kick that long runs no interrupt handler
+meanwhile, and Windows then refills a period of the sound card's cyclic
+buffer after the HDA model has read it again. So the kick returns at once,
+and the context is made and its worker looked for on a `gpu-deferred` thread,
+without the device lock. The control queue keeps its order: no chain behind
+the command is taken until it is answered, and the thread that answers it
+serves the chains that waited. A device reset waits for the thread's work and
+drops its answer with the queue. The measurements are in
+`guest/win3d/docs/acceptance/C912.md`.
+
 See `display-export.md` for the hardware checks and latency measurements.
 
 Online snapshot save and restore return `unsupported` whenever acceleration

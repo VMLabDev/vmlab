@@ -221,6 +221,78 @@ struct State {
     /// The last reset has not confirmed that the renderer and its workers
     /// stopped: the transport keeps the status nonzero.
     unsettled: bool,
+    /// The slow command that runs off the thread that kicked the control
+    /// queue ([`Deferred`]). The queue is not served until it is answered.
+    deferred: Option<Arc<Flight>>,
+    /// Stands in for the renderer's part of a slow command.
+    #[cfg(test)]
+    slow: Option<SlowHook>,
+}
+
+/// `VIRTIO_GPU_CMD_CTX_CREATE`.
+const CMD_CTX_CREATE: u32 = 0x200;
+
+/// A control command that leaves the vCPU thread that kicked the queue.
+///
+/// A queue kick is an MMIO exit, and its vCPU runs nothing of the guest until
+/// the kick returns: no interrupt handler and no timer. A context create
+/// ends with a look for the render worker it started
+/// ([`teardown::running`]), which reads the `stat` file of every process of
+/// the host: 5 to 17 ms on a host with a few thousand. A guest makes two
+/// contexts for each process that opens the adapter, and a vCPU that is away
+/// that long answers the sound card's period interrupt after the period has
+/// been played again. So the context is created and its worker looked for on
+/// a thread of its own, without the device lock, and the kick returns at
+/// once. The control queue keeps its order: no chain behind the command is
+/// taken until the command is answered, and the thread that answers it then
+/// serves the queue.
+struct Deferred {
+    head: u16,
+    request: Vec<u8>,
+    /// The writable descriptors of the chain: guest address and length.
+    response: Vec<(GuestAddress, u32)>,
+    /// The renderer's part of the command, until it has run. It takes no
+    /// device lock.
+    run: Option<SlowPart>,
+    flight: Arc<Flight>,
+}
+
+/// The answer of a command: the response type and its payload, or the error.
+type Answer = Result<(u32, Vec<u8>), u32>;
+/// What the renderer answered, and the render workers that run now.
+type Slow = (Answer, Vec<(u32, u64)>);
+#[cfg(test)]
+type SlowHook = Arc<dyn Fn(&[u8]) -> Answer + Send + Sync>;
+type SlowPart = Box<dyn FnOnce() -> Slow + Send>;
+
+impl Deferred {
+    fn run(&mut self) -> Slow {
+        self.run
+            .take()
+            .map_or((Err(UNSPEC), Vec::new()), |run| run())
+    }
+}
+
+/// Whether the renderer's part of a deferred command has ended. A reset
+/// waits for it, so that the command cannot land in the renderer after the
+/// reset has emptied it.
+#[derive(Default)]
+struct Flight {
+    landed: Mutex<bool>,
+    changed: parking_lot::Condvar,
+}
+
+impl Flight {
+    fn land(&self) {
+        *self.landed.lock() = true;
+        self.changed.notify_all();
+    }
+    fn wait(&self) {
+        let mut landed = self.landed.lock();
+        while !*landed {
+            self.changed.wait(&mut landed);
+        }
+    }
 }
 
 impl Drop for State {
@@ -279,6 +351,9 @@ impl Gpu {
                 lost_flag: lost::Flag::default(),
                 workers: teardown::Workers::default(),
                 unsettled: false,
+                deferred: None,
+                #[cfg(test)]
+                slow: None,
             })),
         }
     }
@@ -703,6 +778,131 @@ impl State {
 }
 
 impl State {
+    /// The chain as a [`Deferred`] command, when it is one that must not
+    /// run on the thread that kicked the queue. `None` leaves it to
+    /// [`State::chain`], which also answers every malformed chain.
+    fn deferrable(
+        &self,
+        mem: &GuestMemory,
+        q: usize,
+        chain: &DescriptorChain<&GuestMemory>,
+    ) -> Option<Deferred> {
+        if q != 0 || self.lost.is_some() {
+            return None;
+        }
+        let mut reader = chain.clone().reader(mem).ok()?;
+        let len = reader.available_bytes();
+        if !(24..=4096).contains(&len) {
+            return None;
+        }
+        let mut kind = [0; 4];
+        reader.read_exact(&mut kind).ok()?;
+        if u32::from_le_bytes(kind) != CMD_CTX_CREATE {
+            return None;
+        }
+        let mut request = vec![0; len];
+        request[..4].copy_from_slice(&kind);
+        reader.read_exact(&mut request[4..]).ok()?;
+        let response: Vec<_> = chain
+            .clone()
+            .filter(|desc| desc.is_write_only())
+            .map(|desc| (desc.addr(), desc.len()))
+            .collect();
+        let room: u64 = response.iter().map(|&(_, len)| u64::from(len)).sum();
+        if room < 24 {
+            return None;
+        }
+        let run = self.slow_part(mem, &request)?;
+        Some(Deferred {
+            head: chain.head_index(),
+            request,
+            response,
+            run: Some(run),
+            flight: Arc::new(Flight::default()),
+        })
+    }
+
+    /// The renderer's part of a slow command, as a call that needs no
+    /// device lock. `None` on a device without a renderer, where no command
+    /// is slow.
+    fn slow_part(&self, mem: &GuestMemory, request: &[u8]) -> Option<SlowPart> {
+        let request = request.to_vec();
+        #[cfg(test)]
+        if let Some(slow) = self.slow.clone() {
+            return Some(Box::new(move || (slow(&request), Vec::new())));
+        }
+        let renderer = self.renderer.clone()?;
+        let mem = mem.clone();
+        let proc = self.workers.proc().to_path_buf();
+        Some(Box::new(move || {
+            let result = renderer.command(&mem, &request);
+            // CTX_CREATE: a Venus context has a worker of its own.
+            let workers = match result {
+                Ok(_) => teardown::running(&proc, renderer.servers()),
+                Err(_) => Vec::new(),
+            };
+            (result, workers)
+        }))
+    }
+
+    /// Answer a [`Deferred`] command with what its slow part returned: the
+    /// rest of [`State::command`] and of [`State::chain`] for it.
+    fn answer_deferred(&mut self, job: &Deferred, (result, workers): Slow) {
+        // The workers are noted whatever became of the queue: a reset
+        // waits for them.
+        self.workers.add(workers);
+        let Some(mem) = self.mem.clone() else { return };
+        if self.queues.is_empty() {
+            return;
+        }
+        self.current_fence = None;
+        let (mut kind, mut payload) = result.unwrap_or_else(|error| (error, Vec::new()));
+        let room: u64 = job.response.iter().map(|&(_, len)| u64::from(len)).sum();
+        if room < 24 + payload.len() as u64 {
+            kind = INVALID;
+            payload.clear();
+        }
+        let request = &job.request;
+        let mut response = vec![0; 24];
+        if request[4] & 1 != 0 {
+            response[4..24].copy_from_slice(&request[4..24]);
+            if self.lost.is_none()
+                && let Some(renderer) = &self.renderer
+            {
+                let flags = u32::from_le_bytes(request[4..8].try_into().unwrap());
+                let id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+                let ctx = u32::from_le_bytes(request[16..20].try_into().unwrap());
+                match renderer.fence(flags, id, ctx, request[20]) {
+                    Err(error) => kind = error,
+                    Ok(()) => self.current_fence = Some((flags, id, ctx, request[20])),
+                }
+            }
+        }
+        response[..4].copy_from_slice(&kind.to_le_bytes());
+        response.extend_from_slice(&payload);
+        vblank::write_response(&mem, &job.response, &response);
+        let len = response.len() as u32;
+        if let Some((flags, id, ctx, ring)) = self.current_fence.take()
+            && self.hold_fence(PendingFence {
+                queue: 0,
+                head: job.head,
+                len,
+                flags,
+                id,
+                ctx,
+                ring,
+            })
+        {
+            return;
+        }
+        if self.queues[0].add_used(&mem, job.head, len).is_ok()
+            && crate::virtio::used_needs_interrupt(&mut self.queues[0], &mem)
+            && let Some(irq) = &self.interrupt
+        {
+            irq.notify_queue(0);
+        }
+    }
+
     /// [`CMD_VBLANK`]: check the wait and return the writable descriptors
     /// its answer goes into at the next tick.
     fn vblank_wait(
@@ -1232,6 +1432,137 @@ fn read_backing(
     Err(INVALID)
 }
 
+impl Gpu {
+    /// Serve queue `index` until it is empty or until a chain is a
+    /// [`Deferred`] command, which is returned unanswered with the chains
+    /// behind it still in the queue.
+    fn drain(&self, s: &mut State, index: usize) -> Option<Deferred> {
+        let mem = s.mem.clone()?;
+        if index >= s.queues.len() || !s.queues[index].ready() {
+            return None;
+        }
+        let mut used = false;
+        let mut deferred = None;
+        'queue: loop {
+            // An avail index beyond the queue size yields no chain and still
+            // reads as "buffers waiting": stop, or this loop never ends.
+            if !crate::virtio::avail_idx_in_range(&s.queues[index], &mem) {
+                break;
+            }
+            while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
+                let head = chain.head_index();
+                if let Some(job) = s.deferrable(&mem, index, &chain) {
+                    deferred = Some(job);
+                    break 'queue;
+                }
+                let len = s.chain(&mem, index, chain);
+                let mut len = len;
+                if let Some(response) = s.held_vblank.take() {
+                    let wait = vblank::Wait {
+                        queue: index as u16,
+                        head,
+                        response,
+                    };
+                    match s.hold_vblank(wait) {
+                        Ok(()) => {
+                            self.arm_vblank(s);
+                            continue;
+                        }
+                        // No room to hold it: refuse it at once.
+                        Err(wait) => {
+                            let mut refusal = [0; 24];
+                            refusal[..4].copy_from_slice(&OUT_OF_MEMORY.to_le_bytes());
+                            vblank::write_response(&mem, &wait.response, &refusal);
+                            len = refusal.len() as u32;
+                        }
+                    }
+                }
+                if let Some((flags, id, ctx, ring)) = s.current_fence.take()
+                    && s.hold_fence(PendingFence {
+                        queue: index as u16,
+                        head,
+                        len,
+                        flags,
+                        id,
+                        ctx,
+                        ring,
+                    })
+                {
+                    continue;
+                }
+                // A fence with no room to be held is answered here, early.
+                if s.queues[index].add_used(&mem, head, len).is_err() {
+                    return None;
+                }
+                used = true;
+            }
+            if !s.queues[index].enable_notification(&mem).unwrap_or(false) {
+                break;
+            }
+        }
+        if used
+            && crate::virtio::used_needs_interrupt(&mut s.queues[index], &mem)
+            && let Some(irq) = &s.interrupt
+        {
+            irq.notify_queue(index as u16);
+        }
+        deferred
+    }
+
+    /// Give a [`Deferred`] command a thread of its own and mark the control
+    /// queue as held by it. The command comes back when no thread could be
+    /// started.
+    fn defer(&self, s: &mut State, job: Deferred) -> Option<Deferred> {
+        s.deferred = Some(job.flight.clone());
+        let slot = Arc::new(Mutex::new(Some(job)));
+        let (gpu, theirs) = (self.clone(), slot.clone());
+        let spawned = std::thread::Builder::new()
+            .name("gpu-deferred".into())
+            .spawn(move || {
+                let job = theirs.lock().take();
+                if let Some(job) = job {
+                    gpu.run_deferred(job);
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!(
+                "{}: no thread for a GPU context create: {error}; it runs on the vCPU thread",
+                self.id
+            );
+            s.deferred = None;
+            return slot.lock().take();
+        }
+        None
+    }
+
+    /// The thread of a [`Deferred`] command: run its slow part without the
+    /// device lock, answer it, and serve the chains that waited behind it.
+    fn run_deferred(&self, mut job: Deferred) {
+        loop {
+            let result = job.run();
+            job.flight.land();
+            let mut s = self.state.lock();
+            // A reset took the queue, and the chain with it.
+            if !s
+                .deferred
+                .as_ref()
+                .is_some_and(|flight| Arc::ptr_eq(flight, &job.flight))
+            {
+                return;
+            }
+            s.deferred = None;
+            s.answer_deferred(&job, result);
+            match self.drain(&mut s, 0) {
+                Some(next) => {
+                    s.deferred = Some(next.flight.clone());
+                    job = next;
+                }
+                None => return,
+            }
+        }
+    }
+}
+
 impl VirtioDevice for Gpu {
     fn device_type(&self) -> u32 {
         16
@@ -1313,76 +1644,26 @@ impl VirtioDevice for Gpu {
     }
     fn queue_notify(&mut self, index: u16) {
         let mut s = self.state.lock();
-        let index = index as usize;
-        let Some(mem) = s.mem.clone() else {
-            return;
-        };
-        if index >= s.queues.len() || !s.queues[index].ready() {
+        // A deferred command has the control queue: its thread serves the
+        // chains behind it once it is answered.
+        if index == 0 && s.deferred.is_some() {
             return;
         }
-        let mut used = false;
-        loop {
-            // An avail index beyond the queue size yields no chain and still
-            // reads as "buffers waiting": stop, or this loop never ends.
-            if !crate::virtio::avail_idx_in_range(&s.queues[index], &mem) {
-                break;
-            }
-            while let Some(chain) = s.queues[index].pop_descriptor_chain(&mem) {
-                let head = chain.head_index();
-                let len = s.chain(&mem, index, chain);
-                let mut len = len;
-                if let Some(response) = s.held_vblank.take() {
-                    let wait = vblank::Wait {
-                        queue: index as u16,
-                        head,
-                        response,
-                    };
-                    match s.hold_vblank(wait) {
-                        Ok(()) => {
-                            self.arm_vblank(&mut s);
-                            continue;
-                        }
-                        // No room to hold it: refuse it at once.
-                        Err(wait) => {
-                            let mut refusal = [0; 24];
-                            refusal[..4].copy_from_slice(&OUT_OF_MEMORY.to_le_bytes());
-                            vblank::write_response(&mem, &wait.response, &refusal);
-                            len = refusal.len() as u32;
-                        }
-                    }
-                }
-                if let Some((flags, id, ctx, ring)) = s.current_fence.take()
-                    && s.hold_fence(PendingFence {
-                        queue: index as u16,
-                        head,
-                        len,
-                        flags,
-                        id,
-                        ctx,
-                        ring,
-                    })
-                {
-                    continue;
-                }
-                // A fence with no room to be held is answered here, early.
-                if s.queues[index].add_used(&mem, head, len).is_err() {
-                    return;
-                }
-                used = true;
-            }
-            if !s.queues[index].enable_notification(&mem).unwrap_or(false) {
-                break;
-            }
-        }
-        if used
-            && crate::virtio::used_needs_interrupt(&mut s.queues[index], &mem)
-            && let Some(irq) = &s.interrupt
-        {
-            irq.notify_queue(index as u16);
+        while let Some(job) = self.drain(&mut s, index as usize) {
+            let Some(mut job) = self.defer(&mut s, job) else {
+                return;
+            };
+            // No thread to give it to: it runs here, as every command does.
+            let result = job.run();
+            s.answer_deferred(&job, result);
         }
     }
     fn reset(&mut self) {
         let mut s = self.state.lock();
+        if let Some(flight) = s.deferred.take() {
+            // Its thread finds the command gone and answers nothing.
+            flight.wait();
+        }
         let patience = s.workers.patience;
         s.unsettled = !s.teardown(patience);
         s.fences.clear();
