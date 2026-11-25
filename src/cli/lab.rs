@@ -3624,7 +3624,7 @@ mod tests {
         let root = root.canonicalize().unwrap();
         std::fs::write(
             root.join("vmlab.wcl"),
-            "lab \"l\" { vm \"a\" { template = \"x86_64/t\" } }\n",
+            "import <vmlab.wcl>\nlab \"l\" { vm \"a\" { template = \"x86_64/t\" } }\n",
         )
         .unwrap();
         let lab_local = crate::paths::lab_local_dir(&root);
