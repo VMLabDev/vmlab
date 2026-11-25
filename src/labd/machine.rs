@@ -2000,7 +2000,8 @@ mod tests {
         let err = slot
             .connect("m1", &sock, "hint")
             .await
-            .expect_err("the guest is asleep");
+            .err()
+            .expect("the guest is asleep");
         assert!(
             format!("{err:#}").contains("is suspended"),
             "not the suspended refusal: {err:#}"
@@ -2041,11 +2042,13 @@ mod tests {
         let slot = AgentSlot::default();
         slot.connect("m1", &nobody, "hint")
             .await
-            .expect_err("nothing listens");
+            .err()
+            .expect("nothing listens");
         let started = std::time::Instant::now();
         slot.connect("m1", &sock, "hint")
             .await
-            .expect_err("the backoff answers without dialling");
+            .err()
+            .expect("the backoff answers without dialling");
         assert!(started.elapsed() < Duration::from_secs(1));
 
         slot.note_sleep(true).await;
@@ -2059,7 +2062,8 @@ mod tests {
         let err = slot
             .connect("m1", &nobody, "hint")
             .await
-            .expect_err("nothing listens");
+            .err()
+            .expect("nothing listens");
         assert!(
             format!("{err:#}").contains("is suspended"),
             "not the suspended refusal: {err:#}"
