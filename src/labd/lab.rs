@@ -413,7 +413,10 @@ async fn until_cancelled<F: std::future::Future>(
 
 /// Fail `up` with `first` (§7.2): abort the machines still starting, cancel
 /// every step still running and wait for each to stop, then report the first
-/// real failure — never a cancellation it caused.
+/// real failure — never a cancellation it caused. A start that is under way
+/// is abandoned and not dropped: it runs to its end and stops its machine
+/// again, under the machine's start lock
+/// ([`finish_start`](super::machine::finish_start)).
 async fn abandon_up<T: 'static>(
     first: anyhow::Error,
     mut starting: tokio::task::JoinSet<Result<T>>,
@@ -1600,11 +1603,38 @@ impl LabRuntime {
         // machine's start lock, so a stop is not either. A stop that comes
         // meanwhile makes the ticket stale.
         self.ensure_pulled(&[name.to_string()], None).await?;
-        // Held until the machine has started: a stop that arrives now waits
-        // and then has an emulator to stop.
-        let _admitted = self.starts.admit(name, ticket).await?;
-        let _gate = self.rebuild_gate.read().await;
-        self.machine(name)?.start(self.services(), output).await
+        // The start itself runs to its end whatever becomes of this caller:
+        // dropped part-way it would leave the machine `Starting` and a
+        // hypervisor nothing owns. An `up` that gives up on its wave, or a
+        // caller that goes away, abandons it instead, and what it started is
+        // then stopped again.
+        let me = Arc::clone(self);
+        let name = name.to_string();
+        let output = output.cloned();
+        super::machine::finish_start(move |abandoned| async move {
+            // Held until the machine has started, and until an abandoned
+            // start has stopped it again: a stop that arrives now waits and
+            // then has an emulator to stop.
+            let _admitted = me.starts.admit(&name, ticket).await?;
+            if abandoned.get() {
+                bail!("the start of \"{name}\" was abandoned, and it was not started");
+            }
+            let _gate = me.rebuild_gate.read().await;
+            let m = me.machine(&name)?;
+            // A start of a machine that is already up starts nothing, so
+            // there is nothing of this start's to stop.
+            let was_stopped = m.state().await == PowerState::Stopped;
+            let started = Arc::clone(&m).start(me.services(), output.as_ref()).await;
+            if started.is_ok() && was_stopped && abandoned.get() {
+                tracing::info!("{name}: its start was abandoned, stopping it");
+                if let Err(e) = m.stop(true).await {
+                    tracing::warn!("{name}: stopping it after an abandoned start: {e:#}");
+                }
+                wait_settled(&*m).await;
+            }
+            started
+        })
+        .await
     }
 
     /// Set NOCOW on `name`'s disk directory when it is on btrfs, before the
@@ -1745,10 +1775,31 @@ impl LabRuntime {
     /// Stop one machine, finalising its recording first (D6: unlike the
     /// workspace syncer, a recording ends with the machine it shows).
     pub async fn stop_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
-        let m = self.machine(name)?;
+        self.machine(name)?;
+        // Marked before anything else, as `down` does: a start asked for
+        // before this stop boots nothing after it.
+        self.starts.stop_requested([name]);
         self.stop_mounting(name);
         self.record_finalise_machine(name, "machine stopped").await;
-        m.stop(force).await
+        self.stop_behind_starts(name, force).await
+    }
+
+    /// Stop `name` alone, leaving what rides on it (wscript's `stop()`). No
+    /// start of it crosses this stop: one asked for earlier is stale from
+    /// here on, and one under way finishes first, so that there is an
+    /// emulator to stop.
+    pub async fn stop_machine_alone(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+        self.machine(name)?;
+        self.starts.stop_requested([name]);
+        self.stop_behind_starts(name, force).await
+    }
+
+    /// The stop of a machine whose earlier starts are already stale: wait
+    /// for a start of it that is under way, then stop the instance that
+    /// start made, which may have rebuilt the machine (§7.1).
+    async fn stop_behind_starts(&self, name: &str, force: bool) -> Result<()> {
+        drop(self.starts.hold(name).await);
+        self.machine(name)?.stop(force).await
     }
 
     /// End `name`'s share-mount task, if one is still running (§7.5). The
@@ -1807,6 +1858,7 @@ impl LabRuntime {
             entry.repaired_agent = None;
             entry.hypervisor = None;
             entry.snapshots.clear();
+            entry.pending_snapshots.clear();
             m.forget_artefacts(entry).await;
             state.save(&self.lab_local)?;
         }
@@ -2171,12 +2223,20 @@ impl LabRuntime {
         force: bool,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
-        let m = self.machine(name)?;
-        m.stop(force).await?;
-        m.wait_state(PowerState::Stopped, Duration::from_secs(60))
+        self.machine(name)?;
+        // The restart's own stop makes the earlier starts stale, and its
+        // start is asked for here, before that stop and not after it: a
+        // `down` that runs to its end while the machine stops is later than
+        // this ticket, and the restart then boots nothing behind it.
+        self.starts.stop_requested([name]);
+        let ticket = self.starts.ticket()?;
+        self.stop_behind_starts(name, force).await?;
+        self.machine(name)?
+            .wait_state(PowerState::Stopped, Duration::from_secs(60))
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
-        self.start_machine_with_output(name, Some(output)).await?;
+        self.start_machine_at(name, Some(output), ticket).await?;
+        self.ensure_workspace(name, Some(output)).await;
         self.run_owed_first_boot(name, output).await
     }
 
@@ -3916,9 +3976,26 @@ impl LabRuntime {
     /// seen, this refuses. **With no escape flag**: a snapshot of a tree that
     /// exists nowhere else is not a thing to take against a warning. Every
     /// other machine passes straight through.
-    pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
-        let m = self.machine(vm_name)?;
+    pub async fn snapshot(self: &Arc<Self>, vm_name: &str, snap: &str) -> Result<bool> {
         super::vm::validate_snapshot_name(snap)?;
+        let ticket = self.starts.ticket()?;
+        let lab = Arc::clone(self);
+        let (vm_name, snap) = (vm_name.to_owned(), snap.to_owned());
+        // The caller can stop waiting while the disk operation is still
+        // running. Keep the machine reserved through the record save.
+        let capture = tokio::spawn(async move {
+            let _admitted = lab.starts.admit(&vm_name, ticket).await?;
+            lab.snapshot_to_its_end(&vm_name, &snap).await
+        });
+        match capture.await {
+            Ok(captured) => captured,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(anyhow!("the capture did not run to its end: {e}")),
+        }
+    }
+
+    async fn snapshot_to_its_end(&self, vm_name: &str, snap: &str) -> Result<bool> {
+        let m = self.machine(vm_name)?;
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
@@ -4009,7 +4086,7 @@ impl LabRuntime {
 
     /// Lab-wide capture rolls back earlier machines if a later one fails.
     /// Capture times remain uncoordinated across guests (PRD §7.3).
-    pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
+    pub async fn snapshot_all(self: &Arc<Self>, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
         let mut captured: Vec<String> = Vec::new();
         for m in self.machines() {
@@ -4925,11 +5002,20 @@ mod tests {
         /// the test lets it go: the window in which a real adapter has no
         /// emulator yet and a stop finds nothing to stop.
         hold_start: Option<Hold>,
+        /// Stop inside `start` once the machine is `Starting`, until the
+        /// test lets it go: the seconds a real adapter spends on its disks,
+        /// its helpers and its hypervisor.
+        hold_starting: Option<Hold>,
+        /// Stop inside `start` until the test lets it go, and then fail it.
+        fail_start: Option<Hold>,
+        /// Stop inside the first `stop` until the test lets it go.
+        hold_first_stop: Option<Hold>,
         /// Stop inside `wait_state`, once the machine has settled, until the
         /// test lets it go: the gap between a destroy's stop and its removal.
         hold_settle: Option<Hold>,
         /// Stop inside `restore` until the test lets it go.
         hold_restore: Option<HeldRestore>,
+        hold_capture: Option<Hold>,
         /// Why this machine cannot restore, as a real one finds out from its
         /// own disks and hypervisor: said when asked, and again by a
         /// `restore` that was not asked first.
@@ -5099,8 +5185,12 @@ mod tests {
                 usb: None,
                 display: None,
                 hold_start: None,
+                hold_starting: None,
+                fail_start: None,
+                hold_first_stop: None,
                 hold_settle: None,
                 hold_restore: None,
+                hold_capture: None,
                 restore_refused: None,
                 makes_disk: false,
             })
@@ -5118,6 +5208,14 @@ mod tests {
             m.hold_start = start.cloned();
             m.hold_settle = settle.cloned();
             m.makes_disk = true;
+            Arc::new(m)
+        }
+
+        /// A container double changed by `with` before it is shared.
+        fn with(name: &str, shared: &Shared, with: impl FnOnce(&mut Self)) -> Arc<Self> {
+            let mut m = Arc::into_inner(Self::new(name, MachineKind::Container, shared))
+                .expect("sole owner");
+            with(&mut m);
             Arc::new(m)
         }
 
@@ -5366,7 +5464,12 @@ mod tests {
             report.mounted("data");
         }
         async fn stop(&self, _force: bool) -> Result<()> {
-            self.stops.fetch_add(1, Ordering::SeqCst);
+            let earlier = self.stops.fetch_add(1, Ordering::SeqCst);
+            if earlier == 0
+                && let Some(hold) = &self.hold_first_stop
+            {
+                hold.pass().await;
+            }
             self.note("stop").await;
             *self.state.write().await = PowerState::Stopped;
             *self.agent_up.write().await = false;
@@ -5400,11 +5503,18 @@ mod tests {
             if let Some(hold) = &self.hold_start {
                 hold.pass().await;
             }
+            if let Some(hold) = &self.fail_start {
+                hold.pass().await;
+                bail!("{}: the hypervisor refused it", self.name);
+            }
             if self.makes_disk {
                 std::fs::create_dir_all(&self.dir)?;
                 std::fs::write(self.dir.join("disk0.qcow2"), b"disk")?;
             }
             *self.state.write().await = PowerState::Starting;
+            if let Some(hold) = &self.hold_starting {
+                hold.pass().await;
+            }
             tokio::time::sleep(self.boot).await;
             // The paused window a real VM offers before its CPUs run (D20).
             if let Err(e) = lab.before_resume(&self.name).await {
@@ -5491,6 +5601,9 @@ mod tests {
         async fn snapshot(&self, name: &str) -> Result<bool, SnapshotCaptureError> {
             super::super::vm::validate_snapshot_name(name)?;
             self.note(&format!("snapshot:{name}")).await;
+            if let Some(hold) = &self.hold_capture {
+                hold.pass().await;
+            }
             if self.snapshot_refused {
                 return Err(anyhow!("injected capture refusal").into());
             }
@@ -5717,6 +5830,63 @@ lab "t" {
             !log.iter().any(|line| line.contains("restore:s")),
             "a machine was rewound before every machine was asked: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_destroy_waits_for_a_capture_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        let held = Hold::new();
+        machine.hold_capture = Some(held.clone());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        let mut capture = std::pin::pin!(lab.snapshot("a", "capture"));
+        assert!(futures::poll!(&mut capture).is_pending());
+        held.reached().await;
+        let mut destroy = std::pin::pin!(lab.destroy_machine("a", false));
+        assert!(futures::poll!(&mut destroy).is_pending());
+        assert!(
+            !sh.log
+                .lock()
+                .await
+                .iter()
+                .any(|line| line.ends_with(":a:stop")),
+            "destroy stopped the machine during capture"
+        );
+        held.release();
+        capture.await.unwrap();
+        destroy.await.unwrap();
+        assert!(lab.state.lock().await.machines["a"].snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_destroy_clears_the_pending_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+        lab.state
+            .lock()
+            .await
+            .machine_mut("a")
+            .pending_snapshots
+            .insert("interrupted".into());
+        lab.destroy_machine("a", false).await.unwrap();
+        assert!(
+            lab.state.lock().await.machines["a"]
+                .pending_snapshots
+                .is_empty()
+        );
+        lab.snapshot("a", "interrupted").await.unwrap();
     }
 
     #[tokio::test]
@@ -7174,6 +7344,120 @@ lab "t" {
             "the up booted a later wave after the down"
         );
         assert!(up.is_err(), "the up reported a lab it did not bring up");
+    }
+
+    const TWO_SIBLINGS: &str = r#"import <vmlab.wcl>
+lab "t" {
+  container "a" { image = "a:1" }
+  container "b" { image = "b:1" }
+}"#;
+
+    /// Review lab-lifecycle-2 F17 (card #980). When one machine of a wave
+    /// fails its start, `up` gives up on the rest of the wave. A sibling
+    /// whose start is under way must not be left `Starting` for the life of
+    /// the daemon: it ends `Stopped`, and it keeps its start lock until it
+    /// has, so no stop or start acts on it half-made. Before the fix the
+    /// start was dropped where it stood and "a" stayed `Starting`.
+    #[tokio::test]
+    async fn a_failed_sibling_leaves_no_machine_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let starting = Hold::new();
+        let failing = Hold::new();
+        let a = FakeMachine::with("a", &sh, |m| m.hold_starting = Some(starting.clone()));
+        let b = FakeMachine::with("b", &sh, |m| m.fail_start = Some(failing.clone()));
+        let lab = lab_of(dir.path(), TWO_SIBLINGS, vec![a.clone(), b.clone()]);
+
+        let up = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.up(&[], quiet()).await }
+        });
+        starting.reached().await;
+        failing.reached().await;
+        failing.release();
+        let failed = up.await.unwrap().expect_err("\"b\" failed its start");
+        assert!(
+            format!("{failed:#}").contains("b: the hypervisor refused it"),
+            "{failed:#}"
+        );
+        starting.release();
+        // A start that outlived its `up` holds the lock to its end.
+        drop(lab.starts.hold("a").await);
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "the up that failed left \"a\" in this state"
+        );
+    }
+
+    /// Review lab-lifecycle-2 F21 (card #980). A `vm stop` that arrives
+    /// while a start of the machine has no emulator yet waits for the start
+    /// and then stops what it made. Before the fix it found nothing to stop,
+    /// answered success, and the machine booted behind it.
+    #[tokio::test]
+    async fn a_vm_stop_stops_a_start_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, Some(&hold), None);
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+
+        let start = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.start_machine("a").await }
+        });
+        hold.reached().await;
+        let stop = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.stop_machine("a", false).await }
+        });
+        run_until_stalled().await;
+        hold.release();
+        stop.await.unwrap().expect("stop");
+        let _ = start.await.unwrap();
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "\"a\" runs after its stop answered success"
+        );
+    }
+
+    /// F21's second half. A `down` of the machine that runs to its end while
+    /// a restart is still stopping it is later than the restart's start, so
+    /// the restart boots nothing. Before the fix the restart took its start
+    /// ticket after its stop, and booted "a" behind the `down`.
+    #[tokio::test]
+    async fn a_restart_boots_nothing_behind_a_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::with("a", &sh, |m| m.hold_first_stop = Some(hold.clone()));
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+        lab.start_machine("a").await.expect("start");
+
+        let restart = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.restart_machine("a", false, &quiet()).await }
+        });
+        hold.reached().await;
+        lab.down(&["a".to_string()], false).await.expect("down");
+        hold.release();
+        let restarted = restart.await.unwrap();
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "the restart booted \"a\" after its down answered success"
+        );
+        assert_eq!(a.starts.load(Ordering::SeqCst), 1);
+        assert!(
+            restarted.is_err(),
+            "the restart reported a machine it did not boot"
+        );
     }
 
     /// Review lab-lifecycle F4 (card #547). A start of the machine that

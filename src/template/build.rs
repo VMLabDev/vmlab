@@ -2064,8 +2064,14 @@ fn log_build_gpu(
     let Some(gpu) = spec.gpu else {
         return;
     };
-    let Ok(host) = crate::config::host::HostConfig::load_default() else {
-        return;
+    let host = match crate::config::host::HostConfig::load_default() {
+        Ok(host) => host,
+        Err(e) => {
+            log(format!(
+                "warning: build VM: the host config is unreadable, so its host GPU is not known: {e:#}\n"
+            ));
+            return;
+        }
     };
     let plan = crate::qemu::hostgpu::render_plan(
         Some(gpu),

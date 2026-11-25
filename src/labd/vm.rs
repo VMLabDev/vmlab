@@ -1402,7 +1402,19 @@ impl VmInstance {
         before_ready: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
-        Box::pin(async move { self.boot_inner(hooks, before_ready, before_resume).await })
+        // In a task of its own (F17 of the second lab-lifecycle review): a
+        // caller that is dropped part-way would otherwise leave `Starting`
+        // set, and a hypervisor and helpers that nothing owns. The boot runs
+        // to its end instead, and an abandoned one is stopped again.
+        Box::pin(super::machine::finish_start(move |abandoned| async move {
+            self.boot_inner(hooks, before_ready, before_resume).await?;
+            if abandoned.get() {
+                tracing::info!("{}: its start was abandoned, stopping it", self.cfg.name);
+                self.stop_ladder(true).await?;
+                bail!("{}: its start was abandoned", self.cfg.name);
+            }
+            Ok(())
+        }))
     }
 
     fn check_apple_smc_osk(&self) -> Result<()> {
@@ -1471,6 +1483,7 @@ impl VmInstance {
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
+            remove_stale_restore_snapshots(&self.all_disk_paths()).await?;
 
             // Per-VM writable OVMF VARS from the firmware template — copied
             // once, at the VM's first start; an existing copy is never
@@ -2451,6 +2464,7 @@ impl super::machine::Machine for VmInstance {
     /// `qemu_binary` needs no emulator on PATH: the start checks that one
     /// itself, naming the GPU (§5.2).
     fn check_host_config(&self) -> Result<()> {
+        (self.host_config)().context("the host config is unreadable")?;
         if self.selection().source == SelectionSource::QemuMigration {
             let why = crate::config::hypervisor::vmlab_refusals(
                 model::MachineCfg::Vm(&self.cfg),
@@ -2472,7 +2486,9 @@ impl super::machine::Machine for VmInstance {
             .into_iter()
             .collect();
         let own_qemu = t.resolved.gpu.as_ref().is_some_and(|gpu| {
-            crate::config::host::HostConfig::load_default().is_ok_and(|host| {
+            // An unreadable host config is refused by `check_host_config`,
+            // which the pre-flight runs ahead of this.
+            (self.host_config)().is_ok_and(|host| {
                 qemu::hostgpu::pick(gpu, &host)
                     .is_ok_and(|p| p.gpu.is_some_and(|g| g.qemu_binary.is_some()))
             })
@@ -3147,6 +3163,39 @@ pub(super) async fn check_disks_hold_snapshot(disks: &[PathBuf], name: &str) -> 
     Ok(())
 }
 
+// The colon keeps new recovery snapshots outside the user name grammar.
+// Unmarked names from older versions may belong to users.
+pub(crate) const RESTORE_RECOVERY_PREFIX: &str = "vmlab-restore-:";
+
+async fn remove_stale_restore_snapshots(disks: &[PathBuf]) -> Result<()> {
+    use crate::template::qimg;
+
+    // A daemon can die partway through capture or cleanup, so inspect each
+    // writable disk independently before giving it to the hypervisor.
+    for disk in disks {
+        let info = qimg::image_info(disk).await.with_context(|| {
+            format!(
+                "checking {} for interrupted restore snapshots",
+                disk.display()
+            )
+        })?;
+        for snapshot in info.snapshots {
+            if snapshot.name.starts_with(RESTORE_RECOVERY_PREFIX) {
+                qimg::snapshot_delete(disk, &snapshot.name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "removing interrupted restore snapshot {:?} from {}",
+                            snapshot.name,
+                            disk.display()
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn restore_offline_disks(
     disks: &[PathBuf],
     name: &str,
@@ -3155,7 +3204,7 @@ async fn restore_offline_disks(
     check_disks_hold_snapshot(disks, name).await?;
 
     stop.await?;
-    let backup = format!("vmlab-restore-{:032x}", rand::random::<u128>());
+    let backup = format!("{RESTORE_RECOVERY_PREFIX}{:032x}", rand::random::<u128>());
     snapshot_offline_disks(disks, &backup)
         .await
         .context("saving disk state before offline restore")?;
@@ -3217,7 +3266,7 @@ async fn refuse_held_name(disks: &[PathBuf], name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+pub(super) async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
     // Refuse duplicate names before changing any disk, so rollback never
     // removes a snapshot that predates this operation.
     refuse_held_name(disks, name).await?;
@@ -3238,6 +3287,9 @@ async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
+    if name == crate::freeze::plan::HOLD_SNAPSHOT {
+        bail!("snapshot name `{name}` is reserved for worktree operations");
+    }
     if name.is_empty()
         || !name
             .chars()
@@ -3436,6 +3488,11 @@ mod tests {
         let got = super::read_log_since(&log, &mut seen);
         assert_eq!(got.len() as u64, super::FOLLOW_READ_LIMIT);
         assert_eq!(seen, std::fs::metadata(&log).unwrap().len());
+    }
+
+    #[test]
+    fn a_name_vmlab_keeps_for_itself_is_refused() {
+        assert!(super::validate_snapshot_name(crate::freeze::plan::HOLD_SNAPSHOT).is_err());
     }
 
     #[tokio::test]

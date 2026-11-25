@@ -45,6 +45,12 @@ pub async fn ensure_supervisor() -> Result<SupClient> {
         wait_supervisor_gone(&sock).await;
     }
 
+    // The supervisor does not start on a host config that does not load.
+    // Say why here, at once, and not after the wait for a process that has
+    // exited.
+    crate::config::host::HostConfig::load_default()
+        .context("the host config is unreadable, and vmlabd does not start on it")?;
+
     let mut scoped = match spawn_supervisor(true) {
         Ok(child) => Some(child),
         Err(err)
