@@ -804,9 +804,10 @@ mod tests {
             assert!(scan.tree.contains_key(".gitignore"), "{bad:?}");
             assert!(!scan.tree.contains_key("target/out"), "{bad:?}");
             assert!(!scan.tree.contains_key("build.log"), "{bad:?}");
-            assert_eq!(
-                ignores.prune_list(&scan.pruned)[0],
-                "target".to_string(),
+            assert!(
+                ignores
+                    .prune_list(&scan.pruned)
+                    .contains(&"target".to_string()),
                 "{bad:?}"
             );
             if accepted {

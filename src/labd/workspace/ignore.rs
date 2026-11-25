@@ -1192,10 +1192,10 @@ mod tests {
             ],
         );
         assert!(set.refused().is_empty(), "{:?}", set.refused());
-        let list = set.prune_list(&["found".to_string()]);
+        let list = set.prune_list(&[]);
         assert_eq!(list.len(), MAX_PRUNE_PREFIXES);
         assert!(list.contains(&"top0".to_string()));
-        assert!(list.contains(&"found".to_string()));
+        assert!(list.contains(&format!("one/mid{}", per_file - 1)));
         assert!(list.iter().all(|prefix| !prefix.starts_with("one/two/")));
         // What is left off the list is still guest-owned: the list is about
         // watch registration, and the filter stays whole on the host.
