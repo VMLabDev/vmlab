@@ -375,18 +375,17 @@ impl HostConfig {
                 None => true,
             });
             let hide_uncached_memory =
-                r.value("hide_uncached_memory")
-                    .and_then(|v| match v.value {
-                        Value::Bool(enabled) => Some(enabled),
-                        Value::Utf8(s) if s == "auto" => None,
-                        _ => {
-                            r.issue_at(
-                                v.span,
-                                "`hide_uncached_memory` must be true, false, or \"auto\"",
-                            );
-                            None
-                        }
-                    });
+                r.value("hide_uncached_memory").and_then(|v| match v.value {
+                    Value::Bool(enabled) => Some(enabled),
+                    Value::Utf8(s) if s == "auto" => None,
+                    _ => {
+                        r.issue_at(
+                            v.span,
+                            "`hide_uncached_memory` must be true, false, or \"auto\"",
+                        );
+                        None
+                    }
+                });
             let gpu = HostGpu {
                 name,
                 address: address.value,
