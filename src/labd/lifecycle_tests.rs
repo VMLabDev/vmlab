@@ -2807,6 +2807,179 @@ async fn a_freeze_point_restore_excludes_a_concurrent_destroy() {
     assert!(!machine.dirs.local.exists());
 }
 
+/// Review snapshots-2 F17, the freeze point, against the real plan: a disk
+/// that holds `vmlab-freeze-hold` refuses the restore, and the refusal comes
+/// before the stop.
+#[tokio::test]
+async fn a_freeze_point_restore_that_must_refuse_leaves_the_vm_running() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (lab, machine, _hv) = lab_at_a_freeze_point(&dirs).await;
+    let name = machine.name();
+    lab.start_machine(name).await.expect("start");
+    assert_eq!(machine.state().await, PowerState::Running);
+    qimg::snapshot_create(
+        &machine.dirs.primary_disk(),
+        crate::freeze::plan::HOLD_SNAPSHOT,
+    )
+    .await
+    .unwrap();
+
+    let error = lab
+        .restore(name, "base", false)
+        .await
+        .expect_err("a disk with the hold snapshot refuses the restore");
+    assert!(
+        format!("{error:#}").contains(crate::freeze::plan::HOLD_SNAPSHOT),
+        "{error:#}"
+    );
+    assert_eq!(
+        machine.state().await,
+        PowerState::Running,
+        "the machine was stopped for a restore that was then refused"
+    );
+    lab.stop_machine(name, true).await.unwrap();
+}
+
+/// Review snapshots-2 F17, the container: an offline restore whose scratch
+/// disk lacks the snapshot is refused before the stop, as a VM's is.
+#[tokio::test]
+async fn a_container_restore_that_cannot_apply_leaves_it_running() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(&dirs, WORKLOAD, Script::healthy());
+    // A real scratch disk, which holds no snapshot.
+    let scratch = ctr.dirs.scratch_disk();
+    std::fs::remove_file(&scratch).unwrap();
+    qimg::create_blank(&scratch, 1 << 20).await.unwrap();
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("start");
+    assert!(snapshot_names(&scratch).await.is_empty());
+    let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
+    let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
+    let m: Arc<dyn Machine> = ctr.clone();
+
+    let error = m
+        .clone()
+        .restore(lab, "s", false)
+        .await
+        .expect_err("the scratch disk holds no snapshot \"s\"");
+    assert_eq!(
+        ctr.state().await,
+        PowerState::Running,
+        "the container was stopped for a restore that could not be done: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("snapshot \"s\" is missing"),
+        "{error:#}"
+    );
+    ctr.stop(true).await.expect("stop");
+}
+
+/// A lab runtime over the one VM of [`LINUX_VM`].
+fn lab_of_the_vm(dirs: &Dirs, machine: &Arc<VmInstance>) -> Arc<super::lab::LabRuntime> {
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .unwrap();
+    super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap()
+}
+
+/// What `vmlab snapshot list` holds for `machine`, pending captures
+/// included.
+async fn listed_snapshots(lab: &super::lab::LabRuntime, machine: &str) -> Vec<serde_json::Value> {
+    lab.snapshots(machine)
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Review snapshots-2 F20: a VM that never started has no disk, so a capture
+/// of it fails before anything is written. It is a refusal by name, and it
+/// leaves no pending entry to clean up.
+#[tokio::test]
+async fn a_capture_of_a_never_started_vm_leaves_no_pending_entry() {
+    use crate::template::qimg::{Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (machine, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    // `vm` makes the primary disk; a VM that never started has none.
+    std::fs::remove_file(machine.dirs.primary_disk()).unwrap();
+    let lab = lab_of_the_vm(&dirs, &machine);
+
+    let error = lab.snapshot(machine.name(), "s").await.unwrap_err();
+    let listed = listed_snapshots(&lab, machine.name()).await;
+    assert!(listed.is_empty(), "{listed:?}");
+    assert!(
+        format!("{error:#}").contains("has never started"),
+        "{error:#}"
+    );
+}
+
+/// Review snapshots-2 F20: an offline capture under a name a disk already
+/// holds, which no record knows, is refused before anything is written. A
+/// pending entry would ask the user for a delete, and that delete removes
+/// the older snapshot.
+#[tokio::test]
+async fn an_offline_capture_under_a_name_a_disk_holds_leaves_no_pending_entry() {
+    use crate::template::qimg::{self, Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (machine, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let disk = machine.dirs.primary_disk();
+    std::fs::remove_file(&disk).unwrap();
+    qimg::create_blank(&disk, 1 << 20).await.unwrap();
+    qimg::snapshot_create(&disk, "s").await.unwrap();
+    let lab = lab_of_the_vm(&dirs, &machine);
+
+    let error = lab.snapshot(machine.name(), "s").await.unwrap_err();
+    let listed = listed_snapshots(&lab, machine.name()).await;
+    assert!(listed.is_empty(), "{listed:?}");
+    assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+    assert_eq!(snapshot_names(&disk).await, ["s"], "the older one stays");
+}
+
+/// Review snapshots-2 F20: what vmlab-hv refuses before it stops the guest
+/// comes back as `unsupported`. Nothing was written, so no pending entry
+/// stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_vmlab_hv_refuses_leaves_no_pending_entry() {
+    let dirs = Dirs::new();
+    let (machine, _hv) = vm(
+        &dirs,
+        LINUX_VM,
+        on_vmlab_hv(Script {
+            capabilities: Capabilities {
+                snapshots: true,
+                ..Capabilities::default()
+            },
+            snapshot_save_refused: Some("disk `disk0`: snapshot \"s\" already exists".into()),
+            ..Script::healthy()
+        }),
+    );
+    let (cbs, _observed) = callbacks();
+    start_vm(&machine, cbs).await.expect("start");
+    let lab = lab_of_the_vm(&dirs, &machine);
+
+    let error = lab.snapshot(machine.name(), "s").await.unwrap_err();
+    let listed = listed_snapshots(&lab, machine.name()).await;
+    assert!(listed.is_empty(), "{listed:?}");
+    let said = format!("{error:#}");
+    assert!(said.contains("already exists"), "{said}");
+    assert!(!said.contains("pending intent retained"), "{said}");
+    machine.stop(true).await.expect("stop");
+}
+
 /// A `firmware_dir` laid out like the bundled x86_64 set, each file holding
 /// its own name: the plain and secure-boot CODE builds, the blank VARS
 /// template and the one with keys enrolled. The four are the same length, as
