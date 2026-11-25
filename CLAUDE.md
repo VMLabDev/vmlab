@@ -56,7 +56,8 @@ restore takes the syncer off the workspace, rewinds, and puts it back owing a
 **re-seed**: a host-only, **digest-based** reconcile that emits no guest→host
 action at all, completes **before the watch reopens**, and replaces the
 stat-walk rather than following one; the first pass under the reopened watch
-lists the guest tree by name, for what the guest made while the re-seed ran. The note that a re-seed is owed, and the
+lists the guest tree by name, for what the guest made while the re-seed ran.
+The note that a re-seed is owed, and the
 halt a restore refuses on, both ride the **ledger**, because a restore does not
 need a running machine. Restore's refusal has the one escape flag in §19.6
 (`--discard-guest-changes`); capture's has none. **A stop takes a last pass**

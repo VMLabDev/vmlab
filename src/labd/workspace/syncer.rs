@@ -5938,7 +5938,9 @@ mod tests {
         let found = syncer.pass_now().await.unwrap();
         let report = syncer.pass_now().await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("late.rs")).ok().as_deref(),
+            std::fs::read_to_string(dir.path().join("late.rs"))
+                .ok()
+                .as_deref(),
             Some("written while the re-seed ran"),
             "the host never received the file the guest made during the re-seed: after the \
              first flush unsynced was {:?}, after the second {:?}",
