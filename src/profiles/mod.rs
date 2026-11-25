@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow};
 use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
 
 use crate::config::IssueList;
-use crate::config::block::{Reader, Unspan, finish};
+use crate::config::block::{Reader, Unspan, finish, place};
 
 pub const PROFILE_SCHEMA_WCL: &str = include_str!("profile_schema.wcl");
 pub const SHIPPED_PROFILES_WCL: &str = include_str!("shipped.wcl");
@@ -272,6 +272,7 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             out.push(p);
         }
     }
+    place(&doc, &mut issues, true);
     Ok(finish(name, source, issues, Some(out))?)
 }
 

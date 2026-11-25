@@ -243,6 +243,24 @@ impl HostConfig {
         Self::parse(&source, &path.display().to_string())
     }
 
+    /// [`HostConfig::load_default`] for a person-facing command that only
+    /// looks for a program to start (a viewer, a shared-app client) and has
+    /// nothing to refuse: a file that does not load is said on stderr, with
+    /// what it then runs on. Never silent: the defaults are not what the
+    /// file says.
+    pub fn load_default_or_warn() -> Self {
+        Self::or_warn(Self::load_default(), |warning| eprintln!("{warning}"))
+    }
+
+    fn or_warn(loaded: Result<Self>, warn: impl FnOnce(String)) -> Self {
+        loaded.unwrap_or_else(|e| {
+            warn(format!(
+                "warning: the host config is unreadable, so its defaults are used: {e:#}"
+            ));
+            Self::default()
+        })
+    }
+
     pub fn parse(source: &str, name: &str) -> Result<Self> {
         if !source.contains("import <vmlab-host.wcl>") {
             return Err(anyhow!(
@@ -411,11 +429,9 @@ impl HostConfig {
         }
         super::supersede(&mut issues, moved);
         // Preserve byte offsets and lines without retaining secret-bearing
-        // source excerpts in diagnostics.
-        let diagnostic_source: String = source
-            .bytes()
-            .map(|b| if b == b'\n' { '\n' } else { ' ' })
-            .collect();
+        // source excerpts in diagnostics, of this file or of one it imports.
+        super::block::place(&doc, &mut issues, false);
+        let diagnostic_source = super::sources::blank(source);
         Ok(finish(name, &diagnostic_source, issues, Some(cfg))?)
     }
 
@@ -1086,5 +1102,48 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
         assert!(text.contains("`keepawake` must be one of"), "{text}");
         assert!(text.contains(&format!("{}:9:", inc.display())), "{text}");
         assert!(!text.contains("config.wcl:"), "{text}");
+        // The host config holds secrets: no text of either file is kept.
+        let diag = err
+            .downcast_ref::<crate::config::block::IssueError>()
+            .expect("host config errors carry their issues")
+            .diagnostic();
+        for issue in &diag.issues {
+            let origin = issue.origin.as_ref().expect("in the imported file");
+            assert!(
+                origin.inner().chars().all(|c| c == ' ' || c == '\n'),
+                "{:?}",
+                origin.inner()
+            );
+        }
+    }
+
+    /// Review finding F17: where a command has nothing to refuse, a file
+    /// that does not load is said, with the mistake. Never silent.
+    #[test]
+    fn an_unreadable_host_config_is_said_where_the_defaults_are_used() {
+        let unreadable =
+            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "c.wcl");
+        let mut said = Vec::new();
+        let cfg = HostConfig::or_warn(unreadable, |w| said.push(w));
+        assert_eq!(cfg.trunk_port, HostConfig::default().trunk_port);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("warning: the host config is unreadable"), "{}", said[0]);
+        assert!(said[0].contains("trunk_port"), "{}", said[0]);
+
+        let mut said = Vec::new();
+        HostConfig::or_warn(Ok(HostConfig::default()), |w: String| said.push(w));
+        assert!(said.is_empty());
+    }
+
+    /// And `vmlab validate` reports it for every lab, not only for one with
+    /// a `gpu {}` or an Apple SMC.
+    #[test]
+    fn validation_refuses_an_unreadable_host_config() {
+        let unreadable =
+            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "c.wcl");
+        let error = crate::cli::validate::host_config(unreadable).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("the host config is unreadable"), "{text}");
+        assert!(text.contains("trunk_port"), "{text}");
     }
 }

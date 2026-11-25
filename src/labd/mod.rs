@@ -122,7 +122,8 @@ async fn run_async(lab: String, root: PathBuf) -> Result<()> {
 
     // Select the network fast-path tier (PRD §9.1) before the runtime builds
     // any switches; the host config is reused for the disk watchdog below.
-    let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+    let host_cfg = crate::config::host::HostConfig::load_default()
+        .context("the host config is unreadable")?;
     crate::net::fastpath::init(host_cfg.fastpath);
 
     let profiles = crate::profiles::ProfileSet::load_default()?;

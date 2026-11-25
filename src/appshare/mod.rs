@@ -126,7 +126,7 @@ impl HostEnv {
     /// set, else `waypipe`, then `xfreerdp3` and `xfreerdp`, on `PATH`.
     pub fn detect() -> Self {
         let set = |var| std::env::var_os(var).is_some_and(|v| !v.is_empty());
-        let cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+        let cfg = crate::config::host::HostConfig::load_default_or_warn();
         Self {
             wayland: set("WAYLAND_DISPLAY"),
             x11: set("DISPLAY"),

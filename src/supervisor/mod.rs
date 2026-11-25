@@ -147,7 +147,12 @@ async fn run_async() -> Result<()> {
     let guard = crate::proto::server::SocketGuard::acquire(&sock)
         .context("a supervisor is already running")?;
 
-    let host_cfg = crate::config::host::HostConfig::load_default().unwrap_or_default();
+    // An unreadable host config is not the defaults: this process reads it
+    // one time and outlives every lab, so it would serve the global segments
+    // without the file's PSK, DNS suffix and upstream resolver until it is
+    // restarted, whatever the user corrects in between.
+    let host_cfg = crate::config::host::HostConfig::load_default()
+        .context("the host config is unreadable")?;
     // Select the network fast-path tier (PRD §9.1) before any switch exists —
     // the global segments this daemon hosts pick it up from here.
     crate::net::fastpath::init(host_cfg.fastpath);

@@ -7,6 +7,7 @@ pub mod host;
 pub mod hypervisor;
 pub mod model;
 pub mod projection;
+pub(crate) mod sources;
 pub mod validate;
 
 use std::path::Path;
@@ -33,6 +34,12 @@ pub struct Issue {
     pub message: String,
     #[label]
     pub span: Option<miette::SourceSpan>,
+    /// The imported file the issue is in, with the text an excerpt is taken
+    /// from. `None` for the top file, whose text the list of issues carries.
+    /// A loader sets it ([`sources::Sources::place`]): until then `span` is
+    /// an address among all the files of the document.
+    #[source_code]
+    pub origin: Option<NamedSource<String>>,
 }
 
 impl Issue {
@@ -40,6 +47,7 @@ impl Issue {
         Self {
             message: message.into(),
             span: None,
+            origin: None,
         }
     }
 
@@ -50,6 +58,7 @@ impl Issue {
                 span.0.into(),
                 span.1.saturating_sub(span.0),
             )),
+            origin: None,
         }
     }
 }
@@ -111,37 +120,80 @@ fn open(source: &str, name: &str, base_dir: Option<&Path>) -> Result<Document, C
 /// is blanked whole.
 pub fn diagnostic_source(source: &str, name: &str, root: &Path) -> String {
     match open(source, name, Some(root)) {
-        Ok(doc) => redacted_source(source, &doc),
+        Ok(doc) => redacted_source(&doc),
         Err(_) => blank_source(source),
     }
 }
 
 /// `source` with nothing left but its line breaks.
 fn blank_source(source: &str) -> String {
-    source
-        .bytes()
-        .map(|b| if b == b'\n' { '\n' } else { ' ' })
-        .collect()
+    sources::blank(source)
 }
 
 /// [`diagnostic_source`] for a file that is open already.
-fn redacted_source(source: &str, doc: &Document) -> String {
+fn redacted_source(doc: &Document) -> String {
+    redacted_sources(doc, &sources::Sources::of(doc)).swap_remove(0)
+}
+
+/// The text of every file of `doc`, the top file first, with every secret
+/// starred out in the file that declares it.
+fn redacted_sources(doc: &Document, files: &sources::Sources) -> Vec<String> {
     let mut fields = Vec::new();
     for block in doc.blocks() {
         secret_fields(&block, &mut fields);
     }
-    let mut out = source.as_bytes().to_vec();
+    let texts = files.texts();
+    let mut out: Vec<Vec<u8>> = texts.iter().map(|t| t.as_bytes().to_vec()).collect();
     for (name, span) in fields {
-        let (start, end) = secret_value(source, name, span);
-        for b in &mut out[start..end] {
+        // A field in no file of the document has no text to star.
+        let Some((file, offset)) = files.locate(span.0) else {
+            continue;
+        };
+        let local = (offset, offset + span.1.saturating_sub(span.0));
+        let (start, end) = secret_value(&texts[file], name, local);
+        for b in &mut out[file][start..end] {
             if *b != b'\n' {
                 *b = b'*';
             }
         }
     }
-    // Whole characters were replaced by ASCII, so this cannot fail. A blank
-    // source is the safe answer if it ever does.
-    String::from_utf8(out).unwrap_or_else(|_| blank_source(source))
+    // Whole characters were replaced by ASCII, so the conversion cannot fail.
+    // A blank text is the safe answer if it ever does.
+    out.into_iter()
+        .zip(&texts)
+        .map(|(bytes, text)| String::from_utf8(bytes).unwrap_or_else(|_| blank_source(text)))
+        .collect()
+}
+
+/// The issues about the document `doc`, renderable: each one placed in the
+/// file it is in, with no password and no secret value in any excerpt.
+fn config_errors(name: &str, doc: &Document, mut issues: IssueList) -> ConfigErrors {
+    let files = sources::Sources::of(doc);
+    let mut shown = redacted_sources(doc, &files);
+    files.place(&mut issues, &shown);
+    ConfigErrors {
+        name: name.to_string(),
+        src: NamedSource::new(name, shown.swap_remove(0)),
+        issues,
+    }
+}
+
+/// Issues a later pass raised about the lab file `source` (the validation
+/// pass, which works on the model), renderable against the files they are
+/// in. A file that does not parse has no position to give and no field to
+/// find: its issues lose their spans and its text is blanked whole.
+pub fn diagnostic(source: &str, name: &str, root: &Path, issues: IssueList) -> ConfigErrors {
+    match open(source, name, Some(root)) {
+        Ok(doc) => config_errors(name, &doc, issues),
+        Err(_) => ConfigErrors {
+            name: name.to_string(),
+            src: NamedSource::new(name, blank_source(source)),
+            issues: issues
+                .into_iter()
+                .map(|issue| Issue::new(issue.message))
+                .collect(),
+        },
+    }
 }
 
 /// The fields under `block` that hold a secret, by name and span: any
@@ -187,13 +239,20 @@ fn secret_value(source: &str, name: &str, span: model::Span) -> (usize, usize) {
 /// Schema violations as positioned issues, so a caller can accumulate them
 /// alongside the ones [`block::Reader`] raises.
 pub(crate) fn schema_issues(doc: &Document) -> IssueList {
+    let files = sources::Sources::of(doc);
     doc.schema_errors()
         .into_iter()
         .map(|e| {
-            let span = e.labels().and_then(|mut it| it.next()).map(|l| *l.inner());
+            // The label counts in the file the error is in.
+            let base = e.origin().map_or(0, |origin| files.base_of(&origin));
+            let span = e
+                .labels()
+                .and_then(|mut it| it.next())
+                .map(|l| miette::SourceSpan::new((l.offset() + base).into(), l.len()));
             Issue {
                 message: e.to_string(),
                 span,
+                origin: None,
             }
         })
         .collect()
@@ -225,11 +284,7 @@ pub fn load_lab_source(source: &str, name: &str, root: &Path) -> Result<LabFile,
     let lab = extract::extract_lab_file(&doc, root, &mut issues);
     match lab {
         Some(lab) if issues.is_empty() => Ok(lab),
-        _ => Err(ConfigErrors {
-            name: name.to_string(),
-            src: NamedSource::new(name, redacted_source(source, &doc)),
-            issues,
-        }),
+        _ => Err(config_errors(name, &doc, issues)),
     }
 }
 
@@ -326,11 +381,7 @@ pub fn load_template_source(
     if issues.is_empty() {
         Ok(tf)
     } else {
-        Err(ConfigErrors {
-            name: name.to_string(),
-            src: NamedSource::new(name, redacted_source(source, &doc)),
-            issues,
-        })
+        Err(config_errors(name, &doc, issues))
     }
 }
 
@@ -1244,7 +1295,7 @@ lab "l" {
 
     fn redacted(source: &str) -> String {
         let doc = open(source, "<test>", None).expect("the source parses");
-        redacted_source(source, &doc)
+        redacted_source(&doc)
     }
 
     #[test]
@@ -1314,11 +1365,67 @@ lab "l" {
         let root = tempfile::tempdir().unwrap();
         let src = lab_with_a_faulty_import(root.path());
         let err = load_lab_source(&src, "vmlab.wcl", root.path()).unwrap_err();
+        assert!(!err.issues.is_empty());
+        for issue in &err.issues {
+            let Some(span) = issue.span else { continue };
+            let text = match &issue.origin {
+                Some(origin) => origin.inner().as_str(),
+                None => err.src.inner().as_str(),
+            };
+            assert!(
+                span.offset() + span.len() <= text.len(),
+                "{} at {span:?} is outside its file of {} bytes",
+                issue.message,
+                text.len()
+            );
+        }
+        let bogus = err
+            .issues
+            .iter()
+            .find(|i| i.message.contains("bogus"))
+            .expect("the mistake in the imported file is reported");
+        let origin = bogus.origin.as_ref().expect("placed in the imported file");
+        assert!(origin.name().ends_with("inc.wcl"), "{}", origin.name());
+        let span = bogus.span.expect("positioned");
+        assert!(
+            origin.inner()[span.offset()..].starts_with("arch = "),
+            "{:?}",
+            &origin.inner()[span.offset()..]
+        );
         // The report shows the imported file, and no password of either file.
         let report = format!("{:?}", miette::Report::new(err));
         assert!(report.contains("inc.wcl"), "{report}");
         assert!(report.contains("arch = \"bogus\""), "{report}");
         assert!(!report.contains("OutOfBounds"), "{report}");
         assert!(!report.contains("hunter2"), "{report}");
+    }
+
+    /// The same for an issue a later pass raises from a span the model kept:
+    /// the validation pass reports against a second open of the lab file.
+    #[test]
+    fn a_span_the_model_kept_from_an_imported_file_is_placed_in_that_file() {
+        let root = tempfile::tempdir().unwrap();
+        let src = lab_with_a_faulty_import(root.path());
+        let inc = root.path().join("inc.wcl");
+        let fixed = std::fs::read_to_string(&inc)
+            .unwrap()
+            .replace("bogus", "x86_64");
+        std::fs::write(&inc, &fixed).unwrap();
+        let lab = load_lab_source(&src, "vmlab.wcl", root.path()).expect("loads");
+        let template = lab.templates.first().expect("the imported template");
+        let issues = vec![
+            Issue::at(template.span, "about the template"),
+            Issue::at(lab.lab.span, "about the lab"),
+        ];
+        let err = diagnostic(&src, "vmlab.wcl", root.path(), issues);
+        let origin = err.issues[0].origin.as_ref().expect("in the imported file");
+        assert!(origin.name().ends_with("inc.wcl"), "{}", origin.name());
+        let span = err.issues[0].span.expect("positioned");
+        assert_eq!(span.offset(), fixed.find("template \"t\"").unwrap());
+        assert!(!origin.inner().contains("hunter2"), "{}", origin.inner());
+        // An issue in the top file stays where it was.
+        assert!(err.issues[1].origin.is_none());
+        let span = err.issues[1].span.expect("positioned");
+        assert_eq!(span.offset(), src.find("lab \"l\"").unwrap());
     }
 }
