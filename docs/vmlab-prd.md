@@ -2094,7 +2094,17 @@ proportion with a floor (a fixed count punishes large repos; a bare proportion
 lets a ten-file project lose everything). This exists not for deliberate deletion
 but for the guest doing something catastrophic and the syncer faithfully
 replicating it onto the canonical copy. A single deletion still propagates
-immediately; the guard is about mass.
+immediately; the guard is about mass. **The mass is a deletion's, not a pass's.**
+A pass sees only the removals whose events have settled, so an `rm -rf` still
+running arrives in parts; counted a pass at a time, each part of half the ledger
+or less would go through and shrink the number the next part is measured
+against. So the count runs from when the guest starts deleting until it has
+deleted nothing for a hold period: what earlier passes carried out is added to
+the removals and to the agreement they are a proportion of. And past the floor,
+removals still under the proportion are **held, not carried out**, until the
+guest has stopped — a deferral, not a halt — so a deletion in progress is judged
+whole, before any of it reaches the host. A verb's pass (`flush`, a capture's
+pre-flight, `down`) holds nothing: it carries the removals out or halts on them.
 
 **An absence nothing saw is not a deletion** (#190). The mass guard is about
 deletions somebody made; this is about a path the guest merely does not hold

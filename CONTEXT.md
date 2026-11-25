@@ -633,7 +633,9 @@ The threshold — a proportion of the ledger, with a floor — past which
 **guest→host** deletions are withheld and the workspace halts. Asymmetric on
 purpose: the guest copy is reconstructible and the canonical one is not, so
 host→guest deletes are unguarded. About mass, not about deletion: a single
-deletion propagates immediately.
+deletion propagates immediately. The mass is counted over one run of guest
+deletions, not over one pass, and past the floor a removal waits for the guest
+to stop deleting before it is carried out.
 _Avoid_: delete protection, safety limit
 
 **Volume warning**:
