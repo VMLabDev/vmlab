@@ -169,9 +169,17 @@ fn evaluated(
 // ---- the extractor ---------------------------------------------------------
 
 /// Span of a block, for a caller holding the block rather than a reader.
+///
+/// Like every span this module hands out, it is an address among all the
+/// files of the document ([`sources`](super::sources)): a block of an
+/// imported file is not at its offsets in the top file.
 pub fn span_of(b: &Block) -> Span {
-    let s = b.span();
-    (s.start, s.end)
+    based(super::sources::base(b), b.span())
+}
+
+/// A span WCL gives, as an address among all the files of the document.
+fn based(base: usize, s: wcl_lang::Span) -> Span {
+    (s.start + base, s.end + base)
 }
 
 /// Typed, span-carrying, issue-accumulating access to one WCL block.
@@ -181,11 +189,18 @@ pub fn span_of(b: &Block) -> Span {
 pub struct Reader<'b, 'i> {
     block: &'b Block<'b>,
     issues: &'i mut IssueList,
+    /// Where the file that declares the block starts among the files of the
+    /// document: what every span read through this reader is moved by.
+    base: usize,
 }
 
 impl<'b, 'i> Reader<'b, 'i> {
     pub fn new(block: &'b Block<'b>, issues: &'i mut IssueList) -> Self {
-        Self { block, issues }
+        Self {
+            block,
+            issues,
+            base: super::sources::base(block),
+        }
     }
 
     // ---- the block itself --------------------------------------------
@@ -198,7 +213,7 @@ impl<'b, 'i> Reader<'b, 'i> {
     /// Span of the whole block — where an issue about the block as a unit
     /// (a missing required field, a contradiction between two fields) goes.
     pub fn span(&self) -> Span {
-        span_of(self.block)
+        based(self.base, self.block.span())
     }
 
     /// Whether the field is written at all. Distinguishes "unset, take the
@@ -210,7 +225,7 @@ impl<'b, 'i> Reader<'b, 'i> {
     /// Span of the field as written, when it is.
     pub fn field_span(&self, name: &str) -> Option<Span> {
         let field = self.block.field(name)?;
-        Some((field.span().start, field.span().end))
+        Some(based(self.base, field.span()))
     }
 
     /// The block's first label, as a name. A block that needs a label and
@@ -254,6 +269,7 @@ impl<'b, 'i> Reader<'b, 'i> {
         Some(DecoratorReader {
             decorator,
             issues: self.issues,
+            base: self.base,
         })
     }
 
@@ -288,7 +304,7 @@ impl<'b, 'i> Reader<'b, 'i> {
     /// reports an issue).
     pub fn value(&mut self, name: &str) -> Option<Spanned<Value>> {
         let field = self.block.field(name)?;
-        let span = (field.span().start, field.span().end);
+        let span = based(self.base, field.span());
         evaluated(name, span, field.value().cloned(), self.issues)
     }
 
@@ -577,6 +593,8 @@ impl<'b, 'i> Reader<'b, 'i> {
 pub struct DecoratorReader<'b, 'i> {
     decorator: wcl_lang::Decorator<'b>,
     issues: &'i mut IssueList,
+    /// As [`Reader`]'s: a decorator is in the file of its block.
+    base: usize,
 }
 
 impl DecoratorReader<'_, '_> {
@@ -584,8 +602,7 @@ impl DecoratorReader<'_, '_> {
     /// goes, and what the model records so a later diagnostic can point at
     /// `@dev(…)` rather than at the machine block around it.
     pub fn span(&self) -> Span {
-        let s = self.decorator.span();
-        (s.start, s.end)
+        based(self.base, self.decorator.span())
     }
 
     /// One named argument's evaluated value. `None` for an argument that is
@@ -593,7 +610,7 @@ impl DecoratorReader<'_, '_> {
     /// reports an issue).
     pub fn value(&mut self, name: &str) -> Option<Spanned<Value>> {
         let arg = self.decorator.named().find(|a| a.name() == name)?;
-        let span = (arg.span().start, arg.span().end);
+        let span = based(self.base, arg.span());
         evaluated(name, span, arg.value(), self.issues)
     }
 
@@ -641,8 +658,26 @@ impl IssueError {
     }
 }
 
+/// Give each issue of `doc` its position in the file it is in, ahead of
+/// [`finish`]: an issue about something an imported file declares names that
+/// file and is counted in its text. `show_text` says whether an excerpt of
+/// an imported file may be shown. A file family that holds secrets says no,
+/// and gets the position without the text.
+pub fn place(doc: &wcl_lang::Document, issues: &mut IssueList, show_text: bool) {
+    let files = super::sources::Sources::of(doc);
+    let shown = if show_text {
+        files.texts()
+    } else {
+        files.blank_texts()
+    };
+    files.place(issues, &shown);
+}
+
 /// Turn one pass's accumulated issues into a `Result`: the extracted value
 /// when nothing went wrong, else one error carrying every issue.
+///
+/// The issues are placed already ([`place`]): `source` is the top file's
+/// text, and an issue in another file carries its own.
 ///
 /// This is the shape all four call sites share once their field mapping is
 /// done, so it lives here rather than being written out four times.
@@ -678,6 +713,12 @@ pub fn finish<T>(
 pub fn render_issues(name: &str, source: &str, issues: &[Issue]) -> String {
     let mut out = format!("{} error(s) in {name}", issues.len());
     for issue in issues {
+        // An issue in an imported file is named by that file and counted in
+        // its text, not in the top file's.
+        let (name, source) = match &issue.origin {
+            Some(origin) => (origin.name(), origin.inner().as_str()),
+            None => (name, source),
+        };
         let where_ = match issue.span {
             Some(span) => {
                 let (line, col) = line_col(source, span.offset());
@@ -692,7 +733,13 @@ pub fn render_issues(name: &str, source: &str, issues: &[Issue]) -> String {
 
 /// 1-based line and column of a byte offset.
 fn line_col(source: &str, offset: usize) -> (usize, usize) {
-    let upto = &source[..offset.min(source.len())];
+    // An offset past the text, or inside a character, is not a reason to
+    // panic while reporting an error: count up to the character it is in.
+    let mut offset = offset.min(source.len());
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let upto = &source[..offset];
     let line = upto.matches('\n').count() + 1;
     let col = upto
         .rsplit_once('\n')
@@ -1192,5 +1239,23 @@ mod tests {
         assert_eq!(line_col("a\nbc", 3), (2, 2));
         // Past the end clamps rather than panicking.
         assert_eq!(line_col("a\n", 99), (2, 1));
+    }
+
+    /// An offset inside a character counts up to that character. Reporting
+    /// an error never panics on a position (review finding F18).
+    #[test]
+    fn line_col_takes_an_offset_inside_a_character() {
+        assert_eq!(line_col("a\n\u{e9}\u{e9}b", 3), (2, 1));
+        assert_eq!(line_col("a\n\u{e9}\u{e9}b", 5), (2, 2));
+    }
+
+    #[test]
+    fn render_names_the_imported_file_an_issue_is_in() {
+        let mut issue = Issue::at((4, 7), "in the import");
+        issue.origin = Some(NamedSource::new("inc.wcl", "x\ny\n\nz = 1".to_string()));
+        assert_eq!(
+            render_issues("f.wcl", "one", &[issue]),
+            "1 error(s) in f.wcl\n  inc.wcl:3:1: in the import"
+        );
     }
 }

@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow};
 use wcl_lang::{Block, Document, Environment, Registry, disk_loader};
 
 use crate::config::IssueList;
-use crate::config::block::{Reader, Unspan, finish};
+use crate::config::block::{Reader, Unspan, finish, place};
 
 pub const PROFILE_SCHEMA_WCL: &str = include_str!("profile_schema.wcl");
 pub const SHIPPED_PROFILES_WCL: &str = include_str!("shipped.wcl");
@@ -272,6 +272,7 @@ fn parse_profiles(source: &str, name: &str) -> Result<Vec<Profile>> {
             out.push(p);
         }
     }
+    place(&doc, &mut issues, true);
     Ok(finish(name, source, issues, Some(out))?)
 }
 
@@ -845,5 +846,33 @@ profile "freebsd" { machine = "q35" firmware = "seabios" }
         std::fs::write(tmp.path().join("noimport.wcl"), "profile \"x\" { }\n").unwrap();
         let err = ProfileSet::load(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("vmlab-profile.wcl"));
+    }
+
+    /// Review finding F18: a span in an imported file counts in that file.
+    /// Applied to this file, whose second line is longer in bytes than in
+    /// characters, the offset is inside a character.
+    #[test]
+    fn an_issue_in_an_imported_profile_file_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc.wcl");
+        std::fs::write(
+            &inc,
+            "import <vmlab-profile.wcl>\nprofile \"p\" { machine = \"bogus\" }\n",
+        )
+        .unwrap();
+        let top = format!(
+            "import <vmlab-profile.wcl>\n// {}\nimport \"{}\"\nprofile \"q\" {{ }}\n",
+            "\u{e9}".repeat(40),
+            inc.display()
+        );
+        let err = parse_profiles(&top, "main.wcl").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("`machine` must be one of"), "{text}");
+        // In the imported file, at the line and column it is on there.
+        assert!(
+            text.contains(&format!("{}:2:15: ", inc.display())),
+            "{text}"
+        );
+        assert!(!text.contains("main.wcl:"), "{text}");
     }
 }
