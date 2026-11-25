@@ -55,13 +55,19 @@ impl Workers {
 
     /// Note the running children of `servers`.
     pub(super) fn note(&mut self, servers: &[u32]) {
-        for &server in servers {
-            for pid in children(&self.proc, server) {
-                if let Some(stat) = Stat::read(&self.proc, pid) {
-                    self.known.insert((pid, stat.start));
-                }
-            }
-        }
+        let found = running(&self.proc, servers);
+        self.add(found);
+    }
+
+    /// Note workers that [`running`] found. A context create looks for
+    /// them without the device lock and notes them under it.
+    pub(super) fn add(&mut self, found: Vec<(u32, u64)>) {
+        self.known.extend(found);
+    }
+
+    /// Where [`running`] must look for this set.
+    pub(super) fn proc(&self) -> &Path {
+        &self.proc
     }
 
     /// Wait at most `timeout` until every noted worker has exited, and
@@ -83,6 +89,23 @@ impl Workers {
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// Number and start time of each running child of `servers`, in `proc`.
+///
+/// This reads the `stat` file of every process of the host, which takes 5
+/// to 17 ms on a host with a few thousand. It needs no device lock, and a
+/// caller on the path of a vCPU must not hold one meanwhile.
+pub(super) fn running(proc: &Path, servers: &[u32]) -> Vec<(u32, u64)> {
+    let mut found = Vec::new();
+    for &server in servers {
+        for pid in children(proc, server) {
+            if let Some(stat) = Stat::read(proc, pid) {
+                found.push((pid, stat.start));
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -122,6 +145,10 @@ pub(super) mod tests {
         proc_entry(&proc, 30, 'S', 1, 300);
         let mut workers = Workers::at(&proc, Duration::ZERO);
         workers.note(&[10]);
+        assert_eq!(workers.wait(Duration::ZERO), Err(vec![20, 21]));
+        // What a context create finds without the device lock is the same.
+        assert_eq!(running(workers.proc(), &[10]), [(20, 200), (21, 210)]);
+        workers.add(vec![(20, 200)]);
         assert_eq!(workers.wait(Duration::ZERO), Err(vec![20, 21]));
 
         // A zombie has exited; a number taken by a later process is not

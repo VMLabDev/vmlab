@@ -1040,3 +1040,156 @@ fn a_reset_is_acknowledged_only_after_the_render_workers_have_exited() {
     assert_eq!(status(&mut pci), 1);
     std::fs::remove_dir_all(&proc).unwrap();
 }
+
+fn ctx_create(ctx: u32) -> Vec<u8> {
+    // The header, then the name length, the context type and a 64-byte name.
+    let mut request = command(CMD_CTX_CREATE, &[0, 0]);
+    request[16..20].copy_from_slice(&ctx.to_le_bytes());
+    request.resize(96, 0);
+    request
+}
+
+/// A device whose slow part of a context create waits for a word from the
+/// test, and answers with it.
+fn slow_fixture() -> (
+    QueueFixture,
+    std::sync::mpsc::Sender<Result<(u32, Vec<u8>), u32>>,
+) {
+    let f = QueueFixture::new(FEATURES);
+    let (answer, answers) = std::sync::mpsc::channel();
+    let answers = parking_lot::Mutex::new(answers);
+    f.gpu.state.lock().slow = Some(Arc::new(move |_| answers.lock().recv().unwrap()));
+    (f, answer)
+}
+
+fn wait_for(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Card #912: a context create took 5 to 17 ms on the vCPU thread that
+/// kicked the queue, most of it the look for its render worker, and the
+/// guest answered its sound card's period interrupt too late meanwhile.
+#[test]
+fn a_context_create_leaves_the_kicking_thread_and_holds_the_commands_behind_it() {
+    let (mut f, answer) = slow_fixture();
+    f.put(0, &ctx_create(1), 24);
+    f.put(2, &display_info(), 408);
+    // The kick returns while the context is still being made.
+    f.notify();
+    assert_eq!(f.used(), 0);
+    assert!(f.gpu.state.lock().deferred.is_some());
+    assert_eq!(f.response(0, 24), vec![0xee; 24]);
+
+    // A later kick does not pass the create either: the queue keeps its order.
+    f.put(4, &display_info(), 408);
+    f.notify();
+    assert_eq!(f.used(), 0);
+    assert!(f.interrupt.0.lock().is_empty());
+
+    answer.send(Ok((NODATA, Vec::new()))).unwrap();
+    wait_for(
+        "the create and both commands behind it are answered",
+        || f.used() == 3 && f.gpu.state.lock().deferred.is_none(),
+    );
+    assert_eq!(f.used_entry(0), (0, 24));
+    assert_eq!(u32_at(&f.response(0, 24), 0), NODATA);
+    assert_eq!(f.used_entry(1).0, 2);
+    assert_eq!(u32_at(&f.response(2, 24), 0), 0x1101);
+    assert_eq!(f.used_entry(2).0, 4);
+    assert!(!f.interrupt.0.lock().is_empty(), "the guest is interrupted");
+
+    // The queue is served on the kick again.
+    f.put(6, &display_info(), 408);
+    f.notify();
+    assert_eq!(f.used(), 4);
+}
+
+/// A guest makes two contexts for one process, one behind the other.
+#[test]
+fn context_creates_in_a_row_are_answered_in_order() {
+    let (mut f, answer) = slow_fixture();
+    f.put(0, &ctx_create(1), 24);
+    f.put(2, &ctx_create(2), 24);
+    f.put(4, &display_info(), 408);
+    f.notify();
+    assert_eq!(f.used(), 0);
+    answer.send(Ok((NODATA, Vec::new()))).unwrap();
+    wait_for("the first create is answered", || f.used() == 1);
+    // The second holds the queue now, on the same thread.
+    assert!(f.gpu.state.lock().deferred.is_some());
+    assert_eq!(f.response(2, 24), vec![0xee; 24]);
+    // The renderer refuses it: the guest gets the error and the queue goes on.
+    answer.send(Err(INVALID)).unwrap();
+    wait_for(
+        "the second create and the command behind it are answered",
+        || f.used() == 3 && f.gpu.state.lock().deferred.is_none(),
+    );
+    assert_eq!([f.used_entry(0), f.used_entry(1)], [(0, 24), (2, 24)]);
+    assert_eq!(u32_at(&f.response(0, 24), 0), NODATA);
+    assert_eq!(u32_at(&f.response(2, 24), 0), INVALID);
+    assert_eq!(f.used_entry(2).0, 4);
+}
+
+/// A fenced create carries its fence header back, as an answer made on the
+/// kicking thread does.
+#[test]
+fn a_deferred_create_answers_with_its_fence_header() {
+    let (mut f, answer) = slow_fixture();
+    let mut request = ctx_create(3);
+    request[4..8].copy_from_slice(&1u32.to_le_bytes());
+    request[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    f.put(0, &request, 24);
+    f.notify();
+    answer.send(Ok((NODATA, Vec::new()))).unwrap();
+    wait_for("the create is answered", || f.used() == 1);
+    let response = f.response(0, 24);
+    assert_eq!(u32_at(&response, 0), NODATA);
+    assert_eq!(response[4..24], request[4..24]);
+}
+
+/// A reset waits for the renderer's part of the command, so that it cannot
+/// land in a renderer the reset has emptied, and drops its answer with the
+/// queue.
+#[test]
+fn a_reset_waits_for_a_deferred_create_and_drops_its_answer() {
+    let (mut f, answer) = slow_fixture();
+    f.put(0, &ctx_create(1), 24);
+    f.notify();
+    assert!(f.gpu.state.lock().deferred.is_some());
+    let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender = {
+        let landed = landed.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            landed.store(true, std::sync::atomic::Ordering::SeqCst);
+            answer.send(Ok((NODATA, Vec::new()))).unwrap();
+        })
+    };
+    f.gpu.reset();
+    assert!(
+        landed.load(std::sync::atomic::Ordering::SeqCst),
+        "the reset returned before the command ended"
+    );
+    sender.join().unwrap();
+    assert!(f.gpu.state.lock().deferred.is_none());
+    // The thread of the command finds its chain gone.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(f.used(), 0);
+    assert_eq!(f.response(0, 24), vec![0xee; 24]);
+    assert!(f.interrupt.0.lock().is_empty());
+}
+
+/// Only the control queue's context create is deferred: a device without a
+/// renderer answers it on the kick, as it answers everything.
+#[test]
+fn a_device_without_a_renderer_defers_nothing() {
+    let mut f = QueueFixture::new(FEATURES);
+    f.put(0, &ctx_create(1), 24);
+    f.notify();
+    assert_eq!(f.used(), 1);
+    assert!(f.gpu.state.lock().deferred.is_none());
+}
