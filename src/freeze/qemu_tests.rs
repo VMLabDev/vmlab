@@ -180,7 +180,9 @@ async fn freeze(lab: &Lab, names: &[&str], generation: u32, snapshot: &str) -> a
 
 async fn point_restore(disk: &Path, machine: &str, snapshot: &str, generation: u32) {
     let facts = disk_facts(disk).await.unwrap().unwrap();
-    let plan = plan::plan_point_restore(machine, snapshot, generation, &[facts]).unwrap();
+    let disks = [facts];
+    let firmware = super::inspect::firmware_facts(disk.parent().unwrap(), &disks);
+    let plan = plan::plan_point_restore(machine, snapshot, generation, &disks, &firmware).unwrap();
     let applied = execute(plan).await.unwrap();
     assert!(applied.finish().await.is_empty());
 }

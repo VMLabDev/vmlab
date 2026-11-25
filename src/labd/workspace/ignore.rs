@@ -129,9 +129,28 @@ pub struct Ignores {
 const SYMLINK_REFUSED: &str =
     "host: a rule file that is a symlink is never read, so its rules do not apply";
 
+/// The most bytes one rule file may hold and still be read as rules.
+///
+/// A rule file is the guest's to write: it syncs guest to host and the host
+/// reads it on the next pass. Without a bound the only limit is the size guard
+/// on the file itself, and every line costs the host on every pass (review
+/// labd-sync-2 F18). A hand-written `.gitignore` is a few kilobytes.
+pub const MAX_RULE_FILE_BYTES: u64 = 512 * 1024;
+/// The most lines one rule file may hold and still be read as rules.
+pub const MAX_RULE_FILE_LINES: usize = 8192;
+/// The most prefixes [`Ignores::prune_list`] examines and so the most it
+/// returns. The bound on one rule file does not bound the list, because every
+/// directory may hold a rule file of its own.
+pub const MAX_PRUNE_PREFIXES: usize = 4096;
+/// How many refused lines of one rule file are named. The rest are counted.
+const NAMED_LINES: usize = 3;
+
 /// What opening one rule file found.
 enum RuleFile {
     Read(Vec<u8>),
+    /// A regular file over [`MAX_RULE_FILE_BYTES`] or
+    /// [`MAX_RULE_FILE_LINES`]. Reading stopped at the bound.
+    TooLarge(String),
     Absent,
     /// The name is a symlink. Its target was not opened.
     Symlink,
@@ -161,6 +180,9 @@ fn not_a_file(kind: std::fs::FileType) -> Option<&'static str> {
 /// and a FIFO or a device may never end. The open does not block and the
 /// opened handle is checked again, so a FIFO put there after the first check
 /// is not waited on either.
+///
+/// At most [`MAX_RULE_FILE_BYTES`] and one byte are read, whatever the file's
+/// length says: the length is read before the bytes and the file can grow.
 fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
     use std::io::Read;
     match std::fs::symlink_metadata(file) {
@@ -181,7 +203,7 @@ fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
         let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
         options.custom_flags(flags.bits() as i32);
     }
-    let mut opened = match options.open(file) {
+    let opened = match options.open(file) {
         Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RuleFile::Absent),
         Err(e) => {
@@ -202,7 +224,25 @@ fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
         return Ok(RuleFile::NotAFile(why));
     }
     let mut bytes = Vec::new();
-    opened.read_to_end(&mut bytes)?;
+    opened
+        .take(MAX_RULE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RULE_FILE_BYTES {
+        return Ok(RuleFile::TooLarge(format!(
+            "host: a rule file over {MAX_RULE_FILE_BYTES} bytes is not read, so its rules do not \
+             apply"
+        )));
+    }
+    // `str::lines` ends a line at `\n`, so this is the count it would give
+    // or one more, without decoding the file first.
+    if bytes.iter().filter(|b| **b == b'\n').count() >= MAX_RULE_FILE_LINES
+        && String::from_utf8_lossy(&bytes).lines().count() > MAX_RULE_FILE_LINES
+    {
+        return Ok(RuleFile::TooLarge(format!(
+            "host: a rule file over {MAX_RULE_FILE_LINES} lines is not read, so its rules do not \
+             apply"
+        )));
+    }
     Ok(RuleFile::Read(bytes))
 }
 
@@ -267,6 +307,17 @@ impl Ignores {
     /// a socket — is the same named refusal and not an error. It holds no
     /// rules to lose, and a guest makes one with `mkdir`: failing on it would
     /// fail every pass before the guest is looked at (review labd-sync F9).
+    ///
+    /// **A rule file over the bound** ([`MAX_RULE_FILE_BYTES`],
+    /// [`MAX_RULE_FILE_LINES`]) is the same named refusal: none of its rules
+    /// apply, and the pass says so (review labd-sync-2 F18).
+    ///
+    /// **A line the glob parser refuses is skipped, and the file's other
+    /// lines apply.** The parser refuses lines git reads — a trailing
+    /// backslash, an unbalanced brace, a reversed range — so an error here
+    /// would stop a repository git handles, on every pass, and a guest can
+    /// write such a line (review labd-sync-2 F17). The file and the line
+    /// numbers are kept in [`refused`](Ignores::refused).
     pub fn read_dir_rules(&mut self, root: &Path, rel: &str) -> Result<()> {
         let dir = if rel.is_empty() {
             root.to_path_buf()
@@ -291,14 +342,40 @@ impl Ignores {
                     self.refused.push((join_rel(rel, name), why.to_string()));
                     continue;
                 }
+                Ok(RuleFile::TooLarge(why)) => {
+                    self.refused.push((join_rel(rel, name), why));
+                    continue;
+                }
                 Err(e) => return Err(e).context(format!("reading {}", file.display())),
             };
             let mut builder = GitignoreBuilder::new(&dir);
-            for line in String::from_utf8_lossy(&source).lines() {
-                builder
-                    .add_line(Some(file.clone()), line)
-                    .with_context(|| format!("in {}", file.display()))?;
+            let mut bad_lines = 0usize;
+            let mut named = Vec::new();
+            for (index, line) in String::from_utf8_lossy(&source).lines().enumerate() {
+                if let Err(e) = builder.add_line(Some(file.clone()), line) {
+                    bad_lines += 1;
+                    if named.len() < NAMED_LINES {
+                        named.push(format!("line {} ({})", index + 1, line_error(&e)));
+                    }
+                    continue;
+                }
                 self.prune.read_line(rel, line);
+            }
+            if bad_lines > 0 {
+                let more = match bad_lines - named.len() {
+                    0 => String::new(),
+                    more => format!(" and {more} more"),
+                };
+                self.refused.push((
+                    join_rel(rel, name),
+                    format!(
+                        "host: {bad_lines} rule {} the pattern parser refuses {} skipped, and the \
+                         other lines of the file apply: {}{more}",
+                        if bad_lines == 1 { "line" } else { "lines" },
+                        if bad_lines == 1 { "is" } else { "are" },
+                        named.join(", "),
+                    ),
+                ));
             }
             *slot = Some(
                 builder
@@ -408,6 +485,13 @@ impl Ignores {
     ///   — git's rule, and `verdict`'s. Reading the unanchored form as
     ///   reaching everywhere would disable pruning for the exact repo §19.6
     ///   names as the common case.
+    ///
+    /// **The list is bounded.** At most [`MAX_PRUNE_PREFIXES`] candidates are
+    /// examined, the shallowest first and by name within a depth, and the
+    /// rest are left off. A shorter list is the safe direction, for the
+    /// reason above: pruning less only costs watch descriptors. The bound is
+    /// there because the guest writes rule files and this runs every pass
+    /// (review labd-sync-2 F18).
     pub fn prune_list(&self, discovered: &[String]) -> Vec<String> {
         let mut prefixes: BTreeSet<&str> = self
             .prune
@@ -417,27 +501,27 @@ impl Ignores {
             .filter(|p| !p.is_empty())
             .map(String::as_str)
             .collect();
+        if prefixes.len() > MAX_PRUNE_PREFIXES {
+            let mut shallowest: Vec<&str> = prefixes.into_iter().collect();
+            shallowest.sort_by_key(|prefix| prefix.matches('/').count());
+            shallowest.truncate(MAX_PRUNE_PREFIXES);
+            prefixes = shallowest.into_iter().collect();
+        }
         // The rules decide, not the pattern text: a prefix derived from a
         // rule some other file negates is not excluded at all.
         prefixes.retain(|prefix| self.verdict(prefix, true).is_guest_owned());
         // A negation inside one: the guest is handed prefixes, not rules, and
         // a prefix cannot carry "except this". Keeping the watcher on costs
         // descriptors; taking it off would stop a path syncing.
-        prefixes.retain(|prefix| {
-            !self
-                .prune
-                .negated
-                .iter()
-                .any(|negated| at_or_below(negated, prefix))
-        });
+        prefixes.retain(|prefix| !self.prune.negation_at_or_below(prefix));
         // Shortest wins: `a` covers `a/b`, and sending both is the guest
         // matching a prefix twice for nothing.
         prefixes
             .iter()
             .filter(|prefix| {
-                !prefixes
-                    .iter()
-                    .any(|other| other != *prefix && at_or_below(prefix, other))
+                !prefix
+                    .match_indices('/')
+                    .any(|(cut, _)| prefixes.contains(&prefix[..cut]))
             })
             .map(|prefix| (*prefix).to_string())
             .collect()
@@ -467,6 +551,24 @@ impl Default for Ignores {
 }
 
 impl PruneCandidates {
+    /// Whether an anchored negation names `prefix` or something below it:
+    /// the prefix itself, or a path that starts with the prefix and a `/`.
+    /// That is the reading the agent's own prune match uses. The set is
+    /// ordered, so everything below `prefix` starts at `prefix/`.
+    fn negation_at_or_below(&self, prefix: &str) -> bool {
+        if self.negated.contains(prefix) {
+            return true;
+        }
+        let below = format!("{prefix}/");
+        self.negated
+            .range::<str, _>((
+                std::ops::Bound::Included(below.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|negated| negated.starts_with(&below))
+    }
+
     /// Take one line of one rule file, from the directory `dir` holds it in.
     ///
     /// Deliberately a *second* reading of the same text rather than something
@@ -518,19 +620,22 @@ impl PruneCandidates {
     }
 }
 
+/// Why the pattern parser refused one line, without the file path and the
+/// line text the `ignore` crate puts around it: the refusal names the file
+/// already, and the text is the guest's.
+fn line_error(e: &ignore::Error) -> String {
+    match e {
+        ignore::Error::WithLineNumber { err, .. }
+        | ignore::Error::WithPath { err, .. }
+        | ignore::Error::WithDepth { err, .. } => line_error(err),
+        ignore::Error::Glob { err, .. } => err.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Whether a glob metacharacter makes this path segment unpredictable.
 fn is_glob(part: &str) -> bool {
     part.contains(['*', '?', '[', ']', '\\'])
-}
-
-/// Whether `path` is `prefix` itself or lies under it — the same reading the
-/// agent's own prune match uses, so the two sides never disagree about what a
-/// prefix covers.
-fn at_or_below(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || (path.len() > prefix.len()
-            && path.starts_with(prefix)
-            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 /// `a/b/c` → `a/b`; a path with no separator → `""` (the root).
@@ -972,6 +1077,137 @@ mod tests {
         let mut set = Ignores::new();
         set.read_dir_rules(dir.path(), "").unwrap();
         assert_eq!(set.refused().len(), 1);
+    }
+
+    /// Review labd-sync-2 F17: the glob parser refuses lines git reads. One
+    /// such line must not fail the read: it is skipped, the file and the line
+    /// are named, and the other lines of the same file apply.
+    #[test]
+    fn a_rule_line_the_parser_refuses_is_skipped_and_named() {
+        for bad in ["obj\\", "x{y", "x}y", "[z-a]"] {
+            let dir = tmp();
+            std::fs::write(
+                dir.path().join(GIT_IGNORE),
+                format!("target/\n{bad}\n*.log\n"),
+            )
+            .unwrap();
+            let mut set = Ignores::new();
+            set.read_dir_rules(dir.path(), "")
+                .unwrap_or_else(|e| panic!("{bad:?} failed the read: {e:#}"));
+            assert_eq!(set.verdict("target", true), Verdict::GuestOwned, "{bad:?}");
+            assert_eq!(set.verdict("a.log", false), Verdict::GuestOwned, "{bad:?}");
+            assert_eq!(set.prune_list(&[]), vec!["target".to_string()], "{bad:?}");
+            assert_eq!(set.refused().len(), 1, "{bad:?}: {:?}", set.refused());
+            assert_eq!(set.refused()[0].0, GIT_IGNORE);
+            assert!(
+                set.refused()[0].1.contains("line 2"),
+                "{bad:?}: {:?}",
+                set.refused()
+            );
+        }
+    }
+
+    /// Many refused lines in one file are one refusal that names the first
+    /// few and counts the rest.
+    #[test]
+    fn many_refused_lines_are_one_refusal() {
+        let dir = tmp();
+        std::fs::write(dir.path().join(GIT_IGNORE), "x{y\n".repeat(10)).unwrap();
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        assert_eq!(set.refused().len(), 1);
+        let why = &set.refused()[0].1;
+        assert!(why.contains("10 rule lines"), "{why}");
+        assert!(why.contains("line 3") && !why.contains("line 4"), "{why}");
+        assert!(why.contains("and 7 more"), "{why}");
+    }
+
+    /// Review labd-sync-2 F18: a rule file is the guest's to write and is
+    /// read every pass, so it has a byte bound and a line bound. Over either
+    /// it is refused by name and none of its rules apply. At the bound it is
+    /// read.
+    #[test]
+    fn a_rule_file_over_the_bound_is_refused_by_name() {
+        // Lines: one over the bound, in few bytes.
+        let dir = tmp();
+        let lines = "a/\n".repeat(MAX_RULE_FILE_LINES + 1);
+        assert!((lines.len() as u64) < MAX_RULE_FILE_BYTES);
+        std::fs::write(dir.path().join(GIT_IGNORE), lines).unwrap();
+        std::fs::write(dir.path().join(VMLAB_IGNORE), "target/\n").unwrap();
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        assert_eq!(set.refused().len(), 1, "{:?}", set.refused());
+        assert_eq!(set.refused()[0].0, GIT_IGNORE);
+        assert!(set.refused()[0].1.contains("lines"), "{:?}", set.refused());
+        assert_eq!(set.verdict("a", true), Verdict::Synced);
+        // The file beside it is read as before.
+        assert_eq!(set.prune_list(&[]), vec!["target".to_string()]);
+
+        // Bytes: one over the bound, in one line.
+        let dir = tmp();
+        let long = "b".repeat(MAX_RULE_FILE_BYTES as usize - 1);
+        std::fs::write(dir.path().join(GIT_IGNORE), format!("{long}/\n")).unwrap();
+        let mut set = Ignores::new();
+        set.read_dir_rules(dir.path(), "").unwrap();
+        assert_eq!(set.refused().len(), 1, "{:?}", set.refused());
+        assert_eq!(set.refused()[0].0, GIT_IGNORE);
+        assert!(set.refused()[0].1.contains("bytes"), "{:?}", set.refused());
+        assert!(set.prune_list(&[]).is_empty());
+
+        // Exactly the line bound, with and without a last newline, is read.
+        for tail in ["\n", ""] {
+            let dir = tmp();
+            let body = format!("{}a/{tail}", "a/\n".repeat(MAX_RULE_FILE_LINES - 1));
+            std::fs::write(dir.path().join(GIT_IGNORE), body).unwrap();
+            let mut set = Ignores::new();
+            set.read_dir_rules(dir.path(), "").unwrap();
+            assert!(set.refused().is_empty(), "{:?}", set.refused());
+            assert_eq!(set.verdict("a", true), Verdict::GuestOwned);
+        }
+    }
+
+    /// Review labd-sync-2 F18: every directory may hold a rule file, so the
+    /// bound on one file does not bound the prune list. More prefixes than
+    /// the bound gives a shorter list, the shallowest first. That is safe:
+    /// pruning less only costs watch descriptors.
+    #[test]
+    fn the_prune_list_is_bounded() {
+        let dir = tmp();
+        let per_file = MAX_PRUNE_PREFIXES / 2;
+        let body =
+            |tag: &str| -> String { (0..per_file).map(|n| format!("{tag}{n}/\n")).collect() };
+        let set = ignores(
+            dir.path(),
+            &[
+                (".gitignore", &body("top")),
+                ("one/.gitignore", &body("mid")),
+                ("one/two/.gitignore", &body("low")),
+            ],
+        );
+        assert!(set.refused().is_empty(), "{:?}", set.refused());
+        let list = set.prune_list(&[]);
+        assert_eq!(list.len(), MAX_PRUNE_PREFIXES);
+        assert!(list.contains(&"top0".to_string()));
+        assert!(list.contains(&format!("one/mid{}", per_file - 1)));
+        assert!(list.iter().all(|prefix| !prefix.starts_with("one/two/")));
+        // What is left off the list is still guest-owned: the list is about
+        // watch registration, and the filter stays whole on the host.
+        assert_eq!(set.verdict("one/two/low0", true), Verdict::GuestOwned);
+    }
+
+    /// The two orderings the prune list leans on: a sibling whose name sorts
+    /// between a prefix and its children does not hide them from each other.
+    #[test]
+    fn prefix_cover_and_negation_survive_a_sibling_that_sorts_between() {
+        let dir = tmp();
+        let set = ignores(
+            dir.path(),
+            &[(".gitignore", "a/\na-b/\na/c/\nd/\nd-e/\n!d/keep/x\n")],
+        );
+        assert_eq!(
+            set.prune_list(&[]),
+            vec!["a".to_string(), "a-b".to_string(), "d-e".to_string()]
+        );
     }
 
     #[test]

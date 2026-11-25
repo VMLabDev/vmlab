@@ -94,7 +94,6 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
         // descendants, so an oversize refusal also protects any guest subtree
         // that would have been replaced by that file.
         if inputs.undecided.contains(path)
-            || colliding.contains(path.as_str())
             || path.match_indices('/').any(|(end, _)| {
                 inputs.undecided.contains(&path[..end]) || refused.contains(&path[..end])
             })
@@ -103,6 +102,24 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
         }
         let host = inputs.host.get(path);
         let guest = inputs.guest.get(path);
+        // Neither colliding name is placed, as in the steady state. What the
+        // guest holds at one of them is the rolled-back copy, and it goes:
+        // the steady state passes over both names for as long as they
+        // collide, so a copy left here would be found as guest work on the
+        // day the collision ends. That is why a collision does not have to
+        // hold the barrier. A directory stays, because its children are
+        // decided at their own paths, and so does a file over the cap, which
+        // cannot be removed without a digest.
+        if colliding.contains(path.as_str()) {
+            if let Some(guest) = guest.filter(|guest| guest.kind != Kind::Dir && !guest.oversize) {
+                removals.push(Action::Remove {
+                    direction: Direction::ToGuest,
+                    path: path.clone(),
+                    kind: guest.kind,
+                });
+            }
+            continue;
+        }
         // Apply requires a verified digest to remove or overwrite a guest
         // file. An oversize guest file was deliberately left unhashed.
         if let Some(guest) = guest.filter(|guest| guest.oversize)
@@ -221,15 +238,25 @@ pub struct Reconverged {
     /// Rule files whose rules were refused (a symlink). Reported, and no part
     /// of [`complete`](Reconverged::complete): the path itself converges.
     pub refused_rules: Vec<Skip>,
+    /// Symlinks the guest would not create (§19.4). Reported, and no part of
+    /// [`complete`](Reconverged::complete): the guest holds nothing at the
+    /// path, and the steady state warns about the same link and carries on.
+    pub symlinks_refused: Vec<Failure>,
     /// Paths that did not land and must retry under the host-only policy.
     pub failures: Vec<Failure>,
 }
 
 impl Reconverged {
-    /// Skips and size refusals are warnings. Collisions and failed actions
-    /// keep the re-seed barrier in place.
+    /// Only a failed action keeps the re-seed barrier in place.
+    ///
+    /// A skip, a size refusal, a case collision and a symlink the guest
+    /// refuses are conditions the steady state accepts for as long as they
+    /// last, and the last two are what a Windows login with
+    /// `elevated = false` brings. Holding the barrier on one would stop the
+    /// workspace for good after any restore (docs/reviews/labd-sync-2.md
+    /// F19).
     pub fn complete(&self) -> bool {
-        self.collisions.is_empty() && self.failures.is_empty()
+        self.failures.is_empty()
     }
 
     /// The one line the event feed and `dev sync status` both carry.
@@ -238,7 +265,7 @@ impl Reconverged {
             return format!(
                 "\"{machine}\"'s workspace re-convergence is incomplete after a snapshot restore: \
                  {} placed, {} removed, {} already matched. The host-only re-seed remains owed \
-                 until failed and colliding paths converge.",
+                 until the failed paths converge.",
                 self.placed, self.removed, self.adopted,
             );
         }
@@ -349,11 +376,8 @@ pub async fn reconverge(
         collisions: plan.collisions,
         skipped: skipped.into_iter().chain(scan.unrepresentable).collect(),
         refused_rules: scan.refused_rules,
-        failures: applied
-            .failures
-            .into_iter()
-            .chain(applied.symlinks_refused)
-            .collect(),
+        symlinks_refused: applied.symlinks_refused,
+        failures: applied.failures,
     };
     // Persist partial progress without authorizing ordinary reconciliation.
     // A retry or daemon restart must still discard restored guest state.
@@ -472,14 +496,20 @@ mod tests {
         assert!(!host.path().join("old.rs").exists());
     }
 
+    /// Review labd-sync-2 F19 (card 957): a case collision is refused by name
+    /// and does not hold the barrier. The rolled-back copy the guest holds at
+    /// one of the colliding names is removed, so nothing of it is left for a
+    /// later pass to carry to the host.
     #[tokio::test]
-    async fn a_reseed_collision_keeps_the_durable_barrier() {
+    async fn a_reseed_collision_is_refused_by_name_and_does_not_hold_the_barrier() {
         let host = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let guest = FakeGuest::new();
+        guest.folding();
         guest.dir("/src");
         std::fs::write(host.path().join("file.rs"), "host truth").unwrap();
         std::fs::write(host.path().join("FILE.rs"), "other host file").unwrap();
+        std::fs::write(host.path().join("ok.rs"), "fine").unwrap();
         guest.file("/src/file.rs", "restored content", 10);
         let workspace = Workspace {
             machine: "dev01".into(),
@@ -494,13 +524,70 @@ mod tests {
         let done = reconverge(&guest, &workspace, false, true, &mut ledger)
             .await
             .unwrap();
-        assert!(!done.collisions.is_empty());
-        assert!(!done.complete());
-        ledger.save(&workspace.ledger_path).unwrap();
-        assert!(Ledger::load(&workspace.ledger_path, host.path(), "/src").reseed_owed);
+        assert_eq!(done.collisions.len(), 1, "{:?}", done.collisions);
+        assert_eq!(done.collisions[0].paths, ["FILE.rs", "file.rs"]);
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert!(done.complete());
+        assert!(!ledger.reseed_owed);
+        assert_eq!(guest.text("/src/ok.rs").as_deref(), Some("fine"));
+        assert!(
+            guest.get("/src/file.rs").is_none() && guest.get("/src/FILE.rs").is_none(),
+            "the rolled-back copy stayed at a colliding name: {:?}",
+            guest.paths()
+        );
+        assert!(
+            !ledger.entries.contains_key("file.rs") && !ledger.entries.contains_key("FILE.rs"),
+            "a colliding name was agreed"
+        );
         assert_eq!(
             std::fs::read_to_string(host.path().join("file.rs")).unwrap(),
             "host truth"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.path().join("FILE.rs")).unwrap(),
+            "other host file"
+        );
+    }
+
+    /// The same for a symlink the guest refuses (§19.4): reported by name,
+    /// nothing left at its path, and no barrier.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reseed_symlink_the_guest_refuses_does_not_hold_the_barrier() {
+        let host = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let guest = FakeGuest::new();
+        guest.refuse_symlinks();
+        guest.dir("/src");
+        std::fs::write(host.path().join("main.rs"), "host truth").unwrap();
+        std::os::unix::fs::symlink("main.rs", host.path().join("link.rs")).unwrap();
+        guest.file("/src/link.rs", "restored content", 10);
+        let workspace = Workspace {
+            machine: "dev01".into(),
+            host_root: host.path().to_path_buf(),
+            guest_root: "/src".into(),
+            ledger_path: state.path().join("ledger.json"),
+            max_file_bytes: NO_CAP,
+            preconditions: Preconditions::default(),
+        };
+        let mut ledger = Ledger::new(host.path(), "/src");
+        ledger.reseed_owed = true;
+        let done = reconverge(&guest, &workspace, false, false, &mut ledger)
+            .await
+            .unwrap();
+        assert_eq!(done.symlinks_refused.len(), 1, "{:?}", done.failures);
+        assert_eq!(done.symlinks_refused[0].path, "link.rs");
+        assert!(done.failures.is_empty(), "{:?}", done.failures);
+        assert!(done.complete());
+        assert!(!ledger.reseed_owed);
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("host truth"));
+        assert!(guest.get("/src/link.rs").is_none(), "{:?}", guest.paths());
+        assert!(!ledger.entries.contains_key("link.rs"));
+        assert!(
+            std::fs::symlink_metadata(host.path().join("link.rs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
