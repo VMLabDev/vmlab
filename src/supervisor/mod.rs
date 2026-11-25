@@ -54,8 +54,9 @@ pub struct Supervisor {
 const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// What a release adds to the stop wait a lab daemon reports: the rest of its
-/// teardown (the workspace syncers, smbd, the global segments, five seconds
-/// for its tasks) and the settle after each kill rung.
+/// teardown (smbd, the global segments, five seconds for its tasks) and the
+/// settle after each kill rung. The last pass of each workspace syncer is in
+/// the reported wait.
 const RELEASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a release waits for the lab daemon that answered `shutdown` with
@@ -1163,6 +1164,15 @@ mod tests {
         run_orphan_fixture("restart");
     }
 
+    /// A reap was one SIGKILL to every process of the lab, guests that run
+    /// included, and a hypervisor killed that way drops what it had not
+    /// flushed (docs/reviews/lab-lifecycle-2.md F16). The orphan here writes
+    /// a marker file when it is asked to end, which a SIGKILL never lets it.
+    #[test]
+    fn a_reap_asks_before_it_kills() {
+        run_orphan_fixture("asks");
+    }
+
     const ORPHAN_FIXTURE: &str = "VMLAB_TEST_ORPHAN_FIXTURE";
 
     fn run_orphan_fixture(operation: &str) {
@@ -1200,10 +1210,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let name = format!("f10-{}", root.path().file_name().unwrap().to_str().unwrap());
         let qmp = crate::paths::lab_runtime_dir(&name).join("a/qmp.sock");
+        // The helper of "asks" ends by itself on SIGTERM, and says so first.
+        let marker = root.path().join("asked");
+        let script = if operation == "asks" {
+            "set -eu; trap 'echo asked > \"$ORPHAN_MARKER\"; exit 0' TERM; printf R; read -r line"
+        } else {
+            "set -eu; printf R; read -r line"
+        };
         let mut orphan = tokio::process::Command::new("bash")
             .args([
                 "-c",
-                "set -eu; exec -a qemu-system-x86_64 bash -c 'set -eu; printf R; read -r line' -- \"$@\"",
+                "set -eu; exec -a qemu-system-x86_64 bash -c \"$ORPHAN_SCRIPT\" -- \"$@\"",
                 "--",
                 "-name",
                 &format!("vmlab:{name}/a"),
@@ -1212,6 +1229,8 @@ mod tests {
                 "-qmp",
                 &format!("unix:{}", qmp.display()),
             ])
+            .env("ORPHAN_SCRIPT", script)
+            .env("ORPHAN_MARKER", &marker)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -1230,7 +1249,7 @@ mod tests {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             keepers: super::keepawake::Keepers::default(),
         });
-        if operation == "restart" {
+        if operation != "release" {
             std::fs::create_dir_all(crate::paths::state_dir()).unwrap();
             supervisor
                 .registry
@@ -1253,10 +1272,16 @@ mod tests {
             supervisor.release_lab(&name).await.unwrap();
         }
         // wait closes stdin, letting the helper exit normally if it survived.
-        assert_eq!(
-            orphan.wait().await.unwrap().signal(),
-            Some(nix::libc::SIGKILL)
-        );
+        let status = orphan.wait().await.unwrap();
+        if operation == "asks" {
+            assert!(
+                marker.exists(),
+                "the orphan was not asked to end before it was killed: {status:?}"
+            );
+            return;
+        }
+        // This helper has no handler, so the request itself ends it.
+        assert_eq!(status.signal(), Some(nix::libc::SIGTERM));
     }
 
     #[test]
