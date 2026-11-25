@@ -26,6 +26,7 @@
 //!   A stopped workspace can still refuse based on a halt saved in its ledger.
 
 use super::ledger::{LeftOwed, StoppedWork};
+use super::plan::Direction;
 use super::syncer::Report;
 
 /// How many outstanding paths a refusal names before it stops.
@@ -91,6 +92,9 @@ pub struct Outstanding {
     pub unanswered: Option<String>,
     /// Paths the flush did not carry, by name.
     pub unsynced: Vec<String>,
+    /// The size guard refused guest files, so the guest holds the only copy
+    /// of each ([`Outstanding::unsaved`]). The files are named in `unsynced`.
+    pub refused: Option<String>,
     /// The syncer has never completed a pass, so nothing about this workspace
     /// has been agreed at all.
     pub never_synced: bool,
@@ -109,7 +113,10 @@ impl Outstanding {
     /// Everything here is a *transient* state that clears itself or resolves:
     /// a named skip is not among them, because a socket in the tree or a
     /// root-owned build artefact is permanent and normal, and refusing on one
-    /// would make a whole class of repository unsnapshottable.
+    /// would make a whole class of repository unsnapshottable. A file the
+    /// size guard refused is as permanent, so a **capture** does not refuse
+    /// on one either: the snapshot holds the guest's copy. What deletes that
+    /// copy asks [`unsaved`](Outstanding::unsaved).
     pub fn of(machine: &str, report: &Report) -> Option<Outstanding> {
         let found = Outstanding {
             machine: machine.to_string(),
@@ -119,6 +126,7 @@ impl Outstanding {
             reseed: report.reseed.clone(),
             unanswered: report.unanswered.clone(),
             unsynced: report.unsynced.clone(),
+            refused: None,
             never_synced: report.passes == 0,
             stopped: None,
             running: true,
@@ -168,11 +176,61 @@ impl Outstanding {
             rescan: None,
             unanswered: None,
             unsynced: halted.to_vec(),
+            refused: None,
             never_synced: false,
             stopped: None,
             running: false,
         };
         (found.halt.is_some() || found.reseed.is_some()).then_some(found)
+    }
+
+    /// What a **restore** refuses on: everything [`of`](Outstanding::of)
+    /// finds, and the guest files the size guard refused
+    /// (docs/reviews/labd-sync-2.md F16).
+    ///
+    /// A refused guest file is never carried, so the guest's copy is the only
+    /// one, and a restore or a `destroy` deletes it. It is permanent like a
+    /// named skip, which is why a capture passes over it, but it is work and
+    /// a skip is not: nobody writes a socket by hand.
+    pub fn unsaved(machine: &str, report: &Report) -> Option<Outstanding> {
+        let refused: Vec<String> = report
+            .oversize
+            .iter()
+            .filter(|refusal| refusal.direction == Direction::ToHost)
+            .map(|refusal| refusal.path.clone())
+            .collect();
+        let found = Outstanding::of(machine, report);
+        if refused.is_empty() {
+            return found;
+        }
+        let mut found = found.unwrap_or_else(|| Outstanding {
+            machine: machine.to_string(),
+            halt: None,
+            trouble: None,
+            rescan: None,
+            reseed: None,
+            unanswered: None,
+            unsynced: Vec::new(),
+            refused: None,
+            never_synced: false,
+            stopped: None,
+            running: true,
+        });
+        found.refused = Some(format!(
+            "The size guard refused {} guest {} over the workspace file cap, so the host has \
+             never taken {} and the guest holds the only copy: copy {} out of the guest, or \
+             raise `workspace_max_file` in the host config and let the workspace sync",
+            refused.len(),
+            if refused.len() == 1 { "file" } else { "files" },
+            if refused.len() == 1 { "it" } else { "them" },
+            if refused.len() == 1 { "it" } else { "them" },
+        ));
+        for path in refused {
+            if !found.unsynced.contains(&path) {
+                found.unsynced.push(path);
+            }
+        }
+        Some(found)
     }
 
     /// Guest work a **running** workspace holds that the host has not taken,
@@ -184,7 +242,7 @@ impl Outstanding {
         if report.reseed.is_some() {
             return None;
         }
-        let mut found = Outstanding::of(machine, report)?;
+        let mut found = Outstanding::unsaved(machine, report)?;
         // A halt's headline counts its paths, and the guest copy of each is
         // what would be lost, so they are named with the rest.
         for path in report.halt.iter().flat_map(super::halt::Halt::paths) {
@@ -206,6 +264,7 @@ impl Outstanding {
             reseed: None,
             unanswered: None,
             unsynced: left.paths.clone(),
+            refused: None,
             never_synced: false,
             stopped: Some(left.why.clone()),
             running: false,
@@ -245,7 +304,12 @@ impl Outstanding {
                  unknown rather than merely behind: {trouble}"
             )?;
         }
-        for waiting in [&self.rescan, &self.reseed, &self.unanswered]
+        for waiting in [
+            &self.rescan,
+            &self.reseed,
+            &self.unanswered,
+            &self.refused,
+        ]
             .into_iter()
             .flatten()
         {
@@ -685,6 +749,45 @@ mod tests {
         assert!(said.contains("vmlab up dev01"), "{said}");
         assert!(!said.contains("dev sync flush"), "{said}");
         assert!(said.contains(DISCARD_FLAG), "{said}");
+    }
+
+    /// Review labd-sync-2 F16 (card 957): a guest file the size guard
+    /// refused is work only the guest holds. A capture keeps it and passes.
+    /// A restore, a `destroy` and the record a stop writes all name it.
+    #[test]
+    fn a_refused_guest_file_is_guest_work_and_a_refused_host_file_is_not() {
+        use crate::labd::workspace::plan::Oversize;
+        let refusal = |path: &str, direction| Oversize {
+            path: path.into(),
+            direction,
+            size: 128,
+            cap: 64,
+        };
+        let host_side = Report {
+            passes: 3,
+            oversize: vec![refusal("disk.vhdx", Direction::ToGuest)],
+            ..Report::default()
+        };
+        assert_eq!(Outstanding::unsaved("dev01", &host_side), None);
+        assert_eq!(Outstanding::guest_work("dev01", &host_side), None);
+        assert_eq!(left_at_stop("dev01", &host_side), None);
+
+        let guest_side = Report {
+            passes: 3,
+            oversize: vec![refusal("dump.sql", Direction::ToHost)],
+            ..Report::default()
+        };
+        assert_eq!(Outstanding::of("dev01", &guest_side), None);
+        let restore = RestoreOutstanding(Outstanding::unsaved("dev01", &guest_side).unwrap());
+        let destroy = DestroyOutstanding(Outstanding::guest_work("dev01", &guest_side).unwrap());
+        for said in [restore.to_string(), destroy.to_string()] {
+            assert!(said.contains("dump.sql"), "{said}");
+            assert!(said.contains("size guard"), "{said}");
+            assert!(said.contains(DISCARD_FLAG), "{said}");
+        }
+        let left = left_at_stop("dev01", &guest_side).expect("the file is owed");
+        assert_eq!(left.paths, ["dump.sql"]);
+        assert!(left.why.contains("size guard"), "{}", left.why);
     }
 
     /// Review dev-machines F10 (card 859): `dev sync status`, `flush` and

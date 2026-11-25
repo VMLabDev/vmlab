@@ -285,6 +285,10 @@ pub struct Report {
     /// the syncer's login could not open.
     pub skipped: Vec<Skip>,
     /// Files the size guard refused before transfer, by name.
+    ///
+    /// A refused **guest** file stays here for as long as the guest holds it:
+    /// the host has never taken it, so a restore and a `destroy` refuse on it
+    /// ([`Outstanding::unsaved`](super::bracket::Outstanding::unsaved)).
     pub oversize: Vec<Oversize>,
     /// `.git`'s mutable set, waiting on a lock held on one side or the other.
     pub deferred: Vec<String>,
@@ -623,7 +627,7 @@ impl WorkspaceSyncers {
                     return refuse(Some(halt));
                 }
                 refuse(
-                    super::bracket::Outstanding::of(machine, &report)
+                    super::bracket::Outstanding::unsaved(machine, &report)
                         .map(super::bracket::RestoreOutstanding),
                 )
             }
@@ -1012,6 +1016,9 @@ async fn run(
     // a path once, at the moment it appears, so a lock held across several
     // passes has to be re-asked about rather than re-reported.
     let mut lock_candidates: BTreeSet<String> = BTreeSet::new();
+    // Guest files the size guard refused, asked about by name every pass for
+    // as long as the guest holds them (docs/reviews/labd-sync-2.md F16).
+    let mut refused: Vec<Oversize> = Vec::new();
     // What the passes have seen at each moved path, so a change no event has
     // named yet waits out a quiet period exactly once.
     let mut sighted = Sighted::default();
@@ -1090,6 +1097,9 @@ async fn run(
                     // was rolled back, and the re-seed has just recomputed
                     // them — so the watch opens on the current list.
                     prune = ledger.prune.clone();
+                    // No walk follows, so what the re-seed left in the guest
+                    // over the cap is known only from its report.
+                    refused = guest_refusals(&report.oversize);
                     syncer.publish(Report {
                         rescans,
                         passes,
@@ -1272,6 +1282,7 @@ async fn run(
                     unwitnessed: rescan && unwitnessed,
                     flush,
                     lock_candidates: &lock_candidates,
+                    refused: &refused,
                     sighted: &sighted,
                     resolved: &resolutions,
                     previous_halt: syncer.report().halt,
@@ -1311,6 +1322,7 @@ async fn run(
                     owed.extend(done.deferred);
                     host_dirty = done.host_deferred;
                     lock_candidates = done.locks;
+                    refused = done.refused;
                     sighted = done.sighted;
                     // Found moved with no event behind them: their quiet
                     // period starts here, and an event that does arrive
@@ -1783,6 +1795,10 @@ struct Pending<'a> {
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
     lock_candidates: &'a BTreeSet<String>,
+    /// Guest files the size guard refused on the last pass. The host holds
+    /// none of them and no agreement names them, so the steady state asks
+    /// about each by name, or the refusal would be said once and forgotten.
+    refused: &'a [Oversize],
     /// What earlier passes saw at each path that had moved, and since when.
     sighted: &'a Sighted,
     /// Who wins where, as the developer has already said.
@@ -1911,6 +1927,9 @@ struct Passed {
     host_deferred: BTreeSet<String>,
     /// Guest-side locks still held, to re-ask about next pass.
     locks: BTreeSet<String>,
+    /// Guest files the size guard refuses as things stand, to re-ask about
+    /// next pass.
+    refused: Vec<Oversize>,
     /// Each side's moved paths as this pass saw them.
     sighted: Sighted,
     /// Host paths that moved with no settled event: their quiet period starts
@@ -1999,6 +2018,7 @@ async fn pass(
                 pending
                     .guest_dirty
                     .iter()
+                    .chain(pending.refused.iter().map(|refusal| &refusal.path))
                     .filter(|path| !ignores.verdict(path, false).is_guest_owned())
                     .cloned(),
             )
@@ -2610,6 +2630,20 @@ async fn pass(
     owed.extend(failed.iter().map(|failure| failure.path.clone()));
     owed.extend(rule_deferred.iter().cloned());
 
+    // A refusal this pass could not look at again still stands: the path is
+    // inside a quiet period or behind a lock, and nothing has said the file
+    // is gone or smaller.
+    let mut oversize = plan.oversize.clone();
+    let carried: Vec<Oversize> = pending
+        .refused
+        .iter()
+        .filter(|refusal| undecided.contains(&refusal.path))
+        .filter(|refusal| oversize.iter().all(|said| said.path != refusal.path))
+        .cloned()
+        .collect();
+    oversize.extend(carried);
+    oversize.sort_by(|a, b| a.path.cmp(&b.path));
+
     Ok(Passed {
         prune,
         host_deferred: match halt {
@@ -2618,6 +2652,7 @@ async fn pass(
         },
         deferred: owed,
         locks: held,
+        refused: guest_refusals(&oversize),
         sighted,
         found_host,
         found_guest,
@@ -2628,7 +2663,7 @@ async fn pass(
             halt,
             volume: plan.volume.clone(),
             skipped: skipped.into_iter().take(REPORTED).collect(),
-            oversize: plan.oversize.clone(),
+            oversize,
             deferred: deferred
                 .into_iter()
                 .chain(rule_deferred)
@@ -2637,6 +2672,15 @@ async fn pass(
             ..Report::default()
         },
     })
+}
+
+/// The refusals that name a file only the guest holds.
+fn guest_refusals(oversize: &[Oversize]) -> Vec<Oversize> {
+    oversize
+        .iter()
+        .filter(|refusal| refusal.direction == Direction::ToHost)
+        .cloned()
+        .collect()
 }
 
 fn rule_dir(path: &str) -> Option<&str> {
@@ -2730,6 +2774,13 @@ async fn reconverge(
         events.emit(
             "workspace.skipped",
             json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
+    // Attempted, and named where it did not take, as in an ordinary pass.
+    for refused in &done.symlinks_refused {
+        events.emit(
+            "workspace.symlink_refused",
+            json!({"machine": workspace.machine, "path": refused.path, "reason": refused.why}),
         );
     }
     // Failed paths stay under host-authoritative reseeding on every retry.
@@ -3005,6 +3056,7 @@ mod tests {
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                refused: &[],
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
@@ -3386,6 +3438,7 @@ mod tests {
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                refused: &[],
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 previous_halt: None,
@@ -3800,6 +3853,7 @@ mod tests {
             unwitnessed: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
+            refused: &[],
             sighted: &Sighted::default(),
             resolved: &BTreeMap::new(),
             previous_halt: None,

@@ -87,7 +87,6 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
         // descendants, so an oversize refusal also protects any guest subtree
         // that would have been replaced by that file.
         if inputs.undecided.contains(path)
-            || colliding.contains(path.as_str())
             || path.match_indices('/').any(|(end, _)| {
                 inputs.undecided.contains(&path[..end]) || refused.contains(&path[..end])
             })
@@ -96,6 +95,24 @@ pub fn reseed(inputs: &Inputs<'_>) -> Plan {
         }
         let host = inputs.host.get(path);
         let guest = inputs.guest.get(path);
+        // Neither colliding name is placed, as in the steady state. What the
+        // guest holds at one of them is the rolled-back copy, and it goes:
+        // the steady state passes over both names for as long as they
+        // collide, so a copy left here would be found as guest work on the
+        // day the collision ends. That is why a collision does not have to
+        // hold the barrier. A directory stays, because its children are
+        // decided at their own paths, and so does a file over the cap, which
+        // cannot be removed without a digest.
+        if colliding.contains(path.as_str()) {
+            if let Some(guest) = guest.filter(|guest| guest.kind != Kind::Dir && !guest.oversize) {
+                removals.push(Action::Remove {
+                    direction: Direction::ToGuest,
+                    path: path.clone(),
+                    kind: guest.kind,
+                });
+            }
+            continue;
+        }
         // Apply requires a verified digest to remove or overwrite a guest
         // file. An oversize guest file was deliberately left unhashed.
         if let Some(guest) = guest.filter(|guest| guest.oversize)
@@ -214,15 +231,25 @@ pub struct Reconverged {
     /// Rule files whose rules were refused (a symlink). Reported, and no part
     /// of [`complete`](Reconverged::complete): the path itself converges.
     pub refused_rules: Vec<Skip>,
+    /// Symlinks the guest would not create (§19.4). Reported, and no part of
+    /// [`complete`](Reconverged::complete): the guest holds nothing at the
+    /// path, and the steady state warns about the same link and carries on.
+    pub symlinks_refused: Vec<Failure>,
     /// Paths that did not land and must retry under the host-only policy.
     pub failures: Vec<Failure>,
 }
 
 impl Reconverged {
-    /// Skips and size refusals are warnings. Collisions and failed actions
-    /// keep the re-seed barrier in place.
+    /// Only a failed action keeps the re-seed barrier in place.
+    ///
+    /// A skip, a size refusal, a case collision and a symlink the guest
+    /// refuses are conditions the steady state accepts for as long as they
+    /// last, and the last two are what a Windows login with
+    /// `elevated = false` brings. Holding the barrier on one would stop the
+    /// workspace for good after any restore (docs/reviews/labd-sync-2.md
+    /// F19).
     pub fn complete(&self) -> bool {
-        self.collisions.is_empty() && self.failures.is_empty()
+        self.failures.is_empty()
     }
 
     /// The one line the event feed and `dev sync status` both carry.
@@ -231,7 +258,7 @@ impl Reconverged {
             return format!(
                 "\"{machine}\"'s workspace re-convergence is incomplete after a snapshot restore: \
                  {} placed, {} removed, {} already matched. The host-only re-seed remains owed \
-                 until failed and colliding paths converge.",
+                 until the failed paths converge.",
                 self.placed, self.removed, self.adopted,
             );
         }
@@ -341,11 +368,8 @@ pub async fn reconverge(
         collisions: plan.collisions,
         skipped: skipped.into_iter().chain(scan.unrepresentable).collect(),
         refused_rules: scan.refused_rules,
-        failures: applied
-            .failures
-            .into_iter()
-            .chain(applied.symlinks_refused)
-            .collect(),
+        symlinks_refused: applied.symlinks_refused,
+        failures: applied.failures,
     };
     // Persist partial progress without authorizing ordinary reconciliation.
     // A retry or daemon restart must still discard restored guest state.
@@ -543,6 +567,8 @@ mod tests {
         let done = reconverge(&guest, &workspace, false, false, &mut ledger)
             .await
             .unwrap();
+        assert_eq!(done.symlinks_refused.len(), 1, "{:?}", done.failures);
+        assert_eq!(done.symlinks_refused[0].path, "link.rs");
         assert!(done.failures.is_empty(), "{:?}", done.failures);
         assert!(done.complete());
         assert!(!ledger.reseed_owed);
