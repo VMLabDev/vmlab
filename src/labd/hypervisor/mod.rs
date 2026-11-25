@@ -183,6 +183,15 @@ pub trait Debugger: Send + Sync + 'static {
     ) -> Result<vmlab_hv_proto::debug::DebugResponse>;
 }
 
+/// A [`Snapshots::save`] the hypervisor refused, with nothing of the snapshot
+/// on any disk afterwards: a refusal ahead of the capture, or a capture it
+/// undid in full. The caller owes no cleanup for it, and must not offer one:
+/// a save refused because a disk already holds the name would have its
+/// cleanup delete that older snapshot.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SaveRefused(pub String);
+
 /// The **snapshots** capability: save, load and delete a snapshot of a
 /// running machine — RAM and device state into `vmstate`, every disk in
 /// `devices` captured at the same instant (PRD §7.3).
@@ -192,6 +201,8 @@ pub trait Debugger: Send + Sync + 'static {
 /// done; there is no job to poll above the seam.
 #[async_trait::async_trait]
 pub trait Snapshots: Send + Sync {
+    /// An error that is a [`SaveRefused`] says the hypervisor wrote nothing
+    /// and left nothing behind. Any other error may have.
     async fn save(&self, name: &str, vmstate: &str, devices: &[&str]) -> Result<()>;
 
     /// Load over the running guest. The caller pauses the machine first and
