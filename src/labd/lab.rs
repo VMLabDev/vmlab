@@ -8559,9 +8559,12 @@ fn main(lab: Lab) {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().canonicalize().unwrap();
-        let frozen = crate::freeze::machine_dir(&dir.join(".vmlab"), 1, "a");
+        let root = tmp.path().canonicalize().unwrap();
+        // The double keeps its disk and its directory at `<root>/<name>`.
+        let dir = root.join("a");
+        let frozen = crate::freeze::machine_dir(&root.join(".vmlab"), 1, "a");
         std::fs::create_dir_all(&frozen).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         crate::template::qimg::create_blank(&frozen.join("disk0.qcow2"), 1 << 20)
             .await
             .unwrap();
@@ -8582,9 +8585,9 @@ fn main(lab: Lab) {
         }
         std::fs::write(dir.join("tpm-state/sealed-since"), "now").unwrap();
 
-        let sh = shared(&dir);
+        let sh = shared(&root);
         let lab = lab_of(
-            &dir,
+            &root,
             r#"import <vmlab.wcl>
 lab "t" { vm "a" { template = "x86_64/t" } }"#,
             vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
