@@ -54,8 +54,9 @@ pub struct Supervisor {
 const RELEASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// What a release adds to the stop wait a lab daemon reports: the rest of its
-/// teardown (the workspace syncers, smbd, the global segments, five seconds
-/// for its tasks) and the settle after each kill rung.
+/// teardown (smbd, the global segments, five seconds for its tasks) and the
+/// settle after each kill rung. The last pass of each workspace syncer is in
+/// the reported wait.
 const RELEASE_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a release waits for the lab daemon that answered `shutdown` with
@@ -1279,7 +1280,8 @@ mod tests {
             );
             return;
         }
-        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        // This helper has no handler, so the request itself ends it.
+        assert_eq!(status.signal(), Some(nix::libc::SIGTERM));
     }
 
     #[test]

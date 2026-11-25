@@ -864,7 +864,7 @@ impl WorkspaceSyncers {
                 )
             })
         };
-        self.stop(machine).await;
+        self.stop_within(machine, STOP_UNWIND).await;
         let workspace = &syncer.workspace;
         if let Some(left) = &left {
             tracing::warn!(
@@ -892,6 +892,43 @@ impl WorkspaceSyncers {
             let _ = running.stop.send(true);
             let _ = running.task.await;
         }
+    }
+
+    /// Stop one machine's syncer ahead of its machine's stop, and cut its
+    /// loop off when it has not ended within `bound`.
+    ///
+    /// A loop ends between passes. One whose pass is held by a guest that
+    /// stopped answering would hold the stop of the machine, and with it the
+    /// release of the lab, for as long as the guest stays silent. The loop is
+    /// waited for after the cut, so no pass writes the ledger behind the
+    /// record the stop writes next. A pass cut off this way saved nothing, so
+    /// the next syncer reconciles the same paths again.
+    async fn stop_within(&self, machine: &str, bound: Duration) {
+        let running = self.running.lock().await.remove(machine);
+        let Some(mut running) = running else {
+            return;
+        };
+        let _ = running.stop.send(true);
+        if tokio::time::timeout(bound, &mut running.task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{machine}: the workspace syncer did not end its pass within {}s of the stop; \
+                 the pass is cut off",
+                bound.as_secs()
+            );
+            running.task.abort();
+            let _ = running.task.await;
+        }
+    }
+
+    /// The longest the syncers that run now can hold a `down` before its
+    /// first machine is asked to stop: [`LAST_PASS_BOUND`] for each, since a
+    /// `down` takes their last passes one after the other.
+    pub async fn stop_wait(&self) -> Duration {
+        let running = self.running.lock().await.len();
+        LAST_PASS_BOUND.saturating_mul(u32::try_from(running).unwrap_or(u32::MAX))
     }
 
     /// Stop every syncer in the lab — `down` and `destroy`.

@@ -1445,9 +1445,10 @@ impl LabRuntime {
 
     /// The longest stopping every machine can take, each running out its whole
     /// stop ladder: the sum over machines, since a `down` stops its waves one
-    /// after the other.
+    /// after the other. Ahead of the machines a `down` gives each workspace
+    /// syncer that runs a last pass (§19.6), so their bounds are in the sum.
     pub async fn stop_wait(&self) -> std::time::Duration {
-        let mut total = std::time::Duration::ZERO;
+        let mut total = self.workspaces.stop_wait().await;
         for m in self.machines() {
             total += m.stop_wait().await;
         }
