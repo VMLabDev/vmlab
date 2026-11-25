@@ -2180,10 +2180,20 @@ impl VmInstance {
                 let snapshots = self.capability(|c| c.snapshots()).await?;
                 let nodes = disk_nodes(self.all_disk_paths().len());
                 let refs: Vec<&str> = nodes.iter().map(String::as_str).collect();
-                snapshots.delete(name, &refs).await?;
+                let deleted = snapshots.delete(name, &refs).await;
                 // An offline snapshot can be deleted while the VM runs. What
                 // it held beside the disks is not in use by the emulator.
-                self.dirs.firmware_state().delete(name)?;
+                // "No disk holds it" still leaves that state to remove: the
+                // lab drops the record on that answer.
+                let missing = deleted.as_ref().is_err_and(|error| {
+                    error
+                        .downcast_ref::<crate::proto::CommandError>()
+                        .is_some_and(|error| error.code == crate::proto::ErrorCode::NotFound)
+                });
+                if deleted.is_ok() || missing {
+                    self.dirs.firmware_state().delete(name)?;
+                }
+                deleted?;
             }
             PowerState::Stopped => {
                 let disks = self.all_disk_paths();

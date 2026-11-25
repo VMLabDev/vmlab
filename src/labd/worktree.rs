@@ -265,7 +265,8 @@ impl LabRuntime {
 
     /// Restore the freeze point of generation `generation` on `m` (§21.3):
     /// stop it like any offline restore, then empty its overlays down to the
-    /// frozen files they back onto. The same in the main lab and a worktree.
+    /// frozen files they back onto, and put back the UEFI variables and the
+    /// TPM state the freeze copied. The same in the main lab and a worktree.
     pub(crate) async fn restore_freeze_point(
         &self,
         m: &Arc<dyn Machine>,
@@ -306,7 +307,8 @@ impl LabRuntime {
             })?;
             disks.push(facts);
         }
-        plan::plan_point_restore(m.name(), snap, generation, &disks)
+        let firmware = inspect::firmware_facts(m.local_dir(), &disks);
+        plan::plan_point_restore(m.name(), snap, generation, &disks, &firmware)
     }
 }
 
