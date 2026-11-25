@@ -294,6 +294,10 @@ pub struct Report {
     /// the syncer's login could not open.
     pub skipped: Vec<Skip>,
     /// Files the size guard refused before transfer, by name.
+    ///
+    /// A refused **guest** file stays here for as long as the guest holds it:
+    /// the host has never taken it, so a restore and a `destroy` refuse on it
+    /// ([`Outstanding::unsaved`](super::bracket::Outstanding::unsaved)).
     pub oversize: Vec<Oversize>,
     /// `.git`'s mutable set, waiting on a lock held on one side or the other.
     pub deferred: Vec<String>,
@@ -642,7 +646,7 @@ impl WorkspaceSyncers {
                     return refuse(Some(halt));
                 }
                 refuse(
-                    super::bracket::Outstanding::of(machine, &report)
+                    super::bracket::Outstanding::unsaved(machine, &report)
                         .map(super::bracket::RestoreOutstanding),
                 )
             }
@@ -1034,6 +1038,9 @@ async fn run(
     // a path once, at the moment it appears, so a lock held across several
     // passes has to be re-asked about rather than re-reported.
     let mut lock_candidates: BTreeSet<String> = BTreeSet::new();
+    // Guest files the size guard refused, asked about by name every pass for
+    // as long as the guest holds them (docs/reviews/labd-sync-2.md F16).
+    let mut refused: Vec<Oversize> = Vec::new();
     // What the passes have seen at each moved path, so a change no event has
     // named yet waits out a quiet period exactly once.
     let mut sighted = Sighted::default();
@@ -1049,6 +1056,14 @@ async fn run(
     // The re-seed has just completed, so the watch about to open is the one
     // (re)open that is **not** a discontinuity — see below.
     let mut seeded = false;
+    // The watch has opened behind a re-seed, and the guest tree has not been
+    // listed under it yet. The re-seed read the guest with no watch open, and
+    // the guest kept running: a file it made after the re-seed listed its
+    // directory is in no dirty set, on no ledger and not on the host, so no
+    // steady pass would ever ask about it. The first pass under the new watch
+    // lists the tree once ([`Pending::listing`]), and until that pass
+    // completes no verb is answered.
+    let mut listing = false;
     // The bracket's second half, read off the ledger rather than passed in:
     // a snapshot restore notes the rewind there precisely so that a machine
     // restored while it was *down* owes the same re-seed as one restored while
@@ -1112,12 +1127,20 @@ async fn run(
                     // was rolled back, and the re-seed has just recomputed
                     // them — so the watch opens on the current list.
                     prune = ledger.prune.clone();
+                    // No walk follows, so what the re-seed left in the guest
+                    // over the cap is known only from its report.
+                    refused = guest_refusals(&report.oversize);
                     syncer.publish(Report {
                         rescans,
                         passes,
                         ..report
                     });
-                    let _ = syncer.served.send(serving);
+                    // **No verb is answered here.** The guest ran while the
+                    // re-seed did, with no watch open, so what it made in that
+                    // time is not known yet: a `flush` answered now would say
+                    // "in step" over it, and a capture or a `destroy` would
+                    // go ahead. The pass under the watch that opens next lists
+                    // the guest tree, and that pass is the answer.
                 }
                 Err(e) => {
                     // The barrier **stays**. A re-seed that failed leaves a
@@ -1175,7 +1198,13 @@ async fn run(
                     // there was no watch is exactly what the walk is for. The
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
-                    rescan = !std::mem::take(&mut seeded);
+                    //
+                    // That open still leaves one question the re-seed could
+                    // not answer — what the guest made while it ran — so the
+                    // first pass under it lists the guest tree.
+                    let after_reseed = std::mem::take(&mut seeded);
+                    rescan = !after_reseed;
+                    listing |= after_reseed;
                     let changed_prune = std::mem::take(&mut prune_reopen);
                     unwitnessed = rescan && !changed_prune;
                     due = true;
@@ -1296,9 +1325,11 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
+                    listing,
                     unwitnessed: rescan && unwitnessed,
                     flush,
                     lock_candidates: &lock_candidates,
+                    refused: &refused,
                     sighted: &sighted,
                     resolved: &resolutions,
                     deletions: &deletions,
@@ -1336,11 +1367,13 @@ async fn run(
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
+                    listing = false;
                     unwitnessed = false;
                     // Nothing the pass declined to decide is forgotten.
                     owed.extend(done.deferred);
                     host_dirty = done.host_deferred;
                     lock_candidates = done.locks;
+                    refused = done.refused;
                     sighted = done.sighted;
                     // Found moved with no event behind them: their quiet
                     // period starts here, and an event that does arrive
@@ -1813,6 +1846,13 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
+    /// List the guest tree by name, against the ledger as it stands, rather
+    /// than probing named paths: the first pass under the watch that opens
+    /// behind a re-seed. It finds what the guest made between the re-seed's
+    /// own look at a directory and that open. **Not the stat-walk**: nothing
+    /// the ledger vouches for is hashed again, nothing is unwitnessed, and a
+    /// name it finds waits out a quiet period like any change no event named.
+    listing: bool,
     /// The walk follows startup or a channel failure. Agreements it finds
     /// present are confirmed, and missing paths get the unwitnessed-absence
     /// policy ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
@@ -1821,6 +1861,10 @@ struct Pending<'a> {
     flush: bool,
     /// Guest-side git locks seen on an earlier pass and not yet observed gone.
     lock_candidates: &'a BTreeSet<String>,
+    /// Guest files the size guard refused on the last pass. The host holds
+    /// none of them and no agreement names them, so the steady state asks
+    /// about each by name, or the refusal would be said once and forgotten.
+    refused: &'a [Oversize],
     /// What earlier passes saw at each path that had moved, and since when.
     sighted: &'a Sighted,
     /// Who wins where, as the developer has already said.
@@ -2028,6 +2072,9 @@ struct Passed {
     host_deferred: BTreeSet<String>,
     /// Guest-side locks still held, to re-ask about next pass.
     locks: BTreeSet<String>,
+    /// Guest files the size guard refuses as things stand, to re-ask about
+    /// next pass.
+    refused: Vec<Oversize>,
     /// Each side's moved paths as this pass saw them.
     sighted: Sighted,
     /// Host paths that moved with no settled event: their quiet period starts
@@ -2092,7 +2139,11 @@ async fn pass(
         );
     }
 
-    let mut probe = if pending.rescan {
+    // A listing is the same descent as the walk, asked against the ledger as
+    // it stands, since only a rescan cleared the scan cache above: the guest is asked for a digest only where its
+    // own `(size, mtime)` no longer matches what the re-seed recorded, and
+    // every name the ledger does not hold comes back with the rest.
+    let mut probe = if pending.rescan || pending.listing {
         guest_walk(
             guest.as_ref(),
             &workspace.guest_root,
@@ -2120,6 +2171,7 @@ async fn pass(
                 pending
                     .guest_dirty
                     .iter()
+                    .chain(pending.refused.iter().map(|refusal| &refusal.path))
                     .filter(|path| !ignores.verdict(path, false).is_guest_owned())
                     .cloned(),
             )
@@ -2760,6 +2812,20 @@ async fn pass(
     // such until a pass carries it out.
     owed.extend(plan.held.iter().cloned());
 
+    // A refusal this pass could not look at again still stands: the path is
+    // inside a quiet period or behind a lock, and nothing has said the file
+    // is gone or smaller.
+    let mut oversize = plan.oversize.clone();
+    let carried: Vec<Oversize> = pending
+        .refused
+        .iter()
+        .filter(|refusal| undecided.contains(&refusal.path))
+        .filter(|refusal| oversize.iter().all(|said| said.path != refusal.path))
+        .cloned()
+        .collect();
+    oversize.extend(carried);
+    oversize.sort_by(|a, b| a.path.cmp(&b.path));
+
     Ok(Passed {
         prune,
         host_deferred: match halt {
@@ -2768,6 +2834,7 @@ async fn pass(
         },
         deferred: owed,
         locks: held,
+        refused: guest_refusals(&oversize),
         sighted,
         found_host,
         found_guest,
@@ -2780,7 +2847,7 @@ async fn pass(
             halt,
             volume: plan.volume.clone(),
             skipped: skipped.into_iter().take(REPORTED).collect(),
-            oversize: plan.oversize.clone(),
+            oversize,
             deferred: deferred
                 .into_iter()
                 .chain(rule_deferred)
@@ -2789,6 +2856,15 @@ async fn pass(
             ..Report::default()
         },
     })
+}
+
+/// The refusals that name a file only the guest holds.
+fn guest_refusals(oversize: &[Oversize]) -> Vec<Oversize> {
+    oversize
+        .iter()
+        .filter(|refusal| refusal.direction == Direction::ToHost)
+        .cloned()
+        .collect()
 }
 
 fn rule_dir(path: &str) -> Option<&str> {
@@ -2882,6 +2958,13 @@ async fn reconverge(
         events.emit(
             "workspace.skipped",
             json!({"machine": workspace.machine, "path": skip.path, "reason": skip.why}),
+        );
+    }
+    // Attempted, and named where it did not take, as in an ordinary pass.
+    for refused in &done.symlinks_refused {
+        events.emit(
+            "workspace.symlink_refused",
+            json!({"machine": workspace.machine, "path": refused.path, "reason": refused.why}),
         );
     }
     // Failed paths stay under host-authoritative reseeding on every retry.
@@ -3154,9 +3237,11 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan: true,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                refused: &[],
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 deletions: &Deletions::default(),
@@ -3537,9 +3622,11 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
+                refused: &[],
                 sighted: &Sighted::default(),
                 resolved: &BTreeMap::new(),
                 deletions: &Deletions::default(),
@@ -3953,9 +4040,11 @@ mod tests {
             host_dirty: &BTreeSet::new(),
             in_flight: BTreeSet::new(),
             rescan: true,
+            listing: false,
             unwitnessed: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
+            refused: &[],
             sighted: &Sighted::default(),
             resolved: &BTreeMap::new(),
             deletions: &Deletions::default(),
@@ -6018,6 +6107,247 @@ mod tests {
         }
     }
 
+    /// A lab whose size cap is 64 bytes, seeded, with a 128-byte `dump.sql`
+    /// the guest has just made and the watch has reported: the size guard
+    /// has refused it once.
+    async fn lab_with_a_refused_guest_file(
+        dir: &std::path::Path,
+        state: &std::path::Path,
+    ) -> (WorkspaceSyncers, Arc<FakeGuest>, Arc<OneFake>, Workspace) {
+        std::fs::write(dir.join("main.rs"), "seed").unwrap();
+        let ws = Workspace {
+            max_file_bytes: 64,
+            ..workspace(dir, state)
+        };
+        let guest = Arc::new(FakeGuest::new());
+        let (events, _rx) = EventLog::recording("lab", state.join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        let sessions = OneFake::new(guest.clone());
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+
+        guest.file("/src/dump.sql", &"x".repeat(128), 900);
+        sessions.watcher.mark("dump.sql");
+        let syncer = syncers.get("dev01").await.unwrap();
+        let refused = eventually(move || names_dump(&syncer.report())).await;
+        assert!(refused, "the size guard never refused the guest file");
+        (syncers, guest, sessions, ws)
+    }
+
+    fn names_dump(report: &Report) -> bool {
+        report
+            .oversize
+            .iter()
+            .any(|refusal| refusal.path == "dump.sql" && refusal.direction == Direction::ToHost)
+    }
+
+    /// Review labd-sync-2 F16 (card 957): a guest file the size guard
+    /// refused is in no agreement and not on the host, so nothing asked the
+    /// guest about it again and the next report forgot it. It stays reported
+    /// for as long as the guest holds it, and no longer.
+    #[tokio::test]
+    async fn a_refused_guest_file_stays_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, sessions, _ws) =
+            lab_with_a_refused_guest_file(dir.path(), state.path()).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+
+        for pass in 1..=3 {
+            let report = syncer.pass_now().await.unwrap();
+            assert!(
+                names_dump(&report),
+                "pass {pass} after the refusal forgot the file: {report:?}"
+            );
+            let status = report.project();
+            assert!(
+                status.skipped.iter().any(|skip| skip.path == "dump.sql"),
+                "`dev sync status` does not name it: {:?}",
+                status.skipped
+            );
+        }
+        // Refused is not owed: once the path is still, nothing waits on it.
+        let settled = {
+            let syncer = syncer.clone();
+            eventually(move || {
+                let report = syncer.report();
+                names_dump(&report) && report.unsynced.is_empty() && report.trouble.is_none()
+            })
+            .await
+        };
+        assert!(settled, "{:?}", syncer.report());
+        assert!(!dir.path().join("dump.sql").exists());
+        assert!(guest.get("/src/dump.sql").is_some());
+
+        // Gone from the guest: the refusal goes with it.
+        guest.unlink("/src/dump.sql");
+        sessions.watcher.mark("dump.sql");
+        let cleared = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().oversize.is_empty()).await
+        };
+        assert!(cleared, "{:?}", syncer.report());
+        let report = syncer.pass_now().await.unwrap();
+        assert!(report.oversize.is_empty(), "{report:?}");
+        syncers.stop("dev01").await;
+    }
+
+    /// The other half of F16: the guest's copy of a refused file is the only
+    /// one, so a restore and a `destroy` refuse on it and name the flag,
+    /// running or stopped. A capture keeps the file and goes ahead.
+    #[tokio::test]
+    async fn a_restore_and_a_destroy_refuse_on_a_guest_file_the_size_guard_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (syncers, guest, _sessions, ws) =
+            lab_with_a_refused_guest_file(dir.path(), state.path()).await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        syncer.pass_now().await.unwrap();
+
+        let said_by = |refused: anyhow::Error| {
+            let said = format!("{refused:#}");
+            assert!(said.contains("dump.sql"), "{said}");
+            assert!(said.contains("size guard"), "{said}");
+            assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
+        };
+        said_by(
+            syncers
+                .before_restore("dev01", false, None, true)
+                .await
+                .expect_err("a restore deletes the only copy of the refused file"),
+        );
+        said_by(
+            syncers
+                .before_destroy("dev01", false, None)
+                .await
+                .expect_err("a destroy deletes the only copy of the refused file"),
+        );
+        syncers
+            .before_restore("dev01", true, None, true)
+            .await
+            .unwrap();
+        syncers.before_destroy("dev01", true, None).await.unwrap();
+        // A capture holds the guest's copy, so the file is no reason to
+        // refuse one once the path is still.
+        let asked = &syncers;
+        let captured =
+            eventually_async(|| async { asked.before_capture("dev01", None, true).await.is_ok() })
+                .await;
+        assert!(captured, "{:?}", syncer.report());
+
+        // Stopped, the syncer that knew is gone: the stop wrote it down.
+        syncers.stop_before_machine("dev01", true).await;
+        said_by(
+            syncers
+                .before_restore("dev01", false, Some(&ws), false)
+                .await
+                .expect_err("a restore of the stopped machine deletes the file too"),
+        );
+        said_by(
+            syncers
+                .before_destroy("dev01", false, Some(&ws))
+                .await
+                .expect_err("a destroy of the stopped machine deletes the file too"),
+        );
+        assert!(guest.get("/src/dump.sql").is_some());
+        assert!(!dir.path().join("dump.sql").exists());
+    }
+
+    /// Review labd-sync-2 F19 (card 957): the two degradations a Windows
+    /// login with `elevated = false` brings do not hold the re-seed. A refused
+    /// symlink and a case collision are both said by name, the barrier lifts
+    /// and the watch opens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_re_seed_completes_beside_a_refused_symlink_and_a_case_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "canonical").unwrap();
+        let degraded = Preconditions {
+            windows: true,
+            case_sensitive_dirs: false,
+            symlinks: false,
+        };
+        let ws = windows_workspace(dir.path(), state.path(), degraded);
+        let guest = Arc::new(FakeGuest::new());
+        guest.folding().refuse_symlinks();
+        let sessions = OneFake::new(guest.clone());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.text("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+
+        let opens = sessions.opens().len();
+        restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            // The rolled-back tree holds a copy at one of the colliding
+            // names, which must not outlive the re-seed.
+            guest.file("/src/foo.cs", "the version in the snapshot", 1);
+            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
+            std::fs::write(dir.path().join("Foo.cs"), "upper").unwrap();
+            std::fs::write(dir.path().join("foo.cs"), "lower").unwrap();
+        })
+        .await;
+
+        let syncer = syncers.get("dev01").await.unwrap();
+        let lifted = {
+            let syncer = syncer.clone();
+            eventually(move || syncer.report().passes > 0 && syncer.report().reseed.is_none()).await
+        };
+        assert!(
+            lifted,
+            "the re-seed barrier never lifted: {:?}",
+            syncer.report()
+        );
+        assert!(!Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root).reseed_owed);
+        let reopened = {
+            let sessions = sessions.clone();
+            eventually(move || sessions.opens().len() > opens).await
+        };
+        assert!(reopened, "the watch never came back");
+        assert_eq!(guest.text("/src/main.rs").as_deref(), Some("canonical"));
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(guest.get("/src/foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/Foo.cs").is_none(), "{:?}", guest.paths());
+        assert!(guest.get("/src/link.rs").is_none(), "{:?}", guest.paths());
+        syncers.stop("dev01").await;
+
+        // Nothing of the rolled-back tree reached the canonical copy.
+        assert!(!dir.path().join("experiment.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo.cs")).unwrap(),
+            "lower"
+        );
+        let events = events_of(state.path());
+        assert!(
+            events
+                .iter()
+                .any(|(name, _)| name == "workspace.reconverged"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.symlink_refused" && data["path"] == "link.rs"
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|(name, data)| {
+                name == "workspace.case_collision"
+                    && data["paths"] == serde_json::json!(["Foo.cs", "foo.cs"])
+            }),
+            "{events:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_incomplete_reseed_keeps_the_loop_and_restart_behind_the_barrier() {
@@ -6027,10 +6357,11 @@ mod tests {
         let (syncers, guest, sessions) = seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
         let ws = workspace(dir.path(), state.path());
         let opens = sessions.opens().len();
+        // A failure that can end, and has not: a refused symlink is not one
+        // (docs/reviews/labd-sync-2.md F19).
         restore_bracket(&syncers, &ws, || {
             rewind(&guest);
-            std::os::unix::fs::symlink("main.rs", dir.path().join("link.rs")).unwrap();
-            guest.refuse_symlinks();
+            guest.fail_pushes();
         })
         .await;
         for restart in [false, true] {
@@ -6119,6 +6450,88 @@ mod tests {
             "a restore must not answer itself with a stat-walk",
         );
         assert!(syncer.report().reseed.is_none(), "the barrier never lifted");
+        syncers.stop("dev01").await;
+    }
+
+    /// The re-seed reads the guest with the watch closed, and a restore of an
+    /// online snapshot resumes the guest's processes: a build that was running
+    /// at the capture writes while the re-seed runs. A file it makes after the
+    /// re-seed listed its directory is in no dirty set, on no ledger and not
+    /// on the host, so the first pass under the new watch lists the guest tree
+    /// — and the file reaches the host, with no stat-walk taken for it.
+    ///
+    /// The hook makes the file at the last moment nothing is watching: as the
+    /// watch opens behind the re-seed.
+    #[tokio::test]
+    async fn a_guest_file_made_during_a_re_seed_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, _| {
+            if guest.get("/restored").is_some() && guest.get("/src/late.rs").is_none() {
+                guest.file("/src/late.rs", "written while the re-seed ran", 7);
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        let ws = workspace(dir.path(), state.path());
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+        syncers
+            .get("dev01")
+            .await
+            .unwrap()
+            .pass_now()
+            .await
+            .unwrap();
+
+        restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            // Outside the workspace, so the re-seed leaves it: how the hook
+            // knows the restore has happened.
+            guest.file("/restored", "", 1);
+        })
+        .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        let reopened = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/late.rs").is_some()).await
+        };
+        assert!(reopened, "the watch never reopened after the re-seed");
+
+        // The first flush finds the file and gives it its quiet period, the
+        // second carries it.
+        let found = syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("late.rs"))
+                .ok()
+                .as_deref(),
+            Some("written while the re-seed ran"),
+            "the host never received the file the guest made during the re-seed: after the \
+             first flush unsynced was {:?}, after the second {:?}",
+            found.unsynced,
+            report.unsynced,
+        );
+        assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+        assert!(report.reseed.is_none(), "the barrier never lifted");
+        assert_eq!(
+            report.rescans, 0,
+            "the listing behind a re-seed is not a stat-walk",
+        );
+        // The re-seed itself still discarded what the snapshot held.
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(!dir.path().join("experiment.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "the canonical version",
+        );
         syncers.stop("dev01").await;
     }
 

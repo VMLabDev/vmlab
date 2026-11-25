@@ -2187,7 +2187,13 @@ guest's clock runs behind the host, so a same-size in-place write compares
 identical on `(size, mtime)`. A literal wipe-and-re-transfer trivially satisfies
 the guarantee and remains legal; it is not required. **The re-seed completes
 before the watch re-opens**, or the syncer's own writes fill the fresh dirty set
-with tens of thousands of self-inflicted paths.
+with tens of thousands of self-inflicted paths. The guest runs while the re-seed
+does, and a restore of an online snapshot resumes its processes, so **the first
+pass under the re-opened watch lists the guest tree by name**: a file the guest
+made after the re-seed read its directory is in no dirty set, and the listing is
+what finds it. It is not the stat-walk — the ledger the re-seed wrote vouches
+for what it placed, so nothing is hashed again — and until that pass completes
+no flush is answered, so a capture or a `destroy` cannot go ahead over the file.
 
 **A pre-flight flush brackets capture as well as restore.** If the guest has
 unsynced work — channel down, sync paused, guest writing faster than it drains —
