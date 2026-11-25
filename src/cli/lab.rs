@@ -3656,7 +3656,7 @@ mod tests {
         assert_eq!(
             seen.first(),
             Some(&true),
-            "the first release must find the lab directory in place: {seen:?}"
+            "the first release must find the lab directory in place: {seen:?}, {result:?}"
         );
         if fail {
             let err = result.expect_err("the destroy went on past a failed release");
