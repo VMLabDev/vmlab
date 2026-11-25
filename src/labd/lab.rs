@@ -1807,6 +1807,7 @@ impl LabRuntime {
             entry.repaired_agent = None;
             entry.hypervisor = None;
             entry.snapshots.clear();
+            entry.pending_snapshots.clear();
             m.forget_artefacts(entry).await;
             state.save(&self.lab_local)?;
         }
@@ -3916,9 +3917,26 @@ impl LabRuntime {
     /// seen, this refuses. **With no escape flag**: a snapshot of a tree that
     /// exists nowhere else is not a thing to take against a warning. Every
     /// other machine passes straight through.
-    pub async fn snapshot(&self, vm_name: &str, snap: &str) -> Result<bool> {
-        let m = self.machine(vm_name)?;
+    pub async fn snapshot(self: &Arc<Self>, vm_name: &str, snap: &str) -> Result<bool> {
         super::vm::validate_snapshot_name(snap)?;
+        let ticket = self.starts.ticket()?;
+        let lab = Arc::clone(self);
+        let (vm_name, snap) = (vm_name.to_owned(), snap.to_owned());
+        // The caller can stop waiting while the disk operation is still
+        // running. Keep the machine reserved through the record save.
+        let capture = tokio::spawn(async move {
+            let _admitted = lab.starts.admit(&vm_name, ticket).await?;
+            lab.snapshot_to_its_end(&vm_name, &snap).await
+        });
+        match capture.await {
+            Ok(captured) => captured,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(anyhow!("the capture did not run to its end: {e}")),
+        }
+    }
+
+    async fn snapshot_to_its_end(&self, vm_name: &str, snap: &str) -> Result<bool> {
+        let m = self.machine(vm_name)?;
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
@@ -4009,7 +4027,7 @@ impl LabRuntime {
 
     /// Lab-wide capture rolls back earlier machines if a later one fails.
     /// Capture times remain uncoordinated across guests (PRD §7.3).
-    pub async fn snapshot_all(&self, snap: &str) -> Result<Value> {
+    pub async fn snapshot_all(self: &Arc<Self>, snap: &str) -> Result<Value> {
         let mut results = Vec::new();
         let mut captured: Vec<String> = Vec::new();
         for m in self.machines() {

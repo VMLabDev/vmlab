@@ -22,6 +22,7 @@ use anyhow::Result;
 
 use super::steps::{Plan, Planned, Step};
 use crate::labd::state::LabState;
+use crate::labd::vm::RESTORE_RECOVERY_PREFIX;
 use crate::proto::CommandError;
 use crate::template::qimg::InternalSnapshot;
 
@@ -680,7 +681,10 @@ pub fn plan_point_restore(
             }],
         );
         active.create(&mut plan, &fresh, snapshot);
-        for s in d.snapshots.iter().filter(|s| s.name != HOLD_SNAPSHOT) {
+        for s in &d.snapshots {
+            if s.name == HOLD_SNAPSHOT || s.name.starts_with(RESTORE_RECOVERY_PREFIX) {
+                continue;
+            }
             active.apply(&mut plan, &fresh, snapshot);
             plan.push(
                 Step::Export {
@@ -869,7 +873,7 @@ fn thaw_disk(
         f.snapshots
             .iter()
             .map(|s| s.name.clone())
-            .filter(|n| n != HOLD_SNAPSHOT)
+            .filter(|n| n != HOLD_SNAPSHOT && !n.starts_with(RESTORE_RECOVERY_PREFIX))
             .collect()
     };
     let Some(((base_gen, base), above)) = d.layers.split_last() else {
@@ -932,7 +936,10 @@ fn thaw_disk(
         }
         for s in &layer.snapshots {
             let name = &s.name;
-            if name == HOLD_SNAPSHOT || stranded.contains(name) {
+            if name == HOLD_SNAPSHOT
+                || name.starts_with(RESTORE_RECOVERY_PREFIX)
+                || stranded.contains(name)
+            {
                 continue;
             }
             // The empty mark a freeze-point restore leaves is the base's own

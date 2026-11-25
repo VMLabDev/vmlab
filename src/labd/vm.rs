@@ -1468,6 +1468,7 @@ impl VmInstance {
             std::fs::create_dir_all(&self.dirs.run)?;
             std::fs::create_dir_all(&self.dirs.logs)?;
             self.ensure_disks().await?;
+            remove_stale_restore_snapshots(&self.all_disk_paths()).await?;
 
             // Per-VM writable OVMF VARS from the firmware template — copied
             // once, at the VM's first start; an existing copy is never
@@ -3128,6 +3129,36 @@ pub(super) async fn check_disks_hold_snapshot(disks: &[PathBuf], name: &str) -> 
     Ok(())
 }
 
+// The colon keeps new recovery snapshots outside the user name grammar.
+// Unmarked names from older versions may belong to users.
+pub(crate) const RESTORE_RECOVERY_PREFIX: &str = "vmlab-restore-:";
+
+async fn remove_stale_restore_snapshots(disks: &[PathBuf]) -> Result<()> {
+    use crate::template::qimg;
+
+    // A daemon can die partway through capture or cleanup, so inspect each
+    // writable disk independently before giving it to the hypervisor.
+    for disk in disks {
+        let info = qimg::image_info(disk).await.with_context(|| {
+            format!("checking {} for interrupted restore snapshots", disk.display())
+        })?;
+        for snapshot in info.snapshots {
+            if snapshot.name.starts_with(RESTORE_RECOVERY_PREFIX) {
+                qimg::snapshot_delete(disk, &snapshot.name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "removing interrupted restore snapshot {:?} from {}",
+                            snapshot.name,
+                            disk.display()
+                        )
+                    })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn restore_offline_disks(
     disks: &[PathBuf],
     name: &str,
@@ -3136,7 +3167,7 @@ async fn restore_offline_disks(
     check_disks_hold_snapshot(disks, name).await?;
 
     stop.await?;
-    let backup = format!("vmlab-restore-{:032x}", rand::random::<u128>());
+    let backup = format!("{RESTORE_RECOVERY_PREFIX}{:032x}", rand::random::<u128>());
     snapshot_offline_disks(disks, &backup)
         .await
         .context("saving disk state before offline restore")?;
@@ -3213,6 +3244,9 @@ pub(super) async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Res
 }
 
 pub(crate) fn validate_snapshot_name(name: &str) -> Result<()> {
+    if name == crate::freeze::plan::HOLD_SNAPSHOT {
+        bail!("snapshot name `{name}` is reserved for worktree operations");
+    }
     if name.is_empty()
         || !name
             .chars()
