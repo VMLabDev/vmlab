@@ -59,8 +59,19 @@ pub struct Assets {
 }
 
 impl Assets {
-    /// `None` when the tests can run; otherwise the reason to skip with.
+    /// Report missing guest fixtures, or fail when the gate requires them.
     pub fn skip_reason(&self) -> Option<String> {
+        let reason = self.missing_reason();
+        if let Some(reason) = &reason {
+            assert!(
+                std::env::var_os("VMLAB_REQUIRE_GUEST_ASSETS").is_none(),
+                "cannot run guest test: {reason}"
+            );
+        }
+        reason
+    }
+
+    fn missing_reason(&self) -> Option<String> {
         if !self.kvm {
             return Some("/dev/kvm is not present".to_string());
         }
@@ -68,6 +79,12 @@ impl Assets {
             return Some(format!(
                 "container kernel {} is not present (vmlab checkout?)",
                 self.kernel.display()
+            ));
+        }
+        if !self.initrd.is_file() {
+            return Some(format!(
+                "container initramfs {} is not present",
+                self.initrd.display()
             ));
         }
         if self.rootfs.is_none() {

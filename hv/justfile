@@ -46,7 +46,7 @@ s1-tarball:
 [group('test')]
 s1-rootfs-build: s1-tarball
 	@command -v sqfstar > /dev/null || (echo 'sqfstar is required to build the S1 rootfs' && exit 1)
-	@gzip -dc target/s1/alpine.tar.gz | sqfstar -no-xattrs -all-root -repro-time 0 -comp gzip -force target/s1/rootfs.sqfs
+	@bash -euo pipefail -c 'gzip -dc target/s1/alpine.tar.gz | sqfstar -no-xattrs -all-root -mkfs-time 0 -all-time 0 -processors 2 -comp gzip -force target/s1/rootfs.sqfs'
 
 # Run the S1 integration suite against the built rootfs
 [group('test')]

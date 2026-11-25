@@ -183,7 +183,9 @@ hv-ipxe-build: require-uv
 # Run before release e2e and nightly on next (see docs/agents/hv-gate.md)
 [group('ci')]
 hv-gate: require-cargo hv-virgl-build hv-ipxe-build
-	VMLAB_REQUIRE_KVM=1 PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab
+	rootfs=$(python3 scripts/hv_gate_guest.py {{quote(ci_cache / 'hv-guest')}}) && \
+	{{hv_gate_target_env}}VMLAB_HV_TEST_ROOTFS="$rootfs" VMLAB_REQUIRE_GUEST_ASSETS=1 VMLAB_REQUIRE_KVM=1 \
+	PKG_CONFIG_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib/pkgconfig" LD_LIBRARY_PATH="{{ci_cache}}/{{hv_virgl_key}}/lib" RENDER_SERVER_EXEC_PATH="{{ci_cache}}/{{hv_virgl_key}}/libexec/virgl_render_server" RUST_TEST_THREADS="{{hv_gate_test_threads}}" cargo test --workspace --exclude vmlab -- --show-output
 
 # Check guest pins, documentation, Python packaging and shell scripts without building drivers
 [group('ci')]
@@ -201,6 +203,7 @@ win3d-check: require-uv
 host_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'host') + ' ' }
 test_result_root := if _target_root == '' { 'target' } else { _target_root }
 hv_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'hv') + ' ' }
+hv_gate_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(_target_root / 'hv-gate') + ' ' }
 agent_target := if _target_root == '' { 'guest/agent/target' } else { _target_root / 'guest-agent' }
 agent_target_env := if _target_root == '' { '' } else { 'CARGO_TARGET_DIR=' + quote(agent_target) + ' ' }
 
