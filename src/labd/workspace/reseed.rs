@@ -41,6 +41,13 @@
 //! guest do while we were not looking*, and here vmlab already knows — it did
 //! exactly this. Two routes re-establish agreement, and each has its own; see
 //! [`syncer`](super::syncer) for the barrier that keeps them apart.
+//!
+//! What vmlab does **not** know is what the guest made while the re-seed ran:
+//! the tree is read here with the watch closed, and the guest's processes are
+//! running. A file made after its directory was listed is seen by nothing in
+//! this module. The loop answers that with one listing of the guest tree, by
+//! name and against the ledger written here, on the first pass under the
+//! watch that opens next.
 
 use std::collections::{BTreeMap, BTreeSet};
 

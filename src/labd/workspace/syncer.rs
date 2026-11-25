@@ -1049,6 +1049,14 @@ async fn run(
     // The re-seed has just completed, so the watch about to open is the one
     // (re)open that is **not** a discontinuity — see below.
     let mut seeded = false;
+    // The watch has opened behind a re-seed, and the guest tree has not been
+    // listed under it yet. The re-seed read the guest with no watch open, and
+    // the guest kept running: a file it made after the re-seed listed its
+    // directory is in no dirty set, on no ledger and not on the host, so no
+    // steady pass would ever ask about it. The first pass under the new watch
+    // lists the tree once ([`Pending::listing`]), and until that pass
+    // completes no verb is answered.
+    let mut listing = false;
     // The bracket's second half, read off the ledger rather than passed in:
     // a snapshot restore notes the rewind there precisely so that a machine
     // restored while it was *down* owes the same re-seed as one restored while
@@ -1117,7 +1125,12 @@ async fn run(
                         passes,
                         ..report
                     });
-                    let _ = syncer.served.send(serving);
+                    // **No verb is answered here.** The guest ran while the
+                    // re-seed did, with no watch open, so what it made in that
+                    // time is not known yet: a `flush` answered now would say
+                    // "in step" over it, and a capture or a `destroy` would
+                    // go ahead. The pass under the watch that opens next lists
+                    // the guest tree, and that pass is the answer.
                 }
                 Err(e) => {
                     // The barrier **stays**. A re-seed that failed leaves a
@@ -1175,7 +1188,13 @@ async fn run(
                     // there was no watch is exactly what the walk is for. The
                     // one exception is the open that follows a re-seed, where
                     // the answer is already in hand.
-                    rescan = !std::mem::take(&mut seeded);
+                    //
+                    // That open still leaves one question the re-seed could
+                    // not answer — what the guest made while it ran — so the
+                    // first pass under it lists the guest tree.
+                    let after_reseed = std::mem::take(&mut seeded);
+                    rescan = !after_reseed;
+                    listing |= after_reseed;
                     let changed_prune = std::mem::take(&mut prune_reopen);
                     unwitnessed = rescan && !changed_prune;
                     due = true;
@@ -1296,6 +1315,7 @@ async fn run(
                         .cloned()
                         .collect(),
                     rescan,
+                    listing,
                     unwitnessed: rescan && unwitnessed,
                     flush,
                     lock_candidates: &lock_candidates,
@@ -1336,6 +1356,7 @@ async fn run(
                     }
                     // The barrier lifts only on a completed walk.
                     rescan = false;
+                    listing = false;
                     unwitnessed = false;
                     // Nothing the pass declined to decide is forgotten.
                     owed.extend(done.deferred);
@@ -1813,6 +1834,13 @@ struct Pending<'a> {
     /// Take the stat-walk rather than probing named paths, and do not
     /// propagate anything until it has completed.
     rescan: bool,
+    /// List the guest tree by name, against the ledger as it stands, rather
+    /// than probing named paths: the first pass under the watch that opens
+    /// behind a re-seed. It finds what the guest made between the re-seed's
+    /// own look at a directory and that open. **Not the stat-walk**: nothing
+    /// the ledger vouches for is hashed again, nothing is unwitnessed, and a
+    /// name it finds waits out a quiet period like any change no event named.
+    listing: bool,
     /// The walk follows startup or a channel failure. Agreements it finds
     /// present are confirmed, and missing paths get the unwitnessed-absence
     /// policy ([`Inputs::unwitnessed`](super::plan::Inputs::unwitnessed), #190).
@@ -2092,7 +2120,11 @@ async fn pass(
         );
     }
 
-    let mut probe = if pending.rescan {
+    // A listing is the same descent as the walk, asked against the ledger as
+    // it stands, since only a rescan cleared the scan cache above: the guest is asked for a digest only where its
+    // own `(size, mtime)` no longer matches what the re-seed recorded, and
+    // every name the ledger does not hold comes back with the rest.
+    let mut probe = if pending.rescan || pending.listing {
         guest_walk(
             guest.as_ref(),
             &workspace.guest_root,
@@ -3154,6 +3186,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan: true,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
@@ -3537,6 +3570,7 @@ mod tests {
                 host_dirty: &BTreeSet::new(),
                 in_flight: BTreeSet::new(),
                 rescan,
+                listing: false,
                 unwitnessed: false,
                 flush: false,
                 lock_candidates: &BTreeSet::new(),
@@ -3953,6 +3987,7 @@ mod tests {
             host_dirty: &BTreeSet::new(),
             in_flight: BTreeSet::new(),
             rescan: true,
+            listing: false,
             unwitnessed: false,
             flush: false,
             lock_candidates: &BTreeSet::new(),
@@ -6119,6 +6154,88 @@ mod tests {
             "a restore must not answer itself with a stat-walk",
         );
         assert!(syncer.report().reseed.is_none(), "the barrier never lifted");
+        syncers.stop("dev01").await;
+    }
+
+    /// The re-seed reads the guest with the watch closed, and a restore of an
+    /// online snapshot resumes the guest's processes: a build that was running
+    /// at the capture writes while the re-seed runs. A file it makes after the
+    /// re-seed listed its directory is in no dirty set, on no ledger and not
+    /// on the host, so the first pass under the new watch lists the guest tree
+    /// — and the file reaches the host, with no stat-walk taken for it.
+    ///
+    /// The hook makes the file at the last moment nothing is watching: as the
+    /// watch opens behind the re-seed.
+    #[tokio::test]
+    async fn a_guest_file_made_during_a_re_seed_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, _| {
+            if guest.get("/restored").is_some() && guest.get("/src/late.rs").is_none() {
+                guest.file("/src/late.rs", "written while the re-seed ran", 7);
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        let ws = workspace(dir.path(), state.path());
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+        syncers
+            .get("dev01")
+            .await
+            .unwrap()
+            .pass_now()
+            .await
+            .unwrap();
+
+        restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            // Outside the workspace, so the re-seed leaves it: how the hook
+            // knows the restore has happened.
+            guest.file("/restored", "", 1);
+        })
+        .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        let reopened = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/late.rs").is_some()).await
+        };
+        assert!(reopened, "the watch never reopened after the re-seed");
+
+        // The first flush finds the file and gives it its quiet period, the
+        // second carries it.
+        let found = syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("late.rs"))
+                .ok()
+                .as_deref(),
+            Some("written while the re-seed ran"),
+            "the host never received the file the guest made during the re-seed: after the \
+             first flush unsynced was {:?}, after the second {:?}",
+            found.unsynced,
+            report.unsynced,
+        );
+        assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+        assert!(report.reseed.is_none(), "the barrier never lifted");
+        assert_eq!(
+            report.rescans, 0,
+            "the listing behind a re-seed is not a stat-walk",
+        );
+        // The re-seed itself still discarded what the snapshot held.
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(!dir.path().join("experiment.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "the canonical version",
+        );
         syncers.stop("dev01").await;
     }
 
