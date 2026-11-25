@@ -1554,6 +1554,12 @@ impl LabRuntime {
         Ok(())
     }
 
+    /// Whether a start, a destroy or a restore holds `name`'s start lock now.
+    #[cfg(test)]
+    pub(super) fn start_lock_held(&self, name: &str) -> bool {
+        self.starts.lock_of(name).try_lock().is_err()
+    }
+
     /// Boot one machine, whichever kind it is.
     pub async fn start_machine(self: &Arc<Self>, name: &str) -> Result<()> {
         self.start_machine_with_output(name, None).await
@@ -4148,7 +4154,16 @@ impl LabRuntime {
             // A freeze point is no internal snapshot of the machine's own
             // disks but the state of the frozen files under them (§21.3).
             Ok(()) => match record.freeze_point {
-                Some(generation) => self.restore_freeze_point(&m, snap, generation).await,
+                Some(generation) => {
+                    // It replaces the machine's disks, so it holds the
+                    // machine's start lock from before its stop to its last
+                    // rename: a start waits and boots on the restored disks,
+                    // and a destroy waits rather than removing the directory
+                    // under the plan. It boots nothing, so it takes no
+                    // ticket.
+                    let _no_start = self.starts.hold(m.name()).await;
+                    self.restore_freeze_point(&m, snap, generation).await
+                }
                 None => {
                     // An online restore boots a stopped machine, so it is a
                     // start: refused in a lab that is going away, and held

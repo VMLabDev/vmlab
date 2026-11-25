@@ -2608,6 +2608,174 @@ async fn offline_snapshot_writes_exclude_start_on_both_machine_kinds() {
     }
 }
 
+/// A lab with the one VM of [`LINUX_VM`], stopped, whose disk is an overlay
+/// on generation 1's frozen disk, and whose record `base` is that
+/// generation's freeze point (§21.3).
+async fn lab_at_a_freeze_point(
+    dirs: &Dirs,
+) -> (
+    Arc<super::lab::LabRuntime>,
+    Arc<VmInstance>,
+    Arc<FakeHypervisor>,
+) {
+    use super::state::{LabState, SnapshotRecord};
+    use crate::template::qimg;
+
+    let (machine, hv) = vm(dirs, LINUX_VM, Script::healthy());
+    let disk = machine.dirs.primary_disk();
+    let frozen = dirs
+        .root
+        .join(crate::freeze::FREEZE_DIR)
+        .join("1")
+        .join(machine.name())
+        .join(disk.file_name().unwrap());
+    std::fs::create_dir_all(frozen.parent().unwrap()).unwrap();
+    qimg::create_blank(&frozen, 1 << 20).await.unwrap();
+    let _ = std::fs::remove_file(&disk);
+    qimg::create_linked_clone(&frozen, &disk).await.unwrap();
+    // Taken since the freeze, so the restore replaces the overlay and
+    // carries this one into the new one.
+    qimg::snapshot_create(&disk, "later").await.unwrap();
+
+    let local = crate::paths::lab_local_dir(&dirs.root);
+    let mut state = LabState::default();
+    state.machine_mut(machine.name()).snapshots.insert(
+        "base".into(),
+        SnapshotRecord {
+            online: false,
+            taken_at: chrono::Utc::now(),
+            image_digest: None,
+            frozen_in: None,
+            freeze_point: Some(1),
+            hypervisor: machine.hypervisor(),
+        },
+    );
+    state.save(&local).unwrap();
+    let config = crate::config::load_lab_source(
+        &format!("import <vmlab.wcl>\nlab \"t\" {{\n{LINUX_VM}\n}}\n"),
+        "<test>",
+        &dirs.root,
+    )
+    .unwrap();
+    let lab = super::lab::LabRuntime::with_machines(config, vec![machine.clone()]).unwrap();
+    (lab, machine, hv)
+}
+
+/// Start the restore of the freeze point and return once its plan is inside
+/// the image tool, creating its first snapshot. The restore stays there
+/// until the sender is used.
+async fn freeze_point_restore_in_the_image_tool(
+    lab: &Arc<super::lab::LabRuntime>,
+    name: &str,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<Vec<String>>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, release) = crate::template::qimg::testing::pause_next("snapshot");
+    let mut restore = {
+        let (lab, name) = (lab.clone(), name.to_string());
+        tokio::spawn(async move { lab.restore(&name, "base", false).await })
+    };
+    tokio::select! {
+        biased;
+        entered = entered => entered.unwrap(),
+        ended = &mut restore => panic!("the restore ended before it reached the image tool: {ended:?}"),
+    }
+    (restore, release)
+}
+
+/// The names of the internal snapshots `disk` holds.
+async fn snapshot_names(disk: &std::path::Path) -> Vec<String> {
+    let info = crate::template::qimg::image_info(disk).await.unwrap();
+    info.snapshots.into_iter().map(|s| s.name).collect()
+}
+
+/// Review snapshots-2 F12: a freeze-point restore replaces the machine's
+/// disks, so a start asked for while it runs waits for it.
+#[tokio::test]
+async fn a_freeze_point_restore_excludes_a_concurrent_start() {
+    use crate::template::qimg::{Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (lab, machine, hv) = lab_at_a_freeze_point(&dirs).await;
+    let name = machine.name();
+    let disk = machine.dirs.primary_disk();
+
+    let (restore, release) = freeze_point_restore_in_the_image_tool(&lab, name).await;
+    assert!(
+        lab.start_lock_held(name),
+        "a freeze-point restore must hold the machine's start lock while its plan runs"
+    );
+    let start = {
+        let lab = lab.clone();
+        tokio::spawn(async move { lab.start_machine("dc01").await })
+    };
+    // The start has every chance to run, and must still be waiting.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        hv.launched_disks().is_empty(),
+        "the start launched a hypervisor on a disk the restore is replacing"
+    );
+    assert_eq!(machine.state().await, PowerState::Stopped);
+
+    release.send(()).unwrap();
+    restore.await.unwrap().expect("freeze-point restore");
+    start
+        .await
+        .unwrap()
+        .expect("the start runs after the restore");
+    assert_eq!(hv.launched_disks().len(), 1);
+    // It booted on the restored overlay: the mark of the freeze point, the
+    // snapshot carried over, and no hold left by a plan that was cut short.
+    let mut names = snapshot_names(&disk).await;
+    names.sort();
+    assert_eq!(names, ["base", "later"]);
+    lab.stop_machine(name, true).await.unwrap();
+}
+
+/// Review snapshots-2 F12, the destroy half: a destroy asked for while the
+/// freeze-point restore runs waits rather than removing the directory under
+/// the plan.
+#[tokio::test]
+async fn a_freeze_point_restore_excludes_a_concurrent_destroy() {
+    use crate::template::qimg::{Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let dirs = Dirs::new();
+    let (lab, machine, _hv) = lab_at_a_freeze_point(&dirs).await;
+    let name = machine.name();
+    let disk = machine.dirs.primary_disk();
+
+    let (restore, release) = freeze_point_restore_in_the_image_tool(&lab, name).await;
+    assert!(
+        lab.start_lock_held(name),
+        "a freeze-point restore must hold the machine's start lock while its plan runs"
+    );
+    let destroy = {
+        let lab = lab.clone();
+        tokio::spawn(async move { lab.destroy_machine("dc01", false).await })
+    };
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        disk.exists(),
+        "the destroy removed a disk the restore is replacing"
+    );
+
+    release.send(()).unwrap();
+    // The plan ran to its end on disks that were still there.
+    restore.await.unwrap().expect("freeze-point restore");
+    destroy
+        .await
+        .unwrap()
+        .expect("the destroy runs after the restore");
+    assert!(!machine.dirs.local.exists());
+}
+
 /// A `firmware_dir` laid out like the bundled x86_64 set, each file holding
 /// its own name: the plain and secure-boot CODE builds, the blank VARS
 /// template and the one with keys enrolled. The four are the same length, as
