@@ -419,12 +419,16 @@ pub trait Machine: Send + Sync + 'static {
         online: bool,
     ) -> Result<()>;
 
-    /// Why a [`restore`](Machine::restore) with this `online` cannot be
-    /// done now, `None` when nothing known speaks against it. It moves
-    /// nothing, so the lab asks it before it touches what a restore rewinds
-    /// with the machine: its host USB devices and its workspace.
-    async fn restore_refusal(&self, _online: bool) -> Option<String> {
-        None
+    /// Whether a restore of `snap` can run on this machine as it is now,
+    /// asked before anything moves (PRD §7.3). `online` is the record's, as
+    /// for [`restore`](Machine::restore). It reads and changes nothing: no
+    /// stop, no boot, no write to a disk.
+    ///
+    /// A lab-wide restore asks every machine before it rewinds the first, so
+    /// that one machine's refusal does not leave the lab at two points in
+    /// time. What only the rewind itself can find out is not asked here.
+    async fn check_restore(&self, _snap: &str, _online: bool) -> Result<()> {
+        Ok(())
     }
 
     /// Wait for the exit monitor to settle the power state.

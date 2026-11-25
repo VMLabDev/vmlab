@@ -267,7 +267,7 @@ impl LabRuntime {
     /// stop it like any offline restore, then empty its overlays down to the
     /// frozen files they back onto. The same in the main lab and a worktree.
     ///
-    /// The caller has asked [`Self::check_freeze_point_restore`] already. It
+    /// The caller has asked [`Self::plan_freeze_point_restore`] already. It
     /// is asked again here, ahead of the stop, for a caller that did not.
     pub(crate) async fn restore_freeze_point(
         &self,
@@ -276,12 +276,15 @@ impl LabRuntime {
         generation: u32,
     ) -> Result<()> {
         if m.state().await != PowerState::Stopped {
-            self.check_freeze_point_restore(m, snap, generation).await?;
+            self.plan_freeze_point_restore(m.as_ref(), snap, generation)
+                .await?;
             m.stop(false).await?;
             m.wait_state(PowerState::Stopped, STOP_WAIT).await?;
         }
         // Planned from the disks as the stop left them.
-        let plan = point_restore_plan(m.as_ref(), snap, generation).await?;
+        let plan = self
+            .plan_freeze_point_restore(m.as_ref(), snap, generation)
+            .await?;
         let applied = execute(plan).await?;
         for warning in applied.finish().await {
             tracing::warn!("{}: {warning}", m.name());
@@ -289,41 +292,28 @@ impl LabRuntime {
         Ok(())
     }
 
-    /// Refuse a freeze-point restore that cannot be done, while nothing has
-    /// moved: a restore that must refuse leaves a running machine running.
-    /// Reads the disks and plans; runs nothing.
-    pub(crate) async fn check_freeze_point_restore(
+    /// The steps of a freeze-point restore of `m`, or why it is refused
+    /// (§21.3). It reads the disks' headers and changes nothing, so a restore
+    /// asks it before anything moves and again once the machine has stopped.
+    pub(crate) async fn plan_freeze_point_restore(
         &self,
-        m: &Arc<dyn Machine>,
+        m: &dyn Machine,
         snap: &str,
         generation: u32,
-    ) -> Result<()> {
-        point_restore_plan(m.as_ref(), snap, generation)
-            .await
-            .map(drop)
+    ) -> Result<crate::freeze::steps::Plan> {
+        let mut disks = Vec::new();
+        for path in m.disk_paths() {
+            let facts = disk_facts(&path).await?.ok_or_else(|| {
+                CommandError::conflict(format!(
+                    "\"{}\" has no disk {} to restore",
+                    m.name(),
+                    path.display()
+                ))
+            })?;
+            disks.push(facts);
+        }
+        plan::plan_point_restore(m.name(), snap, generation, &disks)
     }
-}
-
-/// The plan of a freeze-point restore of `m`, from its disks as they are
-/// now, or the refusal: a disk that is missing, and whatever
-/// [`plan::plan_point_restore`] refuses.
-async fn point_restore_plan(
-    m: &dyn Machine,
-    snap: &str,
-    generation: u32,
-) -> Result<crate::freeze::steps::Plan> {
-    let mut disks = Vec::new();
-    for path in m.disk_paths() {
-        let facts = disk_facts(&path).await?.ok_or_else(|| {
-            CommandError::conflict(format!(
-                "\"{}\" has no disk {} to restore",
-                m.name(),
-                path.display()
-            ))
-        })?;
-        disks.push(facts);
-    }
-    plan::plan_point_restore(m.name(), snap, generation, &disks)
 }
 
 /// The refusal for taking a snapshot under a name a freeze owns: a locked

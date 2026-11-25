@@ -282,6 +282,8 @@ pub mod fake {
         writes: Vec<String>,
         /// Paths whose next push fails, standing in for a dropped channel.
         fail_push: Vec<String>,
+        /// Every push fails, standing in for a guest that takes no file.
+        fail_pushes: bool,
         /// Paths whose pull fails, the same thing in the other direction.
         fail_pull: Vec<String>,
         edit_host_on_pull: Option<(std::path::PathBuf, String)>,
@@ -423,6 +425,11 @@ pub mod fake {
                 .expect("fake guest")
                 .fail_push
                 .push(path.to_string());
+        }
+
+        /// Every push fails from here on: a failure that does not end.
+        pub fn fail_pushes(&self) {
+            self.inner.lock().expect("fake guest").fail_pushes = true;
         }
 
         /// The next pull of `path` fails, as a dropped channel would.
@@ -877,6 +884,9 @@ pub mod fake {
                     break;
                 }
                 guest.nodes.entry(prefix.clone()).or_insert((Node::Dir, 0));
+            }
+            if guest.fail_pushes {
+                bail!("the guest takes no file: {remote}");
             }
             if let Some(at) = guest.fail_push.iter().position(|p| p == remote) {
                 guest.fail_push.remove(at);

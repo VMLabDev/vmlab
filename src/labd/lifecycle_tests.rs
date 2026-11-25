@@ -3215,6 +3215,97 @@ async fn an_offline_restore_returns_the_firmware_variables() {
     );
 }
 
+/// A lab of the VM "a" and one more machine, both stopped and both holding
+/// the offline snapshot "s" on the record. `a` has data written since. The
+/// other machine's `lacking` disk has lost the snapshot, which is what a disk
+/// added after the capture looks like.
+async fn lab_wide_restore_with_a_machine_that_cannot(
+    root: &Dirs,
+    first: Arc<VmInstance>,
+    other: Arc<dyn Machine>,
+    other_decl: &str,
+    lacking: PathBuf,
+) {
+    use crate::template::qimg;
+
+    let disk = first.dirs.primary_disk();
+    for path in std::iter::once(disk.clone()).chain(other.disk_paths()) {
+        let _ = std::fs::remove_file(&path);
+        qimg::create_blank(&path, 1 << 20).await.unwrap();
+    }
+    let config = crate::config::load_lab_source(
+        &format!(
+            "import <vmlab.wcl>\nlab \"t\" {{\n{}\n{other_decl}\n}}\n",
+            LINUX_VM.replace("dc01", "a")
+        ),
+        "<test>",
+        &root.root,
+    )
+    .unwrap();
+    let other_name = other.name().to_string();
+    let lab =
+        super::lab::LabRuntime::with_machines(config, vec![first.clone(), other.clone()]).unwrap();
+    lab.snapshot_all("s").await.expect("lab-wide capture");
+    qimg::snapshot_delete(&lacking, "s").await.unwrap();
+    let pattern = [0x42; 512];
+    {
+        let mut image = vmlab_disk::open(&disk, vmlab_disk::Format::Qcow2, false).unwrap();
+        image.write_at(0, &pattern).unwrap();
+        image.flush().unwrap();
+    }
+
+    let error = lab
+        .restore_all("s", false)
+        .await
+        .expect_err("one machine cannot restore the snapshot");
+    let said = format!("{error:#}");
+    assert!(said.contains(lacking.to_str().unwrap()), "{said}");
+    let mut data = [0; 512];
+    vmlab_disk::open(&disk, vmlab_disk::Format::Qcow2, true)
+        .unwrap()
+        .read_at(0, &mut data)
+        .unwrap();
+    assert!(
+        data == pattern,
+        "\"a\" was rewound although \"{other_name}\" could not follow"
+    );
+}
+
+/// Review snapshots-2 F13: a lab-wide restore asks every machine before it
+/// rewinds the first. A VM whose second disk lacks the snapshot refused only
+/// after the machine before it was at the snapshot, and the lab was left at
+/// two points in time.
+#[tokio::test]
+async fn a_lab_wide_restore_asks_every_machine_before_any_moves() {
+    use crate::template::qimg::{Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let root = Dirs::new();
+    let (a_dirs, b_dirs) = (Dirs::new(), Dirs::new());
+    let (a, _) = vm(&a_dirs, &LINUX_VM.replace("dc01", "a"), Script::healthy());
+    let decl = r#"vm "b" {
+        template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+        disk "data" { size = 1GiB }
+    }"#;
+    let (b, _) = vm(&b_dirs, decl, Script::healthy());
+    let lacking = b.dirs.extra_disk("data");
+    lab_wide_restore_with_a_machine_that_cannot(&root, a, b, decl, lacking).await;
+}
+
+/// The same for a container: its scratch disk is the one disk it has.
+#[tokio::test]
+async fn a_lab_wide_restore_asks_a_container_before_any_machine_moves() {
+    use crate::template::qimg::{Backend, testing};
+
+    let _tool = testing::select(Backend::VmlabDisk).unwrap();
+    let root = Dirs::new();
+    let (a_dirs, web_dirs) = (Dirs::new(), Dirs::new());
+    let (a, _) = vm(&a_dirs, &LINUX_VM.replace("dc01", "a"), Script::healthy());
+    let (web, _) = container(&web_dirs, WORKLOAD, Script::healthy());
+    let lacking = web.dirs.scratch_disk();
+    lab_wide_restore_with_a_machine_that_cannot(&root, a, web, WORKLOAD, lacking).await;
+}
+
 /// A machine whose hypervisor reports no snapshots capability — the fake's
 /// default — reports exactly what a stopped one does rather than inventing a
 /// result: the honest failure that keeps what a snapshot does to a guest

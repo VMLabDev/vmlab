@@ -1602,6 +1602,27 @@ impl super::machine::Machine for ContainerInstance {
         .await
     }
 
+    /// The refusals [`restore`](Self::restore) makes that need nothing to
+    /// have moved, as for a VM: the online refusal, an offline snapshot
+    /// operation in progress, and a scratch disk that lacks the snapshot.
+    /// A running micro-VM's online snapshot is in the hypervisor's hands.
+    async fn check_restore(&self, snap: &str, online: bool) -> Result<()> {
+        if online {
+            if let Some(why) = self.online_snapshot_refusal().await {
+                bail!("{why}");
+            }
+            if self.power_state().await != PowerState::Stopped {
+                return Ok(());
+            }
+        } else {
+            drop(super::machine::snapshot_guard(
+                &self.snapshot_gate,
+                &self.cfg.name,
+            )?);
+        }
+        super::vm::check_disks_hold_snapshot(&[self.dirs.scratch_disk()], snap).await
+    }
+
     /// Full VM semantics (PRD §18): an online record boots the micro-VM if
     /// needed, loads the snapshot and resumes exactly where it was; an offline
     /// record reverts the scratch disk and leaves the container stopped.
@@ -1617,8 +1638,7 @@ impl super::machine::Machine for ContainerInstance {
         lab.ensure_pulled(&self.cfg.name).await?;
         // Refused before anything moves: a load the virtiofs devices cannot
         // take fails after the scratch disk has been rewound.
-        // The lab has asked already; a caller that did not is answered here.
-        if let Some(why) = super::machine::Machine::restore_refusal(&*self, online).await {
+        if online && let Some(why) = self.online_snapshot_refusal().await {
             bail!("{why}");
         }
         if online {
@@ -1662,14 +1682,6 @@ impl super::machine::Machine for ContainerInstance {
     /// host's vmlab and cannot go stale (§19.4).
     fn agent_origin(&self) -> super::machine::AgentOrigin {
         super::machine::AgentOrigin::HostAsset
-    }
-
-    async fn restore_refusal(&self, online: bool) -> Option<String> {
-        if online {
-            self.online_snapshot_refusal().await
-        } else {
-            None
-        }
     }
 
     async fn snapshot(&self, name: &str) -> Result<bool, super::machine::SnapshotCaptureError> {

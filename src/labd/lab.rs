@@ -4033,7 +4033,10 @@ impl LabRuntime {
         Ok(json!(results))
     }
 
-    /// Run daemon preflight for every machine before any rewind (PRD §7.3).
+    /// Run daemon preflight for every machine before any rewind (PRD §7.3):
+    /// the records, and each machine's own answer ([`Machine::check_restore`],
+    /// the freeze-point plan), so a refusal that needs nothing to have moved
+    /// is made before the first machine is rewound.
     pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
         let machines: Vec<_> = self.machines().collect();
         for m in &machines {
@@ -4245,7 +4248,8 @@ impl LabRuntime {
                 // ticket.
                 let no_start = self.starts.hold(m.name()).await;
                 // What the plan refuses, it refuses before the stop.
-                self.check_freeze_point_restore(m, snap, generation).await?;
+                self.plan_freeze_point_restore(m.as_ref(), snap, generation)
+                    .await?;
                 Ok(no_start)
             }
             None => {
@@ -4253,9 +4257,9 @@ impl LabRuntime {
                 // start: refused in a lab that is going away, and held
                 // against a destroy of this machine.
                 let admitted = self.starts.admit(m.name(), self.starts.ticket()?).await?;
-                if let Some(why) = m.restore_refusal(record.online).await {
-                    bail!("{why}");
-                }
+                // Asked again under the lock, for what changed since the
+                // first answer.
+                m.check_restore(snap, record.online).await?;
                 Ok(admitted)
             }
         }
@@ -4314,6 +4318,15 @@ impl LabRuntime {
                     current.as_deref().unwrap_or("<not pulled>")
                 );
             }
+        }
+        // Ask the machine itself, before the flush and before any machine of
+        // a lab-wide restore is rewound: the records do not know what its
+        // disks hold or what its hypervisor can load.
+        match record.freeze_point {
+            Some(generation) => {
+                self.plan_freeze_point_restore(m, snap, generation).await?;
+            }
+            None => m.check_restore(snap, record.online).await?,
         }
         // Flush after any deferred pull, before the caller suspends sync.
         let running = m.state().await != PowerState::Stopped;
@@ -4913,12 +4926,12 @@ mod tests {
         hold_settle: Option<Hold>,
         /// Stop inside `restore` until the test lets it go.
         hold_restore: Option<HeldRestore>,
+        /// Why this machine cannot restore, as a real one finds out from its
+        /// own disks and hypervisor: said when asked, and again by a
+        /// `restore` that was not asked first.
+        restore_refused: Option<&'static str>,
         /// `start` makes `disk0.qcow2`, as a real machine makes its clone.
         makes_disk: bool,
-        /// An online restore is refused with these words, before anything
-        /// of the machine moves, as a real one refuses a load its devices
-        /// cannot take.
-        restore_refused: Option<&'static str>,
     }
 
     /// A point a double stops at until the test lets it go, so a test orders
@@ -5084,8 +5097,8 @@ mod tests {
                 hold_start: None,
                 hold_settle: None,
                 hold_restore: None,
-                makes_disk: false,
                 restore_refused: None,
+                makes_disk: false,
             })
         }
 
@@ -5412,20 +5425,23 @@ mod tests {
             self: Arc<Self>,
             _lab: Arc<dyn LabServices>,
             snap: &str,
-            online: bool,
+            _online: bool,
         ) -> Result<()> {
-            if online && let Some(why) = self.restore_refused {
-                bail!("{why}");
-            }
             self.note(&format!("restore:{snap}")).await;
+            if let Some(why) = self.restore_refused {
+                bail!("{}: {why}", self.name);
+            }
             if let Some(held) = &self.hold_restore {
                 held.pass().await;
             }
             Ok(())
         }
 
-        async fn restore_refusal(&self, online: bool) -> Option<String> {
-            self.restore_refused.filter(|_| online).map(str::to_string)
+        async fn check_restore(&self, _snap: &str, _online: bool) -> Result<()> {
+            match self.restore_refused {
+                Some(why) => bail!("{}: {why}", self.name),
+                None => Ok(()),
+            }
         }
 
         fn display(self: Arc<Self>) -> Option<super::super::display::Display> {
@@ -5667,6 +5683,36 @@ lab "t" {
         assert!(error.to_string().contains("no snapshot \"s\" on b"));
         let log = sh.log.lock().await;
         assert!(log.is_empty(), "restore called the backend: {log:?}");
+    }
+
+    /// Review snapshots-2 F13: the records of both machines hold the
+    /// snapshot, and one machine cannot restore it. The lab-wide restore
+    /// asks every machine before it rewinds the first.
+    #[tokio::test]
+    async fn a_lab_wide_restore_asks_every_machine_before_any_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, &sh)).unwrap();
+        last.restore_refused = Some("disk1.qcow2: snapshot \"s\" is missing");
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" {
+ vm "a" { template = "x86_64/t" }
+ vm "b" { template = "x86_64/t" }
+}"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh), Arc::new(last)],
+        );
+        lab.snapshot_all("s").await.unwrap();
+        sh.log.lock().await.clear();
+
+        let error = lab.restore_all("s", false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("b: disk1.qcow2"), "{error:#}");
+        let log = sh.log.lock().await;
+        assert!(
+            !log.iter().any(|line| line.contains("restore:s")),
+            "a machine was rewound before every machine was asked: {log:?}"
+        );
     }
 
     #[tokio::test]
