@@ -294,7 +294,7 @@ impl LabRuntime {
         m: &dyn Machine,
         snap: &str,
         generation: u32,
-    ) -> Result<plan::Plan> {
+    ) -> Result<crate::freeze::steps::Plan> {
         let mut disks = Vec::new();
         for path in m.disk_paths() {
             let facts = disk_facts(&path).await?.ok_or_else(|| {
