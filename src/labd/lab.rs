@@ -5709,7 +5709,11 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
         let mut destroy = std::pin::pin!(lab.destroy_machine("a", false));
         assert!(futures::poll!(&mut destroy).is_pending());
         assert!(
-            !sh.log.lock().await.iter().any(|line| line.ends_with(":a:stop")),
+            !sh.log
+                .lock()
+                .await
+                .iter()
+                .any(|line| line.ends_with(":a:stop")),
             "destroy stopped the machine during capture"
         );
         held.release();
