@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
+use nix::sys::signal::Signal;
 use tokio::process::Command;
 use tokio::sync::watch;
 
@@ -578,34 +579,84 @@ fn cmdline_mentions(cmdline: &[u8], markers: &[String]) -> bool {
 /// SIGKILL every process vmlab started for `lab` — QEMU or vmlab-hv **and**
 /// their helpers (swtpm, virtiofsd, smbd). Returns how many were signalled.
 ///
-/// Used to reap what a lab daemon orphaned by dying without stopping anything:
-/// there is no `Proc` handle left, so we scan `/proc` for argvs
-/// `LabIdentity::started` recognises. Pass the lab's `root` when known so
-/// the lab's `smbd` is covered too — an orphaned smbd holds its port against
-/// the next `up`.
+/// For a template build's leftovers, whose disks are thrown away with the
+/// build: there is no `Proc` handle left, so we scan `/proc` for argvs
+/// `LabIdentity::started` recognises. A lab's own processes hold disks that
+/// are kept and go through [`reap_lab_orphans`], which asks first.
 pub fn kill_lab_orphans(lab: &str, root: Option<&Path>) -> usize {
-    signal_lab_orphans(LabIdentity::new(lab, root)).0.len()
+    signal_lab_orphans(&LabIdentity::new(lab, root), Signal::SIGKILL)
+        .0
+        .len()
 }
 
-/// Wait for the signalled processes to exit before a successor opens the
-/// same disks or a release reports success.
+/// How long a reaped process gets to end by itself after SIGTERM: what the
+/// stop ladder gives a hypervisor that was asked to quit (`RUNG_EXIT_WAIT`).
+const ORPHAN_TERM_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a reap waits for the processes it sent SIGKILL.
+const ORPHAN_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// End what a lab daemon orphaned by dying without stopping anything, and
+/// wait for it to exit before a successor opens the same disks or a release
+/// reports success. Pass the lab's `root` when known so the lab's `smbd` is
+/// covered too — an orphaned smbd holds its port against the next `up`.
+///
+/// Each process is **asked first**: an orphan can be a guest that runs, and a
+/// hypervisor that gets SIGKILL drops the disk metadata it still holds, where
+/// one that gets SIGTERM quits and flushes (QEMU and vmlab-hv both). SIGKILL
+/// is for what still runs after [`ORPHAN_TERM_WAIT`].
 pub(crate) async fn reap_lab_orphans(lab: &str, root: Option<&Path>) -> Result<(), String> {
-    let (mut processes, all_signalled) = signal_lab_orphans(LabIdentity::new(lab, root));
+    reap_orphans(lab, &LabIdentity::new(lab, root), ORPHAN_TERM_WAIT).await
+}
+
+async fn reap_orphans(
+    lab: &str,
+    identity: &LabIdentity,
+    term_wait: std::time::Duration,
+) -> Result<(), String> {
+    let (asked, _) = signal_lab_orphans(identity, Signal::SIGTERM);
+    if !asked.is_empty() {
+        // Nothing else tells the user that guests of the lab were ended.
+        tracing::warn!(
+            "lab {lab}: {} process(es) ran with no lab daemon; asked each to end (SIGTERM)",
+            asked.len()
+        );
+        let left = wait_orphans_gone(asked, term_wait).await;
+        if !left.is_empty() {
+            tracing::warn!(
+                "lab {lab}: {} process(es) still ran {}s after SIGTERM; killing them",
+                left.len(),
+                term_wait.as_secs()
+            );
+        }
+    }
+    // A second scan: what ignored the request, what could not be asked, and
+    // what was started meanwhile.
+    let (killed, all_signalled) = signal_lab_orphans(identity, Signal::SIGKILL);
     if !all_signalled {
         return Err(format!(
             "could not kill all orphaned processes for lab {lab}"
         ));
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    if wait_orphans_gone(killed, ORPHAN_KILL_WAIT).await.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "orphaned processes for lab {lab} did not exit after SIGKILL"
+        ))
+    }
+}
+
+/// Wait up to `within` for `processes` to exit. Returns those that still run.
+async fn wait_orphans_gone(
+    mut processes: Vec<(u32, u64)>,
+    within: std::time::Duration,
+) -> Vec<(u32, u64)> {
+    let deadline = tokio::time::Instant::now() + within;
     loop {
         processes.retain(|&(pid, started)| crate::supervisor::daemon_running(pid, Some(started)));
-        if processes.is_empty() {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "orphaned processes for lab {lab} did not exit after SIGKILL"
-            ));
+        if processes.is_empty() || tokio::time::Instant::now() >= deadline {
+            return processes;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -614,11 +665,17 @@ pub(crate) async fn reap_lab_orphans(lab: &str, root: Option<&Path>) -> Result<(
 /// Reap a build in the runtime where it started. A failed signal leaves the
 /// workdir available for another cleanup attempt.
 pub(crate) fn kill_build_orphans(lab: &str, runtime: &Path) -> bool {
-    signal_lab_orphans(LabIdentity::in_runtime(lab, None, runtime)).1
+    signal_lab_orphans(
+        &LabIdentity::in_runtime(lab, None, runtime),
+        Signal::SIGKILL,
+    )
+    .1
 }
 
-fn signal_lab_orphans(identity: LabIdentity) -> (Vec<(u32, u64)>, bool) {
-    let pids = lab_orphans(&process_table(), &identity);
+/// Send `signal` to every process of the lab. Returns those it reached, and
+/// whether it reached every one.
+fn signal_lab_orphans(identity: &LabIdentity, signal: Signal) -> (Vec<(u32, u64)>, bool) {
+    let pids = lab_orphans(&process_table(), identity);
     let mut processes = Vec::new();
     let mut all_signalled = true;
     for pid in pids {
@@ -632,12 +689,10 @@ fn signal_lab_orphans(identity: LabIdentity) -> (Vec<(u32, u64)>, bool) {
         {
             continue;
         }
-        if let Err(error) = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        ) && error != nix::errno::Errno::ESRCH
+        if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal)
+            && error != nix::errno::Errno::ESRCH
         {
-            tracing::warn!("could not kill orphaned process {pid}: {error}");
+            tracing::warn!("could not send {signal} to orphaned process {pid}: {error}");
             all_signalled = false;
         } else {
             processes.push((pid as u32, started));
@@ -1219,6 +1274,47 @@ mod tests {
             ),
         ];
         assert!(lab_orphans(&table, &LabIdentity::new("demo", None)).is_empty());
+    }
+
+    /// A reap asks first and kills what still runs after the wait: an orphan
+    /// that ignores SIGTERM does not outlive it. The wait is zero here, so
+    /// the test waits on no clock.
+    #[tokio::test]
+    async fn a_reap_kills_what_does_not_end_when_asked() {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::AsyncReadExt;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let lab = "reap-deaf";
+        let qmp = crate::paths::lab_runtime_dir_in(runtime.path(), lab).join("a/qmp.sock");
+        let mut orphan = Command::new("bash")
+            .args([
+                "-c",
+                "set -eu; exec -a qemu-system-x86_64 bash -c \
+                 'set -eu; trap \"\" TERM; printf R; read -r line' -- \"$@\"",
+                "--",
+                "-name",
+                &format!("vmlab:{lab}/a"),
+                "-machine",
+                "virt",
+                "-qmp",
+                &format!("unix:{}", qmp.display()),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert_eq!(orphan.stdout.take().unwrap().read_u8().await.unwrap(), b'R');
+
+        let identity = LabIdentity::in_runtime(lab, None, runtime.path());
+        reap_orphans(lab, &identity, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            orphan.wait().await.unwrap().signal(),
+            Some(nix::libc::SIGKILL)
+        );
     }
 
     /// `lab move` only refuses, so it still counts a process that mentions

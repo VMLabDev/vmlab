@@ -179,6 +179,17 @@ async fn lock_reconciliation(host_root: &Path) -> Result<Vec<Flock<std::fs::File
 /// agent has stopped answering says so at a terminal rather than holding one.
 const VERB_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the stop of a machine waits for its syncer's loop to end, after
+/// the last pass. A loop that is idle ends at once. One whose pass is held by
+/// a guest that stopped answering is cut off here, because the machine is
+/// about to stop and the release of the lab waits on a bound (§19.6).
+const STOP_UNWIND: Duration = Duration::from_secs(30);
+
+/// The longest [`WorkspaceSyncers::stop_before_machine`] takes for one
+/// machine: the last pass and the end of the loop. The lab daemon adds it to
+/// the stop wait it reports for each syncer that runs.
+pub(crate) const LAST_PASS_BOUND: Duration = VERB_TIMEOUT.saturating_add(STOP_UNWIND);
+
 /// How soon a pass that deferred `.git`'s mutable set looks again.
 ///
 /// A deferral has to re-arm the loop itself, because the thing that clears it
@@ -853,7 +864,7 @@ impl WorkspaceSyncers {
                 )
             })
         };
-        self.stop(machine).await;
+        self.stop_within(machine, STOP_UNWIND).await;
         let workspace = &syncer.workspace;
         if let Some(left) = &left {
             tracing::warn!(
@@ -881,6 +892,43 @@ impl WorkspaceSyncers {
             let _ = running.stop.send(true);
             let _ = running.task.await;
         }
+    }
+
+    /// Stop one machine's syncer ahead of its machine's stop, and cut its
+    /// loop off when it has not ended within `bound`.
+    ///
+    /// A loop ends between passes. One whose pass is held by a guest that
+    /// stopped answering would hold the stop of the machine, and with it the
+    /// release of the lab, for as long as the guest stays silent. The loop is
+    /// waited for after the cut, so no pass writes the ledger behind the
+    /// record the stop writes next. A pass cut off this way saved nothing, so
+    /// the next syncer reconciles the same paths again.
+    async fn stop_within(&self, machine: &str, bound: Duration) {
+        let running = self.running.lock().await.remove(machine);
+        let Some(mut running) = running else {
+            return;
+        };
+        let _ = running.stop.send(true);
+        if tokio::time::timeout(bound, &mut running.task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{machine}: the workspace syncer did not end its pass within {}s of the stop; \
+                 the pass is cut off",
+                bound.as_secs()
+            );
+            running.task.abort();
+            let _ = running.task.await;
+        }
+    }
+
+    /// The longest the syncers that run now can hold a `down` before its
+    /// first machine is asked to stop: [`LAST_PASS_BOUND`] for each, since a
+    /// `down` takes their last passes one after the other.
+    pub async fn stop_wait(&self) -> Duration {
+        let running = self.running.lock().await.len();
+        LAST_PASS_BOUND.saturating_mul(u32::try_from(running).unwrap_or(u32::MAX))
     }
 
     /// Stop every syncer in the lab — `down` and `destroy`.
@@ -3375,6 +3423,53 @@ mod tests {
         assert_eq!(
             guest_b.text("/src/main.rs").as_deref(),
             Some("guest B edit")
+        );
+    }
+
+    /// The stop of a machine takes its syncer's last pass and then waits for
+    /// the loop to end. A guest that never answers held that second wait for
+    /// good, so the stop wait the lab daemon reports was no bound at all
+    /// (docs/reviews/lab-lifecycle-2.md F15). The clock is paused: the limit
+    /// below is virtual time, and it is the bound the daemon reports.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_within_its_bound_for_a_guest_that_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let ws = workspace(dir.path(), state.path());
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let opened = Arc::new(Notify::new());
+        let syncers = WorkspaceSyncers::default();
+        syncers
+            .start(
+                ws.clone(),
+                Arc::new(PausedSession {
+                    sessions: OneFake::new(Arc::new(FakeGuest::new())),
+                    opened: opened.clone(),
+                    // Never notified: the guest takes the session and says
+                    // nothing more.
+                    release: Some(Arc::new(Notify::new())),
+                }),
+                events,
+            )
+            .await;
+        opened.notified().await;
+
+        let stopped = tokio::time::timeout(
+            LAST_PASS_BOUND + Duration::from_secs(1),
+            syncers.stop_before_machine("dev01", true),
+        )
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the stop outlasted the bound the lab daemon reports for it"
+        );
+        assert!(!syncers.is_running("dev01").await);
+        // The pass that was cut off carried nothing, and the record says so.
+        let ledger = Ledger::load(&ws.ledger_path, &ws.host_root, &ws.guest_root);
+        assert!(
+            ledger.left_owed.is_some(),
+            "a last pass that did not complete left no record on the ledger"
         );
     }
 
