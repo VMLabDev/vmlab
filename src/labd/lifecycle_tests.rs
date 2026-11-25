@@ -2924,8 +2924,8 @@ async fn lab_wide_restore_with_a_machine_that_cannot(
         .unwrap()
         .read_at(0, &mut data)
         .unwrap();
-    assert_eq!(
-        data, pattern,
+    assert!(
+        data == pattern,
         "\"a\" was rewound although \"{other_name}\" could not follow"
     );
 }

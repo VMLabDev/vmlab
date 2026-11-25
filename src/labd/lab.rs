@@ -4027,7 +4027,10 @@ impl LabRuntime {
         Ok(json!(results))
     }
 
-    /// Run daemon preflight for every machine before any rewind (PRD §7.3).
+    /// Run daemon preflight for every machine before any rewind (PRD §7.3):
+    /// the records, and each machine's own answer ([`Machine::check_restore`],
+    /// the freeze-point plan), so a refusal that needs nothing to have moved
+    /// is made before the first machine is rewound.
     pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
         let machines: Vec<_> = self.machines().collect();
         for m in &machines {
@@ -4266,6 +4269,15 @@ impl LabRuntime {
                     current.as_deref().unwrap_or("<not pulled>")
                 );
             }
+        }
+        // Ask the machine itself, before the flush and before any machine of
+        // a lab-wide restore is rewound: the records do not know what its
+        // disks hold or what its hypervisor can load.
+        match record.freeze_point {
+            Some(generation) => {
+                self.plan_freeze_point_restore(m, snap, generation).await?;
+            }
+            None => m.check_restore(snap, record.online).await?,
         }
         // Flush after any deferred pull, before the caller suspends sync.
         let running = m.state().await != PowerState::Stopped;
