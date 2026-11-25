@@ -246,6 +246,12 @@ pub enum Proto {
     Both,
 }
 
+impl Proto {
+    pub fn overlaps(self, other: Self) -> bool {
+        self == other || self == Self::Both || other == Self::Both
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Forward {
     /// `None` = automatic: vmlab binds a free port when it installs the
@@ -756,6 +762,9 @@ impl std::str::FromStr for MacAddr {
         }
         let mut b = [0u8; 6];
         for (i, p) in parts.iter().enumerate() {
+            if !p.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("malformed MAC address `{s}`"));
+            }
             b[i] = u8::from_str_radix(p, 16).map_err(|_| format!("malformed MAC address `{s}`"))?;
         }
         Ok(MacAddr(b))
@@ -1716,6 +1725,7 @@ mod tests {
         let m: MacAddr = "52:54:00:ab:cd:ef".parse().unwrap();
         assert_eq!(m.to_string(), "52:54:00:ab:cd:ef");
         assert!("52:54:00".parse::<MacAddr>().is_err());
+        assert!("+1:+2:+3:+4:+5:+6".parse::<MacAddr>().is_err());
     }
 
     #[test]
