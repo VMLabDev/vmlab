@@ -452,6 +452,93 @@ mod tests {
         assert_eq!(watch.registered(), 1);
     }
 
+    /// The kernel drops a watch with its directory, so a directory deleted
+    /// and made again between two scans — `rm -rf dist && mkdir dist`, a
+    /// branch switch away and back — has to be given a new one, although the
+    /// scan lists the same names as before. The kernel queues an event inside
+    /// the write that causes it, so nothing here waits.
+    #[test]
+    fn a_directory_made_again_is_watched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let mut watch = HostWatch::start().unwrap();
+        let dirs = vec![String::new(), "d".to_string()];
+        assert!(watch.register(dir.path(), &dirs).is_empty());
+        std::fs::remove_dir(dir.path().join("d")).unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let first = watch.settle();
+        assert!(first.contains(&HostEvent::Rescan), "{first:?}");
+        // The scan that answers the rescan finds the same directory list.
+        assert!(watch.register(dir.path(), &dirs).is_empty());
+        assert_eq!(watch.registered(), 2);
+        std::fs::write(dir.path().join("d/new.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("top.rs"), "x").unwrap();
+        let events = watch.settle();
+        assert!(
+            events.contains(&HostEvent::Touched("top.rs".into())),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&HostEvent::Touched("d/new.rs".into())),
+            "the directory made again is not watched: {events:?}"
+        );
+    }
+
+    /// The same when the scan runs before the watcher has read that the old
+    /// watch is gone: registration asks the kernel about every directory, so
+    /// it does not depend on which of the two comes first.
+    #[test]
+    fn a_directory_made_again_is_watched_before_its_events_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let mut watch = HostWatch::start().unwrap();
+        let dirs = vec![String::new(), "d".to_string()];
+        assert!(watch.register(dir.path(), &dirs).is_empty());
+        {
+            // Hold the pump off, so the events of the delete stay unread.
+            let _reading = watch.reading.lock_recover();
+            std::fs::remove_dir(dir.path().join("d")).unwrap();
+            std::fs::create_dir(dir.path().join("d")).unwrap();
+            assert!(watch.register(dir.path(), &dirs).is_empty());
+        }
+        std::fs::write(dir.path().join("d/new.rs"), "x").unwrap();
+        let events = watch.settle();
+        assert!(
+            events.contains(&HostEvent::Touched("d/new.rs".into())),
+            "the directory made again is not watched: {events:?}"
+        );
+        assert_eq!(watch.registered(), 2);
+    }
+
+    /// A directory moved to another name is one directory with one watch, and
+    /// the name it left gets a watch of its own when it is made again.
+    #[test]
+    fn a_renamed_directory_and_the_name_it_left_are_both_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let mut watch = HostWatch::start().unwrap();
+        assert!(
+            watch
+                .register(dir.path(), &[String::new(), "d".to_string()])
+                .is_empty()
+        );
+        std::fs::rename(dir.path().join("d"), dir.path().join("e")).unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let dirs = vec![String::new(), "d".to_string(), "e".to_string()];
+        assert!(watch.register(dir.path(), &dirs).is_empty());
+        assert_eq!(watch.registered(), 3);
+        watch.settle();
+        std::fs::write(dir.path().join("d/in_d.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("e/in_e.rs"), "x").unwrap();
+        let events = watch.settle();
+        for path in ["d/in_d.rs", "e/in_e.rs"] {
+            assert!(
+                events.contains(&HostEvent::Touched(path.into())),
+                "{path} is not watched: {events:?}"
+            );
+        }
+    }
+
     /// A directory that cannot be watched is named rather than passed over.
     #[tokio::test]
     async fn an_unwatchable_directory_is_reported() {

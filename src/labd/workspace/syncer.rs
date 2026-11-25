@@ -5846,6 +5846,86 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// The re-seed reads the guest with the watch closed, and a restore of an
+    /// online snapshot resumes the guest's processes: a build that was running
+    /// at the capture writes while the re-seed runs. A file it makes after the
+    /// re-seed listed its directory is in no dirty set, on no ledger and not
+    /// on the host, so the first pass under the new watch lists the guest tree
+    /// — and the file reaches the host, with no stat-walk taken for it.
+    ///
+    /// The hook makes the file at the last moment nothing is watching: as the
+    /// watch opens behind the re-seed.
+    #[tokio::test]
+    async fn a_guest_file_made_during_a_re_seed_reaches_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "the canonical version").unwrap();
+        let guest = Arc::new(FakeGuest::new());
+        let mut sessions = OneFake::new(guest.clone());
+        Arc::get_mut(&mut sessions).unwrap().before_watch = |guest, _| {
+            if guest.get("/restored").is_some() && guest.get("/src/late.rs").is_none() {
+                guest.file("/src/late.rs", "written while the re-seed ran", 7);
+            }
+        };
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        let syncers = WorkspaceSyncers::default();
+        let ws = workspace(dir.path(), state.path());
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let seeded = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/main.rs").is_some()).await
+        };
+        assert!(seeded, "the seed never landed: {:?}", guest.paths());
+        syncers
+            .get("dev01")
+            .await
+            .unwrap()
+            .pass_now()
+            .await
+            .unwrap();
+
+        restore_bracket(&syncers, &ws, || {
+            rewind(&guest);
+            // Outside the workspace, so the re-seed leaves it: how the hook
+            // knows the restore has happened.
+            guest.file("/restored", "", 1);
+        })
+        .await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        let reopened = {
+            let guest = guest.clone();
+            eventually(move || guest.get("/src/late.rs").is_some()).await
+        };
+        assert!(reopened, "the watch never reopened after the re-seed");
+
+        // The first flush finds the file and gives it its quiet period, the
+        // second carries it.
+        let found = syncer.pass_now().await.unwrap();
+        let report = syncer.pass_now().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("late.rs")).ok().as_deref(),
+            Some("written while the re-seed ran"),
+            "the host never received the file the guest made during the re-seed: after the \
+             first flush unsynced was {:?}, after the second {:?}",
+            found.unsynced,
+            report.unsynced,
+        );
+        assert!(report.unsynced.is_empty(), "{:?}", report.unsynced);
+        assert!(report.reseed.is_none(), "the barrier never lifted");
+        assert_eq!(
+            report.rescans, 0,
+            "the listing behind a re-seed is not a stat-walk",
+        );
+        // The re-seed itself still discarded what the snapshot held.
+        assert!(guest.get("/src/experiment.rs").is_none());
+        assert!(!dir.path().join("experiment.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "the canonical version",
+        );
+        syncers.stop("dev01").await;
+    }
+
     /// A restore discards the guest side by design, so the halt it was
     /// carrying goes with it: a developer who asked for the restore has
     /// already answered the question the halt was asking.
