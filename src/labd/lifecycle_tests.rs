@@ -2902,8 +2902,8 @@ async fn lab_wide_restore_with_a_machine_that_cannot(
     )
     .unwrap();
     let other_name = other.name().to_string();
-    let lab = super::lab::LabRuntime::with_machines(config, vec![first.clone(), other.clone()])
-        .unwrap();
+    let lab =
+        super::lab::LabRuntime::with_machines(config, vec![first.clone(), other.clone()]).unwrap();
     lab.snapshot_all("s").await.expect("lab-wide capture");
     qimg::snapshot_delete(&lacking, "s").await.unwrap();
     let pattern = [0x42; 512];
