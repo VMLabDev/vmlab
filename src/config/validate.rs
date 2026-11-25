@@ -351,10 +351,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
                 ));
             }
             if let Some(problem) = share_guest_problem(&share.guest, share_family) {
-                issues.push(Issue::at(
-                    share.span,
-                    format!("share guest path {problem}"),
-                ));
+                issues.push(Issue::at(share.span, format!("share guest path {problem}")));
             }
             // Whatever the transport: `auto` can land on SMB, and a virtiofs
             // guest writes the same files (docs/reviews/smb.md F1).
