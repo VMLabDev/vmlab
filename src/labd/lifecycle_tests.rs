@@ -2813,14 +2813,18 @@ async fn a_freeze_point_restore_that_must_refuse_leaves_the_vm_running() {
 /// disk lacks the snapshot is refused before the stop, as a VM's is.
 #[tokio::test]
 async fn a_container_restore_that_cannot_apply_leaves_it_running() {
-    use crate::template::qimg::{Backend, testing};
+    use crate::template::qimg::{self, Backend, testing};
 
     let _tool = testing::select(Backend::VmlabDisk).unwrap();
     let dirs = Dirs::new();
     let (ctr, _hv) = container(&dirs, WORKLOAD, Script::healthy());
+    // A real scratch disk, which holds no snapshot.
+    let scratch = ctr.dirs.scratch_disk();
+    std::fs::remove_file(&scratch).unwrap();
+    qimg::create_blank(&scratch, 1 << 20).await.unwrap();
     let (cbs, _observed) = callbacks();
     start_container(&ctr, cbs).await.expect("start");
-    assert!(ctr.dirs.scratch_disk().exists(), "the start made the disk");
+    assert!(snapshot_names(&scratch).await.is_empty());
     let (events, _rx) = EventLog::recording("t", dirs.root.join("events.jsonl"));
     let lab = Arc::new(TestLab::new(events)) as Arc<dyn LabServices>;
     let m: Arc<dyn Machine> = ctr.clone();
@@ -2830,11 +2834,14 @@ async fn a_container_restore_that_cannot_apply_leaves_it_running() {
         .restore(lab, "s", false)
         .await
         .expect_err("the scratch disk holds no snapshot \"s\"");
-    assert!(format!("{error:#}").contains("\"s\""), "{error:#}");
     assert_eq!(
         ctr.state().await,
         PowerState::Running,
-        "the container was stopped for a restore that could not be done"
+        "the container was stopped for a restore that could not be done: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("snapshot \"s\" is missing"),
+        "{error:#}"
     );
     ctr.stop(true).await.expect("stop");
 }

@@ -334,6 +334,11 @@ pub(crate) fn remove_stale_checkpoints(disks: &[DiskNode]) -> Result<(), Snapsho
 /// `snapshot_save {name}`: quiesce, capture, stream into the vmstate disk,
 /// write the internal snapshot on every writable disk, and leave the machine
 /// in the run state it had.
+///
+/// `Unsupported` says nothing of the snapshot is on any disk: every refusal
+/// ahead of the stop is one, and a capture that fails that way was undone in
+/// full (an undo that fails is `Internal`). vmlab keeps no pending entry for
+/// it, so a new refusal that leaves something behind must not use it.
 pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
     if name.starts_with(ROLLBACK_PREFIX) {
         return Err(SnapshotError::Unsupported(

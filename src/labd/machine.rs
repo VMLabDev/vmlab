@@ -65,6 +65,19 @@ pub enum SnapshotCaptureError {
     Attempted(anyhow::Error),
 }
 
+impl SnapshotCaptureError {
+    /// What a failed [`Snapshots::save`](super::hypervisor::Snapshots::save)
+    /// is: a refusal when the hypervisor says it wrote nothing, an attempt
+    /// otherwise.
+    pub(super) fn of_save(error: anyhow::Error) -> Self {
+        if error.is::<super::hypervisor::SaveRefused>() {
+            Self::Refused(error)
+        } else {
+            Self::Attempted(error)
+        }
+    }
+}
+
 /// Boot reserves only the transition out of Stopped. Offline snapshot work
 /// reserves the power-state check and every disk operation together.
 pub(super) fn snapshot_guard(gate: &Arc<Mutex<()>>, name: &str) -> Result<OwnedMutexGuard<()>> {
@@ -78,10 +91,10 @@ pub(super) fn snapshot_guard(gate: &Arc<Mutex<()>>, name: &str) -> Result<OwnedM
 
 /// Keep the machine reserved if the caller is cancelled while an image
 /// tool's blocking disk operation is still running.
-pub(super) async fn finish_offline_snapshot(
+pub(super) async fn finish_offline_snapshot<T: Send + 'static>(
     guard: OwnedMutexGuard<()>,
-    work: impl Future<Output = Result<()>> + Send + 'static,
-) -> Result<()> {
+    work: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
     tokio::spawn(async move {
         let _guard = guard;
         work.await
@@ -405,6 +418,14 @@ pub trait Machine: Send + Sync + 'static {
         snap: &str,
         online: bool,
     ) -> Result<()>;
+
+    /// Why a [`restore`](Machine::restore) with this `online` cannot be
+    /// done now, `None` when nothing known speaks against it. It moves
+    /// nothing, so the lab asks it before it touches what a restore rewinds
+    /// with the machine: its host USB devices and its workspace.
+    async fn restore_refusal(&self, _online: bool) -> Option<String> {
+        None
+    }
 
     /// Wait for the exit monitor to settle the power state.
     async fn wait_state(&self, want: PowerState, timeout: Duration) -> Result<()> {

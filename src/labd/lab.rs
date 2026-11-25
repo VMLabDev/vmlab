@@ -4121,6 +4121,23 @@ impl LabRuntime {
         // Suspending is a real stop, waited for, which closes both.
         let bracket = self.workspaces.suspend(name).await;
 
+        // **Every refusal that needs nothing to have moved comes here**,
+        // ahead of the unplug and the note below (review snapshots-2 F14,
+        // F17). A restore refused at this point rewound nothing, so it owes
+        // no re-seed: one would carry the host's tree over guest work the
+        // developer gave up for a snapshot that was never restored.
+        let reserved = match self.reserve_restore(&m, snap, &record).await {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                // Only what was taken off goes back. No syncer is started
+                // for a restore that did not happen.
+                if let Some(bracket) = bracket {
+                    self.workspaces.resume(bracket).await;
+                }
+                return Err(refusal);
+            }
+        };
+
         // An online restore rewinds the guest to a moment it held none of
         // the host USB devices it holds now (capture refuses while any are
         // attached), so they are unplugged first rather than left on a bus
@@ -4151,35 +4168,16 @@ impl LabRuntime {
             // A freeze point is no internal snapshot of the machine's own
             // disks but the state of the frozen files under them (§21.3).
             Ok(()) => match record.freeze_point {
-                Some(generation) => {
-                    // It replaces the machine's disks, so it holds the
-                    // machine's start lock from before its stop to its last
-                    // rename: a start waits and boots on the restored disks,
-                    // and a destroy waits rather than removing the directory
-                    // under the plan. It boots nothing, so it takes no
-                    // ticket.
-                    let _no_start = self.starts.hold(m.name()).await;
-                    self.restore_freeze_point(&m, snap, generation).await
-                }
+                Some(generation) => self.restore_freeze_point(&m, snap, generation).await,
                 None => {
-                    // An online restore boots a stopped machine, so it is a
-                    // start: refused in a lab that is going away, and held
-                    // against a destroy of this machine.
-                    match self.starts.ticket() {
-                        Ok(ticket) => match self.starts.admit(m.name(), ticket).await {
-                            Ok(_admitted) => {
-                                Arc::clone(&m)
-                                    .restore(self.services(), snap, record.online)
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(e),
-                    }
+                    Arc::clone(&m)
+                        .restore(self.services(), snap, record.online)
+                        .await
                 }
             },
             Err(e) => Err(e),
         };
+        drop(reserved);
         // Put back on **both** paths. A workspace whose syncer quietly never
         // came back looks exactly like a machine with nothing to sync, which
         // is the silent-divergence failure ADR-0014 exists to rule out.
@@ -4226,6 +4224,42 @@ impl LabRuntime {
         }
         self.events.emit("snapshot.restored", event);
         Ok(warnings)
+    }
+
+    /// Take what a restore of `m` runs under, and ask everything that can
+    /// refuse it while nothing has moved. The guard is the machine's start
+    /// lock.
+    async fn reserve_restore(
+        &self,
+        m: &Arc<dyn Machine>,
+        snap: &str,
+        record: &SnapshotRecord,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        match record.freeze_point {
+            Some(generation) => {
+                // It replaces the machine's disks, so it holds the
+                // machine's start lock from before its stop to its last
+                // rename: a start waits and boots on the restored disks,
+                // and a destroy waits rather than removing the directory
+                // under the plan. It boots nothing, so it takes no
+                // ticket.
+                let no_start = self.starts.hold(m.name()).await;
+                // What the plan refuses, it refuses before the stop.
+                self.check_freeze_point_restore(m, snap, generation)
+                    .await?;
+                Ok(no_start)
+            }
+            None => {
+                // An online restore boots a stopped machine, so it is a
+                // start: refused in a lab that is going away, and held
+                // against a destroy of this machine.
+                let admitted = self.starts.admit(m.name(), self.starts.ticket()?).await?;
+                if let Some(why) = m.restore_refusal(record.online).await {
+                    bail!("{why}");
+                }
+                Ok(admitted)
+            }
+        }
     }
 
     async fn check_restore(
@@ -5389,6 +5423,12 @@ mod tests {
                 held.pass().await;
             }
             Ok(())
+        }
+
+        async fn restore_refusal(&self, online: bool) -> Option<String> {
+            self.restore_refused
+                .filter(|_| online)
+                .map(str::to_string)
         }
 
         fn display(self: Arc<Self>) -> Option<super::super::display::Display> {
