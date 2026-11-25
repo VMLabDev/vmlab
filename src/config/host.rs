@@ -284,20 +284,49 @@ impl HostConfig {
             let mut r = Reader::new(&block, &mut issues);
             // Every field is an override: absent (or malformed, which is
             // reported) leaves the default in place.
-            if let Some(v) = r.parse_as("subnet_pool", "CIDR").unspan() {
-                cfg.subnet_pool = v;
+            if let Some(pool) = r.parse_as::<ipnet::Ipv4Net>("subnet_pool", "CIDR") {
+                // Check the whole range because any of its /24s may be allocated.
+                let network = pool.value.network();
+                let broadcast = pool.value.broadcast();
+                if !(1..=24).contains(&pool.value.prefix_len()) {
+                    r.issue_at(
+                        pool.span,
+                        "`subnet_pool` must have a prefix length from /1 to /24",
+                    );
+                } else if network.octets()[0] == 0
+                    || network.is_loopback()
+                    || broadcast.is_loopback()
+                    || broadcast.octets()[0] >= 224
+                {
+                    r.issue_at(
+                        pool.span,
+                        "`subnet_pool` must exclude 0.0.0.0/8, loopback, multicast, and reserved addresses at or above 240.0.0.0",
+                    );
+                } else {
+                    cfg.subnet_pool = pool.value;
+                }
             }
-            if let Some(v) = r.string("dns_suffix").unspan() {
-                cfg.dns_suffix = v;
+            if let Some(suffix) = r.string("dns_suffix") {
+                let name = suffix.value.strip_suffix('.').unwrap_or(&suffix.value);
+                if name.len() <= 253 && name.split('.').all(super::validate::is_dns_label) {
+                    cfg.dns_suffix = suffix.value;
+                } else {
+                    r.issue_at(suffix.span, "`dns_suffix` must be a valid DNS domain name");
+                }
             }
             if let Some(upstream) = r.string("dns_upstream") {
-                if parse_upstream(&upstream.value).is_some() {
-                    cfg.dns_upstream = Some(upstream.value);
-                } else {
-                    r.issue_at(
+                match parse_upstream(&upstream.value) {
+                    Some(addr) if addr.port() != 0 && !addr.ip().is_unspecified() => {
+                        cfg.dns_upstream = Some(upstream.value);
+                    }
+                    Some(_) => r.issue_at(
+                        upstream.span,
+                        "`dns_upstream` must have a specified IP address and a nonzero port",
+                    ),
+                    None => r.issue_at(
                         upstream.span,
                         "`dns_upstream` must be an IP address, optionally with a port",
-                    );
+                    ),
                 }
             }
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
@@ -361,8 +390,8 @@ impl HostConfig {
                     );
                 }
             }
-            if let Some(v) = r.size("workspace_max_file").unspan() {
-                cfg.workspace_max_file = v;
+            if let Some(size) = r.int_at_least("workspace_max_file", 1).unspan() {
+                cfg.workspace_max_file = size;
             }
         }
         for block in doc.blocks().filter(|b| b.kind() == "gpu") {
@@ -982,6 +1011,8 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
             "0.0.0.0/0",
             "224.0.0.0/4",
             "0.0.0.0/8",
+            "64.0.0.0/2",
+            "127.1.0.0/16",
             "192.0.0.0/2",
         ] {
             let err = host_err(&format!("host {{ subnet_pool = \"{pool}\" }}\n"));
