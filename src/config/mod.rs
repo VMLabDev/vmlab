@@ -1242,6 +1242,64 @@ lab "l" {
         assert!(!shown.contains("hunter2-login"), "{shown}");
     }
 
+    /// A field the schema does not know is reported with a label on that
+    /// field (config review 2, F27): a `password` written `passwd` is such a
+    /// field, and a `secret` written `secrt` leaves a `value` nothing marks.
+    #[test]
+    fn a_mistyped_field_name_does_not_show_a_secret_value() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" passwd = "hunter2-login" }
+    playbook "pb" {
+      play = "base"
+      var "token" { value = "hunter2-var" secrt = true }
+      var "domain" { value = "plain-var" }
+    }
+  }
+}
+"#;
+        let err = load_lab_source(source, "<test>", &std::env::temp_dir())
+            .expect_err("`passwd` and `secrt` are not fields");
+        assert!(err.issues.iter().any(|i| i.span.is_some()), "{err:?}");
+        let shown = format!("{:?}", miette::Report::new(err));
+        // Which field it was is still in the excerpt.
+        assert!(shown.contains("passwd"), "{shown}");
+        assert!(shown.contains("secrt"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+        assert!(!shown.contains("hunter2-var"), "{shown}");
+    }
+
+    #[test]
+    fn redaction_stars_a_field_the_schema_does_not_know() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" passwd = "pässwörd=1" }
+    playbook "pb" {
+      var "a" { value = "s3cret" secrt = true }
+      var "b" { value = "plain" }
+    }
+  }
+}
+"#;
+        let out = redacted(source);
+        assert_eq!(out.len(), source.len());
+        for secret in ["pässwörd", "s3cret"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+        for kept in [
+            r#"user = "dev" passwd = *"#,
+            r#"var "a" { value = *"#,
+            r#"var "b" { value = "plain" }"#,
+            r#"template = "x86_64/t""#,
+        ] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
+    }
+
     fn redacted(source: &str) -> String {
         let doc = open(source, "<test>", None).expect("the source parses");
         redacted_source(source, &doc)
