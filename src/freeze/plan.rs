@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::steps::{Plan, Step};
+use super::steps::{Plan, Planned, Step};
 use crate::labd::state::LabState;
 use crate::proto::CommandError;
 use crate::template::qimg::InternalSnapshot;
@@ -188,6 +188,155 @@ pub const CARRIED: [&str; 6] = [
     "firstboot.done",
     "tsc-hz",
 ];
+
+/// What of [`CARRIED`] belongs to the disks' state rather than to the
+/// machine's identity: the UEFI variable store, the record of how it was last
+/// booted, and the TPM. A freeze-point restore returns these with the disks
+/// (§21.3), as an offline restore of an ordinary snapshot does (§7.3). The
+/// record comes before its store here, and [`point_firmware`] relies on it.
+pub const POINT_STATE: [&str; 3] = ["OVMF_VARS.boot", "OVMF_VARS.fd", "tpm-state"];
+
+/// One entry of [`POINT_STATE`] on one machine, as the filesystem has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwareFacts {
+    /// The machine's own, in its directory.
+    pub live: PathBuf,
+    pub live_exists: bool,
+    /// The copy the freeze made. `None` where the machine had none at the
+    /// freeze, and then the restore removes the machine's own: a store
+    /// written since does not belong to the disk the restore brings back,
+    /// and the next start makes a fresh one.
+    pub frozen: Option<PathBuf>,
+}
+
+/// The directory of generation `generation`'s copy of `machine`, read off the
+/// frozen file its first disk backs onto. That is right in the main lab and
+/// in a linked worktree alike, whose freeze is in another checkout.
+pub fn frozen_dir(disks: &[DiskFacts]) -> Option<&Path> {
+    disks.first()?.backing.as_deref()?.parent()
+}
+
+/// A file a `vmlab` start reads as "last booted without secure boot": the
+/// least a variable store can be trusted for (`labd::vars_boot`).
+const BOOT_RECORD_PLAIN: &[u8] = b"plain\n";
+
+/// The firmware half of a freeze-point restore, as two lists of steps: the
+/// copies out of the freeze, which run before any disk changes so a failed
+/// copy changes nothing, and the swap, which runs once every disk is at the
+/// freeze point.
+///
+/// While the variable store changes hands its boot record says `plain`, so a
+/// restore that dies between two steps leaves no store vouched for by another
+/// store's record.
+fn point_firmware(firmware: &[FirmwareFacts], plan: &mut Plan) -> Vec<Planned> {
+    let mut swap = Vec::new();
+    let mut later = |step: Step, undo: Vec<Step>| swap.push(Planned { step, undo });
+    let record = firmware
+        .iter()
+        .find(|f| file_name(&f.live) == std::ffi::OsStr::new(POINT_STATE[0]));
+    let store_changes = firmware
+        .iter()
+        .any(|f| file_name(&f.live) == std::ffi::OsStr::new(POINT_STATE[1]));
+    for f in firmware {
+        let staged = beside(&f.live, ".restore");
+        let old = beside(&f.live, ".old");
+        // Left by a restore that died: the name must be free.
+        plan.push(
+            Step::Remove {
+                path: staged.clone(),
+            },
+            vec![],
+        );
+        plan.push(Step::Remove { path: old.clone() }, vec![]);
+        if let Some(frozen) = &f.frozen {
+            plan.push(
+                Step::Copy {
+                    from: frozen.clone(),
+                    to: staged.clone(),
+                },
+                vec![Step::Remove {
+                    path: staged.clone(),
+                }],
+            );
+        }
+        let is_record = record.is_some_and(|r| r == f);
+        if f.live_exists {
+            later(
+                Step::Rename {
+                    from: f.live.clone(),
+                    to: old.clone(),
+                },
+                vec![Step::Rename {
+                    from: old.clone(),
+                    to: f.live.clone(),
+                }],
+            );
+            plan.cleanup.push(Step::Remove { path: old });
+        }
+        if is_record {
+            if store_changes {
+                later(
+                    Step::WriteFile {
+                        path: f.live.clone(),
+                        bytes: BOOT_RECORD_PLAIN.to_vec(),
+                    },
+                    vec![Step::Remove {
+                        path: f.live.clone(),
+                    }],
+                );
+            }
+            // Its own state goes in after the store's, below.
+            continue;
+        }
+        if f.frozen.is_some() {
+            later(
+                Step::Rename {
+                    from: staged.clone(),
+                    to: f.live.clone(),
+                },
+                vec![Step::Rename {
+                    from: f.live.clone(),
+                    to: staged,
+                }],
+            );
+        }
+    }
+    if let Some(f) = record {
+        let staged = beside(&f.live, ".restore");
+        match &f.frozen {
+            // Over the `plain` written above, which a rename replaces.
+            Some(_) => later(
+                Step::Rename {
+                    from: staged.clone(),
+                    to: f.live.clone(),
+                },
+                vec![
+                    Step::Rename {
+                        from: f.live.clone(),
+                        to: staged,
+                    },
+                    Step::WriteFile {
+                        path: f.live.clone(),
+                        bytes: BOOT_RECORD_PLAIN.to_vec(),
+                    },
+                ],
+            ),
+            // The freeze held a store with no record, or no store: either
+            // way the machine's record is not that state's.
+            None if store_changes => later(
+                Step::Remove {
+                    path: f.live.clone(),
+                },
+                vec![Step::WriteFile {
+                    path: f.live.clone(),
+                    bytes: BOOT_RECORD_PLAIN.to_vec(),
+                }],
+            ),
+            None => {}
+        }
+    }
+    swap
+}
 
 /// Plan `vmlab worktree freeze <snapshot>` (§21.1), or refuse it.
 ///
@@ -455,11 +604,15 @@ pub fn is_frozen_file(backing: &Path, disk: &Path, machine: &str, generation: u3
 /// the freeze is carried into it, so restoring the freeze point keeps them,
 /// as restoring any snapshot does (§7.3). An online one cannot be carried,
 /// and is refused by name rather than lost.
+///
+/// `firmware` is the machine's [`POINT_STATE`]: what the freeze copied of it
+/// replaces the machine's own once the disks are at the freeze point.
 pub fn plan_point_restore(
     machine: &str,
     snapshot: &str,
     generation: u32,
     disks: &[DiskFacts],
+    firmware: &[FirmwareFacts],
 ) -> Result<Plan> {
     for d in disks {
         let Some(backing) = &d.backing else {
@@ -500,6 +653,7 @@ pub fn plan_point_restore(
     }
 
     let mut plan = Plan::default();
+    let firmware_swap = point_firmware(firmware, &mut plan);
     for d in disks {
         let disk = &d.path;
         let backing = d.backing.clone().unwrap_or_default();
@@ -574,6 +728,7 @@ pub fn plan_point_restore(
         plan.cleanup.pop();
         plan.cleanup.push(Step::Remove { path: old });
     }
+    plan.steps.extend(firmware_swap);
     Ok(plan)
 }
 
@@ -1092,7 +1247,7 @@ mod tests {
     #[test]
     fn point_restore_on_a_marked_overlay_is_an_apply() {
         let d = facts(DISK, Some(FROZEN), &["base", "after"]);
-        let plan = plan_point_restore("dc", "base", 1, &[d]).unwrap();
+        let plan = plan_point_restore("dc", "base", 1, &[d], &[]).unwrap();
         let disk = PathBuf::from(DISK);
         assert_eq!(
             plan.forward(),
@@ -1116,10 +1271,56 @@ mod tests {
         );
     }
 
+    /// The firmware state is copied out of the freeze before a disk changes
+    /// and swapped in after the last one has, and the boot record says
+    /// `plain` for as long as the store is not the one it belongs to.
+    #[test]
+    fn point_restore_brackets_the_disks_with_the_firmware_state() {
+        let d = facts(DISK, Some(FROZEN), &["base"]);
+        let fact = |name: &str, live_exists: bool, frozen: bool| FirmwareFacts {
+            live: PathBuf::from(format!("/w/.vmlab/vms/dc/{name}")),
+            live_exists,
+            frozen: frozen.then(|| PathBuf::from(format!("/m/.vmlab/freeze/1/dc/{name}"))),
+        };
+        let firmware = [
+            fact("OVMF_VARS.boot", true, true),
+            fact("OVMF_VARS.fd", true, true),
+            fact("tpm-state", true, false),
+        ];
+        let plan = plan_point_restore("dc", "base", 1, &[d], &firmware).unwrap();
+        let short = |p: &Path| file_name(p).to_string_lossy().into_owned();
+        let got: Vec<String> = plan
+            .forward()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Copy { to, .. } => Some(format!("cp {}", short(to))),
+                Step::SnapshotApply { .. } => Some("disk".into()),
+                Step::Rename { from, to } => Some(format!("mv {} {}", short(from), short(to))),
+                Step::WriteFile { path, .. } => Some(format!("plain {}", short(path))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "cp OVMF_VARS.boot.restore",
+                "cp OVMF_VARS.fd.restore",
+                "disk",
+                "mv OVMF_VARS.boot OVMF_VARS.boot.old",
+                "plain OVMF_VARS.boot",
+                "mv OVMF_VARS.fd OVMF_VARS.fd.old",
+                "mv OVMF_VARS.fd.restore OVMF_VARS.fd",
+                "mv tpm-state tpm-state.old",
+                "mv OVMF_VARS.boot.restore OVMF_VARS.boot",
+            ]
+        );
+        assert_eq!(plan.cleanup.len(), 4, "three set aside, and the hold");
+    }
+
     #[test]
     fn point_restore_replaces_the_overlay_and_carries_its_snapshots() {
         let d = facts(DISK, Some(FROZEN), &["after"]);
-        let plan = plan_point_restore("dc", "base", 1, &[d]).unwrap();
+        let plan = plan_point_restore("dc", "base", 1, &[d], &[]).unwrap();
         let disk = PathBuf::from(DISK);
         let fresh = PathBuf::from(format!("{DISK}.restore"));
         let carry = PathBuf::from(format!("{DISK}.carry"));
@@ -1178,15 +1379,15 @@ mod tests {
     #[test]
     fn point_restore_refuses_a_foreign_backing_and_stranded_online_snapshots() {
         let d = facts(DISK, Some("/store/t.qcow2"), &[]);
-        assert!(refusal(plan_point_restore("dc", "base", 1, &[d])).contains("not an overlay"));
+        assert!(refusal(plan_point_restore("dc", "base", 1, &[d], &[])).contains("not an overlay"));
         let d = facts(DISK, None, &[]);
-        assert!(refusal(plan_point_restore("dc", "base", 1, &[d])).contains("no backing"));
+        assert!(refusal(plan_point_restore("dc", "base", 1, &[d], &[])).contains("no backing"));
         let mut d = facts(DISK, Some(FROZEN), &[]);
         d.snapshots.push(InternalSnapshot {
             name: "live".into(),
             vm_state_size: 4096,
         });
-        assert!(refusal(plan_point_restore("dc", "base", 1, &[d])).contains("live"));
+        assert!(refusal(plan_point_restore("dc", "base", 1, &[d], &[])).contains("live"));
     }
 
     fn thaw_input(disks: Vec<ThawDisk>) -> ThawInput {

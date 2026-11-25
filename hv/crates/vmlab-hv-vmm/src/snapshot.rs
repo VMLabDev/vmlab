@@ -1034,7 +1034,7 @@ pub(crate) fn delete_from(disks: &[DiskNode], name: &str) -> Result<(), Snapshot
     }
     match (first_err, missing) {
         (Some(err), _) => Err(err),
-        (None, Some(err)) if !deleted || true => Err(err),
+        (None, Some(err)) if !deleted => Err(err),
         _ => Ok(()),
     }
 }

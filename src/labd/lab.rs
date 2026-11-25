@@ -4386,11 +4386,15 @@ impl LabRuntime {
             state.save(&self.lab_local)?;
             return Ok(());
         }
+        // "No disk holds it" is the end a delete asks for, with a record as
+        // without one: a record that outlived its snapshot can be neither
+        // restored nor deleted, so it goes. A machine answers this only when
+        // it removed nothing and failed at nothing.
         if let Err(error) = m.delete_snapshot(snap).await {
             let missing = error
                 .downcast_ref::<crate::proto::CommandError>()
                 .is_some_and(|error| error.code == crate::proto::ErrorCode::NotFound);
-            if record.is_some() || !missing {
+            if !missing {
                 return Err(error);
             }
         }
