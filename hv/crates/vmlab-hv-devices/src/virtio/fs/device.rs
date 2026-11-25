@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use virtio_queue::{Queue, QueueState, QueueT};
-use vm_memory::GuestMemoryMmap;
 
 use super::fuse::Server;
 use super::fuse::filesystem::FileSystem;
@@ -66,7 +65,7 @@ struct Inner {
     pending_queues: Option<Vec<QueueState>>,
 }
 
-type GuestMemory = GuestMemoryMmap<()>;
+type GuestMemory = crate::GuestMemory;
 
 impl InProcessFs {
     /// Open the share named by `config` and build the FUSE server over it.
@@ -415,7 +414,7 @@ mod tests {
     use std::sync::Arc;
 
     use vm_memory::ByteValued;
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32, Le64};
+    use vm_memory::{Bytes, GuestAddress, Le16, Le32, Le64};
 
     use super::*;
     use crate::Snapshot;
@@ -438,7 +437,7 @@ mod tests {
     /// guest addresses, plus the memory the "driver" builds chains in.
     struct Fixture {
         fs: InProcessFs,
-        mem: GuestMemoryMmap<()>,
+        mem: GuestMemory,
         desc: u64,
         avail: u64,
         used: u64,
@@ -459,7 +458,7 @@ mod tests {
         /// The same fixture over a directory the caller keeps alive.
         fn over(dir: tempfile::TempDir, read_only: bool) -> Self {
             std::fs::write(dir.path().join("hello.txt"), b"hello fuse\n").unwrap();
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
+            let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
             let interrupt = Arc::new(RecInterrupt::default());
             let mut fs = InProcessFs::new(
                 "fs@test",
@@ -715,7 +714,7 @@ mod tests {
         }
 
         f.fs.reset();
-        f.mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
+        f.mem = GuestMemory::from_ranges(&[(GuestAddress(0), 4 << 20)]).unwrap();
         f.submitted = 0;
         Fixture::activate(&mut f.fs, &f.mem, &f.interrupt);
         submit_init(&mut f);
@@ -866,7 +865,7 @@ mod tests {
 
         // A fresh device over the same directory restores and keeps serving
         // with the same inode numbers.
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         let interrupt = Arc::new(RecInterrupt::default());
         let mut fs2 = InProcessFs::new(
             "fs@test",

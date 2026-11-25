@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
 use super::logon::MintedLogon;
 use super::port::wide;
 use super::tree;
-use crate::spawn::{ProcessSpec, Spawned, checked_command_line};
+use crate::spawn::{ProcessSpec, Spawned, checked_command_line, checked_cwd, checked_env};
 
 /// A handle we own and close exactly once.
 pub struct Owned(pub HANDLE);
@@ -78,13 +78,21 @@ impl EnvBlock {
 /// that is already there (case-insensitively — Windows environment keys are)
 /// rather than appending a second entry the child would have to choose
 /// between.
-fn with_overrides(mut vars: Vec<String>, overrides: &[(String, String)]) -> Vec<String> {
+///
+/// An override the block cannot carry as what it says is refused
+/// ([`checked_env`]): the block is NUL-separated, so a NUL in one would end
+/// its entry early and start another.
+fn with_overrides(
+    mut vars: Vec<String>,
+    overrides: &[(String, String)],
+) -> std::io::Result<Vec<String>> {
+    checked_env(overrides)?;
     for (key, value) in overrides {
         let prefix = format!("{key}=").to_lowercase();
         vars.retain(|v| !v.to_lowercase().starts_with(&prefix));
         vars.push(format!("{key}={value}"));
     }
-    vars
+    Ok(vars)
 }
 
 /// The environment a process started in `session` gets: the profile's own
@@ -100,15 +108,15 @@ pub fn env_block(logon: &MintedLogon, overrides: &[(String, String)]) -> std::io
     // SAFETY: the block we were just handed, freed once.
     unsafe { DestroyEnvironmentBlock(raw) };
 
-    Ok(EnvBlock::from_vars(with_overrides(vars, overrides)))
+    Ok(EnvBlock::from_vars(with_overrides(vars, overrides)?))
 }
 
 /// The agent's *own* environment with the caller's overrides applied — the
 /// [`env_block`] counterpart for the agent identity, which has no profile to
 /// load and would otherwise simply inherit ours.
-pub fn agent_env_block(overrides: &[(String, String)]) -> EnvBlock {
+pub fn agent_env_block(overrides: &[(String, String)]) -> std::io::Result<EnvBlock> {
     let vars = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
-    EnvBlock::from_vars(with_overrides(vars, overrides))
+    Ok(EnvBlock::from_vars(with_overrides(vars, overrides)?))
 }
 
 /// Copy a `K=V\0K=V\0\0` block out of Win32-owned memory.
@@ -181,7 +189,9 @@ pub fn spawn_piped(logon: Option<&MintedLogon>, spec: ProcessSpec) -> std::io::R
         // The agent identity inherits our environment; a block is built
         // only when the open carried overrides.
         None => (
-            (!spec.env.is_empty()).then(|| agent_env_block(&spec.env)),
+            (!spec.env.is_empty())
+                .then(|| agent_env_block(&spec.env))
+                .transpose()?,
             spec.cwd.clone(),
         ),
     };
@@ -319,6 +329,9 @@ fn create(
     flags: u32,
     tree: Option<&str>,
 ) -> std::io::Result<Owned> {
+    if let Some(cwd) = cwd {
+        checked_cwd(cwd)?;
+    }
     let joining = tree.map(tree::join).transpose()?;
     let suspended = if joining.is_some() {
         CREATE_SUSPENDED

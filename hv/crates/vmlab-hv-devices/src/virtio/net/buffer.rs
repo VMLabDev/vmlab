@@ -3,15 +3,15 @@
 use std::io::{self, Write};
 
 use virtio_queue::DescriptorChain;
+use vm_memory::GuestMemoryBackend;
 use vm_memory::bitmap::Bitmap;
-use vm_memory::{GuestMemoryBackend, VolatileSlice};
 
 use crate::GuestMemory;
 
 use super::checksum::CopyChecksum;
 
 pub(super) struct ReceiveWriter<'a> {
-    slices: Vec<VolatileSlice<'a>>,
+    slices: Vec<crate::GuestSlice<'a>>,
     index: usize,
     offset: usize,
     remaining: usize,

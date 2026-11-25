@@ -15,11 +15,16 @@ use virtio_queue::desc::split::Descriptor;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion,
-    GuestRegionMmap, Le32, Le64, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryRegion, Le32, Le64,
+    VolatileSlice,
 };
 
-use crate::{DeviceError, GuestMemory, Snapshot, VirtioDevice, VirtioInterrupt};
+use crate::{
+    DeviceError, GuestMemory, GuestRegion, GuestSlice, Snapshot, VirtioDevice, VirtioInterrupt,
+};
+
+/// The bitmap slice of a [`GuestSlice`].
+type Hook<'a> = vm_memory::bitmap::RefSlice<'a, crate::WriteDiscard>;
 
 /// Virtio device id for a block device.
 pub const VIRTIO_ID_BLOCK: u32 = 2;
@@ -112,7 +117,7 @@ unsafe impl ByteValued for DiscardRange {}
 struct ReadDescriptors<'a> {
     access: GuestAccess<'a>,
     table: GuestAddress,
-    table_slice: Option<VolatileSlice<'a>>,
+    table_slice: Option<GuestSlice<'a>>,
     entries: u16,
     index: u16,
     remaining: u16,
@@ -126,14 +131,14 @@ struct ReadDescriptors<'a> {
 /// change, and every access still checks its address and length.
 struct GuestAccess<'a> {
     mem: &'a GuestMemory,
-    region: Cell<Option<&'a GuestRegionMmap>>,
+    region: Cell<Option<&'a GuestRegion>>,
 }
 
 impl<'a> GuestAccess<'a> {
     fn region(
         &self,
         address: GuestAddress,
-    ) -> Option<(&'a GuestRegionMmap, vm_memory::MemoryRegionAddress)> {
+    ) -> Option<(&'a GuestRegion, vm_memory::MemoryRegionAddress)> {
         let (region, offset) = self
             .region
             .get()
@@ -150,12 +155,12 @@ impl<'a> GuestAccess<'a> {
         Some((region, offset))
     }
 
-    fn slice(&self, address: GuestAddress, len: usize) -> Option<VolatileSlice<'a>> {
+    fn slice(&self, address: GuestAddress, len: usize) -> Option<GuestSlice<'a>> {
         let (region, offset) = self.region(address)?;
         region.get_slice(offset, len).ok()
     }
 
-    fn span(&self, address: GuestAddress, max_len: usize) -> Option<VolatileSlice<'a>> {
+    fn span(&self, address: GuestAddress, max_len: usize) -> Option<GuestSlice<'a>> {
         let (region, offset) = self.region(address)?;
         let len = max_len.min((region.len() - offset.raw_value()) as usize);
         region.get_slice(offset, len).ok()
@@ -169,6 +174,17 @@ impl<'a> GuestAccess<'a> {
     }
 }
 
+/// Marks the spans as written when the kernel has filled them.
+struct Written<'s, 'a>(&'s [Option<GuestSlice<'a>>]);
+
+impl Drop for Written<'_, '_> {
+    fn drop(&mut self) {
+        for slice in self.0.iter().flatten() {
+            slice.bitmap().mark_dirty(0, slice.len());
+        }
+    }
+}
+
 struct GuestReadTarget<'a, 'b> {
     access: GuestAccess<'a>,
     ranges: &'b [(GuestAddress, usize)],
@@ -178,7 +194,7 @@ struct GuestReadTarget<'a, 'b> {
 }
 
 impl<'a> GuestReadTarget<'a, '_> {
-    fn next_span(&mut self, len: usize) -> vmlab_disk::Result<VolatileSlice<'a>> {
+    fn next_span(&mut self, len: usize) -> vmlab_disk::Result<GuestSlice<'a>> {
         let invalid = || vmlab_disk::Error::Unsupported("block read target is out of range".into());
         if len == 0 || self.remaining == 0 {
             return Err(invalid());
@@ -232,16 +248,18 @@ impl vmlab_disk::ReadTarget for GuestReadTarget<'_, '_> {
         // allocation. Guards retain every mapping throughout all short reads.
         const BATCH: usize = 256;
         while len != 0 {
-            let mut slices: [Option<VolatileSlice<'_>>; BATCH] = std::array::from_fn(|_| None);
+            let mut slices: [Option<GuestSlice<'_>>; BATCH] = std::array::from_fn(|_| None);
             let mut count = 0;
             let mut bytes = 0;
             while count < BATCH && bytes < len {
                 let slice = self.next_span(len - bytes)?;
-                slice.bitmap().mark_dirty(0, slice.len());
                 bytes += slice.len();
                 slices[count] = Some(slice);
                 count += 1;
             }
+            // Told of the write after it, also when the read fails part way:
+            // a region that discards writes must see every one of them.
+            let _written = Written(&slices[..count]);
             let guards: [_; BATCH] =
                 std::array::from_fn(|i| slices[i].as_ref().map(|slice| slice.ptr_guard_mut()));
             let mut vectors: [_; BATCH] = std::array::from_fn(|i| libc::iovec {
@@ -664,7 +682,7 @@ impl Block {
 
     /// `VIRTIO_BLK_T_IN`: fill the driver-writable descriptors from the
     /// image.
-    fn read(&mut self, sector: u64, writer: &mut virtio_queue::Writer<'_, ()>) -> u8 {
+    fn read(&mut self, sector: u64, writer: &mut virtio_queue::Writer<'_, Hook<'_>>) -> u8 {
         let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
             return S_IOERR;
         };
@@ -700,8 +718,8 @@ impl Block {
     fn write(
         &mut self,
         sector: u64,
-        reader: &mut virtio_queue::Reader<'_, ()>,
-        writer: &mut virtio_queue::Writer<'_, ()>,
+        reader: &mut virtio_queue::Reader<'_, Hook<'_>>,
+        writer: &mut virtio_queue::Writer<'_, Hook<'_>>,
     ) -> u8 {
         if self.disk.read_only() {
             return S_IOERR;
@@ -736,7 +754,7 @@ impl Block {
 
     /// `VIRTIO_BLK_T_DISCARD`: one 16-byte range per segment, and no more
     /// segments than `max_discard_seg` advertises.
-    fn discard(&mut self, reader: &mut virtio_queue::Reader<'_, ()>) -> u8 {
+    fn discard(&mut self, reader: &mut virtio_queue::Reader<'_, Hook<'_>>) -> u8 {
         if self.features & self.acked_features & F_DISCARD == 0 {
             return S_UNSUPP;
         }
@@ -934,7 +952,7 @@ mod tests {
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, Le16, Le32, Le64};
+    use vm_memory::{Bytes, GuestAddress, Le16, Le32, Le64};
 
     use super::*;
     use crate::virtio::testing::MemDisk;
@@ -984,7 +1002,7 @@ mod tests {
     /// addresses, plus the memory the "driver" builds chains in.
     struct Fixture {
         block: Block,
-        mem: GuestMemoryMmap<()>,
+        mem: GuestMemory,
         desc: u64,
         avail: u64,
         used: u64,
@@ -996,7 +1014,7 @@ mod tests {
 
     impl Fixture {
         fn new(disk: Box<dyn vmlab_disk::DiskImage>) -> Self {
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+            let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
             let interrupt = Arc::new(RecInterrupt::default());
             let mut block = Block::new("virtio-blk@test", disk);
             block.ack_features(block.features());
@@ -1124,7 +1142,7 @@ mod tests {
     fn file_reads_fill_fragmented_guest_targets_across_batches_and_report_eof() {
         use vmlab_disk::ReadTarget;
 
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         let ranges: Vec<_> = (0..300)
             .map(|i| (GuestAddress(0x10000 + i * 2048), 512))
             .collect();
@@ -1159,7 +1177,7 @@ mod tests {
     fn zero_reads_preserve_unrequested_data_and_the_status_byte() {
         use vmlab_disk::ReadTarget;
 
-        let mem = GuestMemoryMmap::from_ranges(&[
+        let mem = GuestMemory::from_ranges(&[
             (GuestAddress(0), 0x10000),
             (GuestAddress(0x10000), 0x10000),
         ])
@@ -1202,7 +1220,7 @@ mod tests {
         }
         const LEN: usize = 256 << 20;
         const REPEATS: usize = 16;
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), LEN)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(GuestAddress(0), LEN)]).unwrap();
         let ranges = [(GuestAddress(0), LEN)];
         let target = || GuestReadTarget {
             access: GuestAccess {
@@ -1428,7 +1446,7 @@ mod tests {
             (0x10000, u64::MAX - 255, false),
         ] {
             let mut f = Fixture::new(Box::new(MemDisk::new(64 * 1024)));
-            f.mem = GuestMemoryMmap::from_ranges(&[
+            f.mem = GuestMemory::from_ranges(&[
                 (GuestAddress(0), 0x10000),
                 (GuestAddress(second_region), 0x10000),
             ])
