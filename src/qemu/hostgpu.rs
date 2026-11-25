@@ -428,6 +428,8 @@ pub struct RenderPlan {
     /// emulator spawns ([`vk_layer::install`]); set when the environment
     /// names it.
     pub vk_layer: Option<PathBuf>,
+    /// The memory filter decision to log at launch when the layer is used.
+    pub uncached_memory_policy: Option<String>,
     /// What the start should warn about, once each: a missing `host_gpu`
     /// the plan fell back from ([`Picked::warning`]), and on vmlab-hv the
     /// host GPU's QEMU-only keys it ignored and the render node it chose.
@@ -689,10 +691,26 @@ pub fn render_plan(
         }
         plan.env = emulator_env(vulkan, plan.gpu.as_ref(), icd, plan.vk_layer.as_deref());
         // The memory rule is the layer's, so it goes only where the layer does.
-        if plan.vk_layer.is_some() && decl.is_some_and(|g| g.hide_uncached_memory) {
-            plan.env
-                .set
-                .push((vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()));
+        if let Some(render) = plan.gpu.as_ref().filter(|_| plan.vk_layer.is_some()) {
+            let driver = render.driver.as_deref();
+            let (enabled, reason) = match decl.and_then(|g| g.hide_uncached_memory) {
+                Some(enabled) => (enabled, format!("explicit {enabled}")),
+                None => (
+                    driver == Some("nvidia"),
+                    format!("auto, kernel driver {}", driver.unwrap_or("unknown")),
+                ),
+            };
+            let state = if enabled { "enabled" } else { "disabled" };
+            plan.uncached_memory_policy = Some(format!(
+                "{} ({}): hide_uncached_memory {state} ({reason})",
+                context(),
+                render.address
+            ));
+            if enabled {
+                plan.env
+                    .set
+                    .push((vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()));
+            }
         }
     }
     if let Some(decl) = decl
@@ -1165,7 +1183,7 @@ mod tests {
             qemu_binary: None,
             qemu_env: Vec::new(),
             keepawake: KeepAwake::Auto,
-            hide_uncached_memory: false,
+            hide_uncached_memory: None,
             passthrough_functions: None,
         }
     }
@@ -1452,7 +1470,8 @@ mod tests {
             set(&plan.env)[0],
             ("VK_DRIVER_FILES", icd.to_str().unwrap())
         );
-        assert_eq!(owned(&plan.env)[1..], layer_env("0000:05:00.0"));
+        assert_eq!(owned(&plan.env)[1..3], layer_env("0000:05:00.0"));
+        assert_eq!(set(&plan.env)[3], (vk_layer::HIDE_UNCACHED_VAR, "1"));
         let plan = render_plan(Some(&gpu(GpuMode::Virgl, Some("Nvidia2"))), &h, &sysfs).unwrap();
         assert!(plan.env.set.is_empty());
         h.gpus[2].vulkan_icd = Some("/nonexistent/icd.json".into());
@@ -1923,6 +1942,7 @@ mod tests {
                 ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia*".into()),
                 path.clone(),
                 address.clone(),
+                (vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()),
                 ("VKR_DEBUG".into(), "validate".into())
             ]
         );
@@ -1933,6 +1953,7 @@ mod tests {
             [
                 path.clone(),
                 address,
+                (vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()),
                 ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia_icd*".into())
             ]
         );
@@ -1950,6 +1971,7 @@ mod tests {
             [
                 ("VK_LOADER_DRIVERS_SELECT".into(), "*nvidia*".into()),
                 path,
+                (vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()),
                 (vk_layer::ADDRESS_VAR.into(), "0000:05:00.0".into()),
                 (vk_layer::DISABLE_VAR.into(), "1".into())
             ]
@@ -2002,7 +2024,18 @@ mod tests {
                 render_plan(Some(&gpu(GpuMode::Vulkan, Some(name))), &host(), &sysfs).unwrap();
             let mut want = vec![("VK_LOADER_DRIVERS_SELECT".to_string(), select.to_string())];
             want.extend(layer_env(address));
+            let enabled = select == "*nvidia*";
+            if enabled {
+                want.push((vk_layer::HIDE_UNCACHED_VAR.into(), "1".into()));
+            }
             assert_eq!(owned(&plan.env), want, "{name}");
+            let policy = plan.uncached_memory_policy.as_deref().unwrap();
+            let expected = if enabled {
+                "enabled (auto, kernel driver nvidia)"
+            } else {
+                "disabled (auto, kernel driver amdgpu)"
+            };
+            assert!(policy.ends_with(expected), "{policy}");
             assert_eq!(
                 plan.vk_layer.as_deref(),
                 Some(vk_layer::dir(Path::new(DATA)).as_path())
@@ -2010,30 +2043,36 @@ mod tests {
         }
     }
 
-    /// A host GPU's `hide_uncached_memory` turns the layer's memory rule on
-    /// for a `vulkan` guest on that GPU and on no other; the GPU's
-    /// `qemu_env` still has the last word. `virgl` on the same GPU loads no
-    /// layer and so gets no switch.
+    /// Explicit values override both automatic outcomes for Vulkan, and
+    /// QEMU's environment can still override the switch.
     #[test]
     fn hide_uncached_memory_sets_the_layers_switch_for_that_gpu_only() {
         let sys = fake_host();
         let sysfs = Sysfs::new(sys.path());
         let mut h = host();
-        let nvidia2 = h.gpus.iter().position(|g| g.name == "Nvidia2").unwrap();
-        h.gpus[nvidia2].hide_uncached_memory = true;
+        h.gpus[0].hide_uncached_memory = Some(true);
+        h.gpus[2].hide_uncached_memory = Some(false);
         let switch = (vk_layer::HIDE_UNCACHED_VAR.to_string(), "1".to_string());
         let plan = |mode, name| render_plan(Some(&gpu(mode, Some(name))), &h, &sysfs).unwrap();
-        let on = plan(GpuMode::Vulkan, "Nvidia2");
+        let on = plan(GpuMode::Vulkan, "AMD1");
         assert_eq!(owned(&on.env).last(), Some(&switch));
-        for other in [
-            plan(GpuMode::Vulkan, "Nvidia1"),
-            plan(GpuMode::Vulkan, "AMD1"),
-        ] {
-            assert!(!owned(&other.env).contains(&switch));
-        }
-        assert!(plan(GpuMode::Virgl, "Nvidia2").env.set.is_empty());
-        h.gpus[nvidia2].qemu_env = vec![(vk_layer::HIDE_UNCACHED_VAR.into(), "0".into())];
-        let off = render_plan(Some(&gpu(GpuMode::Vulkan, Some("Nvidia2"))), &h, &sysfs).unwrap();
+        assert!(
+            on.uncached_memory_policy
+                .unwrap()
+                .ends_with("enabled (explicit true)")
+        );
+        let off = plan(GpuMode::Vulkan, "Nvidia2");
+        assert!(!owned(&off.env).contains(&switch));
+        assert!(
+            off.uncached_memory_policy
+                .unwrap()
+                .ends_with("disabled (explicit false)")
+        );
+        let virgl = plan(GpuMode::Virgl, "AMD1");
+        assert!(virgl.env.set.is_empty());
+        assert!(virgl.uncached_memory_policy.is_none());
+        h.gpus[0].qemu_env = vec![(vk_layer::HIDE_UNCACHED_VAR.into(), "0".into())];
+        let off = render_plan(Some(&gpu(GpuMode::Vulkan, Some("AMD1"))), &h, &sysfs).unwrap();
         let set: Vec<_> = owned(&off.env)
             .into_iter()
             .filter(|(k, _)| k == vk_layer::HIDE_UNCACHED_VAR)
