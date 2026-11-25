@@ -3140,7 +3140,10 @@ async fn remove_stale_restore_snapshots(disks: &[PathBuf]) -> Result<()> {
     // writable disk independently before giving it to the hypervisor.
     for disk in disks {
         let info = qimg::image_info(disk).await.with_context(|| {
-            format!("checking {} for interrupted restore snapshots", disk.display())
+            format!(
+                "checking {} for interrupted restore snapshots",
+                disk.display()
+            )
         })?;
         for snapshot in info.snapshots {
             if snapshot.name.starts_with(RESTORE_RECOVERY_PREFIX) {
