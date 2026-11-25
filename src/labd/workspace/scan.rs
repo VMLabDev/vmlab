@@ -92,7 +92,9 @@ pub struct HostScan {
     /// reporting only and can coincide with valid UTF-8 paths.
     pub unrepresentable: Vec<Skip>,
     /// Rule files whose rules were refused — a `.gitignore` or `.vmlabignore`
-    /// that is a symlink. Reported like a skip, and apart from
+    /// that is a symlink, is not a regular file or is over the bound — and
+    /// rule files with lines the pattern parser refused, which were skipped.
+    /// Reported like a skip, and apart from
     /// [`skipped`](HostScan::skipped) because the path itself is still an
     /// ordinary sync object: only its reading as rules was declined.
     pub refused_rules: Vec<Skip>,
@@ -770,6 +772,55 @@ mod tests {
         assert_eq!(scan.skipped[0].path, "build.sock");
         assert!(scan.skipped[0].to_string().contains("build.sock"));
         assert!(scan.tree.contains_key("src/main.rs"));
+    }
+
+    /// Review labd-sync-2 F17: the glob parser refuses rule lines git reads
+    /// (a trailing backslash, an unbalanced brace, a reversed range), and a
+    /// guest can write one. Such a line must not stop the scan, or every pass
+    /// fails from then on. The scan completes, the other lines of the file
+    /// apply, and the file and the line are a named skip.
+    #[test]
+    fn a_rule_line_the_parser_refuses_is_a_named_skip() {
+        for (bad, accepted) in [
+            ("obj\\", false),
+            ("x{y", false),
+            ("x}y", false),
+            ("[z-a]", false),
+            ("a[b", true),
+            ("ok/", true),
+        ] {
+            let rules = format!("target/\n\n{bad}\n*.log\n");
+            let dir = workspace(&[
+                (".gitignore", rules.as_str()),
+                ("target/out", "o"),
+                ("build.log", "l"),
+                ("src/main.rs", "y"),
+            ]);
+
+            let (scan, ignores) = host_scan(dir.path(), &empty_ledger(), NO_CAP)
+                .unwrap_or_else(|e| panic!("{bad:?} failed the scan: {e:#}"));
+
+            assert!(scan.tree.contains_key("src/main.rs"), "{bad:?}");
+            assert!(scan.tree.contains_key(".gitignore"), "{bad:?}");
+            assert!(!scan.tree.contains_key("target/out"), "{bad:?}");
+            assert!(!scan.tree.contains_key("build.log"), "{bad:?}");
+            assert_eq!(
+                ignores.prune_list(&scan.pruned)[0],
+                "target".to_string(),
+                "{bad:?}"
+            );
+            if accepted {
+                assert!(scan.refused_rules.is_empty(), "{bad:?}");
+                continue;
+            }
+            assert_eq!(scan.refused_rules.len(), 1, "{bad:?}");
+            assert_eq!(scan.refused_rules[0].path, ".gitignore", "{bad:?}");
+            assert!(
+                scan.refused_rules[0].why.contains("line 3"),
+                "{bad:?}: {}",
+                scan.refused_rules[0].why
+            );
+        }
     }
 
     /// A directory or a FIFO named like a rule file holds no rules, and it
