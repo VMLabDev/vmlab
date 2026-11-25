@@ -100,7 +100,7 @@ pub struct ForwardRule {
 }
 
 /// Two or more forwards claiming one host port on overlapping addresses
-/// ([`forward_binds_overlap`]), in plan order. Config validation already
+/// and protocols, in plan order. Config validation already
 /// rejects this within a lab file; the plan catches
 /// whatever reaches it anyway — a partial `up`, or a rule composed from more
 /// than one source. The first claimant keeps the port; every other is dropped
@@ -332,9 +332,8 @@ fn push(plan: &mut ForwardPlan, inputs: &ForwardInputs, draft: Draft) {
 }
 
 /// Settle every host port claimed more than once on overlapping addresses
-/// ([`forward_binds_overlap`]): the first claimant in plan order keeps it,
-/// the rest are dropped with a reason naming the winner. Two rules on one
-/// port but different explicit addresses both keep it.
+/// and protocols. The first claimant in plan order keeps it, and the rest
+/// are dropped with a reason naming the winner.
 ///
 /// Dropping them is the point. Installing all of them and letting the losers
 /// fail at bind time is what this used to do, and a bind failure names
@@ -350,7 +349,9 @@ fn resolve_conflicts(plan: &mut ForwardPlan) {
         };
         let beaten_by = winners.iter_mut().find(|(w, _)| {
             let w = &plan.rules[*w];
-            w.host == HostBinding::Port(port) && forward_binds_overlap(w.bind, r.bind)
+            w.host == HostBinding::Port(port)
+                && w.proto.overlaps(r.proto)
+                && forward_binds_overlap(w.bind, r.bind)
         });
         match beaten_by {
             Some((_, losers)) => losers.push(i),
@@ -670,6 +671,28 @@ lab "l" {
             p.conflicts[0].claimants,
             ["a: forward".to_string(), "b: container port".to_string()]
         );
+    }
+
+    #[test]
+    fn tcp_and_udp_share_a_host_port_in_the_plan() {
+        let lab = lab_of(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "lan" { subnet = "10.0.0.0/24" nat = true
+    forward { host_port = 5353 to = "a:53" proto = "tcp" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "lan" } }
+  container "b" { image = "nginx" nic { segment = "lan" }
+    port { host = 5353 container = 5353 proto = "udp" }
+  }
+}"#,
+        );
+        let obs = leased(&[("a", 10), ("b", 11)]);
+        let p = plan(&inputs(&lab, &obs), &[]);
+        assert!(p.conflicts.is_empty(), "{p:#?}");
+        assert_eq!(p.rules.len(), 2, "{p:#?}");
+        assert_eq!(p.rules[0].proto, Proto::Tcp);
+        assert_eq!(p.rules[1].proto, Proto::Udp);
     }
 
     /// A scoped plan — what a single container's readiness recomputes —

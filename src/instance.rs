@@ -30,8 +30,7 @@ pub const ENV: &str = "VMLAB_INSTANCE";
 /// A lab name is a DNS label.
 const LABEL_MAX: usize = 63;
 
-/// Hex characters of the instance's hash kept when the effective name has to
-/// be shortened.
+/// Hex characters of the lab and instance hash kept in a disambiguated name.
 const HASH_LEN: usize = 6;
 
 static FLAG: OnceLock<String> = OnceLock::new();
@@ -109,9 +108,9 @@ pub fn worktree_name(root: &Path) -> Option<String> {
 }
 
 /// `<declared>-<instance>`, with the instance lowercased and reduced to
-/// letters, digits and single hyphens so the result is a DNS label. When that
-/// would pass 63 characters the instance is cut short and a 6-character hash
-/// of it appended, so two long instances that share a prefix stay distinct.
+/// letters, digits and single hyphens so the result is a DNS label. Append a
+/// hash when slugging loses information, the lab/instance boundary is
+/// ambiguous, or the name needs shortening.
 pub fn effective_name(declared: &str, id: &str) -> Result<String> {
     let mut slug = String::new();
     for c in id.chars().flat_map(char::to_lowercase) {
@@ -126,12 +125,13 @@ pub fn effective_name(declared: &str, id: &str) -> Result<String> {
         bail!("instance `{id}` has no letters or digits to name a lab with");
     }
     let full = format!("{declared}-{slug}");
-    if full.len() <= LABEL_MAX {
+    if id == slug && !declared.contains('-') && full.len() <= LABEL_MAX {
         return Ok(full);
     }
-    // declared, '-', a cut of the slug, '-', the hash.
+    // A double hyphen separates the hash from the slug, which has only
+    // single hyphens. This keeps ordinary instance IDs out of this space.
     let room = LABEL_MAX
-        .checked_sub(declared.len() + 2 + HASH_LEN)
+        .checked_sub(declared.len() + 3 + HASH_LEN)
         .filter(|&n| n > 0)
         .ok_or_else(|| {
             anyhow!(
@@ -139,9 +139,9 @@ pub fn effective_name(declared: &str, id: &str) -> Result<String> {
                  the two together must fit in 63 characters"
             )
         })?;
-    let cut = slug[..room].trim_end_matches('-');
-    let hash = hex::encode(Sha256::digest(slug.as_bytes()));
-    Ok(format!("{declared}-{cut}-{}", &hash[..HASH_LEN]))
+    let cut = slug[..room.min(slug.len())].trim_end_matches('-');
+    let hash = hex::encode(Sha256::digest(format!("{declared}\0{id}")));
+    Ok(format!("{declared}-{cut}--{}", &hash[..HASH_LEN]))
 }
 
 /// Rename `file`'s lab to the effective name for the instance at `root`.
@@ -192,12 +192,29 @@ mod tests {
     #[test]
     fn effective_name_joins_and_slugs() {
         assert_eq!(effective_name("demo", "feat-x").unwrap(), "demo-feat-x");
-        assert_eq!(
-            effective_name("demo", "Feature/Login_Page").unwrap(),
-            "demo-feature-login-page"
+        assert!(
+            effective_name("demo", "Feature/Login_Page")
+                .unwrap()
+                .starts_with("demo-feature-login-page--")
         );
-        assert_eq!(effective_name("demo", "--a..b--").unwrap(), "demo-a-b");
+        assert!(
+            effective_name("demo", "--a..b--")
+                .unwrap()
+                .starts_with("demo-a-b--")
+        );
         assert!(effective_name("demo", "///").is_err());
+    }
+
+    #[test]
+    fn two_instances_have_two_names() {
+        assert_ne!(
+            effective_name("demo", "fix_1").unwrap(),
+            effective_name("demo", "fix-1").unwrap()
+        );
+        assert_ne!(
+            effective_name("demo-a", "b").unwrap(),
+            effective_name("demo", "a-b").unwrap()
+        );
     }
 
     #[test]
@@ -207,7 +224,7 @@ mod tests {
         assert!(a.len() <= LABEL_MAX && b.len() <= LABEL_MAX, "{a} {b}");
         assert_ne!(a, b);
         assert!(a.starts_with("demo-x"));
-        assert!(!a.contains("--"));
+        assert_eq!(a.rsplit_once("--").unwrap().1.len(), HASH_LEN);
     }
 
     #[test]
