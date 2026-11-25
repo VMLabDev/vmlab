@@ -212,6 +212,9 @@ pub fn checked_command_line(argv: &[String]) -> std::io::Result<String> {
     let Some(program) = argv.first() else {
         return Ok(String::new());
     };
+    for arg in argv {
+        refuse_nul("argument", arg)?;
+    }
     if !is_batch(program) {
         return Ok(command_line(argv));
     }
@@ -225,6 +228,46 @@ pub fn checked_command_line(argv: &[String]) -> std::io::Result<String> {
         ));
     }
     Ok(render_command_line(argv, true))
+}
+
+/// Refuse a string holding a NUL before it is handed to Win32, which reads
+/// every string up to its first one: the rest would be dropped silently, or
+/// in an environment block read as a second entry.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn refuse_nul(what: &str, value: &str) -> std::io::Result<()> {
+    if value.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{what} {value:?} holds a NUL character"),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse environment overrides a Windows environment block cannot carry as
+/// what they say: a NUL in a name or a value ends the entry there, so the
+/// rest becomes another variable or ends the block, and a name that is
+/// empty or holds `=` names a different variable than the one asked for.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn checked_env(overrides: &[(String, String)]) -> std::io::Result<()> {
+    for (key, value) in overrides {
+        refuse_nul("environment variable name", key)?;
+        if key.is_empty() || key.contains('=') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("environment variable name {key:?} is empty or holds `=`"),
+            ));
+        }
+        refuse_nul(&format!("the value of environment variable {key}"), value)?;
+    }
+    Ok(())
+}
+
+/// Refuse a working directory holding a NUL, which would name the directory
+/// spelled before it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn checked_cwd(cwd: &str) -> std::io::Result<()> {
+    refuse_nul("working directory", cwd)
 }
 
 fn render_command_line(argv: &[String], quote_all: bool) -> String {
@@ -356,7 +399,9 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Spawned, checked_command_line, command_line, hold_until_it_exits};
+    use super::{
+        Spawned, checked_command_line, checked_cwd, checked_env, command_line, hold_until_it_exits,
+    };
     use std::sync::Arc;
 
     /// A `Spawned` with nothing behind it: `wait` reports what the test
@@ -452,5 +497,58 @@ mod tests {
             }
         }
         assert_eq!(checked_command_line(&[]).unwrap(), "");
+    }
+
+    /// G7: in an environment block a NUL ends one entry and starts the next,
+    /// so a value could add a variable of its own or end the block, and in a
+    /// working directory it names another directory. Each is refused, as is
+    /// a name that is empty or holds `=`.
+    #[test]
+    fn a_nul_in_the_environment_or_the_working_directory_is_refused() {
+        let env = |k: &str, v: &str| checked_env(&[(k.to_string(), v.to_string())]);
+        assert!(env("NAME", "value").is_ok());
+        assert!(env("NAME", "").is_ok());
+        assert!(env("NAME", "a=b").is_ok());
+        for (key, value) in [
+            ("NAME", "x\0PATH=C:\\evil"),
+            ("NAME", "\0"),
+            ("NA\0ME", "x"),
+            ("NA=ME", "x"),
+            ("", "x"),
+        ] {
+            let err = env(key, value).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{key:?}={value:?}"
+            );
+        }
+        // One bad entry refuses the whole set.
+        let set = [
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "\0".to_string()),
+        ];
+        assert!(checked_env(&set).is_err());
+
+        assert!(checked_cwd("C:\\Users\\dev").is_ok());
+        let err = checked_cwd("C:\\Users\0\\dev").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// G7: `CreateProcessW` reads a command line up to its first NUL, so an
+    /// argument holding one would cut the line there and run something other
+    /// than what was asked for. It is refused, for a program and for a batch
+    /// file, wherever in the argv it sits.
+    #[test]
+    fn a_nul_in_an_argument_is_refused() {
+        for argv in [
+            &["prog", "a\0b"][..],
+            &["prog", "ok", "\0"],
+            &["pr\0og", "ok"],
+            &["run.bat", "a\0b"],
+        ] {
+            let err = checked_command_line(&args(argv)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{argv:?}");
+        }
     }
 }

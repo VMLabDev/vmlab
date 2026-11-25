@@ -762,10 +762,12 @@ impl TapBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GuestRegion;
     use std::collections::BTreeSet;
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::sync::{Mutex, Weak};
-    use vm_memory::{GuestRegionMmap, MmapRegion};
+
+    type MmapRegion = vm_memory::MmapRegion<crate::WriteDiscard>;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -791,7 +793,7 @@ mod tests {
         fail_all_detach: bool,
         fail_reset: bool,
         reject_uso: bool,
-        memory: Option<Weak<MmapRegion<()>>>,
+        memory: Option<Weak<MmapRegion>>,
     }
 
     #[derive(Default)]
@@ -1245,10 +1247,10 @@ mod tests {
 
     #[test]
     fn memory_table_preserves_aliases_with_distinct_guest_addresses() {
-        let mapping = Arc::new(MmapRegion::<()>::new(0x10000).unwrap());
+        let mapping = Arc::new(MmapRegion::new(0x10000).unwrap());
         let memory = GuestMemory::from_regions(vec![
-            GuestRegionMmap::with_arc(mapping.clone(), GuestAddress(0)).unwrap(),
-            GuestRegionMmap::with_arc(mapping, GuestAddress(0x10000)).unwrap(),
+            GuestRegion::with_arc(mapping.clone(), GuestAddress(0)).unwrap(),
+            GuestRegion::with_arc(mapping, GuestAddress(0x10000)).unwrap(),
         ])
         .unwrap();
         let (mut backend, fake, _, _) = fixture(1, true, memory.clone());

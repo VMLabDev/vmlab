@@ -1076,7 +1076,7 @@ fn control_snapshot_restores_ram_outside_the_boot_layout() {
         |_, _| {},
         |kvm, ram| {
             let region =
-                Arc::new(vm_memory::GuestRegionMmap::from_range(base, 4096, None).unwrap());
+                Arc::new(vmlab_hv_devices::GuestRegion::from_range(base, 4096, None).unwrap());
             let slot = kvm_bindings::kvm_userspace_memory_region {
                 slot: 128,
                 guest_phys_addr: base.0,
