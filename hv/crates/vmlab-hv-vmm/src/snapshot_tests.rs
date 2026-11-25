@@ -1481,6 +1481,7 @@ fn snapshot_stops_console_dma_before_saving_ram() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(mem.read_obj::<u32>(PORT_OPEN_BUFFER).unwrap(), 0);
     let wrote = Arc::new(AtomicBool::new(false));
     let original = m.handle.shared().snapshot_registry().unwrap();
     m.handle
