@@ -3573,12 +3573,12 @@ lab "l" {{
         for (guest, profile) in [
             ("/mnt/x", linux),
             ("S:", windows),
-            ("S:\\", windows),
-            ("C:\\data", windows),
+            (r"S:\\", windows),
+            (r"C:\\data", windows),
             ("C:/data", windows),
             ("/mnt/x", ""),
             ("S:", ""),
-            ("C:\\data", ""),
+            (r"C:\\data", ""),
         ] {
             let es = share_errs(guest, profile);
             assert!(es.is_empty(), "{guest:?} with {profile:?} → {es:#?}");
