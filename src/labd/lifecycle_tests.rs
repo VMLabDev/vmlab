@@ -2789,9 +2789,12 @@ async fn a_freeze_point_restore_that_must_refuse_leaves_the_vm_running() {
     let name = machine.name();
     lab.start_machine(name).await.expect("start");
     assert_eq!(machine.state().await, PowerState::Running);
-    qimg::snapshot_create(&machine.dirs.primary_disk(), crate::freeze::plan::HOLD_SNAPSHOT)
-        .await
-        .unwrap();
+    qimg::snapshot_create(
+        &machine.dirs.primary_disk(),
+        crate::freeze::plan::HOLD_SNAPSHOT,
+    )
+    .await
+    .unwrap();
 
     let error = lab
         .restore(name, "base", false)

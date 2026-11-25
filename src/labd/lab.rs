@@ -4245,8 +4245,7 @@ impl LabRuntime {
                 // ticket.
                 let no_start = self.starts.hold(m.name()).await;
                 // What the plan refuses, it refuses before the stop.
-                self.check_freeze_point_restore(m, snap, generation)
-                    .await?;
+                self.check_freeze_point_restore(m, snap, generation).await?;
                 Ok(no_start)
             }
             None => {
@@ -5426,9 +5425,7 @@ mod tests {
         }
 
         async fn restore_refusal(&self, online: bool) -> Option<String> {
-            self.restore_refused
-                .filter(|_| online)
-                .map(str::to_string)
+            self.restore_refused.filter(|_| online).map(str::to_string)
         }
 
         fn display(self: Arc<Self>) -> Option<super::super::display::Display> {
@@ -8018,17 +8015,22 @@ lab "t" {
             super::super::usb::UsbHost::fake(sys.path().to_path_buf(), dev),
         )
         .expect("runtime");
-        lab.state.lock().await.machine_mut("dev01").snapshots.insert(
-            "s".into(),
-            SnapshotRecord {
-                online: true,
-                taken_at: chrono::Utc::now(),
-                image_digest: None,
-                freeze_point: None,
-                frozen_in: None,
-                hypervisor: Machine::hypervisor(&*machine),
-            },
-        );
+        lab.state
+            .lock()
+            .await
+            .machine_mut("dev01")
+            .snapshots
+            .insert(
+                "s".into(),
+                SnapshotRecord {
+                    online: true,
+                    taken_at: chrono::Utc::now(),
+                    image_digest: None,
+                    freeze_point: None,
+                    frozen_in: None,
+                    hypervisor: Machine::hypervisor(&*machine),
+                },
+            );
         lab.usb_attach("dev01", "port:1-10", false).await.unwrap();
         (lab, sys, machine)
     }
@@ -8088,10 +8090,7 @@ lab "t" {
         lab.starts.close("shutting down");
 
         let error = lab.restore("dev01", "s", true).await.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("shutting down"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("shutting down"), "{error:#}");
         let log = machine.log.lock().await.clone();
         assert_the_refused_restore_changed_nothing(&lab, &log).await;
     }
