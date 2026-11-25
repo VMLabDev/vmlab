@@ -34,9 +34,16 @@ The gate sets `VMLAB_REQUIRE_KVM=1`. Packages with KVM tests probe read/write
 access during their Cargo build. Without KVM, ordinary tests are reported
 as ignored with a reason by libtest. Required mode fails the build instead.
 Cargo tracks `/dev/kvm` and the environment flag for rebuilds. Build and run
-on the same host. Do not copy prebuilt test binaries between hosts. Existing
-local-asset and GPU prerequisites still apply, so inspect ignored counts
-alongside passes rather than treating them as hardware coverage.
+on the same host. Do not copy prebuilt test binaries between hosts.
+
+The gate prepares the x86_64 kernel and initramfs with
+`just guest-build x86_64` and builds the pinned Alpine S1 rootfs with
+`sqfstar`. It caches these files by their build inputs under `.ci-cache/hv-guest`
+(under `VMLAB_TARGET_ROOT` when set). The build needs `cpio`, `sqfstar`, and
+the `x86_64-unknown-linux-musl` Rust target on a cache miss. Missing guest
+fixtures fail the gate. Successful S1 tests log guest output, including
+`boot-to-agent-ready` and the guest's `uname`. Other host-asset and GPU
+prerequisites still apply, so inspect the log for their skips.
 
 The real PipeWire and PulseAudio smoke tests inspect sinks with `pw-dump`
 and `pactl --format=json list sinks`, respectively. They print `SKIP` directly
