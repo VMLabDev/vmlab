@@ -392,8 +392,12 @@ removes them, but guest-to-host deletions past a threshold are withheld and
 halt. The threshold is a proportion with a floor: more than 20 paths and more
 than half of what the ledger had agreed on. A fixed count would punish large
 repos and a bare proportion would let a ten-file project lose everything. A
-single deletion still propagates immediately. `--guest` on the halt is what
-releases the withheld removals.
+single deletion still propagates immediately. The count is of one deletion, not
+of one pass: it runs until the guest has deleted nothing for two seconds. More
+than 20 deletions that are still under half wait those two seconds before they
+are removed on the host, so an `rm -rf` that is still running is judged whole.
+`vmlab dev sync flush` does not wait. `--guest` on the halt is what releases
+the withheld removals.
 DOC
 
   p <<'DOC'

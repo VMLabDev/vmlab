@@ -43,8 +43,9 @@ the guest's workspace root is the only signal that side of ADR-0013's invariant
 can get; resolution is host-side necessarily, through `vmlab dev sync
 status/flush/diff/resolve`, with `--host`/`--guest`/`--all` and a free third
 route — make the two sides identical by hand — that needs no verb. With it the
-**guest→host bulk-delete guard** (a proportion with a floor; host→guest deletes
-stay unguarded), the **unwitnessed-absence rule** (#190: after a break in the
+**guest→host bulk-delete guard** (a proportion with a floor, counted over one
+run of guest deletions and not one pass, with a mass past the floor held until
+the guest stops deleting; host→guest deletes stay unguarded), the **unwitnessed-absence rule** (#190: after a break in the
 watch a path the guest lacks is never deleted on the host — an unconfirmed
 agreement is copied again, a confirmed one halts on that path), the
 **volume warning** that names a subtree and never halts,
