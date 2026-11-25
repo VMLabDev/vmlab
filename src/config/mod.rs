@@ -144,9 +144,17 @@ fn redacted_source(source: &str, doc: &Document) -> String {
     String::from_utf8(out).unwrap_or_else(|_| blank_source(source))
 }
 
-/// The fields under `block` that hold a secret, by name and span: any
-/// `password`, and the `value` beside a `secret` that is not plainly false.
-fn secret_fields(block: &wcl_lang::Block, out: &mut Vec<(&'static str, model::Span)>) {
+/// The fields under `block` whose value a diagnostic must not print, by
+/// name and span: any `password`, the `value` beside a `secret` that is not
+/// plainly false, and what a mistyped name hides from those two rules.
+///
+/// The schema reports a field it does not know with a label on that field, so
+/// a `password` written `passwd` would be printed by the diagnostic about the
+/// mistake. Such a field's value is starred wherever it stands: the message
+/// names the field, and nothing reads the value. A `secret` written `secrt`
+/// is one of those fields, so beside any of them the `value` of a block that
+/// could have declared a `secret` is starred too.
+fn secret_fields<'a>(block: &wcl_lang::Block<'a>, out: &mut Vec<(&'a str, model::Span)>) {
     let mut unused = IssueList::new();
     let mut r = block::Reader::new(block, &mut unused);
     if let Some(span) = r.field_span("password") {
@@ -154,7 +162,18 @@ fn secret_fields(block: &wcl_lang::Block, out: &mut Vec<(&'static str, model::Sp
     }
     // A `secret` that does not evaluate to a bool is an issue of its own,
     // and no reason to print the value.
-    let secret = r.has("secret") && r.bool("secret").is_none_or(|s| s.value);
+    let mut secret = r.has("secret") && r.bool("secret").is_none_or(|s| s.value);
+    if let Some(schema) = block.schema() {
+        let declared: Vec<&str> = schema.fields().map(|f| f.name()).collect();
+        let mut stray = false;
+        for field in block.fields() {
+            if !declared.contains(&field.name()) {
+                stray = true;
+                out.push((field.name(), (field.span().start, field.span().end)));
+            }
+        }
+        secret |= stray && declared.contains(&"secret");
+    }
     if secret && let Some(span) = r.field_span("value") {
         out.push(("value", span));
     }
