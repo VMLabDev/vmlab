@@ -232,17 +232,9 @@ fn a_new_process_removes_a_stale_rollback_checkpoint() {
     use vmlab_hv_proto::client::Client;
     use vmlab_hv_tests::process::ManagedChild;
 
-    let assets = probe_assets();
-    if let Some(reason) = assets.skip_reason() {
-        // VMLAB_REQUIRE_KVM requires KVM only: the guest assets stay a local
-        // prerequisite of the gate (docs/agents/hv-gate.md), as in `check`.
-        assert!(
-            assets.kvm || std::env::var_os("VMLAB_REQUIRE_KVM").is_none(),
-            "cannot run killed-load proof: {reason}"
-        );
-        eprintln!("skipping S1: {reason}");
+    let Some(assets) = check() else {
         return;
-    }
+    };
     let mut spec = MachineSpec::idle("s1-killed-load");
     spec.paused = true;
     let mut guest = vmlab_hv_tests::launch(&spec, &assets);
