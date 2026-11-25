@@ -1985,8 +1985,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         // The two pings of the racing connect (2 s, then the grace) are
         // never answered; the ping after the wake is.
-        let (_dir, sock, accepted) =
-            slow_agent(2, Duration::from_secs(600), Arc::new(AtomicBool::new(false))).await;
+        let (_dir, sock, accepted) = slow_agent(
+            2,
+            Duration::from_secs(600),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         let slot = Arc::new(AgentSlot::with_grace(Duration::from_secs(1)));
         let first = slot
             .connect("m1", &sock, "hint")
