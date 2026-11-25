@@ -1182,7 +1182,8 @@ mod tests {
     fn the_prune_list_is_bounded() {
         let dir = tmp();
         let per_file = MAX_PRUNE_PREFIXES / 2;
-        let body = |tag: &str| -> String { (0..per_file).map(|n| format!("{tag}{n}/\n")).collect() };
+        let body =
+            |tag: &str| -> String { (0..per_file).map(|n| format!("{tag}{n}/\n")).collect() };
         let set = ignores(
             dir.path(),
             &[
