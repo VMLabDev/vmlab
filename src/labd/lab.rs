@@ -5790,7 +5790,11 @@ lab "t" { vm "a" { template = "x86_64/t" } }"#,
             vec![Arc::new(machine)],
         );
         lab.snapshot("a", "s").await.unwrap();
-        assert!(lab.state.lock().await.machines["a"].snapshots.contains_key("s"));
+        assert!(
+            lab.state.lock().await.machines["a"]
+                .snapshots
+                .contains_key("s")
+        );
         lab.delete_snapshot("a", "s").await.unwrap();
         assert!(
             lab.snapshots("a")
