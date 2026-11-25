@@ -501,6 +501,15 @@ the cause. A first reading is not a diagnosis.
   guest has not refilled). Before that, repeat the row on a quiet host to
   separate the host's part.
 - Known card: no open card found for A1 of C447.
+- Cause (card #912): two, and neither is the host's load. On the quiet host
+  the row still failed. `pw-record` lost whole quanta when its write to the
+  capture file waited for the disk (6 of 18 tones on btrfs, 0 of 18 on
+  tmpfs, captured at the same time): the check now captures to tmpfs. And a
+  virtio-gpu context create kept a vCPU out of the guest for 5 to 17 ms, so
+  that Windows refilled a period late (6 of 50 tones on `windows-11`):
+  vmlab-hv now creates the context off the vCPU thread. The measurements
+  and the evidence paths are in
+  [C912](../../guest/win3d/docs/acceptance/C912.md).
 
 ### D4. win3d: Direct3D 11 pixel shaders with more than 32 combined texture slots draw nothing
 
@@ -622,5 +631,5 @@ the cause. A first reading is not a diagnosis.
 | Code | Point |
 | --- | --- |
 | O2 | Done by card #916: the win3d suite ran on Nvidia2 in vulkan mode (R7 to R9). |
-| O3 | The `audio` row should be repeated on a host with no other heavy job before D3 is sized. |
+| O3 | Done by card #912: the `audio` row was repeated on a quiet host, failed there too, and its two causes are fixed (D3). |
 | O4 | The win3d baseline tables in `guest/win3d/docs/acceptance.md` are from 2026-11-20 and no longer match: seven rows that fail there pass now. This card did not change them. |
