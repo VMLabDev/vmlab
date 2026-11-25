@@ -1452,7 +1452,8 @@ fn snapshot_stops_console_dma_before_saving_ram() {
     let mem = m.vm.ram.mem.clone();
     // Queue 2 receives PORT_ADD for the single configured port, then keeps
     // a separate empty descriptor for the host's PORT_OPEN.
-    for (index, buffer) in [0x9100, PORT_OPEN_BUFFER.raw_value()].into_iter().enumerate() {
+    let ctrl_rx_buffers = [0x9100, PORT_OPEN_BUFFER.raw_value()];
+    for (index, buffer) in ctrl_rx_buffers.into_iter().enumerate() {
         let desc = 0x30000 + index as u64 * 16;
         mem.write_obj(buffer, GuestAddress(desc)).unwrap();
         mem.write_obj(64u32, GuestAddress(desc + 8)).unwrap();
