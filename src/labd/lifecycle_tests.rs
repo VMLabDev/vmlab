@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::container::{ContainerDirs, ContainerInstance};
 use super::events::EventLog;
-use super::hypervisor::fake::{Capabilities, FakeHypervisor, Run, Script};
+use super::hypervisor::fake::{Capabilities, FakeHypervisor, Run, Script, StartHold};
 use super::machine::{LabServices, Machine};
 use super::vm::{Floppy, PowerState, StopReason, TemplateParts, VmDirs, VmInstance};
 use crate::oci::image::model::{ImageConfig, RuntimeDefaults};
@@ -4273,6 +4273,113 @@ async fn before_resume_runs_in_the_paused_window_and_can_refuse_the_start() {
     m.wait_state(PowerState::Stopped, SETTLE)
         .await
         .expect("the failed start leaves the VM stopped");
+}
+
+/// Review lab-lifecycle-2 F17 (card #980). A start whose caller is dropped
+/// (an `up` that aborts its wave when a sibling fails) must not leave the
+/// machine `Starting` with a hypervisor nothing owns. Here the caller goes
+/// away in the paused window: the emulator and a virtiofsd run. The machine
+/// must end `Stopped` with no helper left, and a later start must start it.
+/// Before the fix the state stayed `Starting`, the emulator and the daemon
+/// lived on, and no later start was possible.
+///
+/// No clock: the start's callbacks go with the start. A start dropped where
+/// it stood drops them unused, which closes the channel. A start that runs
+/// to its end and is then stopped reports that exit through them.
+#[tokio::test]
+async fn an_aborted_start_leaves_the_machine_stopped() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        r#"vm "dc01" { template = "scratch" arch = "x86_64" profile = "linux-generic" disk = 10GiB
+             share "data" { host = "./data" guest = "/mnt/data" transport = "virtiofs" } }"#,
+        Script::healthy(),
+    );
+    let (cbs, mut observed) = callbacks();
+    let Callbacks { exits, readies, .. } = cbs;
+    let (reached, at_resume) = tokio::sync::oneshot::channel::<()>();
+    let (go, released) = tokio::sync::oneshot::channel::<()>();
+    let start = tokio::spawn({
+        let vm = vm.clone();
+        async move {
+            vm.boot(
+                move |reason, status| {
+                    let _ = exits.send(Exited { reason, status });
+                },
+                move || {
+                    readies.fetch_add(1, Ordering::SeqCst);
+                },
+                std::future::ready(()),
+                async move {
+                    let _ = reached.send(());
+                    let _ = released.await;
+                    Ok(())
+                },
+                |_| {},
+            )
+            .await
+        }
+    });
+    at_resume.await.expect("the start reached the paused window");
+    start.abort();
+    assert!(start.await.expect_err("aborted").is_cancelled());
+    let _ = go.send(());
+    let exit = observed.exits.recv().await;
+
+    assert_eq!(
+        vm.state().await,
+        PowerState::Stopped,
+        "the aborted start left the machine in this state"
+    );
+    assert!(exit.is_some(), "what the start made was never stopped");
+    let live = hv.live_helpers().await;
+    assert!(live.is_empty(), "the aborted start left {live:?} running");
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("a later start");
+    assert_eq!(hv.starts(), 2, "the later start started nothing");
+    assert_eq!(vm.state().await, PowerState::Running);
+    vm.stop(true).await.expect("stop");
+}
+
+/// F17 for a container, whose `boot` sets `Starting` the same way. The
+/// caller goes away while the hypervisor is being started.
+#[tokio::test]
+async fn an_aborted_container_start_leaves_it_stopped() {
+    let dirs = Dirs::new();
+    let hold = StartHold::default();
+    let (ctr, hv) = container(
+        &dirs,
+        WORKLOAD,
+        Script {
+            start_hold: Some(hold.clone()),
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    let start = tokio::spawn({
+        let ctr = ctr.clone();
+        async move { start_container(&ctr, cbs).await }
+    });
+    hold.reached().await;
+    start.abort();
+    assert!(start.await.expect_err("aborted").is_cancelled());
+    hold.release();
+    let exit = observed.exits.recv().await;
+
+    assert_eq!(
+        ctr.state().await,
+        PowerState::Stopped,
+        "the aborted start left the container in this state"
+    );
+    assert!(exit.is_some(), "what the start made was never stopped");
+
+    hold.release();
+    let (cbs, _observed) = callbacks();
+    start_container(&ctr, cbs).await.expect("a later start");
+    assert_eq!(hv.starts(), 2, "the later start started nothing");
+    assert_eq!(ctr.state().await, PowerState::Running);
+    ctr.stop(true).await.expect("stop");
 }
 
 // ---- vmlab-hv's control protocol (§22, ADR-0021) ----------------------------

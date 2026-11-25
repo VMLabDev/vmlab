@@ -4943,6 +4943,14 @@ mod tests {
         /// the test lets it go: the window in which a real adapter has no
         /// emulator yet and a stop finds nothing to stop.
         hold_start: Option<Hold>,
+        /// Stop inside `start` once the machine is `Starting`, until the
+        /// test lets it go: the seconds a real adapter spends on its disks,
+        /// its helpers and its hypervisor.
+        hold_starting: Option<Hold>,
+        /// Stop inside `start` until the test lets it go, and then fail it.
+        fail_start: Option<Hold>,
+        /// Stop inside the first `stop` until the test lets it go.
+        hold_first_stop: Option<Hold>,
         /// Stop inside `wait_state`, once the machine has settled, until the
         /// test lets it go: the gap between a destroy's stop and its removal.
         hold_settle: Option<Hold>,
@@ -5118,6 +5126,9 @@ mod tests {
                 usb: None,
                 display: None,
                 hold_start: None,
+                hold_starting: None,
+                fail_start: None,
+                hold_first_stop: None,
                 hold_settle: None,
                 hold_restore: None,
                 hold_capture: None,
@@ -5138,6 +5149,14 @@ mod tests {
             m.hold_start = start.cloned();
             m.hold_settle = settle.cloned();
             m.makes_disk = true;
+            Arc::new(m)
+        }
+
+        /// A container double changed by `with` before it is shared.
+        fn with(name: &str, shared: &Shared, with: impl FnOnce(&mut Self)) -> Arc<Self> {
+            let mut m = Arc::into_inner(Self::new(name, MachineKind::Container, shared))
+                .expect("sole owner");
+            with(&mut m);
             Arc::new(m)
         }
 
@@ -5386,7 +5405,12 @@ mod tests {
             report.mounted("data");
         }
         async fn stop(&self, _force: bool) -> Result<()> {
-            self.stops.fetch_add(1, Ordering::SeqCst);
+            let earlier = self.stops.fetch_add(1, Ordering::SeqCst);
+            if earlier == 0
+                && let Some(hold) = &self.hold_first_stop
+            {
+                hold.pass().await;
+            }
             self.note("stop").await;
             *self.state.write().await = PowerState::Stopped;
             *self.agent_up.write().await = false;
@@ -5420,11 +5444,18 @@ mod tests {
             if let Some(hold) = &self.hold_start {
                 hold.pass().await;
             }
+            if let Some(hold) = &self.fail_start {
+                hold.pass().await;
+                bail!("{}: the hypervisor refused it", self.name);
+            }
             if self.makes_disk {
                 std::fs::create_dir_all(&self.dir)?;
                 std::fs::write(self.dir.join("disk0.qcow2"), b"disk")?;
             }
             *self.state.write().await = PowerState::Starting;
+            if let Some(hold) = &self.hold_starting {
+                hold.pass().await;
+            }
             tokio::time::sleep(self.boot).await;
             // The paused window a real VM offers before its CPUs run (D20).
             if let Err(e) = lab.before_resume(&self.name).await {
@@ -7254,6 +7285,120 @@ lab "t" {
             "the up booted a later wave after the down"
         );
         assert!(up.is_err(), "the up reported a lab it did not bring up");
+    }
+
+    const TWO_SIBLINGS: &str = r#"import <vmlab.wcl>
+lab "t" {
+  container "a" { image = "a:1" }
+  container "b" { image = "b:1" }
+}"#;
+
+    /// Review lab-lifecycle-2 F17 (card #980). When one machine of a wave
+    /// fails its start, `up` gives up on the rest of the wave. A sibling
+    /// whose start is under way must not be left `Starting` for the life of
+    /// the daemon: it ends `Stopped`, and it keeps its start lock until it
+    /// has, so no stop or start acts on it half-made. Before the fix the
+    /// start was dropped where it stood and "a" stayed `Starting`.
+    #[tokio::test]
+    async fn a_failed_sibling_leaves_no_machine_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let starting = Hold::new();
+        let failing = Hold::new();
+        let a = FakeMachine::with("a", &sh, |m| m.hold_starting = Some(starting.clone()));
+        let b = FakeMachine::with("b", &sh, |m| m.fail_start = Some(failing.clone()));
+        let lab = lab_of(dir.path(), TWO_SIBLINGS, vec![a.clone(), b.clone()]);
+
+        let up = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.up(&[], quiet()).await }
+        });
+        starting.reached().await;
+        failing.reached().await;
+        failing.release();
+        let failed = up.await.unwrap().expect_err("\"b\" failed its start");
+        assert!(
+            format!("{failed:#}").contains("b: the hypervisor refused it"),
+            "{failed:#}"
+        );
+        starting.release();
+        // A start that outlived its `up` holds the lock to its end.
+        drop(lab.starts.hold("a").await);
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "the up that failed left \"a\" in this state"
+        );
+    }
+
+    /// Review lab-lifecycle-2 F21 (card #980). A `vm stop` that arrives
+    /// while a start of the machine has no emulator yet waits for the start
+    /// and then stops what it made. Before the fix it found nothing to stop,
+    /// answered success, and the machine booted behind it.
+    #[tokio::test]
+    async fn a_vm_stop_stops_a_start_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::held("a", &sh, Some(&hold), None);
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+
+        let start = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.start_machine("a").await }
+        });
+        hold.reached().await;
+        let stop = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.stop_machine("a", false).await }
+        });
+        run_until_stalled().await;
+        hold.release();
+        stop.await.unwrap().expect("stop");
+        let _ = start.await.unwrap();
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "\"a\" runs after its stop answered success"
+        );
+    }
+
+    /// F21's second half. A `down` of the machine that runs to its end while
+    /// a restart is still stopping it is later than the restart's start, so
+    /// the restart boots nothing. Before the fix the restart took its start
+    /// ticket after its stop, and booted "a" behind the `down`.
+    #[tokio::test]
+    async fn a_restart_boots_nothing_behind_a_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let hold = Hold::new();
+        let a = FakeMachine::with("a", &sh, |m| m.hold_first_stop = Some(hold.clone()));
+        let b = FakeMachine::new("b", MachineKind::Container, &sh);
+        let lab = lab_of(dir.path(), TWO_DEPENDENT, vec![a.clone(), b]);
+        lab.start_machine("a").await.expect("start");
+
+        let restart = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.restart_machine("a", false, &quiet()).await }
+        });
+        hold.reached().await;
+        lab.down(&["a".to_string()], false).await.expect("down");
+        hold.release();
+        let restarted = restart.await.unwrap();
+
+        assert_eq!(
+            a.state().await,
+            PowerState::Stopped,
+            "the restart booted \"a\" after its down answered success"
+        );
+        assert_eq!(a.starts.load(Ordering::SeqCst), 1);
+        assert!(
+            restarted.is_err(),
+            "the restart reported a machine it did not boot"
+        );
     }
 
     /// Review lab-lifecycle F4 (card #547). A start of the machine that
