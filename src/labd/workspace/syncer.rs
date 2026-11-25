@@ -5901,10 +5901,7 @@ mod tests {
             let said = format!("{refused:#}");
             assert!(said.contains("dump.sql"), "{said}");
             assert!(said.contains("size guard"), "{said}");
-            assert!(
-                said.contains(super::super::bracket::DISCARD_FLAG),
-                "{said}"
-            );
+            assert!(said.contains(super::super::bracket::DISCARD_FLAG), "{said}");
         };
         said_by(
             syncers

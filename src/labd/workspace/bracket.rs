@@ -304,12 +304,7 @@ impl Outstanding {
                  unknown rather than merely behind: {trouble}"
             )?;
         }
-        for waiting in [
-            &self.rescan,
-            &self.reseed,
-            &self.unanswered,
-            &self.refused,
-        ]
+        for waiting in [&self.rescan, &self.reseed, &self.unanswered, &self.refused]
             .into_iter()
             .flatten()
         {
