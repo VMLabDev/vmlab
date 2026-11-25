@@ -3494,4 +3494,168 @@ mod tests {
         assert!(root_for(&labs, "gamma").is_none());
         assert!(root_for(&[], "alpha").is_none());
     }
+
+    const DESTROY_HELPER: &str = "VMLAB_TEST_DESTROY_HELPER";
+    const DESTROY_ROOT: &str = "VMLAB_TEST_DESTROY_ROOT";
+
+    /// A supervisor for the destroy verbs: it lists one lab, `l`, and notes at
+    /// each `lab.release` whether the lab's directory was still there.
+    struct ReleaseRecorder {
+        root: std::path::PathBuf,
+        fail: bool,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proto::server::Handler<crate::proto::SupRequest> for ReleaseRecorder {
+        async fn handle(
+            &self,
+            req: crate::proto::SupRequest,
+            _s: &crate::proto::server::Streamer,
+        ) -> Result<serde_json::Value, crate::proto::CommandError> {
+            use crate::proto::SupRequest;
+            match req {
+                SupRequest::Ping {} => Ok(json!("pong")),
+                SupRequest::Version {} => Ok(json!(crate::version::BUILD)),
+                SupRequest::Status {} => Ok(json!([
+                    {"name": "l", "root": self.root, "pid": 1, "state": "failed"}
+                ])),
+                SupRequest::LabRelease { name } => {
+                    assert_eq!(name, "l");
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push(crate::paths::lab_local_dir(&self.root).exists());
+                    if self.fail {
+                        Err(crate::proto::CommandError::conflict(
+                            "lab daemon for l did not exit after SIGKILL",
+                        ))
+                    } else {
+                        Ok(json!(true))
+                    }
+                }
+                _ => Err(crate::proto::CommandError::conflict(
+                    "not served by the test's supervisor",
+                )),
+            }
+        }
+    }
+
+    /// Run [`destroy_helper`] for `case` in a child with scratch XDG
+    /// directories and a scratch lab root, so the paths and the working
+    /// directory of this process are untouched.
+    fn run_destroy_helper(case: &str) {
+        let scratch = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::lab::tests::destroy_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DESTROY_HELPER, case)
+            .env(DESTROY_ROOT, scratch.path().join("lab"))
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .env_remove("VMLAB_INSTANCE")
+            .env_remove("VMLAB_WORK_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Lab-lifecycle F22: with no answering daemon, `vmlab lab destroy
+    /// <name>` removed `.vmlab/` and asked for the release afterwards, so a
+    /// daemon that was starting, or the guests of one that crashed, lost
+    /// their files while they ran. The release must come while the directory
+    /// is still there.
+    #[test]
+    fn a_lab_destroy_releases_before_it_removes() {
+        run_destroy_helper("lab-destroy-order");
+    }
+
+    /// Lab-lifecycle F22: `vmlab destroy` discarded the release's result, so
+    /// a release that failed (a daemon that survives SIGKILL, an orphan that
+    /// cannot be killed) was followed by the removal and "destroyed".
+    #[test]
+    fn a_destroy_stops_at_a_failed_release() {
+        run_destroy_helper("destroy-failed-release");
+    }
+
+    /// Lab-lifecycle F22, the same for the verb by lab name.
+    #[test]
+    fn a_lab_destroy_stops_at_a_failed_release() {
+        run_destroy_helper("lab-destroy-failed-release");
+    }
+
+    /// A lab `l` with a `.vmlab/` and no daemon, a [`ReleaseRecorder`] on the
+    /// supervisor socket, and the destroy verb the case names.
+    #[test]
+    #[ignore = "subprocess helper for the lab-lifecycle F22 tests"]
+    fn destroy_helper() {
+        let Ok(case) = std::env::var(DESTROY_HELPER) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(std::env::var_os(DESTROY_ROOT).unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(
+            root.join("vmlab.wcl"),
+            "lab \"l\" { vm \"a\" { template = \"x86_64/t\" } }\n",
+        )
+        .unwrap();
+        let lab_local = crate::paths::lab_local_dir(&root);
+        std::fs::create_dir_all(lab_local.join("vms/a")).unwrap();
+        std::fs::write(lab_local.join("vms/a/disk.qcow2"), b"disk").unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fail = case != "lab-destroy-order";
+        let serving = tokio::runtime::Runtime::new().unwrap();
+        let _server = serving
+            .block_on(crate::proto::server::Server::bind(
+                &crate::paths::supervisor_socket(),
+                std::sync::Arc::new(ReleaseRecorder {
+                    root: root.clone(),
+                    fail,
+                    seen: seen.clone(),
+                }),
+            ))
+            .unwrap();
+
+        let result = match case.as_str() {
+            "destroy-failed-release" => {
+                std::env::set_current_dir(&root).unwrap();
+                super::cmd_destroy(false)
+            }
+            _ => super::cmd_lab_destroy("l", false),
+        };
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.first(),
+            Some(&true),
+            "the first release must find the lab directory in place: {seen:?}"
+        );
+        if fail {
+            let err = result.expect_err("the destroy went on past a failed release");
+            assert!(
+                format!("{err:#}").contains("did not exit after SIGKILL"),
+                "{err:#}"
+            );
+            assert!(
+                lab_local.join("vms/a/disk.qcow2").exists(),
+                "the lab directory was removed after a failed release"
+            );
+        } else {
+            result.expect("the destroy failed");
+            assert!(!lab_local.exists(), "the lab directory is still there");
+        }
+    }
 }
