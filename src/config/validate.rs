@@ -221,21 +221,21 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     // Container `port` blocks compile into the same forward machinery, so
     // they share the uniqueness space with segment forwards. Only declared
     // ports can collide: an omitted one is picked free at install time. Two
-    // forwards on one port collide unless each binds its own explicit
-    // address (§9.8).
-    let mut fwd_ports: Vec<(u16, Ipv4Addr)> = Vec::new();
-    let mut claim = |port: u16, bind: Option<Ipv4Addr>| {
+    // forwards on one port collide when their protocols and bind addresses
+    // overlap (§9.8).
+    let mut fwd_ports: Vec<(u16, Ipv4Addr, Proto)> = Vec::new();
+    let mut claim = |port: u16, bind: Option<Ipv4Addr>, proto: Proto| {
         let bind = bind.unwrap_or(Ipv4Addr::LOCALHOST);
-        let taken = fwd_ports
-            .iter()
-            .any(|(p, b)| *p == port && forward_binds_overlap(*b, bind));
-        fwd_ports.push((port, bind));
+        let taken = fwd_ports.iter().any(|(used_port, used_bind, used_proto)| {
+            *used_port == port && used_proto.overlaps(proto) && forward_binds_overlap(*used_bind, bind)
+        });
+        fwd_ports.push((port, bind, proto));
         taken
     };
     for seg in &lab.segments {
         for fwd in &seg.forwards {
             let Some(port) = fwd.host_port else { continue };
-            if claim(port, fwd.bind) {
+            if claim(port, fwd.bind, fwd.proto) {
                 issues.push(Issue::at(
                     fwd.span,
                     format!("duplicate forward host_port {port}"),
@@ -246,7 +246,7 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     for c in &lab.containers {
         for p in &c.ports {
             let Some(port) = p.host_port else { continue };
-            if claim(port, p.bind) {
+            if claim(port, p.bind, p.proto) {
                 issues.push(Issue::at(
                     p.span,
                     format!("duplicate forward host port {port}"),
@@ -1153,6 +1153,12 @@ fn check_vm_template(file: &LabFile, vm: &Vm, ctx: &dyn ValidationContext, issue
             }
         }
         TemplateRef::Registry { reference, .. } => {
+            if let Err(error) = crate::oci::reference::Reference::parse(reference) {
+                issues.push(Issue::at(
+                    vm.template_span,
+                    format!("invalid registry template: {error}"),
+                ));
+            }
             if vm.arch.is_none() {
                 issues.push(Issue::at(
                     vm.template_span,
@@ -1890,10 +1896,15 @@ fn check_nics(
                 issues.push(Issue::at(nic.span, format!("duplicate static ip {ip}")));
             }
         }
-        if let Some(mac) = nic.mac
-            && macs.insert(mac, nic.span).is_some()
-        {
-            issues.push(Issue::at(nic.span, format!("duplicate MAC {mac}")));
+        if let Some(mac) = nic.mac {
+            if mac.0 == [0; 6] || mac.0[0] & 1 != 0 {
+                issues.push(Issue::at(
+                    nic.span,
+                    format!("`mac` must be a nonzero unicast MAC address, got {mac}"),
+                ));
+            } else if macs.insert(mac, nic.span).is_some() {
+                issues.push(Issue::at(nic.span, format!("duplicate MAC {mac}")));
+            }
         }
     }
 }
@@ -3330,12 +3341,18 @@ lab "l" {
 
     #[test]
     fn a_mac_is_a_unicast_address() {
-        for mac in ["01:00:5e:00:00:01", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"] {
+        for mac in [
+            "01:00:5e:00:00:01",
+            "00:00:00:00:00:00",
+            "ff:ff:ff:ff:ff:ff",
+        ] {
             assert_err(
-                &format!(r#"import <vmlab.wcl>
+                &format!(
+                    r#"import <vmlab.wcl>
 lab "l" {{
   vm "a" {{ template = "x86_64/t" nic {{ nat = true mac = "{mac}" }} }}
-}}"#),
+}}"#
+                ),
                 "unicast MAC",
             );
         }
