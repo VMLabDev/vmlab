@@ -5063,6 +5063,86 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// Review labd-sync-2 F13 (card 953): the guest loses an agreed file
+    /// across a break and the host edits the same path. The start's own pass
+    /// halts on "one side changed it and the other deleted it". Taking the
+    /// host edit back is the natural answer to that, and it must not turn the
+    /// absence nothing saw into a deletion on the canonical copy.
+    #[tokio::test]
+    async fn an_unwitnessed_absence_stays_withheld_when_the_host_also_changed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "other").unwrap();
+        let (syncers, guest, sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/other.rs").await;
+        let ws = workspace(dir.path(), state.path());
+        let on_disk = {
+            let (path, root) = (
+                Ledger::path(state.path(), "dev01"),
+                dir.path().to_path_buf(),
+            );
+            move || Ledger::load(&path, &root, "/src")
+        };
+        let recorded = {
+            let on_disk = on_disk.clone();
+            eventually(move || on_disk().entries.len() == 2).await
+        };
+        assert!(recorded, "the seed was never recorded");
+        syncers.stop("dev01").await;
+
+        // A clean restart: the walk finds both files, which bears them out.
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        let borne_out = {
+            let on_disk = on_disk.clone();
+            eventually(move || on_disk().unconfirmed.is_empty()).await
+        };
+        assert!(borne_out, "the restart never bore the agreements out");
+        syncers.stop("dev01").await;
+
+        // The machine is away. The guest loses the file with nothing
+        // watching, and the host edits it.
+        guest.unlink("/src/main.rs");
+        std::fs::write(dir.path().join("main.rs"), "edited on the host").unwrap();
+        let (events, _rx) = EventLog::recording("lab", state.path().join("events.jsonl"));
+        syncers.start(ws.clone(), sessions.clone(), events).await;
+        // The start's own pass, with no verb asking for it: a flush holds
+        // every missing guest path back and would hide the fault.
+        let halt = halt_of(&syncers, "dev01")
+            .await
+            .expect("an edit against an absence did not halt");
+        assert_eq!(halt.paths(), vec!["main.rs".to_string()]);
+        assert_eq!(halt.conflicts[0].kind, ConflictKind::ModifiedAndDeleted);
+        assert!(
+            on_disk().withheld.contains("main.rs"),
+            "the absence nothing saw is not held by name"
+        );
+
+        // The developer takes the host edit back.
+        std::fs::write(dir.path().join("main.rs"), "agreed").unwrap();
+        let syncer = syncers.get("dev01").await.expect("no syncer");
+        let held = eventually(|| {
+            syncer.report().halt.is_some_and(|halt| {
+                halt.conflicts
+                    .iter()
+                    .any(|c| c.path == "main.rs" && c.kind == ConflictKind::MissingUnseen)
+            })
+        })
+        .await;
+        assert!(
+            dir.path().join("main.rs").exists(),
+            "the host copy was deleted for an absence nothing saw"
+        );
+        assert!(held, "the workspace did not halt on the unseen absence");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+            "agreed"
+        );
+        assert_eq!(guest.text("/src/main.rs"), None);
+        syncers.stop("dev01").await;
+    }
+
     /// **Never sync `*.lock`, and defer the mutable set while one is held** —
     /// which is *timing*, not a conflict: nothing is reported as needing a
     /// developer, and it clears itself.
