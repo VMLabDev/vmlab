@@ -201,6 +201,18 @@ mod tests {
     }
 
     #[test]
+    fn two_instances_have_two_names() {
+        assert_ne!(
+            effective_name("demo", "fix_1").unwrap(),
+            effective_name("demo", "fix-1").unwrap()
+        );
+        assert_ne!(
+            effective_name("demo-a", "b").unwrap(),
+            effective_name("demo", "a-b").unwrap()
+        );
+    }
+
+    #[test]
     fn long_instances_stay_labels_and_distinct() {
         let a = effective_name("demo", &format!("{}-one", "x".repeat(80))).unwrap();
         let b = effective_name("demo", &format!("{}-two", "x".repeat(80))).unwrap();

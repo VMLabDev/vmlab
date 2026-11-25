@@ -3329,6 +3329,45 @@ lab "l" {
     }
 
     #[test]
+    fn a_mac_is_a_unicast_address() {
+        for mac in ["01:00:5e:00:00:01", "00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"] {
+            assert_err(
+                &format!(r#"import <vmlab.wcl>
+lab "l" {{
+  vm "a" {{ template = "x86_64/t" nic {{ nat = true mac = "{mac}" }} }}
+}}"#),
+                "unicast MAC",
+            );
+        }
+    }
+
+    #[test]
+    fn a_registry_reference_is_parsed_at_validation() {
+        assert_err(
+            r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" { template = "ghcr.io/a/../b:1" arch = "x86_64" }
+}"#,
+            "invalid registry template",
+        );
+    }
+
+    #[test]
+    fn a_tcp_and_a_udp_forward_share_a_host_port() {
+        let es = errs(
+            r#"import <vmlab.wcl>
+lab "l" {
+  segment "s" { subnet = "10.1.1.0/24" nat = true
+    forward { host_port = 5353 to = "a:53" proto = "tcp" }
+    forward { host_port = 5353 to = "a:5353" proto = "udp" }
+  }
+  vm "a" { template = "x86_64/t" nic { segment = "s" } }
+}"#,
+        );
+        assert!(es.is_empty(), "{es:#?}");
+    }
+
+    #[test]
     fn duplicate_static_ips_and_macs() {
         assert_err(
             r#"import <vmlab.wcl>
