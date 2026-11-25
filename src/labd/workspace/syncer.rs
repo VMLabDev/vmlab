@@ -6902,6 +6902,72 @@ mod tests {
         syncers.stop("dev01").await;
     }
 
+    /// Review labd-sync-2 F20: the scan gives a guest link the length of its
+    /// target as its size, and a guest's `lstat` need not agree — a symlink
+    /// on NTFS reports 0. The check before an overwrite or a removal must
+    /// compare the link by its target, or no synced link can be changed or
+    /// removed on such a guest.
+    #[tokio::test]
+    async fn a_guest_link_is_compared_by_its_target_not_its_lstat_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "m").unwrap();
+        let (syncers, guest, _sessions) =
+            seeded_lab(dir.path(), state.path(), "/src/main.rs").await;
+        let syncer = syncers.get("dev01").await.unwrap();
+        guest.report_size("/src/link", 0);
+
+        // A pass count bounds each step, not a clock.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink("first-target", &link).unwrap();
+        let mut report = syncer.pass_now().await.unwrap();
+        for _ in 0..3 {
+            if guest.get("/src/link").is_some() {
+                break;
+            }
+            report = syncer.pass_now().await.unwrap();
+        }
+        assert_eq!(
+            guest.get("/src/link"),
+            Some(Node::Symlink("first-target".into())),
+            "the first placement: {:?}",
+            report.trouble
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("another-target", &link).unwrap();
+        for _ in 0..4 {
+            report = syncer.pass_now().await.unwrap();
+            if guest.get("/src/link") == Some(Node::Symlink("another-target".into())) {
+                break;
+            }
+        }
+        assert_eq!(
+            guest.get("/src/link"),
+            Some(Node::Symlink("another-target".into())),
+            "the guest link gets the new target: {:?}",
+            report.trouble
+        );
+        assert!(report.trouble.is_none(), "{:?}", report.trouble);
+
+        std::fs::remove_file(&link).unwrap();
+        for _ in 0..4 {
+            report = syncer.pass_now().await.unwrap();
+            if guest.get("/src/link").is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            guest.get("/src/link"),
+            None,
+            "the guest link is removed: {:?}",
+            report.trouble
+        );
+        assert!(report.trouble.is_none(), "{:?}", report.trouble);
+        assert!(report.halt.is_none(), "{:?}", report.halt);
+        syncers.stop("dev01").await;
+    }
+
     /// A rule file is read by the host, and a symlink syncs guest to host
     /// verbatim — so a guest that plants `.vmlabignore` as a link to a host
     /// file must never get that file's lines back as a prune list (review

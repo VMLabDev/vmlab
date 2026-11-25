@@ -547,7 +547,18 @@ async fn onto_host(
     }
 }
 
+/// The size of a guest symlink: the length of its target string.
+///
+/// Never the size the guest's `lstat` reports. The scan gives a link the
+/// length of its target ([`super::scan`]'s `resolve`), and a guest need not
+/// agree: a symlink on NTFS reports 0. Comparing the two made every change
+/// and removal of a synced link fail (review labd-sync-2 F20).
+async fn guest_link_size(guest: &dyn GuestFs, guest_path: &str) -> anyhow::Result<u64> {
+    Ok(guest.readlink(guest_path).await?.len() as u64)
+}
+
 /// The receiving side's own `(size, mtime)`, read back after the rename.
+/// A guest symlink's size is [`guest_link_size`].
 async fn receiving_side(
     guest: &dyn GuestFs,
     target: &Target,
@@ -559,6 +570,10 @@ async fn receiving_side(
         Direction::ToGuest => {
             let guest_path = join_guest(&target.guest_root, path);
             match guest.lstat(&guest_path).await {
+                Ok(Some(attrs)) if kind == Kind::Symlink && Kind::of(attrs.kind) == Some(kind) => {
+                    let size = guest_link_size(guest, &guest_path).await?;
+                    Ok(Side::new(size, attrs.mtime_ns))
+                }
                 Ok(Some(attrs)) => Ok(Side::new(attrs.size, attrs.mtime_ns)),
                 Ok(None) => Err(anyhow::anyhow!(
                     "the guest reports nothing there after the rename"
@@ -610,10 +625,21 @@ async fn verify_copy(
         None
     };
     let current = match direction {
-        Direction::ToGuest => guest
-            .lstat(&join_guest(&target.guest_root, path))
-            .await?
-            .map(|a| (Kind::of(a.kind), Side::new(a.size, a.mtime_ns))),
+        Direction::ToGuest => {
+            let guest_path = join_guest(&target.guest_root, path);
+            match guest.lstat(&guest_path).await? {
+                Some(a) => {
+                    let kind = Kind::of(a.kind);
+                    let size = if kind == Some(Kind::Symlink) {
+                        guest_link_size(guest, &guest_path).await?
+                    } else {
+                        a.size
+                    };
+                    Some((kind, Side::new(size, a.mtime_ns)))
+                }
+                None => None,
+            }
+        }
         Direction::ToHost => match std::fs::symlink_metadata(&resolved.as_ref().unwrap().path) {
             Ok(m) => {
                 let kind = if m.is_symlink() {
