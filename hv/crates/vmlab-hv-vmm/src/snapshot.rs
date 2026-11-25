@@ -1010,26 +1010,37 @@ fn restore(
 // ---- delete ------------------------------------------------------------
 
 /// `snapshot_delete {name}`: remove the internal snapshot from every
-/// writable disk. Report missing entries only if every attempted deletion
-/// succeeded or found nothing, so a caller can safely accept that outcome.
+/// writable disk that holds it.
 pub fn delete(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
-    let reg = registry(handle)?;
+    delete_from(&registry(handle)?.disks, name)
+}
+
+/// A disk that lacks the name is skipped, as the offline delete skips it: a
+/// disk added after the capture never held it. `snapshot_not_found` is the
+/// answer only when no writable disk held the name, so it never follows a
+/// deletion. Every disk is attempted before another error is reported.
+pub(crate) fn delete_from(disks: &[DiskNode], name: &str) -> Result<(), SnapshotError> {
     let mut first_err = None;
     let mut missing = None;
-    for disk in writable_disks(&reg) {
+    let mut deleted = false;
+    for disk in disks.iter().filter(|disk| disk.writable) {
         let mut image = disk.image.lock();
-        if let Err(e) = image.snapshot_delete(name) {
-            let err = SnapshotError::from_disk("snapshot_delete", &disk.id, e);
-            if err.is_not_found() {
-                missing.get_or_insert(err);
-            } else {
-                first_err.get_or_insert(err);
+        match image.snapshot_delete(name) {
+            Ok(()) => deleted = true,
+            Err(e) => {
+                let err = SnapshotError::from_disk("snapshot_delete", &disk.id, e);
+                if err.is_not_found() {
+                    missing.get_or_insert(err);
+                } else {
+                    first_err.get_or_insert(err);
+                }
             }
         }
     }
-    match first_err.or(missing) {
-        Some(err) => Err(err),
-        None => Ok(()),
+    match (first_err, missing) {
+        (Some(err), _) => Err(err),
+        (None, Some(err)) if !deleted => Err(err),
+        _ => Ok(()),
     }
 }
 
