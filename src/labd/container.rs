@@ -814,7 +814,20 @@ impl ContainerInstance {
             on_health: Box::new(on_health),
             ready_fired: AtomicBool::new(false),
         });
-        self.clone().start_attempt(cbs).await
+        // In a task of its own, as a VM's boot is: a caller that is dropped
+        // part-way would otherwise leave `Starting` set and a hypervisor
+        // nothing owns. An abandoned start runs to its end and is stopped.
+        let me = self.clone();
+        super::machine::finish_start(move |abandoned| async move {
+            me.clone().start_attempt(cbs).await?;
+            if abandoned.get() {
+                tracing::info!("{}: its start was abandoned, stopping it", me.cfg.name);
+                me.stop_ladder(true).await?;
+                bail!("{}: its start was abandoned", me.cfg.name);
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// One run of the start sequence. The state must already be `Starting`;

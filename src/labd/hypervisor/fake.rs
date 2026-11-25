@@ -203,6 +203,41 @@ pub struct Script {
     /// `unsupported` and this message, as vmlab-hv refuses a save before it
     /// stops the guest. Read only with `vmlab_hv`.
     pub snapshot_save_refused: Option<String>,
+    /// `start_emulator` stops here until the test lets it go: the wait of a
+    /// real adapter for its hypervisor to answer.
+    pub start_hold: Option<StartHold>,
+}
+
+/// A point `start_emulator` stops at until the test lets it go, so a test
+/// catches a start under way by an event and not by a clock.
+#[derive(Debug, Clone)]
+pub struct StartHold {
+    reached: Arc<tokio::sync::Semaphore>,
+    go: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for StartHold {
+    fn default() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            go: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+impl StartHold {
+    async fn pass(&self) {
+        self.reached.add_permits(1);
+        self.go.acquire().await.expect("hold").forget();
+    }
+    /// Wait until a start got here.
+    pub async fn reached(&self) {
+        self.reached.acquire().await.expect("hold").forget();
+    }
+    /// Let one start go on.
+    pub fn release(&self) {
+        self.go.add_permits(1);
+    }
 }
 
 /// Which capabilities a running fake machine reports. Each one off is a
@@ -411,6 +446,9 @@ impl Hypervisor for FakeHypervisor {
                 .push(paths.floppy.clone());
         }
         let run = self.next_run();
+        if let Some(hold) = &self.script.start_hold {
+            hold.pass().await;
+        }
         if let Some(msg) = &run.start_fails {
             bail!("{}: {msg}", spec.label);
         }
