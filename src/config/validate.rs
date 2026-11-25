@@ -227,7 +227,9 @@ pub fn validate(file: &LabFile, ctx: &dyn ValidationContext) -> IssueList {
     let mut claim = |port: u16, bind: Option<Ipv4Addr>, proto: Proto| {
         let bind = bind.unwrap_or(Ipv4Addr::LOCALHOST);
         let taken = fwd_ports.iter().any(|(used_port, used_bind, used_proto)| {
-            *used_port == port && used_proto.overlaps(proto) && forward_binds_overlap(*used_bind, bind)
+            *used_port == port
+                && used_proto.overlaps(proto)
+                && forward_binds_overlap(*used_bind, bind)
         });
         fwd_ports.push((port, bind, proto));
         taken
