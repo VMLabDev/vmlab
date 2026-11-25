@@ -788,6 +788,13 @@ fn dispatch_ctrl(sh: &mut Shared, id: u32, event: u16, value: u16, max_port: u32
                 value: 0,
                 name: Some(sh.names[id as usize - 1].clone()),
             });
+            // A driver that resumes from suspend (Linux `virtcons_restore`)
+            // resets the device and re-acks each port it already knows; it
+            // sends no second DEVICE_READY. Its PORT_READY is the proof that
+            // it handles control messages again. Without this, a host client
+            // that connects after the resume is never reported, and the
+            // guest holds its writes for a host it believes absent.
+            sh.device_ready = true;
             // Mirror the current host connection state to a freshly added
             // port, as QEMU does when the driver acks a port.
             if sh.ports[id as usize - 1].host_open {
@@ -1922,6 +1929,59 @@ mod tests {
         assert_eq!(msgs[1], (2, EV_PORT_ADD, 1, Vec::new()));
         assert_eq!(msgs[3], (2, EV_PORT_NAME, 0, b"vmlab.agent.0".to_vec()));
         assert_eq!(msgs[4], (2, EV_PORT_OPEN, 1, Vec::new()));
+    }
+
+    /// A Linux guest resuming from S3 resets the device, rebuilds its
+    /// queues and sends PORT_READY and PORT_OPEN for each port, with no
+    /// DEVICE_READY. A host client that connects after that must still be
+    /// reported, or the guest never writes to it.
+    #[test]
+    fn host_open_after_a_resume_without_device_ready_reaches_the_guest() {
+        let mut f = Fixture::new();
+        f.device_ready(8, 4);
+
+        // The suspend: the driver resets the device and forgets its rings.
+        f.dev.reset();
+        for vq in &mut f.vqs {
+            f.mem.write_obj(0u16, GuestAddress(vq.avail + 2)).unwrap();
+            f.mem.write_obj(0u16, GuestAddress(vq.used + 2)).unwrap();
+            vq.next_desc = 0;
+        }
+        // A host client that came and went while the guest slept.
+        let asleep = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("host open in the sleep", || {
+            lock(&f.dev.shared).ports[1].host_open
+        });
+        drop(asleep);
+        wait_for("host closed in the sleep", || {
+            !lock(&f.dev.shared).ports[1].host_open
+        });
+
+        // The resume.
+        f.activate();
+        let mut sent = 0;
+        for id in 1..=2 {
+            for event in [EV_PORT_READY, EV_PORT_OPEN] {
+                f.send_ctrl(id, event, 1);
+                sent += 1;
+                wait_for("resume control message", || {
+                    f.vqs[3].used_idx(&f.mem) == sent
+                });
+            }
+        }
+        for i in 0..4 {
+            f.post_ctrl_rx(i);
+        }
+        f.dev.queue_notify(2);
+        wait_for("port names", || f.ctrl_delivered().len() == 2);
+        assert!(lock(&f.dev.shared).ports[1].guest_open);
+
+        let _client = UnixStream::connect(&f.agent_sock).unwrap();
+        wait_for("PORT_OPEN(2,1) after the resume", || {
+            f.ctrl_delivered()
+                .last()
+                .is_some_and(|m| *m == (2, EV_PORT_OPEN, 1, Vec::new()))
+        });
     }
 
     #[test]
