@@ -51,6 +51,7 @@ impl LabRuntime {
     /// `vmlab worktree freeze <snapshot>` (§21.1).
     pub async fn worktree_freeze(&self, snapshot: &str) -> Result<Value> {
         super::vm::validate_snapshot_name(snapshot)?;
+        let _working = self.working(format!("a worktree freeze at `{snapshot}`"));
         let mut state = self.state.lock().await;
         let previous = WorktreeConfig::load(&self.lab_local)?;
         let generation = fz::generations(&self.lab_local)
@@ -162,6 +163,7 @@ impl LabRuntime {
 
     /// `vmlab worktree thaw` (§21.3).
     pub async fn worktree_thaw(&self, drop_online: bool) -> Result<Value> {
+        let _working = self.working("a worktree thaw");
         if self.in_linked_worktree() {
             return Err(CommandError::conflict(
                 "this lab is in a linked git worktree; only the main checkout's lab thaws — \

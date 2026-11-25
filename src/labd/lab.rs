@@ -206,6 +206,9 @@ pub struct LabRuntime {
     /// starts their syncers itself, after provisioning (§19.6), so a start
     /// made inside it — a provision's `m.start()` — starts none.
     ups: std::sync::Mutex<HashMap<String, usize>>,
+    /// What the daemon is doing now that must run to its end, as `status`
+    /// reports it ([`LabStatus::working`]).
+    work: std::sync::Mutex<WorkInFlight>,
     /// The console recordings this lab owns, one per machine (§11.1).
     pub recordings: super::record::Recordings,
     /// Worktree isolation (§21.4), decided once when the daemon starts:
@@ -675,6 +678,7 @@ impl LabRuntime {
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
             ups: std::sync::Mutex::default(),
+            work: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb: super::usb::UsbHost::default(),
             isolation,
@@ -756,6 +760,7 @@ impl LabRuntime {
             playbook_ops: crate::labd::playbook::PlaybookOps::default(),
             workspaces: crate::labd::workspace::WorkspaceSyncers::default(),
             ups: std::sync::Mutex::default(),
+            work: std::sync::Mutex::default(),
             recordings: super::record::Recordings::default(),
             usb,
             isolation,
@@ -1591,6 +1596,9 @@ impl LabRuntime {
         output: Option<&crate::scripting::OutputSink>,
         ticket: super::start_gate::Ticket,
     ) -> Result<()> {
+        // A start makes the machine's disks before the machine leaves
+        // `stopped`: a clone from a template, or from the freeze (§21.2).
+        let _working = self.working(format!("the start of {name}"));
         {
             // What makes disks is held against a destroy of this machine,
             // which removes them.
@@ -2492,6 +2500,9 @@ impl LabRuntime {
         // One ticket for every wave: a `down` or a destroy that crosses this
         // `up` refuses the starts it has not made yet.
         let ticket = self.starts.ticket()?;
+        // An `up` clones, provisions and runs scripts between boots, with
+        // every machine stopped for part of it.
+        let _working = self.working("an `up`");
         // Decide the whole schedule before touching anything: which
         // machines a subset drags in, which wave each lands in, and which
         // configuration steps are in scope (see `labd::plan`).
@@ -3793,6 +3804,20 @@ impl LabRuntime {
         crate::labd::workspace::diff::all(guest.as_ref(), &syncer.workspace, &paths).await
     }
 
+    /// Say that `what` is under way until the answer is dropped, so that
+    /// nothing replaces this daemon in the middle of it. `what` follows "is
+    /// busy with" in the refusal a boot verb prints.
+    pub(crate) fn working(&self, what: impl Into<String>) -> Working<'_> {
+        let mut work = self.work.lock_recover();
+        let id = work.next;
+        work.next += 1;
+        work.held.insert(id, what.into());
+        Working {
+            work: &self.work,
+            id,
+        }
+    }
+
     /// The lab status projection (ADR-0004) — produced here, rendered unchanged
     /// by the CLI, the REST surface and the console.
     pub async fn status(&self) -> LabStatus {
@@ -3902,6 +3927,7 @@ impl LabRuntime {
             isolation: self.isolation.as_ref().map(|p| p.status()),
             freeze_stale,
             daemon_pid: std::process::id(),
+            working: self.work.lock_recover().held.values().cloned().collect(),
         }
     }
 
@@ -3997,6 +4023,7 @@ impl LabRuntime {
 
     async fn snapshot_to_its_end(&self, vm_name: &str, snap: &str) -> Result<bool> {
         let m = self.machine(vm_name)?;
+        let _working = self.working(format!("the snapshot `{snap}` of {vm_name}"));
         if let Some(why) = super::worktree::take_refusal(&*self.state.lock().await, vm_name, snap) {
             return Err(crate::proto::CommandError::conflict(why).into());
         }
@@ -4088,6 +4115,8 @@ impl LabRuntime {
     /// Lab-wide capture rolls back earlier machines if a later one fails.
     /// Capture times remain uncoordinated across guests (PRD §7.3).
     pub async fn snapshot_all(self: &Arc<Self>, snap: &str) -> Result<Value> {
+        // Held over the whole lab, the gaps between two machines included.
+        let _working = self.working(format!("the snapshot `{snap}` of every machine"));
         let mut results = Vec::new();
         let mut captured: Vec<String> = Vec::new();
         for m in self.machines() {
@@ -4116,6 +4145,8 @@ impl LabRuntime {
     /// the freeze-point plan), so a refusal that needs nothing to have moved
     /// is made before the first machine is rewound.
     pub async fn restore_all(self: &Arc<Self>, snap: &str, discard: bool) -> Result<Vec<String>> {
+        // Held over the whole lab, the gaps between two machines included.
+        let _working = self.working(format!("the restore of every machine to snapshot `{snap}`"));
         let machines: Vec<_> = self.machines().collect();
         for m in &machines {
             let workspace = self.restore_workspace_of(m.name());
@@ -4186,6 +4217,7 @@ impl LabRuntime {
         let m = self
             .machine(name)
             .map_err(|_| missing_snapshot(name, snap))?;
+        let _working = self.working(format!("the restore of {name} to snapshot `{snap}`"));
         let workspace = self.restore_workspace_of(name);
         let record = self
             .check_restore(m.as_ref(), snap, discard, workspace.as_ref())
@@ -4455,6 +4487,7 @@ impl LabRuntime {
     /// nothing deletes but a thaw, and the overlay's empty mark of it (when a
     /// restore left one) goes with it.
     pub async fn delete_snapshot(&self, vm_name: &str, snap: &str) -> Result<()> {
+        let _working = self.working(format!("the removal of snapshot `{snap}` of {vm_name}"));
         let mut state = self.state.lock().await;
         let m = self
             .machine(vm_name)
@@ -4807,6 +4840,30 @@ async fn fetch_global_peer_states() -> Option<std::collections::HashMap<String, 
             })
             .collect(),
     )
+}
+
+/// The operations a daemon has under way that its machines' states do not
+/// show, each as a phrase to follow "is busy with". A boot verb reads them
+/// from `status` before it replaces the daemon: an offline restore, a freeze
+/// or the clone at the head of an `up` runs on stopped machines, and a daemon
+/// ended in the middle of one leaves disks half rewound or half rebased.
+#[derive(Default)]
+struct WorkInFlight {
+    next: u64,
+    held: std::collections::BTreeMap<u64, String>,
+}
+
+/// One operation in [`LabRuntime::work`], there until this is dropped: when
+/// the operation returns, fails, or is dropped where it waited.
+pub(crate) struct Working<'a> {
+    work: &'a std::sync::Mutex<WorkInFlight>,
+    id: u64,
+}
+
+impl Drop for Working<'_> {
+    fn drop(&mut self) {
+        self.work.lock_recover().held.remove(&self.id);
+    }
 }
 
 /// The machines one `up` is bringing up, held in [`LabRuntime::ups`] until
@@ -10505,5 +10562,57 @@ fn main(lab: Lab) { let r = lab.this_vm().expect("vm").restore("s") }
         let said = format!("{refused:#}");
         assert!(said.contains("by force"), "{said}");
         assert!(said.contains("vmlab up dev01"), "{said}");
+    }
+
+    /// Review lab-lifecycle-2 F18: a boot verb replaces the lab daemon after
+    /// an edit when "nothing would be lost", and it asked only whether a
+    /// machine runs or a download is under way. An offline restore is neither,
+    /// and the replacement cut it where it stood.
+    #[tokio::test]
+    async fn a_daemon_at_work_on_stopped_machines_is_not_restarted() {
+        use crate::cli::lab::{DaemonFreshness, daemon_freshness};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let held = HeldRestore::new();
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.hold_restore = Some(held.clone());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        lab.snapshot("a", "s").await.expect("snapshot");
+
+        let restore = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.restore("a", "s", false).await }
+        });
+        // The restore is inside the machine's image step.
+        held.hold.reached().await;
+        let status = lab.status().await;
+        assert!(status.all_stopped(), "the restore is an offline one");
+        assert!(status.pulls.is_empty());
+        let during = daemon_freshness("t", &status, "the digest of an edited file");
+
+        held.hold.release();
+        restore.await.unwrap().expect("restore");
+        let after = daemon_freshness("t", &lab.status().await, "the digest of an edited file");
+
+        assert_ne!(
+            during,
+            DaemonFreshness::Restart,
+            "the daemon would be replaced in the middle of its restore"
+        );
+        let DaemonFreshness::Refuse(why) = during else {
+            panic!("a restore under way is not reloaded over: {during:?}");
+        };
+        assert!(why.contains("the restore of a"), "{why}");
+        assert_eq!(
+            after,
+            DaemonFreshness::Restart,
+            "an idle daemon is replaced as before"
+        );
     }
 }
