@@ -4320,7 +4320,9 @@ async fn an_aborted_start_leaves_the_machine_stopped() {
             .await
         }
     });
-    at_resume.await.expect("the start reached the paused window");
+    at_resume
+        .await
+        .expect("the start reached the paused window");
     start.abort();
     assert!(start.await.expect_err("aborted").is_cancelled());
     let _ = go.send(());
