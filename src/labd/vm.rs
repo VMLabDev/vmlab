@@ -3183,7 +3183,7 @@ async fn apply_offline_snapshot(disks: &[PathBuf], name: &str, backup: &str) -> 
     Ok(())
 }
 
-async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
+pub(super) async fn snapshot_offline_disks(disks: &[PathBuf], name: &str) -> Result<()> {
     // Refuse duplicate names before changing any disk, so rollback never
     // removes a snapshot that predates this operation.
     for disk in disks {
@@ -3411,6 +3411,11 @@ mod tests {
         let got = super::read_log_since(&log, &mut seen);
         assert_eq!(got.len() as u64, super::FOLLOW_READ_LIMIT);
         assert_eq!(seen, std::fs::metadata(&log).unwrap().len());
+    }
+
+    #[test]
+    fn a_name_vmlab_keeps_for_itself_is_refused() {
+        assert!(super::validate_snapshot_name(crate::freeze::plan::HOLD_SNAPSHOT).is_err());
     }
 
     #[tokio::test]

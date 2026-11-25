@@ -4896,6 +4896,7 @@ mod tests {
         hold_settle: Option<Hold>,
         /// Stop inside `restore` until the test lets it go.
         hold_restore: Option<HeldRestore>,
+        hold_capture: Option<Hold>,
         /// Why this machine cannot restore, as a real one finds out from its
         /// own disks and hypervisor: said when asked, and again by a
         /// `restore` that was not asked first.
@@ -5067,6 +5068,7 @@ mod tests {
                 hold_start: None,
                 hold_settle: None,
                 hold_restore: None,
+                hold_capture: None,
                 restore_refused: None,
                 makes_disk: false,
             })
@@ -5457,6 +5459,9 @@ mod tests {
         async fn snapshot(&self, name: &str) -> Result<bool, SnapshotCaptureError> {
             super::super::vm::validate_snapshot_name(name)?;
             self.note(&format!("snapshot:{name}")).await;
+            if let Some(hold) = &self.hold_capture {
+                hold.pass().await;
+            }
             if self.snapshot_refused {
                 return Err(anyhow!("injected capture refusal").into());
             }
@@ -5683,6 +5688,59 @@ lab "t" {
             !log.iter().any(|line| line.contains("restore:s")),
             "a machine was rewound before every machine was asked: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_destroy_waits_for_a_capture_under_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        let held = Hold::new();
+        machine.hold_capture = Some(held.clone());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        let mut capture = std::pin::pin!(lab.snapshot("a", "capture"));
+        assert!(futures::poll!(&mut capture).is_pending());
+        held.reached().await;
+        let mut destroy = std::pin::pin!(lab.destroy_machine("a", false));
+        assert!(futures::poll!(&mut destroy).is_pending());
+        assert!(
+            !sh.log.lock().await.iter().any(|line| line == "a:stop"),
+            "destroy stopped the machine during capture"
+        );
+        held.release();
+        capture.await.unwrap();
+        destroy.await.unwrap();
+        assert!(lab.state.lock().await.machines["a"].snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_destroy_clears_the_pending_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![FakeMachine::new("a", MachineKind::Vm, &sh)],
+        );
+        lab.state
+            .lock()
+            .await
+            .machine_mut("a")
+            .pending_snapshots
+            .insert("interrupted".into());
+        lab.destroy_machine("a", false).await.unwrap();
+        assert!(
+            lab.state.lock().await.machines["a"]
+                .pending_snapshots
+                .is_empty()
+        );
+        lab.snapshot("a", "interrupted").await.unwrap();
     }
 
     #[tokio::test]

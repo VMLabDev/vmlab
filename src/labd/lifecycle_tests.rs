@@ -1442,6 +1442,35 @@ async fn a_clone_with_no_recorded_source_boots_and_is_recorded() {
     vm.stop(true).await.expect("stop");
 }
 
+#[tokio::test]
+async fn an_interrupted_offline_restore_leaves_no_recovery_snapshot() {
+    use crate::template::qimg;
+
+    let dirs = Dirs::new();
+    let (vm, _hv) = vm(&dirs, LINUX_VM, Script::healthy());
+    let disk = vm.dirs.primary_disk();
+    std::fs::remove_file(&disk).unwrap();
+    qimg::create_blank(&disk, 1 << 20).await.unwrap();
+    qimg::snapshot_create(&disk, "capture").await.unwrap();
+    qimg::snapshot_create(&disk, "vmlab-restore-0").await.unwrap();
+    // Stop after creating the recovery snapshot, as if the daemon died.
+    super::vm::snapshot_offline_disks(std::slice::from_ref(&disk), "vmlab-restore-:0")
+        .await
+        .unwrap();
+
+    let (cbs, _observed) = callbacks();
+    start_vm(&vm, cbs).await.unwrap();
+    vm.stop(true).await.unwrap();
+    let names: Vec<_> = qimg::image_info(&disk)
+        .await
+        .unwrap()
+        .snapshots
+        .into_iter()
+        .map(|snapshot| snapshot.name)
+        .collect();
+    assert_eq!(names, ["capture", "vmlab-restore-0"]);
+}
+
 /// A filesystem daemon that dies during startup fails the start too — the
 /// guest would otherwise boot with a vhost-user chardev nothing is listening
 /// on, which QEMU turns into a far less legible failure.
