@@ -1355,8 +1355,13 @@ fn snapshot_stops_console_dma_before_saving_ram() {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use virtio_queue::QueueT;
+    use vm_memory::Address;
     use vmlab_hv_devices::virtio::console::{Console, PortConfig};
     use vmlab_hv_devices::{DeviceError, Snapshot, VirtioDevice, VirtioInterrupt};
+
+    const PORT_OPEN_BUFFER: GuestAddress = GuestAddress(0x9000);
+    const CTRL_RX_USED_IDX: GuestAddress = GuestAddress(0x32002);
+    const ENUMERATION_COMPLETIONS: u16 = 1;
 
     struct Interrupt;
     impl VirtioInterrupt for Interrupt {
@@ -1373,14 +1378,14 @@ fn snapshot_stops_console_dma_before_saving_ram() {
         fn connect_and_observe(&self, restoring: bool) -> Result<(), DeviceError> {
             // A rollback capture can start with an earlier DMA result in RAM.
             // Detect new writes, including another completion of the same data.
-            // Restore must retain the saved empty buffer and used ring, even
-            // if a broken device resumes DMA before this callback begins.
+            // Restore must retain the saved empty buffer and enumeration
+            // index, even if DMA resumes before this callback begins.
             let before = if restoring {
-                (0, 1)
+                (0, ENUMERATION_COMPLETIONS)
             } else {
                 (
-                    self.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
-                    self.mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap(),
+                    self.mem.read_obj::<u32>(PORT_OPEN_BUFFER).unwrap(),
+                    self.mem.read_obj::<u16>(CTRL_RX_USED_IDX).unwrap(),
                 )
             };
             self.client.lock().take();
@@ -1390,8 +1395,8 @@ fn snapshot_stops_console_dma_before_saving_ram() {
             let deadline = std::time::Instant::now() + Duration::from_millis(200);
             while std::time::Instant::now() < deadline {
                 let current = (
-                    self.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(),
-                    self.mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap(),
+                    self.mem.read_obj::<u32>(PORT_OPEN_BUFFER).unwrap(),
+                    self.mem.read_obj::<u16>(CTRL_RX_USED_IDX).unwrap(),
                 );
                 if current != before {
                     self.wrote.store(true, Ordering::SeqCst);
@@ -1445,21 +1450,23 @@ fn snapshot_stops_console_dma_before_saving_ram() {
         })
         .collect();
     let mem = m.vm.ram.mem.clone();
-    // The control receive queue has two buffers: 0xb000 takes the PORT_ADD
-    // that answers DEVICE_READY, and 0x9000 stays free for the PORT_OPEN of
-    // the host connection the snapshot must hold back.
-    mem.write_obj(0xb000u64, GuestAddress(0x30000)).unwrap();
-    mem.write_obj(64u32, GuestAddress(0x30008)).unwrap();
-    mem.write_obj(2u16, GuestAddress(0x3000c)).unwrap();
-    mem.write_obj(0x9000u64, GuestAddress(0x30010)).unwrap();
-    mem.write_obj(64u32, GuestAddress(0x30018)).unwrap();
-    mem.write_obj(2u16, GuestAddress(0x3001c)).unwrap();
-    mem.write_obj(1u16, GuestAddress(0x31006)).unwrap();
+    // Queue 2 receives PORT_ADD for the single configured port, then keeps
+    // a separate empty descriptor for the host's PORT_OPEN.
+    let ctrl_rx_buffers = [0x9100, PORT_OPEN_BUFFER.raw_value()];
+    for (index, buffer) in ctrl_rx_buffers.into_iter().enumerate() {
+        let desc = 0x30000 + index as u64 * 16;
+        mem.write_obj(buffer, GuestAddress(desc)).unwrap();
+        mem.write_obj(64u32, GuestAddress(desc + 8)).unwrap();
+        mem.write_obj(2u16, GuestAddress(desc + 12)).unwrap(); // WRITE
+        mem.write_obj(index as u16, GuestAddress(0x31004 + index as u64 * 2))
+            .unwrap();
+    }
     mem.write_obj(2u16, GuestAddress(0x31002)).unwrap();
-    // The device reports a host connection only to a ready driver, so the
-    // control transmit queue carries DEVICE_READY (id 0, event 0, value 1).
-    mem.write_obj(1u16, GuestAddress(0xa006)).unwrap();
-    mem.write_obj(0xa000u64, GuestAddress(0x40000)).unwrap();
+
+    // Queue 3 carries DEVICE_READY (id = BAD_ID, event = 0, value = 1).
+    mem.write_slice(&[0xff, 0xff, 0xff, 0xff, 0, 0, 1, 0], GuestAddress(0x9200))
+        .unwrap();
+    mem.write_obj(0x9200u64, GuestAddress(0x40000)).unwrap();
     mem.write_obj(8u32, GuestAddress(0x40008)).unwrap();
     mem.write_obj(1u16, GuestAddress(0x41002)).unwrap();
     console
@@ -1467,14 +1474,14 @@ fn snapshot_stops_console_dma_before_saving_ram() {
         .unwrap();
     console.queue_notify(3);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while mem.read_obj::<u16>(GuestAddress(0x32002)).unwrap() != 1 {
+    while mem.read_obj::<u16>(CTRL_RX_USED_IDX).unwrap() != ENUMERATION_COMPLETIONS {
         assert!(
             std::time::Instant::now() < deadline,
-            "console did not answer DEVICE_READY"
+            "console did not announce its port after DEVICE_READY"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap(), 0);
+    assert_eq!(mem.read_obj::<u32>(PORT_OPEN_BUFFER).unwrap(), 0);
     let wrote = Arc::new(AtomicBool::new(false));
     let original = m.handle.shared().snapshot_registry().unwrap();
     m.handle
@@ -1516,7 +1523,7 @@ fn snapshot_stops_console_dma_before_saving_ram() {
     );
     let wait_for_dma = || {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while m.vm.ram.mem.read_obj::<u32>(GuestAddress(0x9000)).unwrap() == 0 {
+        while m.vm.ram.mem.read_obj::<u32>(PORT_OPEN_BUFFER).unwrap() == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "console did not resume DMA"
