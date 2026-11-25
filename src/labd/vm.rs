@@ -1157,6 +1157,9 @@ impl VmInstance {
             self.hypervisor(),
         )
         .with_context(|| format!("{}: gpu", self.cfg.name))?;
+        if let Some(policy) = &plan.uncached_memory_policy {
+            tracing::info!("{}: {policy}", self.cfg.name);
+        }
         for warning in &plan.warnings {
             tracing::warn!("{}: {warning}", self.cfg.name);
         }

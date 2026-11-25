@@ -24,6 +24,12 @@ Card #886 did not run the win3d suite on Nvidia2, because Nvidia2 was bound
 to `vfio-pci` for passthrough during its pass. Card #916 ran it on
 `next` at a later commit, when the overseer had switched Nvidia2 to the host.
 
+Card #963 repeated R7 and R8 for `windows-11` with the host GPU default
+`hide_uncached_memory = "auto"`, which turns the Vulkan memory filter on for
+Nvidia2. The verdict of every row is the same, and the probe frame rates are
+within the noise of a run:
+[C963](../../guest/win3d/docs/acceptance/C963.md).
+
 ## What was tested
 
 - Commit: `edd01cfe2b9b91139f2a7dbbc7cfcd60f9442c6b`, the head of `next` on
