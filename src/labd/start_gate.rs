@@ -4,18 +4,24 @@
 //! A machine's own power state cannot do this. A stop of a machine whose
 //! start has not spawned an emulator yet finds nothing to stop and returns,
 //! and requests are served concurrently, so a start can run between a
-//! destroy's stop and its removal of the disks. Three rules close that, and
+//! destroy's stop and its removal of the disks. Four rules close that, and
 //! every start, `down` and destroy of the lab runtime goes through them:
 //!
 //! - **A stop makes the starts before it stale.** A start carries a
 //!   [`Ticket`] taken when its request began — for `up`, once for all its
-//!   waves. A `down` or a destroy of a machine refuses every ticket older
-//!   than itself for that machine, so an `up` under way boots nothing after
-//!   the `down` that crossed it.
+//!   waves. A `down`, a `vm stop`, a restart's own stop or a destroy of a
+//!   machine refuses every ticket older than itself for that machine, so an
+//!   `up` under way boots nothing after the `down` that crossed it. A
+//!   restart takes the ticket of its start before its stop, so a `down` that
+//!   ends while the machine stops refuses that start too.
 //! - **One machine, one of them at a time.** A start holds the machine's
 //!   lock from the check of its ticket until the machine has started. A stop
 //!   takes the lock before it stops, so it never acts on a start that has
 //!   nothing to stop yet, and a destroy holds it until the disks are gone.
+//! - **A start runs to its end.** The start that holds the lock is a task
+//!   of its own ([`finish_start`](super::machine::finish_start)): a caller
+//!   that is dropped abandons it, and it stops the machine it started before
+//!   it gives the lock back.
 //! - **A lab that is going away takes no start.** The daemon's teardown and
 //!   a lab destroy [`close`](StartGate::close) the gate: every ticket is
 //!   refused, old or new.

@@ -102,6 +102,49 @@ pub(super) async fn finish_offline_snapshot<T: Send + 'static>(
     .await?
 }
 
+/// Whether the caller of a [`finish_start`] was dropped before the start
+/// ended: nobody waits for the machine it makes.
+pub(super) struct Abandoned(Arc<std::sync::atomic::AtomicBool>);
+
+impl Abandoned {
+    pub(super) fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Run a start to its end in a task of its own, whatever becomes of the
+/// caller. A start sets `Starting` first and spawns a hypervisor and its
+/// helpers on the way. Dropped at one of its awaits it would leave the state
+/// and whichever of those processes no field holds yet, for the life of the
+/// daemon. So a caller that goes away (an `up` that aborts its wave, a
+/// cancelled build) only sets [`Abandoned`]: `work` runs on, and stops what
+/// it started once it reads the flag.
+pub(super) async fn finish_start<T, F>(work: impl FnOnce(Abandoned) -> F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    /// Sets the flag when it is dropped while the task is still awaited.
+    struct OnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(flag) = &self.0 {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(work(Abandoned(Arc::clone(&flag))));
+    let mut on_drop = OnDrop(Some(flag));
+    let joined = task.await;
+    on_drop.0 = None;
+    match joined {
+        Ok(out) => out,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => Err(anyhow!("the start was cancelled: {e}")),
+    }
+}
+
 /// How long [`Machine::poweroff`] waits for the emulator to actually go.
 pub(super) const POWEROFF_SETTLE: Duration = Duration::from_secs(30);
 

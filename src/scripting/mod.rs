@@ -857,11 +857,18 @@ pub fn lab_module() -> Module {
             })
             .map_err(estr)
         })
+        // Through the lab, so that no start of the machine crosses the stop.
         .method("stop", |h: &MachineHandle| -> Result<(), String> {
-            h.block(h.machine.stop(false)).map_err(estr)
+            let runtime = h.runtime.clone();
+            let name = h.name().to_string();
+            h.block(async move { runtime.stop_machine_alone(&name, false).await })
+                .map_err(estr)
         })
         .method("stop_force", |h: &MachineHandle| -> Result<(), String> {
-            h.block(h.machine.stop(true)).map_err(estr)
+            let runtime = h.runtime.clone();
+            let name = h.name().to_string();
+            h.block(async move { runtime.stop_machine_alone(&name, true).await })
+                .map_err(estr)
         })
         .method("restart", |h: &MachineHandle| -> Result<(), String> {
             let runtime = h.runtime.clone();
