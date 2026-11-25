@@ -276,6 +276,25 @@ impl LabRuntime {
             m.stop(false).await?;
             m.wait_state(PowerState::Stopped, STOP_WAIT).await?;
         }
+        let plan = self
+            .plan_freeze_point_restore(m.as_ref(), snap, generation)
+            .await?;
+        let applied = execute(plan).await?;
+        for warning in applied.finish().await {
+            tracing::warn!("{}: {warning}", m.name());
+        }
+        Ok(())
+    }
+
+    /// The steps of a freeze-point restore of `m`, or why it is refused
+    /// (§21.3). It reads the disks' headers and changes nothing, so a restore
+    /// asks it before anything moves and again once the machine has stopped.
+    pub(crate) async fn plan_freeze_point_restore(
+        &self,
+        m: &dyn Machine,
+        snap: &str,
+        generation: u32,
+    ) -> Result<crate::freeze::steps::Plan> {
         let mut disks = Vec::new();
         for path in m.disk_paths() {
             let facts = disk_facts(&path).await?.ok_or_else(|| {
@@ -287,12 +306,7 @@ impl LabRuntime {
             })?;
             disks.push(facts);
         }
-        let plan = plan::plan_point_restore(m.name(), snap, generation, &disks)?;
-        let applied = execute(plan).await?;
-        for warning in applied.finish().await {
-            tracing::warn!("{}: {warning}", m.name());
-        }
-        Ok(())
+        plan::plan_point_restore(m.name(), snap, generation, &disks)
     }
 }
 

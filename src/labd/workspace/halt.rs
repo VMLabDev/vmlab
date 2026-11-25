@@ -318,6 +318,7 @@ mod tests {
             bulk_delete: Some(BulkDelete {
                 paths: vec!["a.rs".into(), "b.rs".into()],
                 agreed: 2,
+                carried: 0,
             }),
             ..Plan::default()
         };
