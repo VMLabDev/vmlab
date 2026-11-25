@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use wcl_lang::{Document, Environment, Registry, disk_loader};
+use wcl_lang::{Document, Environment, Registry, Value, disk_loader};
 
 use super::block::{Reader, Unspan, finish};
 
@@ -152,9 +152,9 @@ pub struct HostGpu {
     /// VMs render on it (ADR-0018).
     pub keepawake: KeepAwake,
     /// Hide this GPU's uncached host-visible memory types from a `vulkan`
-    /// guest where the same heap has a cached one (PRD §5.2). Off unless
-    /// set: for a host whose CPU and GPU do not see that memory alike.
-    pub hide_uncached_memory: bool,
+    /// guest where the same heap has a cached one (PRD §5.2).
+    /// None means automatic, based on the selected GPU's kernel driver.
+    pub hide_uncached_memory: Option<bool>,
     /// The card's other PCI functions `passthrough` hands a vmlab-hv guest
     /// with it — its HDMI/DP audio (PRD §5.2). `None`, the key left out,
     /// takes every function of the slot already bound to `vfio-pci`; a list
@@ -392,6 +392,18 @@ impl HostConfig {
                 }
                 None => true,
             });
+            let hide_uncached_memory =
+                r.value("hide_uncached_memory").and_then(|v| match v.value {
+                    Value::Bool(enabled) => Some(enabled),
+                    Value::Utf8(s) if s == "auto" => None,
+                    _ => {
+                        r.issue_at(
+                            v.span,
+                            "`hide_uncached_memory` must be true, false, or \"auto\"",
+                        );
+                        None
+                    }
+                });
             let gpu = HostGpu {
                 name,
                 address: address.value,
@@ -403,7 +415,7 @@ impl HostConfig {
                     .keyword("keepawake", KeepAwake::NAMES)
                     .unspan()
                     .unwrap_or_default(),
-                hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
+                hide_uncached_memory,
                 passthrough_functions: r.opt_string_list("passthrough_functions"),
             };
             if let Some(prev) = cfg
@@ -770,7 +782,7 @@ gpu "Nvidia1" {
         assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
     }
 
-    /// `hide_uncached_memory` is off unless a GPU block turns it on.
+    /// Omitting the setting selects the same policy as explicit "auto".
     #[test]
     fn parses_a_host_gpus_hide_uncached_memory() {
         let cfg = HostConfig::parse(
@@ -778,12 +790,24 @@ gpu "Nvidia1" {
 gpu "AMD1"    { address = "0000:72:00.0"  default = true }
 gpu "Nvidia1" { address = "0000:01:00.0"  hide_uncached_memory = true }
 gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
+gpu "Intel"   { address = "0000:00:02.0"  hide_uncached_memory = "auto" }
 "#,
             "<test>",
         )
         .unwrap();
-        let on: Vec<bool> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
-        assert_eq!(on, [false, true, false]);
+        let policies: Vec<_> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
+        assert_eq!(policies, [None, Some(true), Some(false), None]);
+        let err = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1" { address = "0000:72:00.0" hide_uncached_memory = "off" }
+"#,
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be true, false, or \"auto\""),
+            "{err}"
+        );
     }
 
     /// `passthrough_functions` tells a key left out from an empty list:

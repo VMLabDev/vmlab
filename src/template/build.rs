@@ -2087,6 +2087,9 @@ fn log_build_gpu(
     for warning in &plan.warnings {
         log(format!("warning: build VM: {warning}\n"));
     }
+    if let Some(policy) = &plan.uncached_memory_policy {
+        log(format!("build VM: {policy}\n"));
+    }
     log(gpu_log_line(gpu, &plan));
 }
 

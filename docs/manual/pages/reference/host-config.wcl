@@ -255,7 +255,7 @@ SRC
       | "`qemu_binary`" | "utf8" | "none" | "Absolute path to the QEMU every VM on this GPU runs, in every mode including passthrough, instead of `qemu-system-<arch>` from `PATH`. vmlab also passes it `-L <dir>` (see below)." |
       | "`qemu_env`" | "record of utf8" | "none" | "Variables set in that VM's QEMU process, written `{ KEY: \"value\" }`. Applied last, so a key here beats the Vulkan loader variable vmlab derives. Includes `RENDER_SERVER_EXEC_PATH` for QEMU's Venus render server. Ignored on vmlab-hv, with a warning." |
       | "`keepawake`" | "utf8" | "`auto`" | "Whether the supervisor holds this GPU out of runtime suspend from the first virgl or vulkan VM started on it until the supervisor stops. `auto`: only an NVIDIA GPU that can runtime-suspend. `on`: always, on any driver with EGL. `off`: never. See below." |
-      | "`hide_uncached_memory`" | "bool" | "`false`" | "Under `vulkan`, report an uncached host-visible memory type of this GPU as not host-visible when the same heap has a cached one, so guest drivers map the cached type. For a host where guest images arrive with short dashes. See below." |
+      | "`hide_uncached_memory`" | "bool or `\"auto\"`" | "`\"auto\"`" | "Under `vulkan`, hide an uncached host-visible memory type when the same heap has a cached counterpart. Automatic mode enables this for the `nvidia` kernel driver." |
       | "`passthrough_functions`" | "list of utf8" | "none" | "The card's other PCI functions, such as its HDMI/DP audio, that a `passthrough` guest on vmlab-hv gets with it. Each entry is the host PCI address of another function of the same slot, bound to `vfio-pci`. Left out, every function of the slot already bound to `vfio-pci` goes. `[]` sends the card alone. See below." |
   }
   p "The parser enforces these rules:"
@@ -313,8 +313,13 @@ SRC
     Template builds never have a `gpu {}`, so they always run the stock QEMU.
   DOC
   p <<DOC
-    `hide_uncached_memory = true` adds `VMLAB_VK_HIDE_UNCACHED=1` to that
-    set, for a `vulkan` guest only. The same layer then changes what the
+    `hide_uncached_memory = "auto"` is the default. It enables the filter
+    for a Vulkan GPU using the `nvidia` kernel driver and disables it for
+    other drivers. On some NVIDIA hosts, writes through uncached guest
+    mappings can leave 64-byte holes in images. Set `true` to enable the
+    filter explicitly or `false` to disable it. The host launch log records
+    the policy and its reason. When enabled, vmlab adds
+    `VMLAB_VK_HIDE_UNCACHED=1` to the Vulkan environment. The layer then changes what the
     renderer learns about the GPU's memory types: a type that is host-visible
     and coherent, but neither cached nor device-local, loses those two flags
     when another type of the same heap has every flag of it and is cached
@@ -323,7 +328,7 @@ SRC
     `vmlab-hide-uncached: memory type 2 (uncached) is hidden, guests use
     type 3 (cached)` or `vmlab-hide-uncached: no uncached memory type has a
     cached counterpart, hid none`. The setting is read when a VM starts, so
-    restart the VM after changing it. It is off by default.
+    restart the VM after changing it.
   DOC
   h3 "Runtime power management"
   p <<DOC
