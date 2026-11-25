@@ -5,7 +5,8 @@ use std::sync::Arc;
 use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
 use kvm_ioctls::VmFd;
 use parking_lot::Mutex;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_devices::{BarInfo, BusDevice, DeviceError, PciDevice, Snapshot};
 
 use crate::error::VmmError;
@@ -59,28 +60,30 @@ pub fn pam_bank(index: usize) -> (u64, usize, usize, u8) {
 /// shadow shared, so reads and writes are the shadow's (a write-only bank
 /// therefore reads the shadow and not the ROM). Any other bank maps what the
 /// CPU reads there, shadow or ROM, privately: a device write goes to a
-/// copy-on-write page that only the device view sees and that the next change
-/// of the bank drops.
+/// copy-on-write page that only the device view sees, and the view's
+/// `WriteDiscard` hands that page back as soon as the write is made. The
+/// chipset stores such a write nowhere, so the next device read returns what
+/// the CPU reads.
 pub struct Pam {
-    shadow: GuestMemoryMmap,
-    rom: GuestMemoryMmap,
+    shadow: GuestMemory,
+    rom: GuestMemory,
     /// The memfd behind `shadow` (offset 0) and `rom` (offset `ALIAS_SIZE`),
     /// so the device view can map either.
     backing: std::fs::File,
-    device: GuestMemoryMmap,
+    device: GuestMemory,
     vm: Option<Arc<VmFd>>,
     first_slot: u32,
     attributes: [u8; 13],
-    smram: GuestMemoryMmap,
+    smram: GuestMemory,
     smram_open: bool,
     isolated_smram: bool,
     a20_enabled: bool,
 }
 
 impl Pam {
-    pub fn shadow_region(&self) -> Arc<vm_memory::GuestRegionMmap> {
+    pub fn shadow_region(&self) -> Arc<vmlab_hv_devices::GuestRegion> {
         Arc::new(
-            vm_memory::GuestRegionMmap::with_arc(
+            vmlab_hv_devices::GuestRegion::with_arc(
                 self.shadow.iter().next().unwrap().get_mmap(),
                 GuestAddress(ALIAS),
             )
@@ -88,9 +91,9 @@ impl Pam {
         )
     }
     /// 0xc0000-0xfffff as device models see it.
-    pub fn device_region(&self) -> Arc<vm_memory::GuestRegionMmap> {
+    pub fn device_region(&self) -> Arc<vmlab_hv_devices::GuestRegion> {
         Arc::new(
-            vm_memory::GuestRegionMmap::with_arc(
+            vmlab_hv_devices::GuestRegion::with_arc(
                 self.device.iter().next().unwrap().get_mmap(),
                 GuestAddress(ALIAS),
             )
@@ -99,9 +102,9 @@ impl Pam {
     }
     /// The legacy SMRAM backing. It belongs in the complete memory view the
     /// snapshot and the debugger use, and never in the one devices get.
-    pub fn smram_region(&self) -> Arc<vm_memory::GuestRegionMmap> {
+    pub fn smram_region(&self) -> Arc<vmlab_hv_devices::GuestRegion> {
         Arc::new(
-            vm_memory::GuestRegionMmap::with_arc(
+            vmlab_hv_devices::GuestRegion::with_arc(
                 self.smram.iter().next().unwrap().get_mmap(),
                 GuestAddress(0xa0000),
             )
@@ -134,7 +137,7 @@ impl Pam {
             let file = backing
                 .try_clone()
                 .map_err(|e| VmmError::Memory(e.to_string()))?;
-            GuestMemoryMmap::from_ranges_with_files([(
+            GuestMemory::from_ranges_with_files([(
                 GuestAddress(ALIAS),
                 ALIAS_SIZE,
                 Some(vm_memory::FileOffset::new(file, offset)),
@@ -143,15 +146,23 @@ impl Pam {
         };
         let shadow = file_backed(0)?;
         let rom = file_backed(ALIAS_SIZE as u64)?;
-        let device = GuestMemoryMmap::from_ranges(&[(GuestAddress(ALIAS), ALIAS_SIZE)])
+        let device = GuestMemory::from_ranges(&[(GuestAddress(ALIAS), ALIAS_SIZE)])
             .map_err(|e| VmmError::Memory(e.to_string()))?;
         rom.write_slice(&vec![0xff; ALIAS_SIZE], GuestAddress(ALIAS))
             .map_err(|e| VmmError::Memory(e.to_string()))?;
         let n = image.len().min(0x20000);
         rom.write_slice(&image[image.len() - n..], GuestAddress(0x100000 - n as u64))
             .map_err(|e| VmmError::Memory(e.to_string()))?;
-        let smram = GuestMemoryMmap::from_ranges(&[(GuestAddress(0xa0000), 0x20000)])
+        let smram = GuestMemory::from_ranges(&[(GuestAddress(0xa0000), 0x20000)])
             .map_err(|e| VmmError::Memory(e.to_string()))?;
+        // Whatever a device writes to a bank it may not write is dropped
+        // after the write: see `map_device_bank`.
+        let view = device.iter().next().unwrap();
+        // SAFETY: the mapping is `device`'s own, page aligned and
+        // `ALIAS_SIZE` long. `refresh_device_view` below maps every bank of
+        // it from the memfd before the view leaves this function, and
+        // `map_device_bank` is the only thing that maps there afterwards.
+        unsafe { view.get_mmap().bitmap().arm(view.as_ptr(), ALIAS_SIZE) };
         crate::memory::dont_dump(&shadow)?;
         crate::memory::dont_dump(&smram)?;
         let pam = Self {
@@ -242,8 +253,8 @@ impl Pam {
     }
 
     /// Map every bank of the device view again. A bank that is not writable
-    /// holds private pages, which neither see a shadow replaced under them
-    /// (a restore, a reset) nor forget what a device wrote to them.
+    /// holds private pages, which do not see a shadow replaced under them
+    /// (a restore, a reset).
     fn refresh_device_view(&self) -> Result<(), VmmError> {
         (0..13).try_for_each(|bank| self.map_device_bank(bank))
     }
@@ -431,7 +442,7 @@ pub(crate) fn attach_firmware_memory(
     ram: &mut crate::memory::GuestRam,
     pam: &Pam,
     secure_smm: bool,
-) -> Result<GuestMemoryMmap, VmmError> {
+) -> Result<GuestMemory, VmmError> {
     ram.device_mem = ram
         .device_mem
         .insert_region(pam.device_region())
@@ -677,7 +688,7 @@ impl Snapshot for Mch {
 
 /// Register the immutable high ROM independently of RAM and PAM aliases.
 /// The returned mmap must be retained for the lifetime of the VM.
-pub fn map_bios(vm: &VmFd, image: &[u8], slot: u32) -> Result<GuestMemoryMmap, VmmError> {
+pub fn map_bios(vm: &VmFd, image: &[u8], slot: u32) -> Result<GuestMemory, VmmError> {
     if image.len() < 0x10000 || !image.len().is_multiple_of(0x10000) || image.len() > 0x400000 {
         return Err(VmmError::InvalidMachine(
             "BIOS size must be a multiple of 64 KiB in 64 KiB..=4 MiB".into(),
@@ -688,15 +699,15 @@ pub fn map_bios(vm: &VmFd, image: &[u8], slot: u32) -> Result<GuestMemoryMmap, V
 }
 
 /// Executable immutable CODE backing; VARS remains on the flash MMIO path.
-pub fn map_pflash_code(vm: &VmFd, image: &[u8], slot: u32) -> Result<GuestMemoryMmap, VmmError> {
+pub fn map_pflash_code(vm: &VmFd, image: &[u8], slot: u32) -> Result<GuestMemory, VmmError> {
     if image.len() != vmlab_hv_devices::pflash::CODE_SIZE {
         return Err(VmmError::InvalidMachine("invalid OVMF CODE length".into()));
     }
     map_rom(vm, image, slot, vmlab_hv_devices::pflash::CODE_BASE)
 }
 
-fn map_rom(vm: &VmFd, image: &[u8], slot: u32, base: u64) -> Result<GuestMemoryMmap, VmmError> {
-    let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(base), image.len())])
+fn map_rom(vm: &VmFd, image: &[u8], slot: u32, base: u64) -> Result<GuestMemory, VmmError> {
+    let memory = GuestMemory::from_ranges(&[(GuestAddress(base), image.len())])
         .map_err(|e| VmmError::Memory(e.to_string()))?;
     memory
         .write_slice(image, GuestAddress(base))
@@ -880,7 +891,7 @@ mod tests {
         assert!(progress.terminal_count);
     }
 
-    fn backing(memory: &GuestMemoryMmap, address: u64) -> [u8; 512] {
+    fn backing(memory: &GuestMemory, address: u64) -> [u8; 512] {
         let mut bytes = [0; 512];
         memory
             .read_slice(&mut bytes, GuestAddress(address))
@@ -946,6 +957,36 @@ mod tests {
         assert_eq!(backing(&device, 0xf0000), [0x33; 512]);
         mch.restore_state(&state).unwrap();
         assert_eq!(backing(&device, 0xf0000), [0x22; 512]);
+    }
+
+    /// Review vmm-core-2 F3: the chipset stores a device write to a
+    /// write-protected bank nowhere, so the next device read of that address
+    /// returns the shadow, as a CPU read does.
+    #[test]
+    fn device_write_to_read_only_shadow_is_not_read_back() {
+        let (ram, mut mch, _isa) = pc_with_isa_dma();
+        mch.config_write(0x58 / 4, 1, &[0x30]);
+        ram.device_mem
+            .write_slice(&[0x22; 512], GuestAddress(0xf0000))
+            .unwrap();
+        mch.config_write(0x58 / 4, 1, &[0x10]);
+        // The chipset drops the write: whether the access reports an error
+        // is the device's concern, the content is the guest's.
+        let _ = ram
+            .device_mem
+            .write_slice(&[0x44; 512], GuestAddress(0xf0000));
+        assert_eq!(
+            backing(&ram.device_mem, 0xf0000),
+            [0x22; 512],
+            "a device read back its write to a read-only bank"
+        );
+        assert_eq!(backing(&mch.pam.lock().shadow, 0xf0000), [0x22; 512]);
+        // The same for a bank that reads the ROM.
+        mch.config_write(0x58 / 4, 1, &[0]);
+        let _ = ram
+            .device_mem
+            .write_slice(&[0x44; 512], GuestAddress(0xf0000));
+        assert_eq!(backing(&ram.device_mem, 0xf0000), [0x5a; 512]);
     }
 
     #[test]

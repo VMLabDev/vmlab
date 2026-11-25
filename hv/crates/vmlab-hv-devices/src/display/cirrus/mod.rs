@@ -19,9 +19,9 @@ mod blit;
 mod tests;
 
 use super::{CRTC, Frame, GC, Mode, PixelFormat, ROM_BAR, SEQ, StandardVga};
-use crate::{BarInfo, BarKind, DeviceError, PciDevice, Snapshot};
+use crate::{BarInfo, BarKind, DeviceError, GuestMemory, PciDevice, Snapshot};
 use blit::{Blit, Window};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress};
 
 /// Video memory, from the capture's `vgamem_mb = 4`.
 pub const VRAM_SIZE: usize = 4 << 20;
@@ -155,7 +155,7 @@ impl CirrusVga {
     }
 
     /// Page-aligned BAR0 storage. The VMM may map it while memory decoding is on.
-    pub fn linear_framebuffer(&self) -> GuestMemoryMmap {
+    pub fn linear_framebuffer(&self) -> GuestMemory {
         self.vga.linear_framebuffer()
     }
 

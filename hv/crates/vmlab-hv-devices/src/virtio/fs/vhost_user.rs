@@ -800,7 +800,7 @@ mod tests {
     use super::*;
     use crate::VirtioDevice;
     use virtio_queue::QueueT;
-    use vm_memory::{FileOffset, GuestAddress, GuestMemoryMmap};
+    use vm_memory::{FileOffset, GuestAddress};
 
     /// Bits [0..2] of the header flags carry the protocol version (1); bit 2
     /// marks a reply.
@@ -1177,7 +1177,7 @@ mod tests {
 
     /// A memfd-backed guest memory shaped like the VMM's shared RAM: two
     /// regions, each mapped at file offset equal to its guest-physical base.
-    fn shared_guest_memory() -> GuestMemoryMmap {
+    fn shared_guest_memory() -> GuestMemory {
         const REGION: u64 = 4 << 20;
         // SAFETY: memfd_create(2) with a NUL-terminated name; the return is
         // either a valid fd or -1 with errno set.
@@ -1192,7 +1192,7 @@ mod tests {
         // SAFETY: the fd is fresh and owned from here on.
         let memfd = unsafe { File::from_raw_fd(fd as RawFd) };
         memfd.set_len(0x1_0000_0000 + REGION).expect("size memfd");
-        let mem = GuestMemoryMmap::from_ranges_with_files([
+        let mem = GuestMemory::from_ranges_with_files([
             (
                 GuestAddress(0),
                 REGION as usize,
@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     /// Two ready queues with distinct, in-memory ring addresses.
-    fn ready_queues(mem: &GuestMemoryMmap, size: u16) -> Vec<Queue> {
+    fn ready_queues(mem: &GuestMemory, size: u16) -> Vec<Queue> {
         let layout = |n: usize| -> (u64, u64, u64) {
             // desc: n * 16 bytes, avail: 6 + 2*n (+flags), used: 6 + 8*n,
             // each ring start 4-aligned as virtio-queue's setters require.
@@ -1450,7 +1450,7 @@ mod tests {
         let memfd = unsafe { File::from_raw_fd(fd as RawFd) };
         memfd.set_len(0x1_0040_0000).expect("size memfd");
         let file = |off: u64| Some(FileOffset::new(memfd.try_clone().unwrap(), off));
-        let mem = GuestMemoryMmap::from_ranges_with_files([
+        let mem = GuestMemory::from_ranges_with_files([
             (GuestAddress(0), 0xa0000, file(0)),
             (GuestAddress(0x100000), 0x400000 - 0x100000, file(0x100000)),
             (GuestAddress(0x1_0000_0000), 4 << 20, file(0x1_0000_0000)),

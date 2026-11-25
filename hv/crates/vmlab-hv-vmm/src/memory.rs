@@ -7,26 +7,26 @@ use std::sync::Arc;
 
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VmFd;
-use vm_memory::{
-    FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
-    GuestRegionMmap, MmapRegion,
-};
+use vm_memory::{FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryRegion};
+use vmlab_hv_devices::{GuestMemory, GuestRegion};
 
 use crate::error::VmmError;
 use crate::layout::MemLayout;
 
+type MmapRegion = vm_memory::MmapRegion<vmlab_hv_devices::WriteDiscard>;
+
 /// Built guest memory plus what backs it.
 pub struct GuestRam {
-    pub mem: GuestMemoryMmap,
+    pub mem: GuestMemory,
     /// Guest memory as a device model sees it: `mem` on a machine without
     /// firmware. On a firmware machine it holds no SMRAM, and its
     /// 0xc0000-0xfffff follows the PAM write enables (`q35::Pam`). Every
     /// access made for the guest outside SMM goes through this view.
-    pub device_mem: GuestMemoryMmap,
+    pub device_mem: GuestMemory,
     layout: MemLayout,
     /// The memfd backing RAM, when shared; kept open so the mapping lives.
     _file: Option<File>,
-    pub(crate) firmware_rom: Option<GuestMemoryMmap>,
+    pub(crate) firmware_rom: Option<GuestMemory>,
     pub(crate) a20: Option<Arc<parking_lot::Mutex<crate::a20::A20>>>,
 }
 
@@ -95,7 +95,7 @@ impl GuestRam {
 }
 
 /// Exclude every guest-RAM mapping, including CPU-only aliases, from host cores.
-pub(crate) fn dont_dump(mem: &GuestMemoryMmap) -> Result<(), VmmError> {
+pub(crate) fn dont_dump(mem: &GuestMemory) -> Result<(), VmmError> {
     for region in mem.iter() {
         // SAFETY: each region owns this page-aligned mapping for its full length.
         if unsafe {
@@ -118,12 +118,12 @@ pub(crate) fn dont_dump(mem: &GuestMemoryMmap) -> Result<(), VmmError> {
 fn mmap_regions(
     layout: &MemLayout,
     file: &File,
-) -> Result<GuestMemoryMmap, vm_memory::mmap::FromRangesError> {
+) -> Result<GuestMemory, vm_memory::mmap::FromRangesError> {
     let ranges = layout.regions.iter().map(|(base, size)| {
         let file_offset = FileOffset::new(file.try_clone().expect("clone memfd"), *base);
         (GuestAddress(*base), *size as usize, Some(file_offset))
     });
-    GuestMemoryMmap::from_ranges_with_files(ranges)
+    GuestMemory::from_ranges_with_files(ranges)
 }
 
 /// The page size KVM maps guest RAM with when the host backs it with
@@ -140,17 +140,17 @@ fn huge_page_congruent(host: *mut u8, base: u64) -> bool {
 /// pages for it. q35's main low region starts at guest address 1 MiB, and an
 /// address the kernel chooses is not congruent with that: every page of low
 /// RAM then costs its own nested page fault (card #71, D28 G1).
-fn mmap_anonymous(layout: &MemLayout) -> Result<GuestMemoryMmap, String> {
+fn mmap_anonymous(layout: &MemLayout) -> Result<GuestMemory, String> {
     let regions = layout
         .regions
         .iter()
         .map(|&(base, size)| {
             let mapping = map_congruent(base, size as usize).map_err(|e| e.to_string())?;
-            GuestRegionMmap::new(mapping, GuestAddress(base))
+            GuestRegion::new(mapping, GuestAddress(base))
                 .ok_or_else(|| format!("RAM region {base:#x}+{size:#x} wraps the address space"))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    GuestMemoryMmap::from_regions(regions).map_err(|e| e.to_string())
+    GuestMemory::from_regions(regions).map_err(|e| e.to_string())
 }
 
 /// One anonymous mapping for the region at guest address `base`. vm-memory
@@ -351,7 +351,8 @@ mod tests {
         let mut ram = GuestRam::anonymous(MemLayout::q35(8).unwrap()).unwrap();
         register_memslots(&kvm.vm, &ram).unwrap();
         let aperture = Arc::new(
-            vm_memory::GuestRegionMmap::from_range(GuestAddress(0xa0000), 0x20000, None).unwrap(),
+            vmlab_hv_devices::GuestRegion::from_range(GuestAddress(0xa0000), 0x20000, None)
+                .unwrap(),
         );
         let region = kvm_userspace_memory_region {
             slot: 128,
