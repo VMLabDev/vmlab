@@ -2653,4 +2653,81 @@ mod tests {
         assert_eq!(list[0]["refcount"], 2);
         assert_eq!(list[0]["subnet"], "10.214.3.0/24");
     }
+
+    const UNREADABLE_HOST_CONFIG_HELPER: &str = "VMLAB_TEST_UNREADABLE_HOST_CONFIG";
+
+    /// Review finding F17: the supervisor reads the host config one time and
+    /// outlives every lab. Started on a file that does not load, it must not
+    /// serve on the defaults: it exits and names the mistake.
+    #[test]
+    fn a_supervisor_does_not_start_on_an_unreadable_host_config() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = scratch.path().join("config/vmlab");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.wcl"),
+            "import <vmlab-host.wcl>\nhost { psk = \"k\" trunk_port = 0 }\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::tests::unreadable_host_config_helper",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UNREADABLE_HOST_CONFIG_HELPER, "1")
+            .env("XDG_RUNTIME_DIR", scratch.path().join("run"))
+            .env("XDG_STATE_HOME", scratch.path().join("state"))
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Isolated paths: the supervisor's own start, raced against its socket
+    /// answering. The start must end first, with the error.
+    #[test]
+    #[ignore = "subprocess helper for a_supervisor_does_not_start_on_an_unreadable_host_config"]
+    fn unreadable_host_config_helper() {
+        if std::env::var_os(UNREADABLE_HOST_CONFIG_HELPER).is_none() {
+            return;
+        }
+        assert!(
+            crate::paths::config_dir().join("config.wcl").is_file(),
+            "the fixture's host config is not where the supervisor reads it"
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let serves = async {
+                let sock = crate::paths::supervisor_socket();
+                loop {
+                    if let Ok(client) = crate::proto::client::SupClient::connect(&sock).await
+                        && client.send(crate::proto::SupRequest::Ping {}).await.is_ok()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            };
+            tokio::select! {
+                ended = super::run_async() => {
+                    let error = format!("{:#}", ended.expect_err("the start is refused"));
+                    assert!(error.contains("host config"), "{error}");
+                    assert!(error.contains("trunk_port"), "{error}");
+                }
+                () = serves => panic!("the supervisor serves on the defaults"),
+            }
+        });
+        // A started supervisor leaves tasks that never end: do not wait for
+        // the runtime to drop them.
+        std::process::exit(0);
+    }
 }

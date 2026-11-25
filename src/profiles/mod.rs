@@ -846,4 +846,32 @@ profile "freebsd" { machine = "q35" firmware = "seabios" }
         let err = ProfileSet::load(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("vmlab-profile.wcl"));
     }
+
+    /// Review finding F18: a span in an imported file counts in that file.
+    /// Applied to this file, whose second line is longer in bytes than in
+    /// characters, the offset is inside a character.
+    #[test]
+    fn an_issue_in_an_imported_profile_file_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc.wcl");
+        std::fs::write(
+            &inc,
+            "import <vmlab-profile.wcl>\nprofile \"p\" { machine = \"bogus\" }\n",
+        )
+        .unwrap();
+        let top = format!(
+            "import <vmlab-profile.wcl>\n// {}\nimport \"{}\"\nprofile \"q\" {{ }}\n",
+            "\u{e9}".repeat(40),
+            inc.display()
+        );
+        let err = parse_profiles(&top, "main.wcl").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("`machine` must be one of"), "{text}");
+        // In the imported file, at the line and column it is on there.
+        assert!(
+            text.contains(&format!("{}:2:15: ", inc.display())),
+            "{text}"
+        );
+        assert!(!text.contains("main.wcl:"), "{text}");
+    }
 }

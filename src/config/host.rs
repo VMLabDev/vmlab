@@ -1065,4 +1065,26 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
             .expect("watchdog exits on cancel")
             .unwrap();
     }
+
+    /// Review finding F18: an issue in an imported file names that file and
+    /// its line there, not a line of `config.wcl` where nothing is wrong.
+    #[test]
+    fn an_issue_in_an_imported_host_file_names_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("inc.wcl");
+        std::fs::write(
+            &inc,
+            "import <vmlab-host.wcl>\n\n\n\n\n\n\n\ngpu \"g\" { address = \"0000:01:00.0\" keepawake = \"bogus\" }\n",
+        )
+        .unwrap();
+        let top = format!(
+            "import <vmlab-host.wcl>\nimport \"{}\"\nhost {{ disk_low_percent = 10 }}\n",
+            inc.display()
+        );
+        let err = HostConfig::parse(&top, "config.wcl").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("`keepawake` must be one of"), "{text}");
+        assert!(text.contains(&format!("{}:9:", inc.display())), "{text}");
+        assert!(!text.contains("config.wcl:"), "{text}");
+    }
 }

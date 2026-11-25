@@ -1289,4 +1289,36 @@ lab "l" {
         assert!(out.chars().all(|c| c == ' ' || c == '\n'), "{out}");
         assert_eq!(out.matches('\n').count(), 2);
     }
+
+    /// A lab file that imports `inc.wcl`, which declares a template with a
+    /// mistake and a password, far past the length of the lab file.
+    fn lab_with_a_faulty_import(root: &Path) -> String {
+        let pad = "// pad pad pad pad pad pad pad pad pad pad\n".repeat(40);
+        std::fs::write(
+            root.join("inc.wcl"),
+            format!(
+                "import <vmlab.wcl>\n{pad}template \"t\" {{ arch = \"bogus\" version = \"1\" source \"scratch\" {{ }} login \"d\" {{ user = \"u\" password = \"hunter2-import\" }} }}\n"
+            ),
+        )
+        .unwrap();
+        format!(
+            "import <vmlab.wcl>\nimport \"inc.wcl\"\nlab \"l\" {{ vm \"a\" {{ template = \"x86_64/t\" login \"d\" {{ user = \"u\" password = \"hunter2-main\" }} }} }}\n// {}\n",
+            "\u{e9}".repeat(20)
+        )
+    }
+
+    /// Review finding F18: an issue in an imported file carries offsets of
+    /// that file. Every issue must be inside the text of the file it names.
+    #[test]
+    fn an_issue_in_an_imported_lab_file_is_placed_in_that_file() {
+        let root = tempfile::tempdir().unwrap();
+        let src = lab_with_a_faulty_import(root.path());
+        let err = load_lab_source(&src, "vmlab.wcl", root.path()).unwrap_err();
+        // The report shows the imported file, and no password of either file.
+        let report = format!("{:?}", miette::Report::new(err));
+        assert!(report.contains("inc.wcl"), "{report}");
+        assert!(report.contains("arch = \"bogus\""), "{report}");
+        assert!(!report.contains("OutOfBounds"), "{report}");
+        assert!(!report.contains("hunter2"), "{report}");
+    }
 }
