@@ -162,6 +162,9 @@ impl Registry {
         }
     }
 
+    /// Remove `name`'s entry whoever its daemon is. The supervisor itself
+    /// removes through [`Registry::remove_daemon`] only.
+    #[cfg(test)]
     pub fn remove(&mut self, name: &str) {
         self.labs.retain(|l| l.name != name);
     }
