@@ -2310,13 +2310,16 @@ fn check_dev_defaults(lab: &Lab, issues: &mut IssueList) {
     }
 }
 
-fn check_dns_label(name: &str, span: Span, what: &str, issues: &mut IssueList) {
-    let ok = !name.is_empty()
+pub(super) fn is_dns_label(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= 63
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && !name.starts_with('-')
-        && !name.ends_with('-');
-    if !ok {
+        && !name.ends_with('-')
+}
+
+fn check_dns_label(name: &str, span: Span, what: &str, issues: &mut IssueList) {
+    if !is_dns_label(name) {
         issues.push(Issue::at(
             span,
             format!(
