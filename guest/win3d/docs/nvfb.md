@@ -258,11 +258,12 @@ timing on helios could not be isolated: with ten VMs on the host,
   guest driver; the package cannot change either (decision D3).
 - Yttrium's D3D9/D3D10/D3D11 driver has its own Venus transport and is not
   covered by 0067. It passed every check on Zeus Nvidia1. On a second Intel
-  and NVIDIA laptop its images arrived with 64-byte holes. vmlab can hide the
-  uncached type from every guest driver on the host side: the host GPU
-  setting `hide_uncached_memory = true` (vmlab manual, host configuration).
-  It is off by default, and it is not yet measured on such a host through
-  vmlab.
+  and NVIDIA laptop its images arrived with 64-byte holes. Card #136
+  measured clean images on two boots with the host-side Vulkan memory
+  filter enabled. The host GPU setting `hide_uncached_memory = "auto"`
+  enables that filter by default for the `nvidia` kernel driver and leaves
+  it off for other drivers. Explicit `true` and `false` override this
+  decision (vmlab manual, host configuration).
 
 ## Files
 

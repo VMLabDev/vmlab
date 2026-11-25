@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use wcl_lang::{Document, Environment, Registry, disk_loader};
+use wcl_lang::{Document, Environment, Registry, Value, disk_loader};
 
 use super::block::{Reader, Unspan, finish};
 
@@ -152,9 +152,9 @@ pub struct HostGpu {
     /// VMs render on it (ADR-0018).
     pub keepawake: KeepAwake,
     /// Hide this GPU's uncached host-visible memory types from a `vulkan`
-    /// guest where the same heap has a cached one (PRD §5.2). Off unless
-    /// set: for a host whose CPU and GPU do not see that memory alike.
-    pub hide_uncached_memory: bool,
+    /// guest where the same heap has a cached one (PRD §5.2).
+    /// None means automatic, based on the selected GPU's kernel driver.
+    pub hide_uncached_memory: Option<bool>,
     /// The card's other PCI functions `passthrough` hands a vmlab-hv guest
     /// with it — its HDMI/DP audio (PRD §5.2). `None`, the key left out,
     /// takes every function of the slot already bound to `vfio-pci`; a list
@@ -284,20 +284,49 @@ impl HostConfig {
             let mut r = Reader::new(&block, &mut issues);
             // Every field is an override: absent (or malformed, which is
             // reported) leaves the default in place.
-            if let Some(v) = r.parse_as("subnet_pool", "CIDR").unspan() {
-                cfg.subnet_pool = v;
+            if let Some(pool) = r.parse_as::<ipnet::Ipv4Net>("subnet_pool", "CIDR") {
+                // Check the whole range because any of its /24s may be allocated.
+                let network = pool.value.network();
+                let broadcast = pool.value.broadcast();
+                if !(1..=24).contains(&pool.value.prefix_len()) {
+                    r.issue_at(
+                        pool.span,
+                        "`subnet_pool` must have a prefix length from /1 to /24",
+                    );
+                } else if network.octets()[0] == 0
+                    || network.is_loopback()
+                    || broadcast.is_loopback()
+                    || broadcast.octets()[0] >= 224
+                {
+                    r.issue_at(
+                        pool.span,
+                        "`subnet_pool` must exclude 0.0.0.0/8, loopback, multicast, and reserved addresses at or above 240.0.0.0",
+                    );
+                } else {
+                    cfg.subnet_pool = pool.value;
+                }
             }
-            if let Some(v) = r.string("dns_suffix").unspan() {
-                cfg.dns_suffix = v;
+            if let Some(suffix) = r.string("dns_suffix") {
+                let name = suffix.value.strip_suffix('.').unwrap_or(&suffix.value);
+                if name.len() <= 253 && name.split('.').all(super::validate::is_dns_label) {
+                    cfg.dns_suffix = suffix.value;
+                } else {
+                    r.issue_at(suffix.span, "`dns_suffix` must be a valid DNS domain name");
+                }
             }
             if let Some(upstream) = r.string("dns_upstream") {
-                if parse_upstream(&upstream.value).is_some() {
-                    cfg.dns_upstream = Some(upstream.value);
-                } else {
-                    r.issue_at(
+                match parse_upstream(&upstream.value) {
+                    Some(addr) if addr.port() != 0 && !addr.ip().is_unspecified() => {
+                        cfg.dns_upstream = Some(upstream.value);
+                    }
+                    Some(_) => r.issue_at(
+                        upstream.span,
+                        "`dns_upstream` must have a specified IP address and a nonzero port",
+                    ),
+                    None => r.issue_at(
                         upstream.span,
                         "`dns_upstream` must be an IP address, optionally with a port",
-                    );
+                    ),
                 }
             }
             if let Some(v) = r.int_in("disk_low_percent", 0, 100).unspan() {
@@ -361,8 +390,8 @@ impl HostConfig {
                     );
                 }
             }
-            if let Some(v) = r.size("workspace_max_file").unspan() {
-                cfg.workspace_max_file = v;
+            if let Some(size) = r.int_at_least("workspace_max_file", 1).unspan() {
+                cfg.workspace_max_file = size;
             }
         }
         for block in doc.blocks().filter(|b| b.kind() == "gpu") {
@@ -392,6 +421,18 @@ impl HostConfig {
                 }
                 None => true,
             });
+            let hide_uncached_memory =
+                r.value("hide_uncached_memory").and_then(|v| match v.value {
+                    Value::Bool(enabled) => Some(enabled),
+                    Value::Utf8(s) if s == "auto" => None,
+                    _ => {
+                        r.issue_at(
+                            v.span,
+                            "`hide_uncached_memory` must be true, false, or \"auto\"",
+                        );
+                        None
+                    }
+                });
             let gpu = HostGpu {
                 name,
                 address: address.value,
@@ -403,7 +444,7 @@ impl HostConfig {
                     .keyword("keepawake", KeepAwake::NAMES)
                     .unspan()
                     .unwrap_or_default(),
-                hide_uncached_memory: r.bool("hide_uncached_memory").unspan().unwrap_or(false),
+                hide_uncached_memory,
                 passthrough_functions: r.opt_string_list("passthrough_functions"),
             };
             if let Some(prev) = cfg
@@ -770,7 +811,7 @@ gpu "Nvidia1" {
         assert!(amd.qemu_binary.is_none() && amd.qemu_env.is_empty());
     }
 
-    /// `hide_uncached_memory` is off unless a GPU block turns it on.
+    /// Omitting the setting selects the same policy as explicit "auto".
     #[test]
     fn parses_a_host_gpus_hide_uncached_memory() {
         let cfg = HostConfig::parse(
@@ -778,12 +819,24 @@ gpu "Nvidia1" {
 gpu "AMD1"    { address = "0000:72:00.0"  default = true }
 gpu "Nvidia1" { address = "0000:01:00.0"  hide_uncached_memory = true }
 gpu "Nvidia2" { address = "0000:05:00.0"  hide_uncached_memory = false }
+gpu "Intel"   { address = "0000:00:02.0"  hide_uncached_memory = "auto" }
 "#,
             "<test>",
         )
         .unwrap();
-        let on: Vec<bool> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
-        assert_eq!(on, [false, true, false]);
+        let policies: Vec<_> = cfg.gpus.iter().map(|g| g.hide_uncached_memory).collect();
+        assert_eq!(policies, [None, Some(true), Some(false), None]);
+        let err = HostConfig::parse(
+            r#"import <vmlab-host.wcl>
+gpu "AMD1" { address = "0000:72:00.0" hide_uncached_memory = "off" }
+"#,
+            "<test>",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be true, false, or \"auto\""),
+            "{err}"
+        );
     }
 
     /// `passthrough_functions` tells a key left out from an empty list:
@@ -940,6 +993,46 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
                 host_err(&format!("host {{ oci_chunk_size = {size} }}\n"))
                     .contains("config.wcl:2:8: `oci_chunk_size`")
             );
+        }
+    }
+
+    #[test]
+    fn a_zero_workspace_cap_is_refused_at_load() {
+        assert!(
+            host_err("host { workspace_max_file = 0 }\n")
+                .contains("config.wcl:2:8: `workspace_max_file`")
+        );
+    }
+
+    #[test]
+    fn an_unusable_subnet_pool_is_refused_at_load() {
+        for pool in [
+            "10.0.0.0/28",
+            "0.0.0.0/0",
+            "224.0.0.0/4",
+            "0.0.0.0/8",
+            "64.0.0.0/2",
+            "127.1.0.0/16",
+            "192.0.0.0/2",
+        ] {
+            let err = host_err(&format!("host {{ subnet_pool = \"{pool}\" }}\n"));
+            assert!(err.contains("config.wcl:2:8: `subnet_pool`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unusable_dns_setting_is_refused() {
+        for (field, value) in [
+            ("dns_upstream", "10.0.0.1:0"),
+            ("dns_upstream", "0.0.0.0"),
+            ("dns_upstream", "::"),
+            ("dns_suffix", ""),
+            ("dns_suffix", "has space"),
+            ("dns_suffix", "lab..local"),
+            ("dns_suffix", "-lab.local"),
+        ] {
+            let err = host_err(&format!("host {{ {field} = \"{value}\" }}\n"));
+            assert!(err.contains(&format!("config.wcl:2:8: `{field}`")), "{err}");
         }
     }
 
