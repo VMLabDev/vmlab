@@ -203,7 +203,7 @@ fn read_rule_file(file: &Path) -> std::io::Result<RuleFile> {
         let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
         options.custom_flags(flags.bits() as i32);
     }
-    let mut opened = match options.open(file) {
+    let opened = match options.open(file) {
         Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RuleFile::Absent),
         Err(e) => {
@@ -551,8 +551,10 @@ impl Default for Ignores {
 }
 
 impl PruneCandidates {
-    /// Whether an anchored negation names `prefix` or something below it.
-    /// The set is ordered, so everything below `prefix` follows `prefix/`.
+    /// Whether an anchored negation names `prefix` or something below it:
+    /// the prefix itself, or a path that starts with the prefix and a `/`.
+    /// That is the reading the agent's own prune match uses. The set is
+    /// ordered, so everything below `prefix` starts at `prefix/`.
     fn negation_at_or_below(&self, prefix: &str) -> bool {
         if self.negated.contains(prefix) {
             return true;
@@ -634,16 +636,6 @@ fn line_error(e: &ignore::Error) -> String {
 /// Whether a glob metacharacter makes this path segment unpredictable.
 fn is_glob(part: &str) -> bool {
     part.contains(['*', '?', '[', ']', '\\'])
-}
-
-/// Whether `path` is `prefix` itself or lies under it — the same reading the
-/// agent's own prune match uses, so the two sides never disagree about what a
-/// prefix covers.
-fn at_or_below(path: &str, prefix: &str) -> bool {
-    path == prefix
-        || (path.len() > prefix.len()
-            && path.starts_with(prefix)
-            && path.as_bytes()[prefix.len()] == b'/')
 }
 
 /// `a/b/c` → `a/b`; a path with no separator → `""` (the root).
