@@ -10506,4 +10506,56 @@ fn main(lab: Lab) { let r = lab.this_vm().expect("vm").restore("s") }
         assert!(said.contains("by force"), "{said}");
         assert!(said.contains("vmlab up dev01"), "{said}");
     }
+
+    /// Review lab-lifecycle-2 F18: a boot verb replaces the lab daemon after
+    /// an edit when "nothing would be lost", and it asked only whether a
+    /// machine runs or a download is under way. An offline restore is neither,
+    /// and the replacement cut it where it stood.
+    #[tokio::test]
+    async fn a_daemon_at_work_on_stopped_machines_is_not_restarted() {
+        use crate::cli::lab::{DaemonFreshness, daemon_freshness};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let held = HeldRestore::new();
+        let mut machine = Arc::into_inner(FakeMachine::new("a", MachineKind::Vm, &sh)).unwrap();
+        machine.hold_restore = Some(held.clone());
+        let lab = lab_of(
+            dir.path(),
+            r#"import <vmlab.wcl>
+lab "t" { vm "a" { template = "x86_64/t" } }"#,
+            vec![Arc::new(machine)],
+        );
+        lab.snapshot("a", "s").await.expect("snapshot");
+
+        let restore = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.restore("a", "s", false).await }
+        });
+        // The restore is inside the machine's image step.
+        held.hold.reached().await;
+        let status = lab.status().await;
+        assert!(status.all_stopped(), "the restore is an offline one");
+        assert!(status.pulls.is_empty());
+        let during = daemon_freshness("t", &status, "the digest of an edited file");
+
+        held.hold.release();
+        restore.await.unwrap().expect("restore");
+        let after = daemon_freshness("t", &lab.status().await, "the digest of an edited file");
+
+        assert_ne!(
+            during,
+            DaemonFreshness::Restart,
+            "the daemon would be replaced in the middle of its restore"
+        );
+        let DaemonFreshness::Refuse(why) = during else {
+            panic!("a restore under way is not reloaded over: {during:?}");
+        };
+        assert!(why.contains("the restore of a"), "{why}");
+        assert_eq!(
+            after,
+            DaemonFreshness::Restart,
+            "an idle daemon is replaced as before"
+        );
+    }
 }

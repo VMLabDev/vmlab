@@ -86,7 +86,7 @@ async fn current_lab_client_for(lab: Option<String>, targets: &[String]) -> Resu
 /// What a verb that boots machines does with the lab daemon it found, given
 /// that daemon's status and the digest of the lab file on disk now.
 #[derive(Debug, PartialEq, Eq)]
-enum DaemonFreshness {
+pub(crate) enum DaemonFreshness {
     /// The daemon loaded this file: use it.
     Current,
     /// The file changed and nothing would be lost by replacing the daemon.
@@ -115,7 +115,7 @@ enum DaemonFreshness {
 /// machines clone from the main checkout, and worktree isolation — is decided
 /// when the network is assembled, so it needs a fresh daemon and refuses
 /// rather than reloads while anything runs.
-fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
+pub(crate) fn daemon_freshness(name: &str, status: &LabStatus, digest: &str) -> DaemonFreshness {
     let edited = status.config_digest != digest;
     if !edited && !status.freeze_stale {
         return DaemonFreshness::Current;
