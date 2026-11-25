@@ -559,27 +559,40 @@ pub fn cmd_destroy(discard: bool) -> Result<()> {
                 // have lost its socket file, and it holds the lab's state
                 // open. The release waits for a start and stops such a
                 // daemon before the directory goes.
-                if let Ok(sup) = daemon::ensure_supervisor().await {
-                    let _ = sup
-                        .send(SupRequest::LabRelease { name: name.clone() })
-                        .await;
-                }
+                release_for_destroy(&name, Some(&lab_local)).await?;
                 std::fs::remove_dir_all(&lab_local)
                     .with_context(|| format!("removing {}", lab_local.display()))?;
                 crate::freeze::ports::release_worktree(&root)?;
+                println!("lab \"{name}\" destroyed");
+                return Ok(());
             }
             // Nothing materialised, but a worktree lab may still hold a port
             // slot (§21.7).
             None => crate::freeze::ports::release_worktree(&root)?,
         }
         // Reap the lab daemon.
-        if let Ok(sup) = daemon::ensure_supervisor().await {
-            let _ = sup
-                .send(SupRequest::LabRelease { name: name.clone() })
-                .await;
-        }
+        release_for_destroy(&name, None).await?;
         println!("lab \"{name}\" destroyed");
         Ok(())
+    })
+}
+
+/// The release a destroy asks of the supervisor, which reaps the lab's daemon
+/// and what it left running. A release that failed stops the destroy: the
+/// daemon or its hypervisors may still run on the lab's files.
+///
+/// `kept` is the lab directory when the release comes before its removal, so
+/// the refusal can say it was left in place.
+async fn release_for_destroy(name: &str, kept: Option<&std::path::Path>) -> Result<()> {
+    release(name).await.with_context(|| match kept {
+        Some(dir) => format!(
+            "lab \"{name}\" was not destroyed: its daemon and processes could not be \
+             released, so {} was left in place",
+            dir.display()
+        ),
+        None => format!(
+            "lab \"{name}\"'s state is removed, but its daemon and processes could not be released"
+        ),
     })
 }
 
@@ -1374,23 +1387,25 @@ fn cmd_lab_destroy(name: &str, discard: bool) -> Result<()> {
                     if lab_local.exists() {
                         refuse_destroy_under_freeze(root).await?;
                         refuse_destroy_over_guest_work(&lab_local, discard)?;
+                        // As `cmd_destroy`: a daemon that does not answer may
+                        // be starting or have crashed over running guests,
+                        // and the release stops both before the directory
+                        // goes.
+                        release_for_destroy(name, Some(&lab_local)).await?;
                         std::fs::remove_dir_all(&lab_local)
                             .with_context(|| format!("removing {}", lab_local.display()))?;
+                        // A worktree lab's port slot goes back to the family (§21.7).
+                        crate::freeze::ports::release_worktree(root)?;
+                        println!("lab \"{name}\" destroyed");
+                        return Ok(());
                     }
-                    // A worktree lab's port slot goes back to the family (§21.7).
                     crate::freeze::ports::release_worktree(root)?;
                 }
                 None => bail!("lab \"{name}\" is not running"),
             },
         }
         // Reap the lab daemon.
-        if let Ok(sup) = daemon::ensure_supervisor().await {
-            let _ = sup
-                .send(SupRequest::LabRelease {
-                    name: name.to_string(),
-                })
-                .await;
-        }
+        release_for_destroy(name, None).await?;
         println!("lab \"{name}\" destroyed");
         Ok(())
     })
