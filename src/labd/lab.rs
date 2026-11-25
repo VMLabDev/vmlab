@@ -6472,6 +6472,37 @@ lab "t" {
         lab.workspaces.stop_all().await;
     }
 
+    /// A `down` gives each running workspace syncer a last pass before any
+    /// machine stops, and the stop wait the daemon reports left that out, so
+    /// a release could kill guests in the middle of their shutdown
+    /// (docs/reviews/lab-lifecycle-2.md F15).
+    #[tokio::test]
+    async fn the_reported_stop_wait_covers_a_last_pass() {
+        use crate::labd::workspace::syncer::LAST_PASS_BOUND;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_of(
+            dir.path(),
+            DEV_WORKSPACE_LAB,
+            vec![FakeMachine::new("dev01", MachineKind::Vm, &sh)],
+        );
+        lab.start_machine("dev01").await.unwrap();
+        assert!(lab.workspaces.is_running("dev01").await);
+
+        let machine = lab.machine("dev01").unwrap().stop_wait().await;
+        let reported = lab.stop_wait().await;
+        assert!(
+            reported >= machine + LAST_PASS_BOUND,
+            "the lab reports {reported:?} for a machine that takes {machine:?} and a last pass \
+             that takes up to {LAST_PASS_BOUND:?}"
+        );
+
+        // A syncer that does not run has no last pass to wait for.
+        lab.workspaces.stop_all().await;
+        assert_eq!(lab.stop_wait().await, machine);
+    }
+
     /// A machine that runs with no syncer is not a machine that is down: no
     /// flush can run, so nothing knows what its guest holds. Capture refuses
     /// with no escape, and restore refuses without the discard flag (§19.6,
