@@ -609,6 +609,13 @@ the cause. A first reading is not a diagnosis.
   `windows-10`, and on AMD1, to get a rate. If it repeats only on Nvidia2, look at what in the copy path
   depends on the host GPU.
 - Known card: none open on the board.
+- Cause (card #938): 3 torn frames in about 36,000 on `windows-10` on
+  Nvidia2. The destination of the present copy is whole in each. Windows
+  makes two more copies of the window with guest CPUs, and when two presents
+  fall inside one tick both copies start on the same vsync report and the
+  second overtakes the first. No change to the driver. The measurements and
+  the evidence paths are in
+  [C938](../../guest/win3d/docs/acceptance/C938.md).
 
 ## Open points
 
