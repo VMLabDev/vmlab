@@ -144,9 +144,17 @@ fn redacted_source(source: &str, doc: &Document) -> String {
     String::from_utf8(out).unwrap_or_else(|_| blank_source(source))
 }
 
-/// The fields under `block` that hold a secret, by name and span: any
-/// `password`, and the `value` beside a `secret` that is not plainly false.
-fn secret_fields(block: &wcl_lang::Block, out: &mut Vec<(&'static str, model::Span)>) {
+/// The fields under `block` whose value a diagnostic must not print, by
+/// name and span: any `password`, the `value` beside a `secret` that is not
+/// plainly false, and what a mistyped name hides from those two rules.
+///
+/// The schema reports a field it does not know with a label on that field, so
+/// a `password` written `passwd` would be printed by the diagnostic about the
+/// mistake. Such a field's value is starred wherever it stands: the message
+/// names the field, and nothing reads the value. A `secret` written `secrt`
+/// is one of those fields, so beside any of them the `value` of a block that
+/// could have declared a `secret` is starred too.
+fn secret_fields<'a>(block: &wcl_lang::Block<'a>, out: &mut Vec<(&'a str, model::Span)>) {
     let mut unused = IssueList::new();
     let mut r = block::Reader::new(block, &mut unused);
     if let Some(span) = r.field_span("password") {
@@ -154,11 +162,22 @@ fn secret_fields(block: &wcl_lang::Block, out: &mut Vec<(&'static str, model::Sp
     }
     // A `secret` that does not evaluate to a bool is an issue of its own,
     // and no reason to print the value.
-    let secret = r.has("secret") && r.bool("secret").is_none_or(|s| s.value);
+    let mut secret = r.has("secret") && r.bool("secret").is_none_or(|s| s.value);
+    if let Some(schema) = block.schema() {
+        let declared: Vec<&str> = schema.fields().map(|f| f.name()).collect();
+        let mut stray = false;
+        for field in block.fields() {
+            if !declared.contains(&field.name()) {
+                stray = true;
+                out.push((field.name(), (field.span().start, field.span().end)));
+            }
+        }
+        secret |= stray && declared.contains(&"secret");
+    }
     if secret && let Some(span) = r.field_span("value") {
         out.push(("value", span));
     }
-    for child in r.children() {
+    for child in block.blocks() {
         secret_fields(&child, out);
     }
 }
@@ -1240,6 +1259,64 @@ lab "l" {
         let shown = format!("{:?}", miette::Report::new(err));
         assert!(shown.contains("elevated"), "{shown}");
         assert!(!shown.contains("hunter2-login"), "{shown}");
+    }
+
+    /// A field the schema does not know is reported with a label on that
+    /// field (config review 2, F27): a `password` written `passwd` is such a
+    /// field, and a `secret` written `secrt` leaves a `value` nothing marks.
+    #[test]
+    fn a_mistyped_field_name_does_not_show_a_secret_value() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" passwd = "hunter2-login" }
+    playbook "pb" {
+      play = "base"
+      var "token" { value = "hunter2-var" secrt = true }
+      var "domain" { value = "plain-var" }
+    }
+  }
+}
+"#;
+        let err = load_lab_source(source, "<test>", &std::env::temp_dir())
+            .expect_err("`passwd` and `secrt` are not fields");
+        assert!(err.issues.iter().any(|i| i.span.is_some()), "{err:?}");
+        let shown = format!("{:?}", miette::Report::new(err));
+        // Which field it was is still in the excerpt.
+        assert!(shown.contains("passwd"), "{shown}");
+        assert!(shown.contains("secrt"), "{shown}");
+        assert!(!shown.contains("hunter2-login"), "{shown}");
+        assert!(!shown.contains("hunter2-var"), "{shown}");
+    }
+
+    #[test]
+    fn redaction_stars_a_field_the_schema_does_not_know() {
+        let source = r#"import <vmlab.wcl>
+lab "l" {
+  vm "a" {
+    template = "x86_64/t"
+    login "dev" { user = "dev" passwd = "pässwörd=1" }
+    playbook "pb" {
+      var "a" { value = "s3cret" secrt = true }
+      var "b" { value = "plain" }
+    }
+  }
+}
+"#;
+        let out = redacted(source);
+        assert_eq!(out.len(), source.len());
+        for secret in ["pässwörd", "s3cret"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+        for kept in [
+            r#"user = "dev" passwd = *"#,
+            r#"var "a" { value = *"#,
+            r#"var "b" { value = "plain" }"#,
+            r#"template = "x86_64/t""#,
+        ] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
     }
 
     fn redacted(source: &str) -> String {
