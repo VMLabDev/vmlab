@@ -66,8 +66,11 @@ def _run(h):
             before = boot_id(h, lab, "sleepy")
             t0 = datetime.now(timezone.utc).replace(tzinfo=None)
             sh(h, lab, "sleepy", SLEEP_NOW, timeout=60)
+            # No pause between the polls: one of them then lands between the
+            # guest freezing its tasks and the lab daemon hearing of the
+            # suspend, which once cost the agent connection (#1003).
             h.wait_until(lambda: state_of(h, lab, "sleepy") == "suspended",
-                         timeout=60, interval=1, what="sleepy to report suspended")
+                         timeout=60, interval=0, what="sleepy to report suspended")
             row = next((l for l in h.vmlab("status", cwd=lab).out.splitlines()
                         if l.split()[:1] == ["sleepy"]), "")
             refused = sh(h, lab, "sleepy", "true", check=False, timeout=60)

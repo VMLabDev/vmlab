@@ -1794,6 +1794,10 @@ impl VmInstance {
         // A guest that slept between the resume and the subscribe.
         let mut now = *asleep.borrow_and_update();
         loop {
+            // The agent slot hears first: a connect that already passed the
+            // power-state check must not take the sleeping guest's silence
+            // for a dead connection (see `AgentSlot::note_sleep`).
+            self.agent.note_sleep(now).await;
             if now {
                 {
                     let mut st = self.state.write().await;

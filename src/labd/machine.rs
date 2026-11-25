@@ -1165,6 +1165,13 @@ pub(super) struct AgentSlot {
     /// How long a connect waits on a cached connection that missed its first
     /// ping ([`PING_GRACE`]; shorter in tests).
     grace: Duration,
+    /// Whether the guest is asleep (ACPI S3), as the machine's sleep watch
+    /// last said ([`note_sleep`](Self::note_sleep)). A sleeping guest answers
+    /// no ping, and its silence says nothing about its connection.
+    asleep: std::sync::atomic::AtomicBool,
+    /// Counts the guest's sleep transitions, so a ping or a handshake can
+    /// tell that the guest slept or woke while it was in flight.
+    sleep_changes: std::sync::atomic::AtomicU64,
 }
 
 impl Default for AgentSlot {
@@ -1178,6 +1185,8 @@ impl Default for AgentSlot {
             replacing: Arc::new(tokio::sync::Semaphore::new(1)),
             on_handshake: std::sync::Mutex::new(None),
             grace: PING_GRACE,
+            asleep: std::sync::atomic::AtomicBool::new(false),
+            sleep_changes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1188,6 +1197,9 @@ enum Checked<'a> {
     Live(AgentHandle),
     /// The cached connection is open but its agent has not answered yet; kept.
     Slow,
+    /// The cached connection is open and silent because the guest is asleep
+    /// (ACPI S3); kept, for the agent that answers on it after the wake.
+    Asleep,
     /// Nothing usable was cached, or the dead connection is gone now: the
     /// slot, locked, for the caller's handshake. It may hold a connection
     /// another caller made meanwhile.
@@ -1259,6 +1271,30 @@ impl AgentSlot {
             grace,
             ..Self::default()
         }
+    }
+
+    /// The guest went to sleep (ACPI S3) or woke, as the machine's sleep
+    /// watch saw it. While it sleeps a connect neither replaces a silent
+    /// connection nor records a failed handshake, and a wake forgets the
+    /// failure a connect recorded before the daemon knew of the sleep: the
+    /// agent that went silent is the one that answers after the wake, on the
+    /// connection it had, so the next connect must reach it at once.
+    pub async fn note_sleep(&self, asleep: bool) {
+        use std::sync::atomic::Ordering;
+        if self.asleep.swap(asleep, Ordering::SeqCst) != asleep {
+            self.sleep_changes.fetch_add(1, Ordering::SeqCst);
+        }
+        if !asleep {
+            *self.failed_at.lock().await = None;
+        }
+    }
+
+    fn asleep(&self) -> bool {
+        self.asleep.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn sleep_changes(&self) -> u64 {
+        self.sleep_changes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install what every fresh handshake runs from now on (see
@@ -1362,9 +1398,11 @@ impl AgentSlot {
         hint: &str,
         backoff: Backoff,
     ) -> Result<AgentHandle> {
+        let sleep_changes = self.sleep_changes();
         let mut agent = match self.check_cached(name, self.grace, false).await {
             Checked::Live(handle) => return Ok(handle),
             Checked::Slow => unreachable!("only probes report a slow connection"),
+            Checked::Asleep => return Err(suspended_error(name)),
             Checked::Empty(agent) => agent,
         };
         if let Some(handle) = agent.as_ref() {
@@ -1390,9 +1428,14 @@ impl AgentSlot {
                 self.handshook(&handle).await;
                 Ok(handle)
             }
+            // A handshake that ran into the guest's sleep says nothing
+            // about its agent: no backoff for the connects after the wake.
+            Err(_) if self.asleep() => Err(suspended_error(name)),
             Err(e) => {
                 tracing::warn!(machine = name, "agent: handshake failed: {e:#}");
-                *self.failed_at.lock().await = Some(std::time::Instant::now());
+                if self.sleep_changes() == sleep_changes {
+                    *self.failed_at.lock().await = Some(std::time::Instant::now());
+                }
                 Err(AgentUnavailable::Handshake {
                     machine: name.to_string(),
                     message: format!("{e:#} — {hint}"),
@@ -1419,7 +1462,7 @@ impl AgentSlot {
             Checked::Live(_) => return true,
             // Not now, but nothing a new connection would do better: keep its
             // sessions for when the agent catches up.
-            Checked::Slow => return false,
+            Checked::Slow | Checked::Asleep => return false,
             Checked::Empty(agent) => agent,
         };
         if agent.is_some() {
@@ -1454,6 +1497,7 @@ impl AgentSlot {
             let Some(handle) = self.handle.lock().await.clone() else {
                 break;
             };
+            let sleep_changes = self.sleep_changes();
             let verdict = cached_verdict(&handle, who, grace, keep_slow).await;
             let mut agent = self.handle.lock().await;
             if !agent.as_ref().is_some_and(|h| h.same_connection(&handle)) {
@@ -1462,6 +1506,21 @@ impl AgentSlot {
             match verdict {
                 Cached::Reuse => return Checked::Live(handle),
                 Cached::Slow => return Checked::Slow,
+                // The guest went to sleep under the ping (a caller checks
+                // the power state before it connects, and the guest freezes
+                // before the daemon hears of it). Its agent answers on this
+                // connection after the wake, with its sessions.
+                Cached::Gone if handle.is_open() && self.asleep() => {
+                    tracing::info!(
+                        agent = who,
+                        "agent: silent because the guest is asleep; kept the connection"
+                    );
+                    return Checked::Asleep;
+                }
+                // It slept and woke under the ping: ask the woken guest.
+                Cached::Gone if handle.is_open() && self.sleep_changes() != sleep_changes => {
+                    continue;
+                }
                 Cached::Gone => {
                     if let Some(dead) = agent.take() {
                         dead.shutdown().await;
@@ -1912,6 +1971,108 @@ mod tests {
             "the silent connection was kept"
         );
         assert!(!first.is_open() && second.is_open());
+    }
+
+    /// **A guest that goes to sleep under a ping keeps its connection**
+    /// (#1003). A connect checks the power state before it pings, and the
+    /// guest freezes before the daemon hears of the suspend, so the ping of
+    /// the cached connection goes unanswered past the grace. The connection
+    /// is neither shut down nor replaced, the connect says the guest is
+    /// suspended, and after the wake the next connect gets the same
+    /// connection at once.
+    #[tokio::test]
+    async fn a_connect_keeps_the_connection_of_a_guest_that_went_to_sleep() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The two pings of the racing connect (2 s, then the grace) are
+        // never answered; the ping after the wake is.
+        let (_dir, sock, accepted) = slow_agent(
+            2,
+            Duration::from_secs(600),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let slot = Arc::new(AgentSlot::with_grace(Duration::from_secs(1)));
+        let first = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .expect("first connect");
+        let watch = Arc::clone(&slot);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            watch.note_sleep(true).await;
+        });
+        let err = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .err()
+            .expect("the guest is asleep");
+        assert!(
+            format!("{err:#}").contains("is suspended"),
+            "not the suspended refusal: {err:#}"
+        );
+        assert!(first.is_open(), "the sleeping guest's connection was cut");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert!(
+            slot.failed_at.lock().await.is_none(),
+            "a sleeping guest left a handshake backoff behind"
+        );
+
+        slot.note_sleep(false).await;
+        let started = std::time::Instant::now();
+        let again = slot
+            .connect("m1", &sock, "hint")
+            .await
+            .expect("the woken guest answers");
+        assert!(again.same_connection(&first));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the woken guest's connection was replaced"
+        );
+    }
+
+    /// **A wake ends the failed-handshake backoff** (#1003). A handshake
+    /// that failed just before the daemon heard of the suspend answers every
+    /// connect for 30 s without dialling; a guest that woke meanwhile is
+    /// dialled at once. A handshake that fails while the guest is known to
+    /// be asleep records no failure at all.
+    #[tokio::test]
+    async fn a_wake_forgets_the_handshake_that_failed_into_the_sleep() {
+        use std::sync::atomic::AtomicBool;
+        let (dir, sock, _accepted) =
+            slow_agent(0, Duration::ZERO, Arc::new(AtomicBool::new(false))).await;
+        let nobody = dir.path().join("nobody.sock");
+        let slot = AgentSlot::default();
+        slot.connect("m1", &nobody, "hint")
+            .await
+            .err()
+            .expect("nothing listens");
+        let started = std::time::Instant::now();
+        slot.connect("m1", &sock, "hint")
+            .await
+            .err()
+            .expect("the backoff answers without dialling");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        slot.note_sleep(true).await;
+        slot.note_sleep(false).await;
+        slot.connect("m1", &sock, "hint")
+            .await
+            .expect("the woken guest is dialled at once");
+
+        let slot = AgentSlot::default();
+        slot.note_sleep(true).await;
+        let err = slot
+            .connect("m1", &nobody, "hint")
+            .await
+            .err()
+            .expect("nothing listens");
+        assert!(
+            format!("{err:#}").contains("is suspended"),
+            "not the suspended refusal: {err:#}"
+        );
+        assert!(slot.failed_at.lock().await.is_none());
     }
 
     #[tokio::test(start_paused = true)]
