@@ -1452,7 +1452,9 @@ async fn an_interrupted_offline_restore_leaves_no_recovery_snapshot() {
     std::fs::remove_file(&disk).unwrap();
     qimg::create_blank(&disk, 1 << 20).await.unwrap();
     qimg::snapshot_create(&disk, "capture").await.unwrap();
-    qimg::snapshot_create(&disk, "vmlab-restore-0").await.unwrap();
+    qimg::snapshot_create(&disk, "vmlab-restore-0")
+        .await
+        .unwrap();
     // Stop after creating the recovery snapshot, as if the daemon died.
     super::vm::snapshot_offline_disks(std::slice::from_ref(&disk), "vmlab-restore-:0")
         .await
