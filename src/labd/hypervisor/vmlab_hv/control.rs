@@ -447,15 +447,30 @@ struct HvSnapshots(Arc<Mutex<Client>>);
 
 #[async_trait::async_trait]
 impl Snapshots for HvSnapshots {
+    /// vmlab-hv answers `snapshot_save` with `unsupported` for what it
+    /// refuses before it stops the guest, and for a capture that failed that
+    /// way and that it undid in full; a capture whose undo failed is
+    /// `internal` (`vmlab-hv-vmm`'s `snapshot::save`).
     async fn save(&self, name: &str, _vmstate: &str, _devices: &[&str]) -> Result<()> {
-        call(
-            &self.0,
-            Command::SnapshotSave {
-                name: name.to_string(),
-            },
-        )
-        .await
-        .map(drop)
+        let command = Command::SnapshotSave {
+            name: name.to_string(),
+        };
+        let what = command_name(&command);
+        let outcome = send(&self.0, command).await?;
+        let nothing_written = matches!(
+            &outcome,
+            Outcome::Error {
+                code: ErrorCode::Unsupported,
+                ..
+            }
+        );
+        refused(&what, outcome).map(drop).map_err(|error| {
+            if nothing_written {
+                super::super::SaveRefused(format!("{error:#}")).into()
+            } else {
+                error
+            }
+        })
     }
 
     async fn load(&self, name: &str, _vmstate: &str, _devices: &[&str]) -> Result<()> {

@@ -1201,7 +1201,7 @@ impl ContainerInstance {
                 snapshots
                     .save(name, "scratch", &["scratch"])
                     .await
-                    .map_err(Attempted)?;
+                    .map_err(super::machine::SnapshotCaptureError::of_save)?;
                 Ok(true)
             }
             PowerState::Stopped => {
@@ -1279,13 +1279,29 @@ impl ContainerInstance {
     /// Apply an offline snapshot: power off if needed, revert the scratch
     /// disk, stay off (PRD §7.3 restore semantics). The stop sets
     /// `stop_requested`, so the exit is classified as requested.
+    ///
+    /// A restore that cannot be done leaves a running container running, so
+    /// the scratch disk is asked for the snapshot before the stop, as a VM's
+    /// disks are.
     async fn restore_offline(&self, name: &str) -> Result<()> {
         let guard = super::machine::snapshot_guard(&self.snapshot_gate, &self.cfg.name)?;
+        let scratch = self.dirs.scratch_disk();
+        if !scratch.exists() {
+            bail!(
+                "{}: no scratch disk to restore {name:?} on — the container has never started",
+                self.cfg.name
+            );
+        }
+        let info = crate::template::qimg::image_info(&scratch)
+            .await
+            .with_context(|| format!("checking {} for snapshot {name:?}", scratch.display()))?;
+        if !info.snapshots.iter().any(|snapshot| snapshot.name == name) {
+            bail!("{}: snapshot {name:?} is missing", scratch.display());
+        }
         if self.power_state().await != PowerState::Stopped {
             self.stop_ladder(false).await?;
             self.settle_stopped(Duration::from_secs(60)).await?;
         }
-        let scratch = self.dirs.scratch_disk();
         let name = name.to_owned();
         super::machine::finish_offline_snapshot(guard, async move {
             crate::template::qimg::snapshot_apply(&scratch, &name).await?;

@@ -199,6 +199,10 @@ pub struct Script {
     /// — so the lifecycle tests run against that adapter's protocol handling
     /// rather than the in-memory [`Control`].
     pub vmlab_hv: bool,
+    /// The vmlab-hv control server answers `snapshot_save` with
+    /// `unsupported` and this message, as vmlab-hv refuses a save before it
+    /// stops the guest. Read only with `vmlab_hv`.
+    pub snapshot_save_refused: Option<String>,
 }
 
 /// Which capabilities a running fake machine reports. Each one off is a
@@ -884,6 +888,7 @@ fn serve_vmlab_hv(
     let m = machine.clone();
     let (ignores_powerdown, ignores_quit) = (run.ignores_powerdown, run.ignores_quit);
     let tx = std::sync::Mutex::new(power_off.clone());
+    let save_refused = script.snapshot_save_refused.clone();
     // S3, as vmlab-hv reports it: `suspend` as the guest sleeps, and a
     // `resume` while it is asleep wakes it with `wakeup`.
     let (wake, woken) = std::sync::mpsc::channel::<Event>();
@@ -913,6 +918,10 @@ fn serve_vmlab_hv(
                 }
                 ok
             }
+            Command::SnapshotSave { .. } if save_refused.is_some() => Outcome::Error {
+                code: ErrorCode::Unsupported,
+                message: save_refused.clone().unwrap_or_default(),
+            },
             Command::SnapshotSave { name } => {
                 snapshots.insert(name);
                 ok

@@ -35,6 +35,28 @@ pub async fn disk_facts(path: &Path) -> Result<Option<DiskFacts>> {
     }))
 }
 
+/// A machine's [`POINT_STATE`](super::plan::POINT_STATE) for a freeze-point
+/// restore: what its directory `local_dir` holds now and what the freeze its
+/// `disks` back onto copied. An entry neither side holds is left out, so a
+/// BIOS VM and a container yield nothing.
+pub fn firmware_facts(local_dir: &Path, disks: &[DiskFacts]) -> Vec<super::plan::FirmwareFacts> {
+    let frozen_dir = super::plan::frozen_dir(disks);
+    super::plan::POINT_STATE
+        .iter()
+        .map(|name| {
+            let live = local_dir.join(name);
+            super::plan::FirmwareFacts {
+                live_exists: live.symlink_metadata().is_ok(),
+                live,
+                frozen: frozen_dir
+                    .map(|dir| dir.join(name))
+                    .filter(|path| path.symlink_metadata().is_ok()),
+            }
+        })
+        .filter(|f| f.live_exists || f.frozen.is_some())
+        .collect()
+}
+
 /// The longest backing chain followed. Real chains are a handful of files;
 /// this only stops a loop.
 const MAX_CHAIN: usize = 64;

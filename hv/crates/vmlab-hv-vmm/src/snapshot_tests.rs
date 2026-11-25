@@ -590,6 +590,37 @@ fn delete_removes_and_missing_snapshots_error() {
     assert!(err.is_not_found(), "{err}");
 }
 
+/// A disk attached after the capture never held the snapshot. The delete
+/// removes it where it is and says so, as the offline delete does. Needs no
+/// KVM: the delete is a walk over the disks.
+#[test]
+fn a_delete_skips_a_disk_that_lacks_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let disks: Vec<DiskNode> = ["first", "second"]
+        .into_iter()
+        .map(|id| {
+            let path = dir.path().join(format!("{id}.qcow2"));
+            vmlab_disk::ops::create_qcow2(&path, 1024 * 1024, None, None).unwrap();
+            let image: crate::factory::SharedImage = Arc::new(PlMutex::new(
+                vmlab_disk::open(&path, vmlab_disk::Format::Qcow2, false).unwrap(),
+            ));
+            DiskNode {
+                id: id.into(),
+                writable: true,
+                vmstate: id == "first",
+                image,
+            }
+        })
+        .collect();
+    disks[0].image.lock().snapshot_create("s", 0, 0).unwrap();
+
+    snapshot::delete_from(&disks, "s").expect("the delete was done on the disk that held it");
+    assert!(disks[0].image.lock().snapshots().unwrap().is_empty());
+
+    let err = snapshot::delete_from(&disks, "s").expect_err("no disk holds it now");
+    assert!(err.is_not_found(), "{err}");
+}
+
 #[test]
 #[cfg_attr(vmlab_ci_no_kvm, ignore = "requires KVM and/or local guest assets")]
 fn a_failed_save_leaves_no_snapshot_and_no_vmstate() {
