@@ -413,7 +413,10 @@ async fn until_cancelled<F: std::future::Future>(
 
 /// Fail `up` with `first` (§7.2): abort the machines still starting, cancel
 /// every step still running and wait for each to stop, then report the first
-/// real failure — never a cancellation it caused.
+/// real failure — never a cancellation it caused. A start that is under way
+/// is abandoned and not dropped: it runs to its end and stops its machine
+/// again, under the machine's start lock
+/// ([`finish_start`](super::machine::finish_start)).
 async fn abandon_up<T: 'static>(
     first: anyhow::Error,
     mut starting: tokio::task::JoinSet<Result<T>>,
@@ -1600,11 +1603,38 @@ impl LabRuntime {
         // machine's start lock, so a stop is not either. A stop that comes
         // meanwhile makes the ticket stale.
         self.ensure_pulled(&[name.to_string()], None).await?;
-        // Held until the machine has started: a stop that arrives now waits
-        // and then has an emulator to stop.
-        let _admitted = self.starts.admit(name, ticket).await?;
-        let _gate = self.rebuild_gate.read().await;
-        self.machine(name)?.start(self.services(), output).await
+        // The start itself runs to its end whatever becomes of this caller:
+        // dropped part-way it would leave the machine `Starting` and a
+        // hypervisor nothing owns. An `up` that gives up on its wave, or a
+        // caller that goes away, abandons it instead, and what it started is
+        // then stopped again.
+        let me = Arc::clone(self);
+        let name = name.to_string();
+        let output = output.cloned();
+        super::machine::finish_start(move |abandoned| async move {
+            // Held until the machine has started, and until an abandoned
+            // start has stopped it again: a stop that arrives now waits and
+            // then has an emulator to stop.
+            let _admitted = me.starts.admit(&name, ticket).await?;
+            if abandoned.get() {
+                bail!("the start of \"{name}\" was abandoned, and it was not started");
+            }
+            let _gate = me.rebuild_gate.read().await;
+            let m = me.machine(&name)?;
+            // A start of a machine that is already up starts nothing, so
+            // there is nothing of this start's to stop.
+            let was_stopped = m.state().await == PowerState::Stopped;
+            let started = Arc::clone(&m).start(me.services(), output.as_ref()).await;
+            if started.is_ok() && was_stopped && abandoned.get() {
+                tracing::info!("{name}: its start was abandoned, stopping it");
+                if let Err(e) = m.stop(true).await {
+                    tracing::warn!("{name}: stopping it after an abandoned start: {e:#}");
+                }
+                wait_settled(&*m).await;
+            }
+            started
+        })
+        .await
     }
 
     /// Set NOCOW on `name`'s disk directory when it is on btrfs, before the
@@ -1745,10 +1775,31 @@ impl LabRuntime {
     /// Stop one machine, finalising its recording first (D6: unlike the
     /// workspace syncer, a recording ends with the machine it shows).
     pub async fn stop_machine(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
-        let m = self.machine(name)?;
+        self.machine(name)?;
+        // Marked before anything else, as `down` does: a start asked for
+        // before this stop boots nothing after it.
+        self.starts.stop_requested([name]);
         self.stop_mounting(name);
         self.record_finalise_machine(name, "machine stopped").await;
-        m.stop(force).await
+        self.stop_behind_starts(name, force).await
+    }
+
+    /// Stop `name` alone, leaving what rides on it (wscript's `stop()`). No
+    /// start of it crosses this stop: one asked for earlier is stale from
+    /// here on, and one under way finishes first, so that there is an
+    /// emulator to stop.
+    pub async fn stop_machine_alone(self: &Arc<Self>, name: &str, force: bool) -> Result<()> {
+        self.machine(name)?;
+        self.starts.stop_requested([name]);
+        self.stop_behind_starts(name, force).await
+    }
+
+    /// The stop of a machine whose earlier starts are already stale: wait
+    /// for a start of it that is under way, then stop the instance that
+    /// start made, which may have rebuilt the machine (§7.1).
+    async fn stop_behind_starts(&self, name: &str, force: bool) -> Result<()> {
+        drop(self.starts.hold(name).await);
+        self.machine(name)?.stop(force).await
     }
 
     /// End `name`'s share-mount task, if one is still running (§7.5). The
@@ -2172,12 +2223,20 @@ impl LabRuntime {
         force: bool,
         output: &crate::scripting::OutputSink,
     ) -> Result<()> {
-        let m = self.machine(name)?;
-        m.stop(force).await?;
-        m.wait_state(PowerState::Stopped, Duration::from_secs(60))
+        self.machine(name)?;
+        // The restart's own stop makes the earlier starts stale, and its
+        // start is asked for here, before that stop and not after it: a
+        // `down` that runs to its end while the machine stops is later than
+        // this ticket, and the restart then boots nothing behind it.
+        self.starts.stop_requested([name]);
+        let ticket = self.starts.ticket()?;
+        self.stop_behind_starts(name, force).await?;
+        self.machine(name)?
+            .wait_state(PowerState::Stopped, Duration::from_secs(60))
             .await
             .map_err(|_| anyhow!("{name} did not stop for restart"))?;
-        self.start_machine_with_output(name, Some(output)).await?;
+        self.start_machine_at(name, Some(output), ticket).await?;
+        self.ensure_workspace(name, Some(output)).await;
         self.run_owed_first_boot(name, output).await
     }
 

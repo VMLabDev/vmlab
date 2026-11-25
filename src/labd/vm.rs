@@ -1399,7 +1399,19 @@ impl VmInstance {
         before_ready: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         before_resume: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
-        Box::pin(async move { self.boot_inner(hooks, before_ready, before_resume).await })
+        // In a task of its own (F17 of the second lab-lifecycle review): a
+        // caller that is dropped part-way would otherwise leave `Starting`
+        // set, and a hypervisor and helpers that nothing owns. The boot runs
+        // to its end instead, and an abandoned one is stopped again.
+        Box::pin(super::machine::finish_start(move |abandoned| async move {
+            self.boot_inner(hooks, before_ready, before_resume).await?;
+            if abandoned.get() {
+                tracing::info!("{}: its start was abandoned, stopping it", self.cfg.name);
+                self.stop_ladder(true).await?;
+                bail!("{}: its start was abandoned", self.cfg.name);
+            }
+            Ok(())
+        }))
     }
 
     fn check_apple_smc_osk(&self) -> Result<()> {
