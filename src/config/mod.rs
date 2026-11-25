@@ -177,7 +177,7 @@ fn secret_fields<'a>(block: &wcl_lang::Block<'a>, out: &mut Vec<(&'a str, model:
     if secret && let Some(span) = r.field_span("value") {
         out.push(("value", span));
     }
-    for child in r.children() {
+    for child in block.blocks() {
         secret_fields(&child, out);
     }
 }
