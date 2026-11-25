@@ -151,8 +151,8 @@ async fn run_async() -> Result<()> {
     // one time and outlives every lab, so it would serve the global segments
     // without the file's PSK, DNS suffix and upstream resolver until it is
     // restarted, whatever the user corrects in between.
-    let host_cfg = crate::config::host::HostConfig::load_default()
-        .context("the host config is unreadable")?;
+    let host_cfg =
+        crate::config::host::HostConfig::load_default().context("the host config is unreadable")?;
     // Select the network fast-path tier (PRD §9.1) before any switch exists —
     // the global segments this daemon hosts pick it up from here.
     crate::net::fastpath::init(host_cfg.fastpath);

@@ -1121,13 +1121,19 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
     /// that does not load is said, with the mistake. Never silent.
     #[test]
     fn an_unreadable_host_config_is_said_where_the_defaults_are_used() {
-        let unreadable =
-            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "c.wcl");
+        let unreadable = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n",
+            "c.wcl",
+        );
         let mut said = Vec::new();
         let cfg = HostConfig::or_warn(unreadable, |w| said.push(w));
         assert_eq!(cfg.trunk_port, HostConfig::default().trunk_port);
         assert_eq!(said.len(), 1);
-        assert!(said[0].starts_with("warning: the host config is unreadable"), "{}", said[0]);
+        assert!(
+            said[0].starts_with("warning: the host config is unreadable"),
+            "{}",
+            said[0]
+        );
         assert!(said[0].contains("trunk_port"), "{}", said[0]);
 
         let mut said = Vec::new();
@@ -1139,8 +1145,10 @@ gpu "Nvidia2" { address = "0000:05:00.0"  keepawake = "off" }
     /// a `gpu {}` or an Apple SMC.
     #[test]
     fn validation_refuses_an_unreadable_host_config() {
-        let unreadable =
-            HostConfig::parse("import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n", "c.wcl");
+        let unreadable = HostConfig::parse(
+            "import <vmlab-host.wcl>\nhost { trunk_port = 0 }\n",
+            "c.wcl",
+        );
         let error = crate::cli::validate::host_config(unreadable).unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("the host config is unreadable"), "{text}");
