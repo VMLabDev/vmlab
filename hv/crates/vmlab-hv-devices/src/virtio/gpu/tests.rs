@@ -1051,10 +1051,7 @@ fn ctx_create(ctx: u32) -> Vec<u8> {
 
 /// A device whose slow part of a context create waits for a word from the
 /// test, and answers with it.
-fn slow_fixture() -> (
-    QueueFixture,
-    std::sync::mpsc::Sender<Result<(u32, Vec<u8>), u32>>,
-) {
+fn slow_fixture() -> (QueueFixture, std::sync::mpsc::Sender<Answer>) {
     let f = QueueFixture::new(FEATURES);
     let (answer, answers) = std::sync::mpsc::channel();
     let answers = parking_lot::Mutex::new(answers);

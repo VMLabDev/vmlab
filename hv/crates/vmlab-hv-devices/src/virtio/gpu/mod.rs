@@ -226,7 +226,7 @@ struct State {
     deferred: Option<Arc<Flight>>,
     /// Stands in for the renderer's part of a slow command.
     #[cfg(test)]
-    slow: Option<Arc<dyn Fn(&[u8]) -> Result<(u32, Vec<u8>), u32> + Send + Sync>>,
+    slow: Option<SlowHook>,
 }
 
 /// `VIRTIO_GPU_CMD_CTX_CREATE`.
@@ -257,8 +257,12 @@ struct Deferred {
     flight: Arc<Flight>,
 }
 
+/// The answer of a command: the response type and its payload, or the error.
+type Answer = Result<(u32, Vec<u8>), u32>;
 /// What the renderer answered, and the render workers that run now.
-type Slow = (Result<(u32, Vec<u8>), u32>, Vec<(u32, u64)>);
+type Slow = (Answer, Vec<(u32, u64)>);
+#[cfg(test)]
+type SlowHook = Arc<dyn Fn(&[u8]) -> Answer + Send + Sync>;
 type SlowPart = Box<dyn FnOnce() -> Slow + Send>;
 
 impl Deferred {
