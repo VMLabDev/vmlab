@@ -602,7 +602,7 @@ fn bits_mask(bytes: u8) -> u128 {
 }
 
 impl Compiled {
-    #[inline]
+    #[inline(always)]
     fn pure(code: &[Packed], values: &mut [u128]) -> Result<(), Halt> {
         for packed in code {
             let Some(value) = packed.evaluate(values) else {
@@ -684,25 +684,21 @@ impl Compiled {
         Ok(())
     }
 
-    /// Run the block. The count of instructions that completed, and why the
-    /// block left before its end when it did.
-    #[inline]
-    fn run<M: Memory>(
+    /// Run the effects of the block, each after the pure code before it.
+    /// `Ok`: the count of `code` entries that have run. `Err`: the block
+    /// left before its end.
+    #[inline(never)]
+    fn effects<M: Memory>(
         &mut self,
         state: &mut State,
         memory: &mut M,
         side: &mut Side,
-    ) -> (u32, Option<Halt>) {
-        for (scratch, register) in &self.inputs {
-            self.values[*scratch as usize] = state.slots[*register as usize];
-        }
+    ) -> Result<usize, (u32, Halt)> {
         let mut done = 0usize;
         for index in 0..self.effects.len() {
             let (before, effect) = self.effects[index];
             let before = before as usize;
-            if let Err(halt) = Self::pure(&self.code[done..before], &mut self.values) {
-                return (0, Some(halt));
-            }
+            Self::pure(&self.code[done..before], &mut self.values).map_err(|halt| (0, halt))?;
             done = before;
             if let Err((exit, failed)) = self.effect(effect, memory, side) {
                 let leave = self.leave(state, exit);
@@ -725,9 +721,33 @@ impl Compiled {
                     }
                     Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
                 };
-                return (leave.completed, Some(halt));
+                return Err((leave.completed, halt));
             }
         }
+        Ok(done)
+    }
+
+    /// Run the block. The count of instructions that completed, and why the
+    /// block left before its end when it did.
+    #[inline]
+    fn run<M: Memory>(
+        &mut self,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+    ) -> (u32, Option<Halt>) {
+        for (scratch, register) in &self.inputs {
+            self.values[*scratch as usize] = state.slots[*register as usize];
+        }
+        // A block without memory events is its pure code and nothing else.
+        let done = if self.effects.is_empty() {
+            0
+        } else {
+            match self.effects(state, memory, side) {
+                Ok(done) => done,
+                Err((completed, halt)) => return (completed, Some(halt)),
+            }
+        };
         if let Err(halt) = Self::pure(&self.code[done..], &mut self.values) {
             return (0, Some(halt));
         }
