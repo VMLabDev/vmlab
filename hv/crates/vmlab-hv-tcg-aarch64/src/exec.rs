@@ -430,7 +430,7 @@ impl Side {
             return true;
         }
         self.mmu
-            .page(memory, va)
+            .page(memory, va, Kind::Read)
             .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
     }
 
@@ -1673,7 +1673,7 @@ impl<M: Memory> Cpu<M> {
             // AT S1E1R, S1E1W, S1E0R and S1E0W: the result is in PAR_EL1.
             (0, 7, 8, op2 @ 0..=3) if !el0 => {
                 let kind = if op2 & 1 == 0 { Kind::Read } else { Kind::Write };
-                let par = match self.side.mmu.walk(&mut self.memory, value) {
+                let par = match self.side.mmu.walk(&mut self.memory, value, false) {
                     Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
                         mmu::par_of(&page)
                     }
@@ -1802,7 +1802,11 @@ impl<M: Memory> Cpu<M> {
     fn code_address(&mut self) -> Result<u64, Refused> {
         let pc = self.state.pc();
         let need = mmu::needed(Kind::Execute, self.state.context.el == 0);
+        // An entry of the TLB is kept under the address with its tag, and
+        // a PC with a tag may have another translation than a data address
+        // with that tag: the slow path decides.
         if pc & 3 == 0
+            && mmu::canonical(pc)
             && let Some((phys, _)) = self.side.mmu.hit(pc, 4, need)
         {
             return Ok(phys);

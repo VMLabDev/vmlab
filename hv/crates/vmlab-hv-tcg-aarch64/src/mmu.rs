@@ -214,11 +214,26 @@ impl Controls {
         ips.min(self.pa_bits)
     }
 
+    /// TBI0 and TBI1 as they hold for an instruction address: without the
+    /// halves that TCR.TBID0 and TBID1 (the bits 51 and 52) take out. Those
+    /// two bits belong to pointer authentication, which this CPU does not
+    /// have, and QEMU's `cortex-a53` acts on them all the same: the lockstep
+    /// found a branch that kept its tag. We follow QEMU (DESIGN.md P2, U1).
+    pub fn tbi_of_instructions(&self) -> u8 {
+        tbi_of_instructions(self.tcr)
+    }
+
     /// `va` without the bits that the regime ignores: with TCR.TBI of its
-    /// half set, the top byte is the bit 55 repeated.
-    pub fn untagged(&self, va: u64) -> u64 {
+    /// half set, the top byte is the bit 55 repeated. `execute`: `va` is an
+    /// instruction address.
+    pub fn untagged(&self, va: u64, execute: bool) -> u64 {
         let upper = va & (1 << 55) != 0;
-        if self.tbi() & (1 << u8::from(upper)) == 0 {
+        let tbi = if execute {
+            self.tbi_of_instructions()
+        } else {
+            self.tbi()
+        };
+        if tbi & (1 << u8::from(upper)) == 0 {
             va
         } else if upper {
             va | 0xff << 56
@@ -258,6 +273,11 @@ impl Controls {
             .find(|other| self.granules & (1 << other) != 0)
             .unwrap_or(12)
     }
+}
+
+/// TBI0 and TBI1 of a TCR as they hold for an instruction address.
+pub fn tbi_of_instructions(tcr: u64) -> u8 {
+    (tcr >> 37) as u8 & 3 & !((tcr >> 51) as u8 & 3)
 }
 
 struct Half {
@@ -463,6 +483,12 @@ pub fn par_fault(fault: Fault) -> u64 {
     1 | u64::from(fault.status() & 0x3f) << 1 | 1 << 11
 }
 
+/// Whether the top byte of `va` is its bit 55 repeated.
+#[inline(always)]
+pub fn canonical(va: u64) -> bool {
+    ((va as i64) << 8 >> 8) as u64 == va
+}
+
 /// Why `Mmu::translate` gives no address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Miss {
@@ -559,8 +585,21 @@ impl Mmu {
 
     /// The translation of the page of `va`, from the TLB or from a walk,
     /// without a permission check. A walk that succeeds fills the TLB.
-    pub fn page<M: Memory>(&mut self, memory: &mut M, va: u64) -> Result<Translation, Miss> {
-        if let Some(entry) = self.tlbs[0].lookup(va >> PAGE_BITS, self.asid) {
+    /// `kind` says whether `va` is an instruction address.
+    pub fn page<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        kind: Kind,
+    ) -> Result<Translation, Miss> {
+        // An entry is kept under the address with its tag. An instruction
+        // address may keep a tag that a data address loses: then the entry
+        // of the data address is not its translation.
+        let execute = kind == Kind::Execute;
+        let tagged = execute && !canonical(va) && self.controls.untagged(va, true) == va;
+        if !tagged
+            && let Some(entry) = self.tlbs[0].lookup(va >> PAGE_BITS, self.asid)
+        {
             // The entry keeps what an access needs, not the attributes of an
             // address translation instruction: those walk again.
             return Ok(Translation {
@@ -573,7 +612,7 @@ impl Mmu {
                 shareability: 0,
             });
         }
-        let translation = self.walk(memory, va)?;
+        let translation = self.walk(memory, va, execute)?;
         self.tlbs[0].insert(Entry {
             page: va >> PAGE_BITS,
             phys: translation.page,
@@ -598,12 +637,18 @@ impl Mmu {
             seen.push((address, value));
             Some(value)
         };
-        let page = walk(&self.controls, self.controls.untagged(va), &mut read);
+        let page = walk(&self.controls, self.controls.untagged(va, false), &mut read);
         (seen, page.ok().map(|page| page.page | (va & 0xfff)))
     }
 
-    /// Walk the tables for `va` and keep nothing.
-    pub fn walk<M: Memory>(&self, memory: &mut M, va: u64) -> Result<Translation, Miss> {
+    /// Walk the tables for `va` and keep nothing. `execute`: `va` is an
+    /// instruction address.
+    pub fn walk<M: Memory>(
+        &self,
+        memory: &mut M,
+        va: u64,
+        execute: bool,
+    ) -> Result<Translation, Miss> {
         let mut host = None;
         let mut read = |address: u64| {
             let mut bytes = [0u8; 8];
@@ -616,7 +661,7 @@ impl Mmu {
                 }
             }
         };
-        let result = walk(&self.controls, self.controls.untagged(va), &mut read);
+        let result = walk(&self.controls, self.controls.untagged(va, execute), &mut read);
         match host {
             Some(message) => Err(Miss::Host(message)),
             None => result.map_err(Miss::Fault),
@@ -632,7 +677,7 @@ impl Mmu {
         kind: Kind,
         user: bool,
     ) -> Result<(u64, u8), Miss> {
-        let translation = self.page(memory, va)?;
+        let translation = self.page(memory, va, kind)?;
         if translation.flags & needed(kind, user) == 0 {
             return Err(Miss::Fault(fault(FaultKind::Permission, translation.level)));
         }
