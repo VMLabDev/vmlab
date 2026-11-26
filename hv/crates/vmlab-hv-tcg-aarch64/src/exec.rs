@@ -226,6 +226,56 @@ fn compile(
     Ok(compiled)
 }
 
+/// Run the packed instructions of a block that has helper calls, each call
+/// at its place.
+fn run_with_calls(
+    code: &[Packed],
+    calls: &[Call],
+    values: &mut [u128],
+    state: &mut State,
+) -> Result<(), Stop> {
+    let mut from = 0;
+    let ends = calls
+        .iter()
+        .map(|call| (call.at as usize, Some(call)))
+        .chain([(code.len(), None)]);
+    for (until, call) in ends {
+        for packed in &code[from..until] {
+            let Some(value) = packed.evaluate(values) else {
+                return Err(host("an arithmetic operation outside its domain"));
+            };
+            values[packed.output as usize] = value;
+        }
+        from = until;
+        let Some(call) = call else {
+            break;
+        };
+        let mut args = [0u128; CALL_ARGUMENTS];
+        for (arg, slot) in args.iter_mut().zip(&call.args) {
+            *arg = values[*slot as usize];
+        }
+        let args = &args[..call.args.len()];
+        match call.function {
+            HelperFn::Pure(function) => {
+                let (slot, mask) = call.results[0];
+                values[slot as usize] = function(args) & mask;
+            }
+            // An ordered helper sees the state as it was at the entry of the
+            // block for every register slot: the slots are written back at
+            // the exit. What it may touch is the state that is not in a slot.
+            HelperFn::Ordered(function) => {
+                let mut results = [0u128; CALL_ARGUMENTS];
+                let count = call.results.len().min(CALL_ARGUMENTS);
+                function(&mut *state, args, &mut results[..count]);
+                for ((slot, mask), result) in call.results.iter().zip(results) {
+                    values[*slot as usize] = result & mask;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Compiled {
     #[inline]
     fn run(&mut self, state: &mut State) -> Result<(), Stop> {
@@ -233,47 +283,15 @@ impl Compiled {
         for (scratch, register) in &self.inputs {
             values[*scratch as usize] = state.slots[*register as usize];
         }
-        // A block without a helper call is the one run of packed
-        // instructions after this loop.
-        let mut from = 0;
-        for call in &self.calls {
-            let until = call.at as usize;
-            for packed in &self.code[from..until] {
+        if self.calls.is_empty() {
+            for packed in &self.code {
                 let Some(value) = packed.evaluate(values) else {
                     return Err(host("an arithmetic operation outside its domain"));
                 };
                 values[packed.output as usize] = value;
             }
-            from = until;
-            let mut args = [0u128; CALL_ARGUMENTS];
-            for (arg, slot) in args.iter_mut().zip(&call.args) {
-                *arg = values[*slot as usize];
-            }
-            let args = &args[..call.args.len()];
-            match call.function {
-                HelperFn::Pure(function) => {
-                    let (slot, mask) = call.results[0];
-                    values[slot as usize] = function(args) & mask;
-                }
-                // An ordered helper sees the state as it was at the entry of
-                // the block for every register slot: the slots are written
-                // back at the exit. What it may touch is the state that is
-                // not in a slot.
-                HelperFn::Ordered(function) => {
-                    let mut results = [0u128; CALL_ARGUMENTS];
-                    let count = call.results.len().min(CALL_ARGUMENTS);
-                    function(&mut *state, args, &mut results[..count]);
-                    for ((slot, mask), result) in call.results.iter().zip(results) {
-                        values[*slot as usize] = result & mask;
-                    }
-                }
-            }
-        }
-        for packed in &self.code[from..] {
-            let Some(value) = packed.evaluate(values) else {
-                return Err(host("an arithmetic operation outside its domain"));
-            };
-            values[packed.output as usize] = value;
+        } else {
+            run_with_calls(&self.code, &self.calls, values, state)?;
         }
         for (register, scratch) in &self.outputs {
             state.slots[*register as usize] = values[*scratch as usize];
