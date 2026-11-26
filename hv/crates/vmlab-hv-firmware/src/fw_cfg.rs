@@ -320,6 +320,46 @@ impl BusDevice for FwCfg {
     }
 }
 
+/// The size of the register block of [`FwCfgMmio`].
+pub const MMIO_SIZE: u64 = 0x18;
+
+/// fw_cfg as a memory-mapped device, as the aarch64 `virt` machine has it:
+/// the data register at 0 (a read of any width takes that many bytes of the
+/// item), the selector at 8 and the DMA address at 16, both big-endian.
+pub struct FwCfgMmio(pub FwCfg);
+
+impl FwCfgMmio {
+    /// Put the item stream back to where a reset leaves it.
+    pub fn rewind(&mut self) {
+        self.0.select(0);
+        self.0.state.dma_address = 0;
+    }
+}
+
+impl BusDevice for FwCfgMmio {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        data.fill(0);
+        let len = data.len() as u64;
+        if offset.checked_add(len).is_some_and(|end| end <= 8) {
+            self.0.stream_read(data);
+        } else if offset >= 16 && offset.checked_add(len).is_some_and(|end| end <= 24) {
+            // A read of the DMA register gives the signature.
+            let signature = b"QEMU CFG";
+            let at = offset as usize - 16;
+            data.copy_from_slice(&signature[at..at + data.len()]);
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        match (offset, data.len()) {
+            (8, 2) => self.0.select(u16::from_be_bytes(data.try_into().unwrap())),
+            // The DMA register sits at 4 of the port block: 16 here.
+            (16, 8) | (16, 4) | (20, 4) => self.0.write(offset - 12, data),
+            _ => {}
+        }
+    }
+}
+
 impl Snapshot for FwCfg {
     fn state_id(&self) -> String {
         "fw-cfg".into()

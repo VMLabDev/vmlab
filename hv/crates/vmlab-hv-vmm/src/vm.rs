@@ -120,6 +120,27 @@ impl Drop for MemoryUpdateGuard<'_> {
     }
 }
 
+/// The KVM VM of a machine. A machine that runs on the emulator has none:
+/// what reaches for it there is a defect, and says so.
+pub(crate) struct KvmHandle(Option<Arc<KvmVm>>);
+
+impl KvmHandle {
+    /// The KVM VM, when the machine has one.
+    pub(crate) fn get(&self) -> Option<&Arc<KvmVm>> {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for KvmHandle {
+    type Target = Arc<KvmVm>;
+
+    fn deref(&self) -> &Arc<KvmVm> {
+        self.0
+            .as_ref()
+            .expect("an emulated machine has no KVM VM")
+    }
+}
+
 /// Everything the vCPU threads and the control threads share.
 pub struct VmShared {
     pub(crate) debugger: crate::debug::Debugger,
@@ -136,7 +157,10 @@ pub struct VmShared {
     memory_gate: Mutex<MemoryGate>,
     memory_cv: Condvar,
     memory_writer: Mutex<()>,
-    pub(crate) kvm: Arc<KvmVm>,
+    pub(crate) kvm: KvmHandle,
+    /// The aarch64 `virt` machine, when this is one: its emulated vCPUs,
+    /// PSCI, the power button and the reset.
+    pub(crate) virt: std::sync::OnceLock<Arc<crate::virt::Virt>>,
     io_bus: Mutex<IoBus>,
     /// The chipset's fixed MMIO. Its regions do not change after the build,
     /// so the dispatch takes no bus lock: a device call that waits (a TPM
@@ -210,6 +234,60 @@ impl VmShared {
         mmio64_base: u64,
     ) -> Arc<Self> {
         let mmio64_end = pci_root.lock().mmio64_end();
+        Self::with(
+            Some(kvm),
+            io_bus,
+            mmio_bus,
+            pci_root,
+            pm,
+            sleep_signal,
+            (
+                (MMIO32_BASE, MMIO32_BASE + MMIO32_SIZE),
+                (mmio64_base, mmio64_end),
+            ),
+        )
+    }
+
+    /// The shared state of a machine without KVM: its vCPUs run on the
+    /// emulator. `pci_windows` are the two ranges that hold BARs, each as
+    /// (base, end).
+    pub(crate) fn emulated(
+        io_bus: IoBus,
+        mmio_bus: MmioBus,
+        pci_root: Arc<Mutex<PciRoot>>,
+        pci_windows: ((u64, u64), (u64, u64)),
+    ) -> Arc<Self> {
+        // The ACPI PM block is a part of the x86 machines. This one sits on
+        // no bus, and nothing presses its button.
+        struct NoLine;
+        impl vmlab_hv_devices::IrqLine for NoLine {
+            fn set_level(&self, _high: bool) {}
+        }
+        let sleep_signal = Arc::new(SleepSignal::default());
+        let pm = Arc::new(Mutex::new(PmDevice::new(
+            Arc::new(NoLine),
+            sleep_signal.sink(),
+        )));
+        Self::with(
+            None,
+            io_bus,
+            mmio_bus,
+            pci_root,
+            pm,
+            sleep_signal,
+            pci_windows,
+        )
+    }
+
+    fn with(
+        kvm: Option<KvmVm>,
+        io_bus: IoBus,
+        mmio_bus: MmioBus,
+        pci_root: Arc<Mutex<PciRoot>>,
+        pm: Arc<Mutex<PmDevice>>,
+        sleep_signal: Arc<SleepSignal>,
+        pci_windows: ((u64, u64), (u64, u64)),
+    ) -> Arc<Self> {
         Arc::new(VmShared {
             debugger: crate::debug::Debugger::default(),
             coalesced_vga: std::sync::OnceLock::new(),
@@ -225,16 +303,14 @@ impl VmShared {
             memory_gate: Mutex::new(MemoryGate::default()),
             memory_cv: Condvar::new(),
             memory_writer: Mutex::new(()),
-            kvm: Arc::new(kvm),
+            kvm: KvmHandle(kvm.map(Arc::new)),
+            virt: std::sync::OnceLock::new(),
             io_bus: Mutex::new(io_bus),
             mmio_bus,
             pci_root,
             pm,
             sleep_signal,
-            pci_windows: (
-                (MMIO32_BASE, MMIO32_BASE + MMIO32_SIZE),
-                (mmio64_base, mmio64_end),
-            ),
+            pci_windows,
             state: Mutex::new(RunState::Paused),
             state_cv: Condvar::new(),
             exit: Mutex::new(None),
@@ -363,11 +439,15 @@ impl VmShared {
             if self.exited() {
                 return Ok(());
             }
-            let mut reset = self.reset_state.lock();
-            reset
-                .as_mut()
-                .ok_or("machine has no reset state")?
-                .reset(self, self.reset_description.lock().as_ref())?;
+            if let Some(virt) = self.virt.get() {
+                virt.reset(self)?;
+            } else {
+                let mut reset = self.reset_state.lock();
+                reset
+                    .as_mut()
+                    .ok_or("machine has no reset state")?
+                    .reset(self, self.reset_description.lock().as_ref())?;
+            }
             if !self.exited() {
                 self.emit(Event::Reset);
                 self.finish_snapshot(if was == RunState::Paused {
@@ -661,8 +741,40 @@ impl VmShared {
             return false;
         }
         !self.reset_pending.load(std::sync::atomic::Ordering::SeqCst)
+            && self.powered(id)
             && ((*self.state.lock() == RunState::Running && self.debugger.allowed(id))
                 || self.debugger.stepping(id))
+    }
+
+    /// Whether the vCPU `id` is on. A CPU of `virt` is off until PSCI turns
+    /// it on, and after it turned itself off.
+    fn powered(&self, id: u8) -> bool {
+        self.virt.get().is_none_or(|virt| virt.powered(id))
+    }
+
+    /// Wake the parked vCPUs for them to look at the machine state again.
+    pub(crate) fn wake_parked(&self) {
+        let _state = self.state.lock();
+        self.state_cv.notify_all();
+    }
+
+    /// How many vCPUs the machine has.
+    fn vcpu_count(&self) -> usize {
+        match self.virt.get() {
+            Some(virt) => virt.vcpus(),
+            None => self.vcpus.lock().len(),
+        }
+    }
+
+    /// The chipset's fixed MMIO, for a machine that decodes its own map.
+    pub(crate) fn mmio_bus(&self) -> &MmioBus {
+        &self.mmio_bus
+    }
+
+    /// Whether `addr` is in a range that holds PCI BARs.
+    pub(crate) fn pci_window(&self, addr: u64) -> bool {
+        let ((b32, e32), (b64, e64)) = self.pci_windows;
+        (b32 <= addr && addr < e32) || (b64 <= addr && addr < e64)
     }
 
     pub(crate) fn debug_wake(&self) {
@@ -691,7 +803,8 @@ impl VmShared {
         let mut state = self.state.lock();
         while (((*state != RunState::Running || !self.debugger.allowed(id))
             && !self.debugger.stepping(id))
-            || self.reset_pending.load(std::sync::atomic::Ordering::SeqCst))
+            || self.reset_pending.load(std::sync::atomic::Ordering::SeqCst)
+            || !self.powered(id))
             && self.exit.lock().is_none()
         {
             self.state_cv.wait(&mut state);
@@ -708,7 +821,7 @@ impl VmShared {
         let deadline = std::time::Instant::now() + timeout;
         let mut parked = self.parked.lock();
         loop {
-            let total = self.vcpus.lock().len();
+            let total = self.vcpu_count();
             if self.exit.lock().is_some() || *parked >= total {
                 return Ok(());
             }
@@ -1286,6 +1399,9 @@ impl VmShared {
     }
 
     fn clock_running(&self, running: bool) {
+        if let Some(virt) = self.virt.get() {
+            virt.clock_running(running);
+        }
         self.advance_serials(Some(running));
         if let Some(chipset) = self.chipset.lock().as_ref() {
             chipset.set_running(running);
@@ -1391,6 +1507,11 @@ impl VmShared {
             xhci.lock().poll();
         }
         self.detach_lost_usb();
+        if let Some(virt) = self.virt.get()
+            && let Err(error) = virt.poll()
+        {
+            self.request_exit(ExitReason::Error(error));
+        }
         let chipset = self.chipset.lock().clone();
         let Some(chipset) = chipset else { return };
         chipset.advance();
@@ -1642,6 +1763,51 @@ impl Vm {
         Ok(machine)
     }
 
+    /// A machine whose vCPUs run on the emulator. Each backend is shared
+    /// with the machine, which reaches a vCPU while its thread is parked:
+    /// PSCI turns one on, and a reset puts each back.
+    pub(crate) fn from_emulated(
+        shared: Arc<VmShared>,
+        vcpus: Vec<(u8, Arc<Mutex<crate::vcpu::emulated::EmulatedVcpu>>)>,
+        ram: GuestRam,
+    ) -> Result<Self, VmmError> {
+        let ram = Arc::new(ram);
+        *shared.ram.lock() = Some(ram.clone());
+        let mut machine = Self {
+            shared,
+            vcpus: Vec::new(),
+            ram,
+            timer: None,
+            display_worker: None,
+        };
+        for (id, vcpu) in vcpus {
+            machine.vcpus.push(
+                VcpuThread::spawn_backend(id, vcpu, machine.shared.clone())
+                    .map_err(|e| VmmError::Other(format!("spawning vCPU threads: {e}")))?,
+            );
+        }
+        let weak = Arc::downgrade(&machine.shared);
+        machine.timer = Some(
+            std::thread::Builder::new()
+                .name("machine-events".into())
+                .spawn(move || {
+                    while let Some(shared) = weak.upgrade() {
+                        if shared.exited() {
+                            break;
+                        }
+                        shared.poll_chipset();
+                        shared.service_reset();
+                        let mut state = shared.state.lock();
+                        shared
+                            .state_cv
+                            .wait_for(&mut state, std::time::Duration::from_millis(1));
+                    }
+                })
+                .map_err(|e| VmmError::Other(format!("spawning machine events: {e}")))?,
+        );
+        Ok(machine)
+    }
+
     /// A handle for the control server and tests.
     pub fn handle(&self) -> VmHandle {
         VmHandle(self.shared.clone())
@@ -1681,6 +1847,11 @@ impl Vm {
             && let Err(error) = flash.lock().flush()
         {
             reason.cleanup_error("pflash flush at VM exit", &error);
+        }
+        if let Some(virt) = self.shared.virt.get()
+            && let Err(error) = virt.flush()
+        {
+            reason.cleanup_error("flash flush at VM exit", &VmmError::Other(error));
         }
         for device in self.shared.vfio.lock().iter() {
             if let Err(error) = device.lock().reset() {
@@ -1745,6 +1916,12 @@ impl Drop for Vm {
             && let Err(error) = flash.lock().flush()
         {
             log::error!("pflash flush while dropping VM: {error}");
+        }
+        if !finished
+            && let Some(virt) = self.shared.virt.get()
+            && let Err(error) = virt.flush()
+        {
+            log::error!("flash flush while dropping VM: {error}");
         }
         if let Some(display) = self.shared.display.lock().as_ref() {
             display.shutdown();
@@ -1838,7 +2015,9 @@ impl VmHandle {
         if self.0.exit.lock().is_some() {
             return Err("the machine is shutting down".to_string());
         }
-        if let Some(chipset) = self.0.chipset.lock().as_ref() {
+        if let Some(virt) = self.0.virt.get() {
+            virt.power_button();
+        } else if let Some(chipset) = self.0.chipset.lock().as_ref() {
             chipset.lpc.lock().power_button();
         } else {
             self.0.pm.lock().press_power_button();

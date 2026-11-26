@@ -269,14 +269,14 @@ pub fn serve_with_network(
         .map_err(|e| VmmError::Control(format!("binding {}: {e}", path.display())))?;
 
     let weak = Arc::downgrade(vm.shared());
-    let mut capabilities = vec![Capability::Snapshots, Capability::NetFds];
-    if vm
-        .shared()
-        .kvm
-        .kvm
-        .check_extension(kvm_ioctls::Cap::SetGuestDebug)
-    {
-        capabilities.push(Capability::Debug);
+    let mut capabilities = vec![Capability::NetFds];
+    // Snapshots and the debug port of an emulated machine come with card
+    // C14 of phase 3d.
+    if let Some(kvm) = vm.shared().kvm.get() {
+        capabilities.insert(0, Capability::Snapshots);
+        if kvm.kvm.check_extension(kvm_ioctls::Cap::SetGuestDebug) {
+            capabilities.push(Capability::Debug);
+        }
     }
     if crate::diagnostics::report::configured() {
         capabilities.push(Capability::Diagnostics);

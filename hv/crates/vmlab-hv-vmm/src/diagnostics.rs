@@ -53,8 +53,11 @@ pub(crate) fn vm_state(shared: &VmShared) -> serde_json::Value {
     });
     let exit_rip = json!({
         "requested":report::capture_exit_rip(),
-        "supported":shared.kvm.kvm.check_extension_int(kvm_ioctls::Cap::SyncRegs)
-            & kvm_bindings::KVM_SYNC_X86_REGS as i32 != 0,
+        "supported":shared.kvm.get().is_some_and(|kvm| {
+            kvm.kvm.check_extension_int(kvm_ioctls::Cap::SyncRegs)
+                & kvm_bindings::KVM_SYNC_X86_REGS as i32
+                != 0
+        }),
     });
     json!({"vcpus":vcpus, "exit_rip":exit_rip,
         "exit_recorder":{"enabled":report::exit_recorder_mode() != report::RECORD_OFF},
@@ -102,6 +105,10 @@ fn lapic_u32(regs: &[std::os::raw::c_char], offset: usize) -> u32 {
 
 pub(crate) fn timer_state(shared: &VmShared, mem: &GuestMemory) -> Vec<String> {
     let mut lines = Vec::new();
+    // The timers below are those of KVM's x86 machines.
+    if shared.kvm.get().is_none() {
+        return lines;
+    }
     macro_rules! record {
         ($($args:tt)*) => { lines.push(format!($($args)*)) };
     }

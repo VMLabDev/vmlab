@@ -375,13 +375,27 @@ impl VcpuHost for VmShared {
     /// An address that no device decodes reads as the bus leaves it and
     /// ignores a write: these machines have no bus error.
     fn mmio_read(&self, address: u64, data: &mut [u8]) -> bool {
+        // `virt` has a bus error: an address that nothing decodes.
+        if let Some(virt) = self.virt.get() {
+            return virt.mmio_read(self, address, data);
+        }
         VmShared::mmio_read(self, address, data);
         true
     }
 
     fn mmio_write(&self, address: u64, data: &[u8]) -> bool {
+        if let Some(virt) = self.virt.get() {
+            return virt.mmio_write(self, address, data);
+        }
         VmShared::mmio_write(self, address, data);
         true
+    }
+
+    fn hypercall(&self, id: u8, call: &super::Hypercall) -> super::HypercallOutcome {
+        match self.virt.get() {
+            Some(virt) => virt.hypercall(self, id, call),
+            None => super::HypercallOutcome::Refused,
+        }
     }
 
     fn request_exit(&self, reason: ExitReason) {

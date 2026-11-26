@@ -76,7 +76,14 @@ pub struct EmulatedVcpu {
     hypercall: Option<u64>,
     /// What the guest asked for and the CPU does not have, as logged.
     logged: usize,
+    /// The system counter of the machine and its frequency. The counter of
+    /// the CPU is set from it before each slice, so that it stands still
+    /// while the machine is paused.
+    counter: Option<(Counter, u64)>,
 }
+
+/// The count of the system counter of a machine now.
+pub type Counter = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 impl EmulatedVcpu {
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
@@ -104,7 +111,38 @@ impl EmulatedVcpu {
             timer_levels: [None; 2],
             hypercall: None,
             logged: 0,
+            counter: None,
         }
+    }
+
+    /// Take the system counter from `counter`, at `frequency` counts per
+    /// second, in place of the clock that the vCPU was made with.
+    pub fn set_counter(&mut self, counter: Counter, frequency: u64) {
+        self.counter = Some((counter, frequency));
+        self.sync_counter();
+    }
+
+    fn sync_counter(&mut self) {
+        if let Some((counter, frequency)) = &self.counter {
+            self.cpu.clock = Clock::host(counter(), *frequency);
+        }
+    }
+
+    /// The core, for a harness that steps it and for the machine that
+    /// resets it. The thread of the vCPU is parked.
+    pub fn cpu(&mut self) -> &mut Cpu<GuestBus> {
+        &mut self.cpu
+    }
+
+    /// Put the CPU into `state`, as a reset and PSCI `CPU_ON` do.
+    pub fn reset(&mut self, state: State) {
+        self.cpu.state = state;
+        self.cpu.clear_exclusive();
+        self.cpu.irq = false;
+        self.cpu.fiq = false;
+        self.hypercall = None;
+        self.timer_levels = [None; 2];
+        self.sync_counter();
     }
 
     /// The interrupt inputs, for the interrupt controller of the machine.
@@ -119,7 +157,7 @@ impl EmulatedVcpu {
     }
 
     /// Give the timer lines the levels of the timers now.
-    fn drive_timer(&mut self) {
+    pub fn drive_timer(&mut self) {
         let Some(timer) = &self.timer else {
             return;
         };
@@ -185,6 +223,7 @@ impl VcpuBackend for EmulatedVcpu {
             return Exit::Again;
         }
         self.waker.clear();
+        self.sync_counter();
         self.drive_timer();
         self.cpu.irq = self.lines.irq.level.load(Ordering::SeqCst);
         self.cpu.fiq = self.lines.fiq.level.load(Ordering::SeqCst);
@@ -234,6 +273,7 @@ impl VcpuBackend for EmulatedVcpu {
     /// a kick. The lines are levels, so a wake that comes first is seen.
     fn wait(&mut self) {
         loop {
+            self.sync_counter();
             self.drive_timer();
             if self.interrupted() || self.waker.kicked() {
                 return;

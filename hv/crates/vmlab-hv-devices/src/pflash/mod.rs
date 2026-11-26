@@ -4,6 +4,8 @@
 //! commands change what reads return. The VMM supplies the issuing vCPU's
 //! SMM state to `write_access`; ordinary bus writes are always non-SMM.
 
+pub mod cfi;
+
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
