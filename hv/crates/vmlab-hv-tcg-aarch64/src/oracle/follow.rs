@@ -312,7 +312,9 @@ impl Follower {
     }
 
     /// The discontinuity that QEMU must show for an exception or a call of
-    /// ours at `pc`, as its kind and its target. `seen`: it came already.
+    /// ours at `pc`, as its kind and its target. The target is compared by
+    /// the caller, so a source that is one instruction off cannot hide a
+    /// difference. `seen`: it came already.
     /// `Err`: QEMU does something else.
     fn expect(
         &mut self,
@@ -340,7 +342,8 @@ impl Follower {
                 }
             },
         };
-        if from != pc {
+        // QEMU names the instruction after a call as the source.
+        if from != pc && from != pc.wrapping_add(4) {
             return Ok(Err(format!(
                 "we leave the stream at {pc:#x} and QEMU at {from:#x}"
             )));
