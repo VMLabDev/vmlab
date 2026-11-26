@@ -84,7 +84,8 @@ class Signing:
     def __init__(self, tmp_path, committed='release-key'):
         self.tmp = tmp_path
         self.checkout = tmp_path / 'checkout'
-        for name in ['scripts/release-publish.sh', 'scripts/release-sign.sh', 'scripts/release-assets.py']:
+        for name in ['scripts/release-publish.sh', 'scripts/release-sign.sh', 'scripts/release-assets.py',
+                     'scripts/release-cosign.sh', 'scripts/release-verify.sh']:
             (self.checkout / name).parent.mkdir(parents=True, exist_ok=True)
             (self.checkout / name).write_bytes((ROOT / name).read_bytes())
         if committed is not None:
@@ -99,11 +100,14 @@ class Signing:
         self.gh_log = tmp_path / 'gh.log'
         self.env = {k: v for k, v in os.environ.items()
                     if k != 'COSIGN' and not k.startswith('VMLAB_')}
-        self.env.update(PATH=f"{tools}:{os.environ['PATH']}", GH_LOG=str(self.gh_log))
+        # COSIGN names the stub: without it the scripts run cosign in the build
+        # container (scripts/release-cosign.sh).
+        self.env.update(PATH=f"{tools}:{os.environ['PATH']}", GH_LOG=str(self.gh_log),
+                        COSIGN=str(tools / 'cosign'))
 
     def sign(self, dist, key, public=None):
         """Sign with the private half of `key`; `public` is the test override of release-sign.sh."""
-        env = dict(self.env, VMLAB_RELEASE_COSIGN_KEY=f'private of {key}')
+        env = dict(self.env, VMLAB_RELEASE_COSIGN_KEY=f'private of {key}', COSIGN_PASSWORD='the password')
         if public is not None:
             other = self.tmp / 'test.pub'
             other.write_text(public + '\n')

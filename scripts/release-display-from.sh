@@ -22,8 +22,8 @@
 # Usage: release-display-from.sh <tag> [checkout]
 #   tag       the release that holds the package, for example v0.48.0-alpha
 #   checkout  the checkout that gets the package (default: this one)
-# Env: COSIGN    the cosign binary (default: cosign on PATH, v2.6.1 or newer:
-#                scripts/install-cosign.sh)
+# Env: COSIGN, VMLAB_BUILD_IMAGE  cosign runs in the vmlab-build container:
+#                scripts/release-cosign.sh
 #      BASE_URL  the release download URL (default: the GitHub releases of
 #                VMLabDev/vmlab)
 
@@ -45,9 +45,8 @@ version="${tag#v}"
 checkout="$(cd "${2:-$ROOT}" && pwd)"
 [ -n "$checkout" ] && [ "$checkout" != / ] || die "the checkout is empty or /"
 [ -f "$checkout/guest/vdisplay-windows/package.py" ] || die "no vmlab checkout at $checkout"
-cosign="${COSIGN:-cosign}"
-command -v "$cosign" >/dev/null 2>&1 \
-  || die "need cosign to verify the release $tag (scripts/install-cosign.sh installs the pinned one)"
+cosign() { bash "$ROOT/scripts/release-cosign.sh" "$@"; }
+cosign --check || die "cosign is needed to verify the release $tag"
 
 work="$(mktemp -d)"
 [ -n "$work" ] && [ "$work" != / ] || die "unsafe work directory"
@@ -66,11 +65,11 @@ fetch SHA256SUMS || die "the release $tag has no SHA256SUMS"
 if fetch SHA256SUMS.key.bundle 2>/dev/null; then
   key="$checkout/build/release-signing.pub"
   [ -s "$key" ] || die "the release $tag is signed with a release key, and $key is missing"
-  "$cosign" verify-blob --key "$key" --bundle "$work/SHA256SUMS.key.bundle" \
+  cosign --ro "$work" --ro "$key" -- verify-blob --key "$key" --bundle "$work/SHA256SUMS.key.bundle" \
     --insecure-ignore-tlog=true "$work/SHA256SUMS" >/dev/null 2>&1 \
     || die "the signature of the release $tag does not verify with $key"
 elif fetch SHA256SUMS.bundle 2>/dev/null; then
-  "$cosign" verify-blob --bundle "$work/SHA256SUMS.bundle" \
+  cosign --ro "$work" --network -- verify-blob --bundle "$work/SHA256SUMS.bundle" \
     --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     "$work/SHA256SUMS" >/dev/null 2>&1 \
