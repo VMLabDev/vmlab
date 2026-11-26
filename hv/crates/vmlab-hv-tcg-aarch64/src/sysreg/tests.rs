@@ -220,7 +220,9 @@ fn probe() -> BTreeMap<u16, (String, BTreeMap<String, String>)> {
     let mut lines = BTreeMap::new();
     for line in text
         .lines()
-        .filter(|line| !line.starts_with('#') && !line.starts_with("pstate"))
+        .filter(|line| {
+            !line.starts_with('#') && !line.starts_with("pstate") && !line.starts_with("ccsidr")
+        })
     {
         let mut parts = line.split_whitespace();
         let encoding = u16::from_str_radix(parts.next().unwrap(), 16).unwrap();
@@ -460,10 +462,20 @@ fn the_special_registers() {
     // The cache that CSSELR_EL1 selects.
     bench.fresh();
     assert_eq!(bench.named("CCSIDR_EL1"), Answer::Ran(0x700f_e01a));
-    bench.set("CSSELR_EL1", 2);
-    assert_eq!(bench.named("CCSIDR_EL1"), Answer::Ran(0x70ff_e07a));
-    bench.set("CSSELR_EL1", 7);
-    assert_eq!(bench.named("CCSIDR_EL1"), Answer::Ran(0));
+    let text = include_str!("../../tests/qemu-cortex-a53-sysregs.txt");
+    let mut caches = 0;
+    for line in text.lines().filter(|line| line.starts_with("ccsidr")) {
+        let mut parts = line.split_whitespace().skip(1);
+        let mut field = |key: &str| {
+            let value = parts.next().and_then(|part| part.strip_prefix(key)).unwrap();
+            u64::from_str_radix(value, 16).unwrap()
+        };
+        let (select, value) = (field("select="), field("value="));
+        bench.set("CSSELR_EL1", select);
+        assert_eq!(bench.named("CCSIDR_EL1"), Answer::Ran(value), "{line}");
+        caches += 1;
+    }
+    assert_eq!(caches, 16);
     // The OS lock: OSLAR_EL1 is write-only and shows in OSLSR_EL1.OSLK.
     assert_eq!(bench.named("OSLSR_EL1"), Answer::Ran(0xa));
     assert_eq!(bench.named("OSLAR_EL1"), Answer::Fault(0x0200_0000));

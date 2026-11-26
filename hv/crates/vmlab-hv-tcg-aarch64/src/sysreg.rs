@@ -501,13 +501,14 @@ pub struct CpuModel {
     pub ccsidr: [u64; 16],
 }
 
-/// The cache geometry that QEMU's `cortex-a53` reports, which the 3d CPU
-/// keeps: 32 KiB of data and of instruction cache, and 1 MiB at level 2.
+/// The cache geometry that QEMU's `cortex-a53` reports (the `ccsidr` lines
+/// of the probe file), which the 3d CPU keeps: a data and an instruction
+/// cache at level 1, and a unified cache at level 2.
 const CCSIDR: [u64; 16] = {
     let mut values = [0; 16];
     values[0] = 0x700f_e01a;
-    values[1] = 0x201f_e012;
-    values[2] = 0x70ff_e07a;
+    values[1] = 0x203f_e002;
+    values[2] = 0x707f_e07a;
     values
 };
 

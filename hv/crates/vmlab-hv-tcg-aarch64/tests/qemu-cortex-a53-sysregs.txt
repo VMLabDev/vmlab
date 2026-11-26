@@ -189,3 +189,20 @@ df7f PMCCFILTR_EL0 el1r=0 el1w=ok el0r=t623ef81f el0w=t623ef81e
 pstate return=el1h spsr=3c5 follows=f01003c0 extra=0
 pstate return=el0t spsr=3c0 follows=f01003c0 extra=0
 pstate return=illegal spsr=3c9 follows=f01023c0 extra=100000
+# CCSIDR_EL1 for each value of CSSELR_EL1.
+ccsidr select=0 value=700fe01a
+ccsidr select=1 value=203fe002
+ccsidr select=2 value=707fe07a
+ccsidr select=3 value=0
+ccsidr select=4 value=0
+ccsidr select=5 value=0
+ccsidr select=6 value=0
+ccsidr select=7 value=0
+ccsidr select=8 value=0
+ccsidr select=9 value=0
+ccsidr select=a value=0
+ccsidr select=b value=0
+ccsidr select=c value=0
+ccsidr select=d value=0
+ccsidr select=e value=0
+ccsidr select=f value=0
