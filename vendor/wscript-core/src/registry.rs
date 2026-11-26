@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::bytecode::Const;
 use crate::defs::{DefId, DefTable};
-use crate::host::HostCallable;
+use crate::host::{HostCallable, HostCtx};
 use crate::types::{FnSig, Type};
 
 #[derive(Clone)]
@@ -20,6 +20,17 @@ pub struct HostFnEntry {
 impl std::fmt::Debug for HostFnEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HostFnEntry({:?})", self.sig)
+    }
+}
+
+impl HostFnEntry {
+    /// Run a host-side check before invoking this function.
+    pub fn before_call(&mut self, check: fn()) {
+        let imp = self.imp.clone();
+        self.imp = Arc::new(move |ctx: &mut dyn HostCtx, args| {
+            check();
+            imp.call(ctx, args)
+        });
     }
 }
 
