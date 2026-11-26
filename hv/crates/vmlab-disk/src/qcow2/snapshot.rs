@@ -287,8 +287,7 @@ impl Qcow2Image {
         ((entries as u64) * 8).div_ceil(self.cluster_size).max(1)
     }
 
-    /// Replace the vmstate entries of the active L1 with zero-flag
-    /// descriptors, COWing L2 tables that became shared.
+    /// Clear the active vmstate mappings, COWing L2 tables that became shared.
     pub(crate) fn punch_vmstate(&mut self, vm_state_size: u64) -> Result<()> {
         if vm_state_size == 0 {
             return Ok(());
@@ -300,6 +299,8 @@ impl Qcow2Image {
         let shift = self.cluster_bits + (self.cluster_bits - 3);
         let first_l1 = (base >> shift) as usize;
         let last_l1 = ((end - 1) >> shift) as usize;
+        let cleared_entry = if self.version >= 3 { ZERO_BIT } else { 0 };
+        let backing_size = self.backing_chain.size();
         for l1_index in first_l1..(last_l1 + 1).min(self.l1.len()) {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
             if l2_host == 0 {
@@ -318,7 +319,7 @@ impl Qcow2Image {
             } else {
                 l2_host
             };
-            // Zero-flag every vmstate cluster this entry maps.
+            // Clear every vmstate cluster this entry maps.
             let l2e = self.l2_entries();
             let entry_start = l1_index as u64 * l2e * self.cluster_size;
             let idx_start = if base > entry_start {
@@ -332,6 +333,16 @@ impl Qcow2Image {
                 if entry == 0 {
                     continue;
                 }
+                let cluster_off = entry_start + l2_index * self.cluster_size;
+                let replacement = if self.version < 3 && cluster_off < backing_size {
+                    // An unallocated entry here would expose backing data.
+                    let host = self.alloc_cluster()?;
+                    self.write_file(host, &vec![0; self.cluster_size as usize])?;
+                    self.set_cluster_refcount(host / self.cluster_size, 1)?;
+                    host | COPIED_BIT
+                } else {
+                    cleared_entry
+                };
                 if entry & COMPRESSED_BIT != 0 {
                     self.adjust_compressed_refcounts(entry, -1)?;
                 } else {
@@ -340,7 +351,7 @@ impl Qcow2Image {
                         self.dec_refcount(host / self.cluster_size)?;
                     }
                 }
-                self.set_l2_entry(active_l2, l2_index, ZERO_BIT)?;
+                self.set_l2_entry(active_l2, l2_index, replacement)?;
             }
         }
         Ok(())

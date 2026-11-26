@@ -157,6 +157,15 @@ impl Qcow2Image {
                     let sectors = ((entry >> shift) & ((1u64 << (62 - shift)) - 1)) + 1;
                     // The data ends at the end of its last sector.
                     let end = (offset / 512 + sectors) * 512;
+                    // QEMU writes only the compressed bytes, so a cluster
+                    // that is the last thing in the file ends inside that
+                    // sector. The read path takes the missing bytes as zeros.
+                    let file_len = self.file.metadata()?.len();
+                    let end = if end > file_len && end - file_len < 512 && offset < file_len {
+                        file_len
+                    } else {
+                        end
+                    };
                     self.count_range(counts, offset, end - offset)?;
                 } else if entry & OFFSET_MASK != 0 {
                     self.count_range(counts, entry & OFFSET_MASK, self.cluster_size)?;
