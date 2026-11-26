@@ -85,12 +85,30 @@ impl TerminalHandle {
     }
 
     /// Pull whatever the shell has produced so far (non-blocking-ish: drains
-    /// data already queued, without waiting for more).
+    /// data already queued, without waiting for more). An incomplete UTF-8
+    /// character stays buffered until more bytes arrive or the session ends.
     pub fn read(&self) -> String {
         let mut st = self.state.lock().expect("term state");
         self.pump(&mut st, Duration::from_millis(50));
-        let text = String::from_utf8_lossy(&st.buf).into_owned();
-        st.buf.clear();
+        let mut text = String::new();
+        let mut consumed = 0;
+        for chunk in st.buf.utf8_chunks() {
+            text.push_str(chunk.valid());
+            consumed += chunk.valid().len();
+            let invalid = chunk.invalid();
+            if invalid.is_empty() {
+                continue;
+            }
+            if st.ended.is_none()
+                && consumed + invalid.len() == st.buf.len()
+                && std::str::from_utf8(invalid).is_err_and(|error| error.error_len().is_none())
+            {
+                break;
+            }
+            text.push(char::REPLACEMENT_CHARACTER);
+            consumed += invalid.len();
+        }
+        st.buf.drain(..consumed);
         text
     }
 
@@ -262,6 +280,28 @@ mod tests {
         AgentMsg, Frame, FrameDecoder, FrameKind, HostMsg, INITIAL_WINDOW, MAX_PAYLOAD,
         PROTO_VERSION, encode_ctrl, encode_frame, features,
     };
+
+    #[tokio::test]
+    async fn read_keeps_a_character_split_across_reads() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: b"ok\xe2\x82".to_vec(),
+                ended: None,
+            })),
+        };
+        let first = term.read();
+        term.state.lock().unwrap().buf.push(0xac);
+        assert_eq!((first, term.read()), ("ok".into(), "€".into()));
+
+        term.state.lock().unwrap().buf.extend(b"\xff\xe2\x82");
+        assert_eq!(term.read(), "�");
+        term.close();
+        assert_eq!(term.read(), "�");
+        assert_eq!(term.read(), "");
+    }
 
     #[tokio::test]
     async fn card_861_expect_keeps_a_character_split_across_reads() {
