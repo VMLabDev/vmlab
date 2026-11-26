@@ -617,4 +617,67 @@ fn main() {
             String::from_utf8_lossy(&child.stderr)
         );
     }
+
+    /// Set in the child process of
+    /// `a_script_that_allocates_without_end_faults`.
+    const GROWING_VALUE_CHILD_ENV: &str = "VMLAB_TEST_GROWING_VALUE_CHILD";
+
+    /// A script that doubles a string in a loop asks for 1 TiB in about 400
+    /// instructions, far inside the instruction budget, and a failed
+    /// allocation is an abort of the lab daemon
+    /// (docs/reviews/wscript-2.md F13, card #1086). The run has to end with
+    /// a fault that names the memory limit. It runs in a child process so
+    /// that an abort is an exit status, and under a 4 GiB limit on the
+    /// address space so that a run without the fix cannot take the memory
+    /// of the host.
+    #[test]
+    fn a_script_that_allocates_without_end_faults() {
+        const SCRIPT: &str = r#"
+fn main() {
+    let s = "x"
+    let i = 0
+    while i < 40 {
+        s = s + s
+        i = i + 1
+    }
+}
+"#;
+        if std::env::var_os(GROWING_VALUE_CHILD_ENV).is_some() {
+            let limit = 4 * 1024 * 1024 * 1024;
+            rustix::process::setrlimit(
+                rustix::process::Resource::As,
+                rustix::process::Rlimit {
+                    current: Some(limit),
+                    maximum: Some(limit),
+                },
+            )
+            .unwrap();
+            let result = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| execute(SCRIPT, "grow.ws", ScriptEntry::Main, (), Arc::new(|_| {})))
+                .unwrap()
+                .join()
+                .unwrap();
+            let error = format!("{:#}", result.expect_err("the script ran to its end"));
+            assert!(error.contains("memory limit"), "{error}");
+            return;
+        }
+        // libtest names a test without the crate.
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::a_script_that_allocates_without_end_faults"),
+                "--nocapture",
+            ])
+            .env(GROWING_VALUE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "the script run ended its process, or without the fault: {}\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
 }
