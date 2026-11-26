@@ -64,7 +64,9 @@ impl Leader {
         let child = Command::new(qemu)
             .args(["-machine", "virt", "-cpu", "cortex-a53", "-accel", "tcg"])
             .args(["-smp", "1", "-m", &ram_mib.to_string()])
-            .args(["-display", "none", "-monitor", "none", "-serial", "none", "-S"])
+            .args([
+                "-display", "none", "-monitor", "none", "-serial", "none", "-S",
+            ])
             .arg("-gdb")
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             .arg("-plugin")

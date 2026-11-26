@@ -24,7 +24,11 @@ fn requires(value: &Value) -> Result<String> {
     let text = value["Requires"].as_str().context("no Requires")?;
     let inner = text.trim().trim_start_matches('{').trim_end_matches('}');
     let mut names = Vec::new();
-    for item in inner.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in inner
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let Some(feature) = item.strip_prefix("AArch64::") else {
             bail!("the Requires entry {item:?} is not of the form AArch64::Name");
         };
@@ -110,7 +114,11 @@ pub fn generate(json: &Value, sha256: &str) -> Result<String> {
     for (class, table) in [("DC", "DC_OPS"), ("AT", "AT_OPS")] {
         let mut operations = Vec::new();
         for record in instances(json, class)? {
-            operations.push((bits(record, "Encoding")?, name(record)?.to_string(), requires(record)?));
+            operations.push((
+                bits(record, "Encoding")?,
+                name(record)?.to_string(),
+                requires(record)?,
+            ));
         }
         operations.sort();
         let _ = writeln!(
@@ -157,7 +165,10 @@ pub fn generate(json: &Value, sha256: &str) -> Result<String> {
             bits(record, "Op2")?,
             name(record)?.to_string(),
             record["HasTLBIP"].as_i64() == Some(1),
-            record["RegUse"]["def"].as_str().context("RegUse")?.to_string(),
+            record["RegUse"]["def"]
+                .as_str()
+                .context("RegUse")?
+                .to_string(),
         ));
     }
     operations.sort();

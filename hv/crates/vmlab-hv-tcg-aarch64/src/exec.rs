@@ -59,18 +59,30 @@ fn host(message: &str) -> Stop {
     Stop::Host(message.to_string())
 }
 
-fn compile(pc: u64, context: Context, instructions: u32, mut block: BlockOf<A64Exit>) -> Result<Compiled, Stop> {
+fn compile(
+    pc: u64,
+    context: Context,
+    instructions: u32,
+    mut block: BlockOf<A64Exit>,
+) -> Result<Compiled, Stop> {
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
     let [Event::Exit(exit)] = block.events.as_slice() else {
-        return Err(host("an aarch64 block of this card has one exit and no other event"));
+        return Err(host(
+            "an aarch64 block of this card has one exit and no other event",
+        ));
     };
     let exit = &block.exits[*exit];
     let A64Next::Pc(next) = exit.next else {
         return Err(host("an exception exit has no executor yet"));
     };
     let (slots, slot_count) = linear::slots(graph);
-    let mut roots: Vec<_> = exit.writeback.writes.iter().map(|(_, scalar)| *scalar).collect();
+    let mut roots: Vec<_> = exit
+        .writeback
+        .writes
+        .iter()
+        .map(|(_, scalar)| *scalar)
+        .collect();
     roots.push(next);
     let mut seen = vec![false; graph.scalars.len()];
     let order = schedule::scalars(graph, &roots, &mut seen);
@@ -83,19 +95,22 @@ fn compile(pc: u64, context: Context, instructions: u32, mut block: BlockOf<A64E
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
-    let narrow = |value: usize| u32::try_from(value).map_err(|_| host("a block with too many slots"));
+    let narrow =
+        |value: usize| u32::try_from(value).map_err(|_| host("a block with too many slots"));
     for id in order {
         match graph.scalars[id].operation {
             Operation::Constant(value) => compiled.values[slots[id]] = value,
             Operation::Input(register) => {
-                compiled.inputs.push((narrow(slots[id])?, narrow(register)?));
+                compiled
+                    .inputs
+                    .push((narrow(slots[id])?, narrow(register)?));
             }
             // A view of another scalar shares its slot.
             Operation::Refine(_) => {}
             Operation::Effect(_) => return Err(host("a memory effect has no executor yet")),
             _ => {
-                let mut instruction =
-                    linear::lower(graph, id).ok_or_else(|| host("a scalar without a linear form"))?;
+                let mut instruction = linear::lower(graph, id)
+                    .ok_or_else(|| host("a scalar without a linear form"))?;
                 instruction.remap(&slots);
                 let mut packed = Packed::new(slots[id], instruction)
                     .ok_or_else(|| host("a scalar without a packed form"))?;
@@ -113,9 +128,13 @@ fn compile(pc: u64, context: Context, instructions: u32, mut block: BlockOf<A64E
         }
     }
     for (register, scalar) in &exit.writeback.writes {
-        compiled.outputs.push((narrow(*register)?, narrow(slots[*scalar])?));
+        compiled
+            .outputs
+            .push((narrow(*register)?, narrow(slots[*scalar])?));
     }
-    compiled.outputs.push((slot::PC as u32, narrow(slots[next])?));
+    compiled
+        .outputs
+        .push((slot::PC as u32, narrow(slots[next])?));
     Ok(compiled)
 }
 
@@ -304,11 +323,25 @@ impl<M: Memory> Cpu<M> {
         self.check_generation();
         let mut left = budget;
         while left > 0 {
+            let pc = self.state.pc();
+            let context = self.state.context;
+            // The common case: the block is translated and fits the budget.
+            if let Some(block) = self.blocks.entries[Cache::index(pc)].as_mut()
+                && block.pc == pc
+                && block.context == context
+                && u64::from(block.instructions) <= left
+            {
+                if let Err(stop) = block.run(&mut self.state) {
+                    return stop;
+                }
+                let count = u64::from(block.instructions);
+                self.instructions += count;
+                left -= count;
+                continue;
+            }
             // A whole block where the budget allows one, else one
             // instruction. A block that is not translated yet can be as long
             // as `BLOCK_INSTRUCTIONS`.
-            let pc = self.state.pc();
-            let context = self.state.context;
             let cached = self.blocks.entries[Cache::index(pc)]
                 .as_ref()
                 .filter(|block| block.pc == pc && block.context == context)
@@ -354,7 +387,10 @@ mod tests {
         cpu.state.set_x(1, 1000);
         // The word after the loop is zero: UDF, which is not in the group.
         let stop = cpu.run(u64::MAX);
-        assert!(matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 12), "{stop:?}");
+        assert!(
+            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 12),
+            "{stop:?}"
+        );
         assert_eq!(cpu.state.x(0), 1000);
         assert_eq!(cpu.state.x(1), 0);
         assert_eq!(cpu.state.pc(), BASE + 12);
@@ -422,7 +458,9 @@ mod tests {
         assert_eq!(cpu.run(1), Stop::Budget);
         assert_eq!(cpu.state.x(0), 1);
         // add x0, x0, #2 in place of add x0, x0, #1.
-        cpu.memory.write(BASE, &0x9100_0800u32.to_le_bytes()).unwrap();
+        cpu.memory
+            .write(BASE, &0x9100_0800u32.to_le_bytes())
+            .unwrap();
         cpu.state.set_pc(BASE);
         assert_eq!(cpu.run(1), Stop::Budget);
         assert_eq!(cpu.state.x(0), 3);

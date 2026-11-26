@@ -17,7 +17,8 @@ fn the_committed_corpus_replays_on_our_interpreter() {
     let mut failures = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(&file).expect("a corpus file");
-        let entries = corpus::parse(&text).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        let entries =
+            corpus::parse(&text).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
         for entry in entries {
             replayed += 1;
             if let Err(error) = entry.replay() {
@@ -25,7 +26,12 @@ fn the_committed_corpus_replays_on_our_interpreter() {
             }
         }
     }
-    assert!(failures.is_empty(), "{} of {replayed} entries differ:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} of {replayed} entries differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     assert!(replayed > 0, "the corpus has no entry");
     println!("replayed {replayed} corpus entries");
 }

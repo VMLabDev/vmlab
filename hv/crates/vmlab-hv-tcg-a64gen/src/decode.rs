@@ -228,7 +228,8 @@ fn prioritise(records: &mut [Record], config: &Config) -> Result<Vec<usize>> {
                 entry.loser
             );
         };
-        if key(&records[winner]) != key(&records[loser]) || !overlap(&records[winner], &records[loser])
+        if key(&records[winner]) != key(&records[loser])
+            || !overlap(&records[winner], &records[loser])
         {
             bail!(
                 "overrides.toml: {} and {} do not need an override",
@@ -475,7 +476,7 @@ pub fn generate(json: &Value, config: &Config, sha256: &str) -> Result<Output> {
     out.push_str(
         "//\n// Input: the JSON dump of AArch64.td by the pinned llvm-tblgen\n\
          // (hv/toolchain/llvm/pins.env), and tables/{sets,overrides,constraints}.toml.\n\n\
-         #![allow(non_camel_case_types, clippy::all)]\n\n",
+         #![allow(non_camel_case_types, unused_parens, clippy::all)]\n\n",
     );
     let _ = writeln!(
         out,

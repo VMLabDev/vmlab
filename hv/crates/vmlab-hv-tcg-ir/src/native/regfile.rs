@@ -92,10 +92,13 @@ mod tests {
         let before = block.graph.scalars.len();
         dce::prune_scalars(&mut block);
         assert!(block.graph.scalars.len() < before);
-        assert!(!block.graph.scalars.iter().any(|scalar| matches!(
-            scalar.operation,
-            Operation::Binary(Binary::Add, _, _)
-        )));
+        assert!(
+            !block
+                .graph
+                .scalars
+                .iter()
+                .any(|scalar| matches!(scalar.operation, Operation::Binary(Binary::Add, _, _)))
+        );
         let _ = dead_flag;
         let writes = &block.exits[0].writes;
         assert!(matches!(

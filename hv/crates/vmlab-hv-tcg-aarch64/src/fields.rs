@@ -233,7 +233,12 @@ mod tests {
     fn conditions_come_in_inverse_pairs() {
         for bits in (0..14).step_by(2) {
             for flags in 0..16 {
-                let (n, z, c, v) = (flags & 8 != 0, flags & 4 != 0, flags & 2 != 0, flags & 1 != 0);
+                let (n, z, c, v) = (
+                    flags & 8 != 0,
+                    flags & 4 != 0,
+                    flags & 2 != 0,
+                    flags & 1 != 0,
+                );
                 assert_ne!(
                     Condition::from_bits(bits).holds(n, z, c, v),
                     Condition::from_bits(bits + 1).holds(n, z, c, v)

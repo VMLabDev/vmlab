@@ -61,7 +61,9 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "dp-immediate" => immediate.to_vec(),
         "branch" => branch.to_vec(),
         "c1" => LIFTED_FORMATS.to_vec(),
-        other => return Err(format!("the group {other} is not known: dp-immediate, branch, c1").into()),
+        other => {
+            return Err(format!("the group {other} is not known: dp-immediate, branch, c1").into());
+        }
     })
 }
 
@@ -133,10 +135,15 @@ impl Run {
                 self.counts.end(end);
                 Ok((end, verified.len()))
             }
-            Outcome::Differed { difference, verified } => {
+            Outcome::Differed {
+                difference,
+                verified,
+            } => {
                 self.counts.add(&mut self.rng, &verified);
                 eprint!("{difference}");
-                if let (Some((encoding, before)), Some(after)) = (difference.instruction, difference.qemu) {
+                if let (Some((encoding, before)), Some(after)) =
+                    (difference.instruction, difference.qemu)
+                {
                     eprintln!(
                         "  corpus line: {}",
                         Entry {
@@ -252,7 +259,9 @@ fn main() -> Result<(), Failure> {
     executed.sort_unstable();
     executed.dedup();
     let total_encodings = executed.len();
-    executed.retain(|word| decode(*word).is_some_and(|decoded| formats.contains(&decoded.record.info().format)));
+    executed.retain(|word| {
+        decode(*word).is_some_and(|decoded| formats.contains(&decoded.record.info().format))
+    });
     let is_branch = |word: &u32| {
         decode(*word).is_some_and(|decoded| {
             !matches!(
@@ -283,7 +292,11 @@ fn main() -> Result<(), Failure> {
         };
         let (_, verified) = run.round(&round)?;
         if verified != chunk.len() {
-            return Err(format!("a round of {} executed encodings verified {verified}", chunk.len()).into());
+            return Err(format!(
+                "a round of {} executed encodings verified {verified}",
+                chunk.len()
+            )
+            .into());
         }
         executed_verified += verified;
     }
@@ -317,7 +330,11 @@ fn main() -> Result<(), Failure> {
         unconstrained
     );
     for format in &formats {
-        println!("  {:<28} {:>9} instructions verified", format.name(), run.counts.of_format(*format));
+        println!(
+            "  {:<28} {:>9} instructions verified",
+            format.name(),
+            run.counts.of_format(*format)
+        );
         for record in records_of(*format) {
             println!(
                 "    {:<26} {:>9}",

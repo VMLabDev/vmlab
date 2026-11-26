@@ -152,7 +152,10 @@ mod tests {
         let line = entry.line();
         assert!(line.starts_with("91000400 pc=42000ffc cpsr=200003c5 sp=10 x=29,0,"));
         assert_eq!(Entry::parse(&line), Ok(entry.clone()));
-        assert_eq!(parse(&format!("# a comment\n\n{line}\n")), Ok(vec![entry.clone()]));
+        assert_eq!(
+            parse(&format!("# a comment\n\n{line}\n")),
+            Ok(vec![entry.clone()])
+        );
         assert_eq!(entry.replay(), Ok(()));
     }
 

@@ -109,8 +109,7 @@ impl Builder {
     /// `value` must have the type of the slot.
     pub fn write(&mut self, slot: usize, value: ScalarId) {
         debug_assert_eq!(
-            self.block.graph.scalars[value].ty,
-            REGISTER_FILE.slots[slot].ty,
+            self.block.graph.scalars[value].ty, REGISTER_FILE.slots[slot].ty,
             "slot {}",
             REGISTER_FILE.slots[slot].name
         );

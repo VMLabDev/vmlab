@@ -87,8 +87,14 @@ impl std::fmt::Display for Difference {
 }
 
 pub enum Outcome {
-    Agreed { end: End, verified: Vec<Verified> },
-    Differed { difference: Box<Difference>, verified: Vec<Verified> },
+    Agreed {
+        end: End,
+        verified: Vec<Verified>,
+    },
+    Differed {
+        difference: Box<Difference>,
+        verified: Vec<Verified>,
+    },
 }
 
 /// How long QEMU may take to write the next record.
@@ -146,14 +152,17 @@ impl Follower {
         let mut last: Option<(u32, Record, Core)> = None;
         let mut expect = Expect::Instruction;
         let mut followed = 0u64;
-        let differed = |what: String, last: &Option<(u32, Record, Core)>, ours: Core, qemu: Option<Core>| {
-            Box::new(Difference {
-                what,
-                instruction: last.as_ref().map(|(encoding, _, before)| (*encoding, *before)),
-                ours,
-                qemu,
-            })
-        };
+        let differed =
+            |what: String, last: &Option<(u32, Record, Core)>, ours: Core, qemu: Option<Core>| {
+                Box::new(Difference {
+                    what,
+                    instruction: last
+                        .as_ref()
+                        .map(|(encoding, _, before)| (*encoding, *before)),
+                    ours,
+                    qemu,
+                })
+            };
         let result = loop {
             let ours = Core::of(&self.cpu.state);
             match self.leader.next_record(RECORD_TIMEOUT)? {
@@ -185,7 +194,9 @@ impl Follower {
                     }
                     if core.pc & 3 == 0 && self.word(core.pc) != Some(encoding) {
                         break Err(differed(
-                            format!("QEMU runs the word {encoding:08x}, which our memory does not hold at the PC"),
+                            format!(
+                                "QEMU runs the word {encoding:08x}, which our memory does not hold at the PC"
+                            ),
                             &last,
                             ours,
                             Some(core),
@@ -202,12 +213,18 @@ impl Follower {
                                 last = Some((encoding, decoded.record, core));
                             }
                         }
-                        Err(Stop::Undefined { pc, .. }) => expect = Expect::Exception(pc, End::Undefined),
-                        Err(Stop::PcAlignment { pc }) => expect = Expect::Exception(pc, End::PcAlignment),
+                        Err(Stop::Undefined { pc, .. }) => {
+                            expect = Expect::Exception(pc, End::Undefined)
+                        }
+                        Err(Stop::PcAlignment { pc }) => {
+                            expect = Expect::Exception(pc, End::PcAlignment)
+                        }
                         Err(Stop::Unimplemented { pc, record }) => {
                             // QEMU goes on or takes an exception. The next record says which.
                             match self.leader.next_record(RECORD_TIMEOUT)? {
-                                Trace::Discontinuity { kind: 2, from_pc, .. } if from_pc == pc => {
+                                Trace::Discontinuity {
+                                    kind: 2, from_pc, ..
+                                } if from_pc == pc => {
                                     self.leader.stop(false)?;
                                     break Ok(End::UnliftedException(record));
                                 }
@@ -219,7 +236,9 @@ impl Follower {
                         }
                         Err(stop) => {
                             break Err(differed(
-                                format!("our side cannot run the instruction that QEMU runs: {stop:?}"),
+                                format!(
+                                    "our side cannot run the instruction that QEMU runs: {stop:?}"
+                                ),
                                 &last,
                                 ours,
                                 Some(core),
@@ -227,10 +246,16 @@ impl Follower {
                         }
                     }
                 }
-                Trace::Discontinuity { kind, from_pc, to_pc } => {
+                Trace::Discontinuity {
+                    kind,
+                    from_pc,
+                    to_pc,
+                } => {
                     if kind != 2 {
                         break Err(differed(
-                            format!("QEMU took an interrupt or a host call (kind {kind}) from {from_pc:#x} to {to_pc:#x}"),
+                            format!(
+                                "QEMU took an interrupt or a host call (kind {kind}) from {from_pc:#x} to {to_pc:#x}"
+                            ),
                             &last,
                             ours,
                             None,
@@ -240,7 +265,9 @@ impl Follower {
                         Expect::Exception(pc, end) if pc == from_pc => end,
                         Expect::Exception(pc, _) => {
                             break Err(differed(
-                                format!("we stop with an exception at {pc:#x} and QEMU takes one from {from_pc:#x}"),
+                                format!(
+                                    "we stop with an exception at {pc:#x} and QEMU takes one from {from_pc:#x}"
+                                ),
                                 &last,
                                 ours,
                                 None,
@@ -248,12 +275,18 @@ impl Follower {
                         }
                         // No record for the instruction at our PC: QEMU could
                         // not fetch it. Our memory must hold nothing there.
-                        Expect::Instruction if from_pc == ours.pc && ours.pc & 3 == 0 && self.word(ours.pc).is_none() => {
+                        Expect::Instruction
+                            if from_pc == ours.pc
+                                && ours.pc & 3 == 0
+                                && self.word(ours.pc).is_none() =>
+                        {
                             End::FetchAbort
                         }
                         Expect::Instruction => {
                             break Err(differed(
-                                format!("QEMU took an exception from {from_pc:#x} where we would run on"),
+                                format!(
+                                    "QEMU took an exception from {from_pc:#x} where we would run on"
+                                ),
                                 &last,
                                 ours,
                                 None,
@@ -288,7 +321,9 @@ impl Follower {
                 }
                 Trace::Write { address, size, .. } => {
                     break Err(differed(
-                        format!("QEMU wrote {size} bytes at {address:#x} and no lifter of ours writes memory yet"),
+                        format!(
+                            "QEMU wrote {size} bytes at {address:#x} and no lifter of ours writes memory yet"
+                        ),
                         &last,
                         ours,
                         None,
@@ -301,7 +336,10 @@ impl Follower {
             Err(difference) => {
                 // Leave QEMU stopped, so that the next round can start.
                 self.leader.stop(true)?;
-                Outcome::Differed { difference, verified }
+                Outcome::Differed {
+                    difference,
+                    verified,
+                }
             }
         })
     }

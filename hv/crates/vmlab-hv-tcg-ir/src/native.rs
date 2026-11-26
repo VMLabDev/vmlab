@@ -1102,12 +1102,18 @@ mod tests {
 
     #[test]
     fn bit_reversal_byte_reversal_and_population_count() {
-        assert_eq!(evaluate_unary(Unary::ReverseBits(8), 0b0000_0110), Some(0b0110_0000));
+        assert_eq!(
+            evaluate_unary(Unary::ReverseBits(8), 0b0000_0110),
+            Some(0b0110_0000)
+        );
         assert_eq!(evaluate_unary(Unary::ReverseBits(32), 1), Some(1 << 31));
         assert_eq!(evaluate_unary(Unary::ReverseBits(64), 1 << 63), Some(1));
         assert_eq!(evaluate_unary(Unary::ReverseBits(128), 1), Some(1 << 127));
         assert_eq!(evaluate_unary(Unary::ReverseBits(0), u128::MAX), Some(0));
-        assert_eq!(evaluate_unary(Unary::ReverseBytes(16), 0x1234), Some(0x3412));
+        assert_eq!(
+            evaluate_unary(Unary::ReverseBytes(16), 0x1234),
+            Some(0x3412)
+        );
         assert_eq!(
             evaluate_unary(Unary::ReverseBytes(32), 0xffff_ffff_1122_3344),
             Some(0x4433_2211)

@@ -84,7 +84,11 @@ impl Core {
 
 impl std::fmt::Display for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pc={:x} cpsr={:x} sp={:x} x=", self.pc, self.cpsr, self.sp)?;
+        write!(
+            f,
+            "pc={:x} cpsr={:x} sp={:x} x=",
+            self.pc, self.cpsr, self.sp
+        )?;
         for (n, value) in self.x.iter().enumerate() {
             write!(f, "{}{value:x}", if n == 0 { "" } else { "," })?;
         }
@@ -92,13 +96,20 @@ impl std::fmt::Display for Core {
     }
 }
 
-/// One record of the plugin stream.
+/// One record of the plugin stream. Nearly every record is an instruction,
+/// so the size of that variant is the size that matters.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Trace {
     /// The registers before the instruction `encoding` at `core.pc` runs.
     Instruction { encoding: u32, core: Core },
     /// A memory write of the last instruction.
-    Write { address: u64, size: u32, low: u64, high: u64 },
+    Write {
+        address: u64,
+        size: u32,
+        low: u64,
+        high: u64,
+    },
     /// An exception (kind 2), an interrupt (1) or a host call (4).
     Discontinuity { kind: u32, from_pc: u64, to_pc: u64 },
 }
@@ -176,7 +187,9 @@ pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, Stri
                 24,
             )))
         }
-        other => Err(format!("the plugin stream has a record with the tag {other}")),
+        other => Err(format!(
+            "the plugin stream has a record with the tag {other}"
+        )),
     }
 }
 
@@ -205,7 +218,10 @@ mod tests {
         };
         assert_eq!(encoding, 0x9100_0400);
         assert_eq!(core.x[30], 90);
-        assert_eq!((core.sp, core.pc, core.cpsr), (0x1000, 0x4200_0000, 0x6000_03c5));
+        assert_eq!(
+            (core.sp, core.pc, core.cpsr),
+            (0x1000, 0x4200_0000, 0x6000_03c5)
+        );
         // With vectors the record is longer, and the same core comes out.
         assert_eq!(parse(&bytes, true), Ok(None));
         bytes.extend([0u8; 32 * 16 + 16]);
@@ -246,6 +262,9 @@ mod tests {
         core.cpsr = 0x3c0;
         assert!(core.state().is_none());
         let other = Core { pc: 0, ..core };
-        assert_eq!(core.difference(&other), vec!["pc: 0x42000010 / 0x0".to_string()]);
+        assert_eq!(
+            core.difference(&other),
+            vec!["pc: 0x42000010 / 0x0".to_string()]
+        );
     }
 }

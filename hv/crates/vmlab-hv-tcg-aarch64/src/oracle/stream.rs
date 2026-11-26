@@ -97,7 +97,11 @@ impl Generator {
             let Some(width) = field_width(record, info.name) else {
                 continue;
             };
-            let ones = if width >= 32 { u32::MAX } else { (1 << width) - 1 };
+            let ones = if width >= 32 {
+                u32::MAX
+            } else {
+                (1 << width) - 1
+            };
             let value = match self.rng.below(4) {
                 0 => 0,
                 1 | 2 => ones,
@@ -195,7 +199,9 @@ impl Generator {
         let value = |rng: &mut Rng| match rng.below(8) {
             0 | 1 => rng.below(17),
             2 | 3 => image.0 + 4 * rng.below(image.1 / 4),
-            4 => [0, u64::MAX, 1 << 63, (1 << 63) - 1, 1 << 31, (1 << 32) - 1][rng.below(6) as usize],
+            4 => {
+                [0, u64::MAX, 1 << 63, (1 << 63) - 1, 1 << 31, (1 << 32) - 1][rng.below(6) as usize]
+            }
             _ => rng.next_u64(),
         };
         let mut x = [0; 31];
@@ -290,7 +296,10 @@ mod tests {
     fn adr_points_a_register_at_a_target() {
         let mut generator = Generator::new(0);
         // adr x1, .+8 is 0x10000041.
-        assert_eq!(generator.adr(1, 0x4200_0000, 0x4200_0008), Some(0x1000_0041));
+        assert_eq!(
+            generator.adr(1, 0x4200_0000, 0x4200_0008),
+            Some(0x1000_0041)
+        );
         assert_eq!(generator.adr(1, 0x4200_0000, 0x4300_0000), None);
         let back = generator.adr(30, 0x4200_0100, 0x4200_0000).unwrap();
         let label = field(Record::ADR, "label", back).unwrap();

@@ -43,7 +43,9 @@ fn unhex(text: &[u8]) -> io::Result<Vec<u8>> {
         b'0'..=b'9' => Ok(c - b'0'),
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(other("the gdbstub sent a character that is not a hex digit")),
+        _ => Err(other(
+            "the gdbstub sent a character that is not a hex digit",
+        )),
     };
     if !text.len().is_multiple_of(2) {
         return Err(other("the gdbstub sent an odd count of hex digits"));
@@ -55,7 +57,9 @@ fn unhex(text: &[u8]) -> io::Result<Vec<u8>> {
 
 /// A packet around `payload`: `$payload#checksum`.
 pub fn frame(payload: &[u8]) -> Vec<u8> {
-    let checksum = payload.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    let checksum = payload
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
     let mut packet = Vec::with_capacity(payload.len() + 4);
     packet.push(b'$');
     packet.extend_from_slice(payload);
@@ -78,7 +82,9 @@ pub fn unframe(bytes: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
         return Ok(None);
     }
     let payload = &bytes[start + 1..end];
-    let checksum = payload.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    let checksum = payload
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
     if unhex(&bytes[end + 1..end + 3])? != [checksum] {
         return Err(other("a packet of the gdbstub has a wrong checksum"));
     }
@@ -322,7 +328,10 @@ mod tests {
         rsp.set_core(&core).unwrap();
         rsp.write_memory(0x4200_0000, &0x9100_0400u32.to_le_bytes())
             .unwrap();
-        assert_eq!(rsp.read_memory(0x4200_0000, 4).unwrap(), [0x00, 0x04, 0x00, 0x91]);
+        assert_eq!(
+            rsp.read_memory(0x4200_0000, 4).unwrap(),
+            [0x00, 0x04, 0x00, 0x91]
+        );
         rsp.break_at(0x200).unwrap();
         assert!(rsp.write_memory(0, &[0]).is_err());
         server.join().unwrap();

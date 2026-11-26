@@ -13,7 +13,9 @@ const LOOP: [u32; 3] = [0x9100_0400, 0xf100_0421, 0x54ff_ffc1];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
-    let iterations: u64 = arguments.next().map_or(Ok(100_000_000), |text| text.parse())?;
+    let iterations: u64 = arguments
+        .next()
+        .map_or(Ok(100_000_000), |text| text.parse())?;
     let repeats: usize = arguments.next().map_or(Ok(3), |text| text.parse())?;
     if iterations == 0 || repeats == 0 {
         return Err("iterations and repeats must be positive".into());

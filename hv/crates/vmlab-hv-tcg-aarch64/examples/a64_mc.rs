@@ -77,7 +77,9 @@ fn llvm_names(llvm_mc: &str, words: &[u32]) -> Result<Vec<Option<String>>, Failu
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut names = stdout.lines().filter_map(|line| {
         let rest = line.split("<MCInst #").nth(1)?;
-        rest.split_whitespace().nth(1).map(|name| name.trim_end_matches('>').to_string())
+        rest.split_whitespace()
+            .nth(1)
+            .map(|name| name.trim_end_matches('>').to_string())
     });
     let mut result = Vec::with_capacity(words.len());
     for bad in invalid {
@@ -291,7 +293,10 @@ fn main() -> Result<(), Failure> {
     }
     if let Some(path) = vectors_check {
         if std::fs::read_to_string(&path)? != vector_file(&llvm_mc)? {
-            return Err(format!("{path} differs from what llvm-mc gives: run `just tcg-a64-generate`").into());
+            return Err(format!(
+                "{path} differs from what llvm-mc gives: run `just tcg-a64-generate`"
+            )
+            .into());
         }
         println!("{path} is what llvm-mc gives");
         return Ok(());
@@ -300,7 +305,11 @@ fn main() -> Result<(), Failure> {
     println!("seed={seed} records={}", RECORDS.len());
     tally.report();
     if tally.different != 0 {
-        return Err(format!("{} words decode to another record than llvm-mc names", tally.different).into());
+        return Err(format!(
+            "{} words decode to another record than llvm-mc names",
+            tally.different
+        )
+        .into());
     }
     Ok(())
 }

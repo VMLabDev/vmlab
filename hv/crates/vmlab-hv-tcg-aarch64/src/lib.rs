@@ -60,7 +60,11 @@ pub fn decode_unconstrained(word: u32) -> Option<Record> {
 
 /// The value of the raw field `name` of `record` in `word`.
 pub fn field(record: Record, name: &str, word: u32) -> Option<u32> {
-    let info = record.info().fields.iter().find(|field| field.name == name)?;
+    let info = record
+        .info()
+        .fields
+        .iter()
+        .find(|field| field.name == name)?;
     let mut value = 0;
     for part in info.parts {
         let mask = (1u64 << part.len) as u32 - 1;
@@ -71,7 +75,11 @@ pub fn field(record: Record, name: &str, word: u32) -> Option<u32> {
 
 /// `word` with the raw field `name` of `record` set to `value`.
 pub fn with_field(record: Record, name: &str, word: u32, value: u32) -> Option<u32> {
-    let info = record.info().fields.iter().find(|field| field.name == name)?;
+    let info = record
+        .info()
+        .fields
+        .iter()
+        .find(|field| field.name == name)?;
     let mut word = word;
     for part in info.parts {
         let mask = (1u64 << part.len) as u32 - 1;
@@ -83,7 +91,11 @@ pub fn with_field(record: Record, name: &str, word: u32, value: u32) -> Option<u
 
 /// The width in bits of the raw field `name` of `record`.
 pub fn field_width(record: Record, name: &str) -> Option<u32> {
-    let info = record.info().fields.iter().find(|field| field.name == name)?;
+    let info = record
+        .info()
+        .fields
+        .iter()
+        .find(|field| field.name == name)?;
     info.parts
         .iter()
         .map(|part| u32::from(part.field_lsb) + u32::from(part.len))

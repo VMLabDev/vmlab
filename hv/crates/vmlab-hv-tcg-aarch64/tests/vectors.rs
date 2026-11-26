@@ -38,7 +38,8 @@ fn the_decoder_names_the_record_that_llvm_names() {
         let record = decode_unconstrained(word);
         assert!(
             ours.is_none()
-                && record.is_some_and(|record| record.info().constrained && Some(record.name()) == llvm),
+                && record
+                    .is_some_and(|record| record.info().constrained && Some(record.name()) == llvm),
             "{word:08x}: ours {ours:?}, llvm-mc {llvm:?}"
         );
         refused += 1;
@@ -50,7 +51,10 @@ fn the_decoder_names_the_record_that_llvm_names() {
         .filter(|name| !named.contains(name))
         .collect();
     assert!(missing.is_empty(), "no vector decodes to {missing:?}");
-    println!("{} vectors, {refused} refused by a constraint", vectors().len());
+    println!(
+        "{} vectors, {refused} refused by a constraint",
+        vectors().len()
+    );
 }
 
 #[test]
