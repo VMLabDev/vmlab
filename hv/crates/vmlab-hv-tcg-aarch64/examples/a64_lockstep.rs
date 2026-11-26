@@ -99,9 +99,24 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "simd" => SIMD_FORMATS.to_vec(),
         "crypto" => CRYPTO_FORMATS.to_vec(),
         "c7" => [SIMD_FORMATS.as_slice(), CRYPTO_FORMATS.as_slice()].concat(),
+        // One format class of AdvSIMD or crypto by its name, for a longer
+        // run of a class with many records.
+        other
+            if SIMD_FORMATS
+                .iter()
+                .chain(&CRYPTO_FORMATS)
+                .any(|format| format.name() == other) =>
+        {
+            SIMD_FORMATS
+                .iter()
+                .chain(&CRYPTO_FORMATS)
+                .copied()
+                .filter(|format| format.name() == other)
+                .collect()
+        }
         other => {
             return Err(format!(
-                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, simd, crypto, c7"
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, simd, crypto, c7, or one format class of c7 by its name"
             )
             .into());
         }
