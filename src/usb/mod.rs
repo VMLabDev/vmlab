@@ -60,11 +60,15 @@ pub struct HostDevice {
     /// Four lowercase hex digits.
     pub vendor_id: String,
     pub product_id: String,
-    #[serde(default)]
+    /// The three strings below are the device's own string descriptors, so
+    /// whoever made or reprogrammed the device chose them. They are held
+    /// cleaned ([`clean_device_string`]) whichever way a `HostDevice` is
+    /// made: read from sysfs, or decoded from a daemon's reply.
+    #[serde(default, deserialize_with = "clean_device_string_field")]
     pub manufacturer: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "clean_device_string_field")]
     pub product: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "clean_device_string_field")]
     pub serial: Option<String>,
     /// Negotiated speed in Mbit/s, as sysfs spells it (`1.5`, `12`, `480`,
     /// `5000`, …).
@@ -154,6 +158,48 @@ impl HostDevice {
     }
 }
 
+/// A string descriptor of a device made safe to print: every control
+/// character (ESC, a line break, the C1 set), every other kind of white
+/// space and every invisible formatting character (bidirectional overrides,
+/// zero-width characters) becomes one plain space, and the ends are trimmed.
+/// The text comes from outside the host and reaches a terminal through the
+/// listing, the refusals, the log and the events. `None` when nothing
+/// printable is left.
+pub fn clean_device_string(raw: &str) -> Option<String> {
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(
+                c,
+                '\u{00ad}'
+                    | '\u{061c}'
+                    | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}'
+                    | '\u{fff9}'..='\u{fffb}'
+                    | '\u{e0000}'..='\u{e007f}'
+            )
+    };
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if unsafe_char(c) { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+/// [`clean_device_string`] on the way in from a serialised `HostDevice`: a
+/// reply of a daemon is not trusted to have cleaned the strings itself.
+fn clean_device_string_field<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?
+        .as_deref()
+        .and_then(clean_device_string))
+}
+
 /// The qdev id an attachment at `port` carries.
 pub fn qdev_id(port: &str) -> String {
     format!("usbhost-{port}")
@@ -201,6 +247,12 @@ fn read_device(dir: &Path, port: &str) -> Option<HostDevice> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    // A string descriptor: lossy, because sysfs promises no valid UTF-8 and
+    // an unreadable string must not hide the device, and cleaned.
+    let text = |name: &str| -> Option<String> {
+        let raw = std::fs::read(dir.join(name)).ok()?;
+        clean_device_string(&String::from_utf8_lossy(&raw))
+    };
     let hex = |name: &str| attr(name).and_then(|s| u8::from_str_radix(&s, 16).ok());
     let mut interfaces = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -237,9 +289,9 @@ fn read_device(dir: &Path, port: &str) -> Option<HostDevice> {
         devnum: attr("devnum")?.parse().ok()?,
         vendor_id: attr("idVendor")?.to_lowercase(),
         product_id: attr("idProduct")?.to_lowercase(),
-        manufacturer: attr("manufacturer"),
-        product: attr("product"),
-        serial: attr("serial"),
+        manufacturer: text("manufacturer"),
+        product: text("product"),
+        serial: text("serial"),
         speed: attr("speed").unwrap_or_default(),
         class: hex("bDeviceClass").unwrap_or(0),
         interfaces,
@@ -497,24 +549,68 @@ const BLOCK_WALK_DEPTH: usize = 12;
 /// How many layers of holders (dm-crypt, LVM, md) are followed above a disk.
 const HOLDER_DEPTH: usize = 8;
 
+/// One block device below a USB device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Block {
+    /// The kernel name (`sdb1`, `dm-0`).
+    name: String,
+    /// `major:minor`.
+    devno: String,
+    /// The name of a device-mapper mapping (`/dev/mapper/<name>`).
+    dm_name: Option<String>,
+}
+
+impl Block {
+    /// Whether `source`, the mount source of a mount table line, names this
+    /// block device: `/dev/sdb1`, `/dev/mapper/backup`, or one member of a
+    /// multi-device list (`/dev/sda1:/dev/sdb1`, as bcachefs writes it).
+    fn is_source(&self, source: &str) -> bool {
+        source.split(':').any(|path| {
+            let Some(below_dev) = path.strip_prefix("/dev/") else {
+                return false;
+            };
+            below_dev == self.name
+                || self
+                    .dm_name
+                    .as_deref()
+                    .is_some_and(|dm| below_dev.strip_prefix("mapper/") == Some(dm))
+        })
+    }
+}
+
 /// Every filesystem of `dev` the host has mounted: the block devices sysfs
 /// lists below the device at `sysfs_root`, their partitions and whatever
-/// holds them (a dm-crypt or LVM mapping), each looked up by its
-/// `major:minor` in `mount_table` (the text of [`MOUNT_TABLE`]). Sorted by
-/// mount point. An unreadable entry is skipped, as in [`scan`].
+/// holds them (a dm-crypt or LVM mapping), each looked up in `mount_table`
+/// (the text of [`MOUNT_TABLE`]) two ways: by its `major:minor`, and by its
+/// name as the mount source. The second is the only one that finds a
+/// filesystem mounted under an anonymous device number (`0:45`), as btrfs
+/// and bcachefs are. Sorted by mount point. An unreadable entry is skipped,
+/// as in [`scan`].
 pub fn host_mounts(sysfs_root: &Path, dev: &HostDevice, mount_table: &str) -> Vec<HostMount> {
     let mut blocks = Vec::new();
     find_blocks(&sysfs_root.join(&dev.port), BLOCK_WALK_DEPTH, &mut blocks);
     let mut out: Vec<HostMount> = Vec::new();
     for line in mount_table.lines() {
         // `36 35 8:17 / /run/media/u/STICK rw,... - vfat /dev/sdb1 rw`
+        // `36 35 0:45 / /mnt/stick rw,... shared:1 - btrfs /dev/sdb1 rw`
         let mut fields = line.split(' ');
         let (Some(devno), Some(mount_point)) = (fields.nth(2), fields.nth(1)) else {
             continue;
         };
-        if let Some((block, _)) = blocks.iter().find(|(_, d)| d == devno) {
+        // After the optional fields and their ` - ` end mark: the
+        // filesystem type, then the mount source.
+        let source = fields
+            .skip_while(|f| *f != "-")
+            .nth(2)
+            .map(unescape_mount)
+            .unwrap_or_default();
+        if let Some(block) = blocks
+            .iter()
+            .find(|b| b.devno == devno)
+            .or_else(|| blocks.iter().find(|b| b.is_source(&source)))
+        {
             let mount = HostMount {
-                block: block.clone(),
+                block: block.name.clone(),
                 mount_point: unescape_mount(mount_point),
             };
             if !out.contains(&mount) {
@@ -526,10 +622,10 @@ pub fn host_mounts(sysfs_root: &Path, dev: &HostDevice, mount_table: &str) -> Ve
     out
 }
 
-/// Collect `(name, major:minor)` of every block device below `dir`. Symlinks
+/// Collect every block device below `dir`. Symlinks
 /// are not followed on the way down: sysfs is full of them (`subsystem`,
 /// `driver`, `device`) and they lead out of the device.
-fn find_blocks(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
+fn find_blocks(dir: &Path, depth: usize, out: &mut Vec<Block>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -551,7 +647,7 @@ fn find_blocks(dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
 }
 
 /// One disk directory: the disk, each partition, and the holders of both.
-fn block_and_parts(disk: &Path, out: &mut Vec<(String, String)>) {
+fn block_and_parts(disk: &Path, out: &mut Vec<Block>) {
     block_and_holders(disk, HOLDER_DEPTH, out);
     if let Ok(entries) = std::fs::read_dir(disk) {
         for entry in entries.flatten() {
@@ -566,14 +662,21 @@ fn block_and_parts(disk: &Path, out: &mut Vec<(String, String)>) {
 
 /// One block device directory, and — through its `holders/` links — every
 /// mapping stacked on it.
-fn block_and_holders(block: &Path, depth: usize, out: &mut Vec<(String, String)>) {
+fn block_and_holders(block: &Path, depth: usize, out: &mut Vec<Block>) {
     let (Some(name), Ok(devno)) = (
         block.file_name().map(|n| n.to_string_lossy().into_owned()),
         std::fs::read_to_string(block.join("dev")),
     ) else {
         return;
     };
-    let entry = (name, devno.trim().to_string());
+    let entry = Block {
+        name,
+        devno: devno.trim().to_string(),
+        dm_name: std::fs::read_to_string(block.join("dm/name"))
+            .ok()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
+    };
     if out.contains(&entry) {
         return;
     }
