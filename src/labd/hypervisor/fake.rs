@@ -76,6 +76,8 @@ pub struct Run {
     /// The emulator itself is wedged and ignores a QMP `quit`, which is what
     /// leaves the stop ladder nothing but the kill.
     pub ignores_quit: bool,
+    /// The emulator closes the attach connection at exit without replying.
+    pub ignores_attach: bool,
     /// The emulator never answers a `detach`: wedged with the device held.
     pub ignores_detach: bool,
     /// The emulator answers a `detach` with this error and keeps the device:
@@ -454,6 +456,7 @@ impl Hypervisor for FakeHypervisor {
         }
         let machine = Arc::new(FakeProc {
             journal: self.journal.clone(),
+            ignores_attach: run.ignores_attach,
             ignores_detach: run.ignores_detach,
             detach_fails: run.detach_fails.clone(),
             ignores_agent_shutdown: run.ignores_agent_shutdown,
@@ -568,6 +571,7 @@ pub(crate) struct FakeProc {
     /// Where its hot-plug calls and its kill are written down. A machine
     /// shares the hypervisor's; a helper keeps its own.
     journal: Journal,
+    ignores_attach: bool,
     /// A `detach` is written down and then never answered.
     ignores_detach: bool,
     /// A `detach` is written down, refused with this error, and the device
@@ -601,6 +605,7 @@ impl FakeProc {
             snapshots: Default::default(),
             plugged: Default::default(),
             journal: Journal::default(),
+            ignores_attach: false,
             ignores_detach: false,
             detach_fails: None,
             ignores_agent_shutdown: false,
@@ -838,6 +843,10 @@ impl Frames for FakeCapabilities {
 impl Hotplug for FakeCapabilities {
     async fn attach_usb(&self, plan: &crate::usb::AttachPlan) -> Result<()> {
         self.0.note(format!("attach {}", plan.device.qdev_id()));
+        if self.0.ignores_attach {
+            self.0.ended().await;
+            bail!("the control connection closed");
+        }
         self.0
             .plugged
             .lock()

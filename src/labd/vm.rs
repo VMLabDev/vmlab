@@ -2006,15 +2006,25 @@ impl VmInstance {
     /// drops the backend. A killed process drops nothing: the kernel releases
     /// the claims on close and binds no driver, and the host then has a
     /// device it cannot use until a replug. So the kill rung asks for each
-    /// detach first, within [`USB_KILL_DETACH_WAIT`] for all of them, and
-    /// names each device it could not give back. The tracking is `teardown`'s.
+    /// detach first, within [`USB_KILL_DETACH_WAIT`] for the lock and all
+    /// detaches. The tracking is `teardown`'s.
     async fn usb_return_before_kill(&self, control: Option<&dyn Control>) {
-        let held = self.usb.lock().await.clone();
+        let deadline = tokio::time::Instant::now() + USB_KILL_DETACH_WAIT;
+        let held = match tokio::time::timeout_at(deadline, self.usb.lock()).await {
+            Ok(attached) => attached.clone(),
+            Err(_) => {
+                tracing::warn!(
+                    "{}: a USB operation is still pending before the kill; attached devices \
+                     may have no host driver until they are replugged",
+                    self.cfg.name
+                );
+                return;
+            }
+        };
         if held.is_empty() {
             return;
         }
         let hotplug = control.and_then(|c| c.hotplug());
-        let deadline = tokio::time::Instant::now() + USB_KILL_DETACH_WAIT;
         for a in held {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             let outcome = match &hotplug {

@@ -343,6 +343,12 @@ fn hardware_refusals(
     }
     let pc = legacy_pc(&h.machine);
     if pc {
+        if h.usb {
+            why.push(format!(
+                "vm \"{name}\": `usb = true` requires the q35 xHCI on vmlab-hv (PRD §5.2.1); \
+                 set `usb = false` on the pc machine"
+            ));
+        }
         if !delivered.machine_core {
             why.push(phase(
                 name,
@@ -886,6 +892,15 @@ mod tests {
             let why = refused(&body);
             assert!(why.is_empty(), "{body}: {why:?}");
         }
+    }
+
+    #[test]
+    fn usb_passthrough_on_the_pc_machine_is_refused_by_name() {
+        let why = refused(
+            r#"template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-xp" usb = true"#,
+        );
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("usb = true"), "{why:?}");
     }
 
     #[test]
