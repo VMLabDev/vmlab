@@ -22,16 +22,30 @@
 //!   of the allocation they follow, and a script is stopped at about one and
 //!   a half times the limit at the latest.
 //!
-//! A string concatenation is the one instruction whose size is known before
-//! it allocates and is not bounded by its operands' count, so it reserves
-//! first and faults *before* the allocation. Every other operation makes a
-//! value no larger than a small multiple of values the script already holds
-//! (a clone, a join, a split, a render), and is counted after.
+//! Counting after a value exists is too late for an operation whose result
+//! can be any size next to what the script holds. A shared value is counted
+//! once, so a list of a million references to one string of 1 MiB is small,
+//! and its `join` is 1 TiB. Every such operation is counted *before* it
+//! allocates:
+//!
+//! - One allocation of a size known in advance asks with
+//!   [`Vm::mem_reserve`]: a concatenation, `repeat`, a pad, `replace`,
+//!   `chars`, a list concatenation.
+//! - A result built piece by piece asks for each piece with
+//!   [`Vm::mem_grow`] before it appends it: `join`, and the rendering of a
+//!   value (`str`, `print`, `fmt`), where each piece is a string the script
+//!   holds.
+//!
+//! What is left is counted after it exists, when the builtin has returned.
+//! Those results are a bounded multiple of one value the script holds (a
+//! split, a slice, a change of case, a clone), or cost fuel for each value
+//! they visit (a deep clone, the small pieces of a rendering).
 //!
 //! What a native function holds while it runs is not on the register stack.
 //! The builtins that collect the results of a callback (`map` and its
-//! relatives) say what they hold with [`Vm::mem_hold`]; the count is given
-//! back when the native call returns and its result is in a register.
+//! relatives) say what they hold with [`Vm::mem_hold`], and a builder says
+//! it with [`Vm::mem_grow`]; the count is given back when the native call
+//! returns and its result is in a register.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -216,6 +230,12 @@ fn is_heap(v: &Value) -> bool {
 }
 
 impl Vm {
+    /// Whether this `Vm` has a memory limit, for a site that has to compute
+    /// a size before it can ask.
+    pub(crate) fn mem_limited(&self) -> bool {
+        self.mem.is_some()
+    }
+
     /// The bytes `v` brought into being: the nodes under it that nothing
     /// else refers to. For a value that was just made and is owned by the
     /// caller alone. Zero on a `Vm` without a limit.
@@ -269,6 +289,20 @@ impl Vm {
             mem.held = mem.held.saturating_add(bytes);
         }
         self.mem_note(bytes)
+    }
+
+    /// Count `bytes` that a native function is about to append to a result
+    /// it builds piece by piece, and fault instead when the result so far
+    /// and this piece do not fit. The result is in no register until the
+    /// function returns, so it is counted as held until then.
+    pub(crate) fn mem_grow(&mut self, bytes: u64) -> Result<(), RuntimeError> {
+        match &mut self.mem {
+            None => Ok(()),
+            Some(mem) => {
+                mem.held = mem.held.saturating_add(bytes);
+                self.mem_note(bytes)
+            }
+        }
     }
 
     /// What running native functions hold; see [`Vm::mem_hold`].

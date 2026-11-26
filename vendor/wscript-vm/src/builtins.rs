@@ -275,6 +275,15 @@ impl Vm {
                 let s = str_arg!(0);
                 let from = str_arg!(1);
                 let to = str_arg!(2);
+                // The result can be any multiple of `s`: each match becomes
+                // `to`. It has to fit before it is allocated, twice, as a
+                // `String` and as the value made from it.
+                if self.mem_limited() {
+                    let matches = s.matches(&*from).count() as u64;
+                    let kept = (s.len() as u64).saturating_sub(matches * from.len() as u64);
+                    let size = kept.saturating_add(matches.saturating_mul(to.len() as u64));
+                    self.mem_reserve(size.saturating_mul(2))?;
+                }
                 Value::Str(Rc::from(s.replace(&*from, &to).as_str()))
             }
             Builtin::StrRepeat => {
@@ -283,6 +292,7 @@ impl Vm {
                 if s.len().saturating_mul(n) > 64 * 1024 * 1024 {
                     return Err(self.fault("repeat: resulting string too large"));
                 }
+                self.mem_reserve((s.len() * n) as u64 * 2)?;
                 Value::Str(Rc::from(s.repeat(n).as_str()))
             }
             Builtin::StrPadLeft | Builtin::StrPadRight => {
@@ -310,6 +320,10 @@ impl Vm {
             }
             Builtin::StrChars => {
                 let s = str_arg!(0);
+                // A list slot for each character: up to 24 times the string.
+                if self.mem_limited() {
+                    self.mem_reserve(crate::mem::node(s.chars().count() as u64))?;
+                }
                 Value::new_list(s.chars().map(Value::Char).collect())
             }
             Builtin::StrSlice => {
@@ -629,11 +643,17 @@ impl Vm {
                 let sep = str_arg!(1);
                 let mut out = String::new();
                 for (i, item) in snapshot.iter().enumerate() {
+                    // The elements can all be one string that is counted
+                    // once: each piece has to fit before it is appended.
                     if i > 0 {
+                        self.mem_grow(sep.len() as u64)?;
                         out.push_str(&sep);
                     }
                     match item {
-                        Value::Str(s) => out.push_str(s),
+                        Value::Str(s) => {
+                            self.mem_grow(s.len() as u64)?;
+                            out.push_str(s);
+                        }
                         other => {
                             return Err(self.fault(format!(
                                 "join: expected string elements, found {}",
@@ -707,6 +727,7 @@ impl Vm {
             Builtin::ListConcat => {
                 let a = list_arg!(0).borrow().clone();
                 let b_items = list_arg!(1).borrow().clone();
+                self.mem_reserve(crate::mem::node((a.len() + b_items.len()) as u64))?;
                 let mut out = a;
                 out.extend(b_items);
                 Value::new_list(out)

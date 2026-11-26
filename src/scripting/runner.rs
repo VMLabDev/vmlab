@@ -916,6 +916,97 @@ fn main() -> int {
         stopped_at_one_mib(SCRIPT);
     }
 
+    /// A list of 1000 references to one string of 16 KiB is counted as the list
+    /// and the string once. Its `join` is 16 MiB, built inside one builtin: each
+    /// piece has to fit before it is appended (review of card #1086, F1).
+    #[test]
+    fn memory_limit_stops_a_join_of_one_string_many_times() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 1
+    while i < 1000 {
+        l.push(big)
+        i = i + 1
+    }
+    l.join("").bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `replace` makes each match as long as its replacement: 16 KiB of matches
+    /// times 16 KiB is 256 MiB in one call. It is refused before it allocates
+    /// (review of card #1086, F1).
+    #[test]
+    fn memory_limit_stops_a_replace_that_multiplies() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "x".repeat(16384)
+    big.replace("x", "y".repeat(16384)).bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `str` of the same list writes the string 1000 times, like `join`.
+    #[test]
+    fn memory_limit_stops_a_rendering_of_one_string_many_times() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 1
+    while i < 1000 {
+        l.push(big)
+        i = i + 1
+    }
+    str(l).bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `chars` makes a list slot for each byte of an ASCII string: 128 KiB
+    /// become some MiB. It is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_chars_of_a_long_string() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(8192)
+    big.chars().len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// The builtins that ask the limit first are not stopped when the result
+    /// fits: a join, a replace and a rendering of 64 KiB each under 1 MiB.
+    #[test]
+    fn memory_limit_lets_a_result_that_fits_through() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let line = "0123456789abcdef".repeat(4)
+    let l = [line]
+    let i = 1
+    while i < 1000 {
+        l.push(line)
+        i = i + 1
+    }
+    let joined = l.join("")
+    let replaced = joined.replace("0", "zero")
+    joined.bytes_len() + replaced.bytes_len() + str(l).bytes_len()
+}
+"#;
+        // 64,000 joined. 4000 matches of "0" grow by 3 bytes each. The
+        // rendering is 1000 strings and 999 of ", " in brackets.
+        assert_eq!(
+            run_limited(SCRIPT, Some(MIB)),
+            Ok(64000 + 76000 + 64000 + 1998 + 2)
+        );
+    }
+
     /// A chain of structs nested to any depth is walked without recursion,
     /// and is stopped when it is too long.
     #[test]

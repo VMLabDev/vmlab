@@ -395,6 +395,12 @@ impl Vm {
             return Err(self.fault(DEPTH_FAULT));
         }
         self.charge_structural()?;
+        // A string is the one piece of a rendering that is not small. The
+        // same one can be in a list a million times and be counted once, so
+        // each has to fit before it is appended (`Vm::mem_grow`).
+        if let Value::Str(s) = v {
+            self.mem_grow(s.len() as u64)?;
+        }
         // Custom Display impls take priority for nominal types.
         let custom = match v {
             Value::Struct(s) => self.unit_impls().display.get(&s.def.0).copied(),
@@ -409,6 +415,7 @@ impl Vm {
             let r = self.call_proto_nested(proto, vec![v.clone()])?;
             return match r {
                 Value::Str(s) => {
+                    self.mem_grow(s.len() as u64)?;
                     out.push_str(&s);
                     Ok(())
                 }
