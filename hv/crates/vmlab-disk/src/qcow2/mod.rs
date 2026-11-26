@@ -34,6 +34,8 @@ const MAX_BACKING_DEPTH: usize = 8;
 /// `QCOW_MAX_REFTABLE_SIZE`, `QCOW_MAX_SNAPSHOTS`). The file length alone does
 /// not bound them: a sparse file holds a long run of zeros for nothing.
 pub(crate) const MAX_L1_ENTRIES: u32 = (32 << 20) / 8;
+/// The unit QEMU counts a disk in. A virtual size is a whole number of these.
+const SECTOR_SIZE: u64 = 512;
 const MAX_REFCOUNT_TABLE_BYTES: u64 = 8 << 20;
 pub(crate) const MAX_SNAPSHOTS: u32 = 65536;
 const INCOMPAT_DIRTY: u64 = 1;
@@ -1101,12 +1103,20 @@ impl Qcow2Image {
 
     /// Create a fresh version-3 image at `path` (which must not exist).
     /// `cluster_bits` 16 (64 KiB) matches qemu-img's default.
+    ///
+    /// `size` is rounded up to the next multiple of 512, as `qemu-img
+    /// create` and `qemu-img convert` round it: QEMU and the virtio-blk
+    /// device count a disk in sectors and round the header size down, so a
+    /// partial last sector would be lost (review vmlab-disk-2 F18).
     pub fn create(
         path: &Path,
         size: u64,
         cluster_bits: u32,
         backing: Option<(&Path, Option<&str>)>,
     ) -> Result<Qcow2Image> {
+        let size = size.checked_next_multiple_of(SECTOR_SIZE).ok_or_else(|| {
+            Error::Unsupported(format!("a {size}-byte disk is over the qcow2 limit"))
+        })?;
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
         let l1_entries = size.div_ceil(span).max(1);
@@ -1436,7 +1446,16 @@ impl Qcow2Image {
     /// Ensure the active L1 (memory and on-disk region) has at least
     /// `needed` entries.
     pub(crate) fn ensure_l1_covers(&mut self, end_offset: u64) -> Result<()> {
-        let needed = (self.l1_index_of(end_offset - 1) + 1).max(1) as u32;
+        // The count is compared with the limit as a 64-bit value: a cast to
+        // `u32` first would wrap for a size of 2 EiB or more (review
+        // vmlab-disk-2 F15).
+        let needed = (self.l1_index_of(end_offset - 1) + 1).max(1);
+        if needed > u64::from(MAX_L1_ENTRIES) {
+            return Err(Error::Unsupported(format!(
+                "an L1 table of {needed} entries is over the qcow2 limit of {MAX_L1_ENTRIES}"
+            )));
+        }
+        let needed = needed as u32;
         if needed <= self.l1_size {
             return Ok(());
         }
@@ -2268,6 +2287,37 @@ mod tests {
 
     fn img_cluster_size(path: &Path) -> u64 {
         Qcow2Image::open(path, true).unwrap().cluster_size_bytes()
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    /// Review vmlab-disk-2 F15: the L1 entry count wrapped in a cast to
+    /// `u32`, so a resize to 2 EiB or more passed the limit of card #555.
+    #[test]
+    fn a_resize_past_the_l1_limit_is_refused_for_every_size() {
+        let (_dir, mut img) = testsupport::blank(1 << 20);
+        let l1_size = img.l1_size;
+        for shift in [60, 61, 62] {
+            let new_size = 1u64 << shift;
+            assert!(
+                img.resize_grow(new_size).is_err(),
+                "a resize to 1 << {shift} must be refused"
+            );
+            assert_eq!(img.size(), 1 << 20, "size after 1 << {shift}");
+            assert_eq!(img.l1_size, l1_size, "L1 size after 1 << {shift}");
+        }
+    }
+
+    /// Review vmlab-disk-2 F18: a size is a whole number of sectors.
+    #[test]
+    fn create_rounds_a_size_up_to_a_whole_sector() {
+        for (asked, made) in [(0, 0), (1, 512), (1000, 1024), (1024, 1024)] {
+            let (_dir, img) = testsupport::blank(asked);
+            assert_eq!(img.size(), made, "create of {asked} bytes");
+        }
     }
 }
 

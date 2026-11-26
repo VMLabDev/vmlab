@@ -750,6 +750,19 @@ mod tests {
     }
     on_both_tools!(async convert_flattens);
 
+    /// A raw source with a partial last sector converts to the same disk
+    /// under both tools: the size rounded up to a whole sector (review
+    /// vmlab-disk-2 F18).
+    async fn convert_of_a_raw_file_with_a_partial_last_sector() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("odd.img");
+        std::fs::write(&raw, vec![b'U'; 1000]).unwrap();
+        let converted = dir.path().join("odd.qcow2");
+        convert_to_qcow2(&raw, &converted).await.unwrap();
+        assert_eq!(image_info(&converted).await.unwrap().virtual_size, 1024);
+    }
+    on_both_tools!(async convert_of_a_raw_file_with_a_partial_last_sector);
+
     #[tokio::test]
     async fn qemu_img_failure_carries_stderr() {
         let Some(_tool) = select(Backend::QemuImg) else {
