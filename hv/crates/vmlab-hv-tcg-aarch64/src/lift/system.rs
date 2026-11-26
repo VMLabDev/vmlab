@@ -6,7 +6,9 @@
 //! after the registers are written back (DESIGN.md G3d): they can take an
 //! exception, change the level or write a system register. What stays in
 //! the graph is what a guest runs often and what touches only register
-//! slots: the hints, the barriers, and NZCV, FPCR and FPSR.
+//! slots: the hints, the barriers, and NZCV, FPCR and FPSR. An `MRS` of a
+//! register that is a stored word, such as TPIDR_EL1, stays in the block
+//! too, as an ordered helper call (R10).
 //!
 //! Sources read (DESIGN.md "Sources"):
 //! - S1: the generated tables, for the records, their fields and the PSTATE
@@ -23,7 +25,7 @@ use crate::generated::decode::{
     CRmSystemI, ExceptionGeneration, HintI, MRSI, MSRI, MSRpstateImm0_15, Record, UDFType,
 };
 use crate::state::slot;
-use crate::sysreg::{FPCR_MASK, FPSR_MASK};
+use crate::sysreg::{self, FPCR_MASK, FPSR_MASK};
 use vmlab_hv_tcg_ir::native::Binary;
 
 /// The encodings of the three registers that are register slots.
@@ -117,13 +119,26 @@ pub fn mrs(b: &mut Builder, _record: Record, f: &MRSI) -> Lifted {
             b.set_x(f.rt, 64, value);
             Lifted::Next
         }
-        _ => trap(
-            b,
-            Trap::Mrs {
-                encoding: f.systemreg as u16,
-                rt: f.rt as u8,
-            },
-        ),
+        encoding => {
+            // A stored word that this level may read without a condition is
+            // read inside the block. Every write of a system register ends
+            // its block, so the word is current.
+            if let Some(row) = sysreg::find(encoding as u16)
+                && sysreg::reads_stored(row, b.context().el)
+            {
+                let row = b.imm(64, row as u64);
+                let value = b.call_ordered(64, &sysreg::READ_STORED, &[row]);
+                b.set_x(f.rt, 64, value);
+                return Lifted::Next;
+            }
+            trap(
+                b,
+                Trap::Mrs {
+                    encoding: encoding as u16,
+                    rt: f.rt as u8,
+                },
+            )
+        }
     }
 }
 

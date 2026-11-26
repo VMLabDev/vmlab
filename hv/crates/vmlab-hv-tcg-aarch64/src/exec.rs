@@ -1226,6 +1226,59 @@ mod tests {
     }
 
     #[test]
+    fn a_read_of_a_stored_register_stays_in_its_block() {
+        // mrs x0, tpidr_el1 ; add x0, x0, #1 ; mrs x1, tpidr_el0 ;
+        // mrs x2, midr_el1 ; mrs xzr, tpidr_el1 ; mrs x3, cntvct_el0 ; nop
+        let words = [
+            mrs(0, "TPIDR_EL1"),
+            0x9100_0400,
+            mrs(1, "TPIDR_EL0"),
+            mrs(2, "MIDR_EL1"),
+            mrs(31, "TPIDR_EL1"),
+            mrs(3, "CNTVCT_EL0"),
+            NOP,
+        ];
+        let mut cpu = with_vectors(&words);
+        cpu.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x1000;
+        cpu.state.system.regs[sysreg::index("TPIDR_EL0")] = 0x2000;
+        cpu.clock = Clock::Manual(77);
+        assert_eq!(cpu.run(64), Stop::Budget);
+        // The counter is computed, so it ends the block. The five
+        // instructions before it are one block with it.
+        assert_eq!(cpu.translations, 2);
+        assert_eq!(
+            (cpu.state.x(0), cpu.state.x(1), cpu.state.x(2), cpu.state.x(3)),
+            (0x1001, 0x2000, 0x000f_3d00, 77)
+        );
+        // Stepping gives the same, and a second run of the cached block
+        // reads the words as they are then.
+        let mut step = with_vectors(&words);
+        step.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x1000;
+        step.state.system.regs[sysreg::index("TPIDR_EL0")] = 0x2000;
+        step.clock = Clock::Manual(77);
+        for _ in 0..7 {
+            step.step().unwrap();
+        }
+        assert_eq!(step.state.slots[..31], cpu.state.slots[..31]);
+        cpu.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x5000;
+        cpu.state.set_pc(BASE);
+        assert_eq!(cpu.run(7), Stop::Budget);
+        assert_eq!(cpu.state.x(0), 0x5001);
+        assert_eq!(cpu.translations, 2);
+        // At EL0 only what EL0 may read without a control bit stays inside:
+        // TPIDR_EL1 is undefined there, and CTR_EL0 asks SCTLR_EL1.
+        assert!(sysreg::reads_stored(sysreg::index("TPIDR_EL0"), 0));
+        assert!(!sysreg::reads_stored(sysreg::index("TPIDR_EL1"), 0));
+        assert!(!sysreg::reads_stored(sysreg::index("CTR_EL0"), 0));
+        assert!(sysreg::reads_stored(sysreg::index("CTR_EL0"), 1));
+        assert!(!sysreg::reads_stored(sysreg::index("OSLAR_EL1"), 1));
+        let mut user = with_vectors(&[mrs(0, "TPIDR_EL1")]);
+        assert!(user.state.set_cpsr(0x3c0));
+        user.step().unwrap();
+        assert_eq!(user.taken, sync(Exception::Undefined, BASE, VECTORS + 0x400));
+    }
+
+    #[test]
     fn a_machine_adds_registers_and_instructions_through_the_hooks() {
         // S3_0_C15_C0_0: IMPLEMENTATION DEFINED, no row.
         const ENCODING: u16 = sysreg::encoding(3, 0, 15, 0, 0);

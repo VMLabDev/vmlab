@@ -10,7 +10,7 @@ use crate::fields::Condition;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
-use vmlab_hv_tcg_ir::native::{Binary, Helper, ScalarId, ScalarType, Unary};
+use vmlab_hv_tcg_ir::native::{Binary, Helper, HelperRef, ScalarId, ScalarType, Unary};
 
 /// A PSTATE field that `MSR` writes with an immediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +94,9 @@ pub struct Builder {
     branch: Option<ScalarId>,
     /// What the last instruction does outside the graph.
     trap: Option<Trap>,
+    /// The count of ordered helper calls so far: each result is an effect
+    /// scalar of its own.
+    calls: usize,
 }
 
 fn total(value: Option<ScalarId>) -> ScalarId {
@@ -110,6 +113,7 @@ impl Builder {
             pc,
             branch: None,
             trap: None,
+            calls: 0,
         }
     }
 
@@ -414,6 +418,29 @@ impl Builder {
             .graph
             .call(ScalarType::Bits(width), helper, args)
             .expect("a pure helper with its count of arguments")
+    }
+
+    /// The result of the ordered helper `helper` on `args`, as `width` bits
+    /// (R10): the call runs once, at this place among the events of the
+    /// block, and sees the state of the CPU that is not in a register slot.
+    pub fn call_ordered(
+        &mut self,
+        width: u16,
+        helper: &'static Helper,
+        args: &[ScalarId],
+    ) -> ScalarId {
+        debug_assert_eq!(usize::from(helper.args), args.len());
+        let result = self
+            .block
+            .graph
+            .effect(self.calls, ScalarType::Bits(width));
+        self.calls += 1;
+        self.block.events.push(Event::Call {
+            helper: HelperRef(helper),
+            args: args.to_vec(),
+            results: vec![result],
+        });
+        result
     }
 
     /// FPCR now.

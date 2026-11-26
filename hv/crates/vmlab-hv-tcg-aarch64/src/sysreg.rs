@@ -677,6 +677,33 @@ pub fn write(row: usize, state: &mut State, environment: &Environment, value: u6
     }
 }
 
+/// Whether an `MRS` of the row at the level `el` is a read of the stored
+/// word and nothing else: no control bit decides it, and nothing is
+/// computed. A lifter then reads the word inside the block (`READ_STORED`).
+pub fn reads_stored(row: usize, el: u8) -> bool {
+    let info = &ROWS[row];
+    let access = if el == 0 { info.el0 } else { info.el1 };
+    info.kind == Kind::Stored && access.allows(false) && (el != 0 || info.gate == Gate::Open)
+}
+
+fn read_stored(context: &mut dyn std::any::Any, args: &[u128], results: &mut [u128]) {
+    let state = context
+        .downcast_mut::<State>()
+        .expect("the context of an aarch64 helper is the state");
+    results[0] = state.system.regs[args[0] as usize].into();
+}
+
+/// The ordered helper that reads the stored word of the row that its
+/// argument names. A register that a guest reads often, as TPIDR_EL1 for
+/// every per-CPU variable of a kernel, then does not end its block.
+pub static READ_STORED: vmlab_hv_tcg_ir::native::Helper = vmlab_hv_tcg_ir::native::Helper {
+    name: "sysreg_read_stored",
+    args: 1,
+    results: 1,
+    effects: vmlab_hv_tcg_ir::native::Effects::READS_STATE,
+    function: vmlab_hv_tcg_ir::native::HelperFn::Ordered(read_stored),
+};
+
 /// The word of a row as a snapshot, a debugger and the lockstep see it,
 /// without the access rules and without what a read computes: the stored
 /// word, the compare value of a timer, its two control bits, SP_EL0.
