@@ -112,6 +112,9 @@ impl Counts {
             End::Undefined => "undefined on both sides".to_string(),
             End::FetchAbort => "fetch abort on both sides".to_string(),
             End::PcAlignment => "pc alignment on both sides".to_string(),
+            End::OutsideMemory => {
+                "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
+            }
             End::UnliftedException(record) => format!("exception at {} (no lifter)", record.name()),
             End::Unlifted(record) => format!("QEMU ran {} (no lifter)", record.name()),
         };

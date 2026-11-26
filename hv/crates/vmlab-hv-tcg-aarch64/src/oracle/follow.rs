@@ -46,6 +46,9 @@ pub enum End {
     FetchAbort,
     /// Both sides refused a PC that is not a multiple of four.
     PcAlignment,
+    /// QEMU went on at a PC outside the memory that the round mirrors, where
+    /// it has flash or a device. The branch that went there is verified.
+    OutsideMemory,
     /// QEMU took an exception at a record that we decode and have no lifter
     /// for. Nothing to compare: the exception cards (C6) decide these.
     UnliftedException(Record),
@@ -192,10 +195,17 @@ impl Follower {
                             after: core,
                         });
                     }
-                    if core.pc & 3 == 0 && self.word(core.pc) != Some(encoding) {
+                    // QEMU has memory that the round does not mirror: flash
+                    // at 0 and devices. A branch that lands there is verified
+                    // by the registers above, and the round ends.
+                    let Some(word) = self.word(core.pc) else {
+                        self.leader.stop(true)?;
+                        break Ok(End::OutsideMemory);
+                    };
+                    if core.pc & 3 == 0 && word != encoding {
                         break Err(differed(
                             format!(
-                                "QEMU runs the word {encoding:08x}, which our memory does not hold at the PC"
+                                "QEMU runs the word {encoding:08x} where our memory holds {word:08x}"
                             ),
                             &last,
                             ours,
