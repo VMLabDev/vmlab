@@ -475,6 +475,7 @@ mod tests {
         words.extend(asm::load(16, BASE));
         words.push(asm::msr(reg::VBAR_EL1, 16));
         words.extend(&body);
+        words.push(asm::b(0));
         let mut data = vec![0u8; 0x2000];
         data[..words.len() * 4].copy_from_slice(&asm::bytes(&words));
         let state = State::reset_as(BASE + TABLE_BYTES, &sysreg::QEMU_CORTEX_A53);

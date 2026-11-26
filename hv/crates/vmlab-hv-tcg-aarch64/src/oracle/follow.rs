@@ -622,8 +622,16 @@ impl Follower {
                         ));
                     }
                     // The registers before it are verified by nothing: the
-                    // last instruction is not counted.
-                    last = None;
+                    // last instruction is not counted. A difference names
+                    // the instruction that QEMU did not retire.
+                    last = self.word(from_pc).map(|encoding| Last {
+                        encoding,
+                        record: None,
+                        before: ours,
+                        vectors: None,
+                        system: None,
+                        adopt: Adopt::Nothing,
+                    });
                     let stepped = self.cpu.step();
                     self.react(stepped, None, Some((kind, from_pc, to_pc)))?
                 }
