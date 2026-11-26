@@ -19,8 +19,8 @@ page gs_install {
 
   list {
     li "A Linux host, or Windows with WSL 2. There is no macOS build, because vmlab drives QEMU/KVM."
-    li "`/dev/kvm` present and writable by your user. Without it every guest is emulated, which is far slower. On WSL 2 this needs the nested-virtualisation setting described at the end of this chapter."
-    li "A package manager that can install QEMU. The package names below are Debian and Ubuntu names. Other distributions ship the same tools under different names."
+    li "For x86 guests and lab containers, vmlab-hv and `/dev/kvm` present and writable by your user. On WSL 2 this needs the nested-virtualisation setting described at the end of this chapter."
+    li "A package manager for the tools your guests need. The package names below are Debian and Ubuntu names. Other distributions ship the same tools under different names."
     li "`curl` or `wget` for the installer, and a Rust toolchain only if you build from source."
   }
 
@@ -89,7 +89,7 @@ page gs_install {
   h3 "Install vmlab-hv"
 
   p <<DOC
-    New modern x86_64 KVM VMs use vmlab-hv. The CLI installer does not
+    x86 guests and lab containers on x86_64 hosts use vmlab-hv. The CLI installer does not
     install it, but its `--fetch` option downloads the bundle,
     `vmlab-hv-<version>-linux-x86_64.tar.gz`, from the same release as your
     CLI and checks it the way it checks the CLI: the cosign signature of the
@@ -219,7 +219,7 @@ SRC
   code sh { source = <<'SRC'
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
+  qemu-system-arm qemu-system-misc qemu-utils \
   seabios swtpm \
   qemu-efi-riscv64 \
   tesseract-ocr passt \
@@ -230,7 +230,7 @@ SRC
   table {
     rows:
       | "Package" | "Provides" | "Needed for" |
-      | "`qemu-system-x86`, `qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-x86_64`, `qemu-system-aarch64`, `qemu-system-riscv64`" | "Running aarch64 and riscv64 guests. x86 guests run on vmlab-hv, which needs `/dev/kvm`, and not on `qemu-system-x86_64`. Install only the architectures you use." |
+      | "`qemu-system-arm`, `qemu-system-misc`" | "`qemu-system-aarch64`, `qemu-system-riscv64`" | "Running aarch64 and riscv64 guests. Install only the architectures you use." |
       | "`qemu-utils`" | "`qemu-img`" | "Optional. vmlab makes clones, snapshots and template disks itself; `qemu-img` runs them only when `VMLAB_IMAGE_TOOL=qemu-img` selects it as a fallback" |
       | "`seabios`" | "BIOS firmware" | "Booting `firmware = \"seabios\"` guests; usually pulled in by QEMU itself" |
       | "`qemu-efi-riscv64`" | "UEFI firmware for riscv64" | "riscv64 guests; vmlab bundles no riscv64 firmware" |
@@ -266,7 +266,7 @@ SRC
 
   callout "Runtime tools are installed" {
     kind = :success
-    body = "`qemu-system-x86_64 --version` prints a version. `ls /dev/kvm` shows the device."
+    body = "For x86 guests and lab containers, `command -v vmlab-hv` shows the binary and `ls -l /dev/kvm` shows the device and its permissions."
   }
 
   h2 "Get the guest assets"
@@ -439,7 +439,7 @@ SRC
 
   callout "Emulation is not a substitute for KVM" {
     kind = :warning
-    body = "If `/dev/kvm` is missing, vmlab still runs guests under pure emulation. A Windows installer under emulation takes hours rather than minutes, and template builds time out. Confirm the device exists before building anything."
+    body = "x86 guests and lab containers require KVM. Confirm `/dev/kvm` exists and your user can read and write it before building an x86 template."
   }
 
   h2 "Next steps"
