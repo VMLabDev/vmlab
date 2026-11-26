@@ -255,6 +255,7 @@ fn execute(
     super::cancel::check();
     let config = VmConfig {
         out: Box::new(move |text, newline| {
+            super::cancel::check();
             let mut chunk = text.to_owned();
             if newline {
                 chunk.push('\n');
