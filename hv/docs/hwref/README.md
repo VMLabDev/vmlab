@@ -179,6 +179,22 @@ test. It boots QEMU twice, requires an empty diff with no allow-list, then
 changes a captured PCI ID and requires exit 1. Without that opt-in, the test
 skips with a prerequisite message.
 
+## aarch64 `virt` (D9)
+
+`virt-fwcfg/` holds what QEMU's aarch64 `virt` machine hands a firmware
+through fw_cfg: the ACPI tables, their loader program, SMBIOS and the numeric
+items, for 16 configurations. `scripts/hwref/virt_fwcfg.py` captures it over
+qtest with no guest running. `vmlab_hv_firmware::virt` generates the same
+files, and `crates/vmlab-hv-firmware/tests/virt_hwref.rs` is the diff, inside
+`just ci::check`. Its allow-list is
+`scripts/hwref/approved-differences-virt.json`. `virt-fwcfg/README.md` has the
+configurations and what they show. `virt-boot/` is a Debian boot on QEMU with
+the firmware inputs that vmlab-hv generates (`scripts/hwref/virt_boot.py`).
+
+A capture from inside an aarch64 guest, as the x86 configurations have, is not
+made yet: vmlab-hv boots no aarch64 kernel before cards C10 and C13 of phase
+3d.
+
 ## Capture contents and limits
 
 Each configuration directory records exact argv, version, host CPU and firmware

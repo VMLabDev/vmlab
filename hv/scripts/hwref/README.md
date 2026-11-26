@@ -61,6 +61,27 @@ Enforcing secure boot is not captured. The legacy configuration combines
 devices across profiles and therefore has different slots from each individual
 profile. IRQ counts, timestamps, and host-derived CPUID data can vary.
 
+## aarch64 `virt`
+
+```
+python3 scripts/hwref/virt_fwcfg.py --output docs/hwref/virt-fwcfg   # all 16
+python3 scripts/hwref/virt_fwcfg.py --list
+python3 scripts/hwref/virt_boot.py --output /tmp/virt-boot           # a Debian boot
+```
+
+`virt_fwcfg.py` reads the fw_cfg files of QEMU's aarch64 `virt` over qtest: no
+guest runs, and a configuration takes less than a second. Requirements:
+`qemu-system-aarch64` and AAVMF under
+`~/.local/share/vmlab/guest/firmware/aarch64` or `/usr/share/AAVMF`. The diff
+against vmlab-hv is the Rust test `virt_hwref` of `vmlab-hv-firmware`, with the
+allow-list `approved-differences-virt.json`. See
+`docs/hwref/virt-fwcfg/README.md`.
+
+`virt_boot.py` boots an aarch64 template under QEMU TCG with the CPU whose
+firmware inputs vmlab-hv reproduces, waits for the vmlab agent, and records
+how the kernel booted. It needs the template under
+`~/.local/share/vmlab/templates/aarch64` and takes about a minute.
+
 ## Clean room
 
 QEMU is only ever run as a black box — never read. vmlab's sources are read
