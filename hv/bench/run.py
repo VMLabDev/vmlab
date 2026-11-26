@@ -63,8 +63,9 @@ def parse_args(argv):
                         "the template's own for x86_64)")
     p.add_argument("--repeats", type=int, default=3, help="repeats per configuration")
     p.add_argument("--guest", default="debian-13", help="template name")
-    p.add_argument("--suite", choices=("full", *lib.G2G_SUITES), default="full",
-                   help="x86_64: full single-VM set, jumbo g2g, MTU-1500 g2g1500, "
+    p.add_argument("--suite", choices=("full", "boot", *lib.G2G_SUITES), default="full",
+                   help="TCG: full set or boot only; "
+                        "x86_64: full single-VM set, jumbo g2g, MTU-1500 g2g1500, "
                         "or four-flow MTU-1500 g2g-multiflow")
     p.add_argument("--cpus", default=None, help="taskset window override (e.g. 16-19)")
     p.add_argument("--hv-bin", default=os.path.join(lib.REPO_DIR, "target/release/vmlab-hv"))
@@ -137,6 +138,10 @@ def one_repeat(args, arch, smp, pin, version, index):
             k: hello.get(k) for k in ("agent_version", "os", "features")
         }
         log(f"agent ready after {result['boot_to_agent_ready']}s")
+
+        if args.suite == "boot":
+            result["samples"] = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
+            return result, backend, session, agent, None
 
         def timed(name, argv, timeout):
             t = time.monotonic()
@@ -227,7 +232,8 @@ def one_repeat(args, arch, smp, pin, version, index):
 
 def run_config(args, arch, smp, pin, version, commit, dirty, host):
     """N repeats of one configuration → one history line per workload."""
-    all_samples = {w: [] for w in lib.workloads(arch, args.guest, args.suite)}
+    workloads = ("boot_to_agent_ready",) if args.suite == "boot" else lib.TCG_WORKLOADS
+    all_samples = {w: [] for w in workloads}
     digests = set()
     env = {
         "governor": lib.read_governor(),
@@ -244,12 +250,13 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         )
         env["loadavg_end"] = lib.read_loadavg()
         env["backend_version"] = backend.backend_version()
-        for w in lib.workloads(arch, args.guest, args.suite):
+        for w in workloads:
             all_samples[w].append(result["samples"][w])
-        digests.add(digest)
+        if digest is not None:
+            digests.add(digest)
         log(f"repeat {i}: {result['samples']}")
 
-    if len(digests) != 1:
+    if args.suite != "boot" and len(digests) != 1:
         raise lib.BenchError(f"sha256 digest changed across repeats: {digests}")
 
     return finish_config(args, arch, smp, all_samples, env, commit, dirty, host)
@@ -1157,12 +1164,16 @@ def main(argv=None):
     args = parse_args(argv)
     if args.backend in ("interpreter", "interpreter-reference", "interpreter-specialized") or (
             args.backend == "qemu" and args.guest == "flat-rv64gc"):
+        if args.suite == "boot":
+            raise lib.BenchError("--suite boot requires a TCG VM template")
         import micro
         commit, dirty = git_commit()
         return micro.run(args, commit, dirty, os.uname().nodename, log)
     if args.repeats < 2:
         log("note: --repeats < 2 leaves no spread; bench-check treats that as zero noise")
     arches = resolve_arches(args.arch)
+    if args.suite == "boot" and "x86_64" in arches:
+        raise lib.BenchError("--suite boot requires a TCG arch")
     if args.suite in lib.G2G_SUITES and arches != ["x86_64"]:
         raise lib.BenchError(f"--suite {args.suite} is an x86_64 suite")
     if args.suite in lib.G2G_SUITES and args.guest.startswith("windows-"):
