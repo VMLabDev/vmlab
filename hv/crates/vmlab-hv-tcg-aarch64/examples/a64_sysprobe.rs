@@ -57,10 +57,92 @@ fn vector_table() -> Vec<u32> {
     words
 }
 
+/// Sixteen entries of the handler of the PSTATE pass: note the saved PSTATE
+/// in X1, and return to EL1 with SP_EL1 at the instruction after the one
+/// that faulted.
+fn pstate_table() -> Vec<u32> {
+    let handler = [
+        asm::mrs(1, reg::SPSR_EL1),
+        asm::mrs(17, reg::ELR_EL1),
+        asm::add(17, 17, 4),
+        asm::msr(reg::ELR_EL1, 17),
+        asm::movz(16, 0x3c5, 0),
+        asm::msr(reg::SPSR_EL1, 16),
+        asm::ERET,
+    ];
+    let mut words = Vec::new();
+    for _ in 0..16 {
+        words.extend(handler);
+        words.resize(words.len() + 32 - handler.len(), asm::NOP);
+    }
+    words
+}
+
+/// Which bits of a saved PSTATE an exception return takes into PSTATE: for
+/// each base, the bits above the mode whose value follows SPSR_EL1.
+fn pstate(arguments: &Arguments) -> Result<String, Failure> {
+    const CASE: usize = 10;
+    let bases = [("el1h", 0x3c5u64), ("el0t", 0x3c0), ("illegal", 0x3c9)];
+    let mut body = Vec::new();
+    for (_, base) in bases {
+        for bit in 5..64 {
+            body.extend(asm::load(16, base ^ (1 << bit)));
+            body.push(asm::msr(reg::SPSR_EL1, 16));
+            let at = CODE + 4 * (5 + body.len() as u64);
+            // adr x16, .+12
+            body.push(0x1000_0070);
+            let _ = at;
+            body.push(asm::msr(reg::ELR_EL1, 16));
+            body.push(asm::ERET);
+            // The marker: BRK, whose handler notes the PSTATE it came from.
+            body.push(0xd420_0000);
+            body.push(asm::NOP);
+        }
+    }
+    let outcomes = phase_with(arguments, &pstate_table(), false, false, &body, None)?;
+    let mut text = String::new();
+    for (number, (name, base)) in bases.iter().enumerate() {
+        let (mut kept, mut entry) = (0u64, 0u64);
+        for bit in 5..64u64 {
+            let case = (number * 59 + (bit as usize - 5)) * CASE;
+            let saved = base ^ (1 << bit);
+            match outcomes[&(case + 8)] {
+                Outcome::Fault(pstate) => {
+                    let pstate = u64::from(pstate);
+                    if (pstate ^ saved) & (1 << bit) == 0 {
+                        kept |= 1 << bit;
+                    }
+                    // What an illegal return or a return with IL leaves set
+                    // beyond the bit itself.
+                    entry |= pstate & !saved & !0x1f;
+                }
+                Outcome::Ran(_) => return Err("the marker of the PSTATE pass ran".into()),
+            }
+        }
+        text.push_str(&format!(
+            "pstate return={name} spsr={base:x} follows={kept:x} extra={entry:x}\n"
+        ));
+    }
+    Ok(text)
+}
+
 /// One QEMU from its reset: run `body` at EL1 or EL0 and say what each of
 /// its instructions did, by its index in `body`.
 fn phase(
     arguments: &Arguments,
+    el0: bool,
+    fp: bool,
+    body: &[u32],
+    names: Option<&Path>,
+) -> Result<HashMap<usize, Outcome>, Failure> {
+    phase_with(arguments, &vector_table(), el0, fp, body, names)
+}
+
+/// As `phase`, with another vector table. An entry of the table leaves in X1
+/// what `Outcome::Fault` then holds.
+fn phase_with(
+    arguments: &Arguments,
+    table: &[u32],
     el0: bool,
     fp: bool,
     body: &[u32],
@@ -97,7 +179,7 @@ fn phase(
     words.extend(body);
     let end = CODE + 4 * words.len() as u64;
     words.push(asm::b(0));
-    leader.load(VECTORS, &asm::bytes(&vector_table()))?;
+    leader.load(VECTORS, &asm::bytes(table))?;
     leader.load(CODE, &asm::bytes(&words))?;
     leader.set_core(&Core {
         x: [0; 31],
@@ -355,6 +437,13 @@ fn main() -> Result<(), Failure> {
         text.push_str(&line);
         text.push('\n');
     }
+    text.push_str(
+        "# Which bits of PSTATE an exception return takes from SPSR_EL1: for a return to EL1\n\
+         # with SP_EL1, to EL0, and for a saved state of EL2, which is illegal. follows: the\n\
+         # bits from 5 up whose value in PSTATE after the return is their value in SPSR_EL1.\n\
+         # extra: bits that are set after the return and were clear in SPSR_EL1.\n",
+    );
+    text.push_str(&pstate(&arguments)?);
     match out {
         Some(path) => std::fs::write(&path, text)?,
         None => print!("{text}"),
