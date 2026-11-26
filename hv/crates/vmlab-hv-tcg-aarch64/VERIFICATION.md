@@ -524,3 +524,122 @@ that does not use it.
   lockstep are written from general knowledge of the two registers, and the
   lockstep shows that they have the effect that the prelude wants.
 - X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
+
+## Card C5 (2026-11-27)
+
+Scope: the flat aarch64 CoreMark image and the scalar loop in `bench/a64`,
+their runner on the interpreter and on QEMU (`bench/micro_a64.py`), the
+aarch64 lines of the bench history, and the gate of the design (M6): the
+interpreter runs the CoreMark mix at 100 MIPS or more, or it gets a
+pre-decoded block form in this card. It was below, and it got the form
+(`src/block.rs`).
+
+### The gate
+
+All numbers are from helios, 3 repeats, pinned with `taskset`, QEMU 11.1.3.
+
+| | CoreMark mix, MIPS (median) | Scalar loop, MIPS (median) |
+|---|---|---|
+| The interpreter of `next` (the slot executor on `u128` slots), commit `820007cd`, CPU 30 | 88.50, 88.51, 88.48 (**88.50**) | 96.10, 95.23, 95.46 (**95.46**) |
+| The pre-decoded block form, commit `0053c015`, CPUs 16-19, in the history | 160.76, 167.16, 167.73 (**167.16**) | 168.16, 165.74, 168.81 (**168.16**) |
+| QEMU TCG, `-machine virt -cpu cortex-a53`, CPUs 16-19, in the history | 2716.48, 2702.74, 2647.84 (**2702.74**) | 3441.74, 3197.08, 3458.65 (**3441.74**) |
+
+- The first row is the measurement that decided the gate: 88.50 MIPS is
+  below 100. It is not in the history, because that commit is not the code
+  of this card.
+- The CoreMark mix is 245,425,680 instructions in 336 blocks, and the loop is
+  300,000,014 instructions (3 N + 14, which the run asserts) in 3 blocks.
+- CoreMark's own checksums: the image leaves `0xe714` (list), `0x1fd7`
+  (matrix) and `0x8e3a` (state) in X2 to X4 and an error count of 0 in X5,
+  and its exit code is 0. The runner compares the four values on the
+  interpreter. QEMU ends with the same exit code of 0, which the image
+  computes from the same comparison.
+- The interpreter's time holds the translation of the blocks. A QEMU sample
+  is the wall time of the process less the median startup (0.0303 s, 15 runs
+  of the loop image with one iteration). The net time of a QEMU sample is
+  0.09 s, so its spread is a few percent.
+- QEMU is 16 times faster on the mix and 20 times on the loop. The design
+  expects that for 3d (M6) and leaves the bar of D1 to the JIT of 3e.
+  `just bench-report` prints the ratio as "BELOW D1".
+- The commands: `just bench-run qemu aarch64 1 3 flat-a64`, then
+  `just bench-run interpreter aarch64 1 3`.
+
+### What the block form is
+
+A block of the typed IR is lowered once into a stream of 16-byte operations
+on a frame of 64-bit words. A scalar of at most 64 bits is one word and a
+wider one is two. An operation with a result of one word that needs one word
+of each operand has a code of its own, and every other operation runs through
+the `u128` evaluators of `vmlab-hv-tcg-ir`, as before. Loads and stores of 1
+to 8 bytes, guards and helper calls are operations of the same stream. The
+semantics are still only in the lifters: `block.rs` knows the operations of
+the graph and nothing of aarch64. The slot executor of `vmlab-hv-tcg-ir`
+(`packed`) is unchanged and the riscv path still uses it.
+
+What it does not do, and what is left for speed: the registers are still
+copied into the frame before a block and out after it, a block is still looked
+up by its PC after every block (no chaining), the four flags are computed at
+the end of every block that sets them, and a vector or FP operation runs on
+the generic path at about the old speed. The mix of this card has no FP and
+no vector instruction, and no MMU: a boot has both, and a softmmu lookup per
+access (card C8). So 167 MIPS is the measure of the integer path on a flat
+memory, not of a boot.
+
+### The block form computes what the slot executor computed
+
+- `src/block.rs` has a test that builds a graph of one operation for every
+  binary and unary operation, slice, concat and select over twelve types, and
+  compares the lowered form with `linear::lower` and `Packed::evaluate` on 16
+  random values each: 30,481 binary graphs (11,152 of them with a code of
+  their own), 14,325 unary graphs (7,345), and the binary operations again
+  with a literal operand.
+- The tests of the crate pass on it unchanged, among them the corpus of
+  cards C1 to C4 with the registers that QEMU had: `cargo test --release -p
+  vmlab-hv-tcg-aarch64`, 96 tests.
+- Instruction lockstep against QEMU on the block form, commit `c4e7fcde`, no
+  difference in any run:
+
+| Run | Instructions verified | Rounds |
+|---|---|---|
+| `just tcg-a64-lockstep all 100000 3` | 3,347,191 | 73,159 |
+| `just tcg-a64-lockstep fp 100000 5` | 1,600,560 | 133,380 |
+| `just tcg-a64-lockstep loadstore 100000 5` | 5,226,214 | 2,977,243 |
+| `all 1000 3` with the four traces | 584,441, with all 550,472 executed encodings of the group | 301,376 |
+| `fp 1000 3` with the four traces | 16,773, with all 693 executed encodings | 1,403 |
+| `loadstore 1000 3` with the four traces | 232,673, with all 180,209 executed encodings | 230,587 |
+
+A finding about the harness, not about this card: `just tcg-a64-lockstep all
+100000 5` stops after 50,000 rounds with "QEMU wrote no record before the
+timeout". It does the same with the executor of `next` (the sources of
+`820007cd`), at the same round.
+
+### What the image needed
+
+- No FP and no vector register (`-mgeneral-regs-only`): the vector lifters
+  and `CPACR_EL1` come with later cards.
+- Aligned accesses only (`-mstrict-align`), as card C3 found for a flat
+  memory.
+- No linker relaxation (`-Wl,--no-relax`): lld turns an `adrp` and `add`
+  pair into a `nop` and an `adr`, and the hint space has no lifter before
+  card C6. The interpreter stopped at that `nop` in the first run.
+- An end that both sides honour without a system register: the semihosting
+  call `SYS_EXIT`. The interpreter stops in front of `hlt #0xf000` because
+  `HLT` has no lifter. When card C6 gives `HLT` an exception, `a64_bench`
+  must stop at that exception instead.
+
+### Shared code that changed
+
+`FlatMemory::read`, `write` and `range` of `vmlab-hv-tcg` are `#[inline]`
+now, so that a load of a known size in another crate is a bounds check and a
+move. Nothing else outside this crate and `bench/` changed.
+
+### Sources read for this card
+
+- None of S1 to S8 for semantics: this card wrote no instruction semantics.
+  `block.rs` and `exec.rs` hold none.
+- S6: the behaviour of a running QEMU 11.1.3, as the lockstep oracle and as
+  the yardstick of the benchmark. The semihosting call is from the public
+  semihosting specification of Arm (a prose document, S7 in kind).
+- CoreMark (Apache-2.0, EEMBC) is fetched at its pinned revision by the bench
+  and not committed, as for riscv64.
+- X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
