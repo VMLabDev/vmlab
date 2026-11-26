@@ -54,19 +54,38 @@ pub enum Trap {
         field: PstateField,
         immediate: u8,
     },
+    /// `SYS` (`read` false) or `SYSL`: a cache, TLB or address translation
+    /// operation (card C8). `encoding`: op1:CRn:CRm:op2, as the LLVM tables
+    /// key their operations.
+    Sys {
+        encoding: u16,
+        rt: u8,
+        read: bool,
+    },
 }
 
 /// The class of an exception that leaves a block before its end, at a load
-/// or a store (card C3). The loop stops for these until the translation card
-/// (C8) gives them their syndromes.
+/// or a store (card C3). The loop takes the data abort (card C8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExceptionClass {
     Undefined,
-    /// A load or a store that the memory does not hold.
-    DataAbort,
-    /// An access to an address that is not a multiple of its size, where the
-    /// instruction or the memory asks for one. The syndrome is the address.
-    Alignment,
+    /// A load or a store that cannot be made. `unprivileged`: the accesses
+    /// of the instruction are made as EL0 (`LDTR`, `STTR`).
+    DataAbort {
+        unprivileged: bool,
+    },
+    /// An access to an address that is not a multiple of its size. The
+    /// syndrome is the address. `always`: the instruction asks for the
+    /// alignment (an exclusive access). Otherwise the memory that the
+    /// address maps to decides, and SCTLR_EL1.A.
+    Alignment {
+        write: bool,
+        always: bool,
+        unprivileged: bool,
+        /// The alignment in bytes that Device memory asks of this access. 1:
+        /// none.
+        device: u8,
+    },
 }
 
 /// Where a block goes when it ends.
@@ -141,15 +160,16 @@ pub struct Builder {
     /// The addresses of this instruction that an alignment guard covers,
     /// each with the size that it was checked for.
     aligned: Vec<(ScalarId, u8)>,
+    /// The accesses of this instruction are made as EL0.
+    unprivileged: bool,
 }
 
-/// Whether an access that is not aligned to its size takes an alignment
-/// fault. On the flat address space it does, always: the lockstep shows
-/// that QEMU with the MMU off takes one for every load and store whose
-/// address is not a multiple of its size, also with `SCTLR_EL1.A` clear
-/// (S6, `a64_lockstep --probe`). The translation card (C8) makes this a
-/// property of the memory that an address maps to.
-const UNALIGNED_ACCESS_FAULTS: bool = true;
+/// The alignment that Device memory asks of a load or a store of a register
+/// whose own alignment is `align` bytes. What the lockstep found on QEMU
+/// (card C8): the size of the register, also for one of 16 bytes.
+fn device_alignment(align: u8) -> u8 {
+    align
+}
 
 fn total(value: Option<ScalarId>) -> ScalarId {
     value.expect("an operation on bitvectors that the graph always builds")
@@ -172,6 +192,7 @@ impl Builder {
             abort: None,
             effects: 0,
             aligned: Vec::new(),
+            unprivileged: false,
         }
     }
 
@@ -186,6 +207,15 @@ impl Builder {
         self.before_written = self.written;
         self.abort = None;
         self.aligned.clear();
+        self.unprivileged = false;
+    }
+
+    /// The loads and stores of the instruction that is being lifted are
+    /// made as EL0, whatever the level (`LDTR`, `STTR`). Call it before the
+    /// first access.
+    pub fn unprivileged(&mut self) {
+        debug_assert!(self.abort.is_none(), "after an access of the instruction");
+        self.unprivileged = true;
     }
 
     /// Take back the `begin` of an instruction that was not lifted and that
@@ -193,6 +223,17 @@ impl Builder {
     pub fn unbegin(&mut self) {
         debug_assert!(self.completed > 0, "the first instruction of a block");
         self.completed = self.completed.saturating_sub(1);
+    }
+
+    /// What the instruction has written to its registers so far stays
+    /// written when a later access of it faults. A load of several vector
+    /// registers calls this after each: QEMU writes them as it goes, and
+    /// the registers of a load that faults are whatever the CPU left in
+    /// them (DESIGN.md U1).
+    pub fn commit(&mut self) {
+        self.before = self.current;
+        self.before_written = self.written;
+        self.abort = None;
     }
 
     /// The address of the instruction that is being lifted.
@@ -673,7 +714,10 @@ impl Builder {
         if let Some(exit) = self.abort {
             return exit;
         }
-        let exit = self.exit_before(ExceptionClass::DataAbort, Vec::new());
+        let class = ExceptionClass::DataAbort {
+            unprivileged: self.unprivileged,
+        };
+        let exit = self.exit_before(class, Vec::new());
         self.abort = Some(exit);
         exit
     }
@@ -736,9 +780,15 @@ impl Builder {
     /// As `load`, for an access of several elements of `align` bytes each:
     /// the address must be a multiple of `align`.
     pub fn load_aligned(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
-        if UNALIGNED_ACCESS_FAULTS {
-            self.require_aligned(address, align);
-        }
+        self.require_aligned(address, align, device_alignment(align), false, false);
+        self.read_event(address, bytes, false)
+    }
+
+    /// As `load_aligned`, for a load of whole vector registers as a
+    /// structure (`LD1` to `LD4`): Device memory asks no alignment of it.
+    /// It does of the forms of one lane and of the replicating ones.
+    pub fn load_structure(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
+        self.require_aligned(address, align, 1, false, false);
         self.read_event(address, bytes, false)
     }
 
@@ -749,16 +799,21 @@ impl Builder {
 
     /// As `store`, for an access of several elements of `align` bytes each.
     pub fn store_aligned(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
-        if UNALIGNED_ACCESS_FAULTS {
-            self.require_aligned(address, align);
-        }
+        self.require_aligned(address, align, device_alignment(align), true, false);
+        self.write_event(address, bytes, value, false);
+    }
+
+    /// As `store_aligned`, for a store of whole vector registers as a
+    /// structure (`ST1` to `ST4`).
+    pub fn store_structure(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
+        self.require_aligned(address, align, 1, true, false);
         self.write_event(address, bytes, value, false);
     }
 
     /// A load that also marks the address for exclusive access. The address
     /// must be a multiple of `bytes` on every memory.
     pub fn load_exclusive(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
-        self.require_aligned(address, bytes);
+        self.require_aligned(address, bytes, bytes, false, true);
         self.read_event(address, bytes, true)
     }
 
@@ -773,8 +828,19 @@ impl Builder {
     }
 
     /// Leave the block with an alignment fault before this instruction,
-    /// unless `address` is a multiple of `bytes`, a power of two.
-    pub fn require_aligned(&mut self, address: ScalarId, bytes: u8) {
+    /// unless `address` is a multiple of `bytes`, a power of two. `always`:
+    /// the instruction asks for the alignment. Otherwise the fault is taken
+    /// only where something asks for it: SCTLR_EL1.A or the MMU being off,
+    /// which ask for `bytes`, or Device memory at the address, which asks
+    /// for `device` bytes. The loop decides that when the guard fails.
+    pub fn require_aligned(
+        &mut self,
+        address: ScalarId,
+        bytes: u8,
+        device: u8,
+        write: bool,
+        always: bool,
+    ) {
         if bytes == 1
             || self
                 .aligned
@@ -790,7 +856,13 @@ impl Builder {
         if self.block.graph.literal(aligned) == Some(1) {
             return;
         }
-        let exit = self.exit_before(ExceptionClass::Alignment, vec![address]);
+        let class = ExceptionClass::Alignment {
+            write,
+            always,
+            unprivileged: self.unprivileged,
+            device,
+        };
+        let exit = self.exit_before(class, vec![address]);
         self.block.events.push(Event::Guard {
             condition: aligned,
             expected: true,

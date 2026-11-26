@@ -19,6 +19,7 @@ pub mod rsp;
 pub mod stream;
 pub mod system;
 pub mod testfloat;
+pub mod translate;
 
 use crate::state::{State, slot};
 use crate::sysreg;

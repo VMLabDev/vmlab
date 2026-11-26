@@ -100,7 +100,7 @@ tcg-a64-plugin-build:
 	@mkdir -p target/tcg
 	gcc -O2 -Wall -Werror -shared -fPIC $(pkg-config --cflags glib-2.0) -o target/tcg/a64lock.so {{a64_crate}}/plugin/a64lock.c
 
-# Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3: c1, dp-immediate, branch, fp, which also compares V0 to V31, FPSR and FPCR, simd, crypto and c7, which do too, or system, which also takes the exceptions and compares the system registers); traces are files of the measure plugin with the executed encodings, separated by spaces
+# Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3: c1, dp-immediate, branch, fp, which also compares V0 to V31, FPSR and FPCR, simd, crypto and c7, which do too, system, which also takes the exceptions and compares the system registers, mmu, which runs with the MMU on over random translation tables of the 4K and 64K granules and also compares the memory writes, or walk, which does that for the 16K and 64K granules against QEMU's -cpu max); traces are files of the measure plugin with the executed encodings, separated by spaces
 [group('tcg')]
 tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='' samples='3': tcg-a64-plugin-build
 	#!/usr/bin/env bash
