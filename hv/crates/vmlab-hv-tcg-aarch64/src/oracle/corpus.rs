@@ -467,7 +467,7 @@ mod tests {
         before.x[3] = 7;
         let mut after = before;
         after.pc = 0x4208_0400;
-        after.cpsr = 0x6000_03c5;
+        after.cpsr = 0x3c5;
         // SP_EL1 is the stack pointer after the entry.
         after.sp = 0x9000;
         let call = Entry {

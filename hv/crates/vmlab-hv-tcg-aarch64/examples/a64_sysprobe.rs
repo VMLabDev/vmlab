@@ -31,10 +31,10 @@ const FIRST: u32 = 0x8000;
 const COUNT: u32 = 0x8000;
 
 /// What one instruction of a sweep did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Outcome {
     /// It ran. The registers after it.
-    Ran(Core),
+    Ran(Box<Core>),
     /// It took an exception with this syndrome.
     Fault(u32),
 }
@@ -126,7 +126,7 @@ fn phase(
                     && core.pc == pc + 4
                     && (first..end).contains(&pc)
                 {
-                    outcomes.entry(index(pc)).or_insert(Outcome::Ran(core));
+                    outcomes.entry(index(pc)).or_insert(Outcome::Ran(Box::new(core)));
                 }
                 if core.pc == end {
                     break;
@@ -210,7 +210,7 @@ fn unstable(name: &str) -> Option<&'static str> {
     }
 }
 
-fn read(outcome: Outcome, register: usize) -> String {
+fn read(outcome: &Outcome, register: usize) -> String {
     match outcome {
         Outcome::Ran(core) => format!("{:x}", core.x[register]),
         Outcome::Fault(0x0200_0000) => "u".into(),
@@ -218,7 +218,7 @@ fn read(outcome: Outcome, register: usize) -> String {
     }
 }
 
-fn wrote(outcome: Outcome) -> String {
+fn wrote(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Ran(_) => "ok".into(),
         Outcome::Fault(0x0200_0000) => "u".into(),
@@ -258,7 +258,7 @@ fn main() -> Result<(), Failure> {
             .iter()
             .enumerate()
             .flat_map(|(index, encoding)| {
-                let first = match read[&index] {
+                let first = match &read[&index] {
                     Outcome::Ran(_) => asm::mrs(0, *encoding),
                     Outcome::Fault(_) => asm::movz(0, 0, 0),
                 };
@@ -322,13 +322,13 @@ fn main() -> Result<(), Failure> {
             _ => text,
         };
         let columns = [
-            stable(read(el1_read[&index], 0)),
-            wrote(el1_write[&(2 * index + 1)]),
-            read(el0_read[&index], 0),
-            wrote(el0_write[&(2 * index + 1)]),
+            stable(read(&el1_read[&index], 0)),
+            wrote(&el1_write[&(2 * index + 1)]),
+            read(&el0_read[&index], 0),
+            wrote(&el0_write[&(2 * index + 1)]),
         ];
-        let fp = stable(read(fp_read[&index], 0));
-        let fp_wrote = wrote(fp_write[&(2 * index + 1)]);
+        let fp = stable(read(&fp_read[&index], 0));
+        let fp_wrote = wrote(&fp_write[&(2 * index + 1)]);
         if columns.iter().all(|column| column == "u") && fp == "u" && fp_wrote == "u" {
             continue;
         }
@@ -344,10 +344,10 @@ fn main() -> Result<(), Failure> {
         }
         if let Some(slot) = masked.iter().position(|masked| *masked == index) {
             let at = 1 + slot * SLOT;
-            let value = |offset: usize, register: usize| read(masks[&(at + offset)], register);
+            let value = |offset: usize, register: usize| read(&masks[&(at + offset)], register);
             line.push_str(&format!(" ones={} zeros={}", value(4, 3), value(6, 4)));
             for offset in [3, 5, 7] {
-                if let Outcome::Fault(esr) = masks[&(at + offset)] {
+                if let Outcome::Fault(esr) = &masks[&(at + offset)] {
                     line.push_str(&format!(" maskfault{offset}={esr:x}"));
                 }
             }

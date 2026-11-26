@@ -140,6 +140,11 @@ pub fn enter(state: &mut State, cause: Cause, pc: u64) {
         Cause::Interrupt(_) => system.regs[reg::ELR_EL1] = pc,
     }
     let vector = system.regs[reg::VBAR_EL1].wrapping_add(offset);
+    // QEMU clears N, Z, C and V at an entry (the lockstep of card C6 found
+    // it at the first exception). The saved PSTATE has them, so a guest
+    // sees it only in a handler that reads the flags before it sets them.
+    // QEMU is the reference (DESIGN.md P2, U1).
+    state.set_nzcv(0);
     state.daif = 0xf;
     state.il = false;
     state.context.el = target;
@@ -241,7 +246,8 @@ mod tests {
             0x4000_1000,
         );
         assert_eq!(state.pc(), 0x4008_0400);
-        assert_eq!(state.cpsr(), 0xa000_03c5);
+        // The flags are clear in the handler, and saved.
+        assert_eq!(state.cpsr(), 0x3c5);
         assert_eq!(state.system.regs[reg::SPSR_EL1], 0xa000_0100);
         assert_eq!(state.system.regs[reg::ELR_EL1], 0x4000_1004);
         assert_eq!(state.system.regs[reg::ESR_EL1], 0x5600_0007);
@@ -253,14 +259,14 @@ mod tests {
         assert_eq!(state.system.regs[reg::ELR_EL1], 0x4008_0402);
         assert_eq!(state.system.regs[reg::FAR_EL1], 0x4008_0402);
         assert_eq!(state.system.regs[reg::ESR_EL1], 0x8a00_0000);
-        assert_eq!(state.system.regs[reg::SPSR_EL1], 0xa000_03c5);
+        assert_eq!(state.system.regs[reg::SPSR_EL1], 0x3c5);
         // An interrupt leaves ESR_EL1 alone and returns to what did not run.
         state.context.sp_sel = false;
         enter(&mut state, Cause::Interrupt(Interrupt::Irq), 0x4000_2000);
         assert_eq!(state.pc(), 0x4008_0080);
         assert_eq!(state.system.regs[reg::ELR_EL1], 0x4000_2000);
         assert_eq!(state.system.regs[reg::ESR_EL1], 0x8a00_0000);
-        assert_eq!(state.system.regs[reg::SPSR_EL1], 0xa000_03c4);
+        assert_eq!(state.system.regs[reg::SPSR_EL1], 0x3c4);
         assert!(state.context.sp_sel);
     }
 

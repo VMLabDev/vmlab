@@ -1008,7 +1008,7 @@ mod tests {
             cpu.taken,
             sync(Exception::SupervisorCall(7), BASE, VECTORS + 0x400)
         );
-        assert_eq!(cpu.state.cpsr(), 0x2000_03c5);
+        assert_eq!(cpu.state.cpsr(), 0x3c5);
         assert_eq!(cpu.state.sp(), 0x2000);
         assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x5600_0007);
         assert_eq!(cpu.state.system.regs[reg::ELR_EL1], BASE + 4);
