@@ -1255,11 +1255,6 @@ impl Qcow2Image {
             hc[ext_off..ext_off + name.len()].copy_from_slice(name);
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
         file.set_len(l1_offset + l1_clusters * cluster_size)?;
 
         // Refcount table: entry 0 -> refblock 0.
