@@ -934,8 +934,11 @@ impl Builder<'_> {
                     2 => (reg::MAIR_EL1, self.mair()),
                     // The MMU off, one time in three, and on again the next
                     // time.
+                    // With `strict` it stays on: what an address that is
+                    // wider than a physical address does while the MMU is
+                    // off depends on the CPU.
                     _ => {
-                        *enabled = !*enabled || !self.chance(1, 3);
+                        *enabled = !*enabled || self.profile.strict || !self.chance(1, 3);
                         (reg::SCTLR_EL1, self.sctlr(*enabled))
                     }
                 };
