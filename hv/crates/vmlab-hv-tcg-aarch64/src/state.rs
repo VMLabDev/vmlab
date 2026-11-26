@@ -153,6 +153,12 @@ pub struct State {
     /// PSTATE.IL: the next instruction takes the Illegal Execution State
     /// exception.
     pub il: bool,
+    /// Bit 13 of PSTATE in the layout of an SPSR. It does nothing on this
+    /// CPU. QEMU's `cortex-a53` takes it from SPSR_EL1 at an exception return
+    /// to a state that does not exist, shows it in CPSR and saves it at the
+    /// next exception (the probe, `tests/qemu-cortex-a53-sysregs.txt`). We
+    /// keep it so that our PSTATE is QEMU's (DESIGN.md P2, U1).
+    pub pstate13: bool,
     /// The system registers.
     pub system: System,
 }
@@ -181,6 +187,7 @@ impl State {
             },
             daif: 0xf,
             il: false,
+            pstate13: false,
             system: System::reset(model),
         };
         state.set_pc(pc);
@@ -277,6 +284,7 @@ impl State {
     pub fn cpsr(&self) -> u32 {
         (u32::from(self.nzcv()) << 28)
             | (u32::from(self.il) << 20)
+            | (u32::from(self.pstate13) << 13)
             | (u32::from(self.daif & 0xf) << 6)
             | (u32::from(self.context.el & 3) << 2)
             | u32::from(self.context.sp_sel)
@@ -295,6 +303,7 @@ impl State {
         self.set_nzcv((cpsr >> 28) as u8);
         self.daif = (cpsr >> 6) as u8 & 0xf;
         self.il = cpsr & (1 << 20) != 0;
+        self.pstate13 = cpsr & (1 << 13) != 0;
         self.context.el = level;
         self.context.sp_sel = cpsr & 1 != 0;
         self.refresh();
@@ -366,7 +375,7 @@ mod tests {
     #[test]
     fn a_cpsr_goes_into_the_state_and_back() {
         let mut state = State::reset(0);
-        for cpsr in [0x3c5u32, 0x3c4, 0x6000_0000, 0x9010_0345, 0x0000_0080] {
+        for cpsr in [0x3c5u32, 0x3c4, 0x6000_0000, 0x9010_2345, 0x0000_0080] {
             assert!(state.set_cpsr(cpsr), "{cpsr:#x}");
             assert_eq!(state.cpsr(), cpsr);
         }

@@ -218,7 +218,10 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
 fn probe() -> BTreeMap<u16, (String, BTreeMap<String, String>)> {
     let text = include_str!("../../tests/qemu-cortex-a53-sysregs.txt");
     let mut lines = BTreeMap::new();
-    for line in text.lines().filter(|line| !line.starts_with('#')) {
+    for line in text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with("pstate"))
+    {
         let mut parts = line.split_whitespace();
         let encoding = u16::from_str_radix(parts.next().unwrap(), 16).unwrap();
         let name = parts.next().unwrap().split('/').next().unwrap().to_string();

@@ -182,3 +182,10 @@ df63 PMEVTYPER3_EL0 el1r=0 el1w=ok el0r=t6236f819 el0w=t6236f818
 df64 PMEVTYPER4_EL0 el1r=0 el1w=ok el0r=t6238f819 el0w=t6238f818
 df65 PMEVTYPER5_EL0 el1r=0 el1w=ok el0r=t623af819 el0w=t623af818
 df7f PMCCFILTR_EL0 el1r=0 el1w=ok el0r=t623ef81f el0w=t623ef81e
+# Which bits of PSTATE an exception return takes from SPSR_EL1: for a return to EL1
+# with SP_EL1, to EL0, and for a saved state of EL2, which is illegal. follows: the
+# bits from 5 up whose value in PSTATE after the return is their value in SPSR_EL1.
+# extra: bits that are set after the return and were clear in SPSR_EL1.
+pstate return=el1h spsr=3c5 follows=f01003c0 extra=0
+pstate return=el0t spsr=3c0 follows=f01003c0 extra=0
+pstate return=illegal spsr=3c9 follows=f01023c0 extra=100000

@@ -147,6 +147,7 @@ pub fn enter(state: &mut State, cause: Cause, pc: u64) {
     state.set_nzcv(0);
     state.daif = 0xf;
     state.il = false;
+    state.pstate13 = false;
     state.context.el = target;
     state.context.sp_sel = true;
     state.refresh();
@@ -176,8 +177,10 @@ pub fn exception_return(state: &mut State) {
         state.context.el = (spsr >> 2) as u8 & 3;
         state.context.sp_sel = spsr & 1 != 0;
         state.il = spsr & (1 << 20) != 0;
+        state.pstate13 = false;
     } else {
         state.il = true;
+        state.pstate13 = spsr & (1 << 13) != 0;
     }
     state.refresh();
     state.set_pc(target);
@@ -305,6 +308,40 @@ mod tests {
         assert!(return_is_legal(0x3c5, 1));
         assert!(return_is_legal(0x3c4, 1));
         assert!(return_is_legal(0x3c0, 1));
+    }
+
+    /// The probe of QEMU's exception return: for each saved state, the bits
+    /// from 5 up that PSTATE takes from SPSR_EL1, one bit flipped at a time.
+    #[test]
+    fn a_return_takes_the_bits_of_pstate_that_qemu_takes() {
+        let text = include_str!("../tests/qemu-cortex-a53-sysregs.txt");
+        let mut lines = 0;
+        for line in text.lines().filter(|line| line.starts_with("pstate")) {
+            let field = |key: &str| {
+                let value = line
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix(key))
+                    .unwrap_or_else(|| panic!("{line}: no {key}"));
+                u64::from_str_radix(value, 16).unwrap()
+            };
+            let (base, follows, extra) = (field("spsr="), field("follows="), field("extra="));
+            let (mut ours_follows, mut ours_extra) = (0u64, 0u64);
+            for bit in 5..64 {
+                let saved = base ^ (1 << bit);
+                let mut state = State::reset(0);
+                state.system.regs[reg::SPSR_EL1] = saved;
+                exception_return(&mut state);
+                let pstate = u64::from(state.cpsr());
+                if (pstate ^ saved) & (1 << bit) == 0 {
+                    ours_follows |= 1 << bit;
+                }
+                ours_extra |= pstate & !saved & !0x1f;
+            }
+            assert_eq!(ours_follows, follows, "{line}");
+            assert_eq!(ours_extra, extra, "{line}");
+            lines += 1;
+        }
+        assert_eq!(lines, 3);
     }
 
     #[test]
