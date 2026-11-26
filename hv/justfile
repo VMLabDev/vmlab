@@ -119,12 +119,13 @@ tcg-a64-boot-lockstep firmware='../guest/dist/firmware/aarch64' until='Shell>' r
 	set -euo pipefail
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64boot.XXXXXX")
 	finish() {
+		[ -n "$dir" ] && [ -d "$dir" ] || exit 1
 		if [ -n "{{keep}}" ] && [ -d "{{keep}}" ]; then
 			for name in follower-serial.log leader-serial.log last-instructions.txt; do
 				if [ -f "$dir/$name" ]; then cp -- "$dir/$name" "{{keep}}/$name"; fi
 			done
 		fi
-		if [ -n "$dir" ] && [ -d "$dir" ]; then rm -rf -- "$dir"; fi
+		rm -rf -- "$dir"
 	}
 	trap finish EXIT
 	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --code "{{firmware}}/AAVMF_CODE.fd" --vars "{{firmware}}/AAVMF_VARS.fd" --until "{{until}}" --resync "{{resync}}")
