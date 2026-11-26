@@ -629,4 +629,31 @@ mod tests {
         convert(&src, &dest, None, None, None).unwrap();
         assert_eq!(first_bytes(&dest), vec![0x77; 4096]);
     }
+
+    /// Review vmlab-disk-2 F14: a convert that fails because its source does
+    /// not open leaves an existing destination as it was.
+    #[test]
+    fn convert_from_a_missing_source_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.qcow2");
+        patterned(&dest, 0x42);
+        let missing = dir.path().join("nosuch.qcow2");
+        assert!(convert(&missing, &dest, None, None, None).is_err());
+        assert!(dest.exists(), "the destination was deleted");
+        assert_eq!(first_bytes(&dest), vec![0x42; 4096]);
+    }
+
+    /// The same when the source opens and the snapshot it is read at does
+    /// not exist.
+    #[test]
+    fn convert_of_a_missing_snapshot_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.qcow2");
+        patterned(&src, 0x10);
+        let dest = dir.path().join("keep.qcow2");
+        patterned(&dest, 0x24);
+        assert!(convert(&src, &dest, Some("nosuch"), None, None).is_err());
+        assert!(dest.exists(), "the destination was deleted");
+        assert_eq!(first_bytes(&dest), vec![0x24; 4096]);
+    }
 }
