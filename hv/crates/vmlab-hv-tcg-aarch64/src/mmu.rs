@@ -856,8 +856,11 @@ mod tests {
                 let high = (u64::MAX << input) + 2 * block + 7 * page;
                 tables.map(roots[0], granule, input, low, 3, 0x8000_0000 | TABLE | AF);
                 tables.map(roots[1], granule, input, high, 3, 0x9000_0000 | TABLE | AF | NOT_GLOBAL);
-                let found = tables.walk(&controls, low + 0x1234).unwrap();
-                assert_eq!(found.page, 0x8000_0000 + (0x1234 & !0xfff & (page - 1)), "{granule} {tsz}");
+                // An address in the upper half of the page: the 4K page of
+                // the result is the one that holds it.
+                let offset = page / 2 + 0x234;
+                let found = tables.walk(&controls, low + offset).unwrap();
+                assert_eq!(found.page, 0x8000_0000 + (offset & !0xfff), "{granule} {tsz}");
                 assert_eq!((found.span, found.level, found.global), (granule as u8, 3, true));
                 let found = tables.walk(&controls, high + page - 1).unwrap();
                 assert_eq!(found.page, 0x9000_0000 + ((page - 1) & !0xfff));
