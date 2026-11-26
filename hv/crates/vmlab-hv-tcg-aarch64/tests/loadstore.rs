@@ -822,6 +822,21 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     cpu.state.set_pc(BASE + 8);
     cpu.step().unwrap();
     assert_eq!(cpu.state.x(11), 0);
+    // QEMU keeps "no mark" as the last address, so an exclusive store there
+    // is an access without a mark too: it faults, where every other
+    // address fails without a fault.
+    let mut cpu = self::cpu(&[stxr(10, 1, 0)]);
+    cpu.state.set_x(0, u64::MAX);
+    assert_eq!(
+        cpu.step(),
+        Err(Stop::Alignment {
+            pc: BASE,
+            address: u64::MAX
+        })
+    );
+    let mut cpu = self::cpu(&[word(Record::STXRB, &[("ws", 10), ("rt", 1), ("rn", 0)])]);
+    cpu.state.set_x(0, u64::MAX);
+    assert!(matches!(cpu.step(), Err(Stop::DataAbort { write: true, .. })));
 }
 
 #[test]

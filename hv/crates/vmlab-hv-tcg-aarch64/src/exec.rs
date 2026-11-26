@@ -261,14 +261,17 @@ impl Side {
         bytes: u8,
         value: u128,
     ) -> Result<bool, Fault> {
-        let reservation = match self.exclusive {
-            Some(reservation) if reservation.address == address => reservation,
-            _ => {
-                // Another address, or no mark: no memory is looked at.
-                self.exclusive = None;
-                return Ok(false);
-            }
-        };
+        // QEMU keeps "no mark" as the address 2^64 - 1, so for it a store
+        // there is at the marked address also without a mark, and is an
+        // access that can fault. The architecture leaves open whether an
+        // exclusive store that fails takes the fault of its access, so the
+        // same is done here. Such a store never writes.
+        let marked = self.exclusive.map_or(u64::MAX, |mark| mark.address);
+        if marked != address {
+            // Another address: no memory is looked at.
+            self.exclusive = None;
+            return Ok(false);
+        }
         // From here the store is an access. One that faults leaves the
         // mark, as its instruction did not complete.
         if address & (u64::from(bytes) - 1) != 0 {
@@ -281,7 +284,9 @@ impl Side {
         let mut now = [0u8; 16];
         memory.read(address, &mut now[..usize::from(bytes)])?;
         let now = u128::from_le_bytes(now);
-        self.exclusive = None;
+        let Some(reservation) = self.exclusive.take() else {
+            return Ok(false);
+        };
         let same = if bytes == 16 {
             now as u64 == self.exclusive_value && (now >> 64) as u64 == self.exclusive_high
         } else {
