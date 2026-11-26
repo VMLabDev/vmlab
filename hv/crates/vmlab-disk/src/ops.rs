@@ -351,7 +351,8 @@ pub fn convert(
     backing: Option<&Path>,
     backing_format: Option<&str>,
 ) -> Result<()> {
-    if dest.exists() {
+    let dest_exists = dest.exists();
+    if dest_exists {
         // The destination is replaced, so it must not be an image this
         // convert reads: the source, the `backing` argument, or a file of
         // either backing chain, under any name (review vmlab-disk F11).
@@ -365,45 +366,40 @@ pub fn convert(
                 )));
             }
         }
-        std::fs::remove_file(dest)?;
     }
-    let backing_ref = backing.map(|b| (b, backing_format));
-    match snapshot {
+    // The source opens before the destination is removed, so a source that
+    // is missing, refused or lacks the snapshot leaves an existing
+    // destination as it was (review vmlab-disk-2 F14).
+    enum Source {
+        Raw(crate::raw::RawImage),
+        Qcow2(Qcow2Image),
+    }
+    let mut source = match snapshot {
         Some(name) => {
             let mut view = Qcow2Image::open(src, true)?;
             view.install_snapshot_view(name)?;
-            let size = view.size();
-            let mut dest_img = Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-            if backing.is_some() {
-                copy_own_layer(&mut view, &mut dest_img)?;
-            } else {
-                copy_full(&mut view, &mut dest_img)?;
-            }
-            dest_img.flush()
+            Source::Qcow2(view)
         }
         None => match probe_format(src)? {
-            Format::Raw => {
-                let mut reader = crate::raw::RawImage::open(src, true)?;
-                let size = reader.size();
-                let mut dest_img =
-                    Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-                copy_full(&mut reader, &mut dest_img)?;
-                dest_img.flush()
-            }
-            Format::Qcow2 => {
-                let mut reader = Qcow2Image::open(src, true)?;
-                let size = reader.size();
-                let mut dest_img =
-                    Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-                if backing.is_some() {
-                    copy_own_layer(&mut reader, &mut dest_img)?;
-                } else {
-                    copy_full(&mut reader, &mut dest_img)?;
-                }
-                dest_img.flush()
-            }
+            Format::Raw => Source::Raw(crate::raw::RawImage::open(src, true)?),
+            Format::Qcow2 => Source::Qcow2(Qcow2Image::open(src, true)?),
         },
+    };
+    if dest_exists {
+        std::fs::remove_file(dest)?;
     }
+    let backing_ref = backing.map(|b| (b, backing_format));
+    let size = match &source {
+        Source::Raw(reader) => reader.size(),
+        Source::Qcow2(reader) => reader.size(),
+    };
+    let mut dest_img = Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
+    match &mut source {
+        Source::Raw(reader) => copy_full(reader, &mut dest_img)?,
+        Source::Qcow2(reader) if backing.is_some() => copy_own_layer(reader, &mut dest_img)?,
+        Source::Qcow2(reader) => copy_full(reader, &mut dest_img)?,
+    }
+    dest_img.flush()
 }
 
 /// The first file of `image`'s backing chain (the image itself first) that
