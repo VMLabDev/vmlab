@@ -238,15 +238,20 @@ that signs an earlier `SHA256SUMS`.
 `install.sh` picks the check by the signature file of the release.
 `SHA256SUMS.key.bundle` is verified with `cosign verify-blob --key` against
 `RELEASE_KEY`, a variable at the top of `install.sh`. That variable is the
-switch, and it is empty today: the installer trusts no key and refuses a
-key-signed release. `SHA256SUMS.bundle` is verified keyless against the
+switch, and it is on since card 1030 (2026-11-26): it holds the operator's
+public key, the same text as `build/release-signing.pub`, and the installer
+refuses a release that another key signed. With an empty variable the
+installer trusts no key and refuses every key-signed release.
+`SHA256SUMS.bundle` is verified keyless against the
 identity of `ci.yml` as before, so every release that GitHub built still
 installs. `--release-key FILE` verifies with another public key. It is for
 testing a local build.
 
-Until the operator's public key is committed, every version built on helios is
-unsigned, and `curl ... | sh -s -- --pre` refuses it without
-`--insecure-skip-signature`.
+The operator's public key is committed. No version is signed with it yet: a
+version built with `--signing none`, and every version published before the
+first key-signed one, is unsigned, and `curl ... | sh -s -- --pre` refuses it
+without `--insecure-skip-signature`. The first key-signed version needs K4
+and K5 below.
 
 The operator decided (2026-11-26, card 1021):
 
@@ -263,7 +268,9 @@ The operator decided (2026-11-26, card 1021):
   leaked key needs a new key and a new `install.sh`, and old copies of the
   installer refuse the new releases.
 
-To turn `key` on:
+To turn `key` on. K1 and K3 are done: the operator made the pair on
+2026-11-26, and card 1030 committed its public half. K4 and K5 are open, and
+whether K2 is done is the operator's to say:
 
 - K1. The operator makes the pair, at a terminal, on a machine they trust:
   `just release::keygen <dir>`. `<dir>` is outside every git checkout, and
@@ -332,5 +339,6 @@ provenance, both signing ways through a cosign contract stub, what of the key
 reaches an argument list, a message and a file (a docker stub), the recipes
 `keygen`, `trust` and `doctor`, the installer's refusals and the upload
 command. They prove no cryptography: card 1021 holds the proof with a real
-cosign and a throwaway key. Action SHA pins
+cosign and a throwaway key, and card 1030 the proof that the committed
+`install.sh` refuses a release signed by a throwaway key. Action SHA pins
 in the remaining workflows must stay intact.
