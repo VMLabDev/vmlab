@@ -441,12 +441,12 @@ impl Builder<'_> {
             // Three in four are pages, next to each other. The others are
             // blocks, further up.
             let (level, va) = if index % 4 != 3 {
-                (3, region + u64::from(index) * page)
+                (3, region.wrapping_add(u64::from(index) * page))
             } else {
                 let level = if granule == 12 && self.chance(1, 4) { 1 } else { 2 };
                 let span = 1u64 << (granule + stride * (3 - level));
                 let slot = 1 + self.below(4);
-                (level, (region & !(span - 1)) + slot * span)
+                (level, (region & !(span - 1)).wrapping_add(slot * span))
             };
             // The address stays in its half.
             let within = va & (half - 1);
