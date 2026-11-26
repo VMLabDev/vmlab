@@ -252,7 +252,7 @@ impl Generator {
         let rng = &mut self.rng;
         match rng.below(8) {
             0 | 1 => rng.next_u64(),
-            2 | 3 | 4 => value(rng, 11, 52),
+            2..=4 => value(rng, 11, 52),
             // Single precision in the low half, with zeros or anything above.
             5 | 6 => {
                 let high = if rng.chance(1, 2) {

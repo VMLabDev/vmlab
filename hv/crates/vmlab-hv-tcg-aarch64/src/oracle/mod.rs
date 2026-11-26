@@ -99,21 +99,11 @@ impl std::fmt::Display for Core {
 
 /// The vector registers and the two FP registers, as the gdbstub and the
 /// plugin give them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Vectors {
     pub v: [u128; 32],
     pub fpsr: u32,
     pub fpcr: u32,
-}
-
-impl Default for Vectors {
-    fn default() -> Self {
-        Self {
-            v: [0; 32],
-            fpsr: 0,
-            fpcr: 0,
-        }
-    }
 }
 
 impl Vectors {

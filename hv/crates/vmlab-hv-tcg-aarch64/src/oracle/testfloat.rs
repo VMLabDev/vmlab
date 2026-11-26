@@ -330,7 +330,10 @@ mod tests {
     fn a_line_of_the_generator_is_checked_against_the_helpers() {
         // 1 + 2 = 3, and 1 / 3 in two modes: inexact is the flag 01.
         let add = case("f32_add", Rounding::NearEven, true);
-        assert_eq!(check(&add, "3F800000 40000000 40400000 00"), Ok(Verdict::Same));
+        assert_eq!(
+            check(&add, "3F800000 40000000 40400000 00"),
+            Ok(Verdict::Same)
+        );
         assert!(check(&add, "3F800000 40000000 40400001 00").is_err());
         assert!(check(&add, "3F800000 40000000 40400000 01").is_err());
         assert!(check(&add, "3F800000").is_err());
@@ -348,15 +351,24 @@ mod tests {
         // A conversion in the mode of the case, a compare, and a fused
         // multiply-add whose operands are the factors and then the addend.
         assert_eq!(
-            check(&case("f32_to_i32", Rounding::NearMaxMag, true), "40200000 00000003 01"),
+            check(
+                &case("f32_to_i32", Rounding::NearMaxMag, true),
+                "40200000 00000003 01"
+            ),
             Ok(Verdict::Same)
         );
         assert_eq!(
-            check(&case("f32_lt", Rounding::NearEven, true), "3F800000 7FC00000 0 10"),
+            check(
+                &case("f32_lt", Rounding::NearEven, true),
+                "3F800000 7FC00000 0 10"
+            ),
             Ok(Verdict::Same)
         );
         assert_eq!(
-            check(&case("f32_lt_quiet", Rounding::NearEven, true), "3F800000 7FC00000 0 00"),
+            check(
+                &case("f32_lt_quiet", Rounding::NearEven, true),
+                "3F800000 7FC00000 0 00"
+            ),
             Ok(Verdict::Same)
         );
         assert_eq!(
@@ -374,15 +386,24 @@ mod tests {
             Ok(Verdict::Skipped)
         );
         assert_eq!(
-            check(&case("ui64_to_f32", Rounding::MinMag, true), "FFFFFFFFFFFFFFFF 5F7FFFFF 01"),
+            check(
+                &case("ui64_to_f32", Rounding::MinMag, true),
+                "FFFFFFFFFFFFFFFF 5F7FFFFF 01"
+            ),
             Ok(Verdict::Same)
         );
         assert_eq!(
-            check(&case("f64_roundToInt", Rounding::NearMaxMag, false), "4004000000000000 4008000000000000 00"),
+            check(
+                &case("f64_roundToInt", Rounding::NearMaxMag, false),
+                "4004000000000000 4008000000000000 00"
+            ),
             Ok(Verdict::Same)
         );
         assert_eq!(
-            check(&case("f64_to_f16", Rounding::NearEven, true), "3FF0000000000000 3C00 00"),
+            check(
+                &case("f64_to_f16", Rounding::NearEven, true),
+                "3FF0000000000000 3C00 00"
+            ),
             Ok(Verdict::Same)
         );
         assert!(check(&case("f80_add", Rounding::NearEven, true), "0 0 0 0").is_err());
@@ -393,7 +414,10 @@ mod tests {
     fn a_sample_line_goes_to_text_and_back() {
         let case = case("f64_roundToInt", Rounding::NearMaxMag, false);
         let line = sample_line(&case, "4004000000000000 4008000000000000 00\n");
-        assert_eq!(line, "f64_roundToInt near_maxMag notexact 4004000000000000 4008000000000000 00");
+        assert_eq!(
+            line,
+            "f64_roundToInt near_maxMag notexact 4004000000000000 4008000000000000 00"
+        );
         assert_eq!(
             parse_sample(&line),
             Ok((case.clone(), "4004000000000000 4008000000000000 00"))
@@ -402,7 +426,14 @@ mod tests {
         assert!(parse_sample("f32_add odd exact 0 0 0 0").is_err());
         assert_eq!(
             generator_arguments(&case, 1),
-            ["-level", "1", "-tininessbefore", "-rnear_maxMag", "-notexact", "f64_roundToInt"]
+            [
+                "-level",
+                "1",
+                "-tininessbefore",
+                "-rnear_maxMag",
+                "-notexact",
+                "f64_roundToInt"
+            ]
         );
     }
 
@@ -419,7 +450,13 @@ mod tests {
         // Per width: 6 arithmetic functions in 4 modes, roundToInt in 4 and
         // in 5, 6 compares, 4 integers out in 5 modes and in in 4.
         assert_eq!(cases.len(), 2 * (6 * 4 + 4 + 5 + 6 + 4 * 5 + 4 * 4) + 6 * 4);
-        for name in ["f32_mulAdd", "f64_to_ui64", "i32_to_f32", "f16_to_f64", "f64_lt_quiet"] {
+        for name in [
+            "f32_mulAdd",
+            "f64_to_ui64",
+            "i32_to_f32",
+            "f16_to_f64",
+            "f64_lt_quiet",
+        ] {
             assert!(cases.iter().any(|case| case.function == name), "{name}");
         }
     }
