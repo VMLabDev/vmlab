@@ -22,8 +22,10 @@ const TABLE_PAGES: u64 = 16;
 const DATA: u64 = RAM + 0x2_0000;
 const OTHER: u64 = RAM + 0x2_1000;
 
-/// Where the tests map their data: a page in the lower half.
-const VA: u64 = 0x80_0000_0000;
+/// Where the tests map their data: a page in the lower half. Its entry
+/// of the TLB is not the one of the code, of the vectors or of the tables,
+/// so that no fetch replaces it.
+const VA: u64 = 0x80_0012_3000;
 
 const VALID_PAGE: u64 = 3;
 const AF: u64 = 1 << 10;
@@ -136,13 +138,13 @@ fn a_load_and_a_store_go_through_the_tables() {
     machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
     machine.cpu.memory.write(DATA + 0x10, &0x1122_3344u64.to_le_bytes()).unwrap();
     machine.cpu.state.set_x(0, VA + 0x10);
-    machine.cpu.state.set_x(2, VA + 0x1ffc);
+    machine.cpu.state.set_x(2, VA + 0x1ff8);
     assert!(matches!(machine.cpu.run(10), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     assert_eq!(machine.cpu.state.x(1), 0x1122_3344);
     // The store is in the last bytes of the second page: nothing of it is
     // in a third one.
-    assert_eq!(machine.word(OTHER + 0xffc) as u32, 0x1122_3344);
+    assert_eq!(machine.word(OTHER + 0xff8), 0x1122_3344);
     assert_eq!(machine.cpu.physical_address(VA + 0x1234), Some(OTHER + 0x234));
     assert_eq!(machine.cpu.physical_address(VA + 0x2000), None);
     assert!(machine.cpu.tlb_entries() >= 3);
@@ -379,7 +381,8 @@ fn dc_zva_zeroes_its_block_and_faults_as_a_store() {
             sysreg::trap_iss(0x4000 | op::DC_ZVA, 0, true)
         )))
     );
-    assert_eq!(machine.cpu.state.system.regs[sysreg::reg::ESR_EL1], 0x622c_7408);
+    // op0 1, op2 1, op1 3, CRn 7, CRm 4, a write, as QEMU reports it.
+    assert_eq!(machine.cpu.state.system.regs[sysreg::reg::ESR_EL1], 0x6212_dc08);
     machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::DZE;
     machine.to_el0();
     machine.cpu.state.set_pc(CODE);
