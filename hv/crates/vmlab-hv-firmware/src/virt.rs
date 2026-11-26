@@ -89,7 +89,7 @@ impl Platform {
         if self.vcpus == 0 || self.vcpus > MAX_VCPUS {
             return Err(format!("virt requires 1 <= vcpus <= {MAX_VCPUS}"));
         }
-        if self.ram_size == 0 || self.ram_size % (1 << 20) != 0 || self.ram_size > MAX_RAM {
+        if self.ram_size == 0 || !self.ram_size.is_multiple_of(1 << 20) || self.ram_size > MAX_RAM {
             return Err("virt RAM must be a whole number of MiB up to 255 GiB".into());
         }
         Ok(())
