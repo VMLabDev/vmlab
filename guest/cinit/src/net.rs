@@ -11,6 +11,7 @@
 //! back to write resolv.conf and emit `net_up`.
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use crate::util::{Ctx, Result};
@@ -36,34 +37,38 @@ pub fn loopback_up() -> Result<()> {
     busybox(&["ip", "link", "set", "lo", "up"])
 }
 
-fn udhcpc_argv(ifname: &str) -> [&str; 11] {
+fn udhcpc_argv<'a>(ifname: &'a str, pidfile: &'a str) -> [&'a str; 13] {
     [
-        "udhcpc",
         "-i",
         ifname,
-        "-f",
-        "-q",
         "-n",
         "-t",
         "6",
         "-T",
         "3",
         "-s",
+        UDHCPC_SCRIPT,
+        "-p",
+        pidfile,
+        "-O",
+        "staticroutes",
     ]
 }
 
-/// Bring up `eth<n>` and run one DHCP round. Returns the leased IP, or None
+/// Bring up `eth<n>` and start a DHCP client. Returns the initial IP, or None
 /// when no lease was obtained (logged, non-fatal: a NIC-less segment or a
 /// static-only fabric should not stop the container).
 pub fn dhcp_up(n: u32) -> Result<Option<String>> {
     let ifname = format!("eth{n}");
     fs::create_dir_all(STATE_DIR).ctx("mkdir /run/vmlab-net")?;
     busybox(&["ip", "link", "set", &ifname, "up"])?;
-    // -f foreground, -q quit once bound, -n give up after the retries below
-    // instead of looping forever (6 tries x 3s).
+    // BusyBox backgrounds itself after the bound hook returns. Waiting for
+    // its launcher gives us the hook's state while the client stays to renew.
+    // -n makes the launcher exit if the initial acquisition fails.
+    let pidfile = format!("{STATE_DIR}/{ifname}.pid");
     let st = Command::new(BUSYBOX)
-        .args(udhcpc_argv(&ifname))
-        .arg(UDHCPC_SCRIPT)
+        .arg0("udhcpc")
+        .args(udhcpc_argv(&ifname, &pidfile))
         .status()
         .ctx("run udhcpc")?;
     if !st.success() {
@@ -110,7 +115,11 @@ mod tests {
 
     #[test]
     fn the_dhcp_client_stays_to_renew() {
-        assert!(!udhcpc_argv("eth0").contains(&"-q"));
+        let args = udhcpc_argv("eth0", "/run/vmlab-net/eth0.pid");
+        assert!(!args.contains(&"-q"));
+        assert!(!args.contains(&"-f"));
+        assert!(!args.contains(&"-b"));
+        assert!(args.contains(&"-n"));
     }
 
     #[test]
@@ -122,21 +131,57 @@ mod tests {
         let hook = hook
             .replace("BB=/bin/busybox", "BB=busybox")
             .replace("STATE=/run/vmlab-net", "STATE=$TEST_STATE");
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!("busybox() {{ printf '%s\\n' \"$*\"; return 1; }}\n{hook}"))
-            .args(["udhcpc", "bound"])
-            .env_clear()
-            .env("TEST_STATE", state.path())
-            .env("interface", "eth0")
-            .env("ip", "10.0.0.10")
-            .env("router", "10.0.0.1")
-            .env("staticroutes", "10.99.0.0/24 10.0.0.5 0.0.0.0/0 10.0.0.2")
-            .output()
-            .unwrap();
-        let commands = String::from_utf8(output.stdout).unwrap();
-        assert!(commands.contains("ip route replace 10.99.0.0/24 via 10.0.0.5 dev eth0"), "{commands}");
-        assert!(commands.contains("ip route replace 0.0.0.0/0 via 10.0.0.2 dev eth0"), "{commands}");
+        let run = |event, staticroutes: Option<&str>| {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!("busybox() {{ printf '%s\\n' \"$*\"; }}\n{hook}"))
+                .args(["udhcpc", event])
+                .env_clear()
+                .env("TEST_STATE", state.path())
+                .env("interface", "eth0")
+                .env("ip", "10.0.0.10")
+                .env("router", "10.0.0.1");
+            if let Some(routes) = staticroutes {
+                command.env("staticroutes", routes);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let commands = run("bound", Some("10.99.0.0/24 10.0.0.5 0.0.0.0/0 10.0.0.2"));
+        assert!(
+            commands.contains("ip route replace 10.99.0.0/24 via 10.0.0.5 dev eth0"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains("ip route replace 0.0.0.0/0 via 10.0.0.2 dev eth0"),
+            "{commands}"
+        );
         assert!(!commands.contains("10.0.0.1"), "{commands}");
+
+        let commands = run("renew", None);
+        assert!(
+            commands.contains("ip route del 10.99.0.0/24 via 10.0.0.5 dev eth0"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains("ip route del 0.0.0.0/0 via 10.0.0.2 dev eth0"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains("ip route replace default via 10.0.0.1 dev eth0"),
+            "{commands}"
+        );
+
+        let commands = run("deconfig", None);
+        assert!(
+            commands.contains("ip route del default via 10.0.0.1 dev eth0"),
+            "{commands}"
+        );
+        assert_eq!(
+            fs::read_to_string(state.path().join("eth0.ip")).unwrap(),
+            ""
+        );
     }
 }
