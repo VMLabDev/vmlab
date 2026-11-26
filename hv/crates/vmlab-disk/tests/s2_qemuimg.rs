@@ -1738,6 +1738,71 @@ fn a_v2_image_with_a_qemu_snapshot_table_at_the_end_opens() {
     open_qemu_snapshot_table_at_eof("0.10");
 }
 
+/// F13 of docs/reviews/vmlab-disk-2.md: refcount recovery counts a
+/// compressed cluster up to the end of its last sector. When QEMU wrote that
+/// cluster last, the file ends inside the sector, and the writable open must
+/// still work.
+fn open_image_that_ends_in_a_compressed_cluster(compat: &str) {
+    use std::os::unix::fs::FileExt as _;
+
+    let temp = tmpdir("compressed-eof-recovery");
+    let path = temp.path().join("b.qcow2");
+    let filename = path.to_str().unwrap();
+    let cluster = 64 * 1024;
+    qemu_img(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-o",
+        &format!("compat={compat}"),
+        filename,
+        "64M",
+    ]);
+    qemu_io(&["-f", "qcow2", "-c", "write -c -P 3 0 64k", filename]);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    assert_ne!(
+        len % 512,
+        0,
+        "the file must end inside a sector, it is {len} bytes"
+    );
+    if compat == "1.1" {
+        // Set the dirty incompatible-feature bit to trigger v3 recovery.
+        file.write_all_at(&1u64.to_be_bytes(), 72).unwrap();
+    }
+    drop(file);
+
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, false).unwrap();
+    image.write_at(cluster as u64, &[0xaa; 512]).unwrap();
+    image.flush().unwrap();
+    drop(image);
+    qemu_check(&path);
+
+    let mut image = vmlab_disk::open(&path, Format::Qcow2, true).unwrap();
+    let mut buf = vec![0u8; cluster + 512];
+    image.read_at(0, &mut buf).unwrap();
+    assert!(
+        buf[..cluster].iter().all(|&b| b == 3),
+        "the compressed cluster does not read as 0x03"
+    );
+    assert!(
+        buf[cluster..].iter().all(|&b| b == 0xaa),
+        "the new write does not read back"
+    );
+}
+
+#[test]
+fn a_dirty_image_that_ends_in_a_compressed_cluster_opens() {
+    require_qemu_img!();
+    open_image_that_ends_in_a_compressed_cluster("1.1");
+}
+
+#[test]
+fn a_v2_image_that_ends_in_a_compressed_cluster_opens() {
+    require_qemu_img!();
+    open_image_that_ends_in_a_compressed_cluster("0.10");
+}
+
 /// VML-107: an owner that drops the image without `flush` keeps the writes.
 /// New clusters get their L2 and refcount updates in the write-back caches;
 /// closing the image must write them. The writes cover the first L2 table,

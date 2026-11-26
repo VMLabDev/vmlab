@@ -555,6 +555,36 @@ mod tests {
         assert_eq!(i.snapshots[0].name, "one");
     }
 
+    /// Review vmlab-disk-2 F21: a create that fails after it made the file
+    /// must remove it, because `up` takes an existing file as the disk.
+    #[test]
+    fn a_failed_create_leaves_no_file() {
+        use std::os::unix::fs::FileExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let top = dir.path().join("top.qcow2");
+        create_qcow2(&base, 1 << 20, None, None).unwrap();
+        // An incompatible feature bit that vmlab-disk does not know.
+        let file = std::fs::OpenOptions::new().write(true).open(&base).unwrap();
+        file.write_all_at(&(1u64 << 40).to_be_bytes(), 72).unwrap();
+        drop(file);
+        assert!(Qcow2Image::open(&base, true).is_err());
+
+        assert!(create_qcow2(&top, 1 << 20, Some(&base), Some("qcow2")).is_err());
+        assert!(!top.exists(), "the failed create left {}", top.display());
+    }
+
+    /// A create onto an existing file is refused and leaves that file alone.
+    #[test]
+    fn a_create_onto_an_existing_file_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top.qcow2");
+        std::fs::write(&top, b"mine").unwrap();
+        assert!(create_qcow2(&top, 1 << 20, None, None).is_err());
+        assert_eq!(std::fs::read(&top).unwrap(), b"mine");
+    }
+
     fn patterned(path: &Path, byte: u8) {
         create_qcow2(path, 1 << 20, None, None).unwrap();
         let mut img = Qcow2Image::open(path, false).unwrap();
