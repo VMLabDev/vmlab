@@ -146,8 +146,11 @@ fn sources(directory: &Path) -> Vec<PathBuf> {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            // The ARM-VFPv2 specialisation has no bfloat16.
             path.extension().is_some_and(|extension| extension == "c")
-                && !EXCLUDED.contains(&path.file_name().unwrap().to_str().unwrap())
+                && !EXCLUDED.contains(&name)
+                && !name.to_ascii_lowercase().contains("bf16")
         })
         .collect();
     files.sort();
