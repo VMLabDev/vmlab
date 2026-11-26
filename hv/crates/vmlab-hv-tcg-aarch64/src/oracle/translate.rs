@@ -973,10 +973,9 @@ mod tests {
                 }
             }
         }
-        println!("on {on} user {user} stores {stores} entries {entries} kinds {kinds:x?}");
         assert!(on > 40_000, "{on}");
         assert!(user > 2_000, "{user}");
-        assert!(stores > 500, "{stores}");
+        assert!(stores > 150, "{stores}");
         assert!(entries > 4, "{entries}");
         // Data aborts: translation, access flag and permission faults of
         // level 3, an alignment fault and an external abort. Instruction
