@@ -1578,7 +1578,10 @@ fn a_superspeed_burst_endpoint_is_configured() {
             1,
             "Max Burst Size {burst}"
         );
-        let state = d.mem.read_obj::<u32>(GuestAddress(0x5000 + 5 * 32)).unwrap();
+        let state = d
+            .mem
+            .read_obj::<u32>(GuestAddress(0x5000 + 5 * 32))
+            .unwrap();
         assert_eq!(u32::from_le(state) & 7, 1, "the endpoint is running");
     }
 }
@@ -1597,7 +1600,10 @@ fn a_streams_endpoint_is_refused() {
             5,
             "MaxPStreams {streams}"
         );
-        let state = d.mem.read_obj::<u32>(GuestAddress(0x5000 + 5 * 32)).unwrap();
+        let state = d
+            .mem
+            .read_obj::<u32>(GuestAddress(0x5000 + 5 * 32))
+            .unwrap();
         assert_eq!(u32::from_le(state) & 7, 0, "the endpoint stays disabled");
     }
 }
