@@ -4412,6 +4412,8 @@ dependencies = [
  "vmlab-hv-display",
  "vmlab-hv-firmware",
  "vmlab-hv-proto",
+ "vmlab-hv-tcg",
+ "vmlab-hv-tcg-aarch64",
  "vmlab-hv-tests",
  "vmm-sys-util",
  "zerocopy",
