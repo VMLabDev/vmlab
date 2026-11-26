@@ -100,11 +100,22 @@ version. `just release::verify <dir>` runs the check again, and checks a
 a checkout with uncommitted changes to tracked files, a checkout with an
 untracked file that the committed `.gitignore` files do not ignore (an exclude
 in `.git/info/exclude`, in your own git configuration or in an untracked
-`.gitignore` does not count), and a
+`.gitignore` does not count), a checkout with anything in `.ci-cache/` (what
+an earlier build or check in that checkout left: remove the directory, or run
+checks with `VMLAB_TARGET_ROOT` set), and a
 version whose tag exists. It uploads nothing. Start it like every heavy run on helios.
 
 The command rebuilds the `vmlab-build` image first, so the image has the
-toolchains that the commit pins. `--image-as-is` skips that for a test build.
+toolchains that the commit pins. It takes the id of the image that this build
+made, and starts every container of the release by that id: the build
+containers and the cosign container. `provenance.json` holds the same id as
+`buildImage`. The tag `vmlab-build` is one name for the whole docker host, and
+a build of another checkout can move it while the release runs. That changes
+nothing for the release. `--image-as-is` skips the rebuild and takes the image
+that the tag names at that moment. It is for the version `0.0.0-dry-run`
+only, and the command refuses it for every other version.
+The hypervisor bundle takes its virglrenderer from a build of the same run,
+not from `.ci-cache/`.
 A change of `scripts/guest-toolchains.sh` rebuilds every layer of the image
 (about 10 GiB). Every release build is a cold build: the command gives its
 containers new docker volumes (`vmlab-release-<random>-*`, the cargo home and

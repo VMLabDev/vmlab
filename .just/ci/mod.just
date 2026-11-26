@@ -159,7 +159,7 @@ hv-virgl-build: require-uv
 # Build and check the in-tree hypervisor release bundle in target/dist/
 [group('ci')]
 hv-package version='': require-cargo hv-virgl-build
-	uv run --no-project python build/hv.py package {{quote(version)}}
+	uv run --no-project --with meson --with PyYAML python build/hv.py package {{quote(version)}}
 
 # Check hypervisor formatting with the root toolchain
 [group('ci')]

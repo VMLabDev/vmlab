@@ -25,7 +25,8 @@
 #                 the sigstore trust root)
 # Env: COSIGN             run this cosign binary, and no container (the tests,
 #                         and a host that has the pinned cosign)
-#      VMLAB_BUILD_IMAGE  the image (default vmlab-build)
+#      VMLAB_BUILD_IMAGE  the image (default vmlab-build): a tag, or the image
+#                         id that scripts/release-local.sh pins for a release
 
 set -euo pipefail
 set +x

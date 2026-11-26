@@ -2,6 +2,7 @@
 """Build the in-tree hypervisor and its relocatable release bundle."""
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import os
@@ -29,15 +30,23 @@ def patch_digest(patches):
         patch.name.encode() + b"\0" + patch.read_bytes() for patch in patches)).hexdigest()
 
 
-def cache_key(version, sha256, patches):
-    """The virglrenderer build's identity: a new pin or patch set is a new key."""
-    return f"virglrenderer-{version}-{sha256}-{patch_digest(patches)}"
+def options_digest(options):
+    return hashlib.sha256(b"".join(option.encode() + b"\0" for option in options)).hexdigest()
+
+
+def cache_key(version, sha256, patches, options):
+    """The virglrenderer build's identity: a new pin, patch set or meson
+    option is a new key. The compiler is not in it: a build that must not
+    inherit one (a release) does not read the cache at all (`package_virgl`)."""
+    return f"virglrenderer-{version}-{sha256}-{patch_digest(patches)}-{options_digest(options)[:16]}"
 
 
 PATCH_SHA256 = patch_digest(PATCHES)
-CACHE_KEY = cache_key(VIRGL_VERSION, VIRGL_SHA256, PATCHES)
+CACHE_KEY = cache_key(VIRGL_VERSION, VIRGL_SHA256, PATCHES, VIRGL_MESON_OPTIONS)
 CACHE = Path(os.environ["VMLAB_TARGET_ROOT"]) / ".ci-cache" if os.environ.get("VMLAB_TARGET_ROOT") else ROOT / ".ci-cache"
 VIRGL = CACHE / CACHE_KEY
+# Where a dist build makes its own virglrenderer (`package_virgl`).
+DIST_VIRGL = ROOT / "target/hv-virgl"
 
 
 def run(*args, **kwargs):
@@ -86,26 +95,95 @@ def test_native_deps_install():
         run(*prefix, "ln", "-s", "/usr/bin/convert", "/usr/local/bin/magick")
 
 
+def fresh_virgl():
+    """A dist build (build/dist.sh sets VMLAB_HV_VIRGL=fresh) packages a
+    virglrenderer that it built itself, and reads none from the cache."""
+    return os.environ.get("VMLAB_HV_VIRGL") == "fresh"
+
+
+def tree_manifest(prefix):
+    """Every file and link under `prefix` with its content, `.complete` apart."""
+    lines = []
+    for path in sorted(prefix.rglob("*")):
+        name = path.relative_to(prefix).as_posix()
+        if name == ".complete":
+            continue
+        if path.is_symlink():
+            lines.append(f"link {os.readlink(path)}  {name}\n")
+        elif path.is_file():
+            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {name}\n")
+        elif not path.is_dir():
+            lines.append(f"other  {name}\n")
+    return "".join(lines)
+
+
 def virgl_build(prefix=None):
     """Build the pinned, patched virglrenderer into `prefix`, by default the
-    cache directory named by its key, which is reused while it is complete."""
+    cache directory named by its key.
+
+    The cache directory is reused only while it is the tree that a build here
+    left: `.complete` holds the manifest of that tree, written after the
+    install, and a tree that differs from it in one file is removed and built
+    again. This finds a tree that was cut short, damaged, or put there with no
+    manifest. It is no proof against code that can write the cache, which can
+    write a manifest too: a dist build does not come here (`package_virgl`)."""
     if prefix is not None:
         CACHE.mkdir(parents=True, exist_ok=True)
         virgl_install(Path(prefix))
         return
-    if (VIRGL / ".complete").is_file():
-        run("pkg-config", f"--with-path={VIRGL}/lib/pkgconfig",
-            f"--exact-version={VIRGL_VERSION}", "virglrenderer")
-        if not (VIRGL / "libexec/virgl_render_server").is_file():
-            raise RuntimeError("cached virglrenderer has no render server")
+    if fresh_virgl():
+        print("virgl-build: nothing to do, the package step builds its own virglrenderer", flush=True)
         return
+    complete = VIRGL / ".complete"
+    if complete.is_file() and not complete.is_symlink():
+        recorded = complete.read_text()
+        if recorded and recorded == tree_manifest(VIRGL):
+            run("pkg-config", f"--with-path={VIRGL}/lib/pkgconfig",
+                f"--exact-version={VIRGL_VERSION}", "virglrenderer")
+            if not (VIRGL / "libexec/virgl_render_server").is_file():
+                raise RuntimeError("cached virglrenderer has no render server")
+            return
+        print(f"virgl-build: {VIRGL} is not the tree that its build left: building it again", flush=True)
     CACHE.mkdir(parents=True, exist_ok=True)
+    remove_tree(VIRGL, "virglrenderer-")
     virgl_install(VIRGL)
-    (VIRGL / ".complete").touch()
+    complete.write_text(tree_manifest(VIRGL))
 
 
-def virgl_install(prefix):
-    with tempfile.TemporaryDirectory(prefix="virgl-", dir=CACHE) as temporary:
+def remove_tree(path, name):
+    """Remove the directory `path`, which must be named `name` and not be a link."""
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        if not path.name.startswith(name) or path.parent in (path, Path("/")):
+            raise RuntimeError(f"refusing to remove {path}")
+        shutil.rmtree(path)
+
+
+@contextlib.contextmanager
+def package_virgl():
+    """The virglrenderer that `package` builds against and copies from: the
+    cache directory, or for a dist build one that is built now in
+    `DIST_VIRGL`, which is emptied first and removed afterwards. That path is
+    fixed and inside the checkout because the library keeps the prefix as its
+    last-resort render server path: a path under /tmp there could be made by
+    any user of the host that runs the bundle, and a random one would change
+    the bundle from build to build."""
+    if not fresh_virgl():
+        yield VIRGL
+        return
+    remove_tree(DIST_VIRGL, "hv-virgl")
+    DIST_VIRGL.mkdir(parents=True)
+    try:
+        prefix = DIST_VIRGL / "prefix"
+        virgl_install(prefix, scratch=DIST_VIRGL)
+        yield prefix
+    finally:
+        remove_tree(DIST_VIRGL, "hv-virgl")
+
+
+def virgl_install(prefix, scratch=None):
+    with tempfile.TemporaryDirectory(prefix="virgl-", dir=scratch or CACHE) as temporary:
         work = Path(temporary)
         archive = work / "virgl.tar.gz"
         run("curl", "-fsSL", "--retry", "3", "-o", archive, VIRGL_URL)
@@ -175,10 +253,15 @@ def package(version):
         version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", version):
         raise ValueError(f"invalid release version: {version}")
+    with package_virgl() as virgl:
+        package_from(virgl, version)
+
+
+def package_from(virgl, version):
     commit = revision()
     target = ROOT / "target/hv"
     env = os.environ.copy()
-    env["PKG_CONFIG_PATH"] = f"{VIRGL}/lib/pkgconfig"
+    env["PKG_CONFIG_PATH"] = f"{virgl}/lib/pkgconfig"
     env["CARGO_TARGET_DIR"] = str(target)
     run("cargo", "build", "--release", "--locked", "-p", "vmlab-hv", "-p", "vmlab-hv-viewer", "--bin", "vmlab-hv",
         "--bin", "vmlab-hv-viewer", cwd=ROOT, env=env)
@@ -192,9 +275,9 @@ def package(version):
         stage_viewer_desktop(stage)
         shutil.copy2(target / "release/vmlab-hv", stage / "libexec/vmlab-hv")
         shutil.copy2(target / "release/vmlab-hv-viewer", stage / "bin/vmlab-hv-viewer")
-        shutil.copy2(VIRGL / "libexec/virgl_render_server", stage / "libexec/virgl_render_server")
-        shutil.copy2(VIRGL / "BUILDINFO", stage / "virglrenderer-BUILDINFO")
-        for library in (VIRGL / "lib").glob("libvirglrenderer.so*"):
+        shutil.copy2(virgl / "libexec/virgl_render_server", stage / "libexec/virgl_render_server")
+        shutil.copy2(virgl / "BUILDINFO", stage / "virglrenderer-BUILDINFO")
+        for library in (virgl / "lib").glob("libvirglrenderer.so*"):
             shutil.copy2(library, stage / "lib" / library.name, follow_symlinks=False)
         launcher = stage / "bin/vmlab-hv"
         launcher.write_text('''#!/bin/sh
@@ -204,7 +287,7 @@ export RENDER_SERVER_EXEC_PATH="${RENDER_SERVER_EXEC_PATH:-$root/libexec/virgl_r
 exec "$root/libexec/vmlab-hv" "$@"
 ''')
         launcher.chmod(0o755)
-        shutil.copy2(VIRGL / "COPYING", stage / "licenses/virglrenderer-COPYING")
+        shutil.copy2(virgl / "COPYING", stage / "licenses/virglrenderer-COPYING")
         for notice in ("LICENSE", "LICENSE.crosvm", "THIRD_PARTY_NOTICES"):
             origin = ROOT / notice if notice != "LICENSE.crosvm" else ROOT / "hv" / notice
             shutil.copy2(origin, stage / "licenses" / notice)

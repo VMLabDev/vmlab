@@ -1,4 +1,5 @@
-//! PC firmware inputs and the fw_cfg port-I/O device.
+//! Firmware inputs of the PC machines and of aarch64 `virt`, and the fw_cfg
+//! port-I/O device.
 
 pub mod acpi;
 pub mod fw_cfg;
@@ -6,6 +7,7 @@ pub mod loader;
 pub mod pc;
 pub mod platform;
 pub mod smbios;
+pub mod virt;
 
 pub use acpi::{PciDevice, Platform};
 pub use fw_cfg::FwCfg;
