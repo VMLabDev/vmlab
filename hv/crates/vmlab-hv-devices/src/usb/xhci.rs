@@ -715,10 +715,25 @@ impl XhciController {
                 result.map(|cc| (cc, slot))
             }
             14..=16 => {
-                let e = &mut self.state.slots[slot].endpoints[ep];
+                let e = &self.state.slots[slot].endpoints[ep];
                 if ep == 0 || e.context[0] & 7 == 0 {
                     return Ok((12, slot));
                 }
+                // Review usb-2.md F15: a transfer the backend has finished
+                // and the poll has not collected yet completes its TD here.
+                // The device moved those bytes, so the guest gets them in a
+                // Transfer Event ahead of the Stopped event. The control
+                // endpoint has no such look: its request is dropped whole.
+                if kind == 15 && ep > 1 && e.kicked && e.context[0] & 7 == 1 {
+                    self.serve(slot, ep, true)?;
+                    // The transfer ended in a stall: the endpoint is
+                    // halted, which Stop Endpoint does not change (xHCI
+                    // 4.6.9).
+                    if self.state.slots[slot].endpoints[ep].context[0] & 7 == 2 {
+                        return Ok((CONTEXT_ERROR, slot));
+                    }
+                }
+                let e = &mut self.state.slots[slot].endpoints[ep];
                 let stopped = if kind == 15 && e.kicked && e.context[0] & 7 == 1 {
                     let mut ring = e.ring;
                     match ring.pop_within(&self.mem, &mut self.reads)? {
@@ -917,8 +932,18 @@ impl XhciController {
         Ok(SUCCESS)
     }
     fn transfers(&mut self, slot: usize, ep: usize) -> Result<Served, DeviceError> {
+        self.serve(slot, ep, false)
+    }
+    /// Serve the TDs of one endpoint. With `stopping`, this is the last
+    /// look of a Stop Endpoint command at the TD at the dequeue pointer:
+    /// the backend is asked through `endpoint_stopped` for a transfer that
+    /// has finished already, nothing new is started, and at most that one
+    /// TD completes.
+    fn serve(&mut self, slot: usize, ep: usize, stopping: bool) -> Result<Served, DeviceError> {
         for _ in 0..BUDGET {
-            if self.state.interrupters[self.interrupter].pending.len() >= BUDGET {
+            // A stop reports what the backend holds whatever is queued:
+            // the command drops that result otherwise.
+            if !stopping && self.state.interrupters[self.interrupter].pending.len() >= BUDGET {
                 break;
             }
             if self.reads == 0 {
@@ -962,6 +987,9 @@ impl XhciController {
                 break;
             }
             if !finished {
+                if stopping {
+                    break;
+                }
                 // An unfinished TD waits for the guest to queue the rest,
                 // unless it is longer than the controller walks at all: in
                 // TRBs, or in the reads of one whole poll.
@@ -1023,11 +1051,16 @@ impl XhciController {
                 valid = false;
             }
             let bus_transfer = control || !td.iter().all(|(_, t)| matches!(t.kind(), 7 | 8));
-            if interrupt && bus_transfer && endpoint.service_remaining() != 0 {
+            if stopping && (!valid || control || !bus_transfer) {
+                break;
+            }
+            // The service interval paces new transactions. A stop starts
+            // none.
+            if !stopping && interrupt && bus_transfer && endpoint.service_remaining() != 0 {
                 break;
             }
             let mut data = Vec::new();
-            if valid && !input {
+            if valid && !input && !stopping {
                 for &(_, t) in &buffers {
                     if t.control & 64 != 0 {
                         data.extend_from_slice(&t.parameter.to_le_bytes()[..t.length()]);
@@ -1045,8 +1078,14 @@ impl XhciController {
                 }
             }
             let port = self.state.slots[slot].port;
+            let address = ((ep / 2) as u8) | if input { 0x80 } else { 0 };
             let outcome = if !valid {
                 UsbTransfer::Stall
+            } else if stopping {
+                port.checked_sub(1)
+                    .and_then(|p| self.devices.get_mut(p))
+                    .and_then(Option::as_mut)
+                    .map_or(UsbTransfer::Nak, |d| d.endpoint_stopped(address))
             } else if let Some(d) = port
                 .checked_sub(1)
                 .and_then(|p| self.devices.get_mut(p))
@@ -1061,7 +1100,6 @@ impl XhciController {
                 } else if !bus_transfer {
                     UsbTransfer::Ack(vec![])
                 } else {
-                    let address = ((ep / 2) as u8) | if input { 0x80 } else { 0 };
                     if td.iter().any(|(_, t)| t.kind() == 5) {
                         // One isochronous TD is the data of one service
                         // interval, whatever the endpoint's packet size.
@@ -1074,7 +1112,7 @@ impl XhciController {
             } else {
                 UsbTransfer::Stall
             };
-            if interrupt && bus_transfer {
+            if interrupt && bus_transfer && !stopping {
                 // xHCI 6.2.3.6: one interrupt transaction per 2^Interval microframes.
                 let endpoint = &mut self.state.slots[slot].endpoints[ep];
                 endpoint.service_counter = 1 << interval;
@@ -1152,7 +1190,7 @@ impl XhciController {
                 }
             }
             self.store_endpoint(slot, ep)?;
-            if cc != SUCCESS || !self.running() {
+            if cc != SUCCESS || !self.running() || stopping {
                 break;
             }
         }

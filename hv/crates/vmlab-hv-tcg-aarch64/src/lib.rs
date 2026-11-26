@@ -6,7 +6,7 @@
 //! (`exec`). `sysreg` is the table of the system registers, `exception` the
 //! exception levels with entry and return, and `timer` the generic timer.
 //! `helpers` holds what a lifter calls and does not express in the
-//! graph: floating point on Berkeley SoftFloat. `oracle` is the test harness that follows a running QEMU
+//! graph: floating point on Berkeley SoftFloat, the lanes of AdvSIMD, AES and SHA. `oracle` is the test harness that follows a running QEMU
 //! instruction by instruction. QEMU is the test oracle only: nothing in this
 //! crate starts it outside that harness.
 //!
