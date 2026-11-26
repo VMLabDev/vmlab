@@ -104,7 +104,7 @@ class ReleaseVersionTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         git(repo, "switch", "-c", "release")
         git(repo, "commit", "--allow-empty", "-m", "feat: prior release")
-        git(repo, "switch", "-c", "main", "v0.1.0-alpha")
+        git(repo, "switch", "-C", "main", "v0.1.0-alpha")
         git(repo, "merge", "--no-ff", "-m", "Merge prior release", "release")
         git(repo, "tag", "v0.2.0-alpha")
         git(repo, "switch", "release")
@@ -117,6 +117,10 @@ class ReleaseVersionTest(unittest.TestCase):
                 got = calc(repo, args=args)
                 self.assertEqual(got["version"], version)
                 self.assertEqual(got["last_tag"], "v0.2.0-alpha")
+        git(repo, "tag", "v0.2.0", "main")
+        got = calc(repo, args=["--release"])
+        self.assertEqual(got["version"], "0.2.1")
+        self.assertEqual(got["last_tag"], "v0.2.0")
 
     def test_breaking_change_in_0x_bumps_minor(self):
         self.check(

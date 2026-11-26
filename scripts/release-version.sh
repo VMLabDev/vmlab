@@ -16,12 +16,11 @@
 # Rules:
 #   - No kind on the command line and neither trailer on HEAD:
 #     do_release=false, and nothing else is printed.
-#   - A release (not a pre-release) and the last v* tag has a suffix
+#   - A release (not a pre-release) and the highest version tag has a suffix
 #     (vX.Y.Z-alpha): promote it. The version is X.Y.Z, with no bump.
-#   - Otherwise bump from the last v* tag with its suffix stripped. The bump
-#     level comes from --bump or HEAD's bump trailer, or otherwise the
-#     conventional-commit subjects since that tag. In 0.x a
-#     major bump is a minor bump.
+#   - Otherwise strip the suffix from the highest version tag and bump it.
+#     The level comes from --bump, HEAD's bump trailer, or the conventional
+#     commit subjects since that tag. In 0.x a major bump is a minor bump.
 #   - A pre-release appends -alpha to the version.
 set -eu
 
@@ -64,7 +63,10 @@ if [ "$IS_RELEASE" != "true" ] && [ "$IS_PRERELEASE" != "true" ]; then
   exit 0
 fi
 
-LAST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "")
+# Published tags can sit on main's merge commits outside HEAD's ancestry.
+# A stable tag sorts ahead of the alpha with the same version number.
+TAGS=$(git -c versionsort.suffix=-alpha tag --list 'v[0-9]*' --sort=-version:refname)
+LAST_TAG=$(printf '%s\n' "$TAGS" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+(-alpha)?$/ {print; exit}')
 VER=""
 BASE=""
 if [ -z "$LAST_TAG" ]; then

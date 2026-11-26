@@ -54,7 +54,10 @@ class ReleaseDryRun(unittest.TestCase):
 set -eu
 name="${4##*/}"
 [ "${TIMEOUT_DOWNLOAD:-}" != "$name" ] || exit 28
-[ "${FAIL_DOWNLOAD:-}" != "$name" ] || exit 22
+if [ "${FAIL_DOWNLOAD:-}" = "$name" ] || [ ! -f "$FIXTURES/$name" ]; then
+  printf 404
+  exit 22
+fi
 cat "$FIXTURES/$name" > "$3"
 ''')
         self.tool('cosign', '''#!/bin/sh
@@ -249,7 +252,10 @@ set -eu
 case "$*" in
   *api.github.com*) exit 22 ;;
   *url_effective*) printf 'https://github.com/VMLabDev/vmlab/releases/tag/v1.2.3' ;;
-  *) cat "$FIXTURES/${4##*/}" > "$3" ;;
+  *)
+    name="${4##*/}"
+    if [ ! -f "$FIXTURES/$name" ]; then printf 404; exit 22; fi
+    cat "$FIXTURES/$name" > "$3" ;;
 esac
 ''')
         result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--no-guest',
@@ -401,8 +407,16 @@ esac
         self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), self.helper_digest())
         self.assertEqual(self.staging_left(), [])
 
-    def test_release_without_helper_still_installs_the_binary(self):
+    def release_without_helper(self):
         (self.dist / self.helper).unlink()
+        manifest = self.dist / 'SHA256SUMS'
+        manifest.write_text(''.join(
+            line for line in manifest.read_text().splitlines(keepends=True)
+            if line.split()[1] != self.helper
+        ))
+
+    def test_release_without_helper_still_installs_the_binary(self):
+        self.release_without_helper()
         self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
         self.tool('sudo', '#!/bin/sh\nset -eu\nexit 99\n')
         result = self.install('--no-guest', '--fastpath')
@@ -430,10 +444,10 @@ esac
         return installed
 
     def test_old_helper_is_removed_when_the_release_gives_none(self):
-        # Review install-release F5, card 636: a helper download that fails
+        # Review install-release F5, card 636: a release without a helper
         # must not leave the previous, capable helper beside the new vmlab.
         installed = self.old_install()
-        self.env['FAIL_DOWNLOAD'] = self.helper
+        self.release_without_helper()
         result = self.install('--no-guest')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn('old vmlab', (installed / 'vmlab').read_text())
@@ -510,6 +524,7 @@ out=""; here=0; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
     -fLO) here=1; shift ;;
     -*) shift ;;
     *) url="$1"; shift ;;
@@ -517,7 +532,7 @@ while [ $# -gt 0 ]; do
 done
 name="${url##*/}"
 if [ "$name" = install.sh ]; then cat "$INSTALL_SH"; exit 0; fi
-[ -f "$FIXTURES/$name" ] || exit 22
+if [ ! -f "$FIXTURES/$name" ]; then printf 404; exit 22; fi
 if [ -n "$out" ]; then cat "$FIXTURES/$name" > "$out"
 elif [ "$here" = 1 ]; then cat "$FIXTURES/$name" > "./$name"
 else cat "$FIXTURES/$name"
