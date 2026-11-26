@@ -489,8 +489,7 @@ impl Follower {
                                 Some(core),
                             );
                             difference.vectors = Some((ours_vectors, theirs));
-                            difference.vectors_before =
-                                last.as_ref().and_then(|last| last.vectors);
+                            difference.vectors_before = last.as_ref().and_then(|last| last.vectors);
                             break Err(difference);
                         }
                     }
@@ -716,8 +715,7 @@ impl Follower {
                                 Some(after),
                             );
                             difference.vectors = Some((ours_vectors, theirs));
-                            difference.vectors_before =
-                                last.as_ref().and_then(|last| last.vectors);
+                            difference.vectors_before = last.as_ref().and_then(|last| last.vectors);
                             break Err(difference);
                         }
                         vectors_after = Some(ours_vectors);

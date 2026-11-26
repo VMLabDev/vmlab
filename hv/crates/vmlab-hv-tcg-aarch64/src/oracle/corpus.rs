@@ -254,7 +254,11 @@ impl Entry {
             match part.split_once('=') {
                 Some(("r", value)) => reads.push(parse_memory(value)?),
                 Some(("w", value)) => writes.push(parse_memory(value)?),
-                _ => return Err(format!("`{part}` is not r=address:bytes or w=address:bytes")),
+                _ => {
+                    return Err(format!(
+                        "`{part}` is not r=address:bytes or w=address:bytes"
+                    ));
+                }
             }
         }
         let (encoding, rest) = line

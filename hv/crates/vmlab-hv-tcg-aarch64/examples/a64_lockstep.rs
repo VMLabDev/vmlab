@@ -722,8 +722,7 @@ fn memory_rounds(
     run.follower.load_memory(WINDOW.0, &data)?;
     let mut vectors = Vectors::default();
     for value in &mut vectors.v {
-        *value =
-            u128::from(generator.rng.next_u64()) << 64 | u128::from(generator.rng.next_u64());
+        *value = u128::from(generator.rng.next_u64()) << 64 | u128::from(generator.rng.next_u64());
     }
     run.follower.set_vectors(&vectors)?;
     let core = |(x, sp, nzcv): ([u64; 31], u64, u8)| Core {
