@@ -409,6 +409,20 @@ impl UsbFs for FakeUsbFs {
             let _ = entered.send(());
             let _ = release.recv();
         }
+        // As the kernel does (usb_set_interface disables the endpoints of
+        // the interface): the URBs in flight on them end as cancelled. Of
+        // the fake's endpoints only 0x83 belongs to interface 1.
+        let cancelled: Vec<Submitted> = {
+            let mut in_flight = self.inner.in_flight.lock();
+            let (cancelled, kept): (Vec<_>, Vec<_>) = in_flight
+                .drain(..)
+                .partition(|u| u.endpoint & 0x7f != 0 && (u.endpoint == 0x83) == (interface == 1));
+            *in_flight = kept;
+            cancelled
+        };
+        for urb in &cancelled {
+            self.finish(urb, -libc::ESHUTDOWN, &[]);
+        }
         self.shared()
             .lock()
             .calls
