@@ -76,7 +76,8 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         self.env = dict(os.environ, PATH=str(self.bin) + ':' + os.environ['PATH'],
                         FIXTURES=str(self.release), COSIGN_LOG=str(self.root / 'cosign.log'),
                         BASE_URL='https://fixture.invalid')
-        self.env.pop('COSIGN', None)
+        # Without COSIGN the script runs cosign in the build container.
+        self.env['COSIGN'] = str(self.bin / 'cosign')
         self.staged = source / 'target/signed-package'
 
     def tool(self, name, body):

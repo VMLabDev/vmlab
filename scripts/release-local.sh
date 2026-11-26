@@ -15,7 +15,10 @@
 #   4. The four assets and the two bundle .sha256 files go to the release
 #      directory. scripts/release-assets.py writes provenance.json (the
 #      builder id names this host and the commit) and SHA256SUMS.
-#   5. scripts/release-sign.sh signs SHA256SUMS: key or none.
+#   5. scripts/release-sign.sh signs SHA256SUMS: key or none. cosign runs in
+#      the container too. The key and its password come from the environment
+#      variables VMLAB_RELEASE_COSIGN_KEY and COSIGN_PASSWORD, and are in no
+#      file on this host.
 #   6. The check: every asset is there, SHA256SUMS and provenance.json match
 #      the files, and the CLI reports the version.
 #
@@ -75,7 +78,7 @@ while [ $# -gt 0 ]; do
         --display) display="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -127,6 +130,18 @@ fi
 [ -n "$builder" ] || builder="$(hostname -s 2>/dev/null || uname -n)"
 out="${out:-$ROOT/target/release-local/v$version}"
 log "version $version at $commit, built on $builder, into $out"
+
+# ── The release key, before the long build ──────────────────────────────────
+# release-sign.sh checks the same after the build. Here a missing variable
+# costs a second and not a build. Names only: no value is read into a message,
+# and the build containers of build/run.sh never get the two variables.
+if [ "$signing" = key ]; then
+  for name in VMLAB_RELEASE_COSIGN_KEY COSIGN_PASSWORD; do
+    [ -n "${!name:+set}" ] || die "--signing key: $name is not set (just release::doctor key)"
+  done
+  [ -s "${VMLAB_RELEASE_PUBLIC_KEY:-$ROOT/build/release-signing.pub}" ] \
+    || die "--signing key: no public half at ${VMLAB_RELEASE_PUBLIC_KEY:-$ROOT/build/release-signing.pub}: see docs/agents/release-gate.md"
+fi
 
 # ── Volumes of this release alone ────────────────────────────────────────────
 # build/run.sh keeps the cargo home in one volume that every container build

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Install the cosign that a release is signed and verified with, pinned by
-# version and sha256, for the account that runs it. No root, no package
-# manager: one static binary under ~/.local/bin (card 444;
-# docs/agents/release-gate.md, K5).
+# version and sha256. No package manager: one static binary. This is the
+# single pin. build/Dockerfile runs it, so the vmlab-build image holds this
+# cosign and the release steps need none on the host (card 1021;
+# scripts/release-cosign.sh). On a host it puts the binary under ~/.local/bin
+# of the account that runs it, which no release step needs any more.
 #
 # The version is pinned because signing with cosign v3 fails on
 # `--tlog-upload=false` (scripts/release-sign.sh). The sha256 is the one of

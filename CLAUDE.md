@@ -414,7 +414,11 @@ throughout the code and commit messages.
   release directory — the four assets, `SHA256SUMS`, `provenance.json` and the
   signature of `scripts/release-sign.sh` — and `just release::publish` uploads
   it with `gh release create`. GitHub Actions builds and publishes no version
-  (`docs/agents/release-gate.md`).
+  (`docs/agents/release-gate.md`). cosign runs in the `vmlab-build` image
+  (`scripts/release-cosign.sh`), and the release key reaches it from two
+  environment variables, never from a file; `release::keygen`, `release::trust`
+  and `release::doctor` make the pair, turn its public half on and say what a
+  build machine lacks.
 - `just buildbox::dist` builds every release artefact (binary, strict guest
   bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
   (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the

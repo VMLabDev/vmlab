@@ -16,7 +16,8 @@
 # Usage: release-publish.sh <release-dir> [--print]
 #   --print  print the command and upload nothing
 # Env: VMLAB_RELEASE_REPO (default VMLabDev/vmlab), and the GitHub login of gh.
-#      COSIGN  the cosign binary that checks a signature (default: cosign on PATH)
+#      COSIGN, VMLAB_BUILD_IMAGE  cosign runs in the vmlab-build container:
+#      scripts/release-cosign.sh
 
 set -euo pipefail
 
@@ -59,9 +60,11 @@ if [ -e "$bundle" ]; then
   [ -s "$bundle" ] || die "$bundle is empty: sign again, or remove it for an unsigned release"
   public="$ROOT/build/release-signing.pub"
   [ -s "$public" ] || die "no public half at $public to check $bundle with: see docs/agents/release-gate.md"
-  cosign="${COSIGN:-cosign}"
-  command -v "$cosign" >/dev/null 2>&1 || die "need cosign (v2.6.1 or newer) to check $bundle"
-  "$cosign" verify-blob --key "$public" --bundle "$bundle" \
+  # cosign runs in the build container. A cosign that cannot run is told
+  # apart from a signature that does not verify.
+  bash "$ROOT/scripts/release-cosign.sh" --check || die "cosign is needed to check $bundle"
+  bash "$ROOT/scripts/release-cosign.sh" --ro "$dir" --ro "$public" -- \
+    verify-blob --key "$public" --bundle "$bundle" \
     --insecure-ignore-tlog=true "$dir/SHA256SUMS" >/dev/null 2>&1 \
     || die "$bundle does not verify with $public and this SHA256SUMS: sign again with the release key (just release::sign <dir> key)"
   files+=("$bundle")

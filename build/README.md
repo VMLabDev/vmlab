@@ -32,8 +32,10 @@ that rebuild before the build.
 A version for publishing is `just release::local`, which wraps `buildbox::dist`:
 it calculates the version, builds here, and puts the four assets with
 `SHA256SUMS`, `provenance.json` and the signature into a release directory.
-`just release::publish` uploads that directory. See
-`docs/agents/release-gate.md`.
+`just release::publish` uploads that directory. The image also holds the
+pinned cosign that signs and verifies a release (`scripts/install-cosign.sh`
+is the pin, `scripts/release-cosign.sh` runs it), so a build machine needs
+none. See `docs/agents/release-gate.md`.
 
 ```sh
 just buildbox::image          # build the image (tag: $VMLAB_BUILD_IMAGE, default vmlab-build)

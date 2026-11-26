@@ -79,6 +79,9 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
 ''')
         self.env['COSIGN_LOG'] = str(self.root / 'cosign.log')
         self.env['EXPECT_KEY'] = KEY
+        # The release scripts run cosign in the build container unless COSIGN
+        # names a binary (scripts/release-cosign.sh). install.sh takes PATH.
+        self.env['COSIGN'] = str(self.bin / 'cosign')
 
     def prepare(self):
         ASSETS.prepare(self.dist, '1.2.3', COMMIT, 'helios', image='sha256:' + 'b' * 64)
@@ -760,7 +763,8 @@ esac
 ''')
         key = self.root / 'release.pub'
         key.write_text(KEY + '\n')
-        return {'VMLAB_RELEASE_PUBLIC_KEY': str(key), 'VMLAB_RELEASE_COSIGN_KEY': 'private half'}
+        return {'VMLAB_RELEASE_PUBLIC_KEY': str(key), 'VMLAB_RELEASE_COSIGN_KEY': 'fixture-private-key',
+                'COSIGN_PASSWORD': 'fixture-password'}
 
     def test_sign_none_leaves_the_manifest_alone(self):
         (self.dist / 'SHA256SUMS.key.bundle').write_text('stale')
@@ -778,7 +782,8 @@ esac
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((self.dist / 'SHA256SUMS.key.bundle').is_file())
             self.assertFalse((self.dist / 'SHA256SUMS.bundle').exists())
-            self.assertNotIn('private half', result.stdout + result.stderr)
+            self.assertNotIn('fixture-private-key', result.stdout + result.stderr)
+            self.assertNotIn('fixture-password', result.stdout + result.stderr)
         commands = [line.split()[0] for line in (self.root / 'cosign.log').read_text().splitlines()]
         self.assertEqual(commands, ['sign-blob', 'verify-blob'] * 2)
         # What it wrote is what install.sh takes.
@@ -791,9 +796,14 @@ esac
             result = self.sign('key', **dict(env, **{missing: ''}))
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((self.dist / 'SHA256SUMS.key.bundle').exists())
+            # The error names the variable that is missing, and no value.
+            if missing != 'VMLAB_RELEASE_PUBLIC_KEY':
+                self.assertIn(f'{missing} is not set', result.stderr)
+            self.assertNotIn('fixture-private-key', result.stdout + result.stderr)
+            self.assertNotIn('fixture-password', result.stdout + result.stderr)
         # No public half is committed until the operator turns the way on.
         if not PUBLIC_KEY.exists():
-            result = self.sign('key', VMLAB_RELEASE_COSIGN_KEY='private half')
+            result = self.sign('key', VMLAB_RELEASE_COSIGN_KEY='fixture-private-key', COSIGN_PASSWORD='fixture-password')
             self.assertIn('no public half', result.stderr)
 
     def test_sign_removes_a_signature_that_the_public_half_rejects(self):

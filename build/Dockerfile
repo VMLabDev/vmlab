@@ -82,6 +82,20 @@ RUN apt-get update -q \
  && apt-get install -y -q --no-install-recommends clang lld \
  && rm -rf /var/lib/apt/lists/*
 
+# cosign, for the signature of a release (card 1021): `just release::sign`,
+# `release::verify`, `release::publish` and `release::keygen` run it in this
+# image, so a build machine needs none (scripts/release-cosign.sh). The script
+# is the single pin: it downloads the binary of the sigstore/cosign release it
+# names and refuses one that does not have the sha256 it names. The label
+# tells a release step that the image has cosign without starting a container
+# (scripts/test_release_workflow.py holds it equal to the pin). No key is in
+# this image or in its history: a key reaches a container at run time only.
+# Last of the toolchain layers, so adding it rebuilt none of them.
+COPY scripts/install-cosign.sh scripts/
+RUN ./scripts/install-cosign.sh /usr/local/bin \
+ && cosign version 2>&1 | grep -q 'GitVersion: *v2\.6\.1$'
+LABEL io.vmlab.cosign="v2.6.1"
+
 # Runtime: any uid. HOME and CARGO_HOME are world-writable cache paths, and
 # build/run.sh mounts named volumes over CARGO_HOME and the checkout's target
 # dirs so rebuilds stay incremental. git refuses a repository owned by another uid;
