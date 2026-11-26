@@ -8683,10 +8683,10 @@ pub static RECORDS: [RecordInfo; 2332] = [
     RecordInfo { name: "LD4i64_POST", mask: 0xbfe0fc00, value: 0x0de0a400, features: Features(0x2), format: FormatClass::SIMDLdStSingleDTiedPost, fallback: false, priority: 1818, constrained: false, fields: &L103, layout: 103 },
     RecordInfo { name: "LD4i8", mask: 0xbfffe000, value: 0x0d602000, features: Features(0x2), format: FormatClass::SIMDLdStSingleBTied, fallback: false, priority: 791, constrained: false, fields: &L104, layout: 104 },
     RecordInfo { name: "LD4i8_POST", mask: 0xbfe0e000, value: 0x0de02000, features: Features(0x2), format: FormatClass::SIMDLdStSingleBTiedPost, fallback: false, priority: 2034, constrained: false, fields: &L105, layout: 105 },
-    RecordInfo { name: "LDARB", mask: 0xffe08000, value: 0x08c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2137, constrained: false, fields: &L106, layout: 106 },
-    RecordInfo { name: "LDARH", mask: 0xffe08000, value: 0x48c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2138, constrained: false, fields: &L106, layout: 106 },
-    RecordInfo { name: "LDARW", mask: 0xffe08000, value: 0x88c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2139, constrained: false, fields: &L106, layout: 106 },
-    RecordInfo { name: "LDARX", mask: 0xffe08000, value: 0xc8c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2140, constrained: false, fields: &L106, layout: 106 },
+    RecordInfo { name: "LDARB", mask: 0xffe08000, value: 0x08c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2137, constrained: true, fields: &L106, layout: 106 },
+    RecordInfo { name: "LDARH", mask: 0xffe08000, value: 0x48c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2138, constrained: true, fields: &L106, layout: 106 },
+    RecordInfo { name: "LDARW", mask: 0xffe08000, value: 0x88c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2139, constrained: true, fields: &L106, layout: 106 },
+    RecordInfo { name: "LDARX", mask: 0xffe08000, value: 0xc8c08000, features: Features(0x0), format: FormatClass::LoadAcquire, fallback: false, priority: 2140, constrained: true, fields: &L106, layout: 106 },
     RecordInfo { name: "LDAXPW", mask: 0xffe08000, value: 0x88608000, features: Features(0x0), format: FormatClass::LoadExclusivePair, fallback: false, priority: 2141, constrained: false, fields: &L107, layout: 107 },
     RecordInfo { name: "LDAXPX", mask: 0xffe08000, value: 0xc8608000, features: Features(0x0), format: FormatClass::LoadExclusivePair, fallback: false, priority: 2142, constrained: false, fields: &L107, layout: 107 },
     RecordInfo { name: "LDAXRB", mask: 0xffe08000, value: 0x08408000, features: Features(0x0), format: FormatClass::LoadExclusive, fallback: false, priority: 2143, constrained: false, fields: &L108, layout: 108 },
@@ -9600,10 +9600,10 @@ pub static RECORDS: [RecordInfo; 2332] = [
     RecordInfo { name: "ST4i64_POST", mask: 0xbfe0fc00, value: 0x0da0a400, features: Features(0x2), format: FormatClass::SIMDLdStSingleDPost, fallback: false, priority: 1844, constrained: false, fields: &L183, layout: 183 },
     RecordInfo { name: "ST4i8", mask: 0xbfffe000, value: 0x0d202000, features: Features(0x2), format: FormatClass::SIMDLdStSingleB, fallback: false, priority: 845, constrained: false, fields: &L184, layout: 184 },
     RecordInfo { name: "ST4i8_POST", mask: 0xbfe0e000, value: 0x0da02000, features: Features(0x2), format: FormatClass::SIMDLdStSingleBPost, fallback: false, priority: 2090, constrained: false, fields: &L185, layout: 185 },
-    RecordInfo { name: "STLRB", mask: 0xffe08000, value: 0x08808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2161, constrained: false, fields: &L186, layout: 186 },
-    RecordInfo { name: "STLRH", mask: 0xffe08000, value: 0x48808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2162, constrained: false, fields: &L186, layout: 186 },
-    RecordInfo { name: "STLRW", mask: 0xffe08000, value: 0x88808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2163, constrained: false, fields: &L186, layout: 186 },
-    RecordInfo { name: "STLRX", mask: 0xffe08000, value: 0xc8808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2164, constrained: false, fields: &L186, layout: 186 },
+    RecordInfo { name: "STLRB", mask: 0xffe08000, value: 0x08808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2161, constrained: true, fields: &L186, layout: 186 },
+    RecordInfo { name: "STLRH", mask: 0xffe08000, value: 0x48808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2162, constrained: true, fields: &L186, layout: 186 },
+    RecordInfo { name: "STLRW", mask: 0xffe08000, value: 0x88808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2163, constrained: true, fields: &L186, layout: 186 },
+    RecordInfo { name: "STLRX", mask: 0xffe08000, value: 0xc8808000, features: Features(0x0), format: FormatClass::StoreRelease, fallback: false, priority: 2164, constrained: true, fields: &L186, layout: 186 },
     RecordInfo { name: "STLXPW", mask: 0xffe08000, value: 0x88208000, features: Features(0x0), format: FormatClass::StoreExclusivePair, fallback: false, priority: 2165, constrained: false, fields: &L187, layout: 187 },
     RecordInfo { name: "STLXPX", mask: 0xffe08000, value: 0xc8208000, features: Features(0x0), format: FormatClass::StoreExclusivePair, fallback: false, priority: 2166, constrained: false, fields: &L187, layout: 187 },
     RecordInfo { name: "STLXRB", mask: 0xffe08000, value: 0x08008000, features: Features(0x0), format: FormatClass::StoreExclusive, fallback: false, priority: 2167, constrained: false, fields: &L188, layout: 188 },
@@ -10793,6 +10793,9 @@ pub fn extract(record: Record, w: u32) -> Option<Fields> {
         106 => {
             let rn = ((w >> 5) & 0x1f);
             let rt = (w & 0x1f);
+            if !(((w >> 16) & 0x1f == 0x1f && (w >> 10) & 0x1f == 0x1f)) {
+                return None;
+            }
             Fields::LoadAcquire(LoadAcquire { rn, rt })
         }
         107 => {
@@ -11293,6 +11296,9 @@ pub fn extract(record: Record, w: u32) -> Option<Fields> {
         186 => {
             let rn = ((w >> 5) & 0x1f);
             let rt = (w & 0x1f);
+            if !(((w >> 16) & 0x1f == 0x1f && (w >> 10) & 0x1f == 0x1f)) {
+                return None;
+            }
             Fields::StoreRelease(StoreRelease { rn, rt })
         }
         187 => {

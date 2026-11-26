@@ -30,6 +30,16 @@ fn word(record: Record, fields: &[(&str, u32)]) -> u32 {
     word
 }
 
+/// `LDAR` or `STLR`: the bits 20 to 16 and 14 to 10 are ones, or the word
+/// is undefined.
+fn ordered(record: Record, rt: u32, rn: u32) -> u32 {
+    let word = record.info().value | 0x001f_7c00 | rn << 5 | rt;
+    assert_eq!(decode(word).map(|decoded| decoded.record), Some(record));
+    assert_eq!(decode(word & !0x0001_0000), None);
+    assert_eq!(decode(word & !0x0000_0400), None);
+    word
+}
+
 fn image(words: &[u32]) -> Vec<u8> {
     let mut data = vec![0u8; SIZE];
     for (index, word) in words.iter().enumerate() {
@@ -756,8 +766,8 @@ fn exclusive_pairs_and_the_smaller_sizes_move_what_their_names_say() {
         word(Record::LDAXRH, &[("rt", 8), ("rn", 0)]),
         word(Record::STXRH, &[("ws", 12), ("rt", 3), ("rn", 0)]),
         // ldarb w13, [x0, #1 through x14] ; stlr x3, [x0]
-        word(Record::LDARB, &[("rt", 13), ("rn", 14)]),
-        word(Record::STLRX, &[("rt", 3), ("rn", 0)]),
+        ordered(Record::LDARB, 13, 14),
+        ordered(Record::STLRX, 3, 0),
     ]);
     cpu.state.set_x(0, DATA + 0x100);
     cpu.state.set_x(3, 0x3333_3333_3333_3333);
@@ -861,7 +871,7 @@ fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
     let ld1r = word(Record::LD1Rv4s, &[("vt", 2), ("rn", 0)]);
     assert!(aligned(ld1r, 4) && refused(ld1r, 2));
     // An ordered access, as an exclusive one.
-    let ldar = word(Record::LDARW, &[("rt", 2), ("rn", 0)]);
+    let ldar = ordered(Record::LDARW, 2, 0);
     assert!(aligned(ldar, 4) && refused(ldar, 2));
     // The alignment is looked at before the memory: an address that is
     // outside the memory and not aligned is an alignment fault.

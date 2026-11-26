@@ -199,6 +199,14 @@ impl Generator {
                     word = with_field(record, name, word, encoded as u32).unwrap_or(word);
                 }
             }
+            // The ten bits of LDAR and STLR that are ones in every word that
+            // QEMU runs (tables/constraints.toml). Random bits rarely are.
+            if matches!(
+                record.info().format,
+                FormatClass::LoadAcquire | FormatClass::StoreRelease
+            ) {
+                word |= 0x001f_7c00;
+            }
             // An offset in bytes keeps the alignment of its base three times
             // out of four: an access that is not aligned ends the round.
             if matches!(
