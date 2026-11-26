@@ -300,7 +300,7 @@ impl Qcow2Image {
         let first_l1 = (base >> shift) as usize;
         let last_l1 = ((end - 1) >> shift) as usize;
         let cleared_entry = if self.version >= 3 { ZERO_BIT } else { 0 };
-        let backing_size = self.backing_image.as_ref().map_or(0, |image| image.size());
+        let backing_size = self.backing_chain.size();
         for l1_index in first_l1..(last_l1 + 1).min(self.l1.len()) {
             let l2_host = self.l1[l1_index] & OFFSET_MASK;
             if l2_host == 0 {
