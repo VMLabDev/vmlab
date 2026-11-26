@@ -443,45 +443,47 @@ impl Generator {
     }
 }
 
+/// A floating-point value of one layout, the count of exponent bits and of
+/// fraction bits, where the rules of an FP instruction change.
+fn fp_bits(rng: &mut Rng, exponent_bits: u32, fraction_bits: u32) -> u64 {
+    let exponent_max = (1u64 << exponent_bits) - 1;
+    let bias = exponent_max >> 1;
+    let fraction_mask = (1u64 << fraction_bits) - 1;
+    let exponent = match rng.below(10) {
+        0 | 1 => 0,
+        2 | 3 => exponent_max,
+        4 => 1 + rng.below(2),
+        5 => exponent_max - 1,
+        // Near one, and around 2^31, 2^32, 2^63 and 2^64.
+        6 => bias - 2 + rng.below(5),
+        7 => bias + [7, 8, 15, 16, 30, 31, 32, 33, 62, 63, 64, 65][rng.below(12) as usize],
+        8 => bias.wrapping_sub(70).wrapping_add(rng.below(140)),
+        _ => rng.below(exponent_max + 1),
+    } & exponent_max;
+    let fraction = match rng.below(8) {
+        0 | 1 => 0,
+        2 => 1,
+        3 => fraction_mask,
+        // The top bit: a quiet NaN, or one half above a power of two.
+        4 => 1 << (fraction_bits - 1),
+        5 => (1 << (fraction_bits - 1)) | rng.below(4),
+        // A few bits at the top: ties of a conversion to an integer.
+        6 => rng.below(1 << 6) << (fraction_bits - 6),
+        _ => rng.next_u64() & fraction_mask,
+    };
+    let sign = rng.below(2) << (exponent_bits + fraction_bits);
+    sign | exponent << fraction_bits | fraction
+}
+
 impl Generator {
     /// 64 bits that an FP instruction reads as a value where its rules
     /// change: zeros, denormals, infinities, both kinds of NaN, the powers of
     /// two that an integer conversion saturates at, ties, and random bits.
     pub fn fp_value(&mut self) -> u64 {
-        // One layout: the count of exponent bits and of fraction bits.
-        fn value(rng: &mut Rng, exponent_bits: u32, fraction_bits: u32) -> u64 {
-            let exponent_max = (1u64 << exponent_bits) - 1;
-            let bias = exponent_max >> 1;
-            let fraction_mask = (1u64 << fraction_bits) - 1;
-            let exponent = match rng.below(10) {
-                0 | 1 => 0,
-                2 | 3 => exponent_max,
-                4 => 1 + rng.below(2),
-                5 => exponent_max - 1,
-                // Near one, and around 2^31, 2^32, 2^63 and 2^64.
-                6 => bias - 2 + rng.below(5),
-                7 => bias + [7, 8, 15, 16, 30, 31, 32, 33, 62, 63, 64, 65][rng.below(12) as usize],
-                8 => bias.wrapping_sub(70).wrapping_add(rng.below(140)),
-                _ => rng.below(exponent_max + 1),
-            } & exponent_max;
-            let fraction = match rng.below(8) {
-                0 | 1 => 0,
-                2 => 1,
-                3 => fraction_mask,
-                // The top bit: a quiet NaN, or one half above a power of two.
-                4 => 1 << (fraction_bits - 1),
-                5 => (1 << (fraction_bits - 1)) | rng.below(4),
-                // A few bits at the top: ties of a conversion to an integer.
-                6 => rng.below(1 << 6) << (fraction_bits - 6),
-                _ => rng.next_u64() & fraction_mask,
-            };
-            let sign = rng.below(2) << (exponent_bits + fraction_bits);
-            sign | exponent << fraction_bits | fraction
-        }
         let rng = &mut self.rng;
         match rng.below(8) {
             0 | 1 => rng.next_u64(),
-            2..=4 => value(rng, 11, 52),
+            2..=4 => fp_bits(rng, 11, 52),
             // Single precision in the low half, with zeros or anything above.
             5 | 6 => {
                 let high = if rng.chance(1, 2) {
@@ -489,10 +491,10 @@ impl Generator {
                 } else {
                     rng.next_u64() << 32
                 };
-                high | value(rng, 8, 23)
+                high | fp_bits(rng, 8, 23)
             }
             // Half precision in the low 16 bits.
-            _ => (rng.next_u64() << 16) | value(rng, 5, 10),
+            _ => (rng.next_u64() << 16) | fp_bits(rng, 5, 10),
         }
     }
 
@@ -524,6 +526,62 @@ impl Generator {
         // IOC, DZC, OFC, UFC, IXC, IDC and QC.
         if self.rng.chance(1, 2) {
             vectors.fpsr = self.rng.next_u64() as u32 & 0x0800_009f;
+        }
+        vectors
+    }
+}
+
+impl Generator {
+    /// One lane of `bits` bits for an AdvSIMD instruction: the ends of the
+    /// signed and of the unsigned range, where a saturating operation
+    /// changes, small numbers and numbers near the lane size, which are the
+    /// amounts of a shift by a register, floating-point values, and random
+    /// bits.
+    fn simd_lane(&mut self, bits: u32) -> u64 {
+        let rng = &mut self.rng;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1 << bits) - 1
+        };
+        let top = 1u64 << (bits - 1);
+        let value = match rng.below(12) {
+            0 => 0,
+            1 => mask,
+            2 => top,
+            3 => top - 1,
+            4 => [1, 2, top + 1, mask - 1, top >> 1, top | top >> 1][rng.below(6) as usize],
+            // A small signed number.
+            5 | 6 => (rng.below(17) as i64 - 8) as u64,
+            // Around the lane size, with either sign.
+            7 => {
+                let near = i64::from(bits) - 2 + rng.below(5) as i64;
+                (if rng.chance(1, 2) { near } else { -near }) as u64
+            }
+            8 | 9 if bits == 32 => fp_bits(rng, 8, 23),
+            8 | 9 if bits == 64 => fp_bits(rng, 11, 52),
+            8 if bits == 16 => fp_bits(rng, 5, 10),
+            _ => rng.next_u64(),
+        };
+        value & mask
+    }
+
+    /// V0 to V31, FPSR and FPCR at the start of a round of AdvSIMD
+    /// instructions. Each register has lanes of one size. FPCR and FPSR are
+    /// as for scalar FP.
+    pub fn simd_vectors(&mut self) -> super::Vectors {
+        let mut vectors = self.vectors();
+        for register in &mut vectors.v {
+            let bits = 8u32 << self.rng.below(4);
+            let mut value = 0u128;
+            for lane in 0..128 / bits {
+                value |= u128::from(self.simd_lane(bits)) << (lane * bits);
+            }
+            // One register in eight has zeros in its upper half.
+            if self.rng.chance(1, 8) {
+                value &= u128::from(u64::MAX);
+            }
+            *register = value;
         }
         vectors
     }
@@ -784,6 +842,28 @@ mod tests {
             }
         }
         assert_eq!(records, 140);
+    }
+
+    #[test]
+    fn the_vectors_of_an_advsimd_round_reach_the_ends_of_every_lane_size() {
+        let mut generator = Generator::new(13);
+        let (mut most_negative, mut ones, mut small) = ([0u32; 4], [0u32; 4], 0u32);
+        for _ in 0..100 {
+            let vectors = generator.simd_vectors();
+            assert_eq!(vectors.fpcr & !0x07c0_0000, 0);
+            for value in vectors.v {
+                for (size, bits) in [8u32, 16, 32, 64].into_iter().enumerate() {
+                    let lane = value as u64 & (u64::MAX >> (64 - bits));
+                    most_negative[size] += u32::from(lane == 1 << (bits - 1));
+                    ones[size] += u32::from(lane == u64::MAX >> (64 - bits));
+                }
+                small += u32::from((value as u8 as i8).unsigned_abs() <= 8);
+            }
+        }
+        assert!(most_negative.iter().all(|count| *count > 20), "{most_negative:?}");
+        assert!(ones.iter().all(|count| *count > 20), "{ones:?}");
+        assert!(small > 400, "{small}");
+        assert_eq!(Generator::new(4).simd_vectors(), Generator::new(4).simd_vectors());
     }
 
     #[test]

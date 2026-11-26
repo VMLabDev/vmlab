@@ -19,6 +19,9 @@
 //! FPCR. Its rounds are short, because FPSR only collects: after a few
 //! instructions most of its bits are set, and an instruction that sets one
 //! more or one less no longer shows.
+//! The groups `simd`, `crypto` and `c7` (card C7) run as `fp` does, from
+//! vector registers whose lanes hold the ends of each integer range, shift
+//! amounts and FP values.
 //! The group `loadstore` runs another way, because its instructions work on
 //! memory and on the vector registers. QEMU first runs a prelude that turns
 //! the FP and vector registers on and the stack pointer alignment check
@@ -40,8 +43,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 use vmlab_hv_tcg::FlatMemory;
 use vmlab_hv_tcg_aarch64::lift::{
-    BRANCH_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LIFTED_FORMATS, LOAD_STORE_FORMATS,
-    REGISTER_FORMATS,
+    BRANCH_FORMATS, CRYPTO_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LIFTED_FORMATS,
+    LOAD_STORE_FORMATS, REGISTER_FORMATS, SIMD_FORMATS,
 };
 use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
@@ -93,9 +96,12 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "fp" => FP_FORMATS.to_vec(),
         "all" => LIFTED_FORMATS.to_vec(),
         "loadstore" => LOAD_STORE_FORMATS.to_vec(),
+        "simd" => SIMD_FORMATS.to_vec(),
+        "crypto" => CRYPTO_FORMATS.to_vec(),
+        "c7" => [SIMD_FORMATS.as_slice(), CRYPTO_FORMATS.as_slice()].concat(),
         other => {
             return Err(format!(
-                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore"
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, simd, crypto, c7"
             )
             .into());
         }
@@ -367,7 +373,19 @@ fn main() -> Result<(), Failure> {
     let formats = group(&group_name)?;
     let started = Instant::now();
     // A group of FP instructions compares the vector and FP registers.
-    let vectors = formats.iter().any(|format| FP_FORMATS.contains(format));
+    // A group of AdvSIMD or crypto instructions does too, from vector
+    // registers that are made for lanes.
+    let lanes = formats
+        .iter()
+        .any(|format| SIMD_FORMATS.contains(format) || CRYPTO_FORMATS.contains(format));
+    let vectors = lanes || formats.iter().any(|format| FP_FORMATS.contains(format));
+    let start_vectors = |generator: &mut Generator| {
+        if lanes {
+            generator.simd_vectors()
+        } else {
+            generator.vectors()
+        }
+    };
     let image_words = if vectors { FP_IMAGE_WORDS } else { IMAGE_WORDS };
 
     // The group of the loads and stores compares them too, and its rounds
@@ -442,7 +460,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, pc),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: image_words as u64 * if vectors { 1 } else { 2 },
             visits: 2,
         };
@@ -487,7 +505,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, IMAGE_BASE),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: chunk.len() as u64,
             visits: 1,
         };
@@ -507,7 +525,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
             start: start(&mut generator, IMAGE_BASE),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: 1,
             visits: 1,
         };

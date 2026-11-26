@@ -1436,7 +1436,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!((classes, checked), (26, 1323));
+        assert_eq!((classes, checked), (27, 1323));
     }
 
     #[test]
