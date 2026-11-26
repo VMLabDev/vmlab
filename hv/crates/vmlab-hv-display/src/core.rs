@@ -1,7 +1,7 @@
 use crate::{
     Capabilities, FrameFlags, Message, Rect, SurfaceKind, invalid, protocol, receive, send,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::net::Shutdown;
@@ -23,6 +23,9 @@ pub const MAX_SESSIONS: usize = 64;
 pub const MAX_HANDSHAKES: usize = 16;
 /// The longest wait for one read of a handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Keys one connection may hold down at once. A connection that presses one
+/// more is closed, so its record of held keys cannot grow without limit.
+pub const MAX_HELD_KEYS: usize = 256;
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 const WARN_EVERY: Duration = Duration::from_secs(5);
 
@@ -194,6 +197,75 @@ struct Shared {
     accept_failures: AtomicU64,
     input: Arc<crate::input::InputQueue>,
     input_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    held_input: Mutex<HeldInput>,
+}
+/// What each connection holds down in the guest, by connection.
+#[derive(Default)]
+struct HeldInput {
+    next: u64,
+    clients: BTreeMap<u64, Holding>,
+}
+#[derive(Default)]
+struct Holding {
+    keys: BTreeSet<String>,
+    buttons: u32,
+}
+/// The input of one connection. It records the keys and the pointer buttons
+/// that the connection holds down, and releases them in the guest when it
+/// drops: a client that closes, fails or is closed by the server cannot leave
+/// a key or a button down. A key that another connection also holds stays
+/// down, and the buttons go back to what the other connections hold.
+pub(crate) struct InputClient {
+    server: DisplayServer,
+    id: u64,
+}
+impl InputClient {
+    pub(crate) fn send(&self, message: Message) -> io::Result<()> {
+        let shared = &self.server.shared;
+        match &message {
+            Message::Key { qcode, down } => {
+                // The record and the queue change under one lock, so that a
+                // release at the end of another connection cannot pass a
+                // press of this one.
+                let mut held = shared.held_input.lock().unwrap();
+                let mine = held.clients.entry(self.id).or_default();
+                if !*down {
+                    mine.keys.remove(qcode);
+                } else if !mine.keys.contains(qcode) {
+                    if mine.keys.len() >= MAX_HELD_KEYS {
+                        return Err(invalid("too many keys held down"));
+                    }
+                    mine.keys.insert(qcode.clone());
+                }
+                shared.input.push(message)
+            }
+            Message::Buttons { mask } => {
+                let mut held = shared.held_input.lock().unwrap();
+                held.clients.entry(self.id).or_default().buttons = *mask;
+                shared.input.push(message)
+            }
+            _ => shared.input.push(message),
+        }
+    }
+}
+impl Drop for InputClient {
+    fn drop(&mut self) {
+        let shared = &self.server.shared;
+        let mut held = shared.held_input.lock().unwrap();
+        let Some(mine) = held.clients.remove(&self.id) else {
+            return;
+        };
+        // A push fails only when the server has stopped: no guest input then.
+        for qcode in mine.keys {
+            if !held.clients.values().any(|other| other.keys.contains(&qcode)) {
+                let _ = shared.input.push(Message::Key { qcode, down: false });
+            }
+        }
+        if mine.buttons != 0 {
+            let mask = held.clients.values().fold(0, |mask, other| mask | other.buttons);
+            let _ = shared.input.push(Message::Buttons { mask });
+        }
+    }
 }
 struct SessionEntry {
     stream: Weak<UnixStream>,
@@ -263,6 +335,7 @@ impl DisplayServer {
                 accept_failures: AtomicU64::new(0),
                 input,
                 input_worker: Mutex::new(Some(input_worker)),
+                held_input: Mutex::new(HeldInput::default()),
             }),
         })
     }
@@ -364,6 +437,16 @@ impl DisplayServer {
     /// Capture the source once. No socket or client lock is acquired here.
     pub fn publish(&self) -> io::Result<()> {
         self.capture(false)
+    }
+
+    /// Capture the source once, and warn when that fails, at most once per
+    /// five seconds for the whole server. The last valid frame stays.
+    pub fn publish_or_warn(&self) {
+        if let Err(error) = self.publish() {
+            self.warn(format_args!(
+                "display frame: {error}; the last valid frame stays"
+            ));
+        }
     }
 
     /// Publish a device flush without calling back into the locked device.
@@ -470,8 +553,13 @@ impl DisplayServer {
             s.led_seq,
         )
     }
-    pub(crate) fn input(&self, message: Message) -> io::Result<()> {
-        self.shared.input.push(message)
+    pub(crate) fn input_client(&self) -> InputClient {
+        let mut held = self.shared.held_input.lock().unwrap();
+        held.next += 1;
+        InputClient {
+            server: self.clone(),
+            id: held.next,
+        }
     }
     pub(crate) fn cpu_pixels(&self, frame: &Frame) -> io::Result<Vec<u8>> {
         let mut bytes = match &frame.pixels {
@@ -583,7 +671,9 @@ impl DisplayServer {
         let _cpu = (caps.has(Capabilities::FRAMES) && !caps.has(Capabilities::DMABUF_OK))
             .then(|| self.cpu_client());
         if caps.has(Capabilities::FRAMES) {
-            self.publish()?;
+            // A source that fails now does not refuse the client: it gets
+            // the last valid frame.
+            self.publish_or_warn();
         }
         send(
             &stream,
@@ -598,7 +688,11 @@ impl DisplayServer {
         let state = local.clone();
         let server = self.clone();
         let handle = std::thread::Builder::new().spawn(move || {
-            let result = server.native_input(&reader, caps, &state);
+            let input = server.input_client();
+            let result = server.native_input(&reader, caps, &state, &input);
+            // The end of the connection, whatever ended it: release what it
+            // held down in the guest.
+            drop(input);
             {
                 let mut local = state.lock().unwrap();
                 local.closed = true;
@@ -635,6 +729,7 @@ impl DisplayServer {
         stream: &UnixStream,
         caps: Capabilities,
         local: &Mutex<ClientState>,
+        input: &InputClient,
     ) -> io::Result<()> {
         loop {
             let msg = receive(stream)?.message;
@@ -681,7 +776,7 @@ impl DisplayServer {
                 | Message::Scroll { .. }
                     if caps.has(Capabilities::INPUT) =>
                 {
-                    self.input(msg)?;
+                    input.send(msg)?;
                     continue;
                 }
                 Message::RequestSize { width, height }
@@ -689,7 +784,7 @@ impl DisplayServer {
                         && (1..=16384).contains(&width)
                         && (1..=16384).contains(&height) =>
                 {
-                    self.input(msg)?;
+                    input.send(msg)?;
                     continue;
                 }
                 _ => return Err(invalid("unexpected client message or missing capability")),

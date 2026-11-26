@@ -631,9 +631,12 @@ impl StandardVga {
                 + ((overflow & 0x40) << 3)
                 + 1;
             if self.regs[GC + 5] & 0x40 != 0 {
+                // A mode that is active has at least one row: a guest that
+                // writes the CRTC registers one at a time passes through a
+                // display end below the scan-line count.
                 (
                     width / 2,
-                    height / (self.regs[CRTC + 9] as u32 & 31).saturating_add(1),
+                    (height / (self.regs[CRTC + 9] as u32 & 31).saturating_add(1)).max(1),
                 )
             } else {
                 (width, height)
