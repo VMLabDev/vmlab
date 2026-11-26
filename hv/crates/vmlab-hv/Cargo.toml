@@ -32,3 +32,4 @@ vmlab-hv-display = { path = "../vmlab-hv-display" }
 tempfile = "3"
 vmlab-hv-proto = { workspace = true, features = ["gdb"] }
 vmlab-hv-tests = { path = "../vmlab-hv-tests" }
+vmlab-hv-tcg-aarch64 = { path = "../vmlab-hv-tcg-aarch64" }
