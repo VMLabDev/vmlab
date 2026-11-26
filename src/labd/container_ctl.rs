@@ -631,6 +631,50 @@ mod tests {
         assert!(err.to_string().contains("closed"), "{err}");
     }
 
+    /// Review containers-2 G1: the ctl watcher subscribes and keeps a handle
+    /// for its answers to `boot`. The stream it waits on must close when the
+    /// reader ends, or the watcher, its handle and the socket outlive the
+    /// run. The clock is paused, so the test has no wall-clock limit: it
+    /// waits on the reader's end, which closes the `exited` watch.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscriber_that_holds_the_handle_sees_the_channel_close() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
+            // QEMU dies: the socket closes.
+        })
+        .await;
+
+        // As the watcher does: a subscription, and the handle kept alive.
+        let handle = CtlHandle::connect(&path).await.unwrap();
+        let mut rx = handle.subscribe();
+
+        let err = handle.wait_exited(LONG).await.unwrap_err();
+        assert!(err.to_string().contains("ctl channel closed"), "{err}");
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(CtlEvent::Boot {
+                proto_version: PROTO_VERSION,
+            })
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed),
+            "the stream is closed while the subscriber still holds the handle"
+        );
+        // A subscriber that comes after the end is told the same.
+        assert_eq!(
+            handle.subscribe().try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        );
+    }
+
     #[tokio::test]
     async fn wait_times_out_when_nothing_happens() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
