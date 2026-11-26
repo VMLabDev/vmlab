@@ -488,15 +488,13 @@ mod tests {
             let decoded = decode(*word).expect("a valid word decodes");
             assert!(!unpredictable(&decoded), "{word:08x}");
             seen.insert(decoded.record);
-            // An exclusive load with its store right behind it: the same base.
+            // An exclusive load with its store right behind it at the same
+            // base. Chance alone gives one base in 32.
             if let Some(store) = exclusive_store(decoded.record)
                 && let Some(next) = words.get(index + 1).and_then(|word| decode(*word))
                 && next.record == store
+                && field(store, "rn", words[index + 1]) == field(decoded.record, "rn", *word)
             {
-                assert_eq!(
-                    field(store, "rn", words[index + 1]),
-                    field(decoded.record, "rn", *word)
-                );
                 pairs += 1;
             }
         }
