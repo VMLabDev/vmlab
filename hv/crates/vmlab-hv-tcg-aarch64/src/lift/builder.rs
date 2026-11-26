@@ -782,8 +782,9 @@ impl Builder {
         self.read_event(address, bytes, false)
     }
 
-    /// As `load_aligned`, for a load of vector registers as a structure
-    /// (`LD1` to `LD4`): Device memory asks no alignment of it.
+    /// As `load_aligned`, for a load of whole vector registers as a
+    /// structure (`LD1` to `LD4`): Device memory asks no alignment of it.
+    /// It does of the forms of one lane and of the replicating ones.
     pub fn load_structure(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
         self.require_aligned(address, align, 1, false, false);
         self.read_event(address, bytes, false)
@@ -800,8 +801,8 @@ impl Builder {
         self.write_event(address, bytes, value, false);
     }
 
-    /// As `store_aligned`, for a store of vector registers as a structure
-    /// (`ST1` to `ST4`).
+    /// As `store_aligned`, for a store of whole vector registers as a
+    /// structure (`ST1` to `ST4`).
     pub fn store_structure(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
         self.require_aligned(address, align, 1, true, false);
         self.write_event(address, bytes, value, false);

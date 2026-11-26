@@ -718,13 +718,13 @@ pub fn simd_single(
         let address = displace(b, base, i64::from(register * u32::from(element_bytes)));
         let vector = b.v(list(vt, register), 128);
         if load {
-            let element = b.load_structure(address, element_bytes, element_bytes);
+            let element = b.load(address, element_bytes);
             let value = insert(b, vector, position, width, element);
             b.set_v(list(vt, register), 128, value);
             b.commit();
         } else {
             let element = b.slice(vector, position, width);
-            b.store_structure(address, element_bytes, element, element_bytes);
+            b.store(address, element_bytes, element);
         }
     }
     structure_write_back(b, rn, base, xm, registers * u32::from(element_bytes));
@@ -747,7 +747,7 @@ pub fn simd_replicate(
     let base = b.x_or_sp(rn, 64);
     for register in 0..registers {
         let address = displace(b, base, i64::from(register * u32::from(element_bytes)));
-        let mut vector = b.load_structure(address, element_bytes, element_bytes);
+        let mut vector = b.load(address, element_bytes);
         let mut width = u16::from(element_bytes) * 8;
         while width < vector_width {
             vector = b.concat(vector, vector, width, width * 2);
