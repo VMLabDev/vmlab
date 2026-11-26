@@ -53,7 +53,11 @@ class ReleaseDryRun(unittest.TestCase):
         self.tool('curl', '''#!/bin/sh
 set -eu
 name="${4##*/}"
-[ "${FAIL_DOWNLOAD:-}" != "$name" ] || exit 22
+[ "${TIMEOUT_DOWNLOAD:-}" != "$name" ] || exit 28
+if [ "${FAIL_DOWNLOAD:-}" = "$name" ] || [ ! -f "$FIXTURES/$name" ]; then
+  printf 404
+  exit 22
+fi
 cat "$FIXTURES/$name" > "$3"
 ''')
         self.tool('cosign', '''#!/bin/sh
@@ -109,9 +113,9 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         script.write_text(text)
         return script
 
-    def install(self, *args, script=None):
+    def install(self, *args, script=None, checks=False):
         return subprocess.run(['sh', str(script or INSTALL), '--version', '1.2.3',
-                               '--no-fastpath', '--skip-checks', *args],
+                               '--no-fastpath', *([] if checks else ['--skip-checks']), *args],
                               env=self.env, capture_output=True, text=True)
 
     def refused(self, result):
@@ -248,7 +252,10 @@ set -eu
 case "$*" in
   *api.github.com*) exit 22 ;;
   *url_effective*) printf 'https://github.com/VMLabDev/vmlab/releases/tag/v1.2.3' ;;
-  *) cat "$FIXTURES/${4##*/}" > "$3" ;;
+  *)
+    name="${4##*/}"
+    if [ ! -f "$FIXTURES/$name" ]; then printf 404; exit 22; fi
+    cat "$FIXTURES/$name" > "$3" ;;
 esac
 ''')
         result = subprocess.run(['sh', str(ROOT / 'install.sh'), '--no-guest',
@@ -400,8 +407,16 @@ esac
         self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), self.helper_digest())
         self.assertEqual(self.staging_left(), [])
 
-    def test_release_without_helper_still_installs_the_binary(self):
+    def release_without_helper(self):
         (self.dist / self.helper).unlink()
+        manifest = self.dist / 'SHA256SUMS'
+        manifest.write_text(''.join(
+            line for line in manifest.read_text().splitlines(keepends=True)
+            if line.split()[1] != self.helper
+        ))
+
+    def test_release_without_helper_still_installs_the_binary(self):
+        self.release_without_helper()
         self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
         self.tool('sudo', '#!/bin/sh\nset -eu\nexit 99\n')
         result = self.install('--no-guest', '--fastpath')
@@ -429,10 +444,10 @@ esac
         return installed
 
     def test_old_helper_is_removed_when_the_release_gives_none(self):
-        # Review install-release F5, card 636: a helper download that fails
+        # Review install-release F5, card 636: a release without a helper
         # must not leave the previous, capable helper beside the new vmlab.
         installed = self.old_install()
-        self.env['FAIL_DOWNLOAD'] = self.helper
+        self.release_without_helper()
         result = self.install('--no-guest')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn('old vmlab', (installed / 'vmlab').read_text())
@@ -451,6 +466,25 @@ esac
         self.assertIn('old vmlab', (installed / 'vmlab').read_text())
         self.assertIn('old helper', (installed / 'vmlab-fastpath').read_text())
         self.assertFalse((self.root / 'executed').exists())
+
+    def test_failed_helper_download_preserves_the_old_install(self):
+        installed = self.old_install()
+        before = {path: path.read_bytes() for path in installed.iterdir()}
+        self.env['TIMEOUT_DOWNLOAD'] = self.helper
+        result = self.install('--no-guest')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'download failed: https://fixture.invalid/v1.2.3/{self.helper}', result.stderr)
+        self.assertEqual({path: path.read_bytes() for path in installed.iterdir()}, before)
+
+    def test_runtime_report_gives_x86_hypervisor_requirements(self):
+        self.restricted_path()
+        result = self.install('--no-guest', checks=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('vmlab-hv', result.stdout)
+        self.assertIn('--fetch vmlab-hv-1.2.3-linux-x86_64.tar.gz', result.stdout)
+        self.assertIn('require /dev/kvm', result.stdout)
+        self.assertNotIn('qemu-system-x86_64', result.stdout)
+        self.assertNotIn('guests will run under emulation', result.stdout)
 
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
@@ -490,6 +524,7 @@ out=""; here=0; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    -w) shift 2 ;;
     -fLO) here=1; shift ;;
     -*) shift ;;
     *) url="$1"; shift ;;
@@ -497,7 +532,7 @@ while [ $# -gt 0 ]; do
 done
 name="${url##*/}"
 if [ "$name" = install.sh ]; then cat "$INSTALL_SH"; exit 0; fi
-[ -f "$FIXTURES/$name" ] || exit 22
+if [ ! -f "$FIXTURES/$name" ]; then printf 404; exit 22; fi
 if [ -n "$out" ]; then cat "$FIXTURES/$name" > "$out"
 elif [ "$here" = 1 ]; then cat "$FIXTURES/$name" > "./$name"
 else cat "$FIXTURES/$name"
@@ -721,6 +756,15 @@ fi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.verified_with(), ['--key'])
         self.assertTrue((self.root / 'executed').exists())
+
+    def test_failed_key_signature_download_reports_the_transfer_error(self):
+        self.key_signed()
+        self.env['TIMEOUT_DOWNLOAD'] = 'SHA256SUMS.key.bundle'
+        result = self.install('--no-guest', script=self.installer_with_key())
+        self.refused(result)
+        self.assertIn('download failed: https://fixture.invalid/v1.2.3/SHA256SUMS.key.bundle',
+                      result.stderr)
+        self.assertNotIn('--insecure-skip-signature', result.stderr)
 
     def test_bad_key_signature_never_executes(self):
         self.key_signed()
