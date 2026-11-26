@@ -8,7 +8,7 @@
 //
 // Input: the JSON dump of AArch64.td by the pinned llvm-tblgen
 // (hv/toolchain/llvm/pins.env): the records of the classes SysReg, TLBI,
-// DC, AT and IC, of every feature.
+// DC, AT, IC, PStateImm0_15, PStateImm0_1 and SVCR, of every feature.
 
 #![allow(clippy::all)]
 
@@ -26,7 +26,10 @@ pub struct SysReg {
     pub requires: &'static [&'static str],
 }
 
-/// A system operation of `SYS`. `encoding` is op1:CRn:CRm:op2, 14 bits.
+/// A named operation with an encoding. For `DC` and `AT` the encoding
+/// is op1:CRn:CRm:op2 of `SYS`, 14 bits. For a PSTATE field it is the
+/// `pstatefield` of the MSR record that takes it, and for `SVCR` the
+/// three bits of its operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SysOp {
     pub name: &'static str,
@@ -1778,6 +1781,31 @@ pub static AT_OPS: [SysOp; 17] = [
     SysOp { name: "S1E3R", encoding: 0x33c0, requires: &[] },
     SysOp { name: "S1E3W", encoding: 0x33c1, requires: &[] },
     SysOp { name: "S1E3A", encoding: 0x33ca, requires: &[] },
+];
+
+/// Every `PStateImm0_15` record, sorted by encoding.
+pub static PSTATE_IMM0_15_OPS: [SysOp; 8] = [
+    SysOp { name: "UAO", encoding: 0x0003, requires: &["FeaturePsUAO"] },
+    SysOp { name: "PAN", encoding: 0x0004, requires: &["FeaturePAN"] },
+    SysOp { name: "SPSel", encoding: 0x0005, requires: &[] },
+    SysOp { name: "SSBS", encoding: 0x0019, requires: &["FeatureSSBS"] },
+    SysOp { name: "DIT", encoding: 0x001a, requires: &["FeatureDIT"] },
+    SysOp { name: "TCO", encoding: 0x001c, requires: &["FeatureMTE"] },
+    SysOp { name: "DAIFSet", encoding: 0x001e, requires: &[] },
+    SysOp { name: "DAIFClr", encoding: 0x001f, requires: &[] },
+];
+
+/// Every `PStateImm0_1` record, sorted by encoding.
+pub static PSTATE_IMM0_1_OPS: [SysOp; 2] = [
+    SysOp { name: "ALLINT", encoding: 0x0008, requires: &["FeatureNMI"] },
+    SysOp { name: "PM", encoding: 0x0048, requires: &[] },
+];
+
+/// Every `SVCR` record, sorted by encoding.
+pub static SVCR_OPS: [SysOp; 3] = [
+    SysOp { name: "SVCRSM", encoding: 0x0001, requires: &["FeatureSME"] },
+    SysOp { name: "SVCRZA", encoding: 0x0002, requires: &["FeatureSME"] },
+    SysOp { name: "SVCRSMZA", encoding: 0x0003, requires: &["FeatureSME"] },
 ];
 
 /// Every `IC` record, sorted by encoding.

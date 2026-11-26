@@ -100,9 +100,12 @@ pub fn pstate_imm0_1_is_known(pstatefield: u32) -> bool {
     is_known(&crate::generated::sysreg::PSTATE_IMM0_1_OPS, pstatefield)
 }
 
-/// Whether the operand of `MSRpstatesvcrImm1` names an `SVCR` field.
+/// Whether the operand of `MSRpstatesvcrImm1` names an `SVCR` field. LLVM's
+/// decoder does not ask for the feature of the field here, so this does not.
 pub fn svcr_is_known(pstatefield: u32) -> bool {
-    is_known(&crate::generated::sysreg::SVCR_OPS, pstatefield)
+    crate::generated::sysreg::SVCR_OPS
+        .iter()
+        .any(|operation| u32::from(operation.encoding) == pstatefield)
 }
 
 /// The sixteen condition codes of `Bcc`, `CSEL` and the rest.
@@ -258,8 +261,9 @@ mod tests {
         assert_eq!(known, vec![0b000_101, 0b011_110, 0b011_111]);
         // PAN, UAO, DIT, SSBS and TCO need features outside the 3d set.
         assert!(!pstate_imm0_15_is_known(0b000_100));
-        // Every SVCR field needs SME.
-        assert!((0..8).all(|field| !svcr_is_known(field)));
+        // SM, ZA and both.
+        let fields: Vec<u32> = (0..8).filter(|field| svcr_is_known(*field)).collect();
+        assert_eq!(fields, vec![1, 2, 3]);
     }
 
     #[test]

@@ -27,13 +27,13 @@ why = "The field is shift:imm12 with a 2-bit shift, and only 0 (LSL #0) and 1 (L
 [[constraint]]
 format = "BaseMoveImmediate"
 records = ["MOVNWi", "MOVZWi"]
-require = "shift < 2"
-why = "A 32-bit move wide has a shift of 0 or 16 only. LLVM's DecodeMoveImmInstruction refuses bit 22 on the W records."
+require = "shift < 32"
+why = "The field is the shift in bits: 0, 16, 32 or 48. A 32-bit move wide has a shift of 0 or 16 only. LLVM's DecodeMoveImmInstruction refuses bit 22 on the W records."
 
 [[constraint]]
 format = "BaseInsertImmediate"
 records = ["MOVKWi"]
-require = "shift < 2"
+require = "shift < 32"
 why = "As MOVZWi: LLVM's DecodeMoveImmInstruction refuses bit 22 on the W records."
 
 [[constraint]]
@@ -92,7 +92,7 @@ why = "As MSRpstateImm0_15, for the PStateImm0_1 table: LLVM's DecodeSystemPStat
 [[constraint]]
 format = "PstateWriteSimple"
 require = "crate::fields::svcr_is_known(pstatefield)"
-why = "The operand is an entry of the SVCR table whose features are selected. LLVM's DecodeSVCROp refuses the rest. In the 3d set no entry is selected (all need SME), so this record never matches."
+why = "The operand is an entry of the SVCR table. LLVM's DecodeSVCROp refuses the other values and does not ask for the feature of the entry (SME), so neither does this. The system card (C6) decides what the CPU of the 3d set does with the record."
 
 [[constraint]]
 format = "BasePrefetchRO"

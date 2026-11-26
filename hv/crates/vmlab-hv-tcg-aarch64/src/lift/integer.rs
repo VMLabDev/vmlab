@@ -97,6 +97,8 @@ pub fn logical_immediate(b: &mut Builder, record: Record, f: &BaseLogicalImm) ->
 }
 
 /// `MOVZ` and `MOVN`: a 16-bit immediate at a multiple of 16, or its inverse.
+/// The raw field `shift` is the shift in bits (0, 16, 32 or 48), as the LLVM
+/// record numbers its bits.
 pub fn move_wide(b: &mut Builder, record: Record, f: &BaseMoveImmediate) -> Lifted {
     let (width, invert) = match record {
         Record::MOVZWi => (32, false),
@@ -105,10 +107,10 @@ pub fn move_wide(b: &mut Builder, record: Record, f: &BaseMoveImmediate) -> Lift
         Record::MOVNXi => (64, true),
         _ => return Lifted::Unsupported,
     };
-    if width == 32 && f.shift > 1 {
+    if f.shift >= u32::from(width) || !f.shift.is_multiple_of(16) {
         return Lifted::Unsupported;
     }
-    let mut value = u64::from(f.imm) << (16 * f.shift);
+    let mut value = u64::from(f.imm) << f.shift;
     if invert {
         value = !value & ones(width.into());
     }
@@ -124,10 +126,10 @@ pub fn move_keep(b: &mut Builder, record: Record, f: &BaseInsertImmediate) -> Li
         Record::MOVKXi => 64,
         _ => return Lifted::Unsupported,
     };
-    if width == 32 && f.shift > 1 {
+    if f.shift >= u32::from(width) || !f.shift.is_multiple_of(16) {
         return Lifted::Unsupported;
     }
-    let position = 16 * f.shift;
+    let position = f.shift;
     let keep = !(0xffffu64 << position) & ones(width.into());
     let old = b.x(f.rd, width);
     let keep = b.imm(width, keep);
