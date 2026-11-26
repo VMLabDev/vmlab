@@ -1,0 +1,15 @@
+# Winners of overlaps that specificity does not decide (DESIGN.md G1b).
+#
+# The generator orders overlapping records by the count of their fixed bits:
+# the record with more fixed bits is tried first, and the records of LLVM's
+# `Fallback` decoder namespace are tried last. Two overlapping records of the
+# same namespace with the same count fail the generation, unless an entry
+# here names the winner:
+#
+#   [[override]]
+#   winner = "RecordA"
+#   loser = "RecordB"
+#
+# The 3d set has no such pair: its two crossing pairs (PRFMroW and PRFMroX
+# against RPRFM) and its one pair of equal encodings (MSRpstateImm4 against
+# MSRpstateImm1) are decided by the Fallback namespace.

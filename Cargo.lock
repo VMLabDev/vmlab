@@ -4293,6 +4293,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlab-hv-tcg-a64gen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "toml",
+]
+
+[[package]]
+name = "vmlab-hv-tcg-aarch64"
+version = "0.1.0"
+dependencies = [
+ "vmlab-hv-tcg",
+ "vmlab-hv-tcg-ir",
+]
+
+[[package]]
 name = "vmlab-hv-tcg-emit"
 version = "0.1.0"
 dependencies = [

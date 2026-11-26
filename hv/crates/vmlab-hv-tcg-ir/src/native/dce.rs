@@ -1,7 +1,92 @@
 use super::Operation;
-use super::block::{Block, Event, Recipe};
+use super::block::{Block, BlockOf, Event, ExitScalars, Recipe};
+use super::{Graph, ScalarId};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// The scalars that `roots` reach.
+fn live(graph: &Graph, mut roots: Vec<ScalarId>) -> Vec<bool> {
+    let mut live = vec![false; graph.scalars.len()];
+    while let Some(id) = roots.pop() {
+        if std::mem::replace(&mut live[id], true) {
+            continue;
+        }
+        match graph.scalars[id].operation {
+            Operation::Refine(value)
+            | Operation::Unary(_, value)
+            | Operation::Slice { value, .. } => roots.push(value),
+            Operation::Binary(_, a, b)
+            | Operation::Concat {
+                high: a, low: b, ..
+            } => roots.extend([a, b]),
+            Operation::Select {
+                condition,
+                when_true,
+                when_false,
+            } => roots.extend([condition, when_true, when_false]),
+            _ => {}
+        }
+    }
+    live
+}
+
+/// Dead code elimination for a block whose exits name scalars directly
+/// (R8): keep what the events and the exits reach, drop the rest, and
+/// renumber. A register slot that a block writes twice keeps only the value
+/// of the last write, because the exit names only that one.
+pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
+    let mut roots = Vec::new();
+    for event in &block.events {
+        match *event {
+            Event::Guard { condition, .. } => roots.push(condition),
+            Event::ReadMemory {
+                address, result, ..
+            } => roots.extend([address, result]),
+            Event::WriteMemory {
+                address,
+                value,
+                result,
+                ..
+            } => {
+                roots.extend([address, value]);
+                roots.extend(result);
+            }
+            Event::Checkpoint(_) | Event::Exit(_) => {}
+        }
+    }
+    for exit in &mut block.exits {
+        exit.for_each_scalar(&mut |scalar| roots.push(*scalar));
+    }
+    let live = live(&block.graph, roots);
+    let map = block.graph.retain(&live);
+    for event in &mut block.events {
+        match event {
+            Event::Guard { condition, .. } => *condition = map[*condition],
+            Event::ReadMemory {
+                address, result, ..
+            } => {
+                *address = map[*address];
+                *result = map[*result];
+            }
+            Event::WriteMemory {
+                address,
+                value,
+                result,
+                ..
+            } => {
+                *address = map[*address];
+                *value = map[*value];
+                if let Some(result) = result {
+                    *result = map[*result];
+                }
+            }
+            Event::Checkpoint(_) | Event::Exit(_) => {}
+        }
+    }
+    for exit in &mut block.exits {
+        exit.for_each_scalar(&mut |scalar| *scalar = map[*scalar]);
+    }
+}
 
 /// Remove discarded specialization work while preserving every checkpoint,
 /// ordered effect, guard continuation, and constant configuration assumption.
@@ -107,22 +192,7 @@ pub fn prune(block: &mut Block) -> Vec<usize> {
             _ => {}
         }
     }
-    let mut live_scalars = vec![false; block.graph.scalars.len()];
-    while let Some(id) = scalars.pop() {
-        if std::mem::replace(&mut live_scalars[id], true) {
-            continue;
-        }
-        match block.graph.scalars[id].operation {
-            Operation::Refine(value)
-            | Operation::Unary(_, value)
-            | Operation::Slice { value, .. } => scalars.push(value),
-            Operation::Binary(_, a, b)
-            | Operation::Concat {
-                high: a, low: b, ..
-            } => scalars.extend([a, b]),
-            _ => {}
-        }
-    }
+    let live_scalars = live(&block.graph, scalars);
     let scalar_map = block.graph.retain(&live_scalars);
     let constants: Vec<_> = constants.into_iter().collect();
     let constant_map: std::collections::BTreeMap<_, _> = constants
