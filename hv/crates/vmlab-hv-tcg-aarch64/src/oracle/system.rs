@@ -194,7 +194,7 @@ pub fn unfollowed(encoding: u32, x: &[u64; 31], state: &crate::state::State) -> 
 
 /// Whether both sides agree about the encoding: we have a row that is not
 /// left out, or neither side has the register.
-fn agreed(encoding: u16) -> bool {
+pub fn agreed(encoding: u16) -> bool {
     match sysreg::find(encoding) {
         Some(row) => !matches!(ROWS[row].kind, Kind::Absent(_)),
         None => !QEMU_ONLY.contains(&encoding),

@@ -37,7 +37,7 @@ use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verifi
 use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, Options, RAM_BASE};
 use vmlab_hv_tcg_aarch64::oracle::stream::{Generator, Rng, executed_encodings, records_of};
 use vmlab_hv_tcg_aarch64::oracle::system::{
-    STREAM_FORMATS, TABLE_BYTES, directed, vector_table,
+    STREAM_FORMATS, TABLE_BYTES, agreed, directed, vector_table,
 };
 use vmlab_hv_tcg_aarch64::oracle::{CPSR_EL1H, Compared, Core, asm, compared};
 use vmlab_hv_tcg_aarch64::sysreg;
@@ -376,6 +376,9 @@ fn main() -> Result<(), Failure> {
     // of the streams and every register zero: an `MSR` then writes zero,
     // which turns nothing on. WFI is left out: it would stop QEMU.
     let mut waits = 0;
+    // `MRS` and `MSR` of a register that QEMU's CPU has and ours leaves out
+    // by decision: the PMU (DESIGN.md V5, the allow-list of `sysreg.rs`).
+    let mut left_out = 0;
     if system {
         let mut missed = Vec::new();
         // The rounds that the random streams cannot hold.
@@ -409,6 +412,13 @@ fn main() -> Result<(), Failure> {
         for word in &executed {
             if *word == 0xd503_207f {
                 waits += 1;
+                continue;
+            }
+            if word & 0xffc0_0000 == 0xd500_0000
+                && word & (1 << 20) != 0
+                && !agreed((word >> 5) as u16)
+            {
+                left_out += 1;
                 continue;
             }
             let mut words = vector_table(0x3c5);
@@ -532,7 +542,7 @@ fn main() -> Result<(), Failure> {
     }
     if system {
         println!(
-            "{waits} WFI encodings left out, {} verified instructions that QEMU leads in (counter reads, host calls)",
+            "{waits} WFI encodings left out, {left_out} encodings of registers that the 3d CPU leaves out (the PMU), {} verified instructions that QEMU leads in (counter reads, host calls)",
             run.counts.led
         );
     }
