@@ -1,0 +1,27 @@
+{
+  "decision": "D9",
+  "design": "docs/plans/phase-3d-aarch64/DESIGN.md",
+  "reference": "docs/hwref/virt-fwcfg",
+  "reason": "aarch64 virt: the differences from QEMU that the operator approved in Q2 of the phase 3d design",
+  "differences": [
+    {
+      "id": "V5",
+      "file": "etc/acpi/tables",
+      "table": "APIC",
+      "structure": "GICC",
+      "structure_type": 11,
+      "field": "Performance Interrupt GSIV",
+      "field_offset": 20,
+      "field_width": 4,
+      "reference": 23,
+      "candidate": 0,
+      "reason": "vmlab-hv presents no PMU. QEMU's -cpu max has PMUv3 on PPI 7 (GSIV 23). QEMU itself writes 0 here for -cpu cortex-a53,pmu=off (captures a53-nopmu-*)."
+    }
+  ],
+  "no_difference": [
+    {
+      "id": "G2",
+      "reason": "The CPU that vmlab-hv presents (Armv8.0-A with CRC32, AES, SHA1 and SHA2) is not QEMU's -cpu max. No fw_cfg file depends on the CPU model: QEMU's files for -cpu max and -cpu cortex-a53 are the same (captures smp2-2g and a53-smp2-2g). The difference shows in the ID registers, which a capture from inside a guest compares."
+    }
+  ]
+}

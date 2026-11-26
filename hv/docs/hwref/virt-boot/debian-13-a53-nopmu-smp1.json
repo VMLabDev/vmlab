@@ -1,0 +1,107 @@
+{
+  "template": "debian-13",
+  "template_version": "13.20261001.0",
+  "cpu": "cortex-a53,pmu=off",
+  "smp": 1,
+  "qemu_version": "QEMU emulator version 11.1.3",
+  "boot_to_agent_ready_s": 21.09,
+  "agent": {
+    "agent_version": "agent=e42dd74",
+    "os": "linux"
+  },
+  "kernel": [
+    "Linux 6.12.111+deb13-cloud-arm64 aarch64"
+  ],
+  "acpi_log": [
+    "[    0.000000] efi: SMBIOS 3.0=0x47d60000 MEMATTR=0x45a45018 ACPI 2.0=0x47ff3018 MOKvar=0x45a30000 INITRD=0x45a4dc98 MEMRESERVE=0x45a4db18 ",
+    "[    0.000000] ACPI: Early table checksum verification disabled",
+    "[    0.000000] ACPI: RSDP 0x0000000047FF3018 000024 (v02 BOCHS )",
+    "[    0.000000] ACPI: XSDT 0x0000000047FF3F18 000064 (v01 BOCHS  BXPC     00000001      01000013)",
+    "[    0.000000] ACPI: FACP 0x0000000047FF3B18 000114 (v06 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: DSDT 0x0000000047FF1018 0014FB (v02 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: APIC 0x0000000047FF3C98 0000AC (v04 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: PPTT 0x0000000047FF3D98 000060 (v02 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: GTDT 0x0000000047FF3098 000068 (v03 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: MCFG 0x0000000047FF3A98 00003C (v01 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: SPCR 0x0000000047FF3E98 000050 (v02 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: DBG2 0x0000000047FF3818 000057 (v00 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: IORT 0x0000000047FF3A18 000054 (v05 BOCHS  BXPC     00000001 BXPC 00000001)",
+    "[    0.000000] ACPI: SPCR: console: pl011,mmio32,0x9000000,9600",
+    "[    0.000000] ACPI: Use ACPI SPCR as default console: Yes",
+    "[    0.000000] psci: probing for conduit method from ACPI.",
+    "[    0.000000] psci: PSCIv1.1 detected in firmware.",
+    "[    0.000000] psci: Using standard PSCI v0.2 function IDs",
+    "[    0.000000] psci: Trusted OS migration not required",
+    "[    0.000000] psci: SMC Calling Convention v1.0",
+    "[    0.000000] GICv2m: ACPI overriding V2M MSI_TYPER (base:80, num:64)",
+    "[    0.000000] GICv2m: range[mem 0x08020000-0x08020fff], SPI[80:143]",
+    "[    0.000000] arch_timer: cp15 timer(s) running at 62.50MHz (virt).",
+    "[    0.006907] ACPI: Core revision 20240827",
+    "[    0.115340] DMI: QEMU QEMU Virtual Machine, BIOS unknown 02/02/2022",
+    "[    0.115441] DMI: Memory slots populated: 1/1",
+    "[    0.137167] acpiphp: ACPI Hot Plug PCI Controller Driver version: 0.5",
+    "[    0.174494] ACPI: Added _OSI(Module Device)",
+    "[    0.174517] ACPI: Added _OSI(Processor Device)",
+    "[    0.174522] ACPI: Added _OSI(Processor Aggregator Device)",
+    "[    0.187517] ACPI: 1 ACPI AML tables successfully acquired and loaded",
+    "[    0.203545] ACPI: Interpreter enabled",
+    "[    0.203564] ACPI: Using GIC for interrupt routing",
+    "[    0.203818] ACPI: MCFG table detected, 1 entries",
+    "[    0.228041] ACPI: CPU0 has been hot-added",
+    "[    0.271564] ACPI: PCI: Interrupt link L000 configured for IRQ 35",
+    "[    0.271738] ACPI: PCI: Interrupt link L001 configured for IRQ 36",
+    "[    0.271798] ACPI: PCI: Interrupt link L002 configured for IRQ 37",
+    "[    0.271852] ACPI: PCI: Interrupt link L003 configured for IRQ 38",
+    "[    0.272057] ACPI: PCI Root Bridge [PCI0] (domain 0000 [bus 00-ff])",
+    "[    0.277738] ACPI: Remapped I/O 0x000000003eff0000 to [io  0x0000-0xffff window]",
+    "[    0.314788] pnp: PnP ACPI init",
+    "[    0.316363] pnp: PnP ACPI: found 1 devices",
+    "[    0.679240] ACPI: button: Power Button [PWRB]",
+    "[    0.683054] ACPI: \\_SB_.L001: Enabled at IRQ 36",
+    "[    0.685824] ACPI: \\_SB_.L002: Enabled at IRQ 37",
+    "[    0.704386] No ACPI PMU IRQ for CPU0"
+  ],
+  "acpi_tables": [
+    "APIC",
+    "DBG2",
+    "DSDT",
+    "FACP",
+    "GTDT",
+    "IORT",
+    "MCFG",
+    "PPTT",
+    "SPCR",
+    "data",
+    "dynamic"
+  ],
+  "device_tree": [
+    "ls: cannot access '/proc/device-tree': No such file or directory"
+  ],
+  "madt_hex": [
+    "41504943ac000000045e424f43485320425850432020202001000000425850430100000000000000000000000c18000000000000000000080000000000000000020000000b500000000000000000000001000000000000000000000000000000000000000000010800000000000004080000000000000308000000000000000000000000000000000000000000000000000000000d1800000000000000000208000000000100000040005000"
+  ],
+  "interrupts": [
+    "10:       3284 GIC-0  27 Level     arch_timer",
+    " 12:          0 GIC-0  33 Level     uart-pl011",
+    " 49:          0 GIC-0  41 Edge      ACPI:Ged",
+    " 50:          0  GICv2m-PCI-MSIX-0000:00:01.0   0 Edge      virtio0-config",
+    " 51:         38  GICv2m-PCI-MSIX-0000:00:01.0   1 Edge      virtio0-virtqueues",
+    " 52:          0  GICv2m-PCI-MSIX-0000:00:02.0   0 Edge      virtio1-config",
+    " 53:       2238  GICv2m-PCI-MSIX-0000:00:02.0   1 Edge      virtio1-req.0"
+  ],
+  "dmi": [
+    "sys_vendor:QEMU",
+    "product_name:QEMU Virtual Machine",
+    "product_version:virt-11.1",
+    "chassis_vendor:QEMU",
+    "bios_vendor:EDK II"
+  ],
+  "cpu_features": [
+    "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid"
+  ],
+  "first_processes": [
+    "PID COMMAND",
+    "      1 systemd",
+    "13.37 0.02"
+  ]
+}

@@ -31,8 +31,9 @@
 #   --builder NAME            the host name in the provenance
 #                             (default: $VMLAB_RELEASE_BUILDER, then hostname)
 #   --image-as-is             do not rebuild the vmlab-build image first: use the
-#                             tag as it is (a test build on a host that has
-#                             the image; a real version rebuilds it)
+#                             image that the tag names now. For the version
+#                             0.0.0-dry-run alone: a real version is built in
+#                             the image of its own build/Dockerfile.
 #   --display staged|rebuild|unsigned
 #       staged    (default) use the signed package that is staged already, in
 #                 $VMLAB_VDISPLAY_PACKAGE_DIR or
@@ -44,9 +45,14 @@
 #                 0.0.0-dry-run alone: the bundle has no catalog and no
 #                 certificate, and release-publish.sh refuses that version.
 #
-# The checkout must have no uncommitted change to a tracked file, and no
-# untracked file outside what the .gitignore files of the commit ignore: the
-# provenance names HEAD as the source of every asset.
+# The image: the release resolves the image to its id one time, and every
+# container of the release (the builds, cosign) is started by that id. It is
+# the id in provenance.json. The tag vmlab-build is one name for the whole
+# docker host, and a build of another checkout can move it at any moment.
+#
+# The checkout must have no uncommitted change to a tracked file, no untracked
+# file outside what the .gitignore files of the commit ignore, and nothing in
+# .ci-cache/: the provenance names HEAD as the source of every asset.
 
 set -euo pipefail
 
@@ -78,7 +84,7 @@ while [ $# -gt 0 ]; do
         --display) display="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,56p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -116,6 +122,22 @@ $(printf '%s\n' "$untracked" | sed -n '1,20s/^/  /p')
 Commit or remove them (an exclude outside the tracked .gitignore files does not
 count, and an untracked .gitignore is refused with the directory it hides):
 the provenance names HEAD"
+# .ci-cache/ holds what earlier builds in this checkout made: an installed
+# virglrenderer, unpacked toolchain archives. The committed .gitignore ignores
+# it, so the listing above does not see it, and nothing proves what is in it:
+# code that ran here before as this account (a test, a build.rs, the check of
+# another commit) can leave any file there. build/dist.sh builds the
+# virglrenderer of the bundle outside it. This refusal is for every other
+# reader, now and later.
+cache_left=""
+if [ -e "$ROOT/.ci-cache" ] || [ -L "$ROOT/.ci-cache" ]; then
+  # With the trailing slash a link to a directory is listed too.
+  cache_left="$(find "$ROOT/.ci-cache/" -mindepth 1 -maxdepth 1 -printf '.ci-cache/%f\n' | LC_ALL=C sort)"
+fi
+[ -z "$cache_left" ] || die "the checkout has caches of earlier builds, which a release does not take:
+$(printf '%s\n' "$cache_left" | sed -n '1,20s/^/  /p')
+Remove them (rm -r \"$ROOT/.ci-cache\"), or build in a new checkout. A check that
+runs with VMLAB_TARGET_ROOT set leaves none here."
 commit="$(git rev-parse HEAD)"
 if [ -n "$version" ]; then
   [ -z "$kind" ] && [ -z "$bump" ] || die "--version does not go with a kind or --bump"
@@ -127,6 +149,8 @@ fi
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
   die "the tag v$version exists already"
 fi
+[ "$image_as_is" -eq 0 ] || [ "$version" = "$DRY_VERSION" ] \
+  || die "--image-as-is is for the version $DRY_VERSION only: a real version is built in the image of its own build/Dockerfile"
 [ -n "$builder" ] || builder="$(hostname -s 2>/dev/null || uname -n)"
 out="${out:-$ROOT/target/release-local/v$version}"
 log "version $version at $commit, built on $builder, into $out"
@@ -166,9 +190,28 @@ remove_volumes() {
 trap remove_volumes EXIT
 
 # ── 2. Build image and Windows display driver ────────────────────────────────
-# The image first: the display driver compiles in it too. build/run.sh builds
-# a missing image, and never rebuilds one that exists.
-[ "$image_as_is" -eq 1 ] || just buildbox::image
+# The image first: the display driver compiles in it too. The build is the one
+# of `just buildbox::image`, with --iidfile: docker writes the id of the image
+# that this build made, so the release does not ask the tag which image that
+# was. From here on VMLAB_BUILD_IMAGE is that id, for build/run.sh and for
+# scripts/release-cosign.sh: a tag that another checkout moves while the
+# release builds changes no container of the release, and the key goes into
+# the image that the provenance names.
+tag="${VMLAB_BUILD_IMAGE:-vmlab-build}"
+if [ "$image_as_is" -eq 1 ]; then
+  built="$tag"
+else
+  iidfile="$(mktemp)"
+  [ -n "$iidfile" ] && [ "$iidfile" != / ] && [ -f "$iidfile" ] || die "mktemp gave no file"
+  DOCKER_BUILDKIT=1 docker build -f build/Dockerfile -t "$tag" --iidfile "$iidfile" .
+  built="$(cat "$iidfile")"
+  rm -f "$iidfile"
+  [ -n "$built" ] || die "docker build wrote no image id"
+fi
+image="$(docker image inspect -f '{{.Id}}' "$built")"
+[[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || die "no image id for $built: '$image'"
+export VMLAB_BUILD_IMAGE="$image"
+log "build image $image"
 container_env=()
 case "$display" in
   unsigned)
@@ -197,7 +240,6 @@ guest/vdisplay-windows/README.md), or point VMLAB_VDISPLAY_PACKAGE_DIR at one."
 fi
 
 # ── 3. Build in the container ────────────────────────────────────────────────
-image="$(docker image inspect -f '{{.Id}}' "${VMLAB_BUILD_IMAGE:-vmlab-build}")"
 ./build/run.sh "${container_env[@]}" ./build/dist.sh "$version"
 
 # ── 4. Collect, checksum, provenance ─────────────────────────────────────────

@@ -73,9 +73,16 @@ just buildbox::image
 
 The bundle contains both hypervisor and viewer, virglrenderer 1.3.0 and its
 Venus render server. The build verifies the source tarball's SHA256 before
-compiling. `.ci-cache/virglrenderer-<version>-<sha256>/` holds the installed
-native library outside `target/`, so Rust cache restores cannot overwrite it.
-CI keys that cache on the version, SHA256 and build script. Rust output lives
+compiling. `.ci-cache/virglrenderer-<version>-<sha256>-<patches>-<options>/`
+holds the installed native library outside `target/`, so Rust cache restores
+cannot overwrite it. The name holds the version, the source SHA256, the patch
+set and the meson options. Its `.complete` file is the manifest of the tree
+that the build left, and a tree that differs from it is built again. That
+finds a damaged tree, and it is no proof against code that can write the
+cache. So `build/dist.sh` sets `VMLAB_HV_VIRGL=fresh`: the bundle of a dist
+build takes its virglrenderer from a build of that run in `target/hv-virgl/`,
+which is emptied first and removed afterwards, and reads nothing from
+`.ci-cache/`. CI keys its cache on the same name and the build script. Rust output lives
 under `target/hv/`. `readelf -d` checks relative RUNPATHs and `ldd` checks that
 the hypervisor and server resolve the bundled library before packaging.
 The archive has normalized ownership and timestamps, using `SOURCE_DATE_EPOCH`
@@ -89,8 +96,13 @@ existing guest bundle. The archive's `README` lists the remaining host runtime
 libraries. glibc, Mesa and GPU drivers stay on the host.
 
 `build/run.sh` starts the container and builds the image first if its tag is
-missing. Set `VMLAB_BUILD_IMAGE` to use another tag. An existing image is not
+missing. Set `VMLAB_BUILD_IMAGE` to use another tag, or an image id
+(`sha256:...`). An existing image is not
 rebuilt automatically; use `just buildbox::image` after toolchain changes.
+The tag is one name for the whole docker host, and `buildbox::image` from any
+checkout moves it. `scripts/release-local.sh` therefore builds the image
+itself, takes the id of that build, and starts every container of the release
+by the id.
 
 `just guest-build` and `just guest-install` build the kernel and initramfs on
 the host, then run firmware fetching, OVMF, iPXE, and SeaBIOS through
