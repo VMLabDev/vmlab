@@ -146,7 +146,7 @@ class Qtest:
         self.select(key)
         data = bytearray()
         while len(data) < length:
-            count = min(4096, length - len(data))
+            count = min(128, length - len(data))
             data.extend(int(answer[0], 0) for answer in self.answers([f"readb {DATA:#x}"] * count))
         return bytes(data)
 
