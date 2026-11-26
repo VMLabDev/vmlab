@@ -716,7 +716,8 @@ impl Builder<'_> {
         if self.probes.is_empty() || self.chance(1, 24) {
             return self.generator.rng.next_u64();
         }
-        let probe = self.probes[self.below(self.probes.len() as u64) as usize];
+        let index = self.below(self.probes.len() as u64) as usize;
+        let probe = self.probes[index];
         let offset = match self.below(8) {
             0..=2 => 0,
             3 => self.below(probe.span.min(1 << 16)) & !7,
@@ -832,7 +833,8 @@ impl Builder<'_> {
             // A new descriptor for a probe, and the TLBI that names every
             // ASID.
             66..=73 if !self.probes.is_empty() => {
-                let probe = self.probes[self.below(self.probes.len() as u64) as usize];
+                let index = self.below(self.probes.len() as u64) as usize;
+                let probe = self.probes[index];
                 let (descriptor, stub) = self.leaf(probe.level, probe.granule);
                 // The probe of the `RET` page keeps what its calls rely on.
                 if stub != probe.stub {

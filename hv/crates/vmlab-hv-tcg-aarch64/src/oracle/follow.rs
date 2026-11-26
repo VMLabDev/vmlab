@@ -1437,7 +1437,6 @@ impl Follower {
                         }
                         break Err(differed(what, &last, ours, Some(core)));
                     }
-                    qemu_writes.clear();
                     // The registers agree, so the last instruction did the same on both sides.
                     if let Some(last) = last.take()
                         && let Some(record) = last.record
