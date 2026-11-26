@@ -856,3 +856,56 @@ fn a_refused_call_is_an_undefined_instruction_and_a_kick_ends_a_spinning_guest()
         .request_exit(ExitReason::Shutdown(ShutdownReason::HostRequest));
     vm.join();
 }
+
+/// `AND Xd, Xn, #0x3f`.
+fn and_low6(rd: u32, rn: u32) -> u32 {
+    0x9240_1400 | rn << 5 | rd
+}
+
+/// An address with no RAM and no device.
+const NOTHING: u64 = 0x1000_0000;
+
+// The core had two stops for these until it translated addresses (card C8),
+// and the backend ended the machine on them. They are exceptions of the
+// guest now: the machine runs on, and the guest sees the cause.
+#[test]
+fn a_data_abort_and_an_unaligned_access_are_exceptions_of_the_guest_and_no_exit() {
+    use vmlab_hv_tcg_aarch64::sysreg::reg;
+
+    let mut program = interrupt_setup();
+    // The MMU is off, so data is Device memory: a load of four bytes at an
+    // odd address is an alignment fault.
+    program.extend(asm::load(7, MESSAGE + 1));
+    program.push(ldr32(8, 7, 0));
+    // Nothing is at this address: an external abort, for a load and a store.
+    program.extend(asm::load(7, NOTHING));
+    program.extend([ldr32(8, 7, 0), str32(8, 7, 4)]);
+    program.extend(power_off());
+    // Write the fault status code of ESR_EL1 plus 0x20 as a character, and
+    // go on behind the instruction that faulted.
+    let sync = [
+        asm::mrs(5, asm::reg::ESR_EL1),
+        and_low6(5, 5),
+        asm::add(5, 5, 0x20),
+        strb(5, 4),
+        asm::mrs(6, asm::reg::ELR_EL1),
+        asm::add(6, 6, 4),
+        asm::blr(6),
+    ];
+    let mut vm = TestVm::start(&program, &sync, &[], &[]);
+    assert_eq!(
+        vm.host.wait_exit(),
+        ExitReason::Shutdown(ShutdownReason::GuestShutdown)
+    );
+    vm.join();
+    // 0x21 is the alignment fault and 0x10 the external abort.
+    assert_eq!(vm.output.text(), "A00");
+    // What the last one left: a data abort of the same level, of a store.
+    let VcpuState::Aarch64(state) = vm.vcpu.lock().state().unwrap() else {
+        panic!("an emulated vCPU has aarch64 registers");
+    };
+    let esr = state.system.regs[reg::ESR_EL1];
+    assert_eq!(esr >> 26, 0x25, "ESR_EL1 is {esr:#x}");
+    assert_eq!(esr & 0x7f, 0x40 | 0x10, "ESR_EL1 is {esr:#x}");
+    assert_eq!(state.system.regs[reg::FAR_EL1], NOTHING + 4);
+}
