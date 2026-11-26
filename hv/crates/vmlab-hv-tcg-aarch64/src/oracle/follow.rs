@@ -274,11 +274,12 @@ impl Follower {
                             ));
                         }
                         // No record for the instruction at our PC: QEMU could
-                        // not fetch it. Our memory must hold nothing there.
+                        // not fetch it. Our memory must hold nothing there. A
+                        // PC that is also not a multiple of four gives no
+                        // record either. Which of the two exceptions it is,
+                        // the exception card (C6) compares.
                         Expect::Instruction
-                            if from_pc == ours.pc
-                                && ours.pc & 3 == 0
-                                && self.word(ours.pc).is_none() =>
+                            if from_pc == ours.pc && self.word(ours.pc).is_none() =>
                         {
                             End::FetchAbort
                         }
