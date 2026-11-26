@@ -861,3 +861,130 @@ move. Nothing else outside this crate and `bench/` changed.
 - CoreMark (Apache-2.0, EEMBC) is fetched at its pinned revision by the bench
   and not committed, as for riscv64.
 - X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
+
+## Card C7 (2026-11-26)
+
+Scope: AdvSIMD and the crypto instructions, the 54 format classes of the 3d
+set that had no lifter and are not system instructions (1,426 records). 47
+classes are AdvSIMD (1,412 records, with the four `PMULL` records of the `AES`
+set): three registers of one arrangement, two-register miscellaneous, across
+lanes, scalar pairwise, three registers of two arrangements, indexed element,
+shift by immediate, copy, permute, extract, table lookup and modified
+immediate, each for vectors and for scalars. 7 classes are `AESE`, `AESD`,
+`AESMC`, `AESIMC` and the ten instructions of SHA-1 and SHA-256 (14 records).
+
+### How it is built
+
+- **One lane helper** (`helpers/simd.rs`, DESIGN.md G3d). `eval` runs one of
+  136 operations over the lanes of up to three 128-bit values. A lifter
+  passes the operation, the lane size and the lane count as one constant. It
+  is pure: FPCR is an argument and the bits for FPSR come back beside the
+  value, with QC among them. A result of 64 bits or fewer is one call
+  (`SIMD_LOW`, 72 bits). A 128-bit result that can raise a bit is two calls
+  with the same arguments (`SIMD` and `SIMD_FLAGS`), because a scalar of the
+  graph has at most 128 bits. A result that cannot raise a bit is one call.
+- **The lifters read the instruction word** (`lift/simd.rs`). One encoding
+  group of AdvSIMD is many format classes of the LLVM tables, so a `plan`
+  function turns `U`, `size` and the opcode of a word into an operation.
+  `lift/mod.rs` puts the word back from the fixed bits of the record and the
+  fields of its class, and `lift` keeps its signature. A unit test holds the
+  plan of each of the 1,323 records of the 27 planned classes against the
+  mnemonic in its LLVM name.
+- **Pure IR** for what needs no lane loop: `AND`, `BIC`, `ORR`, `ORN`, `EOR`,
+  `BSL`, `BIT`, `BIF`, `NOT`, `DUP`, `INS`, `SMOV`, `UMOV`, the scalar `MOV`
+  of a lane and the modified immediates.
+- **Two calls for an accumulation**: `MLA`, `SABA`, `SSRA`, `SMLAL`,
+  `SQDMLAL`, `SADALP` and their kin are the inner operation and then an add,
+  a subtract or a saturating add on `Rd`. `FMLA` and `FMLS` are one fused
+  operation.
+- **The FP operations that only AdvSIMD has** (`helpers/fp/vector.rs`):
+  `FMULX`, `FABD`, `FRECPS`, `FRSQRTS`, `FRECPE`, `FRSQRTE`, `FRECPX`, the
+  compares that give a mask, and `FCVTXN`. `FRSQRTS` is `1.5 + (a / 2) * b`
+  as one SoftFloat fused multiply-add, where half of one operand is exact.
+  `FCVTXN` is SoftFloat's conversion toward zero with the last bit set where
+  it is inexact.
+- **Crypto** (`helpers/crypto.rs`): the S-box is computed at compile time
+  from its definition. The unit tests compute the first round of the example
+  of FIPS 197 and the SHA-1 and SHA-256 digests of "abc" with the functions
+  of the instructions, in the order in which a guest uses them.
+
+### Instruction lockstep against QEMU
+
+`just tcg-a64-lockstep c7 100000 1 "<the four traces>" <corpus> 1`, at the
+commit `bcc6090f`: 5,405,721 instructions verified in 450,498 rounds, no
+difference, 137 s. An instruction is verified when both sides ran it from the
+same X0 to X30, SP, PC, CPSR, V0 to V31, FPSR and FPCR and had the same of
+all of them after it.
+
+- Every one of the 54 format classes has at least 100,000 verified
+  instructions, the fewest `SIMDSMov` with 100,001. Every one of the 1,426
+  records was verified, the least often `FABDv4f32` with 249:
+  `BaseSIMDThreeSameVector` has 335 records.
+- Random phase: 450,252 rounds of 12 instructions, seed 1. 27,363 words were
+  made without the constraints. No class of the group has a constraint.
+- Executed phase: the four traces hold 734,599 distinct encodings, 2,697 of
+  them of this group, and all 2,697 were verified.
+- "Undefined on one side only": 0. No round met an undefined word: every
+  round ended at its budget.
+- The same run with the seeds 2 and 3, without the traces: 5,402,940 and
+  5,403,108 instructions verified, no difference.
+- Longer runs of the four classes with the most records, seed 4, by the
+  name of the class as the group: `BaseSIMDThreeSameVector` 3,000,000,
+  `BaseSIMDTwoSameVector` 1,500,000, `BaseSIMDVectorShift` 1,000,008 and
+  `BaseSIMDDifferentThreeVector` 900,000 instructions verified, no
+  difference.
+- The start of a round: FPCR and FPSR as in card C4. Each vector register has
+  lanes of one size, 8 to 64 bits, and a lane holds zero, all ones, the ends
+  of the signed range, a small signed number or one near the lane size (the
+  amount of a shift by a register), an FP value where the rules change, or
+  random bits.
+- QEMU runs these instructions only with CPACR_EL1.FPEN set. The leader sets
+  it with its prelude, as for card C4.
+
+No lifter and no helper needed a change after its first lockstep run. That
+the comparison finds a difference was checked with two bugs put in by hand,
+each run with 2,000 instructions per class. With `TRN2` reading the lanes of
+`TRN1` the run stopped at `TRN2v2i32` (V0 differed). Without FPSR.QC it
+stopped at `UQADDv1i32` (FPSR `0x10` against `0x8000010`).
+
+`just ci::check` replays `tests/corpus/c7.txt` without QEMU: one verified
+instruction of each of the 1,426 records from the run with the seed 1, with
+the vector registers that the instruction names.
+
+### What this card does not do
+
+- The check that FP and AdvSIMD are enabled (CPACR_EL1.FPEN) and its trap
+  came with card C6. After the merge of `next`, `lift::needs_fp` names the
+  format classes of this card too, so they trap as the scalar FP classes do.
+- The speed of AdvSIMD. Every lane operation is a helper call, and a 128-bit
+  result that can raise a bit of FPSR is computed twice. The loop of
+  `just tcg-a64-mips` has no vector instruction and was not measured again:
+  this card changes no line of `exec.rs`.
+- Encodings that the LLVM tables do not decode. The stream is made from our
+  decode tables, so a word that QEMU runs and LLVM refuses is not in it. The
+  decoder check of card C1 covers that side.
+- Half-precision lanes (`FullFP16`), `RDM`, `DotProd`, `SHA3`, `SHA512` and
+  the other later sets are not in the 3d set.
+
+### Sources read for this card
+
+- S1: the generated tables of this crate (records, fields, fixed bits,
+  names). No LLVM source file was opened. The opcode tables of the `plan`
+  functions are written from the author's knowledge of the published A64
+  encoding and checked against the record names.
+- S3: dynarmic at the commit `65a221dd` of the fork
+  `github.com/PabloMK7/dynarmic`, 0BSD, checked in its `LICENSE.txt`:
+  `src/dynarmic/common/fp/op/FPRecipEstimate.cpp`, `FPRSqrtEstimate.cpp`,
+  `FPRecipExponent.cpp`, `FPRecipStepFused.cpp`, `FPRSqrtStepFused.cpp` and
+  `src/dynarmic/common/math_util.cpp`, for the two estimates, `FRECPX` and
+  the two steps. No code of it is copied. No other file of it was opened: the
+  translator files `simd_*.cpp` were listed and not read.
+- S5: SoftFloat 3e, as vendored by card C4.
+- S6: the behaviour of a running QEMU 11.1.3 through the lockstep harness.
+- FIPS 197 and FIPS 180-4, and the published definitions of the integer
+  AdvSIMD, AES and SHA instructions, from the author's memory. These are not
+  among S1 to S8. The known answers of the standards and the lockstep check
+  what was written from them.
+- S2, S4, S7 and S8 were not opened. No chapter of the Arm Architecture
+  Reference Manual was opened (the operator's answer Q1 allows its prose).
+- X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
