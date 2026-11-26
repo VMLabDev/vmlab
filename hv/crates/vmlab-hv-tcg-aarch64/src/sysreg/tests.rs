@@ -414,6 +414,10 @@ fn a_write_changes_the_bits_of_the_mask_and_no_other() {
         ("FPSR", u64::MAX, 0xf800_009f),
         ("TPIDR_EL1", 0x1234_5678_9abc_def0, 0x1234_5678_9abc_def0),
         ("ESR_EL1", u64::MAX, u64::MAX),
+        // The byte address select of a breakpoint is two pairs of bits.
+        ("DBGBCR4_EL1", 0x09cd_3d80_2145_756a, 0x09cd_3d80_2145_746a),
+        ("DBGBCR0_EL1", 0x0a0, 0x1e0),
+        ("DBGBCR5_EL1", 0x140, 0),
     ] {
         bench.fresh();
         assert!(matches!(bench.set(name, wrote), Answer::Ran(_)), "{name}");

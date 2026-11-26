@@ -117,6 +117,9 @@ pub struct Row {
     pub reset: u64,
     /// The bits that a write changes.
     pub mask: u64,
+    /// What a write stores for the value that the guest gives, before the
+    /// mask.
+    pub hook: Option<fn(u64) -> u64>,
 }
 
 const ALL: u64 = u64::MAX;
@@ -132,7 +135,23 @@ const fn stored(name: &'static str, encoding: u16, reset: u64, mask: u64) -> Row
         gate: Gate::Open,
         reset,
         mask,
+        hook: None,
     }
+}
+
+/// A breakpoint control register stores the byte address select as two
+/// pairs of equal bits: bit 5 also in bit 6, and bit 7 also in bit 8. The
+/// lockstep of card C6 found it at a write of 0x...756a, which QEMU reads
+/// back as 0x...746a (S6).
+fn breakpoint_control(value: u64) -> u64 {
+    let pairs = (value & (1 << 5 | 1 << 7)) << 1;
+    (value & !(1 << 6 | 1 << 8)) | pairs
+}
+
+const fn bcr(name: &'static str, encoding: u16) -> Row {
+    let mut row = stored(name, encoding, 0, ALL);
+    row.hook = Some(breakpoint_control);
+    row
 }
 
 /// A register that EL1 reads and nothing writes.
@@ -178,28 +197,28 @@ pub const ROWS: &[Row] = &[
     // --- debug: stored, and no breakpoint or watchpoint acts (V3) ---------
     stored("OSDTRRX_EL1", 0x8002, 0, 0),
     stored("DBGBVR0_EL1", 0x8004, 0, ALL),
-    stored("DBGBCR0_EL1", 0x8005, 0, ALL),
+    bcr("DBGBCR0_EL1", 0x8005),
     stored("DBGWVR0_EL1", 0x8006, 0, !3),
     stored("DBGWCR0_EL1", 0x8007, 0, ALL),
     stored("DBGBVR1_EL1", 0x800c, 0, ALL),
-    stored("DBGBCR1_EL1", 0x800d, 0, ALL),
+    bcr("DBGBCR1_EL1", 0x800d),
     stored("DBGWVR1_EL1", 0x800e, 0, !3),
     stored("DBGWCR1_EL1", 0x800f, 0, ALL),
     stored("MDCCINT_EL1", 0x8010, 0, 0),
     stored("MDSCR_EL1", 0x8012, 0, ALL),
     stored("DBGBVR2_EL1", 0x8014, 0, ALL),
-    stored("DBGBCR2_EL1", 0x8015, 0, ALL),
+    bcr("DBGBCR2_EL1", 0x8015),
     stored("DBGWVR2_EL1", 0x8016, 0, !3),
     stored("DBGWCR2_EL1", 0x8017, 0, ALL),
     stored("OSDTRTX_EL1", 0x801a, 0, 0),
     stored("DBGBVR3_EL1", 0x801c, 0, ALL),
-    stored("DBGBCR3_EL1", 0x801d, 0, ALL),
+    bcr("DBGBCR3_EL1", 0x801d),
     stored("DBGWVR3_EL1", 0x801e, 0, !3),
     stored("DBGWCR3_EL1", 0x801f, 0, ALL),
     stored("DBGBVR4_EL1", 0x8024, 0, ALL),
-    stored("DBGBCR4_EL1", 0x8025, 0, ALL),
+    bcr("DBGBCR4_EL1", 0x8025),
     stored("DBGBVR5_EL1", 0x802c, 0, ALL),
-    stored("DBGBCR5_EL1", 0x802d, 0, ALL),
+    bcr("DBGBCR5_EL1", 0x802d),
     stored("OSECCR_EL1", 0x8032, 0, 0),
     id("MDRAR_EL1", 0x8080),
     special("OSLAR_EL1", 0x8084, Special::Oslar, Rw::Wo),
@@ -622,6 +641,7 @@ pub fn write(row: usize, state: &mut State, environment: &Environment, value: u6
     let info = &ROWS[row];
     let Kind::Special(what) = info.kind else {
         let old = state.system.regs[row];
+        let value = info.hook.map_or(value, |hook| hook(value));
         state.system.regs[row] = (old & !info.mask) | (value & info.mask);
         return;
     };
