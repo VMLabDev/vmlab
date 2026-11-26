@@ -169,6 +169,26 @@ pub fn spawn(
     Ok(())
 }
 
+fn mirror_child_exit(child: Pid) -> ! {
+    let mut status = 0;
+    loop {
+        let rc = unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
+        if rc >= 0 {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                continue;
+            };
+            unsafe { libc::_exit(code) }
+        }
+        if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
+            unsafe { libc::_exit(127) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,25 +225,5 @@ mod tests {
         assert_eq!(check_delays(&spec).next(), first);
         assert_eq!(first, Some(Duration::ZERO));
         assert_eq!(check_delays(&spec).nth(1), Some(Duration::from_secs(1)));
-    }
-}
-
-fn mirror_child_exit(child: Pid) -> ! {
-    let mut status = 0;
-    loop {
-        let rc = unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
-        if rc >= 0 {
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                continue;
-            };
-            unsafe { libc::_exit(code) }
-        }
-        if nix::errno::Errno::last() != nix::errno::Errno::EINTR {
-            unsafe { libc::_exit(127) }
-        }
     }
 }
