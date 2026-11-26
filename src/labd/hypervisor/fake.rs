@@ -1081,7 +1081,8 @@ fn bind(path: &Path) -> Result<UnixListener> {
 /// A fake cinit on `vmlab.ctl.0`: announce boot, block on the spec, then
 /// report the scripted lifecycle. A `stop` command signals the container and
 /// powers the micro-VM off, which is the whole of the container stop ladder's
-/// first rung.
+/// first rung. The connection goes with the machine, however it ends: a dead
+/// emulator closes its side of the socket, and the host's reader sees EOF.
 fn serve_ctl(listener: UnixListener, machine: Arc<FakeProc>, timeline: Vec<(Duration, CtlEvent)>) {
     tokio::spawn(async move {
         let accepted = tokio::select! {
@@ -1110,7 +1111,14 @@ fn serve_ctl(listener: UnixListener, machine: Arc<FakeProc>, timeline: Vec<(Dura
 
         let mut specced = false;
         let mut lines = BufReader::new(read_half).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                () = machine.ended() => return,
+            };
+            let Ok(Some(line)) = line else {
+                return;
+            };
             let Ok(cmd) = serde_json::from_str::<CtlCommand>(line.trim()) else {
                 continue;
             };
@@ -1123,7 +1131,12 @@ fn serve_ctl(listener: UnixListener, machine: Arc<FakeProc>, timeline: Vec<(Dura
                     let timeline = timeline.clone();
                     tokio::spawn(async move {
                         for (delay, ev) in timeline {
-                            tokio::time::sleep(delay).await;
+                            // A machine that has ended reports nothing more,
+                            // and lets go of its side of the socket.
+                            tokio::select! {
+                                () = tokio::time::sleep(delay) => {}
+                                () = machine.ended() => return,
+                            }
                             let mut line = serde_json::to_string(&ev).expect("ctl event");
                             line.push('\n');
                             if out.lock().await.write_all(line.as_bytes()).await.is_err() {

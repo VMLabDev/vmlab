@@ -195,25 +195,66 @@ write_udhcpc_script() {
   cat >"$root/etc/udhcpc/default.script" <<'EOF'
 #!/bin/sh
 # vmlab micro-VM udhcpc hook. busybox exports: $1 (event), $interface, $ip,
-# $subnet, $router, $dns. Applies the lease and records it under
+# $subnet, $router, $staticroutes, $dns. Applies the lease and records it under
 # /run/vmlab-net/ for vmlab-cinit (resolv.conf + the net_up event).
+set -efu
 BB=/bin/busybox
 STATE=/run/vmlab-net
+routes="$STATE/$interface.routes"
+# Give each NIC its own metric so it can renew without replacing another NIC's
+# routes for the same destination. Lower-numbered NICs take precedence.
+metric=$((100 + ${interface#eth}))
+
+lease_route() {
+  if [ "$3" = 0.0.0.0 ]; then
+    $BB ip route "$1" "$2" dev "$interface" metric "$metric"
+  else
+    $BB ip route "$1" "$2" via "$3" dev "$interface" metric "$metric"
+  fi
+}
+
+clear_routes() {
+  if [ -f "$routes" ]; then
+    while read -r destination gateway; do
+      lease_route del "$destination" "$gateway" 2>/dev/null || :
+    done < "$routes"
+  fi
+  : > "$routes"
+}
+
+apply_route() {
+  if lease_route replace "$1" "$2"; then
+    printf '%s %s\n' "$1" "$2" >> "$routes"
+  fi
+}
+
 $BB mkdir -p "$STATE"
 case "$1" in
   deconfig)
+    clear_routes
+    : > "$STATE/$interface.ip"
+    : > "$STATE/$interface.dns"
     $BB ifconfig "$interface" 0.0.0.0
     ;;
   bound|renew)
+    clear_routes
     $BB ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}"
-    if [ -n "${router:-}" ]; then
-      while $BB route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do :; done
+    if [ "${staticroutes+x}" = x ]; then
+      set -- $staticroutes
+      while [ "$#" -ge 2 ]; do
+        apply_route "$1" "$2"
+        shift 2
+      done
+    elif [ -n "${router:-}" ]; then
       for r in $router; do
-        $BB route add default gw "$r" dev "$interface" && break
+        if lease_route replace default "$r"; then
+          printf 'default %s\n' "$r" >> "$routes"
+          break
+        fi
       done
     fi
-    printf '%s\n' "$ip" > "$STATE/$interface.ip"
     printf '%s\n' ${dns:-} > "$STATE/$interface.dns"
+    printf '%s\n' "$ip" > "$STATE/$interface.ip"
     ;;
 esac
 exit 0
