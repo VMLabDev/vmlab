@@ -6327,6 +6327,32 @@ lab "t" {
     }
 
     #[tokio::test]
+    async fn a_script_with_the_wrong_signature_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let error = crate::scripting::run_script_source(
+            lab,
+            "fn main(lab: Lab) -> int {\n    lab.log(\"ran\")\n    1\n}".into(),
+            "wrong-signature.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| output.send(line).unwrap()),
+        )
+        .await
+        .unwrap_err();
+        while let Ok(line) = lines.try_recv() {
+            assert_ne!(line, "ran\n", "invalid script ran: {error:#}");
+        }
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("wrong-signature.ws: main must have signature"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_cancelled_script_stops_without_a_host_call() {
         let dir = tempfile::tempdir().unwrap();
         let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
