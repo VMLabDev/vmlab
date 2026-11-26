@@ -368,10 +368,15 @@ pub fn pair(
     let bytes = access.bytes();
     let offset = sign_extend(u64::from(offset & 0x7f), 7) * i64::from(bytes);
     with_base(b, rn, offset, index, |b, address| {
-        if bytes > 8 {
-            // Two registers of 16 bytes are two accesses.
+        if matches!(access.data, Data::Vector { .. }) {
+            // Two vector registers are two accesses, and a load writes the
+            // first register before the second access: QEMU leaves it
+            // written when that one faults (the lockstep of card C8).
             let second = displace(b, address, i64::from(bytes));
             transfer(b, access, rt, address);
+            if access.load {
+                b.commit();
+            }
             transfer(b, access, rt2, second);
         } else {
             transfer_pair(b, access, rt, rt2, address);
@@ -380,11 +385,11 @@ pub fn pair(
     Lifted::Next
 }
 
-/// A pair of registers of at most 8 bytes each as one access, the first
-/// register at the lower address. QEMU makes it one access: where the pair
-/// crosses into a page that faults, the fault of that page comes before
-/// anything of the first page is looked at (the lockstep of card C8). The
-/// alignment is that of one register.
+/// A pair of general registers as one access, the first register at the
+/// lower address. QEMU makes it one access: where the pair crosses into a
+/// page that faults, the fault of that page comes before the memory of the
+/// first page is looked at, and no register is written (the lockstep of
+/// card C8). The alignment is that of one register.
 fn transfer_pair(b: &mut Builder, access: Access, rt: u32, rt2: u32, address: ScalarId) {
     let bytes = access.bytes();
     let width = u16::from(bytes) * 8;
@@ -408,19 +413,8 @@ fn transfer_pair(b: &mut Builder, access: Access, rt: u32, rt2: u32, address: Sc
             let both = b.concat(high, low, width, width * 2);
             b.store_aligned(address, bytes * 2, both, bytes);
         }
-        (Data::Vector { .. }, true) => {
-            let both = b.load_aligned(address, bytes * 2, bytes);
-            for (target, offset) in [(rt, 0), (rt2, width)] {
-                let value = b.slice(both, offset, width);
-                b.set_v(target, width, value);
-            }
-        }
-        (Data::Vector { .. }, false) => {
-            let low = b.v(rt, width);
-            let high = b.v(rt2, width);
-            let both = b.concat(high, low, width, width * 2);
-            b.store_aligned(address, bytes * 2, both, bytes);
-        }
+        // A pair of vector registers is two accesses.
+        (Data::Vector { .. }, _) => {}
     }
 }
 
