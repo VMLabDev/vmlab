@@ -889,6 +889,15 @@ mod tests {
     }
 
     #[test]
+    fn usb_passthrough_on_the_pc_machine_is_refused_by_name() {
+        let why = refused(
+            r#"template = "scratch" arch = "x86_64" disk = 10GiB profile = "windows-xp" usb = true"#,
+        );
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("usb = true"), "{why:?}");
+    }
+
+    #[test]
     fn firmware_resolution_is_supported_by_fw_cfg() {
         let why = refused(
             r#"template = "scratch" arch = "x86_64" profile = "linux-modern" disk = 10GiB firmware_width = 1024 firmware_height = 768"#,

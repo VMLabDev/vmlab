@@ -3668,6 +3668,47 @@ async fn a_forced_stop_kills_a_hypervisor_that_never_answers_the_detach() {
     assert_eq!(vm.state().await, PowerState::Stopped);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_forced_stop_kills_behind_an_attach_that_never_returns() {
+    let dirs = Dirs::new();
+    let (vm, hv) = vm(
+        &dirs,
+        USB_VM,
+        Script {
+            capabilities: Capabilities::all(),
+            runs: vec![Run {
+                ignores_attach: true,
+                ..Run::forever()
+            }],
+            ..Script::healthy()
+        },
+    );
+    let (cbs, mut observed) = callbacks();
+    start_vm(&vm, cbs).await.expect("start");
+    let m: Arc<dyn Machine> = vm.clone();
+    let plan = usb_plan();
+    let attach_call = format!("attach {}", plan.device.qdev_id());
+    let attach = m.usb_attach(&plan);
+    tokio::pin!(attach);
+    tokio::select! {
+        biased;
+        result = &mut attach => panic!("attach replied before exit: {result:?}"),
+        () = async {} => {}
+    }
+    assert_eq!(hv.journal(), vec![attach_call.clone()]);
+
+    let (attach, stop) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(attach, m.stop(true))
+    })
+    .await
+    .expect("forced stop must reach the kill while attach is pending");
+    attach.expect_err("attach loses its connection at exit");
+    stop.expect("forced stop");
+    assert_eq!(observed.exit().await.status, "signal: 9");
+    assert_eq!(hv.journal(), vec![attach_call, "kill".to_string()]);
+    assert!(m.usb_attached().await.is_empty());
+}
+
 /// A stop that ends before the kill rung detaches nothing: the hypervisor
 /// exits by itself and gives its devices back as it drops them.
 #[tokio::test]
