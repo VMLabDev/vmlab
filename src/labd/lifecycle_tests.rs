@@ -2241,6 +2241,69 @@ async fn a_workload_container_is_ready_once_its_entrypoint_runs() {
     ctr.stop(true).await.expect("stop");
 }
 
+/// A run leaves nothing behind in the lab daemon (docs/reviews/containers-2.md
+/// G1). Every task of a run holds the instance, and the ctl watcher holds a
+/// ctl handle too, which is the socket. The watcher used to wait on a stream
+/// that its own handle kept open, so each start left one task, one socket and
+/// one reference to the instance for the life of the daemon.
+///
+/// Time is paused, so the test has no wall-clock limit: the run's tasks poll
+/// on timers, and the clock moves only when every task is blocked. An hour of
+/// that clock is far past every poll interval of a run.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_container_run_holds_the_instance_no_longer() {
+    for force in [true, false] {
+        let dirs = Dirs::new();
+        let (ctr, _hv) = container(
+            &dirs,
+            WORKLOAD,
+            Script {
+                agent: false,
+                runs: vec![
+                    Run {
+                        ctl: vec![(
+                            Duration::ZERO,
+                            vmlab_cinit_proto::CtlEvent::Started { pid: 7 },
+                        )],
+                        ..Run::forever()
+                    };
+                    2
+                ],
+                ..Script::default()
+            },
+        );
+        let before = Arc::strong_count(&ctr);
+
+        // Twice: the leak was one reference for each start.
+        for run in 1..=2 {
+            let (cbs, mut observed) = callbacks();
+            start_container(&ctr, cbs).await.expect("start");
+            let m: Arc<dyn Machine> = ctr.clone();
+            m.wait_ready(SETTLE).await.expect("ready");
+            drop(m);
+            assert!(
+                Arc::strong_count(&ctr) > before,
+                "the tasks of a live run hold the instance"
+            );
+
+            ctr.stop(force).await.expect("stop");
+            assert_eq!(observed.exit().await.reason, StopReason::Requested);
+
+            for _ in 0..3600 {
+                if Arc::strong_count(&ctr) == before {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            assert_eq!(
+                Arc::strong_count(&ctr),
+                before,
+                "run {run} (force = {force}) still holds the instance after its stop"
+            );
+        }
+    }
+}
+
 /// An idle container has no workload to prove liveness, so its readiness
 /// waits for the vmlab-agent instead — its control plane *is* the service.
 /// The gate must be the agent and not the healthcheck, which idle mode does
