@@ -719,58 +719,6 @@ impl Builder {
         });
     }
 
-    // --- vector registers ----------------------------------------------------
-
-    /// The low `width` bits of the vector register `n`.
-    pub fn v(&mut self, n: u32, width: u16) -> ScalarId {
-        let value = self.read(slot::V0 + (n & 31) as usize);
-        self.low(value, width)
-    }
-
-    /// Write the vector register `n`. A value below 128 bits clears the bits
-    /// above it.
-    pub fn set_v(&mut self, n: u32, value: ScalarId) {
-        let value = self.zero_extend(value, 128);
-        self.write(slot::V0 + (n & 31) as usize, value);
-    }
-
-    /// `value`, of `from` bits, sign-extended to `width` bits.
-    pub fn sign_extend(&mut self, value: ScalarId, from: u16, width: u16) -> ScalarId {
-        debug_assert_eq!(self.block.graph.scalars[value].ty, ScalarType::Bits(from));
-        if from == width {
-            return value;
-        }
-        total(
-            self.block
-                .graph
-                .unary(ScalarType::Bits(width), Unary::SignExtend(from), value),
-        )
-    }
-
-    /// The bits `offset` to `offset + width` of `value`.
-    pub fn slice(&mut self, value: ScalarId, offset: u16, width: u16) -> ScalarId {
-        self.block.graph.slice(value, offset, width)
-    }
-
-    /// `high` above `low`. `low` has `low_width` bits and the result `width`.
-    pub fn concat(
-        &mut self,
-        high: ScalarId,
-        low: ScalarId,
-        low_width: u16,
-        width: u16,
-    ) -> ScalarId {
-        debug_assert_eq!(
-            self.block.graph.scalars[low].ty,
-            ScalarType::Bits(low_width)
-        );
-        debug_assert_eq!(
-            self.block.graph.scalars[high].ty,
-            ScalarType::Bits(width - low_width)
-        );
-        self.block.graph.concat(high, low, low_width, width)
-    }
-
     // --- the end of the block ----------------------------------------------
 
     /// Set the next PC. The instruction that calls this ends the block.

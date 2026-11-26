@@ -223,7 +223,7 @@ fn transfer(b: &mut Builder, access: Access, rt: u32, address: ScalarId) {
         }
         (Data::Vector { bytes }, true) => {
             let value = b.load(address, bytes);
-            b.set_v(rt, value);
+            b.set_v(rt, u16::from(bytes) * 8, value);
         }
         (Data::Vector { bytes }, false) => {
             let value = b.v(rt, u16::from(bytes) * 8);
@@ -465,6 +465,12 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     Lifted::Next
 }
 
+/// The register `index` of a list of vector registers that starts at `vt`:
+/// the list wraps from V31 to V0.
+fn list(vt: u32, index: u32) -> u32 {
+    (vt + index) & 31
+}
+
 /// The write back of an AdvSIMD structure access: the base moves by the
 /// bytes of the access when `xm` is 31, else by the register `xm`.
 fn structure_write_back(b: &mut Builder, rn: u32, base: ScalarId, xm: Option<u32>, bytes: u32) {
@@ -536,9 +542,9 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
             let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
             if shape.load {
                 let value = b.load_aligned(address, vector_bytes, align);
-                b.set_v(vt + register, value);
+                b.set_v(list(vt, register), u16::from(vector_bytes) * 8, value);
             } else {
-                let value = b.v(vt + register, u16::from(vector_bytes) * 8);
+                let value = b.v(list(vt, register), u16::from(vector_bytes) * 8);
                 b.store_aligned(address, vector_bytes, value, align);
             }
         }
@@ -572,12 +578,16 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
             }
             for (register, value) in values.into_iter().enumerate() {
                 if let Some(value) = value {
-                    b.set_v(vt + register as u32, value);
+                    b.set_v(
+                        list(vt, register as u32),
+                        u16::from(vector_bytes) * 8,
+                        value,
+                    );
                 }
             }
         } else {
             let sources: Vec<ScalarId> = (0..registers)
-                .map(|register| b.v(vt + register, 128))
+                .map(|register| b.v(list(vt, register), 128))
                 .collect();
             for element in 0..elements {
                 for register in 0..registers {
@@ -644,11 +654,11 @@ pub fn simd_single(
     let base = b.x_or_sp(rn, 64);
     for register in 0..registers {
         let address = displace(b, base, i64::from(register * u32::from(element_bytes)));
-        let vector = b.v(vt + register, 128);
+        let vector = b.v(list(vt, register), 128);
         if load {
             let element = b.load(address, element_bytes);
             let value = insert(b, vector, position, width, element);
-            b.set_v(vt + register, value);
+            b.set_v(list(vt, register), 128, value);
         } else {
             let element = b.slice(vector, position, width);
             b.store(address, element_bytes, element);
@@ -680,7 +690,7 @@ pub fn simd_replicate(
             vector = b.concat(vector, vector, width, width * 2);
             width *= 2;
         }
-        b.set_v(vt + register, vector);
+        b.set_v(list(vt, register), vector_width, vector);
     }
     structure_write_back(b, rn, base, xm, registers * u32::from(element_bytes));
     Lifted::Next

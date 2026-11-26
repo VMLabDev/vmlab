@@ -37,7 +37,9 @@ use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::linear;
 use vmlab_hv_tcg_ir::native::packed::Packed;
-use vmlab_hv_tcg_ir::native::{Graph, Operation, ScalarId, dce, schedule};
+use vmlab_hv_tcg_ir::native::{
+    Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
+};
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
