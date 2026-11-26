@@ -1426,7 +1426,10 @@ pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String
     check_compiled_entry(&mut unit, entry)
 }
 
-fn check_compiled_entry(unit: &mut wscript::CompiledUnit, entry: ScriptEntry) -> Result<(), String> {
+fn check_compiled_entry(
+    unit: &mut wscript::CompiledUnit,
+    entry: ScriptEntry,
+) -> Result<(), String> {
     let name = entry.name();
     let Some((_, signature)) = unit.exports.get(name) else {
         return Err(format!(
