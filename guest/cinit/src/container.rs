@@ -382,6 +382,21 @@ mod tests {
         fs::create_dir_all(rootfs.join("bin")).unwrap();
         fs::create_dir_all(dir.path().join("bin")).unwrap();
         // Executable only beside the rootfs, where the link would land if
+    /// G8 (docs/reviews/containers-2.md): the `chdir` follows the `chroot`
+    /// with the working directory still in the initramfs, so `etc` would be
+    /// the micro-VM's own `/etc`. Covers an image whose `WorkingDir` is
+    /// relative, which no lab file validation sees.
+    #[test]
+    fn an_exec_identity_refuses_a_relative_workdir() {
+        for relative in ["etc", "lib/modules", "./app", ""] {
+            let err = ExecIdentity::new(Some(relative), None)
+                .err()
+                .unwrap_or_else(|| panic!("{relative:?} was taken"));
+            assert!(err.contains("absolute"), "{err}");
+        }
+        assert!(ExecIdentity::new(Some("/etc"), None).is_ok());
+    }
+
         // it were followed on cinit's side.
         let outside = dir.path().join("bin/outside");
         fs::write(&outside, "#!/bin/sh\n").unwrap();

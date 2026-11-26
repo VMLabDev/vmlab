@@ -3267,6 +3267,20 @@ template "t" {
         );
     }
 
+    /// G8 (docs/reviews/containers-2.md): cinit enters the workdir after
+    /// `chroot`, so a relative one lands in the micro-VM's own tree.
+    #[test]
+    fn a_relative_container_workdir_is_refused() {
+        assert_any_err(
+            r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" workdir = "app" } }"#,
+            "workdir `app` must be an absolute path",
+        );
+        let absolute = r#"import <vmlab.wcl>
+lab "l" { container "c" { image = "nginx" workdir = "/app" } }"#;
+        assert!(errs(absolute).is_empty(), "{:#?}", errs(absolute));
+    }
+
     /// F4 (docs/reviews/config.md): two `disk` blocks with one name would
     /// give the VM two writable drives on one image file.
     #[test]

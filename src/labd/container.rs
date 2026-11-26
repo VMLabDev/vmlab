@@ -1994,6 +1994,66 @@ mod tests {
             entrypoint: vec!["/entry.sh".into()],
             cmd: vec!["serve".into(), "--all".into()],
             ..Default::default()
+    /// G3 of `docs/reviews/containers-2.md`: a virtio-fs tag holds 36 bytes,
+    /// and a container's name alone may have 63.
+    #[tokio::test]
+    async fn a_long_container_name_keeps_its_volume_tags_mountable() {
+        use crate::labd::hypervisor::fake::{FakeHypervisor, Script};
+        let dir = tempfile::tempdir().unwrap();
+        let name = "c".repeat(40);
+        let mut cfg = container(&name);
+        cfg.volumes = ["/data", "/cache"]
+            .iter()
+            .map(|target| Volume {
+                source: VolumeSource::Named(target[1..].into()),
+                target: (*target).into(),
+                read_only: false,
+                span: (0, 0),
+            })
+            .collect();
+        let volumes = resolve_volume_hosts(&cfg, dir.path());
+        let resolved = crate::qemu::resolve_container(
+            &cfg,
+            "x86_64",
+            &crate::profiles::ProfileSet::shipped().unwrap(),
+        )
+        .unwrap();
+        let c = ContainerInstance::new(
+            "lab",
+            cfg,
+            resolved,
+            ContainerDirs::new(dir.path(), "lab", &name),
+            vec![],
+            vec![],
+            Some(PulledImage {
+                manifest_digest: "sha256:0".into(),
+                config: image(RuntimeDefaults::default()),
+                rootfs_image: dir.path().join("rootfs.sqfs"),
+            }),
+            volumes,
+            HypervisorKind::Qemu,
+            FakeHypervisor::new(Script::default()),
+        );
+
+        let devices = c.start_virtiofsds().await.unwrap();
+        assert!(c.virtiofs_active.load(Ordering::SeqCst));
+        let handed: Vec<String> = devices.into_iter().map(|(tag, _)| tag).collect();
+        let mounted: Vec<String> = c
+            .spec_for_guest()
+            .await
+            .unwrap()
+            .volumes
+            .into_iter()
+            .map(|v| v.tag.expect("a virtiofs volume carries its tag"))
+            .collect();
+        assert_eq!(mounted.len(), 2);
+        for tag in &mounted {
+            assert!(tag.len() <= 36, "{tag}: {} bytes", tag.len());
+        }
+        assert_ne!(mounted[0], mounted[1]);
+        assert_eq!(mounted, handed, "cinit mounts what the hypervisor serves");
+    }
+
         });
 
         // No overrides: image entrypoint + image cmd.
