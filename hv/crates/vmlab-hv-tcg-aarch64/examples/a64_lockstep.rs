@@ -258,6 +258,10 @@ fn main() -> Result<(), Failure> {
     };
 
     let mut leader = Leader::start_options(&qemu, &plugin, &directory, RAM_MIB, &options)?;
+    if system {
+        // The streams have their own vector table.
+        leader.clear_vector_break()?;
+    }
     // Our memory starts as a copy of the RAM of QEMU.
     let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
     let memory = FlatMemory::new(RAM_BASE, ram);

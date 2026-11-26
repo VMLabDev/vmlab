@@ -46,6 +46,8 @@ pub struct Leader {
     pending: Vec<u8>,
     parsed: usize,
     running: bool,
+    /// The breakpoint at `VECTOR` is set.
+    vector_break: bool,
     directory: PathBuf,
 }
 
@@ -179,6 +181,7 @@ impl Leader {
             pending: Vec::new(),
             parsed: 0,
             running: false,
+            vector_break: true,
             directory: directory.to_path_buf(),
         };
         leader.rsp.break_at(VECTOR)?;
@@ -213,6 +216,22 @@ impl Leader {
                 "the prelude that enables FP stopped at {:#x}, not at its end",
                 stopped.pc
             )));
+        }
+        Ok(())
+    }
+
+    /// Whether QEMU stops by itself at `VECTOR`.
+    pub fn vector_break(&self) -> bool {
+        self.vector_break
+    }
+
+    /// Remove the breakpoint at `VECTOR`. A round whose stream sets
+    /// VBAR_EL1 does not need it, and a branch of the stream to that address
+    /// would stop QEMU there without a record.
+    pub fn clear_vector_break(&mut self) -> io::Result<()> {
+        if self.vector_break {
+            self.rsp.clear_break(VECTOR)?;
+            self.vector_break = false;
         }
         Ok(())
     }

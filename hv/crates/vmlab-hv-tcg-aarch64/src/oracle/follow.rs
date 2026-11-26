@@ -293,7 +293,12 @@ impl Follower {
     /// Stop QEMU after an exception to `vector`: at the breakpoint when the
     /// vector is the one that has it, else by asking.
     fn halt(&mut self, vector: u64) -> io::Result<()> {
-        self.leader.stop(vector != VECTOR)
+        self.leader.stop(!self.at_break(vector))
+    }
+
+    /// Whether QEMU stops by itself at an exception to `vector`.
+    fn at_break(&self, vector: u64) -> bool {
+        self.leader.vector_break() && vector == VECTOR
     }
 
     /// Both sides took the same exception to `taken.to`.
@@ -303,7 +308,7 @@ impl Follower {
         }
         // The vector is outside the mirrored memory: the round ends.
         self.halt(taken.to)?;
-        if taken.to == VECTOR {
+        if self.at_break(taken.to) {
             // The breakpoint stopped QEMU before the first instruction of
             // the vector, so its registers are those after the entry.
             let stopped = self.leader.core()?;
