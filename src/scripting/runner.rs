@@ -1000,10 +1000,10 @@ fn main() -> int {
 }
 "#;
         // 64,000 joined. 4000 matches of "0" grow by 3 bytes each. The
-        // rendering is 1000 strings and 999 of ", " in brackets.
+        // rendering is 1000 strings in quotes and 999 of ", " in brackets.
         assert_eq!(
             run_limited(SCRIPT, Some(MIB)),
-            Ok(64000 + 76000 + 64000 + 1998 + 2)
+            Ok(64000 + 76000 + 66000 + 1998 + 2)
         );
     }
 
