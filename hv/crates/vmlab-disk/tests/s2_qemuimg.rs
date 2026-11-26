@@ -364,8 +364,7 @@ fn s2_backing_chains() {
     let content = read_all(&overlay, Format::Qcow2);
     assert_eq!(content, std::fs::read(&raw_base).unwrap());
 
-    // Three-deep chain: base <- mid (qcow2) <- top, all via qemu-img, read
-    // through the crate recursively.
+    // A chain with data in three layers, created by both implementations.
     let mid = dir.join("mid.qcow2");
     qemu_img(&[
         "create",
@@ -395,6 +394,15 @@ fn s2_backing_chains() {
             .all(|&b| b == 0x33)
     ); // top
     qemu_check(&top);
+
+    let mut previous = top.clone();
+    for index in 3..12 {
+        let overlay = dir.join(format!("layer-{index}.qcow2"));
+        ops::create_linked_clone(&previous, &overlay).unwrap();
+        previous = overlay;
+    }
+    assert_eq!(read_all(&previous, Format::Qcow2), got);
+    qemu_img(&["compare", previous.to_str().unwrap(), top.to_str().unwrap()]);
 }
 
 #[test]
@@ -842,11 +850,12 @@ fn s2_ops_rebase() {
     std::fs::copy(&base, &base2).unwrap();
     qemu_io(&["-c", "write -P 0x42 128k 64k", &base2.to_string_lossy()]);
     let before = read_all(&overlay, Format::Qcow2);
-    ops::rebase_safe(&overlay, &base2, Some("qcow2")).unwrap();
+    ops::rebase_safe(&overlay, Path::new("base2.qcow2"), Some("qcow2")).unwrap();
     let after = read_all(&overlay, Format::Qcow2);
     assert_eq!(before, after, "safe rebase changed visible content");
     // Only the differing cluster was written into the overlay: 128k..192k.
     let info = ops::info(&overlay).unwrap();
+    assert_eq!(info.backing_file.as_deref(), Some("base2.qcow2"));
     assert_eq!(
         info.full_backing_file.as_deref(),
         Some(base2.canonicalize().unwrap().as_path())
