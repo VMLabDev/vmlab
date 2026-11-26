@@ -153,7 +153,11 @@ pub fn safe_value(row: usize, rng: &mut Rng, table: u64, image: (u64, u64)) -> O
 /// instructions that load a value and the `MSR` that writes it, and the
 /// write then takes what the register held. `x`: X0 to X30 before the
 /// instruction. `state`: our state, which is QEMU's. The text says why.
-pub fn unfollowed(encoding: u32, x: &[u64; 31], state: &crate::state::State) -> Option<&'static str> {
+pub fn unfollowed(
+    encoding: u32,
+    x: &[u64; 31],
+    state: &crate::state::State,
+) -> Option<&'static str> {
     let el0 = state.context.el == 0;
     let sctlr = state.system.regs[sysreg::reg::SCTLR_EL1];
     match encoding {
@@ -320,11 +324,11 @@ impl Generator {
                 let word = match self.rng.below(12) {
                     0..=2 => asm::svc(immediate as u16),
                     3 | 7 => 0xd420_0000 | immediate << 5, // brk
-                    4 => 0xd440_0000 | immediate << 5, // hlt
-                    5 => 0xd4a0_0001 | immediate << 5, // dcps1
-                    6 => 0xd4a0_0002 | immediate << 5, // dcps2
-                    8 => 0xd6bf_03e0,                  // drps
-                    9 => 0xd400_0003 | immediate << 5, // smc
+                    4 => 0xd440_0000 | immediate << 5,     // hlt
+                    5 => 0xd4a0_0001 | immediate << 5,     // dcps1
+                    6 => 0xd4a0_0002 | immediate << 5,     // dcps2
+                    8 => 0xd6bf_03e0,                      // drps
+                    9 => 0xd400_0003 | immediate << 5,     // smc
                     10 => asm::ERET,
                     // A call that is no PSCI function: X0 is below 2^16.
                     _ => {

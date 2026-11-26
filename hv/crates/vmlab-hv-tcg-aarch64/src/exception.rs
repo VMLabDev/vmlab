@@ -222,9 +222,18 @@ mod tests {
         assert_eq!(Exception::SupervisorCall(0xe1).syndrome(0), 0x5600_00e1);
         // MRS X0, CTR_EL0 at EL0, as QEMU reports it.
         assert_eq!(Exception::SystemTrap(0x0032_c001).syndrome(0), 0x6232_c001);
-        assert_eq!(Exception::InstructionAbort(EXTERNAL).syndrome(0), 0x8200_0010);
-        assert_eq!(Exception::InstructionAbort(EXTERNAL).syndrome(1), 0x8600_0010);
-        assert_eq!(Exception::InstructionAbort(ADDRESS_SIZE).syndrome(1), 0x8600_0000);
+        assert_eq!(
+            Exception::InstructionAbort(EXTERNAL).syndrome(0),
+            0x8200_0010
+        );
+        assert_eq!(
+            Exception::InstructionAbort(EXTERNAL).syndrome(1),
+            0x8600_0010
+        );
+        assert_eq!(
+            Exception::InstructionAbort(ADDRESS_SIZE).syndrome(1),
+            0x8600_0000
+        );
         assert_eq!(Exception::PcAlignment.syndrome(1), 0x8a00_0000);
         assert_eq!(Exception::Breakpoint(0x3e8).syndrome(1), 0xf200_03e8);
     }
@@ -266,7 +275,11 @@ mod tests {
         // A call leaves FAR_EL1 alone.
         assert_eq!(state.system.regs[reg::FAR_EL1], 0x1234);
         // A fault at EL1 with SP_EL1 returns to the instruction itself.
-        enter(&mut state, Cause::Exception(Exception::PcAlignment), 0x4008_0402);
+        enter(
+            &mut state,
+            Cause::Exception(Exception::PcAlignment),
+            0x4008_0402,
+        );
         assert_eq!(state.pc(), 0x4008_0200);
         assert_eq!(state.system.regs[reg::ELR_EL1], 0x4008_0402);
         assert_eq!(state.system.regs[reg::FAR_EL1], 0x4008_0402);

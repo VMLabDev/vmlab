@@ -153,7 +153,9 @@ impl Counts {
             End::Undefined => "undefined on both sides".to_string(),
             End::FetchAbort => "fetch abort on both sides".to_string(),
             End::PcAlignment => "pc alignment on both sides".to_string(),
-            End::Exception => "another exception on both sides, to a vector outside the RAM".to_string(),
+            End::Exception => {
+                "another exception on both sides, to a vector outside the RAM".to_string()
+            }
             End::OutsideMemory => {
                 "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
             }
@@ -260,7 +262,10 @@ fn main() -> Result<(), Failure> {
     let compared = if system { compared() } else { Vec::new() };
     let options = Options {
         vectors,
-        system: compared.iter().map(|register| register.qemu.to_string()).collect(),
+        system: compared
+            .iter()
+            .map(|register| register.qemu.to_string())
+            .collect(),
         names: None,
     };
 

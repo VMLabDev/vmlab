@@ -341,8 +341,13 @@ pub const ROWS: &[Row] = &[
         .el0(Rw::Rw, Gate::PhysicalTimer),
     special("CNTP_CTL_EL0", 0xdf11, Special::TimerControl(false), Rw::Rw)
         .el0(Rw::Rw, Gate::PhysicalTimer),
-    special("CNTP_CVAL_EL0", 0xdf12, Special::TimerCompare(false), Rw::Rw)
-        .el0(Rw::Rw, Gate::PhysicalTimer),
+    special(
+        "CNTP_CVAL_EL0",
+        0xdf12,
+        Special::TimerCompare(false),
+        Rw::Rw,
+    )
+    .el0(Rw::Rw, Gate::PhysicalTimer),
     special("CNTV_TVAL_EL0", 0xdf18, Special::TimerValue(true), Rw::Rw)
         .el0(Rw::Rw, Gate::VirtualTimer),
     special("CNTV_CTL_EL0", 0xdf19, Special::TimerControl(true), Rw::Rw)
@@ -630,8 +635,7 @@ pub fn read(row: usize, state: &State, environment: &Environment) -> u64 {
         Special::SpEl0 => state.slots[crate::state::slot::SP_EL0] as u64,
         // Blocks of 64 bytes. DZP: DC ZVA is not allowed at this level.
         Special::Dczid => {
-            let prohibited =
-                state.context.el == 0 && system.regs[reg::SCTLR_EL1] & sctlr::DZE == 0;
+            let prohibited = state.context.el == 0 && system.regs[reg::SCTLR_EL1] & sctlr::DZE == 0;
             4 | u64::from(prohibited) << 4
         }
         Special::Ccsidr => system.model.ccsidr[(system.regs[reg::CSSELR_EL1] & 15) as usize],
@@ -640,7 +644,9 @@ pub fn read(row: usize, state: &State, environment: &Environment) -> u64 {
         Special::ClaimSet => 0xff,
         Special::ClaimClear => system.regs[reg::DBGCLAIMCLR_EL1],
         Special::Counter => environment.count,
-        Special::TimerControl(which) => system.timers[usize::from(which)].control(environment.count),
+        Special::TimerControl(which) => {
+            system.timers[usize::from(which)].control(environment.count)
+        }
         Special::TimerCompare(which) => system.timers[usize::from(which)].compare,
         Special::TimerValue(which) => system.timers[usize::from(which)].value(environment.count),
     }
@@ -673,7 +679,8 @@ pub fn write(row: usize, state: &mut State, environment: &Environment, value: u6
         Special::TimerValue(which) => {
             state.system.timers[usize::from(which)].set_value(environment.count, value);
         }
-        Special::CurrentEl | Special::Dczid | Special::Ccsidr | Special::Isr | Special::Counter => {}
+        Special::CurrentEl | Special::Dczid | Special::Ccsidr | Special::Isr | Special::Counter => {
+        }
     }
 }
 
@@ -709,7 +716,9 @@ pub static READ_STORED: vmlab_hv_tcg_ir::native::Helper = vmlab_hv_tcg_ir::nativ
 /// word, the compare value of a timer, its two control bits, SP_EL0.
 pub fn peek(state: &State, row: usize) -> u64 {
     match ROWS[row].kind {
-        Kind::Special(Special::TimerCompare(which)) => state.system.timers[usize::from(which)].compare,
+        Kind::Special(Special::TimerCompare(which)) => {
+            state.system.timers[usize::from(which)].compare
+        }
         Kind::Special(Special::TimerControl(which)) => {
             u64::from(state.system.timers[usize::from(which)].control)
         }
@@ -774,22 +783,86 @@ pub const QEMU_DIFFERENCES: &[Difference] = &[
         qemu: Some(0x100),
         why: "no revision of a Cortex-A53",
     },
-    Difference { name: "ID_PFR0_EL1", qemu: Some(0x131), why: NO_AARCH32 },
-    Difference { name: "ID_PFR1_EL1", qemu: Some(0x1_0001), why: NO_AARCH32 },
-    Difference { name: "ID_DFR0_EL1", qemu: Some(0x0300_0006), why: NO_AARCH32 },
-    Difference { name: "ID_MMFR0_EL1", qemu: Some(0x1010_1105), why: NO_AARCH32 },
-    Difference { name: "ID_MMFR1_EL1", qemu: Some(0x4000_0000), why: NO_AARCH32 },
-    Difference { name: "ID_MMFR2_EL1", qemu: Some(0x0126_0000), why: NO_AARCH32 },
-    Difference { name: "ID_MMFR3_EL1", qemu: Some(0x0210_2211), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR0_EL1", qemu: Some(0x0210_1110), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR1_EL1", qemu: Some(0x1311_2111), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR2_EL1", qemu: Some(0x2123_2042), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR3_EL1", qemu: Some(0x0111_2131), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR4_EL1", qemu: Some(0x1_1142), why: NO_AARCH32 },
-    Difference { name: "ID_ISAR5_EL1", qemu: Some(0x1_1121), why: NO_AARCH32 },
-    Difference { name: "MVFR0_EL1", qemu: Some(0x1011_0222), why: NO_AARCH32 },
-    Difference { name: "MVFR1_EL1", qemu: Some(0x1211_1111), why: NO_AARCH32 },
-    Difference { name: "MVFR2_EL1", qemu: Some(0x43), why: NO_AARCH32 },
+    Difference {
+        name: "ID_PFR0_EL1",
+        qemu: Some(0x131),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_PFR1_EL1",
+        qemu: Some(0x1_0001),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_DFR0_EL1",
+        qemu: Some(0x0300_0006),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_MMFR0_EL1",
+        qemu: Some(0x1010_1105),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_MMFR1_EL1",
+        qemu: Some(0x4000_0000),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_MMFR2_EL1",
+        qemu: Some(0x0126_0000),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_MMFR3_EL1",
+        qemu: Some(0x0210_2211),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR0_EL1",
+        qemu: Some(0x0210_1110),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR1_EL1",
+        qemu: Some(0x1311_2111),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR2_EL1",
+        qemu: Some(0x2123_2042),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR3_EL1",
+        qemu: Some(0x0111_2131),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR4_EL1",
+        qemu: Some(0x1_1142),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "ID_ISAR5_EL1",
+        qemu: Some(0x1_1121),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "MVFR0_EL1",
+        qemu: Some(0x1011_0222),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "MVFR1_EL1",
+        qemu: Some(0x1211_1111),
+        why: NO_AARCH32,
+    },
+    Difference {
+        name: "MVFR2_EL1",
+        qemu: Some(0x43),
+        why: NO_AARCH32,
+    },
     Difference {
         name: "ID_AA64PFR0_EL1",
         qemu: Some(0x22),
@@ -810,42 +883,186 @@ pub const QEMU_DIFFERENCES: &[Difference] = &[
         qemu: Some(1),
         why: "no warm reset by the guest: a reset is a request of the machine",
     },
-    Difference { name: "PMINTENSET_EL1", qemu: Some(0), why: PMU },
-    Difference { name: "PMINTENCLR_EL1", qemu: Some(0), why: PMU },
-    Difference { name: "PMCR_EL0", qemu: Some(0x4103_3000), why: PMU },
-    Difference { name: "PMCNTENSET_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMCNTENCLR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMOVSCLR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMSWINC_EL0", qemu: None, why: PMU },
-    Difference { name: "PMSELR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMCEID0_EL0", qemu: Some(0x2_0001), why: PMU },
-    Difference { name: "PMCEID1_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMCCNTR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMXEVTYPER_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMXEVCNTR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMUSERENR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMOVSSET_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR0_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR1_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR2_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR3_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR4_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVCNTR5_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER0_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER1_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER2_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER3_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER4_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMEVTYPER5_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "PMCCFILTR_EL0", qemu: Some(0), why: PMU },
-    Difference { name: "S3_1_C11_C0_2", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C11_C0_3", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C0_0", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C2_0", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C2_1", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C2_2", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C2_3", qemu: Some(0), why: A53 },
-    Difference { name: "S3_1_C15_C3_0", qemu: Some(0x0800_0000), why: A53 },
+    Difference {
+        name: "PMINTENSET_EL1",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMINTENCLR_EL1",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCR_EL0",
+        qemu: Some(0x4103_3000),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCNTENSET_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCNTENCLR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMOVSCLR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMSWINC_EL0",
+        qemu: None,
+        why: PMU,
+    },
+    Difference {
+        name: "PMSELR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCEID0_EL0",
+        qemu: Some(0x2_0001),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCEID1_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCCNTR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMXEVTYPER_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMXEVCNTR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMUSERENR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMOVSSET_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR0_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR1_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR2_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR3_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR4_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVCNTR5_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER0_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER1_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER2_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER3_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER4_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMEVTYPER5_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "PMCCFILTR_EL0",
+        qemu: Some(0),
+        why: PMU,
+    },
+    Difference {
+        name: "S3_1_C11_C0_2",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C11_C0_3",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C0_0",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C2_0",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C2_1",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C2_2",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C2_3",
+        qemu: Some(0),
+        why: A53,
+    },
+    Difference {
+        name: "S3_1_C15_C3_0",
+        qemu: Some(0x0800_0000),
+        why: A53,
+    },
 ];
 
 /// QEMU's `cortex-a53` as a CPU model: the 3d CPU with the ID values of the

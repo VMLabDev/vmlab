@@ -154,7 +154,11 @@ fn every_row_has_the_name_and_the_encoding_of_the_llvm_tables() {
         let writes = matches!(row.el1, Rw::Rw | Rw::Wo);
         let reads = matches!(row.el1, Rw::Rw | Rw::Ro);
         if !matches!(row.kind, Kind::Absent(_)) {
-            assert!(!writes || found.writeable || row.name == "DBGDTRRX_EL0", "{}", row.name);
+            assert!(
+                !writes || found.writeable || row.name == "DBGDTRRX_EL0",
+                "{}",
+                row.name
+            );
             assert!(!reads || found.readable, "{}", row.name);
         }
         // A stored word that nothing can write and nothing resets is zero.
@@ -187,8 +191,16 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
         bench.fresh();
         if matches!(row.kind, Kind::Absent(_)) {
             // The PMU registers: undefined, and named in the log of the CPU.
-            assert_eq!(bench.mrs(row.encoding), Answer::Fault(0x0200_0000), "{name}");
-            assert_eq!(bench.msr(row.encoding, 0), Answer::Fault(0x0200_0000), "{name}");
+            assert_eq!(
+                bench.mrs(row.encoding),
+                Answer::Fault(0x0200_0000),
+                "{name}"
+            );
+            assert_eq!(
+                bench.msr(row.encoding, 0),
+                Answer::Fault(0x0200_0000),
+                "{name}"
+            );
             assert!(name.starts_with("PM"), "{name}");
             absent += 1;
             continue;
@@ -198,7 +210,11 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
             assert!(matches!(value, Answer::Ran(_)), "{name}: {value:?}");
             read += 1;
         } else {
-            assert_eq!(bench.mrs(row.encoding), Answer::Fault(0x0200_0000), "{name}");
+            assert_eq!(
+                bench.mrs(row.encoding),
+                Answer::Fault(0x0200_0000),
+                "{name}"
+            );
         }
         if row.el1.allows(true) {
             // Never SCTLR_EL1.M: translation is card C8.
@@ -206,7 +222,11 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
             assert!(matches!(wrote, Answer::Ran(_)), "{name}: {wrote:?}");
             written += 1;
         } else {
-            assert_eq!(bench.msr(row.encoding, 0), Answer::Fault(0x0200_0000), "{name}");
+            assert_eq!(
+                bench.msr(row.encoding, 0),
+                Answer::Fault(0x0200_0000),
+                "{name}"
+            );
         }
     }
     assert_eq!((read, written, absent), (93, 47, 7));
@@ -218,12 +238,9 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
 fn probe() -> BTreeMap<u16, (String, BTreeMap<String, String>)> {
     let text = include_str!("../../tests/qemu-cortex-a53-sysregs.txt");
     let mut lines = BTreeMap::new();
-    for line in text
-        .lines()
-        .filter(|line| {
-            !line.starts_with('#') && !line.starts_with("pstate") && !line.starts_with("ccsidr")
-        })
-    {
+    for line in text.lines().filter(|line| {
+        !line.starts_with('#') && !line.starts_with("pstate") && !line.starts_with("ccsidr")
+    }) {
         let mut parts = line.split_whitespace();
         let encoding = u16::from_str_radix(parts.next().unwrap(), 16).unwrap();
         let name = parts.next().unwrap().split('/').next().unwrap().to_string();
@@ -278,7 +295,8 @@ fn differences(model: &'static CpuModel) -> BTreeSet<String> {
             let expected = &theirs[*key];
             // A counter, and a register that the probe itself had set.
             let any = (expected == "time" || expected == "probe") && value.len() < 17;
-            same &= any || expected == value || (value != "u" && value != "ok" && expected == "probe");
+            same &=
+                any || expected == value || (value != "u" && value != "ok" && expected == "probe");
         }
         // With FP enabled, where the file gives it.
         let expected_fp = theirs.get("fp").unwrap_or(&theirs["el1r"]);
@@ -310,7 +328,11 @@ fn the_table_is_what_qemu_answers_outside_the_allow_list() {
         .iter()
         .map(|difference| difference.name.to_string())
         .collect();
-    assert_eq!(allowed.len(), QEMU_DIFFERENCES.len(), "a name is there twice");
+    assert_eq!(
+        allowed.len(),
+        QEMU_DIFFERENCES.len(),
+        "a name is there twice"
+    );
     assert_eq!(differences(&V8_0), allowed);
     // The value that the allow-list gives for QEMU is the value of the probe.
     let probe = probe();
@@ -467,7 +489,10 @@ fn the_special_registers() {
     for line in text.lines().filter(|line| line.starts_with("ccsidr")) {
         let mut parts = line.split_whitespace().skip(1);
         let mut field = |key: &str| {
-            let value = parts.next().and_then(|part| part.strip_prefix(key)).unwrap();
+            let value = parts
+                .next()
+                .and_then(|part| part.strip_prefix(key))
+                .unwrap();
             u64::from_str_radix(value, 16).unwrap()
         };
         let (select, value) = (field("select="), field("value="));
@@ -583,7 +608,14 @@ fn el0_reaches_what_el1_opens() {
     assert_eq!(bench.named("TPIDRRO_EL0"), Answer::Ran(0));
     assert_eq!(bench.set("TPIDRRO_EL0", 5), Answer::Fault(0x0200_0000));
     assert_eq!(bench.set("CNTFRQ_EL0", 5), Answer::Fault(0x0200_0000));
-    for name in ["SCTLR_EL1", "MIDR_EL1", "TPIDR_EL1", "CurrentEL", "SPSel", "ELR_EL1"] {
+    for name in [
+        "SCTLR_EL1",
+        "MIDR_EL1",
+        "TPIDR_EL1",
+        "CurrentEL",
+        "SPSel",
+        "ELR_EL1",
+    ] {
         assert_eq!(bench.named(name), Answer::Fault(0x0200_0000), "{name}");
     }
     // FPCR and FPSR trap as FP does, at both levels.

@@ -302,11 +302,7 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 /// whole yet. Otherwise the record and its length. `vectors`: the stream
 /// carries V0 to V31, FPSR and FPCR in each instruction record. `system`:
 /// the count of system registers that follow them.
-pub fn parse(
-    bytes: &[u8],
-    vectors: bool,
-    system: usize,
-) -> Result<Option<(Trace, usize)>, String> {
+pub fn parse(bytes: &[u8], vectors: bool, system: usize) -> Result<Option<(Trace, usize)>, String> {
     if bytes.len() < 8 {
         return Ok(None);
     }
@@ -499,9 +495,21 @@ mod tests {
         let compared = compared();
         let names: Vec<&str> = compared.iter().map(|register| register.qemu).collect();
         for name in [
-            "ESR_EL1", "FAR_EL1", "ELR_EL1", "SPSR_EL1", "VBAR_EL1", "SCTLR_EL1", "CPACR_EL1",
-            "CSSELR", "CNTV_CTL_EL0", "CNTP_CVAL_EL0", "SP_EL0", "SP_EL1", "OSLSR_EL1",
-            "TPIDR_EL0", "DBGWCR3_EL1",
+            "ESR_EL1",
+            "FAR_EL1",
+            "ELR_EL1",
+            "SPSR_EL1",
+            "VBAR_EL1",
+            "SCTLR_EL1",
+            "CPACR_EL1",
+            "CSSELR",
+            "CNTV_CTL_EL0",
+            "CNTP_CVAL_EL0",
+            "SP_EL0",
+            "SP_EL1",
+            "OSLSR_EL1",
+            "TPIDR_EL0",
+            "DBGWCR3_EL1",
         ] {
             assert!(names.contains(&name), "{name}");
         }
@@ -533,7 +541,10 @@ mod tests {
         assert_eq!(qemu[at("SP_EL1")], 0x7777);
         assert_eq!(qemu[at("SP_EL0")], values[at("SP_EL0")]);
         assert_eq!(qemu[at("CNTV_CTL_EL0")], values[at("CNTV_CTL_EL0")] & 3);
-        let user = Core { cpsr: 0x3c0, ..core };
+        let user = Core {
+            cpsr: 0x3c0,
+            ..core
+        };
         let mut qemu = values.clone();
         normalise(&mut qemu, &compared, &user);
         assert_eq!(qemu[at("SP_EL0")], 0x7777);

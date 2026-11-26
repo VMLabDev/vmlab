@@ -285,7 +285,11 @@ impl Entry {
         let system = match (before_vectors.system.take(), after_vectors.system.take()) {
             (Some(before), Some(after)) => Some((before, after)),
             (None, None) => None,
-            _ => return Err("an entry has sys before the arrow and dsys after it, or neither".into()),
+            _ => {
+                return Err(
+                    "an entry has sys before the arrow and dsys after it, or neither".into(),
+                );
+            }
         };
         Ok(Self {
             encoding: u32::from_str_radix(encoding, 16)
@@ -312,10 +316,7 @@ impl Entry {
             return Err("the entry starts in a state that the CPU does not have".into());
         }
         // With the stack pointer of the core registers in its slot.
-        let before_system = self
-            .system
-            .is_some()
-            .then(|| system_of(&state, &compared));
+        let before_system = self.system.is_some().then(|| system_of(&state, &compared));
         if let Some((before, _)) = &self.vectors {
             before.apply(&mut state);
             // An entry without system registers is of a group that ran with
@@ -503,7 +504,10 @@ mod tests {
         let mut wrong = call.clone();
         wrong.system.as_mut().unwrap().1[2].1 = 0x5600_0022;
         let error = wrong.replay().unwrap_err();
-        assert!(error.contains("ESR_EL1: 0x56000021 / 0x56000022"), "{error}");
+        assert!(
+            error.contains("ESR_EL1: 0x56000021 / 0x56000022"),
+            "{error}"
+        );
         // No register differs from its reset value, and none changes.
         let mut plain = entry();
         plain.system = Some((Vec::new(), Vec::new()));

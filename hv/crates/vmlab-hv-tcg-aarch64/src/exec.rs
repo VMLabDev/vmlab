@@ -1208,7 +1208,10 @@ mod tests {
     fn an_fp_instruction_traps_while_cpacr_disables_fp() {
         // fadd d0, d1, d2 ; msr cpacr_el1, x0 ; fadd d0, d1, d2
         let mut cpu = with_vectors(&[0x1e62_2820, msr("CPACR_EL1", 0), 0x1e62_2820]);
-        handler(&mut cpu, &[0x9100_0421, 0xd538_4031, 0x9100_1231, 0xd518_4031, ERET]);
+        handler(
+            &mut cpu,
+            &[0x9100_0421, 0xd538_4031, 0x9100_1231, 0xd518_4031, ERET],
+        );
         cpu.state.set_x(0, 3 << 20);
         cpu.step().unwrap();
         assert_eq!(cpu.taken, sync(Exception::FpAccess, BASE, VECTORS + 0x200));
@@ -1248,7 +1251,12 @@ mod tests {
         // itself is the second block.
         assert_eq!(cpu.translations, 2);
         assert_eq!(
-            (cpu.state.x(0), cpu.state.x(1), cpu.state.x(2), cpu.state.x(3)),
+            (
+                cpu.state.x(0),
+                cpu.state.x(1),
+                cpu.state.x(2),
+                cpu.state.x(3)
+            ),
             (0x1001, 0x2000, 0x000f_3d00, 77)
         );
         // Stepping gives the same, and a second run of the cached block
@@ -1276,7 +1284,10 @@ mod tests {
         let mut user = with_vectors(&[mrs(0, "TPIDR_EL1")]);
         assert!(user.state.set_cpsr(0x3c0));
         user.step().unwrap();
-        assert_eq!(user.taken, sync(Exception::Undefined, BASE, VECTORS + 0x400));
+        assert_eq!(
+            user.taken,
+            sync(Exception::Undefined, BASE, VECTORS + 0x400)
+        );
     }
 
     #[test]
@@ -1318,7 +1329,10 @@ mod tests {
         cpu.state.set_pc(BASE + 16);
         cpu.step().unwrap();
         assert_eq!(
-            cpu.unknown.iter().map(Unknown::to_string).collect::<Vec<_>>(),
+            cpu.unknown
+                .iter()
+                .map(Unknown::to_string)
+                .collect::<Vec<_>>(),
             vec![
                 "undefined instruction 00209999".to_string(),
                 "read of the system register S3_0_C15_C0_1, which this CPU does not have"

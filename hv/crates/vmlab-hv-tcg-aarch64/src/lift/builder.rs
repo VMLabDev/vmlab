@@ -39,10 +39,19 @@ pub enum Trap {
     Wfi,
     Wfe,
     /// `MRS Xt, <register>`, the register by its encoding.
-    Mrs { encoding: u16, rt: u8 },
+    Mrs {
+        encoding: u16,
+        rt: u8,
+    },
     /// `MSR <register>, Xt`.
-    Msr { encoding: u16, rt: u8 },
-    MsrPstate { field: PstateField, immediate: u8 },
+    Msr {
+        encoding: u16,
+        rt: u8,
+    },
+    MsrPstate {
+        field: PstateField,
+        immediate: u8,
+    },
 }
 
 /// Where a block goes when it ends.
@@ -430,10 +439,7 @@ impl Builder {
         args: &[ScalarId],
     ) -> ScalarId {
         debug_assert_eq!(usize::from(helper.args), args.len());
-        let result = self
-            .block
-            .graph
-            .effect(self.calls, ScalarType::Bits(width));
+        let result = self.block.graph.effect(self.calls, ScalarType::Bits(width));
         self.calls += 1;
         self.block.events.push(Event::Call {
             helper: HelperRef(helper),

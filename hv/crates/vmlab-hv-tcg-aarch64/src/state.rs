@@ -205,7 +205,10 @@ impl State {
     /// The width of a physical address, from ID_AA64MMFR0_EL1.PARange.
     pub fn physical_address_bits(&self) -> u32 {
         let range = self.system.regs[crate::sysreg::index("ID_AA64MMFR0_EL1")] & 15;
-        [32, 36, 40, 42, 44, 48, 52].get(range as usize).copied().unwrap_or(48)
+        [32, 36, 40, 42, 44, 48, 52]
+            .get(range as usize)
+            .copied()
+            .unwrap_or(48)
     }
 
     /// Set CPACR_EL1.FPEN so that FP and AdvSIMD run at EL0 and EL1.

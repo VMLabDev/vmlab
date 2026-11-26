@@ -769,8 +769,14 @@ mod tests {
         assert!(counter_read(0xd53b_e05f) == Adopt::Nothing);
         assert!(counter_read(0xd53b_d045) == Adopt::Nothing);
         assert!(counter_read(0xd51b_e305) == Adopt::Nothing);
-        assert_eq!(end_of(Cause::Exception(Exception::Undefined)), End::Undefined);
-        assert_eq!(kind_of(Cause::Exception(Exception::FpAccess)), "FP access trap");
+        assert_eq!(
+            end_of(Cause::Exception(Exception::Undefined)),
+            End::Undefined
+        );
+        assert_eq!(
+            kind_of(Cause::Exception(Exception::FpAccess)),
+            "FP access trap"
+        );
         assert_eq!(
             end_of(Cause::Exception(Exception::SupervisorCall(1))),
             End::Exception

@@ -208,7 +208,9 @@ fn phase_with(
                     && core.pc == pc + 4
                     && (first..end).contains(&pc)
                 {
-                    outcomes.entry(index(pc)).or_insert(Outcome::Ran(Box::new(core)));
+                    outcomes
+                        .entry(index(pc))
+                        .or_insert(Outcome::Ran(Box::new(core)));
                 }
                 if core.pc == end {
                     break;
@@ -331,7 +333,10 @@ fn main() -> Result<(), Failure> {
     let encodings: Vec<u16> = (FIRST..FIRST + COUNT).map(|value| value as u16).collect();
 
     // Reads at EL1 and at EL0.
-    let reads: Vec<u32> = encodings.iter().map(|encoding| asm::mrs(0, *encoding)).collect();
+    let reads: Vec<u32> = encodings
+        .iter()
+        .map(|encoding| asm::mrs(0, *encoding))
+        .collect();
     let el1_read = phase(&arguments, false, false, &reads, names_out.as_deref())?;
     let el0_read = phase(&arguments, true, false, &reads, None)?;
     // Writes: the value that was read where a read works, else zero.
@@ -416,10 +421,7 @@ fn main() -> Result<(), Failure> {
         }
         let mut line = format!(
             "{encoding:04x} {name} el1r={} el1w={} el0r={} el0w={}",
-            columns[0],
-            columns[1],
-            columns[2],
-            columns[3]
+            columns[0], columns[1], columns[2], columns[3]
         );
         if fp != columns[0] || fp_wrote != columns[1] {
             line.push_str(&format!(" fp={fp} fpw={fp_wrote}"));

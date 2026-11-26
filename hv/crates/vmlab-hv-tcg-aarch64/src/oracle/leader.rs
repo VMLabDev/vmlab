@@ -124,7 +124,11 @@ impl Leader {
             .arg("-gdb")
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             .arg("-plugin")
-            .arg(format!("{},out={}{extra}", plugin.display(), fifo.display()))
+            .arg(format!(
+                "{},out={}{extra}",
+                plugin.display(),
+                fifo.display()
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
