@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn a_read_of_a_stored_register_stays_in_its_block() {
         // mrs x0, tpidr_el1 ; add x0, x0, #1 ; mrs x1, tpidr_el0 ;
-        // mrs x2, midr_el1 ; mrs xzr, tpidr_el1 ; mrs x3, cntvct_el0 ; nop
+        // mrs x2, midr_el1 ; mrs xzr, tpidr_el1 ; mrs x3, cntvct_el0 ; b .
         let words = [
             mrs(0, "TPIDR_EL1"),
             0x9100_0400,
@@ -1236,7 +1236,7 @@ mod tests {
             mrs(2, "MIDR_EL1"),
             mrs(31, "TPIDR_EL1"),
             mrs(3, "CNTVCT_EL0"),
-            NOP,
+            0x1400_0000,
         ];
         let mut cpu = with_vectors(&words);
         cpu.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x1000;
@@ -1244,7 +1244,8 @@ mod tests {
         cpu.clock = Clock::Manual(77);
         assert_eq!(cpu.run(64), Stop::Budget);
         // The counter is computed, so it ends the block. The five
-        // instructions before it are one block with it.
+        // instructions before it are one block with it, and the branch to
+        // itself is the second block.
         assert_eq!(cpu.translations, 2);
         assert_eq!(
             (cpu.state.x(0), cpu.state.x(1), cpu.state.x(2), cpu.state.x(3)),
