@@ -32,6 +32,12 @@ pub struct Round {
     /// Memory to load on both sides, as address and bytes.
     pub memory: Vec<(u64, Vec<u8>)>,
     pub start: Core,
+    /// V0 to V31, FPSR and FPCR at the start. `Some`: they are loaded on both
+    /// sides and compared before every instruction, and the leader must have
+    /// been started with vectors. `None`: they are left alone. A leader that
+    /// was started with vectors still sends them, and then they carry over
+    /// from the last round on both sides and are compared too.
+    pub vectors: Option<Vectors>,
     /// The most instructions to follow.
     pub budget: u64,
     /// The round ends when one PC is about to run more often than this. It
@@ -105,6 +111,11 @@ pub struct Difference {
     pub instruction: Option<(u32, Core)>,
     pub ours: Core,
     pub qemu: Option<Core>,
+    /// The vector and FP registers of both sides, ours first, in a round
+    /// that compares them.
+    pub vectors: Option<(Vectors, Vectors)>,
+    /// The vector and FP registers before the instruction.
+    pub vectors_before: Option<Vectors>,
 }
 
 impl std::fmt::Display for Difference {
@@ -119,6 +130,14 @@ impl std::fmt::Display for Difference {
         if let Some(qemu) = &self.qemu {
             writeln!(f, "  qemu   {qemu}")?;
             for line in self.ours.difference(qemu) {
+                writeln!(f, "  ours / qemu  {line}")?;
+            }
+        }
+        if let Some(before) = &self.vectors_before {
+            writeln!(f, "  before {before}")?;
+        }
+        if let Some((ours, qemu)) = &self.vectors {
+            for line in ours.difference(qemu) {
                 writeln!(f, "  ours / qemu  {line}")?;
             }
         }
@@ -248,10 +267,11 @@ impl Follower {
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    /// Give the vector register `n` a value on both sides.
-    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
-        self.leader.set_vector(n, value)?;
-        self.cpu.state.slots[crate::state::slot::V0 + n] = value;
+    /// Give the vector registers, FPSR and FPCR these values on both sides.
+    pub fn set_vectors(&mut self, vectors: &Vectors) -> io::Result<()> {
+        self.leader.set_vectors(vectors)?;
+        vectors.apply(&mut self.cpu.state);
+        self.stale = false;
         Ok(())
     }
 
@@ -265,7 +285,7 @@ impl Follower {
             .ok_or_else(|| io::Error::other("a round must start at EL1 with SP_EL1"))?;
         // A round sets the core registers. The vector registers stay what
         // the last round left on both sides.
-        if self.leader.has_vectors() {
+        if self.leader.has_vectors() && round.vectors.is_none() {
             if self.stale {
                 let vectors = self.leader.vectors()?;
                 vectors.apply(&mut self.cpu.state);
@@ -275,6 +295,11 @@ impl Follower {
         }
         self.leader.set_core(&round.start)?;
         self.cpu.state = state;
+        if let Some(vectors) = &round.vectors {
+            self.leader.set_vectors(vectors)?;
+            vectors.apply(&mut self.cpu.state);
+            self.stale = false;
+        }
         self.cpu.take_accesses();
         Ok(())
     }
@@ -368,6 +393,7 @@ impl Follower {
                 words.iter().flat_map(|word| word.to_le_bytes()).collect(),
             )],
             start,
+            vectors: None,
             budget: 3,
             visits: 1,
         };
@@ -409,6 +435,8 @@ impl Follower {
                 instruction: last.as_ref().map(|last| (last.encoding, last.before)),
                 ours,
                 qemu,
+                vectors: None,
+                vectors_before: None,
             })
         };
         let result = loop {
@@ -446,18 +474,24 @@ impl Follower {
                             Some(core),
                         ));
                     }
-                    if let Some(vectors) = &vectors {
-                        let found = Vectors::of(&self.cpu.state).difference(vectors);
-                        if !found.is_empty() {
-                            break Err(differed(
-                                format!(
-                                    "the vector registers before an instruction, ours / QEMU's: {}",
-                                    found.join("; ")
-                                ),
+                    if round.vectors.is_some() && vectors.is_none() {
+                        return Err(io::Error::other(
+                            "a round compares the vector registers and the leader does not send them",
+                        ));
+                    }
+                    if let Some(theirs) = vectors {
+                        let ours_vectors = Vectors::of(&self.cpu.state);
+                        if theirs != ours_vectors {
+                            let mut difference = differed(
+                                "the vector and FP registers before an instruction".into(),
                                 &last,
                                 ours,
                                 Some(core),
-                            ));
+                            );
+                            difference.vectors = Some((ours_vectors, theirs));
+                            difference.vectors_before =
+                                last.as_ref().and_then(|last| last.vectors);
+                            break Err(difference);
                         }
                     }
                     // The registers agree, so the last instruction did the same on both sides.
@@ -666,27 +700,27 @@ impl Follower {
                             Some(after),
                         ));
                     }
+                    // An exception changes no vector register either. A
+                    // round that sets them reads them at every exception.
+                    // Another one reads them where no instruction record
+                    // follows the last instruction.
                     let mut vectors_after = None;
-                    if last.is_some() && self.leader.has_vectors() {
-                        // No instruction record follows the last
-                        // instruction, so its vector registers are read.
+                    if round.vectors.is_some() || (last.is_some() && self.leader.has_vectors()) {
                         let theirs = self.leader.vectors()?;
-                        let mut mine = Vectors::of(&self.cpu.state);
-                        mine.fpsr = 0;
-                        mine.fpcr = 0;
-                        let found = mine.difference(&theirs);
-                        if !found.is_empty() {
-                            break Err(differed(
-                                format!(
-                                    "the vector registers at an exception, ours / QEMU's: {}",
-                                    found.join("; ")
-                                ),
+                        let ours_vectors = Vectors::of(&self.cpu.state);
+                        if theirs != ours_vectors {
+                            let mut difference = differed(
+                                "the vector and FP registers at an exception".into(),
                                 &last,
                                 ours,
                                 Some(after),
-                            ));
+                            );
+                            difference.vectors = Some((ours_vectors, theirs));
+                            difference.vectors_before =
+                                last.as_ref().and_then(|last| last.vectors);
+                            break Err(difference);
                         }
-                        vectors_after = Some(Vectors::of(&self.cpu.state));
+                        vectors_after = Some(ours_vectors);
                     }
                     if let Some(last) = last.take() {
                         verified.push(Verified {

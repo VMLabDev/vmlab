@@ -443,6 +443,92 @@ impl Generator {
     }
 }
 
+impl Generator {
+    /// 64 bits that an FP instruction reads as a value where its rules
+    /// change: zeros, denormals, infinities, both kinds of NaN, the powers of
+    /// two that an integer conversion saturates at, ties, and random bits.
+    pub fn fp_value(&mut self) -> u64 {
+        // One layout: the count of exponent bits and of fraction bits.
+        fn value(rng: &mut Rng, exponent_bits: u32, fraction_bits: u32) -> u64 {
+            let exponent_max = (1u64 << exponent_bits) - 1;
+            let bias = exponent_max >> 1;
+            let fraction_mask = (1u64 << fraction_bits) - 1;
+            let exponent = match rng.below(10) {
+                0 | 1 => 0,
+                2 | 3 => exponent_max,
+                4 => 1 + rng.below(2),
+                5 => exponent_max - 1,
+                // Near one, and around 2^31, 2^32, 2^63 and 2^64.
+                6 => bias - 2 + rng.below(5),
+                7 => bias + [7, 8, 15, 16, 30, 31, 32, 33, 62, 63, 64, 65][rng.below(12) as usize],
+                8 => bias.wrapping_sub(70).wrapping_add(rng.below(140)),
+                _ => rng.below(exponent_max + 1),
+            } & exponent_max;
+            let fraction = match rng.below(8) {
+                0 | 1 => 0,
+                2 => 1,
+                3 => fraction_mask,
+                // The top bit: a quiet NaN, or one half above a power of two.
+                4 => 1 << (fraction_bits - 1),
+                5 => (1 << (fraction_bits - 1)) | rng.below(4),
+                // A few bits at the top: ties of a conversion to an integer.
+                6 => rng.below(1 << 6) << (fraction_bits - 6),
+                _ => rng.next_u64() & fraction_mask,
+            };
+            let sign = rng.below(2) << (exponent_bits + fraction_bits);
+            sign | exponent << fraction_bits | fraction
+        }
+        let rng = &mut self.rng;
+        match rng.below(8) {
+            0 | 1 => rng.next_u64(),
+            2..=4 => value(rng, 11, 52),
+            // Single precision in the low half, with zeros or anything above.
+            5 | 6 => {
+                let high = if rng.chance(1, 2) {
+                    0
+                } else {
+                    rng.next_u64() << 32
+                };
+                high | value(rng, 8, 23)
+            }
+            // Half precision in the low 16 bits.
+            _ => (rng.next_u64() << 16) | value(rng, 5, 10),
+        }
+    }
+
+    /// V0 to V31, FPSR and FPCR at the start of a round. The upper half of a
+    /// vector register is zero in half of the registers: a scalar write must
+    /// clear it. FPCR takes each rounding mode, and flush-to-zero, default
+    /// NaN and alternative half precision each one time in four. FPSR starts
+    /// clear in half of the rounds, so that the bits of the first
+    /// instructions show.
+    pub fn vectors(&mut self) -> super::Vectors {
+        let mut vectors = super::Vectors::default();
+        for register in &mut vectors.v {
+            let low = self.fp_value();
+            let high = if self.rng.chance(1, 2) {
+                0
+            } else {
+                self.fp_value()
+            };
+            *register = u128::from(high) << 64 | u128::from(low);
+        }
+        // RMode in the bits 23 and 22, FZ in 24, DN in 25 and AHP in 26.
+        let mut fpcr = (self.rng.below(4) as u32) << 22;
+        for bit in [24, 25, 26] {
+            if self.rng.chance(1, 4) {
+                fpcr |= 1 << bit;
+            }
+        }
+        vectors.fpcr = fpcr;
+        // IOC, DZC, OFC, UFC, IXC, IDC and QC.
+        if self.rng.chance(1, 2) {
+            vectors.fpsr = self.rng.next_u64() as u32 & 0x0800_009f;
+        }
+        vectors
+    }
+}
+
 /// The distinct encodings of a trace of the measure plugin
 /// (`measure/a64trace.c` of the design card): its lines `enc <hex>`.
 pub fn executed_encodings(text: &str) -> Vec<u32> {
@@ -632,6 +718,72 @@ mod tests {
         assert_eq!(x[2], 0x4210_8000);
         assert!(x[3] < 512 && x[3] % 16 == 0);
         assert_eq!(sp, 0x4210_8000);
+    }
+
+    #[test]
+    fn the_fp_registers_of_a_round_cover_the_special_values_and_every_mode() {
+        let mut generator = Generator::new(9);
+        let (mut zeros, mut infinities, mut nans, mut denormals) = (0, 0, 0, 0);
+        let mut modes = [0u32; 4];
+        let (mut flush, mut clear_status, mut clear_high) = (0, 0, 0);
+        for _ in 0..200 {
+            let vectors = generator.vectors();
+            assert_eq!(vectors.fpcr & !0x07c0_0000, 0);
+            assert_eq!(vectors.fpsr & !0x0800_009f, 0);
+            modes[(vectors.fpcr >> 22) as usize & 3] += 1;
+            flush += u32::from((vectors.fpcr & (1 << 24)) != 0);
+            clear_status += u32::from(vectors.fpsr == 0);
+            for value in vectors.v {
+                clear_high += u32::from(value >> 64 == 0);
+                let double = value as u64;
+                let exponent = (double >> 52) & 0x7ff;
+                let fraction = double & ((1 << 52) - 1);
+                zeros += u32::from(double << 1 == 0);
+                infinities += u32::from(exponent == 0x7ff && fraction == 0);
+                nans += u32::from(exponent == 0x7ff && fraction != 0);
+                denormals += u32::from(exponent == 0 && fraction != 0);
+            }
+        }
+        for count in [zeros, infinities, nans, denormals, flush] {
+            assert!(
+                count > 20,
+                "{zeros} {infinities} {nans} {denormals} {flush}"
+            );
+        }
+        assert!(modes.iter().all(|count| *count > 20), "{modes:?}");
+        assert!((50..150).contains(&clear_status));
+        assert!((2000..4400).contains(&clear_high));
+        // The same seed gives the same registers.
+        assert_eq!(Generator::new(4).vectors(), Generator::new(4).vectors());
+    }
+
+    #[test]
+    fn every_record_of_the_fp_classes_is_generated_and_has_a_lifter() {
+        use crate::lift::{Builder, FP_FORMATS, Lifted, lift};
+        let mut generator = Generator::new(5);
+        generator.unconstrained_one_in = 0;
+        let context = crate::State::reset(0).context;
+        let mut records = 0;
+        for format in FP_FORMATS {
+            for record in records_of(format) {
+                records += 1;
+                for _ in 0..50 {
+                    let (word, kind) =
+                        generator.instruction(record, 0x4200_0000, (0x4200_0000, 64));
+                    assert_eq!(kind, Kind::Valid, "{}", record.name());
+                    let decoded = decode(word).unwrap();
+                    assert_eq!(decoded.record, record);
+                    let mut builder = Builder::new(context, 0x4200_0000);
+                    assert_eq!(
+                        lift(&mut builder, &decoded),
+                        Lifted::Next,
+                        "{} {word:08x}",
+                        record.name()
+                    );
+                }
+            }
+        }
+        assert_eq!(records, 140);
     }
 
     #[test]

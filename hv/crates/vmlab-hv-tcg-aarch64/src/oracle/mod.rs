@@ -8,11 +8,6 @@
 //! `corpus` keeps instructions with the states that QEMU gave, so that
 //! `just ci::check` replays them without QEMU.
 //!
-//! What a round compares: the core registers before every instruction, the
-//! memory writes of every instruction, and the vector registers, FPSR and
-//! FPCR where the plugin runs with `vectors=on`. The exception registers
-//! come with card C6.
-//!
 //! QEMU is a black box here: its register values, its exceptions and its
 //! gdbstub answers (S6). Nothing in this module is part of a product path.
 
@@ -21,8 +16,9 @@ pub mod follow;
 pub mod leader;
 pub mod rsp;
 pub mod stream;
+pub mod testfloat;
 
-use crate::state::{State, slot};
+use crate::state::State;
 
 /// CPSR of the state that every round starts from, without the flags: EL1
 /// with SP_EL1, and D, A, I and F set. QEMU's `virt` resets to it.
@@ -101,8 +97,9 @@ impl std::fmt::Display for Core {
     }
 }
 
-/// The vector registers and the two FP registers, as the plugin gives them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The vector registers and the two FP registers, as the gdbstub and the
+/// plugin give them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Vectors {
     pub v: [u128; 32],
     pub fpsr: u32,
@@ -113,22 +110,22 @@ impl Vectors {
     pub fn of(state: &State) -> Self {
         let mut v = [0; 32];
         for (n, value) in v.iter_mut().enumerate() {
-            *value = state.slots[slot::V0 + n];
+            *value = state.v(n);
         }
         Self {
             v,
-            fpsr: state.slots[slot::FPSR] as u32,
-            fpcr: state.slots[slot::FPCR] as u32,
+            fpsr: state.fpsr(),
+            fpcr: state.fpcr(),
         }
     }
 
     /// Put these registers into `state`.
     pub fn apply(&self, state: &mut State) {
         for (n, value) in self.v.iter().enumerate() {
-            state.slots[slot::V0 + n] = *value;
+            state.set_v(n, *value);
         }
-        state.slots[slot::FPSR] = self.fpsr.into();
-        state.slots[slot::FPCR] = self.fpcr.into();
+        state.set_fpsr(self.fpsr);
+        state.set_fpcr(self.fpcr);
     }
 
     /// The names of the registers that differ, with both values.
@@ -149,13 +146,24 @@ impl Vectors {
     }
 }
 
+/// `fpcr`, `fpsr` and V0 to V31, in the form of a corpus line.
+impl std::fmt::Display for Vectors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fpcr={:x} fpsr={:x} v=", self.fpcr, self.fpsr)?;
+        for (n, value) in self.v.iter().enumerate() {
+            write!(f, "{}{value:x}", if n == 0 { "" } else { "," })?;
+        }
+        Ok(())
+    }
+}
+
 /// One record of the plugin stream. Nearly every record is an instruction,
 /// so the size of that variant is the size that matters.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Trace {
     /// The registers before the instruction `encoding` at `core.pc` runs.
-    /// `vectors`: when the plugin runs with `vectors=on`.
+    /// `vectors`: when the stream carries them.
     Instruction {
         encoding: u32,
         core: Core,
@@ -218,8 +226,8 @@ pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, Stri
                 }
                 Vectors {
                     v,
-                    fpsr: u64_at(bytes, at + 32 * 16) as u32,
-                    fpcr: u64_at(bytes, at + 32 * 16 + 8) as u32,
+                    fpsr: u32_at(bytes, at + 32 * 16),
+                    fpcr: u32_at(bytes, at + 32 * 16 + 8),
                 }
             });
             Ok(Some((
@@ -301,11 +309,11 @@ mod tests {
         );
         // With vectors the record is longer, and the same core comes out.
         assert_eq!(parse(&bytes, true), Ok(None));
-        for n in 0..32u8 {
-            bytes.extend([n; 16]);
+        for n in 0..32u128 {
+            bytes.extend((n << 100 | 7).to_le_bytes());
         }
-        bytes.extend(0x0800_009fu64.to_le_bytes());
-        bytes.extend(0x00c0_0000u64.to_le_bytes());
+        bytes.extend(0x1fu64.to_le_bytes());
+        bytes.extend(0x0340_0000u64.to_le_bytes());
         let (trace, len) = parse(&bytes, true).unwrap().unwrap();
         assert_eq!(len, bytes.len());
         let Trace::Instruction {
@@ -317,20 +325,25 @@ mod tests {
             panic!("an instruction record with vectors");
         };
         assert_eq!(with_vectors, core);
-        assert_eq!(vectors.v[0], 0);
-        assert_eq!(vectors.v[31], u128::from_le_bytes([31; 16]));
-        assert_eq!((vectors.fpsr, vectors.fpcr), (0x0800_009f, 0x00c0_0000));
+        assert_eq!(vectors.v[31], 31 << 100 | 7);
+        assert_eq!((vectors.fpsr, vectors.fpcr), (0x1f, 0x0340_0000));
+        // The registers go to a state and back, and to a corpus line.
         let mut state = State::reset(0);
         vectors.apply(&mut state);
         assert_eq!(Vectors::of(&state), vectors);
+        assert!(
+            vectors
+                .to_string()
+                .starts_with("fpcr=3400000 fpsr=1f v=7,10000000000000000000000007,")
+        );
         let mut other = vectors;
-        other.v[7] = 1;
+        other.v[2] = 0;
         other.fpsr = 0;
         assert_eq!(
             vectors.difference(&other),
             vec![
-                "v7: 0x7070707070707070707070707070707 / 0x1".to_string(),
-                "fpsr: 0x800009f / 0x0".to_string()
+                "v2: 0x20000000000000000000000007 / 0x0".to_string(),
+                "fpsr: 0x1f / 0x0".to_string()
             ]
         );
 

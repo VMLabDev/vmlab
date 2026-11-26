@@ -9169,7 +9169,7 @@ pub static RECORDS: [RecordInfo; 2332] = [
     RecordInfo { name: "SMOVvi8to64", mask: 0xffe1fc00, value: 0x4e012c00, features: Features(0x2), format: FormatClass::SIMDSMov, fallback: false, priority: 811, constrained: false, fields: &L171, layout: 171 },
     RecordInfo { name: "SMOVvi8to64_idx0", mask: 0xfffffc00, value: 0x4e012c00, features: Features(0x2), format: FormatClass::SIMDSMov, fallback: false, priority: 493, constrained: false, fields: &L169, layout: 169 },
     RecordInfo { name: "SMSUBLrrr", mask: 0xffe08000, value: 0x9b208000, features: Features(0x0), format: FormatClass::WideMulAccum, fallback: false, priority: 2159, constrained: false, fields: &L167, layout: 167 },
-    RecordInfo { name: "SMULHrr", mask: 0xffe08000, value: 0x9b400000, features: Features(0x0), format: FormatClass::MulHi, fallback: false, priority: 2160, constrained: false, fields: &L172, layout: 172 },
+    RecordInfo { name: "SMULHrr", mask: 0xffe08000, value: 0x9b400000, features: Features(0x0), format: FormatClass::MulHi, fallback: false, priority: 2160, constrained: true, fields: &L172, layout: 172 },
     RecordInfo { name: "SMULLv16i8_v8i16", mask: 0xffe0fc00, value: 0x4e20c000, features: Features(0x2), format: FormatClass::BaseSIMDDifferentThreeVector, fallback: false, priority: 1330, constrained: false, fields: &L4, layout: 4 },
     RecordInfo { name: "SMULLv2i32_indexed", mask: 0xffc0f400, value: 0x0f80a000, features: Features(0x2), format: FormatClass::BaseSIMDIndexed, fallback: false, priority: 1928, constrained: false, fields: &L83, layout: 83 },
     RecordInfo { name: "SMULLv2i32_v2i64", mask: 0xffe0fc00, value: 0x0ea0c000, features: Features(0x2), format: FormatClass::BaseSIMDDifferentThreeVector, fallback: false, priority: 1331, constrained: false, fields: &L4, layout: 4 },
@@ -9924,7 +9924,7 @@ pub static RECORDS: [RecordInfo; 2332] = [
     RecordInfo { name: "UMOVvi8", mask: 0xffe1fc00, value: 0x0e013c00, features: Features(0x2), format: FormatClass::SIMDUMov, fallback: false, priority: 847, constrained: false, fields: &L207, layout: 207 },
     RecordInfo { name: "UMOVvi8_idx0", mask: 0xfffffc00, value: 0x0e013c00, features: Features(0x2), format: FormatClass::SIMDUMov, fallback: false, priority: 637, constrained: false, fields: &L204, layout: 204 },
     RecordInfo { name: "UMSUBLrrr", mask: 0xffe08000, value: 0x9ba08000, features: Features(0x0), format: FormatClass::WideMulAccum, fallback: false, priority: 2179, constrained: false, fields: &L167, layout: 167 },
-    RecordInfo { name: "UMULHrr", mask: 0xffe08000, value: 0x9bc00000, features: Features(0x0), format: FormatClass::MulHi, fallback: false, priority: 2180, constrained: false, fields: &L172, layout: 172 },
+    RecordInfo { name: "UMULHrr", mask: 0xffe08000, value: 0x9bc00000, features: Features(0x0), format: FormatClass::MulHi, fallback: false, priority: 2180, constrained: true, fields: &L172, layout: 172 },
     RecordInfo { name: "UMULLv16i8_v8i16", mask: 0xffe0fc00, value: 0x6e20c000, features: Features(0x2), format: FormatClass::BaseSIMDDifferentThreeVector, fallback: false, priority: 1662, constrained: false, fields: &L4, layout: 4 },
     RecordInfo { name: "UMULLv2i32_indexed", mask: 0xffc0f400, value: 0x2f80a000, features: Features(0x2), format: FormatClass::BaseSIMDIndexed, fallback: false, priority: 1992, constrained: false, fields: &L83, layout: 83 },
     RecordInfo { name: "UMULLv2i32_v2i64", mask: 0xffe0fc00, value: 0x2ea0c000, features: Features(0x2), format: FormatClass::BaseSIMDDifferentThreeVector, fallback: false, priority: 1663, constrained: false, fields: &L4, layout: 4 },
@@ -11211,6 +11211,9 @@ pub fn extract(record: Record, w: u32) -> Option<Fields> {
             let rd = (w & 0x1f);
             let rm = ((w >> 16) & 0x1f);
             let rn = ((w >> 5) & 0x1f);
+            if !(((w >> 10) & 0x1f == 0x1f)) {
+                return None;
+            }
             Fields::MulHi(MulHi { rd, rm, rn })
         }
         173 => {

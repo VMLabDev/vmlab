@@ -314,7 +314,8 @@ impl Side {
     }
 }
 
-/// A memory event or a guard of a block, between its pure code.
+/// A memory event, a guard or a helper call of a block, between its pure
+/// code.
 #[derive(Clone, Copy, Debug)]
 enum Effect {
     Read {
@@ -337,6 +338,8 @@ enum Effect {
         expected: bool,
         exit: u32,
     },
+    /// The helper call of this index in `calls` (R10).
+    Call(u32),
 }
 
 /// Where a block can leave before its end.
@@ -382,10 +385,25 @@ struct Compiled {
     leaves: Vec<Leave>,
     /// The scratch slots. The constants are in place.
     values: Vec<u128>,
+    /// The helper calls (R10), in the order in which they run.
+    calls: Vec<Call>,
     /// Scratch slot, register slot: copied in before the block runs.
     inputs: Vec<(u32, u32)>,
     /// Register slot, scratch slot: copied out after it.
     outputs: Vec<(u32, u32)>,
+}
+
+/// The most arguments of a helper.
+const CALL_ARGUMENTS: usize = 8;
+
+/// One helper call of a block. Its place among the pure code is that of its
+/// `Effect::Call`.
+struct Call {
+    function: HelperFn,
+    /// The scratch slots of the arguments.
+    args: Vec<u32>,
+    /// The scratch slot of each result, with the mask of its type.
+    results: Vec<(u32, u128)>,
 }
 
 fn host(message: &str) -> Stop {
@@ -396,8 +414,28 @@ fn narrow(value: usize) -> Result<u32, Stop> {
     u32::try_from(value).map_err(|_| host("a block with too many slots"))
 }
 
+/// The mask of the type of a scalar that a helper fills.
+fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
+    match graph.scalars[id].ty {
+        ScalarType::Bits(width) => mask(width),
+        ScalarType::Bool => 1,
+        ScalarType::Integer => u128::MAX,
+    }
+}
+
+/// Put a helper call after the pure code that the block has so far.
+fn push_call(compiled: &mut Compiled, call: Call) -> Result<(), Stop> {
+    let index = narrow(compiled.calls.len())?;
+    compiled.calls.push(call);
+    compiled
+        .effects
+        .push((narrow(compiled.code.len())?, Effect::Call(index)));
+    Ok(())
+}
+
 /// Append the pure scalars that `roots` need and the block has not computed
-/// yet.
+/// yet: constants and inputs are bound, a pure helper call becomes a `Call`,
+/// and the rest is packed.
 fn emit(
     compiled: &mut Compiled,
     graph: &Graph,
@@ -407,25 +445,40 @@ fn emit(
 ) -> Result<(), Stop> {
     let slot_count = compiled.values.len();
     for id in schedule::scalars(graph, roots, seen) {
-        match graph.scalars[id].operation {
-            Operation::Constant(value) => compiled.values[slots[id]] = value,
+        match &graph.scalars[id].operation {
+            Operation::Constant(value) => compiled.values[slots[id]] = *value,
             Operation::Input(register) => {
                 compiled
                     .inputs
-                    .push((narrow(slots[id])?, narrow(register)?));
+                    .push((narrow(slots[id])?, narrow(*register)?));
             }
             // A view of another scalar shares its slot.
             Operation::Refine(_) => {}
             // The event of the effect writes its slot.
             Operation::Effect(_) => {}
+            // A pure helper call runs at its place among the pure code.
+            Operation::Call { helper, args } => {
+                if args.len() > CALL_ARGUMENTS {
+                    return Err(host("a helper with too many arguments"));
+                }
+                let call = Call {
+                    function: helper.0.function,
+                    args: args
+                        .iter()
+                        .map(|arg| narrow(slots[*arg]))
+                        .collect::<Result<_, _>>()?,
+                    results: vec![(narrow(slots[id])?, result_mask(graph, id))],
+                };
+                push_call(compiled, call)?;
+            }
             _ => {
                 let mut instruction = linear::lower(graph, id)
                     .ok_or_else(|| host("a scalar without a linear form"))?;
                 instruction.remap(slots);
                 let mut packed = Packed::new(slots[id], instruction)
                     .ok_or_else(|| host("a scalar without a packed form"))?;
-                if let Operation::Binary(_, _, right) = graph.scalars[id].operation
-                    && let Some(value) = graph.literal(right)
+                if let Operation::Binary(_, _, right) = &graph.scalars[id].operation
+                    && let Some(value) = graph.literal(*right)
                     && let Some(immediate) = packed.with_immediate(value)
                 {
                     packed = immediate;
@@ -472,6 +525,7 @@ fn compile(
         effects: Vec::new(),
         leaves: Vec::new(),
         values: vec![0; slot_count],
+        calls: Vec::new(),
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
@@ -482,18 +536,49 @@ fn compile(
         if ended {
             return Err(host("an event after the exit of a block"));
         }
-        let (exit, mut roots) = match *event {
+        let (exit, mut roots) = match event {
             Event::Guard {
                 condition, exit, ..
-            } => (exit, vec![condition]),
-            Event::ReadMemory { address, error, .. } => (error, vec![address]),
+            } => (*exit, vec![*condition]),
+            Event::ReadMemory { address, error, .. } => (*error, vec![*address]),
             Event::WriteMemory {
                 address,
                 value,
                 error,
                 ..
-            } => (error, vec![address, value]),
-            Event::Exit(exit) => (exit, Vec::new()),
+            } => (*error, vec![*address, *value]),
+            // An ordered helper call, after what its arguments need. It
+            // leaves through no exit.
+            Event::Call {
+                helper,
+                args,
+                results,
+            } => {
+                if !matches!(helper.0.function, HelperFn::Ordered(_))
+                    || args.len() > CALL_ARGUMENTS
+                    || results.len() > CALL_ARGUMENTS
+                {
+                    return Err(host("an ordered call of a helper that is not one"));
+                }
+                emit(&mut compiled, graph, &slots, &mut seen, args)?;
+                for result in results {
+                    seen[*result] = true;
+                }
+                let call = Call {
+                    function: helper.0.function,
+                    args: args
+                        .iter()
+                        .map(|arg| narrow(slots[*arg]))
+                        .collect::<Result<_, _>>()?,
+                    results: results
+                        .iter()
+                        .map(|result| Ok((narrow(slots[*result])?, result_mask(graph, *result))))
+                        .collect::<Result<_, Stop>>()?,
+                };
+                push_call(&mut compiled, call)?;
+                continue;
+            }
+            Event::Exit(exit) => (*exit, Vec::new()),
             Event::Checkpoint(_) => return Err(host("an aarch64 block has no checkpoint")),
         };
         let payload = &block.exits[exit];
@@ -534,14 +619,14 @@ fn compile(
                 leave
             }
         };
-        let effect = match *event {
+        let effect = match event {
             Event::Guard {
                 condition,
                 expected,
                 ..
             } => Effect::Guard {
-                condition: narrow(slots[condition])?,
-                expected,
+                condition: narrow(slots[*condition])?,
+                expected: *expected,
                 exit: leave,
             },
             Event::ReadMemory {
@@ -551,10 +636,10 @@ fn compile(
                 result,
                 ..
             } => Effect::Read {
-                address: narrow(slots[address])?,
-                result: narrow(slots[result])?,
-                bytes,
-                exclusive,
+                address: narrow(slots[*address])?,
+                result: narrow(slots[*result])?,
+                bytes: *bytes,
+                exclusive: *exclusive,
                 exit: leave,
             },
             Event::WriteMemory {
@@ -565,19 +650,19 @@ fn compile(
                 result,
                 ..
             } => Effect::Write {
-                address: narrow(slots[address])?,
-                value: narrow(slots[value])?,
-                bytes,
+                address: narrow(slots[*address])?,
+                value: narrow(slots[*value])?,
+                bytes: *bytes,
                 exclusive: match (exclusive, result) {
                     (false, _) => None,
-                    (true, Some(result)) => Some(narrow(slots[result])?),
+                    (true, Some(result)) => Some(narrow(slots[*result])?),
                     (true, None) => {
                         return Err(host("an exclusive store without a result"));
                     }
                 },
                 exit: leave,
             },
-            Event::Exit(_) | Event::Checkpoint(_) => continue,
+            Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => continue,
         };
         compiled
             .effects
@@ -625,12 +710,39 @@ impl Compiled {
     fn effect<M: Memory>(
         &mut self,
         effect: Effect,
+        state: &mut State,
         memory: &mut M,
         side: &mut Side,
         single: bool,
     ) -> Result<(), (u32, Failed)> {
         let values = &mut self.values;
         match effect {
+            Effect::Call(index) => {
+                let call = &self.calls[index as usize];
+                let mut args = [0u128; CALL_ARGUMENTS];
+                for (arg, slot) in args.iter_mut().zip(&call.args) {
+                    *arg = values[*slot as usize];
+                }
+                let args = &args[..call.args.len()];
+                match call.function {
+                    HelperFn::Pure(function) => {
+                        let (slot, mask) = call.results[0];
+                        values[slot as usize] = function(args) & mask;
+                    }
+                    // An ordered helper sees the state as it was at the
+                    // entry of the block for every register slot: the slots
+                    // are written back at the exit. What it may touch is
+                    // the state that is not in a slot.
+                    HelperFn::Ordered(function) => {
+                        let mut results = [0u128; CALL_ARGUMENTS];
+                        let count = call.results.len().min(CALL_ARGUMENTS);
+                        function(&mut *state, args, &mut results[..count]);
+                        for ((slot, mask), result) in call.results.iter().zip(results) {
+                            values[*slot as usize] = result & mask;
+                        }
+                    }
+                }
+            }
             Effect::Guard {
                 condition,
                 expected,
@@ -700,7 +812,7 @@ impl Compiled {
             let before = before as usize;
             Self::pure(&self.code[done..before], &mut self.values).map_err(|halt| (0, halt))?;
             done = before;
-            if let Err((exit, failed)) = self.effect(effect, memory, side, single) {
+            if let Err((exit, failed)) = self.effect(effect, state, memory, side, single) {
                 let leave = self.leave(state, exit);
                 let pc = state.pc();
                 let halt = match failed {
@@ -1152,6 +1264,142 @@ mod tests {
         cpu.state.set_pc(BASE);
         assert_eq!(cpu.run(1), Stop::Budget);
         assert_eq!(cpu.state.x(0), 3);
+    }
+
+    #[test]
+    fn scalar_fp_runs_through_the_helpers_and_collects_its_exceptions() {
+        use crate::helpers::fp::fpsr;
+        // fadd d0, d1, d2 ; fdiv d3, d1, d4 ; fcvtzs w5, d0 ; fcmp d1, d2
+        let mut cpu = cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
+        cpu.state.set_v(0, u128::MAX);
+        cpu.state
+            .set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        cpu.state.set_v(2, u128::from(2.25f64.to_bits()));
+        cpu.state.set_v(3, u128::MAX);
+        cpu.state.set_x(5, u64::MAX);
+        // The word after them is zero: UDF, which has no lifter.
+        let stop = cpu.run(u64::MAX);
+        assert!(
+            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 16),
+            "{stop:?}"
+        );
+        // A scalar result clears the register above it.
+        assert_eq!(cpu.state.v(0), u128::from(3.75f64.to_bits()));
+        assert_eq!(cpu.state.v(3), u128::from(f64::INFINITY.to_bits()));
+        assert_eq!(cpu.state.x(5), 3);
+        // 1.5 < 2.25: N.
+        assert_eq!(cpu.state.nzcv(), 0b1000);
+        // A division by zero, then an inexact conversion. The bits stay.
+        assert_eq!(cpu.state.fpsr(), u32::from(fpsr::DZC | fpsr::IXC));
+        // The four instructions were one block, and stepping gives the same.
+        assert_eq!(cpu.translations, 1);
+        let mut step = self::cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
+        step.state.set_v(0, u128::MAX);
+        step.state
+            .set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        step.state.set_v(2, u128::from(2.25f64.to_bits()));
+        step.state.set_v(3, u128::MAX);
+        step.state.set_x(5, u64::MAX);
+        for _ in 0..4 {
+            step.step().unwrap();
+        }
+        assert_eq!(step.state, cpu.state);
+    }
+
+    #[test]
+    fn the_rounding_mode_of_fpcr_reaches_the_helpers() {
+        // fdiv s0, s1, s2: 1 / 3 in each of the four modes.
+        for (mode, expected) in [
+            (0u32, 0x3eaa_aaabu32),
+            (1, 0x3eaa_aaab),
+            (2, 0x3eaa_aaaa),
+            (3, 0x3eaa_aaaa),
+        ] {
+            let mut cpu = cpu(&[0x1e22_1820]);
+            cpu.state.set_v(1, u128::from(1.0f32.to_bits()));
+            cpu.state.set_v(2, u128::from(3.0f32.to_bits()));
+            cpu.state.set_fpcr(mode << 22);
+            cpu.step().unwrap();
+            assert_eq!(cpu.state.v(0), u128::from(expected), "mode {mode}");
+            assert_eq!(cpu.state.fpsr(), 0x10);
+            assert_eq!(cpu.state.fpcr(), mode << 22);
+        }
+    }
+
+    fn bump(context: &mut dyn std::any::Any, args: &[u128], results: &mut [u128]) {
+        let state = context
+            .downcast_mut::<State>()
+            .expect("the context of an aarch64 helper is the state");
+        state.daif ^= 0xf;
+        results[0] = args[0] + args[1];
+    }
+
+    static BUMP: vmlab_hv_tcg_ir::native::Helper = vmlab_hv_tcg_ir::native::Helper {
+        name: "bump",
+        args: 2,
+        results: 1,
+        effects: vmlab_hv_tcg_ir::native::Effects::WRITES_STATE,
+        function: HelperFn::Ordered(bump),
+    };
+
+    #[test]
+    fn an_ordered_helper_runs_once_at_its_place_with_the_state() {
+        use crate::state::REGISTER_FILE;
+        use vmlab_hv_tcg_ir::native::regfile::Writeback;
+        use vmlab_hv_tcg_ir::native::{Binary, HelperRef};
+        let ty = ScalarType::Bits(64);
+        let mut block: BlockOf<A64Exit> = BlockOf::default();
+        let x0 = REGISTER_FILE.read(&mut block.graph, slot::X0);
+        let x1 = REGISTER_FILE.read(&mut block.graph, slot::X0 + 1);
+        // x2 = bump(x0 + x1, x1), and nothing reads the result of a second call.
+        let sum = block.graph.binary(ty, Binary::Add, x0, x1).unwrap();
+        let first = block.graph.effect(0, ty);
+        let second = block.graph.effect(1, ty);
+        for (args, result) in [(vec![sum, x1], first), (vec![x0, x0], second)] {
+            block.events.push(Event::Call {
+                helper: HelperRef(&BUMP),
+                args,
+                results: vec![result],
+            });
+        }
+        let next = block.graph.constant(ty, 0x4000_0004);
+        let exit = block.exit(A64Exit {
+            writeback: Writeback {
+                writes: vec![(slot::X0 + 2, first)],
+            },
+            next: A64Next::Pc(next),
+            completed: 1,
+        });
+        block.events.push(Event::Exit(exit));
+        let context = State::reset(0).context;
+        let mut compiled = compile(0x4000_0000, context, 1, block).unwrap();
+        let mut state = State::reset(0x4000_0000);
+        state.set_x(0, 5);
+        state.set_x(1, 7);
+        let mut memory = FlatMemory::new(0x4000_0000, vec![0; 16]);
+        let (count, halt) = compiled.run(&mut state, &mut memory, &mut Side::new());
+        assert!(count == 1 && halt.is_none());
+        assert_eq!(state.x(2), 19);
+        assert_eq!(state.pc(), 0x4000_0004);
+        // Both calls ran: the masks were flipped twice.
+        assert_eq!(state.daif, 0xf);
+        // An ordered call of a pure helper is refused.
+        let mut block: BlockOf<A64Exit> = BlockOf::default();
+        let x0 = REGISTER_FILE.read(&mut block.graph, slot::X0);
+        let result = block.graph.effect(0, ty);
+        block.events.push(Event::Call {
+            helper: HelperRef(&crate::helpers::fp::FP_UNARY),
+            args: vec![x0],
+            results: vec![result],
+        });
+        let next = block.graph.constant(ty, 0);
+        let exit = block.exit(A64Exit {
+            writeback: Writeback::default(),
+            next: A64Next::Pc(next),
+            completed: 1,
+        });
+        block.events.push(Event::Exit(exit));
+        assert!(matches!(compile(0, context, 1, block), Err(Stop::Host(_))));
     }
 
     #[test]

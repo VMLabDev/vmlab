@@ -10,5 +10,8 @@ rust-version.workspace = true
 vmlab-hv-tcg-ir = { path = "../vmlab-hv-tcg-ir" }
 vmlab-hv-tcg = { path = "../vmlab-hv-tcg" }
 
+[build-dependencies]
+cc = "1"
+
 [lints]
 workspace = true

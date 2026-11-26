@@ -4,7 +4,7 @@
 //! Written from the protocol as GDB documents it ("Remote Protocol" in the
 //! GDB manual) and from the answers of QEMU's gdbstub (S6).
 
-use super::Core;
+use super::{Core, Vectors};
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -14,13 +14,14 @@ use std::time::Duration;
 /// of 8 bytes each, and CPSR of 4.
 const CORE_BYTES: usize = 31 * 8 + 8 + 8 + 4;
 
-/// The number of V0 for the `p` and `P` packets: QEMU's target description
-/// puts V0 to V31, FPSR and FPCR after the 34 core registers.
-const FIRST_VECTOR: usize = 34;
-
 /// The most bytes of memory in one `M` packet. QEMU answers
 /// `PacketSize=20020`, and a byte takes two characters.
 const WRITE_CHUNK: usize = 0x4000;
+
+/// The number of V0 in QEMU's target description of an aarch64 CPU: the FP
+/// feature follows the 34 registers of the core.
+const V0_REGISTER: usize = 34;
+const FPSR_REGISTER: usize = V0_REGISTER + 32;
 
 pub struct Rsp {
     stream: UnixStream,
@@ -206,6 +207,55 @@ impl Rsp {
         self.expect_ok(&packet, "G")
     }
 
+    /// The register with the number `number` of the target description, as
+    /// its bytes in the order of the target.
+    pub fn register(&mut self, number: usize) -> io::Result<Vec<u8>> {
+        let answer = self.command(format!("p{number:x}").as_bytes())?;
+        if answer.is_empty() || answer.starts_with(b"E") {
+            return Err(other(format!(
+                "the gdbstub cannot read the register {number}"
+            )));
+        }
+        unhex(&answer)
+    }
+
+    pub fn set_register(&mut self, number: usize, bytes: &[u8]) -> io::Result<()> {
+        let mut packet = format!("P{number:x}=").into_bytes();
+        packet.extend(hex(bytes));
+        self.expect_ok(&packet, "P")
+    }
+
+    /// V0 to V31, FPSR and FPCR: the registers 34 to 67 of QEMU's aarch64
+    /// target description, after the 34 of the core.
+    pub fn vectors(&mut self) -> io::Result<Vectors> {
+        let mut vectors = Vectors::default();
+        for (n, value) in vectors.v.iter_mut().enumerate() {
+            let bytes: [u8; 16] = self
+                .register(V0_REGISTER + n)?
+                .try_into()
+                .map_err(|_| other("a V register of the gdbstub is not 16 bytes"))?;
+            *value = u128::from_le_bytes(bytes);
+        }
+        let mut word = |number: usize| -> io::Result<u32> {
+            let bytes: [u8; 4] = self
+                .register(number)?
+                .try_into()
+                .map_err(|_| other("FPSR and FPCR of the gdbstub are not 4 bytes"))?;
+            Ok(u32::from_le_bytes(bytes))
+        };
+        vectors.fpsr = word(FPSR_REGISTER)?;
+        vectors.fpcr = word(FPSR_REGISTER + 1)?;
+        Ok(vectors)
+    }
+
+    pub fn set_vectors(&mut self, vectors: &Vectors) -> io::Result<()> {
+        for (n, value) in vectors.v.iter().enumerate() {
+            self.set_register(V0_REGISTER + n, &value.to_le_bytes())?;
+        }
+        self.set_register(FPSR_REGISTER, &vectors.fpsr.to_le_bytes())?;
+        self.set_register(FPSR_REGISTER + 1, &vectors.fpcr.to_le_bytes())
+    }
+
     pub fn write_memory(&mut self, address: u64, data: &[u8]) -> io::Result<()> {
         for (index, chunk) in data.chunks(WRITE_CHUNK).enumerate() {
             let at = address + (index * WRITE_CHUNK) as u64;
@@ -224,25 +274,14 @@ impl Rsp {
         unhex(&answer)
     }
 
-    /// The vector register `n`. The gdbstub numbers V0 to V31 after the 34
-    /// core registers.
-    pub fn vector(&mut self, n: usize) -> io::Result<u128> {
-        let bytes = unhex(&self.command(format!("p{:x}", FIRST_VECTOR + n).as_bytes())?)?;
-        let bytes: [u8; 16] = bytes
-            .try_into()
-            .map_err(|_| other("the `p` answer for a vector register is not 16 bytes"))?;
-        Ok(u128::from_le_bytes(bytes))
-    }
-
-    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
-        let mut packet = format!("P{:x}=", FIRST_VECTOR + n).into_bytes();
-        packet.extend(hex(&value.to_le_bytes()));
-        self.expect_ok(&packet, "P")
-    }
-
     /// A hardware breakpoint on the instruction at `address`.
     pub fn break_at(&mut self, address: u64) -> io::Result<()> {
         self.expect_ok(format!("Z1,{address:x},4").as_bytes(), "Z1")
+    }
+
+    /// Remove the hardware breakpoint at `address`.
+    pub fn clear_break(&mut self, address: u64) -> io::Result<()> {
+        self.expect_ok(format!("z1,{address:x},4").as_bytes(), "z1")
     }
 
     /// Let the CPU run. The stop reply comes later, through `receive`.
@@ -347,8 +386,10 @@ mod tests {
             (&b"m42000000,4"[..], b"00040091".to_vec()),
             (&b"Z1,200,4"[..], b"OK".to_vec()),
             (&b"M0,1:00"[..], b"E14".to_vec()),
-            (&b"p23"[..], b"0102030405060708090a0b0c0d0e0f10".to_vec()),
-            (&b"P41=100f0e0d0c0b0a090807060504030201"[..], b"OK".to_vec()),
+            (&b"p23"[..], hex(&[0x11; 16])),
+            (&b"P42=1f000000"[..], b"OK".to_vec()),
+            (&b"z1,200,4"[..], b"OK".to_vec()),
+            (&b"p43"[..], b"E14".to_vec()),
         ]);
         assert_eq!(rsp.core().unwrap(), core);
         rsp.set_core(&core).unwrap();
@@ -360,12 +401,11 @@ mod tests {
         );
         rsp.break_at(0x200).unwrap();
         assert!(rsp.write_memory(0, &[0]).is_err());
-        assert_eq!(
-            rsp.vector(1).unwrap(),
-            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201
-        );
-        rsp.set_vector(31, 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)
-            .unwrap();
+        // V1 is the register 35, FPSR 66 and FPCR 67.
+        assert_eq!(rsp.register(35).unwrap(), vec![0x11; 16]);
+        rsp.set_register(66, &0x1fu32.to_le_bytes()).unwrap();
+        rsp.clear_break(0x200).unwrap();
+        assert!(rsp.register(67).is_err());
         drop(rsp);
         server.join().unwrap();
     }

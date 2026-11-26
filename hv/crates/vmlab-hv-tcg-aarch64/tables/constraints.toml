@@ -4,8 +4,8 @@
 # alone, and LLVM's C++ decoder methods (which the generator does not run)
 # refuse some of those words. Each entry is one such condition, written by
 # hand. `require` is a Rust expression over the raw fields of the class, each
-# a `u32` under its lower-case name, and over the whole word as `w`, for the
-# bits that no field names. A word that fails it does not match the
+# a `u32` under its lower-case name, and over the whole word `w` for a bit
+# that no field of the class holds. A word that fails it does not match the
 # record: the decoder tries the next candidate, and decodes to Undefined when
 # there is none.
 #
@@ -69,6 +69,11 @@ why = "The left shift of an extended register is 0 to 4. LLVM's DecodeAddSubEReg
 format = "BaseAddSubEReg64"
 require = "ext & 7 <= 4"
 why = "As BaseAddSubEReg: LLVM's DecodeAddSubERegInstruction refuses a shift above 4."
+
+[[constraint]]
+format = "MulHi"
+require = "(w >> 10) & 0x1f == 0x1f"
+why = "Bits 14 to 10 of SMULH and UMULH are the place of the addend register of MADD and must be all ones. LLVM marks them SoftFail and decodes any value. QEMU takes the Undefined Instruction exception for another value: the lockstep of card C2 found it at the word 9bc16413 (S6)."
 
 [[constraint]]
 format = "RtSystemI128"

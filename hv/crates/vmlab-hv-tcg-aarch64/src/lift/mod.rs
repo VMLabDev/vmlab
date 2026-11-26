@@ -4,8 +4,10 @@
 
 pub mod branch;
 pub mod builder;
+pub mod fp;
 pub mod integer;
 pub mod loadstore;
+pub mod register;
 
 pub use builder::{A64Exit, A64Next, Builder, ExceptionClass, Flags};
 
@@ -168,6 +170,55 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         | Fields::PrefetchLiteral(_)
         | Fields::BasePrefetchRO(_)
         | Fields::RPRFM(_) => loadstore::prefetch(),
+        Fields::BaseSingleOperandFPData(fields) => fp::single_operand(builder, record, fields),
+        Fields::BaseTwoOperandFPData(fields) => fp::two_operand(builder, record, fields),
+        Fields::BaseThreeOperandFPData(fields) => fp::three_operand(builder, record, fields),
+        Fields::BaseTwoOperandFPComparison(fields) => {
+            fp::compare_registers(builder, record, fields)
+        }
+        Fields::BaseOneOperandFPComparison(fields) => fp::compare_zero(builder, record, fields),
+        Fields::BaseFPCondComparison(fields) => fp::conditional_compare(builder, record, fields),
+        Fields::BaseFPCondSelect(fields) => fp::conditional_select(builder, record, fields),
+        Fields::BaseFPConversion(fields) => fp::convert(builder, record, fields),
+        Fields::BaseFPMoveImmediate(fields) => fp::move_immediate(builder, record, fields),
+        Fields::BaseFPToIntegerUnscaled(fields) => fp::to_integer_unscaled(builder, record, fields),
+        Fields::BaseFPToInteger(fields) => fp::to_integer_scaled(builder, record, fields),
+        Fields::BaseIntegerToFPUnscaled(fields) => {
+            fp::from_integer_unscaled(builder, record, fields)
+        }
+        Fields::BaseIntegerToFP(fields) => fp::from_integer_scaled(builder, record, fields),
+        Fields::BaseUnscaledConversion(fields) => fp::move_general(builder, record, fields),
+        Fields::BaseUnscaledConversionFromHigh(fields) => {
+            fp::move_from_high(builder, record, fields)
+        }
+        Fields::BaseUnscaledConversionToHigh(fields) => fp::move_to_high(builder, record, fields),
+        Fields::BaseAddSubSReg(fields) => register::add_sub_shifted(builder, record, fields),
+        Fields::BaseAddSubEReg(fields) => register::add_sub_extended(builder, record, fields),
+        Fields::BaseAddSubEReg64(fields) => register::add_sub_extended64(builder, record, fields),
+        Fields::BaseAddSubCarry(fields) => register::add_sub_carry(builder, record, fields),
+        Fields::BaseAddSubCarrySetFlags(fields) => {
+            register::add_sub_carry_flags(builder, record, fields)
+        }
+        Fields::BaseLogicalSReg(fields) => register::logical_shifted(builder, record, fields),
+        Fields::BaseCondComparisonImm(fields) => {
+            register::conditional_compare_immediate(builder, record, fields)
+        }
+        Fields::BaseCondComparisonReg(fields) => {
+            register::conditional_compare_register(builder, record, fields)
+        }
+        Fields::BaseCondSelect(fields) => register::conditional_select(builder, record, fields),
+        Fields::BaseCondSelectOp(fields) => {
+            register::conditional_select_op(builder, record, fields)
+        }
+        Fields::BaseShift(fields) => register::shift_variable(builder, record, fields),
+        Fields::BaseDiv(fields) => register::divide(builder, record, fields),
+        Fields::BaseMulAccum(fields) => register::multiply_add(builder, record, fields),
+        Fields::WideMulAccum(fields) => register::multiply_add_long(builder, record, fields),
+        Fields::MulHi(fields) => register::multiply_high(builder, record, fields),
+        Fields::BaseOneOperandData(fields) => register::one_operand(builder, record, fields),
+        Fields::OneWRegData(fields) => register::reverse32(builder, record, fields),
+        Fields::OneXRegData(fields) => register::reverse64(builder, record, fields),
+        Fields::BaseCRC32(fields) => register::crc32(builder, record, fields),
         _ => Lifted::Unsupported,
     }
 }
@@ -228,9 +279,8 @@ pub const LOAD_STORE_FORMATS: [crate::FormatClass; 49] = {
     ]
 };
 
-/// The format classes that have a lifter and no memory access, for the
-/// tests and the lockstep.
-pub const LIFTED_FORMATS: [crate::FormatClass; 14] = {
+/// The format classes of data processing with an immediate (card C1).
+pub const IMMEDIATE_FORMATS: [crate::FormatClass; 8] = {
     use crate::FormatClass::*;
     [
         ADRI,
@@ -241,11 +291,87 @@ pub const LIFTED_FORMATS: [crate::FormatClass; 14] = {
         BaseBitfieldImm,
         BaseBitfieldImmWith2RegArgs,
         BaseExtractImm,
+    ]
+};
+
+/// The format classes of the branches (card C1).
+pub const BRANCH_FORMATS: [crate::FormatClass; 6] = {
+    use crate::FormatClass::*;
+    [
         BranchImm,
         CallImm,
         BranchCond,
         BaseCmpBranch,
         BaseTestBranch,
         BranchReg,
+    ]
+};
+
+/// The format classes of data processing with registers (card C2).
+pub const REGISTER_FORMATS: [crate::FormatClass; 19] = {
+    use crate::FormatClass::*;
+    [
+        BaseAddSubSReg,
+        BaseAddSubEReg,
+        BaseAddSubEReg64,
+        BaseAddSubCarry,
+        BaseAddSubCarrySetFlags,
+        BaseLogicalSReg,
+        BaseCondComparisonImm,
+        BaseCondComparisonReg,
+        BaseCondSelect,
+        BaseCondSelectOp,
+        BaseShift,
+        BaseDiv,
+        BaseMulAccum,
+        WideMulAccum,
+        MulHi,
+        BaseOneOperandData,
+        OneWRegData,
+        OneXRegData,
+        BaseCRC32,
+    ]
+};
+
+/// The format classes that have a lifter, for the tests and the lockstep.
+pub const LIFTED_FORMATS: [crate::FormatClass; 33] = {
+    let mut all = [crate::FormatClass::ADRI; 33];
+    let mut at = 0;
+    while at < 8 {
+        all[at] = IMMEDIATE_FORMATS[at];
+        at += 1;
+    }
+    while at < 14 {
+        all[at] = BRANCH_FORMATS[at - 8];
+        at += 1;
+    }
+    while at < 33 {
+        all[at] = REGISTER_FORMATS[at - 14];
+        at += 1;
+    }
+    all
+};
+
+/// The format classes of scalar floating point (card C4), for the tests and
+/// the lockstep.
+pub const FP_FORMATS: [crate::FormatClass; 16] = {
+    use crate::FormatClass::*;
+    [
+        BaseSingleOperandFPData,
+        BaseTwoOperandFPData,
+        BaseThreeOperandFPData,
+        BaseTwoOperandFPComparison,
+        BaseOneOperandFPComparison,
+        BaseFPCondComparison,
+        BaseFPCondSelect,
+        BaseFPConversion,
+        BaseFPMoveImmediate,
+        BaseFPToIntegerUnscaled,
+        BaseFPToInteger,
+        BaseIntegerToFPUnscaled,
+        BaseIntegerToFP,
+        BaseUnscaledConversion,
+        BaseUnscaledConversionFromHigh,
+        BaseUnscaledConversionToHigh,
     ]
 };

@@ -1,0 +1,2789 @@
+# Test cases of Berkeley TestFloat (testfloat_gen -level 1 -tininessbefore) with the
+# results of upstream SoftFloat 3e, ARM-VFPv2 specialisation: 16 of each function
+# and rounding mode. Made by `just tcg-a64-testfloat` (examples/a64_testfloat.rs
+# --sample-out). A line is the function, the mode, exact or notexact, the operands,
+# the result and SoftFloat's exception flags.
+f32_add near_even exact C10000FB FF02000F FF02000F 01
+f32_add near_even exact 80F3C449 41778000 41778000 01
+f32_add near_even exact 4E8047FE 56000000 56000101 01
+f32_add near_even exact C0FFFFFF 807FFFFE C0FFFFFF 01
+f32_add near_even exact BCFDFFBE 33800001 BCFDFF9E 01
+f32_add near_even exact 5FFF8002 218807FF 5FFF8002 01
+f32_add near_even exact FEFFF01F DEFFBFDF FEFFF01F 01
+f32_add near_even exact 40800000 4BFFFFFE 4C000000 00
+f32_add near_even exact 80FFFFDF C0FFFFFE C0FFFFFE 01
+f32_add near_even exact BF7F6FFF 3E800001 BF3F6FFE 01
+f32_add near_even exact C9801FEE CB800001 CB880200 01
+f32_add near_even exact D701FFBE 407FF9FF D701FFBE 01
+f32_add near_even exact 417FEFFD CB800200 CB8001F8 01
+f32_add near_even exact C380003F 3F000001 C37F807E 01
+f32_add near_even exact 00FFFFFF 2377FFBF 2377FFBF 01
+f32_add near_even exact C2407FFF 4E7FF7FF 4E7FF7FE 01
+f32_add minMag exact 7F80FFDF 3F040400 7FC0FFDF 10
+f32_add minMag exact BCFE1FFF C1EFF7FF C1F03786 01
+f32_add minMag exact BF7FFFFF BBD69AD9 BF80D69A 01
+f32_add minMag exact C101FFF7 C0800000 C141FFF7 00
+f32_add minMag exact 000007FD BF000000 BEFFFFFF 01
+f32_add minMag exact 5EBFFEFE 927FFFAE 5EBFFEFD 01
+f32_add minMag exact 5F843C56 CF80A000 5F843C55 01
+f32_add minMag exact BF000000 CF7FFFD0 CF7FFFD0 01
+f32_add minMag exact 3FFFFFFF CE400004 CE400003 01
+f32_add minMag exact 3F8001C0 418FFFBF 4197FFDB 00
+f32_add minMag exact CE3A23EA BEFE0800 CE3A23EA 01
+f32_add minMag exact FEFF7FFE FEFFFFFE FF7FBFFE 00
+f32_add minMag exact BF800001 3F800000 B4000000 00
+f32_add minMag exact DF17FFFE B77FFF0F DF17FFFE 01
+f32_add minMag exact C07FFFFE 996B4375 C07FFFFE 01
+f32_add minMag exact C11E0000 BD000036 C11E8000 01
+f32_add min exact C0FFFFFF 80000001 C1000000 01
+f32_add min exact FF6F7FFF C1253DBC FF6F8000 01
+f32_add min exact 3E800001 BF7FFFFF BF3FFFFF 01
+f32_add min exact 388040FF 40FF0000 40FF0080 01
+f32_add min exact 80FFFFFF 40000000 3FFFFFFF 01
+f32_add min exact EEE0007F DFF80800 EEE00080 01
+f32_add min exact FEFFFFFE C5F81FFF FEFFFFFF 01
+f32_add min exact 8FFFC03F 4080007E 4080007D 01
+f32_add min exact B3FFFFFE BEFFFFFE BF000001 01
+f32_add min exact 0C80FFF6 FE800001 FE800001 01
+f32_add min exact 3CFFDFF7 00000001 3CFFDFF7 01
+f32_add min exact CF83FFFF B9F7FFBF CF840000 01
+f32_add min exact 7E917C12 310007FE 7E917C12 01
+f32_add min exact BFFFFFFF 807FDFFA C0000000 01
+f32_add min exact B261FFFF C17FF808 C17FF809 01
+f32_add min exact FEF80080 00004FFF FEF80080 01
+f32_add max exact C0FF81FF 4F700670 4F700670 01
+f32_add max exact 40FFFEF7 4BFE0010 4BFE0014 01
+f32_add max exact 7F800001 407FFFFF 7FC00001 10
+f32_add max exact C0FFFFFF CB800000 CB800003 01
+f32_add max exact 337FF400 CFFBC000 CFFBBFFF 01
+f32_add max exact CB80BFFF C20002FE CB80C00F 01
+f32_add max exact BE800001 5E800BFE 5E800BFE 01
+f32_add max exact 3F7FFFFE 3F810008 40008004 01
+f32_add max exact 3F000001 6E00C000 6E00C001 01
+f32_add max exact B9EDFE9B 5E8101FF 5E8101FF 01
+f32_add max exact CB80107E C0800000 CB801080 00
+f32_add max exact 2B7FFFFE 3EFFFFFE 3EFFFFFF 01
+f32_add max exact 4F800600 4FFFF807 503FFF04 01
+f32_add max exact C046B63D 7F7FFFFF 7F7FFFFF 01
+f32_add max exact CCDDFFFF 3FF517FF CCDDFFFE 01
+f32_add max exact FF800001 C05FDFFE FFC00001 10
+f32_sub near_even exact F6A1FFFE 1FE8CBE1 F6A1FFFE 01
+f32_sub near_even exact 80800001 00800000 81000000 01
+f32_sub near_even exact FF00007D BE800001 FF00007D 01
+f32_sub near_even exact C1CE2697 FEFFFFFE 7EFFFFFE 01
+f32_sub near_even exact 3F7FFFFF A094D616 3F7FFFFF 01
+f32_sub near_even exact 4E003000 DF00FFEF 5F00FFEF 01
+f32_sub near_even exact 33800000 CB900100 4B900100 01
+f32_sub near_even exact 64C73E3D 3FFFFFFE 64C73E3D 01
+f32_sub near_even exact D1CEE057 5EE0FFFE DEE0FFFE 01
+f32_sub near_even exact C0800001 5F7F800F DF7F800F 01
+f32_sub near_even exact 40800000 00800001 40800000 01
+f32_sub near_even exact FF800000 BC00000A FF800000 00
+f32_sub near_even exact CBFFFFFE 437FFFBD CC00003F 01
+f32_sub near_even exact 4580009F B213167D 4580009F 01
+f32_sub near_even exact 3F7FFFFF 40000001 BF800002 01
+f32_sub near_even exact BF008004 BF40007F 3E7E01EC 00
+f32_sub minMag exact 3E7D827C 3F77FFEE BF389F4F 00
+f32_sub minMag exact 4F0FFFF7 3E9FFDFF 4F0FFFF6 01
+f32_sub minMag exact C0FFFFFF CB91F580 4B91F57C 01
+f32_sub minMag exact B3803FE0 3A800060 BA800260 01
+f32_sub minMag exact 3E800007 B283F7FF 3E800007 01
+f32_sub minMag exact 4F6F7FFF 3F000000 4F6F7FFE 01
+f32_sub minMag exact 4B800001 C0000000 4B800002 00
+f32_sub minMag exact 4B800000 FFFFFFFF FFFFFFFF 00
+f32_sub minMag exact B3800000 40800001 C0800001 01
+f32_sub minMag exact 3F7FFFFF 3F000001 3EFFFFFC 00
+f32_sub minMag exact 3F7FFFFF 4E080001 CE080000 01
+f32_sub minMag exact 3DFFF900 AEAF5404 3DFFF900 01
+f32_sub minMag exact B380BDA8 40FDEF57 C0FDEF57 01
+f32_sub minMag exact 4F8083FF 4B800000 4F8003FF 00
+f32_sub minMag exact CBFFFFFF 3E800000 CBFFFFFF 01
+f32_sub minMag exact 14FF0006 BC77FFEF 3C77FFEF 01
+f32_sub min exact FF800000 BEFFFFFF FF800000 00
+f32_sub min exact 3E001FF0 BEFFC004 3F1FE7FE 00
+f32_sub min exact FF7FFB80 80080800 FF7FFB80 01
+f32_sub min exact B77FFE10 CEFFFF0F 4EFFFF0E 01
+f32_sub min exact 80FFFFFE 00FFFFFF 817FFFFF 01
+f32_sub min exact 7FFFFFFF FEFFFFFF 7FFFFFFF 00
+f32_sub min exact 4306FFFE 4E00017F CE00017D 01
+f32_sub min exact 3EFFF00F FF605B98 7F605B98 01
+f32_sub min exact 7F7C7FFF B3FFFFFF 7F7C7FFF 01
+f32_sub min exact 80800000 4BFFFFFF CC000000 01
+f32_sub min exact C57FC01F 7E9CFC0A FE9CFC0B 01
+f32_sub min exact FF99630C BE00037E FFD9630C 10
+f32_sub min exact 368003DE 33800001 367C07BB 01
+f32_sub min exact 7FFFFFFE 40000000 7FFFFFFE 00
+f32_sub min exact 4E4354F6 80000000 4E4354F6 00
+f32_sub min exact DECEB817 46F8000F DECEB818 01
+f32_sub max exact 007FFF07 3F083FFE BF083FFD 01
+f32_sub max exact C0800000 7FFFFFFF 7FFFFFFF 00
+f32_sub max exact CF000140 80FFFC1F CF00013F 01
+f32_sub max exact CF3FF94F 33FFFFFE CF3FF94F 01
+f32_sub max exact 3F800001 BEFFFFFE 3FC00001 01
+f32_sub max exact 4E3FFFF7 4BFFFFFE 4E37FFF8 01
+f32_sub max exact 735FFBFF FEFFFFFF 7F000001 01
+f32_sub max exact FFFF3FFF 40800000 FFFF3FFF 00
+f32_sub max exact 3F000001 007FFFFF 3F000001 01
+f32_sub max exact B47FFFC1 3D80043F BD80045E 01
+f32_sub max exact 8E00007A 5E807FFE DE807FFE 01
+f32_sub max exact 5E1FFFEF BC8001FD 5E1FFFF0 01
+f32_sub max exact 00000000 FEFFFFFF 7EFFFFFF 00
+f32_sub max exact BEFFFE80 407C001E C08DFFF7 00
+f32_sub max exact 3FFFFFFF 12A0007F 3FFFFFFF 01
+f32_sub max exact 7F7FFFC3 8980FFDF 7F7FFFC4 01
+f32_mul near_even exact 3F000001 FEFFFFFF FE800000 01
+f32_mul near_even exact 31FBFFFE 003FE000 00000000 03
+f32_mul near_even exact CBDEFFFF FEFFFFFE 7F800000 05
+f32_mul near_even exact 5E9FFC00 43C00003 62EFFA04 01
+f32_mul near_even exact 3FFFFFFF 80000000 80000000 00
+f32_mul near_even exact D0FFFF9E 7F7FFFFE FF800000 05
+f32_mul near_even exact 3EFFFFFE 4380013F 4300013E 01
+f32_mul near_even exact BD90BF6D 40FF8007 BF107711 01
+f32_mul near_even exact DE6CDAEC 33FFFFFF D2ECDAEB 01
+f32_mul near_even exact 7E8BFFFF C005B940 FF12429D 01
+f32_mul near_even exact 5F880003 685B724C 7F800000 05
+f32_mul near_even exact A65887F0 3F800001 A65887F2 01
+f32_mul near_even exact 00FFFBF8 57803FFF 19003DFA 01
+f32_mul near_even exact BF7F0100 CFB42F9D 4FB37C22 01
+f32_mul near_even exact BDE34CDA C07FF800 3EE345C0 01
+f32_mul near_even exact 5F000041 BE800000 DE000041 00
+f32_mul minMag exact 7FFFFFFF DF5C858D 7FFFFFFF 00
+f32_mul minMag exact 00FFFFF4 FEFFFFFE C07FFFF2 01
+f32_mul minMag exact 00FFFFFE 41780FFF 02F80FFD 01
+f32_mul minMag exact D226F723 CE000820 60A701BC 01
+f32_mul minMag exact 5E900007 C0800001 DF900008 01
+f32_mul minMag exact C0800000 7E80087E FF7FFFFF 05
+f32_mul minMag exact 3D75D352 CF00FFF6 CCF7BEE5 01
+f32_mul minMag exact 3F7FFFFF 7F80FF7F 7FC0FF7F 10
+f32_mul minMag exact 00800000 BE800000 80200000 00
+f32_mul minMag exact 3E8CDA67 BE7EF7FF BD8C4925 01
+f32_mul minMag exact BE800000 41A000FF C0A000FF 00
+f32_mul minMag exact 5E058837 45FE991E 6484CD04 01
+f32_mul minMag exact 42E001FF 3D3DD5DC 40A61C9B 01
+f32_mul minMag exact BEA6062F CB800000 4AA6062F 00
+f32_mul minMag exact 3C7FF802 3F00FFFF 3C00FBF8 01
+f32_mul minMag exact 4F1FFF7E 3C619364 4C0CFBAB 01
+f32_mul min exact C097E211 817FFFFE 0297E20F 01
+f32_mul min exact FF740000 3FFB7FFF FF800000 05
+f32_mul min exact 5E1F9CC2 86E7296D A5902048 01
+f32_mul min exact 4781FDFE 3FFFFFFE 4801FDFC 01
+f32_mul min exact CC000FDE 7EF03FFE FF800000 05
+f32_mul min exact BFFFFFFF 407FFFFE C0FFFFFE 01
+f32_mul min exact 42FFFDEF C0800001 C3FFFDF1 01
+f32_mul min exact 807FFFFF 00800001 80000001 03
+f32_mul min exact 4E8027FF C14A08C4 D04A47E6 01
+f32_mul min exact FF800001 3F800001 FFC00001 10
+f32_mul min exact C1840003 3DFBFFF6 C001EFFE 01
+f32_mul min exact D887FDFF 01700000 9A7EFC3F 01
+f32_mul min exact C17FE01E 4E7FFF83 D07FDFA2 01
+f32_mul min exact 009A0D41 BFFFFFFE 811A0D40 01
+f32_mul min exact 4F06FFFF FF7FD000 FF800000 05
+f32_mul min exact BEFFFFFE C07FFF07 3FFFFF05 01
+f32_mul max exact BF7FFFFF 007FFFFF 807FFFFE 03
+f32_mul max exact 00801FF7 5F0000FB 200020F3 01
+f32_mul max exact CF81FFFC A571FFFF 3575C7F8 01
+f32_mul max exact BF80004F 3F7FFFFF BF80004E 01
+f32_mul max exact 5780FBFF FFFFF800 FFFFF800 00
+f32_mul max exact 4B800001 BE35BDC4 CA35BDC5 01
+f32_mul max exact FEFDFFFE 7EFE0FFF FF7FFFFF 05
+f32_mul max exact B3800001 BF13FFFF 33140001 01
+f32_mul max exact 5E91B641 40080010 5F1AD1B8 01
+f32_mul max exact 33FFFFFE DE803F80 D3003F7E 01
+f32_mul max exact C07FFFFE C07FFFFE 417FFFFD 01
+f32_mul max exact CB8077FF BF7FFFFE 4B8077FE 01
+f32_mul max exact A27FFFFF 33FFFFFE 96FFFFFD 01
+f32_mul max exact 4E8A591E 5F1FFFF7 6E2CEF5C 01
+f32_mul max exact 3E7FF0FF 40800001 3F7FF101 01
+f32_mul max exact 4BFE2000 C582001E D2010C5D 01
+f32_div near_even exact C0001FFD E6000000 19801FFD 00
+f32_div near_even exact C080FFF8 417F80FF BE814017 01
+f32_div near_even exact 406AB0D0 BF7FDFFA C06ACE2F 01
+f32_div near_even exact F07FEFEF 4080000E EF7FEFD3 01
+f32_div near_even exact BD80077F A9200003 53CCD8C7 01
+f32_div near_even exact BEFFFFFF FFFFFFFF FFFFFFFF 00
+f32_div near_even exact 7EDFFFFE BFE3CB3A FE7BBC81 01
+f32_div near_even exact 4B000028 8148CE0C FF800000 05
+f32_div near_even exact BE7FFFFF 3780201F C67FBFD1 01
+f32_div near_even exact BF6686D8 BEFBFFEF 3FEA2FA6 01
+f32_div near_even exact BE800000 007FFFFF FD800001 01
+f32_div near_even exact 447F7FF7 40000001 43FF7FF5 01
+f32_div near_even exact 80000001 3FFFFFFF 80000001 03
+f32_div near_even exact C07FFFFE 7FEC363D 7FEC363D 00
+f32_div near_even exact 38FF003F BB541C7D BD19E1CF 01
+f32_div near_even exact 41800010 BF79FFFE C1831280 01
+f32_div minMag exact FFFFFFFE 3E7F8008 FFFFFFFE 00
+f32_div minMag exact 007FFFFF BFBF6374 80559B21 03
+f32_div minMag exact E67F007F 40000001 E5FF007D 01
+f32_div minMag exact 815EFFFE 4F5217D3 80000000 03
+f32_div minMag exact B88000FF BF1003FF 38E389AD 01
+f32_div minMag exact 7F800000 40FFFFFF 7F800000 00
+f32_div minMag exact BF80007B BF800000 3F80007B 00
+f32_div minMag exact 7F000000 FFFFFFFE FFFFFFFE 00
+f32_div minMag exact FE800000 FF800001 FFC00001 10
+f32_div minMag exact 3F800001 4BD83E03 331788A6 01
+f32_div minMag exact 80FFFFFF 40FFFFFE 80200000 03
+f32_div minMag exact 39F9FFFF C3847FFF B5F1826B 01
+f32_div minMag exact 7F000000 001B1E67 7F7FFFFF 05
+f32_div minMag exact C05848A3 9512847E 6ABCF2E6 01
+f32_div minMag exact BDF1FFFF A0DAE7BE 5C8D810F 01
+f32_div minMag exact CE81FFFF 80800001 7F7FFFFF 05
+f32_div min exact 44007FFF 7F7FFFFE 04008000 01
+f32_div min exact DEFBC000 325A6116 EC138F50 01
+f32_div min exact F55DBE8C 4A100020 EAC51AFC 01
+f32_div min exact CF820006 C0800001 4E820004 01
+f32_div min exact 5E3AE609 BF7FFFFF DE3AE60A 01
+f32_div min exact CE1A8D2B 408017FF CD1A7038 01
+f32_div min exact CF001FFF 80FFFFFE 7F7FFFFF 05
+f32_div min exact C07FFF80 3CEEFFFF C3091A84 01
+f32_div min exact 830009FE 301EFFFF 924E26A3 01
+f32_div min exact 807FFFFF 40000000 80400000 03
+f32_div min exact BF800001 0140FFFE FDA9C84E 01
+f32_div min exact C042B258 7F42A1F1 80800ACA 01
+f32_div min exact C0800000 DFFFD800 20001403 01
+f32_div min exact 3CC0001F 44FF2000 3740A8B2 01
+f32_div min exact BEFFFFFF 40800000 BDFFFFFF 00
+f32_div min exact FFE109D3 800000DF FFE109D3 00
+f32_div max exact 4E62EE34 CFFFFFF3 BDE2EE3F 01
+f32_div max exact BDF80000 A9FEFFF7 5378F902 01
+f32_div max exact C55028AC DF8803FF 2543E44A 01
+f32_div max exact 5E082ACA 4BFFFFFF 51882ACB 01
+f32_div max exact 00FFFFFF BF00017E 817FFD03 01
+f32_div max exact FF800000 3FFFFFFF FF800000 00
+f32_div max exact CEFFFFF8 BF000030 4F7FFF99 01
+f32_div max exact CB800000 00FFFFFF FF7FFFFF 05
+f32_div max exact 00000001 3EFFFFFF 00000003 03
+f32_div max exact 3E800001 C0820000 BD7C0FC2 01
+f32_div max exact DE5FFFFA 4FD9FA21 CE038966 01
+f32_div max exact 812A95A3 FF800001 FFC00001 10
+f32_div max exact 3F800001 BEFFFFFE C0000002 01
+f32_div max exact BF7FFF7E CB800000 337FFF7E 00
+f32_div max exact C429C451 00000803 FF7FFFFF 05
+f32_div max exact BF7FFFFF 3DFFFFFF C1000000 00
+f32_sqrt near_even exact 80FFFFFF 7FC00000 10
+f32_sqrt near_even exact 3E7FFFFE 3EFFFFFF 01
+f32_sqrt near_even exact 1A8FFFFE 2D07C3B5 01
+f32_sqrt near_even exact C2600003 7FC00000 10
+f32_sqrt near_even exact BE000081 7FC00000 10
+f32_sqrt near_even exact 4178001F 407BF7EF 01
+f32_sqrt near_even exact CE79AEAB 7FC00000 10
+f32_sqrt near_even exact BEFFFEFB 7FC00000 10
+f32_sqrt near_even exact FFFFFDDF FFFFFDDF 00
+f32_sqrt near_even exact 40800000 40000000 00
+f32_sqrt near_even exact C1000000 7FC00000 10
+f32_sqrt near_even exact B5FE0100 7FC00000 10
+f32_sqrt near_even exact FF000000 7FC00000 10
+f32_sqrt near_even exact 3F7FFFFE 3F7FFFFF 01
+f32_sqrt near_even exact DE65CBD0 7FC00000 10
+f32_sqrt near_even exact C98E0000 7FC00000 10
+f32_sqrt minMag exact C0800001 7FC00000 10
+f32_sqrt minMag exact 00012000 1E400000 00
+f32_sqrt minMag exact C07FFFFE 7FC00000 10
+f32_sqrt minMag exact 7E803DFF 5F001EFB 01
+f32_sqrt minMag exact 4BFFFFFF 45B504F2 01
+f32_sqrt minMag exact 7FF7FFFA 7FF7FFFA 00
+f32_sqrt minMag exact C2FFFFEC 7FC00000 10
+f32_sqrt minMag exact 40DD6229 40285611 01
+f32_sqrt minMag exact 0036476E 1FA6B4B6 01
+f32_sqrt minMag exact B27FE800 7FC00000 10
+f32_sqrt minMag exact B3800001 7FC00000 10
+f32_sqrt minMag exact 67FFFFBA 53B504DA 01
+f32_sqrt minMag exact B3FFFFFE 7FC00000 10
+f32_sqrt minMag exact 817459FF 7FC00000 10
+f32_sqrt minMag exact BE800001 7FC00000 10
+f32_sqrt minMag exact CFFFFFFF 7FC00000 10
+f32_sqrt min exact DFFFFFFF 7FC00000 10
+f32_sqrt min exact BEFFFEFB 7FC00000 10
+f32_sqrt min exact B3FFFFFF 7FC00000 10
+f32_sqrt min exact 3DF77FFF 3EB1FD1F 01
+f32_sqrt min exact 3F7FFFFE 3F7FFFFE 01
+f32_sqrt min exact FEFFFF7E 7FC00000 10
+f32_sqrt min exact DE65CBD0 7FC00000 10
+f32_sqrt min exact 41000001 403504F3 01
+f32_sqrt min exact 2200FFBE 30B5B96F 01
+f32_sqrt min exact 007FF7FF 1FFFF7FE 01
+f32_sqrt min exact 45E68D66 42ABC96A 01
+f32_sqrt min exact DE0001FC 7FC00000 10
+f32_sqrt min exact 4064D70E 3FF20A13 01
+f32_sqrt min exact 7F800000 7F800000 00
+f32_sqrt min exact FE812000 7FC00000 10
+f32_sqrt min exact BE000001 7FC00000 10
+f32_sqrt max exact B3800000 7FC00000 10
+f32_sqrt max exact 017FFFFE 207FFFFF 01
+f32_sqrt max exact BFFC1000 7FC00000 10
+f32_sqrt max exact 4CFDE760 463446D6 01
+f32_sqrt max exact 3E7FFFFF 3F000000 01
+f32_sqrt max exact 00000001 1A3504F4 01
+f32_sqrt max exact DFF80000 7FC00000 10
+f32_sqrt max exact DF7EFFFF 7FC00000 10
+f32_sqrt max exact FFFFFDDF FFFFFDDF 00
+f32_sqrt max exact BF7FF801 7FC00000 10
+f32_sqrt max exact C090000F 7FC00000 10
+f32_sqrt max exact 44FFAFFE 4234E8A8 01
+f32_sqrt max exact C27FDFFB 7FC00000 10
+f32_sqrt max exact C17FDFFD 7FC00000 10
+f32_sqrt max exact 8134B2D7 7FC00000 10
+f32_sqrt max exact 3E7FFFFE 3EFFFFFF 01
+f32_mulAdd near_even exact FE800000 3E7FB800 C07FFFFF FD7FB800 01
+f32_mulAdd near_even exact 4183FBFF BE800001 BF800000 C0A3FC00 01
+f32_mulAdd near_even exact C0FFFFFE FEFFDF7F 80F7574F 7F800000 05
+f32_mulAdd near_even exact 3E0400FE BE0006FF CFFBF000 CFFBF000 01
+f32_mulAdd near_even exact BF7FFFFE 7F800001 21800FBF 7FC00001 10
+f32_mulAdd near_even exact BA01FEFF 3E2FA057 CF7EFFEF CF7EFFEF 01
+f32_mulAdd near_even exact 4EDFFDFF 3F800001 3E8003DF 4EDFFE01 01
+f32_mulAdd near_even exact 413F7FFF 4004DBE1 3F000000 41CAC4F5 01
+f32_mulAdd near_even exact 40000001 7FFFFFFF BFFFFFFF 7FFFFFFF 00
+f32_mulAdd near_even exact 00000001 4F7FA000 C0FFFDF7 C0FFFDF7 01
+f32_mulAdd near_even exact 80000000 407FAFFF 7F7FFFFE 7F7FFFFE 00
+f32_mulAdd near_even exact 00FFFFFE 803F2D29 00FFFFFF 00FFFFFF 01
+f32_mulAdd near_even exact FFFFFFFE E090FFFF C1390E2C FFFFFFFE 00
+f32_mulAdd near_even exact 4F87FFFF 007FFFFE 7F000000 7F000000 01
+f32_mulAdd near_even exact C07FFFFF 40FFFFFF 4BFFFFFE 4BFFFFEE 01
+f32_mulAdd near_even exact C07FFFFF 33800001 41FE0001 41FE0001 01
+f32_mulAdd minMag exact 80E7FFFF 96087FFF C08879B2 C08879B1 01
+f32_mulAdd minMag exact 49F8007F CE7FFBFD 3F7FFF3E D8F7FC9C 01
+f32_mulAdd minMag exact 4BF21026 2F7DFFF8 5EB56D76 5EB56D76 01
+f32_mulAdd minMag exact 817FFF03 BE00000E BEFFFFFE BEFFFFFD 01
+f32_mulAdd minMag exact FF800001 CA880100 BE80D0D3 FFC00001 10
+f32_mulAdd minMag exact 4E7FFE40 BE101FFE 7F000001 7F000000 01
+f32_mulAdd minMag exact 80800000 3F6FFF7F 808040FF 80F840BE 01
+f32_mulAdd minMag exact 5F87F7FF 4B800001 C1BC35E9 6B87F800 01
+f32_mulAdd minMag exact CFFF0000 B48107FE DEFFDFDF DEFFDFDE 01
+f32_mulAdd minMag exact 80800001 B3FFFFFE C080003E C080003D 01
+f32_mulAdd minMag exact CBFFFFFF BF000001 3EFFFFFF 4B800000 01
+f32_mulAdd minMag exact BF800001 807F3FFE C0000000 BFFFFFFF 01
+f32_mulAdd minMag exact DFFFFC02 007E0007 CBFFFFFE CBFFFFFE 01
+f32_mulAdd minMag exact 7FE001FF B3800001 CF69C9DB 7FE001FF 00
+f32_mulAdd minMag exact 7F7FFFFF BF71A9BC 0EF00006 FF71A9BB 01
+f32_mulAdd minMag exact 3E800000 CBFFFFE0 7F000000 7EFFFFFF 01
+f32_mulAdd min exact CBD9F703 DE7FFFE6 FEFFFFFF FEFFFFFF 01
+f32_mulAdd min exact C0F7DFFF 00800001 CBFFFFFF CC000000 01
+f32_mulAdd min exact 3F800001 407FFFFF 56000FF8 56000FF8 01
+f32_mulAdd min exact D4E03FFF 4100000D 72CA7B30 72CA7B2F 01
+f32_mulAdd min exact 3F800001 40800000 CB800001 CB7FFFFE 01
+f32_mulAdd min exact BF7FFFFF FFFFFFFF 3F000FBF FFFFFFFF 00
+f32_mulAdd min exact 5FFF0004 3DA55BDF C17FF006 5E24B685 01
+f32_mulAdd min exact 80800001 7F000000 DFFEFFDF DFFEFFE0 01
+f32_mulAdd min exact 00000001 41700001 80800001 807FFFF2 03
+f32_mulAdd min exact 33800001 FFFFFFFE 3FFFFFFE FFFFFFFE 00
+f32_mulAdd min exact C07FFFFF 00000000 3EFFFFFE 3EFFFFFE 00
+f32_mulAdd min exact 00000000 3F7FF780 7F7FFFFF 7F7FFFFF 00
+f32_mulAdd min exact 42FBDFFF B3901000 3C800010 3C7FDCB0 01
+f32_mulAdd min exact 7F80001C C08EBCFC 407FFFFE 7FC0001C 10
+f32_mulAdd min exact 807FFFFF 0007DFFE 80FF7DFF 80FF7E00 01
+f32_mulAdd min exact DE003BFF 7FF80002 BF000000 7FF80002 00
+f32_mulAdd max exact B9770000 7F7FFFFE C0FFFFFF F976FFFE 01
+f32_mulAdd max exact FF800000 00800000 7BDD01A5 FF800000 00
+f32_mulAdd max exact B6FFFF20 7F7FFFFE FF800001 FFC00001 10
+f32_mulAdd max exact 7EC00008 FF800001 CB800001 FFC00001 10
+f32_mulAdd max exact 40FFFBFC FEFFFFFF FEFFFFFF FF7FFFFF 05
+f32_mulAdd max exact 5E86260A C57FFDBF C0000001 E48624DB 01
+f32_mulAdd max exact 3FC3BBBD CB7FFBFF CB800083 CC21DC98 01
+f32_mulAdd max exact BF800001 BF7FFFFF 4300007D 4301007E 01
+f32_mulAdd max exact BF800000 C0800000 33800001 40800001 01
+f32_mulAdd max exact 00FFFFFF 06001FF7 CB800001 CB800000 01
+f32_mulAdd max exact CB800000 5FF7FFFF BE00203F EBF7FFFF 01
+f32_mulAdd max exact FFFFFFFE C0E8D0C5 3F7FFFFF FFFFFFFE 00
+f32_mulAdd max exact C0FFFFFE C07FFEDF C0000000 41EFFEDE 01
+f32_mulAdd max exact FEFFFFFF FF7FF804 3F000001 7F800000 05
+f32_mulAdd max exact 80000000 C0FFFFFF C07FFFFF C07FFFFF 00
+f32_mulAdd max exact 5E5E73A2 810403FF 3F000000 3F000000 01
+f32_roundToInt near_even exact 3F71A699 3F800000 01
+f32_roundToInt near_even exact AC00081E 80000000 01
+f32_roundToInt near_even exact 481FEFFF 481FF000 01
+f32_roundToInt near_even exact 3C072C85 00000000 01
+f32_roundToInt near_even exact 7E87FDFF 7E87FDFF 00
+f32_roundToInt near_even exact C1000001 C1000000 01
+f32_roundToInt near_even exact 80000001 80000000 01
+f32_roundToInt near_even exact BE203FFE 80000000 01
+f32_roundToInt near_even exact F8400000 F8400000 00
+f32_roundToInt near_even exact DEFFFFFE DEFFFFFE 00
+f32_roundToInt near_even exact CE7FFFFF CE7FFFFF 00
+f32_roundToInt near_even exact C8FDFFFB C8FE0000 01
+f32_roundToInt near_even exact F174DEE7 F174DEE7 00
+f32_roundToInt near_even exact 5E3A71F9 5E3A71F9 00
+f32_roundToInt near_even exact 33801FE0 00000000 01
+f32_roundToInt near_even exact 1A8FFFFE 00000000 01
+f32_roundToInt minMag exact 807FFFFE 80000000 01
+f32_roundToInt minMag exact 409FFF80 40800000 01
+f32_roundToInt minMag exact 46FE00FE 46FE0000 01
+f32_roundToInt minMag exact DA5F117A DA5F117A 00
+f32_roundToInt minMag exact 8081FFFB 80000000 01
+f32_roundToInt minMag exact BF80DFFF BF800000 01
+f32_roundToInt minMag exact 4064D70E 40400000 01
+f32_roundToInt minMag exact DF7EFFFF DF7EFFFF 00
+f32_roundToInt minMag exact 807C1FFF 80000000 01
+f32_roundToInt minMag exact 107FFFFE 00000000 01
+f32_roundToInt minMag exact DACC892B DACC892B 00
+f32_roundToInt minMag exact 417FFFFF 41700000 01
+f32_roundToInt minMag exact 3D900008 00000000 01
+f32_roundToInt minMag exact 5E600004 5E600004 00
+f32_roundToInt minMag exact BF7FFFFE 80000000 01
+f32_roundToInt minMag exact 5EFFFFFF 5EFFFFFF 00
+f32_roundToInt min exact C0472034 C0800000 01
+f32_roundToInt min exact BE900007 BF800000 01
+f32_roundToInt min exact AB1C89BB BF800000 01
+f32_roundToInt min exact BFFFFFFF C0000000 01
+f32_roundToInt min exact 4FFFFFFE 4FFFFFFE 00
+f32_roundToInt min exact DEFFFFFF DEFFFFFF 00
+f32_roundToInt min exact 80000000 80000000 00
+f32_roundToInt min exact DE0003FF DE0003FF 00
+f32_roundToInt min exact B8FFFEFF BF800000 01
+f32_roundToInt min exact 4E800001 4E800001 00
+f32_roundToInt min exact C8FDFFFB C8FE0000 01
+f32_roundToInt min exact B4FFDE00 BF800000 01
+f32_roundToInt min exact 7CFDEFFE 7CFDEFFE 00
+f32_roundToInt min exact BDFF803E BF800000 01
+f32_roundToInt min exact 807FFFFF BF800000 01
+f32_roundToInt min exact 1A8FFFFE 00000000 01
+f32_roundToInt max exact 5F100001 5F100001 00
+f32_roundToInt max exact FFFFFFFF FFFFFFFF 00
+f32_roundToInt max exact C17C13AD C1700000 01
+f32_roundToInt max exact 017FFFFE 3F800000 01
+f32_roundToInt max exact 3F00007F 3F800000 01
+f32_roundToInt max exact 0006274F 3F800000 01
+f32_roundToInt max exact 3E7BF7FE 3F800000 01
+f32_roundToInt max exact BF7F9FFE 80000000 01
+f32_roundToInt max exact 5D000FFF 5D000FFF 00
+f32_roundToInt max exact 339FFEFE 3F800000 01
+f32_roundToInt max exact DFFFFFFC DFFFFFFC 00
+f32_roundToInt max exact DF7FFFFE DF7FFFFE 00
+f32_roundToInt max exact BE5C5E05 80000000 01
+f32_roundToInt max exact C01E1693 C0000000 01
+f32_roundToInt max exact 5F7FFFFE 5F7FFFFE 00
+f32_roundToInt max exact BC7F03FF 80000000 01
+f32_roundToInt near_even notexact BE5C5E05 80000000 00
+f32_roundToInt near_even notexact 7EFFFFFE 7EFFFFFE 00
+f32_roundToInt near_even notexact AC00081E 80000000 00
+f32_roundToInt near_even notexact C0472034 C0400000 00
+f32_roundToInt near_even notexact BFF48022 C0000000 00
+f32_roundToInt near_even notexact 4F7FFFFF 4F7FFFFF 00
+f32_roundToInt near_even notexact 5EFFFFFE 5EFFFFFE 00
+f32_roundToInt near_even notexact BE7FFFFE 80000000 00
+f32_roundToInt near_even notexact 137F7FFB 00000000 00
+f32_roundToInt near_even notexact C08400FF C0800000 00
+f32_roundToInt near_even notexact 3F800000 3F800000 00
+f32_roundToInt near_even notexact 40BD29B7 40C00000 00
+f32_roundToInt near_even notexact 817459FF 80000000 00
+f32_roundToInt near_even notexact FE804FFF FE804FFF 00
+f32_roundToInt near_even notexact CB80037F CB80037F 00
+f32_roundToInt near_even notexact 41DE507F 41E00000 00
+f32_roundToInt minMag notexact 3F8008FF 3F800000 00
+f32_roundToInt minMag notexact F8400000 F8400000 00
+f32_roundToInt minMag notexact 33800FFC 00000000 00
+f32_roundToInt minMag notexact 4FFFFFFF 4FFFFFFF 00
+f32_roundToInt minMag notexact 3C808400 00000000 00
+f32_roundToInt minMag notexact 7CFDEFFE 7CFDEFFE 00
+f32_roundToInt minMag notexact DFFFFFFE DFFFFFFE 00
+f32_roundToInt minMag notexact CFFFFFFF CFFFFFFF 00
+f32_roundToInt minMag notexact DFFFFFFF DFFFFFFF 00
+f32_roundToInt minMag notexact DF800001 DF800001 00
+f32_roundToInt minMag notexact BFF48022 BF800000 00
+f32_roundToInt minMag notexact 3D900000 00000000 00
+f32_roundToInt minMag notexact C1800000 C1800000 00
+f32_roundToInt minMag notexact 4FFFDFF7 4FFFDFF7 00
+f32_roundToInt minMag notexact BD808010 80000000 00
+f32_roundToInt minMag notexact 3F5FFFDF 00000000 00
+f32_roundToInt min notexact 3C808400 00000000 00
+f32_roundToInt min notexact C8FDFFFB C8FE0000 00
+f32_roundToInt min notexact C700FFBF C7010000 00
+f32_roundToInt min notexact BE5FEFFF BF800000 00
+f32_roundToInt min notexact 017FFFFF 00000000 00
+f32_roundToInt min notexact 41000000 41000000 00
+f32_roundToInt min notexact 4B800000 4B800000 00
+f32_roundToInt min notexact C0FFFBFE C1000000 00
+f32_roundToInt min notexact 40800000 40800000 00
+f32_roundToInt min notexact 46FE00FE 46FE0000 00
+f32_roundToInt min notexact BE84003F BF800000 00
+f32_roundToInt min notexact CBCF3EA9 CBCF3EA9 00
+f32_roundToInt min notexact 48BFFFFC 48BFFFE0 00
+f32_roundToInt min notexact 5EFFFFFF 5EFFFFFF 00
+f32_roundToInt min notexact 7FF353AC 7FF353AC 00
+f32_roundToInt min notexact 4E7FFFFE 4E7FFFFE 00
+f32_roundToInt max notexact 4E800001 4E800001 00
+f32_roundToInt max notexact 33801FE0 3F800000 00
+f32_roundToInt max notexact BEFFFFFF 80000000 00
+f32_roundToInt max notexact 4041C35D 40800000 00
+f32_roundToInt max notexact C17C13AD C1700000 00
+f32_roundToInt max notexact 33BFFF7E 3F800000 00
+f32_roundToInt max notexact B8400080 80000000 00
+f32_roundToInt max notexact BFF0007F BF800000 00
+f32_roundToInt max notexact CE800001 CE800001 00
+f32_roundToInt max notexact 015E834A 3F800000 00
+f32_roundToInt max notexact BD808003 80000000 00
+f32_roundToInt max notexact C1800000 C1800000 00
+f32_roundToInt max notexact 3C808400 3F800000 00
+f32_roundToInt max notexact BFFFFFFF BF800000 00
+f32_roundToInt max notexact C0800001 C0800000 00
+f32_roundToInt max notexact 5F800001 5F800001 00
+f32_roundToInt near_maxMag notexact BE7FBFFF 80000000 00
+f32_roundToInt near_maxMag notexact DE000001 DE000001 00
+f32_roundToInt near_maxMag notexact B588000E 80000000 00
+f32_roundToInt near_maxMag notexact 41800001 41800000 00
+f32_roundToInt near_maxMag notexact BE7FFFFF 80000000 00
+f32_roundToInt near_maxMag notexact CF7FFFFF CF7FFFFF 00
+f32_roundToInt near_maxMag notexact DEFFFFFF DEFFFFFF 00
+f32_roundToInt near_maxMag notexact 3AEC60E1 00000000 00
+f32_roundToInt near_maxMag notexact FE800001 FE800001 00
+f32_roundToInt near_maxMag notexact FC81007F FC81007F 00
+f32_roundToInt near_maxMag notexact C1C72FEE C1C80000 00
+f32_roundToInt near_maxMag notexact CB800001 CB800001 00
+f32_roundToInt near_maxMag notexact 5F000028 5F000028 00
+f32_roundToInt near_maxMag notexact 3E2BBE4E 00000000 00
+f32_roundToInt near_maxMag notexact 00800000 00000000 00
+f32_roundToInt near_maxMag notexact 41FFFFFF 42000000 00
+f32_eq near_even exact 4E4E38F3 807FFFFF 0 00
+f32_eq near_even exact 490087FF BECB96F0 0 00
+f32_eq near_even exact D7000FE0 7ED63075 0 00
+f32_eq near_even exact 7EBFFFF8 CE000003 0 00
+f32_eq near_even exact 3F000000 807FFFFE 0 00
+f32_eq near_even exact 7F000000 BB8FB417 0 00
+f32_eq near_even exact 5EFEFFF0 3F000001 0 00
+f32_eq near_even exact 7EFFE00E 5FF7FFFB 0 00
+f32_eq near_even exact 00F81FFE 7F37A128 0 00
+f32_eq near_even exact 3E7DDFFE 7F800001 0 10
+f32_eq near_even exact 3EEFFFFE 2BD2DB02 0 00
+f32_eq near_even exact 7E807BFF BE800000 0 00
+f32_eq near_even exact AD90C921 3FFE8AA0 0 00
+f32_eq near_even exact 5E7FFE04 4E0A74EB 0 00
+f32_eq near_even exact 3E7FEBFE DE500000 0 00
+f32_eq near_even exact BF334ED9 DF00010F 0 00
+f32_le near_even exact 40000076 5EF07FFE 1 00
+f32_le near_even exact 4F91FFFE 3EFFFFFE 0 00
+f32_le near_even exact 51FFFFF2 00DFBFFE 0 00
+f32_le near_even exact 80FFFFFF C0800001 0 00
+f32_le near_even exact BFFFFFFF 3FFFFFFC 1 00
+f32_le near_even exact 3E900002 00838000 0 00
+f32_le near_even exact 59FFFC40 BF7FFFFE 0 00
+f32_le near_even exact C0800001 C87FBFDF 0 00
+f32_le near_even exact BEFFFFFF 3E800001 1 00
+f32_le near_even exact 7FBFDFFE 33FFFFFE 0 10
+f32_le near_even exact 441FFFFF C07FF87F 0 00
+f32_le near_even exact 4BFFFFFF 40800000 0 00
+f32_le near_even exact BEE2ED28 FE9FFE00 0 00
+f32_le near_even exact 007FFFFF C0FEFFBF 0 00
+f32_le near_even exact 40000000 467FE3C3 1 00
+f32_le near_even exact CB800001 33800001 1 00
+f32_lt near_even exact 407FFFFF BEF8001F 0 00
+f32_lt near_even exact 007FFFFF 3F7FFFFE 1 00
+f32_lt near_even exact C1800042 5EFF0010 1 00
+f32_lt near_even exact C17B3EF7 4F007BFF 1 00
+f32_lt near_even exact 7F7FFFFE 40800001 0 00
+f32_lt near_even exact 5F9FFEFE BEABED3A 0 00
+f32_lt near_even exact BF010100 3F000017 1 00
+f32_lt near_even exact DC0DFFFF BF00801E 1 00
+f32_lt near_even exact 00C00006 5E007E00 1 00
+f32_lt near_even exact BCFBFFF7 CE53210E 0 00
+f32_lt near_even exact 80800000 4E7EFFDE 1 00
+f32_lt near_even exact 08FFC07E CF900FFF 0 00
+f32_lt near_even exact CBFFC7FE 407FFFFE 1 00
+f32_lt near_even exact BF96E7E4 BE139E66 1 00
+f32_lt near_even exact B97FFFFF 3E8000FE 1 00
+f32_lt near_even exact 33FFFFFF 40FFFFFF 1 00
+f32_eq_signaling near_even exact BFFFFFFF 3FFCFFFF 0 00
+f32_eq_signaling near_even exact DF7FFEFE DF6515B4 0 00
+f32_eq_signaling near_even exact BE5FFE00 B5BFF7FF 0 00
+f32_eq_signaling near_even exact C30002FF 7E87FDFE 0 00
+f32_eq_signaling near_even exact DF804007 8D5CA9BC 0 00
+f32_eq_signaling near_even exact 077F9FFF 807FFFFE 0 00
+f32_eq_signaling near_even exact 33800000 C0000001 0 00
+f32_eq_signaling near_even exact 4BFFFFFF 40403FFE 0 00
+f32_eq_signaling near_even exact EBEFFFC0 3E8001FF 0 00
+f32_eq_signaling near_even exact 00FFFFFF 33FFFFFF 0 00
+f32_eq_signaling near_even exact 007FFFFF D22007FF 0 00
+f32_eq_signaling near_even exact 339FFEFE 80FFFFED 0 00
+f32_eq_signaling near_even exact BE003FDF BC20FFFF 0 00
+f32_eq_signaling near_even exact 3F7FFFFE BF800000 0 00
+f32_eq_signaling near_even exact CE538C90 C0EFFFFA 0 00
+f32_eq_signaling near_even exact 40FFFE3F AF7FFE01 0 00
+f32_le_quiet near_even exact F6C573D1 B3800000 1 00
+f32_le_quiet near_even exact 4E8017FF 817FF7BF 0 00
+f32_le_quiet near_even exact 47200000 807FFFFE 0 00
+f32_le_quiet near_even exact 811003FF BD801100 0 00
+f32_le_quiet near_even exact 4F00807F 01007FFE 0 00
+f32_le_quiet near_even exact 40000001 3E800001 0 00
+f32_le_quiet near_even exact FF7FE007 017FF83F 1 00
+f32_le_quiet near_even exact C07FFFFE BA7FFFC7 1 00
+f32_le_quiet near_even exact C0579A57 A6FFEFEE 1 00
+f32_le_quiet near_even exact 7F000000 3F000001 0 00
+f32_le_quiet near_even exact B3800001 007FFFFE 1 00
+f32_le_quiet near_even exact 4671773B DFBC0000 0 00
+f32_le_quiet near_even exact AE803FFF 4B87FFF8 1 00
+f32_le_quiet near_even exact 3F0403FF 3E7DB6A4 0 00
+f32_le_quiet near_even exact BEFB7FFF BB284363 1 00
+f32_le_quiet near_even exact CB800001 3F800001 1 00
+f32_lt_quiet near_even exact CBFFFFFE 807FFFFE 1 00
+f32_lt_quiet near_even exact 001F65C2 4F800005 1 00
+f32_lt_quiet near_even exact 43800000 3F800001 0 00
+f32_lt_quiet near_even exact 4F7FBF7F 3CFF7FFB 0 00
+f32_lt_quiet near_even exact 33800000 80FFF80F 0 00
+f32_lt_quiet near_even exact 36C001FF BE7FEFFE 0 00
+f32_lt_quiet near_even exact 00A0001F C0060B1B 0 00
+f32_lt_quiet near_even exact C177DFFF CEBAC1C3 0 00
+f32_lt_quiet near_even exact 3D591CE6 CE0FFFFE 0 00
+f32_lt_quiet near_even exact 3F800000 C0D154CD 0 00
+f32_lt_quiet near_even exact 00000001 3F7FFFFF 1 00
+f32_lt_quiet near_even exact 3E800001 B388001F 0 00
+f32_lt_quiet near_even exact 77FFC3FF BC001FFC 0 00
+f32_lt_quiet near_even exact BF000000 B3800001 1 00
+f32_lt_quiet near_even exact BFFDFFFF 3F003FEF 1 00
+f32_lt_quiet near_even exact 3EFFFFFE 3E0B92D5 0 00
+f32_to_i32 near_even exact 46FE00FE 00007F00 01
+f32_to_i32 near_even exact CB80037F FEFFF902 00
+f32_to_i32 near_even exact 3F7FFFBF 00000001 01
+f32_to_i32 near_even exact 5ECC6A0F 7FFFFFFF 10
+f32_to_i32 near_even exact CEFF4000 80600000 00
+f32_to_i32 near_even exact BC000FBF 00000000 01
+f32_to_i32 near_even exact 3D900008 00000000 01
+f32_to_i32 near_even exact 4BBBFFFE 0177FFFC 00
+f32_to_i32 near_even exact BE717FC3 00000000 01
+f32_to_i32 near_even exact C120000F FFFFFFF6 01
+f32_to_i32 near_even exact 5DA5BBF7 7FFFFFFF 10
+f32_to_i32 near_even exact 4F7FFFFF 7FFFFFFF 10
+f32_to_i32 near_even exact CEFFFFFE 80000100 00
+f32_to_i32 near_even exact 4E7EFFFF 3FBFFFC0 00
+f32_to_i32 near_even exact 4F000000 7FFFFFFF 10
+f32_to_i32 near_even exact 5DFFF80F 7FFFFFFF 10
+f32_to_i32 minMag exact 00012000 00000000 01
+f32_to_i32 minMag exact 52FFFFF9 7FFFFFFF 10
+f32_to_i32 minMag exact 421FFC00 00000027 01
+f32_to_i32 minMag exact 80FFFFED 00000000 01
+f32_to_i32 minMag exact DF000000 80000000 10
+f32_to_i32 minMag exact C090000F FFFFFFFC 01
+f32_to_i32 minMag exact FF7FFFFF 80000000 10
+f32_to_i32 minMag exact FFDAD633 00000000 10
+f32_to_i32 minMag exact BEFFFFFE 00000000 01
+f32_to_i32 minMag exact C0561C35 FFFFFFFD 01
+f32_to_i32 minMag exact DFFFFFFE 80000000 10
+f32_to_i32 minMag exact 3F800001 00000001 01
+f32_to_i32 minMag exact 3E800001 00000000 01
+f32_to_i32 minMag exact 2200FFBE 00000000 01
+f32_to_i32 minMag exact 40E7FFFF 00000007 01
+f32_to_i32 minMag exact 40BD29B7 00000005 01
+f32_to_i32 min exact CAFFFDEF FF800108 01
+f32_to_i32 min exact C0000FDF FFFFFFFD 01
+f32_to_i32 min exact 87258873 FFFFFFFF 01
+f32_to_i32 min exact BE30FFBE FFFFFFFF 01
+f32_to_i32 min exact 9EDE38F7 FFFFFFFF 01
+f32_to_i32 min exact 3F800000 00000001 00
+f32_to_i32 min exact BE000000 FFFFFFFF 01
+f32_to_i32 min exact CE800001 BFFFFF80 00
+f32_to_i32 min exact 760077FF 7FFFFFFF 10
+f32_to_i32 min exact 4F40FFFE 7FFFFFFF 10
+f32_to_i32 min exact BE000001 FFFFFFFF 01
+f32_to_i32 min exact C1000001 FFFFFFF7 01
+f32_to_i32 min exact BFF0007F FFFFFFFE 01
+f32_to_i32 min exact F2F80006 80000000 10
+f32_to_i32 min exact F8400000 80000000 10
+f32_to_i32 min exact 3F8008FF 00000001 01
+f32_to_i32 max exact 5D000FFF 7FFFFFFF 10
+f32_to_i32 max exact 3D800000 00000001 01
+f32_to_i32 max exact 4D8E33CE 11C679C0 00
+f32_to_i32 max exact 41FFFFEB 00000020 01
+f32_to_i32 max exact CB800000 FF000000 00
+f32_to_i32 max exact 4F800001 7FFFFFFF 10
+f32_to_i32 max exact 3E7FFFFE 00000001 01
+f32_to_i32 max exact 87258873 00000000 01
+f32_to_i32 max exact CF800000 80000000 10
+f32_to_i32 max exact BEC111F7 00000000 01
+f32_to_i32 max exact BE717FC3 00000000 01
+f32_to_i32 max exact C0FFFFFF FFFFFFF9 01
+f32_to_i32 max exact FFFFFFFE 00000000 10
+f32_to_i32 max exact C07DFBFE FFFFFFFD 01
+f32_to_i32 max exact 4E4D6940 335A5000 00
+f32_to_i32 max exact 3FDFFFBF 00000002 01
+f32_to_i32 near_maxMag exact 3FFFFFFE 00000002 01
+f32_to_i32 near_maxMag exact BE000081 00000000 01
+f32_to_i32 near_maxMag exact DE00ACFD 80000000 10
+f32_to_i32 near_maxMag exact DA5F117A 80000000 10
+f32_to_i32 near_maxMag exact BE7FFFFE 00000000 01
+f32_to_i32 near_maxMag exact B4FFDE00 00000000 01
+f32_to_i32 near_maxMag exact DE000001 80000000 10
+f32_to_i32 near_maxMag exact 5DFFF80F 7FFFFFFF 10
+f32_to_i32 near_maxMag exact 67FFFFBA 7FFFFFFF 10
+f32_to_i32 near_maxMag exact 3F71F5EF 00000001 01
+f32_to_i32 near_maxMag exact 4F000000 7FFFFFFF 10
+f32_to_i32 near_maxMag exact 408005FF 00000004 01
+f32_to_i32 near_maxMag exact C1FFFFFE FFFFFFE0 01
+f32_to_i32 near_maxMag exact 3EFFFFFD 00000000 01
+f32_to_i32 near_maxMag exact B5FE0100 00000000 01
+f32_to_i32 near_maxMag exact FEFFFF7E 80000000 10
+i32_to_f32 near_even exact FFFFFFEF C1880000 00
+i32_to_f32 near_even exact E0000000 CE000000 00
+i32_to_f32 near_even exact 0000F01F 47701F00 00
+i32_to_f32 near_even exact 0000000A 41200000 00
+i32_to_f32 near_even exact 00000F7D 4577D000 00
+i32_to_f32 near_even exact 000003FF 447FC000 00
+i32_to_f32 near_even exact FFFFFF1B C3650000 00
+i32_to_f32 near_even exact FFFFE327 C5E6C800 00
+i32_to_f32 near_even exact FFBF8003 CA80FFFA 00
+i32_to_f32 near_even exact FFFFC8E2 C65C7800 00
+i32_to_f32 near_even exact 00000010 41800000 00
+i32_to_f32 near_even exact FFFFEFBE C5821000 00
+i32_to_f32 near_even exact FFFFFDFF C4004000 00
+i32_to_f32 near_even exact 000038E7 46639C00 00
+i32_to_f32 near_even exact 812EDF40 CEFDA242 01
+i32_to_f32 near_even exact FFFFF97F C4D02000 00
+i32_to_f32 minMag exact FC000078 CC7FFFE2 00
+i32_to_f32 minMag exact 00080000 49000000 00
+i32_to_f32 minMag exact FFFFFFEF C1880000 00
+i32_to_f32 minMag exact FF8874A5 CAEF16B6 00
+i32_to_f32 minMag exact 03FFFFFF 4C7FFFFF 01
+i32_to_f32 minMag exact 0013F7E6 499FBF30 00
+i32_to_f32 minMag exact 203FFFFD 4E00FFFF 01
+i32_to_f32 minMag exact 0000406D 4680DA00 00
+i32_to_f32 minMag exact 03FFFDBF 4C7FFF6F 01
+i32_to_f32 minMag exact 0FFFFFFF 4D7FFFFF 01
+i32_to_f32 minMag exact 010BFFFD 4B85FFFE 01
+i32_to_f32 minMag exact 00101FFD 4980FFE8 00
+i32_to_f32 minMag exact 007FBFFD 4AFF7FFA 00
+i32_to_f32 minMag exact 00EEFFFF 4B6EFFFF 00
+i32_to_f32 minMag exact 00136721 499B3908 00
+i32_to_f32 minMag exact FFF03FF9 C97C0070 00
+i32_to_f32 min exact 10000000 4D800000 00
+i32_to_f32 min exact 05DA4300 4CBB4860 00
+i32_to_f32 min exact 002107FE 4A041FF8 00
+i32_to_f32 min exact 000D734E 495734E0 00
+i32_to_f32 min exact FFFFFFFD C0400000 00
+i32_to_f32 min exact 1FF00002 4DFF8000 01
+i32_to_f32 min exact 001FFFFB 49FFFFD8 00
+i32_to_f32 min exact FFFF800B C6FFEA00 00
+i32_to_f32 min exact 8001FFEE CEFFFC01 01
+i32_to_f32 min exact F800040E CCFFFF7F 01
+i32_to_f32 min exact FFFFFFDF C2040000 00
+i32_to_f32 min exact FFFFF800 C5000000 00
+i32_to_f32 min exact 0000001A 41D00000 00
+i32_to_f32 min exact FFFF41C6 C73E3A00 00
+i32_to_f32 min exact FFFFFFFC C0800000 00
+i32_to_f32 min exact 00000544 44A88000 00
+i32_to_f32 max exact 8001FFEE CEFFFC00 01
+i32_to_f32 max exact FFFC56DF C86A4840 00
+i32_to_f32 max exact 2FFFFFFE 4E400000 01
+i32_to_f32 max exact 00001000 45800000 00
+i32_to_f32 max exact 80003FFD CEFFFF80 01
+i32_to_f32 max exact FFFE45D2 C7DD1700 00
+i32_to_f32 max exact 28003FFE 4E200100 01
+i32_to_f32 max exact 00000010 41800000 00
+i32_to_f32 max exact 00010000 47800000 00
+i32_to_f32 max exact FFFBDD08 C8845F00 00
+i32_to_f32 max exact EFFFFFFF CD800000 01
+i32_to_f32 max exact F7FFFEFB CD000010 01
+i32_to_f32 max exact FFFF800B C6FFEA00 00
+i32_to_f32 max exact FFAE458D CAA374E6 00
+i32_to_f32 max exact 00FFC001 4B7FC001 00
+i32_to_f32 max exact 00000006 40C00000 00
+f32_to_ui32 near_even exact 5100FFF0 FFFFFFFF 10
+f32_to_ui32 near_even exact DEFFFFFF 00000000 10
+f32_to_ui32 near_even exact BF54EA37 00000000 10
+f32_to_ui32 near_even exact C000DFFF 00000000 10
+f32_to_ui32 near_even exact 3EFFFFFD 00000000 01
+f32_to_ui32 near_even exact 40FFFFFF 00000008 01
+f32_to_ui32 near_even exact CFFFFFFE 00000000 10
+f32_to_ui32 near_even exact CBFFFFFE 00000000 10
+f32_to_ui32 near_even exact 4180807E 00000010 01
+f32_to_ui32 near_even exact CBFFF800 00000000 10
+f32_to_ui32 near_even exact DF7FFFFF 00000000 10
+f32_to_ui32 near_even exact CE9FFFDF 00000000 10
+f32_to_ui32 near_even exact 4F800000 FFFFFFFF 10
+f32_to_ui32 near_even exact 760077FF FFFFFFFF 10
+f32_to_ui32 near_even exact 3F002FFF 00000001 01
+f32_to_ui32 near_even exact 3FBB6EFD 00000001 01
+f32_to_ui32 minMag exact C090000F 00000000 10
+f32_to_ui32 minMag exact 41000076 00000008 01
+f32_to_ui32 minMag exact 3F002FFF 00000000 01
+f32_to_ui32 minMag exact 80000000 00000000 00
+f32_to_ui32 minMag exact BDFF803E 00000000 01
+f32_to_ui32 minMag exact B18997A1 00000000 01
+f32_to_ui32 minMag exact B8FFFEFF 00000000 01
+f32_to_ui32 minMag exact 40FFFFFE 00000007 01
+f32_to_ui32 minMag exact 421FFC00 00000027 01
+f32_to_ui32 minMag exact 4F951295 FFFFFFFF 10
+f32_to_ui32 minMag exact B4FFDE00 00000000 01
+f32_to_ui32 minMag exact 551FFFFE FFFFFFFF 10
+f32_to_ui32 minMag exact 3C808400 00000000 01
+f32_to_ui32 minMag exact B9AEF897 00000000 01
+f32_to_ui32 minMag exact 87258873 00000000 01
+f32_to_ui32 minMag exact C5FFF9FF 00000000 10
+f32_to_ui32 min exact 4BFFFFFE 01FFFFFC 00
+f32_to_ui32 min exact BF7F9FFE 00000000 10
+f32_to_ui32 min exact B383FBFF 00000000 10
+f32_to_ui32 min exact BEFFE080 00000000 10
+f32_to_ui32 min exact EB77FBFF 00000000 10
+f32_to_ui32 min exact 40800000 00000004 00
+f32_to_ui32 min exact C0800000 00000000 10
+f32_to_ui32 min exact 3E000001 00000000 01
+f32_to_ui32 min exact 33FFFFFE 00000000 01
+f32_to_ui32 min exact C0FFFFFF 00000000 10
+f32_to_ui32 min exact CE000300 00000000 10
+f32_to_ui32 min exact C2D0AA48 00000000 10
+f32_to_ui32 min exact CB80037F 00000000 10
+f32_to_ui32 min exact 69FFFF7F FFFFFFFF 10
+f32_to_ui32 min exact 3D900000 00000000 01
+f32_to_ui32 min exact 7F01FDFF FFFFFFFF 10
+f32_to_ui32 max exact 3FBB6EFD 00000002 01
+f32_to_ui32 max exact 7FF7FFFA 00000000 10
+f32_to_ui32 max exact 5F000000 FFFFFFFF 10
+f32_to_ui32 max exact 4FE061BA FFFFFFFF 10
+f32_to_ui32 max exact BFF0007F 00000000 10
+f32_to_ui32 max exact 5E14D901 FFFFFFFF 10
+f32_to_ui32 max exact C76FF800 00000000 10
+f32_to_ui32 max exact FF7FFFFF 00000000 10
+f32_to_ui32 max exact F2F80006 00000000 10
+f32_to_ui32 max exact 3F000001 00000001 01
+f32_to_ui32 max exact EB77FBFF 00000000 10
+f32_to_ui32 max exact 2CD956DB 00000001 01
+f32_to_ui32 max exact CF7FFFFF 00000000 10
+f32_to_ui32 max exact 64005FFE FFFFFFFF 10
+f32_to_ui32 max exact FF97847C 00000000 10
+f32_to_ui32 max exact BFFDFEFE 00000000 10
+f32_to_ui32 near_maxMag exact BD4A82A6 00000000 01
+f32_to_ui32 near_maxMag exact 4F7FFFFE FFFFFE00 00
+f32_to_ui32 near_maxMag exact ED9EFFFF 00000000 10
+f32_to_ui32 near_maxMag exact BF87BFFE 00000000 10
+f32_to_ui32 near_maxMag exact 7FF7FFFA 00000000 10
+f32_to_ui32 near_maxMag exact 7FFFFFFF 00000000 10
+f32_to_ui32 near_maxMag exact 4BCB12EF 019625DE 00
+f32_to_ui32 near_maxMag exact BE000081 00000000 01
+f32_to_ui32 near_maxMag exact BFF48022 00000000 10
+f32_to_ui32 near_maxMag exact 481FEFFF 00027FC0 01
+f32_to_ui32 near_maxMag exact 41000000 00000008 00
+f32_to_ui32 near_maxMag exact CBFFF800 00000000 10
+f32_to_ui32 near_maxMag exact FC81007F 00000000 10
+f32_to_ui32 near_maxMag exact 4FFFDFF7 FFFFFFFF 10
+f32_to_ui32 near_maxMag exact B3877FFE 00000000 01
+f32_to_ui32 near_maxMag exact 3E800000 00000000 01
+ui32_to_f32 near_even exact 00001000 45800000 00
+ui32_to_f32 near_even exact F0000000 4F700000 00
+ui32_to_f32 near_even exact FFE07FC0 4F7FE080 01
+ui32_to_f32 near_even exact 00200000 4A000000 00
+ui32_to_f32 near_even exact 00000590 44B20000 00
+ui32_to_f32 near_even exact F6FFFBFF 4F76FFFC 01
+ui32_to_f32 near_even exact 400087FD 4E800110 01
+ui32_to_f32 near_even exact 00004BFF 4697FE00 00
+ui32_to_f32 near_even exact BFFFFFFF 4F400000 01
+ui32_to_f32 near_even exact 0000CA70 474A7000 00
+ui32_to_f32 near_even exact 000005D1 44BA2000 00
+ui32_to_f32 near_even exact FDFC007E 4F7DFC00 01
+ui32_to_f32 near_even exact 0000607F 46C0FE00 00
+ui32_to_f32 near_even exact 40000000 4E800000 00
+ui32_to_f32 near_even exact 08734668 4D073466 01
+ui32_to_f32 near_even exact BFF3FFFE 4F3FF400 01
+ui32_to_f32 minMag exact FE7FDFFE 4F7E7FDF 01
+ui32_to_f32 minMag exact FF8201FF 4F7F8201 01
+ui32_to_f32 minMag exact F0000000 4F700000 00
+ui32_to_f32 minMag exact 00004000 46800000 00
+ui32_to_f32 minMag exact 00000107 43838000 00
+ui32_to_f32 minMag exact FFF7FFFF 4F7FF7FF 01
+ui32_to_f32 minMag exact 00000AC9 452C9000 00
+ui32_to_f32 minMag exact 0003F584 487D6100 00
+ui32_to_f32 minMag exact C0000000 4F400000 00
+ui32_to_f32 minMag exact FFFFFF00 4F7FFFFF 00
+ui32_to_f32 minMag exact E0007FDE 4F60007F 01
+ui32_to_f32 minMag exact 000874A5 49074A50 00
+ui32_to_f32 minMag exact F00FFFFE 4F700FFF 01
+ui32_to_f32 minMag exact FF2001FD 4F7F2001 01
+ui32_to_f32 minMag exact 000003EF 447BC000 00
+ui32_to_f32 minMag exact 0000047E 448FC000 00
+ui32_to_f32 min exact FFF97FFD 4F7FF97F 01
+ui32_to_f32 min exact 01FB1642 4BFD8B21 00
+ui32_to_f32 min exact 0000B8E7 4738E700 00
+ui32_to_f32 min exact 03FFFDBF 4C7FFF6F 01
+ui32_to_f32 min exact 0037FFE0 4A5FFF80 00
+ui32_to_f32 min exact FFFFF7FF 4F7FFFF7 01
+ui32_to_f32 min exact 0000002D 42340000 00
+ui32_to_f32 min exact 001FFEDD 49FFF6E8 00
+ui32_to_f32 min exact 0000009A 431A0000 00
+ui32_to_f32 min exact 00400000 4A800000 00
+ui32_to_f32 min exact FFFEFFFF 4F7FFEFF 01
+ui32_to_f32 min exact 0213F7E6 4C04FDF9 01
+ui32_to_f32 min exact 2107FFFE 4E041FFF 01
+ui32_to_f32 min exact 0001D2F1 47E97880 00
+ui32_to_f32 min exact 00000007 40E00000 00
+ui32_to_f32 min exact FFFDC007 4F7FFDC0 01
+ui32_to_f32 max exact 027BFFFE 4C1F0000 01
+ui32_to_f32 max exact F8000047 4F780001 01
+ui32_to_f32 max exact 0006007E 48C00FC0 00
+ui32_to_f32 max exact 00000AC9 452C9000 00
+ui32_to_f32 max exact 010BFFFD 4B85FFFF 01
+ui32_to_f32 max exact 0000000F 41700000 00
+ui32_to_f32 max exact 0000FF7C 477F7C00 00
+ui32_to_f32 max exact 8001FFEE 4F000200 01
+ui32_to_f32 max exact 000716EA 48E2DD40 00
+ui32_to_f32 max exact 001C4E5A 49E272D0 00
+ui32_to_f32 max exact FFFFFFFF 4F800000 01
+ui32_to_f32 max exact 00000019 41C80000 00
+ui32_to_f32 max exact 27F174DE 4E1FC5D4 01
+ui32_to_f32 max exact FFFFE000 4F7FFFE0 00
+ui32_to_f32 max exact 40000000 4E800000 00
+ui32_to_f32 max exact 001FFFFF 49FFFFF8 00
+f32_to_i64 near_even exact CE7FFFFF FFFFFFFFC0000040 00
+f32_to_i64 near_even exact CF7C2357 FFFFFFFF03DCA900 00
+f32_to_i64 near_even exact FF7FFFFE 8000000000000000 10
+f32_to_i64 near_even exact AC00081E 0000000000000000 01
+f32_to_i64 near_even exact 9EDE38F7 0000000000000000 01
+f32_to_i64 near_even exact BC5FFE00 0000000000000000 01
+f32_to_i64 near_even exact FD00027F 8000000000000000 10
+f32_to_i64 near_even exact 67FFFFBA 7FFFFFFFFFFFFFFF 10
+f32_to_i64 near_even exact 7FC00002 0000000000000000 10
+f32_to_i64 near_even exact 4FFFFFFE 00000001FFFFFC00 00
+f32_to_i64 near_even exact FE804020 8000000000000000 10
+f32_to_i64 near_even exact 5E3A71F9 2E9C7E4000000000 00
+f32_to_i64 near_even exact 4FD8BEC6 00000001B17D8C00 00
+f32_to_i64 near_even exact C090000F FFFFFFFFFFFFFFFB 01
+f32_to_i64 near_even exact BE784000 0000000000000000 01
+f32_to_i64 near_even exact 00FFFFFF 0000000000000000 01
+f32_to_i64 minMag exact C2600003 FFFFFFFFFFFFFFC8 01
+f32_to_i64 minMag exact A9801BFF 0000000000000000 01
+f32_to_i64 minMag exact C090000F FFFFFFFFFFFFFFFC 01
+f32_to_i64 minMag exact 2A9455AC 0000000000000000 01
+f32_to_i64 minMag exact 3F00000A 0000000000000000 01
+f32_to_i64 minMag exact 5100FFF0 000000080FFF0000 00
+f32_to_i64 minMag exact DA7EEFFF FFC0440040000000 00
+f32_to_i64 minMag exact 80FFFFED 0000000000000000 01
+f32_to_i64 minMag exact 4BFFFFFF 0000000001FFFFFE 00
+f32_to_i64 minMag exact DFF384EB 8000000000000000 10
+f32_to_i64 minMag exact 41E00002 000000000000001C 01
+f32_to_i64 minMag exact B4FFDE00 0000000000000000 01
+f32_to_i64 minMag exact BE000000 0000000000000000 01
+f32_to_i64 minMag exact 3FBB6EFD 0000000000000001 01
+f32_to_i64 minMag exact 007FF7FF 0000000000000000 01
+f32_to_i64 minMag exact 7F7FFFFE 7FFFFFFFFFFFFFFF 10
+f32_to_i64 min exact BD800000 FFFFFFFFFFFFFFFF 01
+f32_to_i64 min exact DE000001 DFFFFFC000000000 00
+f32_to_i64 min exact F2F80006 8000000000000000 10
+f32_to_i64 min exact C58FFFDE FFFFFFFFFFFFEE00 01
+f32_to_i64 min exact C08400FF FFFFFFFFFFFFFFFB 01
+f32_to_i64 min exact 5EFFFFFF 7FFFFF8000000000 00
+f32_to_i64 min exact C0000000 FFFFFFFFFFFFFFFE 00
+f32_to_i64 min exact C1000001 FFFFFFFFFFFFFFF7 01
+f32_to_i64 min exact BED56444 FFFFFFFFFFFFFFFF 01
+f32_to_i64 min exact 7F800000 7FFFFFFFFFFFFFFF 10
+f32_to_i64 min exact 41FFFFEB 000000000000001F 01
+f32_to_i64 min exact 340000EF 0000000000000000 01
+f32_to_i64 min exact C0FFFE80 FFFFFFFFFFFFFFF8 01
+f32_to_i64 min exact 5700002F 000080002F000000 00
+f32_to_i64 min exact 33A9D9DB 0000000000000000 01
+f32_to_i64 min exact 7EFFFFFE 7FFFFFFFFFFFFFFF 10
+f32_to_i64 max exact B3800000 0000000000000000 01
+f32_to_i64 max exact DE7FFFFF C000004000000000 00
+f32_to_i64 max exact 7F800001 0000000000000000 10
+f32_to_i64 max exact CE803FEF FFFFFFFFBFE00880 00
+f32_to_i64 max exact CBFFF800 FFFFFFFFFE001000 00
+f32_to_i64 max exact 3FFFFFC2 0000000000000002 01
+f32_to_i64 max exact 41867F7C 0000000000000011 01
+f32_to_i64 max exact 5100FFF0 000000080FFF0000 00
+f32_to_i64 max exact CE000300 FFFFFFFFDFFF4000 00
+f32_to_i64 max exact 3F00007F 0000000000000001 01
+f32_to_i64 max exact BF54EA37 0000000000000000 01
+f32_to_i64 max exact FF7FFFFF 8000000000000000 10
+f32_to_i64 max exact 01000001 0000000000000001 01
+f32_to_i64 max exact A800081E 0000000000000000 01
+f32_to_i64 max exact BF7F9FFE 0000000000000000 01
+f32_to_i64 max exact BEC111F7 0000000000000000 01
+f32_to_i64 near_maxMag exact CE79AEAB FFFFFFFFC1945540 00
+f32_to_i64 near_maxMag exact 39FFFF07 0000000000000000 01
+f32_to_i64 near_maxMag exact 00FFFFFF 0000000000000000 01
+f32_to_i64 near_maxMag exact 7FC00002 0000000000000000 10
+f32_to_i64 near_maxMag exact CE00203F FFFFFFFFDFF7F040 00
+f32_to_i64 near_maxMag exact 4F000000 0000000080000000 00
+f32_to_i64 near_maxMag exact 5F000028 7FFFFFFFFFFFFFFF 10
+f32_to_i64 near_maxMag exact 3F002FFF 0000000000000001 01
+f32_to_i64 near_maxMag exact B3800001 0000000000000000 01
+f32_to_i64 near_maxMag exact FFFFFFFE 0000000000000000 10
+f32_to_i64 near_maxMag exact 41E00002 000000000000001C 01
+f32_to_i64 near_maxMag exact BE8007EF 0000000000000000 01
+f32_to_i64 near_maxMag exact BF800001 FFFFFFFFFFFFFFFF 01
+f32_to_i64 near_maxMag exact B436F03E 0000000000000000 01
+f32_to_i64 near_maxMag exact FFF19F12 0000000000000000 10
+f32_to_i64 near_maxMag exact CEFFFFFF FFFFFFFF80000080 00
+i64_to_f32 near_even exact F801000000100000 DCFFE000 01
+i64_to_f32 near_even exact 000000E96DF1CB41 53696DF2 01
+i64_to_f32 near_even exact FC00200000001FFE DC7FF800 01
+i64_to_f32 near_even exact C000000037FFFFFE DE800000 01
+i64_to_f32 near_even exact 00000000001F75A5 49FBAD28 00
+i64_to_f32 near_even exact 000000000000724A 46E49400 00
+i64_to_f32 near_even exact 0000006375B23F7B 52C6EB64 01
+i64_to_f32 near_even exact 0000000000001B78 45DBC000 00
+i64_to_f32 near_even exact FFFFFFFFFFFFFFF8 C1000000 00
+i64_to_f32 near_even exact F7FFFFE00007FFFF DD000002 01
+i64_to_f32 near_even exact 00000019BA8D5559 51CDD46B 01
+i64_to_f32 near_even exact 0000000003FFFFFF 4C800000 01
+i64_to_f32 near_even exact 0000000000003B5B 466D6C00 00
+i64_to_f32 near_even exact FFFFFFDFFFFFFFFF D2000000 01
+i64_to_f32 near_even exact FFFFFFBFFFFFEFEE D2800000 01
+i64_to_f32 near_even exact C0001FFFFFFFFFFB DE7FFF80 01
+i64_to_f32 minMag exact FFFFFFFFFFFFFEFF C3808000 00
+i64_to_f32 minMag exact FFFFF00000000000 D5800000 00
+i64_to_f32 minMag exact FC00000000003FF6 DC7FFFFF 01
+i64_to_f32 minMag exact 0040000000000000 5A800000 00
+i64_to_f32 minMag exact 0000000000003B5B 466D6C00 00
+i64_to_f32 minMag exact FFFFFFFFFFFFBFFF C6800200 00
+i64_to_f32 minMag exact FF9000000000001D DADFFFFF 01
+i64_to_f32 minMag exact 0000300004000000 56400010 00
+i64_to_f32 minMag exact FFFFFC13FFFFFFFD D47B0000 01
+i64_to_f32 minMag exact FFBFFFFFFFFFFFFF DA800000 01
+i64_to_f32 minMag exact FFFF83FFFFFFFFBE D6F80000 01
+i64_to_f32 minMag exact 200000FFFFFFF800 5E000003 01
+i64_to_f32 minMag exact 0000013EB4D67EC8 539F5A6B 01
+i64_to_f32 minMag exact FFFFFFFEFFFFFFFF CF800000 01
+i64_to_f32 minMag exact 000000000000001E 41F00000 00
+i64_to_f32 minMag exact FFFFFFF9AD105214 D0CA5DF5 01
+i64_to_f32 min exact FFFFFFFFFFFFFFE7 C1C80000 00
+i64_to_f32 min exact 00000037F35EDC1D 525FCD7B 01
+i64_to_f32 min exact 4000000000000000 5E800000 00
+i64_to_f32 min exact 00F03620C1266ED9 5B703620 01
+i64_to_f32 min exact 000000000000007F 42FE0000 00
+i64_to_f32 min exact FFFBFFFFFFFFFFFF D8800001 01
+i64_to_f32 min exact FFFF4E5ADDDAA4A8 D731A523 01
+i64_to_f32 min exact FFFFFFFFFFDFFFFF CA000004 00
+i64_to_f32 min exact FC00000000000000 DC800000 00
+i64_to_f32 min exact 000000001FFFBFFF 4DFFFDFF 01
+i64_to_f32 min exact BFFFDFFFFBFFFFFF DE800041 01
+i64_to_f32 min exact FFFFFBFFFFFE0FFE D4800001 01
+i64_to_f32 min exact FFFFFFFFFD681E78 CC25F862 00
+i64_to_f32 min exact 0000000000008000 47000000 00
+i64_to_f32 min exact FFBFDFFFBFFFFFFF DA804001 01
+i64_to_f32 min exact FFFED156A62AB849 D79754AD 01
+i64_to_f32 max exact FFFFFC0000000000 D4800000 00
+i64_to_f32 max exact 00000000000003FF 447FC000 00
+i64_to_f32 max exact FFFC8C23DA2CEAD8 D85CF709 01
+i64_to_f32 max exact FFFFFFFFFFFFFF7F C3010000 00
+i64_to_f32 max exact FFFFFFFFFEFFFFFF CB800000 01
+i64_to_f32 max exact C0001FFFFFFFFFFB DE7FFF80 01
+i64_to_f32 max exact FBFFFFFFFFFFFFFF DC800000 01
+i64_to_f32 max exact 01E986274F48EAAD 5BF4C314 01
+i64_to_f32 max exact 00000000000000FE 437E0000 00
+i64_to_f32 max exact 0000000000FC1FCA 4B7C1FCA 00
+i64_to_f32 max exact 07FEFFFFFFFFFFEE 5CFFE000 01
+i64_to_f32 max exact FFFFFFFFFFFFBFFF C6800200 00
+i64_to_f32 max exact 0000013EB4D67EC8 539F5A6C 01
+i64_to_f32 max exact FFFFFFDB5433CB9B D212AF30 01
+i64_to_f32 max exact FFFFFFFFEFDEED86 CD810893 01
+i64_to_f32 max exact 0000000000000080 43000000 00
+f32_to_ui64 near_even exact 3D9FF7FF 0000000000000000 01
+f32_to_ui64 near_even exact B100401E 0000000000000000 01
+f32_to_ui64 near_even exact DFFFFFFE 0000000000000000 10
+f32_to_ui64 near_even exact CEFFFF00 0000000000000000 10
+f32_to_ui64 near_even exact 33801FFC 0000000000000000 01
+f32_to_ui64 near_even exact C07FFFFF 0000000000000000 10
+f32_to_ui64 near_even exact 7E87FDFF FFFFFFFFFFFFFFFF 10
+f32_to_ui64 near_even exact B18997A1 0000000000000000 01
+f32_to_ui64 near_even exact FF7FE07E 0000000000000000 10
+f32_to_ui64 near_even exact B8400080 0000000000000000 01
+f32_to_ui64 near_even exact DA5F117A 0000000000000000 10
+f32_to_ui64 near_even exact B50000FD 0000000000000000 01
+f32_to_ui64 near_even exact 41FFFFEB 0000000000000020 01
+f32_to_ui64 near_even exact 3381BFFF 0000000000000000 01
+f32_to_ui64 near_even exact DE0001FC 0000000000000000 10
+f32_to_ui64 near_even exact 41FDFFFB 0000000000000020 01
+f32_to_ui64 minMag exact 3E7BF7FE 0000000000000000 01
+f32_to_ui64 minMag exact B4FFDE00 0000000000000000 01
+f32_to_ui64 minMag exact C8FDFFFB 0000000000000000 10
+f32_to_ui64 minMag exact C1C72FEE 0000000000000000 10
+f32_to_ui64 minMag exact FFFBFDFF 0000000000000000 10
+f32_to_ui64 minMag exact 41000076 0000000000000008 01
+f32_to_ui64 minMag exact CE9FFFDF 0000000000000000 10
+f32_to_ui64 minMag exact F2F80006 0000000000000000 10
+f32_to_ui64 minMag exact 0006274F 0000000000000000 01
+f32_to_ui64 minMag exact BF01FF00 0000000000000000 01
+f32_to_ui64 minMag exact DECF3286 0000000000000000 10
+f32_to_ui64 minMag exact BF807FFB 0000000000000000 10
+f32_to_ui64 minMag exact C0800000 0000000000000000 10
+f32_to_ui64 minMag exact 3381BFFF 0000000000000000 01
+f32_to_ui64 minMag exact B2FFFDBE 0000000000000000 01
+f32_to_ui64 minMag exact 7CFDEFFE FFFFFFFFFFFFFFFF 10
+f32_to_ui64 min exact 8683F7FF 0000000000000000 10
+f32_to_ui64 min exact C07F3FFF 0000000000000000 10
+f32_to_ui64 min exact 41DFF7FF 000000000000001B 01
+f32_to_ui64 min exact DA5F117A 0000000000000000 10
+f32_to_ui64 min exact 5F800000 FFFFFFFFFFFFFFFF 10
+f32_to_ui64 min exact B17FFBFB 0000000000000000 10
+f32_to_ui64 min exact 4F7FC000 00000000FFC00000 00
+f32_to_ui64 min exact 1F7F8008 0000000000000000 01
+f32_to_ui64 min exact BE000081 0000000000000000 10
+f32_to_ui64 min exact 481FEFFF 0000000000027FBF 01
+f32_to_ui64 min exact BF87BFFE 0000000000000000 10
+f32_to_ui64 min exact 7EFFFFFE FFFFFFFFFFFFFFFF 10
+f32_to_ui64 min exact BF54EA37 0000000000000000 10
+f32_to_ui64 min exact 5F7FFFFE FFFFFE0000000000 00
+f32_to_ui64 min exact 3D900008 0000000000000000 01
+f32_to_ui64 min exact C8FDFFFB 0000000000000000 10
+f32_to_ui64 max exact FF800001 0000000000000000 10
+f32_to_ui64 max exact 33800FFC 0000000000000001 01
+f32_to_ui64 max exact 52FFFFF9 0000007FFFFC8000 00
+f32_to_ui64 max exact 7E800000 FFFFFFFFFFFFFFFF 10
+f32_to_ui64 max exact DE00ACFD 0000000000000000 10
+f32_to_ui64 max exact 40DD6229 0000000000000007 01
+f32_to_ui64 max exact 33A9D9DB 0000000000000001 01
+f32_to_ui64 max exact BDC0003F 0000000000000000 01
+f32_to_ui64 max exact BF7FFFFE 0000000000000000 01
+f32_to_ui64 max exact C09FFBFE 0000000000000000 10
+f32_to_ui64 max exact BCB1B7E5 0000000000000000 01
+f32_to_ui64 max exact 4FFFFDFE 00000001FFFBFC00 00
+f32_to_ui64 max exact FF8000EE 0000000000000000 10
+f32_to_ui64 max exact C0FFFBFE 0000000000000000 10
+f32_to_ui64 max exact DA7EEFFF 0000000000000000 10
+f32_to_ui64 max exact C1800000 0000000000000000 10
+f32_to_ui64 near_maxMag exact B5FE0100 0000000000000000 01
+f32_to_ui64 near_maxMag exact DE7FFFFE 0000000000000000 10
+f32_to_ui64 near_maxMag exact BC1D9886 0000000000000000 01
+f32_to_ui64 near_maxMag exact 3F800001 0000000000000001 01
+f32_to_ui64 near_maxMag exact 9E7BFFF7 0000000000000000 01
+f32_to_ui64 near_maxMag exact C09FFBFE 0000000000000000 10
+f32_to_ui64 near_maxMag exact 0167FFFF 0000000000000000 01
+f32_to_ui64 near_maxMag exact BE7FBFFF 0000000000000000 01
+f32_to_ui64 near_maxMag exact 4FFFFFFF 00000001FFFFFE00 00
+f32_to_ui64 near_maxMag exact DFF384EB 0000000000000000 10
+f32_to_ui64 near_maxMag exact 41E00002 000000000000001C 01
+f32_to_ui64 near_maxMag exact FEFFFF7E 0000000000000000 10
+f32_to_ui64 near_maxMag exact AB1C89BB 0000000000000000 01
+f32_to_ui64 near_maxMag exact 8D7F9FFE 0000000000000000 01
+f32_to_ui64 near_maxMag exact DE800001 0000000000000000 10
+f32_to_ui64 near_maxMag exact 33800001 0000000000000000 01
+ui64_to_f32 near_even exact 000000001040FFFE 4D820800 01
+ui64_to_f32 near_even exact FC00000000000000 5F7C0000 00
+ui64_to_f32 near_even exact 0000000040000000 4E800000 00
+ui64_to_f32 near_even exact 0000000408000002 50810000 01
+ui64_to_f32 near_even exact 000000E775887420 53677588 01
+ui64_to_f32 near_even exact 00000000000000B3 43330000 00
+ui64_to_f32 near_even exact FFFFFBFFFFF8003E 5F7FFFFC 01
+ui64_to_f32 near_even exact 00000000000ABB02 492BB020 00
+ui64_to_f32 near_even exact 0A579475948F0032 5D257947 01
+ui64_to_f32 near_even exact 0003FFF00000000F 587FFC00 01
+ui64_to_f32 near_even exact 000000369E75DF01 525A79D7 01
+ui64_to_f32 near_even exact 000000003FFFFFFD 4E800000 01
+ui64_to_f32 near_even exact FFFE000007FFEFFD 5F7FFE00 01
+ui64_to_f32 near_even exact 0400000000000000 5C800000 00
+ui64_to_f32 near_even exact 00000001FFFFFFFF 50000000 01
+ui64_to_f32 near_even exact 4080000000FFFFFF 5E810000 01
+ui64_to_f32 minMag exact 0000000000000002 40000000 00
+ui64_to_f32 minMag exact FFFFFFFFEFFFFFFF 5F7FFFFF 01
+ui64_to_f32 minMag exact 0000000000A13FF1 4B213FF1 00
+ui64_to_f32 minMag exact FFFFFFFF7FFFFFFF 5F7FFFFF 01
+ui64_to_f32 minMag exact 000080400000003F 57004000 01
+ui64_to_f32 minMag exact 0000000000000001 3F800000 00
+ui64_to_f32 minMag exact 0000000408000002 50810000 01
+ui64_to_f32 minMag exact 0001000000000000 57800000 00
+ui64_to_f32 minMag exact FFFFFFFC00000000 5F7FFFFF 01
+ui64_to_f32 minMag exact 0000200000000000 56000000 00
+ui64_to_f32 minMag exact 00001FFFFFFFFFFF 55FFFFFF 01
+ui64_to_f32 minMag exact 00004E5ADDDAA4A8 569CB5BB 01
+ui64_to_f32 minMag exact FFFFFFFFFFC00000 5F7FFFFF 01
+ui64_to_f32 minMag exact 000000000FDEED86 4D7DEED8 01
+ui64_to_f32 minMag exact 0000B84C2D8BC9CB 57384C2D 01
+ui64_to_f32 minMag exact FF800000004001FF 5F7F8000 01
+ui64_to_f32 min exact 02000007FF7FFFFF 5C000001 01
+ui64_to_f32 min exact 0000D156A62AB849 575156A6 01
+ui64_to_f32 min exact 000274E35A70CD76 581D38D6 01
+ui64_to_f32 min exact 0000001004FFFFFD 518027FF 01
+ui64_to_f32 min exact 0007AA3F2BDACC89 58F547E5 01
+ui64_to_f32 min exact 00000000FFFFFFFF 4F7FFFFF 01
+ui64_to_f32 min exact FFFFFFFFFFEFFFFF 5F7FFFFF 01
+ui64_to_f32 min exact 0716EA43FAC45C97 5CE2DD48 01
+ui64_to_f32 min exact 00001004000FFFFE 55802000 01
+ui64_to_f32 min exact FFFFFFFFFFFCFFF9 5F7FFFFF 01
+ui64_to_f32 min exact 00004800007FFFFD 56900000 01
+ui64_to_f32 min exact FFFF00000BFFFFFD 5F7FFF00 01
+ui64_to_f32 min exact FFFFFF8000000000 5F7FFFFF 01
+ui64_to_f32 min exact FD00000008000000 5F7D0000 01
+ui64_to_f32 min exact FFFFFFFFFFFFFF7F 5F7FFFFF 01
+ui64_to_f32 min exact 000000E775887420 53677588 01
+ui64_to_f32 max exact 3FFF03FFFFFFFFFE 5E7FFC10 01
+ui64_to_f32 max exact FFEFFFFFFFFFFFFE 5F7FF000 01
+ui64_to_f32 max exact BFFF7FFFFFFFFE00 5F3FFF80 01
+ui64_to_f32 max exact FFFFFFFFFFFEE7FF 5F800000 01
+ui64_to_f32 max exact 00B087C6B9FE7FE0 5B3087C7 01
+ui64_to_f32 max exact FFFFFFF800000000 5F800000 01
+ui64_to_f32 max exact DFFFFFE00000001E 5F600000 01
+ui64_to_f32 max exact 0048000000100000 5A900001 01
+ui64_to_f32 max exact 00000000000801FE 49001FE0 00
+ui64_to_f32 max exact FFFFFFFFFF7FFE40 5F800000 01
+ui64_to_f32 max exact FFFFFFFFFFFFF887 5F800000 01
+ui64_to_f32 max exact 0000000000328622 4A4A1888 00
+ui64_to_f32 max exact 00000000013354EA 4B99AA75 00
+ui64_to_f32 max exact 04000003FFFFFFF6 5C800001 01
+ui64_to_f32 max exact FF00000000000000 5F7F0000 00
+ui64_to_f32 max exact FFFFFFFFF7FFFFFF 5F800000 01
+f64_add near_even exact 2510000000000700 BFF00004000007FE BFF00004000007FE 01
+f64_add near_even exact E4900001F7FFFFFF C34FFFFFFFFFFFFF E4900001F7FFFFFF 01
+f64_add near_even exact 4010000000000001 47EF0003FFFFFFFF 47EF0003FFFFFFFF 01
+f64_add near_even exact FFE0000000000000 C1F00000000F0000 FFE0000000000000 01
+f64_add near_even exact C0000000001BFFFF C34FFFFFF7FFE000 C34FFFFFF7FFE001 01
+f64_add near_even exact 43D00003FFFFFFFC 41D3FFFFE0000000 43D000040013FFFC 01
+f64_add near_even exact 3FC39E7CA3AD2538 C03FFF7FFFFFFFE0 C03FD84306B8A596 01
+f64_add near_even exact C7E000000000011E 41AFFFFFFF00FFFF C7E000000000011E 01
+f64_add near_even exact 4FCFFFFFFFFFFBBF 403FFFFF00007FFF 4FCFFFFFFFFFFBBF 01
+f64_add near_even exact 4000000007FFFFFE 43D0008000000007 43D0008000000007 01
+f64_add near_even exact BFFF80007FFFFFFF 0010000000000001 BFFF80007FFFFFFF 01
+f64_add near_even exact C010000000000000 C1E007FFFFFFFEFF C1E00800007FFEFF 00
+f64_add near_even exact BFD6B6A0F68860A3 6FCFFFFDFFFDFFFF 6FCFFFFDFFFDFFFF 01
+f64_add near_even exact 42F211DAA0C7F91D C02FF7E000000000 42F211DAA0C7F81D 01
+f64_add near_even exact 3CAFFFFFFFFFFFFE BFE0000000000000 BFDFFFFFFFFFFFFC 01
+f64_add near_even exact 3FF000FBFFFFFFFE C3E007FFFDFFFFFE C3E007FFFDFFFFFE 01
+f64_add minMag exact 002000000000E000 8001F7C19E4201CB 001E083E61BFBE35 00
+f64_add minMag exact 95DD921E21FAA338 3FDFFFFFFF000000 3FDFFFFFFEFFFFFF 01
+f64_add minMag exact 39CFFFC00000FFFE E9A1BF6F325A5236 E9A1BF6F325A5235 01
+f64_add minMag exact C1DFE0FFFFFFFFFE 43DFFFFFFC7FFFFF 43DFFFFFFC601EFF 01
+f64_add minMag exact C340000000000000 3CA0000000000001 C33FFFFFFFFFFFFF 01
+f64_add minMag exact C00FFFFFFFFFFFFE BFFFFFFFFFFFFFFF C017FFFFFFFFFFFE 01
+f64_add minMag exact C0D020000007FFFF 43C13FFFFFFFFFFF 43C13FFFFFFFFFDE 01
+f64_add minMag exact 0023A28EA4B08B72 C1C31C488D26DA51 C1C31C488D26DA50 01
+f64_add minMag exact C02000000043FFFF 401FFFFFFFFFFFFE BE41000000000000 00
+f64_add minMag exact 3FE0000000000000 BFE0000000000000 0000000000000000 00
+f64_add minMag exact BFD7B882C49637EB 524C911D9F676DBA 524C911D9F676DB9 01
+f64_add minMag exact BFE0000000000001 802D8F2734DDC4E3 BFE0000000000001 01
+f64_add minMag exact 393FFF0000000007 400FFFFFFFFFFFFE 400FFFFFFFFFFFFE 01
+f64_add minMag exact 43C000001FFFFFEF FFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF 00
+f64_add minMag exact 001FF00000400000 C32000000207FFFE C32000000207FFFD 01
+f64_add minMag exact C340000000000001 000FFFFFFFFFFFFE C340000000000000 01
+f64_add min exact BCA0000000000001 801FFFFFFFFFFFFE BCA0000000000002 01
+f64_add min exact BCAFFDFFFDFFFFFF C02D38441ACDFCD7 C02D38441ACDFCD8 01
+f64_add min exact 3FD0000000000000 7FFFFFFFFFFFFFFF 7FFFFFFFFFFFFFFF 00
+f64_add min exact C7E004000001FFFE 3CAFFFFFFF9FFFFF C7E004000001FFFE 01
+f64_add min exact 3FDFFFFFFFFFFFFE 40D0FFF7FFFFFFFF 40D10017FFFFFFFE 01
+f64_add min exact B50FFFFFC000001F 3FB0103FFFFFFFFE 3FB0103FFFFFFFFD 01
+f64_add min exact FFE0000000000000 0010000000000000 FFE0000000000000 01
+f64_add min exact FFF0000000000001 3CA0200000000001 FFF8000000000001 10
+f64_add min exact 37FFFFFFFFFFFFFF C6F1BDD22CE99BE5 C6F1BDD22CE99BE5 01
+f64_add min exact 4000000000000000 FFEFFFFFFFFFFFFF FFEFFFFFFFFFFFFF 01
+f64_add min exact BFF0003FFFBFFFFE C630001FFDFFFFFF C630001FFE000000 01
+f64_add min exact C03000003FFF0000 400FFFFFFFFFFFFE C02800007FFE0001 01
+f64_add min exact CB1000001FFBFFFE C3DFFF0000001FFF CB1000001FFBFFFF 01
+f64_add min exact B7FFFF7FBFFFFFFF 37E4B323331E1C06 B7F5A5EE2670F1FC 00
+f64_add min exact 3C90000FFFFFFFDE BFBFFFC0000007FF BFBFFFC0000007FB 01
+f64_add min exact 401FFFFFFFFFFFFE C7F010000003FFFF C7F010000003FFFF 01
+f64_add max exact BCAFFFFFFFFFFFFE 3FC080FFFFFFFFFE 3FC080FFFFFFFFF7 01
+f64_add max exact 8000000000000001 BFFFFFFFFFFFFFFF BFFFFFFFFFFFFFFF 01
+f64_add max exact 400FFFFFFFFFFFFE D21047FFFFFFFFFE D21047FFFFFFFFFD 01
+f64_add max exact 3CAFFFFFFFFFFFFF 8000000000000001 3CAFFFFFFFFFFFFF 01
+f64_add max exact 3FD1F7FFFFFFFFFF C01000001DFFFFFF C00DC1003BFFFFFE 01
+f64_add max exact B80100000003FFFF C70FFFFFFFFFFFFF C70FFFFFFFFFFFFF 01
+f64_add max exact 402001FFFFFE0000 000242FFFDBFF007 402001FFFFFE0001 01
+f64_add max exact BF9FFF0000000FFF A16001000000001E BF9FFF0000000FFF 01
+f64_add max exact 8010000000000000 BFF0000000000000 BFF0000000000000 01
+f64_add max exact 5054C5A128FA4B0F C07FFC000000001F 5054C5A128FA4B0F 01
+f64_add max exact 3CAFF82000000000 D64000FFFFFFFFFD D64000FFFFFFFFFC 01
+f64_add max exact 41C0000000008002 BFF0000000000001 41BFFFFFFF010004 01
+f64_add max exact 7E60400001000000 C08FFFFF1FFFFFFF 7E60400001000000 01
+f64_add max exact BFFFFFFFFFFFFFFE BADFFFF0003FFFFE BFFFFFFFFFFFFFFE 01
+f64_add max exact CA9FFE00003FFFFE 403FFFFFE0010000 CA9FFE00003FFFFD 01
+f64_add max exact BFE0000000000001 801FFFFFFFFFFFFF BFE0000000000001 01
+f64_sub near_even exact C00FFFFBFFFFBFFF BFBA1330F8385158 C00F2F62783DFD74 01
+f64_sub near_even exact C000000000000000 BFDFFFFFFFFFFFFE BFF8000000000000 01
+f64_sub near_even exact 0010000000000000 C34FFFFFFFFFFFFE 434FFFFFFFFFFFFE 01
+f64_sub near_even exact BFD62C9E5374939B BFC0000001000000 BFCC593CA5E92736 00
+f64_sub near_even exact 7FEFFFFFFFFFFFFE C1E0000000000023 7FEFFFFFFFFFFFFE 01
+f64_sub near_even exact 0000000000000000 B7F00083FFFFFFFE 37F00083FFFFFFFE 00
+f64_sub near_even exact C8058F33299E0041 B47FFFDFEFFFFFFE C8058F33299E0041 01
+f64_sub near_even exact 801FFFFFFFFFFFFE 3FEFFFFFFFFFFFFF BFEFFFFFFFFFFFFF 01
+f64_sub near_even exact C1DFFFFFFFFC003E 3220000000000BFE C1DFFFFFFFFC003E 01
+f64_sub near_even exact FFD803FFFFFFFFFF FFD0003FFFFF7FFF FFC0078000010000 00
+f64_sub near_even exact C1C000000040003F 407EC6CA67D752AC C1C00000F676537E 01
+f64_sub near_even exact 3FF0000000000000 B810000000001E00 3FF0000000000000 01
+f64_sub near_even exact 390FFFFFFFFE0006 479800000000007E C79800000000007E 01
+f64_sub near_even exact BF9FFFFBFFDFFFFF 7FD0003FBFFFFFFF FFD0003FBFFFFFFF 01
+f64_sub near_even exact ABB89DB6C4CCB0D7 3FD400003FFFFFFE BFD400003FFFFFFE 01
+f64_sub near_even exact 7AB3AE3CFC6174AD C191000000000200 7AB3AE3CFC6174AD 01
+f64_sub minMag exact 7FE0000000000001 001FFFFFFFFFFFFE 7FE0000000000000 01
+f64_sub minMag exact BCAB2E7EEE00B307 BFD0002000003FFE 3FD0002000003FFA 01
+f64_sub minMag exact 7D1FFFFF8000FFFF 3D6FFFBFC0000000 7D1FFFFF8000FFFE 01
+f64_sub minMag exact 41D2003FFFFFFFFF 480FFFF0FFFFFFFE C80FFFF0FFFFFFFD 01
+f64_sub minMag exact C01FFFC000FFFFFE 91EFFFFF8003FFFE C01FFFC000FFFFFD 01
+f64_sub minMag exact BCA0000000000001 C34FFFFFFFFFFFFE 434FFFFFFFFFFFFD 01
+f64_sub minMag exact 7DC0000008003FFF 3FE03FCC86A93FD5 7DC0000008003FFE 01
+f64_sub minMag exact 3F90000100000008 47EFDFFFFBFFFFFF C7EFDFFFFBFFFFFE 01
+f64_sub minMag exact 3E000000001FFFFF C7E6C45E6D1ECC38 47E6C45E6D1ECC38 01
+f64_sub minMag exact 7FEFFFFFFFFFFFFF C000000000000001 7FEFFFFFFFFFFFFF 01
+f64_sub minMag exact 7FFFFFFFFFFFFFFF BFE0000000000000 7FFFFFFFFFFFFFFF 00
+f64_sub minMag exact 3FDFFFFFFFFFFFFF C3EFFF7FBFFFFFFE 43EFFF7FBFFFFFFE 01
+f64_sub minMag exact 23EFFFFFFFC7FFFF C34FFFC000000000 434FFFC000000000 01
+f64_sub minMag exact 4165EAA0C0C63E9C 7FEFFFFFFFFFFFFE FFEFFFFFFFFFFFFD 01
+f64_sub minMag exact 3FF0000000000000 FFF0000000000000 7FF0000000000000 00
+f64_sub minMag exact B81FFFFFC00FFFFF FFEFFFFFFFFFFFFF 7FEFFFFFFFFFFFFE 01
+f64_sub min exact C3EC93D65BB5996E 0000000000000001 C3EC93D65BB5996F 01
+f64_sub min exact 8010000000000000 000FFFFFFFFFFFFE 801FFFFFFFFFFFFE 00
+f64_sub min exact 43CD2B68215C161B 7FDD658FBD7F6D5E FFDD658FBD7F6D5E 01
+f64_sub min exact BFEFFFFFFFFFFFFF 7FEFFE2000000000 FFEFFE2000000001 01
+f64_sub min exact 381000400000007E B7E780176F1501A2 3812F042EDE2A0B2 01
+f64_sub min exact 4280002FFFFFFFFE 43CFFF80003FFFFE C3CFFF7F003CFFFF 01
+f64_sub min exact 4010000000000001 C2F7FFFFFBFFFFFF 42F7FFFFFC00003F 01
+f64_sub min exact 92CFE03FFFFFFFFF C1E801FFFFFFFFFF 41E801FFFFFFFFFE 01
+f64_sub min exact C020000000800004 43D4A4D3867E8D13 C3D4A4D3867E8D14 01
+f64_sub min exact 43E0000000000082 3DB000003FFFFEFF 43E0000000000081 01
+f64_sub min exact 4F30100007FFFFFF 800C69A86007E6EF 4F30100007FFFFFF 01
+f64_sub min exact BCAFFFFFFFFFFFFE 4010000000000000 C010000000000001 01
+f64_sub min exact 3CAFFFFFFFFFFFFE BF9FFFFFFFEEFFFF 3F9FFFFFFFEF003E 01
+f64_sub min exact BFEFFFFFFFFFFFFE C80FFFE0000007FF 480FFFE0000007FE 01
+f64_sub min exact C22FFFFFFFDF7FFF 3E8862B1FC332F68 C22FFFFFFFDF8000 01
+f64_sub min exact 403FFFFFFDFFFFFE C1F46DF2088BEB33 41F46DF20A8BEB32 01
+f64_sub max exact BFCFFFFEFFFFEFFE 406EFFFFFFFFE000 C06F07FFFFBFDFFB 01
+f64_sub max exact BCA0000000000001 C2600003FEFFFFFF 42600003FEFFFFFF 01
+f64_sub max exact C00000000003FF00 405FF40000000000 C0603A0000000FFC 00
+f64_sub max exact BFC5D5750B9D5AC7 400FFFFFFFFFFFFF C010AEABA85CEAD5 01
+f64_sub max exact C1CBDFFFFFFFFFFE 3FEFFFFFFFFFFFFF C1CBE000007FFFFD 01
+f64_sub max exact C01FFFFBFF800000 BEC00000FC000000 C01FFFFB7F7FF820 00
+f64_sub max exact 401FFFFFFFBFF800 4DC676E3F2D7F2B1 CDC676E3F2D7F2B0 01
+f64_sub max exact 4020000000100003 000FFFFFFFFFFFFE 4020000000100003 01
+f64_sub max exact 41EFF00000002000 37FFFFFF001FFFFF 41EFF00000002000 01
+f64_sub max exact C11FF0001FFFFFFE FFE0000000000001 7FE0000000000001 01
+f64_sub max exact B7EFFFFF80000007 CB0001000000FFFF 4B0001000000FFFF 01
+f64_sub max exact BE87DCECEBB587DB ACE5A941ABCCB4BD BE87DCECEBB587DA 01
+f64_sub max exact 7FE00FFFF7FFFFFE BFF0000000000000 7FE00FFFF7FFFFFF 01
+f64_sub max exact 3CAFFFFFFFFFFFFF BFB3F92931E0D203 3FB3F92931E0D213 01
+f64_sub max exact FFF0000000000001 3E8FBDFFFFFFFFFF FFF8000000000001 10
+f64_sub max exact 3FFFFFFFFFFFFFFE 47E0000000FFFF80 C7E0000000FFFF7F 01
+f64_mul near_even exact B7E8F94766E4B048 3FD07FFFFF7FFFFF B7C9C111A1540B8D 01
+f64_mul near_even exact 80200001FFFFFFFB 43C000000001FFFE 83F000020001FFF9 01
+f64_mul near_even exact 43FFFFFFFFF8000F FFFCDEB64450ECA0 FFFCDEB64450ECA0 00
+f64_mul near_even exact 7FFFFFFFFFFFFFFE 3FB00000003FFF7F 7FFFFFFFFFFFFFFE 00
+f64_mul near_even exact C01FFFFFFFFFFFFE D31FFFF9FFFFFFFF 534FFFF9FFFFFFFD 01
+f64_mul near_even exact 7FEFFFFFFFFFFFFF BFE0000000000001 FFE0000000000000 01
+f64_mul near_even exact BFEFFFFFFFFFFFFF 7FFFFFFFFFFFFFFE 7FFFFFFFFFFFFFFE 00
+f64_mul near_even exact C0B000020000001E BFD00002001FFFFF 4090000400204021 01
+f64_mul near_even exact B817A2CD6B751605 4008FD98FF590F2B B832756A3A9C4196 01
+f64_mul near_even exact 8000000000000000 97B0400400000000 0000000000000000 00
+f64_mul near_even exact 3B1000001FFFFC00 BE7001FFFF7FFFFE B99002001F83FBFD 01
+f64_mul near_even exact 2C8000080000FFFF F0000000010001FF DC9000080101027E 01
+f64_mul near_even exact C030001000000020 C01FFFFFFFFFFFFF 406000100000001F 01
+f64_mul near_even exact 43FFFFFEFFFFF7FF C34FFFFFFFFFFFFF C75FFFFEFFFFF7FE 01
+f64_mul near_even exact C1DF13481AFD611C B12000003FFFFBFE 330F1348974A79BF 01
+f64_mul near_even exact C11FFFFF7FFFFE00 801FFFFFFFFFFFFE 014FFFFF7FFFFDFE 01
+f64_mul minMag exact C340000000000000 BCA0000000000001 3FF0000000000001 00
+f64_mul minMag exact C000000000000000 BFD0000000000001 3FE0000000000001 00
+f64_mul minMag exact 3FEFFFFFFFFFFFFF 434FFFFFFFFFFFFE 434FFFFFFFFFFFFD 01
+f64_mul minMag exact 801FFFFFFFFFFFFE BFE0000000000001 000FFFFFFFFFFFFF 03
+f64_mul minMag exact BF9000FFFFFFBFFF 4DEC9755FC0D649C CD8C991F716CB313 01
+f64_mul minMag exact B8158B7B98C3C4CD B7EBEAC95470BE7A 3012CBC3CDACAA09 01
+f64_mul minMag exact C1DFFFFFFFE00080 3FA48EDF3623F067 C1948EDF360F61DA 01
+f64_mul minMag exact 43FFBFFFFFFFFBFE 80200000000400FE 842FC0000007EDF6 01
+f64_mul minMag exact 43EBFFEFFFFFFFFF 401FFFFF80003FFF 441BFFEF900077FE 01
+f64_mul minMag exact 3FB1FFFFFBFFFFFE FFE0000000000001 FFA1FFFFFBFFFFFF 01
+f64_mul minMag exact BCAFFFBFFFFFFFF6 41EFFFFFFB7FFFFE BEAFFFBFFB8008F4 01
+f64_mul minMag exact 801FFFFFFFFFFFFF 8000000000000001 0000000000000000 03
+f64_mul minMag exact C1FFE000000000FE 7FF0000000000001 7FF8000000000001 10
+f64_mul minMag exact BFE0000000000000 0010000000000001 8008000000000000 03
+f64_mul minMag exact 3FFFFFFFFFFFFFFE 380000400001FFFF 381000400001FFFD 01
+f64_mul minMag exact BFC0000100000003 C1DBD516561533BF 41ABD51813669925 01
+f64_mul min exact 7FDF7FFFFFFEFFFF 400FFFFFFFFFFFFE 7FEFFFFFFFFFFFFF 05
+f64_mul min exact 405FF7FFF7FFFFFF BCAFFFFFFFFFFFFE BD1FF7FFF7FFFFFE 01
+f64_mul min exact 3F8FF0001FFFFFFF 400FFFFFF7FFFFF6 3FAFF0001803FFED 01
+f64_mul min exact C3FFFFFFFFFFC01F 0022A42A5DA40ED7 8432A42A5DA3E9A1 01
+f64_mul min exact C800000004000020 FFF0000000000000 7FF0000000000000 00
+f64_mul min exact 4000000000000000 BFDFFFFFFFFFFFFE BFEFFFFFFFFFFFFE 00
+f64_mul min exact 43FFFFFE0001FFFE B16080003FFFFFFE B5707FFF380103FD 01
+f64_mul min exact 802FC00000000002 41D0000001FFFFFE 820FC00003F7FFFF 01
+f64_mul min exact 43CF01FFFFFFFFFF 3F8CBA9DF07E4AAE 436BD694AAD9603C 01
+f64_mul min exact 451FF00000000001 001FFFFFFFFFFFFE 054FEFFFFFFFFFFF 01
+f64_mul min exact 4030F7FFFFFFFFFF 43D6D17D41269F54 4418332C569875F8 01
+f64_mul min exact C000000000000000 434FFFFFFFFFFFFE C35FFFFFFFFFFFFE 00
+f64_mul min exact 800FFFFFFFFFFFFF 800FFFFFFFFFFFFE 0000000000000000 03
+f64_mul min exact BFD0000000000001 4030000001FDFFFF C010000001FE0001 01
+f64_mul min exact 403F00000FFFFFFE 401FFFDC00000000 406EFFDD2FFFEDFE 01
+f64_mul min exact E45FFFFFFFFFBBFE 401FFFFFFFFFFFFF E48FFFFFFFFFBBFE 01
+f64_mul max exact C3EFFFFFFC000100 38500000000007FB BC4FFFFFFC0010F5 01
+f64_mul max exact 3CA0000000000001 BCAFFFFFFFFFFFFE B95FFFFFFFFFFFFF 01
+f64_mul max exact ED60040002000000 C058000000000200 6DC8060003000201 01
+f64_mul max exact FFE080003FFFFFFF 47EC00000007FFFF FFEFFFFFFFFFFFFF 05
+f64_mul max exact 4070000000800000 B7F2ECC707E2870B B872ECC70879ED43 01
+f64_mul max exact 43300000007FFFFC 7FEFFFFFFFFFFFFE 7FF0000000000000 05
+f64_mul max exact 4340000000000000 434FFFFFFFFFFFFF 469FFFFFFFFFFFFF 00
+f64_mul max exact 41DFFFFFF3FFFFFF 3FA3FFFFFFFDFFFE 4193FFFFF87DFFFE 01
+f64_mul max exact 37EFFFE000000000 4010000000000001 380FFFE000000002 01
+f64_mul max exact A6D00000800FFFFE 7FE0200000007FFF E6C0200081109FFD 01
+f64_mul max exact 43EFFFFFFFFFF007 C1EEFFFFDFFFFFFF C5EEFFFFDFFFF085 01
+f64_mul max exact C06181D1F227C2B6 802FFFFFBFFFF7FF 00A181D1CF241A71 01
+f64_mul max exact FFF0000000000001 39DEFFFFFFFFFFBF FFF8000000000001 10
+f64_mul max exact BFD001000001FFFF B7E000000004003F 37C001000006007F 01
+f64_mul max exact C8096986C3A608FA 41C68D047FEB5603 C9E1E8893316C454 01
+f64_mul max exact C3D1000000000010 FFFFFEFFFFFFFFC0 FFFFFEFFFFFFFFC0 00
+f64_div near_even exact 3CA003FFFFDFFFFF C01F7FFBFFFFFFFE BC704516620AF822 01
+f64_div near_even exact C08FFFFFFFFFFCFF 407000001000FFFE C00FFFFFDFFDFD23 01
+f64_div near_even exact 40E0000080000006 C340000000000000 BD90000080000006 00
+f64_div near_even exact C5A0008007FFFFFF 001FFFFFFFFFFFFF FFF0000000000000 05
+f64_div near_even exact C7F8000000100000 0010000000000001 FFF0000000000000 05
+f64_div near_even exact 3BDDD6CD1EACF35D BCAFFFFFFFFFFFFF BF1DD6CD1EACF35E 01
+f64_div near_even exact 40FBFFFFFFC00000 BCAFFFFFFFFFFFFF C43BFFFFFFC00001 01
+f64_div near_even exact 437BFE0000000000 7FFFFFFFFFFFFFFF 7FFFFFFFFFFFFFFF 00
+f64_div near_even exact 0010000000000000 FFEFFFF800007FFF 8000000000000000 03
+f64_div near_even exact C0100000006FFFFF 0010000000000001 FFF0000000000000 05
+f64_div near_even exact C76AAFA40B87B9DB EAFFFFFDFFBFFFFF 1C5AAFA5B6B77493 01
+f64_div near_even exact C00FFFFFFFFFFFFF 7107FFBFFFFFFFFF 8EF5558E397B43F4 01
+f64_div near_even exact C1C9C226FA3D15B4 B7F0018000000000 49C9BFBD0085093B 01
+f64_div near_even exact BFFFFFFFFFFFFFFF 7FEFFFFFFF7FFFBE 8008000000200010 03
+f64_div near_even exact 43E003FFFFFFFFFE E7CBE4865F5E4FA4 9C025FBE6C7F0528 01
+f64_div near_even exact 000FFFFFFFFFFFFF FFEFFFFFFFFFFFFE 8000000000000000 03
+f64_div minMag exact C77EFFF800000000 408F8000000000FE C6DF7DEFBEFBEEC1 01
+f64_div minMag exact BFEFFFFFFFFFFFFE C01FFFFFFFFFFFFF 3FBFFFFFFFFFFFFE 01
+f64_div minMag exact CD100100000FFFFF 381FFFFFFFFFFFFF D4E00100000FFFFF 01
+f64_div minMag exact 4061000000000800 7FE0011FFFFFFFFF 0070FECE158284D3 01
+f64_div minMag exact 3FC010000001FFFF 800000000006FFFF FFEFFFFFFFFFFFFF 05
+f64_div minMag exact B7FD972D16FC94D9 410FFFFFFF7FFFFF B6DD972D1772F18E 01
+f64_div minMag exact 8010000000000000 C0A0004008000000 000001FFF7FF2007 03
+f64_div minMag exact B7F0000000400020 3FD0000000000001 B81000000040001E 01
+f64_div minMag exact 2130E6DA46B69E7F C1F0000003FBFFFE 9F30E6DA428121A7 01
+f64_div minMag exact 3FD0000000007EFF BF16F58CA3B61A5B C0A64CEA56352AA0 01
+f64_div minMag exact BFEFFFFFFFFFFFFE 43CD11B899D611D6 BC119CF613F0BAEB 01
+f64_div minMag exact C7E0000040020000 7A89618EBF56E2B7 8D442C2977F5BF87 01
+f64_div minMag exact 7FFFFFFFC001FFFE 3CA0000400000100 7FFFFFFFC001FFFE 00
+f64_div minMag exact C037FFFFFFFFFFFC C733FF8000000000 38F333AE178D6385 01
+f64_div minMag exact 4340000000000000 2E8FFBFFFFFFFF00 54A0020040080180 01
+f64_div minMag exact BCAFFFFFFFFFFFFF 380FFFFDFFDFFFFF C490000100101002 01
+f64_div min exact FFEFFFFFFFFFFFFE 64FFFE0000000002 DAE001001001000F 01
+f64_div min exact 3EB07FFFFFFFFC00 438FFFE0000000FE 3B10801080107B8D 01
+f64_div min exact FFEFFFFFFFFFFFFE B7FFE00000007FFF 7FEFFFFFFFFFFFFF 05
+f64_div min exact 801FFFFFFC0007FE 8E92BFB8E924B93D 317B4EE93B085180 01
+f64_div min exact BF400000001E0000 3FD00000000FFFF7 BF600000000E0009 01
+f64_div min exact BF9000000000004E BCA0000000000000 42E000000000004E 00
+f64_div min exact 3F46274D043814A5 C350100000000010 BBE6113BC86FA4EB 01
+f64_div min exact 001FFFFFFFFFFFFF 000FFFFFFFFFFFFF 4000000000000000 01
+f64_div min exact 48AFFC0000003FFF 4000000000FFFFFF 489FFBFFFE008001 01
+f64_div min exact BFF0000000000000 BFF0000000000001 3FEFFFFFFFFFFFFE 01
+f64_div min exact 899FFFFFEFFFFFDE 9951E58D13C5EDC3 303C9BD08DBE8F2A 01
+f64_div min exact C680002000003FFF BFE0000000000000 4690002000003FFF 00
+f64_div min exact FFED896CB2D57752 BFDFFFFFFFFFFFFE 7FEFFFFFFFFFFFFF 05
+f64_div min exact 777003E000000000 BFFFFFFFFFFFFFFE F76003E000000002 01
+f64_div min exact 401FFFFFFFFFFFFF 401FFFFFFFFFFFFF 3FF0000000000000 00
+f64_div min exact C34FFFFFFFFFFFFE C34FFFFFFFFFF7DE 3FF0000000000410 01
+f64_div max exact FFEFFFFFFFFFFFFF BFEFFFFFFFFFFFFE 7FF0000000000000 05
+f64_div max exact FFFFFFFFE00001FF 0000000000000001 FFFFFFFFE00001FF 00
+f64_div max exact A20C00000000FFFE C29F7FFFFC000000 1F5C71C7200F76BD 01
+f64_div max exact 7FDFF5E450FA61C6 3FB362281468CBAC 7FF0000000000000 05
+f64_div max exact BFFFFFFFFFFFFFFF 499FFFFFF7FF0000 B650000004008000 01
+f64_div max exact 40007FFFFFFFFFC0 000FFFFFFFFFFFFE 7FE07FFFFFFFFFC3 01
+f64_div max exact C00366A90A4F7067 C3C26B864CAD9852 3C30DA243CB0F328 01
+f64_div max exact 7FDB27BE98C22EBC C1EFFFFFEF000000 FDDB27BEA72F4C04 01
+f64_div max exact CB1FFFF000020000 4321000000000040 C7EE1E0F0F10F07F 01
+f64_div max exact 801FFFFFFFFFFFFF 3F6F00000007FFFF 80A08421083DCD62 01
+f64_div max exact BFD0000000000000 BF83FFFFFFFFFFFE 403999999999999D 01
+f64_div max exact C38011FFFFFFFFFF 3A60000000220000 C91011FFFFDDD9BF 01
+f64_div max exact C3EF7FFFFFFFFFFE 4800003FFFFFFDFF BBDF7F8201F7FC0F 01
+f64_div max exact FFE03FFFFFFEFFFF C34FFFFFFFEFFFFE 7C80400000072001 01
+f64_div max exact C020000020000200 C4F000000005FFFF 3B2000001FFA0201 01
+f64_div max exact C04FFFFFFF7BFFFF 3F8001FFFFF7FFFF C0BFFC007F7C0E7F 01
+f64_sqrt near_even exact 41C0000000000000 40D6A09E667F3BCD 01
+f64_sqrt near_even exact 3F9080000007FFFF 3FC03F81F63AA869 01
+f64_sqrt near_even exact 0000000000000000 0000000000000000 00
+f64_sqrt near_even exact 3F500000000000FA 3FA000000000007D 01
+f64_sqrt near_even exact 3FE0000000000000 3FE6A09E667F3BCD 01
+f64_sqrt near_even exact BFBFFFC001000000 7FF8000000000000 10
+f64_sqrt near_even exact 40EFDEFFFFFFFFFF 406FEF7BBCCD110F 01
+f64_sqrt near_even exact 403A793CFB1E2471 401494BC23F37F6D 01
+f64_sqrt near_even exact 000FFFFFFFFFFFFF 1FFFFFFFFFFFFFFF 01
+f64_sqrt near_even exact 3807FFFFFFFFFDFF 3BFBB67AE8584B82 01
+f64_sqrt near_even exact C3C0000000000001 7FF8000000000000 10
+f64_sqrt near_even exact C02FFFFFFEFFFEFF 7FF8000000000000 10
+f64_sqrt near_even exact 44D1DAC2A47AE323 4260E6DF9DA87B41 01
+f64_sqrt near_even exact C0000000011FFFFF 7FF8000000000000 10
+f64_sqrt near_even exact C800000000000000 7FF8000000000000 10
+f64_sqrt near_even exact 4010000000000000 4000000000000000 00
+f64_sqrt minMag exact 353437F613F7E662 3A91FC6D035DB50D 01
+f64_sqrt minMag exact C3D00BFFFFFFFFFE 7FF8000000000000 10
+f64_sqrt minMag exact B7EFFFFFFFFFFFFF 7FF8000000000000 10
+f64_sqrt minMag exact 3FFFFFFFFFFFFFFE 3FF6A09E667F3BCB 01
+f64_sqrt minMag exact 43C0000000000001 41D6A09E667F3BCD 01
+f64_sqrt minMag exact BEC09901B9B2A079 7FF8000000000000 10
+f64_sqrt minMag exact 41FFFFFFFFFFFFFF 40F6A09E667F3BCC 01
+f64_sqrt minMag exact C3C567A7FB6402C6 7FF8000000000000 10
+f64_sqrt minMag exact 7FE0000000000000 5FE6A09E667F3BCC 01
+f64_sqrt minMag exact 434FFFFFFFFE7FFE 419FFFFFFFFF3FFE 01
+f64_sqrt minMag exact C3D00007FFFFFEFF 7FF8000000000000 10
+f64_sqrt minMag exact 000FFFFFFFFFFFFE 1FFFFFFFFFFFFFFD 01
+f64_sqrt minMag exact 40EFDEFFFFFFFFFF 406FEF7BBCCD110F 01
+f64_sqrt minMag exact BFC00000001FFFEE 7FF8000000000000 10
+f64_sqrt minMag exact BBEFFFEFFFFFFDFF 7FF8000000000000 10
+f64_sqrt minMag exact 0010000000000001 2000000000000000 01
+f64_sqrt min exact C3DFFFFFFFFFFFFF 7FF8000000000000 10
+f64_sqrt min exact 47EFFF0008000000 43EFFF8003000C00 01
+f64_sqrt min exact 434000080000003E 4196A0A40EA62093 01
+f64_sqrt min exact C02FFFFFFEFFFEFF 7FF8000000000000 10
+f64_sqrt min exact BFD000003FFFBFFF 7FF8000000000000 10
+f64_sqrt min exact BBEFFFEFFFFFFDFF 7FF8000000000000 10
+f64_sqrt min exact C02FFFFFFFFFFFFF 7FF8000000000000 10
+f64_sqrt min exact 3AA002007FFFFFFF 3D46A208BF92DAC8 01
+f64_sqrt min exact C01F01D4D299B191 7FF8000000000000 10
+f64_sqrt min exact 3CBFFFFFFFE00FFE 3E56A09E6673F124 01
+f64_sqrt min exact C3DFFFFF7FFFFE00 7FF8000000000000 10
+f64_sqrt min exact C00FFFBF7FFFFFFF 7FF8000000000000 10
+f64_sqrt min exact C0114A0730D7F7A8 7FF8000000000000 10
+f64_sqrt min exact 80200007F7FFFFFF 7FF8000000000000 10
+f64_sqrt min exact 3CEEC111F7D2AF02 3E6F5EF3BA279424 01
+f64_sqrt min exact 37EFFFFFFFFFFFFE 3BEFFFFFFFFFFFFE 01
+f64_sqrt max exact 7FFFF8003FFFFFFF 7FFFF8003FFFFFFF 00
+f64_sqrt max exact FFEFFFFFFFFFFFFF 7FF8000000000000 10
+f64_sqrt max exact 3810003FFDFFFFFF 3C00001FFEE00240 01
+f64_sqrt max exact 5BE00000FFFFFFBF 4DE6A09F1B842BFF 01
+f64_sqrt max exact 404FFFFF000007FE 401FFFFF80000300 01
+f64_sqrt max exact C7E10000000000FF 7FF8000000000000 10
+f64_sqrt max exact BFC676F7E5D9E346 7FF8000000000000 10
+f64_sqrt max exact BFCFFFFFFFFFFFFF 7FF8000000000000 10
+f64_sqrt max exact C02FFFFFFFFFFF6E 7FF8000000000000 10
+f64_sqrt max exact C3FFFFFDFFFFFFFD 7FF8000000000000 10
+f64_sqrt max exact FFF0000000010000 FFF8000000010000 10
+f64_sqrt max exact B35E061ABC769F3A 7FF8000000000000 10
+f64_sqrt max exact 41CFFFFFFFFFFFFE 40DFFFFFFFFFFFFF 01
+f64_sqrt max exact C03FFFFFFFFFFFFE 7FF8000000000000 10
+f64_sqrt max exact 403B5AB30B28BE12 4014EBA8114F8754 01
+f64_sqrt max exact C01D9EADF45189B8 7FF8000000000000 10
+f64_mulAdd near_even exact 285FFFFF7FF80000 43C0000003FFBFFE 000FFFFFFFFFFFFF 2C2FFFFF87F77FDC 01
+f64_mulAdd near_even exact C1CFFFFFFC00000F 3CAFFFFFFFFFFFFF BFEFFFFFFFFFFFFE BFF000003FFFFFF7 01
+f64_mulAdd near_even exact 239FFFFFBFFF7FFE 41FF7FFFFFFFFFF7 4010000000000000 4010000000000000 01
+f64_mulAdd near_even exact BFC00007FFFFBFFE 7FE0000000000000 FFEFFFFFFFFFFFFF FFF0000000000000 05
+f64_mulAdd near_even exact 3CA0000000000000 801FFFFFFFFFFFFE FFFFFFFFFFFFFFFF FFFFFFFFFFFFFFFF 00
+f64_mulAdd near_even exact 422FFFFC1FFFFFFF 402FFFC004000000 BFB028DEDD8ED92A 426FFFBC2407BD7E 01
+f64_mulAdd near_even exact FFF0000000000001 C3F01000000FFFFF 6F30000401FFFFFF FFF8000000000001 10
+f64_mulAdd near_even exact C000000000000000 43F0000018000000 BFE0020000FFFFFF C400000018000000 01
+f64_mulAdd near_even exact C000000000000001 8D7FFFFFFFFFEFFF C80F8000000003FF C80F8000000003FF 01
+f64_mulAdd near_even exact 001FFFFFFFFFFF1F 000090358B1AFE27 C00FFFFFFFFFFFFF C00FFFFFFFFFFFFF 01
+f64_mulAdd near_even exact 3FDD7A301C1FC0F2 BFEFFFFFEEFFFFFE 4037602C73EDA1C2 4036EA43B3BBC664 01
+f64_mulAdd near_even exact 8010000000000001 BCAFFFFFFFFFFFFF B7FFFFEFE0000000 B7FFFFEFE0000000 01
+f64_mulAdd near_even exact 4340000000000000 BE77E324CC80BC1D 4EC00007FFFFFEFF 4EC00007FFFFFEFF 01
+f64_mulAdd near_even exact BFEFFFFFFFFFFFFF 800FFFFFFFFFFFFE 4020000FFFFFFF80 4020000FFFFFFF80 01
+f64_mulAdd near_even exact 7FFFFFFFFFFFFFFE 7FD7E8DE72C86001 41FFFFFC0007FFFF 7FFFFFFFFFFFFFFE 00
+f64_mulAdd near_even exact 000FFFFFFFFFFFFE 3F401FFFFFFFEFFF FFF0000000000001 FFF8000000000001 10
+f64_mulAdd minMag exact FFF0000000000000 FFF0000000000001 FFF0000000000000 FFF8000000000001 10
+f64_mulAdd minMag exact BFFFFFFFFFFFFFFF DFE00000EFFFFFFE 380FFFFF0000001F 5FF00000EFFFFFFD 01
+f64_mulAdd minMag exact FFF000003FFDFFFF 4001175FA9A1AAC9 401AA3835054485F FFF800003FFDFFFF 10
+f64_mulAdd minMag exact C1C00000FFFFFBFF C37000000007FFFB FFEFFFFFFFFFFFFE FFEFFFFFFFFFFFFD 01
+f64_mulAdd minMag exact BFDFFFFFFFFFFFFF C000000000000000 BCAFFFFFFFFFFFFE 3FEFFFFFFFFFFFFD 01
+f64_mulAdd minMag exact 3FE00000003EFFFF 40AA5F5AEC6935FD C1DFFFFFFFF801FF C1DFFFFE5A025331 01
+f64_mulAdd minMag exact C15B680833C5F44B B81FFF8000000004 402000000100000F 402000000100000F 01
+f64_mulAdd minMag exact AC3FFFFFF1FFFFFF 3FF1FFFFFFFFFF00 BF000000011FFFFF BF000000011FFFFF 01
+f64_mulAdd minMag exact 3FEFBFFFF0000000 40A01FE000000000 BCA0000000000001 409FFF406FE01FFF 01
+f64_mulAdd minMag exact 434FFFFFFFFFFFFE BE8FFFFFFFFFBDFF C3EB46FDCF4EDA24 C3EB46FDCF6EDA23 01
+f64_mulAdd minMag exact BFBFFFFFFF800002 4340000000000001 401FFFFFC00001FF C30FFFFFFF7FFFC4 01
+f64_mulAdd minMag exact C930001F7FFFFFFF BCAFFFFFFFFFFFFE B7E00007FFF7FFFF 45F0001F7FFFFFFD 01
+f64_mulAdd minMag exact C2FFFFFFF000003E 3D007FFFFFF7FFFF 80000001FEFFFFFF C0107FFFF7B8001E 01
+f64_mulAdd minMag exact BFF0000000000001 C3C000000000009F 1B3FC00040000000 43C00000000000A0 01
+f64_mulAdd minMag exact 4010000000000001 FFE0000000000000 401FFFFFFFFFFFFE FFEFFFFFFFFFFFFF 05
+f64_mulAdd minMag exact 41EFFFE00000FFFE BFD2000FFFFFFFFE C017FFFFFFFFF000 C1D1FFFE01708FFD 01
+f64_mulAdd min exact C01FFFFFDE000000 43D00001FFFFBFFF 3F80000100000006 C4000001EEFFBDE0 01
+f64_mulAdd min exact C34FFFFFFFFFFFFF BFBFFFFFF00007FE 3EAFFE000000000E 431FFFFFF00007FD 01
+f64_mulAdd min exact C34FFFFFFFFFFFFF 0010000000000001 BCAFFFFFFFFFFFFF BCB0000000000000 01
+f64_mulAdd min exact 3FF0000000000001 FFEFFFFFFFFFFFFF 000FFFFFFFFFFFFF FFF0000000000000 05
+f64_mulAdd min exact 4010000000000001 3FF0102000000000 BFC0000802000000 400F203F7FE00002 01
+f64_mulAdd min exact 3D4FFFDFFFBFFFFE 43D7C64974217FB4 FFF0000000000000 FFF0000000000000 00
+f64_mulAdd min exact C036C49930F0724B BFD0000000000000 401FFFFFFFFFFFFF 402B624C98783925 00
+f64_mulAdd min exact 381561DB39FC7305 C1F00103FFFFFFFF C34FFEFFFFFFFEFF C34FFEFFFFFFFF00 01
+f64_mulAdd min exact 000FFFFFFFFFFFFE 3CAFFFFFFFFFFFFE B6E419409C584C3C B6E419409C584C3C 01
+f64_mulAdd min exact 3FDFFF001FFFFFFF 7FE0000000000000 0A0FFFEF80000000 7FCFFF001FFFFFFF 01
+f64_mulAdd min exact 263007FF7FFFFFFF FFE800007FFFFFFF FFD174DF7E4655EE FFD174DF7E4655EF 01
+f64_mulAdd min exact 4018000003FFFFFF C340000000000001 7FEFFFFFFFFFFFFF 7FEFFFFFFFFFFFFE 01
+f64_mulAdd min exact 801C374006D246DD 3CA0000000000000 3FBF000000000004 3FBF000000000003 01
+f64_mulAdd min exact 400FFFFFFFFFFFFF 801FFFFFFFFFFFFE 486A4D4703383089 486A4D4703383088 01
+f64_mulAdd min exact C804BED3D7674091 BF507C0000000000 7FFFFFFFFFFFFFFF 7FFFFFFFFFFFFFFF 00
+f64_mulAdd min exact BFDFFFFFFFFFFFFF F7800009FFFFFFFE C01FFFFFFFFFFFFE 77700009FFFFFFFD 01
+f64_mulAdd max exact FFF0000000000001 FFF0000000800002 C1F2412D50F04006 FFF8000000000001 10
+f64_mulAdd max exact 3516EEF1C19BDAD6 001FFFFFFFFFFFFF 7FFFFFFFFF000400 7FFFFFFFFF000400 00
+f64_mulAdd max exact FFEBFFFFFFFFFFFC 41E0004003FFFFFF 3D50020080000000 FFEFFFFFFFFFFFFF 05
+f64_mulAdd max exact C000000000000000 BDBFF00002000000 401FFFFFFFFFFFFF 4020000000007FC0 01
+f64_mulAdd max exact B80AFE2426806D2D BCA0000000000000 BFE0000000000000 BFDFFFFFFFFFFFFF 01
+f64_mulAdd max exact BFD0000000000000 B57000000040007F 3FFFFFFFFFFFFFFF 4000000000000000 01
+f64_mulAdd max exact 3E704003FFFFFFFF 000FFFFFFFFFFFFF 41FFFFFEFFBFFFFF 41FFFFFEFFC00000 01
+f64_mulAdd max exact 000FFFFFFFFFFFBB 7FE0000000000000 3FF0000000000001 4007FFFFFFFFFFBC 01
+f64_mulAdd max exact C220030000000000 DFF956C1EE374D22 400FFFFFFFFFFFFE 62295B823293F781 01
+f64_mulAdd max exact 0007FFFFFF7FFFFE 419FFFFFFFFFC040 43D0001020000000 43D0001020000001 01
+f64_mulAdd max exact 7FF00101FFFFFFFF 3FDFFFFFFFFFFFFF 801FFFFFFFFFFFFF 7FF80101FFFFFFFF 10
+f64_mulAdd max exact BFDFFFFFFFFFFFFF BFE0000000000000 3FD0000000000001 3FE0000000000001 01
+f64_mulAdd max exact BFFFFFFFFFFFFFFF 3140005FFFFFFFFE 0000000000000000 B150005FFFFFFFFD 01
+f64_mulAdd max exact B6902FFFFFFFFFFF C0280D246B4969D3 3FE000004000FFFE 3FE000004000FFFF 01
+f64_mulAdd max exact 4000000000000001 C340000000000000 BCA0000000000001 C350000000000001 01
+f64_mulAdd max exact C010667F781D1A21 4000008000010000 41E003FFEFFFFFFE 41E003FFEEF98FD4 01
+f64_roundToInt near_even exact B80FFFFFFFFE0002 8000000000000000 01
+f64_roundToInt near_even exact BF47FFE000000000 8000000000000000 01
+f64_roundToInt near_even exact BD607FFFFFFFFBFE 8000000000000000 01
+f64_roundToInt near_even exact FFEFFFFFFFFFFFFE FFEFFFFFFFFFFFFE 00
+f64_roundToInt near_even exact 3CD000000043FFFE 0000000000000000 01
+f64_roundToInt near_even exact 8020200007FFFFFE 8000000000000000 01
+f64_roundToInt near_even exact C01F000000080000 C020000000000000 01
+f64_roundToInt near_even exact C1EA1ADF9696CF65 C1EA1ADF96A00000 01
+f64_roundToInt near_even exact BF800003FFFFFFFE 8000000000000000 01
+f64_roundToInt near_even exact BFE2697F4B561495 BFF0000000000000 01
+f64_roundToInt near_even exact 480FFFFFFFFFFFFE 480FFFFFFFFFFFFE 00
+f64_roundToInt near_even exact C03FFFFFFFFFFFFE C040000000000000 01
+f64_roundToInt near_even exact BFCFFFFFFFFFFFFE 8000000000000000 01
+f64_roundToInt near_even exact C3CFFEFFFFFFFFDF C3CFFEFFFFFFFFDF 00
+f64_roundToInt near_even exact 41D0000000000001 41D0000000000000 01
+f64_roundToInt near_even exact 3F43652672B8C04E 0000000000000000 01
+f64_roundToInt minMag exact 3FFFFFFFFFFFFFF9 3FF0000000000000 01
+f64_roundToInt minMag exact 37FFFFFFFFFFFFFF 0000000000000000 01
+f64_roundToInt minMag exact C80FFFFFFFFFFFFE C80FFFFFFFFFFFFE 00
+f64_roundToInt minMag exact 58B00000008003FE 58B00000008003FE 00
+f64_roundToInt minMag exact 41E0000000000004 41E0000000000000 01
+f64_roundToInt minMag exact 7FEFFFFFFFFFFFFE 7FEFFFFFFFFFFFFE 00
+f64_roundToInt minMag exact A83100000007FFFE 8000000000000000 01
+f64_roundToInt minMag exact 39715BAC743E2963 0000000000000000 01
+f64_roundToInt minMag exact 47F0000000000001 47F0000000000001 00
+f64_roundToInt minMag exact 7FE0000000000001 7FE0000000000001 00
+f64_roundToInt minMag exact 800FFFFFFFFFE07E 8000000000000000 01
+f64_roundToInt minMag exact BFC0000000000001 8000000000000000 01
+f64_roundToInt minMag exact C01FFFFFFFEF0000 C01C000000000000 01
+f64_roundToInt minMag exact 8020000000000000 8000000000000000 01
+f64_roundToInt minMag exact ECA000001BFFFFFF ECA000001BFFFFFF 00
+f64_roundToInt minMag exact 47FFFC0000000001 47FFFC0000000001 00
+f64_roundToInt min exact 43C0000000000000 43C0000000000000 00
+f64_roundToInt min exact 3EF0000000000016 0000000000000000 01
+f64_roundToInt min exact 41C0000007FFFFFF 41C0000007800000 01
+f64_roundToInt min exact 800C24D28274E35A BFF0000000000000 01
+f64_roundToInt min exact FFE000010003FFFF FFE000010003FFFF 00
+f64_roundToInt min exact 32EE409A5F3B66FA 0000000000000000 01
+f64_roundToInt min exact 468F7FE000000000 468F7FE000000000 00
+f64_roundToInt min exact C23FF803FFFFFFFF C23FF80400000000 01
+f64_roundToInt min exact 41EFFFFFFFFFFFFF 41EFFFFFFFE00000 01
+f64_roundToInt min exact B5AFFFFFFFF7FFFE BFF0000000000000 01
+f64_roundToInt min exact 43EFFE000FFFFFFF 43EFFE000FFFFFFF 00
+f64_roundToInt min exact B80FFFFFFFFE0002 BFF0000000000000 01
+f64_roundToInt min exact 3FD2000000000200 0000000000000000 01
+f64_roundToInt min exact FFEFFF8000080000 FFEFFF8000080000 00
+f64_roundToInt min exact C7E10000000000FF C7E10000000000FF 00
+f64_roundToInt min exact C7EFFFFFFFFFFFFE C7EFFFFFFFFFFFFE 00
+f64_roundToInt max exact 8010000000000001 8000000000000000 01
+f64_roundToInt max exact C003FFFFFFF80000 C000000000000000 01
+f64_roundToInt max exact C007B8561C35DA43 C000000000000000 01
+f64_roundToInt max exact BFB0010007FFFFFE 8000000000000000 01
+f64_roundToInt max exact BEC52F80F9199EC0 8000000000000000 01
+f64_roundToInt max exact 7FEFFFFFFFFFFFFF 7FEFFFFFFFFFFFFF 00
+f64_roundToInt max exact 0002B5E3A17E484D 3FF0000000000000 01
+f64_roundToInt max exact 3FFFFFFFFFFFFFFE 4000000000000000 01
+f64_roundToInt max exact C1C0007DFFFFFFFF C1C0007DFF800000 01
+f64_roundToInt max exact 41DFFFFFFFFFFFFF 41E0000000000000 01
+f64_roundToInt max exact FFE0000000000001 FFE0000000000001 00
+f64_roundToInt max exact B81FFFFFFFFFFFFF 8000000000000000 01
+f64_roundToInt max exact 37EFFFFBBFFFFFFF 3FF0000000000000 01
+f64_roundToInt max exact C3E0000000000000 C3E0000000000000 00
+f64_roundToInt max exact 27FFFFFFBFFFDFFE 3FF0000000000000 01
+f64_roundToInt max exact 3770000000000107 3FF0000000000000 01
+f64_roundToInt near_even notexact 37F21FFFFFFFFFFE 0000000000000000 00
+f64_roundToInt near_even notexact C870200000010000 C870200000010000 00
+f64_roundToInt near_even notexact C0114A0730D7F7A8 C010000000000000 00
+f64_roundToInt near_even notexact 41DFFFFFFFFFFFFF 41E0000000000000 00
+f64_roundToInt near_even notexact 41EDFFFFFFFFFFFE 41EE000000000000 00
+f64_roundToInt near_even notexact C3E0E4757C2948E7 C3E0E4757C2948E7 00
+f64_roundToInt near_even notexact 47F9106B08704172 47F9106B08704172 00
+f64_roundToInt near_even notexact 7FFFFF0000FFFFFF 7FFFFF0000FFFFFF 00
+f64_roundToInt near_even notexact C3C0000000000001 C3C0000000000001 00
+f64_roundToInt near_even notexact C1CFFFFFFF87FFFF C1CFFFFFFF800000 00
+f64_roundToInt near_even notexact C80C5E05644472E7 C80C5E05644472E7 00
+f64_roundToInt near_even notexact 4000000000000001 4000000000000000 00
+f64_roundToInt near_even notexact 3FDFFC7FFFFFFFFF 0000000000000000 00
+f64_roundToInt near_even notexact B80FFFFFFFFFFFFF 8000000000000000 00
+f64_roundToInt near_even notexact FFF07FFFFFFFBFFF FFF87FFFFFFFBFFF 10
+f64_roundToInt near_even notexact 381001FDFFFFFFFF 0000000000000000 00
+f64_roundToInt minMag notexact 3FC040000000007F 0000000000000000 00
+f64_roundToInt minMag notexact 401CC0BDC0613B09 401C000000000000 00
+f64_roundToInt minMag notexact 0006274F48EAADA0 0000000000000000 00
+f64_roundToInt minMag notexact 3FFFFFFFFFFFFFF9 3FF0000000000000 00
+f64_roundToInt minMag notexact 7FFFFFFFFFFFFFFE 7FFFFFFFFFFFFFFE 00
+f64_roundToInt minMag notexact 480FFFFFFFFFFFFF 480FFFFFFFFFFFFF 00
+f64_roundToInt minMag notexact C1FFFFFFFFFFFFFE C1FFFFFFFFF00000 00
+f64_roundToInt minMag notexact 3FEFFFFFFFFFFFFE 0000000000000000 00
+f64_roundToInt minMag notexact C1EFFFFFFFFFFC02 C1EFFFFFFFE00000 00
+f64_roundToInt minMag notexact F020400000000100 F020400000000100 00
+f64_roundToInt minMag notexact 0002000003FFFFFF 0000000000000000 00
+f64_roundToInt minMag notexact 37EC0C2EA2E8A60D 0000000000000000 00
+f64_roundToInt minMag notexact C3C0000000000001 C3C0000000000001 00
+f64_roundToInt minMag notexact 3FFFFFFFFFFFFFFF 3FF0000000000000 00
+f64_roundToInt minMag notexact 419FFFFFFDFFEFFF 419FFFFFFC000000 00
+f64_roundToInt minMag notexact C3E0E4757C2948E7 C3E0E4757C2948E7 00
+f64_roundToInt min notexact 40200000000005FF 4020000000000000 00
+f64_roundToInt min notexact 380FFFFFFFFFFFFE 0000000000000000 00
+f64_roundToInt min notexact 37FFFFFFFFFFFFFF 0000000000000000 00
+f64_roundToInt min notexact C1EFFFFFFFFFFFFE C1F0000000000000 00
+f64_roundToInt min notexact 380FFFFFFFFFFFFF 0000000000000000 00
+f64_roundToInt min notexact 3FFFFFFFFFFFFFFE 3FF0000000000000 00
+f64_roundToInt min notexact 3E00000040001FFF 0000000000000000 00
+f64_roundToInt min notexact BFF007FFFFFFFFFB C000000000000000 00
+f64_roundToInt min notexact 405E1876CD43DFED 405E000000000000 00
+f64_roundToInt min notexact C1F1FFFFDFFFFFFF C1F1FFFFE0000000 00
+f64_roundToInt min notexact 4004E72FF4F60EE2 4000000000000000 00
+f64_roundToInt min notexact B3F000000FFFFE00 BFF0000000000000 00
+f64_roundToInt min notexact B7F17FFFFFFFFFFF BFF0000000000000 00
+f64_roundToInt min notexact FFEFFFFFFFFFFFFF FFEFFFFFFFFFFFFF 00
+f64_roundToInt min notexact C3F0000000000001 C3F0000000000001 00
+f64_roundToInt min notexact 3E2FFFFFFE007FFF 0000000000000000 00
+f64_roundToInt max notexact 44D1DAC2A47AE323 44D1DAC2A47AE323 00
+f64_roundToInt max notexact 43F0000000BFFFFE 43F0000000BFFFFE 00
+f64_roundToInt max notexact FFE0000000000001 FFE0000000000001 00
+f64_roundToInt max notexact C340097B5E4F0BE0 C340097B5E4F0BE0 00
+f64_roundToInt max notexact C1E40FFFFFFFFFFF C1E40FFFFFE00000 00
+f64_roundToInt max notexact 3FCFFFFFFFFFFFFE 3FF0000000000000 00
+f64_roundToInt max notexact C22000007FFFFFFF C22000007FFE0000 00
+f64_roundToInt max notexact 3CA0000000000001 3FF0000000000000 00
+f64_roundToInt max notexact 41E00000081FFFFF 41E0000008200000 00
+f64_roundToInt max notexact C0200000001FFFFF C020000000000000 00
+f64_roundToInt max notexact 400FFFFFFFFFFFFF 4010000000000000 00
+f64_roundToInt max notexact C030000000000001 C030000000000000 00
+f64_roundToInt max notexact BF0AD596DBF9FFC8 8000000000000000 00
+f64_roundToInt max notexact B81FFFFFFFFFFFFE 8000000000000000 00
+f64_roundToInt max notexact 0020000000000001 3FF0000000000000 00
+f64_roundToInt max notexact 33B002000007FFFF 3FF0000000000000 00
+f64_roundToInt near_maxMag notexact C23FF803FFFFFFFF C23FF80400000000 00
+f64_roundToInt near_maxMag notexact C80E0000001FFFFE C80E0000001FFFFE 00
+f64_roundToInt near_maxMag notexact 39715BAC743E2963 0000000000000000 00
+f64_roundToInt near_maxMag notexact B81FFFFFFDFEFFFF 8000000000000000 00
+f64_roundToInt near_maxMag notexact 8020000000000001 8000000000000000 00
+f64_roundToInt near_maxMag notexact 74CFFFFFFBFF7FFF 74CFFFFFFBFF7FFF 00
+f64_roundToInt near_maxMag notexact 7FFFFFE00000000F 7FFFFFE00000000F 00
+f64_roundToInt near_maxMag notexact 41FFEFFFFFFFFFDF 41FFF00000000000 00
+f64_roundToInt near_maxMag notexact BF74200A147EA166 8000000000000000 00
+f64_roundToInt near_maxMag notexact C3C0000000000001 C3C0000000000001 00
+f64_roundToInt near_maxMag notexact C7EFFFFFFFFFFFFF C7EFFFFFFFFFFFFF 00
+f64_roundToInt near_maxMag notexact C0114A0730D7F7A8 C010000000000000 00
+f64_roundToInt near_maxMag notexact 3FCFFFFFFFFFFFFF 0000000000000000 00
+f64_roundToInt near_maxMag notexact 3CAFFFFFFFFFFFFF 0000000000000000 00
+f64_roundToInt near_maxMag notexact 47EFFFFFFFFFFFFE 47EFFFFFFFFFFFFE 00
+f64_roundToInt near_maxMag notexact 3E2FFFFFFE007FFF 0000000000000000 00
+f64_eq near_even exact C050000003800000 4340000000000000 0 00
+f64_eq near_even exact C1CFFFFFFFBFEFFF BFF0000000000000 0 00
+f64_eq near_even exact EB3800000001FFFF C3EFFFFFFF01FFFF 0 00
+f64_eq near_even exact 41FFFFFFBFFFFF00 4340000000000001 0 00
+f64_eq near_even exact CC2F7FFF7FFFFFFF BFA003FDFFFFFFFE 0 00
+f64_eq near_even exact 43E0001FFFFFFFE0 4030000020000080 0 00
+f64_eq near_even exact BFFFFFFFFFFFFFFF 3CAFFFFFFFFFFFFE 0 00
+f64_eq near_even exact 43DFFFFFFFFFFFEB FFF0000000000001 0 10
+f64_eq near_even exact 8000000000000000 4603FFFFFFEFFFFF 0 00
+f64_eq near_even exact 7FF0000000000000 BCAFEFFFFFFFFFFF 0 00
+f64_eq near_even exact 40023AAAC9D035BD 3FDE14C8E2C9EF2F 0 00
+f64_eq near_even exact BFFFFFFFFFFFFFFE BFAFFFFFFC001FFF 0 00
+f64_eq near_even exact C00FFFFFFFFFFFFE C34FFFFFFFFFFFFE 0 00
+f64_eq near_even exact 3FEFFFFFFFFFFFFE 401FFFFFFFFFFFFF 0 00
+f64_eq near_even exact B80CD293162B1144 38DFFFFFFEFE0000 0 00
+f64_eq near_even exact C03FFFF7FFFFFFFF 47EFFF80FFFFFFFF 0 00
+f64_le near_even exact 4340000000000000 7FF0000000000000 1 00
+f64_le near_even exact C4D1000000000800 B16FC000FFFFFFFF 1 00
+f64_le near_even exact C3DFFFFFFFFBFFF0 3FCB3AE04BED6D56 1 00
+f64_le near_even exact C010000000000001 C340000000000001 0 00
+f64_le near_even exact 3CA0000000000001 BFF0000000000001 0 00
+f64_le near_even exact 4040007FEFFFFFFF C76287BF186A2767 0 00
+f64_le near_even exact 3FFFFFFFFFFFFFFF FFEFFFFFFFFFFFFE 0 00
+f64_le near_even exact 47E0007FFFFF7FFF C010000000000000 0 00
+f64_le near_even exact 3A4E000000000010 400FFFFFEDFFFFFE 1 00
+f64_le near_even exact 3FBDFFFFFFDFFFFF 802DFFFFFBFFFFFF 0 00
+f64_le near_even exact C71A7B838A1D519E C027585E7B56C79F 1 00
+f64_le near_even exact 3F7FFFFFF7FFFFFC C7FF000000003FFF 0 00
+f64_le near_even exact 36CA5AC03A4D9847 BEB798D2BAD9575F 0 00
+f64_le near_even exact 59FFFFFE00000FFE 0000000000000001 0 00
+f64_le near_even exact BDE0000FF7FFFFFF 434FFFFFFFFFFFFF 1 00
+f64_le near_even exact C0095FFAAE004771 BFF0040100000000 1 00
+f64_lt near_even exact 7FF0000000000000 BFDFFFFFFFFFFFFF 0 00
+f64_lt near_even exact 3CA0000000000001 3FC000000FC00000 1 00
+f64_lt near_even exact BDBFFFF0FFFFFFFF C1D9A745F2E6190B 0 00
+f64_lt near_even exact 7FE0000000000001 405261CD49677E7F 0 00
+f64_lt near_even exact 4223FEFFFFFFFFFF 4011FFFFFE000000 0 00
+f64_lt near_even exact FFF0000000000000 3CAFFFFFFFFFFFFE 1 00
+f64_lt near_even exact 41DFA31E27B9CD38 000FFFFFFFFFFFFF 0 00
+f64_lt near_even exact 457FFFFFF0800000 C94819F5AACBEDDB 0 00
+f64_lt near_even exact 4010000000010020 CD40000FFFBFFFFE 0 00
+f64_lt near_even exact C07A0A894921F414 4010000000000001 1 00
+f64_lt near_even exact 0000000000000001 C1DFF7FFFFFFBFFE 0 00
+f64_lt near_even exact C00A5D7160C7E283 BFF0000000000001 1 00
+f64_lt near_even exact 4010001FFFFFFFFE BFA0E855C629ECD2 0 00
+f64_lt near_even exact C1FFFFFFFFF7FFFF FFE0000000120000 0 00
+f64_lt near_even exact 401395A7515BE3D9 8010000000040007 0 00
+f64_lt near_even exact FFF0000000000001 BFD0000000000000 0 10
+f64_eq_signaling near_even exact C03FFFF002000000 0167FFFFFFFEFFFE 0 00
+f64_eq_signaling near_even exact 4340000000000001 3CA0000000000001 0 00
+f64_eq_signaling near_even exact BFEFFFFFFFFFFFFF 3CA0000000000000 0 00
+f64_eq_signaling near_even exact 480001007FFFFFFE 3FAFFFFFFFFBFFF7 0 00
+f64_eq_signaling near_even exact 3FF0000000000000 C3DE040000000000 0 00
+f64_eq_signaling near_even exact 801FFFFDFFFFFDFF 4340000000000001 0 00
+f64_eq_signaling near_even exact 0010000000000001 3FDFFFFFFFFFFFFF 0 00
+f64_eq_signaling near_even exact 3FFFFFFFF7FE0000 C3EFFFFFFE01FFFF 0 00
+f64_eq_signaling near_even exact C8010000003FFFFF 381FFFDFBFFFFFFF 0 00
+f64_eq_signaling near_even exact BFDFFFFE000003FF C02B3E1EB30278E6 0 00
+f64_eq_signaling near_even exact 41D0000007FFFFFF 401FF000003FFFFF 0 00
+f64_eq_signaling near_even exact FFEFFFFFFFFFFFFE C340000000000000 0 00
+f64_eq_signaling near_even exact 3FEFFFFFFFFFFFFE BFE0000000000000 0 00
+f64_eq_signaling near_even exact 801FFFFFFFFFFFFE 3CAFFFFFFFFFFFFF 0 00
+f64_eq_signaling near_even exact C1E000000FDFFFFF C3C00FFFC0000000 0 00
+f64_eq_signaling near_even exact C018000400000000 0025B499F8291ED6 0 00
+f64_le_quiet near_even exact 3FF0000000000000 0000000000000000 0 00
+f64_le_quiet near_even exact 3FEFFFFFFFFFFFFF 802000003FDFFFFF 0 00
+f64_le_quiet near_even exact 3FCFFFC003FFFFFF 442FFFFFF00003FF 1 00
+f64_le_quiet near_even exact 3FF00000000FFFFD 0010000000000000 0 00
+f64_le_quiet near_even exact B3E00040FFFFFFFF 3DCFFFFFFF8003FF 1 00
+f64_le_quiet near_even exact 3FFFFFFFFFFFFFFE C01FFFFFFFFFFFFF 0 00
+f64_le_quiet near_even exact C34FFFFF8000001E BD0D8059D864A5B5 1 00
+f64_le_quiet near_even exact C3E52BC751C39216 BC20000001FFFEFF 1 00
+f64_le_quiet near_even exact 47E0000001000000 BFE0000000000001 0 00
+f64_le_quiet near_even exact 403000001FFFFFDF 43E2D8971B04EB4E 1 00
+f64_le_quiet near_even exact C3FFFFFFFFFFC01F 0022A42A5DA40ED7 1 00
+f64_le_quiet near_even exact C9F000000007DFFF D485C1E235675DC8 0 00
+f64_le_quiet near_even exact C340000000000000 801FFFFFFFFFFFFF 1 00
+f64_le_quiet near_even exact 3EEFFFFF80000020 C01FFFFFFFFFFFFF 0 00
+f64_le_quiet near_even exact 3FDFFFFFFFFFFFFE 800FFFFFFFFFFFFE 0 00
+f64_le_quiet near_even exact 0000000000000001 BFFFFFFFFFFFFFFF 0 00
+f64_lt_quiet near_even exact BFF0000000000000 BFFFF7FFFFEFFFFF 0 00
+f64_lt_quiet near_even exact 4340000000000001 3FEEEEA8A558E9A1 0 00
+f64_lt_quiet near_even exact 41FFFE000001FFFF 800DFB2BC8F25562 0 00
+f64_lt_quiet near_even exact 41E40001FFFFFFFF 43E4D2959B367469 1 00
+f64_lt_quiet near_even exact C34FF7FFFF7FFFFF C7FFE62480D9F50A 0 00
+f64_lt_quiet near_even exact 41B2286DA5A4711D 3FE07C31783E2167 0 00
+f64_lt_quiet near_even exact 388000001FFFFFBE FFE007FFFFFFEFFE 0 00
+f64_lt_quiet near_even exact 7FEFFFFFFFFFFFFE C70CB71B167A4860 0 00
+f64_lt_quiet near_even exact C00FFFFFFFFFFFFE 4010000000000000 1 00
+f64_lt_quiet near_even exact C000000000000000 C000000000000000 0 00
+f64_lt_quiet near_even exact 800FFFFFFFFFFFFF FFE0000000000001 0 00
+f64_lt_quiet near_even exact BFD0000007FFFFF7 3FF0000000000001 1 00
+f64_lt_quiet near_even exact 401FFFFFFFFFFFFE 7FFFFFFFFFFFFFFF 0 00
+f64_lt_quiet near_even exact A720000000000202 3EF01FFFFFC00000 1 00
+f64_lt_quiet near_even exact C80FBFFFFFFFFFEF 4800DF44B224EF92 1 00
+f64_lt_quiet near_even exact 00000000037FFFFF 3CAFFFFFFFFFFFFF 1 00
+f64_to_i32 near_even exact 7FFFF8003FFFFFFF 00000000 10
+f64_to_i32 near_even exact 41C0000000000001 20000000 01
+f64_to_i32 near_even exact 8010000000000000 00000000 01
+f64_to_i32 near_even exact 801FEFFFFFFFF7FF 00000000 01
+f64_to_i32 near_even exact F8D6275431DA5F5A 80000000 10
+f64_to_i32 near_even exact 0002B5E3A17E484D 00000000 01
+f64_to_i32 near_even exact BF9FC40000000000 00000000 01
+f64_to_i32 near_even exact C1D0000000000000 C0000000 00
+f64_to_i32 near_even exact C03FFFFFFFFFFFFF FFFFFFE0 01
+f64_to_i32 near_even exact 381FFFFFFFFFFFFE 00000000 01
+f64_to_i32 near_even exact BFD0FFFEFFFFFFFF 00000000 01
+f64_to_i32 near_even exact ECA000001BFFFFFF 80000000 10
+f64_to_i32 near_even exact 3DB000003FFFFFF7 00000000 01
+f64_to_i32 near_even exact 3FFFFFFFFFFFFFF9 00000002 01
+f64_to_i32 near_even exact 800963AEAC65CBD0 00000000 01
+f64_to_i32 near_even exact 400FFFFFFFFFFFFE 00000004 01
+f64_to_i32 minMag exact 43EFFE000FFFFFFF 7FFFFFFF 10
+f64_to_i32 minMag exact B7F17FFFFFFFFFFF 00000000 01
+f64_to_i32 minMag exact 002FFFFFFFFFFFFE 00000000 01
+f64_to_i32 minMag exact 3FD0F88932487143 00000000 01
+f64_to_i32 minMag exact 402FFFFFFFFFFFFF 0000000F 01
+f64_to_i32 minMag exact 3CD000000043FFFE 00000000 01
+f64_to_i32 minMag exact 0002B5E3A17E484D 00000000 01
+f64_to_i32 minMag exact EE8000020000007F 80000000 10
+f64_to_i32 minMag exact FFF0000000000001 00000000 10
+f64_to_i32 minMag exact 407EFFBFFFFFFFFF 000001EF 01
+f64_to_i32 minMag exact BFD0000000000001 00000000 01
+f64_to_i32 minMag exact 401020007FFFFFFF 00000004 01
+f64_to_i32 minMag exact 44D1DAC2A47AE323 7FFFFFFF 10
+f64_to_i32 minMag exact ED6FFFFFFFFFFFE8 80000000 10
+f64_to_i32 minMag exact 3FEFFFFFFFFFFFFF 00000000 01
+f64_to_i32 minMag exact 47F0000000000000 7FFFFFFF 10
+f64_to_i32 min exact 80200007F7FFFFFF FFFFFFFF 01
+f64_to_i32 min exact C00FFFFFFFFFFFFE FFFFFFFC 01
+f64_to_i32 min exact 2EEDC50618875049 00000000 01
+f64_to_i32 min exact 43D0000000000001 7FFFFFFF 10
+f64_to_i32 min exact 480FFFFFFFFFFFFF 7FFFFFFF 10
+f64_to_i32 min exact C3F000000020003F 80000000 10
+f64_to_i32 min exact CE70000800000001 80000000 10
+f64_to_i32 min exact C1FFFFFFFFFFFFFE 80000000 10
+f64_to_i32 min exact 4020000000000000 00000008 00
+f64_to_i32 min exact 58B00000008003FE 7FFFFFFF 10
+f64_to_i32 min exact BFCFFFE00001FFFE FFFFFFFF 01
+f64_to_i32 min exact C80F48A9D9DBC8C6 80000000 10
+f64_to_i32 min exact C03FFFFFFFFFFFFE FFFFFFE0 01
+f64_to_i32 min exact 403A793CFB1E2471 0000001A 01
+f64_to_i32 min exact 3FD00001F7FFFFFF 00000000 01
+f64_to_i32 min exact 3FDF7CC18997A120 00000000 01
+f64_to_i32 max exact BFBFFFC001000000 00000000 01
+f64_to_i32 max exact BFDFFFFFFFFFFFFE 00000000 01
+f64_to_i32 max exact 43D0000000000000 7FFFFFFF 10
+f64_to_i32 max exact 380FFFFFFFFFFFFE 00000001 01
+f64_to_i32 max exact 3CAFFFFFFFFFFFFF 00000001 01
+f64_to_i32 max exact C3CFFEFFFFFFFFDF 80000000 10
+f64_to_i32 max exact BFCBCB96CD6CE0E7 00000000 01
+f64_to_i32 max exact 3FE0000000000001 00000001 01
+f64_to_i32 max exact 74CFFFFFFBFF7FFF 7FFFFFFF 10
+f64_to_i32 max exact C01FFFFFFFEF0000 FFFFFFF9 01
+f64_to_i32 max exact 400003FFFFBFFFFE 00000003 01
+f64_to_i32 max exact BF3000007C000000 00000000 01
+f64_to_i32 max exact 4800040080000000 7FFFFFFF 10
+f64_to_i32 max exact 468F7FE000000000 7FFFFFFF 10
+f64_to_i32 max exact FFEFFBFFFFFFFEFE 80000000 10
+f64_to_i32 max exact 000FBFFFFFDFFFFF 00000001 01
+f64_to_i32 near_maxMag exact 381FFFFFFFF0007F 00000000 01
+f64_to_i32 near_maxMag exact 43D0000000000000 7FFFFFFF 10
+f64_to_i32 near_maxMag exact C3D52E10F5566786 80000000 10
+f64_to_i32 near_maxMag exact B800003FFE000000 00000000 01
+f64_to_i32 near_maxMag exact FFD0000000000001 80000000 10
+f64_to_i32 near_maxMag exact 9A5F095312A9CDC5 00000000 01
+f64_to_i32 near_maxMag exact 43D0000010000040 7FFFFFFF 10
+f64_to_i32 near_maxMag exact C7E0000000000001 80000000 10
+f64_to_i32 near_maxMag exact 4C20400000007FFE 7FFFFFFF 10
+f64_to_i32 near_maxMag exact 3CD000000043FFFE 00000000 01
+f64_to_i32 near_maxMag exact BFB3FFF7FFFFFFFE 00000000 01
+f64_to_i32 near_maxMag exact BFDFFFFFFFFFFFFE 00000000 01
+f64_to_i32 near_maxMag exact C0000000011FFFFF FFFFFFFE 01
+f64_to_i32 near_maxMag exact C1EC36947A5606CC 80000000 10
+f64_to_i32 near_maxMag exact 7FEFFFFFFFFFFFFF 7FFFFFFF 10
+f64_to_i32 near_maxMag exact C02FFFFFFFFFFFFF FFFFFFF0 01
+i32_to_f64 near_even exact 1FEFFFEF 41BFEFFFEF000000 00
+i32_to_f64 near_even exact FFFEFFFF C0F0001000000000 00
+i32_to_f64 near_even exact 00007FFF 40DFFFC000000000 00
+i32_to_f64 near_even exact 0001F238 40FF238000000000 00
+i32_to_f64 near_even exact FFFF007E C0EFF04000000000 00
+i32_to_f64 near_even exact 1FFFFFFF 41BFFFFFFF000000 00
+i32_to_f64 near_even exact F8000047 C19FFFFEE4000000 00
+i32_to_f64 near_even exact FFFFFFF0 C030000000000000 00
+i32_to_f64 near_even exact FFFFEFBE C0B0420000000000 00
+i32_to_f64 near_even exact 00000107 4070700000000000 00
+i32_to_f64 near_even exact FB794C79 C1921ACE1C000000 00
+i32_to_f64 near_even exact 01FFFFFF 417FFFFFF0000000 00
+i32_to_f64 near_even exact FFF00000 C130000000000000 00
+i32_to_f64 near_even exact 0000000F 402E000000000000 00
+i32_to_f64 near_even exact 010BFFFD 4170BFFFD0000000 00
+i32_to_f64 near_even exact 07EFFEFD 419FBFFBF4000000 00
+i32_to_f64 minMag exact FFF03FF9 C12F800E00000000 00
+i32_to_f64 minMag exact FF3090D0 C169EDE600000000 00
+i32_to_f64 minMag exact BFFFFFEF C1D0000004400000 00
+i32_to_f64 minMag exact 00000200 4080000000000000 00
+i32_to_f64 minMag exact FFFFC007 C0CFFC8000000000 00
+i32_to_f64 minMag exact FFFCCA70 C109AC8000000000 00
+i32_to_f64 minMag exact FFFFFFEF C031000000000000 00
+i32_to_f64 minMag exact FFFFFFEF C031000000000000 00
+i32_to_f64 minMag exact 3F00001E 41CF80000F000000 00
+i32_to_f64 minMag exact FF7BFF7F C160801020000000 00
+i32_to_f64 minMag exact FFFF48E7 C0E6E32000000000 00
+i32_to_f64 minMag exact F0000000 C1B0000000000000 00
+i32_to_f64 minMag exact 000083F5 40E07EA000000000 00
+i32_to_f64 minMag exact 0101001E 41701001E0000000 00
+i32_to_f64 minMag exact 00040000 4110000000000000 00
+i32_to_f64 minMag exact 00200FFC 414007FE00000000 00
+i32_to_f64 min exact F0000000 C1B0000000000000 00
+i32_to_f64 min exact FFFE45D2 C0FBA2E000000000 00
+i32_to_f64 min exact FFFE6FFE C0F9002000000000 00
+i32_to_f64 min exact 00003FFF 40CFFF8000000000 00
+i32_to_f64 min exact FFAE458D C1546E9CC0000000 00
+i32_to_f64 min exact 203FFFFD 41C01FFFFE800000 00
+i32_to_f64 min exact 01FFFFFF 417FFFFFF0000000 00
+i32_to_f64 min exact FFFFEFBE C0B0420000000000 00
+i32_to_f64 min exact 0000000F 402E000000000000 00
+i32_to_f64 min exact 08000000 41A0000000000000 00
+i32_to_f64 min exact FFFFFE99 C076700000000000 00
+i32_to_f64 min exact 00000007 401C000000000000 00
+i32_to_f64 min exact FFFB1642 C113A6F800000000 00
+i32_to_f64 min exact FFFFFFDF C040800000000000 00
+i32_to_f64 min exact 0013F7E6 4133F7E600000000 00
+i32_to_f64 min exact FFFFFFEF C031000000000000 00
+i32_to_f64 max exact FFFF0000 C0F0000000000000 00
+i32_to_f64 max exact FFF03FF9 C12F800E00000000 00
+i32_to_f64 max exact 00002000 40C0000000000000 00
+i32_to_f64 max exact FFFFFE21 C07DF00000000000 00
+i32_to_f64 max exact DFEFEFFE C1C0080801000000 00
+i32_to_f64 max exact 000FFFFF 412FFFFE00000000 00
+i32_to_f64 max exact 021FFF7D 4180FFFBE8000000 00
+i32_to_f64 max exact 7FFFFFFF 41DFFFFFFFC00000 00
+i32_to_f64 max exact 00100082 4130008200000000 00
+i32_to_f64 max exact FFFFFE00 C080000000000000 00
+i32_to_f64 max exact 7FFFFE03 41DFFFFF80C00000 00
+i32_to_f64 max exact FFFFF42A C0A7AC0000000000 00
+i32_to_f64 max exact 00010000 40F0000000000000 00
+i32_to_f64 max exact 00000A95 40A52A0000000000 00
+i32_to_f64 max exact BFFFFFFF C1D0000000400000 00
+i32_to_f64 max exact FFF8BD5E C11D0A8800000000 00
+f64_to_ui32 near_even exact BFCFFFFFFFFFFFFE 00000000 01
+f64_to_ui32 near_even exact 43C0000000000000 FFFFFFFF 10
+f64_to_ui32 near_even exact BCAFFFFFFFFFFFFF 00000000 01
+f64_to_ui32 near_even exact B3F000000FFFFE00 00000000 01
+f64_to_ui32 near_even exact 41C0000007FFFFFF 20000010 01
+f64_to_ui32 near_even exact 7FF4F3D114AF58E4 00000000 10
+f64_to_ui32 near_even exact 47EFFDFFFDFFFFFF FFFFFFFF 10
+f64_to_ui32 near_even exact 3F50000000000000 00000000 01
+f64_to_ui32 near_even exact 4340000000000001 FFFFFFFF 10
+f64_to_ui32 near_even exact FFD0000000000001 00000000 10
+f64_to_ui32 near_even exact C0DFDFFFFFFFF7FF 00000000 10
+f64_to_ui32 near_even exact C00FFFFFFFFFFFFE 00000000 10
+f64_to_ui32 near_even exact 434000080000003E FFFFFFFF 10
+f64_to_ui32 near_even exact 41CFFFFFFFFFFFFF 40000000 01
+f64_to_ui32 near_even exact 3FBFFFFFFFFFFFFF 00000000 01
+f64_to_ui32 near_even exact 7FEFFFF800010000 FFFFFFFF 10
+f64_to_ui32 minMag exact 400FFFFFF00007FF 00000003 01
+f64_to_ui32 minMag exact 7FF07FFFFFFFFFFE 00000000 10
+f64_to_ui32 minMag exact C7F0000000000001 00000000 10
+f64_to_ui32 minMag exact 3DB000003FFFFFF7 00000000 01
+f64_to_ui32 minMag exact 3FC040000000007F 00000000 01
+f64_to_ui32 minMag exact BFFA5CF563CAE7D4 00000000 10
+f64_to_ui32 minMag exact C03FFFFFFBFFFFFB 00000000 10
+f64_to_ui32 minMag exact 381FFFFFFFFFFFFF 00000000 01
+f64_to_ui32 minMag exact C3FFFFFDFFFFFFFD 00000000 10
+f64_to_ui32 minMag exact C3C567A7FB6402C6 00000000 10
+f64_to_ui32 minMag exact 381FFFFFFFF0007F 00000000 01
+f64_to_ui32 minMag exact 41C000000003FFFD 20000000 01
+f64_to_ui32 minMag exact 47F0000000000000 FFFFFFFF 10
+f64_to_ui32 minMag exact EE8000020000007F 00000000 10
+f64_to_ui32 minMag exact 7FE0000000000000 FFFFFFFF 10
+f64_to_ui32 minMag exact C02FFFFFFFFFFFFE 00000000 10
+f64_to_ui32 min exact 3FB0000000000000 00000000 01
+f64_to_ui32 min exact 802FFDFFFBFFFFFE 00000000 10
+f64_to_ui32 min exact 37E0000000000001 00000000 01
+f64_to_ui32 min exact 3FCFFFFFFFFFFFFE 00000000 01
+f64_to_ui32 min exact 7FD0000000000001 FFFFFFFF 10
+f64_to_ui32 min exact 0000000000000001 00000000 01
+f64_to_ui32 min exact C18ACA47203438E2 00000000 10
+f64_to_ui32 min exact B80FFFFFFFFFFFFF 00000000 10
+f64_to_ui32 min exact 8010000000000000 00000000 10
+f64_to_ui32 min exact C3D2BBE6DEAE1F63 00000000 10
+f64_to_ui32 min exact 3B816CD156A62AB8 00000000 01
+f64_to_ui32 min exact C34FFFFFFFFFFFFE 00000000 10
+f64_to_ui32 min exact C1FFFFFFFFFFFFFF 00000000 10
+f64_to_ui32 min exact BFBFFFFFFFFFFFFF 00000000 10
+f64_to_ui32 min exact 0010000000000000 00000000 01
+f64_to_ui32 min exact 43E0FF7FFFFFFFFE FFFFFFFF 10
+f64_to_ui32 max exact 7FEFFFFFFFFFFFFF FFFFFFFF 10
+f64_to_ui32 max exact 404716EA43FAC45C 0000002F 01
+f64_to_ui32 max exact 37F21FFFFFFFFFFE 00000001 01
+f64_to_ui32 max exact C59000000000083F 00000000 10
+f64_to_ui32 max exact BFCFFFFFFFFFFFFF 00000000 01
+f64_to_ui32 max exact C2B6B180A7B11FCE 00000000 10
+f64_to_ui32 max exact 41FFFFFFFFFFFFFF FFFFFFFF 10
+f64_to_ui32 max exact C1FFFFFFFFEFFC00 00000000 10
+f64_to_ui32 max exact FAEFFFFFFFFFF010 00000000 10
+f64_to_ui32 max exact C3DFFFFFFFFFFFFF 00000000 10
+f64_to_ui32 max exact 41E00000081FFFFF 80000041 01
+f64_to_ui32 max exact 43D0000000000000 FFFFFFFF 10
+f64_to_ui32 max exact 3FEFFFFFFFDFF800 00000001 01
+f64_to_ui32 max exact 47E0000000000000 FFFFFFFF 10
+f64_to_ui32 max exact 43C0000000000000 FFFFFFFF 10
+f64_to_ui32 max exact B7FFFFFFFFFFFFFF 00000000 01
+f64_to_ui32 near_maxMag exact 41CB6EFDCAA9034A 36DDFB95 01
+f64_to_ui32 near_maxMag exact 4037AB310BA6CB64 00000018 01
+f64_to_ui32 near_maxMag exact 43F0000000BFFFFE FFFFFFFF 10
+f64_to_ui32 near_maxMag exact 47F0000000000001 FFFFFFFF 10
+f64_to_ui32 near_maxMag exact C1F0000000000000 00000000 10
+f64_to_ui32 near_maxMag exact BFE0000000000000 00000000 10
+f64_to_ui32 near_maxMag exact 7FFFFFFFFDFFFFFC 00000000 10
+f64_to_ui32 near_maxMag exact 7FDFFFFFFFFFFFFF FFFFFFFF 10
+f64_to_ui32 near_maxMag exact BFEFFBFFFFFFFFEE 00000000 10
+f64_to_ui32 near_maxMag exact 381F83FFFFFFFFFF 00000000 01
+f64_to_ui32 near_maxMag exact C7EFFFFFFFFFFFFE 00000000 10
+f64_to_ui32 near_maxMag exact 41CFFFFFFFF7BFFF 40000000 01
+f64_to_ui32 near_maxMag exact C00195FA60036675 00000000 10
+f64_to_ui32 near_maxMag exact BFF0000100007FFF 00000000 10
+f64_to_ui32 near_maxMag exact C0200003FFFFFFBF 00000000 10
+f64_to_ui32 near_maxMag exact 7FEFFFF800010000 FFFFFFFF 10
+ui32_to_f64 near_even exact 007FBFFD 415FEFFF40000000 00
+ui32_to_f64 near_even exact F800040E 41EF000081C00000 00
+ui32_to_f64 near_even exact 03FFFDBF 418FFFEDF8000000 00
+ui32_to_f64 near_even exact 034613B2 418A309D90000000 00
+ui32_to_f64 near_even exact 00000080 4060000000000000 00
+ui32_to_f64 near_even exact FFFFFFE0 41EFFFFFFC000000 00
+ui32_to_f64 near_even exact BFF3FFFE 41E7FE7FFFC00000 00
+ui32_to_f64 near_even exact 00FFC001 416FF80020000000 00
+ui32_to_f64 near_even exact 00000002 4000000000000000 00
+ui32_to_f64 near_even exact FF8201FF 41EFF0403FE00000 00
+ui32_to_f64 near_even exact 00408D5E 4150235780000000 00
+ui32_to_f64 near_even exact FFFFFF7F 41EFFFFFEFE00000 00
+ui32_to_f64 near_even exact 00000100 4070000000000000 00
+ui32_to_f64 near_even exact 00040000 4110000000000000 00
+ui32_to_f64 near_even exact 00000112 4071200000000000 00
+ui32_to_f64 near_even exact 7FFFFE03 41DFFFFF80C00000 00
+ui32_to_f64 minMag exact 0000FF7C 40EFEF8000000000 00
+ui32_to_f64 minMag exact 0000448E 40D1238000000000 00
+ui32_to_f64 minMag exact 0000000F 402E000000000000 00
+ui32_to_f64 minMag exact FEF801FF 41EFDF003FE00000 00
+ui32_to_f64 minMag exact 00017C6F 40F7C6F000000000 00
+ui32_to_f64 minMag exact 00000327 4089380000000000 00
+ui32_to_f64 minMag exact 00400000 4150000000000000 00
+ui32_to_f64 minMag exact 00200000 4140000000000000 00
+ui32_to_f64 minMag exact FF800803 41EFF00100600000 00
+ui32_to_f64 minMag exact 0000409B 40D026C000000000 00
+ui32_to_f64 minMag exact FFF80000 41EFFF0000000000 00
+ui32_to_f64 minMag exact 02B02B59 4185815AC8000000 00
+ui32_to_f64 minMag exact FFF80100 41EFFF0020000000 00
+ui32_to_f64 minMag exact FFFFC007 41EFFFF800E00000 00
+ui32_to_f64 minMag exact 00000400 4090000000000000 00
+ui32_to_f64 minMag exact 0000003D 404E800000000000 00
+ui32_to_f64 min exact 00FFFFFF 416FFFFFE0000000 00
+ui32_to_f64 min exact 0000F01F 40EE03E000000000 00
+ui32_to_f64 min exact 0010FAEF 4130FAEF00000000 00
+ui32_to_f64 min exact 0000A59F 40E4B3E000000000 00
+ui32_to_f64 min exact 00EEFFFF 416DDFFFE0000000 00
+ui32_to_f64 min exact FFFF007E 41EFFFE00FC00000 00
+ui32_to_f64 min exact 00060001 4118000400000000 00
+ui32_to_f64 min exact 01FB1642 417FB16420000000 00
+ui32_to_f64 min exact 00016393 40F6393000000000 00
+ui32_to_f64 min exact 00000008 4020000000000000 00
+ui32_to_f64 min exact 00000679 4099E40000000000 00
+ui32_to_f64 min exact 00408D5E 4150235780000000 00
+ui32_to_f64 min exact FE000000 41EFC00000000000 00
+ui32_to_f64 min exact 0000007F 405FC00000000000 00
+ui32_to_f64 min exact BDFFFFFC 41E7BFFFFF800000 00
+ui32_to_f64 min exact F0000000 41EE000000000000 00
+ui32_to_f64 max exact 00EEFFFF 416DDFFFE0000000 00
+ui32_to_f64 max exact 08B6FCC9 41A16DF992000000 00
+ui32_to_f64 max exact 000083F5 40E07EA000000000 00
+ui32_to_f64 max exact 005AFFFB 4156BFFEC0000000 00
+ui32_to_f64 max exact 000EDF36 412DBE6C00000000 00
+ui32_to_f64 max exact 01000000 4170000000000000 00
+ui32_to_f64 max exact 021C2358 4180E11AC0000000 00
+ui32_to_f64 max exact FFFFEFBE 41EFFFFDF7C00000 00
+ui32_to_f64 max exact 00E00FFF 416C01FFE0000000 00
+ui32_to_f64 max exact 07EFFEFD 419FBFFBF4000000 00
+ui32_to_f64 max exact 00000327 4089380000000000 00
+ui32_to_f64 max exact 0103DFFE 41703DFFE0000000 00
+ui32_to_f64 max exact DBBFFFFE 41EB77FFFFC00000 00
+ui32_to_f64 max exact 0000A07E 40E40FC000000000 00
+ui32_to_f64 max exact 0000607F 40D81FC000000000 00
+ui32_to_f64 max exact FFFF007E 41EFFFE00FC00000 00
+f64_to_i64 near_even exact 3FBFFFFFFFFFFFFF 0000000000000000 01
+f64_to_i64 near_even exact 3C508003FFFFFFFF 0000000000000000 01
+f64_to_i64 near_even exact C38011FFFFFFFFFF FDFDC00000000020 00
+f64_to_i64 near_even exact C7EFFFFFFFFFFFFE 8000000000000000 10
+f64_to_i64 near_even exact 404716EA43FAC45C 000000000000002E 01
+f64_to_i64 near_even exact 37EFFFFFE07FFFFF 0000000000000000 01
+f64_to_i64 near_even exact 8020000000000000 0000000000000000 01
+f64_to_i64 near_even exact B813D14CF9CC6A0F 0000000000000000 01
+f64_to_i64 near_even exact 391F800001000000 0000000000000000 01
+f64_to_i64 near_even exact A83100000007FFFE 0000000000000000 01
+f64_to_i64 near_even exact 3FF3D4F7273F6526 0000000000000001 01
+f64_to_i64 near_even exact BFE00100001FFFFF FFFFFFFFFFFFFFFF 01
+f64_to_i64 near_even exact 7FF0000000000000 7FFFFFFFFFFFFFFF 10
+f64_to_i64 near_even exact C1CFFFFFFFFFFFFE FFFFFFFFC0000000 01
+f64_to_i64 near_even exact 6FEA335F52DDFE00 7FFFFFFFFFFFFFFF 10
+f64_to_i64 near_even exact C030000000000001 FFFFFFFFFFFFFFF0 01
+f64_to_i64 minMag exact 381FFFFFFFFFFFFE 0000000000000000 01
+f64_to_i64 minMag exact 47FFFFBFFFEFFFFF 7FFFFFFFFFFFFFFF 10
+f64_to_i64 minMag exact B81FFFFFFFFFFFFF 0000000000000000 01
+f64_to_i64 minMag exact BFC0000000000017 0000000000000000 01
+f64_to_i64 minMag exact C1F0000000000000 FFFFFFFF00000000 00
+f64_to_i64 minMag exact C3FFFFFFFFFFFFFE 8000000000000000 10
+f64_to_i64 minMag exact BF7FFFF7FFFFFFFE 0000000000000000 01
+f64_to_i64 minMag exact C38011FFFFFFFFFF FDFDC00000000020 00
+f64_to_i64 minMag exact 47F4000400000000 7FFFFFFFFFFFFFFF 10
+f64_to_i64 minMag exact 800FFFFFFFFFFFFE 0000000000000000 01
+f64_to_i64 minMag exact C22000007FFFFFFF FFFFFFF7FFFFC001 01
+f64_to_i64 minMag exact C1C0000000000000 FFFFFFFFE0000000 00
+f64_to_i64 minMag exact C03FFFFFFFFFFFFE FFFFFFFFFFFFFFE1 01
+f64_to_i64 minMag exact B7E0000000000000 0000000000000000 01
+f64_to_i64 minMag exact 800C24D28274E35A 0000000000000000 01
+f64_to_i64 minMag exact C3F000000020003F 8000000000000000 10
+f64_to_i64 min exact 22300000001FFFDF 0000000000000000 01
+f64_to_i64 min exact 3FC01FFFFFFF0000 0000000000000000 01
+f64_to_i64 min exact C1DFFFFFFFFFFFFF FFFFFFFF80000000 01
+f64_to_i64 min exact 41E00000081FFFFF 0000000080000040 01
+f64_to_i64 min exact 37F21FFFFFFFFFFE 0000000000000000 01
+f64_to_i64 min exact C1D0000000000000 FFFFFFFFC0000000 00
+f64_to_i64 min exact 64B00000000BFFFF 7FFFFFFFFFFFFFFF 10
+f64_to_i64 min exact C3D00007FFFFFEFF BFFFE00000040400 00
+f64_to_i64 min exact 3FC0C468246A1620 0000000000000000 01
+f64_to_i64 min exact 3FF3D4F7273F6526 0000000000000001 01
+f64_to_i64 min exact 43F0000000000000 7FFFFFFFFFFFFFFF 10
+f64_to_i64 min exact 74CFFFFFFBFF7FFF 7FFFFFFFFFFFFFFF 10
+f64_to_i64 min exact C340000000000000 FFE0000000000000 00
+f64_to_i64 min exact 4037AB310BA6CB64 0000000000000017 01
+f64_to_i64 min exact 4150040020000000 0000000000401000 01
+f64_to_i64 min exact 41DFF52055724A9E 000000007FD48155 01
+f64_to_i64 max exact C3DFFFFFFFFFFFFE 8000000000000800 00
+f64_to_i64 max exact C00195FA60036675 FFFFFFFFFFFFFFFE 01
+f64_to_i64 max exact 47F0000000000001 7FFFFFFFFFFFFFFF 10
+f64_to_i64 max exact 3CAFFE000000FFFF 0000000000000001 01
+f64_to_i64 max exact C030080000FFFFFF FFFFFFFFFFFFFFF0 01
+f64_to_i64 max exact 7FE0000000000001 7FFFFFFFFFFFFFFF 10
+f64_to_i64 max exact BF9FC40000000000 0000000000000000 01
+f64_to_i64 max exact 7FD0000000000000 7FFFFFFFFFFFFFFF 10
+f64_to_i64 max exact 3D1FFFFBFE000000 0000000000000001 01
+f64_to_i64 max exact 42BFFFFFFF80001E 00001FFFFFFF8001 01
+f64_to_i64 max exact 41E56167E987D508 00000000AB0B3F4D 01
+f64_to_i64 max exact 4340000000000001 0020000000000002 00
+f64_to_i64 max exact C340000000000000 FFE0000000000000 00
+f64_to_i64 max exact C00FFFFFFFFFFFFE FFFFFFFFFFFFFFFD 01
+f64_to_i64 max exact C7EFFFFFFFFFFFFE 8000000000000000 10
+f64_to_i64 max exact C24003FFFFFFFFBF FFFFFFDFF8000001 01
+f64_to_i64 near_maxMag exact ABC0000000000022 0000000000000000 01
+f64_to_i64 near_maxMag exact 4800000000000001 7FFFFFFFFFFFFFFF 10
+f64_to_i64 near_maxMag exact 801FFFFFFFFFFFFF 0000000000000000 01
+f64_to_i64 near_maxMag exact 8010000000000000 0000000000000000 01
+f64_to_i64 near_maxMag exact 3E2FFFE000000FFF 0000000000000000 01
+f64_to_i64 near_maxMag exact C3CFFFFFFFFFFFFE C000000000000400 00
+f64_to_i64 near_maxMag exact C800000000000001 8000000000000000 10
+f64_to_i64 near_maxMag exact 80002FFFFFFFFFFF 0000000000000000 01
+f64_to_i64 near_maxMag exact BFDFFFFFFFFFFFFF 0000000000000000 01
+f64_to_i64 near_maxMag exact C3DFFFFFFFFFFFFE 8000000000000800 00
+f64_to_i64 near_maxMag exact 3FD0000000000000 0000000000000000 01
+f64_to_i64 near_maxMag exact C3D0000000000000 C000000000000000 00
+f64_to_i64 near_maxMag exact 401FFFFFFFFFF801 0000000000000008 01
+f64_to_i64 near_maxMag exact C3D2BBE6DEAE1F63 B510648547827400 00
+f64_to_i64 near_maxMag exact FFDFFFFFFFFFFFFE 8000000000000000 10
+f64_to_i64 near_maxMag exact 4020000000000001 0000000000000008 01
+i64_to_f64 near_even exact 00000001AB310BA6 41FAB310BA600000 00
+i64_to_f64 near_even exact FFFFFF7353AC45D2 C261958A7745C000 00
+i64_to_f64 near_even exact 00000FFFFFFFFFFF 42AFFFFFFFFFFE00 00
+i64_to_f64 near_even exact 00003FFFFFFFFFFF 42CFFFFFFFFFFF80 00
+i64_to_f64 near_even exact FFFFFFFBF00007FF C2103FFFE0040000 00
+i64_to_f64 near_even exact 0005CEAF34EA1DC7 43173ABCD3A8771C 00
+i64_to_f64 near_even exact 0040000400000002 4350000100000000 01
+i64_to_f64 near_even exact 0000000000000FFF 40AFFE0000000000 00
+i64_to_f64 near_even exact 000000169E75DF01 42369E75DF010000 00
+i64_to_f64 near_even exact 0000000003FFFFFF 418FFFFFF8000000 00
+i64_to_f64 near_even exact FFFFFFFFFF7FFE40 C160003800000000 00
+i64_to_f64 near_even exact FFFFBF7FFBFFFFFE C2D0200100000080 00
+i64_to_f64 near_even exact E000000000000000 C3C0000000000000 00
+i64_to_f64 near_even exact FFFFFFFFFBFFFFFF C190000004000000 00
+i64_to_f64 near_even exact 000407FFFFFFFFF6 43101FFFFFFFFFD8 00
+i64_to_f64 near_even exact 0024D70EC7661FD8 43426B8763B30FEC 00
+i64_to_f64 minMag exact FFFFFFFFFFFFFEFF C070100000000000 00
+i64_to_f64 minMag exact FFFFFFFF79F30F48 C1E0C19E17000000 00
+i64_to_f64 minMag exact FFFFFFFFFFFC0000 C110000000000000 00
+i64_to_f64 minMag exact 00000FFFFFFFFFFF 42AFFFFFFFFFFE00 00
+i64_to_f64 minMag exact FFFFFFFFF60007FF C1A3FFF002000000 00
+i64_to_f64 minMag exact F80000000001007E C39FFFFFFFFFFBFE 01
+i64_to_f64 minMag exact 000FFFFBFFFC0000 432FFFF7FFF80000 00
+i64_to_f64 minMag exact FFFFF00FFFFFFFBE C2AFE00000008400 00
+i64_to_f64 minMag exact FFFFFFFFFE62EC20 C179D13E00000000 00
+i64_to_f64 minMag exact FFFFFFFFFFE385E2 C13C7A1E00000000 00
+i64_to_f64 minMag exact FFE0003EFFFFFFFF C33FFFC100000001 00
+i64_to_f64 minMag exact 0000000000000004 4010000000000000 00
+i64_to_f64 minMag exact 3FFF80000000003E 43CFFFC000000000 01
+i64_to_f64 minMag exact FFFFB65CD8617789 C2D268C9E7A21DC0 00
+i64_to_f64 minMag exact FFFFFDFFDFFDFFFD C280010010001800 00
+i64_to_f64 minMag exact 0000000080000000 41E0000000000000 00
+i64_to_f64 min exact FFFE000000000000 C300000000000000 00
+i64_to_f64 min exact FFFFFFFFFF83FFDF C15F000840000000 00
+i64_to_f64 min exact 00000000000000FF 406FE00000000000 00
+i64_to_f64 min exact FFFFFFFE9B1BCB54 C1F64E434AC00000 00
+i64_to_f64 min exact 000000000000000D 402A000000000000 00
+i64_to_f64 min exact FF800000004001FF C35FFFFFFFEFFF81 01
+i64_to_f64 min exact FFFFFFFEFD10A515 C1F02EF5AEB00000 00
+i64_to_f64 min exact FEB087C6B9FE7FE0 C374F78394601802 00
+i64_to_f64 min exact 0BEFFFFFFFFFFFFF 43A7DFFFFFFFFFFF 01
+i64_to_f64 min exact 000000000000007F 405FC00000000000 00
+i64_to_f64 min exact FFFFFFF83FEFFFFD C21F0040000C0000 00
+i64_to_f64 min exact 0000000040000000 41D0000000000000 00
+i64_to_f64 min exact 4080000000FFFFFF 43D0200000003FFF 01
+i64_to_f64 min exact 08003FFDFFFFFFFE 43A0007FFBFFFFFF 01
+i64_to_f64 min exact 02000007FF7FFFFF 438000003FFBFFFF 01
+i64_to_f64 min exact EFFFFFFFFFFFFFFF C3B0000000000001 01
+i64_to_f64 max exact 000000001433D14C 41B433D14C000000 00
+i64_to_f64 max exact 00003FFFFFFFFFFF 42CFFFFFFFFFFF80 00
+i64_to_f64 max exact 00000FFFEF7FFFFF 42AFFFDEFFFFFE00 00
+i64_to_f64 max exact FFFFFFFFD693872E C1C4B63C69000000 00
+i64_to_f64 max exact 0000000000000FFF 40AFFE0000000000 00
+i64_to_f64 max exact 0000035C939669F1 428AE49CB34F8800 00
+i64_to_f64 max exact 003FF0000003FFFE 434FF8000001FFFF 00
+i64_to_f64 max exact FFFFFFFFFD3354EA C1866558B0000000 00
+i64_to_f64 max exact 0000001FFBFFE000 423FFBFFE0000000 00
+i64_to_f64 max exact FFE0000000000000 C340000000000000 00
+i64_to_f64 max exact FFFFFFFFFFFFF887 C09DE40000000000 00
+i64_to_f64 max exact FFF800000009FFFF C31FFFFFFFD80004 00
+i64_to_f64 max exact 000000114B12EF51 42314B12EF510000 00
+i64_to_f64 max exact 0000000000003FFF 40CFFF8000000000 00
+i64_to_f64 max exact 00000001AB310BA6 41FAB310BA600000 00
+i64_to_f64 max exact FFFFFFFFFFDEAE1F C140A8F080000000 00
+f64_to_ui64 near_even exact FFE0000000000000 0000000000000000 10
+f64_to_ui64 near_even exact 0020000000000000 0000000000000000 01
+f64_to_ui64 near_even exact 40BFFFFFF0010000 0000000000002000 01
+f64_to_ui64 near_even exact 43FFFFFFFFFFFFFE FFFFFFFFFFFFFFFF 10
+f64_to_ui64 near_even exact 77F34F18A693527B FFFFFFFFFFFFFFFF 10
+f64_to_ui64 near_even exact 41CFFFFFFFF7BFFF 0000000040000000 01
+f64_to_ui64 near_even exact 22300000001FFFDF 0000000000000000 01
+f64_to_ui64 near_even exact CE70000800000001 0000000000000000 10
+f64_to_ui64 near_even exact 3FF3D4F7273F6526 0000000000000001 01
+f64_to_ui64 near_even exact C312DE637A398FB0 0000000000000000 10
+f64_to_ui64 near_even exact BFE0000000000001 0000000000000000 10
+f64_to_ui64 near_even exact 50E0100000001000 FFFFFFFFFFFFFFFF 10
+f64_to_ui64 near_even exact BEC52F80F9199EC0 0000000000000000 01
+f64_to_ui64 near_even exact BFBFFFFFFFFFFFFF 0000000000000000 01
+f64_to_ui64 near_even exact C03FFFFEFF800000 0000000000000000 10
+f64_to_ui64 near_even exact BFEFFBFFFFFFFFEE 0000000000000000 10
+f64_to_ui64 minMag exact 3FBFFFFFFFFFFFFE 0000000000000000 01
+f64_to_ui64 minMag exact C3EFFFFFFFFFFFFE 0000000000000000 10
+f64_to_ui64 minMag exact FFF000FFFFDFFFFE 0000000000000000 10
+f64_to_ui64 minMag exact 3AA002007FFFFFFF 0000000000000000 01
+f64_to_ui64 minMag exact BFE0000000000001 0000000000000000 01
+f64_to_ui64 minMag exact 3CA00FFFFFFFEFFF 0000000000000000 01
+f64_to_ui64 minMag exact 402FF000001FFFFF 000000000000000F 01
+f64_to_ui64 minMag exact 41FFFFFFFFFFFFFE 00000001FFFFFFFF 01
+f64_to_ui64 minMag exact C1FFFFFF7EFFFFFE 0000000000000000 10
+f64_to_ui64 minMag exact 800FFFFFFFFFE07E 0000000000000000 01
+f64_to_ui64 minMag exact BFBFFFC001000000 0000000000000000 01
+f64_to_ui64 minMag exact C00195FA60036675 0000000000000000 10
+f64_to_ui64 minMag exact 3DCFFFFFF0000000 0000000000000000 01
+f64_to_ui64 minMag exact 39100003FFF00000 0000000000000000 01
+f64_to_ui64 minMag exact BFC000FFFFBFFFFE 0000000000000000 01
+f64_to_ui64 minMag exact C7EFE0000000001F 0000000000000000 10
+f64_to_ui64 min exact C24003FFFFFFFFBF 0000000000000000 10
+f64_to_ui64 min exact FFF000FFFFDFFFFE 0000000000000000 10
+f64_to_ui64 min exact 4030000000000001 0000000000000010 01
+f64_to_ui64 min exact BFDFFFFFFFFFFFFE 0000000000000000 10
+f64_to_ui64 min exact 408000004000000F 0000000000000200 01
+f64_to_ui64 min exact 37EC0C2EA2E8A60D 0000000000000000 01
+f64_to_ui64 min exact 43EFFFFFFFFFFFFF FFFFFFFFFFFFF800 00
+f64_to_ui64 min exact C1C0000007FFBFFE 0000000000000000 10
+f64_to_ui64 min exact B7FFFFFFFFFFFFFF 0000000000000000 10
+f64_to_ui64 min exact 7FF0010003FFFFFF 0000000000000000 10
+f64_to_ui64 min exact 3CD00FFFFF7FFFFF 0000000000000000 01
+f64_to_ui64 min exact 43C0000000000000 2000000000000000 00
+f64_to_ui64 min exact 33B002000007FFFF 0000000000000000 01
+f64_to_ui64 min exact 43E0000020007FFE 8000010003FFF000 00
+f64_to_ui64 min exact 7FEDFFFFFDFFFFFE FFFFFFFFFFFFFFFF 10
+f64_to_ui64 min exact 4010000000000000 0000000000000004 00
+f64_to_ui64 max exact 3FE0000000000000 0000000000000001 01
+f64_to_ui64 max exact 37FFFFFFFFFFFFFE 0000000000000001 01
+f64_to_ui64 max exact ABC0000000000022 0000000000000000 01
+f64_to_ui64 max exact BD607FFFFFFFFBFE 0000000000000000 01
+f64_to_ui64 max exact 41EFFFFFFFFFFFFF 0000000100000000 01
+f64_to_ui64 max exact C800000000000001 0000000000000000 10
+f64_to_ui64 max exact BCA0000000000000 0000000000000000 01
+f64_to_ui64 max exact B800000000000001 0000000000000000 01
+f64_to_ui64 max exact 7FEFFFF800010000 FFFFFFFFFFFFFFFF 10
+f64_to_ui64 max exact C02FFFFFFE7FFFFF 0000000000000000 10
+f64_to_ui64 max exact B810000000000000 0000000000000000 01
+f64_to_ui64 max exact C02E0000FFFFFFFF 0000000000000000 10
+f64_to_ui64 max exact C38011FFFFFFFFFF 0000000000000000 10
+f64_to_ui64 max exact 3FEFFFFFFFFFFFFE 0000000000000001 01
+f64_to_ui64 max exact 7FD000000100FFFF FFFFFFFFFFFFFFFF 10
+f64_to_ui64 max exact B80FFFFFFFFFFFFF 0000000000000000 01
+f64_to_ui64 near_maxMag exact 41D000FFFFFDFFFF 0000000040040000 01
+f64_to_ui64 near_maxMag exact 801FEFFFFFFFF7FF 0000000000000000 01
+f64_to_ui64 near_maxMag exact C34FFFFFFFFFFFFE 0000000000000000 10
+f64_to_ui64 near_maxMag exact 43DF400000000000 7D00000000000000 00
+f64_to_ui64 near_maxMag exact 49103FFFEFFFFFFF FFFFFFFFFFFFFFFF 10
+f64_to_ui64 near_maxMag exact 8020000000000000 0000000000000000 01
+f64_to_ui64 near_maxMag exact 381001FDFFFFFFFF 0000000000000000 01
+f64_to_ui64 near_maxMag exact 3CBFFFFFFFE00FFE 0000000000000000 01
+f64_to_ui64 near_maxMag exact 3A60000000220000 0000000000000000 01
+f64_to_ui64 near_maxMag exact 0010000000000001 0000000000000000 01
+f64_to_ui64 near_maxMag exact A18C4ACAEE4CFD09 0000000000000000 01
+f64_to_ui64 near_maxMag exact C0200003FFFFFFBF 0000000000000000 10
+f64_to_ui64 near_maxMag exact 80002FFFFFFFFFFF 0000000000000000 01
+f64_to_ui64 near_maxMag exact 50E0100000001000 FFFFFFFFFFFFFFFF 10
+f64_to_ui64 near_maxMag exact C25F117A8F103940 0000000000000000 10
+f64_to_ui64 near_maxMag exact 41EDFFFFFFFFFFFE 00000000F0000000 01
+ui64_to_f64 near_even exact FFFFFFFBF00007FF 43EFFFFFFF7E0001 01
+ui64_to_f64 near_even exact F3FFFFFFFFBFFFFE 43EE7FFFFFFFF800 01
+ui64_to_f64 near_even exact 0002000002000002 4300000010000010 00
+ui64_to_f64 near_even exact FFF800000009FFFF 43EFFF0000000140 01
+ui64_to_f64 near_even exact BFFFFFFFFFFFFFFF 43E8000000000000 01
+ui64_to_f64 near_even exact 0000000000648262 4159209880000000 00
+ui64_to_f64 near_even exact 00000FFFFFFF7DFD 42AFFFFFFEFBFA00 00
+ui64_to_f64 near_even exact 0000000007FFFFFF 419FFFFFFC000000 00
+ui64_to_f64 near_even exact 0000000000000002 4000000000000000 00
+ui64_to_f64 near_even exact 0000000080000000 41E0000000000000 00
+ui64_to_f64 near_even exact 0400000000000000 4390000000000000 00
+ui64_to_f64 near_even exact FC00000001FFFFFE 43EF800000004000 01
+ui64_to_f64 near_even exact 0000000000000195 4079500000000000 00
+ui64_to_f64 near_even exact FFFFFFFFFFFFF000 43EFFFFFFFFFFFFE 00
+ui64_to_f64 near_even exact 00000000000021BA 40C0DD0000000000 00
+ui64_to_f64 near_even exact 8000000003FFFEFE 43E0000000008000 01
+ui64_to_f64 minMag exact FFFFFFD0000FFFFD 43EFFFFFFA0001FF 01
+ui64_to_f64 minMag exact 0000000000000800 40A0000000000000 00
+ui64_to_f64 minMag exact 00000002FD10A515 4207E88528A80000 00
+ui64_to_f64 minMag exact F800000000000000 43EF000000000000 00
+ui64_to_f64 minMag exact FFFA000000001FFF 43EFFF4000000003 01
+ui64_to_f64 minMag exact 0000000000000022 4041000000000000 00
+ui64_to_f64 minMag exact FFFDFFFFFFFFFFFF 43EFFFBFFFFFFFFF 01
+ui64_to_f64 minMag exact FFFFFEFFFFE0007F 43EFFFFFDFFFFC00 01
+ui64_to_f64 minMag exact 0000080000000000 42A0000000000000 00
+ui64_to_f64 minMag exact 0000400000000000 42D0000000000000 00
+ui64_to_f64 minMag exact 0000001FB77C672B 423FB77C672B0000 00
+ui64_to_f64 minMag exact 000001A37C210862 427A37C210862000 00
+ui64_to_f64 minMag exact FFFFFFFFFFFF0000 43EFFFFFFFFFFFE0 00
+ui64_to_f64 minMag exact 0000000000000F58 40AEB00000000000 00
+ui64_to_f64 minMag exact 0000000004FC1FCA 4193F07F28000000 00
+ui64_to_f64 minMag exact 00000000003F75A5 414FBAD280000000 00
+ui64_to_f64 min exact 0000000000001BC9 40BBC90000000000 00
+ui64_to_f64 min exact 000000000D681E78 41AAD03CF0000000 00
+ui64_to_f64 min exact 40000000007FFFFD 43D0000000001FFF 01
+ui64_to_f64 min exact FFFFFFFFFFFFEFFF 43EFFFFFFFFFFFFD 01
+ui64_to_f64 min exact 08003FFDFFFFFFFE 43A0007FFBFFFFFF 01
+ui64_to_f64 min exact 0400000000000000 4390000000000000 00
+ui64_to_f64 min exact 100000000001003E 43B0000000000100 01
+ui64_to_f64 min exact 003FF0000003FFFE 434FF8000001FFFF 00
+ui64_to_f64 min exact 0000200201FFFFFE 42C00100FFFFFF00 00
+ui64_to_f64 min exact C000000000000000 43E8000000000000 00
+ui64_to_f64 min exact 000000000003A359 410D1AC800000000 00
+ui64_to_f64 min exact 00000000000001FF 407FF00000000000 00
+ui64_to_f64 min exact 0000000000000001 3FF0000000000000 00
+ui64_to_f64 min exact 0000000000400000 4150000000000000 00
+ui64_to_f64 min exact 00000000000000FF 406FE00000000000 00
+ui64_to_f64 min exact FD00000008000000 43EFA00000010000 00
+ui64_to_f64 max exact 07FFF80000000002 439FFFE000000001 01
+ui64_to_f64 max exact 0000000072CC8B7A 41DCB322DE800000 00
+ui64_to_f64 max exact FFFFFFFFFFC00000 43EFFFFFFFFFF800 00
+ui64_to_f64 max exact 00000FFF800FFFFE 42AFFF001FFFFC00 00
+ui64_to_f64 max exact FFBFFFFFFFFFFFFF 43EFF80000000000 01
+ui64_to_f64 max exact 000020FFDFFFFFFF 42C07FEFFFFFFF80 00
+ui64_to_f64 max exact 0003FFFFFFFFFFFF 430FFFFFFFFFFFF8 00
+ui64_to_f64 max exact 00003D06B372AA06 42CE8359B9550300 00
+ui64_to_f64 max exact 0000000000000FFF 40AFFE0000000000 00
+ui64_to_f64 max exact 387CAA7DE672DE8B 43CC3E553EF33970 01
+ui64_to_f64 max exact F800000000000000 43EF000000000000 00
+ui64_to_f64 max exact 000000383DE950F6 424C1EF4A87B0000 00
+ui64_to_f64 max exact 00000007FF800003 421FFE00000C0000 00
+ui64_to_f64 max exact FFFFFEFFFEFFFFFD 43EFFFFFDFFFE000 01
+ui64_to_f64 max exact 0000435C939669F1 42D0D724E59A7C40 00
+ui64_to_f64 max exact 200000FFFFFFF800 43C000007FFFFFFC 00
+f16_to_f32 near_even exact ABF6 BD7EC000 00
+f16_to_f32 near_even exact 7FA3 7FF46000 00
+f16_to_f32 near_even exact F401 C6802000 00
+f16_to_f32 near_even exact 437B 406F6000 00
+f16_to_f32 near_even exact 380A 3F014000 00
+f16_to_f32 near_even exact AC01 BD802000 00
+f16_to_f32 near_even exact D45F C28BE000 00
+f16_to_f32 near_even exact B7FF BEFFE000 00
+f16_to_f32 near_even exact 337F 3E6FE000 00
+f16_to_f32 near_even exact 9356 BA6AC000 00
+f16_to_f32 near_even exact CBFE C17FC000 00
+f16_to_f32 near_even exact CB07 C160E000 00
+f16_to_f32 near_even exact 43F2 407E4000 00
+f16_to_f32 near_even exact F400 C6800000 00
+f16_to_f32 near_even exact 073C 38E78000 00
+f16_to_f32 near_even exact 8401 B8802000 00
+f16_to_f32 minMag exact C000 C0000000 00
+f16_to_f32 minMag exact 6BFE 457FC000 00
+f16_to_f32 minMag exact 783F 4707E000 00
+f16_to_f32 minMag exact BEC1 BFD82000 00
+f16_to_f32 minMag exact F801 C7002000 00
+f16_to_f32 minMag exact 23F0 3C7E0000 00
+f16_to_f32 minMag exact 9008 BA010000 00
+f16_to_f32 minMag exact 7FFF 7FFFE000 00
+f16_to_f32 minMag exact 7FA3 7FF46000 00
+f16_to_f32 minMag exact 978F BAF1E000 00
+f16_to_f32 minMag exact 13FD 3A7FA000 00
+f16_to_f32 minMag exact 87BF B8F7E000 00
+f16_to_f32 minMag exact 33B7 3E76E000 00
+f16_to_f32 minMag exact 003A 36680000 00
+f16_to_f32 minMag exact BBFF BF7FE000 00
+f16_to_f32 minMag exact FE2E FFC5C000 00
+f16_to_f32 min exact 0001 33800000 00
+f16_to_f32 min exact B5FA BEBF4000 00
+f16_to_f32 min exact 4B00 41600000 00
+f16_to_f32 min exact 37FE 3EFFC000 00
+f16_to_f32 min exact B327 BE64E000 00
+f16_to_f32 min exact CE3F C1C7E000 00
+f16_to_f32 min exact 7680 46D00000 00
+f16_to_f32 min exact BB9F BF73E000 00
+f16_to_f32 min exact 03FF 387FC000 00
+f16_to_f32 min exact 5008 42010000 00
+f16_to_f32 min exact 2C01 3D802000 00
+f16_to_f32 min exact 93BC BA778000 00
+f16_to_f32 min exact 7AEC 475D8000 00
+f16_to_f32 min exact FEF8 FFDF0000 00
+f16_to_f32 min exact 3C35 3F86A000 00
+f16_to_f32 min exact 0BDE 397BC000 00
+f16_to_f32 max exact F7FD C6FFA000 00
+f16_to_f32 max exact C3EC C07D8000 00
+f16_to_f32 max exact B03B BE076000 00
+f16_to_f32 max exact AA01 BD402000 00
+f16_to_f32 max exact B78F BEF1E000 00
+f16_to_f32 max exact 2C00 3D800000 00
+f16_to_f32 max exact 7890 47120000 00
+f16_to_f32 max exact 7BFE 477FC000 00
+f16_to_f32 max exact FE49 FFC92000 00
+f16_to_f32 max exact 3801 3F002000 00
+f16_to_f32 max exact F47D C68FA000 00
+f16_to_f32 max exact 32DF 3E5BE000 00
+f16_to_f32 max exact AC06 BD80C000 00
+f16_to_f32 max exact 4000 40000000 00
+f16_to_f32 max exact 47A3 40F46000 00
+f16_to_f32 max exact 4801 41002000 00
+f16_to_f64 near_even exact A024 BF80900000000000 00
+f16_to_f64 near_even exact 3346 3FCD180000000000 00
+f16_to_f64 near_even exact 47A3 401E8C0000000000 00
+f16_to_f64 near_even exact 0F9F 3F3E7C0000000000 00
+f16_to_f64 near_even exact 7D03 7FFC0C0000000000 10
+f16_to_f64 near_even exact 45F0 4017C00000000000 00
+f16_to_f64 near_even exact 07FF 3F1FFC0000000000 00
+f16_to_f64 near_even exact B1B3 BFC6CC0000000000 00
+f16_to_f64 near_even exact FC21 FFF8840000000000 10
+f16_to_f64 near_even exact A97F BFA5FC0000000000 00
+f16_to_f64 near_even exact 1000 3F40000000000000 00
+f16_to_f64 near_even exact 3401 3FD0040000000000 00
+f16_to_f64 near_even exact AC01 BFB0040000000000 00
+f16_to_f64 near_even exact B5FA BFD7E80000000000 00
+f16_to_f64 near_even exact 77FF 40DFFC0000000000 00
+f16_to_f64 near_even exact BFAF BFFEBC0000000000 00
+f16_to_f64 minMag exact BFFE BFFFF80000000000 00
+f16_to_f64 minMag exact E850 C0A1400000000000 00
+f16_to_f64 minMag exact 74FE 40D3F80000000000 00
+f16_to_f64 minMag exact 4BFF 402FFC0000000000 00
+f16_to_f64 minMag exact AC01 BFB0040000000000 00
+f16_to_f64 minMag exact F7D2 C0DF480000000000 00
+f16_to_f64 minMag exact F7FD C0DFF40000000000 00
+f16_to_f64 minMag exact AD10 BFB4400000000000 00
+f16_to_f64 minMag exact AFF5 BFBFD40000000000 00
+f16_to_f64 minMag exact 3346 3FCD180000000000 00
+f16_to_f64 minMag exact AC08 BFB0200000000000 00
+f16_to_f64 minMag exact FFFF FFFFFC0000000000 00
+f16_to_f64 minMag exact 017E 3EF7E00000000000 00
+f16_to_f64 minMag exact B78F BFDE3C0000000000 00
+f16_to_f64 minMag exact CF1F C03C7C0000000000 00
+f16_to_f64 minMag exact BCFE BFF3F80000000000 00
+f16_to_f64 min exact A5FE BF97F80000000000 00
+f16_to_f64 min exact 8401 BF10040000000000 00
+f16_to_f64 min exact 0000 0000000000000000 00
+f16_to_f64 min exact CC01 C030040000000000 00
+f16_to_f64 min exact C1F0 C007C00000000000 00
+f16_to_f64 min exact C7FF C01FFC0000000000 00
+f16_to_f64 min exact 4FFE 403FF80000000000 00
+f16_to_f64 min exact 4C01 4030040000000000 00
+f16_to_f64 min exact CFDC C03F700000000000 00
+f16_to_f64 min exact 389B 3FE26C0000000000 00
+f16_to_f64 min exact B40F BFD03C0000000000 00
+f16_to_f64 min exact C35E C00D780000000000 00
+f16_to_f64 min exact 0001 3E70000000000000 00
+f16_to_f64 min exact EFE0 C0BF800000000000 00
+f16_to_f64 min exact B81E BFE0780000000000 00
+f16_to_f64 min exact 0401 3F10040000000000 00
+f16_to_f64 max exact 3C00 3FF0000000000000 00
+f16_to_f64 max exact 07FE 3F1FF80000000000 00
+f16_to_f64 max exact 87BF BF1EFC0000000000 00
+f16_to_f64 max exact CC01 C030040000000000 00
+f16_to_f64 max exact E800 C0A0000000000000 00
+f16_to_f64 max exact C000 C000000000000000 00
+f16_to_f64 max exact BB7A BFEDE80000000000 00
+f16_to_f64 max exact 93FE BF4FF80000000000 00
+f16_to_f64 max exact C19A C006680000000000 00
+f16_to_f64 max exact 57F5 405FD40000000000 00
+f16_to_f64 max exact B81E BFE0780000000000 00
+f16_to_f64 max exact 03FE 3F0FF00000000000 00
+f16_to_f64 max exact 83D7 BF0EB80000000000 00
+f16_to_f64 max exact 1001 3F40040000000000 00
+f16_to_f64 max exact A877 BFA1DC0000000000 00
+f16_to_f64 max exact DBE7 C06F9C0000000000 00
+f32_to_f16 near_even exact 3F8008FF 3C00 01
+f32_to_f16 near_even exact 39FFFF07 1000 01
+f32_to_f16 near_even exact 80000000 8000 00
+f32_to_f16 near_even exact 41FDFFFB 4FF0 01
+f32_to_f16 near_even exact 33FFFFFE 0002 03
+f32_to_f16 near_even exact DA5F117A FC00 05
+f32_to_f16 near_even exact BEFFFFFF B800 01
+f32_to_f16 near_even exact DF7EFFFF FC00 05
+f32_to_f16 near_even exact 3E00FFF6 3008 01
+f32_to_f16 near_even exact DEFFFFFE FC00 05
+f32_to_f16 near_even exact 3FFFFFC2 4000 01
+f32_to_f16 near_even exact FEFFE03E FC00 05
+f32_to_f16 near_even exact 4EFFDFE0 7C00 05
+f32_to_f16 near_even exact 4FFFDFF7 7C00 05
+f32_to_f16 near_even exact BB6FFFBF 9B80 01
+f32_to_f16 near_even exact 4FE061BA 7C00 05
+f32_to_f16 minMag exact 3FFFFFC2 3FFF 01
+f32_to_f16 minMag exact CE83FFFF FBFF 05
+f32_to_f16 minMag exact 00000000 0000 00
+f32_to_f16 minMag exact BD800000 AC00 00
+f32_to_f16 minMag exact DF000001 FBFF 05
+f32_to_f16 minMag exact 4EFFFFFF 7BFF 05
+f32_to_f16 minMag exact 33800001 0001 03
+f32_to_f16 minMag exact C2FFFFEC D7FF 01
+f32_to_f16 minMag exact 3C6426F6 2321 01
+f32_to_f16 minMag exact 2BFFFFCF 0000 03
+f32_to_f16 minMag exact 408005FF 4400 01
+f32_to_f16 minMag exact 4BD86177 7BFF 05
+f32_to_f16 minMag exact CB800000 FBFF 05
+f32_to_f16 minMag exact AC00081E 8000 03
+f32_to_f16 minMag exact C2CF5EC6 D67A 01
+f32_to_f16 minMag exact 3F7FFFFE 3BFF 01
+f32_to_f16 min exact B3800000 8001 00
+f32_to_f16 min exact C07F3FFF C3FA 01
+f32_to_f16 min exact 33801FFC 0001 03
+f32_to_f16 min exact C5FFF9FF F000 01
+f32_to_f16 min exact 2F00BFFF 0000 03
+f32_to_f16 min exact 3FFFFFFE 3FFF 01
+f32_to_f16 min exact FF800001 FE00 10
+f32_to_f16 min exact 4BCB12EF 7BFF 05
+f32_to_f16 min exact C0FFFFFE C800 01
+f32_to_f16 min exact 2C4716EA 0000 03
+f32_to_f16 min exact BB6FFFBF 9B80 01
+f32_to_f16 min exact FFFFFDDF FFFF 00
+f32_to_f16 min exact C2CF5EC6 D67B 01
+f32_to_f16 min exact 7EFFFFB0 7BFF 05
+f32_to_f16 min exact 4FD8BEC6 7BFF 05
+f32_to_f16 min exact 4E00FFEE 7BFF 05
+f32_to_f16 max exact BF01FF00 B80F 01
+f32_to_f16 max exact 4EF7FF7E 7C00 05
+f32_to_f16 max exact 25877FFF 0001 03
+f32_to_f16 max exact B3800000 8001 00
+f32_to_f16 max exact 1DAA0123 0001 03
+f32_to_f16 max exact 3E2BBE4E 315E 01
+f32_to_f16 max exact DF8F0000 FBFF 05
+f32_to_f16 max exact CE803FFC FBFF 05
+f32_to_f16 max exact 81000000 8000 03
+f32_to_f16 max exact 397F5FFE 0BFB 01
+f32_to_f16 max exact 33800FFC 0002 03
+f32_to_f16 max exact BF800001 BC00 01
+f32_to_f16 max exact 7FF353AC 7F9A 00
+f32_to_f16 max exact CF7FFFFF FBFF 05
+f32_to_f16 max exact BEA00FFF B500 01
+f32_to_f16 max exact C000DFFF C006 01
+f32_to_f64 near_even exact 3DFFFFFF 3FBFFFFFE0000000 00
+f32_to_f64 near_even exact CE00203F C1C00407E0000000 00
+f32_to_f64 near_even exact 4E7FFFFF 41CFFFFFE0000000 00
+f32_to_f64 near_even exact 0D80013E 39B00027C0000000 00
+f32_to_f64 near_even exact FFFFFDDF FFFFFFBBE0000000 00
+f32_to_f64 near_even exact B8FFFEFF BF1FFFDFE0000000 00
+f32_to_f64 near_even exact C2D0AA48 C05A154900000000 00
+f32_to_f64 near_even exact 339FFEFE 3E73FFDFC0000000 00
+f32_to_f64 near_even exact 39FFFF07 3F3FFFE0E0000000 00
+f32_to_f64 near_even exact FE800000 C7D0000000000000 00
+f32_to_f64 near_even exact 4F800000 41F0000000000000 00
+f32_to_f64 near_even exact BE000081 BFC0001020000000 00
+f32_to_f64 near_even exact BFFFFFFF BFFFFFFFE0000000 00
+f32_to_f64 near_even exact 5E7FFBFB 43CFFF7F60000000 00
+f32_to_f64 near_even exact BE203FFE BFC407FFC0000000 00
+f32_to_f64 near_even exact 5DA5BBF7 43B4B77EE0000000 00
+f32_to_f64 minMag exact 4E4D6940 41C9AD2800000000 00
+f32_to_f64 minMag exact 4FFFFFFF 41FFFFFFE0000000 00
+f32_to_f64 minMag exact DE0003FF C3C0007FE0000000 00
+f32_to_f64 minMag exact C0472034 C008E40680000000 00
+f32_to_f64 minMag exact C3E00000 C07C000000000000 00
+f32_to_f64 minMag exact 41FFFFFF 403FFFFFE0000000 00
+f32_to_f64 minMag exact 7E803DFF 47D007BFE0000000 00
+f32_to_f64 minMag exact 33BFFF7E 3E77FFEFC0000000 00
+f32_to_f64 minMag exact CE800001 C1D0000020000000 00
+f32_to_f64 minMag exact 4FD8BEC6 41FB17D8C0000000 00
+f32_to_f64 minMag exact DEFFFFFE C3DFFFFFC0000000 00
+f32_to_f64 minMag exact BE900007 BFD20000E0000000 00
+f32_to_f64 minMag exact B27FE800 BE4FFD0000000000 00
+f32_to_f64 minMag exact 468000C0 40D0001800000000 00
+f32_to_f64 minMag exact C8FDFFFB C11FBFFF60000000 00
+f32_to_f64 minMag exact 3E7F800E 3FCFF001C0000000 00
+f32_to_f64 min exact BDFFEFEE BFBFFDFDC0000000 00
+f32_to_f64 min exact 41000001 4020000020000000 00
+f32_to_f64 min exact 3F8FFF00 3FF1FFE000000000 00
+f32_to_f64 min exact C00FFFEE C001FFFDC0000000 00
+f32_to_f64 min exact 407BFFBF 400F7FF7E0000000 00
+f32_to_f64 min exact 3AFFDEFF 3F5FFBDFE0000000 00
+f32_to_f64 min exact 39FFFF07 3F3FFFE0E0000000 00
+f32_to_f64 min exact 41DFF7FF 403BFEFFE0000000 00
+f32_to_f64 min exact FF000001 C7E0000020000000 00
+f32_to_f64 min exact C0FFFE80 C01FFFD000000000 00
+f32_to_f64 min exact C58FFFDE C0B1FFFBC0000000 00
+f32_to_f64 min exact 3F7FFFFE 3FEFFFFFC0000000 00
+f32_to_f64 min exact 5F800000 43F0000000000000 00
+f32_to_f64 min exact BE7FFFFF BFCFFFFFE0000000 00
+f32_to_f64 min exact CB800001 C170000020000000 00
+f32_to_f64 min exact BE3672E3 BFC6CE5C60000000 00
+f32_to_f64 max exact 3EFFFFFE 3FDFFFFFC0000000 00
+f32_to_f64 max exact BE203FFE BFC407FFC0000000 00
+f32_to_f64 max exact 807C1FFF B80F07FFC0000000 00
+f32_to_f64 max exact B980201F BF300403E0000000 00
+f32_to_f64 max exact 5ECC6A0F 43D98D41E0000000 00
+f32_to_f64 max exact BC7F03FF BF8FE07FE0000000 00
+f32_to_f64 max exact CF000001 C1E0000020000000 00
+f32_to_f64 max exact AB1C89BB BD63913760000000 00
+f32_to_f64 max exact C0FFFC3F C01FFF87E0000000 00
+f32_to_f64 max exact 7F7FFFFE 47EFFFFFC0000000 00
+f32_to_f64 max exact BE800000 BFD0000000000000 00
+f32_to_f64 max exact 2608001F 3CC10003E0000000 00
+f32_to_f64 max exact 817FFFFF B82FFFFFE0000000 00
+f32_to_f64 max exact 80000000 8000000000000000 00
+f32_to_f64 max exact 2F00BFFF 3DE017FFE0000000 00
+f32_to_f64 max exact BFFFFFCF BFFFFFF9E0000000 00
+f64_to_f16 near_even exact C9840007FFFFFFFF FC00 05
+f64_to_f16 near_even exact 3F50000000000000 1400 00
+f64_to_f16 near_even exact 0002000003FFFFFF 0000 03
+f64_to_f16 near_even exact BEC09901B9B2A079 8021 03
+f64_to_f16 near_even exact C1DFFFFFFFFFFFFE FC00 05
+f64_to_f16 near_even exact C01000100FFFFFFF C400 01
+f64_to_f16 near_even exact 7FFFFFFFFFFFFFFE 7FFF 00
+f64_to_f16 near_even exact 43CFFFFFFFFFFFFF 7C00 05
+f64_to_f16 near_even exact 405F40F41F6021F8 57D0 01
+f64_to_f16 near_even exact 37EC0C2EA2E8A60D 0000 03
+f64_to_f16 near_even exact 802FFF7FFFFFFFC0 8000 03
+f64_to_f16 near_even exact 3FF0000000000000 3C00 00
+f64_to_f16 near_even exact C3FFFFFDFFFFFFFD FC00 05
+f64_to_f16 near_even exact BA2FFFDFFFF7FFFF 8000 03
+f64_to_f16 near_even exact C1FC003FFFFFFFFE FC00 05
+f64_to_f16 near_even exact F6D01003FFFFFFFF FC00 05
+f64_to_f16 minMag exact C3CFFFFFFFFFFFFF FBFF 05
+f64_to_f16 minMag exact BFDFFFFFFFFFFFFF B7FF 01
+f64_to_f16 minMag exact FFE000010003FFFF FBFF 05
+f64_to_f16 minMag exact 0006274F48EAADA0 0000 03
+f64_to_f16 minMag exact B7EFFFFFFFFFFFE6 8000 03
+f64_to_f16 minMag exact 40600007FFFFFFF8 5800 01
+f64_to_f16 minMag exact B800000000000000 8000 03
+f64_to_f16 minMag exact FFF000FFFFDFFFFE FE00 10
+f64_to_f16 minMag exact 80002FFFFFFFFFFF 8000 03
+f64_to_f16 minMag exact 43D0000000000001 7BFF 05
+f64_to_f16 minMag exact B80FFFFFFFFFFFFF 8000 03
+f64_to_f16 minMag exact 3FEFFFFFFFFFFFFE 3BFF 01
+f64_to_f16 minMag exact FFE0000000000001 FBFF 05
+f64_to_f16 minMag exact C3F00004000001FF FBFF 05
+f64_to_f16 minMag exact C3EFFF000007FFFE FBFF 05
+f64_to_f16 minMag exact BFEFFFFFC003FFFF BBFF 01
+f64_to_f16 min exact 7FD000000100FFFF 7BFF 05
+f64_to_f16 min exact C34FFFFFFFFFFFFF FC00 05
+f64_to_f16 min exact 800FFFFFFFFFFFFE 8001 03
+f64_to_f16 min exact 7FFFFF0000FFFFFF 7FFF 00
+f64_to_f16 min exact 8010000000000001 8001 03
+f64_to_f16 min exact 348FFFFFFDFFFFDF 0000 03
+f64_to_f16 min exact BF70200000000003 9C09 01
+f64_to_f16 min exact BFBFFFFFFFFFFFFE B000 01
+f64_to_f16 min exact BFC8000000400000 B201 01
+f64_to_f16 min exact 800FFFFFFFFFFFFF 8001 03
+f64_to_f16 min exact BAA6A91CDDACAE08 8001 03
+f64_to_f16 min exact C1C0007DFFFFFFFF FC00 05
+f64_to_f16 min exact 2B50000200000020 0000 03
+f64_to_f16 min exact E98BFFF7FFFFFFFE FC00 05
+f64_to_f16 min exact 37EFFFFFFFFFFFFE 0000 03
+f64_to_f16 min exact 7FFFFFFFFFFFFFFF 7FFF 00
+f64_to_f16 max exact 3F50000000FFFFBF 1401 01
+f64_to_f16 max exact 41DFFFFFFFFFFFFF 7C00 05
+f64_to_f16 max exact BFC00000001FFFEE B000 01
+f64_to_f16 max exact 0002000003FFFFFF 0001 03
+f64_to_f16 max exact 078FFFFFFFFF00FE 0001 03
+f64_to_f16 max exact BFFA5CF563CAE7D4 BE97 01
+f64_to_f16 max exact BFC0000000000000 B000 00
+f64_to_f16 max exact C7F0000000000FFE FBFF 05
+f64_to_f16 max exact B7EFFFFFFFFFC006 8000 03
+f64_to_f16 max exact 3FFFFFFFEFFFFFF6 4000 01
+f64_to_f16 max exact BFEFFBFFFFFFFFEE BBFE 01
+f64_to_f16 max exact 43E0FF7FFFFFFFFE 7C00 05
+f64_to_f16 max exact BFD7C2590B89786F B5F0 01
+f64_to_f16 max exact BFF0000000000000 BC00 00
+f64_to_f16 max exact C01002003FFFFFFE C400 01
+f64_to_f16 max exact 47FFFFFFFFF9FFFE 7C00 05
+f64_to_f32 near_even exact C1C0007DFFFFFFFF CE0003F0 01
+f64_to_f32 near_even exact F6D01003FFFFFFFF FF800000 05
+f64_to_f32 near_even exact C340000000000001 DA000000 01
+f64_to_f32 near_even exact BFC8000000400000 BE400000 01
+f64_to_f32 near_even exact 42BFFFFFFF80001E 56000000 01
+f64_to_f32 near_even exact 7FF4F3D114AF58E4 7FE79E88 10
+f64_to_f32 near_even exact BCA00001FF7FFFFE A5000010 01
+f64_to_f32 near_even exact B800000000000000 80400000 00
+f64_to_f32 near_even exact 402FFFF80000FFFF 417FFFC0 01
+f64_to_f32 near_even exact C030080000FFFFFF C1804000 01
+f64_to_f32 near_even exact 39100003FFF00000 08800020 01
+f64_to_f32 near_even exact C1F0000000000000 CF800000 00
+f64_to_f32 near_even exact 47EFFDFFFDFFFFFF 7F7FF000 01
+f64_to_f32 near_even exact 3FC000000807FFFF 3E000000 01
+f64_to_f32 near_even exact C3E0000000000000 DF000000 00
+f64_to_f32 near_even exact 3DCFFFFFF0000000 2E800000 01
+f64_to_f32 minMag exact 40300020001FFFFF 41800100 01
+f64_to_f32 minMag exact B80FFFFFFFFE0002 807FFFFF 03
+f64_to_f32 minMag exact C3FFFFFDFFFFFFFD DFFFFFEF 01
+f64_to_f32 minMag exact 7FEFFFFFFFFFFFFF 7F7FFFFF 05
+f64_to_f32 minMag exact BACC892B4C13F29C 9664495A 01
+f64_to_f32 minMag exact B7FFFFFFFFFFFFFF 803FFFFF 03
+f64_to_f32 minMag exact C03FFFFFFFFFFFFF C1FFFFFF 01
+f64_to_f32 minMag exact 47EFFF0008000000 7F7FF800 01
+f64_to_f32 minMag exact C01002003FFFFFFE C0801001 01
+f64_to_f32 minMag exact 37E0000000000000 00100000 00
+f64_to_f32 minMag exact 3FB00200000000FF 3D801000 01
+f64_to_f32 minMag exact 802FFDFEFFFFFFFE 80000000 03
+f64_to_f32 minMag exact 434FFFFFFFFE7FFE 5A7FFFFF 01
+f64_to_f32 minMag exact C02FFFFFFFFFFFFF C17FFFFF 01
+f64_to_f32 minMag exact 802FFFFFFFFFFFFE 80000000 03
+f64_to_f32 minMag exact C3C0000000000001 DE000000 01
+f64_to_f32 min exact 43EFFFFFFFFFFFFE 5F7FFFFF 01
+f64_to_f32 min exact FFDFFFFFFFFFFFFF FF800000 05
+f64_to_f32 min exact 800FFFFE00003FFF 80000001 03
+f64_to_f32 min exact 400EFFFFFFFFEFFF 4077FFFF 01
+f64_to_f32 min exact C59000000000083F EC800001 01
+f64_to_f32 min exact 3810000000000000 00800000 00
+f64_to_f32 min exact C3C567A7FB6402C6 DE2B3D40 01
+f64_to_f32 min exact C1DFFF7FFFFFFFF8 CEFFFC00 01
+f64_to_f32 min exact CE70000800000001 FF800000 05
+f64_to_f32 min exact 3FC0000000000001 3E000000 01
+f64_to_f32 min exact 64B00000000BFFFF 7F7FFFFF 05
+f64_to_f32 min exact FFEFFBFFFFFFFEFE FF800000 05
+f64_to_f32 min exact C3E0000000000000 DF000000 00
+f64_to_f32 min exact 47EFFFFFFFFFFFFF 7F7FFFFF 01
+f64_to_f32 min exact 41E00000081FFFFF 4F000000 01
+f64_to_f32 min exact 3CC1FFFFC0000000 260FFFFE 00
+f64_to_f32 max exact 400FFFFFFFFFFFFE 40800000 01
+f64_to_f32 max exact 403FFFFFFFFFFFFF 42000000 01
+f64_to_f32 max exact C1C39E834DACB36B CE1CF41A 01
+f64_to_f32 max exact C340097B5E4F0BE0 DA004BDA 01
+f64_to_f32 max exact 41E00003FFFBFFFF 4F000020 01
+f64_to_f32 max exact 43D36FA3CAD3F59E 5E9B7D1F 01
+f64_to_f32 max exact 380FFFFFFFFFFFFE 00800000 03
+f64_to_f32 max exact BFE2697F4B561495 BF134BFA 01
+f64_to_f32 max exact 000FFFFFFFFFFFFF 00000001 03
+f64_to_f32 max exact A1407FFF7FFFFFFF 80000000 03
+f64_to_f32 max exact 43F0000000BFFFFE 5F800001 01
+f64_to_f32 max exact 800963AEAC65CBD0 80000000 03
+f64_to_f32 max exact 3FC0C468246A1620 3E062342 01
+f64_to_f32 max exact 41E56167E987D508 4F2B0B40 01
+f64_to_f32 max exact 43E0FF7FFFFFFFFE 5F07FC00 01
+f64_to_f32 max exact 801FFFFFFFFFFFFE 80000000 03

@@ -8,23 +8,26 @@
 //! 91000400 pc=42000000 cpsr=3c5 sp=0 x=0,...,0 => pc=42000004 cpsr=3c5 sp=0 x=1,...,0
 //! ```
 //!
-//! An instruction that reads or writes memory or a vector register has more
-//! after a `|`, in any order:
+//! An entry of a group that compares the vector and FP registers has them
+//! after the general ones, on both sides: `fpcr=`, `fpsr=` and `v=` with V0
+//! to V31. The state after the instruction has `dv=` in place of `v=`, with
+//! only the registers that the instruction changed, as `number:value`.
+//!
+//! An instruction that reads or writes memory has more after a `|`, in any
+//! order:
 //!
 //! ```text
-//! ... | r=42100000:8877665544332211 w=42100008:00 v3=<32 hex digits>:<32 hex digits>
+//! ... | r=42100000:8877665544332211 w=42100008:00
 //! ```
 //!
 //! `r`: bytes that the memory holds before the instruction, lowest address
-//! first. `w`: bytes that the instruction writes. `v<n>`: a vector register
-//! before and after. A vector register that is not named is zero before and
-//! after. Memory that is not named is zero.
+//! first. `w`: bytes that the instruction writes. Memory that is not named
+//! is zero.
 //!
 //! A line that starts with `#` is a comment.
 
-use super::Core;
+use super::{Core, Vectors};
 use crate::exec::Cpu;
-use crate::state::slot;
 use std::collections::BTreeMap;
 use vmlab_hv_tcg::FlatMemory;
 
@@ -37,12 +40,12 @@ pub struct Entry {
     pub encoding: u32,
     pub before: Core,
     pub after: Core,
+    /// The vector and FP registers before and after.
+    pub vectors: Option<(Vectors, Vectors)>,
     /// Memory before the instruction: address and bytes.
     pub reads: Vec<(u64, Vec<u8>)>,
     /// What the instruction writes: address and bytes.
     pub writes: Vec<(u64, Vec<u8>)>,
-    /// Vector registers: the number, the value before and the value after.
-    pub vectors: Vec<(u8, u128, u128)>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -73,7 +76,23 @@ fn parse_memory(text: &str) -> Result<(u64, Vec<u8>), String> {
     ))
 }
 
-fn parse_core(text: &str) -> Result<Core, String> {
+/// The vector and FP registers of one side of a line, as far as it gives them.
+#[derive(Default)]
+struct VectorsText {
+    fpcr: Option<u32>,
+    fpsr: Option<u32>,
+    /// `v=`: all 32 registers.
+    all: Option<[u128; 32]>,
+    /// `dv=`: the registers that changed.
+    changed: Vec<(usize, u128)>,
+}
+
+fn wide(text: &str) -> Result<u128, String> {
+    u128::from_str_radix(text, 16).map_err(|_| format!("`{text}` is not a hex number"))
+}
+
+fn parse_core(text: &str) -> Result<(Core, VectorsText), String> {
+    let mut vectors = VectorsText::default();
     let mut core = Core {
         x: [0; 31],
         sp: 0,
@@ -103,6 +122,39 @@ fn parse_core(text: &str) -> Result<Core, String> {
                     core.x[n] = number(value)?;
                 }
             }
+            "fpcr" => {
+                vectors.fpcr = Some(u32::try_from(number(value)?).map_err(|_| "fpcr has 32 bits")?);
+                continue;
+            }
+            "fpsr" => {
+                vectors.fpsr = Some(u32::try_from(number(value)?).map_err(|_| "fpsr has 32 bits")?);
+                continue;
+            }
+            "v" => {
+                let values: Vec<&str> = value.split(',').collect();
+                if values.len() != 32 {
+                    return Err(format!("{} V registers, not 32", values.len()));
+                }
+                let mut all = [0u128; 32];
+                for (n, value) in values.iter().enumerate() {
+                    all[n] = wide(value)?;
+                }
+                vectors.all = Some(all);
+                continue;
+            }
+            "dv" => {
+                for part in value.split(',') {
+                    let (n, value) = part
+                        .split_once(':')
+                        .ok_or_else(|| format!("`{part}` is not number:value"))?;
+                    let n: usize = n.parse().map_err(|_| format!("`{n}` is not a number"))?;
+                    if n >= 32 {
+                        return Err(format!("V{n} does not exist"));
+                    }
+                    vectors.changed.push((n, wide(value)?));
+                }
+                continue;
+            }
             other => return Err(format!("the register `{other}` is not known")),
         }
         seen += 1;
@@ -110,7 +162,37 @@ fn parse_core(text: &str) -> Result<Core, String> {
     if seen != 4 {
         return Err("a state is pc, cpsr, sp and x".into());
     }
-    Ok(core)
+    Ok((core, vectors))
+}
+
+/// The vector and FP registers of both sides of a line. `None`: the line
+/// has none.
+fn parse_vectors(
+    before: VectorsText,
+    after: VectorsText,
+) -> Result<Option<(Vectors, Vectors)>, String> {
+    let (Some(fpcr), Some(fpsr), Some(v)) = (before.fpcr, before.fpsr, before.all) else {
+        if before.fpcr.is_some() || before.fpsr.is_some() || before.all.is_some() {
+            return Err("the state before has fpcr, fpsr and v, or none of them".into());
+        }
+        if after.fpcr.is_some() || after.fpsr.is_some() || !after.changed.is_empty() {
+            return Err("the state after has vector registers and the state before none".into());
+        }
+        return Ok(None);
+    };
+    if !before.changed.is_empty() || after.all.is_some() {
+        return Err("the state before has v, and the state after dv".into());
+    }
+    let before = Vectors { v, fpsr, fpcr };
+    let mut after_vectors = Vectors {
+        v,
+        fpsr: after.fpsr.ok_or("the state after has no fpsr")?,
+        fpcr: after.fpcr.ok_or("the state after has no fpcr")?,
+    };
+    for (n, value) in after.changed {
+        after_vectors.v[n] = value;
+    }
+    Ok(Some((before, after_vectors)))
 }
 
 impl Entry {
@@ -121,15 +203,35 @@ impl Entry {
             encoding,
             before,
             after,
+            vectors: None,
             reads: Vec::new(),
             writes: Vec::new(),
-            vectors: Vec::new(),
         }
     }
 
+    /// The registers of the line, without its memory.
+    fn registers_line(&self) -> String {
+        let Some((before, after)) = &self.vectors else {
+            return format!("{:08x} {} => {}", self.encoding, self.before, self.after);
+        };
+        let mut line = format!(
+            "{:08x} {} {before} => {} fpcr={:x} fpsr={:x}",
+            self.encoding, self.before, self.after, after.fpcr, after.fpsr
+        );
+        let changed: Vec<String> = (0..32)
+            .filter(|n| before.v[*n] != after.v[*n])
+            .map(|n| format!("{n}:{:x}", after.v[n]))
+            .collect();
+        if !changed.is_empty() {
+            line.push_str(" dv=");
+            line.push_str(&changed.join(","));
+        }
+        line
+    }
+
     pub fn line(&self) -> String {
-        let mut line = format!("{:08x} {} => {}", self.encoding, self.before, self.after);
-        if self.reads.is_empty() && self.writes.is_empty() && self.vectors.is_empty() {
+        let mut line = self.registers_line();
+        if self.reads.is_empty() && self.writes.is_empty() {
             return line;
         }
         line.push_str(" |");
@@ -139,17 +241,22 @@ impl Entry {
         for (address, bytes) in &self.writes {
             line.push_str(&format!(" w={address:x}:{}", hex(bytes)));
         }
-        for (n, before, after) in &self.vectors {
-            line.push_str(&format!(" v{n}={before:032x}:{after:032x}"));
-        }
         line
     }
 
     pub fn parse(line: &str) -> Result<Self, String> {
-        let (line, more) = match line.split_once('|') {
-            Some((line, more)) => (line, more),
+        let (line, memory) = match line.split_once('|') {
+            Some((line, memory)) => (line, memory),
             None => (line, ""),
         };
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
+        for part in memory.split_whitespace() {
+            match part.split_once('=') {
+                Some(("r", value)) => reads.push(parse_memory(value)?),
+                Some(("w", value)) => writes.push(parse_memory(value)?),
+                _ => return Err(format!("`{part}` is not r=address:bytes or w=address:bytes")),
+            }
+        }
         let (encoding, rest) = line
             .trim()
             .split_once(' ')
@@ -157,49 +264,29 @@ impl Entry {
         let (before, after) = rest
             .split_once("=>")
             .ok_or("an entry has `=>` between its two states")?;
-        let mut entry = Self::core(
-            u32::from_str_radix(encoding, 16)
+        let (before, before_vectors) = parse_core(before)?;
+        let (after, after_vectors) = parse_core(after)?;
+        Ok(Self {
+            encoding: u32::from_str_radix(encoding, 16)
                 .map_err(|_| format!("`{encoding}` is not an encoding"))?,
-            parse_core(before)?,
-            parse_core(after)?,
-        );
-        for part in more.split_whitespace() {
-            let (key, value) = part
-                .split_once('=')
-                .ok_or_else(|| format!("`{part}` is not key=value"))?;
-            match key {
-                "r" => entry.reads.push(parse_memory(value)?),
-                "w" => entry.writes.push(parse_memory(value)?),
-                _ => {
-                    let n: u8 = key
-                        .strip_prefix('v')
-                        .and_then(|n| n.parse().ok())
-                        .filter(|n| *n < 32)
-                        .ok_or_else(|| format!("`{key}` is not r, w or a vector register"))?;
-                    let (before, after) = value
-                        .split_once(':')
-                        .ok_or_else(|| format!("`{value}` is not before:after"))?;
-                    let number = |text: &str| {
-                        u128::from_str_radix(text, 16)
-                            .map_err(|_| format!("`{text}` is not a hex number"))
-                    };
-                    entry.vectors.push((n, number(before)?, number(after)?));
-                }
-            }
-        }
-        Ok(entry)
+            before,
+            after,
+            vectors: parse_vectors(before_vectors, after_vectors)?,
+            reads,
+            writes,
+        })
     }
 
     /// Run the instruction on our interpreter from `before`, and compare
-    /// with `after`: the registers, the vector registers and the bytes that
-    /// it writes.
+    /// with `after`: the registers, the vector and FP registers where the
+    /// entry has them, and the bytes that the instruction writes.
     pub fn replay(&self) -> Result<(), String> {
         let mut state = self
             .before
             .state()
             .ok_or("the entry does not start at EL1 with SP_EL1")?;
-        for (n, before, _) in &self.vectors {
-            state.slots[slot::V0 + usize::from(*n)] = *before;
+        if let Some((before, _)) = &self.vectors {
+            before.apply(&mut state);
         }
         // One memory from the page of the lowest address that the entry
         // names to the page of the highest.
@@ -237,16 +324,8 @@ impl Entry {
         cpu.step()
             .map_err(|stop| format!("{:08x}: our interpreter stops: {stop:?}", self.encoding))?;
         let mut found = Core::of(&cpu.state).difference(&self.after);
-        for n in 0..32u8 {
-            let expected = self
-                .vectors
-                .iter()
-                .find(|(register, _, _)| *register == n)
-                .map_or(0, |(_, _, after)| *after);
-            let ours = cpu.state.slots[slot::V0 + usize::from(n)];
-            if ours != expected {
-                found.push(format!("v{n}: {ours:#x} / {expected:#x}"));
-            }
+        if let Some((_, after)) = &self.vectors {
+            found.extend(Vectors::of(&cpu.state).difference(after));
         }
         let bytes = |writes: &mut dyn Iterator<Item = (u64, Vec<u8>)>| {
             let mut map = BTreeMap::new();
@@ -316,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_with_memory_and_vector_registers_goes_to_a_line_and_back_and_replays() {
+    fn an_entry_with_memory_goes_to_a_line_and_back_and_replays() {
         let mut before = Core {
             x: [0; 31],
             sp: 0,
@@ -333,13 +412,16 @@ mod tests {
             (0x4210_0ff0, value(0x10).to_le_bytes().to_vec()),
             (0x4210_1000, value(0x20).to_le_bytes().to_vec()),
         ];
-        store.vectors = vec![(1, value(0x10), value(0x10)), (2, value(0x20), value(0x20))];
+        let mut vectors = Vectors::default();
+        vectors.v[1] = value(0x10);
+        vectors.v[2] = value(0x20);
+        store.vectors = Some((vectors, vectors));
         let line = store.line();
         assert!(line.contains(" | w=42100ff0:101112"), "{line}");
-        assert!(line.contains(" v2=2f2e2d"), "{line}");
+        assert!(line.contains(" fpcr=0 fpsr=0 v=0,1f1e1d"), "{line}");
         assert_eq!(Entry::parse(&line), Ok(store.clone()));
         assert_eq!(store.replay(), Ok(()));
-        // A wrong byte, and a write that the entry does not have.
+        // A wrong byte, and a write that is shorter than the instruction's.
         let mut wrong = store.clone();
         wrong.writes[1].1[0] ^= 1;
         assert!(wrong.replay().unwrap_err().contains("memory writes"));
@@ -355,11 +437,60 @@ mod tests {
         assert_eq!(Entry::parse(&load.line()), Ok(load.clone()));
         assert_eq!(load.replay(), Ok(()));
         let mut wrong = load.clone();
-        wrong.vectors.push((5, 0, 1));
-        assert!(wrong.replay().unwrap_err().contains("v5: 0x0 / 0x1"));
+        wrong.after.x[3] = 1;
+        assert!(wrong.replay().unwrap_err().contains("x3: 0x88776655 / 0x1"));
         assert!(Entry::parse(&format!("{} | q=1", load.line())).is_err());
-        assert!(Entry::parse(&format!("{} | v32=0:0", load.line())).is_err());
         assert!(Entry::parse(&format!("{} | r=42100000:123", load.line())).is_err());
+    }
+
+    #[test]
+    fn an_entry_with_vector_registers_goes_to_a_line_and_back_and_replays() {
+        // fadd d0, d1, d2 with 1.5 + 2.25, and V0 full of ones before it.
+        let mut entry = entry();
+        entry.encoding = 0x1e62_2820;
+        entry.after.x[0] = entry.before.x[0];
+        let mut before = Vectors {
+            fpcr: 3 << 22,
+            fpsr: 1,
+            ..Vectors::default()
+        };
+        before.v[0] = u128::MAX;
+        before.v[1] = u128::from(1.5f64.to_bits());
+        before.v[2] = u128::from(2.25f64.to_bits());
+        let mut after = before;
+        after.v[0] = u128::from(3.75f64.to_bits());
+        entry.vectors = Some((before, after));
+        let line = entry.line();
+        assert!(
+            line.contains(
+                " fpcr=c00000 fpsr=1 v=ffffffffffffffffffffffffffffffff,3ff8000000000000,"
+            )
+        );
+        assert!(
+            line.ends_with(" fpcr=c00000 fpsr=1 dv=0:400e000000000000"),
+            "{line}"
+        );
+        assert_eq!(Entry::parse(&line), Ok(entry.clone()));
+        assert_eq!(entry.replay(), Ok(()));
+        // A wrong expectation names the register.
+        let mut wrong = entry.clone();
+        wrong.vectors = Some((before, before));
+        let error = wrong.replay().unwrap_err();
+        assert!(
+            error.contains("v0: 0x400e000000000000 / 0xffffffffffffffffffffffffffffffff"),
+            "{error}"
+        );
+        let mut flags = entry.clone();
+        after.fpsr = 0x11;
+        flags.vectors = Some((before, after));
+        assert!(flags.replay().unwrap_err().contains("fpsr: 0x1 / 0x11"));
+        // An instruction that changes no vector register has no dv.
+        entry.vectors = Some((before, before));
+        assert!(entry.line().ends_with(" fpcr=c00000 fpsr=1"));
+        assert_eq!(Entry::parse(&entry.line()), Ok(entry.clone()));
+        // Half of the vector registers is not a state.
+        assert!(Entry::parse(&line.replace(" fpsr=1 v=", " v=")).is_err());
+        assert!(Entry::parse(&line.replace("dv=0:", "dv=40:")).is_err());
     }
 
     #[test]

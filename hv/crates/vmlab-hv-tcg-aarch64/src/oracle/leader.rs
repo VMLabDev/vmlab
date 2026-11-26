@@ -47,8 +47,8 @@ impl Leader {
         Self::start_with(qemu, plugin, directory, ram_mib, false)
     }
 
-    /// As `start`. With `vectors` each instruction record carries V0 to
-    /// V31, FPSR and FPCR.
+    /// As `start`. With `vectors` each instruction record of the plugin
+    /// carries V0 to V31, FPSR and FPCR, and FP is enabled for EL1 and EL0.
     pub fn start_with(
         qemu: &str,
         plugin: &Path,
@@ -120,7 +120,10 @@ impl Leader {
             kill(child);
             return Err(other("the plugin stream does not start with its magic"));
         }
-        let vectors = header[8] & 1 != 0;
+        if (header[8] & 1 != 0) != vectors {
+            kill(child);
+            return Err(other("the plugin stream does not carry what was asked for"));
+        }
         let rsp = loop {
             match Rsp::connect(&socket) {
                 Ok(rsp) => break rsp,
@@ -142,7 +145,47 @@ impl Leader {
             directory: directory.to_path_buf(),
         };
         leader.rsp.break_at(VECTOR)?;
+        if vectors {
+            leader.enable_fp()?;
+        }
         Ok(leader)
+    }
+
+    /// Let QEMU run a prelude that sets CPACR_EL1.FPEN, so that an FP
+    /// instruction does not trap. The gdbstub cannot write a system register
+    /// (DESIGN.md O1), so the guest does it. The RAM is put back afterwards.
+    fn enable_fp(&mut self) -> io::Result<()> {
+        // movz x0, #0x30, lsl #16 ; msr cpacr_el1, x0 ; isb ; b .
+        const PRELUDE: [u32; 4] = [0xd2a0_0600, 0xd518_1040, 0xd503_3fdf, 0x1400_0000];
+        let at = RAM_BASE + 0x1000;
+        let end = at + 12;
+        let bytes: Vec<u8> = PRELUDE.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let saved = self.rsp.read_memory(at, bytes.len())?;
+        self.rsp.write_memory(at, &bytes)?;
+        let mut core = self.rsp.core()?;
+        core.pc = at;
+        self.rsp.set_core(&core)?;
+        self.rsp.break_at(end)?;
+        self.resume()?;
+        self.stop(false)?;
+        let stopped = self.rsp.core()?;
+        self.rsp.clear_break(end)?;
+        self.rsp.write_memory(at, &saved)?;
+        if stopped.pc != end {
+            return Err(other(format!(
+                "the prelude that enables FP stopped at {:#x}, not at its end",
+                stopped.pc
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_vectors(&mut self, vectors: &Vectors) -> io::Result<()> {
+        self.rsp.set_vectors(vectors)
+    }
+
+    pub fn vectors(&mut self) -> io::Result<Vectors> {
+        self.rsp.vectors()
     }
 
     pub fn load(&mut self, address: u64, data: &[u8]) -> io::Result<()> {
@@ -177,24 +220,6 @@ impl Leader {
     /// Whether the instruction records carry the vector registers.
     pub fn has_vectors(&self) -> bool {
         self.vectors
-    }
-
-    /// V0 to V31 of QEMU, through the gdbstub. FPSR and FPCR are not read:
-    /// they are 0 here.
-    pub fn vectors(&mut self) -> io::Result<Vectors> {
-        let mut v = [0; 32];
-        for (n, value) in v.iter_mut().enumerate() {
-            *value = self.rsp.vector(n)?;
-        }
-        Ok(Vectors {
-            v,
-            fpsr: 0,
-            fpcr: 0,
-        })
-    }
-
-    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
-        self.rsp.set_vector(n, value)
     }
 
     /// Run `words` on QEMU alone, from `address`, to set system state that
