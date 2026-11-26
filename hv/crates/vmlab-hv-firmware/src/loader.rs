@@ -66,6 +66,11 @@ impl TableLoader {
         r[120] = size;
     }
 
+    /// The records alone, as QEMU's `virt` machine hands them out.
+    pub fn into_records(self) -> Vec<u8> {
+        self.0
+    }
+
     /// Pad with ignorable command-zero records to a firmware page boundary.
     pub fn finish(mut self) -> Vec<u8> {
         self.0.resize(self.0.len().div_ceil(4096) * 4096, 0);
