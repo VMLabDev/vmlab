@@ -216,7 +216,7 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
             );
         }
         if row.el1.allows(true) {
-            // Never SCTLR_EL1.M: translation is card C8.
+            // Never SCTLR_EL1.M: the test has no translation tables.
             let wrote = bench.msr(row.encoding, 0x5555_5555_5555_5554);
             assert!(matches!(wrote, Answer::Ran(_)), "{name}: {wrote:?}");
             written += 1;
@@ -578,7 +578,13 @@ fn el0_reaches_what_el1_opens() {
         let mut bench = Bench::new(&V8_0, true, false);
         assert_eq!(bench.named(name), Answer::Fault(syndrome), "{name}");
         // Every other bit of the control register leaves the gate closed.
-        bench.cpu.state.system.regs[control] = !bit & ROWS[control].mask;
+        // But SCTLR_EL1.M: the test has no translation tables.
+        let keep = if control == reg::SCTLR_EL1 {
+            !sctlr::M
+        } else {
+            u64::MAX
+        };
+        bench.cpu.state.system.regs[control] = !bit & ROWS[control].mask & keep;
         if name != "CNTFRQ_EL0" {
             assert_eq!(bench.named(name), Answer::Fault(syndrome), "{name}");
         }

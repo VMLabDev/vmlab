@@ -4,7 +4,8 @@
 //! The semantics are our own code: lifters that append to a block of the
 //! typed IR of `vmlab-hv-tcg-ir` (`lift`), run by a small interpreter loop
 //! (`exec`). `sysreg` is the table of the system registers, `exception` the
-//! exception levels with entry and return, and `timer` the generic timer.
+//! exception levels with entry and return, `mmu` address translation with
+//! the softmmu TLB, and `timer` the generic timer.
 //! `helpers` holds what a lifter calls and does not express in the
 //! graph: floating point on Berkeley SoftFloat, the lanes of AdvSIMD, AES and SHA. `oracle` is the test harness that follows a running QEMU
 //! instruction by instruction. QEMU is the test oracle only: nothing in this
@@ -21,6 +22,7 @@ pub mod fields;
 pub mod generated;
 pub mod helpers;
 pub mod lift;
+pub mod mmu;
 pub mod oracle;
 pub mod state;
 pub mod sysreg;

@@ -14,6 +14,7 @@ pub use globals::Globals;
 pub mod lockstep;
 mod memory;
 mod softfloat;
+pub mod tlb;
 mod value;
 pub use cpu::{Privilege, Riscv64, SpecializationStats, TRACE_CACHE_BYTES, TraceProfile};
 pub use memory::{CodeStamp, FlatMemory, Memory, RESERVATION_GRANULE, SharedMemory, next_identity};

@@ -182,6 +182,20 @@ pub fn msr(b: &mut Builder, _record: Record, f: &MSRI) -> Lifted {
     }
 }
 
+/// `SYS` and `SYSL`: the cache, TLB and address translation operations
+/// (card C8). The loop runs each: it can fault, trap, write memory or drop
+/// translations.
+pub fn sys(b: &mut Builder, op1: u32, cn: u32, cm: u32, op2: u32, rt: u32, read: bool) -> Lifted {
+    trap(
+        b,
+        Trap::Sys {
+            encoding: (op1 << 11 | cn << 7 | cm << 3 | op2) as u16,
+            rt: rt as u8,
+            read,
+        },
+    )
+}
+
 /// `MSR` of a PSTATE field with an immediate: `SPSel`, `DAIFSet` and
 /// `DAIFClr` in the 3d set. The field is op1:op2.
 pub fn msr_pstate(b: &mut Builder, _record: Record, f: &MSRpstateImm0_15) -> Lifted {

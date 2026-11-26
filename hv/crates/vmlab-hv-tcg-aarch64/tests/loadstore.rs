@@ -6,7 +6,9 @@
 //! the record that its line names.
 
 use vmlab_hv_tcg::{FlatMemory, Memory, SharedMemory};
+use vmlab_hv_tcg_aarch64::exception::{Cause, Exception};
 use vmlab_hv_tcg_aarch64::state::slot;
+use vmlab_hv_tcg_aarch64::sysreg::reg;
 use vmlab_hv_tcg_aarch64::{Cpu, Record, State, Stop, decode, with_field};
 
 const BASE: u64 = 0x4000_0000;
@@ -40,11 +42,51 @@ fn ordered(record: Record, rt: u32, rn: u32) -> u32 {
     word
 }
 
-/// The word that ends a program of these tests: `IC IALLU`, a `SYS`
-/// instruction, which has no lifter before card C8 and so stops the loop
-/// with `Stop::Unimplemented`. The zero word did that before card C6. It is
-/// `UDF`, which is now an exception of the guest.
-const END: u32 = 0xd508_751f;
+/// The word that ends a program of these tests: `HVC #0`, which stops the
+/// loop with `Stop::Hypercall`. The code pages are full of it, and the
+/// vector table of the tests is in the second of them, so an exception of
+/// the guest ends a run too.
+const END: u32 = 0xd400_0002;
+/// VBAR_EL1 of the tests, and the vector of an exception from EL1 with
+/// SP_EL1.
+const TABLE: u64 = BASE + 0x1000;
+const VECTOR: u64 = TABLE + 0x200;
+
+/// Run to the end word of the program. The call that ends a program is an
+/// instruction of the loop and not of the program: it is not counted.
+/// `false`: the run ended in another way, or the guest took an exception.
+fn run_to_end(cpu: &mut Cpu<impl Memory>, budget: u64) -> bool {
+    let ended = matches!(cpu.run(budget), Stop::Hypercall { .. }) && cpu.taken.is_none();
+    if ended {
+        cpu.instructions -= 1;
+    }
+    ended
+}
+
+/// The data abort that the CPU took last: the instruction, the address in
+/// FAR_EL1, whether the access writes, and the fault status code.
+fn abort(cpu: &Cpu<impl Memory>) -> Option<(u64, u64, bool, u8)> {
+    let taken = cpu.taken?;
+    match taken.cause {
+        Cause::Exception(Exception::DataAbort {
+            status,
+            write,
+            address,
+            ..
+        }) => {
+            assert_eq!(cpu.state.system.regs[reg::FAR_EL1], address);
+            assert_eq!(cpu.state.system.regs[reg::ELR_EL1], taken.from);
+            Some((taken.from, address, write, status))
+        }
+        _ => None,
+    }
+}
+
+/// The fault status codes of the tests: a synchronous external abort, an
+/// alignment fault, and an address size fault of level 0.
+const EXTERNAL: u8 = 0x10;
+const ALIGNMENT: u8 = 0x21;
+const ADDRESS_SIZE: u8 = 0x00;
 
 fn image(words: &[u32]) -> Vec<u8> {
     let mut data = vec![0u8; SIZE];
@@ -61,7 +103,9 @@ fn image(words: &[u32]) -> Vec<u8> {
 }
 
 fn cpu(words: &[u32]) -> Cpu<FlatMemory> {
-    Cpu::new(FlatMemory::new(BASE, image(words)), State::reset(BASE))
+    let mut state = State::reset(BASE);
+    state.system.regs[reg::VBAR_EL1] = TABLE;
+    Cpu::new(FlatMemory::new(BASE, image(words)), state)
 }
 
 fn read(cpu: &mut Cpu<impl Memory>, address: u64, len: usize) -> Vec<u8> {
@@ -121,7 +165,7 @@ fn every_addressing_mode_finds_its_address_and_writes_its_base_back() {
     cpu.state.set_x(11, 0xffff_fff0);
     cpu.state.set_x(12, 0xdead_beef_0000_0003);
     cpu.state.set_sp(DATA + 0x200);
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 9);
     assert_eq!(cpu.state.x(1), pattern(0x110, 8));
     assert_eq!(cpu.state.x(2), pattern(0xf8, 8));
@@ -157,7 +201,7 @@ fn a_load_extends_with_zeros_or_with_the_sign_to_its_register() {
         cpu.state.set_x(n, u64::MAX);
     }
     let sp = cpu.state.sp();
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 9);
     assert_eq!(cpu.state.x(1), 0xf0);
     assert_eq!(cpu.state.x(2), 0xffff_fff0);
@@ -185,7 +229,7 @@ fn a_store_writes_the_low_bytes_of_its_register_and_nothing_beside_them() {
     cpu.state.set_x(0, DATA + 0x400);
     cpu.state.set_x(1, 0x1122_3344_5566_7788);
     cpu.memory.write(DATA + 0x400, &[0xaa; 64]).unwrap();
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     let bytes = read(&mut cpu, DATA + 0x400, 64);
     assert_eq!(bytes[..4], [0xaa, 0x88, 0xaa, 0xaa]);
     assert_eq!(bytes[8..12], [0x88, 0x77, 0xaa, 0xaa]);
@@ -244,7 +288,7 @@ fn a_pair_is_two_registers_side_by_side_with_the_first_at_the_lower_address() {
     set_v(&mut cpu, 1, 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100);
     set_v(&mut cpu, 2, 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110);
     set_v(&mut cpu, 3, u128::MAX);
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 6);
     assert_eq!(cpu.state.sp(), DATA + 0x800);
     assert_eq!(read(&mut cpu, DATA + 0x7f0, 8), 0x1111u64.to_le_bytes());
@@ -290,7 +334,7 @@ fn a_vector_register_moves_its_low_bytes_and_a_load_clears_the_rest() {
     for n in 2..=8 {
         set_v(&mut cpu, n, u128::MAX);
     }
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 12);
     let bytes = read(&mut cpu, DATA + 0x400, 32);
     assert_eq!(bytes[..4], [0x00, 0xaa, 0x00, 0x11]);
@@ -337,7 +381,7 @@ fn whole_register_structures_lie_in_memory_in_turn_or_one_register_after_the_oth
     for n in 0..32 {
         set_v(&mut cpu, n, u128::MAX);
     }
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 7);
     // LD2 of 32-bit elements: the even words to the first register.
     let words = |offsets: [u64; 4]| {
@@ -462,7 +506,7 @@ fn a_single_lane_keeps_the_other_lanes_and_a_replicated_one_fills_them() {
     set_v(&mut cpu, 11, 0x1f1e_1d1c_1b1a_1918_1716_1514_1312_1110);
     set_v(&mut cpu, 12, 0x2f2e_2d2c_2b2a_2928_2726_2524_2322_2120);
     cpu.memory.write(DATA + 0x1000, &[0xaa; 64]).unwrap();
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 11);
     let e = 0xeeee_eeee_eeee_eeee_eeee_eeee_eeee_eeeeu128;
     // LD4 of 16-bit lanes ran later and changed the lane 7 of V1 and V2.
@@ -536,9 +580,10 @@ fn a_prefetch_touches_nothing_also_at_an_address_that_holds_no_memory() {
     cpu.state.set_x(0, 0x1234);
     cpu.state.set_x(1, u64::MAX);
     let mut before = cpu.state.clone();
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 5);
-    before.set_pc(BASE + 20);
+    // After the five prefetches and the call that ends the program.
+    before.set_pc(BASE + 24);
     assert_eq!(cpu.state, before);
 }
 
@@ -555,22 +600,18 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
         let mut cpu = cpu(&program);
         cpu.state.set_x(0, 0x1000);
         cpu.state.set_x(2, 77);
-        let stop = if single {
+        if single {
             cpu.step().unwrap();
-            cpu.step().unwrap_err()
+            cpu.step().unwrap();
+            assert_eq!(cpu.instructions, 1);
         } else {
-            cpu.run(100)
-        };
-        assert_eq!(
-            stop,
-            Stop::DataAbort {
-                pc: BASE + 4,
-                address: 0x1008,
-                write: false
-            }
-        );
-        assert_eq!(cpu.state.pc(), BASE + 4);
-        assert_eq!(cpu.instructions, 1);
+            // The guest takes the abort, and the call at its vector ends
+            // the run.
+            assert!(matches!(cpu.run(100), Stop::Hypercall { pc, .. } if pc == VECTOR));
+            assert_eq!(cpu.instructions, 2);
+        }
+        assert_eq!(abort(&cpu), Some((BASE + 4, 0x1008, false, EXTERNAL)));
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x9600_0010);
         assert_eq!(cpu.state.x(1), 1);
         // No write back, and the register of the load keeps its value.
         assert_eq!(cpu.state.x(0), 0x1000);
@@ -585,14 +626,9 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
     let end = BASE + SIZE as u64;
     cpu.state.set_x(0, end - 8);
     cpu.state.set_x(1, 0x0102_0304_0506_0708);
-    assert_eq!(
-        cpu.run(100),
-        Stop::DataAbort {
-            pc: BASE,
-            address: end,
-            write: true
-        }
-    );
+    cpu.step().unwrap();
+    assert_eq!(abort(&cpu), Some((BASE, end, true, EXTERNAL)));
+    assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x9600_0050);
     assert_eq!(cpu.state.x(0), end - 8);
     assert_eq!(
         read(&mut cpu, end - 8, 8),
@@ -605,7 +641,8 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
     )]);
     cpu.state.set_x(0, end - 8);
     cpu.state.set_x(1, 5);
-    assert!(matches!(cpu.run(100), Stop::DataAbort { write: false, .. }));
+    cpu.step().unwrap();
+    assert_eq!(abort(&cpu), Some((BASE, end, false, EXTERNAL)));
     assert_eq!(cpu.state.x(1), 5);
     assert_eq!(cpu.instructions, 0);
 }
@@ -623,7 +660,7 @@ fn a_store_into_translated_code_runs_the_new_code() {
     ]);
     cpu.state.set_x(0, BASE + 8);
     cpu.state.set_x(1, 0x9100_0863);
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 3);
     assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 2));
     // The same through single steps.
@@ -650,22 +687,31 @@ fn a_store_into_data_keeps_the_translated_blocks() {
     ]);
     cpu.state.set_x(0, DATA);
     cpu.state.set_x(1, 100);
-    assert!(matches!(cpu.run(u64::MAX), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, u64::MAX));
     assert_eq!(cpu.instructions, 300);
-    assert_eq!(cpu.translations, 1);
+    // The loop, and the call that ends the program.
+    assert_eq!(cpu.translations, 2);
     assert_eq!(read(&mut cpu, DATA + 99 * 8, 8), 1u64.to_le_bytes());
-    // A second run finds the block again: our own stores are accounted for.
+    // A second run finds the blocks again: our own stores are accounted for.
     cpu.state.set_pc(BASE);
     cpu.state.set_x(0, DATA);
     cpu.state.set_x(1, 10);
-    assert!(matches!(cpu.run(u64::MAX), Stop::Unimplemented { .. }));
-    assert_eq!(cpu.translations, 1);
-    // A write from outside drops it.
+    assert!(run_to_end(&mut cpu, u64::MAX));
+    assert_eq!(cpu.translations, 2);
+    // A write from outside into a data page keeps them too: the code stamp
+    // of their page still holds.
     cpu.memory.write(DATA, &[1]).unwrap();
     cpu.state.set_pc(BASE);
     cpu.state.set_x(1, 1);
-    assert!(matches!(cpu.run(u64::MAX), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, u64::MAX));
     assert_eq!(cpu.translations, 2);
+    // A write from outside into their page drops both, also when it changes
+    // none of their bytes.
+    cpu.memory.write(BASE + 0x800, &END.to_le_bytes()).unwrap();
+    cpu.state.set_pc(BASE);
+    cpu.state.set_x(1, 1);
+    assert!(run_to_end(&mut cpu, u64::MAX));
+    assert_eq!(cpu.translations, 4);
 }
 
 fn ldxr(rt: u32, rn: u32) -> u32 {
@@ -706,7 +752,7 @@ fn an_exclusive_store_writes_once_after_an_exclusive_load_of_the_same_place() {
         read(&mut cpu, DATA + 0x100, 8),
         pattern(0x100, 8).to_le_bytes()
     );
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 9);
     assert_eq!(cpu.state.x(2), 0x1234_5678_9abc_def0);
     assert_eq!(
@@ -738,7 +784,7 @@ fn a_store_of_the_same_cpu_keeps_the_reservation_unless_it_changes_the_value() {
     cpu.state.set_x(0, DATA + 0x100);
     cpu.state.set_x(1, 7);
     cpu.state.set_x(4, 9);
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!((cpu.state.x(10), cpu.state.x(11)), (0, 1));
     assert_eq!(read(&mut cpu, DATA + 0x100, 8), 9u64.to_le_bytes());
     // `clear_exclusive` ends a reservation, as CLREX will.
@@ -793,7 +839,7 @@ fn an_exclusive_store_compares_the_memory_at_its_own_size_with_the_loaded_value(
     cpu.memory
         .write(DATA + 0x200, &0x42u64.to_le_bytes())
         .unwrap();
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 11);
     assert_eq!(
         [10, 11, 12, 13, 14].map(|n| cpu.state.x(n)),
@@ -819,12 +865,11 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     cpu.state.set_x(0, DATA + 0x101);
     cpu.state.set_x(10, 7);
     cpu.step().unwrap();
+    cpu.step().unwrap();
+    // The alignment fault of an exclusive store says "read", as QEMU's.
     assert_eq!(
-        cpu.step(),
-        Err(Stop::Alignment {
-            pc: BASE + 4,
-            address: DATA + 0x101
-        })
+        abort(&cpu),
+        Some((BASE + 4, DATA + 0x101, false, ALIGNMENT))
     );
     assert_eq!(cpu.state.x(10), 7);
     // The store did not complete, so the mark is still there.
@@ -836,19 +881,13 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     // address fails without a fault.
     let mut cpu = self::cpu(&[stxr(10, 1, 0)]);
     cpu.state.set_x(0, u64::MAX);
-    assert_eq!(
-        cpu.step(),
-        Err(Stop::Alignment {
-            pc: BASE,
-            address: u64::MAX
-        })
-    );
+    cpu.step().unwrap();
+    assert_eq!(abort(&cpu), Some((BASE, u64::MAX, false, ALIGNMENT)));
     let mut cpu = self::cpu(&[word(Record::STXRB, &[("ws", 10), ("rt", 1), ("rn", 0)])]);
     cpu.state.set_x(0, u64::MAX);
-    assert!(matches!(
-        cpu.step(),
-        Err(Stop::DataAbort { write: true, .. })
-    ));
+    cpu.step().unwrap();
+    // The address is wider than a physical address, and the MMU is off.
+    assert_eq!(abort(&cpu), Some((BASE, u64::MAX, true, ADDRESS_SIZE)));
 }
 
 #[test]
@@ -882,7 +921,7 @@ fn exclusive_pairs_and_the_smaller_sizes_move_what_their_names_say() {
     cpu.state.set_x(3, 0x3333_3333_3333_3333);
     cpu.state.set_x(4, 0x4444_4444_4444_4444);
     cpu.state.set_x(14, DATA + 0x101);
-    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 10);
     assert_eq!(cpu.state.x(1), pattern(0x100, 8));
     assert_eq!(cpu.state.x(2), pattern(0x108, 8));
@@ -907,19 +946,19 @@ fn an_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     let mut cpu = cpu(&[0x9100_0421, ldxr(2, 0)]);
     cpu.state.set_x(0, DATA + 0x101);
     cpu.state.set_x(2, 5);
+    assert!(matches!(cpu.run(100), Stop::Hypercall { pc, .. } if pc == VECTOR));
     assert_eq!(
-        cpu.run(100),
-        Stop::Alignment {
-            pc: BASE + 4,
-            address: DATA + 0x101
-        }
+        abort(&cpu),
+        Some((BASE + 4, DATA + 0x101, false, ALIGNMENT))
     );
-    assert_eq!(cpu.instructions, 1);
+    // The instruction before the fault, and the call at the vector.
+    assert_eq!(cpu.instructions, 2);
     assert_eq!((cpu.state.x(1), cpu.state.x(2)), (1, 5));
     // A pair of two 8-byte registers is one exclusive access of 16 bytes.
     let mut cpu = self::cpu(&[word(Record::LDXPX, &[("rt", 1), ("rt2", 2), ("rn", 0)])]);
     cpu.state.set_x(0, DATA + 0x108);
-    assert!(matches!(cpu.step(), Err(Stop::Alignment { .. })));
+    cpu.step().unwrap();
+    assert_eq!(abort(&cpu), Some((BASE, DATA + 0x108, false, ALIGNMENT)));
     // One byte has no alignment.
     let mut cpu = self::cpu(&[word(Record::LDXRB, &[("rt", 1), ("rn", 0)])]);
     cpu.state.set_x(0, DATA + 0x101);
@@ -936,25 +975,34 @@ fn an_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     }
 }
 
-/// The stop of `word` with X0 at `DATA + offset`, when it stops.
-fn stop_at(word: u32, offset: u64) -> Option<Stop> {
+/// The data abort of `word` with X0 at `DATA + offset`, when it takes one.
+fn stop_at(word: u32, offset: u64) -> Option<(u64, u64, bool, u8)> {
     let mut cpu = cpu(&[word]);
     cpu.state.set_x(0, DATA + offset);
     cpu.state.set_x(1, 1);
     let before = cpu.state.clone();
-    let stop = cpu.step().err();
-    if stop.is_some() {
-        // The write back of the base did not happen.
-        assert_eq!(cpu.state, before);
+    cpu.step().unwrap();
+    let fault = abort(&cpu);
+    if fault.is_some() {
+        // The write back of the base did not happen: every general and
+        // every vector register is as it was.
+        for index in (slot::X0..=slot::X30).chain(slot::V0..slot::V0 + 32) {
+            assert_eq!(cpu.state.slots[index], before.slots[index]);
+        }
         assert_eq!(read(&mut cpu, DATA, 0x40), image(&[])[0x2000..0x2040]);
     }
-    stop
+    fault
 }
 
 #[test]
 fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
     let aligned = |word: u32, offset: u64| stop_at(word, offset).is_none();
-    let refused = |word: u32, offset: u64| matches!(stop_at(word, offset), Some(Stop::Alignment { pc, .. }) if pc == BASE);
+    let refused = |word: u32, offset: u64| {
+        matches!(
+            stop_at(word, offset),
+            Some((BASE, _, write, ALIGNMENT)) if write == (word & (1 << 22) == 0)
+        )
+    };
     // A register of 8 bytes: a multiple of 8, also with a write back.
     let ldr = word(Record::LDRXpost, &[("rt", 2), ("rn", 0), ("offset", 8)]);
     assert!(aligned(ldr, 8) && refused(ldr, 4) && refused(ldr, 1));
@@ -995,7 +1043,8 @@ fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
     // outside the memory and not aligned is an alignment fault.
     let mut cpu = cpu(&[word(Record::LDRXui, &[("rt", 2), ("rn", 0)])]);
     cpu.state.set_x(0, 0x1001);
-    assert!(matches!(cpu.step(), Err(Stop::Alignment { .. })));
+    cpu.step().unwrap();
+    assert_eq!(abort(&cpu), Some((BASE, 0x1001, false, ALIGNMENT)));
 }
 
 #[test]
@@ -1014,7 +1063,8 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
     cpu.log_accesses(true);
     cpu.step().unwrap();
     let accesses = cpu.take_accesses();
-    assert_eq!(accesses.len(), 2);
+    // A pair of two 8-byte registers is one access of 16 bytes.
+    assert_eq!(accesses.len(), 1);
     assert_eq!(
         (
             accesses[0].address,
@@ -1022,9 +1072,8 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
             accesses[0].value,
             accesses[0].write
         ),
-        (DATA, 8, 0x11, true)
+        (DATA, 16, 0x22 << 64 | 0x11, true)
     );
-    assert_eq!((accesses[1].address, accesses[1].value), (DATA + 8, 0x22));
     cpu.step().unwrap();
     let accesses = cpu.take_accesses();
     assert_eq!(accesses.len(), 1);
@@ -1090,7 +1139,7 @@ fn a_write_of_another_cpu_between_the_load_and_the_store_fails_the_store() {
     assert_eq!((first.state.x(2), second.state.x(2)), (0, 1));
     assert_eq!(read(&mut first, DATA + 0x1000, 8), 1u64.to_le_bytes());
     // The second goes around its loop and counts on top of the first.
-    assert!(matches!(second.run(100), Stop::Unimplemented { .. }));
+    assert!(run_to_end(&mut second, 100));
     assert_eq!(read(&mut first, DATA + 0x1000, 8), 2u64.to_le_bytes());
 }
 
@@ -1112,7 +1161,8 @@ fn two_threads_count_with_exclusives_and_lose_no_increment() {
             std::thread::spawn(move || {
                 start.wait();
                 let stop = cpu.run(u64::MAX);
-                (stop, cpu.state.x(3), cpu.instructions)
+                // The call that ends the program is not one of its turns.
+                (stop, cpu.state.x(3), cpu.instructions - 1)
             })
         })
         .collect();
@@ -1120,7 +1170,7 @@ fn two_threads_count_with_exclusives_and_lose_no_increment() {
     for thread in threads {
         let (stop, left, count) = thread.join().unwrap();
         assert!(
-            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 24),
+            matches!(stop, Stop::Hypercall { pc, .. } if pc == BASE + 24),
             "{stop:?}"
         );
         assert_eq!(left, 0);

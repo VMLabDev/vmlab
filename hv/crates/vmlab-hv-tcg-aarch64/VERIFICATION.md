@@ -988,3 +988,263 @@ the vector registers that the instruction names.
 - S2, S4, S7 and S8 were not opened. No chapter of the Arm Architecture
   Reference Manual was opened (the operator's answer Q1 allows its prose).
 - X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
+
+## Card C8 (2026-11-27)
+
+Scope: translation and the softmmu. New files: `mmu.rs` (the stage-1 walk
+with its parameters as data, the permissions, the faults, and the TLB of one
+CPU), `vmlab-hv-tcg/src/tlb.rs` (the generic softmmu TLB, R12),
+`oracle/translate.rs` (the streams with the MMU on) and `tests/translate.rs`.
+`exec.rs` now translates every fetch, load and store, takes the data and
+instruction aborts of the guest itself, and runs `SYS`.
+
+### How it is built
+
+- **The walk is a pure function** (`mmu::walk`): the control registers as a
+  value (`Controls`), a virtual address, and a function that reads a
+  descriptor. The granule (4K, 16K, 64K), the size of each half and the
+  output size are numbers, and `geometry` gives the first level and the bits
+  of each level from them (A4). The regime is a value (`Regime`, G4): EL1&0
+  is the one that exists.
+- **The TLB is generic** (`vmlab_hv_tcg::tlb`): direct-mapped, one 4K page
+  per entry, tagged with an ASID unless the mapping is global, with the size
+  of the guest mapping that an invalidation by address takes whole. It knows
+  no architecture, so riscv 3b can use it. A CPU has one for each regime. A
+  fault is never kept. A new table base or ASID drops nothing. A write of
+  SCTLR_EL1, TCR_EL1 or MAIR_EL1 drops everything.
+- **Every access goes through it, also with the MMU off**: the identity
+  mapping is an entry like another, of Device memory. The fast path of a
+  load or a store is one lookup, a permission bit and the read or write.
+- **Aborts are exceptions of the guest.** `Stop::DataAbort` and
+  `Stop::Alignment` are gone. `Exception::DataAbort` carries the fault status
+  code, the direction, the cache bit and the address for FAR_EL1.
+- **Alignment is decided where the guard fails**, because it depends on the
+  memory that the address maps to.
+- **`LDTR` and `STTR`** are made as EL0. A tagged address translates with
+  TCR.TBI, and a branch to a register and `ERET` drop the tag.
+- **`SYS`**: `DC ZVA`, the cache operations (which do nothing: the blocks
+  follow the memory by their stamps), `AT S1E1R/W` and `S1E0R/W` into
+  PAR_EL1, and the TLBI operations of Armv8.0 for the regime, in the forms
+  for this CPU and for all of them. Another operation is undefined and is in
+  `Cpu::unknown` by name (G3f).
+- **Self-modifying code through the code stamps.** A block is kept under its
+  virtual PC, its context and the physical address of its code, with the
+  code stamp of the memory for its bytes. A store of this CPU into a page of
+  translated code, or a write of anything else, starts a new epoch, and a
+  block of an older epoch is used again only when its stamp still holds. A
+  write into a data page no longer drops the blocks. A write of another CPU
+  is seen at the start of `run` and `step` and at every exception and
+  exception return.
+- **No hardware update of the access flag, and no dirty state.** The CPU is
+  Armv8.0, as QEMU's `cortex-a53`: a descriptor with the access flag clear
+  faults, and the guest sets the flag.
+
+### Instruction lockstep with the MMU on
+
+A round of the group `mmu` starts from a reset of both sides. The stream
+(`oracle/translate.rs`) builds translation tables for the 4K or the 64K
+granule in each half, with any size of a half, any output size, TBI, both
+sizes of an ASID, EPD and random MAIR, turns the MMU on, and runs about 260
+items: loads and stores of every record of card C3 at addresses that the
+tables map, do not map or map without the permission (at the start of a
+page, at its end where the access crosses into the next, with and without a
+tag), calls through a mapped page of `RET`, `AT` with a read of PAR_EL1,
+`DC ZVA` and the other cache operations, TLBI, any `SYS` and `SYSL`, a new
+descriptor for a mapped address with its TLBI, a new ASID, MAIR or SCTLR_EL1
+(with WXN, A, UCI, DZE, and the MMU off and on again), returns to EL0 and to
+EL1, and integer instructions between them. The mapped addresses are pages
+next to each other and blocks, with any descriptor: valid or not, the access
+flag, AP, UXN, PXN, nG, any attribute index, the ignored bits, an output
+address in the data, beyond the RAM or beyond the output size, and on the
+way to it a missing table, a table beyond the output size or beyond the RAM,
+a block where none exists, and APTable, UXNTable and PXNTable.
+
+The follower compares, before every instruction, X0 to X30, SP, PC, CPSR, V0
+to V31, FPSR, FPCR and the 72 system registers of card C6, among them
+ESR_EL1, FAR_EL1, ELR_EL1, SPSR_EL1 and PAR_EL1, and the memory writes of
+each instruction.
+
+`just tcg-a64-lockstep mmu 100000 <seed>` on helios, QEMU 11.1.3
+`-cpu cortex-a53`:
+
+| Seed | Instructions verified | Rounds | Halves 4K / 64K | `SYS` verified | Loads and stores | Bytes written and compared | Result |
+|---|---|---|---|---|---|---|---|
+| 1 | 4,403,165 | 1,155 | 1,169 / 1,141 | 100,008 (4,129 distinct) | 117,604 | 156,024 | no difference, 28 s |
+| 2 | 4,457,567 | 1,164 | 1,143 / 1,185 | 100,010 (4,161 distinct) | 117,311 | 153,890 | no difference, 27 s |
+| 3 | 4,454,408 | 1,168 | 1,123 / 1,213 | 100,060 (4,148 distinct) | 117,600 | 154,598 | no difference, 28 s |
+
+Exceptions that both sides took in the run of seed 1, with the same
+registers after them: data aborts 18,754 translation, 19,054 permission,
+9,223 access flag, 16,165 address size, 12,506 alignment, 9,359 external and
+7,167 external on a table walk. Instruction aborts 7,737 translation, 3,012
+permission, 1,946 access flag, 4,102 address size, 2,251 external and 1,582
+external on a table walk. 2,624 trapped system instructions, 13,871 `SVC` and
+63,912 undefined instructions (among them the 4,166 `SYSL` and the `SYS`
+operations that the CPU does not have). Every level from 0 to 3 is among the
+syndromes.
+
+### The walk test for 16K and 64K
+
+`just tcg-a64-lockstep walk 100000 <seed>` runs the same streams for the 16K
+and the 64K granule against QEMU's `-cpu max,sve=off,sme=off`. Our side runs
+as the model `sysreg::QEMU_MAX_WALK`: 16K, 64K, 48 bits of physical address.
+The streams stay inside what an Armv8.0 walk and the walk of that CPU agree
+on (`Profile::strict`): sizes of a half from 16 to 39, an output size of at
+most 48 bits, no bit of TCR above TBI1, no reserved descriptor bit, no block
+where a later extension allows one, the MMU on all the time, no exclusive
+access, no `DC ZVA`, and no other `SYS`. The comparison leaves out the
+control registers and the bits of PSTATE that an Armv8.0 CPU does not have.
+
+| Seed | Instructions verified | Rounds | Halves 16K / 64K | Loads and stores | Result |
+|---|---|---|---|---|---|
+| 1 | 4,454,798 | 1,099 | 1,096 / 1,102 | 115,891 | no difference, 22 s |
+| 2 | 4,419,636 | 1,092 | 1,101 / 1,083 | 115,029 | no difference, 23 s |
+
+The 3d CPU itself has the 4K granule only (G2). The 16K and 64K walks are
+the same code with other numbers, and this test is their proof.
+
+### What the lockstep found on QEMU, and what the core does about it
+
+Each line was a difference of a run, and is now in the code with the reason.
+
+- PAR_EL1 after a translation has bit 9 set (not secure) and bit 11. Device
+  memory and the attribute bytes 0x44 and 0x40 read as outer shareable.
+- `AT` takes a data abort when its walk meets a descriptor that the memory
+  does not hold, with the cache bit and "write" in the syndrome. Every
+  other fault of its walk is in PAR_EL1.
+- `DC ZVA`: a translation, access flag or permission fault names the address
+  that the instruction gave, and an external abort the first byte of the
+  block. The syndrome says "write" and has no cache bit.
+- A size of a half outside 16 to 39 translates nothing: a translation fault
+  of level 0.
+- The address bits of TTBR reach below bit 12 for a first table that is
+  smaller than 4K.
+- TCR.TBID0 and TBID1 (the bits 51 and 52) and TCR.HPD0 and HPD1 (41 and 42)
+  belong to later extensions, and QEMU's `cortex-a53` acts on them: a branch
+  keeps its tag, and a table descriptor takes no permission away. We follow
+  QEMU (P2, U1). A guest for an Armv8.0 CPU leaves them clear.
+- Alignment. With the MMU off, or with SCTLR_EL1.A, the fault comes before
+  every other one. In Device memory it comes after the faults of the walk
+  and before the permission fault, the page of the first byte decides, and
+  it asks for the size of the register, also for one of 16 bytes. A load or
+  a store of whole vector registers as a structure (`LD1` to `LD4`, `ST1` to
+  `ST4`) takes none in Device memory. The forms of one lane and the
+  replicating ones do. The alignment fault of an exclusive store says
+  "read".
+- A pair of general registers is one access: where it crosses into a page
+  that faults, that fault comes before the memory of the first page is
+  looked at, and no register is written. A pair of vector registers is two
+  accesses, and a load has written the first register when the second
+  faults.
+- `LD1` and `ST1` of whole registers are accesses of 8 bytes, and a load has
+  written what it loaded when a later access faults. The upper half of a
+  register of 8 bytes is cleared after the last access.
+- QEMU keeps a translated block under its physical address and runs it at
+  every virtual address that maps there, and the plugin then names the
+  address of the first one. The streams run code at one address only.
+  `tests/translate.rs` has the two cases with code at two addresses.
+
+### What the lockstep does not compare
+
+- **What a TLB keeps** (DESIGN.md U3). After a write to a descriptor or to a
+  control register a stream runs a TLBI that names every ASID. QEMU drops
+  its whole TLB at a write of TTBR, and our TLB keeps the entries of another
+  ASID. Whether a TLBI with an ASID leaves the entries of another ASID is in
+  the unit tests (`tests/translate.rs`, `mmu.rs`, `tlb.rs`).
+- **The registers of a load of several vector registers that faulted**: 4,
+  5 and 11 such loads in the three runs, and 11 in each walk run. QEMU
+  writes them element by element, and our side register by register (`LD1`,
+  the forms of one lane and the replicating ones) or not at all (`LD2` to
+  `LD4`). The architecture leaves those registers open. Our registers take
+  QEMU's there, and the round goes on.
+- **A store of several parts that faulted after another count of parts**: 0
+  in every run.
+- **A round that reaches QEMU's flash or devices** (3 rounds of seed 1): our
+  memory is the RAM.
+- **The stack pointer alignment check** (SCTLR_EL1.SA and SA0) is not built.
+  The streams clear both bits and use no stack pointer as a base.
+- **Big-endian data** (SCTLR_EL1.EE and E0E): the 3d CPU is little-endian
+  only (G2).
+- **More than one CPU** (U5): a TLBI for all CPUs acts on this one. A machine
+  with more CPUs hands it on (card C9).
+
+### The other groups still agree
+
+With the softmmu under every access, on the last commit of this card:
+`loadstore 20000 1` verified 1,045,883 instructions (395,881 of them wrote
+4,035,686 bytes, every byte compared), `system 100000 1` 14,143,805, `c1 20000
+1` 288,490, `c2 5000 1` 95,746, `fp 5000 1` 80,184, `c7 3000 1` 162,456 and
+`all 3000 3` 101,049, each with no difference.
+
+### Without QEMU
+
+`just ci::check` replays `tests/corpus/c8.txt`: 244 verified instructions of
+the run of seed 1, two for each outcome (no exception, or the class and the
+low byte of ESR_EL1) of a load or a store, of a system operation and of the
+other instructions. An entry names its memory by physical address (`p=`):
+the word of the instruction, the descriptors of its walks and its data. A
+replay puts them into an empty memory, runs the instruction with the MMU
+on, and compares the registers, ESR_EL1, FAR_EL1, ELR_EL1, SPSR_EL1,
+PAR_EL1 and the bytes written.
+
+The unit tests: the shape of a walk for each granule, a page and a block of
+each granule in both halves, each fault with its level, the permissions with
+the table bits and WXN, the controls (ASID, tags, output size), PAR_EL1, the
+TLB (`mmu.rs`, 10 tests, and `tlb.rs`, 3 tests). 14 programs with the MMU on
+(`tests/translate.rs`): each fault of an access with ESR_EL1 and FAR_EL1, an
+access that crosses pages, `LDTR` and `STTR`, alignment, execution, tagged
+addresses, `DC ZVA`, `AT`, every TLBI with and without the ASID of the
+entry, the cache operations, code written through a second address, an
+address that is mapped to other code, and a guest that takes an abort,
+repairs the descriptor and returns to the access. A test of
+`oracle/translate.rs` runs 24 streams on our interpreter alone, through
+every kind of fault.
+
+### Speed
+
+`taskset -c 16-19 just bench-run interpreter aarch64 1 3` on helios, the flat
+images of card C5, which run with the MMU off:
+
+| | CoreMark mix, MIPS | Scalar loop, MIPS |
+|---|---|---|
+| Card C5, commit `0053c015` | 160.76, 167.16, 167.73 (**167.16**) | 168.16, 165.74, 168.81 (**168.16**) |
+| This card | 142.84, 138.69, 137.21 (**138.69**) | 142.32, 141.59, 142.43 (**142.32**) |
+
+The softmmu costs 17 % on the mix and 15 % on the loop. The loop has no load
+and no store: its cost is the lookup of the code page and the check of the
+block (physical address and epoch) before every block. Both stay above the
+gate of the design (M6: 100 MIPS). The two lines are not in the bench
+history. What is left for speed: the code page of the last block could be
+kept beside the TLB, and a pair of general registers is one access of 16
+bytes on the path of the wide accesses, not two inlined ones.
+
+### What this card does not do
+
+- EL2 and stage 2: the regime is a value, and only EL1&0 exists (G4).
+- 52-bit addresses, the contiguous bit as a hint, and the hardware update
+  of the access flag (Armv8.1): not in Armv8.0.
+- The `Memory` trait still has no host pointer: a TLB entry holds a physical
+  page, and an access is one call of the memory.
+- A machine with more CPUs must hand a TLBI for all CPUs to the others, and
+  a `DC ZVA` of another CPU into our code is seen at our next exception.
+
+### Sources read for this card
+
+- S1: the generated tables of this crate, for the `SYS` records and the
+  names and encodings of the `DC`, `IC`, `AT` and `TLBI` operations.
+- S6: the behaviour of a running QEMU 11.1.3 through the lockstep, as
+  `cortex-a53` and as `max`. Every rule of "What the lockstep found" was a
+  difference of a run first.
+- The layout of a translation table descriptor, of TCR_EL1, TTBR, MAIR_EL1,
+  PAR_EL1 and of the data and instruction abort syndromes, and the rules of
+  AP, UXN, PXN, WXN and the table bits, are written from the author's
+  knowledge of the published architecture. They are not among S1 to S8, and
+  the lockstep checks what was written from them.
+- S2, S3, S4, S5, S7 and S8 were not opened. No chapter of the Arm
+  Architecture Reference Manual was opened (the operator's answer Q1 allows
+  its prose).
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. Some guesses about the order of two faults came from the
+  author's general knowledge of how an emulator of this kind is built. A
+  guess stayed in the code only where a run of the lockstep confirmed it,
+  and the runs refuted several.

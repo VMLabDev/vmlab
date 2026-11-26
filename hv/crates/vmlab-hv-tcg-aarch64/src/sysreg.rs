@@ -430,6 +430,11 @@ pub const fn index(name: &str) -> usize {
 pub mod reg {
     use super::index;
     pub const SCTLR_EL1: usize = index("SCTLR_EL1");
+    pub const TTBR0_EL1: usize = index("TTBR0_EL1");
+    pub const TTBR1_EL1: usize = index("TTBR1_EL1");
+    pub const TCR_EL1: usize = index("TCR_EL1");
+    pub const MAIR_EL1: usize = index("MAIR_EL1");
+    pub const PAR_EL1: usize = index("PAR_EL1");
     pub const CPACR_EL1: usize = index("CPACR_EL1");
     pub const SPSR_EL1: usize = index("SPSR_EL1");
     pub const ELR_EL1: usize = index("ELR_EL1");
@@ -447,9 +452,15 @@ pub mod reg {
 
 /// Bits of SCTLR_EL1 that the core acts on.
 pub mod sctlr {
+    pub const M: u64 = 1;
+    pub const A: u64 = 1 << 1;
+    pub const WXN: u64 = 1 << 19;
+    /// The bits that a translation depends on.
+    pub const TRANSLATION: u64 = M | A | WXN;
     pub const UMA: u64 = 1 << 9;
     pub const DZE: u64 = 1 << 14;
     pub const UCT: u64 = 1 << 15;
+    pub const UCI: u64 = 1 << 26;
     pub const NTWI: u64 = 1 << 16;
     pub const NTWE: u64 = 1 << 18;
 }
@@ -1095,6 +1106,22 @@ pub static QEMU_CORTEX_A53: CpuModel = CpuModel {
         ("ID_AA64PFR0_EL1", 0x22),
         ("ID_AA64DFR0_EL1", 0x1030_5106),
         ("ID_AA64MMFR0_EL1", 0x1122),
+    ],
+    ccsidr: CCSIDR,
+};
+
+/// The CPU of the walk test against QEMU's `-cpu max` (card C8): QEMU's
+/// `cortex-a53` with the 16K granule and 48 bits of physical address. It
+/// is no CPU of a machine: the streams of that test stay inside what an
+/// Armv8.0 walk and the walk of `max` agree on.
+pub static QEMU_MAX_WALK: CpuModel = CpuModel {
+    name: "qemu-max-walk",
+    resets: &[
+        ("MIDR_EL1", 0x410f_d034),
+        ("ID_AA64PFR0_EL1", 0x22),
+        // PARange 48 bits, 16 bits of ASID, and the 4K, 16K and 64K
+        // granules.
+        ("ID_AA64MMFR0_EL1", 0x0010_1125),
     ],
     ccsidr: CCSIDR,
 };
