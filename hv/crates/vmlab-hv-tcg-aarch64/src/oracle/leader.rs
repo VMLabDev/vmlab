@@ -24,15 +24,30 @@ pub const VECTOR: u64 = 0x200;
 /// `O_NONBLOCK` of Linux, which the FIFO of the plugin is read with.
 const O_NONBLOCK: i32 = 0o4000;
 
+/// What the plugin puts into each instruction record beyond the core
+/// registers.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// V0 to V31, FPSR and FPCR. FP is then enabled for EL1 and EL0.
+    pub vectors: bool,
+    /// System registers, by the names of QEMU's plugin API.
+    pub system: Vec<String>,
+    /// Write the name of every register of the plugin API to this file.
+    pub names: Option<PathBuf>,
+}
+
 pub struct Leader {
     child: Child,
     rsp: Rsp,
     stream: File,
     vectors: bool,
+    system: usize,
     /// Bytes of the plugin stream that are read and not parsed yet.
     pending: Vec<u8>,
     parsed: usize,
     running: bool,
+    /// The breakpoint at `VECTOR` is set.
+    vector_break: bool,
     directory: PathBuf,
 }
 
@@ -56,6 +71,33 @@ impl Leader {
         ram_mib: u32,
         vectors: bool,
     ) -> io::Result<Self> {
+        let options = Options {
+            vectors,
+            ..Options::default()
+        };
+        Self::start_options(qemu, plugin, directory, ram_mib, &options)
+    }
+
+    /// As `start`, with what each instruction record carries.
+    pub fn start_options(
+        qemu: &str,
+        plugin: &Path,
+        directory: &Path,
+        ram_mib: u32,
+        options: &Options,
+    ) -> io::Result<Self> {
+        let vectors = options.vectors;
+        let mut extra = String::new();
+        if vectors {
+            extra.push_str(",vectors=on");
+        }
+        if !options.system.is_empty() {
+            extra.push_str(",sysregs=");
+            extra.push_str(&options.system.join(":"));
+        }
+        if let Some(names) = &options.names {
+            extra.push_str(&format!(",names={}", names.display()));
+        }
         let fifo = directory.join("a64lock.fifo");
         let socket = directory.join("gdb.sock");
         for path in [&fifo, &socket] {
@@ -83,10 +125,9 @@ impl Leader {
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             .arg("-plugin")
             .arg(format!(
-                "{},out={}{}",
+                "{},out={}{extra}",
                 plugin.display(),
-                fifo.display(),
-                if vectors { ",vectors=on" } else { "" }
+                fifo.display()
             ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -120,7 +161,8 @@ impl Leader {
             kill(child);
             return Err(other("the plugin stream does not start with its magic"));
         }
-        if (header[8] & 1 != 0) != vectors {
+        let system = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        if (header[8] & 1 != 0) != vectors || system != options.system.len() {
             kill(child);
             return Err(other("the plugin stream does not carry what was asked for"));
         }
@@ -139,9 +181,11 @@ impl Leader {
             rsp,
             stream,
             vectors,
+            system,
             pending: Vec::new(),
             parsed: 0,
             running: false,
+            vector_break: true,
             directory: directory.to_path_buf(),
         };
         leader.rsp.break_at(VECTOR)?;
@@ -180,6 +224,41 @@ impl Leader {
         Ok(())
     }
 
+    /// Whether QEMU stops by itself at `VECTOR`.
+    pub fn vector_break(&self) -> bool {
+        self.vector_break
+    }
+
+    /// Remove the breakpoint at `VECTOR`. A round whose stream sets
+    /// VBAR_EL1 does not need it, and a branch of the stream to that address
+    /// would stop QEMU there without a record.
+    pub fn clear_vector_break(&mut self) -> io::Result<()> {
+        if self.vector_break {
+            self.rsp.clear_break(VECTOR)?;
+            self.vector_break = false;
+        }
+        Ok(())
+    }
+
+    /// Reset the machine of QEMU, as its monitor command `system_reset`
+    /// does. QEMU stays stopped, at EL1 with SP_EL1, and every system
+    /// register has its reset value. The RAM keeps its content, but the
+    /// device tree at its start.
+    pub fn reset(&mut self) -> io::Result<()> {
+        if self.running {
+            return Err(other("QEMU must be stopped for a reset"));
+        }
+        self.rsp.monitor("system_reset")?;
+        let core = self.rsp.core()?;
+        if core.cpsr & 0xf != 5 {
+            return Err(other(format!(
+                "QEMU is at CPSR {:#x} after a reset, not at EL1 with SP_EL1",
+                core.cpsr
+            )));
+        }
+        Ok(())
+    }
+
     pub fn set_vectors(&mut self, vectors: &Vectors) -> io::Result<()> {
         self.rsp.set_vectors(vectors)
     }
@@ -211,6 +290,16 @@ impl Leader {
 
     pub fn set_core(&mut self, core: &Core) -> io::Result<()> {
         self.rsp.set_core(core)
+    }
+
+    /// A hardware breakpoint that stops QEMU before the instruction at
+    /// `address`.
+    pub fn break_at(&mut self, address: u64) -> io::Result<()> {
+        self.rsp.break_at(address)
+    }
+
+    pub fn clear_break(&mut self, address: u64) -> io::Result<()> {
+        self.rsp.clear_break(address)
     }
 
     pub fn core(&mut self) -> io::Result<Core> {
@@ -279,7 +368,7 @@ impl Leader {
         let mut idle = 0u32;
         loop {
             if let Some((trace, len)) =
-                parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+                parse(&self.pending[self.parsed..], self.vectors, self.system).map_err(other)?
             {
                 self.parsed += len;
                 return Ok(trace);
@@ -305,7 +394,7 @@ impl Leader {
     /// Parse what `pending` holds whole, and keep the memory writes.
     fn drain(&mut self, ahead: &mut Ahead) -> io::Result<()> {
         while let Some((trace, len)) =
-            parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+            parse(&self.pending[self.parsed..], self.vectors, self.system).map_err(other)?
         {
             self.parsed += len;
             match trace {

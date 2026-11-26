@@ -40,9 +40,17 @@ fn ordered(record: Record, rt: u32, rn: u32) -> u32 {
     word
 }
 
+/// The word that ends a program of these tests: `IC IALLU`, a `SYS`
+/// instruction, which has no lifter before card C8 and so stops the loop
+/// with `Stop::Unimplemented`. The zero word did that before card C6. It is
+/// `UDF`, which is now an exception of the guest.
+const END: u32 = 0xd508_751f;
+
 fn image(words: &[u32]) -> Vec<u8> {
     let mut data = vec![0u8; SIZE];
-    for (index, word) in words.iter().enumerate() {
+    // The code pages: the program, and the end word after it.
+    for index in 0..0x2000 / 4 {
+        let word = words.get(index).copied().unwrap_or(END);
         data[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
     // A pattern in the data pages: the byte at DATA + n is n.
