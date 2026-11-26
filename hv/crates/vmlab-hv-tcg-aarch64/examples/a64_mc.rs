@@ -174,7 +174,8 @@ impl Tally {
 }
 
 /// The words of the vector file: for each selected record its fixed bits
-/// with the free bits zero, all ones, and twice random. Then random words.
+/// with the free bits zero, all ones, and twice random, and one word that
+/// decodes to it. Then random words.
 fn vector_words(seed: u64) -> Vec<u32> {
     let mut rng = Rng(seed);
     let mut words = Vec::new();
@@ -183,6 +184,14 @@ fn vector_words(seed: u64) -> Vec<u32> {
         words.push(info.value | !info.mask);
         words.push(of_record(&mut rng, index));
         words.push(of_record(&mut rng, index));
+        // One word that decodes to the record, where the constraints allow
+        // one: random free bits rarely satisfy a narrow constraint.
+        if let Some(word) = (0..5000)
+            .map(|_| of_record(&mut rng, index))
+            .find(|word| decode(*word).is_some_and(|decoded| decoded.record as usize == index))
+        {
+            words.push(word);
+        }
     }
     for _ in 0..2000 {
         words.push(rng.next_u64() as u32);

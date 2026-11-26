@@ -40,3 +40,61 @@ why = "As MOVZWi: LLVM's DecodeMoveImmInstruction refuses bit 22 on the W record
 format = "BaseLogicalImm"
 require = "crate::fields::logical_immediate_is_valid(imm)"
 why = "N:immr:imms must name an element size and a run of ones that is not the whole element. LLVM's DecodeLogicalImmInstruction refuses the rest through AArch64_AM::isValidDecodeLogicalImmediate."
+
+[[constraint]]
+format = "BaseAddSubSReg"
+records = ["ADDWrs", "ADDSWrs", "SUBWrs", "SUBSWrs"]
+require = "shift >> 6 != 3 && shift & 0x20 == 0"
+why = "The field is shift:imm6. The shift 3 is reserved for add and subtract, and a 32-bit record has no shift amount above 31. LLVM's DecodeThreeAddrSRegInstruction refuses both."
+
+[[constraint]]
+format = "BaseAddSubSReg"
+records = ["ADDXrs", "ADDSXrs", "SUBXrs", "SUBSXrs"]
+require = "shift >> 6 != 3"
+why = "The shift 3 is reserved for add and subtract. LLVM's DecodeThreeAddrSRegInstruction refuses it."
+
+[[constraint]]
+format = "BaseLogicalSReg"
+records = ["ANDWrs", "ANDSWrs", "BICWrs", "BICSWrs", "ORRWrs", "ORNWrs", "EORWrs", "EONWrs"]
+require = "shift & 0x20 == 0"
+why = "A 32-bit record has no shift amount above 31. LLVM's DecodeThreeAddrSRegInstruction refuses imm6<5>."
+
+[[constraint]]
+format = "BaseAddSubEReg"
+require = "extend & 7 <= 4"
+why = "The left shift of an extended register is 0 to 4. LLVM's DecodeAddSubERegInstruction refuses the others."
+
+[[constraint]]
+format = "BaseAddSubEReg64"
+require = "ext & 7 <= 4"
+why = "As BaseAddSubEReg: LLVM's DecodeAddSubERegInstruction refuses a shift above 4."
+
+[[constraint]]
+format = "RtSystemI128"
+require = "rt & 1 == 0"
+why = "MRRS and MSRR take a pair of registers that starts at an even one. LLVM's DecodeGPRSeqPairsClassRegisterClass refuses an odd number."
+
+[[constraint]]
+format = "SystemPXtI"
+require = "rt & 1 == 0"
+why = "SYSP takes a pair of registers that starts at an even one (31 is SYSPxt_XZR, a record of its own). LLVM's DecodeGPRSeqPairsClassRegisterClass refuses an odd number."
+
+[[constraint]]
+format = "MSRpstateImm0_15"
+require = "crate::fields::pstate_imm0_15_is_known(pstatefield)"
+why = "The record is an MSR to a PSTATE field of the PStateImm0_15 table whose features are selected. LLVM's DecodeSystemPStateImm0_15Instruction refuses the rest, and the word decodes as the next candidate."
+
+[[constraint]]
+format = "MSRpstateImm0_1"
+require = "crate::fields::pstate_imm0_1_is_known(pstatefield)"
+why = "As MSRpstateImm0_15, for the PStateImm0_1 table: LLVM's DecodeSystemPStateImm0_1Instruction."
+
+[[constraint]]
+format = "PstateWriteSimple"
+require = "crate::fields::svcr_is_known(pstatefield)"
+why = "The operand is an entry of the SVCR table whose features are selected. LLVM's DecodeSVCROp refuses the rest. In the 3d set no entry is selected (all need SME), so this record never matches."
+
+[[constraint]]
+format = "BasePrefetchRO"
+require = "rt & 0x18 != 0x18"
+why = "A prefetch operation 0b11xxx with a register offset is RPRFM. LLVM's DecodePRFMRegInstruction refuses it here, and the Fallback record RPRFM takes it."

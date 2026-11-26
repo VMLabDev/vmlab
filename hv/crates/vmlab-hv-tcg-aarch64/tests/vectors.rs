@@ -9,6 +9,12 @@ use vmlab_hv_tcg_aarch64::{Record, decode, decode_linear, decode_unconstrained};
 
 const VECTORS: &str = include_str!("vectors.txt");
 
+/// Selected records that no word decodes to: a constraint of
+/// tables/constraints.toml never holds in the selected sets.
+/// `MSRpstatesvcrImm1` has no feature predicate in LLVM, and its operand is
+/// an SVCR field, which needs SME.
+const NEVER_MATCHES: [&str; 1] = ["MSRpstatesvcrImm1"];
+
 fn vectors() -> Vec<(u32, Option<&'static str>)> {
     VECTORS
         .lines()
@@ -44,11 +50,11 @@ fn the_decoder_names_the_record_that_llvm_names() {
         );
         refused += 1;
     }
-    // The vectors reach every selected record.
+    // The vectors reach every selected record that can match.
     let missing: Vec<_> = RECORDS
         .iter()
         .map(|info| info.name)
-        .filter(|name| !named.contains(name))
+        .filter(|name| !named.contains(name) && !NEVER_MATCHES.contains(name))
         .collect();
     assert!(missing.is_empty(), "no vector decodes to {missing:?}");
     println!(

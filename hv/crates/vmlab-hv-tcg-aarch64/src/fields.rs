@@ -75,6 +75,36 @@ pub fn logical_immediate(value: u32, width: u32) -> Option<u64> {
     Some(pattern & ones(width))
 }
 
+/// Whether `table` has an entry with this encoding whose features are all
+/// in the selected sets. LLVM's decoder asks the same of its subtarget.
+fn is_known(table: &[crate::generated::sysreg::SysOp], encoding: u32) -> bool {
+    table.iter().any(|operation| {
+        u32::from(operation.encoding) == encoding
+            && operation.requires.iter().all(|feature| {
+                feature
+                    .strip_prefix("Feature")
+                    .is_some_and(|name| crate::generated::decode::FEATURE_NAMES.contains(&name))
+            })
+    })
+}
+
+/// Whether the `pstatefield` of `MSRpstateImm4` names a PSTATE field that
+/// takes a 4-bit immediate (`SPSel`, `DAIFSet`, `DAIFClr` in the 3d set).
+pub fn pstate_imm0_15_is_known(pstatefield: u32) -> bool {
+    is_known(&crate::generated::sysreg::PSTATE_IMM0_15_OPS, pstatefield)
+}
+
+/// Whether the `pstatefield` of `MSRpstateImm1` names a PSTATE field that
+/// takes a 1-bit immediate.
+pub fn pstate_imm0_1_is_known(pstatefield: u32) -> bool {
+    is_known(&crate::generated::sysreg::PSTATE_IMM0_1_OPS, pstatefield)
+}
+
+/// Whether the operand of `MSRpstatesvcrImm1` names an `SVCR` field.
+pub fn svcr_is_known(pstatefield: u32) -> bool {
+    is_known(&crate::generated::sysreg::SVCR_OPS, pstatefield)
+}
+
 /// The sixteen condition codes of `Bcc`, `CSEL` and the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Condition {
@@ -217,6 +247,19 @@ mod tests {
             logical_immediate((8 << 6) | 0b100111, 64),
             Some(0xff00_ff00_ff00_ff00)
         );
+    }
+
+    #[test]
+    fn pstate_fields_of_the_selected_sets() {
+        // op1:op2 of SPSel, DAIFSet and DAIFClr.
+        let known: Vec<u32> = (0..64)
+            .filter(|field| pstate_imm0_15_is_known(*field))
+            .collect();
+        assert_eq!(known, vec![0b000_101, 0b011_110, 0b011_111]);
+        // PAN, UAO, DIT, SSBS and TCO need features outside the 3d set.
+        assert!(!pstate_imm0_15_is_known(0b000_100));
+        // Every SVCR field needs SME.
+        assert!((0..8).all(|field| !svcr_is_known(field)));
     }
 
     #[test]

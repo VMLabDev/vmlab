@@ -54,7 +54,7 @@ pub fn generate(json: &Value, sha256: &str) -> Result<String> {
     out.push_str(
         "//\n// Input: the JSON dump of AArch64.td by the pinned llvm-tblgen\n\
          // (hv/toolchain/llvm/pins.env): the records of the classes SysReg, TLBI,\n\
-         // DC, AT and IC, of every feature.\n\n#![allow(clippy::all)]\n\n",
+         // DC, AT, IC, PStateImm0_15, PStateImm0_1 and SVCR, of every feature.\n\n#![allow(clippy::all)]\n\n",
     );
     let _ = writeln!(
         out,
@@ -68,7 +68,10 @@ pub fn generate(json: &Value, sha256: &str) -> Result<String> {
          pub readable: bool,\n    pub writeable: bool,\n    \
          /// The LLVM features or architecture versions that it needs. Empty: none.\n    \
          pub requires: &'static [&'static str],\n}\n\n\
-         /// A system operation of `SYS`. `encoding` is op1:CRn:CRm:op2, 14 bits.\n\
+         /// A named operation with an encoding. For `DC` and `AT` the encoding\n\
+         /// is op1:CRn:CRm:op2 of `SYS`, 14 bits. For a PSTATE field it is the\n\
+         /// `pstatefield` of the MSR record that takes it, and for `SVCR` the\n\
+         /// three bits of its operand.\n\
          #[derive(Clone, Copy, Debug, PartialEq, Eq)]\n\
          pub struct SysOp {\n    pub name: &'static str,\n    pub encoding: u16,\n    \
          pub requires: &'static [&'static str],\n}\n\n\
@@ -111,7 +114,13 @@ pub fn generate(json: &Value, sha256: &str) -> Result<String> {
     }
     out.push_str("];\n\n");
 
-    for (class, table) in [("DC", "DC_OPS"), ("AT", "AT_OPS")] {
+    for (class, table) in [
+        ("DC", "DC_OPS"),
+        ("AT", "AT_OPS"),
+        ("PStateImm0_15", "PSTATE_IMM0_15_OPS"),
+        ("PStateImm0_1", "PSTATE_IMM0_1_OPS"),
+        ("SVCR", "SVCR_OPS"),
+    ] {
         let mut operations = Vec::new();
         for record in instances(json, class)? {
             operations.push((

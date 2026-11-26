@@ -131,6 +131,19 @@ fn parse_record(
             other => bail!("{name}: bit {position} is {other}"),
         }
     }
+    // A bit that LLVM marks SoftFail is a "should be" bit: its decoder
+    // matches the record with any value there and only warns. The bit is
+    // free here too. A card whose lockstep shows that QEMU refuses such a
+    // word adds a constraint.
+    let soft = record["SoftFail"]
+        .as_array()
+        .with_context(|| format!("{name} has no SoftFail"))?;
+    for (position, bit) in soft.iter().enumerate() {
+        if bit.as_u64() == Some(1) {
+            mask &= !(1 << position);
+        }
+    }
+    value &= mask;
     if mask == 0 {
         return Ok(None);
     }
