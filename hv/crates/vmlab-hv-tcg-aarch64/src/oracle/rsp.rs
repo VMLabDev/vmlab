@@ -407,8 +407,8 @@ mod tests {
             (&b"p23"[..], hex(&[0x11; 16])),
             (&b"P42=1f000000"[..], b"OK".to_vec()),
             (&b"z1,200,4"[..], b"OK".to_vec()),
-            (&b"p43"[..], b"E14".to_vec()),
             (&b"qRcmd,73797374656d5f7265736574"[..], b"OK".to_vec()),
+            (&b"p43"[..], b"E14".to_vec()),
         ]);
         assert_eq!(rsp.core().unwrap(), core);
         rsp.set_core(&core).unwrap();
@@ -424,8 +424,8 @@ mod tests {
         assert_eq!(rsp.register(35).unwrap(), vec![0x11; 16]);
         rsp.set_register(66, &0x1fu32.to_le_bytes()).unwrap();
         rsp.clear_break(0x200).unwrap();
-        assert!(rsp.register(67).is_err());
         rsp.monitor("system_reset").unwrap();
+        assert!(rsp.register(67).is_err());
         server.join().unwrap();
     }
 }

@@ -39,6 +39,10 @@ pub struct Round {
     /// The round ends when one PC is about to run more often than this. It
     /// keeps a loop of the stream from filling the round with repeats.
     pub visits: u32,
+    /// Addresses from the first up to the second that do not count for
+    /// `visits`: the vector table of a system round, which every exception
+    /// of the stream runs through.
+    pub exempt: (u64, u64),
     /// Reset both sides first, so that every system register starts from its
     /// reset value. A round of system instructions does. Without, our side
     /// starts from a new state with FP enabled when the round has vectors,
@@ -575,7 +579,9 @@ impl Follower {
                         break Ok(End::Budget);
                     }
                     let seen = visits.entry(core.pc).or_default();
-                    *seen += 1;
+                    if !(round.exempt.0..round.exempt.1).contains(&core.pc) {
+                        *seen += 1;
+                    }
                     if *seen > round.visits {
                         self.leader.stop(true)?;
                         break Ok(End::Loop);

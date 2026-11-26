@@ -242,7 +242,7 @@ impl Generator {
     fn system_item(&mut self, words: &mut Vec<u32>, at: u64, table: u64, image: (u64, u64)) {
         match self.rng.below(100) {
             // An instruction of the earlier cards: integer, branch and FP.
-            0..=19 => {
+            0..=12 => {
                 let format = if self.rng.chance(1, 4) {
                     FP_FORMATS[self.rng.below(FP_FORMATS.len() as u64) as usize]
                 } else {
@@ -254,11 +254,11 @@ impl Generator {
                     words.push(self.instruction(record, at, image).0);
                 }
             }
-            20..=41 => {
+            13..=27 => {
                 let (encoding, rt) = self.register();
                 words.push(asm::mrs(rt, encoding));
             }
-            42..=63 => {
+            28..=42 => {
                 let (encoding, rt) = self.register();
                 let value = match sysreg::find(encoding) {
                     Some(row) => safe_value(row, &mut self.rng, table, image),
@@ -292,32 +292,37 @@ impl Generator {
                 }
             }
             // SPSel, DAIFSet and DAIFClr with any immediate.
-            64..=70 => {
+            43..=50 => {
                 let field = [0xd500_40bfu32, 0xd503_40df, 0xd503_40ff][self.rng.below(3) as usize];
                 words.push(field | (self.rng.below(16) as u32) << 8);
             }
             // The hint space but WFE and WFI, and the hints with their own
             // record.
-            71..=76 => {
+            51..=58 => {
                 let hint = match self.rng.below(127) as u32 {
                     2 | 3 => 0,
                     other => other,
                 };
                 words.push(0xd503_201f | hint << 5);
             }
-            77..=79 => {
+            // The hints with a record of their own: all NOPs on this CPU.
+            59..=68 => {
+                let record = self.any_record(FormatClass::SystemNoOperands);
+                words.push(record.info().value);
+            }
+            69..=76 => {
                 let record = self.any_record(FormatClass::CRmSystemI);
                 words.push(self.instruction(record, at, image).0);
             }
-            80..=87 => {
+            77..=80 => words.push(self.rng.below(1 << 16) as u32), // udf
+            81..=88 => {
                 let immediate = self.rng.below(1 << 16) as u32;
                 let word = match self.rng.below(12) {
                     0..=2 => asm::svc(immediate as u16),
-                    3 => 0xd420_0000 | immediate << 5, // brk
+                    3 | 7 => 0xd420_0000 | immediate << 5, // brk
                     4 => 0xd440_0000 | immediate << 5, // hlt
                     5 => 0xd4a0_0001 | immediate << 5, // dcps1
                     6 => 0xd4a0_0002 | immediate << 5, // dcps2
-                    7 => immediate,                    // udf
                     8 => 0xd6bf_03e0,                  // drps
                     9 => 0xd400_0003 | immediate << 5, // smc
                     10 => asm::ERET,
@@ -331,7 +336,7 @@ impl Generator {
             }
             // A return to a saved state that the stream makes: to EL0 most
             // of the time. The stream goes on after the ERET.
-            88..=93 => {
+            89..=93 => {
                 let saved = spsr(&mut self.rng);
                 words.extend(asm::load(16, saved));
                 words.push(asm::msr(reg::SPSR_EL1, 16));

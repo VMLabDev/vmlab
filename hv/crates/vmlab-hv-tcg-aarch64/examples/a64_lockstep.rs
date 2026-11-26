@@ -288,8 +288,9 @@ fn main() -> Result<(), Failure> {
                 start: start(&mut generator, IMAGE_BASE + TABLE_BYTES),
                 vectors: Some(generator.vectors()),
                 budget: SYSTEM_BUDGET,
-                visits: 8,
+                visits: 4,
                 reset: true,
+                exempt: (IMAGE_BASE, IMAGE_BASE + TABLE_BYTES),
             };
             run.round(&round)?;
             if run.counts.rounds.is_multiple_of(200) {
@@ -329,6 +330,7 @@ fn main() -> Result<(), Failure> {
             budget: image_words as u64 * if vectors { 1 } else { 2 },
             visits: 2,
             reset: false,
+            exempt: (0, 0),
         };
         run.round(&round)?;
         if run.counts.rounds.is_multiple_of(5000) {
@@ -391,6 +393,7 @@ fn main() -> Result<(), Failure> {
                 budget: 200,
                 visits: 2,
                 reset: true,
+                exempt: (IMAGE_BASE, IMAGE_BASE + TABLE_BYTES),
             };
             run.round(&round)?;
             for word in must {
@@ -421,6 +424,7 @@ fn main() -> Result<(), Failure> {
                 budget: 7,
                 visits: 2,
                 reset: true,
+                exempt: (IMAGE_BASE, IMAGE_BASE + TABLE_BYTES),
             };
             run.round(&round)?;
             let verified = run.counts.distinct.values().any(|set| set.contains(word));
@@ -451,6 +455,7 @@ fn main() -> Result<(), Failure> {
             budget: chunk.len() as u64,
             visits: 1,
             reset: false,
+            exempt: (0, 0),
         };
         let (_, verified) = run.round(&round)?;
         if verified != chunk.len() {
@@ -472,6 +477,7 @@ fn main() -> Result<(), Failure> {
             budget: 1,
             visits: 1,
             reset: false,
+            exempt: (0, 0),
         };
         let (_, verified) = run.round(&round)?;
         if verified != 1 {
