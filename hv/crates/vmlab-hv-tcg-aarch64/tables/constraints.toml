@@ -1,0 +1,42 @@
+# Extra conditions on a format class (DESIGN.md G1d).
+#
+# The LLVM tables describe a disassembler. A record matches on its fixed bits
+# alone, and LLVM's C++ decoder methods (which the generator does not run)
+# refuse some of those words. Each entry is one such condition, written by
+# hand. `require` is a Rust expression over the raw fields of the class, each
+# a `u32` under its lower-case name. A word that fails it does not match the
+# record: the decoder tries the next candidate, and decodes to Undefined when
+# there is none.
+#
+# `why` says where the condition comes from: a decoder method of LLVM (S1,
+# `Disassembler/AArch64Disassembler.cpp` at the pinned commit), or a run of
+# the lockstep against QEMU (S6) that found QEMU taking an Undefined
+# Instruction exception.
+#
+#   [[constraint]]
+#   format = "FormatClass"
+#   records = ["RecordA"]     # optional: without it, every record of the class
+#   require = "imm < 8"
+#   why = "..."
+
+[[constraint]]
+format = "AddSubImmShift"
+require = "imm < 0x2000"
+why = "The field is shift:imm12 with a 2-bit shift, and only 0 (LSL #0) and 1 (LSL #12) are add or subtract immediate. LLVM's DecodeAddSubImmShift refuses the others."
+
+[[constraint]]
+format = "BaseMoveImmediate"
+records = ["MOVNWi", "MOVZWi"]
+require = "shift < 2"
+why = "A 32-bit move wide has a shift of 0 or 16 only. LLVM's DecodeMoveImmInstruction refuses bit 22 on the W records."
+
+[[constraint]]
+format = "BaseInsertImmediate"
+records = ["MOVKWi"]
+require = "shift < 2"
+why = "As MOVZWi: LLVM's DecodeMoveImmInstruction refuses bit 22 on the W records."
+
+[[constraint]]
+format = "BaseLogicalImm"
+require = "crate::fields::logical_immediate_is_valid(imm)"
+why = "N:immr:imms must name an element size and a run of ones that is not the whole element. LLVM's DecodeLogicalImmInstruction refuses the rest through AArch64_AM::isValidDecodeLogicalImmediate."
