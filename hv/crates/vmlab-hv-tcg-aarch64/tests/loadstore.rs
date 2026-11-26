@@ -756,8 +756,9 @@ fn an_exclusive_store_compares_the_memory_at_its_own_size_with_the_loaded_value(
         // 8 bytes of memory are the loaded value with zeros above.
         word(Record::LDXRW, &[("rt", 2), ("rn", 0)]),
         stxr(10, 1, 0),
-        // ldxr x2, [x0] ; stxrb w11, w3, [x0]: the byte in memory is not the
-        // 64-bit value that was loaded.
+        // ldxr x2, [x0] ; stxrb w11, w3, [x0]: the byte in memory is the low
+        // byte of the 64-bit value that was loaded, so the store writes. It
+        // is not the whole value, so the store reports that it failed.
         ldxr(2, 0),
         word(Record::STXRB, &[("ws", 11), ("rt", 3), ("rn", 0)]),
         // ldxr x2, [x5] ; stxrb w12, w3, [x5]: here it is.
@@ -795,7 +796,7 @@ fn an_exclusive_store_compares_the_memory_at_its_own_size_with_the_loaded_value(
         read(&mut cpu, DATA + 0x100, 16),
         [0x33u64, 0x44].map(u64::to_le_bytes).concat()
     );
-    assert_eq!(cpu.state.x(6), 0x1111_2222_3333_4444);
+    assert_eq!(cpu.state.x(6), 0x1111_2222_3333_4433);
     assert_eq!(cpu.state.x(7), pattern(0x108, 8));
 }
 

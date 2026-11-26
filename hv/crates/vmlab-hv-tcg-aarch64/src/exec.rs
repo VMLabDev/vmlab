@@ -17,11 +17,11 @@
 //! What it does on one CPU follows what the lockstep saw QEMU do (S6,
 //! DESIGN.md U1): an exclusive store writes when its address is the marked
 //! one and the memory, read at the size of the store, still holds the value.
-//! The sizes of the load and of the store need not be the same. A store
-//! that finds another address, or no mark, reads no memory and fails. Every
-//! exclusive store that completes ends the mark. A store of this CPU
-//! between the two keeps the mark, and an exception keeps it (the exception
-//! return of card C6 ends it).
+//! The sizes of the load and of the store need not be the same, which the
+//! architecture leaves open. A store that finds another address, or no
+//! mark, reads no memory and fails. Every exclusive store that completes
+//! ends the mark. A store of this CPU between the two keeps the mark, and
+//! an exception keeps it (the exception return of card C6 ends it).
 //!
 //! With more CPUs the store also asks that no other writer reached the
 //! granules of the load (`Memory::store_conditional`), so it fails more
@@ -253,14 +253,17 @@ impl Side {
         Ok(())
     }
 
-    /// Whether the store wrote.
+    /// Whether the store wrote, and whether it reports success. The two are
+    /// the same thing unless the store is smaller than the value of its
+    /// load: QEMU then writes where the low bytes agree and reports failure
+    /// unless the whole value agrees, and so does this.
     fn store_exclusive<M: Memory>(
         &mut self,
         memory: &mut M,
         address: u64,
         bytes: u8,
         value: u128,
-    ) -> Result<bool, Fault> {
+    ) -> Result<(bool, bool), Fault> {
         // QEMU keeps "no mark" as the address 2^64 - 1, so for it a store
         // there is at the marked address also without a mark, and is an
         // access that can fault. The architecture leaves open whether an
@@ -270,7 +273,7 @@ impl Side {
         if marked != address {
             // Another address: no memory is looked at.
             self.exclusive = None;
-            return Ok(false);
+            return Ok((false, false));
         }
         // From here the store is an access. One that faults leaves the
         // mark, as its instruction did not complete.
@@ -285,19 +288,21 @@ impl Side {
         memory.read(address, &mut now[..usize::from(bytes)])?;
         let now = u128::from_le_bytes(now);
         let Some(reservation) = self.exclusive.take() else {
-            return Ok(false);
+            return Ok((false, false));
         };
-        let same = if bytes == 16 {
-            now as u64 == self.exclusive_value && (now >> 64) as u64 == self.exclusive_high
-        } else {
-            now == u128::from(self.exclusive_value)
-        };
+        let expected = u128::from(self.exclusive_value) | u128::from(self.exclusive_high) << 64;
+        // The memory holds the value, as far as the store reaches.
+        let same = now == expected & bits_mask(bytes);
+        // The memory holds the whole value: 64 bits, or 128 for a pair of
+        // 64-bit registers.
+        let whole = same && (bytes == 16 || now == u128::from(self.exclusive_value));
         if !same {
-            return Ok(false);
+            return Ok((false, false));
         }
         let wrote = if bytes == reservation.bytes {
             memory.store_conditional(address, part, reservation.generation)?
-        } else if memory.reservation_generation(reservation.address, usize::from(reservation.bytes))
+        } else if memory
+            .reservation_generation(reservation.address, usize::from(reservation.bytes))
             == reservation.generation
         {
             // A store of another size than its load: the granules of the
@@ -310,7 +315,7 @@ impl Side {
         if wrote {
             self.wrote(address, bytes, value);
         }
-        Ok(wrote)
+        Ok((wrote, wrote && whole))
     }
 }
 
@@ -669,10 +674,10 @@ impl Compiled {
                         .store(memory, at, bytes, value)
                         .map_err(|fault| (exit, Failed::Access(fault, at, true)))?,
                     Some(result) => {
-                        let wrote = side
+                        let (_, succeeded) = side
                             .store_exclusive(memory, at, bytes, value)
                             .map_err(|fault| (exit, Failed::Access(fault, at, true)))?;
-                        values[result as usize] = u128::from(!wrote);
+                        values[result as usize] = u128::from(!succeeded);
                     }
                 }
             }
