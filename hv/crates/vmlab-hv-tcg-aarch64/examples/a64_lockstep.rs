@@ -331,8 +331,17 @@ impl Counts {
                         }
                         _ => 0,
                     };
-                    let first = records_of(item.record.info().format)[0];
-                    ((first, outcome), 1)
+                    // One sample for each outcome of a load or a store, of
+                    // a system operation, and of everything else.
+                    let format = item.record.info().format;
+                    let kind = if LOAD_STORE_FORMATS.contains(&format) {
+                        FormatClass::BaseLoadStoreUI
+                    } else if matches!(format, FormatClass::SystemXtI | FormatClass::SystemLXtI) {
+                        FormatClass::SystemXtI
+                    } else {
+                        FormatClass::ADRI
+                    };
+                    ((records_of(kind)[0], outcome), self.keep)
                 }
             };
             let seen = if self.translated.is_some() {
