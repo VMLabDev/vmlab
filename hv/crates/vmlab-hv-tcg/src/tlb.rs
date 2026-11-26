@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn an_invalidation_by_address_takes_the_whole_mapping() {
-        let mut tlb = Tlb::new(8);
+        let mut tlb = Tlb::new(12);
         // Three pages of one 2 MiB mapping, and a page beside it.
         for page in [0x200, 0x2ff, 0x3ff] {
             tlb.insert(entry(page, 1, false, 21));
