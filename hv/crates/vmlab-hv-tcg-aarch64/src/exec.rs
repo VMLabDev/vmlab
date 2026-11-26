@@ -32,11 +32,11 @@
 //!
 //! Sources read: none. This file holds no instruction semantics.
 
+use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, Lifted, lift};
 use crate::state::{Context, State, slot};
 use vmlab_hv_tcg::{Error, Memory};
-use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
@@ -590,7 +590,14 @@ fn compile(
                 ..
             } => {
                 let condition = lowering.word(*condition);
-                lowering.effect(Code::Guard, u8::from(*expected), 0, condition, 0, leave.into());
+                lowering.effect(
+                    Code::Guard,
+                    u8::from(*expected),
+                    0,
+                    condition,
+                    0,
+                    leave.into(),
+                );
             }
             Event::ReadMemory {
                 address,

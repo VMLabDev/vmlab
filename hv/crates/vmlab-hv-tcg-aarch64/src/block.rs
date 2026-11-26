@@ -169,11 +169,7 @@ impl Generic {
             Kind::Concat { low_width } => {
                 Some((a.checked_shl(low_width.into()).unwrap_or(0) | b) & self.mask)
             }
-            Kind::Select => Some(if a != 0 {
-                b
-            } else {
-                self.args[2].read(frame)
-            }),
+            Kind::Select => Some(if a != 0 { b } else { self.args[2].read(frame) }),
         };
         match value {
             Some(value) => {
@@ -219,9 +215,7 @@ pub(crate) fn step(op: &Op, frame: &mut [u64], generics: &[Generic]) -> bool {
         Code::BitNot => !a & op.imm,
         Code::Negate => a.wrapping_neg() & op.imm,
         Code::SignExtend => ((a << (64 - width)) as i64 >> (64 - width)) as u64 & op.imm,
-        Code::LeadingZeros => {
-            u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm
-        }
+        Code::LeadingZeros => u64::from((a & low(op.aux)).leading_zeros() - (64 - width)) & op.imm,
         Code::TrailingZeros => u64::from((a & low(op.aux)).trailing_zeros().min(width)) & op.imm,
         Code::ReverseBits => ((a & low(op.aux)).reverse_bits() >> (64 - width)) & op.imm,
         Code::ReverseBytes => ((a & low(op.aux)).swap_bytes() >> (64 - width)) & op.imm,
@@ -546,7 +540,14 @@ impl Lowering {
         }
     }
 
-    fn slice(&mut self, graph: &Graph, id: ScalarId, value: ScalarId, offset: u16, width: u16) -> bool {
+    fn slice(
+        &mut self,
+        graph: &Graph,
+        id: ScalarId,
+        value: ScalarId,
+        offset: u16,
+        width: u16,
+    ) -> bool {
         if self.wide[id] {
             return false;
         }
@@ -615,7 +616,14 @@ impl Lowering {
             } => {
                 if !self.wide[id] && low_width < 64 {
                     let (a, b) = (self.first[high], self.first[low]);
-                    self.push(Code::Concat, low_width as u8, self.first[id], a, b, word_mask(ty));
+                    self.push(
+                        Code::Concat,
+                        low_width as u8,
+                        self.first[id],
+                        a,
+                        b,
+                        word_mask(ty),
+                    );
                 } else {
                     let kind = Kind::Concat { low_width };
                     self.generic(kind, id, graph, &[high, low], type_mask(ty));
@@ -974,8 +982,14 @@ mod tests {
         let wide = graph
             .unary(ScalarType::Bits(128), Unary::Truncate(128), byte)
             .expect("a view");
-        assert!(matches!(graph.scalars[word].operation, Operation::Refine(_)));
-        assert!(matches!(graph.scalars[wide].operation, Operation::Refine(_)));
+        assert!(matches!(
+            graph.scalars[word].operation,
+            Operation::Refine(_)
+        ));
+        assert!(matches!(
+            graph.scalars[wide].operation,
+            Operation::Refine(_)
+        ));
         let mut lowering = Lowering::new(&graph).expect("a small block");
         assert_eq!(lowering.place(word), lowering.place(byte));
         assert_ne!(lowering.word(wide), lowering.word(byte));
