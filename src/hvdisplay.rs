@@ -38,15 +38,18 @@ const CONNECT_PATIENCE: Duration = Duration::from_secs(3);
 /// How long a capture waits for the frame the server owes every new client.
 const FIRST_FRAME: Duration = Duration::from_secs(10);
 
-/// Connect and handshake, retrying a socket that is not there yet.
-fn connect(path: &Path, capabilities: u32) -> Result<Client> {
+/// How long an input connection waits for the server's Hello, and then for
+/// room in the socket for one write. The sender holds the machine's input
+/// lock for as long as it waits.
+const INPUT_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Connect and handshake, retrying a socket that is not there yet. The
+/// handshake as a whole takes `patience` at most.
+fn connect(path: &Path, capabilities: u32, patience: Duration) -> Result<Client> {
     let deadline = Instant::now() + CONNECT_PATIENCE;
     loop {
         match UnixStream::connect(path) {
-            Ok(stream) => {
-                return Client::from_stream(stream, Capabilities(capabilities))
-                    .with_context(|| format!("vmlab-hv display handshake on {}", path.display()));
-            }
+            Ok(stream) => return handshake(stream, capabilities, patience, path),
             Err(e)
                 if Instant::now() < deadline
                     && matches!(
@@ -63,6 +66,44 @@ fn connect(path: &Path, capabilities: u32) -> Result<Client> {
     }
 }
 
+/// The Hello exchange, given up after `patience`. A unix socket takes a
+/// connection as soon as its listener exists, so a hypervisor that is
+/// stopped or hung accepts and never answers. A read timeout bounds one read
+/// and not the exchange, so a peer that sends a byte at a time would outlast
+/// it: a watchdog shuts the socket down at the deadline, which ends whatever
+/// read or write the handshake is in.
+fn handshake(
+    stream: UnixStream,
+    capabilities: u32,
+    patience: Duration,
+    path: &Path,
+) -> Result<Client> {
+    let socket = stream.try_clone().context("a second handle on the socket")?;
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::Builder::new()
+        .name("vmlab-hv-hello".into())
+        .spawn(move || {
+            let late = matches!(
+                wait.recv_timeout(patience),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            if late {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+            late
+        })
+        .context("spawning the vmlab-hv handshake watchdog")?;
+    let client = Client::from_stream(stream, Capabilities(capabilities));
+    drop(done);
+    if watchdog.join().unwrap_or(true) {
+        bail!(
+            "vmlab-hv did not answer the display handshake on {} within {patience:?}",
+            path.display()
+        );
+    }
+    client.with_context(|| format!("vmlab-hv display handshake on {}", path.display()))
+}
+
 /// The largest surface side vmlab accepts, as vmlab-hv's server core and its
 /// viewer do.
 const MAX_SURFACE_SIDE: u32 = 16384;
@@ -70,6 +111,17 @@ const MAX_SURFACE_SIDE: u32 = 16384;
 /// The largest surface buffer vmlab accepts (`stride * height`), as
 /// vmlab-hv's server core and its viewer do.
 const MAX_SURFACE_BYTES: u64 = 256 << 20;
+
+/// The most damage rectangles one frame may carry: the limit vmlab-hv's
+/// server core holds its own frames to. The codec takes any count that fits
+/// a message, about a million.
+const MAX_DAMAGE_RECTS: usize = 65535;
+
+/// How many bytes of pixels the damage of one frame may come to, as
+/// `crate::vnc` allows one update. [`decode`] holds them all until the
+/// batch goes to the recorder, and nothing else bounds their sum: every
+/// rectangle may be the whole surface.
+const MAX_DAMAGE_BYTES: u64 = 2 * MAX_SURFACE_BYTES;
 
 /// The shared-memory surface the server last configured.
 struct Surface {
@@ -155,8 +207,14 @@ pub async fn capture(path: &Path) -> Result<RgbImage> {
 }
 
 fn capture_blocking(path: &Path, patience: Duration) -> Result<RgbImage> {
-    let client = connect(path, Capabilities::FRAMES | Capabilities::FRAME_FLAGS)?;
+    // One deadline for the handshake and the frame: the socket being
+    // connected says nothing about the server answering.
     let deadline = Instant::now() + patience;
+    let client = connect(
+        path,
+        Capabilities::FRAMES | Capabilities::FRAME_FLAGS,
+        patience,
+    )?;
     let mut surface: Option<Surface> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -223,33 +281,47 @@ pub fn button_bit(button: &str) -> Result<u32> {
 pub struct InputConn {
     path: PathBuf,
     client: Option<Client>,
+    /// How long one handshake, and one write, may wait on the server.
+    patience: Duration,
 }
 
 impl InputConn {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, client: None }
+        Self::with_patience(path, INPUT_PATIENCE)
     }
 
-    /// The proof tests of review F11 name the wait they allow; nothing
-    /// honours it yet.
-    #[cfg(test)]
-    pub(crate) fn with_patience(path: PathBuf, _patience: Duration) -> Self {
-        Self::new(path)
+    pub(crate) fn with_patience(path: PathBuf, patience: Duration) -> Self {
+        Self {
+            path,
+            client: None,
+            patience,
+        }
     }
 
     /// Send `messages` in order, reconnecting once if the connection went
     /// away under us — a restart or a restore replaced the hypervisor.
+    ///
+    /// No wait in here is unbounded, because the caller holds the machine's
+    /// input lock: the handshake is given up after `patience`, and so is a
+    /// write to a server that has stopped reading. A connection that failed
+    /// is never kept, a timed-out write having left half a message on it.
     pub fn send(&mut self, messages: &[Message]) -> Result<()> {
         for attempt in 0..2 {
-            if self.client.is_none() {
-                self.client = Some(connect(&self.path, Capabilities::INPUT)?);
-            }
-            let client = self.client.as_ref().expect("connected above");
+            let client = match self.client.take() {
+                Some(client) => client,
+                None => {
+                    let client = connect(&self.path, Capabilities::INPUT, self.patience)?;
+                    client.stream().set_write_timeout(Some(self.patience))?;
+                    client
+                }
+            };
             match messages.iter().try_for_each(|m| client.send(m)) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.client = Some(client);
+                    return Ok(());
+                }
                 Err(e) if attempt == 0 => {
                     tracing::debug!("vmlab-hv input connection dropped ({e}); reconnecting");
-                    self.client = None;
                 }
                 Err(e) => {
                     return Err(e)
@@ -282,6 +354,7 @@ impl NativeStream {
             let client = connect(
                 &at,
                 Capabilities::FRAMES | Capabilities::CURSOR | Capabilities::FRAME_FLAGS,
+                FIRST_FRAME,
             )?;
             client.stream().set_read_timeout(Some(FIRST_FRAME))?;
             loop {
@@ -369,14 +442,50 @@ fn decode(client: &Client, surface: &mut Surface, packet: Packet) -> io::Result<
             flags,
             ..
         } => {
+            // The count and the sum are checked before a byte is read: the
+            // peer is one machine's hypervisor process, and every rectangle
+            // below becomes memory the lab daemon keeps until the batch is
+            // consumed.
+            if damage.len() > MAX_DAMAGE_RECTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "vmlab-hv frame carries {} damage rectangles, above the limit of \
+                         {MAX_DAMAGE_RECTS}",
+                        damage.len()
+                    ),
+                ));
+            }
             let mut events = Vec::new();
             // A frame from a superseded configure is released unread: the
             // configure that replaced it promises a full frame of its own.
             if *surface_id == surface.id && !flags.has(FrameFlags::PLACEHOLDER) {
-                for r in damage {
+                let clipped = |r: &vmlab_hv_display::Rect| {
                     let (x, y) = (r.x.min(surface.width), r.y.min(surface.height));
                     let w = r.width.min(surface.width - x);
                     let h = r.height.min(surface.height - y);
+                    (x, y, w, h)
+                };
+                // Each term is at most one surface (2^30 bytes) and there
+                // are at most 65535, so the sum cannot wrap.
+                let bytes: u64 = damage
+                    .iter()
+                    .map(|r| {
+                        let (_, _, w, h) = clipped(r);
+                        u64::from(w) * 4 * u64::from(h)
+                    })
+                    .sum();
+                if bytes > MAX_DAMAGE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "vmlab-hv frame carries {bytes} bytes of damage, above the limit \
+                             of {MAX_DAMAGE_BYTES}"
+                        ),
+                    ));
+                }
+                for r in damage {
+                    let (x, y, w, h) = clipped(r);
                     if w == 0 || h == 0 {
                         continue;
                     }
