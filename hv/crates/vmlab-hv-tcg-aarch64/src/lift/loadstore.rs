@@ -504,7 +504,7 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     };
     let address = b.x_or_sp(rn, 64);
     // On every memory, not only where the memory asks for it.
-    b.require_aligned(address, bytes, !access.load, true);
+    b.require_aligned(address, bytes, bytes, !access.load, true);
     transfer(b, access, rt, address);
     Lifted::Next
 }
@@ -585,7 +585,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
         for register in 0..registers {
             let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
             if shape.load {
-                let value = b.load_aligned(address, vector_bytes, align);
+                let value = b.load_structure(address, vector_bytes, align);
                 let target = list(vt, register);
                 if vector_bytes == 8 {
                     // The upper half of each register is cleared after the
@@ -601,7 +601,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
                 b.commit();
             } else {
                 let value = b.v(list(vt, register), u16::from(vector_bytes) * 8);
-                b.store_aligned(address, vector_bytes, value, align);
+                b.store_structure(address, vector_bytes, value, align);
             }
         }
         if shape.load && vector_bytes == 8 {
@@ -627,7 +627,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
             for element in 0..elements {
                 for register in 0..registers {
                     let address = at(b, element, register);
-                    let loaded = b.load(address, bytes);
+                    let loaded = b.load_structure(address, bytes, bytes);
                     let value = &mut values[register as usize];
                     *value = Some(match *value {
                         None => loaded,
@@ -655,7 +655,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
                 for register in 0..registers {
                     let address = at(b, element, register);
                     let value = b.slice(sources[register as usize], element as u16 * width, width);
-                    b.store(address, bytes, value);
+                    b.store_structure(address, bytes, value, bytes);
                 }
             }
         }
@@ -718,13 +718,13 @@ pub fn simd_single(
         let address = displace(b, base, i64::from(register * u32::from(element_bytes)));
         let vector = b.v(list(vt, register), 128);
         if load {
-            let element = b.load(address, element_bytes);
+            let element = b.load_structure(address, element_bytes, element_bytes);
             let value = insert(b, vector, position, width, element);
             b.set_v(list(vt, register), 128, value);
             b.commit();
         } else {
             let element = b.slice(vector, position, width);
-            b.store(address, element_bytes, element);
+            b.store_structure(address, element_bytes, element, element_bytes);
         }
     }
     structure_write_back(b, rn, base, xm, registers * u32::from(element_bytes));
@@ -747,7 +747,7 @@ pub fn simd_replicate(
     let base = b.x_or_sp(rn, 64);
     for register in 0..registers {
         let address = displace(b, base, i64::from(register * u32::from(element_bytes)));
-        let mut vector = b.load(address, element_bytes);
+        let mut vector = b.load_structure(address, element_bytes, element_bytes);
         let mut width = u16::from(element_bytes) * 8;
         while width < vector_width {
             vector = b.concat(vector, vector, width, width * 2);

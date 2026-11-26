@@ -80,6 +80,9 @@ pub enum ExceptionClass {
         write: bool,
         always: bool,
         unprivileged: bool,
+        /// The alignment in bytes that Device memory asks of this access. 1:
+        /// none.
+        device: u8,
     },
 }
 
@@ -157,6 +160,13 @@ pub struct Builder {
     aligned: Vec<(ScalarId, u8)>,
     /// The accesses of this instruction are made as EL0.
     unprivileged: bool,
+}
+
+/// The alignment that Device memory asks of a load or a store of a register
+/// whose own alignment is `align` bytes. What the lockstep found on QEMU
+/// (card C8): the size of the register, and 8 bytes for one of 16.
+fn device_alignment(align: u8) -> u8 {
+    align.min(8)
 }
 
 fn total(value: Option<ScalarId>) -> ScalarId {
@@ -768,7 +778,14 @@ impl Builder {
     /// As `load`, for an access of several elements of `align` bytes each:
     /// the address must be a multiple of `align`.
     pub fn load_aligned(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
-        self.require_aligned(address, align, false, false);
+        self.require_aligned(address, align, device_alignment(align), false, false);
+        self.read_event(address, bytes, false)
+    }
+
+    /// As `load_aligned`, for a load of vector registers as a structure
+    /// (`LD1` to `LD4`): Device memory asks no alignment of it.
+    pub fn load_structure(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
+        self.require_aligned(address, align, 1, false, false);
         self.read_event(address, bytes, false)
     }
 
@@ -779,14 +796,21 @@ impl Builder {
 
     /// As `store`, for an access of several elements of `align` bytes each.
     pub fn store_aligned(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
-        self.require_aligned(address, align, true, false);
+        self.require_aligned(address, align, device_alignment(align), true, false);
+        self.write_event(address, bytes, value, false);
+    }
+
+    /// As `store_aligned`, for a store of vector registers as a structure
+    /// (`ST1` to `ST4`).
+    pub fn store_structure(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
+        self.require_aligned(address, align, 1, true, false);
         self.write_event(address, bytes, value, false);
     }
 
     /// A load that also marks the address for exclusive access. The address
     /// must be a multiple of `bytes` on every memory.
     pub fn load_exclusive(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
-        self.require_aligned(address, bytes, false, true);
+        self.require_aligned(address, bytes, bytes, false, true);
         self.read_event(address, bytes, true)
     }
 
@@ -803,10 +827,17 @@ impl Builder {
     /// Leave the block with an alignment fault before this instruction,
     /// unless `address` is a multiple of `bytes`, a power of two. `always`:
     /// the instruction asks for the alignment. Otherwise the fault is taken
-    /// only where the memory at the address asks for it: Device memory,
-    /// which is all memory while the MMU is off, or any memory with
-    /// SCTLR_EL1.A set. The loop decides that when the guard fails.
-    pub fn require_aligned(&mut self, address: ScalarId, bytes: u8, write: bool, always: bool) {
+    /// only where something asks for it: SCTLR_EL1.A or the MMU being off,
+    /// which ask for `bytes`, or Device memory at the address, which asks
+    /// for `device` bytes. The loop decides that when the guard fails.
+    pub fn require_aligned(
+        &mut self,
+        address: ScalarId,
+        bytes: u8,
+        device: u8,
+        write: bool,
+        always: bool,
+    ) {
         if bytes == 1
             || self
                 .aligned
@@ -826,6 +857,7 @@ impl Builder {
             write,
             always,
             unprivileged: self.unprivileged,
+            device,
         };
         let exit = self.exit_before(class, vec![address]);
         self.block.events.push(Event::Guard {

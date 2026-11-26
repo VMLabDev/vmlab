@@ -432,15 +432,25 @@ impl Side {
     ///
     /// `false` where another fault comes first: the access itself reports
     /// that one.
+    /// `device`: the alignment in bytes that Device memory asks of the
+    /// access, which is none for a structure of vector registers.
     #[cold]
-    fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64, kind: Kind) -> bool {
+    fn unaligned_faults<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        kind: Kind,
+        device: u8,
+    ) -> bool {
         let controls = *self.mmu.controls();
         if !controls.enabled || controls.strict_alignment {
             return true;
         }
-        self.mmu
-            .page(memory, va, kind)
-            .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
+        va & (u64::from(device.max(1)) - 1) != 0
+            && self
+                .mmu
+                .page(memory, va, kind)
+                .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
     }
 
     fn read_at<M: Memory>(
@@ -1223,12 +1233,18 @@ impl Compiled {
         side: &mut Side,
     ) -> Result<(), (u32, Failed)> {
         let leave = &leaves[exit as usize];
-        let ExceptionClass::Alignment { write, always, .. } = leave.class else {
+        let ExceptionClass::Alignment {
+            write,
+            always,
+            device,
+            ..
+        } = leave.class
+        else {
             return Err((exit, Failed::Guard));
         };
         let address = leave.address.map_or(0, |slot| frame[usize::from(slot)]);
         let kind = if write { Kind::Write } else { Kind::Read };
-        if always || side.unaligned_faults(memory, address, kind) {
+        if always || side.unaligned_faults(memory, address, kind, device) {
             let fault = Fault::Abort(mmu::Fault::ALIGNMENT, address);
             return Err((exit, Failed::Access(fault, write)));
         }
