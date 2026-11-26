@@ -836,7 +836,10 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     );
     let mut cpu = self::cpu(&[word(Record::STXRB, &[("ws", 10), ("rt", 1), ("rn", 0)])]);
     cpu.state.set_x(0, u64::MAX);
-    assert!(matches!(cpu.step(), Err(Stop::DataAbort { write: true, .. })));
+    assert!(matches!(
+        cpu.step(),
+        Err(Stop::DataAbort { write: true, .. })
+    ));
 }
 
 #[test]
