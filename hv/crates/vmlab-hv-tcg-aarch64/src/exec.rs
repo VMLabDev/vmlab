@@ -570,9 +570,10 @@ impl Side {
                 host => host,
             })?;
         let code = self.is_code(spot, 1);
+        // An external abort names the first byte of the block.
         memory
             .write(spot.first, &[0u8; ZERO_BLOCK])
-            .map_err(|error| Fault::memory(error, address))?;
+            .map_err(|error| Fault::memory(error, base))?;
         self.own_writes += 1;
         if code {
             self.code_written = true;
