@@ -5,9 +5,9 @@
 //! The stream leaves out what the lockstep cannot follow: `WFI` and `WFE`,
 //! which stop QEMU for ever without an interrupt or an event (`directed`
 //! runs both at EL0, where SCTLR_EL1 traps them), and the values of a few
-//! registers that would turn on what later cards bring (the MMU and tagged
-//! addresses, card C8) or what phase 3d does not have (debug exceptions,
-//! V3). `safe_value` holds those limits.
+//! registers that would turn on what these streams have no tables for (the
+//! MMU and tagged addresses, which `translate.rs` runs) or what phase 3d
+//! does not have (debug exceptions, V3). `safe_value` holds those limits.
 
 use super::asm::{self, reg};
 use super::stream::{Generator, Rng, records_of};
@@ -122,9 +122,10 @@ pub fn safe_value(row: usize, rng: &mut Rng, table: u64, image: (u64, u64)) -> O
         return None;
     }
     Some(match info.name {
-        // No MMU before card C8.
+        // No MMU: a stream of system instructions has no translation
+        // tables. The rounds with the MMU on are `translate.rs`.
         "SCTLR_EL1" => any & !1,
-        // No tagged addresses before card C8: TBI0 and TBI1.
+        // No tagged addresses either: TBI0 and TBI1.
         "TCR_EL1" => any & !(3 << 37),
         // The one table of the image. The low bits are not stored.
         "VBAR_EL1" => table | (any & 0x1f),
@@ -157,6 +158,7 @@ pub fn unfollowed(
     encoding: u32,
     x: &[u64; 31],
     state: &crate::state::State,
+    translated: bool,
 ) -> Option<&'static str> {
     let el0 = state.context.el == 0;
     let sctlr = state.system.regs[sysreg::reg::SCTLR_EL1];
@@ -174,9 +176,12 @@ pub fn unfollowed(
         _ => {}
     }
     // The loads and stores have their own group, which compares the memory.
-    if crate::generated::decode::decode(encoding).is_some_and(|decoded| {
-        crate::lift::LOAD_STORE_FORMATS.contains(&decoded.record.info().format)
-    }) {
+    // A round with the MMU on (card C8) follows them itself.
+    if !translated
+        && crate::generated::decode::decode(encoding).is_some_and(|decoded| {
+            crate::lift::LOAD_STORE_FORMATS.contains(&decoded.record.info().format)
+        })
+    {
         return Some("a load or a store, which the group of card C3 follows");
     }
     // `MSR <register>, Xt` at EL1.
@@ -189,8 +194,13 @@ pub fn unfollowed(
     };
     let row = sysreg::find((encoding >> 5) as u16)?;
     match ROWS[row].name {
-        "SCTLR_EL1" if value & 1 != 0 => Some("the MMU is card C8"),
-        "TCR_EL1" if value & (3 << 37) != 0 => Some("tagged addresses are card C8"),
+        // A stream of system instructions has no translation tables.
+        "SCTLR_EL1" if !translated && value & 1 != 0 => Some("the MMU without tables"),
+        // The 3d CPU is little-endian only (G2): EE and E0E.
+        "SCTLR_EL1" if translated && value & (3 << 24) != 0 => Some("big-endian data"),
+        "TCR_EL1" if !translated && value & (3 << 37) != 0 => {
+            Some("tagged addresses, which the rounds with the MMU on follow")
+        }
         "MDSCR_EL1" if value & (1 | 1 << 13 | 1 << 15) != 0 => {
             Some("software step and debug exceptions are not in phase 3d (V3)")
         }
@@ -528,31 +538,31 @@ mod tests {
         let mut x = [0u64; 31];
         x[3] = 1;
         let msr = |name: &str| asm::msr(ROWS[sysreg::index(name)].encoding, 3);
-        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state).is_some());
-        assert!(unfollowed(msr("MDSCR_EL1"), &x, &state).is_some());
-        assert!(unfollowed(msr("CNTV_TVAL_EL0"), &x, &state).is_some());
-        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state).is_none());
-        assert!(unfollowed(msr("TCR_EL1"), &x, &state).is_none());
-        assert!(unfollowed(msr("TPIDR_EL1"), &x, &state).is_none());
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state, false).is_some());
+        assert!(unfollowed(msr("MDSCR_EL1"), &x, &state, false).is_some());
+        assert!(unfollowed(msr("CNTV_TVAL_EL0"), &x, &state, false).is_some());
+        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state, false).is_none());
+        assert!(unfollowed(msr("TCR_EL1"), &x, &state, false).is_none());
+        assert!(unfollowed(msr("TPIDR_EL1"), &x, &state, false).is_none());
         x[3] = 1 << 37;
-        assert!(unfollowed(msr("TCR_EL1"), &x, &state).is_some());
-        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state).is_some());
-        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state).is_none());
-        assert!(unfollowed(msr("SCTLR_EL1") | 31, &x, &state).is_none());
-        assert!(unfollowed(0xd503_207f, &x, &state).is_some());
-        assert!(unfollowed(asm::ERET, &x, &state).is_none());
+        assert!(unfollowed(msr("TCR_EL1"), &x, &state, false).is_some());
+        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state, false).is_some());
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state, false).is_none());
+        assert!(unfollowed(msr("SCTLR_EL1") | 31, &x, &state, false).is_none());
+        assert!(unfollowed(0xd503_207f, &x, &state, false).is_some());
+        assert!(unfollowed(asm::ERET, &x, &state, false).is_none());
         let mut user = State::reset(0);
         assert!(user.set_cpsr(0));
         // At EL0 the write is undefined, and the waits trap unless SCTLR_EL1
         // lets them through, as it does after the reset.
         x[3] = 1;
-        assert!(unfollowed(msr("SCTLR_EL1"), &x, &user).is_none());
-        assert!(unfollowed(0xd503_205f, &x, &user).is_some());
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &user, false).is_none());
+        assert!(unfollowed(0xd503_205f, &x, &user, false).is_some());
         user.system.regs[sysreg::reg::SCTLR_EL1] = 0;
-        assert!(unfollowed(0xd503_205f, &x, &user).is_none());
+        assert!(unfollowed(0xd503_205f, &x, &user, false).is_none());
         let mut aarch32 = State::reset(0);
         aarch32.system.regs[sysreg::reg::SPSR_EL1] = 0x10;
-        assert!(unfollowed(asm::ERET, &x, &aarch32).is_some());
+        assert!(unfollowed(asm::ERET, &x, &aarch32, false).is_some());
         assert!(reads_the_time(sysreg::index("CNTVCT_EL0")));
         assert!(!reads_the_time(sysreg::index("CNTV_CTL_EL0")));
         assert!(writable(sysreg::index("OSLAR_EL1")) && !writable(sysreg::index("MIDR_EL1")));

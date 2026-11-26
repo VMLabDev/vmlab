@@ -150,6 +150,7 @@ fn phase_with(
 ) -> Result<HashMap<usize, Outcome>, Failure> {
     let options = Options {
         names: names.map(Path::to_path_buf),
+        cpu: None,
         ..Options::default()
     };
     let mut leader = Leader::start_options(
