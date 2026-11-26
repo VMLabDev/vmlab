@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn a_stream_runs_on_our_interpreter_through_exceptions_levels_and_returns() {
         let mut classes = BTreeSet::new();
-        let mut causes = BTreeSet::new();
+        let mut causes = std::collections::HashSet::new();
         let (mut at_el0, mut returns, mut exceptions, mut unknown) = (0u64, 0u64, 0u64, 0u64);
         for seed in 0..40 {
             let mut generator = Generator::new(seed);

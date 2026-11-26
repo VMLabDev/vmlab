@@ -470,7 +470,7 @@ mod tests {
         after.cpsr = 0x6000_03c5;
         // SP_EL1 is the stack pointer after the entry.
         after.sp = 0x9000;
-        let entry = Entry {
+        let call = Entry {
             encoding: 0xd400_0421,
             before,
             after,
@@ -488,7 +488,7 @@ mod tests {
                 ],
             )),
         };
-        let line = entry.line();
+        let line = call.line();
         assert!(
             line.contains(" sys=VBAR_EL1:42080000,SP_EL1:9000,SP_EL0:1000 => "),
             "{line}"
@@ -497,10 +497,10 @@ mod tests {
             line.ends_with(" dsys=SPSR_EL1:60000000,ELR_EL1:42000014,ESR_EL1:56000021"),
             "{line}"
         );
-        assert_eq!(Entry::parse(&line), Ok(entry.clone()));
-        assert_eq!(entry.replay(), Ok(()));
+        assert_eq!(Entry::parse(&line), Ok(call.clone()));
+        assert_eq!(call.replay(), Ok(()));
         // A wrong syndrome names the register.
-        let mut wrong = entry.clone();
+        let mut wrong = call.clone();
         wrong.system.as_mut().unwrap().1[2].1 = 0x5600_0022;
         let error = wrong.replay().unwrap_err();
         assert!(error.contains("ESR_EL1: 0x56000021 / 0x56000022"), "{error}");

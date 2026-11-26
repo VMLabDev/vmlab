@@ -4,7 +4,7 @@
 //! (`tests/qemu-cortex-a53-sysregs.txt`).
 
 use super::*;
-use crate::exception::{Cause, Exception};
+use crate::exception::Cause;
 use crate::exec::Cpu;
 use crate::generated::sysreg::SYSREGS;
 use crate::timer::Clock;
