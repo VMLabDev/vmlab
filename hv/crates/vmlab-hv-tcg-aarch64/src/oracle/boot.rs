@@ -311,7 +311,9 @@ impl Drop for Qtest {
 /// selector of each: 64 bytes for a file, after a count.
 pub fn directory_entries(directory: &[u8]) -> Vec<(String, u16, usize)> {
     directory
-        .chunks_exact(64)
+        .as_chunks::<64>()
+        .0
+        .iter()
         .map(|entry| {
             let size = u32::from_be_bytes(entry[..4].try_into().unwrap()) as usize;
             let selector = u16::from_be_bytes(entry[4..6].try_into().unwrap());
