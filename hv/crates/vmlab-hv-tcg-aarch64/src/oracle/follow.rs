@@ -247,6 +247,10 @@ pub struct Follower {
     /// The memory writes of QEMU since its last instruction record, in a
     /// round with the MMU on.
     qemu_writes: Vec<QemuWrite>,
+    /// Loads of several vector registers that faulted and left other
+    /// values in their registers on the two sides. A CPU may leave anything
+    /// there: our registers took QEMU's.
+    pub partial_loads: u64,
     /// The CPU that our side runs as.
     pub model: &'static crate::sysreg::CpuModel,
     /// The bits of PSTATE that are compared, in CPSR and in SPSR_EL1. A
@@ -343,6 +347,23 @@ fn counter_read(encoding: u32) -> Adopt {
         0xdf10 | 0xdf18 => Adopt::Counter(rt, false),
         _ => Adopt::Nothing,
     }
+}
+
+/// Whether the word is a load of vector registers as a structure: `LD1` to
+/// `LD4`, of whole registers, of one lane or replicated.
+fn structure_load(encoding: u32) -> bool {
+    use crate::generated::decode::FormatClass;
+    decode(encoding).is_some_and(|decoded| {
+        let info = decoded.record.info();
+        let structure = matches!(
+            info.format,
+            FormatClass::BaseSIMDLdSt
+                | FormatClass::BaseSIMDLdStPost
+                | FormatClass::BaseSIMDLdR
+                | FormatClass::BaseSIMDLdRPost
+        ) || info.format.name().starts_with("SIMDLdStSingle");
+        structure && encoding & (1 << 22) != 0
+    })
 }
 
 /// The kind of an exception, for the counts of a run.
@@ -449,6 +470,7 @@ impl Follower {
             exceptions: BTreeMap::new(),
             translated: false,
             qemu_writes: Vec::new(),
+            partial_loads: 0,
             model: &QEMU_CORTEX_A53,
             pstate_mask: u32::MAX,
         }
@@ -1378,7 +1400,24 @@ impl Follower {
                         difference.taken = self.cpu.taken;
                         break Err(difference);
                     }
-                    let ours_vectors = compare_vectors.then(|| Vectors::of(&self.cpu.state));
+                    let mut ours_vectors = compare_vectors.then(|| Vectors::of(&self.cpu.state));
+                    // A load of several vector registers that faulted: the
+                    // architecture says nothing of what its registers hold.
+                    // QEMU writes them element by element as it goes, and
+                    // our side register by register, or not at all.
+                    let mut adopted = false;
+                    if let (Some(ours), Some(theirs), Some(previous)) =
+                        (ours_vectors.as_mut(), vectors, &last)
+                        && theirs != *ours
+                        && previous.faulted
+                        && structure_load(previous.encoding)
+                        && (theirs.fpsr, theirs.fpcr) == (ours.fpsr, ours.fpcr)
+                    {
+                        theirs.apply(&mut self.cpu.state);
+                        *ours = theirs;
+                        self.partial_loads += 1;
+                        adopted = true;
+                    }
                     if let Some(ours_vectors) = ours_vectors {
                         let Some(theirs) = vectors else {
                             return Err(io::Error::other(
@@ -1448,7 +1487,7 @@ impl Follower {
                             after: core,
                             vectors: last.vectors.zip(ours_vectors),
                             system: last.system.zip(ours_system.clone()),
-                            replayable: last.adopt == Adopt::Nothing,
+                            replayable: last.adopt == Adopt::Nothing && !adopted,
                             accesses: last.accesses,
                             physical: last.physical,
                         });

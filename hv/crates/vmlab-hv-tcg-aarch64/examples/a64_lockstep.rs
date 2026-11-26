@@ -1075,6 +1075,10 @@ fn translated_rounds(
         "stores of several parts that faulted after a different count of parts on the two sides: {}",
         run.follower.partial_stores
     );
+    println!(
+        "loads of several vector registers that faulted with other values in those registers on the two sides: {}",
+        run.follower.partial_loads
+    );
     println!("exceptions that both sides took, with the same registers after them:");
     for (kind, count) in &run.follower.exceptions {
         println!("  {count:>9} {kind}");

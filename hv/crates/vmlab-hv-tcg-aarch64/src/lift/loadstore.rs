@@ -543,10 +543,28 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
             let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
             if shape.load {
                 let value = b.load_aligned(address, vector_bytes, align);
-                b.set_v(list(vt, register), u16::from(vector_bytes) * 8, value);
+                let target = list(vt, register);
+                if vector_bytes == 8 {
+                    // The upper half of each register is cleared after the
+                    // last access. A fault before that leaves the upper
+                    // halves of the registers that are loaded already.
+                    let old = b.v(target, 128);
+                    let high = b.slice(old, 64, 64);
+                    let whole = b.concat(high, value, 64, 128);
+                    b.set_v(target, 128, whole);
+                } else {
+                    b.set_v(target, 128, value);
+                }
+                b.commit();
             } else {
                 let value = b.v(list(vt, register), u16::from(vector_bytes) * 8);
                 b.store_aligned(address, vector_bytes, value, align);
+            }
+        }
+        if shape.load && vector_bytes == 8 {
+            for register in 0..registers {
+                let low = b.v(list(vt, register), 64);
+                b.set_v(list(vt, register), 64, low);
             }
         }
     } else {
@@ -660,6 +678,7 @@ pub fn simd_single(
             let element = b.load(address, element_bytes);
             let value = insert(b, vector, position, width, element);
             b.set_v(list(vt, register), 128, value);
+            b.commit();
         } else {
             let element = b.slice(vector, position, width);
             b.store(address, element_bytes, element);
@@ -692,6 +711,7 @@ pub fn simd_replicate(
             width *= 2;
         }
         b.set_v(list(vt, register), vector_width, vector);
+        b.commit();
     }
     structure_write_back(b, rn, base, xm, registers * u32::from(element_bytes));
     Lifted::Next

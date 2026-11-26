@@ -213,6 +213,17 @@ impl Builder {
         self.completed = self.completed.saturating_sub(1);
     }
 
+    /// What the instruction has written to its registers so far stays
+    /// written when a later access of it faults. A load of several vector
+    /// registers calls this after each: QEMU writes them as it goes, and
+    /// the registers of a load that faults are whatever the CPU left in
+    /// them (DESIGN.md U1).
+    pub fn commit(&mut self) {
+        self.before = self.current;
+        self.before_written = self.written;
+        self.abort = None;
+    }
+
     /// The address of the instruction that is being lifted.
     pub fn pc(&self) -> u64 {
         self.pc
