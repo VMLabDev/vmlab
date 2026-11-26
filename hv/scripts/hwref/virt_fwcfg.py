@@ -146,7 +146,7 @@ class Qtest:
         self.select(key)
         data = bytearray()
         while len(data) < length:
-            count = min(int(os.environ.get("VIRT_FWCFG_BATCH", "1")), length - len(data))
+            count = min(256, length - len(data))
             data.extend(int(answer[0], 0) for answer in self.answers([f"readb {DATA:#x}"] * count))
         return bytes(data)
 
@@ -175,11 +175,12 @@ def capture(qemu: str, name: str, output: Path) -> dict:
         argv = [qemu if word == "qemu-system-aarch64" else word for word in logical]
         argv = [word.replace("file=AAVMF_CODE.fd", f"file={run}/code.fd")
                 .replace("file=AAVMF_VARS.fd", f"file={run}/vars.fd") for word in argv]
-        argv += ["-accel", "qtest", "-qtest", f"unix:{run}/qtest.sock,server=on,wait=off"]
-        if os.environ.get("VIRT_FWCFG_STOPPED"):
-            argv.append("-S")
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT)
+        argv += ["-accel", "qtest", "-qtest", f"unix:{run}/qtest.sock,server=on,wait=off",
+                 "-qtest-log", "/dev/null"]
+        # QEMU writes to a file: a pipe that nobody reads would stop it.
+        with (run / "qemu.log").open("wb") as log:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
+                                       stderr=subprocess.STDOUT)
         try:
             qtest = Qtest(run / "qtest.sock", process)
             numeric = {key: qtest.item(number, length).hex()
@@ -192,9 +193,6 @@ def capture(qemu: str, name: str, output: Path) -> dict:
                 size = int.from_bytes(entry[:4], "big")
                 select = int.from_bytes(entry[4:6], "big")
                 file_name = entry[8:].split(b"\0", 1)[0].decode("ascii")
-                if os.environ.get("VIRT_FWCFG_TRACE"):
-                    print(f"{name}: {file_name} select={select:#x} size={size}",
-                          file=sys.stderr, flush=True)
                 data = qtest.item(select, size)
                 path = blobs / file_name
                 if not path.resolve().is_relative_to(blobs.resolve()):
@@ -203,13 +201,12 @@ def capture(qemu: str, name: str, output: Path) -> dict:
                 path.write_bytes(data)
                 files.append({"name": file_name, "select": select, "size": size,
                               "sha256": hashlib.sha256(data).hexdigest()})
-        except BaseException:
-            process.kill()
-            print(process.communicate()[0].decode(errors="replace"), file=sys.stderr)
-            raise
         finally:
             process.kill()
-            said = process.communicate()[0].decode(errors="replace").strip()
+            process.wait()
+            said = (run / "qemu.log").read_text(errors="replace").strip()
+            if sys.exc_info()[0] is not None and said:
+                print(f"QEMU said: {said}", file=sys.stderr)
     record = {
         "configuration": name,
         "cpu": cpu,
