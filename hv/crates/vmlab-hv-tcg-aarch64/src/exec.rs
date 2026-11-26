@@ -423,7 +423,10 @@ impl Side {
     /// the access itself reports that.
     #[cold]
     fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64) -> bool {
-        if self.mmu.controls().strict_alignment {
+        // While the MMU is off the fault comes before every other one, also
+        // for an address that is wider than a physical address.
+        let controls = self.mmu.controls();
+        if controls.strict_alignment || !controls.enabled {
             return true;
         }
         self.mmu
