@@ -1162,6 +1162,16 @@ def sweep_stale_vms():
 
 def main(argv=None):
     args = parse_args(argv)
+    if (args.backend == "interpreter" and args.arch == "aarch64") or (
+            args.backend == "qemu" and args.guest == "flat-a64"):
+        # The flat aarch64 images on our interpreter loop and on QEMU TCG.
+        if args.arch not in ("all", "aarch64"):
+            raise lib.BenchError("the guest flat-a64 is an aarch64 image")
+        if args.suite == "boot":
+            raise lib.BenchError("--suite boot requires a TCG VM template")
+        import micro_a64
+        commit, dirty = git_commit()
+        return micro_a64.run(args, commit, dirty, os.uname().nodename, log)
     if args.backend in ("interpreter", "interpreter-reference", "interpreter-specialized") or (
             args.backend == "qemu" and args.guest == "flat-rv64gc"):
         if args.suite == "boot":
