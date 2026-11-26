@@ -88,6 +88,10 @@ struct Counts {
     /// By the record, and for `MRS` and `MSR` of a register with a row by
     /// the register too.
     samples: BTreeMap<(Record, u16), Vec<Entry>>,
+    /// The classes whose instructions are sampled. Empty: all. A system
+    /// stream also holds instructions of the earlier groups, which have
+    /// their own corpus.
+    sampled: Vec<FormatClass>,
     /// Instructions that were verified and cannot be replayed without QEMU:
     /// counter reads and host calls.
     led: u64,
@@ -117,6 +121,9 @@ impl Counts {
             // chance to be one of its samples.
             if !item.replayable {
                 self.led += 1;
+                continue;
+            }
+            if !self.sampled.is_empty() && !self.sampled.contains(&item.record.info().format) {
                 continue;
             }
             let (key, keep) = sample_key(item.record, item.encoding);
@@ -269,7 +276,10 @@ fn main() -> Result<(), Failure> {
     follower.compared = compared;
     let mut run = Run {
         follower,
-        counts: Counts::default(),
+        counts: Counts {
+            sampled: if system { formats.clone() } else { Vec::new() },
+            ..Counts::default()
+        },
         rng: Rng(seed ^ 0x5eed),
     };
     let mut generator = Generator::new(seed);
@@ -290,7 +300,9 @@ fn main() -> Result<(), Failure> {
             let round = Round {
                 memory: vec![(IMAGE_BASE, bytes(&words))],
                 start: start(&mut generator, IMAGE_BASE + TABLE_BYTES),
-                vectors: Some(generator.vectors()),
+                // The FP group has the FP values (card C4). Here the vector
+                // registers start at zero, and the stream writes FPCR.
+                vectors: Some(Default::default()),
                 budget: SYSTEM_BUDGET,
                 visits: 4,
                 reset: true,
