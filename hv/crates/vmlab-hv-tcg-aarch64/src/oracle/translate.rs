@@ -973,6 +973,7 @@ mod tests {
                 }
             }
         }
+        println!("on {on} user {user} stores {stores} entries {entries} kinds {kinds:x?}");
         assert!(on > 40_000, "{on}");
         assert!(user > 2_000, "{user}");
         assert!(stores > 500, "{stores}");
