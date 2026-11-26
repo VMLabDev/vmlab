@@ -6,10 +6,11 @@
 //! ends at the first exception, at its instruction budget, or at the first
 //! difference.
 
-use super::leader::Leader;
-use super::{Core, Trace};
-use crate::exec::{Cpu, Stop};
+use super::leader::{Ahead, Leader};
+use super::{Core, Trace, Vectors};
+use crate::exec::{Access, Cpu, Stop};
 use crate::generated::decode::{Record, decode};
+use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
 use vmlab_hv_tcg::{FlatMemory, Memory};
@@ -35,6 +36,12 @@ pub struct Verified {
     pub record: Record,
     pub before: Core,
     pub after: Core,
+    /// The vector registers of QEMU before and after, when the plugin
+    /// gives them.
+    pub vectors: Option<(Vectors, Vectors)>,
+    /// The loads and stores that our side made. The stores are those that
+    /// QEMU made: the round compares them.
+    pub accesses: Vec<Access>,
 }
 
 /// How a round ended when the two sides agreed all the way.
@@ -54,6 +61,15 @@ pub enum End {
     /// QEMU went on at a PC outside the memory that the round mirrors, where
     /// it has flash or a device. The branch that went there is verified.
     OutsideMemory,
+    /// Both sides could not make a load or a store: the address is outside
+    /// the memory. No register of the instruction changed on either side.
+    DataAbort,
+    /// Both sides refused an exclusive access to an address that is not a
+    /// multiple of its size.
+    Alignment,
+    /// Our side has no memory at the address of a load or a store, and QEMU
+    /// has flash or a device there and ran on. Nothing to compare.
+    Device,
     /// QEMU took an exception at a record that we decode and have no lifter
     /// for. Nothing to compare: the exception cards (C6) decide these.
     UnliftedException(Record),
@@ -111,6 +127,13 @@ const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct Follower {
     pub leader: Leader,
     pub cpu: Cpu<FlatMemory>,
+    /// QEMU ran instructions that our side did not follow, so our vector
+    /// registers are not QEMU's any more. The next round reads them.
+    stale: bool,
+    /// Rounds that ended at a store of several parts which failed after a
+    /// different count of parts on the two sides. Our memory took QEMU's
+    /// bytes there.
+    pub partial_stores: u64,
 }
 
 /// What our side expects from QEMU next, after it stopped at an instruction.
@@ -120,28 +143,120 @@ enum Expect {
     Instruction,
     /// An exception at this PC, for this reason.
     Exception(u64, End),
+    /// A data abort at this PC. QEMU runs on instead when it has a device
+    /// or flash at the address.
+    Abort(u64),
+}
+
+/// The last instruction that our side ran.
+struct Last {
+    encoding: u32,
+    record: Record,
+    before: Core,
+    vectors: Option<Vectors>,
+    accesses: Vec<Access>,
+}
+
+type QemuWrite = (u64, u32, u64, u64);
+
+fn qemu_bytes(write: &QemuWrite) -> (u64, Vec<u8>) {
+    let (address, size, low, high) = *write;
+    let value = u128::from(low) | u128::from(high) << 64;
+    (address, value.to_le_bytes()[..(size as usize).min(16)].to_vec())
+}
+
+/// The bytes that a list of writes leaves, by address.
+fn written(writes: impl Iterator<Item = (u64, Vec<u8>)>) -> BTreeMap<u64, u8> {
+    let mut bytes = BTreeMap::new();
+    for (address, data) in writes {
+        for (index, byte) in data.into_iter().enumerate() {
+            bytes.insert(address.wrapping_add(index as u64), byte);
+        }
+    }
+    bytes
+}
+
+fn our_writes(accesses: &[Access]) -> BTreeMap<u64, u8> {
+    written(
+        accesses
+            .iter()
+            .filter(|access| access.write)
+            .map(|access| {
+                (
+                    access.address,
+                    access.value.to_le_bytes()[..usize::from(access.bytes)].to_vec(),
+                )
+            }),
+    )
+}
+
+fn describe(bytes: &BTreeMap<u64, u8>) -> String {
+    let mut text = String::new();
+    let mut next = None;
+    for (address, byte) in bytes {
+        if next != Some(*address) {
+            text.push_str(&format!(" {address:#x}:"));
+        }
+        text.push_str(&format!("{byte:02x}"));
+        next = Some(address.wrapping_add(1));
+    }
+    if text.is_empty() {
+        text.push_str(" nothing");
+    }
+    text
 }
 
 impl Follower {
     /// `cpu` holds the memory that mirrors the RAM of the leader.
-    pub fn new(leader: Leader, cpu: Cpu<FlatMemory>) -> Self {
-        Self { leader, cpu }
+    pub fn new(leader: Leader, mut cpu: Cpu<FlatMemory>) -> Self {
+        cpu.log_accesses(true);
+        // The vector registers of QEMU are not ours until they are read.
+        let stale = leader.has_vectors();
+        Self {
+            leader,
+            cpu,
+            stale,
+            partial_stores: 0,
+        }
+    }
+
+    /// Put `bytes` at `address` on both sides.
+    pub fn load_memory(&mut self, address: u64, bytes: &[u8]) -> io::Result<()> {
+        self.leader.load(address, bytes)?;
+        self.cpu
+            .memory
+            .write(address, bytes)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    /// Give the vector register `n` a value on both sides.
+    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
+        self.leader.set_vector(n, value)?;
+        self.cpu.state.slots[crate::state::slot::V0 + n] = value;
+        Ok(())
     }
 
     fn load(&mut self, round: &Round) -> io::Result<()> {
         for (address, bytes) in &round.memory {
-            self.leader.load(*address, bytes)?;
-            self.cpu
-                .memory
-                .write(*address, bytes)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.load_memory(*address, bytes)?;
         }
-        let state = round
+        let mut state = round
             .start
             .state()
             .ok_or_else(|| io::Error::other("a round must start at EL1 with SP_EL1"))?;
+        // A round sets the core registers. The vector registers stay what
+        // the last round left on both sides.
+        if self.leader.has_vectors() {
+            if self.stale {
+                let vectors = self.leader.vectors()?;
+                vectors.apply(&mut self.cpu.state);
+                self.stale = false;
+            }
+            Vectors::of(&self.cpu.state).apply(&mut state);
+        }
         self.leader.set_core(&round.start)?;
         self.cpu.state = state;
+        self.cpu.take_accesses();
         Ok(())
     }
 
@@ -152,38 +267,89 @@ impl Follower {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// Take into our memory what QEMU wrote and our side did not.
+    fn mirror(&mut self, writes: &[QemuWrite]) {
+        for write in writes {
+            let (address, bytes) = qemu_bytes(write);
+            // A write to a device of QEMU has no place in our memory.
+            let _ = self.cpu.memory.write(address, &bytes);
+        }
+    }
+
+    /// Stop QEMU, which runs ahead of the records that our side has read,
+    /// and take over what it did since: its memory writes now, its vector
+    /// registers at the start of the next round.
+    fn interrupt(&mut self, pending: &[QemuWrite]) -> io::Result<()> {
+        let ahead: Ahead = self.leader.stop(true)?;
+        self.mirror(pending);
+        self.mirror(&ahead.writes);
+        self.stale = self.leader.has_vectors();
+        Ok(())
+    }
+
     pub fn run(&mut self, round: &Round) -> io::Result<Outcome> {
         self.load(round)?;
         self.leader.resume()?;
         let mut verified = Vec::new();
         // The last instruction that our side ran, with the registers before it.
-        let mut last: Option<(u32, Record, Core)> = None;
+        let mut last: Option<Last> = None;
+        // The memory writes of QEMU since its last instruction record.
+        let mut qemu_writes: Vec<QemuWrite> = Vec::new();
+        // The accesses of an instruction of ours that ended in a data abort.
+        let mut partial: Vec<Access> = Vec::new();
         let mut expect = Expect::Instruction;
         let mut followed = 0u64;
         let mut visits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        let differed =
-            |what: String, last: &Option<(u32, Record, Core)>, ours: Core, qemu: Option<Core>| {
-                Box::new(Difference {
-                    what,
-                    instruction: last
-                        .as_ref()
-                        .map(|(encoding, _, before)| (*encoding, *before)),
-                    ours,
-                    qemu,
-                })
-            };
+        let differed = |what: String, last: &Option<Last>, ours: Core, qemu: Option<Core>| {
+            Box::new(Difference {
+                what,
+                instruction: last.as_ref().map(|last| (last.encoding, last.before)),
+                ours,
+                qemu,
+            })
+        };
+        // The memory writes of the last instruction, ours against QEMU's.
+        let writes_differ = |last: &Option<Last>, qemu: &[QemuWrite]| -> Option<String> {
+            let ours = last
+                .as_ref()
+                .map(|last| our_writes(&last.accesses))
+                .unwrap_or_default();
+            let theirs = written(qemu.iter().map(qemu_bytes));
+            (ours != theirs).then(|| {
+                format!(
+                    "the memory writes of an instruction: ours{}, QEMU's{}",
+                    describe(&ours),
+                    describe(&theirs)
+                )
+            })
+        };
         let result = loop {
             let ours = Core::of(&self.cpu.state);
             match self.leader.next_record(RECORD_TIMEOUT)? {
-                Trace::Instruction { encoding, core } => {
-                    if let Expect::Exception(pc, _) = expect {
-                        break Err(differed(
-                            format!("we stop with an exception at {pc:#x} and QEMU runs on"),
-                            &last,
-                            ours,
-                            Some(core),
-                        ));
+                Trace::Instruction {
+                    encoding,
+                    core,
+                    vectors,
+                } => {
+                    match expect {
+                        Expect::Instruction => {}
+                        Expect::Exception(pc, _) => {
+                            break Err(differed(
+                                format!("we stop with an exception at {pc:#x} and QEMU runs on"),
+                                &last,
+                                ours,
+                                Some(core),
+                            ));
+                        }
+                        Expect::Abort(_) => {
+                            self.interrupt(&qemu_writes)?;
+                            break Ok(End::Device);
+                        }
                     }
+                    if let Some(what) = writes_differ(&last, &qemu_writes) {
+                        break Err(differed(what, &last, ours, Some(core)));
+                    }
+                    qemu_writes.clear();
                     if core != ours {
                         break Err(differed(
                             "the registers before an instruction".into(),
@@ -192,20 +358,36 @@ impl Follower {
                             Some(core),
                         ));
                     }
+                    if let Some(vectors) = &vectors {
+                        let found = Vectors::of(&self.cpu.state).difference(vectors);
+                        if !found.is_empty() {
+                            break Err(differed(
+                                format!(
+                                    "the vector registers before an instruction, ours / QEMU's: {}",
+                                    found.join("; ")
+                                ),
+                                &last,
+                                ours,
+                                Some(core),
+                            ));
+                        }
+                    }
                     // The registers agree, so the last instruction did the same on both sides.
-                    if let Some((word, record, before)) = last.take() {
+                    if let Some(last) = last.take() {
                         verified.push(Verified {
-                            encoding: word,
-                            record,
-                            before,
+                            encoding: last.encoding,
+                            record: last.record,
+                            before: last.before,
                             after: core,
+                            vectors: last.vectors.zip(vectors),
+                            accesses: last.accesses,
                         });
                     }
                     // QEMU has memory that the round does not mirror: flash
                     // at 0 and devices. A branch that lands there is verified
                     // by the registers above, and the round ends.
                     let Some(word) = self.word(core.pc) else {
-                        self.leader.stop(true)?;
+                        self.interrupt(&[])?;
                         break Ok(End::OutsideMemory);
                     };
                     if core.pc & 3 == 0 && word != encoding {
@@ -219,20 +401,28 @@ impl Follower {
                         ));
                     }
                     if followed >= round.budget {
-                        self.leader.stop(true)?;
+                        self.interrupt(&[])?;
                         break Ok(End::Budget);
                     }
                     let seen = visits.entry(core.pc).or_default();
                     *seen += 1;
                     if *seen > round.visits {
-                        self.leader.stop(true)?;
+                        self.interrupt(&[])?;
                         break Ok(End::Loop);
                     }
                     followed += 1;
-                    match self.cpu.step() {
+                    let stepped = self.cpu.step();
+                    let accesses = self.cpu.take_accesses();
+                    match stepped {
                         Ok(()) => {
                             if let Some(decoded) = decode(encoding) {
-                                last = Some((encoding, decoded.record, core));
+                                last = Some(Last {
+                                    encoding,
+                                    record: decoded.record,
+                                    before: core,
+                                    vectors,
+                                    accesses,
+                                });
                             }
                         }
                         Err(Stop::Undefined { pc, .. }) => {
@@ -240,6 +430,13 @@ impl Follower {
                         }
                         Err(Stop::PcAlignment { pc }) => {
                             expect = Expect::Exception(pc, End::PcAlignment)
+                        }
+                        Err(Stop::Alignment { pc, .. }) => {
+                            expect = Expect::Exception(pc, End::Alignment)
+                        }
+                        Err(Stop::DataAbort { pc, .. }) => {
+                            partial = accesses;
+                            expect = Expect::Abort(pc);
                         }
                         Err(Stop::Unimplemented { pc, record }) => {
                             // QEMU goes on or takes an exception. The next record says which.
@@ -250,8 +447,17 @@ impl Follower {
                                     self.leader.stop(false)?;
                                     break Ok(End::UnliftedException(record));
                                 }
+                                Trace::Write {
+                                    address,
+                                    size,
+                                    low,
+                                    high,
+                                } => {
+                                    self.interrupt(&[(address, size, low, high)])?;
+                                    break Ok(End::Unlifted(record));
+                                }
                                 _ => {
-                                    self.leader.stop(true)?;
+                                    self.interrupt(&[])?;
                                     break Ok(End::Unlifted(record));
                                 }
                             }
@@ -285,7 +491,8 @@ impl Follower {
                     }
                     let end = match expect {
                         Expect::Exception(pc, end) if pc == from_pc => end,
-                        Expect::Exception(pc, _) => {
+                        Expect::Abort(pc) if pc == from_pc => End::DataAbort,
+                        Expect::Exception(pc, _) | Expect::Abort(pc) => {
                             break Err(differed(
                                 format!(
                                     "we stop with an exception at {pc:#x} and QEMU takes one from {from_pc:#x}"
@@ -324,6 +531,25 @@ impl Follower {
                     // changes no general register, so they are the registers
                     // after the last instruction.
                     self.leader.stop(false)?;
+                    if end == End::DataAbort {
+                        // A store of several parts can fail after a different
+                        // count of parts on the two sides. That is not
+                        // compared: our memory takes QEMU's bytes.
+                        let ours = our_writes(&partial);
+                        let theirs = written(qemu_writes.iter().map(qemu_bytes));
+                        if ours != theirs {
+                            self.partial_stores += 1;
+                            for address in ours.keys().chain(theirs.keys()) {
+                                if let Ok(byte) = self.leader.memory(*address, 1) {
+                                    let _ = self.cpu.memory.write(*address, &byte);
+                                }
+                            }
+                        }
+                        qemu_writes.clear();
+                    }
+                    if let Some(what) = writes_differ(&last, &qemu_writes) {
+                        break Err(differed(what, &last, ours, None));
+                    }
                     let stopped = self.leader.core()?;
                     let mut after = stopped;
                     after.pc = ours.pc;
@@ -336,33 +562,53 @@ impl Follower {
                             Some(after),
                         ));
                     }
-                    if let Some((word, record, before)) = last.take() {
+                    let mut vectors_after = None;
+                    if last.is_some() && self.leader.has_vectors() {
+                        // No instruction record follows the last
+                        // instruction, so its vector registers are read.
+                        let theirs = self.leader.vectors()?;
+                        let mut mine = Vectors::of(&self.cpu.state);
+                        mine.fpsr = 0;
+                        mine.fpcr = 0;
+                        let found = mine.difference(&theirs);
+                        if !found.is_empty() {
+                            break Err(differed(
+                                format!(
+                                    "the vector registers at an exception, ours / QEMU's: {}",
+                                    found.join("; ")
+                                ),
+                                &last,
+                                ours,
+                                Some(after),
+                            ));
+                        }
+                        vectors_after = Some(Vectors::of(&self.cpu.state));
+                    }
+                    if let Some(last) = last.take() {
                         verified.push(Verified {
-                            encoding: word,
-                            record,
-                            before,
+                            encoding: last.encoding,
+                            record: last.record,
+                            before: last.before,
                             after: ours,
+                            vectors: last.vectors.zip(vectors_after),
+                            accesses: last.accesses,
                         });
                     }
                     break Ok(end);
                 }
-                Trace::Write { address, size, .. } => {
-                    break Err(differed(
-                        format!(
-                            "QEMU wrote {size} bytes at {address:#x} and no lifter of ours writes memory yet"
-                        ),
-                        &last,
-                        ours,
-                        None,
-                    ));
-                }
+                Trace::Write {
+                    address,
+                    size,
+                    low,
+                    high,
+                } => qemu_writes.push((address, size, low, high)),
             }
         };
         Ok(match result {
             Ok(end) => Outcome::Agreed { end, verified },
             Err(difference) => {
                 // Leave QEMU stopped, so that the next round can start.
-                self.leader.stop(true)?;
+                self.interrupt(&qemu_writes)?;
                 Outcome::Differed {
                     difference,
                     verified,

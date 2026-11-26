@@ -14,6 +14,10 @@ use std::time::Duration;
 /// of 8 bytes each, and CPSR of 4.
 const CORE_BYTES: usize = 31 * 8 + 8 + 8 + 4;
 
+/// The number of V0 for the `p` and `P` packets: QEMU's target description
+/// puts V0 to V31, FPSR and FPCR after the 34 core registers.
+const FIRST_VECTOR: usize = 34;
+
 /// The most bytes of memory in one `M` packet. QEMU answers
 /// `PacketSize=20020`, and a byte takes two characters.
 const WRITE_CHUNK: usize = 0x4000;
@@ -220,6 +224,22 @@ impl Rsp {
         unhex(&answer)
     }
 
+    /// The vector register `n`. The gdbstub numbers V0 to V31 after the 34
+    /// core registers.
+    pub fn vector(&mut self, n: usize) -> io::Result<u128> {
+        let bytes = unhex(&self.command(format!("p{:x}", FIRST_VECTOR + n).as_bytes())?)?;
+        let bytes: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| other("the `p` answer for a vector register is not 16 bytes"))?;
+        Ok(u128::from_le_bytes(bytes))
+    }
+
+    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
+        let mut packet = format!("P{:x}=", FIRST_VECTOR + n).into_bytes();
+        packet.extend(hex(&value.to_le_bytes()));
+        self.expect_ok(&packet, "P")
+    }
+
     /// A hardware breakpoint on the instruction at `address`.
     pub fn break_at(&mut self, address: u64) -> io::Result<()> {
         self.expect_ok(format!("Z1,{address:x},4").as_bytes(), "Z1")
@@ -323,6 +343,11 @@ mod tests {
             (&b"m42000000,4"[..], b"00040091".to_vec()),
             (&b"Z1,200,4"[..], b"OK".to_vec()),
             (&b"M0,1:00"[..], b"E14".to_vec()),
+            (&b"p23"[..], b"0102030405060708090a0b0c0d0e0f10".to_vec()),
+            (
+                &b"P41=100f0e0d0c0b0a090807060504030201"[..],
+                b"OK".to_vec(),
+            ),
         ]);
         assert_eq!(rsp.core().unwrap(), core);
         rsp.set_core(&core).unwrap();
@@ -334,6 +359,9 @@ mod tests {
         );
         rsp.break_at(0x200).unwrap();
         assert!(rsp.write_memory(0, &[0]).is_err());
+        assert_eq!(rsp.vector(1).unwrap(), 0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201);
+        rsp.set_vector(31, 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)
+            .unwrap();
         server.join().unwrap();
     }
 }

@@ -5,7 +5,7 @@
 //! stream of the plugin (S6).
 
 use super::rsp::Rsp;
-use super::{Core, STREAM_HEADER_BYTES, STREAM_MAGIC, Trace, parse};
+use super::{Core, STREAM_HEADER_BYTES, STREAM_MAGIC, Trace, Vectors, parse};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -44,6 +44,18 @@ impl Leader {
     /// Start QEMU stopped at its reset, with `ram_mib` of RAM at `RAM_BASE`.
     /// `directory` takes the FIFO and the socket. It must exist and be ours.
     pub fn start(qemu: &str, plugin: &Path, directory: &Path, ram_mib: u32) -> io::Result<Self> {
+        Self::start_with(qemu, plugin, directory, ram_mib, false)
+    }
+
+    /// As `start`. With `vectors` each instruction record carries V0 to
+    /// V31, FPSR and FPCR.
+    pub fn start_with(
+        qemu: &str,
+        plugin: &Path,
+        directory: &Path,
+        ram_mib: u32,
+        vectors: bool,
+    ) -> io::Result<Self> {
         let fifo = directory.join("a64lock.fifo");
         let socket = directory.join("gdb.sock");
         for path in [&fifo, &socket] {
@@ -70,7 +82,12 @@ impl Leader {
             .arg("-gdb")
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             .arg("-plugin")
-            .arg(format!("{},out={}", plugin.display(), fifo.display()))
+            .arg(format!(
+                "{},out={}{}",
+                plugin.display(),
+                fifo.display(),
+                if vectors { ",vectors=on" } else { "" }
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -157,6 +174,52 @@ impl Leader {
         self.rsp.core()
     }
 
+    /// Whether the instruction records carry the vector registers.
+    pub fn has_vectors(&self) -> bool {
+        self.vectors
+    }
+
+    /// V0 to V31 of QEMU, through the gdbstub. FPSR and FPCR are not read:
+    /// they are 0 here.
+    pub fn vectors(&mut self) -> io::Result<Vectors> {
+        let mut v = [0; 32];
+        for (n, value) in v.iter_mut().enumerate() {
+            *value = self.rsp.vector(n)?;
+        }
+        Ok(Vectors {
+            v,
+            fpsr: 0,
+            fpcr: 0,
+        })
+    }
+
+    pub fn set_vector(&mut self, n: usize, value: u128) -> io::Result<()> {
+        self.rsp.set_vector(n, value)
+    }
+
+    /// Run `words` on QEMU alone, from `address`, to set system state that
+    /// the gdbstub cannot write. A zero word after them ends the run at the
+    /// breakpoint on the exception vector. The words stay in QEMU's memory:
+    /// take the mirror of the RAM after this.
+    pub fn prelude(&mut self, address: u64, words: &[u32]) -> io::Result<()> {
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes.extend([0u8; 4]);
+        self.load(address, &bytes)?;
+        let mut core = self.core()?;
+        core.pc = address;
+        self.set_core(&core)?;
+        self.resume()?;
+        self.stop(false)?;
+        let stopped = self.core()?;
+        if stopped.pc != VECTOR {
+            return Err(other(format!(
+                "the prelude stopped at {:#x}, not at the exception vector",
+                stopped.pc
+            )));
+        }
+        Ok(())
+    }
+
     pub fn resume(&mut self) -> io::Result<()> {
         self.rsp.resume()?;
         self.running = true;
@@ -214,15 +277,36 @@ impl Leader {
         }
     }
 
-    /// Wait until QEMU has stopped, and drop the records that it wrote
-    /// until then. With `interrupt` it is asked to stop first. Without, it
+    /// Parse what `pending` holds whole, and keep the memory writes.
+    fn drain(&mut self, ahead: &mut Ahead) -> io::Result<()> {
+        while let Some((trace, len)) =
+            parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+        {
+            self.parsed += len;
+            match trace {
+                Trace::Instruction { .. } => ahead.instructions += 1,
+                Trace::Write {
+                    address,
+                    size,
+                    low,
+                    high,
+                } => ahead.writes.push((address, size, low, high)),
+                Trace::Discontinuity { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait until QEMU has stopped, and say what it did that nobody
+    /// followed. With `interrupt` it is asked to stop first. Without, it
     /// is expected to stop at the breakpoint on the exception vector.
     ///
     /// QEMU blocks when the FIFO is full, so the FIFO is drained while the
     /// stop reply is awaited.
-    pub fn stop(&mut self, interrupt: bool) -> io::Result<()> {
+    pub fn stop(&mut self, interrupt: bool) -> io::Result<Ahead> {
+        let mut ahead = Ahead::default();
         if !self.running {
-            return Ok(());
+            return Ok(ahead);
         }
         if interrupt {
             self.rsp.interrupt()?;
@@ -230,8 +314,7 @@ impl Leader {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             while self.fill()? {
-                self.pending.clear();
-                self.parsed = 0;
+                self.drain(&mut ahead)?;
             }
             if let Some(reply) = self.rsp.receive(Duration::from_millis(1))? {
                 if !reply.starts_with(b"T") && !reply.starts_with(b"S") {
@@ -247,12 +330,29 @@ impl Leader {
             }
         }
         // Every record is in the FIFO before the stop reply is sent.
-        while self.fill()? {}
+        while self.fill()? {
+            self.drain(&mut ahead)?;
+        }
+        self.drain(&mut ahead)?;
+        if self.parsed != self.pending.len() {
+            return Err(other("QEMU stopped in the middle of a record"));
+        }
         self.pending.clear();
         self.parsed = 0;
         self.running = false;
-        Ok(())
+        Ok(ahead)
     }
+}
+
+/// What QEMU did between the last record that the follower read and its
+/// stop: it runs ahead of the follower by what the FIFO holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ahead {
+    /// Instruction records that nobody followed.
+    pub instructions: u64,
+    /// The memory writes among them: address, size, and the value as two
+    /// halves.
+    pub writes: Vec<(u64, u32, u64, u64)>,
 }
 
 fn kill(mut child: Child) {
