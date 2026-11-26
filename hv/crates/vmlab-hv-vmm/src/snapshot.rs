@@ -345,6 +345,7 @@ pub fn save(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
             "snapshot name is reserved for internal rollback checkpoints".into(),
         ));
     }
+    emulated_unsupported(handle)?;
     let _op = handle.shared().begin_snapshot();
     save_locked(handle, name)
 }
@@ -678,7 +679,19 @@ pub(crate) fn save_kernel_state(
 /// vmstate header (major version and machine digest), restore RAM then
 /// kernel then devices, and leave the machine in the run state the snapshot
 /// recorded.
+/// The snapshot of an emulated machine comes with card C14 of phase 3d: its
+/// CPU, GIC and timer state has no place in the format yet.
+fn emulated_unsupported(handle: &VmHandle) -> Result<(), SnapshotError> {
+    if handle.shared().kvm.get().is_none() {
+        return Err(SnapshotError::Unsupported(
+            "online snapshots are unavailable for an emulated machine".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn load(handle: &VmHandle, name: &str) -> Result<(), SnapshotError> {
+    emulated_unsupported(handle)?;
     let _op = handle.shared().begin_snapshot();
     load_locked(handle, name)
 }

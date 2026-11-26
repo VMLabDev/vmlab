@@ -77,6 +77,9 @@ struct Shared {
     transaction: Arc<ReentrantMutex<()>>,
     /// More than one CPU writes this memory.
     serialize: bool,
+    /// The ranges, as (base, end), that a CPU reads and does not write: a
+    /// flash bank that the machine maps as memory.
+    roms: Vec<(u64, u64)>,
 }
 
 /// The memory of one emulated CPU. Every CPU of a machine has a clone.
@@ -90,6 +93,17 @@ impl GuestBus {
         memory: GuestMemory,
         host: Arc<dyn VcpuHost>,
         cpus: usize,
+    ) -> std::result::Result<Self, String> {
+        Self::with_roms(memory, host, cpus, &[])
+    }
+
+    /// As `new`. A store of a CPU into one of `roms`, each a base and a
+    /// length inside `memory`, changes nothing.
+    pub fn with_roms(
+        memory: GuestMemory,
+        host: Arc<dyn VcpuHost>,
+        cpus: usize,
+        roms: &[(u64, u64)],
     ) -> std::result::Result<Self, String> {
         let generation = Arc::new(AtomicU64::new(0));
         let mut regions = Vec::new();
@@ -122,6 +136,7 @@ impl GuestBus {
             host,
             transaction: Arc::new(ReentrantMutex::new(())),
             serialize: cpus > 1,
+            roms: roms.iter().map(|(base, len)| (*base, base + len)).collect(),
         })))
     }
 
@@ -175,6 +190,14 @@ impl Memory for GuestBus {
 
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         if self.ram(address, bytes.len()).is_some() {
+            if self
+                .0
+                .roms
+                .iter()
+                .any(|(base, end)| *base <= address && address < *end)
+            {
+                return Ok(());
+            }
             let _atomic = self.lock();
             // The bitmap of the region moves the generations.
             return self

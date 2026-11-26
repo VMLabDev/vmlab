@@ -1248,3 +1248,164 @@ bytes on the path of the wide accesses, not two inlined ones.
   author's general knowledge of how an emulator of this kind is built. A
   guess stayed in the code only where a run of the lockstep confirmed it,
   and the runs refuted several.
+
+## Card C10 (2026-11-27)
+
+Card C10 is the `virt` machine: `vmlab-hv-vmm/src/virt.rs` with the device
+tree (`virt/tree.rs`, `virt/fdt.rs`) and PSCI (`virt/psci.rs`), the flash
+bank of `vmlab-hv-devices/src/pflash/cfi.rs`, fw_cfg over MMIO in
+`vmlab-hv-firmware`, and the boot lockstep (DESIGN.md O4):
+`src/oracle/boot.rs` here and `vmlab-hv-vmm/examples/a64_boot_lockstep.rs`.
+A machine with `arch: aarch64`, `accel: tcg`, `machine: virt` needs no KVM:
+`VmShared` holds no KVM VM for it.
+
+### AAVMF to its UEFI shell (S1)
+
+`cargo test --release -p vmlab-hv --bin vmlab-hv virt_acceptance` starts the
+`vmlab-hv` binary on a machine description, as vmlab does, and reads the
+serial log. On helios, with AAVMF 2026.08+ds-2 of `guest/fetch-firmware.sh
+aarch64`, unchanged:
+
+| vCPUs | Seconds to `Shell>` | Guest resets | Bytes on the serial log |
+|---|---|---|---|
+| 1 | 17.0 | 0 | 3,247 |
+| 2 | 16.4 | 0 | 3,247 |
+
+This AAVMF starts no shell by itself. Without a disk it prints `BdsDxe: No
+bootable option or device was found.` and waits for a key, on QEMU 11.1.3
+too. The key opens its boot menu, whose second entry is `EFI Internal
+Shell`. The test sends four keys through a socket on the PL011 (a `com1`
+port of the machine description).
+
+### Boot lockstep against QEMU (O4)
+
+`just tcg-a64-boot-lockstep` runs QEMU 11.1.3 as `-machine
+virt,dtb-randomness=off -cpu cortex-a53 -smp 1 -m 1024 -icount
+shift=0,sleep=off -rtc base=2020-01-01T00:00:00,clock=vm -nodefaults` with
+the two flash banks and the plugin, and our machine beside it as the same
+CPU (`QEMU_CORTEX_A53`). Before every instruction it compares X0 to X30,
+SP, PC, PSTATE, V0 to V31, FPSR, FPCR and 20 system registers (those of an
+exception, of the translation and of the timers, and both stack pointers),
+and after it the memory writes that the leader reports. The leader gets the
+same four keys on its serial port.
+
+The run of this card on helios, from the reset to `Shell>` on our serial
+log (`just tcg-a64-boot-lockstep`, 2,401 s, 0.59 million instructions a
+second):
+
+| | |
+|---|---|
+| Instructions compared | 1,404,633,088 |
+| CPU differences | 0 |
+| Interrupts taken where the leader took them | 873, each pending in our GIC |
+| Host calls (PSCI) | 2, the same answers |
+| Counter reads taken from the leader | 91,007,818 |
+| Timer and interrupt status reads that differed | 0 |
+| ID registers that differed | none |
+| Device reads taken from the leader | 9,265 |
+| Device reads where our device answered differently | 411, all of the PL011 flag register |
+| Guest resets | 0 |
+
+The 411 reads are `UARTFR` at `0x09000018`: the leader has a key in its
+receive FIFO (`0x80`) and our PL011, which gets no key, has none (`0x90`).
+The shell takes the last key after one second of the leader's instruction
+clock, which is a thousand million instructions: most of the run is that
+wait, and most of the counter reads are its loop.
+
+What the leader leads, as the design says: the moment of an interrupt, the
+value of a device read, the counter and what follows from it, and the answer
+to a host call, which is compared. The follower also takes the device tree
+(`dumpdtb`) and the fw_cfg files of the leader (read from a second QEMU over
+qtest), because the firmware gets both without a device read: the tree is in
+RAM, and the files come through DMA.
+
+### What the lockstep found
+
+- **The flags at reset.** QEMU's CPU starts with Z set (PSTATE `0x400003c5`
+  in the first record of the plugin; the gdbstub of the design measurement
+  showed `0x3c5`). With NZCV at 0 the standalone boot of AAVMF ended in
+  `Synchronous Exception at 0x46AF2284`. The `virt` machine now starts each
+  CPU with Z set.
+- **`SMCCC_VERSION`.** The leader answers `0x80000000` with NOT_SUPPORTED.
+  DESIGN.md G4 lists the SMCCC version among what the machine serves. PSCI
+  of `virt` now answers as the leader does.
+- **The host bridge.** QEMU has a function at 00:00.0 (1b36:0008, class
+  06 00) that our PCI root did not have: 152 ECAM reads differed. It is
+  added, with the writable bits that qtest shows.
+- **The DSDT names the PCI functions of the machine.** The generated tables
+  of card C11 start from the capture of a machine with five PCI functions.
+  For a leader without them the DSDT is 68 bytes shorter (5,320 against
+  5,388), and the firmware read different bytes at instruction 327,549,115.
+  The follower now gets the files of its leader. The product still presents
+  the DSDT of the capture, whatever functions the machine has: that is a
+  finding for card C11, not changed here.
+
+### kvm-unit-tests
+
+`just tcg-a64-kvm-unit-tests` builds kvm-unit-tests (commit `32f8ad45`, with
+clang and lld under the names of the GNU cross tools) and runs each selected
+test of `arm/unittests.cfg` on QEMU 11.1.3 (`-cpu cortex-a53`, TCG) and on
+`vmlab-hv`, booted as a kernel with our own device tree, and compares the
+result lines:
+
+| Test | vCPUs | Result |
+|---|---|---|
+| selftest-setup | 2 | the same: 2 pass |
+| selftest-vectors-kernel | 1 | the same: 3 pass |
+| selftest-vectors-user | 1 | the same: 2 pass |
+| selftest-smp | 4 | the same: 1 pass |
+| gicv2-ipi | 4 | the same: 3 pass |
+| gicv2-mmio | 4 | 17 pass on vmlab-hv; on QEMU 15 pass and 2 fail |
+| gicv2-mmio-up | 1 | the same: 15 pass, 2 fail |
+| gicv2-mmio-3p | 4 | 17 pass on vmlab-hv; on QEMU 15 pass and 2 fail |
+| gicv2-active | 4 | the same: 1 pass |
+| psci (with `cpu-on`) | 4 | the same: 5 pass |
+| timer | 1 | the same: 18 pass |
+
+The two subtests that fail on QEMU with four CPUs and pass here are
+`ITARGETSR: bits for non-existent CPUs masked` and `ITARGETSR: byte writes
+successful`. No subtest passes on QEMU and fails on vmlab-hv.
+
+### Without QEMU
+
+`just ci::check` runs, without KVM and without host assets: the `virt`
+machine on guests of a few words (`vmlab-hv-vmm/src/virt/tests.rs`: a kernel
+boot with the device tree in X0, PSCI `CPU_ON` and `CPU_OFF` on two CPUs, a
+reset in place and with `exit_on_reset`, a firmware that runs from flash and
+reads fw_cfg, the tree and its variables), the same through the binary and
+its control socket (`vmlab-hv/src/virt_acceptance.rs`), the device tree, the
+FDT writer, PSCI as a decision, the flash bank, and the records and the
+adoption rules of the boot lockstep.
+
+### What this card does not do
+
+- Snapshots, the debug port and CPU state in a snapshot: card C14. The
+  control server of an emulated machine offers neither capability.
+- A display, a TPM, USB, shares and vhost NICs on `virt`: `validate` names
+  each as not a part of the machine yet.
+- The keys of the lockstep are sent to the leader alone. Our PL011 reads
+  what the leader's did, so its own receive path is proven by the S1 test
+  and not by the lockstep.
+- The follower keeps the last 4,096 instructions before a difference, not
+  the 100,000 records of DESIGN.md M4.
+- The lockstep runs at 0.6 million instructions a second, not the 1.5
+  million of the design estimate.
+
+### Sources read for this card
+
+- S6: QEMU 11.1.3 as a running program: the plugin stream, `dumpdtb`, and
+  qtest for fw_cfg, the function 00:00.0 and an empty virtio-mmio
+  transport.
+- S7: the Devicetree Specification and the Linux binding documents of the
+  nodes of `tree.rs`; the PSCI specification (DEN 0022) and the SMC Calling
+  Convention (DEN 0028); QEMU's `docs/specs/fw_cfg.rst`; the CFI
+  specification and the Intel command set for the flash bank; VIRTIO 1.2
+  for the empty transport; the arm64 boot protocol of the Linux kernel.
+- The generated tables of this crate (S1) for the encodings of `MRS`, `HVC`
+  and `SMC` in the adoption rules.
+- S2, S3, S4, S5 and S8 were not opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. kvm-unit-tests (GPL-2.0) was built and run, and its sources
+  were not read to write this code. Its `unittests.cfg` is parsed by the
+  script that runs it.

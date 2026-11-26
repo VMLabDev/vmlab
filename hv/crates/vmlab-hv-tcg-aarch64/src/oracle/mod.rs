@@ -12,6 +12,7 @@
 //! gdbstub answers (S6). Nothing in this module is part of a product path.
 
 pub mod asm;
+pub mod boot;
 pub mod corpus;
 pub mod follow;
 pub mod leader;

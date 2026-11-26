@@ -26,6 +26,11 @@ use crate::vm::{Vm, VmShared};
 
 /// Static checks that do not need KVM; each error names what is wrong.
 pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
+    // The aarch64 machine has its own checks: nothing of an x86 chipset
+    // applies to it.
+    if desc.arch == Arch::Aarch64 || desc.machine == Machine::Virt {
+        return crate::virt::validate(desc);
+    }
     validate_fw_cfg(desc)?;
     if let Some(display) = &desc.virtual_display
         && (desc.machine != Machine::Q35
@@ -45,13 +50,13 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
     }
     if desc.arch != Arch::X86_64 {
         return Err(VmmError::InvalidMachine(format!(
-            "arch {:?} is not supported: phase 1 builds x86_64 machines only",
+            "arch {:?} is not supported: vmlab-hv builds x86_64 and aarch64 machines",
             desc.arch
         )));
     }
     if desc.accel != Accel::Kvm {
         return Err(VmmError::InvalidMachine(format!(
-            "accel {:?} is not supported: phase 1 runs KVM only",
+            "accel {:?} is not supported: an x86_64 machine runs on KVM only",
             desc.accel
         )));
     }
@@ -216,7 +221,7 @@ fn validate_fw_cfg(desc: &MachineDescription) -> Result<(), VmmError> {
     Ok(())
 }
 
-fn add_fw_cfg_files(
+pub(crate) fn add_fw_cfg_files(
     device: &mut vmlab_hv_firmware::FwCfg,
     desc: &MachineDescription,
 ) -> Result<(), VmmError> {
@@ -544,6 +549,9 @@ pub fn build(
     factory: &dyn DeviceFactory,
     paused: bool,
 ) -> Result<Vm, VmmError> {
+    if desc.arch == Arch::Aarch64 || desc.machine == Machine::Virt {
+        return crate::virt::build(desc, factory, paused);
+    }
     validate(desc)?;
     crate::vfio::preflight_machine(desc).map_err(VmmError::InvalidMachine)?;
     let kvm = KvmVm::new()?;
@@ -1776,7 +1784,7 @@ fn disk_index_letter(
 /// SHA-256 of the serialised machine description: the snapshot identity a
 /// restore refuses to cross (D32). Field order is fixed by the struct, so
 /// serialisation is deterministic for a given build.
-fn machine_digest(desc: &MachineDescription) -> [u8; 32] {
+pub(crate) fn machine_digest(desc: &MachineDescription) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut desc = desc.redacted();
     // How late ticks are delivered is no part of the machine a snapshot
@@ -2248,9 +2256,15 @@ mod tests {
     #[test]
     fn rejects_unsupported_arch_and_accel() {
         let mut d = desc();
-        d.arch = Arch::Aarch64;
+        d.arch = Arch::Riscv64;
         let err = validate(&d).unwrap_err().to_string();
         assert!(err.contains("x86_64"), "{err}");
+
+        // An aarch64 machine is the `virt` machine, checked by its module.
+        let mut d = desc();
+        d.arch = Arch::Aarch64;
+        let err = validate(&d).unwrap_err().to_string();
+        assert!(err.contains("virt"), "{err}");
 
         let mut d = desc();
         d.accel = Accel::Tcg;
