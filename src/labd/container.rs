@@ -1027,7 +1027,7 @@ impl ContainerInstance {
                 }
             }
             // Phase 2: the healthcheck gate.
-            if me.has_healthcheck() {
+            if super::machine::Machine::has_healthcheck(me.as_ref()) {
                 loop {
                     if me.power_state().await != PowerState::Running {
                         return;
