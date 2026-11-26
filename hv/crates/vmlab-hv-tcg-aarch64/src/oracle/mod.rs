@@ -11,6 +11,7 @@
 //! QEMU is a black box here: its register values, its exceptions and its
 //! gdbstub answers (S6). Nothing in this module is part of a product path.
 
+pub mod asm;
 pub mod corpus;
 pub mod follow;
 pub mod leader;
@@ -164,10 +165,13 @@ impl std::fmt::Display for Vectors {
 pub enum Trace {
     /// The registers before the instruction `encoding` at `core.pc` runs.
     /// `vectors`: when the stream carries them.
+    /// `system`: the system registers that the stream carries, in the order
+    /// in which the plugin was asked for them.
     Instruction {
         encoding: u32,
         core: Core,
         vectors: Option<Vectors>,
+        system: Vec<u64>,
     },
     /// A memory write of the last instruction.
     Write {
@@ -194,8 +198,13 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 
 /// Parse the record at the start of `bytes`. `Ok(None)`: the record is not
 /// whole yet. Otherwise the record and its length. `vectors`: the stream
-/// carries V0 to V31, FPSR and FPCR in each instruction record.
-pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, String> {
+/// carries V0 to V31, FPSR and FPCR in each instruction record. `system`:
+/// the count of system registers that follow them.
+pub fn parse(
+    bytes: &[u8],
+    vectors: bool,
+    system: usize,
+) -> Result<Option<(Trace, usize)>, String> {
     if bytes.len() < 8 {
         return Ok(None);
     }
@@ -203,7 +212,8 @@ pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, Stri
     let second = u32_at(bytes, 4);
     match tag {
         1 => {
-            let len = 8 + 34 * 8 + if vectors { 32 * 16 + 16 } else { 0 };
+            let system_at = 8 + 34 * 8 + if vectors { 32 * 16 + 16 } else { 0 };
+            let len = system_at + 8 * system;
             if bytes.len() < len {
                 return Ok(None);
             }
@@ -235,6 +245,9 @@ pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, Stri
                     encoding: second,
                     core,
                     vectors,
+                    system: (0..system)
+                        .map(|n| u64_at(bytes, system_at + 8 * n))
+                        .collect(),
                 },
                 len,
             )))
@@ -288,19 +301,21 @@ mod tests {
         bytes.extend(0x4200_0000u64.to_le_bytes());
         bytes.extend(0x6000_03c5u64.to_le_bytes());
         for cut in 0..bytes.len() {
-            assert_eq!(parse(&bytes[..cut], false), Ok(None));
+            assert_eq!(parse(&bytes[..cut], false, 0), Ok(None));
         }
-        let (trace, len) = parse(&bytes, false).unwrap().unwrap();
+        let (trace, len) = parse(&bytes, false, 0).unwrap().unwrap();
         assert_eq!(len, bytes.len());
         let Trace::Instruction {
             encoding,
             core,
             vectors,
+            system,
         } = trace
         else {
             panic!("an instruction record");
         };
         assert_eq!(vectors, None);
+        assert!(system.is_empty());
         assert_eq!(encoding, 0x9100_0400);
         assert_eq!(core.x[30], 90);
         assert_eq!(
@@ -308,14 +323,25 @@ mod tests {
             (0x1000, 0x4200_0000, 0x6000_03c5)
         );
         // With vectors the record is longer, and the same core comes out.
-        assert_eq!(parse(&bytes, true), Ok(None));
+        assert_eq!(parse(&bytes, true, 0), Ok(None));
         for n in 0..32u128 {
             bytes.extend((n << 100 | 7).to_le_bytes());
         }
         bytes.extend(0x1fu64.to_le_bytes());
         bytes.extend(0x0340_0000u64.to_le_bytes());
-        let (trace, len) = parse(&bytes, true).unwrap().unwrap();
+        let (trace, len) = parse(&bytes, true, 0).unwrap().unwrap();
         assert_eq!(len, bytes.len());
+        // Two system registers follow the vectors.
+        assert_eq!(parse(&bytes, true, 2), Ok(None));
+        let mut longer = bytes.clone();
+        longer.extend(0x5600_0001u64.to_le_bytes());
+        longer.extend(0x4200_0004u64.to_le_bytes());
+        let Some((Trace::Instruction { system, .. }, used)) = parse(&longer, true, 2).unwrap()
+        else {
+            panic!("an instruction record with system registers");
+        };
+        assert_eq!(used, longer.len());
+        assert_eq!(system, vec![0x5600_0001, 0x4200_0004]);
         let Trace::Instruction {
             core: with_vectors,
             vectors: Some(vectors),
@@ -353,7 +379,7 @@ mod tests {
         discontinuity.extend(0x4200_0004u64.to_le_bytes());
         discontinuity.extend(0x200u64.to_le_bytes());
         assert_eq!(
-            parse(&discontinuity, false),
+            parse(&discontinuity, false, 0),
             Ok(Some((
                 Trace::Discontinuity {
                     kind: 2,
@@ -363,7 +389,7 @@ mod tests {
                 24
             )))
         );
-        assert!(parse(&[9, 0, 0, 0, 0, 0, 0, 0], false).is_err());
+        assert!(parse(&[9, 0, 0, 0, 0, 0, 0, 0], false, 0).is_err());
     }
 
     #[test]

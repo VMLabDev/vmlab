@@ -112,6 +112,17 @@ tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='': tcg
 	if [ -n "{{corpus}}" ]; then args+=(--corpus-out "{{corpus}}"); fi
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_lockstep -- "${args[@]}"
 
+# Probe every system register encoding on QEMU's cortex-a53 (card C6) and write tests/qemu-cortex-a53-sysregs.txt
+[group('tcg')]
+tcg-a64-sysprobe out='crates/vmlab-hv-tcg-aarch64/tests/qemu-cortex-a53-sysregs.txt' names='': tcg-a64-plugin-build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64probe.XXXXXX")
+	trap 'rm -rf -- "$dir"' EXIT
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --out "{{out}}")
+	if [ -n "{{names}}" ]; then args+=(--names-out "{{names}}"); fi
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_sysprobe -- "${args[@]}"
+
 # Run Berkeley TestFloat against the FP helpers of the aarch64 emulator (DESIGN.md O5); it fetches and builds the pinned generator of toolchain/testfloat/pins.env, and sample is a file that takes test cases for tests/testfloat.rs
 [group('tcg')]
 tcg-a64-testfloat level='1' sample='':

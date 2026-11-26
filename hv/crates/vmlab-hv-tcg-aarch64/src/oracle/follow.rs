@@ -208,6 +208,7 @@ impl Follower {
                     encoding,
                     core,
                     vectors,
+                    ..
                 } => {
                     if let Expect::Exception(pc, _) = expect {
                         break Err(differed(

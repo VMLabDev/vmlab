@@ -24,11 +24,24 @@ pub const VECTOR: u64 = 0x200;
 /// `O_NONBLOCK` of Linux, which the FIFO of the plugin is read with.
 const O_NONBLOCK: i32 = 0o4000;
 
+/// What the plugin puts into each instruction record beyond the core
+/// registers.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// V0 to V31, FPSR and FPCR. FP is then enabled for EL1 and EL0.
+    pub vectors: bool,
+    /// System registers, by the names of QEMU's plugin API.
+    pub system: Vec<String>,
+    /// Write the name of every register of the plugin API to this file.
+    pub names: Option<PathBuf>,
+}
+
 pub struct Leader {
     child: Child,
     rsp: Rsp,
     stream: File,
     vectors: bool,
+    system: usize,
     /// Bytes of the plugin stream that are read and not parsed yet.
     pending: Vec<u8>,
     parsed: usize,
@@ -56,6 +69,33 @@ impl Leader {
         ram_mib: u32,
         vectors: bool,
     ) -> io::Result<Self> {
+        let options = Options {
+            vectors,
+            ..Options::default()
+        };
+        Self::start_options(qemu, plugin, directory, ram_mib, &options)
+    }
+
+    /// As `start`, with what each instruction record carries.
+    pub fn start_options(
+        qemu: &str,
+        plugin: &Path,
+        directory: &Path,
+        ram_mib: u32,
+        options: &Options,
+    ) -> io::Result<Self> {
+        let vectors = options.vectors;
+        let mut extra = String::new();
+        if vectors {
+            extra.push_str(",vectors=on");
+        }
+        if !options.system.is_empty() {
+            extra.push_str(",sysregs=");
+            extra.push_str(&options.system.join(":"));
+        }
+        if let Some(names) = &options.names {
+            extra.push_str(&format!(",names={}", names.display()));
+        }
         let fifo = directory.join("a64lock.fifo");
         let socket = directory.join("gdb.sock");
         for path in [&fifo, &socket] {
@@ -82,12 +122,7 @@ impl Leader {
             .arg("-gdb")
             .arg(format!("unix:{},server=on,wait=off", socket.display()))
             .arg("-plugin")
-            .arg(format!(
-                "{},out={}{}",
-                plugin.display(),
-                fifo.display(),
-                if vectors { ",vectors=on" } else { "" }
-            ))
+            .arg(format!("{},out={}{extra}", plugin.display(), fifo.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -120,7 +155,8 @@ impl Leader {
             kill(child);
             return Err(other("the plugin stream does not start with its magic"));
         }
-        if (header[8] & 1 != 0) != vectors {
+        let system = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        if (header[8] & 1 != 0) != vectors || system != options.system.len() {
             kill(child);
             return Err(other("the plugin stream does not carry what was asked for"));
         }
@@ -139,6 +175,7 @@ impl Leader {
             rsp,
             stream,
             vectors,
+            system,
             pending: Vec::new(),
             parsed: 0,
             running: false,
@@ -213,6 +250,16 @@ impl Leader {
         self.rsp.set_core(core)
     }
 
+    /// A hardware breakpoint that stops QEMU before the instruction at
+    /// `address`.
+    pub fn break_at(&mut self, address: u64) -> io::Result<()> {
+        self.rsp.break_at(address)
+    }
+
+    pub fn clear_break(&mut self, address: u64) -> io::Result<()> {
+        self.rsp.clear_break(address)
+    }
+
     pub fn core(&mut self) -> io::Result<Core> {
         self.rsp.core()
     }
@@ -251,7 +298,7 @@ impl Leader {
         let mut idle = 0u32;
         loop {
             if let Some((trace, len)) =
-                parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+                parse(&self.pending[self.parsed..], self.vectors, self.system).map_err(other)?
             {
                 self.parsed += len;
                 return Ok(trace);
