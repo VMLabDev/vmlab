@@ -264,6 +264,22 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn read_keeps_a_character_split_across_reads() {
+        let term = TerminalHandle {
+            machine: "vm".into(),
+            rt: tokio::runtime::Handle::current(),
+            state: Arc::new(Mutex::new(TermState {
+                session: None,
+                buf: b"ok\xe2\x82".to_vec(),
+                ended: Some("closed".into()),
+            })),
+        };
+        let first = term.read();
+        term.state.lock().unwrap().buf.push(0xac);
+        assert_eq!((first, term.read()), ("ok".into(), "€".into()));
+    }
+
+    #[tokio::test]
     async fn card_861_expect_keeps_a_character_split_across_reads() {
         let term = TerminalHandle {
             machine: "vm".into(),
