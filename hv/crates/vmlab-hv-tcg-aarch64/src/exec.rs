@@ -422,16 +422,22 @@ impl Side {
     /// MMU is off. An address without a translation does not fault here:
     /// the access itself reports that.
     #[cold]
-    fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64) -> bool {
+    fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64, bytes: u8) -> bool {
         // While the MMU is off the fault comes before every other one, also
         // for an address that is wider than a physical address.
         let controls = self.mmu.controls();
         if controls.strict_alignment || !controls.enabled {
             return true;
         }
-        self.mmu
-            .page(memory, va, Kind::Read)
-            .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
+        // An access that crosses into a second page faults when either
+        // page is Device memory.
+        let mut device = |va: u64| {
+            self.mmu
+                .page(memory, va, Kind::Read)
+                .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
+        };
+        let last = va.wrapping_add(u64::from(bytes).saturating_sub(1));
+        device(va) || (last >> 12 != va >> 12 && device(last))
     }
 
     fn read_at<M: Memory>(
@@ -1214,11 +1220,17 @@ impl Compiled {
         side: &mut Side,
     ) -> Result<(), (u32, Failed)> {
         let leave = &leaves[exit as usize];
-        let ExceptionClass::Alignment { write, always, .. } = leave.class else {
+        let ExceptionClass::Alignment {
+            write,
+            always,
+            bytes,
+            ..
+        } = leave.class
+        else {
             return Err((exit, Failed::Guard));
         };
         let address = leave.address.map_or(0, |slot| frame[usize::from(slot)]);
-        if always || side.unaligned_faults(memory, address) {
+        if always || side.unaligned_faults(memory, address, bytes) {
             let fault = Fault::Abort(mmu::Fault::ALIGNMENT, address);
             return Err((exit, Failed::Access(fault, write)));
         }
