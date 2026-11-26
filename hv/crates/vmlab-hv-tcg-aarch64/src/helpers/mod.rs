@@ -2,5 +2,7 @@
 //! scalar operations of the graph (DESIGN.md G3d, R10). A lifter calls a
 //! helper through `Builder::call`, and the interpreter loop runs its function.
 
+pub mod crypto;
 pub mod fp;
+pub mod simd;
 pub mod softfloat;
