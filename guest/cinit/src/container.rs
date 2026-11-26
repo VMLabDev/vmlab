@@ -142,8 +142,16 @@ pub struct ExecIdentity {
 
 impl ExecIdentity {
     pub fn new(workdir: Option<&str>, user: Option<&ResolvedUser>) -> Result<Self> {
+        let workdir = workdir.unwrap_or("/");
+        // `apply` runs right after `chroot`, with the working directory
+        // still outside the new root: a relative path would resolve there.
+        if !workdir.starts_with('/') {
+            return Err(format!(
+                "workdir {workdir:?} must be an absolute path inside the container"
+            ));
+        }
         Ok(Self {
-            workdir: cstring(workdir.unwrap_or("/"))?,
+            workdir: cstring(workdir)?,
             ids: user.map(|u| (Uid::from_raw(u.uid), Gid::from_raw(u.gid))),
         })
     }
@@ -372,6 +380,21 @@ mod tests {
         let id = ExecIdentity::new(None, None).unwrap();
         assert_eq!(id.workdir.as_c_str().to_str().unwrap(), "/");
         assert_eq!(id.ids, None);
+    }
+
+    /// G8 (docs/reviews/containers-2.md): the `chdir` follows the `chroot`
+    /// with the working directory still in the initramfs, so `etc` would be
+    /// the micro-VM's own `/etc`. Covers an image whose `WorkingDir` is
+    /// relative, which no lab file validation sees.
+    #[test]
+    fn an_exec_identity_refuses_a_relative_workdir() {
+        for relative in ["etc", "lib/modules", "./app", ""] {
+            let err = ExecIdentity::new(Some(relative), None)
+                .err()
+                .unwrap_or_else(|| panic!("{relative:?} was taken"));
+            assert!(err.contains("absolute"), "{err}");
+        }
+        assert!(ExecIdentity::new(Some("/etc"), None).is_ok());
     }
 
     /// F56: an absolute link on PATH resolves inside the rootfs.

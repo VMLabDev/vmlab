@@ -152,6 +152,14 @@ pub fn volume_share_name(container: &str, i: usize) -> String {
     format!("vol-{container}-{i}")
 }
 
+/// The virtio-fs mount tag of a container volume, from its share name. The
+/// device takes at most 36 bytes and a share name carries the container's
+/// name, a DNS label of up to 63, so the one that goes to the hypervisor and
+/// the one cinit mounts both come from here.
+pub fn volume_mount_tag(share: &str) -> String {
+    crate::qemu::virtiofsd::mount_tag(share)
+}
+
 /// Resolve the config's volume list to concrete exports in declaration
 /// order: (share name, host dir, read-only). Relative host binds resolve
 /// against the lab root; named volumes land under the lab work dir. Each
@@ -650,7 +658,7 @@ impl ContainerInstance {
         if !spec.volumes.is_empty() {
             if self.virtiofs_active.load(Ordering::SeqCst) {
                 for v in &mut spec.volumes {
-                    v.tag = Some(v.share.clone());
+                    v.tag = Some(volume_mount_tag(&v.share));
                 }
             } else {
                 spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
@@ -769,7 +777,7 @@ impl ContainerInstance {
                 .await?;
             // Register each daemon so teardown can stop it if a later volume fails.
             self.virtiofsd.lock().await.push(proc);
-            devices.push((share.clone(), sock));
+            devices.push((volume_mount_tag(share), sock));
         }
         self.virtiofs_active.store(true, Ordering::SeqCst);
         Ok(devices)
@@ -2003,6 +2011,66 @@ mod tests {
         c.drop_snapshot("missing").await.unwrap();
         std::fs::remove_file(&scratch).unwrap();
         c.drop_snapshot("missing").await.unwrap();
+    }
+
+    /// G3 of `docs/reviews/containers-2.md`: a virtio-fs tag holds 36 bytes,
+    /// and a container's name alone may have 63.
+    #[tokio::test]
+    async fn a_long_container_name_keeps_its_volume_tags_mountable() {
+        use crate::labd::hypervisor::fake::{FakeHypervisor, Script};
+        let dir = tempfile::tempdir().unwrap();
+        let name = "c".repeat(40);
+        let mut cfg = container(&name);
+        cfg.volumes = ["/data", "/cache"]
+            .iter()
+            .map(|target| Volume {
+                source: VolumeSource::Named(target[1..].into()),
+                target: (*target).into(),
+                read_only: false,
+                span: (0, 0),
+            })
+            .collect();
+        let volumes = resolve_volume_hosts(&cfg, dir.path());
+        let resolved = crate::qemu::resolve_container(
+            &cfg,
+            "x86_64",
+            &crate::profiles::ProfileSet::shipped().unwrap(),
+        )
+        .unwrap();
+        let c = ContainerInstance::new(
+            "lab",
+            cfg,
+            resolved,
+            ContainerDirs::new(dir.path(), "lab", &name),
+            vec![],
+            vec![],
+            Some(PulledImage {
+                manifest_digest: "sha256:0".into(),
+                config: image(RuntimeDefaults::default()),
+                rootfs_image: dir.path().join("rootfs.sqfs"),
+            }),
+            volumes,
+            HypervisorKind::Qemu,
+            FakeHypervisor::new(Script::default()),
+        );
+
+        let devices = c.start_virtiofsds().await.unwrap();
+        assert!(c.virtiofs_active.load(Ordering::SeqCst));
+        let handed: Vec<String> = devices.into_iter().map(|(tag, _)| tag).collect();
+        let mounted: Vec<String> = c
+            .spec_for_guest()
+            .await
+            .unwrap()
+            .volumes
+            .into_iter()
+            .map(|v| v.tag.expect("a virtiofs volume carries its tag"))
+            .collect();
+        assert_eq!(mounted.len(), 2);
+        for tag in &mounted {
+            assert!(tag.len() <= 36, "{tag}: {} bytes", tag.len());
+        }
+        assert_ne!(mounted[0], mounted[1]);
+        assert_eq!(mounted, handed, "cinit mounts what the hypervisor serves");
     }
 
     // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------

@@ -273,7 +273,7 @@ container "<name>" {
 | `clock` | utf8 | `host` | Guest clock across an online restore: `host` sets it to the host's time after the restore, `snapshot` keeps the captured time, an RFC 3339 date-time such as `2020-01-01T00:00:00Z` starts the micro-VM at that instant and is never set. Declared here only. |
 | `entrypoint` | list<utf8> | image default | Override the image entrypoint, in exec form. |
 | `command` | list<utf8> | image default | Override the image cmd, in exec form. |
-| `workdir` | utf8 | image default | Working directory inside the container. |
+| `workdir` | utf8 | image default | Working directory inside the container. An absolute path. |
 | `user` | utf8 | image default | User to run as: `uid[:gid]` or a name from the image. |
 | `profile` | utf8 | none | Guest profile supplying micro-VM hardware defaults, for example `container`. |
 | `cpus` | i64 | from profile | vCPU count for the micro-VM, greater than 0. One of this field or the profile must supply it. |
