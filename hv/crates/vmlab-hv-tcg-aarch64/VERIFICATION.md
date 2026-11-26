@@ -263,9 +263,11 @@ instructions of each record, with the vector and FP registers.
 
 ### The speed of the loop
 
-`taskset -c 30 just tcg-a64-mips` with the helper calls in the loop:
-MIPS_PLACEHOLDER A block without a helper call runs the same loop of packed
-instructions as before.
+`taskset -c 30 just tcg-a64-mips` with the helper calls in the loop, two
+runs of 3 repeats: medians of 96.22 and 95.84 MIPS, against 97.34 in card C1.
+That is about 1 % lower. A block without a helper call runs the same loop of
+packed instructions as before, after one test for calls. The loop has no FP
+benchmark yet: card C5 measures CoreMark.
 
 ### What this card does not do
 
