@@ -6,6 +6,11 @@
 //! (gvncviewer/vncviewer) gets a localhost display the bridge proxies to.
 //! With `--tcp` or no viewer at all we just bridge and print the address —
 //! the WSL2 path, where the viewer lives on the Windows side.
+//!
+//! A localhost port is open to every user of the host, and `vnc.sock`
+//! asks its clients for nothing. So each bridge has a password of its own
+//! and asks every TCP peer for it ([`crate::vnc_auth`]) before it connects
+//! that peer to the socket.
 
 use std::path::Path;
 
@@ -61,13 +66,15 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
         // No viewer (or --tcp forced): bridge and print the address for the
         // user to point any VNC client at (the WSL2 path).
         if tcp || viewer.is_none() {
-            let (port, _) = bridge(&sock).await?;
+            let password = crate::vnc_auth::new_password();
+            let (port, _) = bridge(&sock, password.clone()).await?;
             // Take SIGINT before the address is printed: a reader that acts
             // on the address line may interrupt at once, and until the
             // handler is installed an interrupt kills the process.
             let mut interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             println!("VNC for {lab}/{vm} on 127.0.0.1:{port}");
+            println!("password: {password}");
             println!("connect a VNC viewer there (Ctrl-C to stop the bridge)");
             interrupt.recv().await;
             return Ok(());
@@ -83,8 +90,9 @@ pub fn cmd_console(vm_ref: &str, tcp: bool) -> Result<()> {
             // of the viewer. Run it in a detached helper so the terminal is
             // freed; the helper exits when the viewer window closes.
             Transport::Tcp => {
-                viewer::spawn_detached_bridge(&lab, &vm)?;
+                let password = viewer::spawn_detached_bridge(&lab, &vm)?;
                 println!("opened {lab}/{vm} in a viewer (closes with the window)");
+                println!("if the viewer asks for a password: {password}");
                 Ok(())
             }
         }
@@ -104,14 +112,25 @@ pub fn run_bridge(lab: String, vm: String) -> Result<()> {
             bail!("VNC socket for {lab}/{vm} not found ({})", sock.display());
         }
         let viewer = viewer::detect().ok_or_else(|| anyhow!("no VNC viewer found"))?;
-        let target = match viewer.transport {
-            Transport::Unix => sock.display().to_string(),
+        // `_handoff` is the file the viewer reads the password from. It is
+        // removed when the helper ends.
+        let (mut child, _handoff) = match viewer.transport {
+            Transport::Unix => (
+                viewer::spawn_child(&viewer, &sock.display().to_string())?,
+                None,
+            ),
             Transport::Tcp => {
-                let (port, display) = bridge(&sock).await?;
-                viewer::tcp_target(&viewer, "127.0.0.1", port, display)
+                // The command that started this helper made the password,
+                // so that it could print it. It is in the environment and
+                // not in the arguments, which every user of the host reads.
+                let password = std::env::var(viewer::BRIDGE_PASSWORD_ENV)
+                    .ok()
+                    .filter(|password| crate::vnc_auth::is_password(password))
+                    .unwrap_or_else(crate::vnc_auth::new_password);
+                let (port, display) = bridge(&sock, password.clone()).await?;
+                viewer::spawn_bridged(&viewer, port, display, &password)?
             }
         };
-        let mut child = viewer::spawn_child(&viewer, &target)?;
         // Hold the bridge alive until the viewer window is closed.
         tokio::task::spawn_blocking(move || child.wait()).await.ok();
         Ok(())
@@ -122,7 +141,10 @@ pub fn run_bridge(lab: String, vm: String) -> Result<()> {
 /// display port (5900 + N) when one is free so viewers taking `host:N`
 /// work, falling back to any free port. Returns `(port, display)` where
 /// `display = port - 5900` (only meaningful in the 5900..5999 range).
-async fn bridge(sock: &Path) -> Result<(u16, u16)> {
+///
+/// Every TCP peer must answer a VNC authentication challenge with
+/// `password` before the bridge connects it to the socket.
+async fn bridge(sock: &Path, password: String) -> Result<(u16, u16)> {
     use tokio::net::TcpListener;
     // Prefer a display port so `host:display` viewers connect cleanly.
     let mut listener = None;
@@ -147,18 +169,57 @@ async fn bridge(sock: &Path) -> Result<(u16, u16)> {
                 break;
             };
             let sock = sock.clone();
+            let password = password.clone();
             tokio::spawn(async move {
-                if let Ok(unix) = tokio::net::UnixStream::connect(&sock).await {
-                    let (mut tr, mut tw) = tcp.into_split();
-                    let (mut ur, mut uw) = unix.into_split();
-                    let a = tokio::io::copy(&mut tr, &mut uw);
-                    let b = tokio::io::copy(&mut ur, &mut tw);
-                    let _ = tokio::join!(a, b);
-                }
+                let _ = serve_viewer(tcp, &sock, &password).await;
             });
         }
     });
     Ok((port, display))
+}
+
+/// One bridged connection: admit the viewer, connect it to `vnc.sock`,
+/// and copy both ways until either side closes.
+async fn serve_viewer(
+    mut tcp: tokio::net::TcpStream,
+    sock: &Path,
+    password: &str,
+) -> std::io::Result<()> {
+    use crate::vnc_auth;
+    use tokio::io::AsyncWriteExt;
+
+    // Nothing reaches the socket for a peer without the password.
+    let admitted = vnc_auth::challenge_viewer(&mut tcp, password).await?;
+    let mut unix = match open_console(sock).await {
+        Ok(unix) => unix,
+        Err(e) => {
+            vnc_auth::refuse(&mut tcp, &admitted, "the console is not available").await?;
+            return Err(e);
+        }
+    };
+    vnc_auth::admit(&mut tcp, admitted).await?;
+
+    // RFB has no half-open state: when either side closes, the session is
+    // over, and the other side must see a close too. `copy` shuts no
+    // writer down, so waiting for both copies would keep the viewer on a
+    // dead server, and a closed viewer's session in the display server.
+    let (mut tr, mut tw) = tcp.split();
+    let (mut ur, mut uw) = unix.split();
+    tokio::select! {
+        _ = tokio::io::copy(&mut tr, &mut uw) => {}
+        _ = tokio::io::copy(&mut ur, &mut tw) => {}
+    }
+    let _ = tw.shutdown().await;
+    let _ = uw.shutdown().await;
+    Ok(())
+}
+
+/// Connect to `vnc.sock` and take the handshake to where an admitted
+/// viewer's stands.
+async fn open_console(sock: &Path) -> std::io::Result<tokio::net::UnixStream> {
+    let mut unix = tokio::net::UnixStream::connect(sock).await?;
+    crate::vnc_auth::open_server(&mut unix).await?;
+    Ok(unix)
 }
 
 #[cfg(test)]
@@ -230,18 +291,21 @@ mod tests {
             tcp.write_all(&[2]).await.unwrap();
             let mut challenge = [0u8; 16];
             tcp.read_exact(&mut challenge).await.unwrap();
-            let _ = password;
-            tcp.write_all(&[0u8; 16]).await.unwrap();
+            tcp.write_all(&crate::vnc_auth::response(password, &challenge))
+                .await
+                .unwrap();
         }
         tcp.read_u32().await.unwrap()
     }
+
+    const PASSWORD: &str = "Ab3dEf7h";
 
     // display-2 F9: the bridge copied every TCP connection to `vnc.sock`
     // and asked the peer for nothing.
     #[tokio::test]
     async fn the_console_bridge_does_not_serve_an_unknown_tcp_peer() {
         let vnc = fake_vnc();
-        let (port, _) = bridge(&vnc.sock).await.unwrap();
+        let (port, _) = bridge(&vnc.sock, PASSWORD.into()).await.unwrap();
         let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         // A peer vmlab did not start has no password to give.
         let result = viewer_handshake(&mut tcp, "").await;
@@ -262,9 +326,9 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_passes_a_server_close_to_the_viewer() {
         let mut vnc = fake_vnc();
-        let (port, _) = bridge(&vnc.sock).await.unwrap();
+        let (port, _) = bridge(&vnc.sock, PASSWORD.into()).await.unwrap();
         let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        assert_eq!(viewer_handshake(&mut tcp, "").await, 0);
+        assert_eq!(viewer_handshake(&mut tcp, PASSWORD).await, 0);
         drop(vnc.sessions.recv().await.unwrap());
         let mut buf = [0u8; 16];
         assert_eq!(tcp.read(&mut buf).await.unwrap(), 0);
@@ -275,9 +339,9 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_passes_a_viewer_close_to_the_server() {
         let mut vnc = fake_vnc();
-        let (port, _) = bridge(&vnc.sock).await.unwrap();
+        let (port, _) = bridge(&vnc.sock, PASSWORD.into()).await.unwrap();
         let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        assert_eq!(viewer_handshake(&mut tcp, "").await, 0);
+        assert_eq!(viewer_handshake(&mut tcp, PASSWORD).await, 0);
         let mut unix = vnc.sessions.recv().await.unwrap();
         drop(tcp);
         let mut buf = [0u8; 16];
