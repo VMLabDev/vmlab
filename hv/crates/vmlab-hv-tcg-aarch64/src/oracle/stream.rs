@@ -293,6 +293,15 @@ impl Generator {
                 && let Some(store) = exclusive_store(record)
                 && let Some(rn) = field(record, "rn", word)
             {
+                // One time in four the store is of another size or kind
+                // than the load. QEMU lets such a store write.
+                let store = if self.rng.chance(1, 4) {
+                    let mut stores = records_of(FormatClass::StoreExclusive);
+                    stores.extend(records_of(FormatClass::StoreExclusivePair));
+                    stores[self.rng.below(stores.len() as u64) as usize]
+                } else {
+                    store
+                };
                 if words.len() + 2 <= count && self.rng.chance(1, 2) {
                     let at = base + 4 * words.len() as u64;
                     let between = choose(&mut self.rng);

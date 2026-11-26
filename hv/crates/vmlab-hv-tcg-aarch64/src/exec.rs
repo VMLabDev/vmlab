@@ -11,21 +11,27 @@
 //! that holds the registers as they were before its instruction, so a failed
 //! access leaves the registers of that instruction untouched.
 //!
-//! The exclusive monitor is one reservation per CPU: the address, the size,
-//! the value that the exclusive load read, and the write generation of the
+//! The exclusive monitor of a CPU is the address of its last exclusive
+//! load, the value that the load read, and the write generation of the
 //! memory's reservation granules at that moment (`Memory::load_reserved`).
-//! An exclusive store writes when the address and the size are those of the
-//! reservation, the memory still holds the value, and no other writer
-//! reached the granules (`Memory::store_conditional`). A store of this CPU
-//! keeps the reservation. What the monitor does on one CPU follows what the
-//! lockstep saw QEMU do (S6). With more CPUs it fails more often than QEMU:
-//! a write of another CPU to the same granule fails the store also when it
-//! left the value as it was.
+//! What it does on one CPU follows what the lockstep saw QEMU do (S6,
+//! DESIGN.md U1): an exclusive store writes when its address is the marked
+//! one and the memory, read at the size of the store, still holds the value.
+//! The sizes of the load and of the store need not be the same. A store
+//! that finds another address, or no mark, reads no memory and fails. Every
+//! exclusive store that completes ends the mark. A store of this CPU
+//! between the two keeps the mark, and an exception keeps it (the exception
+//! return of card C6 ends it).
+//!
+//! With more CPUs the store also asks that no other writer reached the
+//! granules of the load (`Memory::store_conditional`), so it fails more
+//! often than QEMU's: a write of another CPU fails it also when it left the
+//! value as it was.
 //!
 //! Sources read: none. This file holds no instruction semantics.
 
 use crate::generated::decode::{Record, decode};
-use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, lift};
+use crate::lift::{A64Exit, A64Next, Builder, Lifted, lift};
 use crate::state::{Context, State, slot};
 use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
@@ -83,18 +89,41 @@ pub struct Access {
     pub write: bool,
 }
 
-/// The exclusive monitor of one CPU.
+/// The mark that an exclusive load leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reservation {
     address: u64,
+    /// The size of the load.
     bytes: u8,
-    value: u128,
     generation: u64,
+}
+
+/// Why an access did not complete.
+enum Fault {
+    /// The memory holds nothing there.
+    Memory,
+    /// The address is not a multiple of the size of an exclusive store.
+    Unaligned,
+    Host(String),
+}
+
+impl From<Error> for Fault {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Memory(_) => Self::Memory,
+            other => Self::Host(other.to_string()),
+        }
+    }
 }
 
 /// What a block needs beside the registers and the memory.
 struct Side {
     exclusive: Option<Reservation>,
+    /// The value of the last exclusive load, with zeros above its size. A
+    /// load of 16 bytes leaves its lower half here and its upper half in
+    /// `exclusive_high`, which no other load changes.
+    exclusive_value: u64,
+    exclusive_high: u64,
     /// The accesses since the caller last took them, when it asked for them.
     log: Option<Vec<Access>>,
     code_pages: Vec<u64>,
@@ -111,6 +140,8 @@ impl Side {
     fn new() -> Self {
         Self {
             exclusive: None,
+            exclusive_value: 0,
+            exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
             single: false,
@@ -156,18 +187,22 @@ impl Side {
         address: u64,
         bytes: u8,
         exclusive: bool,
-    ) -> Result<u128, Error> {
+    ) -> Result<u128, Fault> {
         let mut buffer = [0u8; 16];
         let part = &mut buffer[..usize::from(bytes)];
         if exclusive {
             // A failed load leaves the monitor as it was.
             let generation = memory.load_reserved(address, part)?;
+            let value = u128::from_le_bytes(buffer);
             self.exclusive = Some(Reservation {
                 address,
                 bytes,
-                value: u128::from_le_bytes(buffer),
                 generation,
             });
+            self.exclusive_value = value as u64;
+            if bytes == 16 {
+                self.exclusive_high = (value >> 64) as u64;
+            }
         } else {
             memory.read(address, part)?;
         }
@@ -189,7 +224,7 @@ impl Side {
         address: u64,
         bytes: u8,
         value: u128,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Fault> {
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
         match self.exclusive {
@@ -225,13 +260,19 @@ impl Side {
         address: u64,
         bytes: u8,
         value: u128,
-    ) -> Result<bool, Error> {
-        // Every exclusive store ends the reservation, also one that fails.
-        let Some(reservation) = self.exclusive.take() else {
-            return Ok(false);
+    ) -> Result<bool, Fault> {
+        let reservation = match self.exclusive {
+            Some(reservation) if reservation.address == address => reservation,
+            _ => {
+                // Another address, or no mark: no memory is looked at.
+                self.exclusive = None;
+                return Ok(false);
+            }
         };
-        if reservation.address != address || reservation.bytes != bytes {
-            return Ok(false);
+        // From here the store is an access. One that faults leaves the
+        // mark, as its instruction did not complete.
+        if address & (u64::from(bytes) - 1) != 0 {
+            return Err(Fault::Unaligned);
         }
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
@@ -239,10 +280,29 @@ impl Side {
         let _atomic = lock.as_ref().map(|lock| lock.lock());
         let mut now = [0u8; 16];
         memory.read(address, &mut now[..usize::from(bytes)])?;
-        if u128::from_le_bytes(now) != reservation.value {
+        let now = u128::from_le_bytes(now);
+        self.exclusive = None;
+        let same = if bytes == 16 {
+            now as u64 == self.exclusive_value && (now >> 64) as u64 == self.exclusive_high
+        } else {
+            now == u128::from(self.exclusive_value)
+        };
+        if !same {
             return Ok(false);
         }
-        let wrote = memory.store_conditional(address, part, reservation.generation)?;
+        let wrote = if bytes == reservation.bytes {
+            memory.store_conditional(address, part, reservation.generation)?
+        } else if memory
+            .reservation_generation(reservation.address, usize::from(reservation.bytes))
+            == reservation.generation
+        {
+            // A store of another size than its load: the granules of the
+            // load are untouched, and the lock is held.
+            memory.write(address, part)?;
+            true
+        } else {
+            false
+        };
         if wrote {
             self.wrote(address, bytes, value);
         }
@@ -283,9 +343,19 @@ struct Leave {
     outputs: Vec<(u32, u32)>,
     /// The instructions of the block that are complete here.
     completed: u32,
-    class: ExceptionClass,
     /// The scratch slot of the address of an alignment fault.
     address: Option<u32>,
+}
+
+/// Why an effect did not complete.
+enum Failed {
+    /// The condition of a guard did not hold.
+    Guard,
+    /// A load or a store, with its address and whether it is a store.
+    Access(Fault, u64, bool),
+    /// A store into a page of translated code, in a block of more than one
+    /// instruction.
+    Retry,
 }
 
 /// Why a block left before its end.
@@ -443,7 +513,7 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { class, syndrome } = &payload.next else {
+                let A64Next::Exception { syndrome, .. } = &payload.next else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let address = match syndrome.first() {
@@ -454,7 +524,6 @@ fn compile(
                 compiled.leaves.push(Leave {
                     outputs,
                     completed: payload.completed,
-                    class: *class,
                     address,
                 });
                 leave_of[exit] = Some(leave);
@@ -548,14 +617,13 @@ impl Compiled {
         leave
     }
 
+    /// Make one effect. The error: the exit to leave through, and why.
     fn effect<M: Memory>(
         &mut self,
         effect: Effect,
         memory: &mut M,
         side: &mut Side,
-    ) -> Result<(), (u32, Option<Halt>, u64, bool)> {
-        // The error: the exit, a halt that is not a data abort, and the
-        // address and direction of a data abort.
+    ) -> Result<(), (u32, Failed)> {
         let values = &mut self.values;
         match effect {
             Effect::Guard {
@@ -564,7 +632,7 @@ impl Compiled {
                 exit,
             } => {
                 if (values[condition as usize] != 0) != expected {
-                    return Err((exit, None, 0, false));
+                    return Err((exit, Failed::Guard));
                 }
             }
             Effect::Read {
@@ -577,10 +645,7 @@ impl Compiled {
                 let at = values[address as usize] as u64;
                 match side.load(memory, at, bytes, exclusive) {
                     Ok(value) => values[result as usize] = value,
-                    Err(Error::Memory(_)) => return Err((exit, None, at, false)),
-                    Err(error) => {
-                        return Err((exit, Some(Halt::Stop(host(&error.to_string()))), at, false));
-                    }
+                    Err(fault) => return Err((exit, Failed::Access(fault, at, false))),
                 }
             }
             Effect::Write {
@@ -593,20 +658,17 @@ impl Compiled {
                 let at = values[address as usize] as u64;
                 let value = values[value as usize] & bits_mask(bytes);
                 if !side.single && side.is_code(at, bytes) {
-                    return Err((exit, Some(Halt::Retry), at, true));
+                    return Err((exit, Failed::Retry));
                 }
-                let outcome = match exclusive {
-                    None => side.store(memory, at, bytes, value).map(|()| None),
-                    Some(result) => side
-                        .store_exclusive(memory, at, bytes, value)
-                        .map(|wrote| Some((result, wrote))),
-                };
-                match outcome {
-                    Ok(None) => {}
-                    Ok(Some((result, wrote))) => values[result as usize] = u128::from(!wrote),
-                    Err(Error::Memory(_)) => return Err((exit, None, at, true)),
-                    Err(error) => {
-                        return Err((exit, Some(Halt::Stop(host(&error.to_string()))), at, true));
+                match exclusive {
+                    None => side
+                        .store(memory, at, bytes, value)
+                        .map_err(|fault| (exit, Failed::Access(fault, at, true)))?,
+                    Some(result) => {
+                        let wrote = side
+                            .store_exclusive(memory, at, bytes, value)
+                            .map_err(|fault| (exit, Failed::Access(fault, at, true)))?;
+                        values[result as usize] = u128::from(!wrote);
                     }
                 }
             }
@@ -634,22 +696,27 @@ impl Compiled {
                 return (0, Some(halt));
             }
             done = before;
-            if let Err((exit, halt, address, write)) = self.effect(effect, memory, side) {
+            if let Err((exit, failed)) = self.effect(effect, memory, side) {
                 let leave = self.leave(state, exit);
                 let pc = state.pc();
-                let halt = halt.unwrap_or_else(|| {
-                    Halt::Stop(match leave.class {
-                        ExceptionClass::Alignment => Stop::Alignment {
-                            pc,
-                            address: leave
-                                .address
-                                .map_or(address, |slot| self.values[slot as usize] as u64),
-                        },
-                        ExceptionClass::DataAbort | ExceptionClass::Undefined => {
-                            Stop::DataAbort { pc, address, write }
-                        }
-                    })
-                });
+                let halt = match failed {
+                    Failed::Retry => Halt::Retry,
+                    // The guards of this card are alignment checks, and
+                    // their exit holds the address.
+                    Failed::Guard => Halt::Stop(Stop::Alignment {
+                        pc,
+                        address: leave
+                            .address
+                            .map_or(0, |slot| self.values[slot as usize] as u64),
+                    }),
+                    Failed::Access(Fault::Memory, address, write) => {
+                        Halt::Stop(Stop::DataAbort { pc, address, write })
+                    }
+                    Failed::Access(Fault::Unaligned, address, _) => {
+                        Halt::Stop(Stop::Alignment { pc, address })
+                    }
+                    Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
+                };
                 return (leave.completed, Some(halt));
             }
         }

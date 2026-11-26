@@ -743,6 +743,84 @@ fn a_store_of_the_same_cpu_keeps_the_reservation_unless_it_changes_the_value() {
 }
 
 #[test]
+fn an_exclusive_store_compares_the_memory_at_its_own_size_with_the_loaded_value() {
+    // The rules of this test are QEMU's, as the lockstep found them.
+    let stxp = |ws| {
+        word(
+            Record::STXPX,
+            &[("ws", ws), ("rt", 3), ("rt2", 4), ("rn", 0)],
+        )
+    };
+    let mut cpu = cpu(&[
+        // ldxr w2, [x0] ; stxr w10, x1, [x0]: 4 bytes loaded, 8 stored. The
+        // 8 bytes of memory are the loaded value with zeros above.
+        word(Record::LDXRW, &[("rt", 2), ("rn", 0)]),
+        stxr(10, 1, 0),
+        // ldxr x2, [x0] ; stxrb w11, w3, [x0]: the byte in memory is not the
+        // 64-bit value that was loaded.
+        ldxr(2, 0),
+        word(Record::STXRB, &[("ws", 11), ("rt", 3), ("rn", 0)]),
+        // ldxr x2, [x5] ; stxrb w12, w3, [x5]: here it is.
+        ldxr(2, 5),
+        word(Record::STXRB, &[("ws", 12), ("rt", 3), ("rn", 5)]),
+        // A pair of 8-byte registers compares its upper half with the upper
+        // half of the last pair load. No such load yet: the store fails.
+        ldxr(2, 0),
+        stxp(13),
+        // ldxp x6, x7, [x0] ; ldxr x2, [x0] ; stxp: the upper half that the
+        // pair load left is still what the memory holds.
+        word(Record::LDXPX, &[("rt", 6), ("rt2", 7), ("rn", 0)]),
+        ldxr(2, 0),
+        stxp(14),
+    ]);
+    cpu.state.set_x(0, DATA + 0x100);
+    cpu.state.set_x(1, 0x1111_2222_3333_4444);
+    cpu.state.set_x(3, 0x33);
+    cpu.state.set_x(4, 0x44);
+    cpu.state.set_x(5, DATA + 0x200);
+    cpu.memory.write(DATA + 0x100, &0x42u64.to_le_bytes()).unwrap();
+    cpu.memory.write(DATA + 0x200, &0x42u64.to_le_bytes()).unwrap();
+    assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
+    assert_eq!(cpu.instructions, 11);
+    assert_eq!(
+        [10, 11, 12, 13, 14].map(|n| cpu.state.x(n)),
+        [0, 1, 0, 1, 0]
+    );
+    assert_eq!(read(&mut cpu, DATA + 0x200, 8), 0x33u64.to_le_bytes());
+    assert_eq!(
+        read(&mut cpu, DATA + 0x100, 16),
+        [0x33u64, 0x44].map(u64::to_le_bytes).concat()
+    );
+    assert_eq!(cpu.state.x(6), 0x1111_2222_3333_4444);
+    assert_eq!(cpu.state.x(7), pattern(0x108, 8));
+}
+
+#[test]
+fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignment() {
+    // ldxrb w2, [x0] ; stxr w10, x1, [x0], at an odd address.
+    let mut cpu = cpu(&[
+        word(Record::LDXRB, &[("rt", 2), ("rn", 0)]),
+        stxr(10, 1, 0),
+        word(Record::STXRB, &[("ws", 11), ("rt", 1), ("rn", 0)]),
+    ]);
+    cpu.state.set_x(0, DATA + 0x101);
+    cpu.state.set_x(10, 7);
+    cpu.step().unwrap();
+    assert_eq!(
+        cpu.step(),
+        Err(Stop::Alignment {
+            pc: BASE + 4,
+            address: DATA + 0x101
+        })
+    );
+    assert_eq!(cpu.state.x(10), 7);
+    // The store did not complete, so the mark is still there.
+    cpu.state.set_pc(BASE + 8);
+    cpu.step().unwrap();
+    assert_eq!(cpu.state.x(11), 0);
+}
+
+#[test]
 fn exclusive_pairs_and_the_smaller_sizes_move_what_their_names_say() {
     let mut cpu = cpu(&[
         // ldxp x1, x2, [x0]

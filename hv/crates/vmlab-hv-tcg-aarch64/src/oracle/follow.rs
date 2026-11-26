@@ -265,6 +265,31 @@ impl Follower {
         Some(u32::from_le_bytes(bytes))
     }
 
+    /// The memory writes of the last instruction, ours against QEMU's:
+    /// every byte that our side wrote, QEMU wrote, and our memory holds now
+    /// what QEMU wrote. QEMU reports an exclusive store that fails its
+    /// compare as a write of the bytes that were there, so the two lists
+    /// are not compared one to one.
+    fn writes_differ(&mut self, last: &Option<Last>, qemu: &[QemuWrite]) -> Option<String> {
+        let ours = last
+            .as_ref()
+            .map(|last| our_writes(&last.accesses))
+            .unwrap_or_default();
+        let theirs = written(qemu.iter().map(qemu_bytes));
+        let mut same = ours.keys().all(|address| theirs.contains_key(address));
+        for (address, byte) in &theirs {
+            let mut now = [0u8; 1];
+            same &= self.cpu.memory.read(*address, &mut now).is_ok() && now[0] == *byte;
+        }
+        (!same).then(|| {
+            format!(
+                "the memory writes of an instruction: ours{}, QEMU's{}",
+                describe(&ours),
+                describe(&theirs)
+            )
+        })
+    }
+
     /// Take into our memory what QEMU wrote and our side did not.
     fn mirror(&mut self, writes: &[QemuWrite]) {
         for write in writes {
@@ -306,21 +331,6 @@ impl Follower {
                 qemu,
             })
         };
-        // The memory writes of the last instruction, ours against QEMU's.
-        let writes_differ = |last: &Option<Last>, qemu: &[QemuWrite]| -> Option<String> {
-            let ours = last
-                .as_ref()
-                .map(|last| our_writes(&last.accesses))
-                .unwrap_or_default();
-            let theirs = written(qemu.iter().map(qemu_bytes));
-            (ours != theirs).then(|| {
-                format!(
-                    "the memory writes of an instruction: ours{}, QEMU's{}",
-                    describe(&ours),
-                    describe(&theirs)
-                )
-            })
-        };
         let result = loop {
             let ours = Core::of(&self.cpu.state);
             match self.leader.next_record(RECORD_TIMEOUT)? {
@@ -344,7 +354,7 @@ impl Follower {
                             break Ok(End::Device);
                         }
                     }
-                    if let Some(what) = writes_differ(&last, &qemu_writes) {
+                    if let Some(what) = self.writes_differ(&last, &qemu_writes) {
                         break Err(differed(what, &last, ours, Some(core)));
                     }
                     qemu_writes.clear();
@@ -545,7 +555,7 @@ impl Follower {
                         }
                         qemu_writes.clear();
                     }
-                    if let Some(what) = writes_differ(&last, &qemu_writes) {
+                    if let Some(what) = self.writes_differ(&last, &qemu_writes) {
                         break Err(differed(what, &last, ours, None));
                     }
                     let stopped = self.leader.core()?;
