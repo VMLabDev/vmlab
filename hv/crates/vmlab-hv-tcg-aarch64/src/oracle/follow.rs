@@ -1456,6 +1456,18 @@ impl Follower {
                             difference.system =
                                 system_difference(&self.compared, ours_system, &system);
                             difference.taken = self.cpu.taken;
+                            // The walk of our side for the address of a
+                            // data abort, to read the difference by.
+                            if let Some(Taken {
+                                cause: Cause::Exception(Exception::DataAbort { address, .. }),
+                                ..
+                            }) = self.cpu.taken
+                            {
+                                let (descriptors, phys) = self.cpu.walk_trace(address);
+                                difference.what.push_str(&format!(
+                                    "; our walk for {address:#x} reads {descriptors:x?} and gives {phys:x?}"
+                                ));
+                            }
                             break Err(difference);
                         }
                     }
