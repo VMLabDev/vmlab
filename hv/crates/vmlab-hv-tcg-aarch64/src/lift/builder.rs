@@ -164,9 +164,9 @@ pub struct Builder {
 
 /// The alignment that Device memory asks of a load or a store of a register
 /// whose own alignment is `align` bytes. What the lockstep found on QEMU
-/// (card C8): the size of the register, and 8 bytes for one of 16.
+/// (card C8): the size of the register, also for one of 16 bytes.
 fn device_alignment(align: u8) -> u8 {
-    align.min(8)
+    align
 }
 
 fn total(value: Option<ScalarId>) -> ScalarId {
