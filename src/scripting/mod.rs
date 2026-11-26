@@ -928,8 +928,7 @@ pub fn lab_module() -> Module {
                 let timeout = script_timeout(timeout_secs, 0)?;
                 let machine = h.machine()?;
                 if h.first_boot_gated {
-                    h.block(machine.wait_agent_answering(timeout))
-                        .map_err(estr)
+                    h.block(machine.wait_agent_answering(timeout)).map_err(estr)
                 } else {
                     h.block(machine.wait_ready(timeout)).map_err(estr)
                 }
