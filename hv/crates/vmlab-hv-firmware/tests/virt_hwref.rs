@@ -190,8 +190,14 @@ fn diff(
                     .find(|(_, base, size)| (*base..base + size).contains(&start))
                     .map(|(signature, base, _)| (signature.clone(), start - base)),
                 offset: start,
-                reference: a.get(start..offset.min(a.len())).unwrap_or_default().to_vec(),
-                candidate: b.get(start..offset.min(b.len())).unwrap_or_default().to_vec(),
+                reference: a
+                    .get(start..offset.min(a.len()))
+                    .unwrap_or_default()
+                    .to_vec(),
+                candidate: b
+                    .get(start..offset.min(b.len()))
+                    .unwrap_or_default()
+                    .to_vec(),
             });
         }
     }
@@ -216,7 +222,11 @@ fn allow_list() -> Value {
 
 /// Whether one rule of the allow-list covers one difference exactly: the
 /// file, the table, the structure type, the field and both values.
-fn rule_covers(rule: &Value, difference: &Difference, reference: &BTreeMap<String, Vec<u8>>) -> bool {
+fn rule_covers(
+    rule: &Value,
+    difference: &Difference,
+    reference: &BTreeMap<String, Vec<u8>>,
+) -> bool {
     let Some((signature, table_offset)) = &difference.table else {
         return false;
     };
@@ -232,10 +242,9 @@ fn rule_covers(rule: &Value, difference: &Difference, reference: &BTreeMap<Strin
     let field = rule["field_offset"].as_u64().unwrap() as usize;
     let width = rule["field_width"].as_u64().unwrap() as usize;
     let kind = rule["structure_type"].as_u64().unwrap() as u8;
-    let Some((_, structure)) = madt_structures(table)
-        .into_iter()
-        .find(|(found, start)| *found == kind && (start + field..start + field + width).contains(table_offset))
-    else {
+    let Some((_, structure)) = madt_structures(table).into_iter().find(|(found, start)| {
+        *found == kind && (start + field..start + field + width).contains(table_offset)
+    }) else {
         return false;
     };
     // The whole field must hold the two approved values, not only the bytes
@@ -273,7 +282,11 @@ fn apply_allow_list(
             .iter()
             .find(|rule| rule_covers(rule, difference, reference));
         match rule {
-            Some(rule) => *used.entry(rule["id"].as_str().unwrap().to_string()).or_default() += 1,
+            Some(rule) => {
+                *used
+                    .entry(rule["id"].as_str().unwrap().to_string())
+                    .or_default() += 1
+            }
             None => unapproved.push(difference.clone()),
         }
     }
@@ -316,7 +329,10 @@ fn product_tables_differ_from_qemu_only_inside_the_allow_list() {
     // No rule is on the list without a difference that needs it.
     for rule in allow["differences"].as_array().unwrap() {
         let id = rule["id"].as_str().unwrap();
-        assert!(total.contains_key(id), "allow-list rule {id} covers nothing");
+        assert!(
+            total.contains_key(id),
+            "allow-list rule {id} covers nothing"
+        );
     }
 }
 
@@ -338,14 +354,14 @@ fn allow_list_keeps_every_other_difference() {
         .1;
     // (file, offset, new byte): none of these is the approved difference.
     let cases = [
-        (TABLES, gicc + 20, 22),      // a PMU interrupt other than "none"
-        (TABLES, gicc + 21, 1),       // the same field, a value that is not 0
-        (TABLES, gicc + 32, 0xff),    // the base of the CPU interface
-        (TABLES, gicc + 12, 0),       // a disabled CPU
-        (TABLES, madt + 44 + 20, 3),  // the GIC version
-        (TABLES, spcr + 54, 34),      // the interrupt of the console
-        (RSDP, 15, 0),                // the revision of the RSDP
-        (LOADER, 4, b'x'),            // a loader record
+        (TABLES, gicc + 20, 22),     // a PMU interrupt other than "none"
+        (TABLES, gicc + 21, 1),      // the same field, a value that is not 0
+        (TABLES, gicc + 32, 0xff),   // the base of the CPU interface
+        (TABLES, gicc + 12, 0),      // a disabled CPU
+        (TABLES, madt + 44 + 20, 3), // the GIC version
+        (TABLES, spcr + 54, 34),     // the interrupt of the console
+        (RSDP, 15, 0),               // the revision of the RSDP
+        (LOADER, 4, b'x'),           // a loader record
         ("etc/smbios/smbios-tables", 4, 9),
     ];
     for (file, offset, byte) in cases {
@@ -353,7 +369,11 @@ fn allow_list_keeps_every_other_difference() {
         assert_ne!(changed.get_mut(file).unwrap()[offset], byte);
         changed.get_mut(file).unwrap()[offset] = byte;
         let (unapproved, _) = apply_allow_list(&diff(&reference, &changed), &reference, &allow);
-        assert_eq!(unapproved.len(), 1, "{file} at {offset:#x}: {unapproved:x?}");
+        assert_eq!(
+            unapproved.len(),
+            1,
+            "{file} at {offset:#x}: {unapproved:x?}"
+        );
         assert_eq!(unapproved[0].file, file);
     }
     // A file that one side lacks, and a file of another size, are differences.
@@ -420,7 +440,11 @@ fn fw_cfg_device_presents_the_directory_and_items_of_qemu() {
                 data.len()
             );
             select(&mut device, *key);
-            assert!(read(&mut device, data.len()) == *data, "{}: {name}", capture.name);
+            assert!(
+                read(&mut device, data.len()) == *data,
+                "{}: {name}",
+                capture.name
+            );
         }
         // The numeric items a firmware reads. An item QEMU leaves unset
         // reads as zeros on both sides.
@@ -484,7 +508,8 @@ fn run_loader(files: &BTreeMap<String, Vec<u8>>) -> (BTreeMap<String, (u64, Vec<
             }
             3 => {
                 let (_, data) = placed.get_mut(&text(&record[4..60])).unwrap();
-                let (offset, start, length) = (word(record, 60), word(record, 64), word(record, 68));
+                let (offset, start, length) =
+                    (word(record, 60), word(record, 64), word(record, 68));
                 assert_eq!(data[offset], 0);
                 let sum = data[start..start + length]
                     .iter()
@@ -531,7 +556,12 @@ fn loader_program_yields_tables_a_guest_can_walk() {
         let expected: [&[u8; 4]; 9] = [
             b"FACP", b"APIC", b"PPTT", b"PPTT", b"GTDT", b"MCFG", b"SPCR", b"DBG2", b"IORT",
         ];
-        assert!(signatures.iter().map(Vec::as_slice).eq(expected.iter().map(|s| s.as_slice())));
+        assert!(
+            signatures
+                .iter()
+                .map(Vec::as_slice)
+                .eq(expected.iter().map(|s| s.as_slice()))
+        );
         let fadt = table_at(u64::from_le_bytes(xsdt[36..44].try_into().unwrap()));
         let dsdt = table_at(u64::from_le_bytes(fadt[140..148].try_into().unwrap()));
         assert_eq!(&dsdt[..4], b"DSDT");
@@ -539,16 +569,24 @@ fn loader_program_yields_tables_a_guest_can_walk() {
         for cpu in 0..vcpus {
             let name = format!("C{cpu:03X}\x08_HID\x0dACPI0007");
             assert_eq!(
-                dsdt.windows(name.len()).filter(|w| *w == name.as_bytes()).count(),
+                dsdt.windows(name.len())
+                    .filter(|w| *w == name.as_bytes())
+                    .count(),
                 1
             );
         }
-        assert!(!dsdt.windows(4).any(|w| w == format!("C{vcpus:03X}").as_bytes()));
+        assert!(
+            !dsdt
+                .windows(4)
+                .any(|w| w == format!("C{vcpus:03X}").as_bytes())
+        );
         let madt = table_at(u64::from_le_bytes(xsdt[44..52].try_into().unwrap()));
         let giccs: Vec<_> = madt_structures(madt)
             .into_iter()
             .filter(|(kind, _)| *kind == 0x0b)
-            .map(|(_, offset)| u32::from_le_bytes(madt[offset + 8..offset + 12].try_into().unwrap()))
+            .map(|(_, offset)| {
+                u32::from_le_bytes(madt[offset + 8..offset + 12].try_into().unwrap())
+            })
             .collect();
         assert!(giccs.iter().copied().eq(0..u32::from(vcpus)));
     }
@@ -559,12 +597,18 @@ fn product_tables_state_psci_over_hvc_and_no_pmu() {
     let files = candidate(&Platform::default());
     let tables = acpi_tables(&files[TABLES]);
     let table = |signature: &str| {
-        let (_, base, length) = tables.iter().find(|(name, _, _)| name == signature).unwrap();
+        let (_, base, length) = tables
+            .iter()
+            .find(|(name, _, _)| name == signature)
+            .unwrap();
         &files[TABLES][*base..base + length]
     };
     let fadt = table("FACP");
     // Hardware-reduced ACPI, PSCI compliant, the HVC conduit (V1).
-    assert_eq!(u32::from_le_bytes(fadt[112..116].try_into().unwrap()), 1 << 20);
+    assert_eq!(
+        u32::from_le_bytes(fadt[112..116].try_into().unwrap()),
+        1 << 20
+    );
     assert_eq!(u16::from_le_bytes(fadt[129..131].try_into().unwrap()), 0b11);
     let madt = table("APIC");
     for (kind, offset) in madt_structures(madt) {
@@ -608,7 +652,10 @@ fn machines_outside_virt_are_refused() {
         assert!(virt::files(&platform).is_err(), "{platform:?}");
     }
     let bootorder = Platform {
-        bootorder: vec!["/pci@i0cf8/scsi@2/disk@0,0".into(), "/pci@i0cf8/usb@5".into()],
+        bootorder: vec![
+            "/pci@i0cf8/scsi@2/disk@0,0".into(),
+            "/pci@i0cf8/usb@5".into(),
+        ],
         ..Platform::default()
     };
     let files = candidate(&bootorder);

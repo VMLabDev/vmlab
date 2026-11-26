@@ -38,17 +38,9 @@ pub fn generate(platform: &Platform) -> Result<AcpiTables, String> {
 
     let mut entries = vec![fadt];
     let pptt = pptt(platform.vcpus);
-    for (index, body) in [
-        madt(platform),
-        pptt,
-        gtdt(),
-        mcfg(),
-        spcr(),
-        dbg2(),
-        iort(),
-    ]
-    .iter()
-    .enumerate()
+    for (index, body) in [madt(platform), pptt, gtdt(), mcfg(), spcr(), dbg2(), iort()]
+        .iter()
+        .enumerate()
     {
         let start = append(&mut tables, body);
         checksum(&mut tables, &mut loader, start);
