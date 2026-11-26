@@ -299,15 +299,16 @@ else:
 '''
 
 
-def release_checkout(tmp_path):
+def release_checkout(tmp_path, docker=STUB_DOCKER,
+                     scripts=('build/run.sh', 'scripts/release-local.sh')):
     """A committed checkout with the release scripts and a `.gitignore`, and the
     environment in which `docker` is the stub. Returns (checkout, env, state)."""
     checkout = tmp_path / 'checkout'
-    for name in ['build/run.sh', 'scripts/release-local.sh']:
+    for name in scripts:
         (checkout / name).parent.mkdir(parents=True, exist_ok=True)
         (checkout / name).write_bytes((ROOT / name).read_bytes())
         (checkout / name).chmod(0o755)
-    (checkout / '.gitignore').write_text('/target\n')
+    (checkout / '.gitignore').write_text('/target\n/.ci-cache/\n')
     git = ['git', '-C', str(checkout), '-c', 'user.name=t', '-c', 'user.email=t@example.invalid']
     subprocess.run([*git, 'init', '-q'], check=True)
     subprocess.run([*git, 'add', '-A'], check=True)
@@ -315,7 +316,7 @@ def release_checkout(tmp_path):
 
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
-    (bin_dir / 'docker').write_text(STUB_DOCKER)
+    (bin_dir / 'docker').write_text(docker)
     (bin_dir / 'docker').chmod(0o755)
     state = tmp_path / 'docker-state'
     env = {k: v for k, v in os.environ.items() if not k.startswith('VMLAB_')}
@@ -415,3 +416,146 @@ def test_a_release_build_takes_nothing_from_the_volumes_of_another_build(tmp_pat
     assert set(second) == set(first)
     # The release leaves no volume behind, and the card build keeps its own.
     assert set(os.listdir(state / 'volumes')) == card_volumes
+
+
+# ── Review install-release-2 F12 and F13 ─────────────────────────────────────
+
+IMAGE_A = 'sha256:' + 'a' * 64
+IMAGE_B = 'sha256:' + 'b' * 64
+
+# A docker with one tag, `vmlab-build`, that the stub can move. `docker build`
+# makes the image A and points the tag at it. With STUB_RETAG set, the first
+# `docker run` moves the tag to the image B: another checkout on the same host
+# ran `just buildbox::image` while the release built. Every `run` logs the
+# image that it names. The run of build/dist.sh leaves the four assets, and the
+# cosign runs sign and verify by contract, as the stub of test_release_key.py.
+STUB_DOCKER_IMAGES = r"""#!/usr/bin/env python3
+import hashlib, json, os, sys
+from pathlib import Path
+
+A, B = 'sha256:' + 'a' * 64, 'sha256:' + 'b' * 64
+state = Path(os.environ['STUB_DOCKER_STATE'])
+state.mkdir(parents=True, exist_ok=True)
+tag = state / 'tag'
+args = sys.argv[1:]
+if args[:1] == ['build']:
+    tag.write_text(A)
+    if '--iidfile' in args:
+        Path(args[args.index('--iidfile') + 1]).write_text(A)
+elif args[:2] == ['image', 'inspect']:
+    name = args[-1]
+    if not name.startswith('sha256:'):
+        if not tag.exists():
+            sys.exit(1)
+        name = tag.read_text()
+    if '-f' in args:
+        print('v2.6.1' if 'Labels' in args[args.index('-f') + 1] else name)
+elif args[:2] == ['volume', 'ls']:
+    pass
+elif args[:1] == ['run']:
+    images = [word for word in args if word == 'vmlab-build' or word.startswith('sha256:')]
+    with open(state / 'runs', 'a') as runs:
+        runs.write(json.dumps({'image': images[0] if images else None,
+                               'tag': tag.read_text() if tag.exists() else None,
+                               'secrets': '-e VMLAB_RELEASE_COSIGN_KEY' in ' '.join(args)}) + '\n')
+    if os.environ.get('STUB_RETAG'):
+        tag.write_text(B)
+    digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    if './build/dist.sh' in args:
+        version = args[args.index('./build/dist.sh') + 1]
+        dist = Path(args[args.index('-w') + 1]) / 'target/dist'
+        dist.mkdir(parents=True, exist_ok=True)
+        cli = dist / f'vmlab-{version}-linux-x86_64'
+        cli.write_text(f'#!/bin/sh\necho "vmlab {version}"\n')
+        cli.chmod(0o755)
+        (dist / f'vmlab-fastpath-{version}-linux-x86_64').write_text('helper\n')
+        for name in (f'vmlab-guest-{version}.tar.gz', f'vmlab-hv-{version}-linux-x86_64.tar.gz'):
+            (dist / name).write_text(name)
+            (dist / (name + '.sha256')).write_text(f'{digest(dist / name)}  {name}\n')
+    elif 'cosign' in args:
+        cosign = args[args.index('cosign') + 1:]
+        if cosign[0] == 'sign-blob':
+            Path(cosign[6]).write_text(f"pair {digest(cosign[7])}\n")
+        elif cosign[0] == 'verify-blob':
+            sys.exit(0 if Path(cosign[4]).read_text() == f"pair {digest(cosign[6])}\n" else 1)
+        else:
+            sys.exit('stub docker: unexpected cosign ' + ' '.join(cosign))
+else:
+    sys.exit('stub docker: unexpected ' + ' '.join(args))
+"""
+
+
+def signed_release(tmp_path, *args, **extra):
+    """`release-local.sh --version 9.9.9 --signing key` of a fixture checkout
+    with a stub key and a staged display package. Returns (result, runs, out)."""
+    checkout, env, state = release_checkout(tmp_path, docker=STUB_DOCKER_IMAGES, scripts=(
+        'build/run.sh', 'build/release-signing.pub', 'scripts/release-local.sh',
+        'scripts/release-sign.sh', 'scripts/release-cosign.sh', 'scripts/release-assets.py',
+        'scripts/release-publish.sh', 'scripts/release-verify.sh'))
+    package = checkout / 'target/display-package'
+    package.mkdir(parents=True)
+    (package / 'PACKAGE.json').write_text('{}\n')
+    out = tmp_path / 'out'
+    env.pop('COSIGN', None)
+    env.update(VMLAB_VDISPLAY_PACKAGE_DIR=str(package), VMLAB_RELEASE_COSIGN_KEY='stub private half',
+               COSIGN_PASSWORD='stub password', **extra)
+    result = subprocess.run([str(checkout / 'scripts/release-local.sh'), '--version', '9.9.9',
+                             '--signing', 'key', '--builder', 'helios', '--out', str(out), *args],
+                            capture_output=True, text=True, env=env)
+    runs = state / 'runs'
+    return result, [json.loads(line) for line in runs.read_text().splitlines()] if runs.exists() else [], out
+
+
+def build_image_of(out):
+    statement = json.loads((out / 'provenance.json').read_text())
+    return statement['predicate']['buildDefinition']['internalParameters']['buildImage']
+
+
+@pytest.mark.parametrize('retag', [False, True])
+def test_a_release_builds_and_signs_in_the_one_image_of_its_provenance(tmp_path, retag):
+    """Review install-release-2 F12: the tag `vmlab-build` is one name for the
+    whole docker host, and a build of another checkout moves it. Every container
+    of a release, the signing one included, names the image by the id that the
+    release built, which is the id that provenance.json holds. A tag that moves
+    while the release builds changes nothing: no container asks the tag again."""
+    result, runs, out = signed_release(tmp_path, **({'STUB_RETAG': '1'} if retag else {}))
+    assert result.returncode == 0, result.stderr
+    # The build, the signature, its check, and the check of the upload command.
+    assert len(runs) == 4, runs
+    assert [run['image'] for run in runs] == [IMAGE_A] * 4, runs
+    assert [run['secrets'] for run in runs] == [False, True, False, False]
+    assert build_image_of(out) == IMAGE_A
+    assert (out / 'SHA256SUMS.key.bundle').is_file()
+    if retag:
+        # The tag did move under the release: the signing container started
+        # while the tag named the other image.
+        assert runs[1]['tag'] == IMAGE_B
+
+
+def test_a_real_version_does_not_take_the_image_tag_as_it_is(tmp_path):
+    """Review install-release-2 F12: --image-as-is takes whatever image the tag
+    names, built from any checkout. It is for the dry-run version only."""
+    result, runs, out = signed_release(tmp_path, '--image-as-is')
+    assert result.returncode != 0
+    assert '--image-as-is is for the version 0.0.0-dry-run only' in result.stderr, result.stderr
+    assert runs == [] and not out.exists()
+
+
+def test_a_release_refuses_a_cache_in_the_checkout(tmp_path):
+    """Review install-release-2 F13: `.ci-cache/` is ignored by the committed
+    `.gitignore`, so the untracked-file check does not see it, and a build
+    that ran earlier in the checkout can leave anything there."""
+    checkout, env, state = release_checkout(tmp_path)
+    (checkout / '.ci-cache/x').mkdir(parents=True)
+    (checkout / '.ci-cache/x/planted').write_text('planted\n')
+
+    release = release_dry_run(checkout, env)
+    assert release.returncode != 0
+    assert '\n  .ci-cache/x\n' in release.stderr, release.stderr
+    # Refused before any container ran.
+    assert not (state / 'runs').exists()
+    # An empty cache directory is no refusal.
+    (checkout / '.ci-cache/x/planted').unlink()
+    (checkout / '.ci-cache/x').rmdir()
+    release = release_dry_run(checkout, env)
+    assert 'the build left no' in release.stderr, release.stderr

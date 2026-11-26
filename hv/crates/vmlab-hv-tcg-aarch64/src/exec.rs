@@ -1,14 +1,14 @@
 //! The interpreter loop: translate a block at the PC, run it on the slot
 //! executor of `vmlab-hv-tcg-ir`, write the registers back, repeat.
 //!
-//! Addresses are physical addresses on a `Memory`: the MMU is card C8. The
-//! loop takes the exceptions and the interrupts of the guest itself
-//! (`exception.rs`) and runs the system instructions that end a block
-//! (`Trap`). It stops for what only its owner can serve: a hypercall, a
-//! `WFI` with no interrupt line high, the end of a budget, and an
-//! instruction that has no lifter yet. A load or a store that fails still
-//! stops it too (`Stop::DataAbort`, `Stop::Alignment`): the translation card
-//! (C8) gives those their syndromes.
+//! The addresses of a guest are virtual. Every fetch, load and store goes
+//! through the softmmu TLB of the CPU (`mmu.rs`, DESIGN.md R12) to a
+//! physical address on a `Memory`, also while the MMU of the guest is off.
+//! The loop takes the exceptions and the interrupts of the guest itself
+//! (`exception.rs`), among them the data and instruction aborts, and runs
+//! the system instructions that end a block (`Trap`). It stops for what
+//! only its owner can serve: a hypercall, a `WFI` with no interrupt line
+//! high, the end of a budget, and an instruction that has no lifter yet.
 //!
 //! A block is lowered once into its pre-decoded form (`block`, the gate of
 //! card C5) and kept under its PC. That form is pure scalar code with memory
@@ -34,18 +34,29 @@
 //! often than QEMU's: a write of another CPU fails it also when it left the
 //! value as it was.
 //!
+//! A block is kept under its virtual PC, its context and the physical
+//! address of its code, so a new mapping of the same PC finds no old block.
+//! It also keeps the code stamp of the memory for its bytes
+//! (`Memory::code_stamp`). A store of this CPU into a page that holds
+//! translated code, and a write of anything else to the memory, start a new
+//! epoch: a block of an older epoch is used again only when its stamp still
+//! holds. A write of another CPU is seen at the start of `run` and `step`
+//! and at every exception and exception return, which are the points where
+//! the architecture lets a CPU see new code.
+//!
 //! Sources read: S6 for what a system instruction does at each level (the
-//! lockstep of card C6 and the probe of the system registers). This file
-//! holds no other instruction semantics.
+//! lockstep of the cards C6 and C8 and the probe of the system registers).
+//! This file holds no other instruction semantics.
 
 use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
-use crate::lift::{A64Exit, A64Next, Builder, Lifted, PstateField, Trap, lift};
+use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
+use crate::mmu::{self, Kind, Miss, Mmu, Regime};
 use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
-use vmlab_hv_tcg::{Error, Memory};
+use vmlab_hv_tcg::{CodeStamp, Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
@@ -77,15 +88,6 @@ pub enum Stop {
     /// The record is decoded and has no lifter yet. The PC of the state is
     /// the instruction, and no part of it has changed the state.
     Unimplemented { pc: u64, record: Record },
-    /// The memory holds nothing at the address of a load or a store: a data
-    /// abort. The PC of the state is the instruction, which has changed no
-    /// register. A store of several parts (a pair, `ST2` to `ST4`) has
-    /// written the parts before the one that failed.
-    DataAbort { pc: u64, address: u64, write: bool },
-    /// An access to an address that is not a multiple of its size: an
-    /// alignment fault. On this flat memory every load and store asks for
-    /// its alignment, as QEMU does with the MMU off.
-    Alignment { pc: u64, address: u64 },
     /// `HVC` or `SMC` at EL1, at the address `pc`. The PC of the state is
     /// the instruction after it. The machine serves the call (PSCI on
     /// `virt`) and runs on, or refuses it with `Cpu::refuse_hypercall`.
@@ -120,6 +122,9 @@ pub enum Unknown {
     /// `MRS` or `MSR` of a register without a row, or one that the CPU
     /// model leaves out.
     Register { encoding: u16, write: bool },
+    /// `SYS` or `SYSL` of an operation that the CPU does not have, by
+    /// op1:CRn:CRm:op2.
+    Operation { encoding: u16, read: bool },
 }
 
 impl std::fmt::Display for Unknown {
@@ -132,8 +137,44 @@ impl std::fmt::Display for Unknown {
                 if *write { "write" } else { "read" },
                 sysreg::name(*encoding)
             ),
+            Self::Operation { encoding, read } => write!(
+                f,
+                "{} of the system operation {}, which this CPU does not have",
+                if *read { "SYSL" } else { "SYS" },
+                operation_name(*encoding)
+            ),
         }
     }
+}
+
+/// The name of a `SYS` operation for a log line: the names of the LLVM
+/// tables, or the generic form.
+pub fn operation_name(encoding: u16) -> String {
+    use crate::generated::sysreg::{AT_OPS, DC_OPS, IC_OPS, TLBI_OPS};
+    let named = |kind: &str, name: &str| format!("{kind} {name}");
+    if let Some(op) = DC_OPS.iter().find(|op| op.encoding == encoding) {
+        return named("DC", op.name);
+    }
+    if let Some(op) = AT_OPS.iter().find(|op| op.encoding == encoding) {
+        return named("AT", op.name);
+    }
+    if let Some(op) = IC_OPS.iter().find(|op| op.encoding == encoding) {
+        return named("IC", op.name);
+    }
+    let (op1, crn, crm, op2) = (
+        encoding >> 11 & 7,
+        encoding >> 7 & 15,
+        encoding >> 3 & 15,
+        encoding & 7,
+    );
+    if crn == 8
+        && let Some(op) = TLBI_OPS.iter().find(|op| {
+            u16::from(op.op1) == op1 && u16::from(op.crm) == crm && u16::from(op.op2) == op2
+        })
+    {
+        return named("TLBI", op.name);
+    }
+    format!("S1_{op1}_C{crn}_C{crm}_{op2}")
 }
 
 /// The hook for a register without a row. `write`: the value of an `MSR`.
@@ -174,7 +215,10 @@ pub struct Access {
 /// The mark that an exclusive load leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reservation {
+    /// The virtual address of the load, which a store is compared with.
     address: u64,
+    /// The physical address, which the memory keeps the generation of.
+    phys: u64,
     /// The size of the load.
     bytes: u8,
     generation: u64,
@@ -182,20 +226,55 @@ struct Reservation {
 
 /// Why an access did not complete.
 enum Fault {
-    /// The memory holds nothing there.
-    Memory,
-    /// The address is not a multiple of the size of an exclusive store.
-    Unaligned,
+    /// A fault of the guest, with the address for FAR_EL1.
+    Abort(mmu::Fault, u64),
     Host(String),
 }
 
-impl From<Error> for Fault {
-    fn from(error: Error) -> Self {
+impl Fault {
+    /// What a failed translation of `address` is.
+    fn of(miss: Miss, address: u64) -> Self {
+        match miss {
+            Miss::Fault(fault) => Self::Abort(fault, address),
+            Miss::Host(message) => Self::Host(message),
+        }
+    }
+
+    /// What an error of the memory at the translation of `address` is: the
+    /// memory holds nothing there, which is an external abort.
+    fn memory(error: Error, address: u64) -> Self {
         match error {
-            Error::Memory(_) => Self::Memory,
+            Error::Memory(_) => Self::Abort(mmu::Fault::EXTERNAL, address),
             other => Self::Host(other.to_string()),
         }
     }
+}
+
+/// Why a store did not complete.
+enum Unstored {
+    /// It goes into a page of translated code, in a block of more than one
+    /// instruction.
+    Retry,
+    Fault(Fault),
+    /// A fault that says "read": the alignment fault of an exclusive store,
+    /// which QEMU reports that way (the lockstep of card C8).
+    ReadFault(Fault),
+}
+
+impl From<Fault> for Unstored {
+    fn from(fault: Fault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
+/// Where the bytes of an access are: the physical address of the first, how
+/// many of them the first page holds, and the physical address of the rest
+/// when the access crosses into another page.
+#[derive(Clone, Copy)]
+struct Spot {
+    first: u64,
+    in_first: usize,
+    second: u64,
 }
 
 /// What a block needs beside the registers and the memory.
@@ -208,23 +287,34 @@ struct Side {
     exclusive_high: u64,
     /// The accesses since the caller last took them, when it asked for them.
     log: Option<Vec<Access>>,
+    /// A filter in front of `code_set`: a bit for the low bits of each
+    /// physical page that holds translated code.
     code_pages: Vec<u64>,
-    /// Stores of this CPU since the caches were last checked.
+    /// The physical pages that hold translated code.
+    code_set: std::collections::HashSet<u64>,
+    /// Writes of this CPU to the memory since the caches were last checked.
     own_writes: u64,
     /// One of them went into a page that holds translated code.
     code_written: bool,
+    /// The translations of the CPU.
+    mmu: Mmu,
+    /// The block that runs is at EL0.
+    user: bool,
 }
 
 impl Side {
-    fn new() -> Self {
+    fn new(state: &State) -> Self {
         Self {
             exclusive: None,
             exclusive_value: 0,
             exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
+            code_set: std::collections::HashSet::new(),
             own_writes: 0,
             code_written: false,
+            mmu: Mmu::new(state),
+            user: false,
         }
     }
 
@@ -233,21 +323,40 @@ impl Side {
         (page / 64, 1 << (page % 64))
     }
 
+    /// The page of the physical address holds translated code from now on.
     fn mark_code(&mut self, address: u64) {
         let (word, bit) = Self::page_bit(address);
         self.code_pages[word] |= bit;
+        self.code_set.insert(address >> 12);
     }
 
-    fn is_code(&self, address: u64, bytes: u8) -> bool {
+    /// Whether the page of the physical address can hold translated code.
+    /// `false` is exact, and `true` asks `code_set`.
+    #[inline(always)]
+    fn maybe_code(&self, address: u64) -> bool {
         let (word, bit) = Self::page_bit(address);
-        let (last_word, last_bit) = Self::page_bit(address.wrapping_add(u64::from(bytes) - 1));
-        self.code_pages[word] & bit != 0 || self.code_pages[last_word] & last_bit != 0
+        self.code_pages[word] & bit != 0
     }
 
-    fn wrote(&mut self, address: u64, bytes: u8, value: u128) {
-        self.own_writes += 1;
-        if self.is_code(address, bytes) {
+    /// Whether the bytes at `spot` are in a page that holds translated code.
+    fn is_code(&self, spot: Spot, bytes: u8) -> bool {
+        let holds =
+            |address: u64| self.maybe_code(address) && self.code_set.contains(&(address >> 12));
+        holds(spot.first) || (spot.in_first < usize::from(bytes) && holds(spot.second))
+    }
+
+    /// A store of this CPU reached the memory, in `writes` parts. `code`: it
+    /// went into a page of translated code. The page is one no more: its
+    /// blocks do not pass their stamp, and translating one marks it again.
+    fn wrote(&mut self, address: u64, spot: Spot, bytes: u8, value: u128, code: bool) {
+        let crossed = spot.in_first < usize::from(bytes);
+        self.own_writes += 1 + u64::from(crossed);
+        if code {
             self.code_written = true;
+            self.code_set.remove(&(spot.first >> 12));
+            if crossed {
+                self.code_set.remove(&(spot.second >> 12));
+            }
         }
         if let Some(log) = &mut self.log {
             log.push(Access {
@@ -259,21 +368,147 @@ impl Side {
         }
     }
 
+    /// Where the `bytes` bytes at the virtual address `va` are, for an
+    /// access of `kind` made as EL0 when `user`.
+    #[inline(always)]
+    fn resolve<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        bytes: u8,
+        kind: Kind,
+        user: bool,
+    ) -> Result<Spot, Fault> {
+        if let Some((first, _)) = self.mmu.hit(va, bytes.into(), mmu::needed(kind, user)) {
+            return Ok(Spot {
+                first,
+                in_first: bytes.into(),
+                second: 0,
+            });
+        }
+        self.resolve_slow(memory, va, bytes, kind, user)
+    }
+
+    #[cold]
+    fn resolve_slow<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        bytes: u8,
+        kind: Kind,
+        user: bool,
+    ) -> Result<Spot, Fault> {
+        let (first, _) = self
+            .mmu
+            .translate(memory, va, kind, user)
+            .map_err(|miss| Fault::of(miss, va))?;
+        let in_first = (0x1000 - (va & 0xfff)).min(u64::from(bytes)) as usize;
+        let mut spot = Spot {
+            first,
+            in_first,
+            second: 0,
+        };
+        if in_first < usize::from(bytes) {
+            // The rest is in the next page, which has a translation of its
+            // own. A fault there names the first address of that page.
+            let next = va.wrapping_add(in_first as u64);
+            spot.second = self
+                .mmu
+                .translate(memory, next, kind, user)
+                .map_err(|miss| Fault::of(miss, next))?
+                .0;
+        }
+        Ok(spot)
+    }
+
+    /// Whether an access at `va` that is not aligned to its size takes an
+    /// alignment fault: with SCTLR_EL1.A, and in Device memory. The order
+    /// of the faults is what the lockstep found on QEMU:
+    ///
+    /// - While the MMU is off all memory is Device memory, and the fault
+    ///   comes before every other one, also for an address that is wider
+    ///   than a physical address. With SCTLR_EL1.A it comes first too.
+    /// - In Device memory it comes after the faults of the walk for the
+    ///   page (translation, address size, access flag) and before the
+    ///   permission fault of the page.
+    /// - The page of the first byte decides. An access that crosses from
+    ///   Normal memory into Device memory does not fault.
+    ///
+    /// `false` where another fault comes first: the access itself reports
+    /// that one.
+    /// `device`: the alignment in bytes that Device memory asks of the
+    /// access, which is none for a structure of vector registers.
+    #[cold]
+    fn unaligned_faults<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        kind: Kind,
+        device: u8,
+    ) -> bool {
+        let controls = *self.mmu.controls();
+        if !controls.enabled || controls.strict_alignment {
+            return true;
+        }
+        va & (u64::from(device.max(1)) - 1) != 0
+            && self
+                .mmu
+                .page(memory, va, kind)
+                .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
+    }
+
+    fn read_at<M: Memory>(
+        memory: &mut M,
+        va: u64,
+        spot: Spot,
+        part: &mut [u8],
+    ) -> Result<(), Fault> {
+        let (low, high) = part.split_at_mut(spot.in_first);
+        memory
+            .read(spot.first, low)
+            .map_err(|error| Fault::memory(error, va))?;
+        if !high.is_empty() {
+            memory
+                .read(spot.second, high)
+                .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
+        }
+        Ok(())
+    }
+
+    fn write_at<M: Memory>(memory: &mut M, va: u64, spot: Spot, part: &[u8]) -> Result<(), Fault> {
+        let (low, high) = part.split_at(spot.in_first);
+        memory
+            .write(spot.first, low)
+            .map_err(|error| Fault::memory(error, va))?;
+        if !high.is_empty() {
+            memory
+                .write(spot.second, high)
+                .map_err(|error| Fault::memory(error, va.wrapping_add(spot.in_first as u64)))?;
+        }
+        Ok(())
+    }
+
     fn load<M: Memory>(
         &mut self,
         memory: &mut M,
         address: u64,
         bytes: u8,
         exclusive: bool,
+        user: bool,
     ) -> Result<u128, Fault> {
+        let spot = self.resolve(memory, address, bytes, Kind::Read, user)?;
         let mut buffer = [0u8; 16];
         let part = &mut buffer[..usize::from(bytes)];
         if exclusive {
-            // A failed load leaves the monitor as it was.
-            let generation = memory.load_reserved(address, part)?;
+            // A failed load leaves the monitor as it was. An exclusive load
+            // is aligned, so it is in one page.
+            let generation = memory
+                .load_reserved(spot.first, part)
+                .map_err(|error| Fault::memory(error, address))?;
             let value = u128::from_le_bytes(buffer);
             self.exclusive = Some(Reservation {
                 address,
+                phys: spot.first,
                 bytes,
                 generation,
             });
@@ -282,7 +517,7 @@ impl Side {
                 self.exclusive_high = (value >> 64) as u64;
             }
         } else {
-            memory.read(address, part)?;
+            Self::read_at(memory, address, spot, part)?;
         }
         let value = u128::from_le_bytes(buffer);
         if let Some(log) = &mut self.log {
@@ -296,17 +531,26 @@ impl Side {
         Ok(value)
     }
 
+    /// `single`: the block is one instruction, which makes its stores also
+    /// into a page of translated code.
     fn store<M: Memory>(
         &mut self,
         memory: &mut M,
         address: u64,
         bytes: u8,
         value: u128,
-    ) -> Result<(), Fault> {
+        user: bool,
+        single: bool,
+    ) -> Result<(), Unstored> {
+        let spot = self.resolve(memory, address, bytes, Kind::Write, user)?;
+        let code = self.is_code(spot, bytes);
+        if code && !single {
+            return Err(Unstored::Retry);
+        }
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
         match self.exclusive {
-            None => memory.write(address, part)?,
+            None => Self::write_at(memory, address, spot, part)?,
             Some(reservation) => {
                 // The store moves the write generation of its granules, and
                 // those can be the reserved ones. A reservation that was
@@ -316,18 +560,53 @@ impl Side {
                 let lock = memory.transaction_lock();
                 let _atomic = lock.as_ref().map(|lock| lock.lock());
                 let len = usize::from(reservation.bytes);
-                let intact = memory.reservation_generation(reservation.address, len)
-                    == reservation.generation;
-                memory.write(address, part)?;
+                let intact =
+                    memory.reservation_generation(reservation.phys, len) == reservation.generation;
+                Self::write_at(memory, address, spot, part)?;
                 if intact {
                     self.exclusive = Some(Reservation {
-                        generation: memory.reservation_generation(reservation.address, len),
+                        generation: memory.reservation_generation(reservation.phys, len),
                         ..reservation
                     });
                 }
             }
         }
-        self.wrote(address, bytes, value);
+        self.wrote(address, spot, bytes, value, code);
+        Ok(())
+    }
+
+    /// `DC ZVA`: zeros in the block of `ZERO_BLOCK` bytes that holds
+    /// `address`.
+    fn zero<M: Memory>(&mut self, memory: &mut M, address: u64, user: bool) -> Result<(), Fault> {
+        let base = address & !(ZERO_BLOCK as u64 - 1);
+        // The block is aligned to its size, so it is in one page. A fault
+        // names the address that the instruction gave, as QEMU's does.
+        let spot =
+            self.resolve(memory, base, 1, Kind::Write, user)
+                .map_err(|fault| match fault {
+                    Fault::Abort(fault, _) => Fault::Abort(fault, address),
+                    host => host,
+                })?;
+        let code = self.is_code(spot, 1);
+        // An external abort names the first byte of the block.
+        memory
+            .write(spot.first, &[0u8; ZERO_BLOCK])
+            .map_err(|error| Fault::memory(error, base))?;
+        self.own_writes += 1;
+        if code {
+            self.code_written = true;
+            self.code_set.remove(&(spot.first >> 12));
+        }
+        if let Some(log) = &mut self.log {
+            for half in 0..ZERO_BLOCK / 16 {
+                log.push(Access {
+                    address: base + 16 * half as u64,
+                    bytes: 16,
+                    value: 0,
+                    write: true,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -341,7 +620,9 @@ impl Side {
         address: u64,
         bytes: u8,
         value: u128,
-    ) -> Result<(bool, bool), Fault> {
+        user: bool,
+        single: bool,
+    ) -> Result<(bool, bool), Unstored> {
         // QEMU keeps "no mark" as the address 2^64 - 1, so for it a store
         // there is at the marked address also without a mark, and is an
         // access that can fault. The architecture leaves open whether an
@@ -356,14 +637,27 @@ impl Side {
         // From here the store is an access. One that faults leaves the
         // mark, as its instruction did not complete.
         if address & (u64::from(bytes) - 1) != 0 {
-            return Err(Fault::Unaligned);
+            return Err(Unstored::ReadFault(Fault::Abort(
+                mmu::Fault::ALIGNMENT,
+                address,
+            )));
         }
+        // The store is aligned, so it is in one page. It is an access that
+        // writes, also when it then finds another value and writes nothing.
+        let spot = self.resolve(memory, address, bytes, Kind::Write, user)?;
+        let code = self.is_code(spot, bytes);
+        if code && !single {
+            return Err(Unstored::Retry);
+        }
+        let phys = spot.first;
         let buffer = value.to_le_bytes();
         let part = &buffer[..usize::from(bytes)];
         let lock = memory.transaction_lock();
         let _atomic = lock.as_ref().map(|lock| lock.lock());
         let mut now = [0u8; 16];
-        memory.read(address, &mut now[..usize::from(bytes)])?;
+        memory
+            .read(phys, &mut now[..usize::from(bytes)])
+            .map_err(|error| Fault::memory(error, address))?;
         let now = u128::from_le_bytes(now);
         let Some(reservation) = self.exclusive.take() else {
             return Ok((false, false));
@@ -378,19 +672,23 @@ impl Side {
             return Ok((false, false));
         }
         let wrote = if bytes == reservation.bytes {
-            memory.store_conditional(address, part, reservation.generation)?
-        } else if memory.reservation_generation(reservation.address, usize::from(reservation.bytes))
+            memory
+                .store_conditional(phys, part, reservation.generation)
+                .map_err(|error| Fault::memory(error, address))?
+        } else if memory.reservation_generation(reservation.phys, usize::from(reservation.bytes))
             == reservation.generation
         {
             // A store of another size than its load: the granules of the
             // load are untouched, and the lock is held.
-            memory.write(address, part)?;
+            memory
+                .write(phys, part)
+                .map_err(|error| Fault::memory(error, address))?;
             true
         } else {
             false
         };
         if wrote {
-            self.wrote(address, bytes, value);
+            self.wrote(address, spot, bytes, value, code);
         }
         Ok((wrote, wrote && whole))
     }
@@ -405,6 +703,8 @@ enum Access16 {
         result: Place,
         bytes: u8,
         exclusive: bool,
+        /// The access is made as EL0, whatever the level.
+        unprivileged: bool,
         exit: u32,
     },
     Write {
@@ -413,9 +713,13 @@ enum Access16 {
         bytes: u8,
         /// The word of the result of an exclusive store.
         exclusive: Option<Slot>,
+        unprivileged: bool,
         exit: u32,
     },
 }
+
+/// The bit of `Op::aux` of a load or a store that is made as EL0.
+const UNPRIVILEGED: u8 = 0x80;
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]
@@ -427,17 +731,29 @@ struct Leave {
     completed: u32,
     /// The word of the address of an alignment fault.
     address: Option<Slot>,
+    class: ExceptionClass,
 }
 
 /// Why an effect did not complete.
 enum Failed {
-    /// The condition of a guard did not hold.
+    /// The condition of a guard did not hold, and the guard names no
+    /// exception.
     Guard,
-    /// A load or a store, with its address and whether it is a store.
-    Access(Fault, u64, bool),
+    /// A load or a store, and whether it is a store.
+    Access(Fault, bool),
     /// A store into a page of translated code, in a block of more than one
     /// instruction.
     Retry,
+}
+
+impl Failed {
+    fn store(refused: Unstored) -> Self {
+        match refused {
+            Unstored::Retry => Self::Retry,
+            Unstored::Fault(fault) => Self::Access(fault, true),
+            Unstored::ReadFault(fault) => Self::Access(fault, false),
+        }
+    }
 }
 
 /// Why a block left before its end.
@@ -447,6 +763,9 @@ enum Halt {
     /// the block. It costs one instruction of a budget, so that a guest
     /// with a broken vector does not hold the loop for ever.
     Taken,
+    /// An instruction of the block takes this exception. The registers are
+    /// those before it.
+    Raise(Exception),
     /// A store into a page that holds translated code, in a block of more
     /// than one instruction. Nothing of the instruction is lost: the loop
     /// runs it alone and then drops the translated blocks.
@@ -456,7 +775,13 @@ enum Halt {
 /// A block as the loop runs it: the pre-decoded form of `block`.
 struct Compiled {
     pc: u64,
+    /// The physical address of the first instruction.
+    phys: u64,
     context: Context,
+    /// The stamp of the memory for the bytes of the code, and the epoch of
+    /// the CPU in which the stamp was last seen to hold.
+    stamp: Option<CodeStamp>,
+    epoch: u64,
     instructions: u32,
     /// The operations in the order in which they run: the pure ones, and
     /// between them the loads, the stores, the guards and the helper calls.
@@ -660,7 +985,7 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { syndrome, .. } = &payload.next else {
+                let A64Next::Exception { class, syndrome } = &payload.next else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
@@ -668,11 +993,17 @@ fn compile(
                     outputs,
                     completed: payload.completed,
                     address: syndrome.first().map(|scalar| lowering.word(*scalar)),
+                    class: *class,
                 });
                 leave_of[exit] = Some(leave);
                 leave
             }
         };
+        let unprivileged = matches!(
+            parts.leaves[leave as usize].class,
+            ExceptionClass::DataAbort { unprivileged: true }
+        );
+        let mode = if unprivileged { UNPRIVILEGED } else { 0 };
         match event {
             Event::Guard {
                 condition,
@@ -712,11 +1043,12 @@ fn compile(
                         result: place,
                         bytes: *bytes,
                         exclusive: *exclusive,
+                        unprivileged,
                         exit: leave,
                     });
                     lowering.effect(code, 0, 0, 0, 0, index.into());
                 } else {
-                    lowering.effect(code, *bytes, place.slot, address, 0, leave.into());
+                    lowering.effect(code, *bytes | mode, place.slot, address, 0, leave.into());
                 }
             }
             Event::WriteMemory {
@@ -748,12 +1080,13 @@ fn compile(
                                 return Err(host("an exclusive store without a result"));
                             }
                         },
+                        unprivileged,
                         exit: leave,
                     });
                     lowering.effect(code, 0, 0, 0, 0, index.into());
                 } else {
                     let value = lowering.word(*value);
-                    lowering.effect(code, *bytes, 0, at, value, leave.into());
+                    lowering.effect(code, *bytes | mode, 0, at, value, leave.into());
                 }
             }
             Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => {}
@@ -764,7 +1097,10 @@ fn compile(
     };
     Ok(Compiled {
         pc,
+        phys: pc,
         context,
+        stamp: None,
+        epoch: 0,
         instructions,
         ops: lowering.ops,
         generics: lowering.generics,
@@ -795,22 +1131,26 @@ fn load<M: Memory, const N: usize>(
     side: &mut Side,
 ) -> Result<(), (u32, Failed)> {
     let at = frame[usize::from(op.a)];
-    // The common case: nothing keeps the accesses, and the memory holds the
-    // address. A read that fails has changed nothing, and the general path
-    // reads again to say why.
-    if side.log.is_none() {
+    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    // The common case: the TLB holds the page with the permission, nothing
+    // keeps the accesses, and the memory holds the address. A read that
+    // fails has changed nothing, and the general path reads again to say
+    // why.
+    if side.log.is_none()
+        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Read, user))
+    {
         let mut bytes = [0u8; 8];
-        if memory.read(at, &mut bytes[..N]).is_ok() {
+        if memory.read(phys, &mut bytes[..N]).is_ok() {
             frame[usize::from(op.dst)] = u64::from_le_bytes(bytes);
             return Ok(());
         }
     }
-    match side.load(memory, at, N as u8, false) {
+    match side.load(memory, at, N as u8, false, user) {
         Ok(value) => {
             frame[usize::from(op.dst)] = value as u64;
             Ok(())
         }
-        Err(fault) => Err((op.imm as u32, Failed::Access(fault, at, false))),
+        Err(fault) => Err((op.imm as u32, Failed::Access(fault, false))),
     }
 }
 
@@ -826,23 +1166,23 @@ fn store<M: Memory, const N: usize>(
     let at = frame[usize::from(op.a)];
     let value = frame[usize::from(op.b)];
     let exit = op.imm as u32;
-    let code = side.is_code(at, N as u8);
-    if !single && code {
-        return Err((exit, Failed::Retry));
-    }
-    // The common case: no exclusive mark to carry over the store, and
-    // nothing keeps the accesses. A write that fails has changed nothing,
-    // and the general path writes again to say why.
+    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    // The common case: the TLB holds the page with the permission, the page
+    // holds no translated code, there is no exclusive mark to carry over
+    // the store, and nothing keeps the accesses. A write that fails has
+    // changed nothing, and the general path writes again to say why.
     if side.exclusive.is_none()
         && side.log.is_none()
-        && memory.write(at, &value.to_le_bytes()[..N]).is_ok()
+        && let Some((phys, _)) = side.mmu.hit(at, N as u64, mmu::needed(Kind::Write, user))
+        && !side.maybe_code(phys)
+        && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
     {
         side.own_writes += 1;
-        side.code_written |= code;
         return Ok(());
     }
-    side.store(memory, at, N as u8, u128::from(value) & bits_mask(N as u8))
-        .map_err(|fault| (exit, Failed::Access(fault, at, true)))
+    let value = u128::from(value) & bits_mask(N as u8);
+    side.store(memory, at, N as u8, value, user, single)
+        .map_err(|refused| (exit, Failed::store(refused)))
 }
 
 impl Compiled {
@@ -854,6 +1194,7 @@ impl Compiled {
         frame: &mut [u64],
         accesses: &[Access16],
         calls: &[Call],
+        leaves: &[Leave],
         state: &mut State,
         memory: &mut M,
         side: &mut Side,
@@ -862,7 +1203,7 @@ impl Compiled {
         match op.code {
             Code::Guard => {
                 if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
-                    return Err((op.imm as u32, Failed::Guard));
+                    return Self::guard(op.imm as u32, frame, leaves, memory, side);
                 }
                 Ok(())
             }
@@ -882,6 +1223,35 @@ impl Compiled {
             // `block::step` runs every other code.
             _ => Ok(()),
         }
+    }
+
+    /// A guard whose condition does not hold. An alignment guard leaves the
+    /// block only where the access faults for its alignment.
+    #[cold]
+    fn guard<M: Memory>(
+        exit: u32,
+        frame: &[u64],
+        leaves: &[Leave],
+        memory: &mut M,
+        side: &mut Side,
+    ) -> Result<(), (u32, Failed)> {
+        let leave = &leaves[exit as usize];
+        let ExceptionClass::Alignment {
+            write,
+            always,
+            device,
+            ..
+        } = leave.class
+        else {
+            return Err((exit, Failed::Guard));
+        };
+        let address = leave.address.map_or(0, |slot| frame[usize::from(slot)]);
+        let kind = if write { Kind::Write } else { Kind::Read };
+        if always || side.unaligned_faults(memory, address, kind, device) {
+            let fault = Fault::Abort(mmu::Fault::ALIGNMENT, address);
+            return Err((exit, Failed::Access(fault, write)));
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -925,12 +1295,14 @@ impl Compiled {
                 result,
                 bytes,
                 exclusive,
+                unprivileged,
                 exit,
             } => {
                 let at = frame[usize::from(address)];
-                match side.load(memory, at, bytes, exclusive) {
+                let user = side.user || unprivileged;
+                match side.load(memory, at, bytes, exclusive, user) {
                     Ok(value) => result.write(frame, value),
-                    Err(fault) => return Err((exit, Failed::Access(fault, at, false))),
+                    Err(fault) => return Err((exit, Failed::Access(fault, false))),
                 }
             }
             Access16::Write {
@@ -938,21 +1310,20 @@ impl Compiled {
                 value,
                 bytes,
                 exclusive,
+                unprivileged,
                 exit,
             } => {
                 let at = frame[usize::from(address)];
                 let value = value.read(frame) & bits_mask(bytes);
-                if !single && side.is_code(at, bytes) {
-                    return Err((exit, Failed::Retry));
-                }
+                let user = side.user || unprivileged;
                 match exclusive {
                     None => side
-                        .store(memory, at, bytes, value)
-                        .map_err(|fault| (exit, Failed::Access(fault, at, true)))?,
+                        .store(memory, at, bytes, value, user, single)
+                        .map_err(|refused| (exit, Failed::store(refused)))?,
                     Some(result) => {
                         let (_, succeeded) = side
-                            .store_exclusive(memory, at, bytes, value)
-                            .map_err(|fault| (exit, Failed::Access(fault, at, true)))?;
+                            .store_exclusive(memory, at, bytes, value, user, single)
+                            .map_err(|refused| (exit, Failed::store(refused)))?;
                         frame[usize::from(result)] = u64::from(!succeeded);
                     }
                 }
@@ -969,24 +1340,18 @@ impl Compiled {
         for (register, place) in &leave.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
         }
-        let pc = state.pc();
         let halt = match failed {
             Failed::Retry => Halt::Retry,
-            // The guards of this card are alignment checks, and their exit
-            // holds the address.
-            Failed::Guard => Halt::Stop(Stop::Alignment {
-                pc,
-                address: leave
-                    .address
-                    .map_or(0, |slot| self.frame[usize::from(slot)]),
-            }),
-            Failed::Access(Fault::Memory, address, write) => {
-                Halt::Stop(Stop::DataAbort { pc, address, write })
+            Failed::Guard => Halt::Stop(host("a guard that names no exception")),
+            Failed::Access(Fault::Abort(fault, address), write) => {
+                Halt::Raise(Exception::DataAbort {
+                    status: fault.status(),
+                    write,
+                    cache: false,
+                    address,
+                })
             }
-            Failed::Access(Fault::Unaligned, address, _) => {
-                Halt::Stop(Stop::Alignment { pc, address })
-            }
-            Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
+            Failed::Access(Fault::Host(message), _) => Halt::Stop(Stop::Host(message)),
         };
         (leave.completed, Some(halt))
     }
@@ -1004,8 +1369,9 @@ impl Compiled {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
         // A block of one instruction makes its stores also into a page of
-        // translated code, and the loop drops the blocks after it.
+        // translated code, and the loop starts a new epoch after it.
         let single = self.instructions == 1;
+        side.user = self.context.el == 0;
         for op in &self.ops {
             if (op.code as u8) < FIRST_EFFECT {
                 if !block::step(op, &mut self.frame, &self.generics) {
@@ -1023,6 +1389,7 @@ impl Compiled {
                 &mut self.frame,
                 &self.accesses,
                 &self.calls,
+                &self.leaves,
                 state,
                 memory,
                 side,
@@ -1057,12 +1424,6 @@ impl Cache {
     fn index(pc: u64) -> usize {
         (pc >> 2) as usize & (CACHE_ENTRIES - 1)
     }
-
-    fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
-    }
 }
 
 /// One CPU on a memory.
@@ -1092,10 +1453,16 @@ pub struct Cpu<M> {
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
-    /// The write generation of the memory that the caches were filled under.
+    /// The write generation of the memory at the last check of the caches.
     generation: u64,
+    /// A block whose epoch is this one is known to hold the code that the
+    /// memory holds.
+    epoch: u64,
     side: Side,
 }
+
+/// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
+pub const ZERO_BLOCK: usize = 64;
 
 /// The most entries of `Cpu::unknown`. A guest that walks an encoding space
 /// must not fill the memory of the host.
@@ -1104,6 +1471,7 @@ const UNKNOWN_ENTRIES: usize = 4096;
 impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
+        let side = Side::new(&state);
         Self {
             state,
             memory,
@@ -1119,8 +1487,28 @@ impl<M: Memory> Cpu<M> {
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
-            side: Side::new(),
+            epoch: 1,
+            side,
         }
+    }
+
+    /// The physical address of the virtual address `va`, when it has one,
+    /// whatever its permissions. Nothing is changed.
+    pub fn physical_address(&mut self, va: u64) -> Option<u64> {
+        self.walk_trace(va).1
+    }
+
+    /// Walk the translation tables for `va` without the TLB: the
+    /// descriptors that the walk reads, as physical address and value, and
+    /// the physical address when `va` has one. Nothing is changed.
+    pub fn walk_trace(&mut self, va: u64) -> (Vec<(u64, u64)>, Option<u64>) {
+        self.side.mmu.sync(&self.state);
+        self.side.mmu.trace(&mut self.memory, va)
+    }
+
+    /// The count of translations that the TLB of the CPU holds.
+    pub fn tlb_entries(&self) -> usize {
+        self.side.mmu.entries()
     }
 
     /// Keep the loads and stores of the CPU from now on, or stop keeping
@@ -1164,6 +1552,8 @@ impl<M: Memory> Cpu<M> {
     }
 
     fn take(&mut self, cause: Cause, pc: u64) {
+        // An exception is a point where the CPU sees new code.
+        self.settle();
         exception::enter(&mut self.state, cause, pc);
         self.exceptions += 1;
         self.taken = Some(Taken {
@@ -1226,6 +1616,7 @@ impl<M: Memory> Cpu<M> {
         if write {
             sysreg::write(row, &mut self.state, &environment, value);
             self.state.refresh();
+            self.side.mmu.sync(&self.state);
         } else if rt != 31 {
             let value = sysreg::read(row, &self.state, &environment);
             self.state.set_x(usize::from(rt), value);
@@ -1258,6 +1649,124 @@ impl<M: Memory> Cpu<M> {
             }
         }
         Ok(())
+    }
+
+    /// `SYS` (or `SYSL` when `read`) of the operation op1:CRn:CRm:op2 with
+    /// the register `rt`: a cache, TLB or address translation operation.
+    /// The inner `Err`: the exception that it takes.
+    fn operation(
+        &mut self,
+        encoding: u16,
+        rt: u8,
+        read: bool,
+    ) -> Result<Result<(), Exception>, Stop> {
+        let el0 = self.state.context.el == 0;
+        let sctlr = self.state.system.regs[reg::SCTLR_EL1];
+        let value = match rt {
+            31 => 0,
+            n => self.state.x(usize::from(n)),
+        };
+        // op0 of a `SYS` is 1.
+        let trapped = Exception::SystemTrap(sysreg::trap_iss(0x4000 | encoding, rt.into(), !read));
+        let split = (
+            encoding >> 11 & 7,
+            encoding >> 7 & 15,
+            encoding >> 3 & 15,
+            encoding & 7,
+        );
+        let done = match split {
+            _ if read => None,
+            // IC IALLUIS and IALLU, DC IVAC, ISW, CSW and CISW: the caches
+            // of this CPU hold nothing that an operation could drop. The
+            // blocks follow the memory by their code stamps.
+            (0, 7, 1 | 5, 0) | (0, 7, 6, 1 | 2) | (0, 7, 10 | 14, 2) if !el0 => Some(Ok(())),
+            // IC IVAU, DC CVAC, CVAU and CIVAC: EL0 runs them with
+            // SCTLR_EL1.UCI.
+            (3, 7, 5, 1) | (3, 7, 10 | 11 | 14, 1) => Some(if el0 && sctlr & sctlr::UCI == 0 {
+                Err(trapped)
+            } else {
+                Ok(())
+            }),
+            // DC ZVA: EL0 runs it with SCTLR_EL1.DZE.
+            (3, 7, 4, 1) => Some(if el0 && sctlr & sctlr::DZE == 0 {
+                Err(trapped)
+            } else {
+                match self.side.zero(&mut self.memory, value, el0) {
+                    Ok(()) => Ok(()),
+                    Err(Fault::Abort(fault, address)) => Err(Exception::DataAbort {
+                        status: fault.status(),
+                        write: true,
+                        cache: false,
+                        address,
+                    }),
+                    Err(Fault::Host(message)) => return Err(Stop::Host(message)),
+                }
+            }),
+            // AT S1E1R, S1E1W, S1E0R and S1E0W: the result is in PAR_EL1.
+            (0, 7, 8, op2 @ 0..=3) if !el0 => {
+                let kind = if op2 & 1 == 0 {
+                    Kind::Read
+                } else {
+                    Kind::Write
+                };
+                let par = match self.side.mmu.walk(&mut self.memory, value, false) {
+                    Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
+                        mmu::par_of(&page)
+                    }
+                    Ok(page) => mmu::par_fault(mmu::Fault {
+                        kind: mmu::FaultKind::Permission,
+                        level: page.level,
+                    }),
+                    // A descriptor that the memory does not hold is an
+                    // exception and no result: QEMU takes the abort.
+                    Err(Miss::Fault(fault)) if fault.kind == mmu::FaultKind::ExternalOnWalk => {
+                        return Ok(Err(Exception::DataAbort {
+                            status: fault.status(),
+                            // The abort of an address translation
+                            // instruction says "write", also for a read.
+                            write: true,
+                            cache: true,
+                            address: value,
+                        }));
+                    }
+                    Err(Miss::Fault(fault)) => mmu::par_fault(fault),
+                    Err(Miss::Host(message)) => return Err(Stop::Host(message)),
+                };
+                self.state.system.regs[reg::PAR_EL1] = par;
+                Some(Ok(()))
+            }
+            // TLBI of the EL1&0 regime, on this CPU or on all of them: a
+            // machine with more CPUs hands the second kind on.
+            (0, 8, 3 | 7, op2) if !el0 => {
+                let asid = (value >> 48) as u16;
+                match op2 {
+                    // VMALLE1.
+                    0 => self.side.mmu.flush(),
+                    // VAE1 and VALE1: one address of one ASID.
+                    1 | 5 => self.side.mmu.flush_page(Regime::El10, value, Some(asid)),
+                    // ASIDE1.
+                    2 => self.side.mmu.flush_asid(Regime::El10, asid),
+                    // VAAE1 and VAALE1: one address of every ASID.
+                    3 | 7 => self.side.mmu.flush_page(Regime::El10, value, None),
+                    _ => return self.unknown_operation(encoding, read),
+                }
+                Some(Ok(()))
+            }
+            _ => None,
+        };
+        match done {
+            Some(done) => Ok(done),
+            None => self.unknown_operation(encoding, read),
+        }
+    }
+
+    fn unknown_operation(
+        &mut self,
+        encoding: u16,
+        read: bool,
+    ) -> Result<Result<(), Exception>, Stop> {
+        self.note(Unknown::Operation { encoding, read });
+        Ok(Err(Exception::Undefined))
     }
 
     /// Run the last instruction of a block, at `pc`.
@@ -1295,6 +1804,8 @@ impl<M: Memory> Cpu<M> {
             Trap::Eret => {
                 exception::exception_return(&mut self.state);
                 self.clear_exclusive();
+                // A return is a point where the CPU sees new code.
+                self.settle();
                 return Ok(());
             }
             Trap::ClearExclusive => {
@@ -1316,6 +1827,7 @@ impl<M: Memory> Cpu<M> {
             Trap::Mrs { encoding, rt } => self.register(encoding, rt, false),
             Trap::Msr { encoding, rt } => self.register(encoding, rt, true),
             Trap::MsrPstate { field, immediate } => self.pstate(field, immediate),
+            Trap::Sys { encoding, rt, read } => self.operation(encoding, rt, read)?,
         };
         match done {
             Ok(()) => self.state.set_pc(next),
@@ -1324,29 +1836,65 @@ impl<M: Memory> Cpu<M> {
         Ok(())
     }
 
-    /// Translate the block at the PC of the state, of at most `limit`
-    /// instructions.
-    fn translate(&mut self, limit: u32) -> Result<Compiled, Refused> {
+    /// The physical address of the instruction at the PC of the state, for
+    /// its execution at the level of the state.
+    #[inline(always)]
+    fn code_address(&mut self) -> Result<u64, Refused> {
         let pc = self.state.pc();
-        let context = self.state.context;
+        let need = mmu::needed(Kind::Execute, self.state.context.el == 0);
+        // An entry of the TLB is kept under the address with its tag, and
+        // a PC with a tag may have another translation than a data address
+        // with that tag: the slow path decides.
+        if pc & 3 == 0
+            && mmu::canonical(pc)
+            && let Some((phys, _)) = self.side.mmu.hit(pc, 4, need)
+        {
+            return Ok(phys);
+        }
+        self.code_address_slow()
+    }
+
+    #[cold]
+    fn code_address_slow(&mut self) -> Result<u64, Refused> {
+        let pc = self.state.pc();
         if pc & 3 != 0 {
             return Err(Refused::Exception(Exception::PcAlignment));
         }
+        let user = self.state.context.el == 0;
+        match self
+            .side
+            .mmu
+            .translate(&mut self.memory, pc, Kind::Execute, user)
+        {
+            Ok((phys, _)) => Ok(phys),
+            Err(Miss::Fault(fault)) => Err(Refused::Exception(Exception::InstructionAbort(
+                fault.status(),
+            ))),
+            Err(Miss::Host(message)) => Err(Refused::Stop(Stop::Host(message))),
+        }
+    }
+
+    /// Translate the block at the PC of the state, whose code is at the
+    /// physical address `phys`, of at most `limit` instructions.
+    fn translate(&mut self, phys: u64, limit: u32) -> Result<Compiled, Refused> {
+        let pc = self.state.pc();
+        let context = self.state.context;
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
         let mut count = 0;
         loop {
             let mut bytes = [0u8; 4];
-            match self.memory.read(at, &mut bytes) {
+            // A block stays inside one page, so one translation serves it.
+            match self
+                .memory
+                .read(phys.wrapping_add(at.wrapping_sub(pc)), &mut bytes)
+            {
                 Ok(()) => {}
                 Err(Error::Memory(_)) if count == 0 => {
-                    // Translation is card C8: the PC is a physical address.
-                    let status = if pc >> self.state.physical_address_bits() != 0 {
-                        exception::ADDRESS_SIZE
-                    } else {
-                        exception::EXTERNAL
-                    };
-                    return Err(Refused::Exception(Exception::InstructionAbort(status)));
+                    // The memory of the machine holds nothing there.
+                    return Err(Refused::Exception(Exception::InstructionAbort(
+                        exception::EXTERNAL,
+                    )));
                 }
                 // The block ends before the instruction. It is looked at
                 // again as the first of the next block.
@@ -1398,48 +1946,70 @@ impl<M: Memory> Cpu<M> {
             }
         }
         self.translations += 1;
-        self.side.mark_code(pc);
-        compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)
+        self.side.mark_code(phys);
+        let mut compiled =
+            compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)?;
+        compiled.phys = phys;
+        compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
+        compiled.epoch = self.epoch;
+        Ok(compiled)
     }
 
-    fn drop_blocks(&mut self) {
-        self.blocks.clear();
-        self.singles.clear();
-        self.side.code_pages.fill(0);
-    }
-
-    /// Drop every block when a write has reached the memory since the
-    /// caches were filled. Card C8 replaces this with the code stamps of the
-    /// pages.
+    /// Bring the caches up to date with the memory and with the system
+    /// registers, at the start of `run` and `step`: the owner of the CPU can
+    /// have changed either.
     fn check_generation(&mut self) {
-        let generation = self.memory.generation();
-        if generation != self.generation {
-            self.generation = generation;
-            self.drop_blocks();
-        }
+        self.side.mmu.sync(&self.state);
+        self.settle();
     }
 
-    /// Account for the stores of this CPU since the last check. They moved
-    /// the write generation of the memory. The blocks stay when no store
-    /// went into a page of translated code and the generation moved by our
-    /// stores alone. A memory whose generation does not count writes one by
-    /// one drops the blocks here, which is slow and correct.
-    ///
-    /// A write of another CPU to our code is seen here and at the start of
-    /// `run` and `step`, not between two blocks of one `run`. Card C8 closes
-    /// that with the code stamps.
+    /// Account for the writes to the memory since the last check. The
+    /// stores of this CPU moved the write generation of the memory by their
+    /// count. When one of them went into a page of translated code, or the
+    /// generation moved by more than that count, a new epoch starts: a block
+    /// of an older epoch is used again only when the code stamp of the
+    /// memory for its bytes still holds. A memory whose generation does not
+    /// count writes one by one starts an epoch here every time, which is
+    /// slow and correct.
     fn settle(&mut self) {
-        if self.side.own_writes == 0 {
-            return;
-        }
         let expected = self.generation.wrapping_add(self.side.own_writes);
         let generation = self.memory.generation();
         if self.side.code_written || generation != expected {
-            self.drop_blocks();
+            self.epoch += 1;
         }
         self.generation = generation;
         self.side.own_writes = 0;
         self.side.code_written = false;
+    }
+
+    /// Whether the block of the cache at `index` is the one for `pc` at
+    /// `phys` in `context`, and holds the code that the memory holds.
+    #[inline(always)]
+    fn usable(&mut self, single: bool, index: usize, pc: u64, phys: u64, context: Context) -> bool {
+        let cache = if single {
+            &mut self.singles
+        } else {
+            &mut self.blocks
+        };
+        let Some(block) = cache.entries[index].as_mut() else {
+            return false;
+        };
+        if block.pc != pc || block.phys != phys || block.context != context {
+            return false;
+        }
+        if block.epoch == self.epoch {
+            return true;
+        }
+        // A write reached the memory since the block was last looked at.
+        let stamp = self
+            .memory
+            .code_stamp(block.phys, block.instructions.max(1) as usize * 4);
+        if stamp.is_some() && stamp == block.stamp {
+            block.epoch = self.epoch;
+            true
+        } else {
+            false
+        }
     }
 
     /// Take what does not wait for an instruction: an interrupt whose line
@@ -1469,15 +2039,17 @@ impl<M: Memory> Cpu<M> {
         let pc = self.state.pc();
         let context = self.state.context;
         let index = Cache::index(pc);
-        let hit = {
-            let cache = if single { &self.singles } else { &self.blocks };
-            cache.entries[index]
-                .as_ref()
-                .is_some_and(|block| block.pc == pc && block.context == context)
+        let phys = match self.code_address() {
+            Ok(phys) => phys,
+            Err(Refused::Stop(stop)) => return Err(stop),
+            Err(Refused::Exception(exception)) => {
+                self.raise(exception, pc);
+                return Ok((0, Some(Halt::Taken)));
+            }
         };
-        if !hit {
+        if !self.usable(single, index, pc, phys, context) {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
-            let compiled = match self.translate(limit) {
+            let compiled = match self.translate(phys, limit) {
                 Ok(compiled) => Box::new(compiled),
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
@@ -1509,6 +2081,11 @@ impl<M: Memory> Cpu<M> {
     fn finish(&mut self, halt: Option<Halt>, terminal: Option<(u64, Trap)>) -> Option<Halt> {
         match (halt, terminal) {
             (None, Some((pc, trap))) => self.trap(pc, trap).err().map(Halt::Stop),
+            (Some(Halt::Raise(exception)), _) => {
+                let pc = self.state.pc();
+                self.raise(exception, pc);
+                Some(Halt::Taken)
+            }
             (halt, _) => halt,
         }
     }
@@ -1525,7 +2102,9 @@ impl<M: Memory> Cpu<M> {
         match halt {
             None | Some(Halt::Taken) => Ok(()),
             Some(Halt::Stop(stop)) => Err(stop),
-            Some(Halt::Retry) => Err(host("a block of one instruction asked to run alone")),
+            Some(Halt::Retry | Halt::Raise(_)) => Err(host(
+                "a block of one instruction left in a way that it cannot",
+            )),
         }
     }
 
@@ -1543,11 +2122,13 @@ impl<M: Memory> Cpu<M> {
             let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
-            // The common case: the block is translated and fits the budget.
+            let index = Cache::index(pc);
+            // The common case: the TLB holds the page of the code, and the
+            // block is translated and fits the budget.
             let outcome = if quiet
-                && let Some(block) = self.blocks.entries[Cache::index(pc)].as_mut()
-                && block.pc == pc
-                && block.context == context
+                && let Ok(phys) = self.code_address()
+                && self.usable(false, index, pc, phys, context)
+                && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
                 let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
@@ -1557,7 +2138,7 @@ impl<M: Memory> Cpu<M> {
                 // A whole block where the budget allows one, else one
                 // instruction. A block that is not translated yet can be as
                 // long as `BLOCK_INSTRUCTIONS`.
-                let cached = self.blocks.entries[Cache::index(pc)]
+                let cached = self.blocks.entries[index]
                     .as_ref()
                     .filter(|block| block.pc == pc && block.context == context)
                     .map(|block| u64::from(block.instructions));
@@ -1577,6 +2158,7 @@ impl<M: Memory> Cpu<M> {
                 None => {}
                 Some(Halt::Taken) => left = left.saturating_sub(1),
                 Some(Halt::Stop(stop)) => return stop,
+                Some(Halt::Raise(_)) => return host("an exception that the loop did not take"),
                 Some(Halt::Retry) => {
                     // The store goes into a page of translated code. The
                     // registers are those before its instruction: run it
@@ -1593,6 +2175,9 @@ impl<M: Memory> Cpu<M> {
                                 Some(Halt::Taken) => left = left.saturating_sub(1),
                                 _ => {}
                             }
+                            // The store is made: the blocks of its page
+                            // are looked at again.
+                            self.settle();
                         }
                         Err(stop) => return stop,
                     }
@@ -2221,7 +2806,8 @@ mod tests {
         state.set_x(0, 5);
         state.set_x(1, 7);
         let mut memory = FlatMemory::new(0x4000_0000, vec![0; 16]);
-        let (count, halt) = compiled.run(&mut state, &mut memory, &mut Side::new());
+        let mut side = Side::new(&state);
+        let (count, halt) = compiled.run(&mut state, &mut memory, &mut side);
         assert!(count == 1 && halt.is_none());
         assert_eq!(state.x(2), 19);
         assert_eq!(state.pc(), 0x4000_0004);

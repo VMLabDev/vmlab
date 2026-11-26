@@ -290,6 +290,40 @@ esac
         self.assertIn('Any program running as you', result.stderr)
         self.assertIn('serves no other user', result.stderr)
 
+    def test_grant_gives_the_helper_to_the_installing_account(self):
+        # Review install-release-2 F14: the bin directory belongs to another
+        # account (root:staff, group-writable), and the installing user is
+        # uid 1000, gid 1001. The helper must end with the account that
+        # consented, not with the owner of the directory.
+        self.fastpath_tools(swap_in=None)
+        self.tool('id', '#!/bin/sh\nset -eu\ncase "${1:-}" in\n'
+                  '  -u) printf "1000\\n" ;;\n  -g) printf "1001\\n" ;;\n'
+                  '  *) exit 1 ;;\nesac\n')
+        real_stat = shutil.which('stat')
+        self.tool('stat', '#!/bin/sh\nset -eu\n'
+                  'if [ "$*" = "-c %u:%g .." ]; then printf "0:50\\n"; exit 0; fi\n'
+                  f'exec {real_stat} "$@"\n')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        chowns = (self.root / 'chown.log').read_text().splitlines()
+        self.assertEqual(chowns, ['1000:1001 ./vmlab-fastpath'])
+        self.assertEqual(self.granted(), [self.helper_digest()])
+        self.assertIn('Granted:', result.stdout)
+
+    def test_grant_refuses_an_account_that_is_not_a_number(self):
+        # Root's script takes the account as an argument: anything but two
+        # numbers is refused before a file is granted.
+        self.fastpath_tools(swap_in=None)
+        self.tool('id', '#!/bin/sh\nset -eu\ncase "${1:-}" in\n'
+                  '  -u) printf "1000\\n" ;;\n  -g) printf "root\\n" ;;\n'
+                  '  *) exit 1 ;;\nesac\n')
+        result = self.install('--no-guest', '--fastpath')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.granted(), [])
+        self.assertFalse((self.root / 'chown.log').exists())
+        self.assertNotIn('Granted:', result.stdout)
+        self.assertEqual(self.staging_left(), [])
+
     def fastpath_tools(self, *, swap_in):
         """Stubs for a grant. `swap_in` names the tool that, when the installer
         starts it, first renames another program onto the helper's path: what
@@ -309,10 +343,14 @@ esac
         }
         for name, body in bodies.items():
             self.tool(name, '#!/bin/sh\nset -eu\n' + (swap if name == swap_in else '') + body)
-        self.tool('id', '#!/bin/sh\nset -eu\nprintf 1000\\n\n')
+        self.tool('id', '#!/bin/sh\nset -eu\nprintf "1000\\n"\n')
         self.tool('setcap', '#!/bin/sh\nset -eu\n[ "$1" = cap_bpf,cap_net_admin+ep ]\n'
                   'sha256sum "$2" | cut -d" " -f1 >> "$CAP_LOG"\n')
         self.tool('getcap', '#!/bin/sh\nprintf "%s cap_bpf,cap_net_admin=ep\\n" "$1"\n')
+        # The grant gives the helper to the installing account, which under
+        # the `id` stub is not the account of this test: record, do not run.
+        self.env['CHOWN_LOG'] = str(self.root / 'chown.log')
+        self.tool('chown', '#!/bin/sh\nset -eu\nprintf "%s\\n" "$*" >> "$CHOWN_LOG"\n')
 
     def granted(self):
         """The digest of every file that was given the capabilities."""

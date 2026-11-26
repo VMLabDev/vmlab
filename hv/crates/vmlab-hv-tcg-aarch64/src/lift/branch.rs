@@ -16,6 +16,7 @@ use crate::generated::decode::{
     BaseCmpBranch, BaseTestBranch, BranchCond, BranchImm, BranchReg, CallImm, Record,
 };
 use crate::state::slot;
+use vmlab_hv_tcg_ir::native::Binary;
 
 /// The address that a PC-relative field of `bits` bits names: the field
 /// counts instructions from the branch.
@@ -114,7 +115,21 @@ pub fn register(b: &mut Builder, record: Record, f: &BranchReg) -> Lifted {
         Record::BLR => true,
         _ => return Lifted::Unsupported,
     };
-    let target = b.x(f.rn, 64);
+    let mut target = b.x(f.rn, 64);
+    // With tagged addresses the PC does not keep the tag: in a half whose
+    // TCR.TBI is set, the top byte becomes the bit 55 repeated (card C8).
+    let tbi = b.context().tbi;
+    if tbi != 0 {
+        let bit = b.bit(target, 55);
+        let upper = b.to_bool(bit);
+        let ones = b.imm(64, 0xff << 56);
+        let high = b.binary(64, Binary::Or, target, ones);
+        let zeros = b.imm(64, !(0xff << 56));
+        let low = b.binary(64, Binary::And, target, zeros);
+        let when_upper = if tbi & 2 != 0 { high } else { target };
+        let when_lower = if tbi & 1 != 0 { low } else { target };
+        target = b.select(64, upper, when_upper, when_lower);
+    }
     if link_register {
         link(b);
     }

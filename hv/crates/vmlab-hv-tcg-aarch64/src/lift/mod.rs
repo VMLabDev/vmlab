@@ -75,6 +75,8 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
             loadstore::signed_offset(builder, record, Index::Offset, f.offset, f.rn, f.rt)
         }
         Fields::BaseLoadStoreUnprivileged(f) => {
+            // `LDTR` and `STTR`: the access is made as EL0 (card C8).
+            builder.unprivileged();
             loadstore::signed_offset(builder, record, Index::Offset, f.offset, f.rn, f.rt)
         }
         Fields::LoadPreIdx(f) => {
@@ -365,6 +367,8 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         Fields::MRSI(fields) => system::mrs(builder, record, fields),
         Fields::MSRI(fields) => system::msr(builder, record, fields),
         Fields::MSRpstateImm0_15(fields) => system::msr_pstate(builder, record, fields),
+        Fields::SystemXtI(f) => system::sys(builder, f.op1, f.cn, f.cm, f.op2, f.rt, false),
+        Fields::SystemLXtI(f) => system::sys(builder, f.op1, f.cn, f.cm, f.op2, f.rt, true),
         // No PSTATE field with a one-bit immediate, no SVCR and no 128-bit
         // system register is in the 3d set.
         Fields::MSRpstateImm0_1(_) | Fields::PstateWriteSimple(_) | Fields::RtSystemI128(_) => {
@@ -484,9 +488,9 @@ pub const REGISTER_FORMATS: [crate::FormatClass; 19] = {
     ]
 };
 
-/// The format classes of the system instructions (card C6). `SYS` and
-/// `SYSL` (the cache, TLB and address translation operations) are card C8.
-pub const SYSTEM_FORMATS: [crate::FormatClass; 12] = {
+/// The format classes of the system instructions (card C6), and `SYS` and
+/// `SYSL`: the cache, TLB and address translation operations (card C8).
+pub const SYSTEM_FORMATS: [crate::FormatClass; 14] = {
     use crate::FormatClass::*;
     [
         ExceptionGeneration,
@@ -501,6 +505,8 @@ pub const SYSTEM_FORMATS: [crate::FormatClass; 12] = {
         MSRpstateImm0_1,
         PstateWriteSimple,
         RtSystemI128,
+        SystemXtI,
+        SystemLXtI,
     ]
 };
 

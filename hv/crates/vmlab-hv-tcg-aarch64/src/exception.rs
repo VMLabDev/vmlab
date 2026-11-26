@@ -32,9 +32,22 @@ pub enum Exception {
     SupervisorCall(u16),
     /// A system instruction that a control bit traps to EL1, with its ISS.
     SystemTrap(u32),
-    /// No instruction can be fetched at the PC, with the fault status code:
-    /// `ADDRESS_SIZE` or `EXTERNAL`.
+    /// No instruction can be fetched at the PC, with the fault status code
+    /// of `mmu::Fault::status`.
     InstructionAbort(u8),
+    /// A load, a store or a cache operation by address that cannot be made
+    /// (card C8).
+    DataAbort {
+        /// The fault status code of `mmu::Fault::status`.
+        status: u8,
+        /// The access writes.
+        write: bool,
+        /// The access is a cache maintenance or an address translation
+        /// instruction.
+        cache: bool,
+        /// The address, for FAR_EL1.
+        address: u64,
+    },
     /// The PC is not a multiple of four.
     PcAlignment,
     /// `BRK` with its immediate.
@@ -67,15 +80,30 @@ impl Exception {
             Self::SystemTrap(iss) => (0x18, iss),
             // 0x20 from a lower level, 0x21 from the same one.
             Self::InstructionAbort(status) => (0x21 - lower, u32::from(status)),
+            // 0x24 from a lower level, 0x25 from the same one. No valid
+            // instruction syndrome: QEMU gives none for a fault of stage 1.
+            Self::DataAbort {
+                status,
+                write,
+                cache,
+                ..
+            } => (
+                0x25 - lower,
+                u32::from(cache) << 8 | u32::from(write) << 6 | u32::from(status),
+            ),
             Self::PcAlignment => (0x22, 0),
             Self::Breakpoint(immediate) => (0x3c, u32::from(immediate)),
         };
         class << 26 | IL | iss
     }
 
-    /// Whether the exception writes FAR_EL1 with the PC.
-    fn sets_far(self) -> bool {
-        matches!(self, Self::InstructionAbort(_) | Self::PcAlignment)
+    /// What the exception at `pc` writes to FAR_EL1, when it writes it.
+    fn far(self, pc: u64) -> Option<u64> {
+        match self {
+            Self::InstructionAbort(_) | Self::PcAlignment => Some(pc),
+            Self::DataAbort { address, .. } => Some(address),
+            _ => None,
+        }
     }
 
     /// The address that ELR_EL1 gets for an exception at `pc`: the next
@@ -141,8 +169,8 @@ pub fn enter(state: &mut State, cause: Cause, pc: u64) {
         Cause::Exception(exception) => {
             system.regs[reg::ELR_EL1] = exception.return_address(pc);
             system.regs[reg::ESR_EL1] = u64::from(exception.syndrome(from));
-            if exception.sets_far() {
-                system.regs[reg::FAR_EL1] = pc;
+            if let Some(address) = exception.far(pc) {
+                system.regs[reg::FAR_EL1] = address;
             }
         }
         Cause::Interrupt(_) => system.regs[reg::ELR_EL1] = pc,
@@ -191,7 +219,8 @@ pub fn exception_return(state: &mut State) {
         state.pstate13 = spsr & (1 << 13) != 0;
     }
     state.refresh();
-    state.set_pc(target);
+    // With tagged addresses the PC does not keep the tag.
+    state.set_pc(state.untagged(target));
 }
 
 /// The interrupt that the CPU takes now, when a line is high and PSTATE
@@ -235,6 +264,17 @@ mod tests {
             0x8600_0000
         );
         assert_eq!(Exception::PcAlignment.syndrome(1), 0x8a00_0000);
+        let abort = |status, write, cache| Exception::DataAbort {
+            status,
+            write,
+            cache,
+            address: 0,
+        };
+        // A translation fault of level 3 at a load from EL0, a permission
+        // fault of level 2 at a store from EL1, and DC ZVA.
+        assert_eq!(abort(0x07, false, false).syndrome(0), 0x9200_0007);
+        assert_eq!(abort(0x0e, true, false).syndrome(1), 0x9600_004e);
+        assert_eq!(abort(0x21, true, true).syndrome(1), 0x9600_0161);
         assert_eq!(Exception::Breakpoint(0x3e8).syndrome(1), 0xf200_03e8);
     }
 

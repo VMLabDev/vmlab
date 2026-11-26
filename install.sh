@@ -409,19 +409,28 @@ fastpath_ask() {
 }
 
 # What root runs for the grant: $1 the capabilities, $2 the bin directory, $3
-# the SHA-256 the signed SHA256SUMS names for the helper, stdin the helper.
+# the SHA-256 the signed SHA256SUMS names for the helper, $4 the uid:gid of
+# the account that runs the installer, stdin the helper.
 # The bin directory is the user's, so any program running as the user can
 # rename another file onto the helper's path while the installer waits at its
 # prompt or sudo at its password. Root therefore never grants a path there. It
 # copies stdin into a directory only root can enter, checks the digest of that
 # copy, grants the copy, and renames it onto the helper's path: the rename
 # keeps the capabilities, and the staging directory is in the bin directory so
-# that it is one filesystem. Exit 3: the bytes are not the helper. Exit 4: the
-# staging directory is not the one made here.
+# that it is one filesystem. The helper goes to the account that consented,
+# which is not always the owner of the bin directory (a group-writable
+# /usr/local/bin, a shared tools directory): the helper serves the owner of
+# its file. Exit 3: the bytes are not the helper. Exit 4: the staging
+# directory is not the one made here. Exit 5: $4 is not two numbers.
 FASTPATH_GRANT='
 set -eu
 umask 077
-caps=$1 want=$3
+caps=$1 want=$3 owner=$4
+case "$owner" in
+  *[!0-9:]*|*:*:*|:*|*:|"") exit 5 ;;
+  *:*) ;;
+  *) exit 5 ;;
+esac
 cd -- "$2"
 bin=$(pwd -P)
 stage=$(mktemp -d "$bin/.vmlab-fastpath.XXXXXX")
@@ -443,7 +452,8 @@ cat > ./vmlab-fastpath
 got=$(sha256sum ./vmlab-fastpath | cut -d" " -f1)
 [ "$got" = "$want" ] || exit 3
 # chown drops file capabilities, so it comes before setcap.
-chown "$(stat -c %u:%g ..)" ./vmlab-fastpath
+[ -n "$owner" ] || exit 5
+chown "$owner" ./vmlab-fastpath
 # Owner only: file capabilities go to whoever executes the file (F2).
 chmod 700 ./vmlab-fastpath
 setcap "$caps" ./vmlab-fastpath
@@ -491,7 +501,9 @@ fastpath_caps() {
   # sudo asks for its password on the terminal, not on stdin.
   # The helper is opened here, as the user, and root reads only that stream.
   grant=0
-  sudo sh -c "$FASTPATH_GRANT" sh "$CAPS" "$BIN_DIR" "$HELPER_SHA" < "$HELPER" || grant=$?
+  # The account is read here, before sudo: under sudo `id` answers root.
+  owner="$(id -u):$(id -g)" || owner=""
+  sudo sh -c "$FASTPATH_GRANT" sh "$CAPS" "$BIN_DIR" "$HELPER_SHA" "$owner" < "$HELPER" || grant=$?
   case "$grant" in
     0)
       printf 'Granted: %s\n' "$(getcap "$HELPER" 2>/dev/null || echo "$CAPS")"
@@ -501,6 +513,8 @@ fastpath_caps() {
       warn "no capabilities granted: the file at $HELPER is not the helper of this release (its SHA-256 differs from the signed checksum). Something replaced it after it was installed. Find out what before you install again." ;;
     4)
       warn "no capabilities granted: something changed $BIN_DIR while the grant ran. Find out what before you install again." ;;
+    5)
+      warn "no capabilities granted: could not read the uid and gid of the account that runs the installer (got '$owner')." ;;
     *)
       warn "setcap failed; the helper is installed without the fast path's capabilities."
       fastpath_hint ;;

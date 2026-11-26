@@ -128,6 +128,11 @@ pub struct Context {
     /// FP and AdvSIMD instructions run at this level: CPACR_EL1.FPEN allows
     /// them. Otherwise each one traps.
     pub fp: bool,
+    /// TCR.TBI0 and TBI1 of the regime as the bits 0 and 1, as they hold
+    /// for an instruction address (`mmu::tbi_of_instructions`): a branch to
+    /// a register drops the top byte of its target in the half that has its
+    /// bit set (card C8).
+    pub tbi: u8,
 }
 
 impl Context {
@@ -184,6 +189,7 @@ impl State {
                 el: 1,
                 sp_sel: true,
                 fp: false,
+                tbi: 0,
             },
             daif: 0xf,
             il: false,
@@ -196,10 +202,25 @@ impl State {
     }
 
     /// Bring the part of the context that follows from the system registers
-    /// up to date. Whoever changes the level or CPACR_EL1 calls this.
+    /// up to date. Whoever changes the level, CPACR_EL1 or TCR_EL1 calls
+    /// this.
     pub fn refresh(&mut self) {
         let fpen = (self.system.regs[reg::CPACR_EL1] >> 20) & 3;
         self.context.fp = fpen == 3 || (fpen == 1 && self.context.el != 0);
+        self.context.tbi = crate::mmu::tbi_of_instructions(self.system.regs[reg::TCR_EL1]);
+    }
+
+    /// `address` as a PC: with TCR.TBI of its half set, the top byte is the
+    /// bit 55 repeated.
+    pub fn untagged(&self, address: u64) -> u64 {
+        let upper = address & (1 << 55) != 0;
+        if self.context.tbi & (1 << u8::from(upper)) == 0 {
+            address
+        } else if upper {
+            address | 0xff << 56
+        } else {
+            address & !(0xff << 56)
+        }
     }
 
     /// The width of a physical address, from ID_AA64MMFR0_EL1.PARange.
@@ -354,6 +375,7 @@ mod tests {
             el,
             sp_sel: true,
             fp: false,
+            tbi: 0,
         };
         assert_eq!(context(0).sp_slot(), slot::SP_EL0);
         assert_eq!(context(2).sp_slot(), slot::SP_EL2);

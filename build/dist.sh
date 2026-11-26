@@ -120,7 +120,9 @@ main() {
   mkdir -p "$OUT"
   build_binary "$version"
   build_bundle "$version"
-  just ci::hv-package "$version"
+  # The bundle takes its virglrenderer from a build of this run, never from
+  # .ci-cache/ in the checkout: nothing proves what an earlier build left there.
+  VMLAB_HV_VIRGL=fresh just ci::hv-package "$version"
   local bpf_ok=0
   build_bpf || bpf_ok=1
 

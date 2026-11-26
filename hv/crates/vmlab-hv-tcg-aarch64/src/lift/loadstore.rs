@@ -28,19 +28,20 @@
 //! case per record: the size, the vector bit and the operation. The tests
 //! of this file check that reading against the name of every record.
 //!
-//! Every address here is a physical address: translation and permissions
-//! come with card C8, and an unprivileged load or store (`LDTR`, `STTR`) is
-//! an ordinary one until then. An access that the memory does not hold
-//! leaves the block before its instruction, and so does an access to an
-//! address that is not a multiple of its size. No register of the
-//! instruction has changed then. The size is that of one register, or of
-//! one element for `LD1` to `LD4` and `ST1` to `ST4`.
+//! Every address here is a virtual address: the loop translates it and
+//! checks the permissions (`mmu.rs`, card C8). An unprivileged load or store
+//! (`LDTR`, `STTR`) is made as EL0. An access that cannot be made leaves the
+//! block before its instruction, as a data abort of the guest, and so does
+//! an access to an address that is not a multiple of its size where the
+//! memory asks for that. No register of the instruction has changed then.
+//! The size is that of one register, or of one element for `LD1` to `LD4`
+//! and `ST1` to `ST4`.
 //!
 //! The alignment rule is what the lockstep found (S6): with the MMU off,
 //! QEMU takes an alignment fault for every such access, with
-//! `SCTLR_EL1.A` set or clear. `Builder::load` and `Builder::store` hold
-//! the rule. The stack pointer alignment check (`SCTLR_EL1.SA`) is another
-//! thing and comes with card C6.
+//! `SCTLR_EL1.A` set or clear, because all memory is Device memory then.
+//! `Builder::require_aligned` and the loop hold the rule. The stack pointer
+//! alignment check (`SCTLR_EL1.SA`) is another thing and is not built.
 
 use super::{Builder, Lifted};
 use crate::fields::sign_extend;
@@ -367,11 +368,59 @@ pub fn pair(
     let bytes = access.bytes();
     let offset = sign_extend(u64::from(offset & 0x7f), 7) * i64::from(bytes);
     with_base(b, rn, offset, index, |b, address| {
-        let second = displace(b, address, i64::from(bytes));
-        transfer(b, access, rt, address);
-        transfer(b, access, rt2, second);
+        if matches!(access.data, Data::Vector { .. }) {
+            // Two vector registers are two accesses, and a load writes the
+            // first register before the second access: QEMU leaves it
+            // written when that one faults (the lockstep of card C8).
+            let second = displace(b, address, i64::from(bytes));
+            transfer(b, access, rt, address);
+            if access.load {
+                b.commit();
+            }
+            transfer(b, access, rt2, second);
+        } else {
+            transfer_pair(b, access, rt, rt2, address);
+        }
     });
     Lifted::Next
+}
+
+/// A pair of general registers as one access, the first register at the
+/// lower address. QEMU makes it one access: where the pair crosses into a
+/// page that faults, the fault of that page comes before the memory of the
+/// first page is looked at, and no register is written (the lockstep of
+/// card C8). The alignment is that of one register.
+fn transfer_pair(b: &mut Builder, access: Access, rt: u32, rt2: u32, address: ScalarId) {
+    let bytes = access.bytes();
+    let width = u16::from(bytes) * 8;
+    match (access.data, access.load) {
+        (Data::Prefetch, _) => {}
+        (
+            Data::Integer {
+                signed, register, ..
+            },
+            true,
+        ) => {
+            let both = b.load_aligned(address, bytes * 2, bytes);
+            for (target, offset) in [(rt, 0), (rt2, width)] {
+                let value = b.slice(both, offset, width);
+                let value = if signed {
+                    b.sign_extend(value, width, register)
+                } else {
+                    b.zero_extend(value, register)
+                };
+                b.set_x(target, register, value);
+            }
+        }
+        (Data::Integer { .. }, false) => {
+            let low = b.x(rt, width);
+            let high = b.x(rt2, width);
+            let both = b.concat(high, low, width, width * 2);
+            b.store_aligned(address, bytes * 2, both, bytes);
+        }
+        // A pair of vector registers is two accesses.
+        (Data::Vector { .. }, _) => {}
+    }
 }
 
 /// The size in bytes of an exclusive or ordered access: the bits 31 to 30.
@@ -460,7 +509,7 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     };
     let address = b.x_or_sp(rn, 64);
     // On every memory, not only where the memory asks for it.
-    b.require_aligned(address, bytes);
+    b.require_aligned(address, bytes, bytes, !access.load, true);
     transfer(b, access, rt, address);
     Lifted::Next
 }
@@ -535,17 +584,42 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
     let base = b.x_or_sp(rn, 64);
     if !shape.interleaved {
         // One register after the other. The elements of a register lie in
-        // memory in their order, lowest first, so a register is one
-        // little-endian access. Its alignment is that of one element.
+        // memory in their order, lowest first, so 8 bytes of a register are
+        // one little-endian access, which is how QEMU reads them: a fault
+        // at the second half of a register comes after the access of the
+        // first, and a load has written the first half by then (the
+        // lockstep of card C8). The alignment is that of one element.
         let align = shape.element_bytes;
         for register in 0..registers {
-            let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
-            if shape.load {
-                let value = b.load_aligned(address, vector_bytes, align);
-                b.set_v(list(vt, register), u16::from(vector_bytes) * 8, value);
-            } else {
-                let value = b.v(list(vt, register), u16::from(vector_bytes) * 8);
-                b.store_aligned(address, vector_bytes, value, align);
+            let target = list(vt, register);
+            for half in 0..u32::from(vector_bytes / 8) {
+                let offset = register * u32::from(vector_bytes) + half * 8;
+                let address = displace(b, base, i64::from(offset));
+                if shape.load {
+                    let value = b.load_structure(address, 8, align);
+                    // The upper half of a register of 8 bytes is cleared
+                    // after the last access of the instruction.
+                    let old = b.v(target, 128);
+                    let whole = if half == 0 {
+                        let high = b.slice(old, 64, 64);
+                        b.concat(high, value, 64, 128)
+                    } else {
+                        let low = b.slice(old, 0, 64);
+                        b.concat(value, low, 64, 128)
+                    };
+                    b.set_v(target, 128, whole);
+                    b.commit();
+                } else {
+                    let source = b.v(target, 128);
+                    let value = b.slice(source, half as u16 * 64, 64);
+                    b.store_structure(address, 8, value, align);
+                }
+            }
+        }
+        if shape.load && vector_bytes == 8 {
+            for register in 0..registers {
+                let low = b.v(list(vt, register), 64);
+                b.set_v(list(vt, register), 64, low);
             }
         }
     } else {
@@ -565,7 +639,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
             for element in 0..elements {
                 for register in 0..registers {
                     let address = at(b, element, register);
-                    let loaded = b.load(address, bytes);
+                    let loaded = b.load_structure(address, bytes, bytes);
                     let value = &mut values[register as usize];
                     *value = Some(match *value {
                         None => loaded,
@@ -593,7 +667,7 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
                 for register in 0..registers {
                     let address = at(b, element, register);
                     let value = b.slice(sources[register as usize], element as u16 * width, width);
-                    b.store(address, bytes, value);
+                    b.store_structure(address, bytes, value, bytes);
                 }
             }
         }
@@ -659,6 +733,7 @@ pub fn simd_single(
             let element = b.load(address, element_bytes);
             let value = insert(b, vector, position, width, element);
             b.set_v(list(vt, register), 128, value);
+            b.commit();
         } else {
             let element = b.slice(vector, position, width);
             b.store(address, element_bytes, element);
@@ -691,6 +766,7 @@ pub fn simd_replicate(
             width *= 2;
         }
         b.set_v(list(vt, register), vector_width, vector);
+        b.commit();
     }
     structure_write_back(b, rn, base, xm, registers * u32::from(element_bytes));
     Lifted::Next
