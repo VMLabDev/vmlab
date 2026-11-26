@@ -90,6 +90,15 @@ pub trait UsbDevice: Snapshot {
         let _ = packet_size;
         self.transfer(endpoint, data, max_length)
     }
+    /// The guest stops this endpoint with a transfer in flight (Stop
+    /// Endpoint). A transfer that has finished already is handed over here,
+    /// as `transfer` would hand it over: the device moved its data, so the
+    /// guest must see it. Anything else is dropped as in
+    /// `endpoint_dropped`, and the answer is `Nak`.
+    fn endpoint_stopped(&mut self, endpoint: u8) -> UsbTransfer {
+        self.endpoint_dropped(endpoint);
+        UsbTransfer::Nak
+    }
     /// The guest dropped this endpoint's transfer state: Stop Endpoint,
     /// Reset Endpoint, Set TR Dequeue Pointer, Reset Device, Disable Slot,
     /// a Configure Endpoint that drops, replaces or deconfigures it, a port

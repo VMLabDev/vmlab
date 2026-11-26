@@ -614,6 +614,20 @@ impl HostUsbDevice {
         let endpoints = self
             .endpoint_table(&descriptor, &alt_settings)
             .map_err(refused)?;
+        // Review usb-2.md F21: as in `set_config`, for the endpoints of
+        // this interface at the alt setting it leaves. The kernel cancels
+        // their URBs when it switches the interface, and the reap would
+        // file each as a stall on the endpoint of the new alt setting.
+        let old_alt = self.alt_settings.get(&interface).copied().unwrap_or(0);
+        let mut old = HashSet::new();
+        if let Some(old_interface) = descriptor.get_interface_descriptor(interface, old_alt) {
+            for index in 0..old_interface.bNumEndpoints {
+                if let Some(endpoint) = old_interface.get_endpoint_descriptor(index) {
+                    old.insert(endpoint.address());
+                }
+            }
+        }
+        self.drop_transfers(|endpoint| endpoint != 0 && old.contains(&endpoint));
         Ok(self.start_job(Job::SetInterface {
             interface,
             alt,
@@ -898,6 +912,18 @@ impl UsbDevice for HostUsbDevice {
             Ok(transfer) => self.start(endpoint, transfer),
             Err(_) => UsbTransfer::Stall,
         }
+    }
+
+    fn endpoint_stopped(&mut self, endpoint: u8) -> UsbTransfer {
+        // Review usb-2.md F15: a URB the kernel has completed stays unseen
+        // until a reap. Its data left the device (IN) or reached it (OUT),
+        // so it is collected before the endpoint's work is dropped.
+        self.reap();
+        if matches!(self.pending.get(&endpoint), Some(Pending::Done(_))) {
+            return self.take_pending(endpoint);
+        }
+        self.endpoint_dropped(endpoint);
+        UsbTransfer::Nak
     }
 
     fn endpoint_dropped(&mut self, endpoint: u8) {
@@ -1275,8 +1301,9 @@ mod tests {
     #[test]
     fn a_blocked_usbdevfs_call_holds_no_caller() {
         let (mut host, fake) = device();
-        // A bulk IN is in flight before the guest switches the interface.
-        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        // An isochronous IN on the other interface is in flight before the
+        // guest switches interface 0.
+        assert_eq!(host.transfer_iso(0x83, &[], 1024, 512), UsbTransfer::Nak);
         let before = fake.submitted_payloads().len();
         let (entered, release) = fake.block_set_interface();
         assert_eq!(host.control(set_interface(0, 1), &[]), UsbTransfer::Nak);
@@ -1294,7 +1321,7 @@ mod tests {
         assert_eq!(host.transfer_iso(0x83, &[], 1024, 512), UsbTransfer::Nak);
         assert_eq!(host.speed(), UsbSpeed::High);
         assert!(!host.is_lost());
-        host.endpoint_dropped(0x81);
+        host.endpoint_dropped(0x83);
         assert_eq!(
             fake.submitted_payloads().len(),
             before,
@@ -1568,6 +1595,97 @@ mod tests {
             UsbTransfer::Ack(b"fresh".to_vec())
         );
         assert!(host.discarded.is_empty());
+    }
+
+    /// Review usb-2.md F21: SET_INTERFACE ends the endpoints of the
+    /// interface as SET_CONFIGURATION ends all of them. The kernel cancels
+    /// the URB in flight, and that result must not answer the first
+    /// transfer on the endpoint of the new alt setting.
+    #[test]
+    fn set_interface_forgets_in_flight_work() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        // The other interface keeps its transfer.
+        assert_eq!(host.transfer_iso(0x83, &[], 1024, 512), UsbTransfer::Nak);
+        assert_eq!(
+            control(&mut host, set_interface(0, 1)),
+            UsbTransfer::Ack(Vec::new())
+        );
+        // A fresh submission, not the cancelled URB's result.
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert!(host.discarded.is_empty(), "the cancelled URB was reaped");
+        fake.complete_with(Completion::Data(vec![7; 1024]));
+        fake.complete_with(Completion::Data(b"fresh".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer(0x81, &[], 64),
+            UsbTransfer::Ack(b"fresh".to_vec())
+        );
+        assert_eq!(
+            host.transfer_iso(0x83, &[], 1024, 512),
+            UsbTransfer::Ack(vec![7; 1024]),
+            "the transfer of interface 1 was dropped with those of interface 0"
+        );
+    }
+
+    /// Review usb-2.md F15: the kernel has completed the URB and nothing
+    /// has reaped it when the guest stops the endpoint. The device sent
+    /// those bytes, so the stop hands them over.
+    #[test]
+    fn a_completed_urb_survives_stop_endpoint() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        fake.complete_with(Completion::Data(b"abcd".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.endpoint_stopped(0x81),
+            UsbTransfer::Ack(b"abcd".to_vec())
+        );
+        // Handed over once: the next transfer is a fresh submission.
+        assert!(host.discarded.is_empty());
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        fake.complete_with(Completion::Data(b"next".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer(0x81, &[], 64),
+            UsbTransfer::Ack(b"next".to_vec())
+        );
+    }
+
+    /// F15, with the completion filed by an earlier reap, and for an OUT
+    /// endpoint, whose payload reached the device.
+    #[test]
+    fn a_filed_completion_survives_stop_endpoint() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(host.transfer(0x02, b"sent", 64), UsbTransfer::Nak);
+        fake.complete_with(Completion::Data(b"abcd".to_vec()));
+        fake.run_irq();
+        host.reap();
+        assert_eq!(
+            host.endpoint_stopped(0x81),
+            UsbTransfer::Ack(b"abcd".to_vec())
+        );
+        assert_eq!(host.endpoint_stopped(0x02), UsbTransfer::Ack(Vec::new()));
+        assert!(host.pending.is_empty());
+    }
+
+    /// F15: a URB that is still in flight at the stop is discarded as
+    /// before, and its cancelled completion answers nothing.
+    #[test]
+    fn stop_endpoint_discards_an_unfinished_urb() {
+        let (mut host, fake) = device();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert_eq!(host.endpoint_stopped(0x81), UsbTransfer::Nak);
+        fake.run_irq();
+        assert_eq!(host.transfer(0x81, &[], 64), UsbTransfer::Nak);
+        assert!(host.discarded.is_empty());
+        fake.complete_with(Completion::Data(b"fresh".to_vec()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer(0x81, &[], 64),
+            UsbTransfer::Ack(b"fresh".to_vec())
+        );
     }
 
     /// F9: the same for a device reset, with a completion nobody collected
