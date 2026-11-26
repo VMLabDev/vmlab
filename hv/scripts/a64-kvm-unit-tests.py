@@ -83,7 +83,8 @@ def toolchain(work: Path) -> tuple[str, dict[str, str]]:
         'for arg in "$@"; do\n'
         '  if [ "$arg" = -print-libgcc-file-name ]; then exit 0; fi\n'
         "done\n"
-        'exec clang --target=aarch64-linux-gnu -fuse-ld=lld -Wno-unknown-warning-option "$@"'
+        "exec clang --target=aarch64-linux-gnu -Wno-unknown-warning-option "
+        '-Wno-unused-command-line-argument "$@"'
     )
     for name, body in wrappers.items():
         path = tools / (PREFIX + name)
@@ -116,7 +117,14 @@ def build(work: Path, revision: str) -> tuple[Path, str]:
         cwd=source,
         env=env,
     )
-    run(["make", "-j8"], cwd=source, env=env)
+    log = work / "build.log"
+    with log.open("w") as output:
+        done = subprocess.run(
+            ["make", "-j8"], cwd=source, env=env, stdout=output, stderr=subprocess.STDOUT
+        )
+    if done.returncode != 0:
+        errors = [line for line in log.read_text().splitlines() if "rror" in line]
+        raise SystemExit(f"the build failed, see {log}:\n" + "\n".join(errors[:12])[:3000])
     stamp.write_text(commit)
     return source, commit
 
