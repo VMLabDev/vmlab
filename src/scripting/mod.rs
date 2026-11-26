@@ -88,7 +88,7 @@ impl LabHandle {
 #[script(name = "Machine")]
 #[script(opaque)]
 pub struct MachineHandle {
-    pub(crate) machine: Arc<dyn Machine>,
+    name: String,
     pub(crate) runtime: Arc<LabRuntime>,
     pub(crate) rt: tokio::runtime::Handle,
     /// Last pointer position, for the VNC input transport: RFB PointerEvent
@@ -339,7 +339,12 @@ impl MachineHandle {
     }
 
     fn name(&self) -> &str {
-        self.machine.name()
+        &self.name
+    }
+
+    /// Reload can replace or remove a machine between calls.
+    fn machine(&self) -> Result<Arc<dyn Machine>, String> {
+        self.runtime.machine(self.name()).map_err(estr)
     }
 
     /// A second handle onto the same machine, whose guest work runs as
@@ -373,16 +378,17 @@ impl MachineHandle {
     /// resolution and its precedence are unchanged — only where the pair is
     /// written moves.
     fn as_identity(&self, selector: &str, password: Option<&str>) -> Result<MachineHandle, String> {
+        let machine = self.machine()?;
         let logon = crate::labd::identity::resolve(
             self.name(),
-            &self.machine.logins(),
-            self.machine.guest_os(),
+            &machine.logins(),
+            machine.guest_os(),
             Some(selector),
             password,
         )
         .map_err(estr)?;
         Ok(MachineHandle {
-            machine: self.machine.clone(),
+            name: self.name.clone(),
             runtime: self.runtime.clone(),
             rt: self.rt.clone(),
             // Shared, not fresh: it is one machine and one pointer, so a
@@ -506,8 +512,7 @@ impl MachineHandle {
     /// unchanged. The message says what this machine does not offer, not what
     /// its kind could never have.
     fn display(&self) -> Result<Display, String> {
-        self.machine
-            .clone()
+        self.machine()?
             .display()
             .ok_or_else(|| format!("machine `{}` has no display", self.name()))
     }
@@ -521,7 +526,7 @@ impl MachineHandle {
         timeout: Duration,
     ) -> Result<ExecResult, String> {
         self.block(async {
-            let agent = self.machine.agent().await.map_err(estr)?;
+            let agent = self.machine()?.agent().await.map_err(estr)?;
             let mut argv = vec![cmd];
             argv.extend(args);
             let r = agent
@@ -603,7 +608,7 @@ impl LabHandle {
     fn handle_for(&self, machine: Arc<dyn Machine>) -> MachineHandle {
         let first_boot_gated = self.owns_first_boot(machine.name());
         MachineHandle {
-            machine,
+            name: machine.name().to_string(),
             runtime: self.runtime.clone(),
             rt: self.rt.clone(),
             last_pointer: Default::default(),
@@ -840,11 +845,14 @@ pub fn lab_module() -> Module {
     // lab author can act on.
     m.ty::<MachineHandle>()
         .method("name", |h: &MachineHandle| h.name().to_string())
-        .method("kind", |h: &MachineHandle| -> String {
-            match h.machine.kind() {
-                MachineKind::Vm => "vm".into(),
-                MachineKind::Container => "container".into(),
-            }
+        .method("kind", |h: &MachineHandle| -> Fault<String> {
+            Fault(h.machine().map_err(HostError::msg).map(|machine| {
+                match machine.kind() {
+                    MachineKind::Vm => "vm",
+                    MachineKind::Container => "container",
+                }
+                .into()
+            }))
         })
         // Lifecycle / state
         .method("start", |h: &MachineHandle| -> Result<(), String> {
@@ -882,61 +890,75 @@ pub fn lab_module() -> Module {
         // (DOS, Win 3.x) this is the only way to seal a consistent disk — a
         // SIGKILL can drop unflushed qcow2 writes and leave it unbootable.
         .method("poweroff", |h: &MachineHandle| -> Result<(), String> {
-            h.block(h.machine.poweroff()).map_err(estr)
+            h.block(h.machine()?.poweroff()).map_err(estr)
         })
         // Force the medium out of the install CD-ROM (the `cdrom =` drive, a
         // template build's `source "iso"`) and no other drive, so an installer
         // that reboots from CD falls through to the disk. Out until QEMU
         // restarts; a guest reboot keeps it out.
         .method("eject_cdrom", |h: &MachineHandle| -> Result<(), String> {
-            h.block(h.machine.eject_cdrom()).map_err(estr)
+            h.block(h.machine()?.eject_cdrom()).map_err(estr)
         })
         // The power state's own wire spelling — `suspended` included, for a
         // guest that went to sleep — so a script reads what `status` shows.
-        .method("state", |h: &MachineHandle| -> String {
-            h.block(h.machine.state()).to_string()
+        .method("state", |h: &MachineHandle| {
+            Fault(
+                h.machine()
+                    .map(|machine| h.block(machine.state()).to_string())
+                    .map_err(HostError::msg),
+            )
         })
         // Readiness. Inside the machine's own first-boot provision the ready
         // flag is deferred until that script returns, so these mean "does the
         // agent answer right now" there (see `MachineHandle::first_boot_gated`)
         // — a live signal the script can use to watch its own guest reboot —
         // and full readiness everywhere else.
-        .method("is_ready", |h: &MachineHandle| -> bool {
-            if h.first_boot_gated {
-                h.block(h.machine.agent_answering())
-            } else {
-                h.block(h.machine.is_ready())
-            }
+        .method("is_ready", |h: &MachineHandle| {
+            Fault(h.machine().map_err(HostError::msg).map(|machine| {
+                if h.first_boot_gated {
+                    h.block(machine.agent_answering())
+                } else {
+                    h.block(machine.is_ready())
+                }
+            }))
         })
         .method(
             "wait_ready",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
                 let timeout = script_timeout(timeout_secs, 0)?;
+                let machine = h.machine()?;
                 if h.first_boot_gated {
-                    h.block(h.machine.wait_agent_answering(timeout))
-                        .map_err(estr)
+                    h.block(machine.wait_agent_answering(timeout)).map_err(estr)
                 } else {
-                    h.block(h.machine.wait_ready(timeout)).map_err(estr)
+                    h.block(machine.wait_ready(timeout)).map_err(estr)
                 }
             },
         )
         // Healthy = the healthcheck's latest verdict; a machine declaring none
         // counts as healthy once it is ready.
-        .method("is_healthy", |h: &MachineHandle| -> bool {
-            h.block(h.machine.is_healthy())
+        .method("is_healthy", |h: &MachineHandle| {
+            Fault(
+                h.machine()
+                    .map(|machine| h.block(machine.is_healthy()))
+                    .map_err(HostError::msg),
+            )
         })
         // The live agent probe, ungated: goes false while the guest is down or
         // mid-reboot even though the sticky ready flag stays set. What a build
         // provision needs to watch an in-guest reboot it requested (`is_ready`
         // outside first-boot never drops while QEMU runs).
-        .method("agent_answering", |h: &MachineHandle| -> bool {
-            h.block(h.machine.agent_answering())
+        .method("agent_answering", |h: &MachineHandle| {
+            Fault(
+                h.machine()
+                    .map(|machine| h.block(machine.agent_answering()))
+                    .map_err(HostError::msg),
+            )
         })
         // The reboot signal `agent_answering` cannot give: a guest that
         // reboots between two pings answers the next one through the new
         // boot's agent. Compare boot identities instead.
         .method("boot_id", |h: &MachineHandle| -> Result<String, String> {
-            h.block(h.machine.boot_id()).map_err(estr)
+            h.block(h.machine()?.boot_id()).map_err(estr)
         })
         // Until the boot identity differs from `since`, then until the machine
         // is ready again — in the same sense `wait_ready` means here — inside
@@ -946,13 +968,14 @@ pub fn lab_module() -> Module {
             |h: &MachineHandle, since: String, timeout_secs: i64| -> Result<(), String> {
                 let timeout = script_timeout(timeout_secs, 0)?;
                 let deadline = tokio::time::Instant::now() + timeout;
+                let machine = h.machine()?;
                 h.block(async {
-                    h.machine.wait_rebooted(&since, timeout).await?;
+                    machine.wait_rebooted(&since, timeout).await?;
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if h.first_boot_gated {
-                        h.machine.wait_agent_answering(left).await
+                        machine.wait_agent_answering(left).await
                     } else {
-                        h.machine.wait_ready(left).await
+                        machine.wait_ready(left).await
                     }
                 })
                 .map_err(estr)
@@ -962,19 +985,19 @@ pub fn lab_module() -> Module {
             "wait_shutdown",
             |h: &MachineHandle, timeout_secs: i64| -> Result<(), String> {
                 h.block(
-                    h.machine
+                    h.machine()?
                         .wait_state(PowerState::Stopped, script_timeout(timeout_secs, 0)?),
                 )
                 .map_err(estr)
             },
         )
         .method("ip", |h: &MachineHandle| -> Result<String, String> {
-            h.block(h.machine.guest_ip(None)).map_err(estr)
+            h.block(h.machine()?.guest_ip(None)).map_err(estr)
         })
         .method(
             "ip_nic",
             |h: &MachineHandle, nic: i64| -> Result<String, String> {
-                h.block(h.machine.guest_ip(Some(nic.max(0) as usize)))
+                h.block(h.machine()?.guest_ip(Some(nic.max(0) as usize)))
                     .map_err(estr)
             },
         )
@@ -1031,6 +1054,7 @@ pub fn lab_module() -> Module {
                     .as_array()
                     .map(|a| {
                         a.iter()
+                            .filter(|s| s["pending"].as_bool() != Some(true))
                             .filter_map(|s| s["name"].as_str().map(String::from))
                             .collect()
                     })
@@ -1215,7 +1239,7 @@ pub fn lab_module() -> Module {
             |h: &MachineHandle, local: String, guest_path: String| -> Result<(), String> {
                 let src = h.resolve_ref(&local);
                 h.block(async {
-                    let agent = h.machine.agent().await.map_err(estr)?;
+                    let agent = h.machine()?.agent().await.map_err(estr)?;
                     agent
                         .push_file_as(&src, &guest_path, None, h.logon.clone())
                         .await
@@ -1227,12 +1251,13 @@ pub fn lab_module() -> Module {
         .method(
             "copy_from",
             |h: &MachineHandle, guest_path: String, local: String| -> Result<(), String> {
+                let machine = h.machine()?;
                 let out = h.resolve_ref(&local);
                 if let Some(parent) = out.parent() {
                     std::fs::create_dir_all(parent).map_err(estr)?;
                 }
                 h.block(async {
-                    let agent = h.machine.agent().await.map_err(estr)?;
+                    let agent = machine.agent().await.map_err(estr)?;
                     agent
                         .pull_file_as(&guest_path, &out, h.logon.clone())
                         .await
@@ -1245,7 +1270,7 @@ pub fn lab_module() -> Module {
         .method(
             "logs",
             |h: &MachineHandle, lines: i64| -> Result<String, String> {
-                match h.machine.console_log(lines.max(0) as usize) {
+                match h.machine()?.console_log(lines.max(0) as usize) {
                     Some(r) => r.map_err(estr),
                     None => Err(format!("machine `{}` has no console log", h.name())),
                 }
@@ -1256,7 +1281,7 @@ pub fn lab_module() -> Module {
             "terminal",
             |h: &MachineHandle| -> Result<terminal::TerminalHandle, String> {
                 let session = h.block(async {
-                    let agent = h.machine.agent().await.map_err(estr)?;
+                    let agent = h.machine()?.agent().await.map_err(estr)?;
                     agent
                         .open_terminal(
                             terminal::SCRIPT_COLS,
@@ -1313,8 +1338,12 @@ pub fn lab_module() -> Module {
                 Ok(attached.into_iter().map(|a| h.usb_record(a)).collect())
             },
         )
-        .method("logins", |h: &MachineHandle| -> Vec<ScriptLogin> {
-            script_logins(&h.machine.logins(), h.machine.guest_os())
+        .method("logins", |h: &MachineHandle| {
+            Fault(
+                h.machine()
+                    .map(|machine| script_logins(&machine.logins(), machine.guest_os()))
+                    .map_err(HostError::msg),
+            )
         })
         // Identity (§19.2's wscript rung). Both return a second handle onto
         // the same machine rather than switching this one, so the identity is
@@ -1335,7 +1364,7 @@ pub fn lab_module() -> Module {
         )
         .method("stats", |h: &MachineHandle| -> Result<GuestStats, String> {
             h.block(async {
-                let agent = h.machine.agent().await.map_err(estr)?;
+                let agent = h.machine()?.agent().await.map_err(estr)?;
                 agent
                     .stats(Duration::from_secs(10))
                     .await
@@ -1402,6 +1431,9 @@ pub fn context() -> Context {
     registry
         .alias_type("Vm", machine)
         .expect("Vm compatibility alias must be unique");
+    for entry in &mut registry.host_fns {
+        entry.before_call(cancel::check);
+    }
     Context::from_registry(registry)
 }
 

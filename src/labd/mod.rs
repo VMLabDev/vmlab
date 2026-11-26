@@ -615,8 +615,13 @@ impl Handler<LabRequest> for LabdHandler {
                 // run started — success or failure — ends these too.
                 let run = lab.recordings.new_run();
                 for r in &record {
-                    lab.record_start(&r.machine, r.path.as_deref(), &r.options, Some(run))
-                        .await?;
+                    if let Err(error) = lab
+                        .record_start(&r.machine, r.path.as_deref(), &r.options, Some(run))
+                        .await
+                    {
+                        lab.record_finalise_run(run).await;
+                        return Err(error.into());
+                    }
                 }
                 let result = streamed(lab, stream, |output| {
                     crate::scripting::run_script_file(
