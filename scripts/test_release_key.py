@@ -450,6 +450,19 @@ def test_the_doctor_names_what_a_machine_lacks(tmp_path):
     result = machine.script('release-doctor.sh')
     assert result.returncode == 1 and 'cannot reach the daemon' in result.stdout
     assert machine.script('release-doctor.sh', 'keyless').returncode == 2
+    # A machine without git and python3: each is named once, and no check that
+    # needs one gives another reason.
+    bare = tmp_path / 'bare'
+    bare.mkdir()
+    for tool in ('bash', 'sed', 'head', 'hostname', 'uname', 'df', 'awk', 'dirname', 'sha256sum', 'od'):
+        found = subprocess.run(['bash', '-c', f'command -v {tool}'], capture_output=True, text=True).stdout.strip()
+        (bare / tool).symlink_to(found)
+    result = machine.script('release-doctor.sh', 'key', shell=(str(bare / 'bash'),), PATH=str(bare))
+    assert result.returncode == 1
+    for tool in ('git', 'python3', 'docker'):
+        assert result.stdout.count(f'MISSING  {tool} on PATH') == 1
+    assert 'there is no git' in result.stdout and 'there is no python3' in result.stdout
+    assert 'install.sh trusts a key' not in result.stdout and 'a git checkout at' not in result.stdout
 
 
 # ── The image ───────────────────────────────────────────────────────────────

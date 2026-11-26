@@ -110,7 +110,9 @@ if [ "$docker_ok" -eq 1 ]; then
 fi
 
 # ── The checkout ─────────────────────────────────────────────────────────────
-if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+if ! command -v git >/dev/null 2>&1; then
+  note "the checkout is not checked: there is no git"
+elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository)" = true ]; then
     miss "a full checkout: this one is shallow, and the version comes from the history and the tags"
   else
@@ -142,9 +144,11 @@ for name in VMLAB_RELEASE_COSIGN_KEY COSIGN_PASSWORD; do
     for_key "$name is not set"
   fi
 done
-if [ -s "$ROOT/build/release-signing.pub" ]; then
+if ! command -v python3 >/dev/null 2>&1; then
+  note "the public key of the repo is not checked: there is no python3"
+elif [ -s "$ROOT/build/release-signing.pub" ]; then
   if bash "$ROOT/scripts/release-trust.sh" --check >/dev/null 2>&1; then
-    ok "build/release-signing.pub is committed, and install.sh trusts the same key"
+    ok "build/release-signing.pub is there, and install.sh trusts the same key"
   else
     miss "build/release-signing.pub and RELEASE_KEY of install.sh differ: \`just release::trust <cosign.pub>\`"
   fi
