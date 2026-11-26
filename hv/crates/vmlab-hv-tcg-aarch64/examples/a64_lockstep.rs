@@ -556,7 +556,9 @@ fn main() -> Result<(), Failure> {
                 .map(|register| register.qemu.to_string())
                 .collect(),
             names: None,
-            cpu: walk.then(|| "max".to_string()),
+            // Without SVE and SME the plugin API offers V0 to V31 by the
+            // names that the plugin asks for.
+            cpu: walk.then(|| "max,sve=off,sme=off".to_string()),
         };
         let mut leader = Leader::start_options(&qemu, &plugin, &directory, RAM_MIB, &options)?;
         // The streams have their own vector table.
