@@ -558,8 +558,14 @@ impl Side {
     /// `address`.
     fn zero<M: Memory>(&mut self, memory: &mut M, address: u64, user: bool) -> Result<(), Fault> {
         let base = address & !(ZERO_BLOCK as u64 - 1);
-        // The block is aligned to its size, so it is in one page.
-        let spot = self.resolve(memory, base, 1, Kind::Write, user)?;
+        // The block is aligned to its size, so it is in one page. A fault
+        // names the address that the instruction gave, as QEMU's does.
+        let spot = self
+            .resolve(memory, base, 1, Kind::Write, user)
+            .map_err(|fault| match fault {
+                Fault::Abort(fault, _) => Fault::Abort(fault, address),
+                host => host,
+            })?;
         let code = self.is_code(spot, 1);
         memory
             .write(spot.first, &[0u8; ZERO_BLOCK])
