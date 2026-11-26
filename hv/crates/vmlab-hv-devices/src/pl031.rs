@@ -185,7 +185,10 @@ impl Pl031 {
 impl BusDevice for Pl031 {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
         let value = self.read_register(offset).to_le_bytes();
-        for (byte, value) in data.iter_mut().zip(value.iter().chain(std::iter::repeat(&0))) {
+        for (byte, value) in data
+            .iter_mut()
+            .zip(value.iter().chain(std::iter::repeat(&0)))
+        {
             *byte = *value;
         }
     }

@@ -497,7 +497,9 @@ impl Gic {
         let word = ((offset & 0x7f) / 4) as usize;
         match offset {
             0x000 => self.state.ctlr,
-            0x004 => (self.interrupts() / 32 - 1) as u32 | ((self.state.cpus.len() - 1) as u32) << 5,
+            0x004 => {
+                (self.interrupts() / 32 - 1) as u32 | ((self.state.cpus.len() - 1) as u32) << 5
+            }
             0x008 => 0x43b,
             0x080..=0x0fc => self.bits(word, |gic, n| gic.irq(cpu, n).group1),
             0x100..=0x1fc => self.bits(word, |gic, n| gic.irq(cpu, n).enabled),
@@ -535,7 +537,9 @@ impl Gic {
                     self.irq(cpu, n).targets
                 }
             }
-            0xf10..=0xf1f | 0xf20..=0xf2f => self.state.cpus[cpu].sgi_sources[(offset & 0xf) as usize],
+            0xf10..=0xf1f | 0xf20..=0xf2f => {
+                self.state.cpus[cpu].sgi_sources[(offset & 0xf) as usize]
+            }
             _ => 0,
         }
     }

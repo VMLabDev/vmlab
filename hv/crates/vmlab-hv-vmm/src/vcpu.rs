@@ -313,7 +313,11 @@ impl VcpuThread {
     }
 
     /// Spawn the thread that runs `backend` against `host`.
-    pub fn spawn_backend<B>(id: u8, mut backend: B, host: Arc<dyn VcpuHost>) -> std::io::Result<Self>
+    pub fn spawn_backend<B>(
+        id: u8,
+        mut backend: B,
+        host: Arc<dyn VcpuHost>,
+    ) -> std::io::Result<Self>
     where
         B: VcpuBackend + Send + 'static,
     {

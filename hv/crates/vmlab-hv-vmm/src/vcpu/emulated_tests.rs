@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use vm_memory::{Bytes, GuestAddress};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_devices::gic::{self, CpuInterface, Distributor, Gic};
 use vmlab_hv_devices::pl011::{self, Pl011};
 use vmlab_hv_devices::serial::SerialOut;
-use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_proto::control::ShutdownReason;
 use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_aarch64::State;
@@ -109,7 +109,8 @@ impl VcpuHost for TestHost {
         self.parked.fetch_add(1, Ordering::SeqCst);
         let mut paused = self.paused.lock();
         while *paused && self.exit.lock().is_none() {
-            self.resumed.wait_for(&mut paused, Duration::from_millis(10));
+            self.resumed
+                .wait_for(&mut paused, Duration::from_millis(10));
         }
         drop(paused);
         self.parked.fetch_sub(1, Ordering::SeqCst);
@@ -191,9 +192,10 @@ impl VcpuBackend for Scripted {
     fn run(&mut self, running: bool) -> Exit {
         self.calls.push(format!("run({running})"));
         self.pending = false;
-        let exit = self.exits.pop_front().unwrap_or(Exit::Fail(ExitReason::Error(
-            "the script is over".into(),
-        )));
+        let exit = self
+            .exits
+            .pop_front()
+            .unwrap_or(Exit::Fail(ExitReason::Error("the script is over".into())));
         self.pending = matches!(exit, Exit::MmioRead { .. });
         exit
     }
@@ -377,7 +379,9 @@ fn ram_is_ram_and_every_other_address_is_the_bus() {
     bus.read(RAM + 0x10, &mut bytes).unwrap();
     assert_eq!(bytes, [1, 2, 3, 4]);
     // The devices see the same bytes.
-    memory.read_slice(&mut bytes, GuestAddress(RAM + 0x10)).unwrap();
+    memory
+        .read_slice(&mut bytes, GuestAddress(RAM + 0x10))
+        .unwrap();
     assert_eq!(bytes, [1, 2, 3, 4]);
     assert_eq!(
         bus.ram_bounds(RAM + 5),
@@ -390,8 +394,14 @@ fn ram_is_ram_and_every_other_address_is_the_bus() {
     bus.read(0x1001, &mut bytes[..2]).unwrap();
     assert_eq!(bytes[..2], [0xbb, 0xcc]);
     // No device and no RAM: the access fault of the address.
-    assert!(matches!(bus.read(0x2000, &mut bytes), Err(Error::Memory(0x2000))));
-    assert!(matches!(bus.write(0x2000, &bytes), Err(Error::Memory(0x2000))));
+    assert!(matches!(
+        bus.read(0x2000, &mut bytes),
+        Err(Error::Memory(0x2000))
+    ));
+    assert!(matches!(
+        bus.write(0x2000, &bytes),
+        Err(Error::Memory(0x2000))
+    ));
     // Over the end of RAM: a fault, and no bus access for the rest.
     let end = RAM + RAM_SIZE as u64;
     assert!(bus.read(end - 2, &mut bytes).is_err());
@@ -423,7 +433,9 @@ fn each_write_is_one_generation_also_the_write_of_a_device() {
     assert_eq!(bus.code_stamp(RAM, 8), Some(code));
 
     // A device writes into the second page, through vm-memory.
-    memory.write_slice(&[9; 4], GuestAddress(RAM + 0x1800)).unwrap();
+    memory
+        .write_slice(&[9; 4], GuestAddress(RAM + 0x1800))
+        .unwrap();
     assert_eq!(bus.generation(), start + 3);
     assert_eq!(bus.code_stamp(RAM, 8), Some(code));
     assert_ne!(bus.code_stamp(RAM + 0xffe, 4), Some(crossing));
@@ -803,10 +815,7 @@ fn the_virtual_timer_wakes_a_halted_vcpu_through_ppi_27() {
     ]);
     // INTID 27, plus 0x40, is '['. The handler masks the timer, whose line
     // is a level, before the end of the interrupt.
-    let handler = report_interrupt(
-        0x40,
-        &[asm::movz(3, 3, 0), asm::msr(CNTV_CTL_EL0, 3)],
-    );
+    let handler = report_interrupt(0x40, &[asm::movz(3, 3, 0), asm::msr(CNTV_CTL_EL0, 3)]);
     let started = Instant::now();
     let mut vm = TestVm::start(&program, &[], &handler, &[]);
     assert_eq!(

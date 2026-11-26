@@ -99,7 +99,11 @@ impl VcpuBackend for KvmVcpu<'_> {
         if mode != crate::diagnostics::report::RECORD_OFF {
             // SAFETY: run_ptr is the live KVM mapping; the exit reason selects the union.
             self.recorder.as_mut().unwrap().record(unsafe {
-                exit_record(run_ptr, result.as_ref().err().map(|e| e.errno()), self.sync_regs)
+                exit_record(
+                    run_ptr,
+                    result.as_ref().err().map(|e| e.errno()),
+                    self.sync_regs,
+                )
             });
         }
         // Deliver buffered VGA writes before reads, register changes, or parking.

@@ -225,11 +225,7 @@ fn replay(configuration: &str) -> usize {
                 );
             }
             "write" => {
-                machine.write(
-                    number("address"),
-                    number("width") as usize,
-                    number("value"),
-                );
+                machine.write(number("address"), number("width") as usize, number("value"));
                 let sent: String = std::mem::take(&mut *machine.output.0.lock())
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
@@ -443,7 +439,10 @@ fn state_survives_a_snapshot_and_a_reset_clears_it() {
     machine.gic.lock().restore_state(&saved.0).unwrap();
     // The UART is acknowledged and active, the clock waits behind it.
     assert_eq!(machine.read(GICD + 0x304, 4), 1 << SPI_PL011);
-    assert_eq!(machine.read(GICD + 0x204, 4), 1 << SPI_PL011 | 1 << SPI_PL031);
+    assert_eq!(
+        machine.read(GICD + 0x204, 4),
+        1 << SPI_PL011 | 1 << SPI_PL031
+    );
     assert_eq!(machine.read(GICC + 0x14, 4), 0);
     assert_eq!(machine.read(PL011, 4), u64::from(b'h'));
     assert_eq!(machine.read(PL031, 4), 77);
