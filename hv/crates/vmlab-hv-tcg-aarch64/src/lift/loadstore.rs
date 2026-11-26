@@ -579,29 +579,36 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
     let base = b.x_or_sp(rn, 64);
     if !shape.interleaved {
         // One register after the other. The elements of a register lie in
-        // memory in their order, lowest first, so a register is one
-        // little-endian access. Its alignment is that of one element.
+        // memory in their order, lowest first, so 8 bytes of a register are
+        // one little-endian access, which is how QEMU reads them: a fault
+        // at the second half of a register comes after the access of the
+        // first, and a load has written the first half by then (the
+        // lockstep of card C8). The alignment is that of one element.
         let align = shape.element_bytes;
         for register in 0..registers {
-            let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
-            if shape.load {
-                let value = b.load_structure(address, vector_bytes, align);
-                let target = list(vt, register);
-                if vector_bytes == 8 {
-                    // The upper half of each register is cleared after the
-                    // last access. A fault before that leaves the upper
-                    // halves of the registers that are loaded already.
+            let target = list(vt, register);
+            for half in 0..u32::from(vector_bytes / 8) {
+                let offset = register * u32::from(vector_bytes) + half * 8;
+                let address = displace(b, base, i64::from(offset));
+                if shape.load {
+                    let value = b.load_structure(address, 8, align);
+                    // The upper half of a register of 8 bytes is cleared
+                    // after the last access of the instruction.
                     let old = b.v(target, 128);
-                    let high = b.slice(old, 64, 64);
-                    let whole = b.concat(high, value, 64, 128);
+                    let whole = if half == 0 {
+                        let high = b.slice(old, 64, 64);
+                        b.concat(high, value, 64, 128)
+                    } else {
+                        let low = b.slice(old, 0, 64);
+                        b.concat(value, low, 64, 128)
+                    };
                     b.set_v(target, 128, whole);
+                    b.commit();
                 } else {
-                    b.set_v(target, 128, value);
+                    let source = b.v(target, 128);
+                    let value = b.slice(source, half as u16 * 64, 64);
+                    b.store_structure(address, 8, value, align);
                 }
-                b.commit();
-            } else {
-                let value = b.v(list(vt, register), u16::from(vector_bytes) * 8);
-                b.store_structure(address, vector_bytes, value, align);
             }
         }
         if shape.load && vector_bytes == 8 {
