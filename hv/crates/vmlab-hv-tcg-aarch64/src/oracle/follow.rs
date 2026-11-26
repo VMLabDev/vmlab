@@ -86,6 +86,9 @@ pub enum End {
     /// QEMU went on at a PC outside the memory that the round mirrors, where
     /// it has flash or a device. The branch that went there is verified.
     OutsideMemory,
+    /// The stream wrote a value or ran an instruction that the lockstep does
+    /// not follow (`system::unfollowed`): the round ends before it.
+    Unfollowed(&'static str),
     /// QEMU took an exception at a record that we decode and have no lifter
     /// for. Nothing to compare.
     UnliftedException(Record),
@@ -576,6 +579,13 @@ impl Follower {
                     if *seen > round.visits {
                         self.leader.stop(true)?;
                         break Ok(End::Loop);
+                    }
+                    if compare_system
+                        && let Some(why) =
+                            super::system::unfollowed(encoding, &core.x, &self.cpu.state)
+                    {
+                        self.leader.stop(true)?;
+                        break Ok(End::Unfollowed(why));
                     }
                     followed += 1;
                     let stepped = self.cpu.step();

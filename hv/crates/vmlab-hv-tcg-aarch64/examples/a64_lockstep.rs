@@ -150,6 +150,7 @@ impl Counts {
             End::OutsideMemory => {
                 "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
             }
+            End::Unfollowed(why) => format!("not followed: {why}"),
             End::UnliftedException(record) => format!("exception at {} (no lifter)", record.name()),
             End::Unlifted(record) => format!("QEMU ran {} (no lifter)", record.name()),
         };

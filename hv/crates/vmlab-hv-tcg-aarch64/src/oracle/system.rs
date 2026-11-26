@@ -147,6 +147,51 @@ pub fn safe_value(row: usize, rng: &mut Rng, table: u64, image: (u64, u64)) -> O
     })
 }
 
+/// Whether the instruction that QEMU is about to run takes the round out of
+/// what the lockstep follows. `safe_value` keeps the values of the stream
+/// inside, but a branch or an exception return can land between the
+/// instructions that load a value and the `MSR` that writes it, and the
+/// write then takes what the register held. `x`: X0 to X30 before the
+/// instruction. `state`: our state, which is QEMU's. The text says why.
+pub fn unfollowed(encoding: u32, x: &[u64; 31], state: &crate::state::State) -> Option<&'static str> {
+    let el0 = state.context.el == 0;
+    let sctlr = state.system.regs[sysreg::reg::SCTLR_EL1];
+    match encoding {
+        0xd503_207f if !el0 || sctlr & sysreg::sctlr::NTWI != 0 => {
+            return Some("WFI waits for an interrupt that no round has");
+        }
+        0xd503_205f if !el0 || sctlr & sysreg::sctlr::NTWE != 0 => {
+            return Some("WFE waits for an event that no round has");
+        }
+        // AArch32 at EL0, which QEMU's CPU has and ours does not (G2).
+        asm::ERET if !el0 && state.system.regs[sysreg::reg::SPSR_EL1] & 0x1f == 0x10 => {
+            return Some("a return to AArch32 at EL0");
+        }
+        _ => {}
+    }
+    // `MSR <register>, Xt` at EL1.
+    if encoding & 0xffe0_0000 != 0xd500_0000 || el0 {
+        return None;
+    }
+    let value = match encoding & 31 {
+        31 => 0,
+        rt => x[rt as usize],
+    };
+    let row = sysreg::find((encoding >> 5) as u16)?;
+    match ROWS[row].name {
+        "SCTLR_EL1" if value & 1 != 0 => Some("the MMU is card C8"),
+        "TCR_EL1" if value & (3 << 37) != 0 => Some("tagged addresses are card C8"),
+        "MDSCR_EL1" if value & (1 | 1 << 13 | 1 << 15) != 0 => {
+            Some("software step and debug exceptions are not in phase 3d (V3)")
+        }
+        "CNTV_CVAL_EL0" | "CNTP_CVAL_EL0" if (1 << 16..1 << 63).contains(&value) => {
+            Some("a timer whose status depends on the time of the host")
+        }
+        "CNTV_TVAL_EL0" | "CNTP_TVAL_EL0" => Some("a timer value takes the count of the host"),
+        _ => None,
+    }
+}
+
 /// Whether both sides agree about the encoding: we have a row that is not
 /// left out, or neither side has the register.
 fn agreed(encoding: u16) -> bool {
@@ -463,6 +508,36 @@ mod tests {
                 .any(|encoding| sysreg::name(*encoding) == difference.name);
             assert!(known || listed, "{}", difference.name);
         }
+        // What a round does not follow, whatever the register held.
+        let state = State::reset(0);
+        let mut x = [0u64; 31];
+        x[3] = 1;
+        let msr = |name: &str| asm::msr(ROWS[sysreg::index(name)].encoding, 3);
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state).is_some());
+        assert!(unfollowed(msr("MDSCR_EL1"), &x, &state).is_some());
+        assert!(unfollowed(msr("CNTV_TVAL_EL0"), &x, &state).is_some());
+        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state).is_none());
+        assert!(unfollowed(msr("TCR_EL1"), &x, &state).is_none());
+        assert!(unfollowed(msr("TPIDR_EL1"), &x, &state).is_none());
+        x[3] = 1 << 37;
+        assert!(unfollowed(msr("TCR_EL1"), &x, &state).is_some());
+        assert!(unfollowed(msr("CNTP_CVAL_EL0"), &x, &state).is_some());
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &state).is_none());
+        assert!(unfollowed(msr("SCTLR_EL1") | 31, &x, &state).is_none());
+        assert!(unfollowed(0xd503_207f, &x, &state).is_some());
+        assert!(unfollowed(asm::ERET, &x, &state).is_none());
+        let mut user = State::reset(0);
+        assert!(user.set_cpsr(0));
+        // At EL0 the write is undefined, and the waits trap unless SCTLR_EL1
+        // lets them through, as it does after the reset.
+        x[3] = 1;
+        assert!(unfollowed(msr("SCTLR_EL1"), &x, &user).is_none());
+        assert!(unfollowed(0xd503_205f, &x, &user).is_some());
+        user.system.regs[sysreg::reg::SCTLR_EL1] = 0;
+        assert!(unfollowed(0xd503_205f, &x, &user).is_none());
+        let mut aarch32 = State::reset(0);
+        aarch32.system.regs[sysreg::reg::SPSR_EL1] = 0x10;
+        assert!(unfollowed(asm::ERET, &x, &aarch32).is_some());
         assert!(reads_the_time(sysreg::index("CNTVCT_EL0")));
         assert!(!reads_the_time(sysreg::index("CNTV_CTL_EL0")));
         assert!(writable(sysreg::index("OSLAR_EL1")) && !writable(sysreg::index("MIDR_EL1")));
