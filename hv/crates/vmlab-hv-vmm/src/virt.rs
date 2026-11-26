@@ -796,6 +796,10 @@ impl Virt {
     /// with every interrupt masked and the MMU off.
     fn start_state(&self, id: usize, entry: u64, x0: u64) -> State {
         let mut state = State::reset_as(entry, self.model);
+        // The architecture leaves the flags of a reset unknown. The CPU of
+        // QEMU starts with Z set (the first record of the boot lockstep),
+        // and so does this one (DESIGN.md P2).
+        state.set_nzcv(0b0100);
         state.set_x(0, x0);
         // Affinity level 0 is the number of the CPU.
         state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::MPIDR_EL1] |= id as u64;

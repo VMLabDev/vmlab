@@ -6,14 +6,17 @@
 //!       --code <AAVMF_CODE.fd> --vars <AAVMF_VARS.fd>
 //!       [--qemu <binary>] [--ram-mib N] [--until <text>]
 //!       [--max-instructions N] [--resync N] [--ignore <register>]...
+//!       [--system core|all]
 //!
 //! QEMU boots the firmware at `-smp 1` with the plugin, and our whole `virt`
 //! machine follows its stream from the reset. Both start from the same
 //! firmware and the same variables (each side gets its own copy), the device
 //! tree that the leader writes, and the same memory map. Before every
 //! instruction the follower compares X0 to X30, SP, PC, PSTATE, V0 to V31,
-//! FPSR, FPCR and the system registers of `oracle::compared`, and after it
-//! the memory writes.
+//! FPSR, FPCR and system registers, and after it the memory writes. The
+//! system registers are those of an exception and of the translation
+//! (`CORE`), or with `--system all` every one of `oracle::compared`, which
+//! makes the leader three times slower.
 //!
 //! The leader leads for what is not a function of the CPU state:
 //! - an interrupt is taken where the stream says. The follower says so when
@@ -57,6 +60,31 @@ use vmlab_hv_vmm::virt;
 use vmlab_hv_vmm::vm::ExitReason;
 
 type Error = Box<dyn std::error::Error>;
+
+/// The system registers that every run compares: those of an exception,
+/// of the translation and of the timers, and the two stack pointers.
+const CORE: [&str; 20] = [
+    "ESR_EL1",
+    "FAR_EL1",
+    "ELR_EL1",
+    "SPSR_EL1",
+    "VBAR_EL1",
+    "SCTLR_EL1",
+    "TCR_EL1",
+    "TTBR0_EL1",
+    "TTBR1_EL1",
+    "MAIR_EL1",
+    "CPACR_EL1",
+    "CONTEXTIDR_EL1",
+    "TPIDR_EL0",
+    "TPIDR_EL1",
+    "CNTKCTL_EL1",
+    "CNTV_CTL_EL0",
+    "CNTV_CVAL_EL0",
+    "CNTP_CTL_EL0",
+    "SP_EL0",
+    "SP_EL1",
+];
 
 /// The instructions that the follower keeps for the report of a difference.
 const KEPT: usize = 4096;
@@ -189,6 +217,7 @@ struct Arguments {
     max_instructions: u64,
     resync: u64,
     ignore: Vec<String>,
+    all: bool,
 }
 
 fn arguments() -> Result<Arguments, Error> {
@@ -203,6 +232,7 @@ fn arguments() -> Result<Arguments, Error> {
         max_instructions: u64::MAX,
         resync: 0,
         ignore: Vec::new(),
+        all: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -220,6 +250,7 @@ fn arguments() -> Result<Arguments, Error> {
             "--max-instructions" => parsed.max_instructions = value.parse()?,
             "--resync" => parsed.resync = value.parse()?,
             "--ignore" => parsed.ignore.push(value),
+            "--system" => parsed.all = value == "all",
             _ => return Err(format!("unknown argument {name}").into()),
         }
     }
@@ -276,6 +307,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
 
     let compared: Vec<_> = compared()
         .into_iter()
+        .filter(|register| arguments.all || CORE.contains(&register.qemu))
         .filter(|register| !arguments.ignore.iter().any(|name| name == register.qemu))
         .collect();
     let options = boot::Options {
