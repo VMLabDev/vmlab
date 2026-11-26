@@ -230,6 +230,13 @@ impl InputConn {
         Self { path, client: None }
     }
 
+    /// The proof tests of review F11 name the wait they allow; nothing
+    /// honours it yet.
+    #[cfg(test)]
+    pub(crate) fn with_patience(path: PathBuf, _patience: Duration) -> Self {
+        Self::new(path)
+    }
+
     /// Send `messages` in order, reconnecting once if the connection went
     /// away under us — a restart or a restore replaced the hypervisor.
     pub fn send(&mut self, messages: &[Message]) -> Result<()> {
