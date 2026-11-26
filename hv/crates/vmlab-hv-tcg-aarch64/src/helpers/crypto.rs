@@ -6,10 +6,11 @@
 //! the columns. The lane `i` of 32 bits is the word `i` of a SHA value.
 //!
 //! Sources read (DESIGN.md "Sources"): the published algorithms, FIPS 197
-//! and FIPS 180-4, from memory, and S3, dynarmic's `simd_aes.cpp` and
-//! `simd_sha.cpp` (0BSD), for which register holds what. The tests run the
-//! known answers of both standards through these functions. S6, the lockstep
-//! against QEMU. Not read: QEMU's source, Arm's ASL or pseudocode (X1, X2).
+//! and FIPS 180-4, and the published definitions of the instructions, from
+//! the author's memory. The tests run the known answers of both standards
+//! through these functions, as a guest computes them. S6, the lockstep
+//! against QEMU. No file of S2, S3 or S4 was opened for this file. Not read:
+//! QEMU's source, Arm's ASL or pseudocode (X1, X2).
 
 use vmlab_hv_tcg_ir::native::{Effects, Helper, HelperFn};
 

@@ -4,9 +4,9 @@
 //! of the instruction (DESIGN.md G3d).
 //!
 //! Sources read (DESIGN.md "Sources"): S1, the generated tables of the LLVM
-//! AArch64 records. S3, dynarmic's `simd_aes.cpp` and `simd_sha.cpp` (0BSD)
-//! for which register holds what. S6, the lockstep against QEMU. Not read:
-//! QEMU's source, Arm's ASL or pseudocode (X1, X2).
+//! AArch64 records. S6, the lockstep against QEMU, which checks which
+//! register holds what. No file of S2, S3 or S4 was opened for this file.
+//! Not read: QEMU's source, Arm's ASL or pseudocode (X1, X2).
 
 use super::{Builder, Lifted};
 use crate::generated::decode::Record;

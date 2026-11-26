@@ -14,11 +14,12 @@
 //! narrowing operation the other way round. An operand that a "2" form takes
 //! from the upper half of a register is moved down by the lifter.
 //!
-//! Sources read (DESIGN.md "Sources"): S1, the LLVM tables for the names of
-//! the operations. S3, dynarmic's A64 translator (`simd_*.cpp`, 0BSD) for
-//! which operand is which, where the lockstep did not say it sooner. S6, the
-//! lockstep against QEMU, for the behaviour. Not read: QEMU's source, Arm's
-//! ASL or pseudocode (X1, X2).
+//! Sources read (DESIGN.md "Sources"): S1, the generated tables of the LLVM
+//! records, for the names of the operations. S6, the lockstep against QEMU,
+//! for the behaviour. The integer operations are written from the author's
+//! knowledge of the published instruction set, and the lockstep found no
+//! difference. No file of S2, S3 or S4 was opened for this file. Not read:
+//! QEMU's source, Arm's ASL or pseudocode (X1, X2).
 
 use super::fp::vector::{self as fpv, Mask};
 use super::fp::{self, Binary as FpBinary, DOUBLE, Format, HALF, SINGLE, Unary as FpUnary};

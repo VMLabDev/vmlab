@@ -1,5 +1,5 @@
-//! AdvSIMD (card C7): the 49 format classes of the `NEON` records that are
-//! not loads and stores (1,411 records, with `PMULL` of the `AES` set).
+//! AdvSIMD (card C7): the 47 format classes of the `NEON` records that are
+//! not loads and stores (1,412 records, with `PMULL` of the `AES` set).
 //!
 //! A lifter here reads the instruction word, not the fields of one record:
 //! the encoding groups of AdvSIMD put the vector length in bit 30 (`Q`), the
@@ -18,9 +18,11 @@
 //! (CPACR_EL1.FPEN), which belongs to the exception card (C6).
 //!
 //! Sources read (DESIGN.md "Sources"): S1, the generated tables of the LLVM
-//! AArch64 records for the records, their fixed bits and their names. S3,
-//! dynarmic's A64 translator (`simd_*.cpp`, 0BSD) for which operand is which.
-//! S6, the lockstep against QEMU, for the behaviour. Not read: QEMU's source,
+//! AArch64 records for the records, their fixed bits and their names. S6,
+//! the lockstep against QEMU, for the behaviour. The opcode tables of the
+//! `plan` functions are written from the author's knowledge of the published
+//! A64 encoding, and the test against the record names checks each row. No
+//! file of S2, S3 or S4 was opened for this file. Not read: QEMU's source,
 //! Arm's ASL or pseudocode (X1, X2).
 
 use super::{Builder, Lifted};

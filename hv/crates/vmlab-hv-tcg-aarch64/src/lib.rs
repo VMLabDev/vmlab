@@ -4,7 +4,7 @@
 //! The semantics are our own code: lifters that append to a block of the
 //! typed IR of `vmlab-hv-tcg-ir` (`lift`), run by a small interpreter loop
 //! (`exec`). `helpers` holds what a lifter calls and does not express in the
-//! graph: floating point on Berkeley SoftFloat. `oracle` is the test harness that follows a running QEMU
+//! graph: floating point on Berkeley SoftFloat, the lanes of AdvSIMD, AES and SHA. `oracle` is the test harness that follows a running QEMU
 //! instruction by instruction. QEMU is the test oracle only: nothing in this
 //! crate starts it outside that harness.
 //!
