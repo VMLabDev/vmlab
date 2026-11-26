@@ -1549,10 +1549,16 @@ impl Follower {
                 } => {
                     let ours = Core::of(&self.cpu.state);
                     if from_pc != ours.pc {
+                        // Our system registers that are not at their reset
+                        // value.
+                        let reset = super::corpus::reset_system(&self.compared);
+                        let now = system_of(&self.cpu.state, &self.compared);
+                        let named = super::corpus::named(&self.compared, &reset, &now);
                         break Err(differed(
                             format!(
-                                "QEMU took a discontinuity of the kind {kind} from {from_pc:#x} to {to_pc:#x} and we are at {:#x}",
-                                ours.pc
+                                "QEMU took a discontinuity of the kind {kind} from {from_pc:#x} to {to_pc:#x} and we are at {:#x}; {}",
+                                ours.pc,
+                                super::corpus::named_text("sys", &named)
                             ),
                             &last,
                             ours,
