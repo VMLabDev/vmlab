@@ -5007,7 +5007,6 @@ dependencies = [
 [[package]]
 name = "wscript-vm"
 version = "0.2.0"
-source = "git+https://github.com/Configweave/wscript.git?rev=faf09e6e4c7e8ed28611993aa8dc71633a67c028#faf09e6e4c7e8ed28611993aa8dc71633a67c028"
 dependencies = [
  "wscript-core",
 ]
