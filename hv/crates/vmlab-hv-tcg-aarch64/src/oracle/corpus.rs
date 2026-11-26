@@ -13,11 +13,27 @@
 //! to V31. The state after the instruction has `dv=` in place of `v=`, with
 //! only the registers that the instruction changed, as `number:value`.
 //!
+//! An instruction that reads or writes memory has more after a `|`, in any
+//! order:
+//!
+//! ```text
+//! ... | r=42100000:8877665544332211 w=42100008:00
+//! ```
+//!
+//! `r`: bytes that the memory holds before the instruction, lowest address
+//! first. `w`: bytes that the instruction writes. Memory that is not named
+//! is zero.
+//!
 //! A line that starts with `#` is a comment.
 
 use super::{Core, Vectors};
 use crate::exec::Cpu;
+use std::collections::BTreeMap;
 use vmlab_hv_tcg::FlatMemory;
+
+/// The most memory that a replay spans, from the lowest address that an
+/// entry names to the highest.
+const REPLAY_SPAN: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -26,6 +42,38 @@ pub struct Entry {
     pub after: Core,
     /// The vector and FP registers before and after.
     pub vectors: Option<(Vectors, Vectors)>,
+    /// Memory before the instruction: address and bytes.
+    pub reads: Vec<(u64, Vec<u8>)>,
+    /// What the instruction writes: address and bytes.
+    pub writes: Vec<(u64, Vec<u8>)>,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return Err(format!("`{text}` is not a run of hex bytes"));
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| {
+            u8::from_str_radix(&text[at..at + 2], 16)
+                .map_err(|_| format!("`{text}` is not a run of hex bytes"))
+        })
+        .collect()
+}
+
+/// `address:bytes`.
+fn parse_memory(text: &str) -> Result<(u64, Vec<u8>), String> {
+    let (address, bytes) = text
+        .split_once(':')
+        .ok_or_else(|| format!("`{text}` is not address:bytes"))?;
+    Ok((
+        u64::from_str_radix(address, 16).map_err(|_| format!("`{address}` is not an address"))?,
+        unhex(bytes)?,
+    ))
 }
 
 /// The vector and FP registers of one side of a line, as far as it gives them.
@@ -148,7 +196,21 @@ fn parse_vectors(
 }
 
 impl Entry {
-    pub fn line(&self) -> String {
+    /// An entry of an instruction that touches no memory and no vector
+    /// register.
+    pub fn core(encoding: u32, before: Core, after: Core) -> Self {
+        Self {
+            encoding,
+            before,
+            after,
+            vectors: None,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }
+    }
+
+    /// The registers of the line, without its memory.
+    fn registers_line(&self) -> String {
         let Some((before, after)) = &self.vectors else {
             return format!("{:08x} {} => {}", self.encoding, self.before, self.after);
         };
@@ -167,7 +229,38 @@ impl Entry {
         line
     }
 
+    pub fn line(&self) -> String {
+        let mut line = self.registers_line();
+        if self.reads.is_empty() && self.writes.is_empty() {
+            return line;
+        }
+        line.push_str(" |");
+        for (address, bytes) in &self.reads {
+            line.push_str(&format!(" r={address:x}:{}", hex(bytes)));
+        }
+        for (address, bytes) in &self.writes {
+            line.push_str(&format!(" w={address:x}:{}", hex(bytes)));
+        }
+        line
+    }
+
     pub fn parse(line: &str) -> Result<Self, String> {
+        let (line, memory) = match line.split_once('|') {
+            Some((line, memory)) => (line, memory),
+            None => (line, ""),
+        };
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
+        for part in memory.split_whitespace() {
+            match part.split_once('=') {
+                Some(("r", value)) => reads.push(parse_memory(value)?),
+                Some(("w", value)) => writes.push(parse_memory(value)?),
+                _ => {
+                    return Err(format!(
+                        "`{part}` is not r=address:bytes or w=address:bytes"
+                    ));
+                }
+            }
+        }
         let (encoding, rest) = line
             .trim()
             .split_once(' ')
@@ -183,11 +276,14 @@ impl Entry {
             before,
             after,
             vectors: parse_vectors(before_vectors, after_vectors)?,
+            reads,
+            writes,
         })
     }
 
     /// Run the instruction on our interpreter from `before`, and compare
-    /// with `after`.
+    /// with `after`: the registers, the vector and FP registers where the
+    /// entry has them, and the bytes that the instruction writes.
     pub fn replay(&self) -> Result<(), String> {
         let mut state = self
             .before
@@ -196,33 +292,76 @@ impl Entry {
         if let Some((before, _)) = &self.vectors {
             before.apply(&mut state);
         }
-        let page = self.before.pc & !0xfff;
-        let mut data = vec![0u8; 0x1000];
-        let at = (self.before.pc - page) as usize;
-        if at + 4 > data.len() {
+        // One memory from the page of the lowest address that the entry
+        // names to the page of the highest.
+        if self.before.pc & 0xfff > 0xffc {
             return Err("the instruction crosses a page".into());
         }
-        data[at..at + 4].copy_from_slice(&self.encoding.to_le_bytes());
-        let mut cpu = Cpu::new(FlatMemory::new(page, data), state);
-        cpu.step()
-            .map_err(|stop| format!("{:08x}: our interpreter stops: {stop:?}", self.encoding))?;
-        let ours = Core::of(&cpu.state);
-        if ours != self.after {
+        let page = self.before.pc & !0xfff;
+        let mut low = page;
+        let mut high = page
+            .checked_add(0x1000)
+            .ok_or("an instruction at the end of the address space")?;
+        for (address, bytes) in self.reads.iter().chain(&self.writes) {
+            low = low.min(*address & !0xfff);
+            let end = address
+                .checked_add(bytes.len() as u64 + 0xfff)
+                .ok_or("an access at the end of the address space")?
+                & !0xfff;
+            high = high.max(end);
+        }
+        if high - low > REPLAY_SPAN {
             return Err(format!(
-                "{:08x}: {}",
-                self.encoding,
-                ours.difference(&self.after).join("; ")
+                "the entry spans {:#x} bytes of memory, more than a replay holds",
+                high - low
             ));
         }
+        let mut data = vec![0u8; (high - low) as usize];
+        for (address, bytes) in &self.reads {
+            let at = (address - low) as usize;
+            data[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let at = (self.before.pc - low) as usize;
+        data[at..at + 4].copy_from_slice(&self.encoding.to_le_bytes());
+        let mut cpu = Cpu::new(FlatMemory::new(low, data), state);
+        cpu.log_accesses(true);
+        cpu.step()
+            .map_err(|stop| format!("{:08x}: our interpreter stops: {stop:?}", self.encoding))?;
+        let mut found = Core::of(&cpu.state).difference(&self.after);
         if let Some((_, after)) = &self.vectors {
-            let ours = Vectors::of(&cpu.state);
-            if ours != *after {
-                return Err(format!(
-                    "{:08x}: {}",
-                    self.encoding,
-                    ours.difference(after).join("; ")
-                ));
+            found.extend(Vectors::of(&cpu.state).difference(after));
+        }
+        let bytes = |writes: &mut dyn Iterator<Item = (u64, Vec<u8>)>| {
+            let mut map = BTreeMap::new();
+            for (address, data) in writes {
+                for (index, byte) in data.into_iter().enumerate() {
+                    map.insert(address + index as u64, byte);
+                }
             }
+            map
+        };
+        let ours = bytes(
+            &mut cpu
+                .take_accesses()
+                .into_iter()
+                .filter(|access| access.write)
+                .map(|access| {
+                    (
+                        access.address,
+                        access.value.to_le_bytes()[..usize::from(access.bytes)].to_vec(),
+                    )
+                }),
+        );
+        let expected = bytes(&mut self.writes.iter().cloned());
+        if ours != expected {
+            found.push(format!(
+                "memory writes: {} bytes / {} bytes, or other values",
+                ours.len(),
+                expected.len()
+            ));
+        }
+        if !found.is_empty() {
+            return Err(format!("{:08x}: {}", self.encoding, found.join("; ")));
         }
         Ok(())
     }
@@ -256,12 +395,56 @@ mod tests {
         after.x[0] = 42;
         after.pc += 4;
         // add x0, x0, #1
-        Entry {
-            encoding: 0x9100_0400,
-            before,
-            after,
-            vectors: None,
-        }
+        Entry::core(0x9100_0400, before, after)
+    }
+
+    #[test]
+    fn an_entry_with_memory_goes_to_a_line_and_back_and_replays() {
+        let mut before = Core {
+            x: [0; 31],
+            sp: 0,
+            pc: 0x4200_0000,
+            cpsr: CPSR_EL1H,
+        };
+        before.x[0] = 0x4210_0ff0;
+        let mut after = before;
+        after.pc += 4;
+        // stp q1, q2, [x0]: 32 bytes across a page boundary.
+        let value = |n: u8| u128::from_le_bytes(core::array::from_fn(|index| n + index as u8));
+        let mut store = Entry::core(0xad00_0801, before, after);
+        store.writes = vec![
+            (0x4210_0ff0, value(0x10).to_le_bytes().to_vec()),
+            (0x4210_1000, value(0x20).to_le_bytes().to_vec()),
+        ];
+        let mut vectors = Vectors::default();
+        vectors.v[1] = value(0x10);
+        vectors.v[2] = value(0x20);
+        store.vectors = Some((vectors, vectors));
+        let line = store.line();
+        assert!(line.contains(" | w=42100ff0:101112"), "{line}");
+        assert!(line.contains(" fpcr=0 fpsr=0 v=0,1f1e1d"), "{line}");
+        assert_eq!(Entry::parse(&line), Ok(store.clone()));
+        assert_eq!(store.replay(), Ok(()));
+        // A wrong byte, and a write that is shorter than the instruction's.
+        let mut wrong = store.clone();
+        wrong.writes[1].1[0] ^= 1;
+        assert!(wrong.replay().unwrap_err().contains("memory writes"));
+        let mut wrong = store.clone();
+        wrong.writes[1].1.pop();
+        assert!(wrong.replay().unwrap_err().contains("memory writes"));
+        // ldr w3, [x0]: the memory before is part of the entry.
+        let mut after = before;
+        after.pc += 4;
+        after.x[3] = 0x8877_6655;
+        let mut load = Entry::core(0xb940_0003, before, after);
+        load.reads = vec![(0x4210_0ff0, vec![0x55, 0x66, 0x77, 0x88])];
+        assert_eq!(Entry::parse(&load.line()), Ok(load.clone()));
+        assert_eq!(load.replay(), Ok(()));
+        let mut wrong = load.clone();
+        wrong.after.x[3] = 1;
+        assert!(wrong.replay().unwrap_err().contains("x3: 0x88776655 / 0x1"));
+        assert!(Entry::parse(&format!("{} | q=1", load.line())).is_err());
+        assert!(Entry::parse(&format!("{} | r=42100000:123", load.line())).is_err());
     }
 
     #[test]

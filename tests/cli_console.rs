@@ -235,6 +235,13 @@ async fn tcp_override_bridges_vnc_on_both_hypervisors() {
         let listener = tokio::net::UnixListener::bind(fixture.vnc_socket()).unwrap();
         let echo = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // `vnc.sock` asks for nothing: security type None.
+            let mut version = [0; 12];
+            stream.write_all(b"RFB 003.008\n").await.unwrap();
+            stream.read_exact(&mut version).await.unwrap();
+            stream.write_all(&[1, 1]).await.unwrap();
+            assert_eq!(stream.read_u8().await.unwrap(), 1);
+            stream.write_u32(0).await.unwrap();
             let mut bytes = [0; 4];
             stream.read_exact(&mut bytes).await.unwrap();
             stream.write_all(&bytes).await.unwrap();
@@ -252,7 +259,27 @@ async fn tcp_override_bridges_vnc_on_both_hypervisors() {
             .unwrap()
             .unwrap();
         let address = line.strip_prefix("VNC for console-test/vm on ").unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(15), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let password = line.strip_prefix("password: ").unwrap();
         let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        // The bridge asks the viewer for the password it printed.
+        let mut version = [0; 12];
+        tcp.read_exact(&mut version).await.unwrap();
+        tcp.write_all(b"RFB 003.008\n").await.unwrap();
+        let mut types = [0; 2];
+        tcp.read_exact(&mut types).await.unwrap();
+        assert_eq!(types, [1, 2], "VNC authentication is the one type offered");
+        tcp.write_all(&[2]).await.unwrap();
+        let mut challenge = [0; 16];
+        tcp.read_exact(&mut challenge).await.unwrap();
+        tcp.write_all(&vmlab::vnc_auth::response(password, &challenge))
+            .await
+            .unwrap();
+        assert_eq!(tcp.read_u32().await.unwrap(), 0);
         tcp.write_all(b"test").await.unwrap();
         let mut reply = [0; 4];
         tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut reply))

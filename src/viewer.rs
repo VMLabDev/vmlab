@@ -230,12 +230,86 @@ pub fn launch(viewer: &Viewer, target: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment variable that carries a bridge's password to its
+/// detached helper.
+pub const BRIDGE_PASSWORD_ENV: &str = "VMLAB_VNCBRIDGE_PASSWORD";
+
+/// Start a detected viewer against the console TCP bridge, and hand it the
+/// bridge's password where the viewer can be handed one: `remote-viewer`
+/// in a connection file, `vncviewer` in a password file. `gvncviewer` has
+/// no way to take one, so it asks, and the user types what `vmlab console`
+/// printed. The returned file must live as long as the viewer may read it.
+pub fn spawn_bridged(
+    viewer: &Viewer,
+    port: u16,
+    display: u16,
+    password: &str,
+) -> Result<(std::process::Child, Option<tempfile::NamedTempFile>)> {
+    let (handoff, command) = bridged_command(viewer, port, display, password)?;
+    let child = command_line(&command)
+        .spawn()
+        .with_context(|| format!("launching viewer `{}`", viewer.cmd))?;
+    Ok((child, handoff))
+}
+
+/// The password file, if the viewer takes one, and the command line that
+/// names it. The file is owner-only, as every temporary file is.
+fn bridged_command(
+    viewer: &Viewer,
+    port: u16,
+    display: u16,
+    password: &str,
+) -> Result<(Option<tempfile::NamedTempFile>, String)> {
+    use std::io::Write;
+    let handoff = |suffix: &str, content: &[u8]| -> Result<tempfile::NamedTempFile> {
+        let mut file = tempfile::Builder::new()
+            .prefix("vmlab-console-")
+            .suffix(suffix)
+            .tempfile()
+            .context("creating the viewer's password file")?;
+        file.write_all(content)?;
+        file.flush()?;
+        Ok(file)
+    };
+    let target = tcp_target(viewer, "127.0.0.1", port, display);
+    match viewer.cmd.split_whitespace().next() {
+        Some("remote-viewer") => {
+            let file = handoff(
+                ".vv",
+                format!(
+                    "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport={port}\npassword={password}\n"
+                )
+                .as_bytes(),
+            )?;
+            let command = format!("remote-viewer {}", file.path().display());
+            Ok((Some(file), command))
+        }
+        Some("vncviewer") => {
+            let file = handoff(".passwd", &crate::vnc_auth::password_file(password))?;
+            let command = format!("vncviewer -passwd {} {target}", file.path().display());
+            Ok((Some(file), command))
+        }
+        _ => Ok((None, viewer.cmd.replace("{}", &target))),
+    }
+}
+
+fn command_line(line: &str) -> Command {
+    let mut parts = line.split_whitespace();
+    let mut command = Command::new(parts.next().unwrap_or_default());
+    command.args(parts);
+    command
+}
+
 /// Launch a detached background helper that holds a unix→TCP VNC bridge and
 /// the viewer for a TCP-only client, freeing the caller's terminal. The
 /// helper (`vmlab __vncbridge`) exits when the viewer window closes,
 /// tearing the bridge down with it. Used by `vmlab console` and the
 /// `gui = true` auto-open for gvncviewer/vncviewer.
-pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<()> {
+///
+/// Returns the password the helper's bridge asks every TCP peer for. The
+/// helper hands it to the viewer where it can; the caller prints it for
+/// the viewer that asks the user instead.
+pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<String> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locating vmlab binary")?;
     let exe = exe.to_string_lossy().into_owned();
@@ -251,12 +325,14 @@ pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<()> {
         c.args(args);
         c
     };
-    cmd.stdin(Stdio::null())
+    let password = crate::vnc_auth::new_password();
+    cmd.env(BRIDGE_PASSWORD_ENV, &password)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("spawning background vnc bridge")?;
-    Ok(())
+    Ok(password)
 }
 
 /// Open a viewer for a lab VM, using its reported hypervisor for `gui = true`.
@@ -276,8 +352,8 @@ pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
     match viewer {
         Some(v) if v.transport == Transport::Unix => launch(&v, &sock.display().to_string()),
         Some(_) => {
-            spawn_detached_bridge(lab, vm)?;
-            println!("gui: opened a viewer for {vm}");
+            let password = spawn_detached_bridge(lab, vm)?;
+            println!("gui: opened a viewer for {vm} (if it asks for a password: {password})");
             Ok(())
         }
         None => {
@@ -320,6 +396,55 @@ pub fn open_when_ready(sock: PathBuf) {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    fn tcp_viewer(cmd: &str) -> Viewer {
+        Viewer {
+            cmd: cmd.to_string(),
+            transport: Transport::Tcp,
+        }
+    }
+
+    // display-2 F9: the bridge asks for a password, so the viewer vmlab
+    // starts must be given it, and in a file no other user reads.
+    #[test]
+    fn a_bridged_viewer_is_handed_the_password_in_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (file, command) =
+            bridged_command(&tcp_viewer("remote-viewer vnc://{}"), 5903, 3, "Ab3dEf7h").unwrap();
+        let file = file.unwrap();
+        assert_eq!(command, format!("remote-viewer {}", file.path().display()));
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport=5903\npassword=Ab3dEf7h\n"
+        );
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let (file, command) =
+            bridged_command(&tcp_viewer("vncviewer {}"), 5903, 3, "password").unwrap();
+        let file = file.unwrap();
+        assert_eq!(
+            command,
+            format!("vncviewer -passwd {} 127.0.0.1:3", file.path().display())
+        );
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            crate::vnc_auth::password_file("password")
+        );
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // gvncviewer takes no password: it asks the user.
+        let (file, command) =
+            bridged_command(&tcp_viewer("gvncviewer {}"), 5903, 3, "Ab3dEf7h").unwrap();
+        assert!(file.is_none());
+        assert_eq!(command, "gvncviewer 127.0.0.1:3");
+    }
 
     fn available<'a>(binaries: &'a [&'a str]) -> impl Fn(&Path) -> Option<PathBuf> + 'a {
         |path| {

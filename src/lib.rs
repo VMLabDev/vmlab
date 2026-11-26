@@ -47,3 +47,5 @@ pub mod version;
 mod viewer;
 mod vision;
 mod vnc;
+/// VNC authentication, which the console TCP bridge asks of each viewer.
+pub mod vnc_auth;
