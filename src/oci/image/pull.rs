@@ -307,7 +307,11 @@ fn record_resolution(
     Ok(())
 }
 
-fn load_cached_selector(cache: &ImageCache, digest: &str, arch: &str) -> Result<Option<PulledImage>> {
+fn load_cached_selector(
+    cache: &ImageCache,
+    digest: &str,
+    arch: &str,
+) -> Result<Option<PulledImage>> {
     if let Some(image) = load_cached(cache, digest)? {
         return Ok(Some(image));
     }
@@ -598,7 +602,9 @@ mod tests {
         let pulled = pull_with_transport(&reference, "x86_64", &cache, &hub, &mut |_| {}).await;
         assert!(
             cached.as_ref().map(|image| image.manifest_digest.as_str()) == Some(manifest.as_str())
-                && pulled.as_ref().is_ok_and(|image| image.manifest_digest == manifest),
+                && pulled
+                    .as_ref()
+                    .is_ok_and(|image| image.manifest_digest == manifest),
             "cache probe: {cached:?}, offline pull: {pulled:?}"
         );
         assert!(
