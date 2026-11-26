@@ -1178,6 +1178,25 @@ impl Qcow2Image {
         if let Some(backing) = &backing {
             check_backing_name_len(&backing.name)?;
         }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // From here the file is ours. A create that fails must not leave it:
+        // a caller that finds a file at `path` takes it as the image.
+        Self::create_in(file, path, size, cluster_bits, backing).inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })
+    }
+
+    fn create_in(
+        file: File,
+        path: &Path,
+        size: u64,
+        cluster_bits: u32,
+        backing: Option<BackingRef>,
+    ) -> Result<Qcow2Image> {
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
         let l1_entries = size.div_ceil(span).max(1);
@@ -1236,11 +1255,6 @@ impl Qcow2Image {
             hc[ext_off..ext_off + name.len()].copy_from_slice(name);
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
         file.set_len(l1_offset + l1_clusters * cluster_size)?;
 
         // Refcount table: entry 0 -> refblock 0.

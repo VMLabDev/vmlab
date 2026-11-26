@@ -184,6 +184,64 @@ impl Builder {
         self.shift(width, Binary::ArithmeticShiftRight, value, amount)
     }
 
+    /// Shift by an amount that is a scalar. The executor gives zero for a
+    /// logical shift by `width` or more, and the sign for an arithmetic one.
+    pub fn shl_by(&mut self, width: u16, value: ScalarId, amount: ScalarId) -> ScalarId {
+        self.binary(width, Binary::ShiftLeft, value, amount)
+    }
+
+    pub fn lsr_by(&mut self, width: u16, value: ScalarId, amount: ScalarId) -> ScalarId {
+        self.binary(width, Binary::ShiftRight, value, amount)
+    }
+
+    pub fn asr_by(&mut self, width: u16, value: ScalarId, amount: ScalarId) -> ScalarId {
+        self.binary(width, Binary::ArithmeticShiftRight, value, amount)
+    }
+
+    /// Rotate right by a constant below `width`.
+    pub fn ror(&mut self, width: u16, value: ScalarId, amount: u32) -> ScalarId {
+        if amount == 0 {
+            return value;
+        }
+        let low = self.lsr(width, value, amount);
+        let high = self.shl(width, value, u32::from(width) - amount);
+        self.binary(width, Binary::Or, low, high)
+    }
+
+    /// The low `from` bits of `value` with their sign above them, as `width`
+    /// bits. `from` is at most `width`.
+    pub fn sign_extend(&mut self, value: ScalarId, from: u16, width: u16) -> ScalarId {
+        let low = self.low(value, from);
+        if from == width {
+            return low;
+        }
+        total(
+            self.block
+                .graph
+                .unary(ScalarType::Bits(width), Unary::SignExtend(from), low),
+        )
+    }
+
+    /// A unary operation on `width` bits with a result of `width` bits.
+    pub fn unary(&mut self, width: u16, operation: Unary, value: ScalarId) -> ScalarId {
+        total(
+            self.block
+                .graph
+                .unary(ScalarType::Bits(width), operation, value),
+        )
+    }
+
+    /// `0 - value` in `width` bits.
+    pub fn negate(&mut self, width: u16, value: ScalarId) -> ScalarId {
+        let zero = self.imm(width, 0);
+        self.binary(width, Binary::Sub, zero, value)
+    }
+
+    /// Bits `offset` and up of `value`, as `width` bits.
+    pub fn slice(&mut self, value: ScalarId, offset: u16, width: u16) -> ScalarId {
+        self.block.graph.slice(value, offset, width)
+    }
+
     /// Bit `index` of `value`, as one bit.
     pub fn bit(&mut self, value: ScalarId, index: u16) -> ScalarId {
         self.block.graph.slice(value, index, 1)
