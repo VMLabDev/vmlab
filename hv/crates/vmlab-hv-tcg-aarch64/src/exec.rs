@@ -1385,12 +1385,6 @@ impl Cache {
     fn index(pc: u64) -> usize {
         (pc >> 2) as usize & (CACHE_ENTRIES - 1)
     }
-
-    fn clear(&mut self) {
-        for entry in &mut self.entries {
-            *entry = None;
-        }
-    }
 }
 
 /// One CPU on a memory.
