@@ -212,15 +212,6 @@ impl VcpuBackend for EmulatedVcpu {
             Stop::Unimplemented { pc, record } => self.fail(format!(
                 "the emulator has no instruction {record:?} yet, at {pc:#x}"
             )),
-            // The core gives these two to the guest as exceptions once it
-            // translates addresses (card C8). Until then they end the run.
-            Stop::DataAbort { pc, address, write } => self.fail(format!(
-                "{} of {address:#x} at {pc:#x}: nothing is at that address",
-                if write { "store" } else { "load" }
-            )),
-            Stop::Alignment { pc, address } => {
-                self.fail(format!("unaligned access to {address:#x} at {pc:#x}"))
-            }
             Stop::Host(error) => self.fail(error),
         }
     }
