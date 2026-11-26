@@ -245,7 +245,11 @@ pub struct Image {
 /// returns to X30: the stream calls its probes, so that is the instruction
 /// after the call. An exception from EL0 that is the exit call returns to
 /// EL1 with `exit_spsr`. Every other exception skips its instruction.
-pub fn vector_table(exit_spsr: u16) -> Vec<u32> {
+/// `saved_state`: the handlers clear the saved PSTATE.IL, which reads
+/// SPSR_EL1 into a register. A later CPU than ours saves bits there that
+/// ours does not have, so the walk test leaves that out: its streams make
+/// no return that sets IL.
+pub fn vector_table(exit_spsr: u16, saved_state: bool) -> Vec<u32> {
     // All ones but bit 20: 63 ones, rotated right by 43.
     let and_not_il = |rd: u32| 0x9240_0000 | 43 << 16 | 62 << 10 | rd << 5 | rd;
     // All ones but the bits 1 and 0: 62 ones, rotated right by 62.
@@ -290,6 +294,25 @@ pub fn vector_table(exit_spsr: u16) -> Vec<u32> {
             asm::msr(reg::ELR_EL1, 17),
             asm::ERET,
         ]);
+        if !saved_state {
+            for word in handler.iter_mut() {
+                let reads = *word == asm::mrs(16, reg::SPSR_EL1);
+                let writes = *word == asm::msr(reg::SPSR_EL1, 16) && entry != 8;
+                if reads || writes || *word == and_not_il(16) {
+                    *word = asm::NOP;
+                }
+            }
+            // The exit call of the entry from EL0 still writes the state
+            // that it returns to.
+            if entry == 8 {
+                handler[6] = asm::msr(reg::SPSR_EL1, 16);
+                for word in handler.iter_mut().skip(8) {
+                    if *word == asm::msr(reg::SPSR_EL1, 16) {
+                        *word = asm::NOP;
+                    }
+                }
+            }
+        }
         words.extend(&handler);
         words.resize(words.len() + 32 - handler.len(), asm::NOP);
     }
@@ -677,7 +700,7 @@ impl Generator {
 
         // --- the code -----------------------------------------------------
         let exit_spsr = [0x3c5, 0x3c4, 0x005, 0x145][builder.below(4) as usize];
-        let mut words = vector_table(exit_spsr);
+        let mut words = vector_table(exit_spsr, !profile.strict);
         let write = |words: &mut Vec<u32>, register: u16, value: u64| {
             words.extend(asm::load(16, value));
             words.push(asm::msr(register, 16));
@@ -951,8 +974,17 @@ mod tests {
 
     #[test]
     fn the_vector_table_is_sixteen_entries_of_code() {
-        let table = vector_table(0x3c5);
+        let table = vector_table(0x3c5, true);
         assert_eq!(table.len() as u64 * 4, VECTORS_BYTES);
+        // Without the saved state no handler reads SPSR_EL1, and the exit
+        // call still writes it.
+        let plain = vector_table(0x3c5, false);
+        assert!(!plain.contains(&asm::mrs(16, reg::SPSR_EL1)));
+        assert_eq!(
+            plain.iter().filter(|word| **word == asm::msr(reg::SPSR_EL1, 16)).count(),
+            1
+        );
+        assert_eq!(plain[8 * 32 + 6], asm::msr(reg::SPSR_EL1, 16));
         for word in &table {
             assert!(decode(*word).is_some(), "{word:08x}");
         }
