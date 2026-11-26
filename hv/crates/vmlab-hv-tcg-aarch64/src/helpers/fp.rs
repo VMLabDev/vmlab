@@ -184,7 +184,7 @@ impl Format {
 }
 
 /// The SoftFloat exception flags as bits of FPSR.
-fn cumulative(flags: u8) -> u8 {
+pub fn cumulative(flags: u8) -> u8 {
     let mut bits = 0;
     for (from, to) in [
         (sf::flag::INVALID, fpsr::IOC),

@@ -16,6 +16,7 @@ pub mod follow;
 pub mod leader;
 pub mod rsp;
 pub mod stream;
+pub mod testfloat;
 
 use crate::state::State;
 
