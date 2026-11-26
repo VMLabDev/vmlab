@@ -25,6 +25,9 @@
 //! FPCR. Its rounds are short, because FPSR only collects: after a few
 //! instructions most of its bits are set, and an instruction that sets one
 //! more or one less no longer shows.
+//! The groups `simd`, `crypto` and `c7` (card C7) run as `fp` does, from
+//! vector registers whose lanes hold the ends of each integer range, shift
+//! amounts and FP values.
 //! The group `loadstore` runs another way, because its instructions work on
 //! memory and on the vector registers. QEMU first runs a prelude that turns
 //! the FP and vector registers on and the stack pointer alignment check
@@ -46,8 +49,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 use vmlab_hv_tcg::FlatMemory;
 use vmlab_hv_tcg_aarch64::lift::{
-    BRANCH_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LIFTED_FORMATS, LOAD_STORE_FORMATS,
-    REGISTER_FORMATS,
+    BRANCH_FORMATS, CRYPTO_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LIFTED_FORMATS,
+    LOAD_STORE_FORMATS, REGISTER_FORMATS, SIMD_FORMATS,
 };
 use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
@@ -108,9 +111,27 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "all" => LIFTED_FORMATS.to_vec(),
         "loadstore" => LOAD_STORE_FORMATS.to_vec(),
         "system" | "c6" => STREAM_FORMATS.to_vec(),
+        "simd" => SIMD_FORMATS.to_vec(),
+        "crypto" => CRYPTO_FORMATS.to_vec(),
+        "c7" => [SIMD_FORMATS.as_slice(), CRYPTO_FORMATS.as_slice()].concat(),
+        // One format class of AdvSIMD or crypto by its name, for a longer
+        // run of a class with many records.
+        other
+            if SIMD_FORMATS
+                .iter()
+                .chain(&CRYPTO_FORMATS)
+                .any(|format| format.name() == other) =>
+        {
+            SIMD_FORMATS
+                .iter()
+                .chain(&CRYPTO_FORMATS)
+                .copied()
+                .filter(|format| format.name() == other)
+                .collect()
+        }
         other => {
             return Err(format!(
-                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, system, c6"
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, system, c6, simd, crypto, c7, or one format class of c7 by its name"
             )
             .into());
         }
@@ -183,9 +204,14 @@ fn entry(item: &Verified, few_vectors: bool) -> Entry {
         return entry;
     }
     let has_field = |name: &str| vmlab_hv_tcg_aarch64::field(item.record, name, 0).is_some();
-    let vector_data = has_field("vt") || item.encoding & (1 << 26) != 0;
+    let format = item.record.info().format;
+    // An AdvSIMD or crypto instruction names Rd, Rn, Rm and, for a table,
+    // the three registers after Rn.
+    let lanes = SIMD_FORMATS.contains(&format) || CRYPTO_FORMATS.contains(&format);
+    let vector_data = lanes || has_field("vt") || item.encoding & (1 << 26) != 0;
     let first = item.encoding & 31;
     let second = (item.encoding >> 10) & 31;
+    let (rn, rm) = ((item.encoding >> 5) & 31, (item.encoding >> 16) & 31);
     let mut kept = (
         Vectors {
             v: [0; 32],
@@ -198,7 +224,14 @@ fn entry(item: &Verified, few_vectors: bool) -> Entry {
     );
     let mut any = before.fpsr != 0 || before.fpcr != 0 || after.fpsr != 0 || after.fpcr != 0;
     for n in 0..32usize {
-        let named = vector_data && ((n as u32).wrapping_sub(first) & 31 < 4 || n as u32 == second);
+        let named = vector_data
+            && ((n as u32).wrapping_sub(first) & 31 < 4
+                || n as u32 == second
+                // An indexed form of 16-bit lanes has four bits of Rm.
+                || (lanes
+                    && ((n as u32).wrapping_sub(rn) & 31 < 4
+                        || n as u32 == rm
+                        || n as u32 == rm & 15)));
         if before.v[n] != after.v[n] || (named && before.v[n] != 0) {
             kept.0.v[n] = before.v[n];
             kept.1.v[n] = after.v[n];
@@ -422,7 +455,19 @@ fn main() -> Result<(), Failure> {
     let formats = group(&group_name)?;
     let started = Instant::now();
     // A group of FP instructions compares the vector and FP registers.
-    let vectors = formats.iter().any(|format| FP_FORMATS.contains(format));
+    // A group of AdvSIMD or crypto instructions does too, from vector
+    // registers that are made for lanes.
+    let lanes = formats
+        .iter()
+        .any(|format| SIMD_FORMATS.contains(format) || CRYPTO_FORMATS.contains(format));
+    let vectors = lanes || formats.iter().any(|format| FP_FORMATS.contains(format));
+    let start_vectors = |generator: &mut Generator| {
+        if lanes {
+            generator.simd_vectors()
+        } else {
+            generator.vectors()
+        }
+    };
     let image_words = if vectors { FP_IMAGE_WORDS } else { IMAGE_WORDS };
 
     // The group of the loads and stores compares them too, and its rounds
@@ -461,7 +506,7 @@ fn main() -> Result<(), Failure> {
         follower,
         counts: Counts {
             keep: samples,
-            few_vectors: memory_group,
+            few_vectors: memory_group || lanes,
             sampled: if system { formats.clone() } else { Vec::new() },
             compared,
             ..Counts::default()
@@ -547,7 +592,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, pc),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: image_words as u64 * if vectors { 1 } else { 2 },
             visits: 2,
             exempt: (0, 0),
@@ -682,7 +727,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, IMAGE_BASE),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: chunk.len() as u64,
             visits: 1,
             exempt: (0, 0),
@@ -704,7 +749,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
             start: start(&mut generator, IMAGE_BASE),
-            vectors: vectors.then(|| generator.vectors()),
+            vectors: vectors.then(|| start_vectors(&mut generator)),
             budget: 1,
             visits: 1,
             exempt: (0, 0),
