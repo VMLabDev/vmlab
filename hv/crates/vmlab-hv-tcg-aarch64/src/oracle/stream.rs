@@ -222,6 +222,14 @@ impl Generator {
             {
                 word = with_field(record, "offset", word, offset & !0xf).unwrap_or(word);
             }
+            // A literal is at a multiple of 16 from its instruction three
+            // times out of four, which is aligned for some instructions.
+            if record.info().format == FormatClass::LoadLiteral
+                && self.rng.chance(3, 4)
+                && let Some(label) = field(record, "label", word)
+            {
+                word = with_field(record, "label", word, label & !3).unwrap_or(word);
+            }
             if decode(word)
                 .is_some_and(|decoded| decoded.record == record && !unpredictable(&decoded))
             {
@@ -335,29 +343,37 @@ impl Generator {
 
     /// The registers at the start of a round of loads and stores. Most of
     /// them point into `window` (first address, length in bytes), which must
-    /// be RAM with room around it for the offsets of the instructions.
-    /// Others are small, as an offset register is, and a few are anything.
+    /// be RAM with room around it for the offsets of the instructions. X0 to
+    /// X5 are mostly small, as an offset register is, so that an instruction
+    /// with a base and an offset register often finds one of each. A few
+    /// are anything. Most pointers are multiples of 16, because an access
+    /// that is not aligned ends the round.
     pub fn memory_registers(&mut self, window: (u64, u64)) -> ([u64; 31], u64, u8) {
         let pointer = |rng: &mut Rng| {
             let address = window.0 + rng.below(window.1);
-            match rng.below(4) {
+            match rng.below(16) {
                 0 => address,
-                1 => address & !7,
+                1 | 2 => address & !7,
                 _ => address & !15,
             }
         };
-        let value = |rng: &mut Rng| match rng.below(16) {
-            0..=9 => pointer(rng),
-            10..=12 => rng.below(64) * [1, 1, 4, 8, 16][rng.below(5) as usize],
-            13 => (rng.below(256) as i64 - 128) as u64,
-            14 => {
+        let small = |rng: &mut Rng| rng.below(64) * 16;
+        let other = |rng: &mut Rng| match rng.below(4) {
+            0 => rng.below(64),
+            1 => (rng.below(256) as i64 - 128) as u64,
+            2 => {
                 [0, u64::MAX, 1 << 63, (1 << 63) - 1, 1 << 31, (1 << 32) - 1][rng.below(6) as usize]
             }
             _ => rng.next_u64(),
         };
         let mut x = [0; 31];
-        for register in &mut x {
-            *register = value(&mut self.rng);
+        for (n, register) in x.iter_mut().enumerate() {
+            *register = match self.rng.below(16) {
+                0 => other(&mut self.rng),
+                1..=12 if n < 6 => small(&mut self.rng),
+                1 => small(&mut self.rng),
+                _ => pointer(&mut self.rng),
+            };
         }
         let sp = pointer(&mut self.rng);
         let nzcv = self.rng.below(16) as u8;
@@ -365,14 +381,14 @@ impl Generator {
     }
 
     /// Bytes for the memory that the loads and stores of a stream work on.
-    /// Half of its 8-byte words point into `window`, so that a register
+    /// Most of its 8-byte words point into `window`, so that a register
     /// that was loaded from it is a base again.
     pub fn memory_bytes(&mut self, window: (u64, u64), len: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(len + 8);
         while bytes.len() < len {
             let word = match self.rng.below(8) {
-                0..=3 => (window.0 + self.rng.below(window.1)) & !15,
-                4 => self.rng.below(256),
+                0..=5 => (window.0 + self.rng.below(window.1)) & !15,
+                6 => self.rng.below(64) * 16,
                 _ => self.rng.next_u64(),
             };
             bytes.extend(word.to_le_bytes());

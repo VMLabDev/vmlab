@@ -263,11 +263,11 @@ impl Run {
                 // The start of the round, to run it again with `--probe`.
                 for (address, data) in &round.memory {
                     let words: Vec<String> = data
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .take(verified.len() + 2)
-                        .map(|word| {
-                            format!("{:08x}", u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                        })
+                        .map(|word| format!("{:08x}", u32::from_le_bytes(*word)))
                         .collect();
                     eprintln!("  the round from {address:#x}: {}", words.join("+"));
                 }
