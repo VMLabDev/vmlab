@@ -386,4 +386,141 @@ benchmark yet: card C5 measures CoreMark.
   original headers) and Berkeley TestFloat, both BSD-3-Clause.
 - S6: the behaviour of a running QEMU through its gdbstub and the plugin.
 - S2, S4, S7 and S8 were not opened. The Arm manual was not opened (Q1).
+## Card C3 (2026-11-27)
+
+Scope: loads and stores on a flat address space, the 49 format classes of the
+group (578 records): every addressing mode with its write back, the pairs, the
+literal, the unscaled and unprivileged forms, the exclusives, `LDAR` and
+`STLR`, the FP and vector register forms, `LD1` to `LD4` and `ST1` to `ST4` of
+whole registers, of one lane and replicated, and the prefetches.
+
+### Instruction lockstep against QEMU
+
+`just tcg-a64-lockstep loadstore 100000 1 "<the four traces>" <corpus> 1`, at
+the commit `0c534006`: 5,408,033 instructions verified in 3,181,492 rounds, no
+difference, 1,256 s. An instruction is verified when both sides ran it from
+the same registers, wrote the same bytes to memory, and had the same registers
+after it: X0 to X30, SP, PC, CPSR, V0 to V31, FPSR and FPCR.
+
+- Every one of the 49 format classes has at least 100,000 verified
+  instructions, the fewest `LoadStore128RO` with 100,182. Every one of the 578
+  records was verified, the least often `ST3Threev2s_POST` with 878.
+- Memory: 2,051,632 of the verified instructions wrote memory, 20,720,045
+  bytes, and every byte was compared.
+- Random phase: 2,980,860 rounds, seed 1. 696,460 words were made without the
+  constraints.
+- Executed phase: the four traces hold 734,599 distinct encodings, 180,209 of
+  them of this group. All 180,209 were verified. Each ran alone, with its base
+  register pointing into the data. Where its address was not aligned that
+  way, it ran again at another place.
+- Exclusive stores: 108,857 wrote and 206,357 did not, with the same result
+  and the same bytes on both sides.
+- "Undefined on one side only": 0. In 1,572 rounds both sides took the
+  Undefined Instruction exception at the same word.
+- How the rounds ended: 1,512,017 at a load or store that reaches QEMU's flash
+  or devices, 862,759 at a load or store outside the memory on both sides,
+  624,931 at an access that is not aligned to its size on both sides, 180,209
+  at the zero word behind the image, 1,572 undefined on both sides, and 4 at a
+  store into the code of the round.
+
+How a round of this group differs from a round of C1:
+
+- QEMU first runs a prelude that sets `CPACR_EL1.FPEN` and clears
+  `SCTLR_EL1.SA` and `SA0`. The gdbstub cannot write a system register. Our
+  side has neither register yet and behaves as with those values.
+- The plugin runs with `vectors=on`. The vector registers are set once, at
+  random, and then carry over from round to round on both sides.
+- A round is a straight run of 48 instructions on registers that mostly point
+  into 64 KiB of data, which is loaded once. It ends at the first exception.
+  A zero word behind the image ends a round that got that far.
+- An exclusive load is followed by an exclusive store at the same base three
+  times out of four, and one such store in four is of another size or kind.
+
+What the run does not compare:
+
+- A round that ends at a device of QEMU. Our memory is the RAM only. Where a
+  register is a small number and is used as a base, QEMU reads its flash and
+  runs on, and our side stops with a data abort. The round ends there, and the
+  instructions before it count.
+- Which exception QEMU takes at a failed access, and its syndrome. Both sides
+  must stop at the same instruction with the registers unchanged. Card C6
+  compares the class, `ESR_EL1` and `FAR_EL1`.
+- A store into the code of the round (4 rounds). QEMU goes on with the block
+  that it has translated and runs the old word. Our side runs the new word.
+  A CPU may do either until the guest synchronizes its caches (DESIGN.md U3).
+- Encodings that the architecture leaves open (DESIGN.md U2):
+  `stream::unpredictable` lists them, and the generator leaves them out.
+- More than one CPU (DESIGN.md U5). `tests/loadstore.rs` has the stress test
+  of the exclusives on two threads: each adds one to a shared counter 20,000
+  times through `LDXR` and `STXR`, and the counter ends at 40,000.
+
+`just ci::check` replays `tests/corpus/c3.txt` without QEMU: one verified
+instruction of each of the 578 records from this run, with the registers, the
+vector registers and the memory that QEMU had before and after. An exclusive
+store that wrote is not in the corpus, because alone it does not write.
+
+### What the run showed about QEMU, and what the core does about it
+
+Each line is a probe on QEMU 11.1.3 (`a64_lockstep --probe`), kept as a test
+in `tests/loadstore.rs`.
+
+- **Alignment with the MMU off.** QEMU takes an exception for every load and
+  store whose address is not a multiple of its size, with `SCTLR_EL1.A` set or
+  clear. The size is that of one register (16 for a Q register), or of one
+  element for `LD1` to `LD4` and `ST1` to `ST4`. The core does the same on the
+  flat address space (`Stop::Alignment`). Card C8 makes it depend on the
+  memory that an address maps to. Card C5 must know it: a flat image that
+  makes an access which is not aligned stops on both sides.
+- **`LDAR` and `STLR`.** QEMU takes the Undefined Instruction exception unless
+  the bits 20 to 16 and 14 to 10 are ones. `tables/constraints.toml` has the
+  two conditions. For `LDXR` and `STXR` QEMU ignores the same bits.
+- **Exclusives on one CPU.** An exclusive store writes when its address is
+  that of the last exclusive load and the memory still holds the value of
+  that load, read at the size of the store. The sizes need not be the same. A
+  store that is smaller than the value of its load writes where the low bytes
+  agree and reports failure unless the whole value agrees. A pair of 64-bit
+  registers compares its upper half with the upper half of the last 16-byte
+  exclusive load. A store at another address reads no memory and checks no
+  alignment. A store at the marked address is an access and checks its
+  alignment. "No mark" is the address 2^64 - 1, so a store there is an access
+  too. An exception keeps the mark. The core follows all of it (DESIGN.md
+  U1). With more CPUs it also fails a store when another CPU wrote to the
+  page of the load, which QEMU does not when the value is the same again.
+- **The plugin reports an exclusive store that fails its compare as a write**
+  of the bytes that were there. The follower compares what the memory holds
+  after an instruction, not the two lists of writes.
+- **QEMU runs ahead** of the records that the follower has read. Where a
+  round ends without an exception of QEMU, the follower takes the memory
+  writes that QEMU made since, reads its vector registers, and runs
+  `LDXP` and `STXP` on both sides to make the exclusive monitors the same.
+
+### The decoder
+
+This card added two constraints to `tables/constraints.toml`, for
+`LoadAcquire` and `StoreRelease`. `just tcg-a64-generate-check host` passes on
+the regenerated `decode.rs` and `tests/vectors.txt`. `tests/vectors.rs` passes
+on the 13,660 vectors.
+
+### The speed of the loop
+
+`taskset -c 30 just tcg-a64-mips`: 95.40, 95.47 and 95.65 MIPS, median 95.47.
+Card C1 measured 97.34 on the same image. A block now carries its memory
+events and its early exits, and the loop looks at them for every block. The
+image has no load and no store, so this is the cost of the change for code
+that does not use it.
+
+### Sources read for this card
+
+- S1: the generated tables of this crate (records, fields, fixed bits,
+  operand classes). No LLVM source file was opened in this card. The cases of
+  `stream::unpredictable` are the soft failures of LLVM's decoder for pairs,
+  writing-back loads and stores and exclusives, written from memory of that
+  decoder and not read again. They shape the test stream only.
+- S6: the behaviour of a running QEMU 11.1.3 through its gdbstub and the
+  lockstep plugin.
+- S2, S3, S4, S5, S7 and S8 were not opened. No prose chapter of the Arm
+  Architecture Reference Manual was opened (the operator's answer Q1 allows
+  it). The fields of `CPACR_EL1` and `SCTLR_EL1` in the prelude of the
+  lockstep are written from general knowledge of the two registers, and the
+  lockstep shows that they have the effect that the prelude wants.
 - X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
