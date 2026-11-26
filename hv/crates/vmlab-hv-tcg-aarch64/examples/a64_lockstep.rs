@@ -397,6 +397,9 @@ fn main() -> Result<(), Failure> {
                 text.push('\n');
             }
         }
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&path, text)?;
         println!("wrote the corpus samples to {path}");
     }
