@@ -46,6 +46,11 @@ impl Machine {
                 .arg("--control")
                 .arg(&control)
                 .arg("--paused")
+                .envs(
+                    std::env::var("VMLAB_HV_VIRT_LOG")
+                        .ok()
+                        .map(|filter| ("VMLAB_HV_LOG", filter)),
+                )
                 .stdout(Stdio::null())
                 .stderr(std::fs::File::create(&stderr).unwrap()),
         )

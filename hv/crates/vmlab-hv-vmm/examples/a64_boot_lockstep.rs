@@ -218,6 +218,8 @@ struct Arguments {
     resync: u64,
     ignore: Vec<String>,
     all: bool,
+    /// Read the stream of the leader and run nothing: how fast it is.
+    leader_only: bool,
 }
 
 fn arguments() -> Result<Arguments, Error> {
@@ -233,6 +235,7 @@ fn arguments() -> Result<Arguments, Error> {
         resync: 0,
         ignore: Vec::new(),
         all: false,
+        leader_only: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -251,6 +254,7 @@ fn arguments() -> Result<Arguments, Error> {
             "--resync" => parsed.resync = value.parse()?,
             "--ignore" => parsed.ignore.push(value),
             "--system" => parsed.all = value == "all",
+            "--leader-only" => parsed.leader_only = value == "1",
             _ => return Err(format!("unknown argument {name}").into()),
         }
     }
@@ -418,6 +422,22 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
 
     let start = Instant::now();
     let mut instructions = 0u64;
+    if arguments.leader_only {
+        while instructions < arguments.max_instructions
+            && next_instruction(&mut leader, &mut reads, &mut writes, &mut discontinuities)?
+                .is_some()
+        {
+            instructions += 1;
+            reads.clear();
+            writes.clear();
+            discontinuities.clear();
+        }
+        println!(
+            "the leader alone: {instructions} instructions, {:.2} million a second",
+            instructions as f64 / start.elapsed().as_secs_f64() / 1e6
+        );
+        return Ok(true);
+    }
     let mut differences = 0u64;
     let mut by_record: BTreeMap<String, u64> = BTreeMap::new();
     let mut interrupts = 0u64;
@@ -493,7 +513,9 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         writes.clear();
         discontinuities.clear();
         let next = next_instruction(&mut leader, &mut reads, &mut writes, &mut discontinuities)?;
-        *host.reads.lock() = reads.iter().copied().collect();
+        if !reads.is_empty() {
+            *host.reads.lock() = reads.iter().copied().collect();
+        }
 
         // Our instruction.
         let cpu = vcpu.cpu();
@@ -536,7 +558,11 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             exceptions += 1;
         }
         instructions += 1;
-        let left = std::mem::take(&mut *host.reads.lock());
+        let left = if reads.is_empty() {
+            VecDeque::new()
+        } else {
+            std::mem::take(&mut *host.reads.lock())
+        };
         if let Some(read) = left.front() {
             host.findings.lock().note(
                 read.address,
@@ -553,7 +579,12 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         // write (`DC ZVA`), so only an instruction that it reports is
         // compared.
         let accesses: Vec<Access> = cpu.take_accesses();
-        if !writes.is_empty() {
+        let same = accesses
+            .iter()
+            .filter(|access| access.write)
+            .map(|access| (access.address, access.value, usize::from(access.bytes)))
+            .eq(writes.iter().copied());
+        if !writes.is_empty() && !same {
             let ours = written(
                 accesses
                     .iter()

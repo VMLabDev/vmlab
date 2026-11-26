@@ -132,7 +132,7 @@ impl Options {
             format!("file:{}", self.serial().display()),
             "-plugin".into(),
             format!(
-                "{},out={},vectors=on,reads=io{}",
+                "{},out={},vectors=on,reads=io,pipe=1048576{}",
                 self.plugin.display(),
                 self.fifo().display(),
                 if self.system.is_empty() {
@@ -461,7 +461,7 @@ mod tests {
         assert!(argv.contains("-drive if=pflash,format=raw,readonly=on,file=/f/code.fd"));
         assert!(argv.contains("-drive if=pflash,format=raw,file=/d/vars.fd"));
         assert!(argv.ends_with(
-            "-plugin /p/a64lock.so,out=/d/a64boot.fifo,vectors=on,reads=io,sysregs=ESR_EL1:FAR_EL1"
+            "-plugin /p/a64lock.so,out=/d/a64boot.fifo,vectors=on,reads=io,pipe=1048576,sysregs=ESR_EL1:FAR_EL1"
         ));
         let dump = options.dump_argv(Path::new("/d/x.dtb")).join(" ");
         assert!(dump.contains("-machine virt,dtb-randomness=off,dumpdtb=/d/x.dtb -cpu"));

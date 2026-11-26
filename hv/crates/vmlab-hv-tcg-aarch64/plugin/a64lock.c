@@ -17,6 +17,8 @@
  *                exception registers and what an MSR wrote).
  *   names=<path> write the name of every register that the plugin API offers
  *                to this file, one per line.
+ *   pipe=<bytes> ask for a FIFO of this size, so that the follower is woken
+ *                less often (the boot lockstep).
  *   reads=io     add a record for each memory read that a device answers,
  *                with the value that it gave (the boot lockstep, DESIGN.md
  *                O4: the follower takes its device reads from the leader).
@@ -37,6 +39,7 @@
  * the FIFO never sees a part of one, and a record is in the FIFO before the
  * guest goes on.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <glib.h>
@@ -54,6 +57,7 @@ enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3, REC_READ = 4 };
 static int out_fd = -1;
 static int vectors;
 static int io_reads;
+static int pipe_bytes;
 static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr;
 static struct qemu_plugin_register *reg_v[32], *reg_fpsr, *reg_fpcr;
 enum { MAX_SYSREGS = 96 };
@@ -293,6 +297,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             vectors = 1;
         } else if (!strcmp(argv[i], "reads=io")) {
             io_reads = 1;
+        } else if (g_str_has_prefix(argv[i], "pipe=")) {
+            pipe_bytes = atoi(argv[i] + 5);
         } else if (g_str_has_prefix(argv[i], "names=")) {
             names_path = argv[i] + 6;
         } else if (g_str_has_prefix(argv[i], "sysregs=")) {
@@ -317,6 +323,10 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     if (out_fd < 0) {
         fprintf(stderr, "a64lock: open %s: %s\n", path, strerror(errno));
         return -1;
+    }
+    if (pipe_bytes > 0 && fcntl(out_fd, F_SETPIPE_SZ, pipe_bytes) < 0) {
+        /* The size is a wish: the default FIFO works, and is slower. */
+        fprintf(stderr, "a64lock: FIFO of %d bytes: %s\n", pipe_bytes, strerror(errno));
     }
     scratch = g_byte_array_new();
     header.flags = vectors | (sys_count ? 2 : 0) | (io_reads ? 4 : 0);

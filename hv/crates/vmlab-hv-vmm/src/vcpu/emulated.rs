@@ -30,6 +30,8 @@ use crate::vm::ExitReason;
 /// The instructions of one slice. A kick, and an interrupt that another
 /// thread raised, wait for the end of a slice.
 const SLICE: u64 = 1 << 16;
+/// The slice while the debug log is on.
+const DEBUG_SLICE: u64 = 64;
 
 /// The longest sleep of a halted vCPU whose timer has no deadline. A wake
 /// ends the sleep at once, so this bounds only a wake that was lost.
@@ -234,7 +236,30 @@ impl VcpuBackend for EmulatedVcpu {
         self.drive_timer();
         self.cpu.irq = self.lines.irq.level.load(Ordering::SeqCst);
         self.cpu.fiq = self.lines.fiq.level.load(Ordering::SeqCst);
-        let stop = self.cpu.run(SLICE);
+        // With the debug log on, the slices are short, so that the log
+        // names nearly every exception that the guest takes.
+        let debug = log::log_enabled!(log::Level::Debug);
+        let before = self.cpu.exceptions;
+        let stop = self.cpu.run(if debug { DEBUG_SLICE } else { SLICE });
+        if debug
+            && self.cpu.exceptions != before
+            && let Some(taken) = self.cpu.taken
+        {
+            use vmlab_hv_tcg_aarch64::sysreg::reg;
+            let regs = &self.cpu.state.system.regs;
+            log::debug!(
+                "vcpu {}: exception {} of the guest: {:?} from {:#x} to {:#x}, ESR_EL1 {:#x}, FAR_EL1 {:#x}, ELR_EL1 {:#x}, after {} instructions",
+                self.id,
+                self.cpu.exceptions,
+                taken.cause,
+                taken.from,
+                taken.to,
+                regs[reg::ESR_EL1],
+                regs[reg::FAR_EL1],
+                regs[reg::ELR_EL1],
+                self.cpu.instructions
+            );
+        }
         self.drive_timer();
         self.log_unknown();
         match stop {
