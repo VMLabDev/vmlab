@@ -278,6 +278,10 @@ five seconds. Shutdown cancels producers waiting for space.
 A blocked input handler does not delay Release while queue capacity remains.
 Once transitions fill the queue, transport backpressure can delay subsequent
 messages on that connection, including Release.
+When a connection ends, native or RFB, the server releases what it held
+down: a Key up for each key that no other connection holds, and a Buttons
+message with the buttons that the other connections hold. A connection that
+holds more than 256 keys down is closed.
 
 The built-in tablet also coalesces consecutive motion-only reports, retaining
 the position at each button or wheel transition. Its queue holds at most

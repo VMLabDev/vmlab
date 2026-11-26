@@ -91,7 +91,9 @@ impl DisplayServer {
         stream.write_all(&0u32.to_be_bytes())?;
         read::<1>(&mut stream)?;
         session.established()?;
-        self.publish()?;
+        // A source that fails now does not refuse the client: it gets the
+        // last valid frame.
+        self.publish_or_warn();
         let (frame, ..) = self.snapshot();
         stream.write_all(&(frame.width as u16).to_be_bytes())?;
         stream.write_all(&(frame.height as u16).to_be_bytes())?;
@@ -109,7 +111,11 @@ impl DisplayServer {
         let mut reader = stream.try_clone()?;
         let server = self.clone();
         let thread = std::thread::Builder::new().spawn(move || {
-            let result = server.rfb_input(&mut reader, &local);
+            let input = server.input_client();
+            let result = server.rfb_input(&mut reader, &local, &input);
+            // The end of the connection, whatever ended it: release what it
+            // held down in the guest.
+            drop(input);
             local.lock().unwrap().closed = true;
             let _ = reader.shutdown(Shutdown::Both);
             result
@@ -119,7 +125,12 @@ impl DisplayServer {
         let _ = thread.join();
         result
     }
-    fn rfb_input(&self, stream: &mut UnixStream, state: &Mutex<ClientState>) -> io::Result<()> {
+    fn rfb_input(
+        &self,
+        stream: &mut UnixStream,
+        state: &Mutex<ClientState>,
+        input: &crate::core::InputClient,
+    ) -> io::Result<()> {
         let mut buttons = 0u8;
         loop {
             match read::<1>(stream)?[0] {
@@ -149,7 +160,7 @@ impl DisplayServer {
                 4 => {
                     let b = read::<7>(stream)?;
                     if let Some(qcode) = keysym_to_qcode(be32(&b[3..])) {
-                        self.input(Message::Key {
+                        input.send(Message::Key {
                             qcode: qcode.to_owned(),
                             down: b[0] != 0,
                         })?;
@@ -158,21 +169,21 @@ impl DisplayServer {
                 5 => {
                     let b = read::<5>(stream)?;
                     let (frame, ..) = self.snapshot();
-                    self.input(Message::PointerAbs {
+                    input.send(Message::PointerAbs {
                         x: (be16(&b[1..3]) as u32).min(frame.width - 1),
                         y: (be16(&b[3..]) as u32).min(frame.height - 1),
                         width: frame.width,
                         height: frame.height,
                     })?;
                     // Native buttons: left, middle, right. Wheel bits are edge pulses.
-                    self.input(Message::Buttons {
+                    input.send(Message::Buttons {
                         mask: (b[0] & 7) as u32,
                     })?;
                     let pressed = b[0] & !buttons;
                     let dx = i32::from(pressed & 64 != 0) - i32::from(pressed & 32 != 0);
                     let dy = i32::from(pressed & 16 != 0) - i32::from(pressed & 8 != 0);
                     if dx != 0 || dy != 0 {
-                        self.input(Message::Scroll { dx, dy })?;
+                        input.send(Message::Scroll { dx, dy })?;
                     }
                     buttons = b[0];
                 }

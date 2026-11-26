@@ -346,6 +346,10 @@ mod tests {
                 theirs.write_all(b"+").unwrap();
                 theirs.write_all(&frame(&answer)).unwrap();
             }
+            // The client acknowledges the last answer. Stay until it has
+            // closed its end, so that the acknowledgement has somewhere to go.
+            let mut buffer = [0u8; 64];
+            while theirs.read(&mut buffer).is_ok_and(|count| count > 0) {}
         });
         (
             Rsp {
@@ -402,6 +406,7 @@ mod tests {
         rsp.set_register(66, &0x1fu32.to_le_bytes()).unwrap();
         rsp.clear_break(0x200).unwrap();
         assert!(rsp.register(67).is_err());
+        drop(rsp);
         server.join().unwrap();
     }
 }

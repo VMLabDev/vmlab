@@ -409,3 +409,220 @@ async fn the_stream_refuses_a_configure_wider_than_the_limit() {
     drop(stream);
     server.join().unwrap();
 }
+
+/// A raw server for the damage tests: it answers the Hello, configures one
+/// `width` x `height` surface with one buffer, sends one `FrameReady` with
+/// `damage`, and holds the connection until the client leaves.
+fn serve_one_frame(
+    listener: std::os::unix::net::UnixListener,
+    width: u32,
+    height: u32,
+    damage: Vec<Rect>,
+) -> std::thread::JoinHandle<()> {
+    use vmlab_hv_display::{receive, send};
+
+    std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let (stream, _) = listener.accept().unwrap();
+        let Message::Hello { capabilities, .. } = receive(&stream).unwrap().message else {
+            panic!("the client opens with a Hello");
+        };
+        let hello = Message::Hello {
+            version: vmlab_hv_display::protocol::VERSION,
+            capabilities,
+        };
+        send(&stream, &hello, &[]).unwrap();
+        let stride = width * 4;
+        let buffer = buffer_of(u64::from(stride) * u64::from(height));
+        send(
+            &stream,
+            &configure_of(1, width, height, stride),
+            &[buffer.as_raw_fd()],
+        )
+        .unwrap();
+        send(
+            &stream,
+            &Message::FrameReady {
+                flags: FrameFlags::default(),
+                surface_id: 1,
+                buffer: 0,
+                seq: 1,
+                timestamp_ns: 1,
+                damage,
+            },
+            &[],
+        )
+        .unwrap();
+        // Hold the connection until the client leaves.
+        while receive(&stream).is_ok() {}
+    })
+}
+
+/// What `next_update` gave, without printing a gigabyte of pixels.
+fn outcome(update: &Result<Vec<StreamEvent>>) -> String {
+    match update {
+        Ok(events) => format!("Ok with {} events", events.len()),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// Review F8 (docs/reviews/display-2.md): the codec takes any damage count
+/// that fits a 16 MiB message, and every rectangle becomes memory the lab
+/// daemon keeps. vmlab-hv's server core sends 65535 rectangles at most, so
+/// 70000 end the stream — and so does damage whose sum is far past the
+/// surface it describes: 16 times the whole of a 64 MiB surface is 1 GiB.
+#[tokio::test]
+async fn the_stream_refuses_more_damage_than_a_server_may_send() {
+    let full = |width, height| Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    for (width, height, damage) in [
+        (4, 4, vec![full(4, 4); 70_000]),
+        (4096, 4096, vec![full(4096, 4096); 16]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("display.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let rectangles = damage.len();
+        let server = serve_one_frame(listener, width, height, damage);
+        let mut stream = NativeStream::connect(&path).await.unwrap();
+        let update = stream.next_update().await;
+        assert!(
+            update.is_err(),
+            "{rectangles} rectangles of {width}x{height} gave {}",
+            outcome(&update)
+        );
+        drop(update);
+        drop(stream);
+        server.join().unwrap();
+    }
+}
+
+/// The limit leaves an honest frame alone: the server core's own maximum of
+/// 65535 rectangles, here one pixel each, arrives whole.
+#[tokio::test]
+async fn the_stream_takes_the_most_damage_a_server_may_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let pixel = Rect {
+        x: 1,
+        y: 2,
+        width: 1,
+        height: 1,
+    };
+    let server = serve_one_frame(listener, 4, 4, vec![pixel; 65_535]);
+    let mut stream = NativeStream::connect(&path).await.unwrap();
+    let events = stream.next_update().await.unwrap();
+    assert_eq!(events.len(), 65_535);
+    drop(stream);
+    server.join().unwrap();
+}
+
+/// A server that takes the connection, reads the client's Hello and never
+/// answers: a vmlab-hv that is stopped or hung. `heard` is told once the
+/// Hello is read; the thread ends when the client closes.
+fn serve_silence(
+    listener: std::os::unix::net::UnixListener,
+    heard: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<()> {
+    use vmlab_hv_display::receive;
+
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let Message::Hello { .. } = receive(&stream).unwrap().message else {
+            panic!("the client opens with a Hello");
+        };
+        let _ = heard.send(());
+        while receive(&stream).is_ok() {}
+    })
+}
+
+/// Review F11 (docs/reviews/display-2.md): a unix socket connects as soon as
+/// its listener exists, so the capture's deadline has to cover the Hello
+/// exchange too. No clock is asserted on: without the deadline this test
+/// does not end.
+#[test]
+fn a_capture_gives_up_on_a_server_that_never_answers_the_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let (heard, hello) = std::sync::mpsc::channel();
+    let server = serve_silence(listener, heard);
+    let refused = capture_blocking(&path, Duration::from_millis(50));
+    let error = format!("{:#}", refused.unwrap_err());
+    assert!(error.contains("display.sock"), "{error}");
+    hello.recv().expect("the server read the Hello");
+    // The client closed its end: the server's second read ends.
+    server.join().unwrap();
+}
+
+/// The same for scripted input, whose sender holds the machine's input lock
+/// while it waits: the send gives up and keeps no connection.
+#[test]
+fn input_gives_up_on_a_server_that_never_answers_the_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let (heard, hello) = std::sync::mpsc::channel();
+    let server = serve_silence(listener, heard);
+    let mut input = InputConn::with_patience(path, Duration::from_millis(50));
+    let refused = input.send(&[Message::Buttons { mask: 1 }]);
+    let error = format!("{:#}", refused.unwrap_err());
+    assert!(error.contains("display.sock"), "{error}");
+    hello.recv().expect("the server read the Hello");
+    server.join().unwrap();
+}
+
+/// A server that answers the Hello and then reads nothing more fills the
+/// socket: the write that finds it full gives up too, instead of holding
+/// the input lock for as long as the hypervisor is stopped.
+#[test]
+fn input_gives_up_on_a_server_that_stops_reading() {
+    use vmlab_hv_display::{receive, send};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("display.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        // Every connection gets its Hello and is then left unread: the
+        // client reconnects once after a failed write.
+        let mut held = Vec::new();
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let Message::Hello { capabilities, .. } = receive(&stream).unwrap().message
+                    else {
+                        panic!("the client opens with a Hello");
+                    };
+                    let hello = Message::Hello {
+                        version: vmlab_hv_display::protocol::VERSION,
+                        capabilities,
+                    };
+                    send(&stream, &hello, &[]).unwrap();
+                    held.push(stream);
+                }
+                Err(_) => match stopped.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => return,
+                },
+            }
+        }
+    });
+    let mut input = InputConn::with_patience(path, Duration::from_millis(50));
+    // More than a socket holds unread, so the first try fills the socket and
+    // the one retry on a new connection fills that one.
+    let batch = vec![Message::Buttons { mask: 1 }; 1 << 18];
+    let error = format!("{:#}", input.send(&batch).unwrap_err());
+    assert!(error.contains("display.sock"), "{error}");
+    drop(stop);
+    server.join().unwrap();
+}
