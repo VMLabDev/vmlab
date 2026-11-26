@@ -421,12 +421,15 @@ impl Run {
                 self.counts.add(&mut self.rng, &verified);
                 eprint!("{difference}");
                 // The start of the round, to run it again with `--probe`.
-                for (address, data) in &round.memory {
+                // A round with the MMU on loads its tables and its data too:
+                // the code is the first part.
+                let parts = if self.follower.translated { 1 } else { usize::MAX };
+                for (address, data) in round.memory.iter().take(parts) {
                     let words: Vec<String> = data
                         .as_chunks::<4>()
                         .0
                         .iter()
-                        .take(verified.len() + 2)
+                        .take((verified.len() + 2).min(if self.follower.translated { 0 } else { usize::MAX }))
                         .map(|word| format!("{:08x}", u32::from_le_bytes(*word)))
                         .collect();
                     eprintln!("  the round from {address:#x}: {}", words.join("+"));

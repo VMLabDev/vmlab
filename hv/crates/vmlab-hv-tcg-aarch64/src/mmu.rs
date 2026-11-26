@@ -444,8 +444,11 @@ pub fn par_of(translation: &Translation) -> u64 {
     } else {
         u64::from(translation.shareability)
     };
+    // Bit 11 reads as one, and bit 9 says "not secure": this CPU has no
+    // secure state, and QEMU sets it.
     (translation.page & ADDRESS)
         | 1 << 11
+        | 1 << 9
         | shareability << 7
         | u64::from(attributes) << 56
 }
