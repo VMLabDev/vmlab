@@ -6,7 +6,7 @@
 //!   a64_lockstep --plugin <a64lock.so> --dir <scratch directory>
 //!       [--qemu <binary>] [--seed S] [--per-class N] [--group NAME]
 //!       [--encodings <trace.txt>]... [--corpus-out <file>] [--samples N]
-//!       [--probe <hex word>,<hex word>...]
+//!       [--probe <hex word>,<hex word>...] [--probe-offset <hex>]
 //!
 //! Two phases. The random phase runs rounds of random instructions until
 //! each format class of the group has `--per-class` instructions that both
@@ -26,7 +26,8 @@
 //!
 //! `--probe` runs each given word alone, as the executed phase of the group
 //! does, and prints how its round ended. It is for a question to QEMU about
-//! one encoding, and it compares nothing else.
+//! one encoding, and it compares nothing else. `--probe-offset` moves the
+//! base register and the stack pointer of a probe by that many bytes.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -285,6 +286,7 @@ fn main() -> Result<(), Failure> {
     let (mut seed, mut per_class, mut group_name) = (1u64, 100_000u64, String::from("c1"));
     let mut samples = 3usize;
     let mut probe: Vec<u32> = Vec::new();
+    let mut probe_offset = 0u64;
     let mut traces = Vec::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -299,6 +301,9 @@ fn main() -> Result<(), Failure> {
             "--encodings" => traces.push(value()?),
             "--corpus-out" => corpus_out = Some(value()?),
             "--samples" => samples = value()?.parse()?,
+            "--probe-offset" => {
+                probe_offset = u64::from_str_radix(value()?.trim_start_matches("0x"), 16)?;
+            }
             "--probe" => {
                 for word in value()?.split(',') {
                     probe.push(u32::from_str_radix(word.trim_start_matches("0x"), 16)?);
@@ -330,7 +335,7 @@ fn main() -> Result<(), Failure> {
     };
     let mut generator = Generator::new(seed);
     if !probe.is_empty() {
-        return probe_rounds(&mut run, &mut generator, &probe, memory_group);
+        return probe_rounds(&mut run, &mut generator, &probe, probe_offset, memory_group);
     }
     if memory_group {
         return memory_rounds(
@@ -587,6 +592,7 @@ fn probe_rounds(
     run: &mut Run,
     generator: &mut Generator,
     words: &[u32],
+    offset: u64,
     memory_group: bool,
 ) -> Result<(), Failure> {
     if memory_group {
@@ -594,7 +600,14 @@ fn probe_rounds(
         run.follower.load_memory(WINDOW.0, &data)?;
     }
     for word in words {
-        let (x, sp, nzcv) = generator.registers_for(*word, WINDOW);
+        let (mut x, sp, nzcv) = generator.registers_for(*word, WINDOW);
+        let sp = sp.wrapping_add(offset);
+        if let Some(n) = decode(*word)
+            .and_then(|decoded| vmlab_hv_tcg_aarch64::field(decoded.record, "rn", *word))
+            .filter(|n| *n < 31)
+        {
+            x[n as usize] = x[n as usize].wrapping_add(offset);
+        }
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
             start: Core {
