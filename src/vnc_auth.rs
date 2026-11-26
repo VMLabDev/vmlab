@@ -83,7 +83,12 @@ where
     } else {
         viewer.write_all(&[1, 2]).await?;
         if viewer.read_u8().await? != 2 {
-            refuse(viewer, &admitted, "this console takes VNC authentication only").await?;
+            refuse(
+                viewer,
+                &admitted,
+                "this console takes VNC authentication only",
+            )
+            .await?;
             return Err(denied("the viewer asked for another security type"));
         }
     }
@@ -297,7 +302,10 @@ mod tests {
 
     #[test]
     fn des_matches_the_standard_worked_example() {
-        let cipher = des_encrypt(0x1334_5779_9bbc_dff1, 0x0123_4567_89ab_cdef_u64.to_be_bytes());
+        let cipher = des_encrypt(
+            0x1334_5779_9bbc_dff1,
+            0x0123_4567_89ab_cdef_u64.to_be_bytes(),
+        );
         assert_eq!(hex(&cipher), "85e813540f0ab405");
     }
 

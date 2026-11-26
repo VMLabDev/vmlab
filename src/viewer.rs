@@ -276,8 +276,10 @@ fn bridged_command(
         Some("remote-viewer") => {
             let file = handoff(
                 ".vv",
-                format!("[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport={port}\npassword={password}\n")
-                    .as_bytes(),
+                format!(
+                    "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport={port}\npassword={password}\n"
+                )
+                .as_bytes(),
             )?;
             let command = format!("remote-viewer {}", file.path().display());
             Ok((Some(file), command))
@@ -416,7 +418,10 @@ mod tests {
             std::fs::read_to_string(file.path()).unwrap(),
             "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport=5903\npassword=Ab3dEf7h\n"
         );
-        assert_eq!(file.path().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let (file, command) =
             bridged_command(&tcp_viewer("vncviewer {}"), 5903, 3, "password").unwrap();
@@ -429,7 +434,10 @@ mod tests {
             std::fs::read(file.path()).unwrap(),
             crate::vnc_auth::password_file("password")
         );
-        assert_eq!(file.path().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // gvncviewer takes no password: it asks the user.
         let (file, command) =
