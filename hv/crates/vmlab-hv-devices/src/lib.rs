@@ -16,10 +16,14 @@ pub mod audio;
 pub mod chipset;
 pub mod display;
 pub mod floppy;
+pub mod ged;
+pub mod gic;
 pub mod hda;
 pub mod ide;
 pub mod nic;
 pub mod pflash;
+pub mod pl011;
+pub mod pl031;
 pub mod serial;
 pub mod tpm;
 pub mod usb;
@@ -29,6 +33,8 @@ pub mod virtio;
 
 #[cfg(test)]
 mod qtest_oracle;
+#[cfg(test)]
+mod virt_oracle;
 
 /// Guest physical memory as devices see it.
 pub type GuestMemory = vm_memory::GuestMemoryMmap<WriteDiscard>;
@@ -44,7 +50,7 @@ pub type GuestSlice<'a> =
 /// makes to it. This is vm-memory's dirty-bitmap seam, and it is the only
 /// place that sees a device write: devices copy straight into the mapping.
 ///
-/// Guest RAM does nothing here. A region armed with
+/// Guest RAM under KVM does nothing here. A region armed with
 /// [`WriteDiscard::arm`] is one where a device write may land in a private
 /// copy-on-write page (the write-protected PAM banks of the chipset, which
 /// store a device write nowhere). After each write there the pages are
@@ -54,8 +60,24 @@ pub type GuestSlice<'a> =
 /// Code that writes through a raw pointer calls `bitmap().mark_dirty` after
 /// the write, as vm-memory asks. A write the kernel makes for another process
 /// (vhost) does not come past here.
-#[derive(Debug, Default)]
-pub struct WriteDiscard(std::sync::OnceLock<(usize, usize)>);
+#[derive(Default)]
+pub struct WriteDiscard {
+    discard: std::sync::OnceLock<(usize, usize)>,
+    watch: std::sync::OnceLock<WriteWatch>,
+}
+
+/// What [`WriteDiscard::watch`] calls after each write to a region: the
+/// offset of the write in the region, and its length.
+pub type WriteWatch = Box<dyn Fn(usize, usize) + Send + Sync>;
+
+impl std::fmt::Debug for WriteDiscard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteDiscard")
+            .field("discard", &self.discard.get())
+            .field("watched", &self.watch.get().is_some())
+            .finish()
+    }
+}
 
 impl WriteDiscard {
     const PAGE: usize = 4096;
@@ -69,7 +91,15 @@ impl WriteDiscard {
     /// private and never meant to keep a write) for as long as the region
     /// lives.
     pub unsafe fn arm(&self, host: *mut u8, len: usize) {
-        let _ = self.0.set((host as usize, len));
+        let _ = self.discard.set((host as usize, len));
+    }
+
+    /// Call `watch`, from now on, after each write that vm-memory makes to
+    /// the region. An emulated CPU keeps the write generations of its guest
+    /// memory with it: a device write into translated code must end that
+    /// code. `false`: the region has a watch already, and keeps it.
+    pub fn watch(&self, watch: WriteWatch) -> bool {
+        self.watch.set(watch).is_ok()
     }
 }
 
@@ -79,7 +109,10 @@ impl<'a> vm_memory::bitmap::WithBitmapSlice<'a> for WriteDiscard {
 
 impl vm_memory::bitmap::Bitmap for WriteDiscard {
     fn mark_dirty(&self, offset: usize, len: usize) {
-        let Some(&(host, size)) = self.0.get() else {
+        if let Some(watch) = self.watch.get() {
+            watch(offset, len);
+        }
+        let Some(&(host, size)) = self.discard.get() else {
             return;
         };
         // vm-memory checks the range before the write. The clamp keeps a

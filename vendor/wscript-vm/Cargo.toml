@@ -1,0 +1,9 @@
+[package]
+name = "wscript-vm"
+description = "wscript register-based virtual machine"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+wscript-core = { path = "../wscript-core", version = "0.2.0" }
