@@ -14,6 +14,7 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+SWITCH = re.compile(r"^RELEASE_KEY='[^']*'$", re.M)
 COMMIT = 'e' * 40
 SECRET_KEY = 'fixture-private-key-NEVER-SHOWN'
 SECRET_PASSWORD = 'fixture-password-NEVER-SHOWN'
@@ -91,6 +92,12 @@ class Machine:
                      'install.sh']:
             (self.checkout / name).parent.mkdir(parents=True, exist_ok=True)
             (self.checkout / name).write_bytes((ROOT / name).read_bytes())
+        # The checkout as it is before `release::trust`: the switch is off.
+        install = self.checkout / 'install.sh'
+        text, count = SWITCH.subn("RELEASE_KEY=''", install.read_text())
+        assert count == 1
+        install.write_text(text)
+        self.before_trust = text
         (self.checkout / 'build').mkdir()
         if committed is not None:
             (self.checkout / 'build/release-signing.pub').write_text(committed)
@@ -360,8 +367,7 @@ def test_trust_writes_the_public_key_to_both_places(tmp_path):
     assert 'hold the same public key' in result.stderr and 'commit' in result.stderr
     assert trust(machine, '--check').returncode == 0
     # Only the switch changed in install.sh, and the installer still parses.
-    original = (ROOT / 'install.sh').read_text()
-    assert (machine.checkout / 'install.sh').read_text() == original.replace(
+    assert (machine.checkout / 'install.sh').read_text() == machine.before_trust.replace(
         "\nRELEASE_KEY=''\n", f"\nRELEASE_KEY='{PUBLIC.strip()}'\n")
     assert subprocess.run(['sh', '-n', str(machine.checkout / 'install.sh')]).returncode == 0
     # A second key replaces the first in both places.
@@ -403,12 +409,16 @@ def test_trust_takes_a_public_key_and_nothing_else(tmp_path):
     assert not (machine.checkout / 'build/release-signing.pub').exists()
 
 
-def test_this_checkout_has_one_public_key_or_none():
-    """What `just ci::release-dry-run` runs first: the switch is off, or both
-    places hold the same key."""
+def test_this_checkout_has_one_public_key():
+    """What `just ci::release-dry-run` runs first: both places hold the same
+    key. The switch is on since card 1030, so the check must not say it is off."""
     result = subprocess.run(['bash', str(ROOT / 'scripts/release-trust.sh'), '--check'],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+    assert 'hold the same public key' in result.stderr
+    committed = (ROOT / 'build/release-signing.pub').read_text()
+    assert committed.strip() == re.search(r"^RELEASE_KEY='([^']*)'$", (ROOT / 'install.sh').read_text(), re.M)[1]
+    assert 'PRIVATE' not in committed
 
 
 # ── release::doctor ─────────────────────────────────────────────────────────

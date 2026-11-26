@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALL = ROOT / 'install.sh'
 PUBLIC_KEY = ROOT / 'build/release-signing.pub'
 COMMIT = 'a' * 40
+SWITCH = re.compile(r"\nRELEASE_KEY='[^']*'\n")
 # A throwaway public key: the tests stub cosign, so only its text matters.
 KEY = '''-----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfixturefixturefixturefixturefixture
@@ -100,12 +101,12 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         path.write_text(body)
         path.chmod(0o755)
 
-    def installer_with_key(self):
-        """install.sh as it is after the operator commits the public half."""
-        text = INSTALL.read_text()
-        self.assertEqual(text.count("\nRELEASE_KEY=''\n"), 1)
+    def installer_with_key(self, key=KEY):
+        """install.sh with another key in the switch: a throwaway one, or '' for the switch off."""
+        text, count = SWITCH.subn(lambda _: f"\nRELEASE_KEY='{key}'\n", INSTALL.read_text())
+        self.assertEqual(count, 1)
         script = self.root / 'install-with-key.sh'
-        script.write_text(text.replace("\nRELEASE_KEY=''\n", f"\nRELEASE_KEY='{KEY}'\n"))
+        script.write_text(text)
         return script
 
     def install(self, *args, script=None):
@@ -670,9 +671,8 @@ fi
     # ── The two ways of a locally built release (scripts/release-sign.sh) ────
 
     def test_key_signed_release_is_refused_while_the_switch_is_off(self):
-        self.assertIn("\nRELEASE_KEY=''\n", INSTALL.read_text())
         self.key_signed()
-        result = self.install('--no-guest')
+        result = self.install('--no-guest', script=self.installer_with_key(''))
         self.refused(result)
         self.assertIn('has none to verify it with', result.stderr)
         self.assertEqual(self.verified_with(), [])
@@ -730,11 +730,20 @@ fi
 
     def test_installer_key_is_the_committed_public_half(self):
         embedded = re.search(r"\nRELEASE_KEY='([^']*)'\n", INSTALL.read_text())[1]
-        if PUBLIC_KEY.exists():
-            self.assertEqual(embedded, PUBLIC_KEY.read_text().strip())
-            self.assertIn('BEGIN PUBLIC KEY', embedded)
-        else:
-            self.assertEqual(embedded, '')
+        self.assertEqual(embedded, PUBLIC_KEY.read_text().strip())
+        self.assertIn('BEGIN PUBLIC KEY', embedded)
+
+    def test_this_installer_takes_a_release_of_the_committed_key_and_of_no_other(self):
+        """install.sh as committed, not a copy with a fixture key."""
+        self.key_signed()
+        # Signed by a throwaway key: cosign is asked to verify with the
+        # committed key, and the stub fails as cosign does.
+        self.refused(self.install('--no-guest'))
+        self.assertEqual(self.verified_with(), [])
+        self.env['EXPECT_KEY'] = PUBLIC_KEY.read_text().strip()
+        result = self.install('--no-guest')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.verified_with(), ['--key'])
 
     def sign(self, *args, **env):
         return subprocess.run(['bash', str(ROOT / 'scripts/release-sign.sh'), str(self.dist), *args],

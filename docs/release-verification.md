@@ -11,8 +11,9 @@ Which signature a release has depends on where it was built:
   bundle includes the certificate and transparency-log evidence.
 - `SHA256SUMS.key.bundle`: releases built on the project's build host and
   signed with the project's cosign key pair. The public half is
-  `build/release-signing.pub` and is also inside `install.sh`. This way is off
-  until that key is committed: until then `install.sh` refuses such a release.
+  `build/release-signing.pub` and is also inside `install.sh`. This way is on
+  since 2026-11-26 (card 1030): `install.sh` installs a release that this key
+  signed, and refuses one that another key signed.
 - Neither: an unsigned release. `install.sh` refuses it without the opt-out
   below.
 

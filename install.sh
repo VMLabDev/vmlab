@@ -77,11 +77,15 @@ SOURCE_BUILD="cargo install --git https://github.com/VMLabDev/vmlab --locked"
 #   SHA256SUMS.key.bundle  a cosign key pair: a release built outside GitHub
 #                          (scripts/release-sign.sh). Verified with
 #                          `cosign verify-blob --key` against RELEASE_KEY.
-# RELEASE_KEY is the switch for the second way. While it is empty this
-# installer trusts no key, and refuses a key-signed release. To turn it on,
-# put the PEM public key between the quotes: the same text as
-# build/release-signing.pub (docs/agents/release-gate.md).
-RELEASE_KEY=''
+# RELEASE_KEY is the switch for the second way, and it is on: it holds the PEM
+# public key of the releases, the same text as build/release-signing.pub. A
+# release signed by another key is refused. Empty, it would trust no key and
+# refuse every key-signed release. `just release::trust <cosign.pub>` writes
+# it and the file together (docs/agents/release-gate.md).
+RELEASE_KEY='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdJtVT5BAlVyiYuqEcgPFxsP5/90K
+i7p71qR5nuN4Kci629Qf9sz2FIm3LIaHNbIQm2JHDJBkMLgM+K2O/M0l7Q==
+-----END PUBLIC KEY-----'
 
 VERSION="${VMLAB_VERSION:-}"
 BIN_DIR="${VMLAB_INSTALL_DIR:-$HOME/.local/bin}"

@@ -391,13 +391,15 @@ and the signed `SHA256SUMS` manifest as the source of the bundle checksum.
 
 These have no proving test, or are decisions already on record.
 
-- N1. No release can be authenticated today. `RELEASE_KEY` is empty
-  (`install.sh:76`), `build/release-signing.pub` does not exist, and no CI
-  job makes the keyless signature any more (`.github/workflows/ci.yml:203-206`).
-  So every current release installs only with `--insecure-skip-signature`,
-  which `release-publish.sh:55` tells the publisher. This is the open
-  decision D1 in `docs/agents/release-gate.md`. It should be closed before
-  users are told to use that flag routinely.
+- N1. No release could be authenticated when this review was written:
+  `RELEASE_KEY` was empty, `build/release-signing.pub` did not exist, and no
+  CI job makes the keyless signature any more
+  (`.github/workflows/ci.yml:203-206`). Decision D1 in
+  `docs/agents/release-gate.md` closed it (card 1021), and card 1030 committed
+  the operator's public key to both places (2026-11-26), so the installer now
+  verifies a key-signed release. Every release published before the first
+  key-signed one is still unsigned and installs only with
+  `--insecure-skip-signature`, which `release-publish.sh` tells the publisher.
 - N2. `install.sh:253-256` and `scripts/release-display-from.sh:73-77` still
   trust any keyless signature by `ci.yml` on `main`. Today `ci.yml` has
   `contents: read` only and no `id-token: write`. A later job given

@@ -418,7 +418,8 @@ throughout the code and commit messages.
   (`scripts/release-cosign.sh`), and the release key reaches it from two
   environment variables, never from a file; `release::keygen`, `release::trust`
   and `release::doctor` make the pair, turn its public half on and say what a
-  build machine lacks.
+  build machine lacks. The public half is on: `build/release-signing.pub` and
+  `RELEASE_KEY` of `install.sh` hold the operator's key.
 - `just buildbox::dist` builds every release artefact (binary, strict guest
   bundle, BPF objects) into `target/dist/` inside the `vmlab-build` container
   (`build/Dockerfile`, toolchains from `scripts/guest-toolchains.sh`), as the
