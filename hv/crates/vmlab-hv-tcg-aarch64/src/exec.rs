@@ -419,16 +419,19 @@ impl Side {
 
     /// Whether an access of `bytes` bytes at `va` that is not aligned to its
     /// size takes an alignment fault: with SCTLR_EL1.A, and in Device
-    /// memory. What the lockstep found on QEMU:
+    /// memory. The order of the faults is what the lockstep found on QEMU:
     ///
     /// - While the MMU is off all memory is Device memory, and the fault
     ///   comes before every other one, also for an address that is wider
-    ///   than a physical address.
-    /// - While it is on, a translation, access flag or permission fault of
-    ///   the access comes first. `false` then: the access itself reports
-    ///   that fault.
-    /// - An access that crosses into a second page faults when either page
-    ///   is Device memory.
+    ///   than a physical address. With SCTLR_EL1.A it comes first too.
+    /// - In Device memory it comes after the faults of the walk for the
+    ///   page (translation, address size, access flag) and before the
+    ///   permission fault of the page.
+    /// - An access that crosses into a second page looks at the first page
+    ///   whole, then at the second.
+    ///
+    /// `false` where another fault comes first: the access itself reports
+    /// that one.
     #[cold]
     fn unaligned_faults<M: Memory>(
         &mut self,
@@ -439,22 +442,23 @@ impl Side {
         user: bool,
     ) -> bool {
         let controls = *self.mmu.controls();
-        if !controls.enabled {
+        if !controls.enabled || controls.strict_alignment {
             return true;
         }
-        let Ok((_, first)) = self.mmu.translate(memory, va, kind, user) else {
-            return false;
-        };
         let last = va.wrapping_add(u64::from(bytes).saturating_sub(1));
-        let second = if last >> 12 == va >> 12 {
-            0
-        } else {
-            match self.mmu.translate(memory, last, kind, user) {
-                Ok((_, flags)) => flags,
-                Err(_) => return false,
+        let pages = if last >> 12 == va >> 12 { 1 } else { 2 };
+        for address in [va, last].into_iter().take(pages) {
+            let Ok(page) = self.mmu.page(memory, address, kind) else {
+                return false;
+            };
+            if page.flags & mmu::flag::DEVICE != 0 {
+                return true;
             }
-        };
-        controls.strict_alignment || (first | second) & mmu::flag::DEVICE != 0
+            if page.flags & mmu::needed(kind, user) == 0 {
+                return false;
+            }
+        }
+        false
     }
 
     fn read_at<M: Memory>(
