@@ -41,7 +41,20 @@ or translate it line by line. QEMU is GPLv2 and this project is MIT, so copied
 or mechanically translated code would change the project's licence.
 
 Code lifted from crosvm keeps its BSD-3 header and gets a line in
-the repository-root `THIRD_PARTY_NOTICES`. Apache-2.0 crates are used as dependencies only.
+the repository-root `THIRD_PARTY_NOTICES`. Apache-2.0 crates are used as
+dependencies, with one exception: the aarch64 decoder is generated from the
+LLVM AArch64 TableGen tables (Apache-2.0 WITH LLVM-exception). The generated
+files and the helpers ported by hand from LLVM carry the LLVM notice and have
+an entry in `THIRD_PARTY_NOTICES`.
+
+The aarch64 CPU core (`vmlab-hv-tcg-aarch64`) has a stricter rule than the
+device rule above. X1: do not read, copy or translate QEMU source under
+`target/arm`, `fpu`, `tcg` and `accel/tcg`. X2: do not use sail-arm, Arm's
+machine-readable specification (ASL, XML) or the pseudocode of the Arm
+Architecture Reference Manual. X3: do not use Unicorn. QEMU is the oracle as a
+running program only. What an author may read (S1 to S8) is in
+`hv/docs/plans/phase-3d-aarch64/DESIGN.md`, section "Sources". Each semantics
+file names in its header the sources that its author read.
 
 ## Finishing a task
 
