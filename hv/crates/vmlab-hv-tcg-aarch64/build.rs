@@ -19,7 +19,12 @@ const PREFIX: &str = "a64sf_";
 
 /// SoftFloat's multiword helpers are alternatives to FAST_INT64, not extra
 /// operations. The list is the one of `vmlab-hv-tcg/build.rs`.
-const EXCLUDED: [&str; 18] = [
+const EXCLUDED: [&str; 22] = [
+    // The same for the specialisation: upstream's 64-bit builds leave these out.
+    "s_commonNaNToExtF80M.c",
+    "s_extF80MToCommonNaN.c",
+    "s_f128MToCommonNaN.c",
+    "s_propagateNaNExtF80M.c",
     "s_addExtF80M.c",
     "s_addF128M.c",
     "s_compareNonnormExtF80M.c",
