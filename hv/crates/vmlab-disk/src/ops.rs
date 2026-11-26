@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::qcow2::{Qcow2Image, probe_format};
+use crate::qcow2::{Qcow2Image, probe_format, resolve_backing};
 use crate::{DiskImage, Error, Format, Result};
 
 const DEFAULT_CLUSTER_BITS: u32 = 16;
@@ -113,14 +113,17 @@ pub fn rebase_unsafe(path: &Path, backing: &str, format: Option<&str>) -> Result
 
 /// Move `path` onto `backing` keeping its content: `qemu-img rebase` in safe
 /// mode. Reads the old chain (through the image) and the new backing, and
-/// writes into the image only the clusters where they differ.
+/// writes into the image only the clusters where they differ. A relative
+/// backing name is resolved against the image's directory.
 pub fn rebase_safe(path: &Path, backing: &Path, format: Option<&str>) -> Result<()> {
     let mut img = Qcow2Image::open(path, false)?;
+    let backing_name = backing.to_string_lossy();
+    let backing_path = resolve_backing(path, &backing_name);
     let fmt = match format {
         Some(f) => format_to_format(f)?,
-        None => probe_format(backing)?,
+        None => probe_format(&backing_path)?,
     };
-    let mut new_backing = crate::open(backing, fmt, true)?;
+    let mut new_backing = crate::open(&backing_path, fmt, true)?;
     let cluster = img.cluster_size_bytes();
     let size = img.size();
     let mut offset = 0u64;
@@ -138,8 +141,7 @@ pub fn rebase_safe(path: &Path, backing: &Path, format: Option<&str>) -> Result<
         }
         offset += n;
     }
-    let backing_str = backing.to_string_lossy().into_owned();
-    img.set_backing(&backing_str, format)?;
+    img.set_backing(&backing_name, format)?;
     img.flush()
 }
 
@@ -407,13 +409,24 @@ pub fn convert(
 /// and stops at the first file it cannot read: `convert` reports that error
 /// itself when it opens the chain.
 fn chain_file_same_as(image: &Path, target: &Path) -> Option<PathBuf> {
-    // A chain longer than this is a loop, which the open refuses.
-    const MAX_DEPTH: usize = 1024;
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    };
+    let target_id = identity(target)?;
+    let mut seen = HashSet::new();
     let mut cursor = Some(image.to_path_buf());
-    for _ in 0..MAX_DEPTH {
-        let path = cursor?;
-        if same_file(&path, target) {
+    while let Some(path) = cursor {
+        let id = identity(&path)?;
+        if id == target_id {
             return Some(path);
+        }
+        if !seen.insert(id) {
+            break;
         }
         cursor = match probe_format(&path) {
             Ok(Format::Qcow2) => Qcow2Image::open_header(&path)
@@ -423,24 +436,6 @@ fn chain_file_same_as(image: &Path, target: &Path) -> Option<PathBuf> {
         };
     }
     None
-}
-
-/// Whether two paths name one file, through links of either kind.
-#[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Copy the whole virtual disk, skipping all-zero chunks (sparse output,
@@ -551,6 +546,36 @@ mod tests {
         assert_eq!(i.snapshots[0].name, "one");
     }
 
+    /// Review vmlab-disk-2 F21: a create that fails after it made the file
+    /// must remove it, because `up` takes an existing file as the disk.
+    #[test]
+    fn a_failed_create_leaves_no_file() {
+        use std::os::unix::fs::FileExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let top = dir.path().join("top.qcow2");
+        create_qcow2(&base, 1 << 20, None, None).unwrap();
+        // An incompatible feature bit that vmlab-disk does not know.
+        let file = std::fs::OpenOptions::new().write(true).open(&base).unwrap();
+        file.write_all_at(&(1u64 << 40).to_be_bytes(), 72).unwrap();
+        drop(file);
+        assert!(Qcow2Image::open(&base, true).is_err());
+
+        assert!(create_qcow2(&top, 1 << 20, Some(&base), Some("qcow2")).is_err());
+        assert!(!top.exists(), "the failed create left {}", top.display());
+    }
+
+    /// A create onto an existing file is refused and leaves that file alone.
+    #[test]
+    fn a_create_onto_an_existing_file_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top.qcow2");
+        std::fs::write(&top, b"mine").unwrap();
+        assert!(create_qcow2(&top, 1 << 20, None, None).is_err());
+        assert_eq!(std::fs::read(&top).unwrap(), b"mine");
+    }
+
     fn patterned(path: &Path, byte: u8) {
         create_qcow2(path, 1 << 20, None, None).unwrap();
         let mut img = Qcow2Image::open(path, false).unwrap();
@@ -563,6 +588,97 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         img.read_at(0, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn a_chain_of_twelve_overlays_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = dir.path().join("0.qcow2");
+        patterned(&base, 0xa5);
+        for index in 1..12 {
+            let overlay = dir.path().join(format!("{index}.qcow2"));
+            create_linked_clone(&base, &overlay).unwrap();
+            base = overlay;
+        }
+        assert_eq!(first_bytes(&base), vec![0xa5; 4096]);
+    }
+
+    #[test]
+    fn a_clone_of_a_backing_path_over_the_name_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        while nested.as_os_str().len() < 1100 {
+            nested.push("a".repeat(100));
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        let base = nested.join("base.qcow2");
+        let clone = dir.path().join("clone.qcow2");
+        patterned(&base, 0xa5);
+        assert!(create_linked_clone(&base, &clone).is_err());
+        assert!(!clone.exists());
+        assert!(create_qcow2(&clone, 1 << 20, Some(&base), Some("qcow2")).is_err());
+        assert!(!clone.exists());
+    }
+
+    #[test]
+    fn a_safe_rebase_onto_a_relative_path_reads_the_same_content_after() {
+        const CHILD: &str = "VMLAB_TEST_RELATIVE_REBASE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let top = Path::new("sub/top.qcow2");
+            rebase_safe(top, Path::new("new.qcow2"), None).unwrap();
+            assert!(first_bytes(top).iter().all(|&byte| byte == 0xa5));
+            assert_eq!(
+                Qcow2Image::open_header(top).unwrap().backing_file_name(),
+                Some("new.qcow2")
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let old = dir.path().join("old.qcow2");
+        patterned(&old, 0xa5);
+        patterned(&dir.path().join("new.qcow2"), 0xa5);
+        patterned(&sub.join("new.qcow2"), 0x5a);
+        create_linked_clone(&old, &sub.join("top.qcow2")).unwrap();
+
+        let test = concat!(
+            module_path!(),
+            "::a_safe_rebase_onto_a_relative_path_reads_the_same_content_after"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test.strip_prefix("vmlab_disk::").unwrap()])
+            .env(CHILD, "1")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_backing_cycle_through_a_hard_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let alias = dir.path().join("alias.qcow2");
+        let top = dir.path().join("top.qcow2");
+        create_qcow2(&base, 1 << 20, None, None).unwrap();
+        std::fs::hard_link(&base, &alias).unwrap();
+        create_linked_clone(&alias, &top).unwrap();
+        rebase_unsafe(&base, "top.qcow2", Some("qcow2")).unwrap();
+
+        match Qcow2Image::open(&base, true) {
+            Err(Error::Unsupported(reason)) => {
+                assert!(reason.contains("backing chain cycle"), "{reason}");
+                assert!(reason.contains("alias.qcow2"), "{reason}");
+            }
+            _ => panic!("expected an error naming the alias that closes the backing cycle"),
+        }
     }
 
     /// Review vmlab-disk F11: `convert` removes an existing destination, so

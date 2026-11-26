@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{OFFSET_MASK, Qcow2Image};
+use super::{OFFSET_MASK, Qcow2Image, l1_size_as_clusters};
 use crate::{Error, Result};
 
 /// Free host clusters the allocator may hand out, plus the cursor of the
@@ -421,8 +421,7 @@ impl Qcow2Image {
         Some(first)
     }
 
-    /// Ensure the on-disk L1 region holds at least `needed` entries and the
-    /// in-memory view matches.
+    /// Resize the active L1 table and its on-disk region to `needed` entries.
     pub(crate) fn ensure_l1_size(&mut self, needed: u32) -> Result<()> {
         if needed > super::MAX_L1_ENTRIES {
             return Err(Error::Unsupported(format!(
@@ -430,23 +429,27 @@ impl Qcow2Image {
                 super::MAX_L1_ENTRIES
             )));
         }
-        if needed <= self.l1_size {
-            if self.l1.len() > needed as usize {
-                // Zero the stale tail on disk.
-                let start = needed as u64 * 8;
-                let end = self.l1.len() as u64 * 8;
-                let region = self.l1_table_offset + start;
-                let zeros = vec![0u8; (end - start) as usize];
-                self.write_file(region, &zeros)?;
-                self.l1.truncate(needed as usize);
-                self.l1_size = needed;
-                self.l1_dirty = true;
-                self.header_dirty = true;
-            }
+        if needed == self.l1_size {
             return Ok(());
         }
-        let old_clusters = (self.l1_size as u64 * 8).div_ceil(self.cluster_size).max(1);
-        let new_clusters = (needed as u64 * 8).div_ceil(self.cluster_size).max(1);
+        let old_clusters = l1_size_as_clusters(self.l1_size, self.cluster_size);
+        let new_clusters = l1_size_as_clusters(needed, self.cluster_size);
+        if needed < self.l1_size {
+            // Zero stale entries in the retained region and retire whole trailing clusters.
+            let start = needed as u64 * 8;
+            let end = (self.l1_size as u64 * 8).min(new_clusters * self.cluster_size);
+            let zeros = vec![0u8; (end - start) as usize];
+            self.write_file(self.l1_table_offset + start, &zeros)?;
+            let first_cluster = self.l1_table_offset / self.cluster_size;
+            for idx in new_clusters..old_clusters {
+                self.dec_refcount(first_cluster + idx)?;
+            }
+            self.l1.truncate(needed as usize);
+            self.l1_size = needed;
+            self.l1_dirty = true;
+            self.header_dirty = true;
+            return Ok(());
+        }
         self.l1.resize(needed as usize, 0);
         if new_clusters > old_clusters {
             let new_offset = self.alloc_clusters_contiguous(new_clusters)?;
