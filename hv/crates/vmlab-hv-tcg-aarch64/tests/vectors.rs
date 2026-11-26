@@ -9,7 +9,6 @@ use vmlab_hv_tcg_aarch64::{Record, decode, decode_linear, decode_unconstrained};
 
 const VECTORS: &str = include_str!("vectors.txt");
 
-
 fn vectors() -> Vec<(u32, Option<&'static str>)> {
     VECTORS
         .lines()
