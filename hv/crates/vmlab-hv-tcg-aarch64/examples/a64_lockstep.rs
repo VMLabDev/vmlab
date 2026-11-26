@@ -253,6 +253,17 @@ impl Run {
             } => {
                 self.counts.add(&mut self.rng, &verified);
                 eprint!("{difference}");
+                // The start of the round, to run it again with `--probe`.
+                for (address, data) in &round.memory {
+                    let words: Vec<String> = data
+                        .chunks_exact(4)
+                        .take(verified.len() + 2)
+                        .map(|word| {
+                            format!("{:08x}", u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                        })
+                        .collect();
+                    eprintln!("  the round from {address:#x}: {}", words.join("+"));
+                }
                 if let (Some((encoding, before)), Some(after)) =
                     (difference.instruction, difference.qemu)
                 {

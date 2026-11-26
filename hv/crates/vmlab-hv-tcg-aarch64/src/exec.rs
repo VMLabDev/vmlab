@@ -301,8 +301,7 @@ impl Side {
         }
         let wrote = if bytes == reservation.bytes {
             memory.store_conditional(address, part, reservation.generation)?
-        } else if memory
-            .reservation_generation(reservation.address, usize::from(reservation.bytes))
+        } else if memory.reservation_generation(reservation.address, usize::from(reservation.bytes))
             == reservation.generation
         {
             // A store of another size than its load: the granules of the
