@@ -256,6 +256,9 @@ enum Unstored {
     /// instruction.
     Retry,
     Fault(Fault),
+    /// A fault that says "read": the alignment fault of an exclusive store,
+    /// which QEMU reports that way (the lockstep of card C8).
+    ReadFault(Fault),
 }
 
 impl From<Fault> for Unstored {
@@ -638,7 +641,10 @@ impl Side {
         // From here the store is an access. One that faults leaves the
         // mark, as its instruction did not complete.
         if address & (u64::from(bytes) - 1) != 0 {
-            return Err(Fault::Abort(mmu::Fault::ALIGNMENT, address).into());
+            return Err(Unstored::ReadFault(Fault::Abort(
+                mmu::Fault::ALIGNMENT,
+                address,
+            )));
         }
         // The store is aligned, so it is in one page. It is an access that
         // writes, also when it then finds another value and writes nothing.
@@ -749,6 +755,7 @@ impl Failed {
         match refused {
             Unstored::Retry => Self::Retry,
             Unstored::Fault(fault) => Self::Access(fault, true),
+            Unstored::ReadFault(fault) => Self::Access(fault, false),
         }
     }
 }

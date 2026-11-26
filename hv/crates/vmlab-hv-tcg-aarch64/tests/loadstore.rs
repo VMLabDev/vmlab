@@ -866,7 +866,8 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     cpu.state.set_x(10, 7);
     cpu.step().unwrap();
     cpu.step().unwrap();
-    assert_eq!(abort(&cpu), Some((BASE + 4, DATA + 0x101, true, ALIGNMENT)));
+    // The alignment fault of an exclusive store says "read", as QEMU's.
+    assert_eq!(abort(&cpu), Some((BASE + 4, DATA + 0x101, false, ALIGNMENT)));
     assert_eq!(cpu.state.x(10), 7);
     // The store did not complete, so the mark is still there.
     cpu.state.set_pc(BASE + 8);
@@ -878,7 +879,7 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     let mut cpu = self::cpu(&[stxr(10, 1, 0)]);
     cpu.state.set_x(0, u64::MAX);
     cpu.step().unwrap();
-    assert_eq!(abort(&cpu), Some((BASE, u64::MAX, true, ALIGNMENT)));
+    assert_eq!(abort(&cpu), Some((BASE, u64::MAX, false, ALIGNMENT)));
     let mut cpu = self::cpu(&[word(Record::STXRB, &[("ws", 10), ("rt", 1), ("rn", 0)])]);
     cpu.state.set_x(0, u64::MAX);
     cpu.step().unwrap();
