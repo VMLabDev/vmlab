@@ -153,6 +153,8 @@ pub struct VmShared {
     exit_announced: std::sync::atomic::AtomicBool,
     exit_cv: Condvar,
     kicks: Mutex<Vec<libc::pthread_t>>,
+    /// The vCPUs that run in the process and take no signal.
+    wakers: Mutex<Vec<(u8, Arc<crate::vcpu::Waker>)>>,
     event_sink: Mutex<Option<EventSink>>,
     /// vCPU file descriptors, shared with the snapshot path: the owning
     /// thread holds each mutex across KVM_RUN, snapshots take it while the
@@ -239,6 +241,7 @@ impl VmShared {
             exit_announced: std::sync::atomic::AtomicBool::new(false),
             exit_cv: Condvar::new(),
             kicks: Mutex::new(Vec::new()),
+            wakers: Mutex::new(Vec::new()),
             event_sink: Mutex::new(None),
             vcpus: Mutex::new(Vec::new()),
             parked: Mutex::new(0),
@@ -605,6 +608,20 @@ impl VmShared {
         self.kicks.lock().retain(|t| *t != tid);
     }
 
+    pub(crate) fn register_kick(&self, id: u8, kick: crate::vcpu::Kick) {
+        match kick {
+            crate::vcpu::Kick::Signal(tid) => self.register_vcpu(tid),
+            crate::vcpu::Kick::Wake(waker) => self.wakers.lock().push((id, waker)),
+        }
+    }
+
+    pub(crate) fn unregister_kick(&self, id: u8, kick: &crate::vcpu::Kick) {
+        match kick {
+            crate::vcpu::Kick::Signal(tid) => self.unregister_vcpu(*tid),
+            crate::vcpu::Kick::Wake(_) => self.wakers.lock().retain(|(vcpu, _)| *vcpu != id),
+        }
+    }
+
     fn kick_all(&self) {
         let tids = self.kicks.lock();
         for &tid in tids.iter() {
@@ -614,6 +631,10 @@ impl VmShared {
             unsafe {
                 libc::pthread_kill(tid, libc::SIGUSR1);
             }
+        }
+        drop(tids);
+        for (_, waker) in self.wakers.lock().iter() {
+            waker.kick();
         }
     }
 
