@@ -208,7 +208,7 @@ impl Gic {
             "a GICv2 has 1 to 8 CPUs"
         );
         assert!(
-            spis % 32 == 0 && spis <= 988,
+            spis.is_multiple_of(32) && spis <= 988,
             "the SPIs of a GICv2 come in words of 32, up to INTID 1019"
         );
         let cpus = lines.len();
@@ -537,7 +537,7 @@ impl Gic {
                     self.irq(cpu, n).targets
                 }
             }
-            0xf10..=0xf1f | 0xf20..=0xf2f => {
+            0xf10..=0xf2f => {
                 self.state.cpus[cpu].sgi_sources[(offset & 0xf) as usize]
             }
             _ => 0,

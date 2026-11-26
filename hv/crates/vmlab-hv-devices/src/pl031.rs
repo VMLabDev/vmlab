@@ -153,7 +153,7 @@ impl Pl031 {
             IMSC => u32::from(self.state.mask),
             RIS => u32::from(self.state.raised),
             MIS => u32::from(self.state.raised && self.state.mask),
-            ID..=0xffc if offset % 4 == 0 => u32::from(IDS[((offset - ID) / 4) as usize]),
+            ID..=0xffc if offset.is_multiple_of(4) => u32::from(IDS[((offset - ID) / 4) as usize]),
             _ => 0,
         }
     }
@@ -171,11 +171,7 @@ impl Pl031 {
                 self.arm();
             }
             IMSC => self.state.mask = value & 1 != 0,
-            ICR => {
-                if value & 1 != 0 {
-                    self.state.raised = false;
-                }
-            }
+            ICR if value & 1 != 0 => self.state.raised = false,
             _ => {}
         }
         self.update_irq();
