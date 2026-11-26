@@ -650,8 +650,24 @@ impl Follower {
             match stepped {
                 Stepped::On(_) => {}
                 Stepped::End(end) => break Ok(end),
-                Stepped::Differ(what) => {
+                Stepped::Differ(mut what) => {
                     let ours = Core::of(&self.cpu.state);
+                    // What QEMU's exception registers say, when it took an
+                    // exception that we did not: they are in its next record.
+                    if compare_system
+                        && let Ok(Trace::Instruction { system, core, .. }) =
+                            self.leader.next_record(Duration::from_secs(1))
+                    {
+                        what.push_str(&format!("; QEMU goes on at {:#x} with", core.pc));
+                        for (register, value) in self.compared.iter().zip(&system) {
+                            if matches!(
+                                register.qemu,
+                                "ESR_EL1" | "FAR_EL1" | "ELR_EL1" | "SPSR_EL1" | "MDSCR_EL1"
+                            ) {
+                                what.push_str(&format!(" {}={value:#x}", register.qemu));
+                            }
+                        }
+                    }
                     let mut difference = differed(what, &last, ours, None);
                     difference.taken = self.cpu.taken;
                     break Err(difference);
