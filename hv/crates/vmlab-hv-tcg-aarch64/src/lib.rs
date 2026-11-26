@@ -14,6 +14,7 @@
 pub mod exec;
 pub mod fields;
 pub mod generated;
+pub mod helpers;
 pub mod lift;
 pub mod oracle;
 pub mod state;

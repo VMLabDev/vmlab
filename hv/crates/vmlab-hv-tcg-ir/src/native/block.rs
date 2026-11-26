@@ -116,6 +116,14 @@ pub enum Event {
         error: ExitId,
         invalidated: ExitId,
     },
+    /// An ordered helper call (R10): it runs at its place among the events,
+    /// once. `results` are `Effect` scalars that the call fills. A pure
+    /// helper is not an event: it is the scalar `Operation::Call`.
+    Call {
+        helper: super::HelperRef,
+        args: Vec<ScalarId>,
+        results: Vec<ScalarId>,
+    },
     Checkpoint(usize),
     Exit(ExitId),
 }

@@ -14,7 +14,7 @@ use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::linear;
 use vmlab_hv_tcg_ir::native::packed::Packed;
-use vmlab_hv_tcg_ir::native::{Operation, dce, schedule};
+use vmlab_hv_tcg_ir::native::{Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule};
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -49,69 +49,83 @@ struct Compiled {
     code: Vec<Packed>,
     /// The scratch slots. The constants are in place.
     values: Vec<u128>,
+    /// The helper calls (R10), in the order in which they run.
+    calls: Vec<Call>,
     /// Scratch slot, register slot: copied in before the block runs.
     inputs: Vec<(u32, u32)>,
     /// Register slot, scratch slot: copied out after it.
     outputs: Vec<(u32, u32)>,
 }
 
+/// The most arguments of a helper.
+const CALL_ARGUMENTS: usize = 8;
+
+/// One helper call of a block.
+struct Call {
+    /// It runs before the packed instruction of this index.
+    at: u32,
+    function: HelperFn,
+    /// The scratch slots of the arguments.
+    args: Vec<u32>,
+    /// The scratch slot of each result, with the mask of its type.
+    results: Vec<(u32, u128)>,
+}
+
 fn host(message: &str) -> Stop {
     Stop::Host(message.to_string())
 }
 
-fn compile(
-    pc: u64,
-    context: Context,
-    instructions: u32,
-    mut block: BlockOf<A64Exit>,
-) -> Result<Compiled, Stop> {
-    dce::prune_scalars(&mut block);
-    let graph = &block.graph;
-    let [Event::Exit(exit)] = block.events.as_slice() else {
-        return Err(host(
-            "an aarch64 block of this card has one exit and no other event",
-        ));
-    };
-    let exit = &block.exits[*exit];
-    let A64Next::Pc(next) = exit.next else {
-        return Err(host("an exception exit has no executor yet"));
-    };
-    let (slots, slot_count) = linear::slots(graph);
-    let mut roots: Vec<_> = exit
-        .writeback
-        .writes
-        .iter()
-        .map(|(_, scalar)| *scalar)
-        .collect();
-    roots.push(next);
-    let mut seen = vec![false; graph.scalars.len()];
-    let order = schedule::scalars(graph, &roots, &mut seen);
-    let mut compiled = Compiled {
-        pc,
-        context,
-        instructions,
-        code: Vec::new(),
-        values: vec![0; slot_count],
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-    };
-    let narrow =
-        |value: usize| u32::try_from(value).map_err(|_| host("a block with too many slots"));
+fn narrow(value: usize) -> Result<u32, Stop> {
+    u32::try_from(value).map_err(|_| host("a block with too many slots"))
+}
+
+/// The mask of the type of a scalar that a helper fills.
+fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
+    match graph.scalars[id].ty {
+        ScalarType::Bits(width) => mask(width),
+        ScalarType::Bool => 1,
+        ScalarType::Integer => u128::MAX,
+    }
+}
+
+/// Append the scalars of `order` to the block: constants and inputs are
+/// bound, a pure helper call becomes a `Call`, and the rest is packed.
+fn emit(
+    graph: &Graph,
+    slots: &[usize],
+    slot_count: usize,
+    order: Vec<ScalarId>,
+    compiled: &mut Compiled,
+) -> Result<(), Stop> {
     for id in order {
-        match graph.scalars[id].operation {
-            Operation::Constant(value) => compiled.values[slots[id]] = value,
+        match &graph.scalars[id].operation {
+            Operation::Constant(value) => compiled.values[slots[id]] = *value,
             Operation::Input(register) => {
                 compiled
                     .inputs
-                    .push((narrow(slots[id])?, narrow(register)?));
+                    .push((narrow(slots[id])?, narrow(*register)?));
             }
             // A view of another scalar shares its slot.
             Operation::Refine(_) => {}
             Operation::Effect(_) => return Err(host("a memory effect has no executor yet")),
+            Operation::Call { helper, args } => {
+                if args.len() > CALL_ARGUMENTS {
+                    return Err(host("a helper with too many arguments"));
+                }
+                compiled.calls.push(Call {
+                    at: narrow(compiled.code.len())?,
+                    function: helper.0.function,
+                    args: args
+                        .iter()
+                        .map(|arg| narrow(slots[*arg]))
+                        .collect::<Result<_, _>>()?,
+                    results: vec![(narrow(slots[id])?, result_mask(graph, id))],
+                });
+            }
             _ => {
                 let mut instruction = linear::lower(graph, id)
                     .ok_or_else(|| host("a scalar without a linear form"))?;
-                instruction.remap(&slots);
+                instruction.remap(slots);
                 let mut packed = Packed::new(slots[id], instruction)
                     .ok_or_else(|| host("a scalar without a packed form"))?;
                 if let Operation::Binary(_, _, right) = graph.scalars[id].operation
@@ -127,6 +141,76 @@ fn compile(
             }
         }
     }
+    Ok(())
+}
+
+fn compile(
+    pc: u64,
+    context: Context,
+    instructions: u32,
+    mut block: BlockOf<A64Exit>,
+) -> Result<Compiled, Stop> {
+    dce::prune_scalars(&mut block);
+    let graph = &block.graph;
+    let Some((Event::Exit(exit), before)) = block.events.split_last() else {
+        return Err(host("an aarch64 block ends in its one exit"));
+    };
+    let exit = &block.exits[*exit];
+    let A64Next::Pc(next) = exit.next else {
+        return Err(host("an exception exit has no executor yet"));
+    };
+    let (slots, slot_count) = linear::slots(graph);
+    let mut seen = vec![false; graph.scalars.len()];
+    let mut compiled = Compiled {
+        pc,
+        context,
+        instructions,
+        code: Vec::new(),
+        values: vec![0; slot_count],
+        calls: Vec::new(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    };
+    // The ordered helper calls, each after what its arguments need.
+    for event in before {
+        let Event::Call {
+            helper,
+            args,
+            results,
+        } = event
+        else {
+            return Err(host("an event of an aarch64 block that has no executor yet"));
+        };
+        if !matches!(helper.0.function, HelperFn::Ordered(_)) || args.len() > CALL_ARGUMENTS {
+            return Err(host("an ordered call of a helper that is not one"));
+        }
+        let order = schedule::scalars(graph, args, &mut seen);
+        emit(graph, &slots, slot_count, order, &mut compiled)?;
+        for result in results {
+            seen[*result] = true;
+        }
+        compiled.calls.push(Call {
+            at: narrow(compiled.code.len())?,
+            function: helper.0.function,
+            args: args
+                .iter()
+                .map(|arg| narrow(slots[*arg]))
+                .collect::<Result<_, _>>()?,
+            results: results
+                .iter()
+                .map(|result| Ok((narrow(slots[*result])?, result_mask(graph, *result))))
+                .collect::<Result<_, Stop>>()?,
+        });
+    }
+    let mut roots: Vec<_> = exit
+        .writeback
+        .writes
+        .iter()
+        .map(|(_, scalar)| *scalar)
+        .collect();
+    roots.push(next);
+    let order = schedule::scalars(graph, &roots, &mut seen);
+    emit(graph, &slots, slot_count, order, &mut compiled)?;
     for (register, scalar) in &exit.writeback.writes {
         compiled
             .outputs
@@ -145,7 +229,43 @@ impl Compiled {
         for (scratch, register) in &self.inputs {
             values[*scratch as usize] = state.slots[*register as usize];
         }
-        for packed in &self.code {
+        // A block without a helper call is the one run of packed
+        // instructions after this loop.
+        let mut from = 0;
+        for call in &self.calls {
+            let until = call.at as usize;
+            for packed in &self.code[from..until] {
+                let Some(value) = packed.evaluate(values) else {
+                    return Err(host("an arithmetic operation outside its domain"));
+                };
+                values[packed.output as usize] = value;
+            }
+            from = until;
+            let mut args = [0u128; CALL_ARGUMENTS];
+            for (arg, slot) in args.iter_mut().zip(&call.args) {
+                *arg = values[*slot as usize];
+            }
+            let args = &args[..call.args.len()];
+            match call.function {
+                HelperFn::Pure(function) => {
+                    let (slot, mask) = call.results[0];
+                    values[slot as usize] = function(args) & mask;
+                }
+                // An ordered helper sees the state as it was at the entry of
+                // the block for every register slot: the slots are written
+                // back at the exit. What it may touch is the state that is
+                // not in a slot.
+                HelperFn::Ordered(function) => {
+                    let mut results = [0u128; CALL_ARGUMENTS];
+                    let count = call.results.len().min(CALL_ARGUMENTS);
+                    function(&mut *state, args, &mut results[..count]);
+                    for ((slot, mask), result) in call.results.iter().zip(results) {
+                        values[*slot as usize] = result & mask;
+                    }
+                }
+            }
+        }
+        for packed in &self.code[from..] {
             let Some(value) = packed.evaluate(values) else {
                 return Err(host("an arithmetic operation outside its domain"));
             };
@@ -464,6 +584,131 @@ mod tests {
         cpu.state.set_pc(BASE);
         assert_eq!(cpu.run(1), Stop::Budget);
         assert_eq!(cpu.state.x(0), 3);
+    }
+
+    #[test]
+    fn scalar_fp_runs_through_the_helpers_and_collects_its_exceptions() {
+        use crate::helpers::fp::fpsr;
+        // fadd d0, d1, d2 ; fdiv d3, d1, d4 ; fcvtzs w5, d0 ; fcmp d1, d2
+        let mut cpu = cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
+        cpu.state.set_v(0, u128::MAX);
+        cpu.state.set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        cpu.state.set_v(2, u128::from(2.25f64.to_bits()));
+        cpu.state.set_v(3, u128::MAX);
+        cpu.state.set_x(5, u64::MAX);
+        assert_eq!(cpu.run(4), Stop::Budget);
+        // A scalar result clears the register above it.
+        assert_eq!(cpu.state.v(0), u128::from(3.75f64.to_bits()));
+        assert_eq!(cpu.state.v(3), u128::from(f64::INFINITY.to_bits()));
+        assert_eq!(cpu.state.x(5), 3);
+        // 1.5 < 2.25: N.
+        assert_eq!(cpu.state.nzcv(), 0b1000);
+        // A division by zero, then an inexact conversion. The bits stay.
+        assert_eq!(cpu.state.fpsr(), u32::from(fpsr::DZC | fpsr::IXC));
+        // The four instructions were one block, and stepping gives the same.
+        assert_eq!(cpu.translations, 1);
+        let mut step = self::cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
+        step.state.set_v(0, u128::MAX);
+        step.state.set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        step.state.set_v(2, u128::from(2.25f64.to_bits()));
+        step.state.set_v(3, u128::MAX);
+        step.state.set_x(5, u64::MAX);
+        for _ in 0..4 {
+            step.step().unwrap();
+        }
+        assert_eq!(step.state, cpu.state);
+    }
+
+    #[test]
+    fn the_rounding_mode_of_fpcr_reaches_the_helpers() {
+        // fdiv s0, s1, s2: 1 / 3 in each of the four modes.
+        for (mode, expected) in [
+            (0u32, 0x3eaa_aaabu32),
+            (1, 0x3eaa_aaab),
+            (2, 0x3eaa_aaaa),
+            (3, 0x3eaa_aaaa),
+        ] {
+            let mut cpu = cpu(&[0x1e22_1820]);
+            cpu.state.set_v(1, u128::from(1.0f32.to_bits()));
+            cpu.state.set_v(2, u128::from(3.0f32.to_bits()));
+            cpu.state.set_fpcr(mode << 22);
+            cpu.step().unwrap();
+            assert_eq!(cpu.state.v(0), u128::from(expected), "mode {mode}");
+            assert_eq!(cpu.state.fpsr(), 0x10);
+            assert_eq!(cpu.state.fpcr(), mode << 22);
+        }
+    }
+
+    fn bump(context: &mut dyn std::any::Any, args: &[u128], results: &mut [u128]) {
+        let state = context
+            .downcast_mut::<State>()
+            .expect("the context of an aarch64 helper is the state");
+        state.daif ^= 0xf;
+        results[0] = args[0] + args[1];
+    }
+
+    static BUMP: vmlab_hv_tcg_ir::native::Helper = vmlab_hv_tcg_ir::native::Helper {
+        name: "bump",
+        args: 2,
+        results: 1,
+        effects: vmlab_hv_tcg_ir::native::Effects::WRITES_STATE,
+        function: HelperFn::Ordered(bump),
+    };
+
+    #[test]
+    fn an_ordered_helper_runs_once_at_its_place_with_the_state() {
+        use crate::state::REGISTER_FILE;
+        use vmlab_hv_tcg_ir::native::regfile::Writeback;
+        use vmlab_hv_tcg_ir::native::{Binary, HelperRef};
+        let ty = ScalarType::Bits(64);
+        let mut block: BlockOf<A64Exit> = BlockOf::default();
+        let x0 = REGISTER_FILE.read(&mut block.graph, slot::X0);
+        let x1 = REGISTER_FILE.read(&mut block.graph, slot::X0 + 1);
+        // x2 = bump(x0 + x1, x1), and nothing reads the result of a second call.
+        let sum = block.graph.binary(ty, Binary::Add, x0, x1).unwrap();
+        let first = block.graph.effect(0, ty);
+        let second = block.graph.effect(1, ty);
+        for (args, result) in [(vec![sum, x1], first), (vec![x0, x0], second)] {
+            block.events.push(Event::Call {
+                helper: HelperRef(&BUMP),
+                args,
+                results: vec![result],
+            });
+        }
+        let next = block.graph.constant(ty, 0x4000_0004);
+        let exit = block.exit(A64Exit {
+            writeback: Writeback {
+                writes: vec![(slot::X0 + 2, first)],
+            },
+            next: A64Next::Pc(next),
+        });
+        block.events.push(Event::Exit(exit));
+        let context = State::reset(0).context;
+        let mut compiled = compile(0x4000_0000, context, 1, block).unwrap();
+        let mut state = State::reset(0x4000_0000);
+        state.set_x(0, 5);
+        state.set_x(1, 7);
+        compiled.run(&mut state).unwrap();
+        assert_eq!(state.x(2), 19);
+        assert_eq!(state.pc(), 0x4000_0004);
+        // Both calls ran: the masks were flipped twice.
+        assert_eq!(state.daif, 0xf);
+        // An ordered call of a pure helper is refused.
+        let mut block: BlockOf<A64Exit> = BlockOf::default();
+        let x0 = REGISTER_FILE.read(&mut block.graph, slot::X0);
+        let result = block.graph.effect(0, ty);
+        block.events.push(Event::Call {
+            helper: HelperRef(&crate::helpers::fp::FP_UNARY),
+            args: vec![x0],
+            results: vec![result],
+        });
+        let next = block.graph.constant(ty, 0);
+        let exit = block.exit(A64Exit {
+            writeback: Writeback::default(),
+            next: A64Next::Pc(next),
+        });
+        block.events.push(Event::Exit(exit));
+        assert!(matches!(compile(0, context, 1, block), Err(Stop::Host(_))));
     }
 
     #[test]

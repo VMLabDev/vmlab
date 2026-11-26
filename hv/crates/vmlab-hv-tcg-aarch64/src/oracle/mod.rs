@@ -96,13 +96,88 @@ impl std::fmt::Display for Core {
     }
 }
 
+/// The vector registers and the two FP registers, as the gdbstub and the
+/// plugin give them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vectors {
+    pub v: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+impl Default for Vectors {
+    fn default() -> Self {
+        Self {
+            v: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+}
+
+impl Vectors {
+    pub fn of(state: &State) -> Self {
+        let mut v = [0; 32];
+        for (n, value) in v.iter_mut().enumerate() {
+            *value = state.v(n);
+        }
+        Self {
+            v,
+            fpsr: state.fpsr(),
+            fpcr: state.fpcr(),
+        }
+    }
+
+    /// Put these registers into `state`.
+    pub fn apply(&self, state: &mut State) {
+        for (n, value) in self.v.iter().enumerate() {
+            state.set_v(n, *value);
+        }
+        state.set_fpsr(self.fpsr);
+        state.set_fpcr(self.fpcr);
+    }
+
+    /// The names of the registers that differ, with both values.
+    pub fn difference(&self, other: &Self) -> Vec<String> {
+        let mut found = Vec::new();
+        for n in 0..32 {
+            if self.v[n] != other.v[n] {
+                found.push(format!("v{n}: {:#x} / {:#x}", self.v[n], other.v[n]));
+            }
+        }
+        if self.fpsr != other.fpsr {
+            found.push(format!("fpsr: {:#x} / {:#x}", self.fpsr, other.fpsr));
+        }
+        if self.fpcr != other.fpcr {
+            found.push(format!("fpcr: {:#x} / {:#x}", self.fpcr, other.fpcr));
+        }
+        found
+    }
+}
+
+/// `fpcr`, `fpsr` and V0 to V31, in the form of a corpus line.
+impl std::fmt::Display for Vectors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fpcr={:x} fpsr={:x} v=", self.fpcr, self.fpsr)?;
+        for (n, value) in self.v.iter().enumerate() {
+            write!(f, "{}{value:x}", if n == 0 { "" } else { "," })?;
+        }
+        Ok(())
+    }
+}
+
 /// One record of the plugin stream. Nearly every record is an instruction,
 /// so the size of that variant is the size that matters.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Trace {
     /// The registers before the instruction `encoding` at `core.pc` runs.
-    Instruction { encoding: u32, core: Core },
+    /// `vectors`: when the stream carries them.
+    Instruction {
+        encoding: u32,
+        core: Core,
+        vectors: Option<Vectors>,
+    },
     /// A memory write of the last instruction.
     Write {
         address: u64,
@@ -128,8 +203,7 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 
 /// Parse the record at the start of `bytes`. `Ok(None)`: the record is not
 /// whole yet. Otherwise the record and its length. `vectors`: the stream
-/// carries V0 to V31, FPSR and FPCR in each instruction record. They are
-/// skipped until a card compares them.
+/// carries V0 to V31, FPSR and FPCR in each instruction record.
 pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, String> {
     if bytes.len() < 8 {
         return Ok(None);
@@ -152,10 +226,24 @@ pub fn parse(bytes: &[u8], vectors: bool) -> Result<Option<(Trace, usize)>, Stri
                 pc: u64_at(bytes, 8 + 32 * 8),
                 cpsr: u64_at(bytes, 8 + 33 * 8) as u32,
             };
+            let vectors = vectors.then(|| {
+                let at = 8 + 34 * 8;
+                let mut v = [0u128; 32];
+                for (n, value) in v.iter_mut().enumerate() {
+                    *value = u128::from(u64_at(bytes, at + n * 16))
+                        | u128::from(u64_at(bytes, at + n * 16 + 8)) << 64;
+                }
+                Vectors {
+                    v,
+                    fpsr: u32_at(bytes, at + 32 * 16),
+                    fpcr: u32_at(bytes, at + 32 * 16 + 8),
+                }
+            });
             Ok(Some((
                 Trace::Instruction {
                     encoding: second,
                     core,
+                    vectors,
                 },
                 len,
             )))
@@ -213,9 +301,15 @@ mod tests {
         }
         let (trace, len) = parse(&bytes, false).unwrap().unwrap();
         assert_eq!(len, bytes.len());
-        let Trace::Instruction { encoding, core } = trace else {
+        let Trace::Instruction {
+            encoding,
+            core,
+            vectors,
+        } = trace
+        else {
             panic!("an instruction record");
         };
+        assert_eq!(vectors, None);
         assert_eq!(encoding, 0x9100_0400);
         assert_eq!(core.x[30], 90);
         assert_eq!(
@@ -224,8 +318,43 @@ mod tests {
         );
         // With vectors the record is longer, and the same core comes out.
         assert_eq!(parse(&bytes, true), Ok(None));
-        bytes.extend([0u8; 32 * 16 + 16]);
-        assert_eq!(parse(&bytes, true).unwrap().unwrap().1, bytes.len());
+        for n in 0..32u128 {
+            bytes.extend((n << 100 | 7).to_le_bytes());
+        }
+        bytes.extend(0x1fu64.to_le_bytes());
+        bytes.extend(0x0340_0000u64.to_le_bytes());
+        let (trace, len) = parse(&bytes, true).unwrap().unwrap();
+        assert_eq!(len, bytes.len());
+        let Trace::Instruction {
+            core: with_vectors,
+            vectors: Some(vectors),
+            ..
+        } = trace
+        else {
+            panic!("an instruction record with vectors");
+        };
+        assert_eq!(with_vectors, core);
+        assert_eq!(vectors.v[31], 31 << 100 | 7);
+        assert_eq!((vectors.fpsr, vectors.fpcr), (0x1f, 0x0340_0000));
+        // The registers go to a state and back, and to a corpus line.
+        let mut state = State::reset(0);
+        vectors.apply(&mut state);
+        assert_eq!(Vectors::of(&state), vectors);
+        assert!(
+            vectors
+                .to_string()
+                .starts_with("fpcr=3400000 fpsr=1f v=7,10000000000000000000000007,")
+        );
+        let mut other = vectors;
+        other.v[2] = 0;
+        other.fpsr = 0;
+        assert_eq!(
+            vectors.difference(&other),
+            vec![
+                "v2: 0x20000000000000000000000007 / 0x0".to_string(),
+                "fpsr: 0x1f / 0x0".to_string()
+            ]
+        );
 
         let mut discontinuity = Vec::new();
         discontinuity.extend(3u32.to_le_bytes());

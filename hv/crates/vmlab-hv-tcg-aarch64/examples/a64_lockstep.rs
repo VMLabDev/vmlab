@@ -13,12 +13,17 @@
 //! phase runs each distinct encoding of the group from the traces of the
 //! template boots (`measure/a64trace.c` of the design card). The first
 //! difference stops the run with exit code 1.
+//!
+//! The group `fp` (card C4) also loads and compares V0 to V31, FPSR and
+//! FPCR. Its rounds are short, because FPSR only collects: after a few
+//! instructions most of its bits are set, and an instruction that sets one
+//! more or one less no longer shows.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use vmlab_hv_tcg::FlatMemory;
-use vmlab_hv_tcg_aarch64::lift::LIFTED_FORMATS;
+use vmlab_hv_tcg_aarch64::lift::{FP_FORMATS, LIFTED_FORMATS};
 use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
 use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, RAM_BASE};
@@ -34,6 +39,8 @@ const RAM_MIB: u32 = 64;
 const IMAGE_BASE: u64 = RAM_BASE + 32 * 1024 * 1024;
 /// Instructions in the image of a random round.
 const IMAGE_WORDS: usize = 1024;
+/// The same for a group that compares FPSR.
+const FP_IMAGE_WORDS: usize = 12;
 /// Corpus entries kept per record.
 const SAMPLES: usize = 3;
 
@@ -61,8 +68,11 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "dp-immediate" => immediate.to_vec(),
         "branch" => branch.to_vec(),
         "c1" => LIFTED_FORMATS.to_vec(),
+        "fp" => FP_FORMATS.to_vec(),
         other => {
-            return Err(format!("the group {other} is not known: dp-immediate, branch, c1").into());
+            return Err(
+                format!("the group {other} is not known: dp-immediate, branch, c1, fp").into(),
+            );
         }
     })
 }
@@ -92,6 +102,7 @@ impl Counts {
                 encoding: item.encoding,
                 before: item.before,
                 after: item.after,
+                vectors: item.vectors,
             };
             let samples = self.samples.entry(item.record).or_default();
             if samples.len() < SAMPLES {
@@ -154,12 +165,16 @@ impl Run {
                 if let (Some((encoding, before)), Some(after)) =
                     (difference.instruction, difference.qemu)
                 {
+                    let vectors = difference
+                        .vectors_before
+                        .zip(difference.vectors.map(|(_, qemu)| qemu));
                     eprintln!(
                         "  corpus line: {}",
                         Entry {
                             encoding,
                             before,
-                            after
+                            after,
+                            vectors,
                         }
                         .line()
                     );
@@ -208,8 +223,11 @@ fn main() -> Result<(), Failure> {
     let directory = directory.ok_or("give --dir <scratch directory>")?;
     let formats = group(&group_name)?;
     let started = Instant::now();
+    // A group of FP instructions compares the vector and FP registers.
+    let vectors = formats.iter().any(|format| FP_FORMATS.contains(format));
+    let image_words = if vectors { FP_IMAGE_WORDS } else { IMAGE_WORDS };
 
-    let mut leader = Leader::start(&qemu, &plugin, &directory, RAM_MIB)?;
+    let mut leader = Leader::start_with(&qemu, &plugin, &directory, RAM_MIB, vectors)?;
     // Our memory starts as a copy of the RAM of QEMU.
     let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
     let memory = FlatMemory::new(RAM_BASE, ram);
@@ -233,7 +251,7 @@ fn main() -> Result<(), Failure> {
         }
         // Three words in four are of a class that is still short of its
         // count. The others keep every class of the group in every image.
-        let (words, loose) = generator.image(IMAGE_BASE, IMAGE_WORDS, |rng| {
+        let (words, loose) = generator.image(IMAGE_BASE, image_words, |rng| {
             if rng.chance(3, 4) {
                 short[rng.below(short.len() as u64) as usize]
             } else {
@@ -241,11 +259,17 @@ fn main() -> Result<(), Failure> {
             }
         });
         unconstrained += loose;
-        let pc = IMAGE_BASE + 4 * generator.rng.below(IMAGE_WORDS as u64);
+        // A round without branches runs its image from the start.
+        let pc = if vectors {
+            IMAGE_BASE
+        } else {
+            IMAGE_BASE + 4 * generator.rng.below(image_words as u64)
+        };
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, pc),
-            budget: 2 * IMAGE_WORDS as u64,
+            vectors: vectors.then(|| generator.vectors()),
+            budget: image_words as u64 * if vectors { 1 } else { 2 },
             visits: 2,
         };
         run.round(&round)?;
@@ -277,16 +301,14 @@ fn main() -> Result<(), Failure> {
     });
     let is_branch = |word: &u32| {
         decode(*word).is_some_and(|decoded| {
-            !matches!(
+            matches!(
                 decoded.record.info().format,
-                FormatClass::ADRI
-                    | FormatClass::AddSubImmShift
-                    | FormatClass::BaseLogicalImm
-                    | FormatClass::BaseMoveImmediate
-                    | FormatClass::BaseInsertImmediate
-                    | FormatClass::BaseBitfieldImm
-                    | FormatClass::BaseBitfieldImmWith2RegArgs
-                    | FormatClass::BaseExtractImm
+                FormatClass::BranchImm
+                    | FormatClass::CallImm
+                    | FormatClass::BranchCond
+                    | FormatClass::BaseCmpBranch
+                    | FormatClass::BaseTestBranch
+                    | FormatClass::BranchReg
             )
         })
     };
@@ -295,12 +317,13 @@ fn main() -> Result<(), Failure> {
     let mut executed_verified = 0usize;
     // Instructions that do not branch run many to a round. A zero word ends
     // the image, and both sides stop there.
-    for chunk in straight.chunks(IMAGE_WORDS - 1) {
+    for chunk in straight.chunks(image_words - 1) {
         let mut words = chunk.to_vec();
-        words.resize(IMAGE_WORDS, 0);
+        words.resize(image_words, 0);
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, IMAGE_BASE),
+            vectors: vectors.then(|| generator.vectors()),
             budget: chunk.len() as u64,
             visits: 1,
         };
@@ -320,6 +343,7 @@ fn main() -> Result<(), Failure> {
         let round = Round {
             memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
             start: start(&mut generator, IMAGE_BASE),
+            vectors: vectors.then(|| generator.vectors()),
             budget: 1,
             visits: 1,
         };
