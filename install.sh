@@ -592,9 +592,30 @@ install_guest() {
     || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
   [ -n "$gtmp" ] && [ -d "$gtmp" ] && [ "$gtmp" != / ] \
     || { guest_fallback "the staging directory in $gparent is missing"; return 0; }
+  # The old guest directory while it is moved aside, else empty. It may be a
+  # long source build (`just guest-install`), so no exit deletes it: it goes
+  # back to $GUEST_DIR, or it stays in the staging directory under a name the
+  # warning gives.
+  gold=""
+  gkept=0
+  restore_guest() {
+    [ -n "$gold" ] || return 0
+    [ "$gkept" -eq 0 ] || return 1
+    # -T: a $GUEST_DIR that something made again is not moved into.
+    if { [ -e "$gold" ] || [ -L "$gold" ]; } && ! mv -T -- "$gold" "$GUEST_DIR"; then
+      gkept=1
+      warn "cannot put the previous guest directory back at $GUEST_DIR. It is saved at $gold"
+      return 1
+    fi
+    gold=""
+  }
   cleanup_guest() {
     [ -n "$gtmp" ] && [ "$gtmp" != / ] || return 1
-    rm -rf "$gtmp"
+    if restore_guest; then
+      rm -rf -- "$gtmp"
+    else
+      rm -rf -- "$gtmp/new" "$gtmp/$gname"
+    fi
     cleanup_release
   }
   trap cleanup_guest EXIT
@@ -615,16 +636,20 @@ install_guest() {
 
   # Swap: the old directory moves aside whole (nothing from an older version
   # survives in the new one), the new one renames into its place, and the old
-  # one is removed. Put the old one back if the second rename fails.
+  # one is removed. `gold` is set before the first rename and cleared after
+  # the second, so a failure or a signal anywhere between them reaches
+  # restore_guest, here or in the exit trap.
   if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
-    mv "$GUEST_DIR" "$gtmp/old" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
+    gold="$gtmp/old"
+    mv -T -- "$GUEST_DIR" "$gold" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
   fi
-  if ! mv "$gtmp/new" "$GUEST_DIR"; then
-    [ -e "$gtmp/old" ] && mv "$gtmp/old" "$GUEST_DIR"
+  if ! mv -T -- "$gtmp/new" "$GUEST_DIR"; then
+    restore_guest || true
     guest_fallback "cannot move the new guest assets into $GUEST_DIR."
     return 0
   fi
-  rm -rf "$gtmp"
+  gold=""
+  rm -rf -- "$gtmp"
   trap cleanup_release EXIT
 
   printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
