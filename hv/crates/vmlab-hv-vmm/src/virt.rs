@@ -198,7 +198,7 @@ struct EmptyTransports;
 
 impl BusDevice for EmptyTransports {
     fn read(&mut self, offset: u64, data: &mut [u8]) {
-        let value: u32 = match offset % map::VIRTIO_MMIO_SIZE & !3 {
+        let value: u32 = match (offset % map::VIRTIO_MMIO_SIZE) & !3 {
             0x000 => 0x7472_6976,
             0x004 => 1,
             0x00c => 0x554d_4551,
