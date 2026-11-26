@@ -144,6 +144,21 @@ impl FakeUsbFs {
         fake
     }
 
+    /// A fake whose isochronous IN endpoint 0x83 is high-bandwidth:
+    /// `wMaxPacketSize` 0x1400, three packets of 1024 bytes per microframe.
+    pub fn with_high_bandwidth_iso() -> Self {
+        let mut descriptors = FAKE_DESCRIPTORS.to_vec();
+        let at = descriptors
+            .windows(5)
+            .position(|w| w == [0x05, 0x83, 0x01, 0x00, 0x02])
+            .expect("the isochronous endpoint descriptor");
+        descriptors[at + 3] = 0x00;
+        descriptors[at + 4] = 0x14;
+        let fake = Self::new();
+        fake.shared().lock().descriptors = Some(descriptors);
+        fake
+    }
+
     /// A fake whose bulk interface has other endpoints at alt setting 1
     /// (0x84 in, 0x05 out) than at alt setting 0 (0x81 in, 0x02 out).
     pub fn with_distinct_alt_setting() -> Self {
@@ -265,6 +280,31 @@ impl FakeUsbFs {
             .lock()
             .iter()
             .map(|u| (u.endpoint, u.submitted.clone()))
+            .collect()
+    }
+
+    /// The lengths of the isochronous packet descriptors of each URB in
+    /// flight, in submission order. A URB that is not isochronous has none.
+    pub fn submitted_iso_packets(&self) -> Vec<(u8, Vec<u32>)> {
+        self.inner
+            .in_flight
+            .lock()
+            .iter()
+            .map(|u| {
+                // SAFETY: an in-flight URB is alive (see `Submitted`), and it
+                // was allocated with `number_of_packets_or_stream_id`
+                // trailing descriptors when it is isochronous.
+                let lengths = unsafe {
+                    if (*u.urb).urb_type == sys::USBDEVFS_URB_TYPE_ISO {
+                        let count = (*u.urb).number_of_packets_or_stream_id as usize;
+                        let iso = (*u.urb).iso_frame_desc.as_ptr();
+                        (0..count).map(|i| (*iso.add(i)).length).collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                (u.endpoint, lengths)
+            })
             .collect()
     }
 

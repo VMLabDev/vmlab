@@ -877,7 +877,7 @@ impl UsbDevice for HostUsbDevice {
         endpoint: u8,
         data: &[u8],
         max_length: usize,
-        packet_size: u32,
+        _packet_size: u32,
     ) -> UsbTransfer {
         self.reap();
         if self.job.is_some() {
@@ -902,13 +902,14 @@ impl UsbDevice for HostUsbDevice {
         if endpoint & 0x80 == 0 {
             return UsbTransfer::Stall;
         }
-        let packet_size = if packet_size == 0 {
-            u32::from(info.max_packet)
-        } else {
-            packet_size
+        // One usbdevfs packet descriptor is one service interval, and so is
+        // one TD: a descriptor of Max Packet Size would have the host ask a
+        // high-bandwidth endpoint for one transaction where it sends three.
+        let Ok(interval) = u32::try_from(max_length) else {
+            return UsbTransfer::Stall;
         };
         let buffer = vec![0; max_length];
-        match Transfer::new_isochronous(endpoint, buffer, packet_size) {
+        match Transfer::new_isochronous(endpoint, buffer, interval) {
             Ok(transfer) => self.start(endpoint, transfer),
             Err(_) => UsbTransfer::Stall,
         }
@@ -1526,6 +1527,27 @@ mod tests {
         fake.run_irq();
         assert_eq!(
             host.transfer_iso(0x83, &[], 1024, 512),
+            UsbTransfer::Ack(payload)
+        );
+    }
+
+    /// Review usb-2.md F18: one isochronous TD of xHCI is the data of one
+    /// service interval, and one usbdevfs packet descriptor is one service
+    /// interval. A high-bandwidth endpoint sends three packets of 1024 bytes
+    /// in it, so the TD of 3072 bytes is one descriptor, not three.
+    #[test]
+    fn one_isochronous_td_is_one_usbdevfs_packet() {
+        let fake = FakeUsbFs::with_high_bandwidth_iso();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(host.transfer_iso(0x83, &[], 3072, 1024), UsbTransfer::Nak);
+        assert_eq!(fake.submitted_iso_packets(), [(0x83, vec![3072])]);
+
+        // The three packets of the interval come back as one payload.
+        let payload: Vec<u8> = (0..3072u32).map(|n| n as u8).collect();
+        fake.complete_with(Completion::Data(payload.clone()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer_iso(0x83, &[], 3072, 1024),
             UsbTransfer::Ack(payload)
         );
     }
