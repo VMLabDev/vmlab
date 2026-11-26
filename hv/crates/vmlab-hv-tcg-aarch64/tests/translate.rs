@@ -13,13 +13,14 @@ use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 
 const RAM: u64 = 0x4000_0000;
-/// The code, the vector table, the three levels of tables below the root,
-/// the root, and two pages of data.
+/// The code, the vector table, the translation tables from their root on,
+/// and two pages of data.
 const CODE: u64 = RAM;
 const VECTORS: u64 = RAM + 0x1000;
 const ROOT: u64 = RAM + 0x2000;
-const DATA: u64 = RAM + 0x8000;
-const OTHER: u64 = RAM + 0x9000;
+const TABLE_PAGES: u64 = 16;
+const DATA: u64 = RAM + 0x2_0000;
+const OTHER: u64 = RAM + 0x2_1000;
 
 /// Where the tests map their data: a page in the lower half.
 const VA: u64 = 0x80_0000_0000;
@@ -85,6 +86,7 @@ impl Machine {
             if next == 0 {
                 next = self.next_table;
                 self.next_table += 0x1000;
+                assert!(next < ROOT + TABLE_PAGES * 0x1000, "the tables are full");
                 self.cpu.memory.write(entry, &(next | 3).to_le_bytes()).unwrap();
             }
             table = next;
@@ -579,7 +581,7 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
     let mut machine = Machine::new(&program);
     let entry = machine.map(RUN, DATA | AF | READ_ONLY);
     // The tables are mapped at their own addresses, for EL1.
-    for page in 0..6 {
+    for page in 0..TABLE_PAGES {
         machine.map(ROOT + page * 0x1000, (ROOT + page * 0x1000) | AF | NO_EXECUTE);
     }
     machine.cpu.memory.write(DATA, &asm::bytes(&[0x9100_0421, asm::RET])).unwrap();
@@ -599,7 +601,7 @@ fn the_guest_takes_the_abort_and_returns_to_the_access() {
     // again. str x1, [x0] ; hvc. The handler: str x3, [x2] ; eret.
     let mut machine = Machine::new(&[str(1, 0), HVC]);
     let entry = machine.map(VA, DATA | NO_EXECUTE);
-    for page in 0..6 {
+    for page in 0..TABLE_PAGES {
         machine.map(ROOT + page * 0x1000, (ROOT + page * 0x1000) | AF | NO_EXECUTE);
     }
     machine
