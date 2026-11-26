@@ -175,7 +175,9 @@ def capture(qemu: str, name: str, output: Path) -> dict:
         argv = [qemu if word == "qemu-system-aarch64" else word for word in logical]
         argv = [word.replace("file=AAVMF_CODE.fd", f"file={run}/code.fd")
                 .replace("file=AAVMF_VARS.fd", f"file={run}/vars.fd") for word in argv]
-        argv += ["-accel", "qtest", "-qtest", f"unix:{run}/qtest.sock,server=on,wait=off", "-S"]
+        argv += ["-accel", "qtest", "-qtest", f"unix:{run}/qtest.sock,server=on,wait=off"]
+        if os.environ.get("VIRT_FWCFG_STOPPED"):
+            argv.append("-S")
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT)
         try:
@@ -201,6 +203,10 @@ def capture(qemu: str, name: str, output: Path) -> dict:
                 path.write_bytes(data)
                 files.append({"name": file_name, "select": select, "size": size,
                               "sha256": hashlib.sha256(data).hexdigest()})
+        except BaseException:
+            process.kill()
+            print(process.communicate()[0].decode(errors="replace"), file=sys.stderr)
+            raise
         finally:
             process.kill()
             said = process.communicate()[0].decode(errors="replace").strip()
