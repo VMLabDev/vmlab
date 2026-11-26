@@ -357,3 +357,19 @@ pc (i440fx) + SeaBIOS, legacy profile device superset
 - BIOS: vendor `SeaBIOS`, version `Arch Linux 1.17.0-2-2`, date `04/01/2014`
 - System: manufacturer `QEMU`, product `Standard PC (i440FX + PIIX, 1996)`, version `pc-i440fx-11.1`, serial ``, SKU ``, family ``
 - UUID: `00000000-0000-0000-0000-000000000000`
+
+## Device oracles
+
+Three files hold register-level recordings of QEMU devices, made over qtest
+with no guest running. Device unit tests replay them and compare every read,
+interrupt level and output byte.
+
+| File | Devices | Recorded by |
+|---|---|---|
+| `pc-fdc-uhci-oracle.json` | pc floppy controller, ISA DMA, UHCI | `scripts/pc-fdc-uhci-oracle.py` |
+| `pc-uart-socket.json` | 16550 on a socket | `scripts/pc-uart-oracle.py` |
+| `virt-devices-oracle.json` | aarch64 `virt`: GICv2, GICv2m, PL011, PL031, GED | `scripts/virt-devices-oracle.py` |
+
+Recapture the `virt` devices with
+`python3 scripts/virt-devices-oracle.py --output docs/hwref/virt-devices-oracle.json`
+from `hv/`. It needs `qemu-system-aarch64` and takes about 20 seconds.

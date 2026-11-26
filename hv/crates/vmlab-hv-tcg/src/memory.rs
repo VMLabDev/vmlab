@@ -8,7 +8,9 @@ const PAGE_SIZE: usize = 4096;
 pub const RESERVATION_GRANULE: usize = PAGE_SIZE;
 static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(crate) fn next_identity() -> u64 {
+/// A new value for `CodeStamp::identity`: one per memory instance, also for
+/// an implementation of `Memory` outside this crate.
+pub fn next_identity() -> u64 {
     let id = NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     assert_ne!(id, 0, "memory identity exhausted");
     id

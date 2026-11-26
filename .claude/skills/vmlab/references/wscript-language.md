@@ -214,6 +214,23 @@ already running, so a script that must not repeat a step checks the guest first.
 The mixed-lab example reads a registry value before enabling autologon and skips
 the reboot when it is already set; see examples.md.
 
+## The limits on a script run
+
+vmlab sets two limits on every script run (a provision, a first-boot script, a
+handler, `vmlab script`). Neither is a time limit and neither can be changed.
+Each ends the run with a runtime error.
+
+- **10,000,000 instructions without a host call.** The count starts again each
+  time a host call returns: any `vmlab::` function, any method of `Lab`,
+  `Machine`, `Segment` or `Term`. A script that keeps reaching the host runs as
+  long as it needs. A script that spins by itself ends with "the script ran
+  10,000,000 instructions without a host call". A method of a string, a list or
+  a map is not a host call. In a long loop over a very large text, call
+  `vmlab::sleep_ms(0)` every few thousand passes.
+- **1024 MiB of values held at one time.** What the script made and dropped does
+  not count. vmlab counts at intervals, so a run can hold about half as much
+  again before it ends with "memory limit exceeded".
+
 ## Not in the language
 
 - Sinkhole modes other than NXDOMAIN: the script surface always sinks with
