@@ -684,7 +684,6 @@ and 40 streams run on our interpreter alone.
   masked, our core takes FIQ first.
 - `SYS` and `SYSL` (cache operations, TLBI, AT, DC ZVA) stop the loop with
   `Stop::Unimplemented`: card C8.
-- `CLREX` does nothing until card C3 brings the exclusives.
 - Translation: the PC is a physical address. A fetch outside the memory is an
   external abort (fault status `0x10`), or an address size fault above 40
   bits. The counts above do not separate the two.
@@ -697,6 +696,36 @@ and 40 streams run on our interpreter alone.
   machine, as `HVC` (G4). In the lockstep the harness refuses the call where
   QEMU did, and takes QEMU's answer where it served one.
 - The speed of the loop was not measured again: card C5 measures it.
+
+### After the merge of card C3 (2026-11-27)
+
+Card C3 (loads and stores) reached `next` first, and this branch took it in.
+How the two fit:
+
+- The loop is that of card C3 (blocks with several exits, the exclusive
+  monitor, the code pages) with the exceptions, the interrupts and the
+  terminal instruction of this card. `ERET` and `CLREX` end the exclusive
+  mark, as the record of card C3 expected of this card.
+- A load or a store that fails still stops the loop (`Stop::DataAbort`,
+  `Stop::Alignment`), as card C3 left it. It is not an exception of the
+  guest yet: the syndrome of a data abort needs the lockstep of the
+  translation card (C8).
+- The follower has two kinds of round. A round that ends at the first
+  exception and compares the memory writes is the one of card C3
+  (`run_plain`). Our CPU now takes its exceptions itself, so that round puts
+  the registers back as they were before the exception. A round of system
+  instructions (`run_system`) is the one of this card. It ends before a load
+  or a store.
+- The programs of `tests/loadstore.rs` ended in a zero word, which stopped
+  the loop as a record without a lifter. `UDF` is now an exception of the
+  guest, so they end in `IC IALLU`, which has no lifter before card C8.
+
+On the merged commit `98d30c68`:
+`just tcg-a64-lockstep system 100000 1 "<the four traces>"` verified
+14,144,660 instructions in 15,867 rounds with no difference, and 68 rounds
+ended before a load or a store. `c1 100000 1` without the traces verified
+1,439,552 instructions, `loadstore 3000 1` 156,639, `fp 3000 1` 48,156,
+`c2 3000 1` 57,991 and `all 3000 3` 101,049, each with no difference.
 
 ### Sources read for this card
 
