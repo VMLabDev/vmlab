@@ -295,11 +295,15 @@ impl Follower {
                                 None,
                             ));
                         }
-                        // No record for the instruction at our PC: QEMU could
-                        // not fetch it. Our memory must hold nothing there. A
-                        // PC that is also not a multiple of four gives no
-                        // record either. Which of the two exceptions it is,
-                        // the exception card (C6) compares.
+                        // No record for the instruction at our PC. Either the
+                        // PC is not a multiple of four (QEMU writes a record
+                        // for some of those and not for others), or QEMU
+                        // could not fetch, and then our memory must hold
+                        // nothing there. Which exception it is when both
+                        // hold, the exception card (C6) compares.
+                        Expect::Instruction if from_pc == ours.pc && ours.pc & 3 != 0 => {
+                            End::PcAlignment
+                        }
                         Expect::Instruction
                             if from_pc == ours.pc && self.word(ours.pc).is_none() =>
                         {
