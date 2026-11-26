@@ -725,4 +725,213 @@ fn main() {
             String::from_utf8_lossy(&child.stderr)
         );
     }
+
+    // -------------------------------------------------------- memory limit
+    //
+    // The memory limit of the vendored VM (`vendor/wscript-vm/src/mem.rs`,
+    // card #1086). That crate's own tests need the compiler as a
+    // dev-dependency, which a crate outside the workspace cannot have, so
+    // the limit is tested here. The limits are small so that no test holds
+    // much.
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Run `main() -> int` of `src` under a memory limit of `limit` bytes
+    /// (none for `None`): its result, or the VM's fault message.
+    fn run_limited(src: &str, limit: Option<u64>) -> Result<i64, String> {
+        let ctx = super::super::context();
+        let unit = ctx
+            .compile(src)
+            .unwrap_or_else(|e| panic!("{}", compile_error(e)));
+        let config = VmConfig {
+            memory: limit,
+            ..VmConfig::default()
+        };
+        let mut vm = Vm::with_config(&ctx, config);
+        vm.call_unit::<_, i64>(&unit, "main", ())
+            .map_err(|e| match e {
+                wscript::Error::Runtime(r) => r.message,
+                other => other.to_string(),
+            })
+    }
+
+    /// `src` must be stopped by a limit of 1 MiB.
+    fn stopped_at_one_mib(src: &str) {
+        let fault = run_limited(src, Some(MIB)).expect_err("the script ran to its end");
+        assert_eq!(fault, format!("memory limit of {MIB} bytes exceeded"));
+    }
+
+    /// Doubling a string asks for any amount in a few instructions. The
+    /// concatenation that does not fit is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_a_doubling_string() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let s = "x"
+    let i = 0
+    while i < 40 {
+        s = s + s
+        i = i + 1
+    }
+    i
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// Without a limit the VM counts nothing: the string doubles to 1 MiB and
+    /// the run ends.
+    #[test]
+    fn memory_none_is_no_limit() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let s = "x"
+    let i = 0
+    while i < 20 {
+        s = s + s
+        i = i + 1
+    }
+    s.bytes_len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, None), Ok(1048576));
+    }
+
+    /// A list that grows one element at a time is stopped too: each `push` is
+    /// small, the list is not.
+    #[test]
+    fn memory_limit_stops_a_growing_list() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let l = [0]
+    while true { l.push(1) }
+    0
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// A list of fresh strings is stopped by what the strings take, not by the
+    /// size of the list alone.
+    #[test]
+    fn memory_limit_counts_what_a_list_holds() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [""]
+    while true { l.push(big + "x") }
+    0
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// The limit is on what the script holds, not on what it has allocated in
+    /// total: 4000 strings of 16 KiB, each dropped at the next pass, are 64 MiB
+    /// of allocation under a limit of 1 MiB.
+    #[test]
+    fn memory_limit_does_not_count_dropped_values() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let n = 0
+    let i = 0
+    while i < 4000 {
+        let t = big + "x"
+        n = n + t.bytes_len()
+        i = i + 1
+    }
+    n
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(65540000));
+    }
+
+    /// The same value in many places is counted once: 10,000 references to one
+    /// string of 16 KiB are a list of 10,000 slots, not 160 MiB.
+    #[test]
+    fn memory_limit_counts_a_shared_value_once() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 0
+    while i < 10000 {
+        l.push(big)
+        i = i + 1
+    }
+    l.len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(10001));
+    }
+
+    /// What `map` collects from its callback is in no register until `map`
+    /// returns. It is counted while `map` runs.
+    #[test]
+    fn memory_limit_counts_what_map_collects() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [0]
+    let i = 0
+    while i < 1000 {
+        l.push(i)
+        i = i + 1
+    }
+    let all = l.map(|x| big + "x")
+    all.len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `fold` keeps one value, however many its callback returned: joining 2000
+    /// lines into 128 KiB returns 128 MiB of strings in total and holds one.
+    #[test]
+    fn memory_limit_does_not_count_what_fold_dropped() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let line = "0123456789abcdef".repeat(4)
+    let l = [line]
+    let i = 1
+    while i < 2000 {
+        l.push(line)
+        i = i + 1
+    }
+    let all = l.fold("", |acc, x| acc + x)
+    all.bytes_len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(128000));
+    }
+
+    /// A pad to a width the script names is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_a_pad_to_any_width() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    "x".pad_left(1000000000000, " ").bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// A chain of structs nested to any depth is walked without recursion,
+    /// and is stopped when it is too long.
+    #[test]
+    fn memory_limit_walks_a_deep_value() {
+        const SCRIPT: &str = r#"
+struct Node { next: Option[Node] }
+
+fn main() -> int {
+    let cur = Node { next: None }
+    while true { cur = Node { next: Some(cur) } }
+    0
+}
+"#;
+        let fault =
+            run_limited(SCRIPT, Some(64 * MIB)).expect_err("the script ran to its end");
+        assert_eq!(fault, format!("memory limit of {} bytes exceeded", 64 * MIB));
+    }
 }

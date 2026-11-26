@@ -25,6 +25,12 @@ for them:
   On `true` the tank goes back to the amount it was set to, so the fuel bounds
   the instructions between two host calls.
 
+The crate's own tests (`tests/vm.rs`, and the unit tests in `src/ops.rs`) need
+`wscript-compiler` as a dev-dependency, which a crate outside the workspace
+cannot have. They are not run here, and `tests/` is not vendored. The two
+deltas are tested from the main crate, in `src/scripting/runner.rs` and
+`src/labd/lab.rs`.
+
 Keep it until upstream has a memory limit and a way for a host function to
 fill the tank.
 
