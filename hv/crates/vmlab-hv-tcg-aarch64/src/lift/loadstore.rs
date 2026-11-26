@@ -28,11 +28,19 @@
 //! case per record: the size, the vector bit and the operation. The tests
 //! of this file check that reading against the name of every record.
 //!
-//! Every address here is a physical address. Alignment checks of the stack
-//! pointer, translation and permissions come with the cards C6 and C8. An
-//! unprivileged load or store (`LDTR`, `STTR`) is an ordinary one until
-//! then. An access that the memory does not hold leaves the block before
-//! its instruction: no register of the instruction has changed.
+//! Every address here is a physical address: translation and permissions
+//! come with card C8, and an unprivileged load or store (`LDTR`, `STTR`) is
+//! an ordinary one until then. An access that the memory does not hold
+//! leaves the block before its instruction, and so does an access to an
+//! address that is not a multiple of its size. No register of the
+//! instruction has changed then. The size is that of one register, or of
+//! one element for `LD1` to `LD4` and `ST1` to `ST4`.
+//!
+//! The alignment rule is what the lockstep found (S6): with the MMU off,
+//! QEMU takes an alignment fault for every such access, with
+//! `SCTLR_EL1.A` set or clear. `Builder::load` and `Builder::store` hold
+//! the rule. The stack pointer alignment check (`SCTLR_EL1.SA`) is another
+//! thing and comes with card C6.
 
 use super::{Builder, Lifted};
 use crate::fields::sign_extend;
@@ -372,11 +380,11 @@ fn ordered_bytes(record: Record) -> u8 {
 }
 
 /// `LoadExclusive`: `LDXR` and `LDAXR` of 1, 2, 4 or 8 bytes. The address
-/// must be a multiple of the size.
+/// must be a multiple of the size on every memory
+/// (`Builder::load_exclusive`).
 pub fn load_exclusive(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     let bytes = ordered_bytes(record);
     let address = b.x_or_sp(rn, 64);
-    b.require_aligned(address, bytes);
     let value = b.load_exclusive(address, bytes);
     let value = b.zero_extend(value, 64);
     b.set_x(rt, 64, value);
@@ -394,7 +402,6 @@ pub fn load_exclusive_pair(b: &mut Builder, record: Record, rn: u32, rt: u32, rt
     let bytes = exclusive_pair_bytes(record);
     let width = u16::from(bytes) * 8;
     let address = b.x_or_sp(rn, 64);
-    b.require_aligned(address, bytes * 2);
     let value = b.load_exclusive(address, bytes * 2);
     let low = b.slice(value, 0, width);
     let high = b.slice(value, width, width);
@@ -413,7 +420,6 @@ fn set_status(b: &mut Builder, ws: u32, status: ScalarId) {
 pub fn store_exclusive(b: &mut Builder, record: Record, rn: u32, rt: u32, ws: u32) -> Lifted {
     let bytes = ordered_bytes(record);
     let address = b.x_or_sp(rn, 64);
-    b.require_aligned(address, bytes);
     let value = b.x(rt, u16::from(bytes) * 8);
     let status = b.store_exclusive(address, bytes, value);
     set_status(b, ws, status);
@@ -432,7 +438,6 @@ pub fn store_exclusive_pair(
     let bytes = exclusive_pair_bytes(record);
     let width = u16::from(bytes) * 8;
     let address = b.x_or_sp(rn, 64);
-    b.require_aligned(address, bytes * 2);
     let low = b.x(rt, width);
     let high = b.x(rt2, width);
     let value = b.concat(high, low, width, width * 2);
@@ -442,8 +447,7 @@ pub fn store_exclusive_pair(
 }
 
 /// `LoadAcquire` and `StoreRelease`: `LDAR` and `STLR`. On one flat memory
-/// with every access in order, the ordering asks for nothing more. The
-/// address must be a multiple of the size.
+/// with every access in order, the ordering asks for nothing more.
 pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     let bytes = ordered_bytes(record);
     let access = Access {
@@ -455,6 +459,7 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
         load: bit(record.info().value, 22),
     };
     let address = b.x_or_sp(rn, 64);
+    // On every memory, not only where the memory asks for it.
     b.require_aligned(address, bytes);
     transfer(b, access, rt, address);
     Lifted::Next
@@ -525,16 +530,17 @@ pub fn simd_multiple(b: &mut Builder, record: Record, rn: u32, vt: u32, xm: Opti
     if !shape.interleaved {
         // One register after the other. The elements of a register lie in
         // memory in their order, lowest first, so a register is one
-        // little-endian access.
+        // little-endian access. Its alignment is that of one element.
+        let align = shape.element_bytes;
         for register in 0..registers {
             let address = displace(b, base, i64::from(register * u32::from(vector_bytes)));
-            let access = Access {
-                data: Data::Vector {
-                    bytes: vector_bytes,
-                },
-                load: shape.load,
-            };
-            transfer(b, access, vt + register, address);
+            if shape.load {
+                let value = b.load_aligned(address, vector_bytes, align);
+                b.set_v(vt + register, value);
+            } else {
+                let value = b.v(vt + register, u16::from(vector_bytes) * 8);
+                b.store_aligned(address, vector_bytes, value, align);
+            }
         }
     } else {
         let bytes = shape.element_bytes;

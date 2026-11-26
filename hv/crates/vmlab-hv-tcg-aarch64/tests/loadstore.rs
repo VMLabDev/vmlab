@@ -72,8 +72,8 @@ fn every_addressing_mode_finds_its_address_and_writes_its_base_back() {
     let mut cpu = cpu(&[
         // ldr x1, [x0, #16]
         word(Record::LDRXui, &[("rt", 1), ("rn", 0), ("offset", 2)]),
-        // ldur x2, [x0, #-3]
-        word(Record::LDURXi, &[("rt", 2), ("rn", 0), ("offset", 0x1fd)]),
+        // ldur x2, [x0, #-8]
+        word(Record::LDURXi, &[("rt", 2), ("rn", 0), ("offset", 0x1f8)]),
         // ldr x3, [x0, #8]!
         word(Record::LDRXpre, &[("rt", 3), ("rn", 0), ("offset", 8)]),
         // ldr x4, [x0], #-24
@@ -106,7 +106,7 @@ fn every_addressing_mode_finds_its_address_and_writes_its_base_back() {
     assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
     assert_eq!(cpu.instructions, 9);
     assert_eq!(cpu.state.x(1), pattern(0x110, 8));
-    assert_eq!(cpu.state.x(2), pattern(0xfd, 8));
+    assert_eq!(cpu.state.x(2), pattern(0xf8, 8));
     assert_eq!(cpu.state.x(3), pattern(0x108, 8));
     // The post-indexed load reads at the base that the pre-indexed one left.
     assert_eq!(cpu.state.x(4), pattern(0x108, 8));
@@ -784,7 +784,7 @@ fn exclusive_pairs_and_the_smaller_sizes_move_what_their_names_say() {
 }
 
 #[test]
-fn an_exclusive_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
+fn an_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     let mut cpu = cpu(&[0x9100_0421, ldxr(2, 0)]);
     cpu.state.set_x(0, DATA + 0x101);
     cpu.state.set_x(2, 5);
@@ -797,7 +797,7 @@ fn an_exclusive_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     );
     assert_eq!(cpu.instructions, 1);
     assert_eq!((cpu.state.x(1), cpu.state.x(2)), (1, 5));
-    // A pair of two 8-byte registers is one access of 16 bytes.
+    // A pair of two 8-byte registers is one exclusive access of 16 bytes.
     let mut cpu = self::cpu(&[word(Record::LDXPX, &[("rt", 1), ("rt2", 2), ("rn", 0)])]);
     cpu.state.set_x(0, DATA + 0x108);
     assert!(matches!(cpu.step(), Err(Stop::Alignment { .. })));
@@ -806,6 +806,70 @@ fn an_exclusive_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     cpu.state.set_x(0, DATA + 0x101);
     cpu.step().unwrap();
     assert_eq!(cpu.state.x(1), 0x01);
+}
+
+/// The stop of `word` with X0 at `DATA + offset`, when it stops.
+fn stop_at(word: u32, offset: u64) -> Option<Stop> {
+    let mut cpu = cpu(&[word]);
+    cpu.state.set_x(0, DATA + offset);
+    cpu.state.set_x(1, 1);
+    let before = cpu.state.clone();
+    let stop = cpu.step().err();
+    if stop.is_some() {
+        // The write back of the base did not happen.
+        assert_eq!(cpu.state, before);
+        assert_eq!(read(&mut cpu, DATA, 0x40), image(&[])[0x2000..0x2040]);
+    }
+    stop
+}
+
+#[test]
+fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
+    let aligned = |word: u32, offset: u64| stop_at(word, offset).is_none();
+    let refused = |word: u32, offset: u64| {
+        matches!(stop_at(word, offset), Some(Stop::Alignment { pc, .. }) if pc == BASE)
+    };
+    // A register of 8 bytes: a multiple of 8, also with a write back.
+    let ldr = word(Record::LDRXpost, &[("rt", 2), ("rn", 0), ("offset", 8)]);
+    assert!(aligned(ldr, 8) && refused(ldr, 4) && refused(ldr, 1));
+    let strh = word(Record::STRHHui, &[("rt", 1), ("rn", 0)]);
+    assert!(aligned(strh, 2) && refused(strh, 1));
+    let ldrb = word(Record::LDRBBui, &[("rt", 1), ("rn", 0)]);
+    assert!(aligned(ldrb, 1));
+    // The address counts, not the base: [x0, #1] of a byte-wide offset.
+    let ldur = word(Record::LDURWi, &[("rt", 2), ("rn", 0), ("offset", 1)]);
+    assert!(aligned(ldur, 3) && refused(ldur, 4));
+    // A 128-bit register is one access of 16 bytes, alone and in a pair.
+    let ldrq = word(Record::LDRQui, &[("rt", 2), ("rn", 0)]);
+    assert!(aligned(ldrq, 16) && refused(ldrq, 8));
+    let stpq = word(Record::STPQi, &[("rt", 1), ("rt2", 2), ("rn", 0)]);
+    assert!(aligned(stpq, 16) && refused(stpq, 8));
+    let stpx = word(Record::STPXpre, &[("rt", 1), ("rt2", 2), ("rn", 0)]);
+    assert!(aligned(stpx, 8) && refused(stpx, 4));
+    // Whole registers of elements: the size of one element.
+    let ld1b = word(Record::LD1Onev16b, &[("vt", 2), ("rn", 0)]);
+    assert!(aligned(ld1b, 1));
+    let ld1h = word(Record::LD1Twov8h, &[("vt", 2), ("rn", 0)]);
+    assert!(aligned(ld1h, 2) && refused(ld1h, 1));
+    let st1d = word(Record::ST1Onev2d, &[("vt", 2), ("rn", 0)]);
+    assert!(aligned(st1d, 8) && refused(st1d, 4));
+    let ld3s = word(Record::LD3Threev4s, &[("vt", 2), ("rn", 0)]);
+    assert!(aligned(ld3s, 4) && refused(ld3s, 2));
+    // One lane, and a replicated element.
+    let ld1 = word(Record::LD1i64, &[("vt", 2), ("rn", 0), ("idx", 1)]);
+    assert!(aligned(ld1, 8) && refused(ld1, 4));
+    let st2 = word(Record::ST2i16, &[("vt", 2), ("rn", 0), ("idx", 1)]);
+    assert!(aligned(st2, 2) && refused(st2, 1));
+    let ld1r = word(Record::LD1Rv4s, &[("vt", 2), ("rn", 0)]);
+    assert!(aligned(ld1r, 4) && refused(ld1r, 2));
+    // An ordered access, as an exclusive one.
+    let ldar = word(Record::LDARW, &[("rt", 2), ("rn", 0)]);
+    assert!(aligned(ldar, 4) && refused(ldar, 2));
+    // The alignment is looked at before the memory: an address that is
+    // outside the memory and not aligned is an alignment fault.
+    let mut cpu = cpu(&[word(Record::LDRXui, &[("rt", 2), ("rn", 0)])]);
+    cpu.state.set_x(0, 0x1001);
+    assert!(matches!(cpu.step(), Err(Stop::Alignment { .. })));
 }
 
 #[test]

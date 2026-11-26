@@ -64,8 +64,8 @@ pub enum End {
     /// Both sides could not make a load or a store: the address is outside
     /// the memory. No register of the instruction changed on either side.
     DataAbort,
-    /// Both sides refused an exclusive access to an address that is not a
-    /// multiple of its size.
+    /// Both sides refused an access to an address that is not a multiple of
+    /// its size.
     Alignment,
     /// Our side has no memory at the address of a load or a store, and QEMU
     /// has flash or a device there and ran on. Nothing to compare.

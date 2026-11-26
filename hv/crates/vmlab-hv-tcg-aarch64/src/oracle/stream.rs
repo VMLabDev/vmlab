@@ -199,6 +199,21 @@ impl Generator {
                     word = with_field(record, name, word, encoded as u32).unwrap_or(word);
                 }
             }
+            // An offset in bytes keeps the alignment of its base three times
+            // out of four: an access that is not aligned ends the round.
+            if matches!(
+                record.info().format,
+                FormatClass::BaseLoadStoreUnscale
+                    | FormatClass::BaseLoadStoreUnprivileged
+                    | FormatClass::LoadPreIdx
+                    | FormatClass::StorePreIdx
+                    | FormatClass::LoadPostIdx
+                    | FormatClass::StorePostIdx
+            ) && self.rng.chance(3, 4)
+                && let Some(offset) = field(record, "offset", word)
+            {
+                word = with_field(record, "offset", word, offset & !0xf).unwrap_or(word);
+            }
             if decode(word)
                 .is_some_and(|decoded| decoded.record == record && !unpredictable(&decoded))
             {

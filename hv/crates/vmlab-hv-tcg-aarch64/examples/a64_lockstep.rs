@@ -67,7 +67,7 @@ const PRELUDE: [u32; 7] = [
     0xd2a0_0600, // movz x0, #0x30, lsl #16
     0xd518_1040, // msr cpacr_el1, x0
     0xd538_1000, // mrs x0, sctlr_el1
-    0xd280_0341, // movz x1, #0x1a
+    0xd280_0301, // movz x1, #0x18
     0x8a21_0000, // bic x0, x0, x1
     0xd518_1000, // msr sctlr_el1, x0
     0xd503_3fdf, // isb
@@ -219,7 +219,7 @@ impl Counts {
                 "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
             }
             End::DataAbort => "a load or store outside the memory on both sides".to_string(),
-            End::Alignment => "an exclusive access that is not aligned on both sides".to_string(),
+            End::Alignment => "an access that is not aligned to its size on both sides".to_string(),
             End::Device => {
                 "a load or store that reaches QEMU's flash or devices (not compared)".to_string()
             }

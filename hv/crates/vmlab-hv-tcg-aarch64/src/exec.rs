@@ -64,8 +64,9 @@ pub enum Stop {
     /// The memory holds nothing at the address of a load or a store: a data
     /// abort.
     DataAbort { pc: u64, address: u64, write: bool },
-    /// An exclusive access to an address that is not a multiple of its
-    /// size: an alignment fault.
+    /// An access to an address that is not a multiple of its size: an
+    /// alignment fault. On this flat memory every load and store asks for
+    /// its alignment, as QEMU does with the MMU off.
     Alignment { pc: u64, address: u64 },
     /// An error of the host, not of the guest.
     Host(String),

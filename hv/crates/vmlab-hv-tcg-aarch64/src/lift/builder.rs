@@ -19,7 +19,7 @@ pub enum ExceptionClass {
     /// A load or a store that the memory does not hold.
     DataAbort,
     /// An access to an address that is not a multiple of its size, where the
-    /// instruction asks for one. The syndrome is the address.
+    /// instruction or the memory asks for one. The syndrome is the address.
     Alignment,
 }
 
@@ -85,7 +85,18 @@ pub struct Builder {
     abort: Option<ExitId>,
     /// The memory effects of the block so far. Each has its own number.
     effects: usize,
+    /// The addresses of this instruction that an alignment guard covers,
+    /// each with the size that it was checked for.
+    aligned: Vec<(ScalarId, u8)>,
 }
+
+/// Whether an access that is not aligned to its size takes an alignment
+/// fault. On the flat address space it does, always: the lockstep shows
+/// that QEMU with the MMU off takes one for every load and store whose
+/// address is not a multiple of its size, also with `SCTLR_EL1.A` clear
+/// (S6, `a64_lockstep --probe`). The translation card (C8) makes this a
+/// property of the memory that an address maps to.
+const UNALIGNED_ACCESS_FAULTS: bool = true;
 
 fn total(value: Option<ScalarId>) -> ScalarId {
     value.expect("an operation on bitvectors that the graph always builds")
@@ -106,6 +117,7 @@ impl Builder {
             before_written: [false; slot::COUNT],
             abort: None,
             effects: 0,
+            aligned: Vec::new(),
         }
     }
 
@@ -119,6 +131,7 @@ impl Builder {
         self.before = self.current;
         self.before_written = self.written;
         self.abort = None;
+        self.aligned.clear();
     }
 
     /// Take back the `begin` of an instruction that was not lifted and that
@@ -526,25 +539,46 @@ impl Builder {
     }
 
     /// The `bytes` bytes at `address`, little-endian, as `bytes * 8` bits.
-    /// `bytes` is 1, 2, 4, 8 or 16.
+    /// `bytes` is 1, 2, 4, 8 or 16. The address must be a multiple of
+    /// `bytes` where the memory asks for that.
     pub fn load(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
+        self.load_aligned(address, bytes, bytes)
+    }
+
+    /// As `load`, for an access of several elements of `align` bytes each:
+    /// the address must be a multiple of `align`.
+    pub fn load_aligned(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
+        if UNALIGNED_ACCESS_FAULTS {
+            self.require_aligned(address, align);
+        }
         self.read_event(address, bytes, false)
     }
 
     /// Store `value`, of `bytes * 8` bits, at `address`, little-endian.
     pub fn store(&mut self, address: ScalarId, bytes: u8, value: ScalarId) {
+        self.store_aligned(address, bytes, value, bytes);
+    }
+
+    /// As `store`, for an access of several elements of `align` bytes each.
+    pub fn store_aligned(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
+        if UNALIGNED_ACCESS_FAULTS {
+            self.require_aligned(address, align);
+        }
         self.write_event(address, bytes, value, false);
     }
 
-    /// A load that also marks the address for exclusive access.
+    /// A load that also marks the address for exclusive access. The address
+    /// must be a multiple of `bytes` on every memory.
     pub fn load_exclusive(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
+        self.require_aligned(address, bytes);
         self.read_event(address, bytes, true)
     }
 
     /// A store that writes only when the exclusive mark of this CPU still
     /// covers the address. The result is one bit: 0 where it wrote, 1 where
-    /// it did not.
+    /// it did not. The address must be a multiple of `bytes` on every memory.
     pub fn store_exclusive(&mut self, address: ScalarId, bytes: u8, value: ScalarId) -> ScalarId {
+        self.require_aligned(address, bytes);
         self.write_event(address, bytes, value, true)
             .expect("an exclusive store has a result")
     }
@@ -552,9 +586,15 @@ impl Builder {
     /// Leave the block with an alignment fault before this instruction,
     /// unless `address` is a multiple of `bytes`, a power of two.
     pub fn require_aligned(&mut self, address: ScalarId, bytes: u8) {
-        if bytes == 1 {
+        if bytes == 1
+            || self
+                .aligned
+                .iter()
+                .any(|(checked, size)| *checked == address && *size >= bytes)
+        {
             return;
         }
+        self.aligned.push((address, bytes));
         let mask = self.imm(64, u64::from(bytes) - 1);
         let low = self.binary(64, Binary::And, address, mask);
         let aligned = self.is_zero(64, low);

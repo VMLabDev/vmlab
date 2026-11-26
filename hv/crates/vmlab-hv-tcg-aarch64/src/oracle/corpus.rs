@@ -323,19 +323,19 @@ mod tests {
             pc: 0x4200_0000,
             cpsr: CPSR_EL1H,
         };
-        before.x[0] = 0x4210_0ff8;
+        before.x[0] = 0x4210_0ff0;
         let mut after = before;
         after.pc += 4;
         // stp q1, q2, [x0]: 32 bytes across a page boundary.
         let value = |n: u8| u128::from_le_bytes(core::array::from_fn(|index| n + index as u8));
         let mut store = Entry::core(0xad00_0801, before, after);
         store.writes = vec![
-            (0x4210_0ff8, value(0x10).to_le_bytes().to_vec()),
-            (0x4210_1008, value(0x20).to_le_bytes().to_vec()),
+            (0x4210_0ff0, value(0x10).to_le_bytes().to_vec()),
+            (0x4210_1000, value(0x20).to_le_bytes().to_vec()),
         ];
         store.vectors = vec![(1, value(0x10), value(0x10)), (2, value(0x20), value(0x20))];
         let line = store.line();
-        assert!(line.contains(" | w=42100ff8:101112"), "{line}");
+        assert!(line.contains(" | w=42100ff0:101112"), "{line}");
         assert!(line.contains(" v2=2f2e2d"), "{line}");
         assert_eq!(Entry::parse(&line), Ok(store.clone()));
         assert_eq!(store.replay(), Ok(()));
@@ -351,7 +351,7 @@ mod tests {
         after.pc += 4;
         after.x[3] = 0x8877_6655;
         let mut load = Entry::core(0xb940_0003, before, after);
-        load.reads = vec![(0x4210_0ff8, vec![0x55, 0x66, 0x77, 0x88])];
+        load.reads = vec![(0x4210_0ff0, vec![0x55, 0x66, 0x77, 0x88])];
         assert_eq!(Entry::parse(&load.line()), Ok(load.clone()));
         assert_eq!(load.replay(), Ok(()));
         let mut wrong = load.clone();
