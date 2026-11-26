@@ -132,6 +132,23 @@ impl Leader {
         self.rsp.write_memory(address, data)
     }
 
+    /// The memory of QEMU from `address`, `len` bytes. The machine puts
+    /// its device tree at the start of the RAM, so the RAM is not all zero
+    /// at the reset, and a mirror of it starts from this.
+    pub fn memory(&mut self, address: u64, len: usize) -> io::Result<Vec<u8>> {
+        const CHUNK: usize = 0x8000;
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            let want = CHUNK.min(len - data.len());
+            let chunk = self.rsp.read_memory(address + data.len() as u64, want)?;
+            if chunk.len() != want {
+                return Err(other("the gdbstub read less memory than asked"));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
+    }
+
     pub fn set_core(&mut self, core: &Core) -> io::Result<()> {
         self.rsp.set_core(core)
     }

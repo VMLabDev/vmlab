@@ -209,8 +209,10 @@ fn main() -> Result<(), Failure> {
     let formats = group(&group_name)?;
     let started = Instant::now();
 
-    let leader = Leader::start(&qemu, &plugin, &directory, RAM_MIB)?;
-    let memory = FlatMemory::new(RAM_BASE, vec![0; RAM_MIB as usize * 1024 * 1024]);
+    let mut leader = Leader::start(&qemu, &plugin, &directory, RAM_MIB)?;
+    // Our memory starts as a copy of the RAM of QEMU.
+    let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
+    let memory = FlatMemory::new(RAM_BASE, ram);
     let mut run = Run {
         follower: Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE))),
         counts: Counts::default(),
