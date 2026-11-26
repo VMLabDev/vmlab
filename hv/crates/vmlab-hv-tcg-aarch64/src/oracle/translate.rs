@@ -21,6 +21,11 @@
 //!   no probe maps them or the code for writing.
 //! - **Little-endian**, and SCTLR_EL1.SA and SA0 clear: the stack pointer
 //!   alignment check is not built.
+//! - **Code runs at one address.** QEMU keeps a translated block under its
+//!   physical address and runs it at every virtual address that maps there,
+//!   and the plugin then names the address of the first one. So one probe
+//!   at most maps the `RET` page, the calls of the stream go there or to an
+//!   address that nothing maps, and nothing else that a probe maps is run.
 //!
 //! `Profile` says which CPU leads. With `strict` the stream stays inside what
 //! an Armv8.0 walk and the walk of a later CPU agree on, for the walk test
@@ -338,6 +343,8 @@ struct Builder<'a> {
     protected: BTreeSet<u64>,
     output_bits: u32,
     probes: Vec<Probe>,
+    /// A probe maps the `RET` page already.
+    stub_mapped: bool,
 }
 
 impl Builder<'_> {
@@ -367,9 +374,12 @@ impl Builder<'_> {
     }
 
     /// A physical address for a probe that maps `span` bytes, and whether
-    /// it is the `RET` page.
-    fn output(&mut self, span: u64, writable_block: bool) -> (u64, bool) {
+    /// it is the `RET` page. `stub`: it must be that page, or must not.
+    fn output(&mut self, span: u64, stub: Option<bool>) -> (u64, bool) {
         let layout = self.layout;
+        if stub == Some(true) {
+            return (layout.stub(), true);
+        }
         match self.below(20) {
             // Beyond the RAM of the machine: an external abort.
             0 | 1 => (layout.base + 0x0800_0000 + self.below(16) * span, false),
@@ -378,25 +388,26 @@ impl Builder<'_> {
                 let bit = u64::from(self.output_bits) + self.below(u64::from(48 - self.output_bits));
                 ((layout.window() & !(span - 1)) | 1 << bit, false)
             }
-            4 | 5 if span <= STUB_BYTES => (layout.stub(), true),
+            4..=6 if span <= STUB_BYTES && stub.is_none() && !self.stub_mapped => {
+                self.stub_mapped = true;
+                (layout.stub(), true)
+            }
             _ if span <= WINDOW_BYTES => {
                 let pages = WINDOW_BYTES / span;
                 (layout.window() + self.below(pages) * span, false)
             }
             // A block is larger than the window: it maps the RAM around the
             // image, and nothing writes through it.
-            _ => {
-                debug_assert!(!writable_block);
-                (layout.base & !(span - 1), false)
-            }
+            _ => (layout.base & !(span - 1), false),
         }
     }
 
-    /// A page or block descriptor for a probe at `level`.
-    fn leaf(&mut self, level: u32, granule: u32) -> (u64, bool) {
+    /// A page or block descriptor for a probe at `level`. `stub`: it must
+    /// map the `RET` page, or must not.
+    fn leaf(&mut self, level: u32, granule: u32, stub: Option<bool>) -> (u64, bool) {
         let stride = granule - 3;
         let span = 1u64 << (granule + stride * (3 - level));
-        let (pa, stub) = self.output(span, false);
+        let (pa, stub) = self.output(span, stub);
         let mut descriptor = pa & ADDRESS & !(span - 1);
         if !self.chance(1, 12) {
             descriptor |= 1;
@@ -460,7 +471,7 @@ impl Builder<'_> {
             if self.protected.contains(&entry) || self.tables.get(entry) != 0 {
                 continue;
             }
-            let (descriptor, stub) = self.leaf(level, granule);
+            let (descriptor, stub) = self.leaf(level, granule, None);
             self.tables.set(entry, descriptor);
             self.probes.push(Probe {
                 va,
@@ -586,6 +597,7 @@ impl Generator {
             protected: BTreeSet::new(),
             output_bits,
             probes: Vec::new(),
+            stub_mapped: false,
         };
         let roots = [
             builder.tables.table(granules[0]).expect("an empty area has room"),
@@ -777,14 +789,21 @@ impl Builder<'_> {
                     words.push(word);
                 }
             }
-            // A call through a probe: of the `RET` page most of the time.
+            // A call through the probe of the `RET` page, or to an address
+            // that nothing maps.
             34..=41 => {
-                let stubs: Vec<Probe> = self.probes.iter().copied().filter(|p| p.stub).collect();
-                let va = if stubs.is_empty() || self.chance(1, 4) {
-                    self.address() & !3
-                } else {
-                    let probe = stubs[self.below(stubs.len() as u64) as usize];
-                    probe.va + 4 * self.below(probe.span.min(STUB_BYTES) / 4)
+                let stub = self.probes.iter().copied().find(|probe| probe.stub);
+                let va = match stub {
+                    Some(probe) if !self.chance(1, 5) => {
+                        let mut va = probe.va + 4 * self.below(probe.span.min(STUB_BYTES) / 4);
+                        // A tag in the top byte, which the regime ignores
+                        // for a branch or does not.
+                        if self.chance(1, 8) {
+                            va ^= self.below(256) << 56;
+                        }
+                        va
+                    }
+                    _ => self.generator.rng.next_u64() & !3,
                 };
                 words.extend(asm::load(16, va));
                 words.push(asm::blr(16));
@@ -835,11 +854,8 @@ impl Builder<'_> {
             66..=73 if !self.probes.is_empty() => {
                 let index = self.below(self.probes.len() as u64) as usize;
                 let probe = self.probes[index];
-                let (descriptor, stub) = self.leaf(probe.level, probe.granule);
-                // The probe of the `RET` page keeps what its calls rely on.
-                if stub != probe.stub {
-                    return;
-                }
+                // The probe of the `RET` page stays the one that maps it.
+                let (descriptor, _) = self.leaf(probe.level, probe.granule, Some(probe.stub));
                 words.extend(asm::load(0, probe.entry));
                 words.extend(asm::load(1, descriptor));
                 words.push(0xf900_0001); // str x1, [x0]

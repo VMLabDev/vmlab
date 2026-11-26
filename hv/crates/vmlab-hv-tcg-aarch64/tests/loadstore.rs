@@ -1056,7 +1056,8 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
     cpu.log_accesses(true);
     cpu.step().unwrap();
     let accesses = cpu.take_accesses();
-    assert_eq!(accesses.len(), 2);
+    // A pair of two 8-byte registers is one access of 16 bytes.
+    assert_eq!(accesses.len(), 1);
     assert_eq!(
         (
             accesses[0].address,
@@ -1064,9 +1065,8 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
             accesses[0].value,
             accesses[0].write
         ),
-        (DATA, 8, 0x11, true)
+        (DATA, 16, 0x22 << 64 | 0x11, true)
     );
-    assert_eq!((accesses[1].address, accesses[1].value), (DATA + 8, 0x22));
     cpu.step().unwrap();
     let accesses = cpu.take_accesses();
     assert_eq!(accesses.len(), 1);
