@@ -576,9 +576,10 @@ impl Builder {
 
     /// A store that writes only when the exclusive mark of this CPU still
     /// covers the address. The result is one bit: 0 where it wrote, 1 where
-    /// it did not. The address must be a multiple of `bytes` on every memory.
+    /// it did not. A store that does not write looks at no memory and at no
+    /// alignment, as QEMU's does not (S6). One that writes has the address
+    /// and the size of its exclusive load, which was aligned.
     pub fn store_exclusive(&mut self, address: ScalarId, bytes: u8, value: ScalarId) -> ScalarId {
-        self.require_aligned(address, bytes);
         self.write_event(address, bytes, value, true)
             .expect("an exclusive store has a result")
     }

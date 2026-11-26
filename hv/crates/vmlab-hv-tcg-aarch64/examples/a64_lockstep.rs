@@ -25,7 +25,8 @@
 //! vector registers are compared after every instruction.
 //!
 //! `--probe` runs each given word alone, as the executed phase of the group
-//! does, and prints how its round ended. It is for a question to QEMU about
+//! does, and prints how its round ended. Words joined by `+` run one after
+//! the other in one round, with the registers made for the first of them. It is for a question to QEMU about
 //! one encoding, and it compares nothing else. `--probe-offset` moves the
 //! base register and the stack pointer of a probe by that many bytes.
 
@@ -285,7 +286,7 @@ fn main() -> Result<(), Failure> {
     let (mut plugin, mut directory, mut corpus_out) = (None, None, None);
     let (mut seed, mut per_class, mut group_name) = (1u64, 100_000u64, String::from("c1"));
     let mut samples = 3usize;
-    let mut probe: Vec<u32> = Vec::new();
+    let mut probe: Vec<Vec<u32>> = Vec::new();
     let mut probe_offset = 0u64;
     let mut traces = Vec::new();
     let mut arguments = std::env::args().skip(1);
@@ -305,8 +306,12 @@ fn main() -> Result<(), Failure> {
                 probe_offset = u64::from_str_radix(value()?.trim_start_matches("0x"), 16)?;
             }
             "--probe" => {
-                for word in value()?.split(',') {
-                    probe.push(u32::from_str_radix(word.trim_start_matches("0x"), 16)?);
+                for sequence in value()?.split(',') {
+                    let mut words = Vec::new();
+                    for word in sequence.split('+') {
+                        words.push(u32::from_str_radix(word.trim_start_matches("0x"), 16)?);
+                    }
+                    probe.push(words);
                 }
             }
             other => return Err(format!("unknown argument {other}").into()),
@@ -587,11 +592,11 @@ fn finish(
     Ok(())
 }
 
-/// Run each word alone and print how its round ended.
+/// Run each sequence of words alone and print how its round ended.
 fn probe_rounds(
     run: &mut Run,
     generator: &mut Generator,
-    words: &[u32],
+    sequences: &[Vec<u32>],
     offset: u64,
     memory_group: bool,
 ) -> Result<(), Failure> {
@@ -599,30 +604,42 @@ fn probe_rounds(
         let data = generator.memory_bytes(WINDOW, WINDOW.1 as usize);
         run.follower.load_memory(WINDOW.0, &data)?;
     }
-    for word in words {
-        let (mut x, sp, nzcv) = generator.registers_for(*word, WINDOW);
+    for sequence in sequences {
+        let first = sequence[0];
+        let (mut x, sp, nzcv) = generator.registers_for(first, WINDOW);
         let sp = sp.wrapping_add(offset);
-        if let Some(n) = decode(*word)
-            .and_then(|decoded| vmlab_hv_tcg_aarch64::field(decoded.record, "rn", *word))
+        if let Some(n) = decode(first)
+            .and_then(|decoded| vmlab_hv_tcg_aarch64::field(decoded.record, "rn", first))
             .filter(|n| *n < 31)
         {
             x[n as usize] = x[n as usize].wrapping_add(offset);
         }
+        let mut words = sequence.clone();
+        words.push(0);
         let round = Round {
-            memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
+            memory: vec![(IMAGE_BASE, bytes(&words))],
             start: Core {
                 x,
                 sp,
                 pc: IMAGE_BASE,
                 cpsr: CPSR_EL1H | u32::from(nzcv) << 28,
             },
-            budget: 2,
+            budget: words.len() as u64,
             visits: 1,
         };
-        let name = decode(*word).map_or("(undefined)", |decoded| decoded.record.name());
+        let names: Vec<String> = sequence
+            .iter()
+            .map(|word| {
+                format!(
+                    "{word:08x} {}",
+                    decode(*word).map_or("(undefined)", |decoded| decoded.record.name())
+                )
+            })
+            .collect();
+        let name = names.join(" + ");
         match run.follower.run(&round)? {
             Outcome::Agreed { end, verified } => {
-                println!("{word:08x} {name}: {end:?}, {} verified", verified.len());
+                println!("{name}: {end:?}, {} verified", verified.len());
                 for item in verified {
                     println!("  after {}", item.after);
                     for access in item.accesses {
@@ -630,7 +647,7 @@ fn probe_rounds(
                     }
                 }
             }
-            Outcome::Differed { difference, .. } => print!("{word:08x} {name}: {difference}"),
+            Outcome::Differed { difference, .. } => print!("{name}: {difference}"),
         }
     }
     Ok(())

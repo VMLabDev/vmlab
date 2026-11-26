@@ -816,6 +816,15 @@ fn an_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     cpu.state.set_x(0, DATA + 0x101);
     cpu.step().unwrap();
     assert_eq!(cpu.state.x(1), 0x01);
+    // An exclusive store that does not write looks at no memory: it fails
+    // the same at an address that is not aligned, or that no memory holds.
+    for address in [DATA + 0x101, 0x1001] {
+        let mut cpu = self::cpu(&[stxr(9, 1, 0)]);
+        cpu.state.set_x(0, address);
+        cpu.state.set_x(9, 7);
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.x(9), 1);
+    }
 }
 
 /// The stop of `word` with X0 at `DATA + offset`, when it stops.
