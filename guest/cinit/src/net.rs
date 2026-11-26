@@ -36,6 +36,22 @@ pub fn loopback_up() -> Result<()> {
     busybox(&["ip", "link", "set", "lo", "up"])
 }
 
+fn udhcpc_argv(ifname: &str) -> [&str; 11] {
+    [
+        "udhcpc",
+        "-i",
+        ifname,
+        "-f",
+        "-q",
+        "-n",
+        "-t",
+        "6",
+        "-T",
+        "3",
+        "-s",
+    ]
+}
+
 /// Bring up `eth<n>` and run one DHCP round. Returns the leased IP, or None
 /// when no lease was obtained (logged, non-fatal: a NIC-less segment or a
 /// static-only fabric should not stop the container).
@@ -46,20 +62,8 @@ pub fn dhcp_up(n: u32) -> Result<Option<String>> {
     // -f foreground, -q quit once bound, -n give up after the retries below
     // instead of looping forever (6 tries x 3s).
     let st = Command::new(BUSYBOX)
-        .args([
-            "udhcpc",
-            "-i",
-            &ifname,
-            "-f",
-            "-q",
-            "-n",
-            "-t",
-            "6",
-            "-T",
-            "3",
-            "-s",
-            UDHCPC_SCRIPT,
-        ])
+        .args(udhcpc_argv(&ifname))
+        .arg(UDHCPC_SCRIPT)
         .status()
         .ctx("run udhcpc")?;
     if !st.success() {
@@ -98,4 +102,41 @@ pub fn write_resolv_conf(nics: u32) -> Result<()> {
     // The image's file, resolved inside the rootfs (F56): an absolute
     // `resolv.conf` symlink must not aim this write at the micro-VM.
     crate::util::write_in_root(crate::mounts::ROOTFS, "/etc/resolv.conf", &out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dhcp_client_stays_to_renew() {
+        assert!(!udhcpc_argv("eth0").contains(&"-q"));
+    }
+
+    #[test]
+    fn dhcp_hook_installs_classless_routes() {
+        let state = tempfile::tempdir().unwrap();
+        let build = include_str!("../../build-asset.sh");
+        let (_, hook) = build.split_once("default.script\" <<'EOF'\n").unwrap();
+        let (hook, _) = hook.split_once("\nEOF\n").unwrap();
+        let hook = hook
+            .replace("BB=/bin/busybox", "BB=busybox")
+            .replace("STATE=/run/vmlab-net", "STATE=$TEST_STATE");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("busybox() {{ printf '%s\\n' \"$*\"; return 1; }}\n{hook}"))
+            .args(["udhcpc", "bound"])
+            .env_clear()
+            .env("TEST_STATE", state.path())
+            .env("interface", "eth0")
+            .env("ip", "10.0.0.10")
+            .env("router", "10.0.0.1")
+            .env("staticroutes", "10.99.0.0/24 10.0.0.5 0.0.0.0/0 10.0.0.2")
+            .output()
+            .unwrap();
+        let commands = String::from_utf8(output.stdout).unwrap();
+        assert!(commands.contains("ip route replace 10.99.0.0/24 via 10.0.0.5 dev eth0"), "{commands}");
+        assert!(commands.contains("ip route replace 0.0.0.0/0 via 10.0.0.2 dev eth0"), "{commands}");
+        assert!(!commands.contains("10.0.0.1"), "{commands}");
+    }
 }
