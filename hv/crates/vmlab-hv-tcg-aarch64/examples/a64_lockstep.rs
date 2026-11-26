@@ -18,7 +18,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use vmlab_hv_tcg::FlatMemory;
-use vmlab_hv_tcg_aarch64::lift::LIFTED_FORMATS;
+use vmlab_hv_tcg_aarch64::lift::{
+    BRANCH_FORMATS, IMMEDIATE_FORMATS, LIFTED_FORMATS, REGISTER_FORMATS,
+};
 use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
 use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, RAM_BASE};
@@ -38,31 +40,17 @@ const IMAGE_WORDS: usize = 1024;
 const SAMPLES: usize = 3;
 
 fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
-    use FormatClass::*;
-    let immediate = [
-        ADRI,
-        AddSubImmShift,
-        BaseLogicalImm,
-        BaseMoveImmediate,
-        BaseInsertImmediate,
-        BaseBitfieldImm,
-        BaseBitfieldImmWith2RegArgs,
-        BaseExtractImm,
-    ];
-    let branch = [
-        BranchImm,
-        CallImm,
-        BranchCond,
-        BaseCmpBranch,
-        BaseTestBranch,
-        BranchReg,
-    ];
     Ok(match name {
-        "dp-immediate" => immediate.to_vec(),
-        "branch" => branch.to_vec(),
-        "c1" => LIFTED_FORMATS.to_vec(),
+        "dp-immediate" => IMMEDIATE_FORMATS.to_vec(),
+        "branch" => BRANCH_FORMATS.to_vec(),
+        "c1" => [IMMEDIATE_FORMATS.as_slice(), BRANCH_FORMATS.as_slice()].concat(),
+        "dp-register" | "c2" => REGISTER_FORMATS.to_vec(),
+        "all" => LIFTED_FORMATS.to_vec(),
         other => {
-            return Err(format!("the group {other} is not known: dp-immediate, branch, c1").into());
+            return Err(format!(
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, all"
+            )
+            .into());
         }
     })
 }
@@ -276,19 +264,8 @@ fn main() -> Result<(), Failure> {
         decode(*word).is_some_and(|decoded| formats.contains(&decoded.record.info().format))
     });
     let is_branch = |word: &u32| {
-        decode(*word).is_some_and(|decoded| {
-            !matches!(
-                decoded.record.info().format,
-                FormatClass::ADRI
-                    | FormatClass::AddSubImmShift
-                    | FormatClass::BaseLogicalImm
-                    | FormatClass::BaseMoveImmediate
-                    | FormatClass::BaseInsertImmediate
-                    | FormatClass::BaseBitfieldImm
-                    | FormatClass::BaseBitfieldImmWith2RegArgs
-                    | FormatClass::BaseExtractImm
-            )
-        })
+        decode(*word)
+            .is_some_and(|decoded| BRANCH_FORMATS.contains(&decoded.record.info().format))
     };
     let (branches, straight): (Vec<u32>, Vec<u32>) =
         executed.iter().copied().partition(|word| is_branch(word));
