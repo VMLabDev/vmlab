@@ -7,7 +7,7 @@
 
 use crate::fields::Condition;
 use crate::state::{Context, REGISTER_FILE, slot};
-use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitScalars};
+use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitId, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
 use vmlab_hv_tcg_ir::native::{Binary, ScalarId, ScalarType, Unary};
 
@@ -16,6 +16,11 @@ use vmlab_hv_tcg_ir::native::{Binary, ScalarId, ScalarType, Unary};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExceptionClass {
     Undefined,
+    /// A load or a store that the memory does not hold.
+    DataAbort,
+    /// An access to an address that is not a multiple of its size, where the
+    /// instruction asks for one. The syndrome is the address.
+    Alignment,
 }
 
 /// Where a block goes when it ends.
@@ -36,6 +41,8 @@ pub enum A64Next {
 pub struct A64Exit {
     pub writeback: Writeback,
     pub next: A64Next,
+    /// The instructions of the block that are complete when it leaves here.
+    pub completed: u32,
 }
 
 impl ExitScalars for A64Exit {
@@ -67,6 +74,17 @@ pub struct Builder {
     pc: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// The instructions before the one that is being lifted.
+    completed: u32,
+    started: bool,
+    /// The slots as they were before the instruction that is being lifted:
+    /// what an exit inside the instruction writes back.
+    before: [Option<ScalarId>; slot::COUNT],
+    before_written: [bool; slot::COUNT],
+    /// The exit of a failed memory access of this instruction, once made.
+    abort: Option<ExitId>,
+    /// The memory effects of the block so far. Each has its own number.
+    effects: usize,
 }
 
 fn total(value: Option<ScalarId>) -> ScalarId {
@@ -82,12 +100,32 @@ impl Builder {
             context,
             pc,
             branch: None,
+            completed: 0,
+            started: false,
+            before: [None; slot::COUNT],
+            before_written: [false; slot::COUNT],
+            abort: None,
+            effects: 0,
         }
     }
 
-    /// Start the instruction at `pc`.
+    /// Start the instruction at `pc`. The instruction before it is complete.
     pub fn begin(&mut self, pc: u64) {
+        if self.started {
+            self.completed += 1;
+        }
+        self.started = true;
         self.pc = pc;
+        self.before = self.current;
+        self.before_written = self.written;
+        self.abort = None;
+    }
+
+    /// Take back the `begin` of an instruction that was not lifted and that
+    /// ends the block before it.
+    pub fn unbegin(&mut self) {
+        debug_assert!(self.completed > 0, "the first instruction of a block");
+        self.completed = self.completed.saturating_sub(1);
     }
 
     /// The address of the instruction that is being lifted.
@@ -391,6 +429,192 @@ impl Builder {
         }
     }
 
+    // --- memory ------------------------------------------------------------
+
+    /// The slots that differ from their value at the entry of the block.
+    fn writes(
+        &mut self,
+        current: [Option<ScalarId>; slot::COUNT],
+        written: [bool; slot::COUNT],
+    ) -> Vec<(usize, ScalarId)> {
+        let mut writes = Vec::new();
+        for slot in 0..slot::COUNT {
+            let Some(value) = current[slot] else {
+                continue;
+            };
+            if !written[slot] {
+                continue;
+            }
+            // A slot that holds its own entry value again needs no write.
+            let entry = REGISTER_FILE.read(&mut self.block.graph, slot);
+            if value != entry {
+                writes.push((slot, value));
+            }
+        }
+        writes
+    }
+
+    /// An exit that leaves the block before the instruction that is being
+    /// lifted: the registers as they were before it, and its address as the
+    /// PC.
+    fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
+        let mut writes = self.writes(self.before, self.before_written);
+        let pc = self.imm(64, self.pc);
+        writes.push((slot::PC, pc));
+        self.block.exit(A64Exit {
+            writeback: Writeback { writes },
+            next: A64Next::Exception { class, syndrome },
+            completed: self.completed,
+        })
+    }
+
+    fn abort_exit(&mut self) -> ExitId {
+        if let Some(exit) = self.abort {
+            return exit;
+        }
+        let exit = self.exit_before(ExceptionClass::DataAbort, Vec::new());
+        self.abort = Some(exit);
+        exit
+    }
+
+    fn effect(&mut self, width: u16) -> ScalarId {
+        let effect = self.effects;
+        self.effects += 1;
+        self.block.graph.effect(effect, ScalarType::Bits(width))
+    }
+
+    fn read_event(&mut self, address: ScalarId, bytes: u8, exclusive: bool) -> ScalarId {
+        debug_assert!(matches!(bytes, 1 | 2 | 4 | 8 | 16));
+        let error = self.abort_exit();
+        let result = self.effect(u16::from(bytes) * 8);
+        self.block.events.push(Event::ReadMemory {
+            address,
+            bytes,
+            exclusive,
+            result,
+            error,
+        });
+        result
+    }
+
+    fn write_event(
+        &mut self,
+        address: ScalarId,
+        bytes: u8,
+        value: ScalarId,
+        exclusive: bool,
+    ) -> Option<ScalarId> {
+        debug_assert!(matches!(bytes, 1 | 2 | 4 | 8 | 16));
+        debug_assert_eq!(
+            self.block.graph.scalars[value].ty,
+            ScalarType::Bits(u16::from(bytes) * 8)
+        );
+        let error = self.abort_exit();
+        let result = exclusive.then(|| self.effect(1));
+        self.block.events.push(Event::WriteMemory {
+            address,
+            value,
+            bytes,
+            exclusive,
+            result,
+            error,
+            // The executor leaves through `error` before a store into a page
+            // that holds translated code, and runs the instruction alone.
+            invalidated: error,
+        });
+        result
+    }
+
+    /// The `bytes` bytes at `address`, little-endian, as `bytes * 8` bits.
+    /// `bytes` is 1, 2, 4, 8 or 16.
+    pub fn load(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
+        self.read_event(address, bytes, false)
+    }
+
+    /// Store `value`, of `bytes * 8` bits, at `address`, little-endian.
+    pub fn store(&mut self, address: ScalarId, bytes: u8, value: ScalarId) {
+        self.write_event(address, bytes, value, false);
+    }
+
+    /// A load that also marks the address for exclusive access.
+    pub fn load_exclusive(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
+        self.read_event(address, bytes, true)
+    }
+
+    /// A store that writes only when the exclusive mark of this CPU still
+    /// covers the address. The result is one bit: 0 where it wrote, 1 where
+    /// it did not.
+    pub fn store_exclusive(&mut self, address: ScalarId, bytes: u8, value: ScalarId) -> ScalarId {
+        self.write_event(address, bytes, value, true)
+            .expect("an exclusive store has a result")
+    }
+
+    /// Leave the block with an alignment fault before this instruction,
+    /// unless `address` is a multiple of `bytes`, a power of two.
+    pub fn require_aligned(&mut self, address: ScalarId, bytes: u8) {
+        if bytes == 1 {
+            return;
+        }
+        let mask = self.imm(64, u64::from(bytes) - 1);
+        let low = self.binary(64, Binary::And, address, mask);
+        let aligned = self.is_zero(64, low);
+        if self.block.graph.literal(aligned) == Some(1) {
+            return;
+        }
+        let exit = self.exit_before(ExceptionClass::Alignment, vec![address]);
+        self.block.events.push(Event::Guard {
+            condition: aligned,
+            expected: true,
+            exit,
+        });
+    }
+
+    // --- vector registers ----------------------------------------------------
+
+    /// The low `width` bits of the vector register `n`.
+    pub fn v(&mut self, n: u32, width: u16) -> ScalarId {
+        let value = self.read(slot::V0 + (n & 31) as usize);
+        self.low(value, width)
+    }
+
+    /// Write the vector register `n`. A value below 128 bits clears the bits
+    /// above it.
+    pub fn set_v(&mut self, n: u32, value: ScalarId) {
+        let value = self.zero_extend(value, 128);
+        self.write(slot::V0 + (n & 31) as usize, value);
+    }
+
+    /// `value`, of `from` bits, sign-extended to `width` bits.
+    pub fn sign_extend(&mut self, value: ScalarId, from: u16, width: u16) -> ScalarId {
+        debug_assert_eq!(self.block.graph.scalars[value].ty, ScalarType::Bits(from));
+        if from == width {
+            return value;
+        }
+        total(
+            self.block
+                .graph
+                .unary(ScalarType::Bits(width), Unary::SignExtend(from), value),
+        )
+    }
+
+    /// The bits `offset` to `offset + width` of `value`.
+    pub fn slice(&mut self, value: ScalarId, offset: u16, width: u16) -> ScalarId {
+        self.block.graph.slice(value, offset, width)
+    }
+
+    /// `high` above `low`. `low` has `low_width` bits and the result `width`.
+    pub fn concat(&mut self, high: ScalarId, low: ScalarId, low_width: u16, width: u16) -> ScalarId {
+        debug_assert_eq!(
+            self.block.graph.scalars[low].ty,
+            ScalarType::Bits(low_width)
+        );
+        debug_assert_eq!(
+            self.block.graph.scalars[high].ty,
+            ScalarType::Bits(width - low_width)
+        );
+        self.block.graph.concat(high, low, low_width, width)
+    }
+
     // --- the end of the block ----------------------------------------------
 
     /// Set the next PC. The instruction that calls this ends the block.
@@ -409,23 +633,12 @@ impl Builder {
             Some(target) => target,
             None => self.imm(64, fallthrough),
         };
-        let mut writes = Vec::new();
-        for slot in 0..slot::COUNT {
-            let Some(value) = self.current[slot] else {
-                continue;
-            };
-            if !self.written[slot] {
-                continue;
-            }
-            // A slot that holds its own entry value again needs no write.
-            let entry = REGISTER_FILE.read(&mut self.block.graph, slot);
-            if value != entry {
-                writes.push((slot, value));
-            }
-        }
+        let writes = self.writes(self.current, self.written);
+        let completed = self.completed + u32::from(self.started);
         let exit = self.block.exit(A64Exit {
             writeback: Writeback { writes },
             next: A64Next::Pc(next),
+            completed,
         });
         self.block.events.push(Event::Exit(exit));
         self.block
