@@ -1,0 +1,37 @@
+# The pinned LLVM tools of the aarch64 decoder generator (DESIGN.md G1):
+# llvm-tblgen for the JSON dump of the AArch64 tables, and llvm-mc as the
+# oracle for the decoder (`--show-inst` prints the record name).
+ARG DEBIAN_BOOKWORM_SLIM_DIGEST
+FROM debian@${DEBIAN_BOOKWORM_SLIM_DIGEST}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake git ninja-build python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG LLVM_TAG
+ARG LLVM_COMMIT
+# A git commit is content-addressed, so the fetch by commit is the pin.
+RUN git init -q /src/llvm-project \
+    && cd /src/llvm-project \
+    && git remote add origin https://github.com/llvm/llvm-project.git \
+    && git sparse-checkout set llvm cmake third-party libc \
+    && git fetch -q --depth 1 --filter=blob:none origin "${LLVM_COMMIT}" \
+    && git checkout -q FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${LLVM_COMMIT}" \
+    && rm -rf .git
+
+ARG BUILD_JOBS=8
+RUN cmake -G Ninja -S /src/llvm-project/llvm -B /build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_TARGETS_TO_BUILD=AArch64 \
+        -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+        -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_BINDINGS=OFF \
+        -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_DOCS=OFF \
+    && ninja -C /build -j "${BUILD_JOBS}" llvm-tblgen llvm-mc \
+    && install -m 755 /build/bin/llvm-tblgen /build/bin/llvm-mc /usr/local/bin/ \
+    && rm -rf /build
+
+ENV LLVM_SRC=/src/llvm-project
+COPY scripts /opt/scripts
+COPY td.sha256 /opt/td.sha256

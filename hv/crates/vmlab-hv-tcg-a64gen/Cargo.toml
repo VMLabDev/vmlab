@@ -1,0 +1,17 @@
+[package]
+name = "vmlab-hv-tcg-a64gen"
+description = "Generate the aarch64 decoder and system register tables from LLVM's TableGen records"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml = "1"
+anyhow.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

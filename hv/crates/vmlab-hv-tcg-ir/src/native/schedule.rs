@@ -1,4 +1,4 @@
-use super::block::{Block, Event, Recipe, ValueId};
+use super::block::{Block, BlockOf, Event, Recipe, ValueId};
 use super::{Graph, Operation, ScalarId};
 
 /// Pure scalar dependencies scheduled before each ordered effect. Exit-only
@@ -19,12 +19,31 @@ fn visit(graph: &Graph, id: ScalarId, seen: &mut [bool], output: &mut Vec<Scalar
             visit(graph, a, seen, output);
             visit(graph, b, seen, output);
         }
+        Operation::Select {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            visit(graph, condition, seen, output);
+            visit(graph, when_true, seen, output);
+            visit(graph, when_false, seen, output);
+        }
         Operation::Effect(_) => return,
         _ => {}
     }
     output.push(id);
 }
-pub fn schedule(block: &Block) -> Vec<Vec<ScalarId>> {
+/// The pure scalars that `roots` need and `seen` does not hold yet, each
+/// after what it depends on. `seen` has one entry per scalar of the graph.
+pub fn scalars(graph: &Graph, roots: &[ScalarId], seen: &mut [bool]) -> Vec<ScalarId> {
+    let mut output = Vec::new();
+    for root in roots {
+        visit(graph, *root, seen, &mut output);
+    }
+    output
+}
+
+pub fn schedule<X>(block: &BlockOf<X>) -> Vec<Vec<ScalarId>> {
     let mut seen = vec![false; block.graph.scalars.len()];
     block
         .events

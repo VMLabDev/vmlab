@@ -351,7 +351,8 @@ pub fn convert(
     backing: Option<&Path>,
     backing_format: Option<&str>,
 ) -> Result<()> {
-    if dest.exists() {
+    let dest_exists = dest.exists();
+    if dest_exists {
         // The destination is replaced, so it must not be an image this
         // convert reads: the source, the `backing` argument, or a file of
         // either backing chain, under any name (review vmlab-disk F11).
@@ -365,45 +366,40 @@ pub fn convert(
                 )));
             }
         }
-        std::fs::remove_file(dest)?;
     }
-    let backing_ref = backing.map(|b| (b, backing_format));
-    match snapshot {
+    // The source opens before the destination is removed, so a source that
+    // is missing, refused or lacks the snapshot leaves an existing
+    // destination as it was (review vmlab-disk-2 F14).
+    enum Source {
+        Raw(crate::raw::RawImage),
+        Qcow2(Box<Qcow2Image>),
+    }
+    let mut source = match snapshot {
         Some(name) => {
             let mut view = Qcow2Image::open(src, true)?;
             view.install_snapshot_view(name)?;
-            let size = view.size();
-            let mut dest_img = Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-            if backing.is_some() {
-                copy_own_layer(&mut view, &mut dest_img)?;
-            } else {
-                copy_full(&mut view, &mut dest_img)?;
-            }
-            dest_img.flush()
+            Source::Qcow2(Box::new(view))
         }
         None => match probe_format(src)? {
-            Format::Raw => {
-                let mut reader = crate::raw::RawImage::open(src, true)?;
-                let size = reader.size();
-                let mut dest_img =
-                    Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-                copy_full(&mut reader, &mut dest_img)?;
-                dest_img.flush()
-            }
-            Format::Qcow2 => {
-                let mut reader = Qcow2Image::open(src, true)?;
-                let size = reader.size();
-                let mut dest_img =
-                    Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
-                if backing.is_some() {
-                    copy_own_layer(&mut reader, &mut dest_img)?;
-                } else {
-                    copy_full(&mut reader, &mut dest_img)?;
-                }
-                dest_img.flush()
-            }
+            Format::Raw => Source::Raw(crate::raw::RawImage::open(src, true)?),
+            Format::Qcow2 => Source::Qcow2(Box::new(Qcow2Image::open(src, true)?)),
         },
+    };
+    if dest_exists {
+        std::fs::remove_file(dest)?;
     }
+    let backing_ref = backing.map(|b| (b, backing_format));
+    let size = match &source {
+        Source::Raw(reader) => reader.size(),
+        Source::Qcow2(reader) => reader.size(),
+    };
+    let mut dest_img = Qcow2Image::create(dest, size, DEFAULT_CLUSTER_BITS, backing_ref)?;
+    match &mut source {
+        Source::Raw(reader) => copy_full(reader, &mut dest_img)?,
+        Source::Qcow2(reader) if backing.is_some() => copy_own_layer(reader, &mut dest_img)?,
+        Source::Qcow2(reader) => copy_full(reader.as_mut(), &mut dest_img)?,
+    }
+    dest_img.flush()
 }
 
 /// The first file of `image`'s backing chain (the image itself first) that
@@ -628,5 +624,32 @@ mod tests {
         patterned(&dest, 0x01);
         convert(&src, &dest, None, None, None).unwrap();
         assert_eq!(first_bytes(&dest), vec![0x77; 4096]);
+    }
+
+    /// Review vmlab-disk-2 F14: a convert that fails because its source does
+    /// not open leaves an existing destination as it was.
+    #[test]
+    fn convert_from_a_missing_source_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.qcow2");
+        patterned(&dest, 0x42);
+        let missing = dir.path().join("nosuch.qcow2");
+        assert!(convert(&missing, &dest, None, None, None).is_err());
+        assert!(dest.exists(), "the destination was deleted");
+        assert_eq!(first_bytes(&dest), vec![0x42; 4096]);
+    }
+
+    /// The same when the source opens and the snapshot it is read at does
+    /// not exist.
+    #[test]
+    fn convert_of_a_missing_snapshot_keeps_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.qcow2");
+        patterned(&src, 0x10);
+        let dest = dir.path().join("keep.qcow2");
+        patterned(&dest, 0x24);
+        assert!(convert(&src, &dest, Some("nosuch"), None, None).is_err());
+        assert!(dest.exists(), "the destination was deleted");
+        assert_eq!(first_bytes(&dest), vec![0x24; 4096]);
     }
 }

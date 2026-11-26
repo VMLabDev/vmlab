@@ -44,7 +44,9 @@ The work is organised in four phases. Where they stand:
   pinned Sail toolchain emits Jib IR from the sail-riscv model; the parser,
   typed IR, and generator produce the committed riscv64 interpreter crate,
   which runs the pinned instruction corpora in lockstep against the Sail
-  oracle. aarch64 and the Cranelift JIT are not started.
+  oracle. aarch64 (sub-phase 3d) has started: a decoder generated from the
+  LLVM AArch64 tables, the integer immediate and branch instructions, and an
+  instruction lockstep against QEMU. The Cranelift JIT is not started.
 - Phase 4, legacy PC (i440fx, IDE, floppy): not started. macOS guests are a
   separate phase after that, also not started.
 
@@ -66,6 +68,8 @@ The work is organised in four phases. Where they stand:
 | `vmlab-hv-tcg-emit` | The generator that emits the committed riscv64 crate from the Jib IR. |
 | `vmlab-hv-tcg-riscv64` | The generated riscv64 model, derived from sail-riscv (BSD-2-Clause). |
 | `vmlab-hv-lockstep` | Instruction-by-instruction lockstep against the Sail oracle. |
+| `vmlab-hv-tcg-a64gen` | The generator that emits the aarch64 decoder and system register tables from the LLVM AArch64 TableGen records. |
+| `vmlab-hv-tcg-aarch64` | The aarch64 emulator core: the generated decoder, lifters into the typed IR, an interpreter loop, and the instruction lockstep against QEMU. |
 
 Device models in `vmlab-hv-devices` cover the virtio family, the ICH9 chipset,
 VGA and virtio-gpu, HDA, xHCI, and the TPM TIS. The `pipewire` and `pulse`
