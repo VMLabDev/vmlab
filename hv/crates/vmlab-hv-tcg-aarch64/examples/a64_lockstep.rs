@@ -174,7 +174,11 @@ fn entry(item: &Verified, few_vectors: bool) -> Entry {
         let named = vector_data
             && ((n as u32).wrapping_sub(first) & 31 < 4
                 || n as u32 == second
-                || (lanes && ((n as u32).wrapping_sub(rn) & 31 < 4 || n as u32 == rm)));
+                // An indexed form of 16-bit lanes has four bits of Rm.
+                || (lanes
+                    && ((n as u32).wrapping_sub(rn) & 31 < 4
+                        || n as u32 == rm
+                        || n as u32 == rm & 15)));
         if before.v[n] != after.v[n] || (named && before.v[n] != 0) {
             kept.0.v[n] = before.v[n];
             kept.1.v[n] = after.v[n];
