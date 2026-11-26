@@ -588,8 +588,8 @@ fn the_pstate_forms_of_msr() {
     // At EL0 SPSel is undefined, and DAIF is behind SCTLR_EL1.UMA.
     let mut user = Bench::new(&V8_0, true, false);
     assert_eq!(user.run(spsel, 0), Answer::Fault(0x0200_0000));
-    assert_eq!(user.run(daifclr | 0xf << 8, 0), Answer::Fault(0x620e_d3fe));
-    assert_eq!(user.run(daifset | 0x2 << 8, 0), Answer::Fault(0x620c_d3e4));
+    assert_eq!(user.run(daifclr | 0xf << 8, 0), Answer::Fault(0x6207_d3fe));
+    assert_eq!(user.run(daifset | 0x2 << 8, 0), Answer::Fault(0x6207_93e4));
     user.cpu.state.system.regs[reg::SCTLR_EL1] |= sctlr::UMA;
     assert_eq!(user.run(daifclr | 0xf << 8, 0), Answer::Ran(0));
     assert_eq!(user.cpu.state.daif, 0);

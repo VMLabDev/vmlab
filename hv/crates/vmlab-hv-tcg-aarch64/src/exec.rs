@@ -565,8 +565,12 @@ impl<M: Memory> Cpu<M> {
             PstateField::DaifSet | PstateField::DaifClr => {
                 if el0 && self.state.system.regs[reg::SCTLR_EL1] & sctlr::UMA == 0 {
                     // op0 0, op1 3, CRn 4, CRm the immediate, Rt 31, a write.
+                    // QEMU reports op1 in the place of op2 and op2 in the
+                    // place of op1 for this form (the lockstep of card C6
+                    // found ESR_EL1 0x620793f6 for `MSR DAIFSet, #11`). We
+                    // follow it (DESIGN.md P2, U1).
                     let op2 = if field == PstateField::DaifSet { 6 } else { 7 };
-                    let iss = op2 << 17 | 3 << 14 | 4 << 10 | 31 << 5 | u32::from(immediate) << 1;
+                    let iss = 3 << 17 | op2 << 14 | 4 << 10 | 31 << 5 | u32::from(immediate) << 1;
                     return Err(Exception::SystemTrap(iss));
                 }
                 if field == PstateField::DaifSet {
