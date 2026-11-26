@@ -10945,7 +10945,7 @@ pub fn extract(record: Record, w: u32) -> Option<Fields> {
             let imm = ((w >> 5) & 0xffff);
             let rd = (w & 0x1f);
             let shift = (((w >> 21) & 0x3) << 4);
-            if !((shift < 2)) {
+            if !((shift < 32)) {
                 return None;
             }
             Fields::BaseInsertImmediate(BaseInsertImmediate { imm, rd, shift })
@@ -10960,7 +10960,7 @@ pub fn extract(record: Record, w: u32) -> Option<Fields> {
             let imm = ((w >> 5) & 0xffff);
             let rd = (w & 0x1f);
             let shift = (((w >> 21) & 0x3) << 4);
-            if !((shift < 2)) {
+            if !((shift < 32)) {
                 return None;
             }
             Fields::BaseMoveImmediate(BaseMoveImmediate { imm, rd, shift })

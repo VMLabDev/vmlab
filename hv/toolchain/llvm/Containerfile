@@ -14,7 +14,7 @@ ARG LLVM_COMMIT
 RUN git init -q /src/llvm-project \
     && cd /src/llvm-project \
     && git remote add origin https://github.com/llvm/llvm-project.git \
-    && git sparse-checkout set llvm cmake third-party \
+    && git sparse-checkout set llvm cmake third-party libc \
     && git fetch -q --depth 1 --filter=blob:none origin "${LLVM_COMMIT}" \
     && git checkout -q FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = "${LLVM_COMMIT}" \
