@@ -1351,6 +1351,164 @@ fn every_endpoint_teardown_reaches_the_backend() {
     }
 }
 
+/// A backend for review usb-2.md F15: its bulk IN transfer stays in flight
+/// until the test sets `ready`, which stands for a URB the host kernel has
+/// completed. From then on the four bytes come out of the next call.
+struct Finisher {
+    ready: Arc<Mutex<Option<super::UsbTransfer>>>,
+    started: Arc<Mutex<u32>>,
+}
+
+impl super::UsbDevice for Finisher {
+    fn speed(&self) -> super::UsbSpeed {
+        super::UsbSpeed::High
+    }
+    fn reset(&mut self) {}
+    fn control(&mut self, setup: crate::usb::SetupPacket, _data: &[u8]) -> super::UsbTransfer {
+        match (setup.request_type & 0x60, setup.request) {
+            (0x00, 5 | 9) => super::UsbTransfer::Ack(Vec::new()),
+            _ => super::UsbTransfer::Stall,
+        }
+    }
+    fn transfer(&mut self, _endpoint: u8, _data: &[u8], _max_length: usize) -> super::UsbTransfer {
+        *self.started.lock().unwrap() += 1;
+        super::UsbTransfer::Nak
+    }
+    fn endpoint_stopped(&mut self, _endpoint: u8) -> super::UsbTransfer {
+        self.ready
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(super::UsbTransfer::Nak)
+    }
+    fn is_host_backed(&self) -> bool {
+        true
+    }
+}
+
+impl crate::Snapshot for Finisher {
+    fn state_id(&self) -> String {
+        "finisher".into()
+    }
+    fn save_state(&self) -> Result<Vec<u8>, crate::DeviceError> {
+        Ok(Vec::new())
+    }
+    fn restore_state(&mut self, _bytes: &[u8]) -> Result<(), crate::DeviceError> {
+        Ok(())
+    }
+}
+
+type FinisherHandles = (Arc<Mutex<Option<super::UsbTransfer>>>, Arc<Mutex<u32>>);
+
+/// A [`Finisher`] on root port 6 with two 64-byte TDs on its bulk IN
+/// endpoint 1 (DCI 3, ring at 0x8000, buffers at 0xa000 and 0xa100). The
+/// first is in flight in the backend. Returns the result the backend will
+/// have finished, for the test to set, and how many transfers it started.
+fn bulk_in_in_flight(d: &mut Driver) -> FinisherHandles {
+    let ready = Arc::new(Mutex::new(None));
+    let started = Arc::new(Mutex::new(0));
+    d.hc.attach(
+        6,
+        Box::new(Finisher {
+            ready: ready.clone(),
+            started: started.clone(),
+        }),
+    )
+    .unwrap();
+    d.start();
+    d.write(0x490, 0x210);
+    assert_eq!(d.event(34).parameter, 6 << 24);
+    let t = d.command(9, 0, 0);
+    assert_eq!(t.status >> 24, 1);
+    d.slot = t.control >> 24;
+    d.mem64(0x4000 + u64::from(d.slot) * 8, 0x5000);
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 3);
+    d.mem32(0x6020, (3 << 20) | (1 << 27));
+    d.mem32(0x6024, 6 << 16);
+    d.mem32(0x6044, (4 << 3) | (64 << 16));
+    d.mem64(0x6048, 0x7001);
+    assert_eq!(d.command(11, 0x6000, d.slot << 24).status >> 24, 1);
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 9);
+    d.mem32(0x6084, (6 << 3) | (512 << 16));
+    d.mem64(0x6088, 0x8001);
+    assert_eq!(d.command(12, 0x6000, d.slot << 24).status >> 24, 1);
+    // Two Normal TRBs with IOC and ISP.
+    d.trb(0x8000, 0xa000, 64, (1 << 10) | 32 | 4);
+    d.trb(0x8010, 0xa100, 64, (1 << 10) | 32 | 4);
+    d.write(0x2000 + u64::from(d.slot) * 4, 3);
+    d.hc.poll();
+    assert!(*started.lock().unwrap() > 0, "no transfer in flight");
+    (ready, started)
+}
+
+/// The state of the endpoint with DCI 3 in the output device context.
+fn bulk_in_state(d: &Driver) -> u32 {
+    let mut word = [0; 4];
+    d.mem
+        .read_slice(&mut word, GuestAddress(0x5000 + 3 * 32))
+        .unwrap();
+    u32::from_le_bytes(word) & 7
+}
+
+/// Review usb-2.md F15. The backend has finished the transfer of the TD at
+/// the dequeue pointer and the poll has not collected it when the guest
+/// issues Stop Endpoint. The data reaches guest memory with a Transfer
+/// Event for that TD, ahead of the Stopped event for the next TD, and no
+/// transfer is started for that next TD.
+#[test]
+fn stop_endpoint_delivers_a_finished_backend_transfer() {
+    let mut d = Driver::new();
+    let (ready, started) = bulk_in_in_flight(&mut d);
+    let before = *started.lock().unwrap();
+    *ready.lock().unwrap() = Some(super::UsbTransfer::Ack(b"abcd".to_vec()));
+
+    d.trb(d.command, 0, 0, (15 << 10) | (d.slot << 24) | (3 << 16));
+    d.command += 16;
+    d.write(0x2000, 0);
+    let transferred = d.event(32);
+    assert_eq!(transferred.parameter, 0x8000);
+    assert_eq!(
+        transferred.status >> 24,
+        13,
+        "the finished transfer was not reported as a short packet"
+    );
+    assert_eq!(transferred.status & 0xff_ffff, 60, "the residual");
+    let mut data = [0; 4];
+    d.mem.read_slice(&mut data, GuestAddress(0xa000)).unwrap();
+    assert_eq!(&data, b"abcd");
+    let stopped = d.event(32);
+    assert_eq!(stopped.status >> 24, 26);
+    assert_eq!(stopped.parameter, 0x8010);
+    assert_eq!(stopped.status & 0xff_ffff, 64);
+    assert_eq!(d.event(33).status >> 24, 1);
+    assert_eq!(bulk_in_state(&d), 3, "the endpoint is stopped");
+    assert_eq!(
+        *started.lock().unwrap(),
+        before,
+        "the stop started a transfer"
+    );
+}
+
+/// F15: a transfer that finished with a stall halts the endpoint, and Stop
+/// Endpoint on a halted endpoint is a Context State Error (xHCI 4.6.9).
+#[test]
+fn stop_endpoint_reports_a_finished_stall() {
+    let mut d = Driver::new();
+    let (ready, _started) = bulk_in_in_flight(&mut d);
+    *ready.lock().unwrap() = Some(super::UsbTransfer::Stall);
+
+    d.trb(d.command, 0, 0, (15 << 10) | (d.slot << 24) | (3 << 16));
+    d.command += 16;
+    d.write(0x2000, 0);
+    let stalled = d.event(32);
+    assert_eq!(stalled.parameter, 0x8000);
+    assert_eq!(stalled.status >> 24, 6);
+    assert_eq!(d.event(33).status >> 24, 19);
+    assert_eq!(bulk_in_state(&d), 2, "the endpoint is halted");
+}
+
 /// A [`Recorder`] on root port 6, addressed, with a GET_DESCRIPTOR on its
 /// control endpoint (DCI 1) that the backend keeps in flight. Returns what
 /// the backend was told was dropped, emptied of what the setup reported.
@@ -1550,4 +1708,60 @@ fn a_td_one_whole_poll_cannot_walk_is_refused() {
         .unwrap();
     assert_eq!(u32::from_le(state) & 7, 2, "the endpoint is halted");
     assert_eq!(d.read(0x44) & 0x1001, 0, "the controller still runs");
+}
+
+/// Configure Endpoint for one bulk IN endpoint (endpoint 2 IN, DCI 5) with
+/// the given dwords 0 and 1 of its context. Returns the completion code.
+fn configure_bulk_in(d: &mut Driver, dword0: u32, dword1: u32) -> u32 {
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 0x21); // slot context + DCI 5
+    d.mem32(0x6020, (3 << 20) | (5 << 27));
+    d.mem32(0x60c0, dword0);
+    d.mem32(0x60c4, dword1);
+    d.mem64(0x60c8, 0xb001);
+    d.command(12, 0x6000, d.slot << 24).status >> 24
+}
+
+/// Review usb-2.md F16: Max Burst Size is bits 8 to 15 of dword 1 of an
+/// endpoint context. A guest writes `bMaxBurst` of a SuperSpeed endpoint
+/// there, up to 15, and the endpoint is configured.
+#[test]
+fn a_superspeed_burst_endpoint_is_configured() {
+    for burst in [0u32, 3, 4, 15] {
+        let mut d = Driver::new();
+        d.enumerate();
+        d.configure();
+        assert_eq!(
+            configure_bulk_in(&mut d, 0, (6 << 3) | (burst << 8) | (1024 << 16)),
+            1,
+            "Max Burst Size {burst}"
+        );
+        let state = d
+            .mem
+            .read_obj::<u32>(GuestAddress(0x5000 + 5 * 32))
+            .unwrap();
+        assert_eq!(u32::from_le(state) & 7, 1, "the endpoint is running");
+    }
+}
+
+/// Review usb-2.md F16: MaxPStreams is bits 10 to 14 of dword 0. The
+/// controller advertises no streams, so an endpoint that asks for them is
+/// refused, and its stream context array is never walked as a ring.
+#[test]
+fn a_streams_endpoint_is_refused() {
+    for streams in [1u32, 4, 31] {
+        let mut d = Driver::new();
+        d.enumerate();
+        d.configure();
+        assert_eq!(
+            configure_bulk_in(&mut d, streams << 10, (6 << 3) | (1024 << 16)),
+            5,
+            "MaxPStreams {streams}"
+        );
+        let state = d
+            .mem
+            .read_obj::<u32>(GuestAddress(0x5000 + 5 * 32))
+            .unwrap();
+        assert_eq!(u32::from_le(state) & 7, 0, "the endpoint stays disabled");
+    }
 }

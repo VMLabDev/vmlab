@@ -61,11 +61,9 @@ def measure(command, environment, timeout=7200):
     return result
 
 
-def build_coremark(iterations=1):
-    if iterations < 1:
-        raise lib.BenchError("CoreMark iterations must be positive")
-    root = Path(lib.REPO_DIR)
-    source = root / "target/tcg/coremark"
+def coremark_source():
+    """The upstream CoreMark sources, clean at the pinned revision."""
+    source = Path(lib.REPO_DIR) / "target/tcg/coremark"
     if not source.exists():
         subprocess.run(["git", "clone", "https://github.com/eembc/coremark.git", str(source)], check=True)
         subprocess.run(["git", "-C", str(source), "checkout", "--detach", COREMARK_REVISION], check=True)
@@ -73,6 +71,14 @@ def build_coremark(iterations=1):
     dirty = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"], text=True)
     if revision != COREMARK_REVISION or dirty:
         raise lib.BenchError(f"CoreMark checkout must be clean at {COREMARK_REVISION}: {source}")
+    return source
+
+
+def build_coremark(iterations=1):
+    if iterations < 1:
+        raise lib.BenchError("CoreMark iterations must be positive")
+    root = Path(lib.REPO_DIR)
+    source = coremark_source()
     port = root / "bench/rv64"
     output = root / "target/tcg/micro"
     output.mkdir(parents=True, exist_ok=True)
