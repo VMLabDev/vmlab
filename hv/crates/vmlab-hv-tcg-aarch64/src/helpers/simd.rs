@@ -972,14 +972,14 @@ mod tests {
     fn a_table_lookup_reads_up_to_four_registers() {
         let t0 = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100u128;
         let t1 = t0 | 0x1010_1010_1010_1010_1010_1010_1010_1010;
-        let indices = 0x20_1f_10_0fu128;
+        let indices = 0x201f_100fu128;
         assert_eq!(
             table(2, 16, false, u128::MAX, indices, [t0, t1, 0, 0]),
-            0x00_1f_10_0f
+            0x001f_100f
         );
         assert_eq!(
             table(2, 8, true, 0xaaaa_aaaa_aaaa_aaaa, indices, [t0, t1, 0, 0]),
-            0x0000_0000_aa_1f_10_0f
+            0x0000_0000_aa1f_100f
         );
         assert_eq!(table(1, 4, false, 0, indices, [t0, t1, 0, 0]), 0x0f);
     }

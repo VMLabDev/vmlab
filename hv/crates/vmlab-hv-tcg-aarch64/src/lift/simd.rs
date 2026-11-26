@@ -1371,7 +1371,7 @@ mod tests {
     /// letter (`d`).
     fn mnemonic_of(name: &str) -> &str {
         let bytes = name.as_bytes();
-        for letter in [b'v', b'i'] {
+        for letter in *b"vi" {
             for index in 0..bytes.len().saturating_sub(1) {
                 if bytes[index] == letter && bytes[index + 1].is_ascii_digit() {
                     return &name[..index];

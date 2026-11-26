@@ -110,7 +110,7 @@ pub fn rsqrt_step(format: Format, a: u64, b: u64, control: u32) -> (u64, u8) {
 pub const fn recip_estimate_integer(a: u64) -> u64 {
     let a = a * 2 + 1;
     let b = (1 << 19) / a;
-    ((b + 1) / 2) & 0xff
+    b.div_ceil(2) & 0xff
 }
 
 const fn rsqrt_table() -> [u8; 512] {
@@ -128,7 +128,7 @@ const fn rsqrt_table() -> [u8; 512] {
         while a * (b + 1) * (b + 1) < 1 << 28 {
             b += 1;
         }
-        table[index as usize] = ((b + 1) / 2) as u8;
+        table[index as usize] = b.div_ceil(2) as u8;
         index += 1;
     }
     table
