@@ -184,6 +184,8 @@ pub struct Follower {
     pub cpu: Cpu<FlatMemory>,
     /// The system registers that the leader sends with each instruction.
     pub compared: Vec<Compared>,
+    /// The exceptions that both sides took, by their kind.
+    pub exceptions: std::collections::BTreeMap<&'static str, u64>,
 }
 
 /// The instruction that our side ran last and that the next record of QEMU
@@ -234,6 +236,24 @@ fn counter_read(encoding: u32) -> Adopt {
     }
 }
 
+/// The kind of an exception, for the counts of a run.
+fn kind_of(cause: Cause) -> &'static str {
+    match cause {
+        Cause::Interrupt(_) => "interrupt",
+        Cause::Exception(exception) => match exception {
+            Exception::Undefined => "undefined instruction",
+            Exception::WaitTrap(_) => "trapped WFI or WFE",
+            Exception::FpAccess => "FP access trap",
+            Exception::IllegalState => "illegal execution state",
+            Exception::SupervisorCall(_) => "SVC",
+            Exception::SystemTrap(_) => "trapped system instruction",
+            Exception::InstructionAbort(_) => "instruction abort",
+            Exception::PcAlignment => "PC alignment",
+            Exception::Breakpoint(_) => "BRK",
+        },
+    }
+}
+
 fn end_of(cause: Cause) -> End {
     match cause {
         Cause::Exception(Exception::Undefined) => End::Undefined,
@@ -250,6 +270,7 @@ impl Follower {
             leader,
             cpu,
             compared: Vec::new(),
+            exceptions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -303,6 +324,7 @@ impl Follower {
 
     /// Both sides took the same exception to `taken.to`.
     fn after_exception(&mut self, taken: Taken) -> io::Result<Stepped> {
+        *self.exceptions.entry(kind_of(taken.cause)).or_default() += 1;
         if taken.to & 3 == 0 && self.word(taken.to).is_some() {
             return Ok(Stepped::On(Adopt::Nothing));
         }
@@ -748,6 +770,7 @@ mod tests {
         assert!(counter_read(0xd53b_d045) == Adopt::Nothing);
         assert!(counter_read(0xd51b_e305) == Adopt::Nothing);
         assert_eq!(end_of(Cause::Exception(Exception::Undefined)), End::Undefined);
+        assert_eq!(kind_of(Cause::Exception(Exception::FpAccess)), "FP access trap");
         assert_eq!(
             end_of(Cause::Exception(Exception::SupervisorCall(1))),
             End::Exception

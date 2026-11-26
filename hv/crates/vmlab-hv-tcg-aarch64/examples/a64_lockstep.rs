@@ -552,6 +552,12 @@ fn main() -> Result<(), Failure> {
     for (end, count) in &run.counts.ends {
         println!("  {count:>9} {end}");
     }
+    if !run.follower.exceptions.is_empty() {
+        println!("exceptions that both sides took, with the same registers after them:");
+        for (kind, count) in &run.follower.exceptions {
+            println!("  {count:>9} {kind}");
+        }
+    }
     if system {
         println!(
             "{waits} WFI encodings left out, {left_out} encodings of registers that the 3d CPU leaves out (the PMU), {} verified instructions that QEMU leads in (counter reads, host calls)",
