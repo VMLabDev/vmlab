@@ -130,6 +130,10 @@ pub struct Follower {
     /// QEMU ran instructions that our side did not follow, so our vector
     /// registers are not QEMU's any more. The next round reads them.
     stale: bool,
+    /// QEMU ran instructions that our side did not follow, and one of them
+    /// can have been an exclusive load: the exclusive monitors of the two
+    /// sides may differ. `sync_monitor` makes them the same again.
+    pub monitor_stale: bool,
     /// Rounds that ended at a store of several parts which failed after a
     /// different count of parts on the two sides. Our memory took QEMU's
     /// bytes there.
@@ -214,6 +218,7 @@ impl Follower {
             leader,
             cpu,
             stale,
+            monitor_stale: false,
             partial_stores: 0,
         }
     }
@@ -307,10 +312,58 @@ impl Follower {
         self.mirror(pending);
         self.mirror(&ahead.writes);
         self.stale = self.leader.has_vectors();
+        self.monitor_stale = true;
         Ok(())
     }
 
+    /// Give the exclusive monitors of both sides one state, which nothing
+    /// reads from outside: an exclusive load of a pair at `data` and its
+    /// exclusive store, which writes back what it loaded. The load sets
+    /// everything that a monitor holds, and the store ends the mark. `pc`:
+    /// where the three words of the round go. `data`: 16 bytes of RAM at a
+    /// multiple of 16.
+    pub fn sync_monitor(&mut self, pc: u64, data: u64) -> io::Result<()> {
+        let build = |record: Record, fields: &[(&str, u32)]| {
+            fields.iter().fold(record.info().value, |word, (name, value)| {
+                crate::with_field(record, name, word, *value).unwrap_or(word)
+            })
+        };
+        let words = [
+            // ldxp x1, x3, [x2] ; stxp w4, x1, x3, [x2]
+            build(Record::LDXPX, &[("rt", 1), ("rt2", 3), ("rn", 2)]),
+            build(Record::STXPX, &[("ws", 4), ("rt", 1), ("rt2", 3), ("rn", 2)]),
+            0,
+        ];
+        let mut start = Core {
+            x: [0; 31],
+            sp: data,
+            pc,
+            cpsr: super::CPSR_EL1H,
+        };
+        start.x[2] = data;
+        let round = Round {
+            memory: vec![(pc, words.iter().flat_map(|word| word.to_le_bytes()).collect())],
+            start,
+            budget: 3,
+            visits: 1,
+        };
+        match self.run(&round)? {
+            Outcome::Agreed { verified, .. }
+                if verified.len() == 2
+                    && verified[1].after.x[4] == 0
+                    && !self.monitor_stale => Ok(()),
+            Outcome::Agreed { end, verified } => Err(io::Error::other(format!(
+                "the round that makes the exclusive monitors the same ended with {end:?} after {} instructions",
+                verified.len()
+            ))),
+            Outcome::Differed { difference, .. } => Err(io::Error::other(format!(
+                "the round that makes the exclusive monitors the same differs: {difference}"
+            ))),
+        }
+    }
+
     pub fn run(&mut self, round: &Round) -> io::Result<Outcome> {
+        self.monitor_stale = false;
         self.load(round)?;
         self.leader.resume()?;
         let mut verified = Vec::new();

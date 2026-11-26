@@ -233,6 +233,9 @@ impl Counts {
 }
 
 struct Run {
+    /// The rounds are of loads and stores: after a round in which QEMU ran
+    /// ahead of our side, the exclusive monitors are made the same again.
+    memory: bool,
     follower: Follower,
     counts: Counts,
     rng: Rng,
@@ -241,7 +244,11 @@ struct Run {
 impl Run {
     /// One round. `Err`: the two sides differed, and the report is printed.
     fn round(&mut self, round: &Round) -> Result<(End, usize), Failure> {
-        match self.follower.run(round)? {
+        let outcome = self.follower.run(round)?;
+        if self.memory && self.follower.monitor_stale && matches!(outcome, Outcome::Agreed { .. }) {
+            self.follower.sync_monitor(IMAGE_BASE, WINDOW.0)?;
+        }
+        match outcome {
             Outcome::Agreed { end, verified } => {
                 self.counts.add(&mut self.rng, &verified);
                 self.counts.end(end);
@@ -342,6 +349,7 @@ fn main() -> Result<(), Failure> {
     let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
     let memory = FlatMemory::new(RAM_BASE, ram);
     let mut run = Run {
+        memory: memory_group,
         follower: Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE))),
         counts: Counts {
             keep: samples,
