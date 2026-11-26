@@ -258,6 +258,10 @@ impl Controls {
             tsz: (fields & 0x3f) as u32,
             granule: self.supported(granule),
             disabled: fields & (1 << 7) != 0,
+            // TCR.HPD0 and HPD1, the bits 41 and 42, belong to Armv8.1, and
+            // QEMU's `cortex-a53` acts on them all the same (the lockstep
+            // of card C8). We follow QEMU (DESIGN.md P2, U1).
+            flat: self.tcr & (1 << (41 + u32::from(upper))) != 0,
             table: self.ttbr[usize::from(upper)],
         }
     }
@@ -287,6 +291,8 @@ struct Half {
     granule: u32,
     /// TCR.EPD: no walk through this half.
     disabled: bool,
+    /// TCR.HPD: a table descriptor takes no permission away.
+    flat: bool,
     table: u64,
 }
 
@@ -392,10 +398,12 @@ pub fn walk(
         }
         let is_table = descriptor & 2 != 0;
         if level < 3 && is_table {
-            no_user |= descriptor & (1 << 61) != 0;
-            read_only |= descriptor & (1 << 62) != 0;
-            uxn |= descriptor & (1 << 60) != 0;
-            pxn |= descriptor & (1 << 59) != 0;
+            if !half.flat {
+                no_user |= descriptor & (1 << 61) != 0;
+                read_only |= descriptor & (1 << 62) != 0;
+                uxn |= descriptor & (1 << 60) != 0;
+                pxn |= descriptor & (1 << 59) != 0;
+            }
             table = descriptor & ADDRESS & !((1u64 << granule) - 1);
             if table >> output != 0 {
                 return Err(fault(FaultKind::AddressSize, level));
