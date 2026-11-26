@@ -372,8 +372,9 @@ pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
 /// [`open_for`], only a unix-socket viewer is launched. Must be called from
 /// within a tokio runtime.
 pub fn open_when_ready(sock: PathBuf) {
-    match detect() {
-        Some(v) if v.transport == Transport::Unix => {
+    let host = HostConfig::load_default_or_warn();
+    match select_build_viewer(&host, &on_path) {
+        Some(v) => {
             tokio::spawn(async move {
                 // ~60s for QEMU to create the socket; the build runs longer.
                 for _ in 0..600 {
@@ -392,10 +393,22 @@ pub fn open_when_ready(sock: PathBuf) {
     }
 }
 
+fn select_build_viewer(host: &HostConfig, on_path: &impl Fn(&str) -> bool) -> Option<Viewer> {
+    detect_vnc(host, on_path).filter(|viewer| viewer.transport == Transport::Unix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn a_build_gui_finds_a_viewer_when_remote_viewer_is_installed() {
+        let viewer = select_build_viewer(&HostConfig::default(), &|bin| bin == "remote-viewer")
+            .expect("the build should launch the installed remote-viewer");
+        assert_eq!(viewer.cmd, "remote-viewer vnc://{}");
+        assert_eq!(viewer.transport, Transport::Tcp);
+    }
 
     fn tcp_viewer(cmd: &str) -> Viewer {
         Viewer {

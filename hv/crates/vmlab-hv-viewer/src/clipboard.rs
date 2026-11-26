@@ -268,6 +268,47 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    #[test]
+    fn focus_does_not_replace_a_host_clipboard_without_text() {
+        #[derive(Default)]
+        struct NonTextHost(Vec<String>);
+
+        impl HostClipboard for NonTextHost {
+            fn get(&mut self) -> anyhow::Result<String> {
+                Err(arboard::Error::ContentNotAvailable.into())
+            }
+
+            fn set(&mut self, text: String) -> anyhow::Result<()> {
+                self.0.push(text);
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lab.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["cmd"], "machine.clipboard_get");
+            writeln!(
+                stream,
+                "{}",
+                json!({"type":"resp", "id":request["id"], "ok":"old guest text"})
+            )
+            .unwrap();
+        });
+        let mut host = NonTextHost::default();
+        let mut lab = LabClipboard::new(path, "vm".into());
+        let mut bridge = Bridge::default();
+        bridge.focus(true);
+        bridge.tick(Instant::now(), &mut host, &mut lab).unwrap();
+        server.join().unwrap();
+        assert!(host.0.is_empty(), "host clipboard writes: {:?}", host.0);
+    }
+
     struct Host {
         text: String,
         blocked: bool,
