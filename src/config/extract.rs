@@ -747,7 +747,21 @@ fn extract_container(b: &Block, issues: &mut IssueList) -> Option<Container> {
     let clock = r.parsed("clock", parse_clock).unspan().unwrap_or_default();
     let entrypoint = r.opt_string_list("entrypoint");
     let command = r.opt_string_list("command");
-    let workdir = r.string("workdir").unspan();
+    // cinit enters the workdir after `chroot`, where a relative path would
+    // resolve against the micro-VM's own tree and not the image's.
+    let workdir = match r.string("workdir") {
+        Some(w) if !w.value.starts_with('/') => {
+            r.issue_at(
+                w.span,
+                format!(
+                    "workdir `{}` must be an absolute path inside the container",
+                    w.value
+                ),
+            );
+            None
+        }
+        w => w.unspan(),
+    };
     let user = r.string("user").unspan();
     let profile = r.string("profile").unspan();
     let cpus = r.int_at_least("cpus", 1).unspan();

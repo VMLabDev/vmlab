@@ -142,8 +142,16 @@ pub struct ExecIdentity {
 
 impl ExecIdentity {
     pub fn new(workdir: Option<&str>, user: Option<&ResolvedUser>) -> Result<Self> {
+        let workdir = workdir.unwrap_or("/");
+        // `apply` runs right after `chroot`, with the working directory
+        // still outside the new root: a relative path would resolve there.
+        if !workdir.starts_with('/') {
+            return Err(format!(
+                "workdir {workdir:?} must be an absolute path inside the container"
+            ));
+        }
         Ok(Self {
-            workdir: cstring(workdir.unwrap_or("/"))?,
+            workdir: cstring(workdir)?,
             ids: user.map(|u| (Uid::from_raw(u.uid), Gid::from_raw(u.gid))),
         })
     }
@@ -374,14 +382,6 @@ mod tests {
         assert_eq!(id.ids, None);
     }
 
-    /// F56: an absolute link on PATH resolves inside the rootfs.
-    #[test]
-    fn exe_lookup_follows_links_inside_the_rootfs() {
-        let dir = tempfile::tempdir().unwrap();
-        let rootfs = dir.path().join("rootfs");
-        fs::create_dir_all(rootfs.join("bin")).unwrap();
-        fs::create_dir_all(dir.path().join("bin")).unwrap();
-        // Executable only beside the rootfs, where the link would land if
     /// G8 (docs/reviews/containers-2.md): the `chdir` follows the `chroot`
     /// with the working directory still in the initramfs, so `etc` would be
     /// the micro-VM's own `/etc`. Covers an image whose `WorkingDir` is
@@ -397,6 +397,14 @@ mod tests {
         assert!(ExecIdentity::new(Some("/etc"), None).is_ok());
     }
 
+    /// F56: an absolute link on PATH resolves inside the rootfs.
+    #[test]
+    fn exe_lookup_follows_links_inside_the_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        fs::create_dir_all(dir.path().join("bin")).unwrap();
+        // Executable only beside the rootfs, where the link would land if
         // it were followed on cinit's side.
         let outside = dir.path().join("bin/outside");
         fs::write(&outside, "#!/bin/sh\n").unwrap();

@@ -152,6 +152,14 @@ pub fn volume_share_name(container: &str, i: usize) -> String {
     format!("vol-{container}-{i}")
 }
 
+/// The virtio-fs mount tag of a container volume, from its share name. The
+/// device takes at most 36 bytes and a share name carries the container's
+/// name, a DNS label of up to 63, so the one that goes to the hypervisor and
+/// the one cinit mounts both come from here.
+pub fn volume_mount_tag(share: &str) -> String {
+    crate::qemu::virtiofsd::mount_tag(share)
+}
+
 /// Resolve the config's volume list to concrete exports in declaration
 /// order: (share name, host dir, read-only). Relative host binds resolve
 /// against the lab root; named volumes land under the lab work dir. Each
@@ -650,7 +658,7 @@ impl ContainerInstance {
         if !spec.volumes.is_empty() {
             if self.virtiofs_active.load(Ordering::SeqCst) {
                 for v in &mut spec.volumes {
-                    v.tag = Some(v.share.clone());
+                    v.tag = Some(volume_mount_tag(&v.share));
                 }
             } else {
                 spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
@@ -769,7 +777,7 @@ impl ContainerInstance {
                 .await?;
             // Register each daemon so teardown can stop it if a later volume fails.
             self.virtiofsd.lock().await.push(proc);
-            devices.push((share.clone(), sock));
+            devices.push((volume_mount_tag(share), sock));
         }
         self.virtiofs_active.store(true, Ordering::SeqCst);
         Ok(devices)
@@ -1986,14 +1994,6 @@ mod tests {
         c.drop_snapshot("missing").await.unwrap();
     }
 
-    // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------
-
-    #[test]
-    fn spec_entrypoint_cmd_matrix() {
-        let img = image(RuntimeDefaults {
-            entrypoint: vec!["/entry.sh".into()],
-            cmd: vec!["serve".into(), "--all".into()],
-            ..Default::default()
     /// G3 of `docs/reviews/containers-2.md`: a virtio-fs tag holds 36 bytes,
     /// and a container's name alone may have 63.
     #[tokio::test]
@@ -2054,6 +2054,14 @@ mod tests {
         assert_eq!(mounted, handed, "cinit mounts what the hypervisor serves");
     }
 
+    // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------
+
+    #[test]
+    fn spec_entrypoint_cmd_matrix() {
+        let img = image(RuntimeDefaults {
+            entrypoint: vec!["/entry.sh".into()],
+            cmd: vec!["serve".into(), "--all".into()],
+            ..Default::default()
         });
 
         // No overrides: image entrypoint + image cmd.

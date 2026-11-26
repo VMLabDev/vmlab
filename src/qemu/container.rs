@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use super::cmdline::{Accel, pick_accel};
+use super::cmdline::{Accel, opt_path, pick_accel};
 use super::resolve::ResolvedContainer;
 use crate::config::model::MacAddr;
 
@@ -154,6 +154,8 @@ pub(crate) fn build_container_args_with_accel(
 
     // Serial console → file: kernel messages plus the container's
     // stdout/stderr (cinit leaves them on the console).
+    // `-serial file:` takes its path whole, like `-kernel` and `-initrd`:
+    // no comma is doubled there (see `cmdline::opt_path`).
     arg(
         &mut a,
         "serial",
@@ -163,7 +165,7 @@ pub(crate) fn build_container_args_with_accel(
     arg(
         &mut a,
         "qmp",
-        format!("unix:{},server=on,wait=off", paths.qmp_sock.display()),
+        format!("unix:{},server=on,wait=off", opt_path(&paths.qmp_sock)),
     );
     a.push("-monitor".into());
     a.push("none".into());
@@ -177,7 +179,7 @@ pub(crate) fn build_container_args_with_accel(
         "chardev",
         format!(
             "socket,id=ctl0,path={},server=on,wait=off",
-            paths.ctl_sock.display()
+            opt_path(&paths.ctl_sock)
         ),
     );
     arg(
@@ -185,7 +187,7 @@ pub(crate) fn build_container_args_with_accel(
         "chardev",
         format!(
             "socket,id=vagent0,path={},server=on,wait=off",
-            paths.agent_sock.display()
+            opt_path(&paths.agent_sock)
         ),
     );
     arg(&mut a, "device", "virtio-serial-pci".into());
@@ -208,14 +210,14 @@ pub(crate) fn build_container_args_with_accel(
     a.push("-blockdev".into());
     a.push(format!(
         "driver=raw,node-name=rootfs,read-only=on,file.driver=file,file.filename={}",
-        paths.rootfs_image.display()
+        opt_path(&paths.rootfs_image)
     ));
     a.push("-device".into());
     a.push("virtio-blk-pci,drive=rootfs".into());
     a.push("-blockdev".into());
     a.push(format!(
         "driver=qcow2,node-name=scratch,file.driver=file,file.filename={}",
-        paths.scratch_disk.display()
+        opt_path(&paths.scratch_disk)
     ));
     a.push("-device".into());
     a.push("virtio-blk-pci,drive=scratch".into());
@@ -229,7 +231,7 @@ pub(crate) fn build_container_args_with_accel(
             "netdev",
             format!(
                 "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
-                sock.display()
+                opt_path(sock)
             ),
         );
         let host_mtu = mtu
@@ -254,7 +256,7 @@ pub(crate) fn build_container_args_with_accel(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=vfs{i},path={}", sock.display()),
+            format!("socket,id=vfs{i},path={}", opt_path(sock)),
         );
         arg(
             &mut a,
@@ -300,8 +302,6 @@ mod tests {
         args.join(" ")
     }
 
-    #[test]
-    fn x86_64_shape() {
     /// G9 (docs/reviews/containers-2.md), the copy of the VM argv's
     /// `a_comma_in_a_path_is_doubled_in_every_option`: QEMU splits an option
     /// value at each `,` and reads `,,` as one. `-kernel`, `-initrd` and
@@ -349,6 +349,8 @@ mod tests {
         assert_eq!(doubled, 7, "{args:?}");
     }
 
+    #[test]
+    fn x86_64_shape() {
         let p = paths();
         let c = resolved(
             "container \"web\" { image = \"nginx:1.27\" cpus = 2 memory = 256MiB }",
