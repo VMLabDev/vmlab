@@ -3,9 +3,9 @@
 // The image ends with the semihosting call SYS_EXIT: `hlt #0xf000` with
 // W0 = 0x18 and X1 at a block of two words, the reason
 // ADP_Stopped_ApplicationExit (0x20026) and the exit code. QEMU ends with
-// that exit code (`-semihosting-config enable=on,target=native`). Our
-// interpreter has no lifter for HLT and stops in front of it, and
-// `a64_bench` reads the same block. X2 to X5 hold the three checksums of
+// that exit code (`-semihosting-config enable=on,target=native`). On our
+// interpreter HLT takes the Undefined Instruction exception, `a64_bench`
+// stops the run at that exception and reads the same block. X2 to X5 hold the three checksums of
 // CoreMark and its error count at that moment.
 //
 // The image uses no system register, no FP and no vector register, and

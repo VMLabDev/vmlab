@@ -4,8 +4,8 @@ Two workloads, both without an MMU, a device or a system register: the
 scalar loop of `bench/a64/loop.S` and the CoreMark algorithm mix of
 `bench/a64/coremark.c`, checked against CoreMark's own checksums. An image
 ends with the semihosting call SYS_EXIT. Our interpreter
-(`vmlab-hv-tcg-aarch64`, example `a64_bench`) stops in front of its `hlt`,
-and QEMU ends with the exit code of the call, so both run the same bytes to
+(`vmlab-hv-tcg-aarch64`, example `a64_bench`) stops at the exception that
+its `hlt` takes, and QEMU ends with the exit code of the call, so both run the same bytes to
 the same instruction.
 
 The `interpreter` backend records the time of the run inside the process,

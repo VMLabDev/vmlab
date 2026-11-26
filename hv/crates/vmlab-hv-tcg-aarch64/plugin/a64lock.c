@@ -12,12 +12,18 @@
  * Arguments:
  *   out=<path>   where the records go: a FIFO that the follower reads.
  *   vectors=on   add V0 to V31, FPSR and FPCR to each instruction record.
+ *   sysregs=A:B  add these registers, by the names of the plugin API and as
+ *                64 bits each, to each instruction record (card C6: the
+ *                exception registers and what an MSR wrote).
+ *   names=<path> write the name of every register that the plugin API offers
+ *                to this file, one per line.
  *
  * The stream, little-endian:
- *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 0
+ *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 count of sysregs
  *   instruction   u32 1, u32 encoding, u64 x[31], u64 sp, u64 pc, u64 cpsr
  *                 (pc is the address of the instruction, not the PC register)
  *                 with vectors: u8 v[32][16], u64 fpsr, u64 fpcr
+ *                 with sysregs: u64 for each, in the order of the argument
  *   memory write  u32 2, u32 size in bytes, u64 vaddr, u64 low, u64 high
  *   discontinuity u32 3, u32 type (1 interrupt, 2 exception, 4 host call),
  *                 u64 from_pc, u64 to_pc
@@ -44,6 +50,11 @@ static int out_fd = -1;
 static int vectors;
 static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr;
 static struct qemu_plugin_register *reg_v[32], *reg_fpsr, *reg_fpcr;
+enum { MAX_SYSREGS = 96 };
+static char *sys_name[MAX_SYSREGS];
+static struct qemu_plugin_register *reg_sys[MAX_SYSREGS];
+static int sys_count;
+static const char *names_path;
 static GByteArray *scratch;
 static int ready;
 /* The address of the translation block that runs now. QEMU does not keep the
@@ -106,6 +117,9 @@ static void insn_exec(unsigned int vcpu, void *udata)
         }
         put_reg(rec, reg_fpsr, 8);
         put_reg(rec, reg_fpcr, 8);
+    }
+    for (int i = 0; i < sys_count; i++) {
+        put_reg(rec, reg_sys[i], 8);
     }
     emit(rec->data, rec->len);
 }
@@ -187,10 +201,27 @@ static void vcpu_init(unsigned int vcpu, void *udata)
         return;
     }
     regs = qemu_plugin_get_registers();
+    if (names_path) {
+        FILE *names = fopen(names_path, "w");
+        if (!names) {
+            fprintf(stderr, "a64lock: open %s: %s\n", names_path, strerror(errno));
+            exit(1);
+        }
+        for (guint i = 0; regs && i < regs->len; i++) {
+            qemu_plugin_reg_descriptor *r = &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+            fprintf(names, "%s %s\n", r->name, r->feature ? r->feature : "-");
+        }
+        fclose(names);
+    }
     for (guint i = 0; regs && i < regs->len; i++) {
         qemu_plugin_reg_descriptor *r = &g_array_index(regs, qemu_plugin_reg_descriptor, i);
         const char *n = r->name;
         char *end;
+        for (int k = 0; k < sys_count; k++) {
+            if (!reg_sys[k] && !strcmp(n, sys_name[k])) {
+                reg_sys[k] = r->handle;
+            }
+        }
         if (!strcmp(n, "sp")) {
             reg_sp = r->handle;
         } else if (!strcmp(n, "cpsr")) {
@@ -218,6 +249,12 @@ static void vcpu_init(unsigned int vcpu, void *udata)
         }
         missing += !reg_fpsr + !reg_fpcr;
     }
+    for (int k = 0; k < sys_count; k++) {
+        if (!reg_sys[k]) {
+            fprintf(stderr, "a64lock: the plugin API offers no register %s\n", sys_name[k]);
+            missing++;
+        }
+    }
     if (missing) {
         fprintf(stderr, "a64lock: the plugin API does not offer %d of the registers\n", missing);
         exit(1);
@@ -238,6 +275,17 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             path = argv[i] + 4;
         } else if (!strcmp(argv[i], "vectors=on")) {
             vectors = 1;
+        } else if (g_str_has_prefix(argv[i], "names=")) {
+            names_path = argv[i] + 6;
+        } else if (g_str_has_prefix(argv[i], "sysregs=")) {
+            char **parts = g_strsplit(argv[i] + 8, ":", -1);
+            for (int k = 0; parts[k]; k++) {
+                if (sys_count == MAX_SYSREGS) {
+                    fprintf(stderr, "a64lock: more than %d sysregs\n", MAX_SYSREGS);
+                    return -1;
+                }
+                sys_name[sys_count++] = parts[k];
+            }
         } else if (strcmp(argv[i], "vectors=off")) {
             fprintf(stderr, "a64lock: unknown argument %s\n", argv[i]);
             return -1;
@@ -253,7 +301,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         return -1;
     }
     scratch = g_byte_array_new();
-    header.flags = vectors;
+    header.flags = vectors | (sys_count ? 2 : 0);
+    header.zero = sys_count;
     emit(&header, sizeof(header));
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);
     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans, NULL);

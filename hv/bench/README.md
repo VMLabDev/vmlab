@@ -240,8 +240,9 @@ MIPS or more.
 An image has no MMU, no device and no system register, uses no FP or vector
 register (`-mgeneral-regs-only`) and only aligned accesses (`-mstrict-align`),
 and is linked without relaxation, which would put a `nop` in it. It ends with
-the semihosting call `SYS_EXIT` (`hlt #0xf000`). The interpreter has no lifter
-for `HLT` and stops in front of it. QEMU ends with the exit code of the call,
+the semihosting call `SYS_EXIT` (`hlt #0xf000`). On the interpreter `HLT`
+takes the Undefined Instruction exception, and `a64_bench` stops the run
+there. QEMU ends with the exit code of the call,
 so a wrong checksum fails the run on both sides.
 
 A history line of these workloads holds seconds as `samples`, as every line
