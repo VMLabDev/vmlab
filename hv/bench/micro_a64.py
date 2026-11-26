@@ -58,9 +58,11 @@ def a64_flags():
 
 
 def link(objects, elf):
+    """Link without relaxation: lld turns an `adrp` and `add` pair into a
+    `nop` and an `adr`, and the hint space has no lifter before card C6."""
     port = Path(lib.REPO_DIR) / "bench/a64"
     subprocess.run([*a64_flags(), "-nostdlib", "-static", "-fuse-ld=lld", "-Wl,--gc-sections",
-                    "-Wl,--build-id=none", "-T", str(port / "link.ld"), *objects, "-o", str(elf)],
+                    "-Wl,--build-id=none", "-Wl,--no-relax", "-T", str(port / "link.ld"), *objects, "-o", str(elf)],
                    check=True)
     image = elf.with_suffix(".bin")
     subprocess.run(["llvm-objcopy", "-O", "binary", str(elf), str(image)], check=True)
