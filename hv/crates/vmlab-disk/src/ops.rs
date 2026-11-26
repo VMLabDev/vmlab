@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::qcow2::{Qcow2Image, probe_format};
+use crate::qcow2::{Qcow2Image, probe_format, resolve_backing};
 use crate::{DiskImage, Error, Format, Result};
 
 const DEFAULT_CLUSTER_BITS: u32 = 16;
@@ -113,14 +113,17 @@ pub fn rebase_unsafe(path: &Path, backing: &str, format: Option<&str>) -> Result
 
 /// Move `path` onto `backing` keeping its content: `qemu-img rebase` in safe
 /// mode. Reads the old chain (through the image) and the new backing, and
-/// writes into the image only the clusters where they differ.
+/// writes into the image only the clusters where they differ. A relative
+/// backing name is resolved against the image's directory.
 pub fn rebase_safe(path: &Path, backing: &Path, format: Option<&str>) -> Result<()> {
     let mut img = Qcow2Image::open(path, false)?;
+    let backing_name = backing.to_string_lossy();
+    let backing_path = resolve_backing(path, &backing_name);
     let fmt = match format {
         Some(f) => format_to_format(f)?,
-        None => probe_format(backing)?,
+        None => probe_format(&backing_path)?,
     };
-    let mut new_backing = crate::open(backing, fmt, true)?;
+    let mut new_backing = crate::open(&backing_path, fmt, true)?;
     let cluster = img.cluster_size_bytes();
     let size = img.size();
     let mut offset = 0u64;
@@ -138,8 +141,7 @@ pub fn rebase_safe(path: &Path, backing: &Path, format: Option<&str>) -> Result<
         }
         offset += n;
     }
-    let backing_str = backing.to_string_lossy().into_owned();
-    img.set_backing(&backing_str, format)?;
+    img.set_backing(&backing_name, format)?;
     img.flush()
 }
 
@@ -411,13 +413,24 @@ pub fn convert(
 /// and stops at the first file it cannot read: `convert` reports that error
 /// itself when it opens the chain.
 fn chain_file_same_as(image: &Path, target: &Path) -> Option<PathBuf> {
-    // A chain longer than this is a loop, which the open refuses.
-    const MAX_DEPTH: usize = 1024;
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    };
+    let target_id = identity(target)?;
+    let mut seen = HashSet::new();
     let mut cursor = Some(image.to_path_buf());
-    for _ in 0..MAX_DEPTH {
-        let path = cursor?;
-        if same_file(&path, target) {
+    while let Some(path) = cursor {
+        let id = identity(&path)?;
+        if id == target_id {
             return Some(path);
+        }
+        if !seen.insert(id) {
+            break;
         }
         cursor = match probe_format(&path) {
             Ok(Format::Qcow2) => Qcow2Image::open_header(&path)
@@ -427,24 +440,6 @@ fn chain_file_same_as(image: &Path, target: &Path) -> Option<PathBuf> {
         };
     }
     None
-}
-
-/// Whether two paths name one file, through links of either kind.
-#[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Copy the whole virtual disk, skipping all-zero chunks (sparse output,
@@ -595,6 +590,8 @@ mod tests {
         patterned(&base, 0xa5);
         assert!(create_linked_clone(&base, &clone).is_err());
         assert!(!clone.exists());
+        assert!(create_qcow2(&clone, 1 << 20, Some(&base), Some("qcow2")).is_err());
+        assert!(!clone.exists());
     }
 
     #[test]
@@ -603,7 +600,11 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let top = Path::new("sub/top.qcow2");
             rebase_safe(top, Path::new("new.qcow2"), None).unwrap();
-            assert_eq!(first_bytes(top), vec![0xa5; 4096]);
+            assert!(first_bytes(top).iter().all(|&byte| byte == 0xa5));
+            assert_eq!(
+                Qcow2Image::open_header(top).unwrap().backing_file_name(),
+                Some("new.qcow2")
+            );
             return;
         }
 
@@ -632,6 +633,26 @@ mod tests {
             "{stdout}{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn a_backing_cycle_through_a_hard_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let alias = dir.path().join("alias.qcow2");
+        let top = dir.path().join("top.qcow2");
+        create_qcow2(&base, 1 << 20, None, None).unwrap();
+        std::fs::hard_link(&base, &alias).unwrap();
+        create_linked_clone(&alias, &top).unwrap();
+        rebase_unsafe(&base, "top.qcow2", Some("qcow2")).unwrap();
+
+        match Qcow2Image::open(&base, true) {
+            Err(Error::Unsupported(reason)) => {
+                assert!(reason.contains("backing chain cycle"), "{reason}");
+                assert!(reason.contains("alias.qcow2"), "{reason}");
+            }
+            _ => panic!("expected an error naming the alias that closes the backing cycle"),
+        }
     }
 
     /// Review vmlab-disk F11: `convert` removes an existing destination, so

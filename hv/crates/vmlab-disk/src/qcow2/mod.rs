@@ -9,13 +9,14 @@ mod refcount;
 mod snapshot;
 
 use self::refcount::FreeClusters;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use crate::{DiskImage, Error, Format, Result, SnapshotInfo};
+use crate::raw::RawImage;
+use crate::{DiskImage, Error, Format, ReadTarget, Result, SnapshotInfo};
 
 pub const QCOW_MAGIC: u32 = 0x5146_49fb;
 
@@ -29,7 +30,7 @@ pub(crate) const ZERO_BIT: u64 = 1;
 const EXT_BACKING_FORMAT: u32 = 0xe279_2aca;
 const EXT_END: u32 = 0;
 
-const MAX_BACKING_DEPTH: usize = 8;
+const MAX_BACKING_NAME_BYTES: u64 = 1023;
 /// QEMU's limits on the header counts (`QCOW_MAX_L1_SIZE`,
 /// `QCOW_MAX_REFTABLE_SIZE`, `QCOW_MAX_SNAPSHOTS`). The file length alone does
 /// not bound them: a sparse file holds a long run of zeros for nothing.
@@ -184,7 +185,7 @@ pub struct Qcow2Image {
     /// Rewritten from this buffer so unknown fields survive.
     header_cluster: Vec<u8>,
     backing: Option<BackingRef>,
-    backing_image: Option<Box<dyn DiskImage>>,
+    backing_chain: BackingChain,
 
     /// Active L1 entries (raw values, copied bit included).
     l1: Vec<u64>,
@@ -205,27 +206,89 @@ pub struct Qcow2Image {
     write_started: bool,
 }
 
+/// Backing files in read order, with a raw image only at the end.
+/// Keeping the layers flat avoids stack growth when opening, reading, or
+/// dropping a deep chain.
+#[derive(Default)]
+struct BackingChain {
+    qcow2: VecDeque<Qcow2Image>,
+    raw: Option<RawImage>,
+}
+
+impl BackingChain {
+    fn size(&self) -> u64 {
+        self.qcow2.front().map_or_else(
+            || self.raw.as_ref().map_or(0, RawImage::size),
+            Qcow2Image::size,
+        )
+    }
+
+    fn read_into(
+        &mut self,
+        mut offset: u64,
+        mut len: usize,
+        target: &mut dyn ReadTarget,
+    ) -> Result<()> {
+        while len != 0 {
+            let mut count = len;
+            let mut found = false;
+            for layer in &mut self.qcow2 {
+                if offset >= layer.size {
+                    target.zero(count)?;
+                    found = true;
+                    break;
+                }
+                count = count.min((layer.size - offset).try_into().unwrap_or(usize::MAX));
+                let (source, extent_len) = layer.read_extent(offset, count)?;
+                count = extent_len;
+                if !matches!(source, ReadSource::Backing) {
+                    layer.read_extent_into(source, offset, count, target)?;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let backed = self.raw.as_ref().map_or(0, |raw| {
+                    raw.size().saturating_sub(offset).min(count as u64) as usize
+                });
+                if let Some(raw) = &mut self.raw
+                    && backed != 0
+                {
+                    raw.read_into(offset, backed, target)?;
+                }
+                target.zero(count - backed)?;
+            }
+            offset += count as u64;
+            len -= count;
+        }
+        Ok(())
+    }
+}
+
+struct SliceReadTarget<'a>(&'a mut [u8]);
+
+impl ReadTarget for SliceReadTarget<'_> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.0
+            .split_off_mut(..bytes.len())
+            .unwrap()
+            .copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn zero(&mut self, len: usize) -> Result<()> {
+        self.0.split_off_mut(..len).unwrap().fill(0);
+        Ok(())
+    }
+
+    fn read_file(&mut self, file: &File, offset: u64, len: usize) -> Result<()> {
+        file.read_exact_at(self.0.split_off_mut(..len).unwrap(), offset)?;
+        Ok(())
+    }
+}
+
 impl Qcow2Image {
     pub fn open(path: &Path, read_only: bool) -> Result<Self> {
-        Self::open_depth(path, read_only, 0)
-    }
-
-    /// Open read-only without opening the backing chain: the header, the
-    /// snapshot table and the backing reference are readable, guest data that
-    /// would read through to a backing file is not. A missing backing file is
-    /// no error here (`qemu-img info` without `--backing-chain`).
-    pub fn open_header(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        Self::parse(path, file, true)
-    }
-
-    fn open_depth(path: &Path, read_only: bool, depth: usize) -> Result<Self> {
-        if depth > MAX_BACKING_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "backing chain deeper than {MAX_BACKING_DEPTH} at {}",
-                path.display()
-            )));
-        }
         let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let mut img = Self::parse(path, file, read_only)?;
         // v2 has no dirty marker, so never trust its refcounts on writable open.
@@ -237,8 +300,17 @@ impl Qcow2Image {
             img.read_only = true;
             return Err(error);
         }
-        img.open_backing(depth)?;
+        img.open_backing()?;
         Ok(img)
+    }
+
+    /// Open read-only without opening the backing chain: the header, the
+    /// snapshot table and the backing reference are readable, guest data that
+    /// would read through to a backing file is not. A missing backing file is
+    /// no error here (`qemu-img info` without `--backing-chain`).
+    pub fn open_header(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Self::parse(path, file, true)
     }
 
     fn parse(path: &Path, mut file: File, read_only: bool) -> Result<Self> {
@@ -442,7 +514,7 @@ impl Qcow2Image {
 
         // Backing file reference.
         let backing = if backing_file_offset != 0 && backing_file_size > 0 {
-            if backing_file_size > 1023 {
+            if backing_file_size > MAX_BACKING_NAME_BYTES {
                 return Err(Error::Format {
                     format: "qcow2",
                     reason: format!("backing file name too long ({backing_file_size})"),
@@ -486,7 +558,7 @@ impl Qcow2Image {
             snapshots_offset,
             header_cluster,
             backing,
-            backing_image: None,
+            backing_chain: BackingChain::default(),
             l1,
             refcount_table,
             l2_cache: TableCache::new(64),
@@ -502,9 +574,9 @@ impl Qcow2Image {
         Ok(img)
     }
 
-    fn open_backing(&mut self, depth: usize) -> Result<()> {
+    fn backing_spec(&self) -> Result<Option<(PathBuf, Format)>> {
         let Some(backing) = &self.backing else {
-            return Ok(());
+            return Ok(None);
         };
         let backing_path = resolve_backing(&self.path, &backing.name);
         let format = match backing.format.as_deref() {
@@ -517,11 +589,31 @@ impl Qcow2Image {
             }
             None => probe_format(&backing_path)?,
         };
-        let image: Box<dyn DiskImage> = match format {
-            Format::Raw => Box::new(crate::raw::RawImage::open(&backing_path, true)?),
-            Format::Qcow2 => Box::new(Qcow2Image::open_depth(&backing_path, true, depth + 1)?),
-        };
-        self.backing_image = Some(image);
+        Ok(Some((backing_path, format)))
+    }
+
+    fn open_backing(&mut self) -> Result<()> {
+        let mut next = self.backing_spec()?;
+        if next.is_none() {
+            return Ok(());
+        }
+        let mut seen = HashSet::new();
+        remember_backing_file(&mut seen, &self.file, &self.path)?;
+        while let Some((path, format)) = next {
+            match format {
+                Format::Raw => {
+                    self.backing_chain.raw = Some(RawImage::open(&path, true)?);
+                    break;
+                }
+                Format::Qcow2 => {
+                    let file = File::open(&path)?;
+                    remember_backing_file(&mut seen, &file, &path)?;
+                    let layer = Self::parse(&path, file, true)?;
+                    next = layer.backing_spec()?;
+                    self.backing_chain.qcow2.push_back(layer);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -675,22 +767,8 @@ impl Qcow2Image {
     // ----- guest byte IO -----
 
     fn read_unallocated(&mut self, guest_offset: u64, out: &mut [u8]) -> Result<()> {
-        match self.backing_image.as_mut() {
-            Some(backing) => {
-                if guest_offset >= backing.size() {
-                    out.fill(0);
-                } else {
-                    let take = out.len().min((backing.size() - guest_offset) as usize);
-                    backing.read_at(guest_offset, &mut out[..take])?;
-                    out[take..].fill(0);
-                }
-                Ok(())
-            }
-            None => {
-                out.fill(0);
-                Ok(())
-            }
-        }
+        self.backing_chain
+            .read_into(guest_offset, out.len(), &mut SliceReadTarget(out))
     }
 
     fn read_compressed_cluster(&mut self, entry: u64, out: &mut [u8]) -> Result<()> {
@@ -780,62 +858,38 @@ impl Qcow2Image {
     }
 
     fn read_bytes(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let mut done = 0;
-        while done < buf.len() {
-            let abs = offset + done as u64;
-            let (source, len) = self.read_extent(abs, buf.len() - done)?;
-            let out = &mut buf[done..done + len];
-            match source {
-                ReadSource::Backing => self.read_unallocated(abs, out)?,
-                ReadSource::Zero => out.fill(0),
-                ReadSource::File(host) => self.read_file(host, out)?,
-                ReadSource::Compressed(entry) => {
-                    let mut cluster = vec![0; self.cluster_size as usize];
-                    self.read_compressed_cluster(entry, &mut cluster)?;
-                    let start = (abs % self.cluster_size) as usize;
-                    out.copy_from_slice(&cluster[start..start + len]);
-                }
-            }
-            done += len;
-        }
-        Ok(())
+        self.read_target(offset, buf.len(), &mut SliceReadTarget(buf))
     }
 
-    fn read_target(
-        &mut self,
-        offset: u64,
-        len: usize,
-        target: &mut dyn crate::ReadTarget,
-    ) -> Result<()> {
+    fn read_target(&mut self, offset: u64, len: usize, target: &mut dyn ReadTarget) -> Result<()> {
         let mut done = 0;
         while done < len {
             let abs = offset + done as u64;
             let (source, count) = self.read_extent(abs, len - done)?;
-            match source {
-                ReadSource::File(host) => target.read_file(&self.file, host, count)?,
-                ReadSource::Zero => target.zero(count)?,
-                ReadSource::Backing => {
-                    let backed = self.backing_image.as_ref().map_or(0, |image| {
-                        image.size().saturating_sub(abs).min(count as u64) as usize
-                    });
-                    if backed != 0 {
-                        self.backing_image
-                            .as_mut()
-                            .unwrap()
-                            .read_into(abs, backed, target)?;
-                    }
-                    target.zero(count - backed)?;
-                }
-                ReadSource::Compressed(entry) => {
-                    let mut cluster = vec![0; self.cluster_size as usize];
-                    self.read_compressed_cluster(entry, &mut cluster)?;
-                    let start = (abs % self.cluster_size) as usize;
-                    target.write_all(&cluster[start..start + count])?;
-                }
-            }
+            self.read_extent_into(source, abs, count, target)?;
             done += count;
         }
         Ok(())
+    }
+
+    fn read_extent_into(
+        &mut self,
+        source: ReadSource,
+        guest_offset: u64,
+        len: usize,
+        target: &mut dyn ReadTarget,
+    ) -> Result<()> {
+        match source {
+            ReadSource::File(host) => target.read_file(&self.file, host, len),
+            ReadSource::Zero => target.zero(len),
+            ReadSource::Backing => self.backing_chain.read_into(guest_offset, len, target),
+            ReadSource::Compressed(entry) => {
+                let mut cluster = vec![0; self.cluster_size as usize];
+                self.read_compressed_cluster(entry, &mut cluster)?;
+                let start = (guest_offset % self.cluster_size) as usize;
+                target.write_all(&cluster[start..start + len])
+            }
+        }
     }
 
     fn write_bytes(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
@@ -1107,6 +1161,13 @@ impl Qcow2Image {
         cluster_bits: u32,
         backing: Option<(&Path, Option<&str>)>,
     ) -> Result<Qcow2Image> {
+        let backing = backing.map(|(path, format)| BackingRef {
+            name: path.to_string_lossy().into_owned(),
+            format: format.map(str::to_owned),
+        });
+        if let Some(backing) = &backing {
+            check_backing_name_len(&backing.name)?;
+        }
         let cluster_size = 1u64 << cluster_bits;
         let span = (cluster_size / 8) * cluster_size;
         let l1_entries = size.div_ceil(span).max(1);
@@ -1118,17 +1179,11 @@ impl Qcow2Image {
         let l1_size = l1_entries as u32;
         let l1_clusters = l1_size_as_clusters(l1_size, cluster_size);
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
         // Layout: cluster 0 header, cluster 1 refcount table, cluster 2
         // refblock 0, then the L1 table.
         let rt_clusters: u64 = 1;
         let refblock0 = 2 * cluster_size;
         let l1_offset = 3 * cluster_size;
-        file.set_len(l1_offset + l1_clusters * cluster_size)?;
 
         let header_len: usize = 112;
         let mut hc = vec![0u8; cluster_size as usize];
@@ -1155,15 +1210,12 @@ impl Qcow2Image {
             hc[*off + 8..*off + 8 + data.len()].copy_from_slice(data);
             *off += 8 + data.len().div_ceil(8) * 8;
         };
-        if let Some((_, backing_format)) = backing
-            && let Some(fmt) = backing_format
-        {
+        if let Some(fmt) = backing.as_ref().and_then(|b| b.format.as_deref()) {
             add_ext(&mut hc, &mut ext_off, EXT_BACKING_FORMAT, fmt.as_bytes());
         }
         add_ext(&mut hc, &mut ext_off, EXT_END, &[]);
-        if let Some((backing_path, _)) = backing {
-            let name = backing_path.to_string_lossy().into_owned();
-            let name = name.as_bytes();
+        if let Some(backing) = &backing {
+            let name = backing.name.as_bytes();
             if ext_off + name.len() > hc.len() {
                 return Err(Error::Unsupported(
                     "backing file name does not fit in the header cluster".into(),
@@ -1173,6 +1225,13 @@ impl Qcow2Image {
             hc[16..20].copy_from_slice(&(name.len() as u32).to_be_bytes());
             hc[ext_off..ext_off + name.len()].copy_from_slice(name);
         }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.set_len(l1_offset + l1_clusters * cluster_size)?;
 
         // Refcount table: entry 0 -> refblock 0.
         let mut rt = vec![0u8; rt_clusters as usize * cluster_size as usize];
@@ -1202,11 +1261,8 @@ impl Qcow2Image {
             nb_snapshots: 0,
             snapshots_offset: 0,
             header_cluster: hc.clone(),
-            backing: backing.map(|(p, f)| BackingRef {
-                name: p.to_string_lossy().into_owned(),
-                format: f.map(|s| s.to_string()),
-            }),
-            backing_image: None,
+            backing,
+            backing_chain: BackingChain::default(),
             l1: vec![0u64; l1_size as usize],
             refcount_table,
             l2_cache: TableCache::new(64),
@@ -1226,7 +1282,7 @@ impl Qcow2Image {
             img.set_cluster_refcount(idx, 1)?;
         }
         img.write_file(cluster_size, &rt)?;
-        img.open_backing(0)?;
+        img.open_backing()?;
         Ok(img)
     }
 
@@ -1253,6 +1309,7 @@ impl Qcow2Image {
     /// is recorded in the backing-format extension.
     pub fn set_backing(&mut self, name: &str, format: Option<&str>) -> Result<()> {
         self.check_writable()?;
+        check_backing_name_len(name)?;
         let header_len = if self.version >= 3 {
             u32::from_be_bytes(self.header_cluster[100..104].try_into().unwrap()) as usize
         } else {
@@ -1283,7 +1340,7 @@ impl Qcow2Image {
         }
         add_ext(&mut hc, &mut ext_off, EXT_END, &[])?;
         let name_bytes = name.as_bytes();
-        if name_bytes.len() > 1023 || ext_off + name_bytes.len() > hc.len() {
+        if ext_off + name_bytes.len() > hc.len() {
             return Err(Error::Unsupported(
                 "backing file name does not fit in the header cluster".into(),
             ));
@@ -1299,14 +1356,20 @@ impl Qcow2Image {
         });
         self.header_dirty = true;
         // Drop the open backing image; callers reopen as needed.
-        self.backing_image = None;
+        self.backing_chain = BackingChain::default();
         Ok(())
     }
 
     /// Open the backing chain of this image for reading and hand it over
     /// (used by rebase, which needs the old chain while comparing).
     pub fn take_backing_image(&mut self) -> Option<Box<dyn DiskImage>> {
-        self.backing_image.take()
+        let mut chain = std::mem::take(&mut self.backing_chain);
+        if let Some(mut first) = chain.qcow2.pop_front() {
+            first.backing_chain = chain;
+            Some(Box::new(first))
+        } else {
+            chain.raw.map(|raw| Box::new(raw) as Box<dyn DiskImage>)
+        }
     }
 
     /// Guest clusters allocated in this image's own layer (any non-zero L2
@@ -1363,7 +1426,7 @@ impl Qcow2Image {
         self.size = new_size;
         self.header_dirty = true;
         // A longer backing file would show through the new area.
-        let backing_size = self.backing_image.as_ref().map_or(0, |b| b.size());
+        let backing_size = self.backing_chain.size();
         let shadow_end = backing_size.min(new_size);
         if shadow_end > old_size {
             let head_end = cluster_end.min(shadow_end);
@@ -1599,6 +1662,27 @@ impl Drop for Qcow2Image {
             let _ = self.close_clean();
         }
     }
+}
+
+fn remember_backing_file(seen: &mut HashSet<(u64, u64)>, file: &File, path: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    if !seen.insert((metadata.dev(), metadata.ino())) {
+        return Err(Error::Unsupported(format!(
+            "backing chain cycle at {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn check_backing_name_len(name: &str) -> Result<()> {
+    if name.len() as u64 > MAX_BACKING_NAME_BYTES {
+        return Err(Error::Unsupported(format!(
+            "backing file name too long ({}, maximum {MAX_BACKING_NAME_BYTES} bytes)",
+            name.len()
+        )));
+    }
+    Ok(())
 }
 
 fn checked_file_range(file_len: u64, offset: u64, len: u64) -> Result<()> {
