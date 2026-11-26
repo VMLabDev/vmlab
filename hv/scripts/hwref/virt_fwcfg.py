@@ -9,6 +9,11 @@ tables as QEMU builds them before a firmware relocates them
 (`etc/acpi/tables`, `etc/acpi/rsdp`, `etc/table-loader`), and SMBIOS
 (`etc/smbios/smbios-tables`, `etc/smbios/smbios-anchor`).
 
+A capture is `<configuration>/capture.json` (the argv, the numeric items, the
+directory with a sha256 of each file), `fwcfg/<file name>` for each file with
+content, and `acpi/<signature>` for each table of `etc/acpi/tables`. That file
+is exactly its tables in the recorded order, then zeros up to its size.
+
 This is black-box observation only (DESIGN.md of phase 3d, S6). No QEMU source
 is read. The fw_cfg register layout is the one of QEMU's published interface
 document `docs/specs/fw_cfg.rst` (S7).
@@ -230,6 +235,10 @@ def capture(qemu: str, name: str, output: Path) -> dict:
         offset += length
     if any(tables[offset:]):
         raise RuntimeError(f"{name}: bytes after the last ACPI table")
+    # The file is the tables in this order and zeros up to its size. The
+    # capture keeps the tables and the sha256 of the file, not 128 KiB of zeros.
+    (blobs / "etc/acpi/tables").unlink()
+    next(entry for entry in files if entry["name"] == "etc/acpi/tables")["stored_as"] = "acpi/"
     record = {
         "configuration": name,
         "cpu": cpu,
