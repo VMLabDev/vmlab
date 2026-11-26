@@ -1,14 +1,13 @@
 //! Cooperative cancellation of a running script (§7.2: the first failed step
 //! fails `up` and cancels the steps still running).
 //!
-//! Every host call that waits on the daemon goes through
-//! [`block_on`], and `sleep_ms` and the screen polls through [`sleep`]. Once
-//! the script's token is cancelled, the next of those drops the work it was
-//! waiting on and unwinds the script thread with [`Cancelled`], which the
-//! runner turns back into [`ScriptCancelled`]. The runner also checks for
-//! cancellation before and after execution, and the VM asks [`alive`] when
-//! any host call has returned. Between two host calls a script has a budget
-//! of instructions, so one that never calls the host still terminates.
+//! Every registered host call and script output checks the token before
+//! doing work. [`block_on`] and [`sleep`] also check while waiting, dropping
+//! the pending work on cancellation. Cancellation unwinds the script thread
+//! with [`Cancelled`], which the runner turns back into [`ScriptCancelled`].
+//! The runner checks for cancellation before and after execution. When a
+//! host call returns, the VM asks [`alive`] whether to renew the instruction
+//! budget. The budget also ends scripts that never call the host.
 //!
 //! The token rides a thread-local, set for the length of one script run by
 //! [`enter`], so the host functions need no extra argument.
