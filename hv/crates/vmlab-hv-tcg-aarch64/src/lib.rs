@@ -12,6 +12,7 @@
 //! `hv/docs/plans/phase-3d-aarch64/DESIGN.md` (S1 to S8, X1 to X3). Each
 //! semantics file names its sources in its header.
 
+mod block;
 pub mod exec;
 pub mod fields;
 pub mod generated;

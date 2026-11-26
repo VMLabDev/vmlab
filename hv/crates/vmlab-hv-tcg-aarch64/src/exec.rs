@@ -6,8 +6,10 @@
 //! with the reason, and the caller decides. The exception card (C6) turns
 //! the stops into exception entries.
 //!
-//! A block is pure scalar code with memory events between it: loads, stores
-//! and guards, in the order of the instructions. Each event names an exit
+//! A block is lowered once into its pre-decoded form (`block`, the gate of
+//! card C5) and kept under its PC. That form is pure scalar code with memory
+//! events between it: loads, stores and guards, in the order of the
+//! instructions. Each event names an exit
 //! that holds the registers as they were before its instruction, so a failed
 //! access leaves the registers of that instruction untouched.
 //!
@@ -34,9 +36,8 @@ use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, Lifted, lift};
 use crate::state::{Context, State, slot};
 use vmlab_hv_tcg::{Error, Memory};
+use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
-use vmlab_hv_tcg_ir::native::linear;
-use vmlab_hv_tcg_ir::native::packed::Packed;
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
@@ -316,44 +317,37 @@ impl Side {
     }
 }
 
-/// A memory event, a guard or a helper call of a block, between its pure
-/// code.
+/// A load or a store that has no code of its own in the block form: one of
+/// 16 bytes, or an exclusive one.
 #[derive(Clone, Copy, Debug)]
-enum Effect {
+enum Access16 {
     Read {
-        address: u32,
-        result: u32,
+        address: Slot,
+        result: Place,
         bytes: u8,
         exclusive: bool,
         exit: u32,
     },
     Write {
-        address: u32,
-        value: u32,
+        address: Slot,
+        value: Place,
         bytes: u8,
-        /// The scratch slot of the result of an exclusive store.
-        exclusive: Option<u32>,
+        /// The word of the result of an exclusive store.
+        exclusive: Option<Slot>,
         exit: u32,
     },
-    Guard {
-        condition: u32,
-        expected: bool,
-        exit: u32,
-    },
-    /// The helper call of this index in `calls` (R10).
-    Call(u32),
 }
 
 /// Where a block can leave before its end.
 #[derive(Clone, Debug)]
 struct Leave {
-    /// Register slot, scratch slot: copied out when the block leaves here.
-    /// The PC is one of them.
-    outputs: Vec<(u32, u32)>,
+    /// Register slot, words of the frame: copied out when the block leaves
+    /// here. The PC is one of them.
+    outputs: Vec<(u32, Place)>,
     /// The instructions of the block that are complete here.
     completed: u32,
-    /// The scratch slot of the address of an alignment fault.
-    address: Option<u32>,
+    /// The word of the address of an alignment fault.
+    address: Option<Slot>,
 }
 
 /// Why an effect did not complete.
@@ -376,36 +370,38 @@ enum Halt {
     Retry,
 }
 
-/// A block as the loop runs it.
+/// A block as the loop runs it: the pre-decoded form of `block`.
 struct Compiled {
     pc: u64,
     context: Context,
     instructions: u32,
-    code: Vec<Packed>,
-    /// Each effect with the count of `code` entries that run before it.
-    effects: Vec<(u32, Effect)>,
+    /// The operations in the order in which they run: the pure ones, and
+    /// between them the loads, the stores, the guards and the helper calls.
+    ops: Vec<Op>,
+    generics: Vec<Generic>,
+    accesses: Vec<Access16>,
     leaves: Vec<Leave>,
-    /// The scratch slots. The constants are in place.
-    values: Vec<u128>,
-    /// The helper calls (R10), in the order in which they run.
+    /// The words of the scalars. The constants are in place.
+    frame: Vec<u64>,
+    /// The helper calls (R10).
     calls: Vec<Call>,
-    /// Scratch slot, register slot: copied in before the block runs.
-    inputs: Vec<(u32, u32)>,
-    /// Register slot, scratch slot: copied out after it.
-    outputs: Vec<(u32, u32)>,
+    /// Words of the frame, register slot: copied in before the block runs.
+    inputs: Vec<(Place, u32)>,
+    /// Register slot, words of the frame: copied out after it.
+    outputs: Vec<(u32, Place)>,
 }
 
 /// The most arguments of a helper.
 const CALL_ARGUMENTS: usize = 8;
 
-/// One helper call of a block. Its place among the pure code is that of its
-/// `Effect::Call`.
+/// One helper call of a block. Its place among the operations is that of
+/// its `Code::Call`.
 struct Call {
     function: HelperFn,
-    /// The scratch slots of the arguments.
-    args: Vec<u32>,
-    /// The scratch slot of each result, with the mask of its type.
-    results: Vec<(u32, u128)>,
+    /// The words of the arguments.
+    args: Vec<Place>,
+    /// The words of each result, with the mask of its type.
+    results: Vec<(Place, u128)>,
 }
 
 fn host(message: &str) -> Stop {
@@ -425,74 +421,59 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
     }
 }
 
-/// Put a helper call after the pure code that the block has so far.
-fn push_call(compiled: &mut Compiled, call: Call) -> Result<(), Stop> {
-    let index = narrow(compiled.calls.len())?;
-    compiled.calls.push(call);
-    compiled
-        .effects
-        .push((narrow(compiled.code.len())?, Effect::Call(index)));
-    Ok(())
+/// What `compile` gathers beside the operations of the block.
+#[derive(Default)]
+struct Parts {
+    accesses: Vec<Access16>,
+    leaves: Vec<Leave>,
+    calls: Vec<Call>,
+    inputs: Vec<(Place, u32)>,
 }
 
-/// Append the pure scalars that `roots` need and the block has not computed
-/// yet: constants and inputs are bound, a pure helper call becomes a `Call`,
-/// and the rest is packed.
-fn emit(
-    compiled: &mut Compiled,
-    graph: &Graph,
-    slots: &[usize],
-    seen: &mut [bool],
-    roots: &[ScalarId],
-) -> Result<(), Stop> {
-    let slot_count = compiled.values.len();
-    for id in schedule::scalars(graph, roots, seen) {
-        match &graph.scalars[id].operation {
-            Operation::Constant(value) => compiled.values[slots[id]] = *value,
-            Operation::Input(register) => {
-                compiled
-                    .inputs
-                    .push((narrow(slots[id])?, narrow(*register)?));
-            }
-            // A view of another scalar shares its slot.
-            Operation::Refine(_) => {}
-            // The event of the effect writes its slot.
-            Operation::Effect(_) => {}
-            // A pure helper call runs at its place among the pure code.
-            Operation::Call { helper, args } => {
-                if args.len() > CALL_ARGUMENTS {
-                    return Err(host("a helper with too many arguments"));
+impl Parts {
+    /// Put a helper call after the operations that the block has so far.
+    fn call(&mut self, lowering: &mut Lowering, call: Call) -> Result<(), Stop> {
+        let index = narrow(self.calls.len())?;
+        self.calls.push(call);
+        lowering.effect(Code::Call, 0, 0, 0, 0, index.into());
+        Ok(())
+    }
+
+    /// Append the pure scalars that `roots` need and the block has not
+    /// computed yet: constants and inputs are bound, a pure helper call
+    /// becomes a `Call`, and the rest is lowered.
+    fn emit(
+        &mut self,
+        lowering: &mut Lowering,
+        graph: &Graph,
+        seen: &mut [bool],
+        roots: &[ScalarId],
+    ) -> Result<(), Stop> {
+        for id in schedule::scalars(graph, roots, seen) {
+            match &graph.scalars[id].operation {
+                Operation::Constant(value) => lowering.constant(id, *value),
+                Operation::Input(register) => {
+                    self.inputs.push((lowering.place(id), narrow(*register)?));
                 }
-                let call = Call {
-                    function: helper.0.function,
-                    args: args
-                        .iter()
-                        .map(|arg| narrow(slots[*arg]))
-                        .collect::<Result<_, _>>()?,
-                    results: vec![(narrow(slots[id])?, result_mask(graph, id))],
-                };
-                push_call(compiled, call)?;
-            }
-            _ => {
-                let mut instruction = linear::lower(graph, id)
-                    .ok_or_else(|| host("a scalar without a linear form"))?;
-                instruction.remap(slots);
-                let mut packed = Packed::new(slots[id], instruction)
-                    .ok_or_else(|| host("a scalar without a packed form"))?;
-                if let Operation::Binary(_, _, right) = &graph.scalars[id].operation
-                    && let Some(value) = graph.literal(*right)
-                    && let Some(immediate) = packed.with_immediate(value)
-                {
-                    packed = immediate;
+                // The event of the effect writes its words.
+                Operation::Effect(_) => {}
+                // A pure helper call runs at its place among the operations.
+                Operation::Call { helper, args } => {
+                    if args.len() > CALL_ARGUMENTS {
+                        return Err(host("a helper with too many arguments"));
+                    }
+                    let call = Call {
+                        function: helper.0.function,
+                        args: args.iter().map(|arg| lowering.place(*arg)).collect(),
+                        results: vec![(lowering.place(id), result_mask(graph, id))],
+                    };
+                    self.call(lowering, call)?;
                 }
-                if !packed.valid_slots(slot_count, slot_count) {
-                    return Err(host("a packed instruction outside the scratch slots"));
-                }
-                compiled.code.push(packed);
+                _ => lowering.scalar(graph, id),
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
@@ -517,25 +498,14 @@ fn compile(
 ) -> Result<Compiled, Stop> {
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
-    let (slots, slot_count) = linear::slots(graph);
+    let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
     let mut seen = vec![false; graph.scalars.len()];
-    let mut compiled = Compiled {
-        pc,
-        context,
-        instructions,
-        code: Vec::new(),
-        effects: Vec::new(),
-        leaves: Vec::new(),
-        values: vec![0; slot_count],
-        calls: Vec::new(),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-    };
+    let mut parts = Parts::default();
+    let mut block_outputs = None;
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
-    let mut ended = false;
     for event in &block.events {
-        if ended {
+        if block_outputs.is_some() {
             return Err(host("an event after the exit of a block"));
         }
         let (exit, mut roots) = match event {
@@ -562,22 +532,19 @@ fn compile(
                 {
                     return Err(host("an ordered call of a helper that is not one"));
                 }
-                emit(&mut compiled, graph, &slots, &mut seen, args)?;
+                parts.emit(&mut lowering, graph, &mut seen, args)?;
                 for result in results {
                     seen[*result] = true;
                 }
                 let call = Call {
                     function: helper.0.function,
-                    args: args
-                        .iter()
-                        .map(|arg| narrow(slots[*arg]))
-                        .collect::<Result<_, _>>()?,
+                    args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
-                        .map(|result| Ok((narrow(slots[*result])?, result_mask(graph, *result))))
-                        .collect::<Result<_, Stop>>()?,
+                        .map(|result| (lowering.place(*result), result_mask(graph, *result)))
+                        .collect(),
                 };
-                push_call(&mut compiled, call)?;
+                parts.call(&mut lowering, call)?;
                 continue;
             }
             Event::Exit(exit) => (*exit, Vec::new()),
@@ -585,10 +552,10 @@ fn compile(
         };
         let payload = &block.exits[exit];
         roots.extend(exit_roots(payload));
-        emit(&mut compiled, graph, &slots, &mut seen, &roots)?;
+        parts.emit(&mut lowering, graph, &mut seen, &roots)?;
         let mut outputs = Vec::new();
         for (register, scalar) in &payload.writeback.writes {
-            outputs.push((narrow(*register)?, narrow(slots[*scalar])?));
+            outputs.push((narrow(*register)?, lowering.place(*scalar)));
         }
         if let Event::Exit(_) = event {
             let A64Next::Pc(next) = payload.next else {
@@ -596,9 +563,8 @@ fn compile(
                     "a block that ends in an exception has no executor yet",
                 ));
             };
-            outputs.push((slot::PC as u32, narrow(slots[next])?));
-            compiled.outputs = outputs;
-            ended = true;
+            outputs.push((slot::PC as u32, lowering.place(next)));
+            block_outputs = Some(outputs);
             continue;
         }
         let leave = match leave_of[exit] {
@@ -607,43 +573,55 @@ fn compile(
                 let A64Next::Exception { syndrome, .. } = &payload.next else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
-                let address = match syndrome.first() {
-                    Some(scalar) => Some(narrow(slots[*scalar])?),
-                    None => None,
-                };
-                let leave = narrow(compiled.leaves.len())?;
-                compiled.leaves.push(Leave {
+                let leave = narrow(parts.leaves.len())?;
+                parts.leaves.push(Leave {
                     outputs,
                     completed: payload.completed,
-                    address,
+                    address: syndrome.first().map(|scalar| lowering.word(*scalar)),
                 });
                 leave_of[exit] = Some(leave);
                 leave
             }
         };
-        let effect = match event {
+        match event {
             Event::Guard {
                 condition,
                 expected,
                 ..
-            } => Effect::Guard {
-                condition: narrow(slots[*condition])?,
-                expected: *expected,
-                exit: leave,
-            },
+            } => {
+                let condition = lowering.word(*condition);
+                lowering.effect(Code::Guard, u8::from(*expected), 0, condition, 0, leave.into());
+            }
             Event::ReadMemory {
                 address,
                 bytes,
                 exclusive,
                 result,
                 ..
-            } => Effect::Read {
-                address: narrow(slots[*address])?,
-                result: narrow(slots[*result])?,
-                bytes: *bytes,
-                exclusive: *exclusive,
-                exit: leave,
-            },
+            } => {
+                let place = lowering.place(*result);
+                let code = match (*bytes, *exclusive || place.wide) {
+                    (1, false) => Code::Load1,
+                    (2, false) => Code::Load2,
+                    (4, false) => Code::Load4,
+                    (8, false) => Code::Load8,
+                    _ => Code::Access,
+                };
+                let address = lowering.word(*address);
+                if code == Code::Access {
+                    let index = narrow(parts.accesses.len())?;
+                    parts.accesses.push(Access16::Read {
+                        address,
+                        result: place,
+                        bytes: *bytes,
+                        exclusive: *exclusive,
+                        exit: leave,
+                    });
+                    lowering.effect(code, 0, 0, 0, 0, index.into());
+                } else {
+                    lowering.effect(code, *bytes, place.slot, address, 0, leave.into());
+                }
+            }
             Event::WriteMemory {
                 address,
                 value,
@@ -651,29 +629,55 @@ fn compile(
                 exclusive,
                 result,
                 ..
-            } => Effect::Write {
-                address: narrow(slots[*address])?,
-                value: narrow(slots[*value])?,
-                bytes: *bytes,
-                exclusive: match (exclusive, result) {
-                    (false, _) => None,
-                    (true, Some(result)) => Some(narrow(slots[*result])?),
-                    (true, None) => {
-                        return Err(host("an exclusive store without a result"));
-                    }
-                },
-                exit: leave,
-            },
-            Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => continue,
-        };
-        compiled
-            .effects
-            .push((narrow(compiled.code.len())?, effect));
+            } => {
+                let code = match (*bytes, *exclusive) {
+                    (1, false) => Code::Store1,
+                    (2, false) => Code::Store2,
+                    (4, false) => Code::Store4,
+                    (8, false) => Code::Store8,
+                    _ => Code::Access,
+                };
+                let at = lowering.word(*address);
+                if code == Code::Access {
+                    let index = narrow(parts.accesses.len())?;
+                    parts.accesses.push(Access16::Write {
+                        address: at,
+                        value: lowering.place(*value),
+                        bytes: *bytes,
+                        exclusive: match (exclusive, result) {
+                            (false, _) => None,
+                            (true, Some(result)) => Some(lowering.word(*result)),
+                            (true, None) => {
+                                return Err(host("an exclusive store without a result"));
+                            }
+                        },
+                        exit: leave,
+                    });
+                    lowering.effect(code, 0, 0, 0, 0, index.into());
+                } else {
+                    let value = lowering.word(*value);
+                    lowering.effect(code, *bytes, 0, at, value, leave.into());
+                }
+            }
+            Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => {}
+        }
     }
-    if !ended {
+    let Some(outputs) = block_outputs else {
         return Err(host("a block without an exit"));
-    }
-    Ok(compiled)
+    };
+    Ok(Compiled {
+        pc,
+        context,
+        instructions,
+        ops: lowering.ops,
+        generics: lowering.generics,
+        accesses: parts.accesses,
+        leaves: parts.leaves,
+        frame: lowering.frame,
+        calls: parts.calls,
+        inputs: parts.inputs,
+        outputs,
+    })
 }
 
 fn bits_mask(bytes: u8) -> u128 {
@@ -684,98 +688,162 @@ fn bits_mask(bytes: u8) -> u128 {
     }
 }
 
+/// A load of `N` bytes, 1 to 8, into one word.
+#[inline(always)]
+fn load<M: Memory, const N: usize>(
+    op: &Op,
+    frame: &mut [u64],
+    memory: &mut M,
+    side: &mut Side,
+) -> Result<(), (u32, Failed)> {
+    let at = frame[usize::from(op.a)];
+    // The common case: nothing keeps the accesses, and the memory holds the
+    // address. A read that fails has changed nothing, and the general path
+    // reads again to say why.
+    if side.log.is_none() {
+        let mut bytes = [0u8; 8];
+        if memory.read(at, &mut bytes[..N]).is_ok() {
+            frame[usize::from(op.dst)] = u64::from_le_bytes(bytes);
+            return Ok(());
+        }
+    }
+    match side.load(memory, at, N as u8, false) {
+        Ok(value) => {
+            frame[usize::from(op.dst)] = value as u64;
+            Ok(())
+        }
+        Err(fault) => Err((op.imm as u32, Failed::Access(fault, at, false))),
+    }
+}
+
+/// A store of the low `N` bytes, 1 to 8, of one word.
+#[inline(always)]
+fn store<M: Memory, const N: usize>(
+    op: &Op,
+    frame: &[u64],
+    memory: &mut M,
+    side: &mut Side,
+    single: bool,
+) -> Result<(), (u32, Failed)> {
+    let at = frame[usize::from(op.a)];
+    let value = frame[usize::from(op.b)];
+    let exit = op.imm as u32;
+    let code = side.is_code(at, N as u8);
+    if !single && code {
+        return Err((exit, Failed::Retry));
+    }
+    // The common case: no exclusive mark to carry over the store, and
+    // nothing keeps the accesses. A write that fails has changed nothing,
+    // and the general path writes again to say why.
+    if side.exclusive.is_none()
+        && side.log.is_none()
+        && memory.write(at, &value.to_le_bytes()[..N]).is_ok()
+    {
+        side.own_writes += 1;
+        side.code_written |= code;
+        return Ok(());
+    }
+    side.store(memory, at, N as u8, u128::from(value) & bits_mask(N as u8))
+        .map_err(|fault| (exit, Failed::Access(fault, at, true)))
+}
+
 impl Compiled {
-    #[inline(always)]
-    fn pure(code: &[Packed], values: &mut [u128]) -> Result<(), Halt> {
-        for packed in code {
-            let Some(value) = packed.evaluate(values) else {
-                return Err(Halt::Stop(host(
-                    "an arithmetic operation outside its domain",
-                )));
-            };
-            values[packed.output as usize] = value;
-        }
-        Ok(())
-    }
-
-    /// Leave through `exit`: the registers as they were before the
-    /// instruction that could not complete.
-    fn leave(&self, state: &mut State, exit: u32) -> &Leave {
-        let leave = &self.leaves[exit as usize];
-        for (register, scratch) in &leave.outputs {
-            state.slots[*register as usize] = self.values[*scratch as usize];
-        }
-        leave
-    }
-
     /// Make one effect. The error: the exit to leave through, and why.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn effect<M: Memory>(
-        &mut self,
-        effect: Effect,
+        op: &Op,
+        frame: &mut [u64],
+        accesses: &[Access16],
+        calls: &[Call],
         state: &mut State,
         memory: &mut M,
         side: &mut Side,
         single: bool,
     ) -> Result<(), (u32, Failed)> {
-        let values = &mut self.values;
-        match effect {
-            Effect::Call(index) => {
-                let call = &self.calls[index as usize];
-                let mut args = [0u128; CALL_ARGUMENTS];
-                for (arg, slot) in args.iter_mut().zip(&call.args) {
-                    *arg = values[*slot as usize];
+        match op.code {
+            Code::Guard => {
+                if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
+                    return Err((op.imm as u32, Failed::Guard));
                 }
-                let args = &args[..call.args.len()];
-                match call.function {
-                    HelperFn::Pure(function) => {
-                        let (slot, mask) = call.results[0];
-                        values[slot as usize] = function(args) & mask;
-                    }
-                    // An ordered helper sees the state as it was at the
-                    // entry of the block for every register slot: the slots
-                    // are written back at the exit. What it may touch is
-                    // the state that is not in a slot.
-                    HelperFn::Ordered(function) => {
-                        let mut results = [0u128; CALL_ARGUMENTS];
-                        let count = call.results.len().min(CALL_ARGUMENTS);
-                        function(&mut *state, args, &mut results[..count]);
-                        for ((slot, mask), result) in call.results.iter().zip(results) {
-                            values[*slot as usize] = result & mask;
-                        }
-                    }
+                Ok(())
+            }
+            Code::Load1 => load::<M, 1>(op, frame, memory, side),
+            Code::Load2 => load::<M, 2>(op, frame, memory, side),
+            Code::Load4 => load::<M, 4>(op, frame, memory, side),
+            Code::Load8 => load::<M, 8>(op, frame, memory, side),
+            Code::Store1 => store::<M, 1>(op, frame, memory, side, single),
+            Code::Store2 => store::<M, 2>(op, frame, memory, side, single),
+            Code::Store4 => store::<M, 4>(op, frame, memory, side, single),
+            Code::Store8 => store::<M, 8>(op, frame, memory, side, single),
+            Code::Access => Self::access(accesses[op.imm as usize], frame, memory, side, single),
+            Code::Call => {
+                Self::call(&calls[op.imm as usize], frame, state);
+                Ok(())
+            }
+            // `block::step` runs every other code.
+            _ => Ok(()),
+        }
+    }
+
+    #[inline(never)]
+    fn call(call: &Call, frame: &mut [u64], state: &mut State) {
+        let mut args = [0u128; CALL_ARGUMENTS];
+        for (arg, place) in args.iter_mut().zip(&call.args) {
+            *arg = place.read(frame);
+        }
+        let args = &args[..call.args.len()];
+        match call.function {
+            HelperFn::Pure(function) => {
+                let (place, mask) = call.results[0];
+                place.write(frame, function(args) & mask);
+            }
+            // An ordered helper sees the state as it was at the entry of the
+            // block for every register slot: the slots are written back at
+            // the exit. What it may touch is the state that is not in a slot.
+            HelperFn::Ordered(function) => {
+                let mut results = [0u128; CALL_ARGUMENTS];
+                let count = call.results.len().min(CALL_ARGUMENTS);
+                function(&mut *state, args, &mut results[..count]);
+                for ((place, mask), result) in call.results.iter().zip(results) {
+                    place.write(frame, result & mask);
                 }
             }
-            Effect::Guard {
-                condition,
-                expected,
-                exit,
-            } => {
-                if (values[condition as usize] != 0) != expected {
-                    return Err((exit, Failed::Guard));
-                }
-            }
-            Effect::Read {
+        }
+    }
+
+    /// A load or a store of 16 bytes, or an exclusive one.
+    #[inline(never)]
+    fn access<M: Memory>(
+        access: Access16,
+        frame: &mut [u64],
+        memory: &mut M,
+        side: &mut Side,
+        single: bool,
+    ) -> Result<(), (u32, Failed)> {
+        match access {
+            Access16::Read {
                 address,
                 result,
                 bytes,
                 exclusive,
                 exit,
             } => {
-                let at = values[address as usize] as u64;
+                let at = frame[usize::from(address)];
                 match side.load(memory, at, bytes, exclusive) {
-                    Ok(value) => values[result as usize] = value,
+                    Ok(value) => result.write(frame, value),
                     Err(fault) => return Err((exit, Failed::Access(fault, at, false))),
                 }
             }
-            Effect::Write {
+            Access16::Write {
                 address,
                 value,
                 bytes,
                 exclusive,
                 exit,
             } => {
-                let at = values[address as usize] as u64;
-                let value = values[value as usize] & bits_mask(bytes);
+                let at = frame[usize::from(address)];
+                let value = value.read(frame) & bits_mask(bytes);
                 if !single && side.is_code(at, bytes) {
                     return Err((exit, Failed::Retry));
                 }
@@ -787,7 +855,7 @@ impl Compiled {
                         let (_, succeeded) = side
                             .store_exclusive(memory, at, bytes, value)
                             .map_err(|fault| (exit, Failed::Access(fault, at, true)))?;
-                        values[result as usize] = u128::from(!succeeded);
+                        frame[usize::from(result)] = u64::from(!succeeded);
                     }
                 }
             }
@@ -795,50 +863,34 @@ impl Compiled {
         Ok(())
     }
 
-    /// Run the effects of the block, each after the pure code before it.
-    /// `Ok`: the count of `code` entries that have run. `Err`: the block
-    /// left before its end.
-    #[inline(never)]
-    fn effects<M: Memory>(
-        &mut self,
-        state: &mut State,
-        memory: &mut M,
-        side: &mut Side,
-    ) -> Result<usize, (u32, Halt)> {
-        // A block of one instruction makes its stores also into a page of
-        // translated code, and the loop drops the blocks after it.
-        let single = self.instructions == 1;
-        let mut done = 0usize;
-        for index in 0..self.effects.len() {
-            let (before, effect) = self.effects[index];
-            let before = before as usize;
-            Self::pure(&self.code[done..before], &mut self.values).map_err(|halt| (0, halt))?;
-            done = before;
-            if let Err((exit, failed)) = self.effect(effect, state, memory, side, single) {
-                let leave = self.leave(state, exit);
-                let pc = state.pc();
-                let halt = match failed {
-                    Failed::Retry => Halt::Retry,
-                    // The guards of this card are alignment checks, and
-                    // their exit holds the address.
-                    Failed::Guard => Halt::Stop(Stop::Alignment {
-                        pc,
-                        address: leave
-                            .address
-                            .map_or(0, |slot| self.values[slot as usize] as u64),
-                    }),
-                    Failed::Access(Fault::Memory, address, write) => {
-                        Halt::Stop(Stop::DataAbort { pc, address, write })
-                    }
-                    Failed::Access(Fault::Unaligned, address, _) => {
-                        Halt::Stop(Stop::Alignment { pc, address })
-                    }
-                    Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
-                };
-                return Err((leave.completed, halt));
-            }
+    /// Leave through `exit`, which `failed` asked for: the registers as they
+    /// were before the instruction that could not complete.
+    #[cold]
+    fn leave(&self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+        let leave = &self.leaves[exit as usize];
+        for (register, place) in &leave.outputs {
+            state.slots[*register as usize] = place.read(&self.frame);
         }
-        Ok(done)
+        let pc = state.pc();
+        let halt = match failed {
+            Failed::Retry => Halt::Retry,
+            // The guards of this card are alignment checks, and their exit
+            // holds the address.
+            Failed::Guard => Halt::Stop(Stop::Alignment {
+                pc,
+                address: leave
+                    .address
+                    .map_or(0, |slot| self.frame[usize::from(slot)]),
+            }),
+            Failed::Access(Fault::Memory, address, write) => {
+                Halt::Stop(Stop::DataAbort { pc, address, write })
+            }
+            Failed::Access(Fault::Unaligned, address, _) => {
+                Halt::Stop(Stop::Alignment { pc, address })
+            }
+            Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
+        };
+        (leave.completed, Some(halt))
     }
 
     /// Run the block. The count of instructions that completed, and why the
@@ -850,23 +902,40 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        for (scratch, register) in &self.inputs {
-            self.values[*scratch as usize] = state.slots[*register as usize];
+        for (place, register) in &self.inputs {
+            place.write(&mut self.frame, state.slots[*register as usize]);
         }
-        // A block without memory events is its pure code and nothing else.
-        let done = if self.effects.is_empty() {
-            0
-        } else {
-            match self.effects(state, memory, side) {
-                Ok(done) => done,
-                Err((completed, halt)) => return (completed, Some(halt)),
+        // A block of one instruction makes its stores also into a page of
+        // translated code, and the loop drops the blocks after it.
+        let single = self.instructions == 1;
+        for op in &self.ops {
+            if (op.code as u8) < FIRST_EFFECT {
+                if !block::step(op, &mut self.frame, &self.generics) {
+                    return (
+                        0,
+                        Some(Halt::Stop(host(
+                            "an arithmetic operation outside its domain",
+                        ))),
+                    );
+                }
+                continue;
             }
-        };
-        if let Err(halt) = Self::pure(&self.code[done..], &mut self.values) {
-            return (0, Some(halt));
+            let done = Self::effect(
+                op,
+                &mut self.frame,
+                &self.accesses,
+                &self.calls,
+                state,
+                memory,
+                side,
+                single,
+            );
+            if let Err((exit, failed)) = done {
+                return self.leave(state, exit, failed);
+            }
         }
-        for (register, scratch) in &self.outputs {
-            state.slots[*register as usize] = self.values[*scratch as usize];
+        for (register, place) in &self.outputs {
+            state.slots[*register as usize] = place.read(&self.frame);
         }
         (self.instructions, None)
     }
