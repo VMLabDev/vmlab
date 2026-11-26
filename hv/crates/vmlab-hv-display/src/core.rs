@@ -257,12 +257,19 @@ impl Drop for InputClient {
         };
         // A push fails only when the server has stopped: no guest input then.
         for qcode in mine.keys {
-            if !held.clients.values().any(|other| other.keys.contains(&qcode)) {
+            if !held
+                .clients
+                .values()
+                .any(|other| other.keys.contains(&qcode))
+            {
                 let _ = shared.input.push(Message::Key { qcode, down: false });
             }
         }
         if mine.buttons != 0 {
-            let mask = held.clients.values().fold(0, |mask, other| mask | other.buttons);
+            let mask = held
+                .clients
+                .values()
+                .fold(0, |mask, other| mask | other.buttons);
             let _ = shared.input.push(Message::Buttons { mask });
         }
     }
