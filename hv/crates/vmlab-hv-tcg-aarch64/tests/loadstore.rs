@@ -778,8 +778,12 @@ fn an_exclusive_store_compares_the_memory_at_its_own_size_with_the_loaded_value(
     cpu.state.set_x(3, 0x33);
     cpu.state.set_x(4, 0x44);
     cpu.state.set_x(5, DATA + 0x200);
-    cpu.memory.write(DATA + 0x100, &0x42u64.to_le_bytes()).unwrap();
-    cpu.memory.write(DATA + 0x200, &0x42u64.to_le_bytes()).unwrap();
+    cpu.memory
+        .write(DATA + 0x100, &0x42u64.to_le_bytes())
+        .unwrap();
+    cpu.memory
+        .write(DATA + 0x200, &0x42u64.to_le_bytes())
+        .unwrap();
     assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
     assert_eq!(cpu.instructions, 11);
     assert_eq!(
