@@ -16,7 +16,7 @@ target=llvm/lib/Target/AArch64
 ( cd "$src" && "$tblgen" --dump-json -I llvm/include -I "$target" \
     "$target/AArch64.td" -d "$out/aarch64.d" -o "$out/aarch64.json" )
 # The depfile names every file that tblgen read.
-read_files=$(sed -e 's/^[^:]*://' -e 's/\\$//' "$out/aarch64.d" | tr ' ' '\n' | grep '\.td$' | sort -u)
+read_files=$(sed -e 's/^[^:]*://' -e 's/\\$//' "$out/aarch64.d" | tr ' ' '\n' | grep '\.td$' | LC_ALL=C sort -u)
 sums=$(cd "$src" && sha256sum $read_files)
 if [ "${PIN:-0}" = 1 ]; then
     printf '%s\n' "$sums" > "$list"
