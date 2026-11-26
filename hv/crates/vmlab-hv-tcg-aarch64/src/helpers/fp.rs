@@ -179,11 +179,6 @@ impl Format {
     }
 }
 
-/// The format of a scalar FP register operand: single or double.
-const fn scalar(double: bool) -> Format {
-    if double { DOUBLE } else { SINGLE }
-}
-
 /// The SoftFloat exception flags as bits of FPSR.
 fn cumulative(flags: u8) -> u8 {
     let mut bits = 0;
