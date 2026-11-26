@@ -8,7 +8,7 @@
 
 use vmlab_hv_tcg::{FlatMemory, Memory};
 use vmlab_hv_tcg_aarch64::exception::{Cause, Exception};
-use vmlab_hv_tcg_aarch64::oracle::asm::{self, op, reg};
+use vmlab_hv_tcg_aarch64::oracle::asm::{self, op};
 use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 

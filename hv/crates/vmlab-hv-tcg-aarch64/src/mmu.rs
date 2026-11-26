@@ -869,7 +869,7 @@ mod tests {
                 // virtual address, whatever the descriptor holds there.
                 let at = 5 * block;
                 if at >> input == 0 {
-                    tables.map(roots[0], granule, input, at, block_level, 0x40_0000_0000 | 0xff_f000 | VALID | AF);
+                    tables.map(roots[0], granule, input, at, block_level, 0x40_0000_0000 | 0x1f_f000 | VALID | AF);
                     let found = tables.walk(&controls, at + 0x12_3456).unwrap();
                     assert_eq!(found.page, 0x40_0000_0000 + 0x12_3000);
                     assert_eq!((u64::from(found.span), found.level), (u64::from(block.trailing_zeros()), 2));
@@ -960,7 +960,7 @@ mod tests {
         let mut controls = controls(12, 16, roots);
         let va = 0x1234_5000u64;
         let path = tables.map(roots[0], 12, 48, va, 3, 0);
-        let mut flags = |tables: &mut Tables, controls: &Controls, leaf: u64, table: u64| {
+        let flags = |tables: &mut Tables, controls: &Controls, leaf: u64, table: u64| {
             tables.words.insert(path[3], 0x8000_0000 | TABLE | AF | leaf);
             let old = tables.words[&path[1]];
             tables.words.insert(path[1], old & 0x07ff_ffff_ffff_ffff | table);
