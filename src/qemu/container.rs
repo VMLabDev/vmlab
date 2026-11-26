@@ -320,7 +320,10 @@ mod tests {
         p.agent_sock = at("agent.sock");
         p.serial_log = at("console.log");
         p.volumes = vec![("vol-web-0".into(), at("vfs0.sock"))];
-        let c = resolved("container \"web\" { image = \"nginx:1.27\" }", "x86_64");
+        let c = resolved(
+            "container \"web\" { image = \"nginx:1.27\" cpus = 2 memory = 256MiB }",
+            "x86_64",
+        );
         let args = build_container_args_with_accel("lab1", &c, &p, Accel::Kvm).unwrap();
         let mut whole = 0;
         let mut doubled = 0;
