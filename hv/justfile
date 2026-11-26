@@ -131,6 +131,12 @@ tcg-a64-boot-lockstep firmware='../guest/dist/firmware/aarch64' until='Shell>' r
 	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
 	cargo run --release -p vmlab-hv-vmm --example a64_boot_lockstep -- "${args[@]}"
 
+# Run kvm-unit-tests for arm64 on QEMU and on vmlab-hv and compare the result lines (DESIGN.md O5; card C10: selftest, gic, timer, psci); it fetches and builds kvm-unit-tests under target/kvm-unit-tests, and tests names the ones to run, separated by spaces
+[group('tcg')]
+tcg-a64-kvm-unit-tests tests='' timeout='120':
+	cargo build --release -p vmlab-hv
+	python3 scripts/a64-kvm-unit-tests.py --work target/kvm-unit-tests --vmlab-hv "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')/release/vmlab-hv" --timeout {{timeout}} {{tests}}
+
 # Probe every system register encoding on QEMU's cortex-a53 (card C6) and write tests/qemu-cortex-a53-sysregs.txt
 [group('tcg')]
 tcg-a64-sysprobe out='crates/vmlab-hv-tcg-aarch64/tests/qemu-cortex-a53-sysregs.txt' names='': tcg-a64-plugin-build
