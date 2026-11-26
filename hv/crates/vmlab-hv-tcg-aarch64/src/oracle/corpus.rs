@@ -344,7 +344,7 @@ mod tests {
         wrong.writes[1].1[0] ^= 1;
         assert!(wrong.replay().unwrap_err().contains("memory writes"));
         let mut wrong = store.clone();
-        wrong.writes.pop();
+        wrong.writes[1].1.pop();
         assert!(wrong.replay().unwrap_err().contains("memory writes"));
         // ldr w3, [x0]: the memory before is part of the entry.
         let mut after = before;

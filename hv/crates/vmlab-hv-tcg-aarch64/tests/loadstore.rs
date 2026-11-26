@@ -826,9 +826,7 @@ fn stop_at(word: u32, offset: u64) -> Option<Stop> {
 #[test]
 fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
     let aligned = |word: u32, offset: u64| stop_at(word, offset).is_none();
-    let refused = |word: u32, offset: u64| {
-        matches!(stop_at(word, offset), Some(Stop::Alignment { pc, .. }) if pc == BASE)
-    };
+    let refused = |word: u32, offset: u64| matches!(stop_at(word, offset), Some(Stop::Alignment { pc, .. }) if pc == BASE);
     // A register of 8 bytes: a multiple of 8, also with a write back.
     let ldr = word(Record::LDRXpost, &[("rt", 2), ("rn", 0), ("offset", 8)]);
     assert!(aligned(ldr, 8) && refused(ldr, 4) && refused(ldr, 1));
