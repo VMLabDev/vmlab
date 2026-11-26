@@ -1137,3 +1137,71 @@ fn client_connects_to_a_named_socket() {
     h.join().unwrap().unwrap();
     std::fs::remove_file(path).unwrap();
 }
+
+/// Review F10 (docs/reviews/display-2.md). What a connection holds down in
+/// the guest is released when the connection ends. What a second, still
+/// connected client holds stays down, also a key that both held.
+#[test]
+fn a_disconnect_releases_what_the_client_held() {
+    let key = |qcode: &str, down| M::Key {
+        qcode: qcode.into(),
+        down,
+    };
+    let (server, _, messages) = channel_server();
+    let (stay, stay_worker) = client(&server, C::INPUT);
+    stay.send(&key("ctrl", true)).unwrap();
+    stay.send(&key("shift", true)).unwrap();
+    assert_eq!(messages.recv().unwrap(), key("ctrl", true));
+    assert_eq!(messages.recv().unwrap(), key("shift", true));
+    let (leave, leave_worker) = client(&server, C::INPUT);
+    leave.send(&key("alt", true)).unwrap();
+    leave.send(&key("shift", true)).unwrap();
+    leave.send(&M::Buttons { mask: 1 }).unwrap();
+    assert_eq!(messages.recv().unwrap(), key("alt", true));
+    assert_eq!(messages.recv().unwrap(), key("shift", true));
+    assert_eq!(messages.recv().unwrap(), M::Buttons { mask: 1 });
+    drop(leave);
+    leave_worker.join().unwrap().unwrap();
+    // The connection is over. A message of the other client marks the end of
+    // what its end put into the queue.
+    let mark = M::Scroll { dx: 0, dy: 1 };
+    stay.send(&mark).unwrap();
+    assert_eq!(
+        up_to(&messages, &mark),
+        [key("alt", false), M::Buttons { mask: 0 }],
+        "the keys and buttons of the closed client, and no key of the other"
+    );
+    drop(stay);
+    stay_worker.join().unwrap().unwrap();
+    let (last, last_worker) = client(&server, C::INPUT);
+    last.send(&mark).unwrap();
+    assert_eq!(
+        up_to(&messages, &mark),
+        [key("ctrl", false), key("shift", false)]
+    );
+    drop(last);
+    last_worker.join().unwrap().unwrap();
+    server.shutdown();
+}
+
+/// Review F14 (docs/reviews/display-2.md). A source that has no valid frame
+/// when a client connects does not refuse the client: it gets its Hello
+/// reply and the last valid frame.
+#[test]
+fn a_failing_source_does_not_refuse_a_new_client() {
+    let (server, source, _) = server();
+    *source.0.lock().unwrap() = frame(7, 4, 3);
+    server.publish().unwrap();
+    *source.0.lock().unwrap() = frame(9, 4, 0);
+    assert!(server.publish().is_err());
+    let (a, b) = socket();
+    let serving = server.clone();
+    let worker = std::thread::spawn(move || serving.serve_native(a));
+    let c = vmlab_hv_display::Client::from_stream(b, C(C::FRAMES))
+        .expect("the Hello reply, with a source that fails");
+    let (_, fds) = configure(&c);
+    let (_, buffer, ..) = ready(&c);
+    assert_eq!(pixels(&fds[buffer as usize], 48), vec![7; 48]);
+    drop(c);
+    worker.join().unwrap().unwrap();
+}

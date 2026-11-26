@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use vmlab_hv_display::{
@@ -74,5 +74,35 @@ pub fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
         }
         assert!(std::time::Instant::now() < deadline, "condition timed out");
         std::thread::park_timeout(Duration::from_millis(2));
+    }
+}
+
+/// An input sink that hands each message to the test, in order.
+pub struct ChannelSink(pub Mutex<mpsc::Sender<Message>>);
+impl InputSink for ChannelSink {
+    fn input(&self, message: Message) {
+        let _ = self.0.lock().unwrap().send(message);
+    }
+}
+pub fn channel_server() -> (DisplayServer, Arc<Source>, mpsc::Receiver<Message>) {
+    let source = Arc::new(Source(Mutex::new(frame(1, 4, 3))));
+    let (sender, messages) = mpsc::channel();
+    let sink = Arc::new(ChannelSink(Mutex::new(sender)));
+    (
+        DisplayServer::new(source.clone(), sink).unwrap(),
+        source,
+        messages,
+    )
+}
+/// Every message up to `mark`, without it. The wait has no clock: `mark`
+/// must be on its way.
+pub fn up_to(messages: &mpsc::Receiver<Message>, mark: &Message) -> Vec<Message> {
+    let mut seen = Vec::new();
+    loop {
+        let message = messages.recv().unwrap();
+        if message == *mark {
+            return seen;
+        }
+        seen.push(message);
     }
 }
