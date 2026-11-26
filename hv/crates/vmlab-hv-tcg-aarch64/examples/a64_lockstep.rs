@@ -615,6 +615,16 @@ fn finish(
     Ok(())
 }
 
+/// Move the base register of `word`, or the stack pointer when that is its
+/// base, by `offset` bytes.
+fn move_base(x: &mut [u64; 31], sp: &mut u64, word: u32, offset: u64) {
+    match decode(word).and_then(|decoded| vmlab_hv_tcg_aarch64::field(decoded.record, "rn", word)) {
+        Some(31) => *sp = sp.wrapping_add(offset),
+        Some(n) => x[n as usize] = x[n as usize].wrapping_add(offset),
+        None => {}
+    }
+}
+
 /// Run each sequence of words alone and print how its round ended.
 fn probe_rounds(
     run: &mut Run,
@@ -629,14 +639,8 @@ fn probe_rounds(
     }
     for sequence in sequences {
         let first = sequence[0];
-        let (mut x, sp, nzcv) = generator.registers_for(first, WINDOW);
-        let sp = sp.wrapping_add(offset);
-        if let Some(n) = decode(first)
-            .and_then(|decoded| vmlab_hv_tcg_aarch64::field(decoded.record, "rn", first))
-            .filter(|n| *n < 31)
-        {
-            x[n as usize] = x[n as usize].wrapping_add(offset);
-        }
+        let (mut x, mut sp, nzcv) = generator.registers_for(first, WINDOW);
+        move_base(&mut x, &mut sp, first, offset);
         let mut words = sequence.clone();
         words.push(0);
         let round = Round {
@@ -757,21 +761,39 @@ fn memory_rounds(
         decode(*word).is_some_and(|decoded| formats.contains(&decoded.record.info().format))
     });
     // Each encoding runs alone, with a base register that points into the
-    // data, so that it runs to its end.
+    // data, so that it runs to its end. Where its address is not aligned
+    // that way, it runs again at another place of the image (a literal) and
+    // then with the base moved by 1 to 15 bytes: the guest that executed it
+    // had an aligned address.
+    let mut places: Vec<(u64, u64)> = vec![(0, 0), (4, 0), (8, 0), (12, 0)];
+    places.extend((1..16).map(|offset| (0, offset)));
     let (mut executed_verified, mut executed_faulted) = (0usize, 0usize);
+    let mut faulted: Vec<u32> = Vec::new();
     for (index, word) in executed.iter().enumerate() {
-        let registers = generator.registers_for(*word, WINDOW);
-        let round = Round {
-            memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
-            start: core(registers),
-            budget: 2,
-            visits: 1,
-        };
-        let (_, verified) = run.round(&round)?;
-        if verified == 1 {
+        let mut verified = false;
+        for (pc_offset, base_offset) in &places {
+            let (mut x, mut sp, nzcv) = generator.registers_for(*word, WINDOW);
+            move_base(&mut x, &mut sp, *word, *base_offset);
+            let pc = IMAGE_BASE + pc_offset;
+            let round = Round {
+                memory: vec![(pc, bytes(&[*word, 0]))],
+                start: Core {
+                    pc,
+                    ..core((x, sp, nzcv))
+                },
+                budget: 2,
+                visits: 1,
+            };
+            if run.round(&round)?.1 == 1 {
+                verified = true;
+                break;
+            }
+        }
+        if verified {
             executed_verified += 1;
         } else {
             executed_faulted += 1;
+            faulted.push(*word);
         }
         if (index + 1).is_multiple_of(50_000) {
             eprintln!(
@@ -787,10 +809,16 @@ fn memory_rounds(
     header.print(random_rounds, unconstrained);
     print_formats(&run.counts, formats);
     println!(
-        "executed phase: {total_encodings} distinct encodings in {} traces, {} of the group, {executed_verified} verified, {executed_faulted} ended in the same exception on both sides",
+        "executed phase: {total_encodings} distinct encodings in {} traces, {} of the group, {executed_verified} verified, {executed_faulted} ended in the same exception on both sides at every place that was tried",
         traces.len(),
         executed.len()
     );
+    for word in faulted.iter().take(20) {
+        println!(
+            "  not run to its end: {word:08x} {}",
+            decode(*word).map_or("(undefined)", |decoded| decoded.record.name())
+        );
+    }
     println!(
         "memory: {} verified instructions wrote {} bytes, every byte compared",
         run.counts.stores, run.counts.stored_bytes
