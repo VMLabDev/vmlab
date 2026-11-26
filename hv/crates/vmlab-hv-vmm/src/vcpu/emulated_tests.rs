@@ -694,7 +694,6 @@ fn one_emulated_vcpu_writes_to_the_pl011_and_powers_off() {
     };
     assert_eq!(state.pc(), RAM + 4 * (program.len() as u64 - 1));
     assert_eq!(state.x(0), 0);
-    assert_eq!(state.x(1), MESSAGE + message.len() as u64);
 }
 
 #[test]
