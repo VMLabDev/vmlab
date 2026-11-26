@@ -1196,8 +1196,9 @@ access that crosses pages, `LDTR` and `STTR`, alignment, execution, tagged
 addresses, `DC ZVA`, `AT`, every TLBI with and without the ASID of the
 entry, the cache operations, code written through a second address, an
 address that is mapped to other code, and a guest that takes an abort,
-repairs the descriptor and returns to the access. 3 tests run 24 streams of
-`oracle/translate.rs` on our interpreter alone.
+repairs the descriptor and returns to the access. A test of
+`oracle/translate.rs` runs 24 streams on our interpreter alone, through
+every kind of fault.
 
 ### Speed
 
@@ -1242,5 +1243,8 @@ bytes on the path of the wide accesses, not two inlined ones.
 - S2, S3, S4, S5, S7 and S8 were not opened. No chapter of the Arm
   Architecture Reference Manual was opened (the operator's answer Q1 allows
   its prose).
-- X1 to X3 hold: no QEMU source was read, no Arm ASL, XML or pseudocode, no
-  Unicorn.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. Some guesses about the order of two faults came from the
+  author's general knowledge of how an emulator of this kind is built. A
+  guess stayed in the code only where a run of the lockstep confirmed it,
+  and the runs refuted several.
