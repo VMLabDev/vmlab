@@ -394,7 +394,7 @@ impl Leader {
     /// Parse what `pending` holds whole, and keep the memory writes.
     fn drain(&mut self, ahead: &mut Ahead) -> io::Result<()> {
         while let Some((trace, len)) =
-            parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+            parse(&self.pending[self.parsed..], self.vectors, self.system).map_err(other)?
         {
             self.parsed += len;
             match trace {
