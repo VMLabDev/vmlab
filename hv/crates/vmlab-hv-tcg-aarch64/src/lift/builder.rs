@@ -5,14 +5,60 @@
 //! the two's complement identities, and the lockstep against QEMU (S6)
 //! checks them.
 
+use crate::exception::Exception;
 use crate::fields::Condition;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitId, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
-use vmlab_hv_tcg_ir::native::{Binary, Helper, ScalarId, ScalarType, Unary};
+use vmlab_hv_tcg_ir::native::{Binary, Helper, HelperRef, ScalarId, ScalarType, Unary};
 
-/// The class of an exception that ends a block. The exception cards (C6)
-/// add the classes and their syndromes.
+/// A PSTATE field that `MSR` writes with an immediate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PstateField {
+    SpSel,
+    DaifSet,
+    DaifClr,
+}
+
+/// What the last instruction of a block does outside the graph (DESIGN.md
+/// G3d): the loop runs it in Rust after the registers of the block are
+/// written back, with the PC at the instruction. An instruction that can
+/// take an exception, change the level or write a system register ends its
+/// block this way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trap {
+    /// The instruction takes this exception.
+    Exception(Exception),
+    /// A word that no selected record matches: the Undefined Instruction
+    /// exception, and a line in the log of the CPU (G3f). A machine can
+    /// claim the word first (A5).
+    Unknown(u32),
+    Hvc(u16),
+    Smc(u16),
+    Eret,
+    Wfi,
+    Wfe,
+    /// `CLREX`: the exclusive mark of the CPU ends (card C3).
+    ClearExclusive,
+    /// `MRS Xt, <register>`, the register by its encoding.
+    Mrs {
+        encoding: u16,
+        rt: u8,
+    },
+    /// `MSR <register>, Xt`.
+    Msr {
+        encoding: u16,
+        rt: u8,
+    },
+    MsrPstate {
+        field: PstateField,
+        immediate: u8,
+    },
+}
+
+/// The class of an exception that leaves a block before its end, at a load
+/// or a store (card C3). The loop stops for these until the translation card
+/// (C8) gives them their syndromes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExceptionClass {
     Undefined,
@@ -28,11 +74,15 @@ pub enum ExceptionClass {
 pub enum A64Next {
     /// The next PC.
     Pc(ScalarId),
-    /// An exception, with the scalars of its syndrome.
+    /// An exception that leaves the block before one of its instructions,
+    /// with the scalars of its syndrome.
     Exception {
         class: ExceptionClass,
         syndrome: Vec<ScalarId>,
     },
+    /// The instruction at `pc` is the last of the block, and the loop runs
+    /// it.
+    Trap { pc: u64, trap: Trap },
 }
 
 /// The exit payload of an aarch64 block (R8): the register slots that the
@@ -51,6 +101,7 @@ impl ExitScalars for A64Exit {
         match &mut self.next {
             A64Next::Pc(scalar) => visit(scalar),
             A64Next::Exception { syndrome, .. } => syndrome.iter_mut().for_each(visit),
+            A64Next::Trap { .. } => {}
         }
     }
 }
@@ -74,6 +125,8 @@ pub struct Builder {
     pc: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// What the last instruction does outside the graph.
+    trap: Option<Trap>,
     /// The instructions before the one that is being lifted.
     completed: u32,
     started: bool,
@@ -111,6 +164,7 @@ impl Builder {
             context,
             pc,
             branch: None,
+            trap: None,
             completed: 0,
             started: false,
             before: [None; slot::COUNT],
@@ -144,6 +198,12 @@ impl Builder {
     /// The address of the instruction that is being lifted.
     pub fn pc(&self) -> u64 {
         self.pc
+    }
+
+    /// The level, the stack pointer choice and the FP enable that the block
+    /// is lifted for.
+    pub fn context(&self) -> Context {
+        self.context
     }
 
     // --- slots -----------------------------------------------------------
@@ -431,6 +491,25 @@ impl Builder {
             .graph
             .call(ScalarType::Bits(width), helper, args)
             .expect("a pure helper with its count of arguments")
+    }
+
+    /// The result of the ordered helper `helper` on `args`, as `width` bits
+    /// (R10): the call runs once, at this place among the events of the
+    /// block, and sees the state of the CPU that is not in a register slot.
+    pub fn call_ordered(
+        &mut self,
+        width: u16,
+        helper: &'static Helper,
+        args: &[ScalarId],
+    ) -> ScalarId {
+        debug_assert_eq!(usize::from(helper.args), args.len());
+        let result = self.effect(width);
+        self.block.events.push(Event::Call {
+            helper: HelperRef(helper),
+            args: args.to_vec(),
+            results: vec![result],
+        });
+        result
     }
 
     /// FPCR now.
@@ -731,17 +810,24 @@ impl Builder {
         self.branch = Some(target);
     }
 
+    /// The instruction that is being lifted is the last of the block, and
+    /// the loop runs `trap` for it.
+    pub fn trap(&mut self, trap: Trap) {
+        self.trap = Some(trap);
+    }
+
     /// End the block. `fallthrough` is the next PC when no instruction set one.
     pub fn finish(mut self, fallthrough: u64) -> BlockOf<A64Exit> {
-        let next = match self.branch {
-            Some(target) => target,
-            None => self.imm(64, fallthrough),
+        let next = match (self.trap, self.branch) {
+            (Some(trap), _) => A64Next::Trap { pc: self.pc, trap },
+            (None, Some(target)) => A64Next::Pc(target),
+            (None, None) => A64Next::Pc(self.imm(64, fallthrough)),
         };
         let writes = self.writes(self.current, self.written);
         let completed = self.completed + u32::from(self.started);
         let exit = self.block.exit(A64Exit {
             writeback: Writeback { writes },
-            next: A64Next::Pc(next),
+            next,
             completed,
         });
         self.block.events.push(Event::Exit(exit));

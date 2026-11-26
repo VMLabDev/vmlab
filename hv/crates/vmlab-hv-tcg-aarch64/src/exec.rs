@@ -1,10 +1,14 @@
 //! The interpreter loop: translate a block at the PC, run it on the slot
 //! executor of `vmlab-hv-tcg-ir`, write the registers back, repeat.
 //!
-//! Addresses are physical addresses on a `Memory`: no MMU, no exception
-//! entry, no interrupts. An instruction that the loop cannot run stops it
-//! with the reason, and the caller decides. The exception card (C6) turns
-//! the stops into exception entries.
+//! Addresses are physical addresses on a `Memory`: the MMU is card C8. The
+//! loop takes the exceptions and the interrupts of the guest itself
+//! (`exception.rs`) and runs the system instructions that end a block
+//! (`Trap`). It stops for what only its owner can serve: a hypercall, a
+//! `WFI` with no interrupt line high, the end of a budget, and an
+//! instruction that has no lifter yet. A load or a store that fails still
+//! stops it too (`Stop::DataAbort`, `Stop::Alignment`): the translation card
+//! (C8) gives those their syndromes.
 //!
 //! A block is pure scalar code with memory events between it: loads, stores
 //! and guards, in the order of the instructions. Each event names an exit
@@ -21,18 +25,23 @@
 //! architecture leaves open. A store that finds another address, or no
 //! mark, reads no memory and fails. Every exclusive store that completes
 //! ends the mark. A store of this CPU between the two keeps the mark, and
-//! an exception keeps it (the exception return of card C6 ends it).
+//! an exception keeps it. An exception return and `CLREX` end it.
 //!
 //! With more CPUs the store also asks that no other writer reached the
 //! granules of the load (`Memory::store_conditional`), so it fails more
 //! often than QEMU's: a write of another CPU fails it also when it left the
 //! value as it was.
 //!
-//! Sources read: none. This file holds no instruction semantics.
+//! Sources read: S6 for what a system instruction does at each level (the
+//! lockstep of card C6 and the probe of the system registers). This file
+//! holds no other instruction semantics.
 
+use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
-use crate::lift::{A64Exit, A64Next, Builder, Lifted, lift};
+use crate::lift::{A64Exit, A64Next, Builder, Lifted, PstateField, Trap, lift};
 use crate::state::{Context, State, slot};
+use crate::sysreg::{self, Denied, Environment, reg, sctlr};
+use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::linear;
@@ -52,32 +61,102 @@ const CACHE_ENTRIES: usize = 1 << 12;
 /// costs a slower store and nothing else.
 const CODE_PAGE_BITS: usize = 1 << 16;
 
-/// Why the loop stopped. The PC of the state is the instruction that did
-/// not run, and that instruction has changed no register. A store of
-/// several parts (a pair, `ST2` to `ST4`) has written the parts before the
-/// one that failed.
+/// How a guest calls what is above EL1 (DESIGN.md G4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conduit {
+    Hvc,
+    Smc,
+}
+
+/// Why the loop stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stop {
     /// The instruction budget of `run` is used up.
     Budget,
-    /// No selected record matches the word: the Undefined Instruction
-    /// exception.
-    Undefined { pc: u64, word: u32 },
-    /// The record is decoded and has no lifter yet.
+    /// The record is decoded and has no lifter yet. The PC of the state is
+    /// the instruction, and no part of it has changed the state.
     Unimplemented { pc: u64, record: Record },
-    /// The memory holds nothing at the PC: an instruction abort.
-    FetchAbort { pc: u64 },
-    /// The PC is not a multiple of four: the PC alignment exception.
-    PcAlignment { pc: u64 },
     /// The memory holds nothing at the address of a load or a store: a data
-    /// abort.
+    /// abort. The PC of the state is the instruction, which has changed no
+    /// register. A store of several parts (a pair, `ST2` to `ST4`) has
+    /// written the parts before the one that failed.
     DataAbort { pc: u64, address: u64, write: bool },
     /// An access to an address that is not a multiple of its size: an
     /// alignment fault. On this flat memory every load and store asks for
     /// its alignment, as QEMU does with the MMU off.
     Alignment { pc: u64, address: u64 },
+    /// `HVC` or `SMC` at EL1, at the address `pc`. The PC of the state is
+    /// the instruction after it. The machine serves the call (PSCI on
+    /// `virt`) and runs on, or refuses it with `Cpu::refuse_hypercall`.
+    Hypercall {
+        conduit: Conduit,
+        immediate: u16,
+        pc: u64,
+    },
+    /// `WFI` with no interrupt line high. The PC of the state is the
+    /// instruction after it. The machine waits for a line and runs on.
+    Halt,
     /// An error of the host, not of the guest.
     Host(String),
+}
+
+/// An exception or an interrupt that the CPU took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Taken {
+    pub cause: Cause,
+    /// The instruction that took it, or that an interrupt came before.
+    pub from: u64,
+    /// The vector.
+    pub to: u64,
+}
+
+/// What the guest asked for that this CPU does not have (DESIGN.md G3f). The
+/// guest got the Undefined Instruction exception, as the architecture says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Unknown {
+    /// A word that no selected record matches.
+    Encoding(u32),
+    /// `MRS` or `MSR` of a register without a row, or one that the CPU
+    /// model leaves out.
+    Register { encoding: u16, write: bool },
+}
+
+impl std::fmt::Display for Unknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoding(word) => write!(f, "undefined instruction {word:08x}"),
+            Self::Register { encoding, write } => write!(
+                f,
+                "{} of the system register {}, which this CPU does not have",
+                if *write { "write" } else { "read" },
+                sysreg::name(*encoding)
+            ),
+        }
+    }
+}
+
+/// The hook for a register without a row. `write`: the value of an `MSR`.
+/// `Some`: the machine has the register, and the value is what an `MRS`
+/// reads.
+pub type RegisterHook = fn(state: &mut State, encoding: u16, write: Option<u64>) -> Option<u64>;
+
+/// The hook for a word that no selected record matches. `true`: the machine
+/// ran it, and the CPU goes on at the next instruction.
+pub type InstructionHook = fn(state: &mut State, word: u32) -> bool;
+
+/// What a machine adds to the core (DESIGN.md G3e, A5): registers of the
+/// IMPLEMENTATION DEFINED space and instructions of its own. Each hook is
+/// asked before the Undefined Instruction exception is taken.
+#[derive(Clone, Copy, Default)]
+pub struct Hooks {
+    pub register: Option<RegisterHook>,
+    pub instruction: Option<InstructionHook>,
+}
+
+/// Why no block starts at the PC.
+enum Refused {
+    Stop(Stop),
+    Exception(Exception),
 }
 
 /// One access that the CPU made, for a harness that compares them.
@@ -370,6 +449,10 @@ enum Failed {
 /// Why a block left before its end.
 enum Halt {
     Stop(Stop),
+    /// The CPU took an exception or an interrupt without an instruction of
+    /// the block. It costs one instruction of a budget, so that a guest
+    /// with a broken vector does not hold the loop for ever.
+    Taken,
     /// A store into a page that holds translated code, in a block of more
     /// than one instruction. Nothing of the instruction is lost: the loop
     /// runs it alone and then drops the translated blocks.
@@ -393,6 +476,9 @@ struct Compiled {
     inputs: Vec<(u32, u32)>,
     /// Register slot, scratch slot: copied out after it.
     outputs: Vec<(u32, u32)>,
+    /// The last instruction, when the loop runs it: its address and what
+    /// it does.
+    terminal: Option<(u64, Trap)>,
 }
 
 /// The most arguments of a helper.
@@ -505,6 +591,7 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
     match &exit.next {
         A64Next::Pc(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
+        A64Next::Trap { .. } => {}
     }
     roots
 }
@@ -530,6 +617,7 @@ fn compile(
         calls: Vec::new(),
         inputs: Vec::new(),
         outputs: Vec::new(),
+        terminal: None,
     };
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
@@ -591,12 +679,14 @@ fn compile(
             outputs.push((narrow(*register)?, narrow(slots[*scalar])?));
         }
         if let Event::Exit(_) = event {
-            let A64Next::Pc(next) = payload.next else {
-                return Err(host(
-                    "a block that ends in an exception has no executor yet",
-                ));
-            };
-            outputs.push((slot::PC as u32, narrow(slots[next])?));
+            match payload.next {
+                A64Next::Pc(next) => outputs.push((slot::PC as u32, narrow(slots[next])?)),
+                // The loop runs the last instruction, with the PC at it.
+                A64Next::Trap { pc, trap } => compiled.terminal = Some((pc, trap)),
+                A64Next::Exception { .. } => {
+                    return Err(host("a block that ends in the exit of an event"));
+                }
+            }
             compiled.outputs = outputs;
             ended = true;
             continue;
@@ -868,6 +958,10 @@ impl Compiled {
         for (register, scratch) in &self.outputs {
             state.slots[*register as usize] = self.values[*scratch as usize];
         }
+        // The loop runs the last instruction with the PC at it.
+        if let Some((pc, _)) = self.terminal {
+            state.set_pc(pc);
+        }
         (self.instructions, None)
     }
 }
@@ -898,10 +992,26 @@ impl Cache {
 pub struct Cpu<M> {
     pub state: State,
     pub memory: M,
-    /// Instructions that have run since the CPU was made.
+    /// The two interrupt lines of the core (DESIGN.md F3, A6). A machine
+    /// drives them from its interrupt controller. They are levels.
+    pub irq: bool,
+    pub fiq: bool,
+    /// Where the system counter comes from.
+    pub clock: Clock,
+    pub hooks: Hooks,
+    /// The last exception or interrupt that `step` or `run` took. `step`
+    /// clears it first.
+    pub taken: Option<Taken>,
+    /// Exceptions and interrupts taken since the CPU was made.
+    pub exceptions: u64,
+    /// Instructions that have run since the CPU was made. An instruction
+    /// that takes an exception counts.
     pub instructions: u64,
     /// Blocks translated since the CPU was made.
     pub translations: u64,
+    /// What the guest asked for that the CPU does not have, each once. The
+    /// owner of the CPU writes it to its log.
+    pub unknown: std::collections::BTreeSet<Unknown>,
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
@@ -910,14 +1020,25 @@ pub struct Cpu<M> {
     side: Side,
 }
 
+/// The most entries of `Cpu::unknown`. A guest that walks an encoding space
+/// must not fill the memory of the host.
+const UNKNOWN_ENTRIES: usize = 4096;
+
 impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
         Self {
             state,
             memory,
+            irq: false,
+            fiq: false,
+            clock: Clock::Manual(0),
+            hooks: Hooks::default(),
+            taken: None,
+            exceptions: 0,
             instructions: 0,
             translations: 0,
+            unknown: std::collections::BTreeSet::new(),
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
@@ -946,13 +1067,193 @@ impl<M: Memory> Cpu<M> {
         self.side.exclusive = None;
     }
 
+    /// What the system registers read that is not in the state.
+    pub fn environment(&self) -> Environment {
+        Environment {
+            count: self.clock.count(),
+            irq: self.irq,
+            fiq: self.fiq,
+        }
+    }
+
+    /// The output lines of the generic timer now.
+    pub fn timer_lines(&self) -> timer::Lines {
+        timer::lines(&self.state.system.timers, self.clock.count())
+    }
+
+    /// The count of the system counter at which a timer line rises next.
+    pub fn timer_deadline(&self) -> Option<u64> {
+        timer::deadline(&self.state.system.timers, self.clock.count())
+    }
+
+    fn take(&mut self, cause: Cause, pc: u64) {
+        exception::enter(&mut self.state, cause, pc);
+        self.exceptions += 1;
+        self.taken = Some(Taken {
+            cause,
+            from: pc,
+            to: self.state.pc(),
+        });
+    }
+
+    fn raise(&mut self, exception: Exception, pc: u64) {
+        self.take(Cause::Exception(exception), pc);
+    }
+
+    fn note(&mut self, unknown: Unknown) {
+        if self.unknown.len() < UNKNOWN_ENTRIES {
+            self.unknown.insert(unknown);
+        }
+    }
+
+    /// The machine does not serve the hypercall that stopped the loop at
+    /// `pc`: the guest takes the Undefined Instruction exception there, as
+    /// on a CPU without EL2 and EL3.
+    pub fn refuse_hypercall(&mut self, pc: u64) {
+        self.raise(Exception::Undefined, pc);
+    }
+
+    /// `MRS` or `MSR` at `pc`. `Err`: the exception that it takes.
+    fn register(&mut self, encoding: u16, rt: u8, write: bool) -> Result<(), Exception> {
+        let value = match rt {
+            31 => 0,
+            n => self.state.x(usize::from(n)),
+        };
+        let Some(row) = sysreg::find(encoding) else {
+            if let Some(hook) = self.hooks.register
+                && let Some(read) = hook(&mut self.state, encoding, write.then_some(value))
+            {
+                if !write && rt != 31 {
+                    self.state.set_x(usize::from(rt), read);
+                }
+                return Ok(());
+            }
+            self.note(Unknown::Register { encoding, write });
+            return Err(Exception::Undefined);
+        };
+        match sysreg::check(row, write, &self.state) {
+            Ok(()) => {}
+            Err(Denied::Undefined) => {
+                if matches!(sysreg::ROWS[row].kind, sysreg::Kind::Absent(_)) {
+                    self.note(Unknown::Register { encoding, write });
+                }
+                return Err(Exception::Undefined);
+            }
+            Err(Denied::Trapped) => {
+                let iss = sysreg::trap_iss(encoding, rt.into(), write);
+                return Err(Exception::SystemTrap(iss));
+            }
+            Err(Denied::Fp) => return Err(Exception::FpAccess),
+        }
+        let environment = self.environment();
+        if write {
+            sysreg::write(row, &mut self.state, &environment, value);
+            self.state.refresh();
+        } else if rt != 31 {
+            let value = sysreg::read(row, &self.state, &environment);
+            self.state.set_x(usize::from(rt), value);
+        }
+        Ok(())
+    }
+
+    /// `MSR` of a PSTATE field with an immediate.
+    fn pstate(&mut self, field: PstateField, immediate: u8) -> Result<(), Exception> {
+        let el0 = self.state.context.el == 0;
+        match field {
+            PstateField::SpSel if el0 => return Err(Exception::Undefined),
+            PstateField::SpSel => self.state.context.sp_sel = immediate & 1 != 0,
+            PstateField::DaifSet | PstateField::DaifClr => {
+                if el0 && self.state.system.regs[reg::SCTLR_EL1] & sctlr::UMA == 0 {
+                    // op0 0, op1 3, CRn 4, CRm the immediate, Rt 31, a write.
+                    // QEMU reports op1 in the place of op2 and op2 in the
+                    // place of op1 for this form (the lockstep of card C6
+                    // found ESR_EL1 0x620793f6 for `MSR DAIFSet, #11`). We
+                    // follow it (DESIGN.md P2, U1).
+                    let op2 = if field == PstateField::DaifSet { 6 } else { 7 };
+                    let iss = 3 << 17 | op2 << 14 | 4 << 10 | 31 << 5 | u32::from(immediate) << 1;
+                    return Err(Exception::SystemTrap(iss));
+                }
+                if field == PstateField::DaifSet {
+                    self.state.daif |= immediate;
+                } else {
+                    self.state.daif &= !immediate;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the last instruction of a block, at `pc`.
+    fn trap(&mut self, pc: u64, trap: Trap) -> Result<(), Stop> {
+        let el0 = self.state.context.el == 0;
+        let next = pc.wrapping_add(4);
+        let sctlr = self.state.system.regs[reg::SCTLR_EL1];
+        let done = match trap {
+            Trap::Exception(exception) => Err(exception),
+            Trap::Unknown(word) => {
+                if let Some(hook) = self.hooks.instruction
+                    && hook(&mut self.state, word)
+                {
+                    Ok(())
+                } else {
+                    self.note(Unknown::Encoding(word));
+                    Err(Exception::Undefined)
+                }
+            }
+            // A call from EL0 to what is above EL1 does not exist.
+            Trap::Hvc(_) | Trap::Smc(_) if el0 => Err(Exception::Undefined),
+            Trap::Hvc(immediate) | Trap::Smc(immediate) => {
+                self.state.set_pc(next);
+                return Err(Stop::Hypercall {
+                    conduit: if matches!(trap, Trap::Hvc(_)) {
+                        Conduit::Hvc
+                    } else {
+                        Conduit::Smc
+                    },
+                    immediate,
+                    pc,
+                });
+            }
+            Trap::Eret if el0 => Err(Exception::Undefined),
+            Trap::Eret => {
+                exception::exception_return(&mut self.state);
+                self.clear_exclusive();
+                return Ok(());
+            }
+            Trap::ClearExclusive => {
+                self.clear_exclusive();
+                Ok(())
+            }
+            Trap::Wfi if el0 && sctlr & sctlr::NTWI == 0 => Err(Exception::WaitTrap(false)),
+            Trap::Wfi => {
+                self.state.set_pc(next);
+                // A line that is high wakes the CPU, masked or not.
+                return if self.irq || self.fiq {
+                    Ok(())
+                } else {
+                    Err(Stop::Halt)
+                };
+            }
+            Trap::Wfe if el0 && sctlr & sctlr::NTWE == 0 => Err(Exception::WaitTrap(true)),
+            Trap::Wfe => Ok(()),
+            Trap::Mrs { encoding, rt } => self.register(encoding, rt, false),
+            Trap::Msr { encoding, rt } => self.register(encoding, rt, true),
+            Trap::MsrPstate { field, immediate } => self.pstate(field, immediate),
+        };
+        match done {
+            Ok(()) => self.state.set_pc(next),
+            Err(exception) => self.raise(exception, pc),
+        }
+        Ok(())
+    }
+
     /// Translate the block at the PC of the state, of at most `limit`
     /// instructions.
-    fn translate(&mut self, limit: u32) -> Result<Compiled, Stop> {
+    fn translate(&mut self, limit: u32) -> Result<Compiled, Refused> {
         let pc = self.state.pc();
         let context = self.state.context;
         if pc & 3 != 0 {
-            return Err(Stop::PcAlignment { pc });
+            return Err(Refused::Exception(Exception::PcAlignment));
         }
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
@@ -961,21 +1262,36 @@ impl<M: Memory> Cpu<M> {
             let mut bytes = [0u8; 4];
             match self.memory.read(at, &mut bytes) {
                 Ok(()) => {}
-                Err(Error::Memory(_)) if count == 0 => return Err(Stop::FetchAbort { pc }),
+                Err(Error::Memory(_)) if count == 0 => {
+                    // Translation is card C8: the PC is a physical address.
+                    let status = if pc >> self.state.physical_address_bits() != 0 {
+                        exception::ADDRESS_SIZE
+                    } else {
+                        exception::EXTERNAL
+                    };
+                    return Err(Refused::Exception(Exception::InstructionAbort(status)));
+                }
                 // The block ends before the instruction. It is looked at
                 // again as the first of the next block.
                 Err(Error::Memory(_)) => break,
-                Err(error) => return Err(Stop::Host(error.to_string())),
+                Err(error) => return Err(Refused::Stop(Stop::Host(error.to_string()))),
             }
             let word = u32::from_le_bytes(bytes);
-            let Some(decoded) = decode(word) else {
-                if count == 0 {
-                    return Err(Stop::Undefined { pc, word });
-                }
-                break;
-            };
             builder.begin(at);
-            match lift(&mut builder, &decoded) {
+            let lifted = match decode(word) {
+                Some(decoded) => lift(&mut builder, &decoded),
+                // `SMC` needs EL3 in the LLVM tables, so no selected record
+                // matches it. The machine serves it as it serves `HVC`.
+                None if word & 0xffe0_001f == 0xd400_0003 => {
+                    builder.trap(Trap::Smc((word >> 5) as u16));
+                    Lifted::Branch
+                }
+                None => {
+                    builder.trap(Trap::Unknown(word));
+                    Lifted::Branch
+                }
+            };
+            match lifted {
                 Lifted::Next => {
                     count += 1;
                     at = at.wrapping_add(4);
@@ -986,11 +1302,13 @@ impl<M: Memory> Cpu<M> {
                     break;
                 }
                 Lifted::Unsupported if count == 0 => {
-                    return Err(Stop::Unimplemented {
-                        pc,
-                        record: decoded.record,
-                    });
+                    let record = decode(word).map(|decoded| decoded.record);
+                    return Err(Refused::Stop(match record {
+                        Some(record) => Stop::Unimplemented { pc, record },
+                        None => host("a word without a record has no lifter"),
+                    }));
                 }
+                // The block ends before the instruction.
                 Lifted::Unsupported => {
                     builder.unbegin();
                     break;
@@ -1004,7 +1322,7 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(pc);
-        compile(pc, context, count, builder.finish(at))
+        compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)
     }
 
     fn drop_blocks(&mut self) {
@@ -1047,9 +1365,30 @@ impl<M: Memory> Cpu<M> {
         self.side.code_written = false;
     }
 
+    /// Take what does not wait for an instruction: an interrupt whose line
+    /// is high and not masked, then the illegal state. `true`: the CPU is at
+    /// a vector now.
+    fn asynchronous(&mut self) -> bool {
+        let pc = self.state.pc();
+        if let Some(interrupt) = exception::pending(&self.state, self.irq, self.fiq) {
+            self.take(Cause::Interrupt(interrupt), pc);
+            return true;
+        }
+        if self.state.il {
+            self.raise(Exception::IllegalState, pc);
+            return true;
+        }
+        false
+    }
+
     /// Run the block at the PC: one instruction when `single`, else a whole
+    /// block, with the last instruction that the loop runs itself. An
+    /// interrupt, the illegal state and a fetch that fails come before the
     /// block. `Err`: no block could be made.
     fn run_block(&mut self, single: bool) -> Result<(u32, Option<Halt>), Stop> {
+        if (self.irq || self.fiq || self.state.il) && self.asynchronous() {
+            return Ok((0, Some(Halt::Taken)));
+        }
         let pc = self.state.pc();
         let context = self.state.context;
         let index = Cache::index(pc);
@@ -1061,7 +1400,14 @@ impl<M: Memory> Cpu<M> {
         };
         if !hit {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
-            let compiled = Box::new(self.translate(limit)?);
+            let compiled = match self.translate(limit) {
+                Ok(compiled) => Box::new(compiled),
+                Err(Refused::Stop(stop)) => return Err(stop),
+                Err(Refused::Exception(exception)) => {
+                    self.raise(exception, pc);
+                    return Ok((0, Some(Halt::Taken)));
+                }
+            };
             let cache = if single {
                 &mut self.singles
             } else {
@@ -1077,21 +1423,32 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        Ok(block.run(&mut self.state, &mut self.memory, &mut self.side))
+        let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+        let terminal = block.terminal;
+        Ok((count, self.finish(halt, terminal)))
     }
 
-    /// Run exactly one instruction.
+    /// Run the last instruction of a block that ran to its end.
+    fn finish(&mut self, halt: Option<Halt>, terminal: Option<(u64, Trap)>) -> Option<Halt> {
+        match (halt, terminal) {
+            (None, Some((pc, trap))) => self.trap(pc, trap).err().map(Halt::Stop),
+            (halt, _) => halt,
+        }
+    }
+
+    /// Run exactly one instruction, or take the interrupt or the exception
+    /// that comes before it. `taken` says which.
     pub fn step(&mut self) -> Result<(), Stop> {
+        self.taken = None;
         self.check_generation();
         let result = self.run_block(true);
         self.settle();
-        match result? {
-            (count, None) => {
-                self.instructions += u64::from(count);
-                Ok(())
-            }
-            (_, Some(Halt::Stop(stop))) => Err(stop),
-            (_, Some(Halt::Retry)) => Err(host("a block of one instruction asked to run alone")),
+        let (count, halt) = result?;
+        self.instructions += u64::from(count);
+        match halt {
+            None | Some(Halt::Taken) => Ok(()),
+            Some(Halt::Stop(stop)) => Err(stop),
+            Some(Halt::Retry) => Err(host("a block of one instruction asked to run alone")),
         }
     }
 
@@ -1108,13 +1465,17 @@ impl<M: Memory> Cpu<M> {
         while left > 0 {
             let pc = self.state.pc();
             let context = self.state.context;
+            let quiet = !(self.irq || self.fiq || self.state.il);
             // The common case: the block is translated and fits the budget.
-            let outcome = if let Some(block) = self.blocks.entries[Cache::index(pc)].as_mut()
+            let outcome = if quiet
+                && let Some(block) = self.blocks.entries[Cache::index(pc)].as_mut()
                 && block.pc == pc
                 && block.context == context
                 && u64::from(block.instructions) <= left
             {
-                block.run(&mut self.state, &mut self.memory, &mut self.side)
+                let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+                let terminal = block.terminal;
+                (count, self.finish(halt, terminal))
             } else {
                 // A whole block where the budget allows one, else one
                 // instruction. A block that is not translated yet can be as
@@ -1137,6 +1498,7 @@ impl<M: Memory> Cpu<M> {
             left = left.saturating_sub(u64::from(count));
             match halt {
                 None => {}
+                Some(Halt::Taken) => left = left.saturating_sub(1),
                 Some(Halt::Stop(stop)) => return stop,
                 Some(Halt::Retry) => {
                     // The store goes into a page of translated code. The
@@ -1149,8 +1511,10 @@ impl<M: Memory> Cpu<M> {
                         Ok((count, halt)) => {
                             self.instructions += u64::from(count);
                             left = left.saturating_sub(u64::from(count));
-                            if let Some(Halt::Stop(stop)) = halt {
-                                return stop;
+                            match halt {
+                                Some(Halt::Stop(stop)) => return stop,
+                                Some(Halt::Taken) => left = left.saturating_sub(1),
+                                _ => {}
                             }
                         }
                         Err(stop) => return stop,
@@ -1187,12 +1551,8 @@ mod tests {
     fn a_counted_loop_runs_to_its_end_with_the_flags_of_the_last_compare() {
         let mut cpu = cpu(&LOOP);
         cpu.state.set_x(1, 1000);
-        // The word after the loop is zero: UDF, which is not in the group.
-        let stop = cpu.run(u64::MAX);
-        assert!(
-            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 12),
-            "{stop:?}"
-        );
+        assert_eq!(cpu.run(3000), Stop::Budget);
+        assert_eq!(cpu.taken, None);
         assert_eq!(cpu.state.x(0), 1000);
         assert_eq!(cpu.state.x(1), 0);
         assert_eq!(cpu.state.pc(), BASE + 12);
@@ -1219,39 +1579,447 @@ mod tests {
         }
     }
 
+    /// The vector table of the tests: `VBAR_EL1` points at the second page.
+    const VECTORS: u64 = BASE + 0x1000;
+
+    fn with_vectors(words: &[u32]) -> Cpu<FlatMemory> {
+        let mut cpu = cpu(words);
+        cpu.state.system.regs[reg::VBAR_EL1] = VECTORS;
+        cpu
+    }
+
+    fn sync(exception: Exception, from: u64, to: u64) -> Option<Taken> {
+        Some(Taken {
+            cause: Cause::Exception(exception),
+            from,
+            to,
+        })
+    }
+
     #[test]
-    fn what_cannot_run_stops_the_loop_with_its_reason_and_an_unchanged_state() {
-        // Outside the memory.
-        let mut cpu = cpu(&[]);
+    fn what_cannot_run_is_an_exception_of_the_guest() {
+        // Outside the memory: an instruction abort, with the PC in FAR_EL1.
+        let mut cpu = with_vectors(&[]);
         cpu.state.set_pc(0x1000);
-        let before = cpu.state.clone();
-        assert_eq!(cpu.run(10), Stop::FetchAbort { pc: 0x1000 });
-        assert_eq!(cpu.state, before);
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            sync(
+                Exception::InstructionAbort(exception::EXTERNAL),
+                0x1000,
+                VECTORS + 0x200
+            )
+        );
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x8600_0010);
+        assert_eq!(cpu.state.system.regs[reg::FAR_EL1], 0x1000);
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], 0x1000);
+        // A PC above the 40 bits of a physical address: an address size fault.
+        cpu.state.set_pc(1 << 40);
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x8600_0000);
+        assert_eq!(cpu.state.system.regs[reg::FAR_EL1], 1 << 40);
         // Not a multiple of four.
         cpu.state.set_pc(BASE + 2);
-        assert_eq!(cpu.step(), Err(Stop::PcAlignment { pc: BASE + 2 }));
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            sync(Exception::PcAlignment, BASE + 2, VECTORS + 0x200)
+        );
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x8a00_0000);
+        assert_eq!(cpu.state.system.regs[reg::FAR_EL1], BASE + 2);
         // An encoding that no record of the selected sets matches: an add
         // with the immediate shift 2, which tables/constraints.toml refuses.
-        let mut cpu = self::cpu(&[0x9180_0400]);
+        // The block ends in it, and the log of the CPU names it once.
+        let mut cpu = with_vectors(&[0x9100_0400, 0x9180_0400]);
+        assert_eq!(cpu.run(2), Stop::Budget);
         assert_eq!(
-            cpu.run(10),
-            Stop::Undefined {
-                pc: BASE,
-                word: 0x9180_0400
-            }
-        );
-        // A block ends before an instruction that cannot run, and the next
-        // attempt names it.
-        let mut cpu = self::cpu(&[0x9100_0400, 0x9180_0400]);
-        assert_eq!(
-            cpu.run(10),
-            Stop::Undefined {
-                pc: BASE + 4,
-                word: 0x9180_0400
-            }
+            cpu.taken,
+            sync(Exception::Undefined, BASE + 4, VECTORS + 0x200)
         );
         assert_eq!(cpu.state.x(0), 1);
-        assert_eq!(cpu.instructions, 1);
+        assert_eq!(cpu.instructions, 2);
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x0200_0000);
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], BASE + 4);
+        assert_eq!(cpu.state.system.regs[reg::SPSR_EL1], 0x3c5);
+        assert_eq!(
+            cpu.unknown.iter().copied().collect::<Vec<_>>(),
+            vec![Unknown::Encoding(0x9180_0400)]
+        );
+        assert_eq!(
+            Unknown::Encoding(0x9180_0400).to_string(),
+            "undefined instruction 91800400"
+        );
+        // UDF is undefined and is no unknown encoding.
+        let mut cpu = with_vectors(&[0]);
+        cpu.step().unwrap();
+        assert_eq!(cpu.taken, sync(Exception::Undefined, BASE, VECTORS + 0x200));
+        assert!(cpu.unknown.is_empty());
+        // A guest whose vector is not in the memory takes one abort after the
+        // other, and the budget still ends the run.
+        let mut cpu = self::cpu(&[0]);
+        assert_eq!(cpu.run(10), Stop::Budget);
+        assert_eq!(cpu.exceptions, 10);
+        assert_eq!(cpu.state.pc(), 0x200);
+    }
+
+    // The words of the system tests.
+    const SVC_7: u32 = 0xd400_00e1;
+    const HVC_0: u32 = 0xd400_0002;
+    const SMC_5: u32 = 0xd400_00a3;
+    const ERET: u32 = 0xd69f_03e0;
+    const WFI: u32 = 0xd503_207f;
+    const WFE: u32 = 0xd503_205f;
+    const NOP: u32 = 0xd503_201f;
+
+    fn mrs(rt: u32, name: &str) -> u32 {
+        0xd520_0000 | u32::from(sysreg::ROWS[sysreg::index(name)].encoding) << 5 | rt
+    }
+
+    fn msr(name: &str, rt: u32) -> u32 {
+        0xd500_0000 | u32::from(sysreg::ROWS[sysreg::index(name)].encoding) << 5 | rt
+    }
+
+    /// Put `words` at the vector that EL0 takes its synchronous exceptions
+    /// to, and at the one of EL1 with SP_EL1.
+    fn handler(cpu: &mut Cpu<FlatMemory>, words: &[u32]) {
+        for offset in [0x200u64, 0x400] {
+            for (index, word) in words.iter().enumerate() {
+                cpu.memory
+                    .write(VECTORS + offset + 4 * index as u64, &word.to_le_bytes())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_system_call_from_el0_and_its_return() {
+        // svc #7 ; add x0, x0, #1. The handler: add x1, x1, #1 ; eret.
+        let mut cpu = with_vectors(&[SVC_7, 0x9100_0400]);
+        handler(&mut cpu, &[0x9100_0421, ERET]);
+        assert!(cpu.state.set_cpsr(0x2000_0000));
+        cpu.state.slots[slot::SP_EL0] = 0x1000;
+        cpu.state.slots[slot::SP_EL1] = 0x2000;
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            sync(Exception::SupervisorCall(7), BASE, VECTORS + 0x400)
+        );
+        assert_eq!(cpu.state.cpsr(), 0x3c5);
+        assert_eq!(cpu.state.sp(), 0x2000);
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x5600_0007);
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], BASE + 4);
+        assert_eq!(cpu.state.system.regs[reg::SPSR_EL1], 0x2000_0000);
+        assert_eq!(cpu.run(3), Stop::Budget);
+        assert_eq!((cpu.state.x(0), cpu.state.x(1)), (1, 1));
+        assert_eq!(cpu.state.cpsr(), 0x2000_0000);
+        assert_eq!(cpu.state.sp(), 0x1000);
+        assert_eq!(cpu.state.pc(), BASE + 8);
+        // ERET at EL0 is undefined.
+        let mut cpu = with_vectors(&[ERET]);
+        assert!(cpu.state.set_cpsr(0));
+        cpu.step().unwrap();
+        assert_eq!(cpu.taken, sync(Exception::Undefined, BASE, VECTORS + 0x400));
+        // A return to a state that does not exist leaves the level, and the
+        // next instruction takes the Illegal Execution State exception.
+        let mut cpu = with_vectors(&[ERET, NOP]);
+        cpu.state.system.regs[reg::SPSR_EL1] = 0x3c9;
+        cpu.state.system.regs[reg::ELR_EL1] = BASE + 4;
+        cpu.step().unwrap();
+        assert_eq!(cpu.taken, None);
+        assert_eq!(cpu.state.cpsr(), 0x0010_03c5);
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            sync(Exception::IllegalState, BASE + 4, VECTORS + 0x200)
+        );
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x3a00_0000);
+        assert_eq!(cpu.state.system.regs[reg::SPSR_EL1], 0x0010_03c5);
+        assert_eq!(cpu.state.cpsr(), 0x3c5);
+    }
+
+    #[test]
+    fn hypercalls_leave_the_core_with_their_conduit() {
+        let mut cpu = with_vectors(&[HVC_0, SMC_5, NOP]);
+        assert_eq!(
+            cpu.run(10),
+            Stop::Hypercall {
+                conduit: Conduit::Hvc,
+                immediate: 0,
+                pc: BASE
+            }
+        );
+        assert_eq!(cpu.state.pc(), BASE + 4);
+        assert_eq!(cpu.taken, None);
+        assert_eq!(
+            cpu.step(),
+            Err(Stop::Hypercall {
+                conduit: Conduit::Smc,
+                immediate: 5,
+                pc: BASE + 4
+            })
+        );
+        assert_eq!(cpu.state.pc(), BASE + 8);
+        // A machine that does not serve the call refuses it.
+        cpu.refuse_hypercall(BASE + 4);
+        assert_eq!(
+            cpu.taken,
+            sync(Exception::Undefined, BASE + 4, VECTORS + 0x200)
+        );
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], BASE + 4);
+        // From EL0 neither call exists.
+        for word in [HVC_0, SMC_5] {
+            let mut cpu = with_vectors(&[word]);
+            assert!(cpu.state.set_cpsr(0));
+            cpu.step().unwrap();
+            assert_eq!(cpu.taken, sync(Exception::Undefined, BASE, VECTORS + 0x400));
+        }
+        // SMC is no unknown encoding.
+        assert!(cpu.unknown.is_empty());
+    }
+
+    #[test]
+    fn an_interrupt_line_is_taken_between_blocks_when_its_mask_is_clear() {
+        let mut cpu = with_vectors(&LOOP);
+        cpu.state.set_x(1, 1000);
+        cpu.irq = true;
+        // Masked at the reset: the loop runs.
+        assert_eq!(cpu.run(30), Stop::Budget);
+        assert_eq!(cpu.taken, None);
+        // msr daifclr, #2 in the loop would unmask. Here the owner does.
+        cpu.state.daif = 0b1101;
+        let before = cpu.state.pc();
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            Some(Taken {
+                cause: Cause::Interrupt(exception::Interrupt::Irq),
+                from: before,
+                to: VECTORS + 0x280
+            })
+        );
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], before);
+        assert_eq!(cpu.state.daif, 0xf);
+        // FIQ has its own mask and its own vector, from EL0 too.
+        let mut cpu = with_vectors(&LOOP);
+        assert!(cpu.state.set_cpsr(0x80));
+        cpu.fiq = true;
+        cpu.irq = true;
+        assert_eq!(cpu.run(1), Stop::Budget);
+        assert_eq!(cpu.state.pc(), VECTORS + 0x500);
+        assert_eq!(cpu.state.system.regs[reg::SPSR_EL1], 0x80);
+        assert_eq!(cpu.instructions, 0);
+    }
+
+    #[test]
+    fn wfi_halts_until_a_line_is_high_and_traps_from_el0() {
+        let mut cpu = with_vectors(&[WFI, NOP, WFI, WFE, NOP]);
+        assert_eq!(cpu.run(10), Stop::Halt);
+        assert_eq!(cpu.state.pc(), BASE + 4);
+        // A masked line still wakes the CPU: the second WFI runs through.
+        cpu.irq = true;
+        assert_eq!(cpu.run(4), Stop::Budget);
+        assert_eq!(cpu.state.pc(), BASE + 20);
+        assert_eq!(cpu.taken, None);
+        // At EL0 with SCTLR_EL1.nTWI clear, WFI is trapped. WFE likewise.
+        for (word, wfe, bit) in [(WFI, false, sctlr::NTWI), (WFE, true, sctlr::NTWE)] {
+            let mut cpu = with_vectors(&[word, NOP]);
+            assert!(cpu.state.set_cpsr(0x3c0));
+            cpu.irq = true;
+            cpu.state.system.regs[reg::SCTLR_EL1] &= !bit;
+            cpu.step().unwrap();
+            assert_eq!(
+                cpu.taken,
+                sync(Exception::WaitTrap(wfe), BASE, VECTORS + 0x400)
+            );
+            assert_eq!(
+                cpu.state.system.regs[reg::ESR_EL1],
+                0x07e0_0000 | u64::from(wfe)
+            );
+            // With the bit set, as it is after the reset, it runs.
+            let mut cpu = with_vectors(&[word, NOP]);
+            assert!(cpu.state.set_cpsr(0x3c0));
+            cpu.irq = true;
+            assert_ne!(cpu.state.system.regs[reg::SCTLR_EL1] & bit, 0);
+            cpu.step().unwrap();
+            assert_eq!(cpu.taken, None);
+            assert_eq!(cpu.state.pc(), BASE + 4);
+        }
+    }
+
+    #[test]
+    fn the_timer_raises_its_line_and_the_interrupt_wakes_wfi() {
+        // msr cntv_cval_el0, x0 ; msr cntv_ctl_el0, x1 ; mrs x2, cntv_ctl_el0 ;
+        // mrs x3, cntvct_el0 ; wfi ; nop
+        let mut cpu = with_vectors(&[
+            msr("CNTV_CVAL_EL0", 0),
+            msr("CNTV_CTL_EL0", 1),
+            mrs(2, "CNTV_CTL_EL0"),
+            mrs(3, "CNTVCT_EL0"),
+            WFI,
+            NOP,
+        ]);
+        cpu.clock = Clock::Manual(100);
+        cpu.state.set_x(0, 500);
+        cpu.state.set_x(1, 1);
+        assert_eq!(cpu.run(10), Stop::Halt);
+        assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 100));
+        assert_eq!(cpu.timer_lines(), timer::Lines::default());
+        assert_eq!(cpu.timer_deadline(), Some(500));
+        // The machine waits until the deadline and wires the line to IRQ.
+        cpu.clock = Clock::Manual(500);
+        assert!(cpu.timer_lines().virtual_);
+        assert_eq!(cpu.timer_deadline(), None);
+        cpu.irq = cpu.timer_lines().virtual_;
+        cpu.state.daif = 0;
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken.map(|taken| (taken.from, taken.to)),
+            Some((BASE + 20, VECTORS + 0x280))
+        );
+        // The handler masks the timer, and the line falls.
+        cpu.state.system.timers[1].set_control(3);
+        assert!(!cpu.timer_lines().virtual_);
+    }
+
+    #[test]
+    fn an_fp_instruction_traps_while_cpacr_disables_fp() {
+        // fadd d0, d1, d2 ; msr cpacr_el1, x0 ; fadd d0, d1, d2
+        let mut cpu = with_vectors(&[0x1e62_2820, msr("CPACR_EL1", 0), 0x1e62_2820]);
+        handler(
+            &mut cpu,
+            &[0x9100_0421, 0xd538_4031, 0x9100_1231, 0xd518_4031, ERET],
+        );
+        cpu.state.set_x(0, 3 << 20);
+        cpu.step().unwrap();
+        assert_eq!(cpu.taken, sync(Exception::FpAccess, BASE, VECTORS + 0x200));
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x1fe0_0000);
+        assert_eq!(cpu.state.system.regs[reg::ELR_EL1], BASE);
+        // The handler skips the instruction (mrs x17, elr_el1 ; add x17,
+        // x17, #4 ; msr elr_el1, x17), the guest enables FP, and the block
+        // that follows is lifted for the new context.
+        cpu.state.set_v(1, u128::from(1.5f64.to_bits()));
+        cpu.state.set_v(2, u128::from(2.25f64.to_bits()));
+        assert_eq!(cpu.run(7), Stop::Budget);
+        assert!(cpu.state.context.fp);
+        assert_eq!(cpu.state.v(0), u128::from(3.75f64.to_bits()));
+        assert_eq!(cpu.exceptions, 1);
+    }
+
+    #[test]
+    fn a_read_of_a_stored_register_stays_in_its_block() {
+        // mrs x0, tpidr_el1 ; add x0, x0, #1 ; mrs x1, tpidr_el0 ;
+        // mrs x2, midr_el1 ; mrs xzr, tpidr_el1 ; mrs x3, cntvct_el0 ; b .
+        let words = [
+            mrs(0, "TPIDR_EL1"),
+            0x9100_0400,
+            mrs(1, "TPIDR_EL0"),
+            mrs(2, "MIDR_EL1"),
+            mrs(31, "TPIDR_EL1"),
+            mrs(3, "CNTVCT_EL0"),
+            0x1400_0000,
+        ];
+        let mut cpu = with_vectors(&words);
+        cpu.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x1000;
+        cpu.state.system.regs[sysreg::index("TPIDR_EL0")] = 0x2000;
+        cpu.clock = Clock::Manual(77);
+        assert_eq!(cpu.run(64), Stop::Budget);
+        // The counter is computed, so it ends the block. The five
+        // instructions before it are one block with it, and the branch to
+        // itself is the second block.
+        assert_eq!(cpu.translations, 2);
+        assert_eq!(
+            (
+                cpu.state.x(0),
+                cpu.state.x(1),
+                cpu.state.x(2),
+                cpu.state.x(3)
+            ),
+            (0x1001, 0x2000, 0x000f_3d00, 77)
+        );
+        // Stepping gives the same, and a second run of the cached block
+        // reads the words as they are then.
+        let mut step = with_vectors(&words);
+        step.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x1000;
+        step.state.system.regs[sysreg::index("TPIDR_EL0")] = 0x2000;
+        step.clock = Clock::Manual(77);
+        for _ in 0..7 {
+            step.step().unwrap();
+        }
+        assert_eq!(step.state.slots[..31], cpu.state.slots[..31]);
+        cpu.state.system.regs[sysreg::index("TPIDR_EL1")] = 0x5000;
+        cpu.state.set_pc(BASE);
+        assert_eq!(cpu.run(7), Stop::Budget);
+        assert_eq!(cpu.state.x(0), 0x5001);
+        assert_eq!(cpu.translations, 2);
+        // At EL0 only what EL0 may read without a control bit stays inside:
+        // TPIDR_EL1 is undefined there, and CTR_EL0 asks SCTLR_EL1.
+        assert!(sysreg::reads_stored(sysreg::index("TPIDR_EL0"), 0));
+        assert!(!sysreg::reads_stored(sysreg::index("TPIDR_EL1"), 0));
+        assert!(!sysreg::reads_stored(sysreg::index("CTR_EL0"), 0));
+        assert!(sysreg::reads_stored(sysreg::index("CTR_EL0"), 1));
+        assert!(!sysreg::reads_stored(sysreg::index("OSLAR_EL1"), 1));
+        let mut user = with_vectors(&[mrs(0, "TPIDR_EL1")]);
+        assert!(user.state.set_cpsr(0x3c0));
+        user.step().unwrap();
+        assert_eq!(
+            user.taken,
+            sync(Exception::Undefined, BASE, VECTORS + 0x400)
+        );
+    }
+
+    #[test]
+    fn a_machine_adds_registers_and_instructions_through_the_hooks() {
+        // S3_0_C15_C0_0: IMPLEMENTATION DEFINED, no row.
+        const ENCODING: u16 = sysreg::encoding(3, 0, 15, 0, 0);
+        fn register(state: &mut State, encoding: u16, write: Option<u64>) -> Option<u64> {
+            if encoding != ENCODING {
+                return None;
+            }
+            if let Some(value) = write {
+                state.set_x(9, value + 1);
+            }
+            Some(0x1234)
+        }
+        fn instruction(state: &mut State, word: u32) -> bool {
+            state.set_x(10, word.into());
+            word == 0x0020_1234
+        }
+        let read = 0xd520_0000 | u32::from(ENCODING) << 5 | 3;
+        let write = 0xd500_0000 | u32::from(ENCODING) << 5 | 4;
+        let other = read + (1 << 5);
+        let words = [read, write, 0x0020_1234, other, 0x0020_9999];
+        let mut cpu = with_vectors(&words);
+        cpu.hooks.register = Some(register);
+        cpu.hooks.instruction = Some(instruction);
+        cpu.state.set_x(4, 41);
+        assert_eq!(cpu.run(3), Stop::Budget);
+        assert_eq!(cpu.taken, None);
+        assert_eq!((cpu.state.x(3), cpu.state.x(9)), (0x1234, 42));
+        assert_eq!(cpu.state.x(10), 0x0020_1234);
+        assert_eq!(cpu.state.pc(), BASE + 12);
+        // What the machine does not claim is undefined and is in the log.
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.taken,
+            sync(Exception::Undefined, BASE + 12, VECTORS + 0x200)
+        );
+        cpu.state.set_pc(BASE + 16);
+        cpu.step().unwrap();
+        assert_eq!(
+            cpu.unknown
+                .iter()
+                .map(Unknown::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "undefined instruction 00209999".to_string(),
+                "read of the system register S3_0_C15_C0_1, which this CPU does not have"
+                    .to_string(),
+            ]
+        );
+        // Without hooks the first word is undefined too.
+        let mut cpu = with_vectors(&words);
+        cpu.step().unwrap();
+        assert_eq!(cpu.taken, sync(Exception::Undefined, BASE, VECTORS + 0x200));
     }
 
     #[test]
@@ -1279,12 +2047,8 @@ mod tests {
         cpu.state.set_v(2, u128::from(2.25f64.to_bits()));
         cpu.state.set_v(3, u128::MAX);
         cpu.state.set_x(5, u64::MAX);
-        // The word after them is zero: UDF, which has no lifter.
-        let stop = cpu.run(u64::MAX);
-        assert!(
-            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 16),
-            "{stop:?}"
-        );
+        cpu.state.enable_fp();
+        assert_eq!(cpu.run(4), Stop::Budget);
         // A scalar result clears the register above it.
         assert_eq!(cpu.state.v(0), u128::from(3.75f64.to_bits()));
         assert_eq!(cpu.state.v(3), u128::from(f64::INFINITY.to_bits()));
@@ -1293,8 +2057,7 @@ mod tests {
         assert_eq!(cpu.state.nzcv(), 0b1000);
         // A division by zero, then an inexact conversion. The bits stay.
         assert_eq!(cpu.state.fpsr(), u32::from(fpsr::DZC | fpsr::IXC));
-        // The four instructions were one block, and stepping gives the same.
-        assert_eq!(cpu.translations, 1);
+        // Stepping gives the same.
         let mut step = self::cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
         step.state.set_v(0, u128::MAX);
         step.state
@@ -1302,6 +2065,7 @@ mod tests {
         step.state.set_v(2, u128::from(2.25f64.to_bits()));
         step.state.set_v(3, u128::MAX);
         step.state.set_x(5, u64::MAX);
+        step.state.enable_fp();
         for _ in 0..4 {
             step.step().unwrap();
         }
@@ -1321,6 +2085,7 @@ mod tests {
             cpu.state.set_v(1, u128::from(1.0f32.to_bits()));
             cpu.state.set_v(2, u128::from(3.0f32.to_bits()));
             cpu.state.set_fpcr(mode << 22);
+            cpu.state.enable_fp();
             cpu.step().unwrap();
             assert_eq!(cpu.state.v(0), u128::from(expected), "mode {mode}");
             assert_eq!(cpu.state.fpsr(), 0x10);
@@ -1413,6 +2178,14 @@ mod tests {
         assert_eq!(cpu.state.x(0), 0x800);
         assert_eq!(cpu.translations, u64::from(0x800 / BLOCK_INSTRUCTIONS));
         assert_eq!(cpu.state.pc(), BASE + 0x2000);
-        assert_eq!(cpu.run(1), Stop::FetchAbort { pc: BASE + 0x2000 });
+        // The memory ends there: an instruction abort.
+        assert_eq!(cpu.run(1), Stop::Budget);
+        assert_eq!(
+            cpu.taken.map(|taken| (taken.cause, taken.from)),
+            Some((
+                Cause::Exception(Exception::InstructionAbort(exception::EXTERNAL)),
+                BASE + 0x2000
+            ))
+        );
     }
 }

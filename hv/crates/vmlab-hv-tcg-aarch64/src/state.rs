@@ -2,7 +2,9 @@
 //! state that is not in a slot.
 //!
 //! Sources read: none beyond the public register names. The layout is ours.
+//! The system registers are in `sysreg.rs`.
 
+use crate::sysreg::{CpuModel, System, V8_0, reg};
 use vmlab_hv_tcg_ir::native::ScalarType;
 use vmlab_hv_tcg_ir::native::regfile::{RegisterFile, Slot};
 
@@ -123,6 +125,9 @@ pub struct Context {
     pub el: u8,
     /// PSTATE.SP: the stack pointer of the current level, not SP_EL0.
     pub sp_sel: bool,
+    /// FP and AdvSIMD instructions run at this level: CPACR_EL1.FPEN allows
+    /// them. Otherwise each one traps.
+    pub fp: bool,
 }
 
 impl Context {
@@ -145,6 +150,17 @@ pub struct State {
     pub context: Context,
     /// PSTATE.D, A, I and F as the bits 3 to 0.
     pub daif: u8,
+    /// PSTATE.IL: the next instruction takes the Illegal Execution State
+    /// exception.
+    pub il: bool,
+    /// Bit 13 of PSTATE in the layout of an SPSR. It does nothing on this
+    /// CPU. QEMU's `cortex-a53` takes it from SPSR_EL1 at an exception return
+    /// to a state that does not exist, shows it in CPSR and saves it at the
+    /// next exception (the probe, `tests/qemu-cortex-a53-sysregs.txt`). We
+    /// keep it so that our PSTATE is QEMU's (DESIGN.md P2, U1).
+    pub pstate13: bool,
+    /// The system registers.
+    pub system: System,
 }
 
 impl Default for State {
@@ -157,16 +173,48 @@ impl State {
     /// The state after a reset into EL1 with SP_EL1 and every interrupt
     /// masked, as the `virt` machine starts its firmware (DESIGN.md G4, V2).
     pub fn reset(pc: u64) -> Self {
+        Self::reset_as(pc, &V8_0)
+    }
+
+    /// As `reset`, for the CPU that `model` describes.
+    pub fn reset_as(pc: u64, model: &'static CpuModel) -> Self {
         let mut state = Self {
             slots: [0; slot::COUNT],
             context: Context {
                 el: 1,
                 sp_sel: true,
+                fp: false,
             },
             daif: 0xf,
+            il: false,
+            pstate13: false,
+            system: System::reset(model),
         };
         state.set_pc(pc);
+        state.refresh();
         state
+    }
+
+    /// Bring the part of the context that follows from the system registers
+    /// up to date. Whoever changes the level or CPACR_EL1 calls this.
+    pub fn refresh(&mut self) {
+        let fpen = (self.system.regs[reg::CPACR_EL1] >> 20) & 3;
+        self.context.fp = fpen == 3 || (fpen == 1 && self.context.el != 0);
+    }
+
+    /// The width of a physical address, from ID_AA64MMFR0_EL1.PARange.
+    pub fn physical_address_bits(&self) -> u32 {
+        let range = self.system.regs[crate::sysreg::index("ID_AA64MMFR0_EL1")] & 15;
+        [32, 36, 40, 42, 44, 48, 52]
+            .get(range as usize)
+            .copied()
+            .unwrap_or(48)
+    }
+
+    /// Set CPACR_EL1.FPEN so that FP and AdvSIMD run at EL0 and EL1.
+    pub fn enable_fp(&mut self) {
+        self.system.regs[reg::CPACR_EL1] |= 3 << 20;
+        self.refresh();
     }
 
     /// X0 to X30. Register 31 is not an X register: use `sp` or zero.
@@ -241,12 +289,34 @@ impl State {
 
     /// PSTATE in the layout of an SPSR, which is also what a debugger calls
     /// CPSR: NZCV in the bits 31 to 28, DAIF in 9 to 6, the level in 3 to 2
-    /// and PSTATE.SP in bit 0.
+    /// and PSTATE.SP in bit 0. PSTATE.IL is bit 20.
     pub fn cpsr(&self) -> u32 {
         (u32::from(self.nzcv()) << 28)
+            | (u32::from(self.il) << 20)
+            | (u32::from(self.pstate13) << 13)
             | (u32::from(self.daif & 0xf) << 6)
             | (u32::from(self.context.el & 3) << 2)
             | u32::from(self.context.sp_sel)
+    }
+}
+
+impl State {
+    /// Put a PSTATE in the layout of `cpsr` into the state. The stack
+    /// pointers stay in their slots. `false`: the value names no state of
+    /// this CPU (AArch32, EL2 or EL3, a reserved mode), and nothing changes.
+    pub fn set_cpsr(&mut self, cpsr: u32) -> bool {
+        let level = (cpsr >> 2) as u8 & 3;
+        if cpsr & 0x12 != 0 || level > 1 || (level == 0 && cpsr & 1 != 0) {
+            return false;
+        }
+        self.set_nzcv((cpsr >> 28) as u8);
+        self.daif = (cpsr >> 6) as u8 & 0xf;
+        self.il = cpsr & (1 << 20) != 0;
+        self.pstate13 = cpsr & (1 << 13) != 0;
+        self.context.el = level;
+        self.context.sp_sel = cpsr & 1 != 0;
+        self.refresh();
+        true
     }
 }
 
@@ -280,21 +350,48 @@ mod tests {
         assert_eq!(state.slots[slot::SP_EL1], 0x1000);
         state.context.sp_sel = false;
         assert_eq!(state.sp(), 0);
-        assert_eq!(
-            Context {
-                el: 0,
-                sp_sel: true
-            }
-            .sp_slot(),
-            slot::SP_EL0
-        );
-        assert_eq!(
-            Context {
-                el: 2,
-                sp_sel: true
-            }
-            .sp_slot(),
-            slot::SP_EL2
-        );
+        let context = |el| Context {
+            el,
+            sp_sel: true,
+            fp: false,
+        };
+        assert_eq!(context(0).sp_slot(), slot::SP_EL0);
+        assert_eq!(context(2).sp_slot(), slot::SP_EL2);
+    }
+
+    #[test]
+    fn fp_follows_cpacr_and_the_level() {
+        let mut state = State::reset(0);
+        assert!(!state.context.fp);
+        // FPEN 1: EL1 only.
+        state.system.regs[reg::CPACR_EL1] = 1 << 20;
+        state.refresh();
+        assert!(state.context.fp);
+        state.context.el = 0;
+        state.refresh();
+        assert!(!state.context.fp);
+        // FPEN 2 traps both levels, FPEN 3 none.
+        state.system.regs[reg::CPACR_EL1] = 2 << 20;
+        state.context.el = 1;
+        state.refresh();
+        assert!(!state.context.fp);
+        state.enable_fp();
+        state.context.el = 0;
+        state.refresh();
+        assert!(state.context.fp);
+    }
+
+    #[test]
+    fn a_cpsr_goes_into_the_state_and_back() {
+        let mut state = State::reset(0);
+        for cpsr in [0x3c5u32, 0x3c4, 0x6000_0000, 0x9010_2345, 0x0000_0080] {
+            assert!(state.set_cpsr(cpsr), "{cpsr:#x}");
+            assert_eq!(state.cpsr(), cpsr);
+        }
+        // EL2, AArch32, a reserved mode and EL0 with PSTATE.SP set.
+        for cpsr in [0x3c9u32, 0x3d0, 0x3c2, 0x3c1] {
+            assert!(!state.set_cpsr(cpsr), "{cpsr:#x}");
+            assert_eq!(state.cpsr(), 0x80);
+        }
     }
 }
