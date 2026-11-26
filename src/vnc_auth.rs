@@ -42,8 +42,9 @@ pub fn is_password(password: &str) -> bool {
 pub fn response(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
     let key = vnc_key(password.as_bytes());
     let mut out = [0u8; 16];
-    for (plain, cipher) in challenge.chunks_exact(8).zip(out.chunks_exact_mut(8)) {
-        cipher.copy_from_slice(&des_encrypt(key, plain.try_into().unwrap()));
+    for half in [0, 8] {
+        let plain: [u8; 8] = std::array::from_fn(|i| challenge[half + i]);
+        out[half..half + 8].copy_from_slice(&des_encrypt(key, plain));
     }
     out
 }
