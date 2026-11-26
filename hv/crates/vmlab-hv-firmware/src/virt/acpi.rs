@@ -209,7 +209,7 @@ fn madt(platform: &Platform) -> Vec<u8> {
 /// PPTT: one package, one container under it, and one leaf per CPU.
 fn pptt(vcpus: u8) -> Vec<u8> {
     let mut b = table(*b"PPTT", 2, 0);
-    let mut node = |b: &mut Vec<u8>, flags: u32, parent: usize, id: u32| -> usize {
+    let node = |b: &mut Vec<u8>, flags: u32, parent: usize, id: u32| -> usize {
         let start = b.len();
         let mut n = vec![0u8; 20];
         n[1] = 20;
