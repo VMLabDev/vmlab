@@ -77,9 +77,11 @@ pub trait UsbDevice: Snapshot {
     fn reset(&mut self);
     fn control(&mut self, setup: SetupPacket, data: &[u8]) -> UsbTransfer;
     fn transfer(&mut self, endpoint: u8, data: &[u8], max_length: usize) -> UsbTransfer;
-    /// Isochronous transfer: as `transfer`, plus the endpoint's packet
-    /// size, which a physical backend needs to lay out the URB's packet
-    /// descriptors. The default delegates to `transfer`.
+    /// Isochronous transfer: as `transfer`, for one TD, which is the data of
+    /// one service interval: up to three packets on a high-bandwidth
+    /// high-speed endpoint and more on SuperSpeed. `packet_size` is the
+    /// endpoint's Max Packet Size and does not divide the TD. The default
+    /// delegates to `transfer`.
     fn transfer_iso(
         &mut self,
         endpoint: u8,
@@ -89,6 +91,15 @@ pub trait UsbDevice: Snapshot {
     ) -> UsbTransfer {
         let _ = packet_size;
         self.transfer(endpoint, data, max_length)
+    }
+    /// The guest stops this endpoint with a transfer in flight (Stop
+    /// Endpoint). A transfer that has finished already is handed over here,
+    /// as `transfer` would hand it over: the device moved its data, so the
+    /// guest must see it. Anything else is dropped as in
+    /// `endpoint_dropped`, and the answer is `Nak`.
+    fn endpoint_stopped(&mut self, endpoint: u8) -> UsbTransfer {
+        self.endpoint_dropped(endpoint);
+        UsbTransfer::Nak
     }
     /// The guest dropped this endpoint's transfer state: Stop Endpoint,
     /// Reset Endpoint, Set TR Dequeue Pointer, Reset Device, Disable Slot,

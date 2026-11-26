@@ -95,6 +95,7 @@ impl FlatMemory {
     pub fn bytes(&self) -> &[u8] {
         &self.data
     }
+    #[inline]
     fn range(&self, address: u64, len: usize) -> Result<std::ops::Range<usize>> {
         let start = address
             .checked_sub(self.base)
@@ -115,10 +116,12 @@ impl Memory for FlatMemory {
             .checked_add(u64::try_from(self.data.len().checked_sub(1)?).ok()?)?;
         (address >= self.base && address <= end).then_some((self.base, end))
     }
+    #[inline]
     fn read(&mut self, address: u64, bytes: &mut [u8]) -> Result<()> {
         bytes.copy_from_slice(&self.data[self.range(address, bytes.len())?]);
         Ok(())
     }
+    #[inline]
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         let range = self.range(address, bytes.len())?;
         self.data[range.clone()].copy_from_slice(bytes);
