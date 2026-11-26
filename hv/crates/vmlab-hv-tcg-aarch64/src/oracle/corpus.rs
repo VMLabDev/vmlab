@@ -45,12 +45,12 @@ pub struct Entry {
 }
 
 /// The values of the compared registers after a reset.
-fn reset_system(compared: &[Compared]) -> Vec<u64> {
+pub fn reset_system(compared: &[Compared]) -> Vec<u64> {
     system_of(&State::reset_as(0, &QEMU_CORTEX_A53), compared)
 }
 
 /// The registers of `values` that differ from `base`, by name.
-fn named(compared: &[Compared], base: &[u64], values: &[u64]) -> Named {
+pub fn named(compared: &[Compared], base: &[u64], values: &[u64]) -> Named {
     compared
         .iter()
         .zip(base.iter().zip(values))
@@ -72,7 +72,7 @@ fn with_named(compared: &[Compared], base: &[u64], named: &Named) -> Result<Vec<
     Ok(values)
 }
 
-fn named_text(key: &str, named: &Named) -> String {
+pub fn named_text(key: &str, named: &Named) -> String {
     if named.is_empty() {
         return format!("{key}=-");
     }

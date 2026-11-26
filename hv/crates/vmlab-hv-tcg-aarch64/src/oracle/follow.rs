@@ -654,6 +654,14 @@ impl Follower {
                     let ours = Core::of(&self.cpu.state);
                     // What QEMU's exception registers say, when it took an
                     // exception that we did not: they are in its next record.
+                    if compare_system {
+                        // Our system registers that are not at their reset
+                        // value. They were QEMU's before the instruction.
+                        let reset = super::corpus::reset_system(&self.compared);
+                        let now = system_of(&self.cpu.state, &self.compared);
+                        let named = super::corpus::named(&self.compared, &reset, &now);
+                        what.push_str(&format!("; {}", super::corpus::named_text("sys", &named)));
+                    }
                     for _ in 0..4 {
                         if !compare_system {
                             break;
