@@ -175,7 +175,8 @@ impl Bridge {
                 if matches!(
                     error.downcast_ref::<arboard::Error>(),
                     Some(arboard::Error::ContentNotAvailable)
-                ) => {
+                ) =>
+            {
                 if self.last_host.take().is_some() {
                     self.last_guest = None;
                 }
