@@ -569,6 +569,71 @@ mod tests {
         buf
     }
 
+    #[test]
+    fn a_chain_of_twelve_overlays_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = dir.path().join("0.qcow2");
+        patterned(&base, 0xa5);
+        for index in 1..12 {
+            let overlay = dir.path().join(format!("{index}.qcow2"));
+            create_linked_clone(&base, &overlay).unwrap();
+            base = overlay;
+        }
+        assert_eq!(first_bytes(&base), vec![0xa5; 4096]);
+    }
+
+    #[test]
+    fn a_clone_of_a_backing_path_over_the_name_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        while nested.as_os_str().len() < 1100 {
+            nested.push("a".repeat(100));
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        let base = nested.join("base.qcow2");
+        let clone = dir.path().join("clone.qcow2");
+        patterned(&base, 0xa5);
+        assert!(create_linked_clone(&base, &clone).is_err());
+        assert!(!clone.exists());
+    }
+
+    #[test]
+    fn a_safe_rebase_onto_a_relative_path_reads_the_same_content_after() {
+        const CHILD: &str = "VMLAB_TEST_RELATIVE_REBASE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let top = Path::new("sub/top.qcow2");
+            rebase_safe(top, Path::new("new.qcow2"), None).unwrap();
+            assert_eq!(first_bytes(top), vec![0xa5; 4096]);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let old = dir.path().join("old.qcow2");
+        patterned(&old, 0xa5);
+        patterned(&dir.path().join("new.qcow2"), 0xa5);
+        patterned(&sub.join("new.qcow2"), 0x5a);
+        create_linked_clone(&old, &sub.join("top.qcow2")).unwrap();
+
+        let test = concat!(
+            module_path!(),
+            "::a_safe_rebase_onto_a_relative_path_reads_the_same_content_after"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test.strip_prefix("vmlab_disk::").unwrap()])
+            .env(CHILD, "1")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Review vmlab-disk F11: `convert` removes an existing destination, so
     /// a destination that is the source must be refused before the removal.
     #[test]
