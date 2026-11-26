@@ -532,12 +532,9 @@ mod tests {
                     }
                 ]
             });
-            hub.put_manifest(
-                repo,
-                tag,
-                media_types::DOCKER_MANIFEST_LIST,
-                serde_json::to_vec(&index).unwrap(),
-            );
+            let bytes = serde_json::to_vec(&index).unwrap();
+            hub.put_manifest(repo, tag, media_types::DOCKER_MANIFEST_LIST, bytes.clone());
+            hub.put_manifest(repo, &digest_of(&bytes), media_types::DOCKER_MANIFEST_LIST, bytes);
         }
         manifest_digest
     }
@@ -546,6 +543,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = ImageCache::new(tmp.path().join("oci"));
         (tmp, cache)
+    }
+
+    #[tokio::test]
+    async fn an_index_digest_resolves_offline_after_its_first_pull() {
+        let hub = FakeHub::default();
+        let repo = "library/nginx";
+        let manifest = seed_image(&hub, repo, Some("latest"), "linux", "amd64", false);
+        let index = digest_of(&hub.get_manifest(repo, "latest").await.unwrap().unwrap().body);
+        let raw = format!("nginx@{index}");
+        let reference = parse_image_reference(&raw).unwrap();
+        let (_tmp, cache) = new_cache();
+        let image = pull_with_transport(&reference, "x86_64", &cache, &hub, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(image.manifest_digest, manifest);
+
+        hub.offline.store(true, Ordering::SeqCst);
+        let cached = cached_container_image(&raw, &cache).unwrap();
+        let pulled = pull_with_transport(&reference, "x86_64", &cache, &hub, &mut |_| {}).await;
+        assert!(
+            cached.as_ref().map(|image| image.manifest_digest.as_str()) == Some(manifest.as_str())
+                && pulled.as_ref().is_ok_and(|image| image.manifest_digest == manifest),
+            "cache probe: {cached:?}, offline pull: {pulled:?}"
+        );
     }
 
     #[tokio::test]

@@ -2171,6 +2171,28 @@ mod tests {
     // ---- build_spec: healthchecks -------------------------------------------
 
     #[test]
+    fn an_image_healthcheck_counts_as_a_healthcheck() {
+        use super::super::machine::Machine;
+        let c = instance("web");
+        assert!(c.cfg.healthcheck.is_none());
+        c.set_image(PulledImage {
+            manifest_digest: String::new(),
+            config: image(RuntimeDefaults {
+                healthcheck: Some(ImageHealthcheck {
+                    test: vec!["CMD".into(), "/check".into()],
+                    interval: None,
+                    timeout: None,
+                    retries: None,
+                    start_period: None,
+                }),
+                ..Default::default()
+            }),
+            rootfs_image: PathBuf::new(),
+        });
+        assert!(c.has_healthcheck());
+    }
+
+    #[test]
     fn spec_healthcheck_config_wins_over_image() {
         let img = image(RuntimeDefaults {
             healthcheck: Some(ImageHealthcheck {

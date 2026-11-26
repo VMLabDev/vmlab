@@ -21,6 +21,40 @@ use crate::mounts::ROOTFS;
 use crate::reap::Reaper;
 use crate::util::Result;
 
+struct HealthState {
+    retries: u32,
+    consecutive_fails: u32,
+    verdict: Option<bool>,
+}
+
+impl HealthState {
+    fn new(retries: u32) -> Self {
+        Self {
+            retries: retries.max(1),
+            consecutive_fails: 0,
+            verdict: None,
+        }
+    }
+
+    fn on_result(&mut self, pass: bool, _in_start_period: bool) -> Option<bool> {
+        let verdict = if pass {
+            self.consecutive_fails = 0;
+            true
+        } else {
+            self.consecutive_fails = self.consecutive_fails.saturating_add(1);
+            if self.consecutive_fails < self.retries {
+                return None;
+            }
+            false
+        };
+        (self.verdict.replace(verdict) != Some(verdict)).then_some(verdict)
+    }
+}
+
+fn first_check_delay(spec: &HealthSpec) -> Duration {
+    Duration::from_secs(spec.start_period_secs)
+}
+
 /// Run one check: fork, chroot, exec, wait with timeout (via the reaper —
 /// only the main thread reaps). Returns pass/fail.
 fn run_check(
@@ -101,11 +135,10 @@ pub fn spawn(
 
     let spec = spec.clone();
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(spec.start_period_secs));
+        thread::sleep(first_check_delay(&spec));
         let timeout = Duration::from_secs(spec.timeout_secs.max(1));
         let interval = Duration::from_secs(spec.interval_secs.max(1));
-        let mut consecutive_fails: u32 = 0;
-        let mut state: Option<bool> = None; // None until the first report
+        let mut state = HealthState::new(spec.retries);
         while !exited.load(Ordering::SeqCst) {
             let pass = run_check(
                 &reaper,
@@ -119,24 +152,50 @@ pub fn spawn(
             if exited.load(Ordering::SeqCst) {
                 break;
             }
-            if pass {
-                consecutive_fails = 0;
-                // First-ever pass and recovery-after-failure both land here.
-                if state != Some(true) {
-                    state = Some(true);
-                    ctl.emit(&CtlEvent::Health { healthy: true });
-                }
-            } else {
-                consecutive_fails += 1;
-                if consecutive_fails >= spec.retries.max(1) && state != Some(false) {
-                    state = Some(false);
-                    ctl.emit(&CtlEvent::Health { healthy: false });
-                }
+            if let Some(healthy) = state.on_result(pass, false) {
+                ctl.emit(&CtlEvent::Health { healthy });
             }
             thread::sleep(interval);
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_inside_the_start_period_reports_healthy() {
+        let mut state = HealthState::new(2);
+        assert_eq!(state.on_result(true, true), Some(true));
+        assert_eq!(state.on_result(true, true), None);
+        assert_eq!(state.on_result(false, true), None);
+        assert_eq!(state.on_result(false, true), Some(false));
+    }
+
+    #[test]
+    fn a_failure_inside_the_start_period_is_not_counted() {
+        let mut state = HealthState::new(2);
+        assert_eq!(state.on_result(false, true), None);
+        assert_eq!(state.on_result(false, true), None);
+        assert_eq!(state.on_result(false, false), None);
+        assert_eq!(state.on_result(false, false), Some(false));
+    }
+
+    #[test]
+    fn the_first_check_does_not_wait_for_the_start_period() {
+        let mut spec = HealthSpec {
+            command: vec!["/check".into()],
+            interval_secs: 1,
+            timeout_secs: 1,
+            retries: 2,
+            start_period_secs: 0,
+        };
+        let first = first_check_delay(&spec);
+        spec.start_period_secs = 120;
+        assert_eq!(first_check_delay(&spec), first);
+    }
 }
 
 fn mirror_child_exit(child: Pid) -> ! {
