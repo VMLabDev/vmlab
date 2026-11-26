@@ -449,16 +449,11 @@ impl Lowering {
                 // A result of at most 64 bits is a function of the low words
                 // of its operands. A Bool has no mask, so its operands are
                 // whole words.
-                let (a, b) = if bits {
-                    (self.first[left], self.first[right])
-                } else if matches!(operation, Binary::And | Binary::Or | Binary::Xor)
-                    && !self.wide[left]
-                    && !self.wide[right]
-                {
-                    (self.first[left], self.first[right])
-                } else {
+                let logical = matches!(operation, Binary::And | Binary::Or | Binary::Xor);
+                if !bits && (!logical || self.wide[left] || self.wide[right]) {
                     return false;
-                };
+                }
+                let (a, b) = (self.first[left], self.first[right]);
                 let code = match operation {
                     Binary::Add => Code::Add,
                     Binary::Sub => Code::Sub,
