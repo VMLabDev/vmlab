@@ -863,7 +863,7 @@ impl UsbDevice for HostUsbDevice {
         endpoint: u8,
         data: &[u8],
         max_length: usize,
-        packet_size: u32,
+        _packet_size: u32,
     ) -> UsbTransfer {
         self.reap();
         if self.job.is_some() {
@@ -888,13 +888,14 @@ impl UsbDevice for HostUsbDevice {
         if endpoint & 0x80 == 0 {
             return UsbTransfer::Stall;
         }
-        let packet_size = if packet_size == 0 {
-            u32::from(info.max_packet)
-        } else {
-            packet_size
+        // One usbdevfs packet descriptor is one service interval, and so is
+        // one TD: a descriptor of Max Packet Size would have the host ask a
+        // high-bandwidth endpoint for one transaction where it sends three.
+        let Ok(interval) = u32::try_from(max_length) else {
+            return UsbTransfer::Stall;
         };
         let buffer = vec![0; max_length];
-        match Transfer::new_isochronous(endpoint, buffer, packet_size) {
+        match Transfer::new_isochronous(endpoint, buffer, interval) {
             Ok(transfer) => self.start(endpoint, transfer),
             Err(_) => UsbTransfer::Stall,
         }

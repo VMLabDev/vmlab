@@ -808,7 +808,9 @@ impl XhciController {
             if add & (1 << ep) != 0 && kind != 13 {
                 let ctx = self.load_context(base + ((ep + 1) * 32) as u64)?;
                 let endpoint_type = (ctx[1] >> 3) & 7;
-                if (ctx[1] >> 10) & 31 != 0
+                // MaxPStreams (dword 0 bits 10 to 14): streams are not
+                // advertised, and a stream context array is not a ring.
+                if (ctx[0] >> 10) & 31 != 0
                     || ctx[1] >> 16 == 0
                     || (ep == 1 && endpoint_type != 4)
                     || (ep != 1 && !matches!(endpoint_type, 1 | 2 | 3 | 5 | 6 | 7))
@@ -881,7 +883,7 @@ impl XhciController {
                         e.context[1] = (e.context[1] & 0xffff) | (ctx[1] & 0xffff0000);
                         e.context[4] = ctx[4];
                     } else {
-                        if (ctx[1] >> 10) & 31 != 0 {
+                        if (ctx[0] >> 10) & 31 != 0 {
                             return Ok(TRB_ERROR);
                         }
                         if matches!((ctx[1] >> 3) & 7, 3 | 7) && (ctx[0] >> 16) & 255 > 15 {
@@ -1061,8 +1063,8 @@ impl XhciController {
                 } else {
                     let address = ((ep / 2) as u8) | if input { 0x80 } else { 0 };
                     if td.iter().any(|(_, t)| t.kind() == 5) {
-                        // Isochronous TDs need the endpoint's packet size
-                        // to lay out the packets.
+                        // One isochronous TD is the data of one service
+                        // interval, whatever the endpoint's packet size.
                         let max_packet = endpoint.context[1] >> 16;
                         d.transfer_iso(address, &data, length, max_packet)
                     } else {
