@@ -654,17 +654,34 @@ impl Follower {
                     let ours = Core::of(&self.cpu.state);
                     // What QEMU's exception registers say, when it took an
                     // exception that we did not: they are in its next record.
-                    if compare_system
-                        && let Ok(Trace::Instruction { system, core, .. }) =
-                            self.leader.next_record(Duration::from_secs(1))
-                    {
-                        what.push_str(&format!("; QEMU goes on at {:#x} with", core.pc));
-                        for (register, value) in self.compared.iter().zip(&system) {
-                            if matches!(
-                                register.qemu,
-                                "ESR_EL1" | "FAR_EL1" | "ELR_EL1" | "SPSR_EL1" | "MDSCR_EL1"
-                            ) {
-                                what.push_str(&format!(" {}={value:#x}", register.qemu));
+                    for _ in 0..4 {
+                        if !compare_system {
+                            break;
+                        }
+                        match self.leader.next_record(Duration::from_secs(1)) {
+                            Ok(Trace::Instruction { system, core, .. }) => {
+                                what.push_str(&format!("; QEMU goes on at {:#x} with", core.pc));
+                                for (register, value) in self.compared.iter().zip(&system) {
+                                    if matches!(
+                                        register.qemu,
+                                        "ESR_EL1" | "FAR_EL1" | "ELR_EL1" | "SPSR_EL1" | "MDSCR_EL1"
+                                    ) {
+                                        what.push_str(&format!(" {}={value:#x}", register.qemu));
+                                    }
+                                }
+                                break;
+                            }
+                            Ok(Trace::Discontinuity {
+                                kind,
+                                from_pc,
+                                to_pc,
+                            }) => what.push_str(&format!(
+                                "; then a discontinuity of the kind {kind} from {from_pc:#x} to {to_pc:#x}"
+                            )),
+                            Ok(Trace::Write { .. }) => {}
+                            Err(error) => {
+                                what.push_str(&format!("; then {error}"));
+                                break;
                             }
                         }
                     }
