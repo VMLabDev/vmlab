@@ -328,8 +328,8 @@ mod tests {
             if !value.contains("with,") {
                 continue;
             }
-            let takes_whole = value.starts_with("file:")
-                || matches!(args[i - 1].as_str(), "-kernel" | "-initrd");
+            let takes_whole =
+                value.starts_with("file:") || matches!(args[i - 1].as_str(), "-kernel" | "-initrd");
             if takes_whole {
                 whole += 1;
                 assert!(!value.contains("with,,comma"), "{value}");
