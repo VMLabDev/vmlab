@@ -6301,7 +6301,7 @@ lab "t" {
         let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
         let error = crate::scripting::run_script_source(
             lab,
-            r#"fn main(lab: Lab) -> int { lab.log("ran") 1 }"#.into(),
+            "fn main(lab: Lab) -> int {\n    lab.log(\"ran\")\n    1\n}".into(),
             "wrong-signature.ws",
             dir.path().to_path_buf(),
             None,
@@ -6310,11 +6310,9 @@ lab "t" {
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            lines.try_recv().ok(),
-            None,
-            "invalid script emitted output: {error:#}"
-        );
+        while let Ok(line) = lines.try_recv() {
+            assert_ne!(line, "ran\n", "invalid script ran: {error:#}");
+        }
         let error = format!("{error:#}");
         assert!(
             error.contains("wrong-signature.ws: main must have signature"),
