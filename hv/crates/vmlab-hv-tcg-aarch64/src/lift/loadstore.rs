@@ -395,7 +395,12 @@ fn transfer_pair(b: &mut Builder, access: Access, rt: u32, rt2: u32, address: Sc
     let width = u16::from(bytes) * 8;
     match (access.data, access.load) {
         (Data::Prefetch, _) => {}
-        (Data::Integer { signed, register, .. }, true) => {
+        (
+            Data::Integer {
+                signed, register, ..
+            },
+            true,
+        ) => {
             let both = b.load_aligned(address, bytes * 2, bytes);
             for (target, offset) in [(rt, 0), (rt2, width)] {
                 let value = b.slice(both, offset, width);

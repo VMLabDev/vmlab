@@ -391,9 +391,7 @@ impl Entry {
                 Some(("w", value)) => writes.push(parse_memory(value)?),
                 Some(("p", value)) => physical.push(parse_memory(value)?),
                 _ => {
-                    return Err(format!(
-                        "`{part}` is not r=, w= or p= with address:bytes"
-                    ));
+                    return Err(format!("`{part}` is not r=, w= or p= with address:bytes"));
                 }
             }
         }
@@ -490,7 +488,11 @@ impl Entry {
             ));
         }
         let mut data = vec![0u8; (high - low) as usize];
-        let before = if translated { &self.physical } else { &self.reads };
+        let before = if translated {
+            &self.physical
+        } else {
+            &self.reads
+        };
         for (address, bytes) in before {
             let at = (address - low) as usize;
             data[at..at + bytes.len()].copy_from_slice(bytes);

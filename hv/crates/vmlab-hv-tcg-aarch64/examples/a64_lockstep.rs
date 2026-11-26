@@ -432,13 +432,21 @@ impl Run {
                 // The start of the round, to run it again with `--probe`.
                 // A round with the MMU on loads its tables and its data too:
                 // the code is the first part.
-                let parts = if self.follower.translated { 1 } else { usize::MAX };
+                let parts = if self.follower.translated {
+                    1
+                } else {
+                    usize::MAX
+                };
                 for (address, data) in round.memory.iter().take(parts) {
                     let words: Vec<String> = data
                         .as_chunks::<4>()
                         .0
                         .iter()
-                        .take((verified.len() + 2).min(if self.follower.translated { 0 } else { usize::MAX }))
+                        .take((verified.len() + 2).min(if self.follower.translated {
+                            0
+                        } else {
+                            usize::MAX
+                        }))
                         .map(|word| format!("{:08x}", u32::from_le_bytes(*word)))
                         .collect();
                     eprintln!("  the round from {address:#x}: {}", words.join("+"));
@@ -552,8 +560,17 @@ fn main() -> Result<(), Failure> {
         compared.retain(|register| {
             matches!(
                 register.qemu,
-                "ESR_EL1" | "FAR_EL1" | "ELR_EL1" | "SPSR_EL1" | "PAR_EL1" | "TTBR0_EL1"
-                    | "TTBR1_EL1" | "MAIR_EL1" | "VBAR_EL1" | "SP_EL0" | "SP_EL1"
+                "ESR_EL1"
+                    | "FAR_EL1"
+                    | "ELR_EL1"
+                    | "SPSR_EL1"
+                    | "PAR_EL1"
+                    | "TTBR0_EL1"
+                    | "TTBR1_EL1"
+                    | "MAIR_EL1"
+                    | "VBAR_EL1"
+                    | "SP_EL0"
+                    | "SP_EL1"
             )
         });
     }
@@ -1066,9 +1083,15 @@ fn translated_rounds(
     }
     header.print(run.counts.rounds, 0);
     for (granule, halves) in &granules {
-        println!("  {halves:>9} halves of an address space with the {}K granule", (1u32 << granule) / 1024);
+        println!(
+            "  {halves:>9} halves of an address space with the {}K granule",
+            (1u32 << granule) / 1024
+        );
     }
-    print_formats(&run.counts, &[FormatClass::SystemXtI, FormatClass::SystemLXtI]);
+    print_formats(
+        &run.counts,
+        &[FormatClass::SystemXtI, FormatClass::SystemLXtI],
+    );
     let loads_and_stores: u64 = LOAD_STORE_FORMATS
         .iter()
         .map(|format| run.counts.of_format(*format))
@@ -1094,7 +1117,9 @@ fn translated_rounds(
     for (kind, count) in &run.follower.exceptions {
         println!("  {count:>9} {kind}");
     }
-    println!("the syndromes of the verified instructions that took an exception (class and low byte):");
+    println!(
+        "the syndromes of the verified instructions that took an exception (class and low byte):"
+    );
     for (syndrome, count) in &run.counts.syndromes {
         println!("  {count:>9} {syndrome:#010x}");
     }

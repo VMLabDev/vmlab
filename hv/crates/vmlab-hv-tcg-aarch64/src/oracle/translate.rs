@@ -387,7 +387,15 @@ impl Builder<'_> {
 
     /// Map `bytes` at `pa` to the same virtual address in the lower half,
     /// with the descriptor bits `attributes`.
-    fn identity(&mut self, root: u64, granule: u32, input: u32, pa: u64, bytes: u64, attributes: u64) {
+    fn identity(
+        &mut self,
+        root: u64,
+        granule: u32,
+        input: u32,
+        pa: u64,
+        bytes: u64,
+        attributes: u64,
+    ) {
         let page = 1u64 << granule;
         let mut at = pa & !(page - 1);
         while at < pa + bytes {
@@ -414,7 +422,8 @@ impl Builder<'_> {
             0 | 1 => (layout.base + 0x0800_0000 + self.below(16) * span, false),
             // Wider than the output size: an address size fault.
             2 | 3 if self.output_bits < 48 => {
-                let bit = u64::from(self.output_bits) + self.below(u64::from(48 - self.output_bits));
+                let bit =
+                    u64::from(self.output_bits) + self.below(u64::from(48 - self.output_bits));
                 ((layout.window() & !(span - 1)) | 1 << bit, false)
             }
             4..=6 if span <= STUB_BYTES && stub.is_none() && !self.stub_mapped => {
@@ -483,7 +492,11 @@ impl Builder<'_> {
             let (level, va) = if index % 4 != 3 {
                 (3, region.wrapping_add(u64::from(index) * page))
             } else {
-                let level = if granule == 12 && self.chance(1, 4) { 1 } else { 2 };
+                let level = if granule == 12 && self.chance(1, 4) {
+                    1
+                } else {
+                    2
+                };
                 let span = 1u64 << (granule + stride * (3 - level));
                 let slot = 1 + self.below(4);
                 (level, (region & !(span - 1)).wrapping_add(slot * span))
@@ -589,7 +602,10 @@ impl Generator {
         // The sizes of the two halves. The code is below 2 GiB, so the lower
         // half has at least 31 bits. Outside 16 to 39 the size is taken as
         // the nearest of the two.
-        let mut tsz = [16 + self.rng.below(18) as u32, 16 + self.rng.below(18) as u32];
+        let mut tsz = [
+            16 + self.rng.below(18) as u32,
+            16 + self.rng.below(18) as u32,
+        ];
         let mut written = tsz;
         if !profile.strict && self.rng.chance(1, 12) {
             written[0] = self.rng.below(16) as u32;
@@ -629,8 +645,14 @@ impl Generator {
             stub_mapped: false,
         };
         let roots = [
-            builder.tables.table(granules[0]).expect("an empty area has room"),
-            builder.tables.table(granules[1]).expect("an empty area has room"),
+            builder
+                .tables
+                .table(granules[0])
+                .expect("an empty area has room"),
+            builder
+                .tables
+                .table(granules[1])
+                .expect("an empty area has room"),
         ];
         // The code and the `RET` page: read-only at both levels, executable
         // at both, global, Normal memory, with the access flag.
@@ -654,7 +676,13 @@ impl Generator {
         // The probes of the lower half are above the RAM and below 2 GiB.
         // Those of the upper half are in its last GiB.
         builder.probes(roots[0], granules[0], input[0], 0x6000_0000, 12);
-        builder.probes(roots[1], granules[1], input[1], u64::MAX << input[1].min(30), 12);
+        builder.probes(
+            roots[1],
+            granules[1],
+            input[1],
+            u64::MAX << input[1].min(30),
+            12,
+        );
 
         // --- the control registers --------------------------------------
         let tg0 = match granules[0] {
@@ -737,7 +765,9 @@ impl Generator {
         let window = (layout.window(), WINDOW_BYTES);
         memory.push((
             layout.window(),
-            builder.generator.memory_bytes(window, WINDOW_BYTES as usize),
+            builder
+                .generator
+                .memory_bytes(window, WINDOW_BYTES as usize),
         ));
         memory.extend(builder.tables.memory());
         Image {
@@ -857,7 +887,11 @@ impl Builder<'_> {
             }
             56 | 57 => {
                 let operation = CACHE_OTHER[self.below(CACHE_OTHER.len() as u64) as usize];
-                let rt = if operation & 7 == 0 { 31 } else { self.below(31) as u32 };
+                let rt = if operation & 7 == 0 {
+                    31
+                } else {
+                    self.below(31) as u32
+                };
                 words.push(asm::sys(operation, rt));
             }
             // A TLBI of the regime. It only drops translations.
@@ -909,7 +943,8 @@ impl Builder<'_> {
             // those returns.
             74..=78 => {
                 let flags = self.below(16) << 28 | self.below(16) << 6;
-                let saved = flags | [0b00000, 0b00000, 0b00000, 0b00101, 0b00100][self.below(5) as usize];
+                let saved =
+                    flags | [0b00000, 0b00000, 0b00000, 0b00101, 0b00100][self.below(5) as usize];
                 words.extend(asm::load(16, saved));
                 words.push(asm::msr(reg::SPSR_EL1, 16));
                 let here = at + 4 * 5;
@@ -973,7 +1008,9 @@ mod tests {
     use vmlab_hv_tcg::{FlatMemory, Memory};
 
     const RAM: u64 = 0x4000_0000;
-    const LAYOUT: Layout = Layout { base: RAM + 0x0200_0000 };
+    const LAYOUT: Layout = Layout {
+        base: RAM + 0x0200_0000,
+    };
 
     #[test]
     fn the_vector_table_is_sixteen_entries_of_code() {
@@ -984,7 +1021,10 @@ mod tests {
         let plain = vector_table(0x3c5, false);
         assert!(!plain.contains(&asm::mrs(16, reg::SPSR_EL1)));
         assert_eq!(
-            plain.iter().filter(|word| **word == asm::msr(reg::SPSR_EL1, 16)).count(),
+            plain
+                .iter()
+                .filter(|word| **word == asm::msr(reg::SPSR_EL1, 16))
+                .count(),
             1
         );
         assert_eq!(plain[8 * 32 + 6], asm::msr(reg::SPSR_EL1, 16));
@@ -1022,7 +1062,11 @@ mod tests {
                 let sctlr = cpu.state.system.regs[sysreg::reg::SCTLR_EL1];
                 on += sctlr & 1;
                 user += u64::from(cpu.state.context.el == 0);
-                stores += cpu.take_accesses().iter().filter(|access| access.write).count() as u64;
+                stores += cpu
+                    .take_accesses()
+                    .iter()
+                    .filter(|access| access.write)
+                    .count() as u64;
                 entries = entries.max(cpu.tlb_entries());
                 if let Some(taken) = cpu.taken
                     && let Cause::Exception(exception) = taken.cause
@@ -1053,7 +1097,12 @@ mod tests {
         for seed in 0..40 {
             let mut generator = Generator::new(seed);
             let image = generator.translated_image(LAYOUT, MAX_WALK, 200);
-            assert!(image.granules.iter().all(|granule| [14, 16].contains(granule)));
+            assert!(
+                image
+                    .granules
+                    .iter()
+                    .all(|granule| [14, 16].contains(granule))
+            );
             let tcr = image.controls.tcr;
             // No bit above TBI1, sizes inside 16 to 39, and an output size
             // of at most 48 bits.

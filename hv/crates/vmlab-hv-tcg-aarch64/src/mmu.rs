@@ -573,8 +573,11 @@ impl Mmu {
 
     fn sctlr_bits(&self) -> u64 {
         let controls = &self.controls;
-        (if controls.enabled { sysreg::sctlr::M } else { 0 })
-            | (if controls.wxn { sysreg::sctlr::WXN } else { 0 })
+        (if controls.enabled {
+            sysreg::sctlr::M
+        } else {
+            0
+        }) | (if controls.wxn { sysreg::sctlr::WXN } else { 0 })
             | (if controls.strict_alignment {
                 sysreg::sctlr::A
             } else {
@@ -606,9 +609,7 @@ impl Mmu {
         // of the data address is not its translation.
         let execute = kind == Kind::Execute;
         let tagged = execute && !canonical(va) && self.controls.untagged(va, true) == va;
-        if !tagged
-            && let Some(entry) = self.tlbs[0].lookup(va >> PAGE_BITS, self.asid)
-        {
+        if !tagged && let Some(entry) = self.tlbs[0].lookup(va >> PAGE_BITS, self.asid) {
             // The entry keeps what an access needs, not the attributes of an
             // address translation instruction: those walk again.
             return Ok(Translation {
@@ -670,7 +671,11 @@ impl Mmu {
                 }
             }
         };
-        let result = walk(&self.controls, self.controls.untagged(va, execute), &mut read);
+        let result = walk(
+            &self.controls,
+            self.controls.untagged(va, execute),
+            &mut read,
+        );
         match host {
             Some(message) => Err(Miss::Host(message)),
             None => result.map_err(Miss::Fault),
@@ -770,7 +775,15 @@ mod tests {
         /// Put `descriptor` where a walk from `root` for `va` reads at
         /// `leaf`, with the tables on the way, and give the addresses of
         /// the descriptors of the path.
-        fn map(&mut self, root: u64, granule: u32, input: u32, va: u64, leaf: u32, descriptor: u64) -> Vec<u64> {
+        fn map(
+            &mut self,
+            root: u64,
+            granule: u32,
+            input: u32,
+            va: u64,
+            leaf: u32,
+            descriptor: u64,
+        ) -> Vec<u64> {
             let (start, first_bits, stride) = geometry(granule, input);
             let va = va & ((1u64 << input) - 1);
             let mut table = root;
@@ -797,7 +810,9 @@ mod tests {
         }
 
         fn walk(&self, controls: &Controls, va: u64) -> Result<Translation, Fault> {
-            walk(controls, va, &mut |address| Some(self.words.get(&address).copied().unwrap_or(0)))
+            walk(controls, va, &mut |address| {
+                Some(self.words.get(&address).copied().unwrap_or(0))
+            })
         }
     }
 
@@ -845,7 +860,11 @@ mod tests {
     #[test]
     fn a_page_and_a_block_of_each_granule_translate() {
         // Granule, the level of a block, the bytes of a block.
-        for (granule, block_level, block) in [(12u32, 2u32, 1u64 << 21), (14, 2, 1 << 25), (16, 2, 1 << 29)] {
+        for (granule, block_level, block) in [
+            (12u32, 2u32, 1u64 << 21),
+            (14, 2, 1 << 25),
+            (16, 2, 1 << 29),
+        ] {
             for tsz in [16u64, 20, 25, 30] {
                 let input = 64 - tsz as u32;
                 let mut tables = Tables::new();
@@ -856,13 +875,27 @@ mod tests {
                 let low = 3 * block + 5 * page;
                 let high = (u64::MAX << input) + 2 * block + 7 * page;
                 tables.map(roots[0], granule, input, low, 3, 0x8000_0000 | TABLE | AF);
-                tables.map(roots[1], granule, input, high, 3, 0x9000_0000 | TABLE | AF | NOT_GLOBAL);
+                tables.map(
+                    roots[1],
+                    granule,
+                    input,
+                    high,
+                    3,
+                    0x9000_0000 | TABLE | AF | NOT_GLOBAL,
+                );
                 // An address in the upper half of the page: the 4K page of
                 // the result is the one that holds it.
                 let offset = page / 2 + 0x234;
                 let found = tables.walk(&controls, low + offset).unwrap();
-                assert_eq!(found.page, 0x8000_0000 + (offset & !0xfff), "{granule} {tsz}");
-                assert_eq!((found.span, found.level, found.global), (granule as u8, 3, true));
+                assert_eq!(
+                    found.page,
+                    0x8000_0000 + (offset & !0xfff),
+                    "{granule} {tsz}"
+                );
+                assert_eq!(
+                    (found.span, found.level, found.global),
+                    (granule as u8, 3, true)
+                );
                 let found = tables.walk(&controls, high + page - 1).unwrap();
                 assert_eq!(found.page, 0x9000_0000 + ((page - 1) & !0xfff));
                 assert!(!found.global);
@@ -870,14 +903,30 @@ mod tests {
                 // virtual address, whatever the descriptor holds there.
                 let at = 5 * block;
                 if at >> input == 0 {
-                    tables.map(roots[0], granule, input, at, block_level, 0x40_0000_0000 | 0x1f_f000 | VALID | AF);
+                    tables.map(
+                        roots[0],
+                        granule,
+                        input,
+                        at,
+                        block_level,
+                        0x40_0000_0000 | 0x1f_f000 | VALID | AF,
+                    );
                     let found = tables.walk(&controls, at + 0x12_3456).unwrap();
                     assert_eq!(found.page, 0x40_0000_0000 + 0x12_3000);
-                    assert_eq!((u64::from(found.span), found.level), (u64::from(block.trailing_zeros()), 2));
+                    assert_eq!(
+                        (u64::from(found.span), found.level),
+                        (u64::from(block.trailing_zeros()), 2)
+                    );
                 }
                 // An address between the two halves is in neither.
-                assert_eq!(tables.walk(&controls, 1 << input), fault_of(FaultKind::Translation, 0));
-                assert_eq!(tables.walk(&controls, !(1 << input)), fault_of(FaultKind::Translation, 0));
+                assert_eq!(
+                    tables.walk(&controls, 1 << input),
+                    fault_of(FaultKind::Translation, 0)
+                );
+                assert_eq!(
+                    tables.walk(&controls, !(1 << input)),
+                    fault_of(FaultKind::Translation, 0)
+                );
             }
         }
         // The 4K granule has a block of 1 GiB at level 1 too.
@@ -886,7 +935,10 @@ mod tests {
         let controls = controls(12, 25, roots);
         tables.map(roots[0], 12, 39, 3 << 30, 1, 0x80_0000_0000 | VALID | AF);
         let found = tables.walk(&controls, (3 << 30) + 0x1234_5678).unwrap();
-        assert_eq!((found.page, found.span, found.level), (0x80_1234_5000, 30, 1));
+        assert_eq!(
+            (found.page, found.span, found.level),
+            (0x80_1234_5000, 30, 1)
+        );
     }
 
     #[test]
@@ -903,41 +955,68 @@ mod tests {
             let level = level as u8;
             // No valid descriptor.
             tables.words.insert(*entry, saved[level as usize] & !VALID);
-            assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::Translation, level));
+            assert_eq!(
+                tables.walk(&controls, va),
+                fault_of(FaultKind::Translation, level)
+            );
             // An address above the output size, in a table descriptor and
             // in the page descriptor.
             tables.words.insert(*entry, saved[level as usize] | 1 << 47);
             controls.tcr = controls.tcr & !(7 << 32) | 2 << 32;
-            assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::AddressSize, level));
+            assert_eq!(
+                tables.walk(&controls, va),
+                fault_of(FaultKind::AddressSize, level)
+            );
             controls.tcr = controls.tcr & !(7 << 32) | 5 << 32;
             tables.words.insert(*entry, saved[level as usize]);
         }
         // The descriptor of level 3 with the bit 1 clear is no page, and a
         // block at level 0 is no block.
         tables.words.insert(path[3], saved[3] & !2);
-        assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::Translation, 3));
+        assert_eq!(
+            tables.walk(&controls, va),
+            fault_of(FaultKind::Translation, 3)
+        );
         tables.words.insert(path[3], saved[3] & !AF);
-        assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::AccessFlag, 3));
+        assert_eq!(
+            tables.walk(&controls, va),
+            fault_of(FaultKind::AccessFlag, 3)
+        );
         tables.words.insert(path[3], saved[3]);
         tables.words.insert(path[0], 0x8000_0000 | VALID | AF);
-        assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::Translation, 0));
+        assert_eq!(
+            tables.walk(&controls, va),
+            fault_of(FaultKind::Translation, 0)
+        );
         tables.words.insert(path[0], saved[0]);
         // A table base above the output size is a fault of level 0.
         controls.ttbr[0] |= 1 << 40;
         controls.tcr = controls.tcr & !(7 << 32) | 2 << 32;
-        assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::AddressSize, 0));
+        assert_eq!(
+            tables.walk(&controls, va),
+            fault_of(FaultKind::AddressSize, 0)
+        );
         controls.ttbr[0] = roots[0];
         // A half that TCR.EPD closes, and a size that Armv8.0 does not have.
         controls.tcr |= 1 << 7;
-        assert_eq!(tables.walk(&controls, va), fault_of(FaultKind::Translation, 0));
+        assert_eq!(
+            tables.walk(&controls, va),
+            fault_of(FaultKind::Translation, 0)
+        );
         controls.tcr &= !(1 << 7);
         for tsz in [0u64, 15, 40, 63] {
             let mut odd = controls;
             odd.tcr = odd.tcr & !0x3f | tsz;
-            assert_eq!(tables.walk(&odd, 0x1000), fault_of(FaultKind::Translation, 0), "{tsz}");
+            assert_eq!(
+                tables.walk(&odd, 0x1000),
+                fault_of(FaultKind::Translation, 0),
+                "{tsz}"
+            );
         }
         // Memory that holds no descriptor.
-        let result = walk(&controls, va, &mut |address| (address != path[2]).then(|| tables.words.get(&address).copied().unwrap_or(0)));
+        let result = walk(&controls, va, &mut |address| {
+            (address != path[2]).then(|| tables.words.get(&address).copied().unwrap_or(0))
+        });
         assert_eq!(result, fault_of(FaultKind::ExternalOnWalk, 2));
     }
 
@@ -962,40 +1041,76 @@ mod tests {
         let va = 0x1234_5000u64;
         let path = tables.map(roots[0], 12, 48, va, 3, 0);
         let flags = |tables: &mut Tables, controls: &Controls, leaf: u64, table: u64| {
-            tables.words.insert(path[3], 0x8000_0000 | TABLE | AF | leaf);
+            tables
+                .words
+                .insert(path[3], 0x8000_0000 | TABLE | AF | leaf);
             let old = tables.words[&path[1]];
-            tables.words.insert(path[1], old & 0x07ff_ffff_ffff_ffff | table);
+            tables
+                .words
+                .insert(path[1], old & 0x07ff_ffff_ffff_ffff | table);
             tables.walk(controls, va).unwrap().flags & 0x3f
         };
         use flag::{PR, PW, PX, UR, UW, UX};
         // AP: EL1 only, both, EL1 read-only, both read-only.
         assert_eq!(flags(&mut tables, &controls, 0, 0), PR | PW | PX | UX);
         // What EL0 can write, EL1 does not execute.
-        assert_eq!(flags(&mut tables, &controls, USER, 0), PR | PW | UR | UW | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER, 0),
+            PR | PW | UR | UW | UX
+        );
         assert_eq!(flags(&mut tables, &controls, READ_ONLY, 0), PR | PX | UX);
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY, 0), PR | PX | UR | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY, 0),
+            PR | PX | UR | UX
+        );
         // UXN and PXN.
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY | UXN, 0), PR | PX | UR);
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY | PXN, 0), PR | UR | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY | UXN, 0),
+            PR | PX | UR
+        );
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY | PXN, 0),
+            PR | UR | UX
+        );
         // A table descriptor takes away: EL0 (bit 61), writes (62),
         // execution at EL0 (60) and at EL1 (59).
-        assert_eq!(flags(&mut tables, &controls, USER, 1 << 61), PR | PW | PX | UX);
-        assert_eq!(flags(&mut tables, &controls, USER, 1 << 62), PR | PX | UR | UX);
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY, 1 << 60), PR | PX | UR);
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY, 1 << 59), PR | UR | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER, 1 << 61),
+            PR | PW | PX | UX
+        );
+        assert_eq!(
+            flags(&mut tables, &controls, USER, 1 << 62),
+            PR | PX | UR | UX
+        );
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY, 1 << 60),
+            PR | PX | UR
+        );
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY, 1 << 59),
+            PR | UR | UX
+        );
         // With TCR.HPD0 it takes nothing away, as on QEMU.
         controls.tcr |= 1 << 41;
-        assert_eq!(flags(&mut tables, &controls, USER, 0xf << 59), PR | PW | UR | UW | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER, 0xf << 59),
+            PR | PW | UR | UW | UX
+        );
         controls.tcr &= !(1 << 41);
         // WXN: what a level can write, it does not execute.
         controls.wxn = true;
         assert_eq!(flags(&mut tables, &controls, 0, 0), PR | PW | UX);
         assert_eq!(flags(&mut tables, &controls, USER, 0), PR | PW | UR | UW);
-        assert_eq!(flags(&mut tables, &controls, USER | READ_ONLY, 0), PR | PX | UR | UX);
+        assert_eq!(
+            flags(&mut tables, &controls, USER | READ_ONLY, 0),
+            PR | PX | UR | UX
+        );
         controls.wxn = false;
         // The memory type comes from the byte of MAIR that the descriptor
         // selects: the index 1 is Device memory here.
-        tables.words.insert(path[3], 0x8000_0000 | TABLE | AF | 1 << 2 | 3 << 8);
+        tables
+            .words
+            .insert(path[3], 0x8000_0000 | TABLE | AF | 1 << 2 | 3 << 8);
         let found = tables.walk(&controls, va).unwrap();
         assert_ne!(found.flags & flag::DEVICE, 0);
         assert_eq!((found.attributes, found.shareability), (0x04, 3));
@@ -1032,13 +1147,29 @@ mod tests {
         assert!(canonical(0xffff_8000_0000_0000) && canonical(0x7f_ffff_ffff_ffff));
         assert!(!canonical(low) && !canonical(0x00ff_0000_0000_0000));
         // The output size: IPS, and at most what the CPU has.
-        for (ips, bits) in [(0u64, 32), (1, 36), (2, 40), (3, 42), (4, 44), (5, 48), (6, 48), (7, 48)] {
+        for (ips, bits) in [
+            (0u64, 32),
+            (1, 36),
+            (2, 40),
+            (3, 42),
+            (4, 44),
+            (5, 48),
+            (6, 48),
+            (7, 48),
+        ] {
             controls.tcr = controls.tcr & !(7 << 32) | ips << 32;
             assert_eq!(controls.output_bits(), bits);
         }
         // A granule that the CPU does not have is replaced.
         controls.granules = 1 << 12;
-        assert_eq!((controls.supported(12), controls.supported(16), controls.supported(14)), (12, 12, 12));
+        assert_eq!(
+            (
+                controls.supported(12),
+                controls.supported(16),
+                controls.supported(14)
+            ),
+            (12, 12, 12)
+        );
         controls.granules = 1 << 14 | 1 << 16;
         assert_eq!((controls.supported(12), controls.supported(14)), (16, 14));
     }
@@ -1052,7 +1183,10 @@ mod tests {
         assert_eq!(found.page, 0x12_3456_7000);
         assert_eq!(found.flags, 0x3f | flag::DEVICE);
         assert!(found.global);
-        assert_eq!(walk(&controls, 1 << 40, &mut |_| None), fault_of(FaultKind::AddressSize, 0));
+        assert_eq!(
+            walk(&controls, 1 << 40, &mut |_| None),
+            fault_of(FaultKind::AddressSize, 0)
+        );
     }
 
     #[test]
@@ -1069,10 +1203,34 @@ mod tests {
         assert_eq!(par_of(&page), 0xff00_0040_1234_5b80);
         // Device memory, and memory that is not cached, read as outer
         // shareable.
-        assert_eq!(par_of(&Translation { attributes: 0x04, ..page }), 0x0400_0040_1234_5b00);
-        assert_eq!(par_of(&Translation { attributes: 0x44, ..page }), 0x4400_0040_1234_5b00);
-        assert_eq!(par_fault(Fault { kind: FaultKind::Translation, level: 2 }), 0x80d);
-        assert_eq!(par_fault(Fault { kind: FaultKind::Permission, level: 3 }), 0x81f);
+        assert_eq!(
+            par_of(&Translation {
+                attributes: 0x04,
+                ..page
+            }),
+            0x0400_0040_1234_5b00
+        );
+        assert_eq!(
+            par_of(&Translation {
+                attributes: 0x44,
+                ..page
+            }),
+            0x4400_0040_1234_5b00
+        );
+        assert_eq!(
+            par_fault(Fault {
+                kind: FaultKind::Translation,
+                level: 2
+            }),
+            0x80d
+        );
+        assert_eq!(
+            par_fault(Fault {
+                kind: FaultKind::Permission,
+                level: 3
+            }),
+            0x81f
+        );
     }
 
     /// A memory with one page mapped at `va` through tables of the 4K
@@ -1103,7 +1261,10 @@ mod tests {
         let mut mmu = Mmu::new(&state);
         assert_eq!(mmu.entries(), 0);
         assert_eq!(mmu.hit(va + 8, 8, flag::PR), None);
-        assert_eq!(mmu.translate(&mut memory, va + 8, Kind::Read, false), Ok((0x4008_0008, flag::PR | flag::PW | flag::PX | flag::UX)));
+        assert_eq!(
+            mmu.translate(&mut memory, va + 8, Kind::Read, false),
+            Ok((0x4008_0008, flag::PR | flag::PW | flag::PX | flag::UX))
+        );
         assert_eq!(mmu.entries(), 1);
         assert!(mmu.hit(va + 8, 8, flag::PR).is_some());
         // An access that leaves the page, or lacks the permission, is no hit.
@@ -1111,23 +1272,38 @@ mod tests {
         assert_eq!(mmu.hit(va, 8, flag::UR), None);
         assert_eq!(
             mmu.translate(&mut memory, va, Kind::Read, true),
-            Err(Miss::Fault(Fault { kind: FaultKind::Permission, level: 3 }))
+            Err(Miss::Fault(Fault {
+                kind: FaultKind::Permission,
+                level: 3
+            }))
         );
         // The descriptor changes, and the TLB still holds the old one.
-        memory.write(path[3], &(0x4009_0000u64 | TABLE | AF | NOT_GLOBAL).to_le_bytes()).unwrap();
-        assert_eq!(mmu.translate(&mut memory, va, Kind::Read, false).unwrap().0, 0x4008_0000);
+        memory
+            .write(
+                path[3],
+                &(0x4009_0000u64 | TABLE | AF | NOT_GLOBAL).to_le_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            mmu.translate(&mut memory, va, Kind::Read, false).unwrap().0,
+            0x4008_0000
+        );
         // A TLBI of another ASID leaves an entry that is not global.
         mmu.flush_page(Regime::El10, va >> 12 | 9 << 48, Some(9));
         mmu.flush_asid(Regime::El10, 9);
         assert_eq!(mmu.entries(), 1);
         mmu.flush_page(Regime::El10, va >> 12 | 7 << 48, Some(7));
         assert_eq!(mmu.entries(), 0);
-        assert_eq!(mmu.translate(&mut memory, va, Kind::Read, false).unwrap().0, 0x4009_0000);
+        assert_eq!(
+            mmu.translate(&mut memory, va, Kind::Read, false).unwrap().0,
+            0x4009_0000
+        );
         mmu.flush_asid(Regime::El10, 7);
         assert_eq!(mmu.entries(), 0);
         // A new ASID finds no entry of the old one, and drops none.
         mmu.translate(&mut memory, va, Kind::Read, false).unwrap();
-        state.system.regs[reg::TTBR0_EL1] = state.system.regs[reg::TTBR0_EL1] & 0xffff_ffff_ffff | 8 << 48;
+        state.system.regs[reg::TTBR0_EL1] =
+            state.system.regs[reg::TTBR0_EL1] & 0xffff_ffff_ffff | 8 << 48;
         mmu.sync(&state);
         assert_eq!(mmu.entries(), 1);
         assert_eq!(mmu.hit(va, 8, flag::PR), None);
@@ -1146,7 +1322,10 @@ mod tests {
         mmu.sync(&state);
         assert_eq!(
             mmu.translate(&mut memory, va, Kind::Read, false),
-            Err(Miss::Fault(Fault { kind: FaultKind::ExternalOnWalk, level: 0 }))
+            Err(Miss::Fault(Fault {
+                kind: FaultKind::ExternalOnWalk,
+                level: 0
+            }))
         );
     }
 
@@ -1155,10 +1334,14 @@ mod tests {
         let va = 0x7f_0020_0000u64;
         let (mut memory, state, path) = mapped(va, 0);
         // A block of 2 MiB at level 2, in place of the table of level 3.
-        memory.write(path[2], &(0x4000_0000u64 | VALID | AF).to_le_bytes()).unwrap();
+        memory
+            .write(path[2], &(0x4000_0000u64 | VALID | AF).to_le_bytes())
+            .unwrap();
         let mut mmu = Mmu::new(&state);
         for page in [0u64, 5, 0x1ff] {
-            let (phys, _) = mmu.translate(&mut memory, va + page * 0x1000, Kind::Read, false).unwrap();
+            let (phys, _) = mmu
+                .translate(&mut memory, va + page * 0x1000, Kind::Read, false)
+                .unwrap();
             assert_eq!(phys, 0x4000_0000 + page * 0x1000);
         }
         assert_eq!(mmu.entries(), 3);

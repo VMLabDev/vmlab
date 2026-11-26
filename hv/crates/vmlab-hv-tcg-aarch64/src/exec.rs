@@ -340,7 +340,8 @@ impl Side {
 
     /// Whether the bytes at `spot` are in a page that holds translated code.
     fn is_code(&self, spot: Spot, bytes: u8) -> bool {
-        let holds = |address: u64| self.maybe_code(address) && self.code_set.contains(&(address >> 12));
+        let holds =
+            |address: u64| self.maybe_code(address) && self.code_set.contains(&(address >> 12));
         holds(spot.first) || (spot.in_first < usize::from(bytes) && holds(spot.second))
     }
 
@@ -474,12 +475,7 @@ impl Side {
         Ok(())
     }
 
-    fn write_at<M: Memory>(
-        memory: &mut M,
-        va: u64,
-        spot: Spot,
-        part: &[u8],
-    ) -> Result<(), Fault> {
+    fn write_at<M: Memory>(memory: &mut M, va: u64, spot: Spot, part: &[u8]) -> Result<(), Fault> {
         let (low, high) = part.split_at(spot.in_first);
         memory
             .write(spot.first, low)
@@ -564,8 +560,8 @@ impl Side {
                 let lock = memory.transaction_lock();
                 let _atomic = lock.as_ref().map(|lock| lock.lock());
                 let len = usize::from(reservation.bytes);
-                let intact = memory.reservation_generation(reservation.phys, len)
-                    == reservation.generation;
+                let intact =
+                    memory.reservation_generation(reservation.phys, len) == reservation.generation;
                 Self::write_at(memory, address, spot, part)?;
                 if intact {
                     self.exclusive = Some(Reservation {
@@ -585,12 +581,12 @@ impl Side {
         let base = address & !(ZERO_BLOCK as u64 - 1);
         // The block is aligned to its size, so it is in one page. A fault
         // names the address that the instruction gave, as QEMU's does.
-        let spot = self
-            .resolve(memory, base, 1, Kind::Write, user)
-            .map_err(|fault| match fault {
-                Fault::Abort(fault, _) => Fault::Abort(fault, address),
-                host => host,
-            })?;
+        let spot =
+            self.resolve(memory, base, 1, Kind::Write, user)
+                .map_err(|fault| match fault {
+                    Fault::Abort(fault, _) => Fault::Abort(fault, address),
+                    host => host,
+                })?;
         let code = self.is_code(spot, 1);
         // An external abort names the first byte of the block.
         memory
@@ -1658,7 +1654,12 @@ impl<M: Memory> Cpu<M> {
     /// `SYS` (or `SYSL` when `read`) of the operation op1:CRn:CRm:op2 with
     /// the register `rt`: a cache, TLB or address translation operation.
     /// The inner `Err`: the exception that it takes.
-    fn operation(&mut self, encoding: u16, rt: u8, read: bool) -> Result<Result<(), Exception>, Stop> {
+    fn operation(
+        &mut self,
+        encoding: u16,
+        rt: u8,
+        read: bool,
+    ) -> Result<Result<(), Exception>, Stop> {
         let el0 = self.state.context.el == 0;
         let sctlr = self.state.system.regs[reg::SCTLR_EL1];
         let value = match rt {
@@ -1681,13 +1682,11 @@ impl<M: Memory> Cpu<M> {
             (0, 7, 1 | 5, 0) | (0, 7, 6, 1 | 2) | (0, 7, 10 | 14, 2) if !el0 => Some(Ok(())),
             // IC IVAU, DC CVAC, CVAU and CIVAC: EL0 runs them with
             // SCTLR_EL1.UCI.
-            (3, 7, 5, 1) | (3, 7, 10 | 11 | 14, 1) => {
-                Some(if el0 && sctlr & sctlr::UCI == 0 {
-                    Err(trapped)
-                } else {
-                    Ok(())
-                })
-            }
+            (3, 7, 5, 1) | (3, 7, 10 | 11 | 14, 1) => Some(if el0 && sctlr & sctlr::UCI == 0 {
+                Err(trapped)
+            } else {
+                Ok(())
+            }),
             // DC ZVA: EL0 runs it with SCTLR_EL1.DZE.
             (3, 7, 4, 1) => Some(if el0 && sctlr & sctlr::DZE == 0 {
                 Err(trapped)
@@ -1705,7 +1704,11 @@ impl<M: Memory> Cpu<M> {
             }),
             // AT S1E1R, S1E1W, S1E0R and S1E0W: the result is in PAR_EL1.
             (0, 7, 8, op2 @ 0..=3) if !el0 => {
-                let kind = if op2 & 1 == 0 { Kind::Read } else { Kind::Write };
+                let kind = if op2 & 1 == 0 {
+                    Kind::Read
+                } else {
+                    Kind::Write
+                };
                 let par = match self.side.mmu.walk(&mut self.memory, value, false) {
                     Ok(page) if page.flags & mmu::needed(kind, op2 & 2 != 0) != 0 => {
                         mmu::par_of(&page)
@@ -1757,7 +1760,11 @@ impl<M: Memory> Cpu<M> {
         }
     }
 
-    fn unknown_operation(&mut self, encoding: u16, read: bool) -> Result<Result<(), Exception>, Stop> {
+    fn unknown_operation(
+        &mut self,
+        encoding: u16,
+        read: bool,
+    ) -> Result<Result<(), Exception>, Stop> {
         self.note(Unknown::Operation { encoding, read });
         Ok(Err(Exception::Undefined))
     }
@@ -1878,7 +1885,10 @@ impl<M: Memory> Cpu<M> {
         loop {
             let mut bytes = [0u8; 4];
             // A block stays inside one page, so one translation serves it.
-            match self.memory.read(phys.wrapping_add(at.wrapping_sub(pc)), &mut bytes) {
+            match self
+                .memory
+                .read(phys.wrapping_add(at.wrapping_sub(pc)), &mut bytes)
+            {
                 Ok(()) => {}
                 Err(Error::Memory(_)) if count == 0 => {
                     // The memory of the machine holds nothing there.
@@ -2092,9 +2102,9 @@ impl<M: Memory> Cpu<M> {
         match halt {
             None | Some(Halt::Taken) => Ok(()),
             Some(Halt::Stop(stop)) => Err(stop),
-            Some(Halt::Retry | Halt::Raise(_)) => {
-                Err(host("a block of one instruction left in a way that it cannot"))
-            }
+            Some(Halt::Retry | Halt::Raise(_)) => Err(host(
+                "a block of one instruction left in a way that it cannot",
+            )),
         }
     }
 

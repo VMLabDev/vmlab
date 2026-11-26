@@ -71,7 +71,9 @@ pub enum ExceptionClass {
     Undefined,
     /// A load or a store that cannot be made. `unprivileged`: the accesses
     /// of the instruction are made as EL0 (`LDTR`, `STTR`).
-    DataAbort { unprivileged: bool },
+    DataAbort {
+        unprivileged: bool,
+    },
     /// An access to an address that is not a multiple of its size. The
     /// syndrome is the address. `always`: the instruction asks for the
     /// alignment (an exclusive access). Otherwise the memory that the

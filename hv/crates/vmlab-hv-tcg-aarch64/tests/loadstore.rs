@@ -867,7 +867,10 @@ fn an_exclusive_store_at_the_marked_address_is_an_access_and_asks_for_its_alignm
     cpu.step().unwrap();
     cpu.step().unwrap();
     // The alignment fault of an exclusive store says "read", as QEMU's.
-    assert_eq!(abort(&cpu), Some((BASE + 4, DATA + 0x101, false, ALIGNMENT)));
+    assert_eq!(
+        abort(&cpu),
+        Some((BASE + 4, DATA + 0x101, false, ALIGNMENT))
+    );
     assert_eq!(cpu.state.x(10), 7);
     // The store did not complete, so the mark is still there.
     cpu.state.set_pc(BASE + 8);
@@ -944,7 +947,10 @@ fn an_access_asks_for_an_address_that_is_a_multiple_of_its_size() {
     cpu.state.set_x(0, DATA + 0x101);
     cpu.state.set_x(2, 5);
     assert!(matches!(cpu.run(100), Stop::Hypercall { pc, .. } if pc == VECTOR));
-    assert_eq!(abort(&cpu), Some((BASE + 4, DATA + 0x101, false, ALIGNMENT)));
+    assert_eq!(
+        abort(&cpu),
+        Some((BASE + 4, DATA + 0x101, false, ALIGNMENT))
+    );
     // The instruction before the fault, and the call at the vector.
     assert_eq!(cpu.instructions, 2);
     assert_eq!((cpu.state.x(1), cpu.state.x(2)), (1, 5));

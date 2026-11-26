@@ -89,12 +89,18 @@ impl Machine {
                 next = self.next_table;
                 self.next_table += 0x1000;
                 assert!(next < ROOT + TABLE_PAGES * 0x1000, "the tables are full");
-                self.cpu.memory.write(entry, &(next | 3).to_le_bytes()).unwrap();
+                self.cpu
+                    .memory
+                    .write(entry, &(next | 3).to_le_bytes())
+                    .unwrap();
             }
             table = next;
         }
         let entry = table + ((va >> 12) & 0x1ff) * 8;
-        self.cpu.memory.write(entry, &(leaf | VALID_PAGE).to_le_bytes()).unwrap();
+        self.cpu
+            .memory
+            .write(entry, &(leaf | VALID_PAGE).to_le_bytes())
+            .unwrap();
         entry
     }
 
@@ -136,7 +142,11 @@ fn a_load_and_a_store_go_through_the_tables() {
     let mut machine = Machine::new(&[ldr(1, 0), str(1, 2), HVC]);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(VA + 0x1000, OTHER | AF | NO_EXECUTE);
-    machine.cpu.memory.write(DATA + 0x10, &0x1122_3344u64.to_le_bytes()).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(DATA + 0x10, &0x1122_3344u64.to_le_bytes())
+        .unwrap();
     machine.cpu.state.set_x(0, VA + 0x10);
     machine.cpu.state.set_x(2, VA + 0x1ff8);
     assert!(matches!(machine.cpu.run(10), Stop::Hypercall { .. }));
@@ -145,7 +155,10 @@ fn a_load_and_a_store_go_through_the_tables() {
     // The store is in the last bytes of the second page: nothing of it is
     // in a third one.
     assert_eq!(machine.word(OTHER + 0xff8), 0x1122_3344);
-    assert_eq!(machine.cpu.physical_address(VA + 0x1234), Some(OTHER + 0x234));
+    assert_eq!(
+        machine.cpu.physical_address(VA + 0x1234),
+        Some(OTHER + 0x234)
+    );
     assert_eq!(machine.cpu.physical_address(VA + 0x2000), None);
     assert!(machine.cpu.tlb_entries() >= 3);
 }
@@ -185,12 +198,31 @@ fn each_fault_of_an_access_has_its_syndrome() {
     // EL1 and at EL0.
     let cases: [(u64, [Option<u64>; 4]); 6] = [
         // No access flag: an access flag fault of level 3.
-        (0, [Some(0x9600_000b), Some(0x9600_004b), Some(0x9200_000b), Some(0x9200_004b)]),
+        (
+            0,
+            [
+                Some(0x9600_000b),
+                Some(0x9600_004b),
+                Some(0x9200_000b),
+                Some(0x9200_004b),
+            ],
+        ),
         // For EL1 only.
         (AF, [None, None, Some(0x9200_000f), Some(0x9200_004f)]),
-        (AF | READ_ONLY, [None, Some(0x9600_004f), Some(0x9200_000f), Some(0x9200_004f)]),
+        (
+            AF | READ_ONLY,
+            [
+                None,
+                Some(0x9600_004f),
+                Some(0x9200_000f),
+                Some(0x9200_004f),
+            ],
+        ),
         (AF | USER, [None, None, None, None]),
-        (AF | USER | READ_ONLY, [None, Some(0x9600_004f), None, Some(0x9200_004f)]),
+        (
+            AF | USER | READ_ONLY,
+            [None, Some(0x9600_004f), None, Some(0x9200_004f)],
+        ),
         // An output address above the 40 bits of IPS.
         (AF | 1 << 44, [Some(0x9600_0003); 4].map(|esr| esr)),
     ];
@@ -214,7 +246,11 @@ fn each_fault_of_an_access_has_its_syndrome() {
                 };
                 (VA + 0x40, esr)
             });
-            assert_eq!(machine.abort(), expected, "{leaf:#x} store {store} user {user}");
+            assert_eq!(
+                machine.abort(),
+                expected,
+                "{leaf:#x} store {store} user {user}"
+            );
         }
     }
     // No descriptor at level 3, and none at level 1.
@@ -246,7 +282,11 @@ fn an_unprivileged_access_is_made_as_el0() {
     // ldtr x1, [x0] ; sttr x1, [x0] ; ldr x2, [x0]
     let mut machine = Machine::new(&[ldtr(1, 0), sttr(1, 0), ldr(2, 0), HVC]);
     machine.map(VA, DATA | AF | NO_EXECUTE);
-    machine.cpu.memory.write(DATA, &77u64.to_le_bytes()).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(DATA, &77u64.to_le_bytes())
+        .unwrap();
     machine.cpu.state.set_x(0, VA);
     machine.cpu.step().unwrap();
     // A permission fault of level 3 from EL1, as a read and as a write.
@@ -271,7 +311,11 @@ fn alignment_faults_in_device_memory_and_with_sctlr_a() {
         machine.cpu.state.set_x(0, VA + 3);
         machine.cpu.step().unwrap();
         let expected = faults.then_some((VA + 3, 0x9600_0021));
-        assert_eq!(machine.abort(), expected, "attribute {attribute} strict {strict}");
+        assert_eq!(
+            machine.abort(),
+            expected,
+            "attribute {attribute} strict {strict}"
+        );
     }
     // In Device memory the permission fault of the page comes after the
     // alignment fault, and the access flag fault before it.
@@ -309,7 +353,11 @@ fn execution_needs_the_permission_of_its_level() {
         let expected = status.map(|status| Cause::Exception(Exception::InstructionAbort(status)));
         // At EL0 the call is undefined: it shows that the page ran.
         let ran = Some(Cause::Exception(Exception::Undefined));
-        assert_eq!(taken, expected.or(if user { ran } else { None }), "{leaf:#x} {user}");
+        assert_eq!(
+            taken,
+            expected.or(if user { ran } else { None }),
+            "{leaf:#x} {user}"
+        );
         if status.is_some() {
             assert_eq!(machine.cpu.state.system.regs[sysreg::reg::FAR_EL1], VA);
         }
@@ -331,7 +379,10 @@ fn a_tagged_address_translates_with_tbi_and_a_branch_drops_the_tag() {
     machine.cpu.state.refresh();
     machine.cpu.state.set_pc(CODE);
     machine.cpu.step().unwrap();
-    assert_eq!((machine.cpu.taken, machine.cpu.state.x(1) as u32), (None, HVC));
+    assert_eq!(
+        (machine.cpu.taken, machine.cpu.state.x(1) as u32),
+        (None, HVC)
+    );
     machine.cpu.step().unwrap();
     assert_eq!(machine.cpu.state.pc(), VA);
     // With TBID0, as QEMU has it, the branch keeps the tag, and the fetch
@@ -377,12 +428,17 @@ fn dc_zva_zeroes_its_block_and_faults_as_a_store() {
     machine.cpu.step().unwrap();
     assert_eq!(
         machine.cpu.taken.map(|taken| taken.cause),
-        Some(Cause::Exception(Exception::SystemTrap(
-            sysreg::trap_iss(0x4000 | op::DC_ZVA, 0, true)
-        )))
+        Some(Cause::Exception(Exception::SystemTrap(sysreg::trap_iss(
+            0x4000 | op::DC_ZVA,
+            0,
+            true
+        ))))
     );
     // op0 1, op2 1, op1 3, CRn 7, CRm 4, a write, as QEMU reports it.
-    assert_eq!(machine.cpu.state.system.regs[sysreg::reg::ESR_EL1], 0x6212_dc08);
+    assert_eq!(
+        machine.cpu.state.system.regs[sysreg::reg::ESR_EL1],
+        0x6212_dc08
+    );
     machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::DZE;
     machine.to_el0();
     machine.cpu.state.set_pc(CODE);
@@ -445,7 +501,11 @@ fn a_changed_descriptor_holds_after_its_tlbi() {
         let mut machine = Machine::new(&[ldr(1, 0), asm::sys(operation, 3), ldr(2, 0), HVC]);
         let entry = machine.map(VA, DATA | AF | NOT_GLOBAL);
         machine.cpu.memory.write(DATA, &1u64.to_le_bytes()).unwrap();
-        machine.cpu.memory.write(OTHER, &2u64.to_le_bytes()).unwrap();
+        machine
+            .cpu
+            .memory
+            .write(OTHER, &2u64.to_le_bytes())
+            .unwrap();
         machine.cpu.state.set_x(0, VA);
         machine.cpu.state.set_x(3, argument);
         machine.cpu.step().unwrap();
@@ -457,24 +517,36 @@ fn a_changed_descriptor_holds_after_its_tlbi() {
         assert!(matches!(machine.cpu.run(10), Stop::Hypercall { .. }));
         assert_eq!(machine.cpu.taken, None);
         let expected = if flushed { 2 } else { 1 };
-        assert_eq!(machine.cpu.state.x(2), expected, "{operation:#x} {argument:#x}");
+        assert_eq!(
+            machine.cpu.state.x(2),
+            expected,
+            "{operation:#x} {argument:#x}"
+        );
     }
     // A global entry goes with its address, whatever the ASID.
     let mut machine = Machine::new(&[ldr(1, 0), asm::sys(0x0439, 3), ldr(2, 0), HVC]);
     let entry = machine.map(VA, DATA | AF);
-    machine.cpu.memory.write(OTHER, &2u64.to_le_bytes()).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(OTHER, &2u64.to_le_bytes())
+        .unwrap();
     machine.cpu.state.set_x(0, VA);
     machine.cpu.state.set_x(3, VA >> 12 | 9 << 48);
     machine.cpu.step().unwrap();
-    machine.cpu.memory.write(entry, &(OTHER | AF | VALID_PAGE).to_le_bytes()).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(entry, &(OTHER | AF | VALID_PAGE).to_le_bytes())
+        .unwrap();
     assert!(matches!(machine.cpu.run(10), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.state.x(2), 2);
     // TLBI is for EL1, and the operations of later extensions do not exist.
     for (word, user) in [
         (asm::sys(op::TLBI_VMALLE1, 31), true),
-        (asm::sys(0x0408, 31), false), // vmalle1os
-        (asm::sys(0x0431, 0), false),  // rvae1
-        (asm::sys(0x2438, 31), false), // alle2
+        (asm::sys(0x0408, 31), false),                // vmalle1os
+        (asm::sys(0x0431, 0), false),                 // rvae1
+        (asm::sys(0x2438, 31), false),                // alle2
         (asm::sys(op::AT_S1E1R, 0) | 1 << 21, false), // sysl
     ] {
         let mut machine = Machine::new(&[word, HVC]);
@@ -504,9 +576,11 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
         machine.cpu.step().unwrap();
         assert_eq!(
             machine.cpu.taken.map(|taken| taken.cause),
-            Some(Cause::Exception(Exception::SystemTrap(
-                sysreg::trap_iss(0x4000 | operation, 0, true)
-            )))
+            Some(Cause::Exception(Exception::SystemTrap(sysreg::trap_iss(
+                0x4000 | operation,
+                0,
+                true
+            ))))
         );
         machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::UCI;
         machine.cpu.state.set_pc(CODE);
@@ -546,7 +620,11 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
-    machine.cpu.memory.write(DATA, &asm::bytes(&[ADD_1, asm::RET])).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(DATA, &asm::bytes(&[ADD_1, asm::RET]))
+        .unwrap();
     machine.cpu.state.set_x(0, VA);
     machine.cpu.state.set_x(2, RUN);
     machine.cpu.state.set_x(3, u64::from(ADD_2));
@@ -558,7 +636,11 @@ fn code_that_is_written_through_another_address_runs_as_written() {
     let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(2), HVC]);
     machine.map(VA, DATA | AF | NO_EXECUTE);
     machine.map(RUN, DATA | AF | READ_ONLY);
-    machine.cpu.memory.write(DATA, &asm::bytes(&[ADD_1, asm::RET])).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(DATA, &asm::bytes(&[ADD_1, asm::RET]))
+        .unwrap();
     machine.cpu.state.set_x(0, VA);
     machine.cpu.state.set_x(2, RUN);
     machine.cpu.state.set_x(3, u64::from(ADD_2));
@@ -585,13 +667,27 @@ fn an_address_that_maps_other_code_runs_the_other_code() {
     let entry = machine.map(RUN, DATA | AF | READ_ONLY);
     // The tables are mapped at their own addresses, for EL1.
     for page in 0..TABLE_PAGES {
-        machine.map(ROOT + page * 0x1000, (ROOT + page * 0x1000) | AF | NO_EXECUTE);
+        machine.map(
+            ROOT + page * 0x1000,
+            (ROOT + page * 0x1000) | AF | NO_EXECUTE,
+        );
     }
-    machine.cpu.memory.write(DATA, &asm::bytes(&[0x9100_0421, asm::RET])).unwrap();
-    machine.cpu.memory.write(OTHER, &asm::bytes(&[0x9100_1421, asm::RET])).unwrap();
+    machine
+        .cpu
+        .memory
+        .write(DATA, &asm::bytes(&[0x9100_0421, asm::RET]))
+        .unwrap();
+    machine
+        .cpu
+        .memory
+        .write(OTHER, &asm::bytes(&[0x9100_1421, asm::RET]))
+        .unwrap();
     machine.cpu.state.set_x(0, entry);
     machine.cpu.state.set_x(2, RUN);
-    machine.cpu.state.set_x(3, OTHER | AF | READ_ONLY | VALID_PAGE);
+    machine
+        .cpu
+        .state
+        .set_x(3, OTHER | AF | READ_ONLY | VALID_PAGE);
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.taken, None);
     // add x1, x1, #1 from the first page, add x1, x1, #5 from the second.
@@ -605,7 +701,10 @@ fn the_guest_takes_the_abort_and_returns_to_the_access() {
     let mut machine = Machine::new(&[str(1, 0), HVC]);
     let entry = machine.map(VA, DATA | NO_EXECUTE);
     for page in 0..TABLE_PAGES {
-        machine.map(ROOT + page * 0x1000, (ROOT + page * 0x1000) | AF | NO_EXECUTE);
+        machine.map(
+            ROOT + page * 0x1000,
+            (ROOT + page * 0x1000) | AF | NO_EXECUTE,
+        );
     }
     machine
         .cpu
@@ -615,10 +714,16 @@ fn the_guest_takes_the_abort_and_returns_to_the_access() {
     machine.cpu.state.set_x(0, VA + 8);
     machine.cpu.state.set_x(1, 0x55);
     machine.cpu.state.set_x(2, entry);
-    machine.cpu.state.set_x(3, DATA | AF | NO_EXECUTE | VALID_PAGE);
+    machine
+        .cpu
+        .state
+        .set_x(3, DATA | AF | NO_EXECUTE | VALID_PAGE);
     assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
     assert_eq!(machine.cpu.exceptions, 1);
     assert_eq!(machine.word(DATA + 8), 0x55);
     // An access flag fault is not kept by the TLB: no TLBI was needed.
-    assert_eq!(machine.cpu.state.system.regs[sysreg::reg::ESR_EL1], 0x9600_004b);
+    assert_eq!(
+        machine.cpu.state.system.regs[sysreg::reg::ESR_EL1],
+        0x9600_004b
+    );
 }
