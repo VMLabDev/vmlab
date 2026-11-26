@@ -226,6 +226,8 @@ localhost TCP bridge to the socket, held open by a detached helper that exits
 when the viewer window closes, so neither command ties up the terminal. With
 no viewer at all, or with `--tcp`, `vmlab console` bridges the socket to a
 localhost port and prints the address for you to point any VNC client at.
+Every bridge asks its connections for a password of its own, which vmlab
+hands to the viewer it starts and prints for one that you start.
 Closing a viewer only disconnects; the VM keeps running, always headless
 behind VNC. See [vmlab console](cmd_console).
 DOC
