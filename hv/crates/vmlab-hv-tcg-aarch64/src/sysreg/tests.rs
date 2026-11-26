@@ -409,7 +409,6 @@ fn a_write_changes_the_bits_of_the_mask_and_no_other() {
         ("SCTLR_EL1", !1, 0xf3ff_f01f_ffff_fffe),
         ("ACTLR_EL1", u64::MAX, 0),
         ("AMAIR_EL1", u64::MAX, 0),
-        ("DBGCLAIMSET_EL1", 0, 0xff),
         ("NZCV", u64::MAX, 0xf000_0000),
         ("DAIF", u64::MAX, 0x3c0),
         ("SPSel", u64::MAX, 1),
@@ -472,6 +471,14 @@ fn the_special_registers() {
     assert_eq!(bench.named("OSLSR_EL1"), Answer::Ran(0x8));
     bench.set("OSLAR_EL1", 0xffff_ffff_ffff_ffff);
     assert_eq!(bench.named("OSLSR_EL1"), Answer::Ran(0xa));
+    // The claim tags: one register sets them, the other clears and shows them.
+    assert_eq!(bench.named("DBGCLAIMSET_EL1"), Answer::Ran(0xff));
+    assert_eq!(bench.named("DBGCLAIMCLR_EL1"), Answer::Ran(0));
+    bench.set("DBGCLAIMSET_EL1", 0xffff_ff0f);
+    assert_eq!(bench.named("DBGCLAIMCLR_EL1"), Answer::Ran(0x0f));
+    assert_eq!(bench.named("DBGCLAIMSET_EL1"), Answer::Ran(0xff));
+    bench.set("DBGCLAIMCLR_EL1", 0x05);
+    assert_eq!(bench.named("DBGCLAIMCLR_EL1"), Answer::Ran(0x0a));
     // ISR_EL1 shows the two lines.
     assert_eq!(bench.named("ISR_EL1"), Answer::Ran(0));
     bench.cpu.irq = true;

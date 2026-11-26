@@ -193,7 +193,7 @@ pub fn compared() -> Vec<Compared> {
                     | sysreg::Special::SpEl0
             )
         );
-        if stored || special || row.name == "OSLSR_EL1" {
+        if stored || special || matches!(row.name, "OSLSR_EL1" | "DBGCLAIMCLR_EL1") {
             let qemu = match row.name {
                 "CSSELR_EL1" => "CSSELR",
                 name => name,

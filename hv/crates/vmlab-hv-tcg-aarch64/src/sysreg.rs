@@ -86,6 +86,12 @@ pub enum Special {
     Isr,
     /// OSLAR_EL1: bit 0 goes to OSLSR_EL1.OSLK.
     Oslar,
+    /// DBGCLAIMSET_EL1: reads as the eight claim tags that exist, and a
+    /// write sets tags.
+    ClaimSet,
+    /// DBGCLAIMCLR_EL1: reads as the tags that are set, and a write clears
+    /// tags. The tags are the word of this row.
+    ClaimClear,
     /// CNTPCT_EL0 and CNTVCT_EL0.
     Counter,
     /// CNT[PV]_CTL_EL0. `true`: the virtual timer.
@@ -225,8 +231,8 @@ pub const ROWS: &[Row] = &[
     // OSLM says that the OS lock is implemented, and OSLK that it is set.
     id("OSLSR_EL1", 0x808c).reset(0xa),
     stored("OSDLR_EL1", 0x809c, 0, 1),
-    stored("DBGCLAIMSET_EL1", 0x83c6, 0xff, 0),
-    stored("DBGCLAIMCLR_EL1", 0x83ce, 0, 0),
+    special("DBGCLAIMSET_EL1", 0x83c6, Special::ClaimSet, Rw::Rw),
+    special("DBGCLAIMCLR_EL1", 0x83ce, Special::ClaimClear, Rw::Rw),
     id("MDCCSR_EL0", 0x9808).el0(Rw::Ro, Gate::Dcc),
     stored("DBGDTR_EL0", 0x9820, 0, 0).el0(Rw::Rw, Gate::Dcc),
     // The same encoding is DBGDTRTX_EL0 for a write.
@@ -427,6 +433,7 @@ pub mod reg {
     pub const OSLSR_EL1: usize = index("OSLSR_EL1");
     pub const CSSELR_EL1: usize = index("CSSELR_EL1");
     pub const MPIDR_EL1: usize = index("MPIDR_EL1");
+    pub const DBGCLAIMCLR_EL1: usize = index("DBGCLAIMCLR_EL1");
     pub const ID_RESERVED: usize = index(super::ID_RESERVED);
 }
 
@@ -629,6 +636,8 @@ pub fn read(row: usize, state: &State, environment: &Environment) -> u64 {
         Special::Ccsidr => system.model.ccsidr[(system.regs[reg::CSSELR_EL1] & 15) as usize],
         Special::Isr => u64::from(environment.irq) << 7 | u64::from(environment.fiq) << 6,
         Special::Oslar => 0,
+        Special::ClaimSet => 0xff,
+        Special::ClaimClear => system.regs[reg::DBGCLAIMCLR_EL1],
         Special::Counter => environment.count,
         Special::TimerControl(which) => system.timers[usize::from(which)].control(environment.count),
         Special::TimerCompare(which) => system.timers[usize::from(which)].compare,
@@ -656,6 +665,8 @@ pub fn write(row: usize, state: &mut State, environment: &Environment, value: u6
             let locked = &mut state.system.regs[reg::OSLSR_EL1];
             *locked = (*locked & !2) | (value & 1) << 1;
         }
+        Special::ClaimSet => state.system.regs[reg::DBGCLAIMCLR_EL1] |= value & 0xff,
+        Special::ClaimClear => state.system.regs[reg::DBGCLAIMCLR_EL1] &= !value,
         Special::TimerControl(which) => state.system.timers[usize::from(which)].set_control(value),
         Special::TimerCompare(which) => state.system.timers[usize::from(which)].compare = value,
         Special::TimerValue(which) => {
