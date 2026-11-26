@@ -1054,6 +1054,10 @@ impl Follower {
                         let ours = our_writes(&partial);
                         let theirs = written(qemu_writes.iter().map(qemu_bytes));
                         if ours != theirs {
+                            if self.partial_stores < 4 {
+                                eprintln!("DEBUG partial: last {:x?} ours{} theirs{} regs x0={:x}", last.as_ref().map(|l| l.encoding), describe(&ours), describe(&theirs), self.cpu.state.x(0));
+                                eprintln!("DEBUG pc {:x} word {:x?}", self.cpu.state.pc(), self.word(self.cpu.state.pc()));
+                            }
                             self.partial_stores += 1;
                             for address in ours.keys().chain(theirs.keys()) {
                                 if let Ok(byte) = self.leader.memory(*address, 1) {
