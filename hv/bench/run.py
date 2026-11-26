@@ -32,6 +32,7 @@ import lib
 import netpeer
 from backends import HvBackend, QemuBackend, X86HvBackend, X86QemuBackend
 
+BOOT_DEADLINE = 1800.0
 X86_BOOT_DEADLINE = {"windows-10": 1800.0, "ubuntu-26.04": 300.0}
 PREP_TIMEOUT = 3600
 WORKLOAD_TIMEOUT = {"sha256_256M": 3600, "xz_9_32M": 7200}
@@ -189,12 +190,24 @@ def one_repeat(args, arch, smp, pin, version, index):
         # a failure in them must not skip the kill.
         try:
             if agent is not None:
-                agent.shutdown()
-                agent.close()
+                try:
+                    if args.guest.startswith("alpine-"):
+                        # Ask BusyBox init to run Alpine's shutdown sequence.
+                        # The guest may close the connection before exec replies.
+                        try:
+                            poweroff = agent.exec(["/sbin/poweroff"], timeout=30)
+                        except ConnectionError:
+                            pass
+                        else:
+                            if poweroff["code"] != 0:
+                                raise lib.BenchError(f"poweroff failed: {poweroff['stderr']!r}")
+                    else:
+                        agent.shutdown()
+                finally:
+                    agent.close()
             if args.backend == "vmlab-hv":
                 backend.quit()
-            code = session.wait_exit(SHUTDOWN_TIMEOUT)
-            if code is None:
+            if agent is not None and session.wait_exit(SHUTDOWN_TIMEOUT) is None:
                 log(f"VM did not exit after powerdown within {SHUTDOWN_TIMEOUT}s")
         except Exception as e:  # noqa: BLE001 - cleanup must reach the kill
             log(f"note: graceful shutdown path failed ({e}); killing")
