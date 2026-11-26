@@ -311,8 +311,7 @@ fn run_error(e: wscript::Error) -> String {
         wscript::Error::Runtime(r) => {
             // A fault can end in a payload's own newline (an `expect` on an
             // `Err` carrying a command's stderr); the trace stays on its line.
-            let mut s = limit_fault(&r.message)
-                .unwrap_or_else(|| r.message.trim_end().to_string());
+            let mut s = limit_fault(&r.message).unwrap_or_else(|| r.message.trim_end().to_string());
             if !r.trace.is_empty() {
                 const TRACE_FRAMES: usize = 12;
                 let mut chain = r
@@ -930,8 +929,10 @@ fn main() -> int {
     0
 }
 "#;
-        let fault =
-            run_limited(SCRIPT, Some(64 * MIB)).expect_err("the script ran to its end");
-        assert_eq!(fault, format!("memory limit of {} bytes exceeded", 64 * MIB));
+        let fault = run_limited(SCRIPT, Some(64 * MIB)).expect_err("the script ran to its end");
+        assert_eq!(
+            fault,
+            format!("memory limit of {} bytes exceeded", 64 * MIB)
+        );
     }
 }
