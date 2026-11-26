@@ -305,10 +305,7 @@ mod tests {
         assert_eq!(S_BOX[0x53], 0xed);
         assert_eq!(crypto(Crypto::AesE, input, key, 0), moved);
         assert_eq!(crypto(Crypto::AesMc, 0, moved, 0), mixed);
-        assert_eq!(
-            mixed ^ round_key,
-            block("a49c7ff2689f352b6b5bea43026a5049")
-        );
+        assert_eq!(mixed ^ round_key, block("a49c7ff2689f352b6b5bea43026a5049"));
         // The inverses undo both steps.
         assert_eq!(crypto(Crypto::AesD, moved, 0, 0), input ^ key);
         assert_eq!(crypto(Crypto::AesImc, 0, mixed, 0), moved);
@@ -373,10 +370,18 @@ mod tests {
         assert_eq!(k[0], 0x428a_2f98);
         assert_eq!(h[0], 0x6a09_e667);
         let mut w = padded(b"abc");
-        let start = (join([h[0], h[1], h[2], h[3]]), join([h[4], h[5], h[6], h[7]]));
+        let start = (
+            join([h[0], h[1], h[2], h[3]]),
+            join([h[4], h[5], h[6], h[7]]),
+        );
         let (mut abcd, mut efgh) = start;
         for group in 0..16 {
-            let constants = join([k[4 * group], k[4 * group + 1], k[4 * group + 2], k[4 * group + 3]]);
+            let constants = join([
+                k[4 * group],
+                k[4 * group + 1],
+                k[4 * group + 2],
+                k[4 * group + 3],
+            ]);
             let schedule = add(w[0], constants);
             let before = abcd;
             abcd = crypto(Crypto::Sha256H, abcd, efgh, schedule);
@@ -403,7 +408,13 @@ mod tests {
 
     #[test]
     fn sha1_of_abc_as_a_guest_computes_it() {
-        let h = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+        let h = [
+            0x6745_2301u32,
+            0xefcd_ab89,
+            0x98ba_dcfe,
+            0x1032_5476,
+            0xc3d2_e1f0,
+        ];
         let k = [0x5a82_7999u32, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c1d6];
         let mut w = padded(b"abc");
         let mut abcd = join([h[0], h[1], h[2], h[3]]);
@@ -433,7 +444,13 @@ mod tests {
         ];
         assert_eq!(
             digest,
-            [0xa999_3e36, 0x4706_816a, 0xba3e_2571, 0x7850_c26c, 0x9cd0_d89d]
+            [
+                0xa999_3e36,
+                0x4706_816a,
+                0xba3e_2571,
+                0x7850_c26c,
+                0x9cd0_d89d
+            ]
         );
     }
 }

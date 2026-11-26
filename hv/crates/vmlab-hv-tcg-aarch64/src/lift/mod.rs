@@ -239,55 +239,115 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         Fields::AESInst(f) => crypto::lift(builder, record, word!(record, f; rd, rn)),
         Fields::AESTiedInst(f) => crypto::lift(builder, record, word!(record, f; rd, rn)),
         Fields::BaseSIMDAcrossLanes(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDBitwiseExtract(f) => simd::lift(builder, record, word!(record, f; imm, rd, rm, rn)),
+        Fields::BaseSIMDBitwiseExtract(f) => {
+            simd::lift(builder, record, word!(record, f; imm, rd, rm, rn))
+        }
         Fields::BaseSIMDCmpTwoScalar(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
         Fields::BaseSIMDCmpTwoVector(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDDifferentThreeVector(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
-        Fields::BaseSIMDDifferentThreeVectorTied(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
+        Fields::BaseSIMDDifferentThreeVector(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rm, rn))
+        }
+        Fields::BaseSIMDDifferentThreeVectorTied(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rm, rn))
+        }
         Fields::BaseSIMDFPCvtTwoVector(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDFPCvtTwoVectorTied(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDIndexed(f) => simd::lift(builder, record, word!(record, f; idx, rd, rm, rn)),
-        Fields::BaseSIMDIndexedTied(f) => simd::lift(builder, record, word!(record, f; idx, rd, rm, rn)),
+        Fields::BaseSIMDFPCvtTwoVectorTied(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rn))
+        }
+        Fields::BaseSIMDIndexed(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rm, rn))
+        }
+        Fields::BaseSIMDIndexedTied(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rm, rn))
+        }
         Fields::BaseSIMDMixedTwoVector(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDMixedTwoVectorTied(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDModifiedImmVectorShift(f) => simd::lift(builder, record, word!(record, f; imm8, rd, shift)),
-        Fields::BaseSIMDModifiedImmVectorShiftHalf(f) => simd::lift(builder, record, word!(record, f; imm8, rd, shift)),
-        Fields::BaseSIMDModifiedImmVectorShiftHalfTied(f) => simd::lift(builder, record, word!(record, f; imm8, rd, shift)),
-        Fields::BaseSIMDModifiedImmVectorShiftTied(f) => simd::lift(builder, record, word!(record, f; imm8, rd, shift)),
+        Fields::BaseSIMDMixedTwoVectorTied(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rn))
+        }
+        Fields::BaseSIMDModifiedImmVectorShift(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd, shift))
+        }
+        Fields::BaseSIMDModifiedImmVectorShiftHalf(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd, shift))
+        }
+        Fields::BaseSIMDModifiedImmVectorShiftHalfTied(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd, shift))
+        }
+        Fields::BaseSIMDModifiedImmVectorShiftTied(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd, shift))
+        }
         Fields::BaseSIMDPairwiseScalar(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDScalarDUP(f) => simd::lift(builder, record, word!(record, f; dst, idx, src)),
-        Fields::BaseSIMDScalarShift(f) => simd::lift(builder, record, word!(record, f; imm, rd, rn)),
-        Fields::BaseSIMDScalarShiftTied(f) => simd::lift(builder, record, word!(record, f; imm, rd, rn)),
+        Fields::BaseSIMDScalarDUP(f) => {
+            simd::lift(builder, record, word!(record, f; dst, idx, src))
+        }
+        Fields::BaseSIMDScalarShift(f) => {
+            simd::lift(builder, record, word!(record, f; imm, rd, rn))
+        }
+        Fields::BaseSIMDScalarShiftTied(f) => {
+            simd::lift(builder, record, word!(record, f; imm, rd, rn))
+        }
         Fields::BaseSIMDTableLookup(f) => simd::lift(builder, record, word!(record, f; vd, vm, vn)),
-        Fields::BaseSIMDTableLookupTied(f) => simd::lift(builder, record, word!(record, f; vd, vm, vn)),
-        Fields::BaseSIMDThreeSameVector(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
-        Fields::BaseSIMDThreeSameVectorTied(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
+        Fields::BaseSIMDTableLookupTied(f) => {
+            simd::lift(builder, record, word!(record, f; vd, vm, vn))
+        }
+        Fields::BaseSIMDThreeSameVector(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rm, rn))
+        }
+        Fields::BaseSIMDThreeSameVectorTied(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rm, rn))
+        }
         Fields::BaseSIMDThreeScalar(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
-        Fields::BaseSIMDThreeScalarMixed(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
+        Fields::BaseSIMDThreeScalarMixed(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rm, rn))
+        }
         Fields::BaseSIMDTwoSameVector(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDTwoSameVectorTied(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
+        Fields::BaseSIMDTwoSameVectorTied(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rn))
+        }
         Fields::BaseSIMDTwoScalar(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
         Fields::BaseSIMDTwoScalarTied(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDVectorLShiftLongBySize(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::BaseSIMDVectorShift(f) => simd::lift(builder, record, word!(record, f; imm, rd, rn)),
-        Fields::BaseSIMDVectorShiftTied(f) => simd::lift(builder, record, word!(record, f; imm, rd, rn)),
+        Fields::BaseSIMDVectorLShiftLongBySize(f) => {
+            simd::lift(builder, record, word!(record, f; rd, rn))
+        }
+        Fields::BaseSIMDVectorShift(f) => {
+            simd::lift(builder, record, word!(record, f; imm, rd, rn))
+        }
+        Fields::BaseSIMDVectorShiftTied(f) => {
+            simd::lift(builder, record, word!(record, f; imm, rd, rn))
+        }
         Fields::BaseSIMDZipVector(f) => simd::lift(builder, record, word!(record, f; rd, rm, rn)),
         Fields::SHAInstSS(f) => crypto::lift(builder, record, word!(record, f; rd, rn)),
         Fields::SHATiedInstQQV(f) => crypto::lift(builder, record, word!(record, f; rd, rm, rn)),
         Fields::SHATiedInstQSV(f) => crypto::lift(builder, record, word!(record, f; rd, rm, rn)),
         Fields::SHATiedInstVV(f) => crypto::lift(builder, record, word!(record, f; rd, rn)),
         Fields::SHATiedInstVVV(f) => crypto::lift(builder, record, word!(record, f; rd, rm, rn)),
-        Fields::SIMDDup16FromElement(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
-        Fields::SIMDDup32FromElement(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
-        Fields::SIMDDup64FromElement(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
-        Fields::SIMDDup8FromElement(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
+        Fields::SIMDDup16FromElement(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rn))
+        }
+        Fields::SIMDDup32FromElement(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rn))
+        }
+        Fields::SIMDDup64FromElement(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rn))
+        }
+        Fields::SIMDDup8FromElement(f) => {
+            simd::lift(builder, record, word!(record, f; idx, rd, rn))
+        }
         Fields::SIMDDupFromMain(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
         Fields::SIMDInexactCvtTwoScalar(f) => simd::lift(builder, record, word!(record, f; rd, rn)),
-        Fields::SIMDInsFromElement(f) => simd::lift(builder, record, word!(record, f; idx, idx2, rd, rn)),
+        Fields::SIMDInsFromElement(f) => {
+            simd::lift(builder, record, word!(record, f; idx, idx2, rd, rn))
+        }
         Fields::SIMDInsFromMain(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
-        Fields::SIMDModifiedImmMoveMSL(f) => simd::lift(builder, record, word!(record, f; imm8, rd, shift)),
-        Fields::SIMDModifiedImmScalarNoShift(f) => simd::lift(builder, record, word!(record, f; imm8, rd)),
-        Fields::SIMDModifiedImmVectorNoShift(f) => simd::lift(builder, record, word!(record, f; imm8, rd)),
+        Fields::SIMDModifiedImmMoveMSL(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd, shift))
+        }
+        Fields::SIMDModifiedImmScalarNoShift(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd))
+        }
+        Fields::SIMDModifiedImmVectorNoShift(f) => {
+            simd::lift(builder, record, word!(record, f; imm8, rd))
+        }
         Fields::SIMDSMov(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
         Fields::SIMDUMov(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
         _ => Lifted::Unsupported,

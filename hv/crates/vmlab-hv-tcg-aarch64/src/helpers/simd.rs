@@ -438,22 +438,19 @@ fn same(op: Op, bits: u32, x: u64, y: u64, z: u64, imm: u16, fpcr: u32, flags: &
         FRecpS => fp(flags, fpv::recip_step(format, x, y, fpcr)),
         FRSqrtS => fp(flags, fpv::rsqrt_step(format, x, y, fpcr)),
         FCmEq => fp(flags, fpv::compare_mask(Mask::Equal, format, x, y, fpcr)),
-        FCmGe => fp(flags, fpv::compare_mask(Mask::GreaterEqual, format, x, y, fpcr)),
+        FCmGe => fp(
+            flags,
+            fpv::compare_mask(Mask::GreaterEqual, format, x, y, fpcr),
+        ),
         FCmGt => fp(flags, fpv::compare_mask(Mask::Greater, format, x, y, fpcr)),
-        FAcGe => fp(flags, fpv::compare_mask(
-            Mask::MagnitudeGreaterEqual,
-            format,
-            x,
-            y,
-            fpcr,
-        )),
-        FAcGt => fp(flags, fpv::compare_mask(
-            Mask::MagnitudeGreater,
-            format,
-            x,
-            y,
-            fpcr,
-        )),
+        FAcGe => fp(
+            flags,
+            fpv::compare_mask(Mask::MagnitudeGreaterEqual, format, x, y, fpcr),
+        ),
+        FAcGt => fp(
+            flags,
+            fpv::compare_mask(Mask::MagnitudeGreater, format, x, y, fpcr),
+        ),
         FMla => fp(flags, fp::mul_add(format, z, x, y, false, false, fpcr)),
         FMls => fp(flags, fp::mul_add(format, z, x, y, false, true, fpcr)),
         FAbs => x & !format.sign_bit(),
@@ -466,23 +463,22 @@ fn same(op: Op, bits: u32, x: u64, y: u64, z: u64, imm: u16, fpcr: u32, flags: &
         FRintA => fp(flags, fp::unary(FpUnary::RoundTiesAway, format, x, fpcr)),
         FRintX => fp(flags, fp::unary(FpUnary::RoundExact, format, x, fpcr)),
         FRintI => fp(flags, fp::unary(FpUnary::RoundCurrent, format, x, fpcr)),
-        FCvtS | FCvtU => fp(flags, fp::to_fixed(
-            format,
-            x,
-            bits,
-            op == FCvtU,
-            u32::from(imm & 0x7f),
-            to_integer_mode(imm),
-            fpcr,
-        )),
-        SCvtF | UCvtF => fp(flags, fp::from_fixed(
-            format,
-            x,
-            bits,
-            op == UCvtF,
-            u32::from(imm & 0x7f),
-            fpcr,
-        )),
+        FCvtS | FCvtU => fp(
+            flags,
+            fp::to_fixed(
+                format,
+                x,
+                bits,
+                op == FCvtU,
+                u32::from(imm & 0x7f),
+                to_integer_mode(imm),
+                fpcr,
+            ),
+        ),
+        SCvtF | UCvtF => fp(
+            flags,
+            fp::from_fixed(format, x, bits, op == UCvtF, u32::from(imm & 0x7f), fpcr),
+        ),
         FRecpE => fp(flags, fpv::recip_estimate(format, x, fpcr)),
         FRSqrtE => fp(flags, fpv::rsqrt_estimate(format, x, fpcr)),
         FRecpX => fp(flags, fpv::recip_exponent(format, x, fpcr)),
@@ -838,10 +834,7 @@ mod tests {
         assert_eq!(eval(code, 0x7f7f, 0x0101, 0, 0), (0x7f7f, QC));
         assert_eq!(eval(code, 0x7e80, 0x01ff, 0, 0), (0x7f80, QC));
         assert_eq!(eval(code, 0x7e10, 0x0101, 0, 0), (0x7f11, 0));
-        assert_eq!(
-            eval(Code::new(Op::UQSub, 1, 1), 1, 2, 0, 0),
-            (0, QC)
-        );
+        assert_eq!(eval(Code::new(Op::UQSub, 1, 1), 1, 2, 0, 0), (0, QC));
         assert_eq!(
             eval(Code::new(Op::SQAbs, 3, 1), 1 << 63, 0, 0, 0),
             (u128::from(u64::MAX >> 1), QC)
@@ -876,9 +869,8 @@ mod tests {
         assert_eq!(one(Op::SQShlU, 0xff, 1), (0, QC));
         assert_eq!(one(Op::SQShlU, 0x41, 1), (0x82, 0));
         // 64-bit lanes: a shift by 63 and by 64.
-        let wide = |op: Op, x: u64, amount: i8| {
-            eval(Code::new(op, 3, 1), u128::from(x), by(amount), 0, 0)
-        };
+        let wide =
+            |op: Op, x: u64, amount: i8| eval(Code::new(op, 3, 1), u128::from(x), by(amount), 0, 0);
         assert_eq!(wide(Op::UShl, 1, 63), (1 << 63, 0));
         assert_eq!(wide(Op::UQShl, 1, 63), (1 << 63, 0));
         assert_eq!(wide(Op::UQShl, 1, 64), (u128::from(u64::MAX), QC));
@@ -905,7 +897,10 @@ mod tests {
             eval(Code::new(Op::SQDMulL, 1, 1), 0x8000, 0x8000, 0, 0),
             (0x7fff_ffff, QC)
         );
-        assert_eq!(value(Code::new(Op::AddHn, 0, 2), 0x12ff_34ff, 0x0001_0001), 0x1335);
+        assert_eq!(
+            value(Code::new(Op::AddHn, 0, 2), 0x12ff_34ff, 0x0001_0001),
+            0x1335
+        );
         assert_eq!(value(Code::new(Op::RAddHn, 0, 1), 0x127f, 0x0001), 0x13);
         assert_eq!(
             eval(Code::new(Op::SQShrN, 0, 2).imm(4), 0x0ff0_8000, 0, 0, 0),
@@ -952,13 +947,20 @@ mod tests {
             value(Code::new(Op::Rev, 1, 8).imm(32), a, 0),
             0x0d0c_0f0e_0908_0b0a_0504_0706_0100_0302
         );
-        assert_eq!(value(Code::new(Op::Dup, 1, 4), 0xabcd, 0), 0xabcd_abcd_abcd_abcd);
+        assert_eq!(
+            value(Code::new(Op::Dup, 1, 4), 0xabcd, 0),
+            0xabcd_abcd_abcd_abcd
+        );
         assert_eq!(value(Code::new(Op::AddV, 0, 16), a, 0), 120);
         assert_eq!(value(Code::new(Op::UMaxV, 0, 8), a, 0), 7);
         assert_eq!(value(Code::new(Op::SAddLV, 0, 2), 0xff80, 0), 0xff7f);
         // A pairwise add of four 16-bit lanes from each operand.
         assert_eq!(
-            value(Code::new(Op::Add, 1, 4).pairwise(), 0x0004_0003_0002_0001, 0x0040_0030_0020_0010),
+            value(
+                Code::new(Op::Add, 1, 4).pairwise(),
+                0x0004_0003_0002_0001,
+                0x0040_0030_0020_0010
+            ),
             0x0070_0030_0007_0003
         );
         // The scalar form: the two lanes of one operand.
@@ -1018,20 +1020,14 @@ mod tests {
         );
         // The maximum of four lanes as a tree, with a quiet NaN in one.
         let lanes = one | two << 32 | 0x7fc0_0000 << 64 | one << 96;
-        assert_eq!(
-            eval(Code::new(Op::FMaxNmV, 2, 4), lanes, 0, 0, 0),
-            (two, 0)
-        );
+        assert_eq!(eval(Code::new(Op::FMaxNmV, 2, 4), lanes, 0, 0, 0), (two, 0));
         assert_eq!(
             eval(Code::new(Op::FMaxV, 2, 4), lanes, 0, 0, 0),
             (0x7fc0_0000, 0)
         );
         assert_eq!(
             eval(Code::new(Op::FCvtL, 2, 2), one | two << 32, 0, 0, 0),
-            (
-                0x3ff0_0000_0000_0000 | 0x4000_0000_0000_0000 << 64,
-                0
-            )
+            (0x3ff0_0000_0000_0000 | 0x4000_0000_0000_0000 << 64, 0)
         );
         assert_eq!(
             eval(

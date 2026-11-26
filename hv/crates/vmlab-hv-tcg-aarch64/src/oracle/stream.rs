@@ -860,10 +860,16 @@ mod tests {
                 small += u32::from((value as u8 as i8).unsigned_abs() <= 8);
             }
         }
-        assert!(most_negative.iter().all(|count| *count > 20), "{most_negative:?}");
+        assert!(
+            most_negative.iter().all(|count| *count > 20),
+            "{most_negative:?}"
+        );
         assert!(ones.iter().all(|count| *count > 20), "{ones:?}");
         assert!(small > 400, "{small}");
-        assert_eq!(Generator::new(4).simd_vectors(), Generator::new(4).simd_vectors());
+        assert_eq!(
+            Generator::new(4).simd_vectors(),
+            Generator::new(4).simd_vectors()
+        );
     }
 
     #[test]

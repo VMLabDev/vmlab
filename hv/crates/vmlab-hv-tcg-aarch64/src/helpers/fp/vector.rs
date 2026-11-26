@@ -357,10 +357,7 @@ mod tests {
             (0x3ff8_0000_0000_0000, 0)
         );
         // (3 - 2 * 2) / 2 is -0.5.
-        assert_eq!(
-            rsqrt_step(DOUBLE, TWO, TWO, 0),
-            (0xbfe0_0000_0000_0000, 0)
-        );
+        assert_eq!(rsqrt_step(DOUBLE, TWO, TWO, 0), (0xbfe0_0000_0000_0000, 0));
         // Two denormals: the product only makes the result inexact.
         assert_eq!(
             rsqrt_step(DOUBLE, 1, 1, 0),

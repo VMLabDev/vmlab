@@ -235,7 +235,10 @@ enum Three {
     /// The same on neighbours of `Rm:Rn`.
     Pairs(Op),
     /// `Rd outer (Rn inner Rm)`.
-    Accumulate { inner: Op, outer: Op },
+    Accumulate {
+        inner: Op,
+        outer: Op,
+    },
     /// `Rd` is the third operand of the operation.
     Fused(Op),
     Logic(Logic),
@@ -457,7 +460,10 @@ enum Two {
     /// The bits of each byte in the other order.
     ReverseBits,
     /// A compare with zero. `swapped`: zero is the first operand.
-    Zero { op: Op, swapped: bool },
+    Zero {
+        op: Op,
+        swapped: bool,
+    },
     /// To lanes of half the size.
     Narrow(Op),
     /// `SHLL`: to lanes of twice the size, shifted left by the lane size.
@@ -569,7 +575,9 @@ fn two_misc(b: &mut Builder, word: Word) -> Lifted {
     let result = match plan {
         Two::Lanes(op) => unary(b, Code::new(op, size as u8, lanes), n),
         Two::LanesImm(op, imm) => unary(b, Code::new(op, size as u8, lanes).imm(imm), n),
-        Two::Reverse(container) => unary(b, Code::new(Op::Rev, size as u8, lanes).imm(container), n),
+        Two::Reverse(container) => {
+            unary(b, Code::new(Op::Rev, size as u8, lanes).imm(container), n)
+        }
         Two::PairLong(op) => unary(b, Code::new(op, size as u8, lanes / 2), n),
         Two::PairLongAccumulate(op) => {
             let d = b.v(word.rd, 128);
@@ -830,12 +838,7 @@ enum Indexed {
 fn indexed_plan(u: bool, opcode: u32) -> Option<(&'static str, Indexed, bool)> {
     use Op::*;
     let lanes = |op: Op| Indexed::Same(Three::Lanes(op));
-    let multiply = |outer: Op| {
-        Indexed::Same(Three::Accumulate {
-            inner: Mul,
-            outer,
-        })
-    };
+    let multiply = |outer: Op| Indexed::Same(Three::Accumulate { inner: Mul, outer });
     let long = |op: Op| Indexed::Different(Different::Long(op));
     let accumulate =
         |inner: Op, outer: Op| Indexed::Different(Different::LongAccumulate { inner, outer });
@@ -1289,16 +1292,9 @@ pub fn lift(b: &mut Builder, record: Record, word: u32) -> Lifted {
         | BaseSIMDVectorShiftTied
         | BaseSIMDScalarShift
         | BaseSIMDScalarShiftTied => shift_immediate(b, fields),
-        SIMDDupFromMain
-        | SIMDDup8FromElement
-        | SIMDDup16FromElement
-        | SIMDDup32FromElement
-        | SIMDDup64FromElement
-        | BaseSIMDScalarDUP
-        | SIMDInsFromMain
-        | SIMDInsFromElement
-        | SIMDSMov
-        | SIMDUMov => copy(b, record, fields),
+        SIMDDupFromMain | SIMDDup8FromElement | SIMDDup16FromElement | SIMDDup32FromElement
+        | SIMDDup64FromElement | BaseSIMDScalarDUP | SIMDInsFromMain | SIMDInsFromElement
+        | SIMDSMov | SIMDUMov => copy(b, record, fields),
         BaseSIMDZipVector => zip(b, fields),
         BaseSIMDBitwiseExtract => extract(b, fields),
         BaseSIMDTableLookup | BaseSIMDTableLookupTied => table(b, fields),
@@ -1407,9 +1403,15 @@ mod tests {
         // The classes without a plan move lanes or are immediates.
         let unplanned = |format: FormatClass| {
             let name = format.name();
-            ["SIMDDup", "SIMDIns", "SIMDSMov", "SIMDUMov", "SIMDModifiedImm"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            [
+                "SIMDDup",
+                "SIMDIns",
+                "SIMDSMov",
+                "SIMDUMov",
+                "SIMDModifiedImm",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
                 || [
                     "BaseSIMDScalarDUP",
                     "BaseSIMDBitwiseExtract",
@@ -1472,18 +1474,54 @@ mod tests {
     #[test]
     fn the_modified_immediates() {
         use Immediate::*;
-        assert_eq!(modified_immediate(false, 0b0000, 0xab), Some(Move(0x0000_00ab_0000_00ab)));
-        assert_eq!(modified_immediate(false, 0b0110, 0xab), Some(Move(0xab00_0000_ab00_0000)));
-        assert_eq!(modified_immediate(true, 0b0010, 0xab), Some(Move(!0x0000_ab00_0000_ab00)));
-        assert_eq!(modified_immediate(false, 0b0011, 0xab), Some(Orr(0x0000_ab00_0000_ab00)));
-        assert_eq!(modified_immediate(true, 0b1011, 0xab), Some(Bic(0xab00_ab00_ab00_ab00)));
-        assert_eq!(modified_immediate(false, 0b1000, 0xab), Some(Move(0x00ab_00ab_00ab_00ab)));
-        assert_eq!(modified_immediate(false, 0b1100, 0xab), Some(Move(0x0000_abff_0000_abff)));
-        assert_eq!(modified_immediate(true, 0b1101, 0xab), Some(Move(!0x00ab_ffff_00ab_ffff)));
-        assert_eq!(modified_immediate(false, 0b1110, 0xab), Some(Move(0xabab_abab_abab_abab)));
-        assert_eq!(modified_immediate(true, 0b1110, 0xa5), Some(Move(0xff00_ff00_00ff_00ff)));
+        assert_eq!(
+            modified_immediate(false, 0b0000, 0xab),
+            Some(Move(0x0000_00ab_0000_00ab))
+        );
+        assert_eq!(
+            modified_immediate(false, 0b0110, 0xab),
+            Some(Move(0xab00_0000_ab00_0000))
+        );
+        assert_eq!(
+            modified_immediate(true, 0b0010, 0xab),
+            Some(Move(!0x0000_ab00_0000_ab00))
+        );
+        assert_eq!(
+            modified_immediate(false, 0b0011, 0xab),
+            Some(Orr(0x0000_ab00_0000_ab00))
+        );
+        assert_eq!(
+            modified_immediate(true, 0b1011, 0xab),
+            Some(Bic(0xab00_ab00_ab00_ab00))
+        );
+        assert_eq!(
+            modified_immediate(false, 0b1000, 0xab),
+            Some(Move(0x00ab_00ab_00ab_00ab))
+        );
+        assert_eq!(
+            modified_immediate(false, 0b1100, 0xab),
+            Some(Move(0x0000_abff_0000_abff))
+        );
+        assert_eq!(
+            modified_immediate(true, 0b1101, 0xab),
+            Some(Move(!0x00ab_ffff_00ab_ffff))
+        );
+        assert_eq!(
+            modified_immediate(false, 0b1110, 0xab),
+            Some(Move(0xabab_abab_abab_abab))
+        );
+        assert_eq!(
+            modified_immediate(true, 0b1110, 0xa5),
+            Some(Move(0xff00_ff00_00ff_00ff))
+        );
         // 1.0 in single and in double precision.
-        assert_eq!(modified_immediate(false, 0b1111, 0x70), Some(Move(0x3f80_0000_3f80_0000)));
-        assert_eq!(modified_immediate(true, 0b1111, 0x70), Some(Move(0x3ff0_0000_0000_0000)));
+        assert_eq!(
+            modified_immediate(false, 0b1111, 0x70),
+            Some(Move(0x3f80_0000_3f80_0000))
+        );
+        assert_eq!(
+            modified_immediate(true, 0b1111, 0x70),
+            Some(Move(0x3ff0_0000_0000_0000))
+        );
     }
 }
