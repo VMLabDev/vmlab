@@ -11,7 +11,8 @@ use std::path::Path;
 use std::process::Command;
 
 use vmlab_disk::ops;
-use vmlab_disk::{Format, SnapshotInfo};
+use vmlab_disk::qcow2::Qcow2Image;
+use vmlab_disk::{DiskImage, Format, SnapshotInfo};
 
 const QEMU_IMG: &str = "/usr/bin/qemu-img";
 const QEMU_IO: &str = "qemu-io";
@@ -364,8 +365,7 @@ fn s2_backing_chains() {
     let content = read_all(&overlay, Format::Qcow2);
     assert_eq!(content, std::fs::read(&raw_base).unwrap());
 
-    // Three-deep chain: base <- mid (qcow2) <- top, all via qemu-img, read
-    // through the crate recursively.
+    // A chain with data in three layers, created by both implementations.
     let mid = dir.join("mid.qcow2");
     qemu_img(&[
         "create",
@@ -395,6 +395,15 @@ fn s2_backing_chains() {
             .all(|&b| b == 0x33)
     ); // top
     qemu_check(&top);
+
+    let mut previous = top.clone();
+    for index in 3..12 {
+        let overlay = dir.join(format!("layer-{index}.qcow2"));
+        ops::create_linked_clone(&previous, &overlay).unwrap();
+        previous = overlay;
+    }
+    assert_eq!(read_all(&previous, Format::Qcow2), got);
+    qemu_img(&["compare", previous.to_str().unwrap(), top.to_str().unwrap()]);
 }
 
 #[test]
@@ -842,11 +851,12 @@ fn s2_ops_rebase() {
     std::fs::copy(&base, &base2).unwrap();
     qemu_io(&["-c", "write -P 0x42 128k 64k", &base2.to_string_lossy()]);
     let before = read_all(&overlay, Format::Qcow2);
-    ops::rebase_safe(&overlay, &base2, Some("qcow2")).unwrap();
+    ops::rebase_safe(&overlay, Path::new("base2.qcow2"), Some("qcow2")).unwrap();
     let after = read_all(&overlay, Format::Qcow2);
     assert_eq!(before, after, "safe rebase changed visible content");
     // Only the differing cluster was written into the overlay: 128k..192k.
     let info = ops::info(&overlay).unwrap();
+    assert_eq!(info.backing_file.as_deref(), Some("base2.qcow2"));
     assert_eq!(
         info.full_backing_file.as_deref(),
         Some(base2.canonicalize().unwrap().as_path())
@@ -1435,6 +1445,66 @@ fn s2_partial_discard_preserves_adjacent_filesystem_blocks() {
     ops::snapshot_apply(&disk, "before-trim").unwrap();
     assert_eq!(read_all(&disk, Format::Qcow2), data);
     qemu_check(&disk);
+}
+
+#[test]
+fn an_online_snapshot_of_a_version_2_image_writes_no_zero_flag() {
+    require_qemu_img!();
+    let temp = tmpdir("v2-online-snapshot");
+    let path = temp.path().join("disk.qcow2");
+    qemu_img(&[
+        "create",
+        "-f",
+        "qcow2",
+        "-o",
+        "compat=0.10,cluster_size=65536",
+        path.to_str().unwrap(),
+        "1M",
+    ]);
+    let state = [0x77; 4096];
+    let mut image = Qcow2Image::open(&path, false).unwrap();
+    image.write_vmstate(0, &state).unwrap();
+    image.snapshot_create("s", state.len() as u64, 0).unwrap();
+    image.flush().unwrap();
+    drop(image);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let l1_offset = u64::from_be_bytes(bytes[40..48].try_into().unwrap()) as usize;
+    // The 1 MiB disk fits in L1 entry 0. Entry 1 maps the vmstate area.
+    let vmstate_l1 = u64::from_be_bytes(bytes[l1_offset + 8..l1_offset + 16].try_into().unwrap());
+    let l2_offset = (vmstate_l1 & 0x00ff_ffff_ffff_fe00) as usize;
+    assert_ne!(l2_offset, 0);
+    for (index, entry) in bytes[l2_offset..l2_offset + 65536]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(u64::from_be_bytes(*entry) & 1, 0, "L2 entry {index}");
+    }
+
+    let mut image = Qcow2Image::open(&path, false).unwrap();
+    image.snapshot_apply("s").unwrap();
+    let mut restored = [0; 4096];
+    image.read_vmstate(0, &mut restored).unwrap();
+    assert_eq!(restored, state);
+}
+
+#[test]
+fn applying_a_snapshot_from_before_a_large_grow_leaks_nothing() {
+    require_qemu_img!();
+    let temp = tmpdir("snapshot-shorter-l1");
+    let path = temp.path().join("disk.qcow2");
+    let mut image = Qcow2Image::create(&path, 1 << 20, 16, None).unwrap();
+    image.write_at(0, &[0x77; 4096]).unwrap();
+    image.snapshot_create("s", 0, 0).unwrap();
+    // At 64 KiB per cluster, 8 TiB needs two L1 clusters.
+    image.resize_grow(8 << 40).unwrap();
+    image.snapshot_apply("s").unwrap();
+    assert_eq!(image.size(), 1 << 20);
+    image.flush().unwrap();
+    drop(image);
+    qemu_check(&path);
 }
 
 /// Snapshot lifecycle churn: create/apply/delete interleaved, with vmstate
