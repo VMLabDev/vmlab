@@ -73,7 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || taken.cause != Cause::Exception(Exception::Undefined)
         || u32::from_le_bytes(at) != HLT
     {
-        return Err(format!("the image stopped at an exception that is not its HLT: {taken:?}").into());
+        return Err(
+            format!("the image stopped at an exception that is not its HLT: {taken:?}").into(),
+        );
     }
     let pc = taken.from;
     // Without the `hlt` and the `hvc` of the vector.
