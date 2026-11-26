@@ -152,6 +152,14 @@ pub fn volume_share_name(container: &str, i: usize) -> String {
     format!("vol-{container}-{i}")
 }
 
+/// The virtio-fs mount tag of a container volume, from its share name. The
+/// device takes at most 36 bytes and a share name carries the container's
+/// name, a DNS label of up to 63, so the one that goes to the hypervisor and
+/// the one cinit mounts both come from here.
+pub fn volume_mount_tag(share: &str) -> String {
+    crate::qemu::virtiofsd::mount_tag(share)
+}
+
 /// Resolve the config's volume list to concrete exports in declaration
 /// order: (share name, host dir, read-only). Relative host binds resolve
 /// against the lab root; named volumes land under the lab work dir. Each
@@ -650,7 +658,7 @@ impl ContainerInstance {
         if !spec.volumes.is_empty() {
             if self.virtiofs_active.load(Ordering::SeqCst) {
                 for v in &mut spec.volumes {
-                    v.tag = Some(v.share.clone());
+                    v.tag = Some(volume_mount_tag(&v.share));
                 }
             } else {
                 spec.smb = Some(self.smb.read().await.clone().ok_or_else(|| {
@@ -769,7 +777,7 @@ impl ContainerInstance {
                 .await?;
             // Register each daemon so teardown can stop it if a later volume fails.
             self.virtiofsd.lock().await.push(proc);
-            devices.push((share.clone(), sock));
+            devices.push((volume_mount_tag(share), sock));
         }
         self.virtiofs_active.store(true, Ordering::SeqCst);
         Ok(devices)
@@ -925,12 +933,15 @@ impl ContainerInstance {
             // cinit blocks its boot on the spec. Check its protocol before
             // sending one. The ctl watcher re-answers later announcements.
             ctl.wait_boot(super::machine::DEFAULT_READY_TIMEOUT).await?;
+            // Subscribe before the spec lets cinit start the workload and
+            // report its first health verdict.
+            let events = ctl.subscribe();
             self.send_spec(&ctl).await?;
 
-            Ok::<_, anyhow::Error>((proc, ctl))
+            Ok::<_, anyhow::Error>((proc, ctl, events))
         };
 
-        let (proc, ctl) = match run.await {
+        let (proc, ctl, events) = match run.await {
             Ok(v) => v,
             Err(e) => {
                 self.teardown().await;
@@ -941,19 +952,23 @@ impl ContainerInstance {
 
         *self.state.write().await = PowerState::Running;
 
-        self.spawn_ctl_watcher(&ctl, &cbs);
-        self.spawn_readiness(&cbs);
-        self.spawn_exit_monitor(proc, cbs);
+        let watcher = self.spawn_ctl_watcher(&ctl, events, &cbs);
+        let [readiness, agent_poller] = self.spawn_readiness(&cbs);
+        self.spawn_exit_monitor(proc, cbs, [watcher, readiness, agent_poller]);
         Ok(())
     }
 
     /// Track ctl events for the run: `started`/`idle`, health transitions
     /// (with the `on_health` callback), and the exit code for classification.
-    fn spawn_ctl_watcher(self: &Arc<Self>, ctl: &CtlHandle, cbs: &Arc<Callbacks>) {
+    fn spawn_ctl_watcher(
+        self: &Arc<Self>,
+        ctl: &CtlHandle,
+        mut rx: tokio::sync::broadcast::Receiver<CtlEvent>,
+        cbs: &Arc<Callbacks>,
+    ) -> tokio::task::JoinHandle<()> {
         let me = self.clone();
         let cbs = cbs.clone();
         let ctl = ctl.clone();
-        let mut rx = ctl.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -981,7 +996,7 @@ impl ContainerInstance {
                     Err(_) => return, // channel gone: QEMU exited
                 }
             }
-        });
+        })
     }
 
     /// Readiness (PRD §7.4 shape): ctl `started`/`idle`, then the applicable
@@ -991,10 +1006,10 @@ impl ContainerInstance {
     /// entrypoint runs regardless (docker semantics), and an agent hiccup
     /// must not wedge readiness. The agent is polled separately below; it
     /// only gates `exec`/`cp`.
-    fn spawn_readiness(self: &Arc<Self>, cbs: &Arc<Callbacks>) {
+    fn spawn_readiness(self: &Arc<Self>, cbs: &Arc<Callbacks>) -> [tokio::task::JoinHandle<()>; 2] {
         let me = self.clone();
         let cbs = cbs.clone();
-        tokio::spawn(async move {
+        let readiness = tokio::spawn(async move {
             // Phase 1: the container process is running.
             loop {
                 if me.power_state().await != PowerState::Running {
@@ -1019,13 +1034,8 @@ impl ContainerInstance {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
-            // Phase 2: the healthcheck gate. (Running implies the image is
-            // bound; a missing one just means no healthcheck gate.)
-            let has_healthcheck = me
-                .image_parts()
-                .map(|p| p.spec.healthcheck.is_some())
-                .unwrap_or(false);
-            if has_healthcheck {
+            // Phase 2: the healthcheck gate.
+            if super::machine::Machine::has_healthcheck(me.as_ref()) {
                 loop {
                     if me.power_state().await != PowerState::Running {
                         return;
@@ -1045,7 +1055,7 @@ impl ContainerInstance {
         // Agent poller (mirrors the VM poller): tracks `agent_up` for
         // exec/cp availability without holding readiness hostage.
         let me = self.clone();
-        tokio::spawn(async move {
+        let agent_poller = tokio::spawn(async move {
             loop {
                 if me.power_state().await != PowerState::Running {
                     return;
@@ -1057,10 +1067,16 @@ impl ContainerInstance {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+        [readiness, agent_poller]
     }
 
     /// Classify why QEMU ended and report it after teardown completes.
-    fn spawn_exit_monitor(self: &Arc<Self>, proc: Arc<dyn Process>, cbs: Arc<Callbacks>) {
+    fn spawn_exit_monitor(
+        self: &Arc<Self>,
+        proc: Arc<dyn Process>,
+        cbs: Arc<Callbacks>,
+        run_tasks: [tokio::task::JoinHandle<()>; 3],
+    ) {
         let me = self.clone();
         tokio::spawn(async move {
             let _ = proc
@@ -1078,10 +1094,18 @@ impl ContainerInstance {
                 StopReason::Crashed
             };
             me.teardown().await;
-            *me.state.write().await = PowerState::Stopped;
+            // Stop run-scoped writers before clearing their flags and allowing a restart.
+            for task in &run_tasks {
+                task.abort();
+            }
+            for task in run_tasks {
+                let _ = task.await;
+            }
             *me.agent_up.write().await = false;
             *me.started.write().await = false;
             *me.ready.write().await = false;
+            *me.healthy.write().await = None;
+            *me.state.write().await = PowerState::Stopped;
             (cbs.on_exit)(reason, exit_code);
         });
     }
@@ -1727,7 +1751,10 @@ impl super::machine::Machine for ContainerInstance {
     }
 
     fn has_healthcheck(&self) -> bool {
-        self.cfg.healthcheck.is_some()
+        self.image_parts().map_or(
+            self.cfg.mode != model::ContainerMode::Idle && self.cfg.healthcheck.is_some(),
+            |parts| parts.spec.healthcheck.is_some(),
+        )
     }
 
     /// cinit mounts the CIFS volumes itself after net-up, from the spec sent
@@ -1986,6 +2013,66 @@ mod tests {
         c.drop_snapshot("missing").await.unwrap();
     }
 
+    /// G3 of `docs/reviews/containers-2.md`: a virtio-fs tag holds 36 bytes,
+    /// and a container's name alone may have 63.
+    #[tokio::test]
+    async fn a_long_container_name_keeps_its_volume_tags_mountable() {
+        use crate::labd::hypervisor::fake::{FakeHypervisor, Script};
+        let dir = tempfile::tempdir().unwrap();
+        let name = "c".repeat(40);
+        let mut cfg = container(&name);
+        cfg.volumes = ["/data", "/cache"]
+            .iter()
+            .map(|target| Volume {
+                source: VolumeSource::Named(target[1..].into()),
+                target: (*target).into(),
+                read_only: false,
+                span: (0, 0),
+            })
+            .collect();
+        let volumes = resolve_volume_hosts(&cfg, dir.path());
+        let resolved = crate::qemu::resolve_container(
+            &cfg,
+            "x86_64",
+            &crate::profiles::ProfileSet::shipped().unwrap(),
+        )
+        .unwrap();
+        let c = ContainerInstance::new(
+            "lab",
+            cfg,
+            resolved,
+            ContainerDirs::new(dir.path(), "lab", &name),
+            vec![],
+            vec![],
+            Some(PulledImage {
+                manifest_digest: "sha256:0".into(),
+                config: image(RuntimeDefaults::default()),
+                rootfs_image: dir.path().join("rootfs.sqfs"),
+            }),
+            volumes,
+            HypervisorKind::Qemu,
+            FakeHypervisor::new(Script::default()),
+        );
+
+        let devices = c.start_virtiofsds().await.unwrap();
+        assert!(c.virtiofs_active.load(Ordering::SeqCst));
+        let handed: Vec<String> = devices.into_iter().map(|(tag, _)| tag).collect();
+        let mounted: Vec<String> = c
+            .spec_for_guest()
+            .await
+            .unwrap()
+            .volumes
+            .into_iter()
+            .map(|v| v.tag.expect("a virtiofs volume carries its tag"))
+            .collect();
+        assert_eq!(mounted.len(), 2);
+        for tag in &mounted {
+            assert!(tag.len() <= 36, "{tag}: {} bytes", tag.len());
+        }
+        assert_ne!(mounted[0], mounted[1]);
+        assert_eq!(mounted, handed, "cinit mounts what the hypervisor serves");
+    }
+
     // ---- build_spec: entrypoint/cmd matrix (docker semantics) --------------
 
     #[test]
@@ -2169,6 +2256,28 @@ mod tests {
     }
 
     // ---- build_spec: healthchecks -------------------------------------------
+
+    #[test]
+    fn an_image_healthcheck_counts_as_a_healthcheck() {
+        use super::super::machine::Machine;
+        let c = instance("web");
+        assert!(c.cfg.healthcheck.is_none());
+        c.set_image(PulledImage {
+            manifest_digest: String::new(),
+            config: image(RuntimeDefaults {
+                healthcheck: Some(ImageHealthcheck {
+                    test: vec!["CMD".into(), "/check".into()],
+                    interval: None,
+                    timeout: None,
+                    retries: None,
+                    start_period: None,
+                }),
+                ..Default::default()
+            }),
+            rootfs_image: PathBuf::new(),
+        });
+        assert!(c.has_healthcheck());
+    }
 
     #[test]
     fn spec_healthcheck_config_wins_over_image() {

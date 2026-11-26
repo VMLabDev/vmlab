@@ -2403,6 +2403,46 @@ async fn a_healthcheck_gates_readiness() {
     ctr.stop(true).await.expect("stop");
 }
 
+#[tokio::test]
+async fn a_stopped_container_reports_no_health() {
+    use vmlab_cinit_proto::CtlEvent;
+    let dirs = Dirs::new();
+    let (ctr, _hv) = container(
+        &dirs,
+        r#"container "web" { image = "nginx:1" profile = "container"
+             healthcheck { command = ["/check"] interval = 1s timeout = 1s retries = 3 } }"#,
+        Script {
+            agent: false,
+            runs: vec![Run {
+                ctl: vec![
+                    (Duration::ZERO, CtlEvent::Started { pid: 7 }),
+                    (Duration::ZERO, CtlEvent::Health { healthy: true }),
+                ],
+                ..Run::forever()
+            }],
+            ..Script::default()
+        },
+    );
+    let (ready, wait_ready) = tokio::sync::oneshot::channel();
+    let ready = std::sync::Mutex::new(Some(ready));
+    ctr.boot(
+        |_, _| {},
+        move || {
+            if let Some(ready) = ready.lock().unwrap().take() {
+                let _ = ready.send(());
+            }
+        },
+        |_| {},
+    )
+    .await
+    .expect("start");
+    wait_ready.await.expect("ready");
+    assert_eq!(ctr.health().await, Some(true));
+    ctr.stop(true).await.expect("stop");
+    assert_eq!(ctr.state().await, PowerState::Stopped);
+    assert_eq!((ctr.health().await, ctr.is_healthy().await), (None, false));
+}
+
 /// A clone of a template that baked no agent is ready once it is running.
 /// Nothing in that guest can ever answer a handshake, so holding it unready
 /// only spends the caller's whole budget waiting for a signal that cannot

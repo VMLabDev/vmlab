@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use super::cmdline::{Accel, pick_accel};
+use super::cmdline::{Accel, opt_path, pick_accel};
 use super::resolve::ResolvedContainer;
 use crate::config::model::MacAddr;
 
@@ -154,6 +154,8 @@ pub(crate) fn build_container_args_with_accel(
 
     // Serial console → file: kernel messages plus the container's
     // stdout/stderr (cinit leaves them on the console).
+    // `-serial file:` takes its path whole, like `-kernel` and `-initrd`:
+    // no comma is doubled there (see `cmdline::opt_path`).
     arg(
         &mut a,
         "serial",
@@ -163,7 +165,7 @@ pub(crate) fn build_container_args_with_accel(
     arg(
         &mut a,
         "qmp",
-        format!("unix:{},server=on,wait=off", paths.qmp_sock.display()),
+        format!("unix:{},server=on,wait=off", opt_path(&paths.qmp_sock)),
     );
     a.push("-monitor".into());
     a.push("none".into());
@@ -177,7 +179,7 @@ pub(crate) fn build_container_args_with_accel(
         "chardev",
         format!(
             "socket,id=ctl0,path={},server=on,wait=off",
-            paths.ctl_sock.display()
+            opt_path(&paths.ctl_sock)
         ),
     );
     arg(
@@ -185,7 +187,7 @@ pub(crate) fn build_container_args_with_accel(
         "chardev",
         format!(
             "socket,id=vagent0,path={},server=on,wait=off",
-            paths.agent_sock.display()
+            opt_path(&paths.agent_sock)
         ),
     );
     arg(&mut a, "device", "virtio-serial-pci".into());
@@ -208,14 +210,14 @@ pub(crate) fn build_container_args_with_accel(
     a.push("-blockdev".into());
     a.push(format!(
         "driver=raw,node-name=rootfs,read-only=on,file.driver=file,file.filename={}",
-        paths.rootfs_image.display()
+        opt_path(&paths.rootfs_image)
     ));
     a.push("-device".into());
     a.push("virtio-blk-pci,drive=rootfs".into());
     a.push("-blockdev".into());
     a.push(format!(
         "driver=qcow2,node-name=scratch,file.driver=file,file.filename={}",
-        paths.scratch_disk.display()
+        opt_path(&paths.scratch_disk)
     ));
     a.push("-device".into());
     a.push("virtio-blk-pci,drive=scratch".into());
@@ -229,7 +231,7 @@ pub(crate) fn build_container_args_with_accel(
             "netdev",
             format!(
                 "stream,id=net{i},server=off,addr.type=unix,addr.path={}",
-                sock.display()
+                opt_path(sock)
             ),
         );
         let host_mtu = mtu
@@ -254,7 +256,7 @@ pub(crate) fn build_container_args_with_accel(
         arg(
             &mut a,
             "chardev",
-            format!("socket,id=vfs{i},path={}", sock.display()),
+            format!("socket,id=vfs{i},path={}", opt_path(sock)),
         );
         arg(
             &mut a,
@@ -298,6 +300,56 @@ mod tests {
 
     fn joined(args: &[String]) -> String {
         args.join(" ")
+    }
+
+    /// G9 (docs/reviews/containers-2.md), the copy of the VM argv's
+    /// `a_comma_in_a_path_is_doubled_in_every_option`: QEMU splits an option
+    /// value at each `,` and reads `,,` as one. `-kernel`, `-initrd` and
+    /// `-serial file:` take a path whole, so theirs stay as they are.
+    #[test]
+    fn a_comma_in_a_container_path_is_doubled_in_every_option() {
+        let at = |name: &str| PathBuf::from(format!("/tmp/with,comma/{name}"));
+        let mut p = paths();
+        p.kernel = at("vmlinuz");
+        p.initrd = at("initramfs.img");
+        p.rootfs_image = at("rootfs.sqfs");
+        p.scratch_disk = at("scratch.qcow2");
+        p.nics[0].1 = at("nic0.sock");
+        p.qmp_sock = at("qmp.sock");
+        p.ctl_sock = at("ctl.sock");
+        p.agent_sock = at("agent.sock");
+        p.serial_log = at("console.log");
+        p.volumes = vec![("vol-web-0".into(), at("vfs0.sock"))];
+        let c = resolved(
+            "container \"web\" { image = \"nginx:1.27\" cpus = 2 memory = 256MiB }",
+            "x86_64",
+        );
+        let args = build_container_args_with_accel("lab1", &c, &p, Accel::Kvm).unwrap();
+        let mut whole = 0;
+        let mut doubled = 0;
+        for (i, value) in args.iter().enumerate() {
+            if !value.contains("with,") {
+                continue;
+            }
+            let takes_whole =
+                value.starts_with("file:") || matches!(args[i - 1].as_str(), "-kernel" | "-initrd");
+            if takes_whole {
+                whole += 1;
+                assert!(!value.contains("with,,comma"), "{value}");
+            } else {
+                doubled += 1;
+                assert!(value.contains("with,,comma"), "{value}");
+                assert!(
+                    !value.replace("with,,comma", "").contains("with,comma"),
+                    "{value}"
+                );
+            }
+        }
+        // The kernel, the initrd and the serial log.
+        assert_eq!(whole, 3, "{args:?}");
+        // QMP, the ctl and agent chardevs, the two blockdevs, the netdev and
+        // the virtiofs chardev.
+        assert_eq!(doubled, 7, "{args:?}");
     }
 
     #[test]

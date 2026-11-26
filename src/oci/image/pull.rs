@@ -51,10 +51,14 @@ pub struct PulledImage {
 /// flattened in the cache. Tag references always return `None` — without the
 /// registry we cannot know what they point at (the digest pin persisted in
 /// lab state is what makes previously-pulled containers hit this).
-pub fn cached_container_image(reference: &str, cache: &ImageCache) -> Result<Option<PulledImage>> {
+pub fn cached_container_image(
+    reference: &str,
+    arch: &str,
+    cache: &ImageCache,
+) -> Result<Option<PulledImage>> {
     let reference = parse_image_reference(reference)?;
     match &reference.selector {
-        Selector::Digest(d) => load_cached(cache, d),
+        Selector::Digest(d) => load_cached_selector(cache, d, oci_arch(arch)?),
         Selector::Tag(_) => Ok(None),
     }
 }
@@ -70,8 +74,8 @@ pub async fn ensure_container_image(
 ) -> Result<PulledImage> {
     let reference = parse_image_reference(reference)?;
     // A cached digest selector needs no transport (and no credentials).
-    if let Selector::Digest(d) = &reference.selector
-        && let Some(image) = load_cached(cache, d)?
+    if let Selector::Digest(digest) = &reference.selector
+        && let Some(image) = load_cached_selector(cache, digest, oci_arch(arch)?)?
     {
         return Ok(image);
     }
@@ -95,7 +99,7 @@ pub(crate) async fn pull_with_transport(
     // 1. Resolve the selector to the top-level manifest/index bytes.
     let fetched = match &reference.selector {
         Selector::Digest(d) => {
-            if let Some(image) = load_cached(cache, d)? {
+            if let Some(image) = load_cached_selector(cache, d, want_arch)? {
                 return Ok(image); // content-addressed: fully offline
             }
             let f = transport
@@ -132,7 +136,7 @@ pub(crate) async fn pull_with_transport(
     // 2. Resolve to the single platform manifest (index-aware).
     let (manifest, manifest_digest, manifest_bytes) = match parse_manifest_or_index(&fetched.body)?
     {
-        ManifestOrIndex::Manifest(m) => (m, top_digest, fetched.body),
+        ManifestOrIndex::Manifest(m) => (m, top_digest.clone(), fetched.body),
         ManifestOrIndex::Index(index) => {
             let desc = resolve_platform(&index, want_arch).ok_or_else(|| {
                 let platforms: Vec<String> = index
@@ -148,10 +152,7 @@ pub(crate) async fn pull_with_transport(
             })?;
             let digest = desc.digest.clone();
             if let Some(image) = load_cached(cache, &digest)? {
-                // Already flattened for this platform; refresh the tag record.
-                if let Selector::Tag(tag) = &reference.selector {
-                    cache.record_ref(&reference.host, repo, tag, &digest)?;
-                }
+                record_resolution(cache, reference, &top_digest, want_arch, &digest)?;
                 return Ok(image);
             }
             let f = transport
@@ -169,9 +170,7 @@ pub(crate) async fn pull_with_transport(
         }
     };
     if let Some(image) = load_cached(cache, &manifest_digest)? {
-        if let Selector::Tag(tag) = &reference.selector {
-            cache.record_ref(&reference.host, repo, tag, &manifest_digest)?;
-        }
+        record_resolution(cache, reference, &top_digest, want_arch, &manifest_digest)?;
         return Ok(image);
     }
 
@@ -273,7 +272,7 @@ pub(crate) async fn pull_with_transport(
     }
 
     // 6. Install the image atomically, then drop the now-redundant blobs
-    // from the cache and record the tag resolution. A pull still flattening
+    // from the cache and record the reference resolution. A pull still flattening
     // a shared blob holds its own link; this pull's went with `holds`.
     std::fs::write(staging.path().join(MANIFEST_FILE), &manifest_bytes)
         .context("cannot stage manifest.json")?;
@@ -283,15 +282,43 @@ pub(crate) async fn pull_with_transport(
     for layer in &manifest.layers {
         let _ = cache.remove_blob(&layer.digest);
     }
-    if let Selector::Tag(tag) = &reference.selector {
-        cache.record_ref(&reference.host, repo, tag, &manifest_digest)?;
-    }
+    record_resolution(cache, reference, &top_digest, want_arch, &manifest_digest)?;
     tracing::info!(reference = %reference, digest = %manifest_digest, "pulled container image");
     Ok(PulledImage {
         manifest_digest,
         config,
         rootfs_image: dir.join(ROOTFS_FILE),
     })
+}
+
+fn record_resolution(
+    cache: &ImageCache,
+    reference: &ImageReference,
+    top_digest: &str,
+    arch: &str,
+    manifest: &str,
+) -> Result<()> {
+    if top_digest != manifest {
+        cache.record_index(top_digest, arch, manifest)?;
+    }
+    if let Selector::Tag(tag) = &reference.selector {
+        cache.record_ref(&reference.host, &reference.repository, tag, manifest)?;
+    }
+    Ok(())
+}
+
+fn load_cached_selector(
+    cache: &ImageCache,
+    digest: &str,
+    arch: &str,
+) -> Result<Option<PulledImage>> {
+    if let Some(image) = load_cached(cache, digest)? {
+        return Ok(Some(image));
+    }
+    match cache.resolved_index(digest, arch) {
+        Some(manifest) => load_cached(cache, &manifest),
+        None => Ok(None),
+    }
 }
 
 /// Pick the index entry for `linux/<want_arch>`. For `arm64` only the `v8`
@@ -532,11 +559,13 @@ mod tests {
                     }
                 ]
             });
+            let bytes = serde_json::to_vec(&index).unwrap();
+            hub.put_manifest(repo, tag, media_types::DOCKER_MANIFEST_LIST, bytes.clone());
             hub.put_manifest(
                 repo,
-                tag,
+                &digest_of(&bytes),
                 media_types::DOCKER_MANIFEST_LIST,
-                serde_json::to_vec(&index).unwrap(),
+                bytes,
             );
         }
         manifest_digest
@@ -546,6 +575,63 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cache = ImageCache::new(tmp.path().join("oci"));
         (tmp, cache)
+    }
+
+    #[tokio::test]
+    async fn an_index_digest_resolves_offline_after_its_first_pull() {
+        let hub = FakeHub::default();
+        let repo = "library/nginx";
+        let manifest = seed_image(&hub, repo, Some("latest"), "linux", "amd64", false);
+        let index = digest_of(
+            &hub.get_manifest(repo, "latest")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+        );
+        let raw = format!("nginx@{index}");
+        let reference = parse_image_reference(&raw).unwrap();
+        let (_tmp, cache) = new_cache();
+        let image = pull_with_transport(&reference, "x86_64", &cache, &hub, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(image.manifest_digest, manifest);
+
+        hub.offline.store(true, Ordering::SeqCst);
+        let cached = cached_container_image(&raw, "x86_64", &cache).unwrap();
+        let pulled = pull_with_transport(&reference, "x86_64", &cache, &hub, &mut |_| {}).await;
+        assert!(
+            cached.as_ref().map(|image| image.manifest_digest.as_str()) == Some(manifest.as_str())
+                && pulled
+                    .as_ref()
+                    .is_ok_and(|image| image.manifest_digest == manifest),
+            "cache probe: {cached:?}, offline pull: {pulled:?}"
+        );
+        assert!(
+            cached_container_image(&raw, "aarch64", &cache)
+                .unwrap()
+                .is_none()
+        );
+
+        // Simulate a cache that already has the platform image, but has
+        // never resolved the index.
+        let (_warm_tmp, warm_cache) = new_cache();
+        hub.offline.store(false, Ordering::SeqCst);
+        let platform = parse_image_reference(&format!("nginx@{manifest}")).unwrap();
+        pull_with_transport(&platform, "x86_64", &warm_cache, &hub, &mut |_| {})
+            .await
+            .unwrap();
+        pull_with_transport(&reference, "x86_64", &warm_cache, &hub, &mut |_| {})
+            .await
+            .unwrap();
+        hub.offline.store(true, Ordering::SeqCst);
+        assert_eq!(
+            pull_with_transport(&reference, "x86_64", &warm_cache, &hub, &mut |_| {})
+                .await
+                .unwrap()
+                .manifest_digest,
+            manifest
+        );
     }
 
     #[tokio::test]
@@ -635,12 +721,12 @@ mod tests {
         // The offline-only probe behind deferred pulls: a digest reference
         // hits the cache, a tag reference never does (even when its digest
         // is cached — without the registry a tag's target is unknowable).
-        let probe = cached_container_image(&format!("nginx@{md}"), &cache)
+        let probe = cached_container_image(&format!("nginx@{md}"), "x86_64", &cache)
             .unwrap()
             .expect("digest-pinned probe should hit the cache");
         assert_eq!(probe.manifest_digest, md);
         assert!(
-            cached_container_image("nginx:latest", &cache)
+            cached_container_image("nginx:latest", "x86_64", &cache)
                 .unwrap()
                 .is_none()
         );
