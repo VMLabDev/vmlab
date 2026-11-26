@@ -925,12 +925,15 @@ impl ContainerInstance {
             // cinit blocks its boot on the spec. Check its protocol before
             // sending one. The ctl watcher re-answers later announcements.
             ctl.wait_boot(super::machine::DEFAULT_READY_TIMEOUT).await?;
+            // Subscribe before the spec lets cinit start the workload and
+            // report its first health verdict.
+            let events = ctl.subscribe();
             self.send_spec(&ctl).await?;
 
-            Ok::<_, anyhow::Error>((proc, ctl))
+            Ok::<_, anyhow::Error>((proc, ctl, events))
         };
 
-        let (proc, ctl) = match run.await {
+        let (proc, ctl, events) = match run.await {
             Ok(v) => v,
             Err(e) => {
                 self.teardown().await;
@@ -941,19 +944,23 @@ impl ContainerInstance {
 
         *self.state.write().await = PowerState::Running;
 
-        self.spawn_ctl_watcher(&ctl, &cbs);
-        self.spawn_readiness(&cbs);
-        self.spawn_exit_monitor(proc, cbs);
+        let watcher = self.spawn_ctl_watcher(&ctl, events, &cbs);
+        let [readiness, agent_poller] = self.spawn_readiness(&cbs);
+        self.spawn_exit_monitor(proc, cbs, [watcher, readiness, agent_poller]);
         Ok(())
     }
 
     /// Track ctl events for the run: `started`/`idle`, health transitions
     /// (with the `on_health` callback), and the exit code for classification.
-    fn spawn_ctl_watcher(self: &Arc<Self>, ctl: &CtlHandle, cbs: &Arc<Callbacks>) {
+    fn spawn_ctl_watcher(
+        self: &Arc<Self>,
+        ctl: &CtlHandle,
+        mut rx: tokio::sync::broadcast::Receiver<CtlEvent>,
+        cbs: &Arc<Callbacks>,
+    ) -> tokio::task::JoinHandle<()> {
         let me = self.clone();
         let cbs = cbs.clone();
         let ctl = ctl.clone();
-        let mut rx = ctl.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -981,7 +988,7 @@ impl ContainerInstance {
                     Err(_) => return, // channel gone: QEMU exited
                 }
             }
-        });
+        })
     }
 
     /// Readiness (PRD §7.4 shape): ctl `started`/`idle`, then the applicable
@@ -991,10 +998,10 @@ impl ContainerInstance {
     /// entrypoint runs regardless (docker semantics), and an agent hiccup
     /// must not wedge readiness. The agent is polled separately below; it
     /// only gates `exec`/`cp`.
-    fn spawn_readiness(self: &Arc<Self>, cbs: &Arc<Callbacks>) {
+    fn spawn_readiness(self: &Arc<Self>, cbs: &Arc<Callbacks>) -> [tokio::task::JoinHandle<()>; 2] {
         let me = self.clone();
         let cbs = cbs.clone();
-        tokio::spawn(async move {
+        let readiness = tokio::spawn(async move {
             // Phase 1: the container process is running.
             loop {
                 if me.power_state().await != PowerState::Running {
@@ -1019,13 +1026,8 @@ impl ContainerInstance {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
-            // Phase 2: the healthcheck gate. (Running implies the image is
-            // bound; a missing one just means no healthcheck gate.)
-            let has_healthcheck = me
-                .image_parts()
-                .map(|p| p.spec.healthcheck.is_some())
-                .unwrap_or(false);
-            if has_healthcheck {
+            // Phase 2: the healthcheck gate.
+            if me.has_healthcheck() {
                 loop {
                     if me.power_state().await != PowerState::Running {
                         return;
@@ -1045,7 +1047,7 @@ impl ContainerInstance {
         // Agent poller (mirrors the VM poller): tracks `agent_up` for
         // exec/cp availability without holding readiness hostage.
         let me = self.clone();
-        tokio::spawn(async move {
+        let agent_poller = tokio::spawn(async move {
             loop {
                 if me.power_state().await != PowerState::Running {
                     return;
@@ -1057,10 +1059,16 @@ impl ContainerInstance {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+        [readiness, agent_poller]
     }
 
     /// Classify why QEMU ended and report it after teardown completes.
-    fn spawn_exit_monitor(self: &Arc<Self>, proc: Arc<dyn Process>, cbs: Arc<Callbacks>) {
+    fn spawn_exit_monitor(
+        self: &Arc<Self>,
+        proc: Arc<dyn Process>,
+        cbs: Arc<Callbacks>,
+        run_tasks: [tokio::task::JoinHandle<()>; 3],
+    ) {
         let me = self.clone();
         tokio::spawn(async move {
             let _ = proc
@@ -1078,10 +1086,18 @@ impl ContainerInstance {
                 StopReason::Crashed
             };
             me.teardown().await;
-            *me.state.write().await = PowerState::Stopped;
+            // Stop run-scoped writers before clearing their flags and allowing a restart.
+            for task in &run_tasks {
+                task.abort();
+            }
+            for task in run_tasks {
+                let _ = task.await;
+            }
             *me.agent_up.write().await = false;
             *me.started.write().await = false;
             *me.ready.write().await = false;
+            *me.healthy.write().await = None;
+            *me.state.write().await = PowerState::Stopped;
             (cbs.on_exit)(reason, exit_code);
         });
     }
@@ -1727,7 +1743,10 @@ impl super::machine::Machine for ContainerInstance {
     }
 
     fn has_healthcheck(&self) -> bool {
-        self.cfg.healthcheck.is_some()
+        self.image_parts().map_or(
+            self.cfg.mode != model::ContainerMode::Idle && self.cfg.healthcheck.is_some(),
+            |parts| parts.spec.healthcheck.is_some(),
+        )
     }
 
     /// cinit mounts the CIFS volumes itself after net-up, from the spec sent

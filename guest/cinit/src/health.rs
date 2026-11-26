@@ -1,14 +1,14 @@
-//! Container healthcheck loop, mirroring OCI/compose semantics: after
-//! `start_period_secs`, run `command` inside the container root every
-//! `interval_secs` with a `timeout_secs` kill-timeout; `retries` consecutive
-//! failures flip the state to unhealthy, any pass flips it (back) to healthy.
+//! Run the healthcheck inside the container root immediately and then at
+//! `interval_secs`, with a `timeout_secs` kill-timeout. During the start
+//! period, failures are ignored until the first pass. After that grace,
+//! `retries` consecutive failures report unhealthy, and a pass reports healthy.
 //! Only state *changes* are emitted (the first-ever pass included).
 
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{ForkResult, Pid, chroot, execve, fork, setsid};
@@ -36,11 +36,14 @@ impl HealthState {
         }
     }
 
-    fn on_result(&mut self, pass: bool, _in_start_period: bool) -> Option<bool> {
+    fn on_result(&mut self, pass: bool, in_start_period: bool) -> Option<bool> {
         let verdict = if pass {
             self.consecutive_fails = 0;
             true
         } else {
+            if in_start_period && self.verdict.is_none() {
+                return None;
+            }
             self.consecutive_fails = self.consecutive_fails.saturating_add(1);
             if self.consecutive_fails < self.retries {
                 return None;
@@ -51,8 +54,9 @@ impl HealthState {
     }
 }
 
-fn first_check_delay(spec: &HealthSpec) -> Duration {
-    Duration::from_secs(spec.start_period_secs)
+fn check_delays(spec: &HealthSpec) -> impl Iterator<Item = Duration> {
+    let interval = Duration::from_secs(spec.interval_secs.max(1));
+    std::iter::once(Duration::ZERO).chain(std::iter::repeat(interval))
 }
 
 /// Run one check: fork, chroot, exec, wait with timeout (via the reaper —
@@ -133,13 +137,18 @@ pub fn spawn(
         .map(|(k, v)| CString::new(format!("{k}={v}")).map_err(|e| e.to_string()))
         .collect::<Result<_>>()?;
 
+    let start = Instant::now();
     let spec = spec.clone();
     thread::spawn(move || {
-        thread::sleep(first_check_delay(&spec));
         let timeout = Duration::from_secs(spec.timeout_secs.max(1));
-        let interval = Duration::from_secs(spec.interval_secs.max(1));
+        let start_period = Duration::from_secs(spec.start_period_secs);
         let mut state = HealthState::new(spec.retries);
-        while !exited.load(Ordering::SeqCst) {
+        for delay in check_delays(&spec) {
+            thread::sleep(delay);
+            if exited.load(Ordering::SeqCst) {
+                break;
+            }
+            let in_start_period = start.elapsed() < start_period;
             let pass = run_check(
                 &reaper,
                 &c_exe,
@@ -152,10 +161,9 @@ pub fn spawn(
             if exited.load(Ordering::SeqCst) {
                 break;
             }
-            if let Some(healthy) = state.on_result(pass, false) {
+            if let Some(healthy) = state.on_result(pass, in_start_period) {
                 ctl.emit(&CtlEvent::Health { healthy });
             }
-            thread::sleep(interval);
         }
     });
     Ok(())
@@ -192,9 +200,11 @@ mod tests {
             retries: 2,
             start_period_secs: 0,
         };
-        let first = first_check_delay(&spec);
+        let first = check_delays(&spec).next();
         spec.start_period_secs = 120;
-        assert_eq!(first_check_delay(&spec), first);
+        assert_eq!(check_delays(&spec).next(), first);
+        assert_eq!(first, Some(Duration::ZERO));
+        assert_eq!(check_delays(&spec).nth(1), Some(Duration::from_secs(1)));
     }
 }
 
