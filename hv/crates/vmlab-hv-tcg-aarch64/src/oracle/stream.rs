@@ -820,7 +820,9 @@ mod tests {
         use crate::lift::{Builder, FP_FORMATS, Lifted, lift};
         let mut generator = Generator::new(5);
         generator.unconstrained_one_in = 0;
-        let context = crate::State::reset(0).context;
+        let mut state = crate::State::reset(0);
+        state.enable_fp();
+        let context = state.context;
         let mut records = 0;
         for format in FP_FORMATS {
             for record in records_of(format) {

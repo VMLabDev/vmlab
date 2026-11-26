@@ -10,8 +10,9 @@ pub mod integer;
 pub mod loadstore;
 pub mod register;
 pub mod simd;
+pub mod system;
 
-pub use builder::{A64Exit, A64Next, Builder, ExceptionClass, Flags};
+pub use builder::{A64Exit, A64Next, Builder, ExceptionClass, Flags, PstateField, Trap};
 
 use crate::generated::decode::{Decoded, Fields};
 use loadstore::Index;
@@ -45,6 +46,11 @@ pub enum Lifted {
 /// Lift one decoded instruction at the PC that `builder.begin` set.
 pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
     let record = decoded.record;
+    // An FP or AdvSIMD instruction while CPACR_EL1.FPEN disables them.
+    if !builder.context().fp && needs_fp(record.info().format) {
+        builder.trap(Trap::Exception(crate::exception::Exception::FpAccess));
+        return Lifted::Branch;
+    }
     match &decoded.fields {
         Fields::ADRI(fields) => integer::adr(builder, record, fields),
         Fields::AddSubImmShift(fields) => integer::add_sub_immediate(builder, record, fields),
@@ -350,6 +356,20 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         }
         Fields::SIMDSMov(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
         Fields::SIMDUMov(f) => simd::lift(builder, record, word!(record, f; idx, rd, rn)),
+        Fields::ExceptionGeneration(fields) => system::exception(builder, record, fields),
+        Fields::UDFType(fields) => system::udf(builder, record, fields),
+        Fields::SpecialReturn(_) => system::special_return(builder, record),
+        Fields::HintI(fields) => system::hint(builder, record, fields),
+        Fields::SystemNoOperands(_) => system::no_operands(builder, record),
+        Fields::CRmSystemI(fields) => system::barrier(builder, record, fields),
+        Fields::MRSI(fields) => system::mrs(builder, record, fields),
+        Fields::MSRI(fields) => system::msr(builder, record, fields),
+        Fields::MSRpstateImm0_15(fields) => system::msr_pstate(builder, record, fields),
+        // No PSTATE field with a one-bit immediate, no SVCR and no 128-bit
+        // system register is in the 3d set.
+        Fields::MSRpstateImm0_1(_) | Fields::PstateWriteSimple(_) | Fields::RtSystemI128(_) => {
+            system::undefined(builder)
+        }
         _ => Lifted::Unsupported,
     }
 }
@@ -463,6 +483,34 @@ pub const REGISTER_FORMATS: [crate::FormatClass; 19] = {
         BaseCRC32,
     ]
 };
+
+/// The format classes of the system instructions (card C6). `SYS` and
+/// `SYSL` (the cache, TLB and address translation operations) are card C8.
+pub const SYSTEM_FORMATS: [crate::FormatClass; 12] = {
+    use crate::FormatClass::*;
+    [
+        ExceptionGeneration,
+        UDFType,
+        SpecialReturn,
+        HintI,
+        SystemNoOperands,
+        CRmSystemI,
+        MRSI,
+        MSRI,
+        MSRpstateImm0_15,
+        MSRpstateImm0_1,
+        PstateWriteSimple,
+        RtSystemI128,
+    ]
+};
+
+/// Whether the instructions of a format class need FP and AdvSIMD enabled.
+/// The cards that add vector and FP load and store classes add them here.
+pub fn needs_fp(format: crate::FormatClass) -> bool {
+    FP_FORMATS.contains(&format)
+        || SIMD_FORMATS.contains(&format)
+        || CRYPTO_FORMATS.contains(&format)
+}
 
 /// The format classes that have a lifter, for the tests and the lockstep.
 pub const LIFTED_FORMATS: [crate::FormatClass; 33] = {

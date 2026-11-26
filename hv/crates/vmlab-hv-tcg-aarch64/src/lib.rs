@@ -3,7 +3,9 @@
 //! The decoder comes from the LLVM AArch64 TableGen tables (`generated`).
 //! The semantics are our own code: lifters that append to a block of the
 //! typed IR of `vmlab-hv-tcg-ir` (`lift`), run by a small interpreter loop
-//! (`exec`). `helpers` holds what a lifter calls and does not express in the
+//! (`exec`). `sysreg` is the table of the system registers, `exception` the
+//! exception levels with entry and return, and `timer` the generic timer.
+//! `helpers` holds what a lifter calls and does not express in the
 //! graph: floating point on Berkeley SoftFloat, the lanes of AdvSIMD, AES and SHA. `oracle` is the test harness that follows a running QEMU
 //! instruction by instruction. QEMU is the test oracle only: nothing in this
 //! crate starts it outside that harness.
@@ -12,6 +14,7 @@
 //! `hv/docs/plans/phase-3d-aarch64/DESIGN.md` (S1 to S8, X1 to X3). Each
 //! semantics file names its sources in its header.
 
+pub mod exception;
 pub mod exec;
 pub mod fields;
 pub mod generated;
@@ -19,8 +22,10 @@ pub mod helpers;
 pub mod lift;
 pub mod oracle;
 pub mod state;
+pub mod sysreg;
+pub mod timer;
 
-pub use exec::{Cpu, Stop};
+pub use exec::{Conduit, Cpu, Stop, Taken};
 pub use generated::decode::{Decoded, Fields, FormatClass, Record, decode};
 pub use state::State;
 

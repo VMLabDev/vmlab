@@ -14,8 +14,8 @@
 //! operation, the lane size and the lane count, three 128-bit operands and
 //! FPCR. An operation that accumulates into its destination is two calls.
 //!
-//! What is not here: the check that FP and AdvSIMD are enabled
-//! (CPACR_EL1.FPEN), which belongs to the exception card (C6).
+//! The check that FP and AdvSIMD are enabled (CPACR_EL1.FPEN) is in
+//! `lift::lift`, before any lifter of this file runs (card C6).
 //!
 //! Sources read (DESIGN.md "Sources"): S1, the generated tables of the LLVM
 //! AArch64 records for the records, their fixed bits and their names. S6,
@@ -1447,7 +1447,8 @@ mod tests {
     fn every_record_of_advsimd_and_crypto_is_generated_and_has_a_lifter() {
         let mut generator = Generator::new(5);
         generator.unconstrained_one_in = 0;
-        let context = crate::State::reset(0).context;
+        let mut context = crate::State::reset(0).context;
+        context.fp = true;
         let mut records = 0;
         for format in SIMD_FORMATS.iter().chain(&CRYPTO_FORMATS) {
             for record in records_of(*format) {

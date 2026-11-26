@@ -525,6 +525,222 @@ that does not use it.
   lockstep shows that they have the effect that the prelude wants.
 - X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
 
+## Card C6 (2026-11-26)
+
+Scope: exceptions, exception levels and the system registers. New files:
+`sysreg.rs` (the register table and the CPU model), `exception.rs` (entry,
+return, syndromes, interrupt masks), `timer.rs` (the generic timer and the
+clock) and `lift/system.rs` (the twelve format classes of the system
+instructions but `SYS` and `SYSL`, which are card C8). `exec.rs` now takes
+the exceptions of the guest itself.
+
+### How it is built
+
+- **A terminal instruction.** An instruction that can take an exception,
+  change the level or write a system register is the last of its block. The
+  block ends in `A64Next::Trap`, and the loop runs the instruction in Rust
+  after the register slots are written back. The hints, the barriers, `MRS`
+  and `MSR` of NZCV, FPCR and FPSR, and `MRS` of a stored register (through
+  the ordered helper `sysreg::READ_STORED`, the first use of R10's ordered
+  form) stay inside the block.
+- **Exceptions are delivered.** `Stop::Undefined`, `Stop::FetchAbort` and
+  `Stop::PcAlignment` are gone. The guest takes the exception to VBAR_EL1,
+  and `Cpu::taken` names it. The loop still stops for a hypercall
+  (`Stop::Hypercall` with `Conduit::Hvc` or `Conduit::Smc`), for `WFI` with
+  no interrupt line high (`Stop::Halt`), and for a record without a lifter.
+- **The table.** 153 rows, keyed by the LLVM encoding: 94 of the 101
+  measured registers answer, and the 7 PMU registers of that list have rows
+  that say why they are absent (V5). The unallocated ID space reads as zero.
+  A machine adds registers and instructions through `Cpu::hooks` (G3e, A5).
+  An access without a row, and a word that no record matches, are in
+  `Cpu::unknown` by name, each once (G3f).
+- **The CPU model.** `sysreg::V8_0` is the CPU of G2. `QEMU_CORTEX_A53` is
+  the same table with QEMU's ID values, and the lockstep runs our core as it.
+- **Interrupts and the timer.** `Cpu::irq` and `Cpu::fiq` are levels that a
+  machine drives. The timer is a value in the state, `Cpu::timer_lines`
+  gives its two output lines, and `Cpu::timer_deadline` the count at which
+  one rises. The counter comes from `timer::Clock`: host time with a base
+  that a machine keeps over a pause, or a count that the owner sets.
+
+### The probe of QEMU's system registers
+
+`just tcg-a64-sysprobe` (`examples/a64_sysprobe.rs`) runs `MRS` and `MSR` of
+each of the 32,768 encodings with op0 of 2 or 3 on QEMU's `cortex-a53`, at
+EL1 and at EL0, from a reset each time. 175 encodings are not undefined. For
+each it notes the value, whether a write runs, the syndrome of a trap, and
+for 61 named registers the value read back after a write of all ones and of
+zero. It also notes which bits of PSTATE an exception return takes from
+SPSR_EL1, and CCSIDR_EL1 of each cache. The output is the committed file
+`tests/qemu-cortex-a53-sysregs.txt`. A second run of the probe gave the same
+file, byte for byte.
+
+`just ci::check` compares the table with that file, without QEMU
+(`src/sysreg/tests.rs`): every encoding is run through `MRS` and `MSR` on our
+interpreter at EL1 and at EL0, as the 3d CPU and as QEMU's CPU.
+
+- As the 3d CPU, 58 names differ, and they are exactly the allow-list
+  `sysreg::QEMU_DIFFERENCES`: MIDR_EL1 and REVIDR_EL1 (the 3d CPU is no
+  Cortex-A53), the 16 AArch32 ID registers that read as zero (G2),
+  ID_AA64PFR0_EL1 (`0x11` against `0x22`), ID_AA64DFR0_EL1 (no PMU, V5),
+  ID_AA64MMFR0_EL1 (the 4K granule only, little-endian only), RMR_EL1, the 28
+  PMU registers, and 8 IMPLEMENTATION DEFINED registers of the Cortex-A53.
+  The test fails on a difference that is not in the list, and on an entry
+  that is no difference. The value that the list gives for QEMU is the value
+  of the probe.
+- As QEMU's CPU, only the 37 registers that we leave out differ.
+
+### Instruction lockstep against QEMU
+
+The follower now takes the exceptions of a stream on both sides and goes on
+at the vector. A round of the group `system` starts from a reset of both
+sides (QEMU's monitor command `system_reset`). Before every instruction it
+compares X0 to X30, SP, PC, CPSR, V0 to V31, FPSR, FPCR and 72 system
+registers (`oracle::compared`), among them ESR_EL1, FAR_EL1, ELR_EL1 and
+SPSR_EL1, every stored register that a write changes, the timers and the
+stack pointer that is not in use. The plugin sends them with each record
+(`sysregs=`).
+
+A stream (`oracle/system.rs`) has a vector table, a prelude that sets
+VBAR_EL1, and about 400 instructions: `MRS` and `MSR` of the rows and of
+random encodings, the PSTATE forms, the hint space, the barriers, `SVC`,
+`HVC`, `SMC`, `BRK`, `HLT`, `DCPS`, `UDF`, `DRPS`, `ERET` with a saved state
+that the stream made (EL0, EL1 with either stack pointer, illegal states,
+PSTATE.IL), branches to a PC that is not a multiple of four, and integer and
+FP instructions of the earlier cards. The handlers return to the instruction
+after the fault. A call `SVC #0xe1` from EL0 returns to EL1.
+
+`just tcg-a64-lockstep system 100000 1 "<the four traces>"` on the commit
+`0d98e906`: 14,146,918 instructions verified in 15,868 rounds, no difference,
+47 s.
+
+| Format class | Instructions verified |
+|---|---|
+| `ExceptionGeneration` | 140,363 |
+| `UDFType` | 192,590 |
+| `SpecialReturn` | 937,266 |
+| `HintI` | 100,048 |
+| `SystemNoOperands` | 195,483 |
+| `CRmSystemI` | 116,454 |
+| `MRSI` | 2,929,713 |
+| `MSRI` | 2,618,170 |
+| `MSRpstateImm0_15` | 116,125 |
+
+- Random phase: 15,387 rounds, seed 1. `MRS` ran with 24,624 distinct
+  encodings and `MSR` with 25,249. The other 6.8 million verified
+  instructions are those of the earlier groups in the streams.
+- Exceptions that both sides took, with the same registers after them:
+  1,120,189. Undefined instruction 589,314, instruction abort 292,285, `SVC`
+  82,733, FP access trap 50,816, trapped system instruction 38,536, PC
+  alignment 34,345, `BRK` 18,532, illegal execution state 13,626, trapped
+  `WFI` and `WFE` 2. `ERET` ran 927,724 times.
+- Executed phase: the four traces hold 495 distinct encodings of the group.
+  Each ran alone after a reset. 480 were verified. 1 is `WFI`, and 14 name a
+  PMU register that the 3d CPU does not have (V5).
+- A directed round runs `WFI` and `WFE` at EL0 with SCTLR_EL1.nTWI and nTWE
+  clear: both trap, with the syndromes `0x07e00000` and `0x07e00001`.
+- "Undefined on one side only": 0.
+- QEMU leads in 9,617 verified instructions: the value of a counter read
+  (CNTVCT_EL0, CNTPCT_EL0 and the two timer values) and the answer of a host
+  call come from its next record (O4).
+- The seeds 2 and 3, without the traces: 14,141,960 and 14,143,307
+  instructions verified, no difference.
+- With the follower of this card the earlier groups still agree:
+  `fp 5000 1` 80,184 instructions, `all 5000 3` 167,998, no difference.
+- 71 rounds ended before a write that the lockstep does not follow
+  (`oracle::system::unfollowed`): SCTLR_EL1.M and TCR_EL1.TBI (card C8),
+  MDSCR_EL1.SS, KDE and MDE (V3), and a timer compare value near the count
+  of the host. 72 ended at a load, a store or an AdvSIMD record that has no
+  lifter yet.
+
+What the lockstep found, each now in the code with the reason:
+
+- QEMU clears N, Z, C and V at an exception entry. We follow it (P2, U1).
+- QEMU reports op1 in the place of op2 and op2 in the place of op1 in the
+  syndrome of a trapped `MSR DAIFSet` or `MSR DAIFClr` at EL0. We follow it.
+- After an exception return to a state that does not exist, QEMU keeps bit
+  13 of SPSR_EL1 in PSTATE. `State::pstate13` holds it. It does nothing.
+- A write of DBGBCR<n>_EL1 stores bit 5 also in bit 6 and bit 7 also in bit 8.
+- DBGCLAIMSET_EL1 and DBGCLAIMCLR_EL1 are one set of eight claim tags.
+- A PC above 40 bits takes an address size fault of level 0 while the MMU is
+  off, not an external abort.
+- `WFE` at EL1 stops QEMU as `WFI` does. Our core runs it as a NOP, which
+  the architecture allows. The streams hold neither.
+- QEMU names the instruction after an `SVC` as the source of its exception.
+- CCSIDR_EL1 of the instruction cache and of the level 2 cache are now the
+  values of the probe.
+
+`just ci::check` replays `tests/corpus/c6.txt` without QEMU: 363 verified
+instructions with the system registers before and after them, one for each
+row that `MRS` and `MSR` reached and three for each other record. 92 unit
+tests cover the rest, among them every row of the table against the probe, the
+interrupt lines and their masks, `WFI`, the timer, the hooks of a machine,
+and 40 streams run on our interpreter alone.
+
+### What this card does not do
+
+- Interrupts and the timer are not in the lockstep: O3 has no device and no
+  interrupt. Unit tests cover the masks, the vectors, `WFI` and the timer
+  lines. kvm-unit-tests come with card C10. When both lines are high and not
+  masked, our core takes FIQ first.
+- `SYS` and `SYSL` (cache operations, TLBI, AT, DC ZVA) stop the loop with
+  `Stop::Unimplemented`: card C8.
+- Translation: the PC is a physical address. A fetch outside the memory is an
+  external abort (fault status `0x10`), or an address size fault above 40
+  bits. The counts above do not separate the two.
+- The debug registers are stored and nothing acts on them (V3). MDSCR_EL1.SS
+  does not step.
+- A return to AArch32 at EL0 is illegal on our CPU (G2) and legal on QEMU's
+  `cortex-a53`. The streams do not make one.
+- RMR_EL1 does not exist: a reset is a request of the machine.
+- `SMC` is undefined on QEMU's `virt` without EL3. Our core leaves it to the
+  machine, as `HVC` (G4). In the lockstep the harness refuses the call where
+  QEMU did, and takes QEMU's answer where it served one.
+- The speed of the loop was not measured again: card C5 measures it.
+
+### After the merge of card C3 (2026-11-27)
+
+Card C3 (loads and stores) reached `next` first, and this branch took it in.
+How the two fit:
+
+- The loop is that of card C3 (blocks with several exits, the exclusive
+  monitor, the code pages) with the exceptions, the interrupts and the
+  terminal instruction of this card. `ERET` and `CLREX` end the exclusive
+  mark, as the record of card C3 expected of this card.
+- A load or a store that fails still stops the loop (`Stop::DataAbort`,
+  `Stop::Alignment`), as card C3 left it. It is not an exception of the
+  guest yet: the syndrome of a data abort needs the lockstep of the
+  translation card (C8).
+- The follower has two kinds of round. A round that ends at the first
+  exception and compares the memory writes is the one of card C3
+  (`run_plain`). Our CPU now takes its exceptions itself, so that round puts
+  the registers back as they were before the exception. A round of system
+  instructions (`run_system`) is the one of this card. It ends before a load
+  or a store.
+- The programs of `tests/loadstore.rs` ended in a zero word, which stopped
+  the loop as a record without a lifter. `UDF` is now an exception of the
+  guest, so they end in `IC IALLU`, which has no lifter before card C8.
+
+On the merged commit `98d30c68`:
+`just tcg-a64-lockstep system 100000 1 "<the four traces>"` verified
+14,144,660 instructions in 15,867 rounds with no difference, and 68 rounds
+ended before a load or a store. `c1 100000 1` without the traces verified
+1,439,552 instructions, `loadstore 3000 1` 156,639, `fp 3000 1` 48,156,
+`c2 3000 1` 57,991 and `all 3000 3` 101,049, each with no difference.
+
+### Sources read for this card
+
+- S1: the generated tables (`generated/decode.rs`, `generated/sysreg.rs`)
+  for the records, the fields, and the names and encodings of the registers.
+  No LLVM source file was opened.
+- S6: the behaviour of a running QEMU through its gdbstub (with the monitor
+  command `system_reset`), the plugin, and the plugin API header
+  `qemu-plugin.h` (the discontinuity callback and the register calls).
+- S2, S3, S4, S5, S7 and S8 were not opened. The Arm manual was not opened
+  (Q1). The first version of each file came from the author's general
+  knowledge of the A64 exception model, and the probe and the lockstep
+  settled every value that is in the code.
+- X1 to X3 hold: no QEMU source, no Arm ASL, XML or pseudocode, no Unicorn.
+
 ## Card C7 (2026-11-26)
 
 Scope: AdvSIMD and the crypto instructions, the 54 format classes of the 3d
@@ -616,9 +832,9 @@ the vector registers that the instruction names.
 
 ### What this card does not do
 
-- The check that FP and AdvSIMD are enabled (CPACR_EL1.FPEN) and its trap. It
-  belongs to the exception card (C6), which must add it to `lift/simd.rs` and
-  `lift/crypto.rs` as to `lift/fp.rs`.
+- The check that FP and AdvSIMD are enabled (CPACR_EL1.FPEN) and its trap
+  came with card C6. After the merge of `next`, `lift::needs_fp` names the
+  format classes of this card too, so they trap as the scalar FP classes do.
 - The speed of AdvSIMD. Every lane operation is a helper call, and a 128-bit
   result that can raise a bit of FPSR is computed twice. The loop of
   `just tcg-a64-mips` has no vector instruction and was not measured again:
