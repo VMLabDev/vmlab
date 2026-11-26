@@ -17,6 +17,9 @@
  *                exception registers and what an MSR wrote).
  *   names=<path> write the name of every register that the plugin API offers
  *                to this file, one per line.
+ *   reads=io     add a record for each memory read that a device answers,
+ *                with the value that it gave (the boot lockstep, DESIGN.md
+ *                O4: the follower takes its device reads from the leader).
  *
  * The stream, little-endian:
  *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 count of sysregs
@@ -27,6 +30,8 @@
  *   memory write  u32 2, u32 size in bytes, u64 vaddr, u64 low, u64 high
  *   discontinuity u32 3, u32 type (1 interrupt, 2 exception, 4 host call),
  *                 u64 from_pc, u64 to_pc
+ *   device read   u32 4, u32 size in bytes, u64 physical address, u64 low,
+ *                 u64 high (with reads=io only; bit 2 of the header flags)
  *
  * Each record is one write(2) of less than PIPE_BUF bytes, so a reader of
  * the FIFO never sees a part of one, and a record is in the FIFO before the
@@ -44,10 +49,11 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3 };
+enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3, REC_READ = 4 };
 
 static int out_fd = -1;
 static int vectors;
+static int io_reads;
 static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr;
 static struct qemu_plugin_register *reg_v[32], *reg_fpsr, *reg_fpcr;
 enum { MAX_SYSREGS = 96 };
@@ -134,6 +140,15 @@ static void mem_write(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t va
     if (!ready || vcpu != 0) {
         return;
     }
+    if (!qemu_plugin_mem_is_store(info)) {
+        /* A load: only one that a device answers is of interest. */
+        struct qemu_plugin_hwaddr *hw = qemu_plugin_get_hwaddr(info, vaddr);
+        if (!hw || !qemu_plugin_hwaddr_is_io(hw)) {
+            return;
+        }
+        rec.tag = REC_READ;
+        rec.vaddr = qemu_plugin_hwaddr_phys_addr(hw);
+    }
     switch (value.type) {
     case QEMU_PLUGIN_MEM_VALUE_U8:
         rec.low = value.data.u8;
@@ -189,7 +204,8 @@ static void tb_trans(struct qemu_plugin_tb *tb, void *udata)
         qemu_plugin_register_vcpu_insn_exec_cb(insn, insn_exec, QEMU_PLUGIN_CB_R_REGS,
                                                (void *)(uintptr_t)(encoding | offset << 32));
         qemu_plugin_register_vcpu_mem_cb(insn, mem_write, QEMU_PLUGIN_CB_NO_REGS,
-                                         QEMU_PLUGIN_MEM_W, NULL);
+                                         io_reads ? QEMU_PLUGIN_MEM_RW : QEMU_PLUGIN_MEM_W,
+                                         NULL);
     }
 }
 
@@ -275,6 +291,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             path = argv[i] + 4;
         } else if (!strcmp(argv[i], "vectors=on")) {
             vectors = 1;
+        } else if (!strcmp(argv[i], "reads=io")) {
+            io_reads = 1;
         } else if (g_str_has_prefix(argv[i], "names=")) {
             names_path = argv[i] + 6;
         } else if (g_str_has_prefix(argv[i], "sysregs=")) {
@@ -301,7 +319,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         return -1;
     }
     scratch = g_byte_array_new();
-    header.flags = vectors | (sys_count ? 2 : 0);
+    header.flags = vectors | (sys_count ? 2 : 0) | (io_reads ? 4 : 0);
     header.zero = sys_count;
     emit(&header, sizeof(header));
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);

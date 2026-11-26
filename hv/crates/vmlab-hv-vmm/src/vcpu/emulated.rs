@@ -41,6 +41,13 @@ pub struct CpuLine {
     waker: Arc<Waker>,
 }
 
+impl CpuLine {
+    /// The level of the line now.
+    pub fn level(&self) -> bool {
+        self.level.load(Ordering::SeqCst)
+    }
+}
+
 impl IrqLine for CpuLine {
     fn set_level(&self, high: bool) {
         if self.level.swap(high, Ordering::SeqCst) != high && high {

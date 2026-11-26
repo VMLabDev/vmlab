@@ -36,6 +36,7 @@ use vmlab_hv_proto::machine::{
     Accel, Arch, Boot, DiskBus, FirmwareKind, Machine, MachineDescription, NicAttachment, NicModel,
 };
 use vmlab_hv_tcg_aarch64::State;
+use vmlab_hv_tcg_aarch64::sysreg::CpuModel;
 use vmlab_hv_tcg_aarch64::timer::Clock;
 
 use crate::bus::{IoBus, MmioBus};
@@ -206,6 +207,12 @@ pub struct Options {
     /// Wrap the machine as the vCPUs see it: the lockstep takes the device
     /// reads of its leader there.
     pub host: Option<HostWrapper>,
+    /// The CPU, in place of the one of the product (DESIGN.md G2): the
+    /// lockstep runs the CPU of its leader.
+    pub model: Option<&'static CpuModel>,
+    /// The interrupt of a PMU in the ACPI tables, for a leader that has
+    /// one. The product has none (DESIGN.md V5).
+    pub performance_interrupt: Option<u32>,
 }
 
 pub type HostWrapper = Box<dyn FnOnce(Arc<dyn VcpuHost>) -> Arc<dyn VcpuHost>>;
@@ -215,6 +222,15 @@ pub struct Assembled {
     pub shared: Arc<VmShared>,
     pub vcpus: Vec<Arc<Mutex<EmulatedVcpu>>>,
     pub ram: GuestRam,
+}
+
+impl Assembled {
+    /// Reset the machine in place, for a caller that runs the vCPUs itself
+    /// and holds none of them.
+    pub fn reset(&self) -> Result<(), String> {
+        let virt = self.shared.virt.get().ok_or("the machine is no virt machine")?;
+        virt.reset_with(&self.shared, &self.ram)
+    }
 }
 
 /// The `virt` half of a machine: what `VmShared` asks it for.
@@ -234,6 +250,7 @@ pub struct Virt {
     /// The BARs of the PCI root at power-on.
     bars: Vec<(u8, Vec<(u64, bool)>)>,
     images: Images,
+    model: &'static CpuModel,
 }
 
 fn invalid(message: impl Into<String>) -> VmmError {
@@ -469,7 +486,7 @@ pub fn assemble(
         vcpus: desc.vcpus as u8,
         ram_size,
         uuid: [0; 16],
-        performance_interrupt: None,
+        performance_interrupt: options.performance_interrupt,
         bootorder: match &desc.boot {
             Boot::Firmware { bootorder, .. } => bootorder.clone(),
             Boot::Kernel { .. } => Vec::new(),
@@ -488,6 +505,7 @@ pub fn assemble(
         mmio64_size: map::PCI_MMIO64_SIZE,
     };
     let ram = GuestRam::anonymous(layout)?;
+    let model = options.model;
     let images = images(desc, options.dtb)?;
 
     let mut mmio_bus = MmioBus::new();
@@ -751,6 +769,7 @@ pub fn assemble(
         functions,
         bars,
         images,
+        model: model.unwrap_or(&vmlab_hv_tcg_aarch64::sysreg::V8_0),
     });
     virt.power_on(&ram)?;
     shared
@@ -775,8 +794,8 @@ impl Virt {
 
     /// The state of the CPU `id` when it starts at `entry` with `x0`: EL1
     /// with every interrupt masked and the MMU off.
-    fn start_state(id: usize, entry: u64, x0: u64) -> State {
-        let mut state = State::reset(entry);
+    fn start_state(&self, id: usize, entry: u64, x0: u64) -> State {
+        let mut state = State::reset_as(entry, self.model);
         state.set_x(0, x0);
         // Affinity level 0 is the number of the CPU.
         state.system.regs[vmlab_hv_tcg_aarch64::sysreg::reg::MPIDR_EL1] |= id as u64;
@@ -799,7 +818,7 @@ impl Virt {
             } else {
                 (0, 0)
             };
-            vcpu.lock().reset(Self::start_state(id, entry, x0));
+            vcpu.lock().reset(self.start_state(id, entry, x0));
             powered[id] = id == 0;
         }
         Ok(())
@@ -807,6 +826,11 @@ impl Virt {
 
     /// Reset the machine in place. Every vCPU thread is parked.
     pub(crate) fn reset(&self, shared: &VmShared) -> Result<(), String> {
+        let ram = shared.ram().ok_or("reset has no guest RAM")?;
+        self.reset_with(shared, &ram)
+    }
+
+    fn reset_with(&self, shared: &VmShared, ram: &GuestRam) -> Result<(), String> {
         let device = |e: vmlab_hv_devices::DeviceError| e.to_string();
         self.gic.lock().reset().map_err(device)?;
         self.uart.lock().reset().map_err(device)?;
@@ -824,8 +848,7 @@ impl Virt {
             .lock()
             .restore_bar_states(&self.bars)
             .map_err(|e| format!("PCI root: {e}"))?;
-        let ram = shared.ram().ok_or("reset has no guest RAM")?;
-        self.power_on(&ram).map_err(|e| e.to_string())
+        self.power_on(ram).map_err(|e| e.to_string())
     }
 
     pub(crate) fn clock_running(&self, running: bool) {
@@ -926,7 +949,7 @@ impl Virt {
                 let target = usize::from(cpu);
                 self.vcpus[target]
                     .lock()
-                    .reset(Self::start_state(target, entry, context));
+                    .reset(self.start_state(target, entry, context));
                 powered[target] = true;
                 drop(powered);
                 shared.wake_parked();

@@ -112,6 +112,25 @@ tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='' samp
 	if [ -n "{{corpus}}" ]; then args+=(--corpus-out "{{corpus}}"); fi
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_lockstep -- "${args[@]}"
 
+# Run the aarch64 boot lockstep against QEMU (DESIGN.md O4): AAVMF on our virt machine beside QEMU's, from the reset until the serial log holds `until`; firmware is the directory of guest/fetch-firmware.sh aarch64, resync is how many CPU differences the run goes past, max ends it after that many instructions (0: no limit), and keep is a directory that takes the logs of the run
+[group('tcg')]
+tcg-a64-boot-lockstep firmware='../guest/dist/firmware/aarch64' until='Shell>' resync='0' max='0' keep='': tcg-a64-plugin-build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64boot.XXXXXX")
+	finish() {
+		if [ -n "{{keep}}" ] && [ -d "{{keep}}" ]; then
+			for name in follower-serial.log leader-serial.log last-instructions.txt; do
+				if [ -f "$dir/$name" ]; then cp -- "$dir/$name" "{{keep}}/$name"; fi
+			done
+		fi
+		if [ -n "$dir" ] && [ -d "$dir" ]; then rm -rf -- "$dir"; fi
+	}
+	trap finish EXIT
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --code "{{firmware}}/AAVMF_CODE.fd" --vars "{{firmware}}/AAVMF_VARS.fd" --until "{{until}}" --resync "{{resync}}")
+	if [ "{{max}}" != 0 ]; then args+=(--max-instructions "{{max}}"); fi
+	cargo run --release -p vmlab-hv-vmm --example a64_boot_lockstep -- "${args[@]}"
+
 # Probe every system register encoding on QEMU's cortex-a53 (card C6) and write tests/qemu-cortex-a53-sysregs.txt
 [group('tcg')]
 tcg-a64-sysprobe out='crates/vmlab-hv-tcg-aarch64/tests/qemu-cortex-a53-sysregs.txt' names='': tcg-a64-plugin-build
