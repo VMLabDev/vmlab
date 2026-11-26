@@ -295,7 +295,13 @@ impl Builder {
     }
 
     /// `high` above the `low_width` bits of `low`, as `width` bits.
-    pub fn concat(&mut self, high: ScalarId, low: ScalarId, low_width: u16, width: u16) -> ScalarId {
+    pub fn concat(
+        &mut self,
+        high: ScalarId,
+        low: ScalarId,
+        low_width: u16,
+        width: u16,
+    ) -> ScalarId {
         self.block.graph.concat(high, low, low_width, width)
     }
 

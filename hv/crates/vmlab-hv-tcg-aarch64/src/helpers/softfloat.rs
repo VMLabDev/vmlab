@@ -93,7 +93,10 @@ mod tests {
             (Rounding::Min, down),
             (Rounding::Max, down + 1),
         ] {
-            assert_eq!(call(F64_DIV, mode, one, three, 0), (expected, flag::INEXACT));
+            assert_eq!(
+                call(F64_DIV, mode, one, three, 0),
+                (expected, flag::INEXACT)
+            );
         }
         // 2.5 to an integer: a tie.
         let two_and_a_half = 0x4020_0000u64;

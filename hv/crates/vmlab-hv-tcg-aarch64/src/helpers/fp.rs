@@ -175,7 +175,11 @@ impl Format {
     /// Both zeros have the key 0.
     const fn key(self, value: u64) -> i128 {
         let magnitude = (value & !self.sign_bit()) as i128;
-        if self.sign(value) { -magnitude } else { magnitude }
+        if self.sign(value) {
+            -magnitude
+        } else {
+            magnitude
+        }
     }
 }
 
@@ -412,7 +416,12 @@ pub fn unary(operation: Unary, format: Format, a: u64, fpcr: u32) -> (u64, u8) {
     let current = rounding(fpcr);
     let (mode, exact) = match operation {
         Unary::Sqrt => {
-            let value = result(format, sf::call(table.sqrt, current, a, 0, 0), fpcr, &mut flags);
+            let value = result(
+                format,
+                sf::call(table.sqrt, current, a, 0, 0),
+                fpcr,
+                &mut flags,
+            );
             return (value, flags);
         }
         Unary::RoundNearEven => (Rounding::NearEven, false),

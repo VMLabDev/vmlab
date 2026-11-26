@@ -255,7 +255,11 @@ impl Generator {
             2 | 3 | 4 => value(rng, 11, 52),
             // Single precision in the low half, with zeros or anything above.
             5 | 6 => {
-                let high = if rng.chance(1, 2) { 0 } else { rng.next_u64() << 32 };
+                let high = if rng.chance(1, 2) {
+                    0
+                } else {
+                    rng.next_u64() << 32
+                };
                 high | value(rng, 8, 23)
             }
             // Half precision in the low 16 bits.
@@ -399,7 +403,10 @@ mod tests {
             }
         }
         for count in [zeros, infinities, nans, denormals, flush] {
-            assert!(count > 20, "{zeros} {infinities} {nans} {denormals} {flush}");
+            assert!(
+                count > 20,
+                "{zeros} {infinities} {nans} {denormals} {flush}"
+            );
         }
         assert!(modes.iter().all(|count| *count > 20), "{modes:?}");
         assert!((50..150).contains(&clear_status));
@@ -419,7 +426,8 @@ mod tests {
             for record in records_of(format) {
                 records += 1;
                 for _ in 0..50 {
-                    let (word, kind) = generator.instruction(record, 0x4200_0000, (0x4200_0000, 64));
+                    let (word, kind) =
+                        generator.instruction(record, 0x4200_0000, (0x4200_0000, 64));
                     assert_eq!(kind, Kind::Valid, "{}", record.name());
                     let decoded = decode(word).unwrap();
                     assert_eq!(decoded.record, record);

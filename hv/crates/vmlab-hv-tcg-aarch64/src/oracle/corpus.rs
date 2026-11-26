@@ -282,15 +282,25 @@ mod tests {
         after.v[0] = u128::from(3.75f64.to_bits());
         entry.vectors = Some((before, after));
         let line = entry.line();
-        assert!(line.contains(" fpcr=c00000 fpsr=1 v=ffffffffffffffffffffffffffffffff,3ff8000000000000,"));
-        assert!(line.ends_with(" fpcr=c00000 fpsr=1 dv=0:400e000000000000"), "{line}");
+        assert!(
+            line.contains(
+                " fpcr=c00000 fpsr=1 v=ffffffffffffffffffffffffffffffff,3ff8000000000000,"
+            )
+        );
+        assert!(
+            line.ends_with(" fpcr=c00000 fpsr=1 dv=0:400e000000000000"),
+            "{line}"
+        );
         assert_eq!(Entry::parse(&line), Ok(entry.clone()));
         assert_eq!(entry.replay(), Ok(()));
         // A wrong expectation names the register.
         let mut wrong = entry.clone();
         wrong.vectors = Some((before, before));
         let error = wrong.replay().unwrap_err();
-        assert!(error.contains("v0: 0x400e000000000000 / 0xffffffffffffffffffffffffffffffff"), "{error}");
+        assert!(
+            error.contains("v0: 0x400e000000000000 / 0xffffffffffffffffffffffffffffffff"),
+            "{error}"
+        );
         let mut flags = entry.clone();
         after.fpsr = 0x11;
         flags.vectors = Some((before, after));

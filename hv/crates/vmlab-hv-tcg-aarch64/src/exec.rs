@@ -14,7 +14,9 @@ use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::linear;
 use vmlab_hv_tcg_ir::native::packed::Packed;
-use vmlab_hv_tcg_ir::native::{Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule};
+use vmlab_hv_tcg_ir::native::{
+    Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
+};
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -179,7 +181,9 @@ fn compile(
             results,
         } = event
         else {
-            return Err(host("an event of an aarch64 block that has no executor yet"));
+            return Err(host(
+                "an event of an aarch64 block that has no executor yet",
+            ));
         };
         if !matches!(helper.0.function, HelperFn::Ordered(_)) || args.len() > CALL_ARGUMENTS {
             return Err(host("an ordered call of a helper that is not one"));
@@ -592,11 +596,17 @@ mod tests {
         // fadd d0, d1, d2 ; fdiv d3, d1, d4 ; fcvtzs w5, d0 ; fcmp d1, d2
         let mut cpu = cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
         cpu.state.set_v(0, u128::MAX);
-        cpu.state.set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        cpu.state
+            .set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
         cpu.state.set_v(2, u128::from(2.25f64.to_bits()));
         cpu.state.set_v(3, u128::MAX);
         cpu.state.set_x(5, u64::MAX);
-        assert_eq!(cpu.run(4), Stop::Budget);
+        // The word after them is zero: UDF, which has no lifter.
+        let stop = cpu.run(u64::MAX);
+        assert!(
+            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 16),
+            "{stop:?}"
+        );
         // A scalar result clears the register above it.
         assert_eq!(cpu.state.v(0), u128::from(3.75f64.to_bits()));
         assert_eq!(cpu.state.v(3), u128::from(f64::INFINITY.to_bits()));
@@ -609,7 +619,8 @@ mod tests {
         assert_eq!(cpu.translations, 1);
         let mut step = self::cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
         step.state.set_v(0, u128::MAX);
-        step.state.set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
+        step.state
+            .set_v(1, u128::from(1.5f64.to_bits()) | 0xdead << 64);
         step.state.set_v(2, u128::from(2.25f64.to_bits()));
         step.state.set_v(3, u128::MAX);
         step.state.set_x(5, u64::MAX);

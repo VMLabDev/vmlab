@@ -53,9 +53,7 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         Fields::BaseFPCondSelect(fields) => fp::conditional_select(builder, record, fields),
         Fields::BaseFPConversion(fields) => fp::convert(builder, record, fields),
         Fields::BaseFPMoveImmediate(fields) => fp::move_immediate(builder, record, fields),
-        Fields::BaseFPToIntegerUnscaled(fields) => {
-            fp::to_integer_unscaled(builder, record, fields)
-        }
+        Fields::BaseFPToIntegerUnscaled(fields) => fp::to_integer_unscaled(builder, record, fields),
         Fields::BaseFPToInteger(fields) => fp::to_integer_scaled(builder, record, fields),
         Fields::BaseIntegerToFPUnscaled(fields) => {
             fp::from_integer_unscaled(builder, record, fields)

@@ -54,7 +54,10 @@ fn samples(format: Format, rng: &mut Rng, random: usize) -> Vec<u64> {
             _ => raw,
         });
     }
-    let negatives: Vec<u64> = values.iter().map(|value| value ^ format.sign_bit()).collect();
+    let negatives: Vec<u64> = values
+        .iter()
+        .map(|value| value ^ format.sign_bit())
+        .collect();
     values.extend(negatives);
     values
 }
@@ -100,7 +103,10 @@ fn a_conversion_to_an_integer_is_softfloats_for_every_mode_and_width() {
 fn a_fixed_point_conversion_is_the_integer_conversion_of_the_scaled_value() {
     // 1.75 with two fraction bits is 7, exactly.
     let value = 0x3ffc_0000_0000_0000u64;
-    assert_eq!(to_fixed(DOUBLE, value, 32, false, 2, Rounding::MinMag, 0), (7, 0));
+    assert_eq!(
+        to_fixed(DOUBLE, value, 32, false, 2, Rounding::MinMag, 0),
+        (7, 0)
+    );
     // With one fraction bit it is 3.5, toward zero 3, and inexact.
     assert_eq!(
         to_fixed(DOUBLE, value, 32, false, 1, Rounding::MinMag, 0),
@@ -113,7 +119,10 @@ fn a_fixed_point_conversion_is_the_integer_conversion_of_the_scaled_value() {
     );
     // 2^-64 with 64 fraction bits is 1.
     let tiny = (1023u64 - 64) << 52;
-    assert_eq!(to_fixed(DOUBLE, tiny, 64, true, 64, Rounding::MinMag, 0), (1, 0));
+    assert_eq!(
+        to_fixed(DOUBLE, tiny, 64, true, 64, Rounding::MinMag, 0),
+        (1, 0)
+    );
     // A negative value that rounds to zero is in the unsigned range.
     assert_eq!(
         to_fixed(SINGLE, 0xbe99_999a, 32, true, 0, Rounding::MinMag, 0),
@@ -214,15 +223,24 @@ fn the_alternative_half_precision_format_has_one_more_binade_and_no_nan() {
     // The exponent field 31 is 2^16 times the significand.
     assert_eq!(convert(HALF, SINGLE, 0x7c00, ahp), (0x4780_0000, 0));
     assert_eq!(convert(HALF, SINGLE, 0xfe00, ahp), (0xc7c0_0000, 0));
-    assert_eq!(convert(HALF, DOUBLE, 0x7fff, ahp), (0x40ff_fc00_0000_0000, 0));
+    assert_eq!(
+        convert(HALF, DOUBLE, 0x7fff, ahp),
+        (0x40ff_fc00_0000_0000, 0)
+    );
     // In the IEEE format the same bits are an infinity and a NaN.
     assert_eq!(convert(HALF, SINGLE, 0x7c00, 0), (0x7f80_0000, 0));
     assert_eq!(convert(HALF, SINGLE, 0xfe00, 0), (0xffc0_0000, 0));
     assert_eq!(convert(HALF, SINGLE, 0x7c01, 0), (0x7fc0_2000, fpsr::IOC));
     // Numbers below the top binade are the same in both formats.
     for value in [0u64, 0x8000, 1, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff] {
-        assert_eq!(convert(HALF, SINGLE, value, ahp), convert(HALF, SINGLE, value, 0));
-        assert_eq!(convert(HALF, DOUBLE, value, ahp), convert(HALF, DOUBLE, value, 0));
+        assert_eq!(
+            convert(HALF, SINGLE, value, ahp),
+            convert(HALF, SINGLE, value, 0)
+        );
+        assert_eq!(
+            convert(HALF, DOUBLE, value, ahp),
+            convert(HALF, DOUBLE, value, 0)
+        );
     }
     // To the alternative format: 65536 fits, where the IEEE format overflows.
     assert_eq!(convert(SINGLE, HALF, 0x4780_0000, ahp), (0x7c00, 0));
@@ -234,8 +252,14 @@ fn the_alternative_half_precision_format_has_one_more_binade_and_no_nan() {
     assert_eq!(convert(SINGLE, HALF, 0x4800_0000, ahp), (0x7fff, fpsr::IOC));
     assert_eq!(convert(SINGLE, HALF, 0xc800_0000, ahp), (0xffff, fpsr::IOC));
     // An infinity and a NaN have no encoding there.
-    assert_eq!(convert(DOUBLE, HALF, DOUBLE.infinity(true), ahp), (0xffff, fpsr::IOC));
-    assert_eq!(convert(DOUBLE, HALF, DOUBLE.default_nan(), ahp), (0, fpsr::IOC));
+    assert_eq!(
+        convert(DOUBLE, HALF, DOUBLE.infinity(true), ahp),
+        (0xffff, fpsr::IOC)
+    );
+    assert_eq!(
+        convert(DOUBLE, HALF, DOUBLE.default_nan(), ahp),
+        (0, fpsr::IOC)
+    );
     assert_eq!(
         convert(DOUBLE, HALF, DOUBLE.default_nan() | 1 << 63, ahp),
         (0x8000, fpsr::IOC)
@@ -255,7 +279,14 @@ fn a_nan_result_is_the_first_signalling_operand_else_the_first_quiet_one() {
     let signal_a = 0x7f80_0011u64;
     let signal_b = 0xff80_0022u64;
     let one = 0x3f80_0000u64;
-    for operation in [Binary::Add, Binary::Sub, Binary::Mul, Binary::Div, Binary::Max, Binary::Min] {
+    for operation in [
+        Binary::Add,
+        Binary::Sub,
+        Binary::Mul,
+        Binary::Div,
+        Binary::Max,
+        Binary::Min,
+    ] {
         assert_eq!(binary(operation, SINGLE, quiet_a, quiet_b, 0), (quiet_a, 0));
         assert_eq!(binary(operation, SINGLE, one, quiet_b, 0), (quiet_b, 0));
         assert_eq!(
@@ -271,7 +302,10 @@ fn a_nan_result_is_the_first_signalling_operand_else_the_first_quiet_one() {
             binary(operation, SINGLE, signal_a, quiet_b, fpcr::DN),
             (0x7fc0_0000, fpsr::IOC)
         );
-        assert_eq!(binary(operation, SINGLE, one, quiet_b, fpcr::DN), (0x7fc0_0000, 0));
+        assert_eq!(
+            binary(operation, SINGLE, one, quiet_b, fpcr::DN),
+            (0x7fc0_0000, 0)
+        );
     }
     // An invalid operation gives the default NaN.
     let infinity = SINGLE.infinity(false);
@@ -279,9 +313,18 @@ fn a_nan_result_is_the_first_signalling_operand_else_the_first_quiet_one() {
         binary(Binary::Sub, SINGLE, infinity, infinity, 0),
         (0x7fc0_0000, fpsr::IOC)
     );
-    assert_eq!(binary(Binary::Mul, SINGLE, infinity, 0, 0), (0x7fc0_0000, fpsr::IOC));
-    assert_eq!(binary(Binary::Div, SINGLE, 0, 0, 0), (0x7fc0_0000, fpsr::IOC));
-    assert_eq!(binary(Binary::Div, SINGLE, one, 0, 0), (infinity, fpsr::DZC));
+    assert_eq!(
+        binary(Binary::Mul, SINGLE, infinity, 0, 0),
+        (0x7fc0_0000, fpsr::IOC)
+    );
+    assert_eq!(
+        binary(Binary::Div, SINGLE, 0, 0, 0),
+        (0x7fc0_0000, fpsr::IOC)
+    );
+    assert_eq!(
+        binary(Binary::Div, SINGLE, one, 0, 0),
+        (infinity, fpsr::DZC)
+    );
     assert_eq!(
         unary(Unary::Sqrt, DOUBLE, 0xbff0_0000_0000_0000, 0),
         (0x7ff8_0000_0000_0000, fpsr::IOC)
@@ -290,7 +333,10 @@ fn a_nan_result_is_the_first_signalling_operand_else_the_first_quiet_one() {
     // The numeric maximum takes the number beside a quiet NaN, in both places.
     assert_eq!(binary(Binary::MaxNumber, SINGLE, quiet_a, one, 0), (one, 0));
     assert_eq!(binary(Binary::MinNumber, SINGLE, one, quiet_b, 0), (one, 0));
-    assert_eq!(binary(Binary::MaxNumber, SINGLE, quiet_a, quiet_b, 0), (quiet_a, 0));
+    assert_eq!(
+        binary(Binary::MaxNumber, SINGLE, quiet_a, quiet_b, 0),
+        (quiet_a, 0)
+    );
     assert_eq!(
         binary(Binary::MaxNumber, SINGLE, signal_a, one, 0),
         (signal_a | 0x40_0000, fpsr::IOC)
@@ -313,14 +359,20 @@ fn a_maximum_of_two_zeros_is_negative_only_when_both_are() {
     let two = 0x4000_0000_0000_0000u64;
     assert_eq!(binary(Binary::Max, DOUBLE, one, two, 0), (two, 0));
     assert_eq!(binary(Binary::Min, DOUBLE, one, two, 0), (one, 0));
-    assert_eq!(binary(Binary::Max, DOUBLE, one | minus, two | minus, 0), (one | minus, 0));
+    assert_eq!(
+        binary(Binary::Max, DOUBLE, one | minus, two | minus, 0),
+        (one | minus, 0)
+    );
     assert_eq!(
         binary(Binary::Min, DOUBLE, DOUBLE.infinity(true), two, 0),
         (DOUBLE.infinity(true), 0)
     );
     // A denormal stays what it is without flush-to-zero.
     assert_eq!(binary(Binary::Max, DOUBLE, 1, 0, 0), (1, 0));
-    assert_eq!(binary(Binary::Max, DOUBLE, 1, minus, fpcr::FZ), (0, fpsr::IDC));
+    assert_eq!(
+        binary(Binary::Max, DOUBLE, 1, minus, fpcr::FZ),
+        (0, fpsr::IDC)
+    );
 }
 
 #[test]
@@ -329,11 +381,23 @@ fn flush_to_zero_replaces_denormal_operands_and_tiny_results() {
     let smallest_normal = 0x0080_0000u64;
     let half = 0x3f00_0000u64;
     // A denormal operand is zero, and IDC records it.
-    assert_eq!(binary(Binary::Add, SINGLE, 1, 0x3f80_0000, fz), (0x3f80_0000, fpsr::IDC));
-    assert_eq!(binary(Binary::Add, SINGLE, 1, 0x3f80_0000, 0), (0x3f80_0000, fpsr::IXC));
+    assert_eq!(
+        binary(Binary::Add, SINGLE, 1, 0x3f80_0000, fz),
+        (0x3f80_0000, fpsr::IDC)
+    );
+    assert_eq!(
+        binary(Binary::Add, SINGLE, 1, 0x3f80_0000, 0),
+        (0x3f80_0000, fpsr::IXC)
+    );
     // A result that is tiny and exact: a denormal without the flag, a zero with UFC.
-    assert_eq!(binary(Binary::Mul, SINGLE, smallest_normal, half, 0), (0x0040_0000, 0));
-    assert_eq!(binary(Binary::Mul, SINGLE, smallest_normal, half, fz), (0, fpsr::UFC));
+    assert_eq!(
+        binary(Binary::Mul, SINGLE, smallest_normal, half, 0),
+        (0x0040_0000, 0)
+    );
+    assert_eq!(
+        binary(Binary::Mul, SINGLE, smallest_normal, half, fz),
+        (0, fpsr::UFC)
+    );
     assert_eq!(
         binary(Binary::Mul, SINGLE, smallest_normal | 1 << 31, half, fz),
         (1 << 31, fpsr::UFC)
@@ -344,14 +408,20 @@ fn flush_to_zero_replaces_denormal_operands_and_tiny_results() {
         binary(Binary::Mul, SINGLE, 0x00ff_ffff, half, 0),
         (smallest_normal, fpsr::UFC | fpsr::IXC)
     );
-    assert_eq!(binary(Binary::Mul, SINGLE, 0x00ff_ffff, half, fz), (0, fpsr::UFC));
+    assert_eq!(
+        binary(Binary::Mul, SINGLE, 0x00ff_ffff, half, fz),
+        (0, fpsr::UFC)
+    );
     // A conversion to single precision flushes its result, and one to half
     // precision does not.
     let tiny_double = (1023u64 - 130) << 52;
     assert_eq!(convert(DOUBLE, SINGLE, tiny_double, 0), (1 << 19, 0));
     assert_eq!(convert(DOUBLE, SINGLE, tiny_double, fz), (0, fpsr::UFC));
-    let tiny_for_half = 0x3880_0000u64;
-    assert_eq!(convert(SINGLE, HALF, tiny_for_half, fz), convert(SINGLE, HALF, tiny_for_half, 0));
+    let tiny_for_half = 0x3800_0000u64;
+    assert_eq!(
+        convert(SINGLE, HALF, tiny_for_half, fz),
+        convert(SINGLE, HALF, tiny_for_half, 0)
+    );
     assert_eq!(convert(SINGLE, HALF, tiny_for_half, 0), (1 << 9, 0));
     // A compare sees the flushed operand.
     assert_eq!(compare(SINGLE, 1, 0, false, fz), (nzcv::EQUAL, fpsr::IDC));
@@ -372,8 +442,14 @@ fn a_fused_multiply_add_takes_its_nan_from_the_addend_first() {
     let signal = 0x7ff0_0000_0000_0007u64;
     assert_eq!(fused(quiet(1), two, signal), (quiet(7), fpsr::IOC));
     // A quiet addend does not hide infinity times zero.
-    assert_eq!(fused(quiet(1), infinity, 0), (DOUBLE.default_nan(), fpsr::IOC));
-    assert_eq!(fused(quiet(1), 0, infinity), (DOUBLE.default_nan(), fpsr::IOC));
+    assert_eq!(
+        fused(quiet(1), infinity, 0),
+        (DOUBLE.default_nan(), fpsr::IOC)
+    );
+    assert_eq!(
+        fused(quiet(1), 0, infinity),
+        (DOUBLE.default_nan(), fpsr::IOC)
+    );
     assert_eq!(fused(one, infinity, 0), (DOUBLE.default_nan(), fpsr::IOC));
     // 1 + 2 * 3, and the three negated forms.
     assert_eq!(fused(one, two, three), (0x401c_0000_0000_0000, 0));
@@ -389,11 +465,14 @@ fn a_fused_multiply_add_takes_its_nan_from_the_addend_first() {
         mul_add(DOUBLE, one, two, three, true, false, 0),
         (0x4014_0000_0000_0000, 0)
     );
-    // One rounding: (1 + 2^-52)^2 - 1 keeps the 2^-104 that two roundings lose.
+    // One rounding: (1 + 2^-52) * (1 - 2^-52) - 1 is -2^-104, exactly. With
+    // two roundings the product is 1, and the result zero.
     let above_one = one + 1;
-    let (value, flags) = mul_add(DOUBLE, one, above_one, above_one, true, false, 0);
-    assert_eq!(flags, 0);
-    assert_eq!(value, 0x3cc0_0000_0000_0001);
+    let below_one = one - 2;
+    assert_eq!(
+        mul_add(DOUBLE, one, above_one, below_one, true, false, 0),
+        (0xb970_0000_0000_0000, 0)
+    );
 }
 
 #[test]
@@ -405,14 +484,23 @@ fn a_compare_orders_numbers_and_calls_a_nan_unordered() {
     assert_eq!(compare(SINGLE, one, one, false, 0), (nzcv::EQUAL, 0));
     assert_eq!(compare(SINGLE, 0, 1 << 31, true, 0), (nzcv::EQUAL, 0));
     assert_eq!(compare(SINGLE, minus_one, one, false, 0), (nzcv::LESS, 0));
-    assert_eq!(compare(SINGLE, one, minus_one, false, 0), (nzcv::GREATER, 0));
+    assert_eq!(
+        compare(SINGLE, one, minus_one, false, 0),
+        (nzcv::GREATER, 0)
+    );
     assert_eq!(
         compare(SINGLE, SINGLE.infinity(true), minus_one, false, 0),
         (nzcv::LESS, 0)
     );
     assert_eq!(compare(SINGLE, quiet, one, false, 0), (nzcv::UNORDERED, 0));
-    assert_eq!(compare(SINGLE, quiet, one, true, 0), (nzcv::UNORDERED, fpsr::IOC));
-    assert_eq!(compare(SINGLE, one, signal, false, 0), (nzcv::UNORDERED, fpsr::IOC));
+    assert_eq!(
+        compare(SINGLE, quiet, one, true, 0),
+        (nzcv::UNORDERED, fpsr::IOC)
+    );
+    assert_eq!(
+        compare(SINGLE, one, signal, false, 0),
+        (nzcv::UNORDERED, fpsr::IOC)
+    );
     // The helper packs the flags below the bits for FPSR.
     let HelperFn::Pure(function) = FP_COMPARE.function else {
         panic!("a pure helper");
@@ -423,7 +511,10 @@ fn a_compare_orders_numbers_and_calls_a_nan_unordered() {
         u128::from(one),
         0,
     ]);
-    assert_eq!(packed, u128::from(nzcv::UNORDERED) | u128::from(fpsr::IOC) << 64);
+    assert_eq!(
+        packed,
+        u128::from(nzcv::UNORDERED) | u128::from(fpsr::IOC) << 64
+    );
 }
 
 #[test]
@@ -450,13 +541,22 @@ fn rounding_to_an_integral_value_follows_its_mode() {
     // A result of zero keeps the sign of the operand.
     assert_eq!(unary(Unary::RoundUp, DOUBLE, value(-0.5), 0), (1 << 63, 0));
     // The two forms that round in the mode of FPCR. One of them is exact.
-    assert_eq!(unary(Unary::RoundCurrent, DOUBLE, value(2.5), RP), (value(3.0), 0));
-    assert_eq!(unary(Unary::RoundCurrent, DOUBLE, value(2.5), RZ), (value(2.0), 0));
+    assert_eq!(
+        unary(Unary::RoundCurrent, DOUBLE, value(2.5), RP),
+        (value(3.0), 0)
+    );
+    assert_eq!(
+        unary(Unary::RoundCurrent, DOUBLE, value(2.5), RZ),
+        (value(2.0), 0)
+    );
     assert_eq!(
         unary(Unary::RoundExact, DOUBLE, value(2.5), RM),
         (value(2.0), fpsr::IXC)
     );
-    assert_eq!(unary(Unary::RoundExact, DOUBLE, value(2.0), RM), (value(2.0), 0));
+    assert_eq!(
+        unary(Unary::RoundExact, DOUBLE, value(2.0), RM),
+        (value(2.0), 0)
+    );
     // A signalling NaN is made quiet, with an invalid operation.
     assert_eq!(
         unary(Unary::RoundToZero, SINGLE, 0x7f80_0001, 0),
@@ -470,12 +570,24 @@ fn an_integer_becomes_a_value_with_one_rounding() {
     let value = |text: f64| text.to_bits();
     assert_eq!(from_fixed(DOUBLE, 7, 32, false, 0, 0), (value(7.0), 0));
     assert_eq!(from_fixed(DOUBLE, 7, 32, false, 2, 0), (value(1.75), 0));
-    assert_eq!(from_fixed(DOUBLE, 0xffff_ffff, 32, false, 0, 0), (value(-1.0), 0));
-    assert_eq!(from_fixed(DOUBLE, 0xffff_ffff, 32, true, 0, 0), (value(4294967295.0), 0));
+    assert_eq!(
+        from_fixed(DOUBLE, 0xffff_ffff, 32, false, 0, 0),
+        (value(-1.0), 0)
+    );
+    assert_eq!(
+        from_fixed(DOUBLE, 0xffff_ffff, 32, true, 0, 0),
+        (value(4294967295.0), 0)
+    );
     // Bits above a 32-bit integer are not part of it.
-    assert_eq!(from_fixed(DOUBLE, 0xdead_0000_0000_0003, 32, true, 0, 0), (value(3.0), 0));
+    assert_eq!(
+        from_fixed(DOUBLE, 0xdead_0000_0000_0003, 32, true, 0, 0),
+        (value(3.0), 0)
+    );
     assert_eq!(from_fixed(DOUBLE, 0, 64, false, 64, 0), (0, 0));
-    assert_eq!(from_fixed(DOUBLE, 1, 64, true, 64, 0), ((1023 - 64) << 52, 0));
+    assert_eq!(
+        from_fixed(DOUBLE, 1, 64, true, 64, 0),
+        ((1023 - 64) << 52, 0)
+    );
     // 2^24 + 1 does not fit single precision: the mode decides.
     let single = |text: f32| u64::from(text.to_bits());
     assert_eq!(
@@ -514,8 +626,14 @@ fn an_integer_becomes_a_value_with_one_rounding() {
 
 #[test]
 fn conversions_between_single_and_double_keep_a_nan_payload() {
-    assert_eq!(convert(SINGLE, DOUBLE, 0x3fc0_0000, 0), (0x3ff8_0000_0000_0000, 0));
-    assert_eq!(convert(DOUBLE, SINGLE, 0x3ff8_0000_0000_0000, 0), (0x3fc0_0000, 0));
+    assert_eq!(
+        convert(SINGLE, DOUBLE, 0x3fc0_0000, 0),
+        (0x3ff8_0000_0000_0000, 0)
+    );
+    assert_eq!(
+        convert(DOUBLE, SINGLE, 0x3ff8_0000_0000_0000, 0),
+        (0x3fc0_0000, 0)
+    );
     // 0.1 is not a single-precision value.
     assert_eq!(
         convert(DOUBLE, SINGLE, 0x3fb9_9999_9999_999a, RN),
@@ -538,7 +656,10 @@ fn conversions_between_single_and_double_keep_a_nan_payload() {
         convert(SINGLE, DOUBLE, 0xff80_0001, 0),
         (0xfff8_0000_2000_0000, fpsr::IOC)
     );
-    assert_eq!(convert(SINGLE, DOUBLE, 0x7fc0_0001, 0), (0x7ff8_0000_2000_0000, 0));
+    assert_eq!(
+        convert(SINGLE, DOUBLE, 0x7fc0_0001, 0),
+        (0x7ff8_0000_2000_0000, 0)
+    );
     assert_eq!(
         convert(DOUBLE, SINGLE, 0x7ff0_0000_2000_0001, 0),
         (0x7fc0_0001, fpsr::IOC)
@@ -558,13 +679,19 @@ fn the_immediate_of_fmov_expands_to_its_value() {
     assert_eq!(expand_immediate(SINGLE, 0x00), u64::from(2.0f32.to_bits()));
     assert_eq!(expand_immediate(DOUBLE, 0xf0), (-1.0f64).to_bits());
     assert_eq!(expand_immediate(DOUBLE, 0x3f), 31.0f64.to_bits());
-    assert_eq!(expand_immediate(SINGLE, 0x40), u64::from(0.125f32.to_bits()));
+    assert_eq!(
+        expand_immediate(SINGLE, 0x40),
+        u64::from(0.125f32.to_bits())
+    );
     // Every immediate is sixteenths of a power of two from 1/8 to 16.
     for immediate in 0..=255u32 {
         let value = f64::from_bits(expand_immediate(DOUBLE, immediate));
         let single = f32::from_bits(expand_immediate(SINGLE, immediate) as u32);
         assert_eq!(f64::from(single), value);
-        assert!((0.125..=31.0).contains(&value.abs()), "{immediate:#x}: {value}");
+        assert!(
+            (0.125..=31.0).contains(&value.abs()),
+            "{immediate:#x}: {value}"
+        );
     }
 }
 
@@ -655,7 +782,11 @@ fn the_helpers_decode_their_constants() {
     assert_eq!(
         run(
             &FP_FROM_FIXED,
-            &[u128::from(from_fixed_code(DOUBLE, 64, false, 64)), 1 << 62, 0]
+            &[
+                u128::from(from_fixed_code(DOUBLE, 64, false, 64)),
+                1 << 62,
+                0
+            ]
         ),
         (0.25f64.to_bits(), 0)
     );

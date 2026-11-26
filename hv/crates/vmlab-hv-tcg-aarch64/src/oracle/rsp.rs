@@ -212,7 +212,9 @@ impl Rsp {
     pub fn register(&mut self, number: usize) -> io::Result<Vec<u8>> {
         let answer = self.command(format!("p{number:x}").as_bytes())?;
         if answer.is_empty() || answer.starts_with(b"E") {
-            return Err(other(format!("the gdbstub cannot read the register {number}")));
+            return Err(other(format!(
+                "the gdbstub cannot read the register {number}"
+            )));
         }
         unhex(&answer)
     }

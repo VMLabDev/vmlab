@@ -19,16 +19,15 @@
 use super::{Builder, Flags, Lifted};
 use crate::fields::Condition;
 use crate::generated::decode::{
-    BaseFPCondComparison, BaseFPCondSelect, BaseFPConversion, BaseFPMoveImmediate,
-    BaseFPToInteger, BaseFPToIntegerUnscaled, BaseIntegerToFP, BaseIntegerToFPUnscaled,
-    BaseOneOperandFPComparison, BaseSingleOperandFPData, BaseThreeOperandFPData,
-    BaseTwoOperandFPComparison, BaseTwoOperandFPData, BaseUnscaledConversion,
-    BaseUnscaledConversionFromHigh, BaseUnscaledConversionToHigh, Record,
+    BaseFPCondComparison, BaseFPCondSelect, BaseFPConversion, BaseFPMoveImmediate, BaseFPToInteger,
+    BaseFPToIntegerUnscaled, BaseIntegerToFP, BaseIntegerToFPUnscaled, BaseOneOperandFPComparison,
+    BaseSingleOperandFPData, BaseThreeOperandFPData, BaseTwoOperandFPComparison,
+    BaseTwoOperandFPData, BaseUnscaledConversion, BaseUnscaledConversionFromHigh,
+    BaseUnscaledConversionToHigh, Record,
 };
 use crate::helpers::fp::{
-    self, Binary as FpBinary, DOUBLE, FP_BINARY, FP_COMPARE, FP_CONVERT, FP_FROM_FIXED,
-    FP_MUL_ADD, FP_TO_FIXED, FP_UNARY, Format, HALF, RESULT_BITS, SINGLE, ToInteger,
-    Unary as FpUnary,
+    self, Binary as FpBinary, DOUBLE, FP_BINARY, FP_COMPARE, FP_CONVERT, FP_FROM_FIXED, FP_MUL_ADD,
+    FP_TO_FIXED, FP_UNARY, Format, HALF, RESULT_BITS, SINGLE, ToInteger, Unary as FpUnary,
 };
 use vmlab_hv_tcg_ir::native::{Binary, Helper, ScalarId};
 
@@ -250,7 +249,12 @@ pub fn conditional_compare(b: &mut Builder, record: Record, f: &BaseFPCondCompar
     let holds = b.condition(Condition::from_bits(f.cond));
     let n = b.v(f.rn, width(format));
     let m = b.v(f.rm, width(format));
-    let packed = call(b, &FP_COMPARE, fp::compare_code(format, signalling), &[n, m]);
+    let packed = call(
+        b,
+        &FP_COMPARE,
+        fp::compare_code(format, signalling),
+        &[n, m],
+    );
     let compared = compare_flags(b, packed);
     let mut pick = |compared: ScalarId, bit: u32| {
         let immediate = b.imm(1, u64::from((f.nzcv >> bit) & 1));
@@ -427,11 +431,7 @@ fn fraction_bits(integer_bits: u32, scale: u32) -> u32 {
 }
 
 /// `FCVT[NPMZA][SU]` to a general register.
-pub fn to_integer_unscaled(
-    b: &mut Builder,
-    record: Record,
-    f: &BaseFPToIntegerUnscaled,
-) -> Lifted {
+pub fn to_integer_unscaled(b: &mut Builder, record: Record, f: &BaseFPToIntegerUnscaled) -> Lifted {
     to_integer(b, record, f.rd, f.rn, 0)
 }
 
