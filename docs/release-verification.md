@@ -43,7 +43,9 @@ cosign verify-blob --bundle SHA256SUMS.bundle \
 sha256sum --check SHA256SUMS
 ```
 
-To verify one that is signed with the release key:
+To verify one that is signed with the release key (in a checkout,
+`just release::verify <dir>` does this with the cosign of the build
+container):
 
 ```sh
 cosign verify-blob --key build/release-signing.pub --bundle SHA256SUMS.key.bundle \
@@ -61,8 +63,16 @@ records the workflow and the run URL. It is authenticated by inclusion in the
 signed manifest. This is not a claim of hermetic or independently verified
 builds, or a SLSA assurance level.
 
+The private half of the release key is in no file of the build machine. The
+signing step takes it and its password from two environment variables and
+hands them to cosign in the build container through the environment of
+`docker run`. `just release::trust <cosign.pub>` is the one command that puts
+a public key into `build/release-signing.pub` and `install.sh`, and
+`just ci::release-dry-run` fails when the two differ.
+
 `just ci::release-dry-run` exercises manifest and provenance creation, both
-signing ways, the installer refusal paths and the upload command offline. Its
-cosign contract stub checks the arguments, but does not prove cryptographic
-signing. No release or signing secret is available to card-branch tests.
+signing ways, the key recipes, the installer refusal paths and the upload
+command offline. Its cosign contract stub checks the arguments, but does not
+prove cryptographic signing. No release or signing secret is available to
+card-branch tests.
 How a version is built and published: `docs/agents/release-gate.md`.
