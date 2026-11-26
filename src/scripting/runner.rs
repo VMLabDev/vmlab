@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use tokio_util::sync::CancellationToken;
-use wscript::{Vm, VmConfig};
+use wscript::{CompiledUnit, Context, Vm, VmConfig};
 
 use super::{EventData, LabHandle, ScriptEntry, SegmentHandle};
 use crate::labd::lab::LabRuntime;
@@ -257,9 +257,21 @@ fn execute(
     output: OutputSink,
 ) -> Result<()> {
     let ctx = super::context();
-    let unit = ctx
+    let mut unit = ctx
         .compile(source)
         .map_err(|e| anyhow!("{name}: {}", compile_error(e)))?;
+    super::check_compiled_entry(&mut unit, entry).map_err(|e| anyhow!("{name}: {e}"))?;
+    execute_unit(&ctx, &unit, name, entry.name(), args, output)
+}
+
+fn execute_unit(
+    ctx: &Context,
+    unit: &CompiledUnit,
+    name: &str,
+    entry: &str,
+    args: impl wscript::IntoArgs,
+    output: OutputSink,
+) -> Result<()> {
     super::cancel::check();
     let config = VmConfig {
         out: Box::new(move |text, newline| {
@@ -274,8 +286,8 @@ fn execute(
         memory: Some(SCRIPT_MEMORY),
         ..VmConfig::default()
     };
-    let mut vm = Vm::with_config(&ctx, config);
-    vm.call_unit::<_, ()>(&unit, entry.name(), args)
+    let mut vm = Vm::with_config(ctx, config);
+    vm.call_unit::<_, ()>(unit, entry, args)
         .map_err(|e| anyhow!("{name}: {}", run_error(e)))
 }
 
@@ -698,7 +710,13 @@ fn main() {
             .unwrap();
             let result = std::thread::Builder::new()
                 .stack_size(2 * 1024 * 1024)
-                .spawn(|| execute(SCRIPT, "grow.ws", ScriptEntry::Main, (), Arc::new(|_| {})))
+                .spawn(|| {
+                    let ctx = super::super::context();
+                    let unit = ctx
+                        .compile(SCRIPT)
+                        .unwrap_or_else(|e| panic!("{}", compile_error(e)));
+                    execute_unit(&ctx, &unit, "grow.ws", "main", (), Arc::new(|_| {}))
+                })
                 .unwrap()
                 .join()
                 .unwrap();

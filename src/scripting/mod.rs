@@ -1423,6 +1423,10 @@ impl ScriptEntry {
 /// Compile a script and check the signature vmlab will call (PRD §5.1).
 pub fn check_script_entry(source: &str, entry: ScriptEntry) -> Result<(), String> {
     let mut unit = context().compile(source).map_err(runner::compile_error)?;
+    check_compiled_entry(&mut unit, entry)
+}
+
+fn check_compiled_entry(unit: &mut wscript::CompiledUnit, entry: ScriptEntry) -> Result<(), String> {
     let name = entry.name();
     let Some((_, signature)) = unit.exports.get(name) else {
         return Err(format!(
