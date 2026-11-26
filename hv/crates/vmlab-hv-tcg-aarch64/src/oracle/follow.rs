@@ -66,8 +66,6 @@ pub struct Round {
     pub reset: bool,
 }
 
-
-
 /// One instruction that both sides ran from the same registers, with the
 /// registers that QEMU had after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -754,15 +752,11 @@ impl Follower {
                                 });
                             }
                         }
-                        Err(Plain::Undefined(pc)) => {
-                            expect = Expect::Exception(pc, End::Undefined)
-                        }
+                        Err(Plain::Undefined(pc)) => expect = Expect::Exception(pc, End::Undefined),
                         Err(Plain::PcAlignment(pc)) => {
                             expect = Expect::Exception(pc, End::PcAlignment)
                         }
-                        Err(Plain::Exception(pc)) => {
-                            expect = Expect::Exception(pc, End::Exception)
-                        }
+                        Err(Plain::Exception(pc)) => expect = Expect::Exception(pc, End::Exception),
                         Err(Plain::Stop(Stop::Alignment { pc, .. })) => {
                             expect = Expect::Exception(pc, End::Alignment)
                         }

@@ -174,9 +174,9 @@ pub fn unfollowed(
         _ => {}
     }
     // The loads and stores have their own group, which compares the memory.
-    if crate::generated::decode::decode(encoding)
-        .is_some_and(|decoded| crate::lift::LOAD_STORE_FORMATS.contains(&decoded.record.info().format))
-    {
+    if crate::generated::decode::decode(encoding).is_some_and(|decoded| {
+        crate::lift::LOAD_STORE_FORMATS.contains(&decoded.record.info().format)
+    }) {
         return Some("a load or a store, which the group of card C3 follows");
     }
     // `MSR <register>, Xt` at EL1.
