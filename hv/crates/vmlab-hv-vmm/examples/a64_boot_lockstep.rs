@@ -6,7 +6,7 @@
 //!       --code <AAVMF_CODE.fd> --vars <AAVMF_VARS.fd>
 //!       [--qemu <binary>] [--ram-mib N] [--until <text>]
 //!       [--max-instructions N] [--resync N] [--ignore <register>]...
-//!       [--system core|all]
+//!       [--system core|all] [--key <text>=<bytes>]...
 //!
 //! QEMU boots the firmware at `-smp 1` with the plugin, and our whole `virt`
 //! machine follows its stream from the reset. Both start from the same
@@ -28,6 +28,14 @@
 //! - a read of an ID register that differs is a line of the allow-list;
 //! - the answer to `HVC` and `SMC` is compared, and a different one is a
 //!   finding about the machine.
+//!
+//! This AAVMF starts no shell by itself. Without a disk it waits for a key,
+//! and its boot menu has the shell as the second entry. So the leader gets
+//! keys on its serial port: each `--key` is sent when the serial log of the
+//! leader holds its text, after the keys before it (`\e` is escape, `\r`
+//! return). Without `--key` the keys are those that lead to the shell
+//! (`TO_THE_SHELL`). Our machine gets no key of its own: it reads the PL011
+//! of the leader, as it reads every device.
 //!
 //! The run ends when our serial log holds `--until` (default `Shell>`), at
 //! `--max-instructions`, or at the first CPU difference with exit code 1.
@@ -85,6 +93,17 @@ const CORE: [&str; 20] = [
     "SP_EL0",
     "SP_EL1",
 ];
+
+/// The keys that take AAVMF from its boot manager to its shell, each with
+/// the text that the serial log of the leader holds before it is sent.
+const TO_THE_SHELL: [(&str, &str); 4] = [
+    ("Press any key to enter the Boot Manager Menu", "x"),
+    ("EFI Internal Shell", "\\e[B"),
+    ("EFI Internal Shell", "\\r"),
+    ("any other key to continue", "\\r"),
+];
+/// The instructions between two keys: the menu draws what a key changed.
+const KEY_GAP: u64 = 1 << 21;
 
 /// The instructions that the follower keeps for the report of a difference.
 const KEPT: usize = 4096;
@@ -220,6 +239,12 @@ struct Arguments {
     all: bool,
     /// Read the stream of the leader and run nothing: how fast it is.
     leader_only: bool,
+    keys: Vec<(String, Vec<u8>)>,
+}
+
+/// The bytes of a key argument: `\e` is escape and `\r` return.
+fn key_bytes(text: &str) -> Vec<u8> {
+    text.replace("\\e", "\x1b").replace("\\r", "\r").into_bytes()
 }
 
 fn arguments() -> Result<Arguments, Error> {
@@ -236,7 +261,9 @@ fn arguments() -> Result<Arguments, Error> {
         ignore: Vec::new(),
         all: false,
         leader_only: false,
+        keys: Vec::new(),
     };
+    let mut keys_given = false;
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
         let value = args
@@ -255,8 +282,21 @@ fn arguments() -> Result<Arguments, Error> {
             "--ignore" => parsed.ignore.push(value),
             "--system" => parsed.all = value == "all",
             "--leader-only" => parsed.leader_only = value == "1",
+            "--key" => {
+                keys_given = true;
+                // An empty value: the leader gets no key.
+                if let Some((text, bytes)) = value.split_once('=') {
+                    parsed.keys.push((text.to_string(), key_bytes(bytes)));
+                }
+            }
             _ => return Err(format!("unknown argument {name}").into()),
         }
+    }
+    if !keys_given {
+        parsed.keys = TO_THE_SHELL
+            .iter()
+            .map(|(text, bytes)| (text.to_string(), key_bytes(bytes)))
+            .collect();
     }
     for (name, path) in [
         ("--plugin", &parsed.plugin),
@@ -372,6 +412,20 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     vcpu.cpu().log_accesses(true);
 
     let mut leader = Leader::start(&options)?;
+    // The serial port of the leader, for its keys.
+    let mut keyboard = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match std::os::unix::net::UnixStream::connect(options.serial_socket()) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() > deadline => return Err(error.into()),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    };
+    keyboard.set_nonblocking(true)?;
+    let mut key = 0;
+    let mut key_at = 0u64;
     let next_instruction = |leader: &mut Leader,
                             reads: &mut Vec<DeviceRead>,
                             writes: &mut Vec<(u64, u128, usize)>,
@@ -705,6 +759,29 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         current = next;
 
         if instructions.is_multiple_of(1 << 16) {
+            // What the leader writes to its serial port is in its log
+            // file. The socket is emptied, so that the leader never waits
+            // for a reader.
+            {
+                use std::io::Read;
+                let mut sink = [0u8; 4096];
+                while matches!(keyboard.read(&mut sink), Ok(count) if count > 0) {}
+            }
+            if let Some((text, bytes)) = arguments.keys.get(key)
+                && instructions >= key_at + KEY_GAP
+                && String::from_utf8_lossy(&std::fs::read(options.serial()).unwrap_or_default())
+                    .contains(text.as_str())
+            {
+                use std::io::Write;
+                keyboard.write_all(bytes)?;
+                println!(
+                    "key {} of {} to the leader after {instructions} instructions",
+                    key + 1,
+                    arguments.keys.len()
+                );
+                key += 1;
+                key_at = instructions;
+            }
             let log = std::fs::read(&description.serial_log).unwrap_or_default();
             if String::from_utf8_lossy(&log).contains(&arguments.until) {
                 reached = true;

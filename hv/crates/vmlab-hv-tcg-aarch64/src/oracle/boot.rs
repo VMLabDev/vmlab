@@ -124,12 +124,24 @@ impl Options {
         self.directory.join("leader-serial.log")
     }
 
+    /// The socket of the serial port of the leader: what a client sends
+    /// there, the guest receives as keys.
+    pub fn serial_socket(&self) -> PathBuf {
+        self.directory.join("leader-serial.sock")
+    }
+
     /// The argv of the leader, after the name of the program.
     pub fn argv(&self) -> Vec<String> {
         let mut argv = self.machine();
         argv.extend([
+            "-chardev".into(),
+            format!(
+                "socket,id=serial,path={},server=on,wait=off,logfile={}",
+                self.serial_socket().display(),
+                self.serial().display()
+            ),
             "-serial".into(),
-            format!("file:{}", self.serial().display()),
+            "chardev:serial".into(),
             "-plugin".into(),
             format!(
                 "{},out={},vectors=on,reads=io,pipe=1048576{}",
@@ -460,6 +472,9 @@ mod tests {
         ));
         assert!(argv.contains("-drive if=pflash,format=raw,readonly=on,file=/f/code.fd"));
         assert!(argv.contains("-drive if=pflash,format=raw,file=/d/vars.fd"));
+        assert!(argv.contains(
+            "-chardev socket,id=serial,path=/d/leader-serial.sock,server=on,wait=off,logfile=/d/leader-serial.log -serial chardev:serial"
+        ));
         assert!(argv.ends_with(
             "-plugin /p/a64lock.so,out=/d/a64boot.fifo,vectors=on,reads=io,pipe=1048576,sysregs=ESR_EL1:FAR_EL1"
         ));
