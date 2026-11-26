@@ -365,8 +365,7 @@ fn s2_backing_chains() {
     let content = read_all(&overlay, Format::Qcow2);
     assert_eq!(content, std::fs::read(&raw_base).unwrap());
 
-    // Three-deep chain: base <- mid (qcow2) <- top, all via qemu-img, read
-    // through the crate recursively.
+    // A chain with data in three layers, created by both implementations.
     let mid = dir.join("mid.qcow2");
     qemu_img(&[
         "create",
@@ -396,6 +395,15 @@ fn s2_backing_chains() {
             .all(|&b| b == 0x33)
     ); // top
     qemu_check(&top);
+
+    let mut previous = top.clone();
+    for index in 3..12 {
+        let overlay = dir.join(format!("layer-{index}.qcow2"));
+        ops::create_linked_clone(&previous, &overlay).unwrap();
+        previous = overlay;
+    }
+    assert_eq!(read_all(&previous, Format::Qcow2), got);
+    qemu_img(&["compare", previous.to_str().unwrap(), top.to_str().unwrap()]);
 }
 
 #[test]
@@ -843,11 +851,12 @@ fn s2_ops_rebase() {
     std::fs::copy(&base, &base2).unwrap();
     qemu_io(&["-c", "write -P 0x42 128k 64k", &base2.to_string_lossy()]);
     let before = read_all(&overlay, Format::Qcow2);
-    ops::rebase_safe(&overlay, &base2, Some("qcow2")).unwrap();
+    ops::rebase_safe(&overlay, Path::new("base2.qcow2"), Some("qcow2")).unwrap();
     let after = read_all(&overlay, Format::Qcow2);
     assert_eq!(before, after, "safe rebase changed visible content");
     // Only the differing cluster was written into the overlay: 128k..192k.
     let info = ops::info(&overlay).unwrap();
+    assert_eq!(info.backing_file.as_deref(), Some("base2.qcow2"));
     assert_eq!(
         info.full_backing_file.as_deref(),
         Some(base2.canonicalize().unwrap().as_path())
@@ -988,6 +997,64 @@ fn s2_ops_commit() {
 
 const PARTIAL_CLUSTER_START: u64 = 1024 * 1024;
 const PARTIAL_CLUSTER_SIZE: u64 = PARTIAL_CLUSTER_START + 512;
+
+/// Review vmlab-disk-2 F18: `qemu-img convert` rounds a raw source up to a
+/// whole sector and fills the rest with zeros. QEMU reads a header size
+/// rounded down, so an image of the byte count loses the last part.
+#[test]
+fn convert_of_a_raw_file_with_a_partial_last_sector() {
+    require_qemu_img!();
+    let temp = tmpdir("convert-partial-sector");
+    let raw = temp.path().join("odd.raw");
+    let ours = temp.path().join("ours.qcow2");
+    let theirs = temp.path().join("theirs.qcow2");
+    let back = temp.path().join("back.raw");
+    std::fs::write(&raw, vec![b'U'; 1000]).unwrap();
+    let mut expected = vec![b'U'; 1000];
+    expected.resize(1024, 0);
+
+    ops::convert(&raw, &ours, None, None, None).unwrap();
+
+    qemu_check(&ours);
+    assert_eq!(ops::info(&ours).unwrap().virtual_size, 1024);
+    qemu_img(&[
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        &ours.to_string_lossy(),
+        &back.to_string_lossy(),
+    ]);
+    assert_eq!(std::fs::read(&back).unwrap(), expected);
+    assert_eq!(read_all(&ours, Format::Qcow2), expected);
+
+    // `qemu-img convert` of the same source gives the same disk.
+    qemu_img(&[
+        "convert",
+        "-f",
+        "raw",
+        "-O",
+        "qcow2",
+        &raw.to_string_lossy(),
+        &theirs.to_string_lossy(),
+    ]);
+    assert_eq!(read_all(&theirs, Format::Qcow2), expected);
+
+    // `create` rounds the same way as `qemu-img create`.
+    let made = temp.path().join("made.qcow2");
+    let made_by_qemu = temp.path().join("made-by-qemu.qcow2");
+    ops::create_qcow2(&made, 1000, None, None).unwrap();
+    qemu_img(&[
+        "create",
+        "-f",
+        "qcow2",
+        &made_by_qemu.to_string_lossy(),
+        "1000",
+    ]);
+    assert_eq!(ops::info(&made).unwrap().virtual_size, 1024);
+    assert_eq!(ops::info(&made_by_qemu).unwrap().virtual_size, 1024);
+}
 
 #[test]
 fn convert_with_backing_of_an_image_with_a_partial_last_cluster() {
