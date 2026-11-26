@@ -537,9 +537,7 @@ impl Gic {
                     self.irq(cpu, n).targets
                 }
             }
-            0xf10..=0xf2f => {
-                self.state.cpus[cpu].sgi_sources[(offset & 0xf) as usize]
-            }
+            0xf10..=0xf2f => self.state.cpus[cpu].sgi_sources[(offset & 0xf) as usize],
             _ => 0,
         }
     }
