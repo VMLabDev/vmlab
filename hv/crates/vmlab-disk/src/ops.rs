@@ -372,17 +372,17 @@ pub fn convert(
     // destination as it was (review vmlab-disk-2 F14).
     enum Source {
         Raw(crate::raw::RawImage),
-        Qcow2(Qcow2Image),
+        Qcow2(Box<Qcow2Image>),
     }
     let mut source = match snapshot {
         Some(name) => {
             let mut view = Qcow2Image::open(src, true)?;
             view.install_snapshot_view(name)?;
-            Source::Qcow2(view)
+            Source::Qcow2(Box::new(view))
         }
         None => match probe_format(src)? {
             Format::Raw => Source::Raw(crate::raw::RawImage::open(src, true)?),
-            Format::Qcow2 => Source::Qcow2(Qcow2Image::open(src, true)?),
+            Format::Qcow2 => Source::Qcow2(Box::new(Qcow2Image::open(src, true)?)),
         },
     };
     if dest_exists {
@@ -397,7 +397,7 @@ pub fn convert(
     match &mut source {
         Source::Raw(reader) => copy_full(reader, &mut dest_img)?,
         Source::Qcow2(reader) if backing.is_some() => copy_own_layer(reader, &mut dest_img)?,
-        Source::Qcow2(reader) => copy_full(reader, &mut dest_img)?,
+        Source::Qcow2(reader) => copy_full(reader.as_mut(), &mut dest_img)?,
     }
     dest_img.flush()
 }
