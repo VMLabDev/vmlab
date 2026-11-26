@@ -18,6 +18,7 @@ the MIPS as `mips_samples` and `mips_median`.
 
 QEMU is the yardstick here and nothing else: no product path starts it."""
 import datetime
+import json
 import os
 import statistics
 import subprocess
@@ -139,7 +140,11 @@ def build_workloads():
 def interpreter_binary():
     subprocess.run(["cargo", "build", "--release", "-p", "vmlab-hv-tcg-aarch64",
                     "--example", "a64_bench"], cwd=lib.REPO_DIR, check=True)
-    return str(Path(lib.REPO_DIR) / "target/release/examples/a64_bench")
+    # The target directory is where cargo says it is: a build host can
+    # move it out of the checkout (CARGO_TARGET_DIR, a cargo config).
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=lib.REPO_DIR, text=True))
+    return str(Path(metadata["target_directory"]) / "release/examples/a64_bench")
 
 
 def run_interpreter(binary, image, pin, environment):
