@@ -13,7 +13,7 @@ use vm_memory::{Bytes, GuestAddress};
 use vmlab_hv_devices::gic::{self, CpuInterface, Distributor, Gic};
 use vmlab_hv_devices::pl011::{self, Pl011};
 use vmlab_hv_devices::serial::SerialOut;
-use vmlab_hv_devices::{GuestMemory, IrqLine};
+use vmlab_hv_devices::GuestMemory;
 use vmlab_hv_proto::control::ShutdownReason;
 use vmlab_hv_tcg::{Error, Memory};
 use vmlab_hv_tcg_aarch64::State;

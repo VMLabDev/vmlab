@@ -233,7 +233,8 @@ impl Memory for GuestBus {
     }
 
     fn load_reserved(&mut self, address: u64, bytes: &mut [u8]) -> Result<u64> {
-        let _atomic = self.lock();
+        let shared = self.0.clone();
+        let _atomic = shared.serialize.then(|| shared.transaction.lock());
         // The generation first: a device write between the two reads is
         // then seen by the store.
         let generation = self.reservation_generation(address, bytes.len());
@@ -242,7 +243,8 @@ impl Memory for GuestBus {
     }
 
     fn store_conditional(&mut self, address: u64, bytes: &[u8], generation: u64) -> Result<bool> {
-        let _atomic = self.lock();
+        let shared = self.0.clone();
+        let _atomic = shared.serialize.then(|| shared.transaction.lock());
         if self.reservation_generation(address, bytes.len()) != generation {
             return Ok(false);
         }
