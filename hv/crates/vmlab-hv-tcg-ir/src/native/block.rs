@@ -120,25 +120,52 @@ pub enum Event {
     Exit(ExitId),
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Block {
+/// A block whose exits carry the payload `X`: what the frontend needs to
+/// resume after the block (R8 of the phase 3d design). The Sail recorder
+/// resumes named frames (`Exit`). A lifter with a register file resumes from
+/// slots that the exit writes back (`regfile::Writeback`).
+#[derive(Clone, Debug)]
+pub struct BlockOf<X> {
     pub graph: Graph,
     pub values: Vec<Recipe>,
     pub events: Vec<Event>,
-    pub exits: Vec<Exit>,
+    pub exits: Vec<X>,
     pub checkpoints: Vec<Checkpoint>,
     pub code_guards: Vec<CodeGuard>,
     pub context_guards: Vec<ContextGuard>,
 }
 
-impl Block {
+/// The block of the Sail recorder.
+pub type Block = BlockOf<Exit>;
+
+impl<X> Default for BlockOf<X> {
+    fn default() -> Self {
+        Self {
+            graph: Graph::default(),
+            values: Vec::new(),
+            events: Vec::new(),
+            exits: Vec::new(),
+            checkpoints: Vec::new(),
+            code_guards: Vec::new(),
+            context_guards: Vec::new(),
+        }
+    }
+}
+
+/// An exit payload that names scalars of the graph directly. Dead code
+/// elimination keeps those scalars and renumbers them through this trait.
+pub trait ExitScalars {
+    fn for_each_scalar(&mut self, visit: &mut dyn FnMut(&mut ScalarId));
+}
+
+impl<X> BlockOf<X> {
     pub fn value(&mut self, recipe: Recipe) -> ValueId {
         let id = self.values.len();
         self.values.push(recipe);
         id
     }
 
-    pub fn exit(&mut self, snapshot: Exit) -> ExitId {
+    pub fn exit(&mut self, snapshot: X) -> ExitId {
         let id = self.exits.len();
         self.exits.push(snapshot);
         id

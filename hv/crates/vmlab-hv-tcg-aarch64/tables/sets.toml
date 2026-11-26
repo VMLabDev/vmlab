@@ -1,0 +1,19 @@
+# Which instruction sets the generator emits (DESIGN.md G1c, G2).
+#
+# A record of the LLVM tables is selected when each of its predicates holds
+# with the features of the selected sets turned on and every other feature
+# off. A record without a predicate is the A64 base and is always selected.
+# An encoding that no selected record matches decodes to Undefined.
+#
+# Feature names are the LLVM record names without the prefix `Feature`.
+
+selected = ["3d"]
+
+# Armv8.0-A as QEMU's cortex-a53 has it: the base, FP, AdvSIMD, AES and PMULL,
+# SHA1 and SHA-256 (LLVM puts both under SHA2), and CRC32.
+[set.3d]
+features = ["FPARMv8", "NEON", "AES", "SHA2", "CRC"]
+
+# Later sets, each a card of its own (DESIGN.md A1). Not selected.
+[set.lse]
+features = ["LSE"]

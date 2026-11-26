@@ -88,6 +88,8 @@ pub enum Instruction {
     Binary64(Binary, ScalarId, ScalarId, u16),
     Slice(ScalarId, u16, u128),
     Concat(ScalarId, ScalarId, u16, u128),
+    /// Condition, the value where it holds, the value where it does not.
+    Select(ScalarId, ScalarId, ScalarId),
 }
 
 impl Instruction {
@@ -107,6 +109,11 @@ impl Instruction {
             | Self::Concat(a, b, ..) => {
                 *a = slots[*a];
                 *b = slots[*b];
+            }
+            Self::Select(condition, when_true, when_false) => {
+                *condition = slots[*condition];
+                *when_true = slots[*when_true];
+                *when_false = slots[*when_false];
             }
             Self::Constant(_) | Self::Input(..) => {}
         }
@@ -130,6 +137,14 @@ pub fn slots(graph: &Graph) -> (Vec<usize>, usize) {
 
 pub fn lower(graph: &Graph, id: ScalarId) -> Option<Instruction> {
     let scalar = &graph.scalars[id];
+    if let Operation::Select {
+        condition,
+        when_true,
+        when_false,
+    } = scalar.operation
+    {
+        return Some(Instruction::Select(condition, when_true, when_false));
+    }
     let word_mask = match scalar.ty {
         ScalarType::Bits(width) if width <= 64 => Some(mask(width) as u64),
         _ if scalar
@@ -201,6 +216,11 @@ pub fn lower(graph: &Graph, id: ScalarId) -> Option<Instruction> {
             low,
             low_width,
         } => Instruction::Concat(high, low, low_width, bits),
+        Operation::Select {
+            condition,
+            when_true,
+            when_false,
+        } => Instruction::Select(condition, when_true, when_false),
     })
 }
 

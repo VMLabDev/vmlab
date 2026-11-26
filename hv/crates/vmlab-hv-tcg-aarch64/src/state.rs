@@ -1,0 +1,273 @@
+//! The register file of an aarch64 CPU as numbered slots (R11), and the
+//! state that is not in a slot.
+//!
+//! Sources read: none beyond the public register names. The layout is ours.
+
+use vmlab_hv_tcg_ir::native::ScalarType;
+use vmlab_hv_tcg_ir::native::regfile::{RegisterFile, Slot};
+
+/// Slot numbers. A slot enters a block as the graph input of its number.
+pub mod slot {
+    /// X0 to X30 are the slots 0 to 30.
+    pub const X0: usize = 0;
+    pub const X30: usize = 30;
+    /// The stack pointer of each exception level. EL2 has a slot so that a
+    /// later machine with EL2 changes no numbering (DESIGN.md G4).
+    pub const SP_EL0: usize = 31;
+    pub const SP_EL1: usize = 32;
+    pub const SP_EL2: usize = 33;
+    pub const PC: usize = 34;
+    /// The flags are four slots of one bit (G3c).
+    pub const N: usize = 35;
+    pub const Z: usize = 36;
+    pub const C: usize = 37;
+    pub const V: usize = 38;
+    /// V0 to V31 are the slots 39 to 70.
+    pub const V0: usize = 39;
+    pub const FPCR: usize = 71;
+    pub const FPSR: usize = 72;
+    pub const COUNT: usize = 73;
+}
+
+const fn bits(name: &'static str, width: u16) -> Slot {
+    Slot {
+        name,
+        ty: ScalarType::Bits(width),
+    }
+}
+
+static SLOTS: [Slot; slot::COUNT] = [
+    bits("x0", 64),
+    bits("x1", 64),
+    bits("x2", 64),
+    bits("x3", 64),
+    bits("x4", 64),
+    bits("x5", 64),
+    bits("x6", 64),
+    bits("x7", 64),
+    bits("x8", 64),
+    bits("x9", 64),
+    bits("x10", 64),
+    bits("x11", 64),
+    bits("x12", 64),
+    bits("x13", 64),
+    bits("x14", 64),
+    bits("x15", 64),
+    bits("x16", 64),
+    bits("x17", 64),
+    bits("x18", 64),
+    bits("x19", 64),
+    bits("x20", 64),
+    bits("x21", 64),
+    bits("x22", 64),
+    bits("x23", 64),
+    bits("x24", 64),
+    bits("x25", 64),
+    bits("x26", 64),
+    bits("x27", 64),
+    bits("x28", 64),
+    bits("x29", 64),
+    bits("x30", 64),
+    bits("sp_el0", 64),
+    bits("sp_el1", 64),
+    bits("sp_el2", 64),
+    bits("pc", 64),
+    bits("n", 1),
+    bits("z", 1),
+    bits("c", 1),
+    bits("v", 1),
+    bits("v0", 128),
+    bits("v1", 128),
+    bits("v2", 128),
+    bits("v3", 128),
+    bits("v4", 128),
+    bits("v5", 128),
+    bits("v6", 128),
+    bits("v7", 128),
+    bits("v8", 128),
+    bits("v9", 128),
+    bits("v10", 128),
+    bits("v11", 128),
+    bits("v12", 128),
+    bits("v13", 128),
+    bits("v14", 128),
+    bits("v15", 128),
+    bits("v16", 128),
+    bits("v17", 128),
+    bits("v18", 128),
+    bits("v19", 128),
+    bits("v20", 128),
+    bits("v21", 128),
+    bits("v22", 128),
+    bits("v23", 128),
+    bits("v24", 128),
+    bits("v25", 128),
+    bits("v26", 128),
+    bits("v27", 128),
+    bits("v28", 128),
+    bits("v29", 128),
+    bits("v30", 128),
+    bits("v31", 128),
+    bits("fpcr", 32),
+    bits("fpsr", 32),
+];
+
+/// The register file that every aarch64 block reads and writes.
+pub static REGISTER_FILE: RegisterFile = RegisterFile { slots: &SLOTS };
+
+/// What decides how a block is lifted and is not a slot: a block is cached
+/// under its PC and this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Context {
+    /// The exception level, 0 to 2. EL3 is never built (G4).
+    pub el: u8,
+    /// PSTATE.SP: the stack pointer of the current level, not SP_EL0.
+    pub sp_sel: bool,
+}
+
+impl Context {
+    /// The slot that `SP` names in this context.
+    pub fn sp_slot(self) -> usize {
+        match (self.sp_sel, self.el) {
+            (false, _) | (true, 0) => slot::SP_EL0,
+            (true, 1) => slot::SP_EL1,
+            (true, _) => slot::SP_EL2,
+        }
+    }
+}
+
+/// The state of one CPU. Every slot is a `u128`, so that the slot executor
+/// copies values in and out without a case per type. A value is always
+/// inside the width of its slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct State {
+    pub slots: [u128; slot::COUNT],
+    pub context: Context,
+    /// PSTATE.D, A, I and F as the bits 3 to 0.
+    pub daif: u8,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::reset(0)
+    }
+}
+
+impl State {
+    /// The state after a reset into EL1 with SP_EL1 and every interrupt
+    /// masked, as the `virt` machine starts its firmware (DESIGN.md G4, V2).
+    pub fn reset(pc: u64) -> Self {
+        let mut state = Self {
+            slots: [0; slot::COUNT],
+            context: Context {
+                el: 1,
+                sp_sel: true,
+            },
+            daif: 0xf,
+        };
+        state.set_pc(pc);
+        state
+    }
+
+    /// X0 to X30. Register 31 is not an X register: use `sp` or zero.
+    pub fn x(&self, n: usize) -> u64 {
+        assert!(n <= slot::X30, "X{n} does not exist");
+        self.slots[slot::X0 + n] as u64
+    }
+
+    pub fn set_x(&mut self, n: usize, value: u64) {
+        assert!(n <= slot::X30, "X{n} does not exist");
+        self.slots[slot::X0 + n] = value.into();
+    }
+
+    /// The stack pointer that the current context selects.
+    pub fn sp(&self) -> u64 {
+        self.slots[self.context.sp_slot()] as u64
+    }
+
+    pub fn set_sp(&mut self, value: u64) {
+        self.slots[self.context.sp_slot()] = value.into();
+    }
+
+    pub fn pc(&self) -> u64 {
+        self.slots[slot::PC] as u64
+    }
+
+    pub fn set_pc(&mut self, value: u64) {
+        self.slots[slot::PC] = value.into();
+    }
+
+    /// N, Z, C and V as the bits 3 to 0.
+    pub fn nzcv(&self) -> u8 {
+        ((self.slots[slot::N] as u8 & 1) << 3)
+            | ((self.slots[slot::Z] as u8 & 1) << 2)
+            | ((self.slots[slot::C] as u8 & 1) << 1)
+            | (self.slots[slot::V] as u8 & 1)
+    }
+
+    pub fn set_nzcv(&mut self, nzcv: u8) {
+        self.slots[slot::N] = u128::from((nzcv >> 3) & 1);
+        self.slots[slot::Z] = u128::from((nzcv >> 2) & 1);
+        self.slots[slot::C] = u128::from((nzcv >> 1) & 1);
+        self.slots[slot::V] = u128::from(nzcv & 1);
+    }
+
+    /// PSTATE in the layout of an SPSR, which is also what a debugger calls
+    /// CPSR: NZCV in the bits 31 to 28, DAIF in 9 to 6, the level in 3 to 2
+    /// and PSTATE.SP in bit 0.
+    pub fn cpsr(&self) -> u32 {
+        (u32::from(self.nzcv()) << 28)
+            | (u32::from(self.daif & 0xf) << 6)
+            | (u32::from(self.context.el & 3) << 2)
+            | u32::from(self.context.sp_sel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_layout_matches_the_slot_numbers() {
+        assert_eq!(REGISTER_FILE.len(), slot::COUNT);
+        assert_eq!(SLOTS[slot::X30].name, "x30");
+        assert_eq!(SLOTS[slot::SP_EL1].name, "sp_el1");
+        assert_eq!(SLOTS[slot::PC].name, "pc");
+        assert_eq!(SLOTS[slot::V].name, "v");
+        assert_eq!(SLOTS[slot::V0].name, "v0");
+        assert_eq!(SLOTS[slot::V0 + 31].name, "v31");
+        assert_eq!(SLOTS[slot::FPSR].name, "fpsr");
+        assert_eq!(SLOTS[slot::N].ty, ScalarType::Bits(1));
+        assert_eq!(SLOTS[slot::V0].ty, ScalarType::Bits(128));
+    }
+
+    #[test]
+    fn reset_is_el1h_with_interrupts_masked() {
+        let mut state = State::reset(0x4000_0000);
+        assert_eq!(state.cpsr(), 0x3c5);
+        assert_eq!(state.pc(), 0x4000_0000);
+        state.set_nzcv(0b0110);
+        assert_eq!(state.cpsr(), 0x6000_03c5);
+        assert_eq!(state.nzcv(), 0b0110);
+        state.set_sp(0x1000);
+        assert_eq!(state.slots[slot::SP_EL1], 0x1000);
+        state.context.sp_sel = false;
+        assert_eq!(state.sp(), 0);
+        assert_eq!(
+            Context {
+                el: 0,
+                sp_sel: true
+            }
+            .sp_slot(),
+            slot::SP_EL0
+        );
+        assert_eq!(
+            Context {
+                el: 2,
+                sp_sel: true
+            }
+            .sp_slot(),
+            slot::SP_EL2
+        );
+    }
+}
