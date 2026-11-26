@@ -444,6 +444,23 @@ fn main() -> Result<(), Failure> {
          # extra: bits that are set after the return and were clear in SPSR_EL1.\n",
     );
     text.push_str(&pstate(&arguments)?);
+    // CCSIDR_EL1 for each value of CSSELR_EL1.
+    let mut body = Vec::new();
+    for select in 0..16 {
+        body.extend([
+            asm::movz(0, select, 0),
+            asm::msr(0xd000, 0),
+            asm::mrs(0, 0xc800),
+        ]);
+    }
+    let caches = phase(&arguments, false, false, &body, None)?;
+    text.push_str("# CCSIDR_EL1 for each value of CSSELR_EL1.\n");
+    for select in 0..16 {
+        text.push_str(&format!(
+            "ccsidr select={select:x} value={}\n",
+            read(&caches[&(3 * select + 2)], 0)
+        ));
+    }
     match out {
         Some(path) => std::fs::write(&path, text)?,
         None => print!("{text}"),
