@@ -5758,22 +5758,26 @@ mod tests {
         LabRuntime::with_machines(config, machines).expect("runtime")
     }
 
-    #[tokio::test]
-    async fn failed_lab_capture_rolls_back_prior_machines_and_keeps_pending_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        let sh = shared(dir.path());
-        let first = FakeMachine::new("a", MachineKind::Vm, &sh);
-        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, &sh)).unwrap();
+    fn lab_with_failing_capture(sh: &Shared) -> Arc<LabRuntime> {
+        let first = FakeMachine::new("a", MachineKind::Vm, sh);
+        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, sh)).unwrap();
         last.snapshot_failure = true;
-        let lab = lab_of(
-            dir.path(),
+        lab_of(
+            &sh.dir,
             r#"import <vmlab.wcl>
 lab "t" {
  vm "a" { template = "x86_64/t" }
  vm "b" { template = "x86_64/t" }
 }"#,
             vec![first, Arc::new(last)],
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_lab_capture_rolls_back_prior_machines_and_keeps_pending_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_with_failing_capture(&sh);
         let error = lab.snapshot_all("capture").await.unwrap_err();
         assert!(format!("{error:#}").contains("rolled back"));
         let state = lab.state.lock().await;
@@ -5788,6 +5792,34 @@ lab "t" {
             log.iter()
                 .any(|line| line.contains("delete_snapshot:capture"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_script_does_not_list_a_pending_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_with_failing_capture(&shared(dir.path()));
+        lab.snapshot_all("capture").await.unwrap_err();
+        assert_eq!(lab.snapshots("b").await.unwrap()[0]["pending"], true);
+
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    for n in lab.vm("b").expect("b").snapshots().expect("list") {
+        lab.log(n)
+    }
+}"#
+            .into(),
+            "snapshots.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| output.send(line).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lines.try_recv().ok(), None);
     }
 
     #[tokio::test]
@@ -9044,6 +9076,42 @@ lab "t" {
             assert!(out.exists());
             lab.record_stop("b").await.expect("stop b");
         }
+    }
+
+    #[tokio::test]
+    async fn a_script_run_that_cannot_start_a_recording_leaves_none() {
+        use crate::proto::server::{Handler, Streamer};
+        use crate::proto::{ErrorCode, LabRequest};
+        use crate::record::RecordRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let handler = super::super::LabdHandler {
+            lab: lab.clone(),
+            tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+        };
+        let (stream, _messages) = Streamer::test_channel();
+        let error = handler
+            .handle(
+                LabRequest::Run {
+                    script: "unused.ws".into(),
+                    record: ["a", "web"]
+                        .map(|machine| RecordRequest {
+                            machine: machine.into(),
+                            options: small(),
+                            ..Default::default()
+                        })
+                        .to_vec(),
+                },
+                &stream,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert_eq!(error.message, "machine `web` has no display");
+        assert!(lab.recordings.live_machines().await.is_empty());
     }
 
     /// `m.record` from a script: a relative path lands under the lab root, the
