@@ -6,6 +6,7 @@
 //!   a64_lockstep --plugin <a64lock.so> --dir <scratch directory>
 //!       [--qemu <binary>] [--seed S] [--per-class N] [--group NAME]
 //!       [--encodings <trace.txt>]... [--corpus-out <file>] [--samples N]
+//!       [--probe <hex word>,<hex word>...]
 //!
 //! Two phases. The random phase runs rounds of random instructions until
 //! each format class of the group has `--per-class` instructions that both
@@ -22,6 +23,10 @@
 //! window of data, and it ends at the first access that the memory does not
 //! hold, or at the zero word behind the image. The memory writes and the
 //! vector registers are compared after every instruction.
+//!
+//! `--probe` runs each given word alone, as the executed phase of the group
+//! does, and prints how its round ended. It is for a question to QEMU about
+//! one encoding, and it compares nothing else.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -279,6 +284,7 @@ fn main() -> Result<(), Failure> {
     let (mut plugin, mut directory, mut corpus_out) = (None, None, None);
     let (mut seed, mut per_class, mut group_name) = (1u64, 100_000u64, String::from("c1"));
     let mut samples = 3usize;
+    let mut probe: Vec<u32> = Vec::new();
     let mut traces = Vec::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -293,6 +299,11 @@ fn main() -> Result<(), Failure> {
             "--encodings" => traces.push(value()?),
             "--corpus-out" => corpus_out = Some(value()?),
             "--samples" => samples = value()?.parse()?,
+            "--probe" => {
+                for word in value()?.split(',') {
+                    probe.push(u32::from_str_radix(word.trim_start_matches("0x"), 16)?);
+                }
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -318,6 +329,9 @@ fn main() -> Result<(), Failure> {
         rng: Rng(seed ^ 0x5eed),
     };
     let mut generator = Generator::new(seed);
+    if !probe.is_empty() {
+        return probe_rounds(&mut run, &mut generator, &probe, memory_group);
+    }
     if memory_group {
         return memory_rounds(
             &mut run,
@@ -563,6 +577,47 @@ fn finish(
         println!("wrote the corpus samples to {path}, {refused} did not replay alone");
         if refused != 0 {
             return Err("verified instructions that do not replay alone".into());
+        }
+    }
+    Ok(())
+}
+
+/// Run each word alone and print how its round ended.
+fn probe_rounds(
+    run: &mut Run,
+    generator: &mut Generator,
+    words: &[u32],
+    memory_group: bool,
+) -> Result<(), Failure> {
+    if memory_group {
+        let data = generator.memory_bytes(WINDOW, WINDOW.1 as usize);
+        run.follower.load_memory(WINDOW.0, &data)?;
+    }
+    for word in words {
+        let (x, sp, nzcv) = generator.registers_for(*word, WINDOW);
+        let round = Round {
+            memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
+            start: Core {
+                x,
+                sp,
+                pc: IMAGE_BASE,
+                cpsr: CPSR_EL1H | u32::from(nzcv) << 28,
+            },
+            budget: 2,
+            visits: 1,
+        };
+        let name = decode(*word).map_or("(undefined)", |decoded| decoded.record.name());
+        match run.follower.run(&round)? {
+            Outcome::Agreed { end, verified } => {
+                println!("{word:08x} {name}: {end:?}, {} verified", verified.len());
+                for item in verified {
+                    println!("  after {}", item.after);
+                    for access in item.accesses {
+                        println!("  {access:?}");
+                    }
+                }
+            }
+            Outcome::Differed { difference, .. } => print!("{word:08x} {name}: {difference}"),
         }
     }
     Ok(())
