@@ -4,7 +4,8 @@
 # alone, and LLVM's C++ decoder methods (which the generator does not run)
 # refuse some of those words. Each entry is one such condition, written by
 # hand. `require` is a Rust expression over the raw fields of the class, each
-# a `u32` under its lower-case name. A word that fails it does not match the
+# a `u32` under its lower-case name, and over the whole word as `w`, for the
+# bits that no field names. A word that fails it does not match the
 # record: the decoder tries the next candidate, and decodes to Undefined when
 # there is none.
 #
@@ -98,3 +99,13 @@ why = "The operand is an entry of the SVCR table. LLVM's DecodeSVCROp refuses th
 format = "BasePrefetchRO"
 require = "rt & 0x18 != 0x18"
 why = "A prefetch operation 0b11xxx with a register offset is RPRFM. LLVM's DecodePRFMRegInstruction refuses it here, and the Fallback record RPRFM takes it."
+
+[[constraint]]
+format = "LoadAcquire"
+require = "(w >> 16) & 0x1f == 0x1f && (w >> 10) & 0x1f == 0x1f"
+why = "The bits 20 to 16 and 14 to 10 of LDAR are ones. LLVM marks them SoftFail, so the generator leaves them free. QEMU takes an Undefined Instruction exception unless all ten are ones (lockstep probe on QEMU 11.1.3: c8dffc41 runs, c8c0fc41 and c8df8041 do not). For LDXR and STXR QEMU ignores the same bits, so those stay free."
+
+[[constraint]]
+format = "StoreRelease"
+require = "(w >> 16) & 0x1f == 0x1f && (w >> 10) & 0x1f == 0x1f"
+why = "As LoadAcquire, for STLR (lockstep probe on QEMU 11.1.3: c89ffc41 runs, c880fc41 and c89f8041 do not)."

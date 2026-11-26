@@ -487,6 +487,8 @@ impl Follower {
                             None,
                         ));
                     }
+                    // The breakpoint on the vector stops QEMU.
+                    self.leader.stop(false)?;
                     let end = match expect {
                         Expect::Exception(pc, end) if pc == from_pc => end,
                         Expect::Abort(pc) if pc == from_pc => End::DataAbort,
@@ -525,10 +527,8 @@ impl Follower {
                             ));
                         }
                     };
-                    // The breakpoint on the vector stops QEMU. An exception
-                    // changes no general register, so they are the registers
-                    // after the last instruction.
-                    self.leader.stop(false)?;
+                    // An exception changes no general register, so they are
+                    // the registers after the last instruction.
                     if end == End::DataAbort {
                         // A store of several parts can fail after a different
                         // count of parts on the two sides. That is not
