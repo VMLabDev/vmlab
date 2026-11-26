@@ -135,9 +135,7 @@ impl std::ops::Deref for KvmHandle {
     type Target = Arc<KvmVm>;
 
     fn deref(&self) -> &Arc<KvmVm> {
-        self.0
-            .as_ref()
-            .expect("an emulated machine has no KVM VM")
+        self.0.as_ref().expect("an emulated machine has no KVM VM")
     }
 }
 

@@ -179,7 +179,9 @@ pub fn dump_device_tree(options: &Options) -> io::Result<Vec<u8>> {
         .stdout(Stdio::null())
         .status()?;
     if !status.success() {
-        return Err(other(format!("QEMU did not write its device tree: {status}")));
+        return Err(other(format!(
+            "QEMU did not write its device tree: {status}"
+        )));
     }
     std::fs::read(&path)
 }

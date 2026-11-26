@@ -172,7 +172,10 @@ pub fn property(blob: &[u8], path: &str, name: &str) -> Option<Vec<u8>> {
                 // The root is the first entry of the stack, with no name.
                 if &blob[name_at..name_at + end] == name.as_bytes()
                     && stack.len() == want.len() + 1
-                    && stack[1..].iter().map(String::as_str).eq(want.iter().copied())
+                    && stack[1..]
+                        .iter()
+                        .map(String::as_str)
+                        .eq(want.iter().copied())
                 {
                     return Some(value.to_vec());
                 }

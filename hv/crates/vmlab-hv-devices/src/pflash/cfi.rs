@@ -43,11 +43,18 @@ enum Mode {
     /// The next write is the word to program.
     Program,
     /// The next write confirms the erase of the block.
-    Erase { block: usize },
+    Erase {
+        block: usize,
+    },
     /// The next write is the count of a buffered program, less one.
-    BufferCount { block: usize },
+    BufferCount {
+        block: usize,
+    },
     /// `left` more bus writes go into the buffer.
-    BufferData { block: usize, left: usize },
+    BufferData {
+        block: usize,
+        left: usize,
+    },
     /// The next write confirms the buffered program.
     BufferConfirm,
     /// The next write is a lock, an unlock or a lock-down of the block.
@@ -324,8 +331,8 @@ impl BusDevice for CfiFlash {
                 }
             }
             Mode::BufferCount { block } => {
-                let count = usize::from(data[0])
-                    | data.get(1).map_or(0, |high| usize::from(*high) << 8);
+                let count =
+                    usize::from(data[0]) | data.get(1).map_or(0, |high| usize::from(*high) << 8);
                 if count >= BUFFER_WRITES {
                     self.status |= PROGRAM_ERROR;
                     self.mode = Mode::Status;

@@ -66,7 +66,11 @@ pub fn build(tree: &Tree) -> Vec<u8> {
 
     fdt.begin(&format!("fw-cfg@{:x}", map::FW_CFG_BASE));
     fdt.flag("dma-coherent");
-    reg(&mut fdt, map::FW_CFG_BASE, vmlab_hv_firmware::fw_cfg::MMIO_SIZE);
+    reg(
+        &mut fdt,
+        map::FW_CFG_BASE,
+        vmlab_hv_firmware::fw_cfg::MMIO_SIZE,
+    );
     fdt.string("compatible", "qemu,fw-cfg-mmio");
     fdt.end();
 
@@ -161,10 +165,7 @@ pub fn build(tree: &Tree) -> Vec<u8> {
 
     fdt.begin(&format!("intc@{:x}", map::GICD_BASE));
     fdt.cells("phandle", &[PHANDLE_GIC]);
-    fdt.cells64(
-        "reg",
-        &[map::GICD_BASE, 0x1_0000, map::GICC_BASE, 0x1_0000],
-    );
+    fdt.cells64("reg", &[map::GICD_BASE, 0x1_0000, map::GICC_BASE, 0x1_0000]);
     fdt.string("compatible", "arm,cortex-a15-gic");
     fdt.flag("ranges");
     fdt.cells("#size-cells", &[2]);

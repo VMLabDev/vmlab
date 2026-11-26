@@ -90,7 +90,12 @@ impl Machine {
     }
 }
 
-fn description(dir: &Path, vcpus: u32, memory_mib: u64, boot: serde_json::Value) -> serde_json::Value {
+fn description(
+    dir: &Path,
+    vcpus: u32,
+    memory_mib: u64,
+    boot: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "name": "virt", "arch": "aarch64", "accel": "tcg", "machine": "virt",
         "vcpus": vcpus, "memory_mib": memory_mib, "boot": boot,
@@ -103,7 +108,10 @@ fn description(dir: &Path, vcpus: u32, memory_mib: u64, boot: serde_json::Value)
 #[test]
 fn a_virt_machine_runs_without_kvm_and_powers_off() {
     use vmlab_hv_tcg_aarch64::oracle::asm;
-    let dir = tempfile::Builder::new().prefix("hv-virt-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("hv-virt-")
+        .tempdir()
+        .unwrap();
     let mut words = asm::load(1, 0x0900_0000).to_vec();
     for byte in *b"S1\n" {
         // movz x2, #byte ; strb w2, [x1]
@@ -165,7 +173,10 @@ fn aavmf_reaches_the_shell(vcpus: u32) {
         );
         return;
     };
-    let dir = tempfile::Builder::new().prefix("hv-virt-").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("hv-virt-")
+        .tempdir()
+        .unwrap();
     let vars = dir.path().join("AAVMF_VARS.fd");
     std::fs::copy(pristine, &vars).unwrap();
     let console = dir.path().join("console.sock");

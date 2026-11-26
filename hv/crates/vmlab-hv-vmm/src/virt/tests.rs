@@ -4,9 +4,7 @@
 use std::path::Path;
 
 use vmlab_hv_proto::control::ShutdownReason;
-use vmlab_hv_proto::machine::{
-    Accel, Arch, Boot, FirmwareKind, Machine, MachineDescription,
-};
+use vmlab_hv_proto::machine::{Accel, Arch, Boot, FirmwareKind, Machine, MachineDescription};
 use vmlab_hv_tcg_aarch64::oracle::asm;
 
 use super::{map, psci};
@@ -245,10 +243,7 @@ fn a_guest_reset_ends_a_machine_that_exits_on_reset() {
     desc.exit_on_reset = true;
     let (reason, log) = run(&desc);
     assert_eq!(log, "1");
-    assert_eq!(
-        reason,
-        ExitReason::Shutdown(ShutdownReason::GuestReset)
-    );
+    assert_eq!(reason, ExitReason::Shutdown(ShutdownReason::GuestReset));
 }
 
 #[test]

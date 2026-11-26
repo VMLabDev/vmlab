@@ -244,7 +244,9 @@ struct Arguments {
 
 /// The bytes of a key argument: `\e` is escape and `\r` return.
 fn key_bytes(text: &str) -> Vec<u8> {
-    text.replace("\\e", "\x1b").replace("\\r", "\r").into_bytes()
+    text.replace("\\e", "\x1b")
+        .replace("\\r", "\r")
+        .into_bytes()
 }
 
 fn arguments() -> Result<Arguments, Error> {
@@ -266,9 +268,7 @@ fn arguments() -> Result<Arguments, Error> {
     let mut keys_given = false;
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| format!("{name} needs a value"))?;
+        let value = args.next().ok_or_else(|| format!("{name} needs a value"))?;
         match name.as_str() {
             "--qemu" => parsed.qemu = value,
             "--plugin" => parsed.plugin = value.into(),
@@ -834,7 +834,10 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         findings.pages.len()
     );
     for (page, (count, example)) in &findings.pages {
-        println!("  page {:#x}: {count} reads, the first: {example}", page << 12);
+        println!(
+            "  page {:#x}: {count} reads, the first: {example}",
+            page << 12
+        );
     }
     let log = std::fs::read(&description.serial_log).unwrap_or_default();
     let text = String::from_utf8_lossy(&log);

@@ -256,7 +256,11 @@ impl Assembled {
     /// Reset the machine in place, for a caller that runs the vCPUs itself
     /// and holds none of them.
     pub fn reset(&self) -> Result<(), String> {
-        let virt = self.shared.virt.get().ok_or("the machine is no virt machine")?;
+        let virt = self
+            .shared
+            .virt
+            .get()
+            .ok_or("the machine is no virt machine")?;
         virt.reset_with(&self.shared, &self.ram)
     }
 }
@@ -290,7 +294,9 @@ fn invalid(message: impl Into<String>) -> VmmError {
 /// Static checks of a description of a `virt` machine.
 pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
     if desc.arch != Arch::Aarch64 || desc.machine != Machine::Virt {
-        return Err(invalid("arch aarch64 requires machine=virt, and virt aarch64"));
+        return Err(invalid(
+            "arch aarch64 requires machine=virt, and virt aarch64",
+        ));
     }
     if desc.accel != Accel::Tcg {
         return Err(invalid(
@@ -412,8 +418,8 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
 }
 
 fn read_image(path: &std::path::Path, what: &str, limit: u64) -> Result<Vec<u8>, VmmError> {
-    let data = std::fs::read(path)
-        .map_err(|e| invalid(format!("{what} {}: {e}", path.display())))?;
+    let data =
+        std::fs::read(path).map_err(|e| invalid(format!("{what} {}: {e}", path.display())))?;
     if data.is_empty() || data.len() as u64 > limit {
         return Err(invalid(format!(
             "{what} {} has {} bytes, and 1 to {limit} fit",
@@ -549,7 +555,9 @@ pub fn assemble(
 
     let mut mmio_bus = MmioBus::new();
     let mut on_bus = |base: u64, len: u64, device: Arc<Mutex<dyn BusDevice>>| {
-        mmio_bus.register(base, len, device).map_err(VmmError::Other)
+        mmio_bus
+            .register(base, len, device)
+            .map_err(VmmError::Other)
     };
 
     // The interrupt controller, with the lines of CPUs that come later.
@@ -588,11 +596,12 @@ pub fn assemble(
     )?;
     let msi: Arc<dyn MsiSink> = Arc::new(v2m);
 
-    let log = crate::serial_log::CappedLog::open(&desc.serial_log, crate::serial_log::SERIAL_LOG_CAP)
-        .map_err(|e| VmmError::DeviceUnavailable {
-            device: "pl011",
-            reason: format!("cannot open serial log {}: {e}", desc.serial_log.display()),
-        })?;
+    let log =
+        crate::serial_log::CappedLog::open(&desc.serial_log, crate::serial_log::SERIAL_LOG_CAP)
+            .map_err(|e| VmmError::DeviceUnavailable {
+                device: "pl011",
+                reason: format!("cannot open serial log {}: {e}", desc.serial_log.display()),
+            })?;
     // The PL011 writes the serial log. A `com1` port is its host end as a
     // socket too: the client reads what the log gets, and what it sends
     // the guest receives.
@@ -641,7 +650,10 @@ pub fn assemble(
     if let Boot::Firmware { code, vars, .. } = &desc.boot {
         let code = read_image(code, "firmware code", map::FLASH_BANK)?;
         ram.mem
-            .write_slice(&vec![0xff; map::FLASH_BANK as usize], GuestAddress(map::FLASH_BASE))
+            .write_slice(
+                &vec![0xff; map::FLASH_BANK as usize],
+                GuestAddress(map::FLASH_BASE),
+            )
             .and_then(|()| ram.mem.write_slice(&code, GuestAddress(map::FLASH_BASE)))
             .map_err(|e| VmmError::Memory(format!("loading the firmware code: {e}")))?;
         let vars = vars.as_ref().expect("validated");
@@ -998,11 +1010,18 @@ impl Virt {
     }
 
     /// Serve a call of the guest: PSCI, on both conduits.
-    pub(crate) fn hypercall(&self, shared: &VmShared, id: u8, call: &Hypercall) -> HypercallOutcome {
+    pub(crate) fn hypercall(
+        &self,
+        shared: &VmShared,
+        id: u8,
+        call: &Hypercall,
+    ) -> HypercallOutcome {
         let function = call.arguments[0] as u32;
         let arguments = [call.arguments[1], call.arguments[2], call.arguments[3]];
         // The call returns in X0 and keeps X1 to X3.
-        let returns = |value: u64| HypercallOutcome::Return([value, arguments[0], arguments[1], arguments[2]]);
+        let returns = |value: u64| {
+            HypercallOutcome::Return([value, arguments[0], arguments[1], arguments[2]])
+        };
         let mut powered = self.powered.lock();
         match psci::decide(function, arguments, &powered) {
             psci::Action::Return(value) => returns(value),

@@ -50,7 +50,11 @@ pub enum Action {
     Off,
     /// The CPU `cpu` starts at `entry` with `context` in X0, and the call
     /// returns success.
-    On { cpu: u8, entry: u64, context: u64 },
+    On {
+        cpu: u8,
+        entry: u64,
+        context: u64,
+    },
     SystemOff,
     SystemReset,
 }
@@ -196,8 +200,14 @@ mod tests {
     #[test]
     fn affinity_info_says_on_or_off() {
         let powered = [true, false];
-        assert_eq!(decide(AFFINITY_INFO64, [0, 0, 0], &powered), Action::Return(0));
-        assert_eq!(decide(AFFINITY_INFO, [1, 0, 0], &powered), Action::Return(1));
+        assert_eq!(
+            decide(AFFINITY_INFO64, [0, 0, 0], &powered),
+            Action::Return(0)
+        );
+        assert_eq!(
+            decide(AFFINITY_INFO, [1, 0, 0], &powered),
+            Action::Return(1)
+        );
         assert_eq!(
             decide(AFFINITY_INFO, [1, 1, 0], &powered),
             Action::Return(INVALID_PARAMETERS)
