@@ -1289,7 +1289,28 @@ exception, of the translation and of the timers, and both stack pointers),
 and after it the memory writes that the leader reports. The leader gets the
 same four keys on its serial port.
 
-O4_RESULT
+The run of this card on helios, from the reset to `Shell>` on our serial
+log (`just tcg-a64-boot-lockstep`, 2,401 s, 0.59 million instructions a
+second):
+
+| | |
+|---|---|
+| Instructions compared | 1,404,633,088 |
+| CPU differences | 0 |
+| Interrupts taken where the leader took them | 873, each pending in our GIC |
+| Host calls (PSCI) | 2, the same answers |
+| Counter reads taken from the leader | 91,007,818 |
+| Timer and interrupt status reads that differed | 0 |
+| ID registers that differed | none |
+| Device reads taken from the leader | 9,265 |
+| Device reads where our device answered differently | 411, all of the PL011 flag register |
+| Guest resets | 0 |
+
+The 411 reads are `UARTFR` at `0x09000018`: the leader has a key in its
+receive FIFO (`0x80`) and our PL011, which gets no key, has none (`0x90`).
+The shell takes the last key after one second of the leader's instruction
+clock, which is a thousand million instructions: most of the run is that
+wait, and most of the counter reads are its loop.
 
 What the leader leads, as the design says: the moment of an interrupt, the
 value of a device read, the counter and what follows from it, and the answer
