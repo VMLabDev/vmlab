@@ -27,16 +27,14 @@ again" is at the end. A number marked *est.* is an estimate, with its basis.
   the `virt` machine, and nothing in 3d may block the M1.
 - **P4.** 3d is accepted when the four aarch64 templates boot to agent ready
   on vmlab-hv, snapshots work, and e2e `arch.emulated` runs on vmlab-hv. Then
-  vmlab selects vmlab-hv for aarch64 and the QEMU code is removed.
+  vmlab selects vmlab-hv for aarch64. QEMU is available for aarch64 only as
+  a troubleshooting tool outside the product path (Q4).
 
 P1 replaces HV-D34 for aarch64 and D14. P2 replaces the per-instruction half
 of D6 for aarch64. The "owner licence check before 3d" of D12 is gone.
 
-One assumption of P4 is wrong as written. The QEMU adapter, the QMP client and
-the QEMU process code also run every riscv64 VM, and riscv64 on vmlab-hv is
-sub-phase 3b, which has not started. After 3d, vmlab can select vmlab-hv for
-aarch64, but the QEMU code can be removed only when 3b is also done, or when
-the operator drops riscv64 guests. This is question Q3.
+The QEMU adapter, the QMP client and the QEMU process code run riscv64 VMs
+until riscv64 runs on vmlab-hv in 3b. C16 is held until then (Q3).
 
 ## Sources: what an agent may read to write the semantics
 
@@ -73,9 +71,9 @@ permissive readable text. dynarmic and VIXL give two more texts for the
 instruction groups where most of the code is (FP and AdvSIMD). The lockstep
 run finds what a text left wrong, at the first instruction that differs. The
 cost of the rule is time, not feasibility: a rare system behaviour that gem5
-does not model must be found by a probe on QEMU. No question to the operator
-blocks the work. Q1 asks only whether the prose chapters of the Arm manual
-(not its pseudocode) may be opened later if a card shows that it needs them.
+does not model can be investigated with a probe on QEMU. If S2 to S6 leave
+a system behaviour unsettled, Q1 allows the card to consult the Arm manual's
+prose chapters and record what it read. X2 still applies.
 
 ## 1. Decode
 
@@ -171,10 +169,10 @@ The union is 615 records in 142 format classes. AAVMF is inside each boot.
 |---|---|---|---|---|
 | Data processing, immediate | 32 | 8 | 32 | 8 |
 | Data processing, register (with CRC32) | 88 | 19 | 101 | 19 |
-| Branches, exceptions, system | 31 | 15 | 54 | 21 |
+| Branches, exceptions, system (including `UDF`) | 31 | 15 | 55 | 22 |
 | Loads and stores (integer, FP, AdvSIMD) | 210 | 40 | 578 | 49 |
 | FP and AdvSIMD (with AES, SHA2) | 254 | 60 | 1,566 | 70 |
-| Total | 615 | 142 | 2,331 | 167 |
+| Total | 615 | 142 | 2,332 | 168 |
 
 - FP and AdvSIMD only mnemonics are 7.5 % to 13.8 % of executed instructions.
   System-class instructions are 1.1 % to 5.2 %.
@@ -195,15 +193,15 @@ The union is 615 records in 142 format classes. AAVMF is inside each boot.
 ### G2. The 3d instruction set
 
 `sets.toml` of 3d selects: the base (no predicate), `FPARMv8`, `NEON`, `AES`,
-`SHA2` (LLVM puts SHA1 and SHA-256 under it) and `CRC`. That is 2,331 records
-in 167 format classes. Cards implement every record of a format class that
-they touch, not only the executed ones, because user programs go past what a
-boot executes.
+`SHA2` (LLVM puts SHA1 and SHA-256 under it) and `CRC`. That is 2,332 records
+in 168 format classes, including `UDF`. Cards implement every record of a
+format class they touch, because user programs go past what a boot executes.
 
-The CPU that the guest sees says exactly this in its ID registers: Armv8.0-A,
-4K granule, EL0 and EL1 in AArch64 only, no AArch32, no SVE, no PMU (V5). QEMU
+The CPU that the guest sees says exactly this in its ID registers: Armv8.0-A
+with CRC32, AES, SHA1 and SHA2, a 4K granule, EL0 and EL1 in AArch64 only,
+no AArch32, no SVE, and no PMU (V5). QEMU
 presents `-cpu max` today, so this is a guest-visible difference under HV-D30,
-as D7 is for riscv64. It needs the approval of the operator (Q2).
+as D7 is for riscv64. The operator approved it in Q2.
 
 A later set, not part of the 3d acceptance: `LSE` (168 records, the atomics of
 v8.1, which help multi-vCPU speed), then the M1 list of the section "M1".
@@ -265,7 +263,7 @@ timer.rs         the generic timer as a value with output lines
 
 - **G3a. One lifter per format class.** A lifter is a Rust function that takes
   the decoded fields and a `Builder`, and appends scalars and events to the
-  block. 167 format classes cover the 2,331 records, because the tables
+  block. 168 format classes cover the 2,332 records, because the tables
   already factor the variants (width, sign, opcode) into fields.
 - **G3b. Shared helpers keep it small.** `b.x(n)`, `b.sp()`, `b.add_with_carry`
   (the one source of N, Z, C, V for ADD, SUB, CMP, CCMP and the rest),
@@ -370,13 +368,15 @@ each for what it can do.
    A, I, F, the level, SPSel), V0 to V31, FPSR, FPCR, and the memory writes of
    the last instruction. After an exception it also compares `ESR_EL1`,
    `FAR_EL1`, `ELR_EL1` and `SPSR_EL1`, which the plugin reads as registers.
+   C1 does not yet compare memory writes (C3), FPSR and FPCR (C4), or V0 to
+   V31 (C7).
 5. The first difference stops the run and prints the encoding, the record
    name from the tables, the state before, and both states after. The failing
    instruction and state are added to a committed regression corpus.
 
 Speed: about 1.5 million compared instructions per second with vector
-registers. One million random instructions per format class, for 167 format
-classes, is 167 million instructions, or two minutes of QEMU time.
+registers. One million random instructions per format class, for 168 format
+classes, is 168 million instructions, or two minutes of QEMU time.
 
 A card proves an instruction group with: every record of the group in the
 stream, at least 100,000 instructions per format class without a difference,
@@ -584,8 +584,8 @@ numbers are the QEMU side of D1 for 3e, and the yardstick for 3d.
 
 At 100 to 300 MIPS the four templates reach agent ready in 1 to 5 minutes at
 one vCPU: 2 to 7 times slower than QEMU, and inside the timeout. That is
-acceptable for P4, which asks for a boot and not for a speed. It is not
-acceptable as the default for users, which is what 3e is for.
+acceptable for the 3d switch (Q4). The JIT in 3e targets the performance
+bar in D1.
 
 Three rules follow:
 
@@ -596,8 +596,7 @@ Three rules follow:
   thread each, as D10 says, from the start. The exclusives and the TLB are
   per vCPU, and memory goes through `SharedMemory`.
 - **The switch of P4**: vmlab selects vmlab-hv for aarch64 when the
-  acceptance list passes. If the operator wants the switch only at QEMU's
-  speed, the switch waits for 3e. This is Q4.
+  3d acceptance list passes (Q4).
 
 ## The M1 machine: what 3d keeps possible
 
@@ -663,7 +662,7 @@ it read (S1 to S8), and keeps X1 to X3.
 | C13 | The four templates to agent ready | What the boots still miss, found by O4 and the unknown-is-loud log (G3f). Multi-vCPU runs. | S1: each template reaches agent ready at 1 and 2 vCPUs inside 600 s under the memory cap. O4 for Debian from reset to agent ready without a CPU difference. kvm-unit-tests with 4 vCPUs. | C7, C10, C11 | C14 |
 | C14 | Snapshots, reset and the debug port for an emulated machine | F6 and D13: CPU, GIC and timer state in the snapshot format, the caches rebuilt after a restore, a guest reset in place. | The S1 snapshot tests on an aarch64 machine: online and offline, restore, and the agent answers after it. | C10 | C13 |
 | C15 | vmlab side: describe and select vmlab-hv for aarch64 | `describe.rs` for an aarch64 launch, the refusal list, the selection of §22 for aarch64 with the migration of QEMU identities, firmware lookup, the display and input path, the manual and the PRD. | e2e `arch.emulated` on `--hypervisor vmlab`. The arch-relevant e2e features. `just ci::check`. | C13, C14 | C16 |
-| C16 | Remove the QEMU hypervisor code | Only after Q3: the QEMU adapter, the QMP client, the process code, `plan_accel`, and `docs/agents/qemu-removal-remaining.md`. | The whole e2e suite on vmlab-hv. No `qemu-system-*` is started by any product path. | C15, and 3b or the answer to Q3 | none |
+| C16 | Remove the QEMU hypervisor code | Held until riscv64 runs on vmlab-hv (Q3). Remove the QEMU adapter, the QMP client, the process code, `plan_accel`, and `docs/agents/qemu-removal-remaining.md`. | The whole e2e suite on vmlab-hv. No `qemu-system-*` is started by any product path. | C15 and 3b | none |
 
 C1 is small enough to prove the path: one generator, two instruction groups
 (29 format classes), a loop without an MMU, and the harness that every later
@@ -671,22 +670,19 @@ card uses.
 
 ## Questions for the operator
 
-None blocks C1 to C14.
+Operator answers, 2026-11-26.
 
-- **Q1.** May a card open the prose chapters of the Arm Architecture
-  Reference Manual (register descriptions, the exception model), never its
-  pseudocode, when S2 to S6 do not settle a system behaviour? Recommended: no
-  for now. Decide only if a card reports such a case.
-- **Q2.** Approve two guest-visible differences from QEMU's `-cpu max`
-  (HV-D30): the CPU presents Armv8.0-A with CRC32, AES, SHA1 and SHA2 (G2),
-  and no PMU (V5). Recommended: approve, as D7 was for riscv64.
-- **Q3.** riscv64 VMs run only on QEMU until 3b. Remove the QEMU code after
-  3d and drop riscv64 guests until 3b, or keep it until 3b? Recommended: keep
-  it, and do C16 after 3b.
-- **Q4.** Does vmlab select vmlab-hv for aarch64 at the end of 3d, at 2 to 7
-  times QEMU's boot time (M6), or only after the JIT of 3e? Recommended: at
-  the end of 3d as P4 says, with QEMU still selectable by `hypervisor =
-  "qemu"` until 3e meets D1.
+- **Q1. YES.** When S2 to S6 do not settle a system behaviour, a card may
+  read the prose chapters of the Arm Architecture Reference Manual, such as
+  register descriptions and the exception model. Its pseudocode remains
+  prohibited. The card report lists what it read.
+- **Q2. APPROVED.** The emulated CPU presents Armv8.0-A with CRC32, AES,
+  SHA1 and SHA2 (G2), and no PMU (V5).
+- **Q3. KEEP.** Keep the QEMU code until riscv64 runs on vmlab-hv in 3b.
+  C16 stays held until then.
+- **Q4. YES.** At the end of 3d, vmlab selects vmlab-hv for aarch64. QEMU
+  stays available for aarch64 only as a troubleshooting tool outside the
+  product path.
 
 ## How to measure again
 
