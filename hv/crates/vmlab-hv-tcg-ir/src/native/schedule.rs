@@ -28,6 +28,11 @@ fn visit(graph: &Graph, id: ScalarId, seen: &mut [bool], output: &mut Vec<Scalar
             visit(graph, when_true, seen, output);
             visit(graph, when_false, seen, output);
         }
+        Operation::Call { ref args, .. } => {
+            for arg in args {
+                visit(graph, *arg, seen, output);
+            }
+        }
         Operation::Effect(_) => return,
         _ => {}
     }
@@ -79,6 +84,18 @@ pub fn schedule<X>(block: &BlockOf<X>) -> Vec<Vec<ScalarId>> {
                     visit(&block.graph, value, &mut seen, &mut output);
                     if let Some(result) = result {
                         seen[result] = true;
+                    }
+                }
+                Event::Call {
+                    ref args,
+                    ref results,
+                    ..
+                } => {
+                    for arg in args {
+                        visit(&block.graph, *arg, &mut seen, &mut output);
+                    }
+                    for result in results {
+                        seen[*result] = true;
                     }
                 }
                 _ => {}

@@ -197,6 +197,33 @@ impl State {
         self.slots[slot::PC] = value.into();
     }
 
+    /// The whole of V0 to V31.
+    pub fn v(&self, n: usize) -> u128 {
+        assert!(n < 32, "V{n} does not exist");
+        self.slots[slot::V0 + n]
+    }
+
+    pub fn set_v(&mut self, n: usize, value: u128) {
+        assert!(n < 32, "V{n} does not exist");
+        self.slots[slot::V0 + n] = value;
+    }
+
+    pub fn fpcr(&self) -> u32 {
+        self.slots[slot::FPCR] as u32
+    }
+
+    pub fn set_fpcr(&mut self, value: u32) {
+        self.slots[slot::FPCR] = value.into();
+    }
+
+    pub fn fpsr(&self) -> u32 {
+        self.slots[slot::FPSR] as u32
+    }
+
+    pub fn set_fpsr(&mut self, value: u32) {
+        self.slots[slot::FPSR] = value.into();
+    }
+
     /// N, Z, C and V as the bits 3 to 0.
     pub fn nzcv(&self) -> u8 {
         ((self.slots[slot::N] as u8 & 1) << 3)
