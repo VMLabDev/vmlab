@@ -102,12 +102,12 @@ tcg-a64-plugin-build:
 
 # Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3: c1, dp-immediate, branch, fp, which also compares V0 to V31, FPSR and FPCR, or system, which also takes the exceptions and compares the system registers); traces are files of the measure plugin with the executed encodings, separated by spaces
 [group('tcg')]
-tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='': tcg-a64-plugin-build
+tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='' samples='3': tcg-a64-plugin-build
 	#!/usr/bin/env bash
 	set -euo pipefail
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64lock.XXXXXX")
 	trap '[ -n "$dir" ] && [ -d "$dir" ] && rm -rf -- "$dir"' EXIT
-	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --group "{{group}}" --per-class "{{per_class}}" --seed "{{seed}}")
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --group "{{group}}" --per-class "{{per_class}}" --seed "{{seed}}" --samples "{{samples}}")
 	for trace in {{traces}}; do args+=(--encodings "$trace"); done
 	if [ -n "{{corpus}}" ]; then args+=(--corpus-out "{{corpus}}"); fi
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_lockstep -- "${args[@]}"

@@ -291,3 +291,84 @@ print('RFB 3.8 handshake and Raw pixels passed')
     );
     h.join().unwrap().unwrap();
 }
+
+/// Review F10 (docs/reviews/display-2.md). The key and the button that an
+/// RFB client holds down are released when its connection ends.
+#[test]
+fn a_disconnect_releases_what_the_client_held() {
+    fn key(s: &mut UnixStream, keysym: u32, down: bool) {
+        let mut event = vec![4, u8::from(down), 0, 0];
+        event.extend(keysym.to_be_bytes());
+        s.write_all(&event).unwrap();
+    }
+    let (server, _, messages) = channel_server();
+    let (a, mut b) = socket();
+    let serving = server.clone();
+    let worker = std::thread::spawn(move || serving.serve_rfb(a));
+    handshake(&mut b);
+    key(&mut b, 0xffe9, true);
+    b.write_all(&[5, 1, 0, 2, 0, 1]).unwrap();
+    assert_eq!(
+        messages.recv().unwrap(),
+        M::Key {
+            qcode: "alt".into(),
+            down: true
+        }
+    );
+    assert_eq!(
+        messages.recv().unwrap(),
+        M::PointerAbs {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3
+        }
+    );
+    assert_eq!(messages.recv().unwrap(), M::Buttons { mask: 1 });
+    drop(b);
+    let _ = worker.join().unwrap();
+    // The connection is over. A key of a second client marks the end of
+    // what its end put into the queue.
+    let (a, mut b) = socket();
+    let serving = server.clone();
+    let worker = std::thread::spawn(move || serving.serve_rfb(a));
+    handshake(&mut b);
+    key(&mut b, 0x61, false);
+    let mark = M::Key {
+        qcode: "a".into(),
+        down: false,
+    };
+    assert_eq!(
+        up_to(&messages, &mark),
+        [
+            M::Key {
+                qcode: "alt".into(),
+                down: false
+            },
+            M::Buttons { mask: 0 }
+        ]
+    );
+    drop(b);
+    let _ = worker.join().unwrap();
+    server.shutdown();
+}
+
+/// Review F14 (docs/reviews/display-2.md). A source that has no valid frame
+/// when an RFB client connects does not refuse the client: it gets the last
+/// valid frame.
+#[test]
+fn a_failing_source_does_not_refuse_a_new_rfb_client() {
+    let (server, source, _) = server();
+    *source.0.lock().unwrap() = frame(7, 4, 3);
+    server.publish().unwrap();
+    *source.0.lock().unwrap() = frame(9, 4, 0);
+    assert!(server.publish().is_err());
+    let (a, mut b) = socket();
+    let serving = server.clone();
+    let worker = std::thread::spawn(move || serving.serve_rfb(a));
+    handshake(&mut b);
+    request(&mut b, false);
+    assert_eq!(update(&mut b)[0].p, [7, 7, 7, 0].repeat(12));
+    drop(b);
+    assert!(worker.join().unwrap().is_ok());
+}

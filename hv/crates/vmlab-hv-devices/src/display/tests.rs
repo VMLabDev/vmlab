@@ -106,6 +106,31 @@ fn fragmented_damage_fits_the_display_protocol_rectangle_limit() {
     assert!(frame.dirty);
 }
 
+/// Review F14 (docs/reviews/display-2.md). In the 256-colour shift mode the
+/// height is the vertical display end plus one, divided by the scan-line
+/// count. A display end of 0 with a count of 2 must not give a mode of
+/// height 0: the display server refuses such a frame.
+#[test]
+fn an_active_vga_mode_has_at_least_one_row() {
+    let mut dev = device();
+    indexed(&mut dev, 0x3ce, 5, 0x40);
+    indexed(&mut dev, 0x3d4, 7, 0);
+    indexed(&mut dev, 0x3d4, 0x12, 0);
+    indexed(&mut dev, 0x3d4, 9, 0);
+    assert!(dev.scanout_active());
+    assert_eq!(dev.mode().height, 1, "one scan line per row");
+    indexed(&mut dev, 0x3d4, 9, 1);
+    assert!(dev.scanout_active());
+    let mode = dev.mode();
+    assert!(mode.height >= 1, "a mode of height {}", mode.height);
+    let frame = dev.frame();
+    assert_eq!(
+        frame.pixels.len(),
+        (mode.stride * mode.height) as usize,
+        "the frame has the pixels of its mode"
+    );
+}
+
 fn indexed(dev: &mut StandardVga, port: u16, index: u8, value: u8) {
     dev.io_write(port, &[index, value]);
 }

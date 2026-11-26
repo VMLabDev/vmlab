@@ -1322,8 +1322,10 @@ impl VmShared {
                     .lock()
                     .as_ref()
                     .is_none_or(|vga| vga.poll_scanout());
-            if poll && let Err(e) = display.publish() {
-                log::warn!("display frame: {e}");
+            if poll {
+                // A source that fails keeps the last valid frame. The warning
+                // has a limit on its rate: this runs every 16 ms.
+                display.publish_or_warn();
             }
             if self.virtual_display.lock().is_none()
                 && let Some(vga) = self.vga.lock().as_ref()

@@ -425,7 +425,8 @@ SRC
 
   p <<DOC
     **Viewers live on the Windows side.** `vmlab console --tcp` bridges a
-    VM's VNC display to a localhost port and prints the address, so a Windows
+    VM's VNC display to a localhost port and prints the address and the
+    bridge's password, so a Windows
     VNC client can attach through WSL's localhost forwarding. Port forwards
     declared in the lab file reach the Windows side the same way.
   DOC

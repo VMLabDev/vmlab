@@ -6,19 +6,15 @@
 //! window. Decoupling the window from the VM means closing it only
 //! disconnects — the VM keeps running and `vmlab console` can reattach.
 //!
-//! The viewer is chosen by [`detect`]: an explicit `viewer` in host config
-//! wins; otherwise we look for a known client on `PATH`. `remote-viewer`
-//! (virt-viewer) speaks the VNC unix socket directly and is preferred —
-//! it needs no bridge, so it also works for the `gui = true` auto-open on
-//! `up` (where the CLI exits right after). `gvncviewer`/`vncviewer` are
-//! TCP-only, so the caller bridges the socket to a localhost display port.
+//! For VNC, an explicit `viewer` in host config connects to the unix socket.
+//! Otherwise `remote-viewer`, `gvncviewer` and `vncviewer` are discovered
+//! on `PATH` in that order and connect through a detached TCP bridge.
 //!
 //! vmlab-hv machines prefer the native viewer via [`detect_for`]. It connects
 //! to `display.sock` and uses the lab control socket for clipboard requests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -73,9 +69,7 @@ const NATIVE_VIEWER_MISSING: &str = "vmlab-hv-viewer not found; install it from 
 /// Select a machine's viewer. `tcp` explicitly requests the VNC bridge.
 pub fn detect_for(hypervisor: HypervisorKind, tcp: bool) -> ConsoleViewer {
     let host = HostConfig::load_default_or_warn();
-    let viewer = select_for(hypervisor, tcp, &host, &find_binary, || {
-        detect_vnc(&host, &on_path)
-    });
+    let viewer = select_for(hypervisor, tcp, &host, &find_binary, &on_path);
     if hypervisor == HypervisorKind::Vmlab && !tcp && matches!(viewer, ConsoleViewer::Vnc(_)) {
         eprintln!("{NATIVE_VIEWER_MISSING}");
     }
@@ -87,7 +81,7 @@ fn select_for(
     tcp: bool,
     host: &HostConfig,
     find: &impl Fn(&Path) -> Option<PathBuf>,
-    vnc: impl FnOnce() -> Option<Viewer>,
+    on_path: &impl Fn(&str) -> bool,
 ) -> ConsoleViewer {
     if hypervisor == HypervisorKind::Vmlab && !tcp {
         let binary = match &host.vmlab_hv_viewer {
@@ -106,7 +100,7 @@ fn select_for(
             });
         }
     }
-    ConsoleViewer::Vnc(vnc())
+    ConsoleViewer::Vnc(detect_vnc(host, on_path))
 }
 
 /// Resolve a bare binary on PATH, or check a configured path directly.
@@ -151,7 +145,7 @@ fn on_path(bin: &str) -> bool {
 }
 
 /// Resolve a viewer: host config first, then known clients on `PATH`.
-/// `remote-viewer` is preferred because it dials the unix socket directly.
+/// Known clients connect through the TCP bridge.
 pub fn detect() -> Option<Viewer> {
     let host = HostConfig::load_default_or_warn();
     detect_vnc(&host, &on_path)
@@ -230,12 +224,86 @@ pub fn launch(viewer: &Viewer, target: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment variable that carries a bridge's password to its
+/// detached helper.
+pub const BRIDGE_PASSWORD_ENV: &str = "VMLAB_VNCBRIDGE_PASSWORD";
+
+/// Start a detected viewer against the console TCP bridge, and hand it the
+/// bridge's password where the viewer can be handed one: `remote-viewer`
+/// in a connection file, `vncviewer` in a password file. `gvncviewer` has
+/// no way to take one, so it asks, and the user types what `vmlab console`
+/// printed. The returned file must live as long as the viewer may read it.
+pub fn spawn_bridged(
+    viewer: &Viewer,
+    port: u16,
+    display: u16,
+    password: &str,
+) -> Result<(std::process::Child, Option<tempfile::NamedTempFile>)> {
+    let (handoff, command) = bridged_command(viewer, port, display, password)?;
+    let child = command_line(&command)
+        .spawn()
+        .with_context(|| format!("launching viewer `{}`", viewer.cmd))?;
+    Ok((child, handoff))
+}
+
+/// The password file, if the viewer takes one, and the command line that
+/// names it. The file is owner-only, as every temporary file is.
+fn bridged_command(
+    viewer: &Viewer,
+    port: u16,
+    display: u16,
+    password: &str,
+) -> Result<(Option<tempfile::NamedTempFile>, String)> {
+    use std::io::Write;
+    let handoff = |suffix: &str, content: &[u8]| -> Result<tempfile::NamedTempFile> {
+        let mut file = tempfile::Builder::new()
+            .prefix("vmlab-console-")
+            .suffix(suffix)
+            .tempfile()
+            .context("creating the viewer's password file")?;
+        file.write_all(content)?;
+        file.flush()?;
+        Ok(file)
+    };
+    let target = tcp_target(viewer, "127.0.0.1", port, display);
+    match viewer.cmd.split_whitespace().next() {
+        Some("remote-viewer") => {
+            let file = handoff(
+                ".vv",
+                format!(
+                    "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport={port}\npassword={password}\n"
+                )
+                .as_bytes(),
+            )?;
+            let command = format!("remote-viewer {}", file.path().display());
+            Ok((Some(file), command))
+        }
+        Some("vncviewer") => {
+            let file = handoff(".passwd", &crate::vnc_auth::password_file(password))?;
+            let command = format!("vncviewer -passwd {} {target}", file.path().display());
+            Ok((Some(file), command))
+        }
+        _ => Ok((None, viewer.cmd.replace("{}", &target))),
+    }
+}
+
+fn command_line(line: &str) -> Command {
+    let mut parts = line.split_whitespace();
+    let mut command = Command::new(parts.next().unwrap_or_default());
+    command.args(parts);
+    command
+}
+
 /// Launch a detached background helper that holds a unix→TCP VNC bridge and
 /// the viewer for a TCP-only client, freeing the caller's terminal. The
 /// helper (`vmlab __vncbridge`) exits when the viewer window closes,
 /// tearing the bridge down with it. Used by `vmlab console` and the
 /// `gui = true` auto-open for gvncviewer/vncviewer.
-pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<()> {
+///
+/// Returns the password the helper's bridge asks every TCP peer for. The
+/// helper hands it to the viewer where it can; the caller prints it for
+/// the viewer that asks the user instead.
+pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<String> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locating vmlab binary")?;
     let exe = exe.to_string_lossy().into_owned();
@@ -251,18 +319,20 @@ pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<()> {
         c.args(args);
         c
     };
-    cmd.stdin(Stdio::null())
+    let password = crate::vnc_auth::new_password();
+    cmd.env(BRIDGE_PASSWORD_ENV, &password)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("spawning background vnc bridge")?;
-    Ok(())
+    Ok(password)
 }
 
 /// Open a viewer for a lab VM, using its reported hypervisor for `gui = true`.
 /// The native viewer waits for its display socket. A VNC unix-socket viewer
 /// is launched directly; a TCP-only viewer runs in a detached bridge so it
-/// survives `up` exiting. Prints how to attach when no viewer is found.
+/// survives the CLI exiting. Prints how to attach when no viewer is found.
 pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
     let viewer = match detect_for(hypervisor, false) {
         ConsoleViewer::Native(viewer) => return viewer.launch(lab, vm),
@@ -276,43 +346,17 @@ pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
     match viewer {
         Some(v) if v.transport == Transport::Unix => launch(&v, &sock.display().to_string()),
         Some(_) => {
-            spawn_detached_bridge(lab, vm)?;
-            println!("gui: opened a viewer for {vm}");
+            let password = spawn_detached_bridge(lab, vm)?;
+            println!("gui: opened a viewer for {vm} (if it asks for a password: {password})");
             Ok(())
         }
         None => {
             println!(
                 "gui: no VNC viewer found — install virt-viewer (remote-viewer), or run \
-                 `vmlab console {vm}`"
+                 `vmlab console {lab}/{vm}`"
             );
             Ok(())
         }
-    }
-}
-
-/// Spawn a background task that waits for a VM's VNC socket to appear (the
-/// VM is still booting) and then opens a viewer. For `vmlab template
-/// build`, whose `up()` blocks until provisioning finishes. Like
-/// [`open_for`], only a unix-socket viewer is launched. Must be called from
-/// within a tokio runtime.
-pub fn open_when_ready(sock: PathBuf) {
-    match detect() {
-        Some(v) if v.transport == Transport::Unix => {
-            tokio::spawn(async move {
-                // ~60s for QEMU to create the socket; the build runs longer.
-                for _ in 0..600 {
-                    if sock.exists() {
-                        let _ = launch(&v, &sock.display().to_string());
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            });
-        }
-        _ => println!(
-            "gui: no unix-socket viewer for the build — install virt-viewer (remote-viewer) \
-             to watch builds"
-        ),
     }
 }
 
@@ -320,6 +364,68 @@ pub fn open_when_ready(sock: PathBuf) {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn a_build_gui_finds_a_viewer_when_remote_viewer_is_installed() {
+        let host = HostConfig::default();
+        let find = available(&["remote-viewer"]);
+        let ConsoleViewer::Vnc(Some(viewer)) =
+            select_available(HypervisorKind::Vmlab, false, &host, &find)
+        else {
+            panic!("the build should launch the installed remote-viewer");
+        };
+        assert_eq!(viewer.cmd, "remote-viewer vnc://{}");
+        assert_eq!(viewer.transport, Transport::Tcp);
+    }
+
+    fn tcp_viewer(cmd: &str) -> Viewer {
+        Viewer {
+            cmd: cmd.to_string(),
+            transport: Transport::Tcp,
+        }
+    }
+
+    // display-2 F9: the bridge asks for a password, so the viewer vmlab
+    // starts must be given it, and in a file no other user reads.
+    #[test]
+    fn a_bridged_viewer_is_handed_the_password_in_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (file, command) =
+            bridged_command(&tcp_viewer("remote-viewer vnc://{}"), 5903, 3, "Ab3dEf7h").unwrap();
+        let file = file.unwrap();
+        assert_eq!(command, format!("remote-viewer {}", file.path().display()));
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "[virt-viewer]\ntype=vnc\nhost=127.0.0.1\nport=5903\npassword=Ab3dEf7h\n"
+        );
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let (file, command) =
+            bridged_command(&tcp_viewer("vncviewer {}"), 5903, 3, "password").unwrap();
+        let file = file.unwrap();
+        assert_eq!(
+            command,
+            format!("vncviewer -passwd {} 127.0.0.1:3", file.path().display())
+        );
+        assert_eq!(
+            std::fs::read(file.path()).unwrap(),
+            crate::vnc_auth::password_file("password")
+        );
+        assert_eq!(
+            file.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // gvncviewer takes no password: it asks the user.
+        let (file, command) =
+            bridged_command(&tcp_viewer("gvncviewer {}"), 5903, 3, "Ab3dEf7h").unwrap();
+        assert!(file.is_none());
+        assert_eq!(command, "gvncviewer 127.0.0.1:3");
+    }
 
     fn available<'a>(binaries: &'a [&'a str]) -> impl Fn(&Path) -> Option<PathBuf> + 'a {
         |path| {
@@ -336,8 +442,8 @@ mod tests {
         host: &HostConfig,
         find: &impl Fn(&Path) -> Option<PathBuf>,
     ) -> ConsoleViewer {
-        select_for(hypervisor, tcp, host, find, || {
-            detect_vnc(host, &|bin| find(Path::new(bin)).is_some())
+        select_for(hypervisor, tcp, host, find, &|bin| {
+            find(Path::new(bin)).is_some()
         })
     }
 

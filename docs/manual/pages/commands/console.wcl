@@ -71,11 +71,28 @@ page cmd_console {
   DOC
 
   p <<DOC
+    A localhost port is open to every user of the host, so each bridge has
+    a password of its own, eight characters made when the bridge starts,
+    and asks every connection for it with VNC authentication. Nothing
+    reaches the VM's display for a connection that does not give it. vmlab
+    hands the password to `remote-viewer` in a connection file and to
+    `vncviewer` in a password file, both readable by you alone and removed
+    when the viewer closes. `gvncviewer` cannot be handed one and asks for
+    it. The command prints the password in a second line,
+    `if the viewer asks for a password: <password>`. VNC authentication
+    keeps another user out of the console. It does not encrypt what the
+    viewer shows or sends.
+  DOC
+
+  p <<DOC
     With `--tcp` on either hypervisor, or when no viewer is found, the command binds a localhost
     port itself, preferring a VNC display port from 5900 upward so a client
     that takes `host:display` works, and prints
-    `VNC for <lab>/<vm> on 127.0.0.1:<port>`. It then holds the bridge until
-    Ctrl-C. This supports a Windows-side VNC viewer under WSL 2.
+    `VNC for <lab>/<vm> on 127.0.0.1:<port>`, then `password: <password>`,
+    the password of this bridge, which the VNC client must give. It then
+    holds the bridge until Ctrl-C. When the VM stops or restarts, the bridge
+    closes its viewers' connections, and a viewer that closes ends its
+    session in the VM's display. This supports a Windows-side VNC viewer under WSL 2.
     The native viewer runs under WSLg and selects its shared-memory mode
     itself, without a TCP bridge or a `--shm` argument from vmlab.
   DOC

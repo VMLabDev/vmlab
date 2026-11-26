@@ -6,7 +6,31 @@
 //! (`exception.rs`) and runs the system instructions that end a block
 //! (`Trap`). It stops for what only its owner can serve: a hypercall, a
 //! `WFI` with no interrupt line high, the end of a budget, and an
-//! instruction that has no lifter yet.
+//! instruction that has no lifter yet. A load or a store that fails still
+//! stops it too (`Stop::DataAbort`, `Stop::Alignment`): the translation card
+//! (C8) gives those their syndromes.
+//!
+//! A block is pure scalar code with memory events between it: loads, stores
+//! and guards, in the order of the instructions. Each event names an exit
+//! that holds the registers as they were before its instruction, so a failed
+//! access leaves the registers of that instruction untouched.
+//!
+//! The exclusive monitor of a CPU is the address of its last exclusive
+//! load, the value that the load read, and the write generation of the
+//! memory's reservation granules at that moment (`Memory::load_reserved`).
+//! What it does on one CPU follows what the lockstep saw QEMU do (S6,
+//! DESIGN.md U1): an exclusive store writes when its address is the marked
+//! one and the memory, read at the size of the store, still holds the value.
+//! The sizes of the load and of the store need not be the same, which the
+//! architecture leaves open. A store that finds another address, or no
+//! mark, reads no memory and fails. Every exclusive store that completes
+//! ends the mark. A store of this CPU between the two keeps the mark, and
+//! an exception keeps it. An exception return and `CLREX` end it.
+//!
+//! With more CPUs the store also asks that no other writer reached the
+//! granules of the load (`Memory::store_conditional`), so it fails more
+//! often than QEMU's: a write of another CPU fails it also when it left the
+//! value as it was.
 //!
 //! Sources read: S6 for what a system instruction does at each level (the
 //! lockstep of card C6 and the probe of the system registers). This file
@@ -32,6 +56,11 @@ pub const BLOCK_INSTRUCTIONS: u32 = 64;
 /// The block cache is direct-mapped by the PC.
 const CACHE_ENTRIES: usize = 1 << 12;
 
+/// The pages that hold translated code are a bit set over the low bits of
+/// the page number. Two pages with the same low bits share a bit, which
+/// costs a slower store and nothing else.
+const CODE_PAGE_BITS: usize = 1 << 16;
+
 /// How a guest calls what is above EL1 (DESIGN.md G4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conduit {
@@ -47,6 +76,15 @@ pub enum Stop {
     /// The record is decoded and has no lifter yet. The PC of the state is
     /// the instruction, and no part of it has changed the state.
     Unimplemented { pc: u64, record: Record },
+    /// The memory holds nothing at the address of a load or a store: a data
+    /// abort. The PC of the state is the instruction, which has changed no
+    /// register. A store of several parts (a pair, `ST2` to `ST4`) has
+    /// written the parts before the one that failed.
+    DataAbort { pc: u64, address: u64, write: bool },
+    /// An access to an address that is not a multiple of its size: an
+    /// alignment fault. On this flat memory every load and store asks for
+    /// its alignment, as QEMU does with the MMU off.
+    Alignment { pc: u64, address: u64 },
     /// `HVC` or `SMC` at EL1, at the address `pc`. The PC of the state is
     /// the instruction after it. The machine serves the call (PSCI on
     /// `virt`) and runs on, or refuses it with `Cpu::refuse_hypercall`.
@@ -121,12 +159,315 @@ enum Refused {
     Exception(Exception),
 }
 
+/// One access that the CPU made, for a harness that compares them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Access {
+    pub address: u64,
+    /// 1, 2, 4, 8 or 16.
+    pub bytes: u8,
+    /// The bytes, little-endian.
+    pub value: u128,
+    pub write: bool,
+}
+
+/// The mark that an exclusive load leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reservation {
+    address: u64,
+    /// The size of the load.
+    bytes: u8,
+    generation: u64,
+}
+
+/// Why an access did not complete.
+enum Fault {
+    /// The memory holds nothing there.
+    Memory,
+    /// The address is not a multiple of the size of an exclusive store.
+    Unaligned,
+    Host(String),
+}
+
+impl From<Error> for Fault {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Memory(_) => Self::Memory,
+            other => Self::Host(other.to_string()),
+        }
+    }
+}
+
+/// What a block needs beside the registers and the memory.
+struct Side {
+    exclusive: Option<Reservation>,
+    /// The value of the last exclusive load, with zeros above its size. A
+    /// load of 16 bytes leaves its lower half here and its upper half in
+    /// `exclusive_high`, which no other load changes.
+    exclusive_value: u64,
+    exclusive_high: u64,
+    /// The accesses since the caller last took them, when it asked for them.
+    log: Option<Vec<Access>>,
+    code_pages: Vec<u64>,
+    /// Stores of this CPU since the caches were last checked.
+    own_writes: u64,
+    /// One of them went into a page that holds translated code.
+    code_written: bool,
+}
+
+impl Side {
+    fn new() -> Self {
+        Self {
+            exclusive: None,
+            exclusive_value: 0,
+            exclusive_high: 0,
+            log: None,
+            code_pages: vec![0; CODE_PAGE_BITS / 64],
+            own_writes: 0,
+            code_written: false,
+        }
+    }
+
+    fn page_bit(address: u64) -> (usize, u64) {
+        let page = (address >> 12) as usize & (CODE_PAGE_BITS - 1);
+        (page / 64, 1 << (page % 64))
+    }
+
+    fn mark_code(&mut self, address: u64) {
+        let (word, bit) = Self::page_bit(address);
+        self.code_pages[word] |= bit;
+    }
+
+    fn is_code(&self, address: u64, bytes: u8) -> bool {
+        let (word, bit) = Self::page_bit(address);
+        let (last_word, last_bit) = Self::page_bit(address.wrapping_add(u64::from(bytes) - 1));
+        self.code_pages[word] & bit != 0 || self.code_pages[last_word] & last_bit != 0
+    }
+
+    fn wrote(&mut self, address: u64, bytes: u8, value: u128) {
+        self.own_writes += 1;
+        if self.is_code(address, bytes) {
+            self.code_written = true;
+        }
+        if let Some(log) = &mut self.log {
+            log.push(Access {
+                address,
+                bytes,
+                value,
+                write: true,
+            });
+        }
+    }
+
+    fn load<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        address: u64,
+        bytes: u8,
+        exclusive: bool,
+    ) -> Result<u128, Fault> {
+        let mut buffer = [0u8; 16];
+        let part = &mut buffer[..usize::from(bytes)];
+        if exclusive {
+            // A failed load leaves the monitor as it was.
+            let generation = memory.load_reserved(address, part)?;
+            let value = u128::from_le_bytes(buffer);
+            self.exclusive = Some(Reservation {
+                address,
+                bytes,
+                generation,
+            });
+            self.exclusive_value = value as u64;
+            if bytes == 16 {
+                self.exclusive_high = (value >> 64) as u64;
+            }
+        } else {
+            memory.read(address, part)?;
+        }
+        let value = u128::from_le_bytes(buffer);
+        if let Some(log) = &mut self.log {
+            log.push(Access {
+                address,
+                bytes,
+                value,
+                write: false,
+            });
+        }
+        Ok(value)
+    }
+
+    fn store<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        address: u64,
+        bytes: u8,
+        value: u128,
+    ) -> Result<(), Fault> {
+        let buffer = value.to_le_bytes();
+        let part = &buffer[..usize::from(bytes)];
+        match self.exclusive {
+            None => memory.write(address, part)?,
+            Some(reservation) => {
+                // The store moves the write generation of its granules, and
+                // those can be the reserved ones. A reservation that was
+                // intact takes the new generation. The lock keeps the store
+                // of another CPU from landing between the check and the new
+                // generation, where it would be taken for our own.
+                let lock = memory.transaction_lock();
+                let _atomic = lock.as_ref().map(|lock| lock.lock());
+                let len = usize::from(reservation.bytes);
+                let intact = memory.reservation_generation(reservation.address, len)
+                    == reservation.generation;
+                memory.write(address, part)?;
+                if intact {
+                    self.exclusive = Some(Reservation {
+                        generation: memory.reservation_generation(reservation.address, len),
+                        ..reservation
+                    });
+                }
+            }
+        }
+        self.wrote(address, bytes, value);
+        Ok(())
+    }
+
+    /// Whether the store wrote, and whether it reports success. The two are
+    /// the same thing unless the store is smaller than the value of its
+    /// load: QEMU then writes where the low bytes agree and reports failure
+    /// unless the whole value agrees, and so does this.
+    fn store_exclusive<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        address: u64,
+        bytes: u8,
+        value: u128,
+    ) -> Result<(bool, bool), Fault> {
+        // QEMU keeps "no mark" as the address 2^64 - 1, so for it a store
+        // there is at the marked address also without a mark, and is an
+        // access that can fault. The architecture leaves open whether an
+        // exclusive store that fails takes the fault of its access, so the
+        // same is done here. Such a store never writes.
+        let marked = self.exclusive.map_or(u64::MAX, |mark| mark.address);
+        if marked != address {
+            // Another address: no memory is looked at.
+            self.exclusive = None;
+            return Ok((false, false));
+        }
+        // From here the store is an access. One that faults leaves the
+        // mark, as its instruction did not complete.
+        if address & (u64::from(bytes) - 1) != 0 {
+            return Err(Fault::Unaligned);
+        }
+        let buffer = value.to_le_bytes();
+        let part = &buffer[..usize::from(bytes)];
+        let lock = memory.transaction_lock();
+        let _atomic = lock.as_ref().map(|lock| lock.lock());
+        let mut now = [0u8; 16];
+        memory.read(address, &mut now[..usize::from(bytes)])?;
+        let now = u128::from_le_bytes(now);
+        let Some(reservation) = self.exclusive.take() else {
+            return Ok((false, false));
+        };
+        let expected = u128::from(self.exclusive_value) | u128::from(self.exclusive_high) << 64;
+        // The memory holds the value, as far as the store reaches.
+        let same = now == expected & bits_mask(bytes);
+        // The memory holds the whole value: 64 bits, or 128 for a pair of
+        // 64-bit registers.
+        let whole = same && (bytes == 16 || now == u128::from(self.exclusive_value));
+        if !same {
+            return Ok((false, false));
+        }
+        let wrote = if bytes == reservation.bytes {
+            memory.store_conditional(address, part, reservation.generation)?
+        } else if memory.reservation_generation(reservation.address, usize::from(reservation.bytes))
+            == reservation.generation
+        {
+            // A store of another size than its load: the granules of the
+            // load are untouched, and the lock is held.
+            memory.write(address, part)?;
+            true
+        } else {
+            false
+        };
+        if wrote {
+            self.wrote(address, bytes, value);
+        }
+        Ok((wrote, wrote && whole))
+    }
+}
+
+/// A memory event, a guard or a helper call of a block, between its pure
+/// code.
+#[derive(Clone, Copy, Debug)]
+enum Effect {
+    Read {
+        address: u32,
+        result: u32,
+        bytes: u8,
+        exclusive: bool,
+        exit: u32,
+    },
+    Write {
+        address: u32,
+        value: u32,
+        bytes: u8,
+        /// The scratch slot of the result of an exclusive store.
+        exclusive: Option<u32>,
+        exit: u32,
+    },
+    Guard {
+        condition: u32,
+        expected: bool,
+        exit: u32,
+    },
+    /// The helper call of this index in `calls` (R10).
+    Call(u32),
+}
+
+/// Where a block can leave before its end.
+#[derive(Clone, Debug)]
+struct Leave {
+    /// Register slot, scratch slot: copied out when the block leaves here.
+    /// The PC is one of them.
+    outputs: Vec<(u32, u32)>,
+    /// The instructions of the block that are complete here.
+    completed: u32,
+    /// The scratch slot of the address of an alignment fault.
+    address: Option<u32>,
+}
+
+/// Why an effect did not complete.
+enum Failed {
+    /// The condition of a guard did not hold.
+    Guard,
+    /// A load or a store, with its address and whether it is a store.
+    Access(Fault, u64, bool),
+    /// A store into a page of translated code, in a block of more than one
+    /// instruction.
+    Retry,
+}
+
+/// Why a block left before its end.
+enum Halt {
+    Stop(Stop),
+    /// The CPU took an exception or an interrupt without an instruction of
+    /// the block. It costs one instruction of a budget, so that a guest
+    /// with a broken vector does not hold the loop for ever.
+    Taken,
+    /// A store into a page that holds translated code, in a block of more
+    /// than one instruction. Nothing of the instruction is lost: the loop
+    /// runs it alone and then drops the translated blocks.
+    Retry,
+}
+
 /// A block as the loop runs it.
 struct Compiled {
     pc: u64,
     context: Context,
     instructions: u32,
     code: Vec<Packed>,
+    /// Each effect with the count of `code` entries that run before it.
+    effects: Vec<(u32, Effect)>,
+    leaves: Vec<Leave>,
     /// The scratch slots. The constants are in place.
     values: Vec<u128>,
     /// The helper calls (R10), in the order in which they run.
@@ -143,10 +484,9 @@ struct Compiled {
 /// The most arguments of a helper.
 const CALL_ARGUMENTS: usize = 8;
 
-/// One helper call of a block.
+/// One helper call of a block. Its place among the pure code is that of its
+/// `Effect::Call`.
 struct Call {
-    /// It runs before the packed instruction of this index.
-    at: u32,
     function: HelperFn,
     /// The scratch slots of the arguments.
     args: Vec<u32>,
@@ -171,16 +511,28 @@ fn result_mask(graph: &Graph, id: ScalarId) -> u128 {
     }
 }
 
-/// Append the scalars of `order` to the block: constants and inputs are
-/// bound, a pure helper call becomes a `Call`, and the rest is packed.
+/// Put a helper call after the pure code that the block has so far.
+fn push_call(compiled: &mut Compiled, call: Call) -> Result<(), Stop> {
+    let index = narrow(compiled.calls.len())?;
+    compiled.calls.push(call);
+    compiled
+        .effects
+        .push((narrow(compiled.code.len())?, Effect::Call(index)));
+    Ok(())
+}
+
+/// Append the pure scalars that `roots` need and the block has not computed
+/// yet: constants and inputs are bound, a pure helper call becomes a `Call`,
+/// and the rest is packed.
 fn emit(
+    compiled: &mut Compiled,
     graph: &Graph,
     slots: &[usize],
-    slot_count: usize,
-    order: Vec<ScalarId>,
-    compiled: &mut Compiled,
+    seen: &mut [bool],
+    roots: &[ScalarId],
 ) -> Result<(), Stop> {
-    for id in order {
+    let slot_count = compiled.values.len();
+    for id in schedule::scalars(graph, roots, seen) {
         match &graph.scalars[id].operation {
             Operation::Constant(value) => compiled.values[slots[id]] = *value,
             Operation::Input(register) => {
@@ -190,20 +542,22 @@ fn emit(
             }
             // A view of another scalar shares its slot.
             Operation::Refine(_) => {}
-            Operation::Effect(_) => return Err(host("a memory effect has no executor yet")),
+            // The event of the effect writes its slot.
+            Operation::Effect(_) => {}
+            // A pure helper call runs at its place among the pure code.
             Operation::Call { helper, args } => {
                 if args.len() > CALL_ARGUMENTS {
                     return Err(host("a helper with too many arguments"));
                 }
-                compiled.calls.push(Call {
-                    at: narrow(compiled.code.len())?,
+                let call = Call {
                     function: helper.0.function,
                     args: args
                         .iter()
                         .map(|arg| narrow(slots[*arg]))
                         .collect::<Result<_, _>>()?,
                     results: vec![(narrow(slots[id])?, result_mask(graph, id))],
-                });
+                };
+                push_call(compiled, call)?;
             }
             _ => {
                 let mut instruction = linear::lower(graph, id)
@@ -211,8 +565,8 @@ fn emit(
                 instruction.remap(slots);
                 let mut packed = Packed::new(slots[id], instruction)
                     .ok_or_else(|| host("a scalar without a packed form"))?;
-                if let Operation::Binary(_, _, right) = graph.scalars[id].operation
-                    && let Some(value) = graph.literal(right)
+                if let Operation::Binary(_, _, right) = &graph.scalars[id].operation
+                    && let Some(value) = graph.literal(*right)
                     && let Some(immediate) = packed.with_immediate(value)
                 {
                     packed = immediate;
@@ -227,6 +581,21 @@ fn emit(
     Ok(())
 }
 
+fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
+    let mut roots: Vec<ScalarId> = exit
+        .writeback
+        .writes
+        .iter()
+        .map(|(_, scalar)| *scalar)
+        .collect();
+    match &exit.next {
+        A64Next::Pc(next) => roots.push(*next),
+        A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
+        A64Next::Trap { .. } => {}
+    }
+    roots
+}
+
 fn compile(
     pc: u64,
     context: Context,
@@ -235,14 +604,6 @@ fn compile(
 ) -> Result<Compiled, Stop> {
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
-    let Some((Event::Exit(exit), before)) = block.events.split_last() else {
-        return Err(host("an aarch64 block ends in its one exit"));
-    };
-    let exit = &block.exits[*exit];
-    let (next, terminal) = match exit.next {
-        A64Next::Pc(next) => (Some(next), None),
-        A64Next::Trap { pc, trap } => (None, Some((pc, trap))),
-    };
     let (slots, slot_count) = linear::slots(graph);
     let mut seen = vec![false; graph.scalars.len()];
     let mut compiled = Compiled {
@@ -250,142 +611,358 @@ fn compile(
         context,
         instructions,
         code: Vec::new(),
+        effects: Vec::new(),
+        leaves: Vec::new(),
         values: vec![0; slot_count],
         calls: Vec::new(),
         inputs: Vec::new(),
         outputs: Vec::new(),
-        terminal,
+        terminal: None,
     };
-    // The ordered helper calls, each after what its arguments need.
-    for event in before {
-        let Event::Call {
-            helper,
-            args,
-            results,
-        } = event
-        else {
-            return Err(host(
-                "an event of an aarch64 block that has no executor yet",
-            ));
+    // The exits that events leave through, by their number in the block.
+    let mut leave_of = vec![None; block.exits.len()];
+    let mut ended = false;
+    for event in &block.events {
+        if ended {
+            return Err(host("an event after the exit of a block"));
+        }
+        let (exit, mut roots) = match event {
+            Event::Guard {
+                condition, exit, ..
+            } => (*exit, vec![*condition]),
+            Event::ReadMemory { address, error, .. } => (*error, vec![*address]),
+            Event::WriteMemory {
+                address,
+                value,
+                error,
+                ..
+            } => (*error, vec![*address, *value]),
+            // An ordered helper call, after what its arguments need. It
+            // leaves through no exit.
+            Event::Call {
+                helper,
+                args,
+                results,
+            } => {
+                if !matches!(helper.0.function, HelperFn::Ordered(_))
+                    || args.len() > CALL_ARGUMENTS
+                    || results.len() > CALL_ARGUMENTS
+                {
+                    return Err(host("an ordered call of a helper that is not one"));
+                }
+                emit(&mut compiled, graph, &slots, &mut seen, args)?;
+                for result in results {
+                    seen[*result] = true;
+                }
+                let call = Call {
+                    function: helper.0.function,
+                    args: args
+                        .iter()
+                        .map(|arg| narrow(slots[*arg]))
+                        .collect::<Result<_, _>>()?,
+                    results: results
+                        .iter()
+                        .map(|result| Ok((narrow(slots[*result])?, result_mask(graph, *result))))
+                        .collect::<Result<_, Stop>>()?,
+                };
+                push_call(&mut compiled, call)?;
+                continue;
+            }
+            Event::Exit(exit) => (*exit, Vec::new()),
+            Event::Checkpoint(_) => return Err(host("an aarch64 block has no checkpoint")),
         };
-        if !matches!(helper.0.function, HelperFn::Ordered(_)) || args.len() > CALL_ARGUMENTS {
-            return Err(host("an ordered call of a helper that is not one"));
+        let payload = &block.exits[exit];
+        roots.extend(exit_roots(payload));
+        emit(&mut compiled, graph, &slots, &mut seen, &roots)?;
+        let mut outputs = Vec::new();
+        for (register, scalar) in &payload.writeback.writes {
+            outputs.push((narrow(*register)?, narrow(slots[*scalar])?));
         }
-        let order = schedule::scalars(graph, args, &mut seen);
-        emit(graph, &slots, slot_count, order, &mut compiled)?;
-        for result in results {
-            seen[*result] = true;
+        if let Event::Exit(_) = event {
+            match payload.next {
+                A64Next::Pc(next) => outputs.push((slot::PC as u32, narrow(slots[next])?)),
+                // The loop runs the last instruction, with the PC at it.
+                A64Next::Trap { pc, trap } => compiled.terminal = Some((pc, trap)),
+                A64Next::Exception { .. } => {
+                    return Err(host("a block that ends in the exit of an event"));
+                }
+            }
+            compiled.outputs = outputs;
+            ended = true;
+            continue;
         }
-        compiled.calls.push(Call {
-            at: narrow(compiled.code.len())?,
-            function: helper.0.function,
-            args: args
-                .iter()
-                .map(|arg| narrow(slots[*arg]))
-                .collect::<Result<_, _>>()?,
-            results: results
-                .iter()
-                .map(|result| Ok((narrow(slots[*result])?, result_mask(graph, *result))))
-                .collect::<Result<_, Stop>>()?,
-        });
-    }
-    let mut roots: Vec<_> = exit
-        .writeback
-        .writes
-        .iter()
-        .map(|(_, scalar)| *scalar)
-        .collect();
-    roots.extend(next);
-    let order = schedule::scalars(graph, &roots, &mut seen);
-    emit(graph, &slots, slot_count, order, &mut compiled)?;
-    for (register, scalar) in &exit.writeback.writes {
+        let leave = match leave_of[exit] {
+            Some(leave) => leave,
+            None => {
+                let A64Next::Exception { syndrome, .. } = &payload.next else {
+                    return Err(host("an event that leaves a block without an exception"));
+                };
+                let address = match syndrome.first() {
+                    Some(scalar) => Some(narrow(slots[*scalar])?),
+                    None => None,
+                };
+                let leave = narrow(compiled.leaves.len())?;
+                compiled.leaves.push(Leave {
+                    outputs,
+                    completed: payload.completed,
+                    address,
+                });
+                leave_of[exit] = Some(leave);
+                leave
+            }
+        };
+        let effect = match event {
+            Event::Guard {
+                condition,
+                expected,
+                ..
+            } => Effect::Guard {
+                condition: narrow(slots[*condition])?,
+                expected: *expected,
+                exit: leave,
+            },
+            Event::ReadMemory {
+                address,
+                bytes,
+                exclusive,
+                result,
+                ..
+            } => Effect::Read {
+                address: narrow(slots[*address])?,
+                result: narrow(slots[*result])?,
+                bytes: *bytes,
+                exclusive: *exclusive,
+                exit: leave,
+            },
+            Event::WriteMemory {
+                address,
+                value,
+                bytes,
+                exclusive,
+                result,
+                ..
+            } => Effect::Write {
+                address: narrow(slots[*address])?,
+                value: narrow(slots[*value])?,
+                bytes: *bytes,
+                exclusive: match (exclusive, result) {
+                    (false, _) => None,
+                    (true, Some(result)) => Some(narrow(slots[*result])?),
+                    (true, None) => {
+                        return Err(host("an exclusive store without a result"));
+                    }
+                },
+                exit: leave,
+            },
+            Event::Call { .. } | Event::Exit(_) | Event::Checkpoint(_) => continue,
+        };
         compiled
-            .outputs
-            .push((narrow(*register)?, narrow(slots[*scalar])?));
+            .effects
+            .push((narrow(compiled.code.len())?, effect));
     }
-    if let Some(next) = next {
-        compiled
-            .outputs
-            .push((slot::PC as u32, narrow(slots[next])?));
+    if !ended {
+        return Err(host("a block without an exit"));
     }
     Ok(compiled)
 }
 
-/// Run the packed instructions of a block that has helper calls, each call
-/// at its place.
-fn run_with_calls(
-    code: &[Packed],
-    calls: &[Call],
-    values: &mut [u128],
-    state: &mut State,
-) -> Result<(), Stop> {
-    let mut from = 0;
-    let ends = calls
-        .iter()
-        .map(|call| (call.at as usize, Some(call)))
-        .chain([(code.len(), None)]);
-    for (until, call) in ends {
-        for packed in &code[from..until] {
-            let Some(value) = packed.evaluate(values) else {
-                return Err(host("an arithmetic operation outside its domain"));
-            };
-            values[packed.output as usize] = value;
-        }
-        from = until;
-        let Some(call) = call else {
-            break;
-        };
-        let mut args = [0u128; CALL_ARGUMENTS];
-        for (arg, slot) in args.iter_mut().zip(&call.args) {
-            *arg = values[*slot as usize];
-        }
-        let args = &args[..call.args.len()];
-        match call.function {
-            HelperFn::Pure(function) => {
-                let (slot, mask) = call.results[0];
-                values[slot as usize] = function(args) & mask;
-            }
-            // An ordered helper sees the state as it was at the entry of the
-            // block for every register slot: the slots are written back at
-            // the exit. What it may touch is the state that is not in a slot.
-            HelperFn::Ordered(function) => {
-                let mut results = [0u128; CALL_ARGUMENTS];
-                let count = call.results.len().min(CALL_ARGUMENTS);
-                function(&mut *state, args, &mut results[..count]);
-                for ((slot, mask), result) in call.results.iter().zip(results) {
-                    values[*slot as usize] = result & mask;
-                }
-            }
-        }
+fn bits_mask(bytes: u8) -> u128 {
+    if bytes >= 16 {
+        u128::MAX
+    } else {
+        (1u128 << (u32::from(bytes) * 8)) - 1
     }
-    Ok(())
 }
 
 impl Compiled {
-    #[inline]
-    fn run(&mut self, state: &mut State) -> Result<(), Stop> {
-        let values = &mut self.values;
-        for (scratch, register) in &self.inputs {
-            values[*scratch as usize] = state.slots[*register as usize];
+    #[inline(always)]
+    fn pure(code: &[Packed], values: &mut [u128]) -> Result<(), Halt> {
+        for packed in code {
+            let Some(value) = packed.evaluate(values) else {
+                return Err(Halt::Stop(host(
+                    "an arithmetic operation outside its domain",
+                )));
+            };
+            values[packed.output as usize] = value;
         }
-        if self.calls.is_empty() {
-            for packed in &self.code {
-                let Some(value) = packed.evaluate(values) else {
-                    return Err(host("an arithmetic operation outside its domain"));
-                };
-                values[packed.output as usize] = value;
+        Ok(())
+    }
+
+    /// Leave through `exit`: the registers as they were before the
+    /// instruction that could not complete.
+    fn leave(&self, state: &mut State, exit: u32) -> &Leave {
+        let leave = &self.leaves[exit as usize];
+        for (register, scratch) in &leave.outputs {
+            state.slots[*register as usize] = self.values[*scratch as usize];
+        }
+        leave
+    }
+
+    /// Make one effect. The error: the exit to leave through, and why.
+    fn effect<M: Memory>(
+        &mut self,
+        effect: Effect,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+        single: bool,
+    ) -> Result<(), (u32, Failed)> {
+        let values = &mut self.values;
+        match effect {
+            Effect::Call(index) => {
+                let call = &self.calls[index as usize];
+                let mut args = [0u128; CALL_ARGUMENTS];
+                for (arg, slot) in args.iter_mut().zip(&call.args) {
+                    *arg = values[*slot as usize];
+                }
+                let args = &args[..call.args.len()];
+                match call.function {
+                    HelperFn::Pure(function) => {
+                        let (slot, mask) = call.results[0];
+                        values[slot as usize] = function(args) & mask;
+                    }
+                    // An ordered helper sees the state as it was at the
+                    // entry of the block for every register slot: the slots
+                    // are written back at the exit. What it may touch is
+                    // the state that is not in a slot.
+                    HelperFn::Ordered(function) => {
+                        let mut results = [0u128; CALL_ARGUMENTS];
+                        let count = call.results.len().min(CALL_ARGUMENTS);
+                        function(&mut *state, args, &mut results[..count]);
+                        for ((slot, mask), result) in call.results.iter().zip(results) {
+                            values[*slot as usize] = result & mask;
+                        }
+                    }
+                }
             }
+            Effect::Guard {
+                condition,
+                expected,
+                exit,
+            } => {
+                if (values[condition as usize] != 0) != expected {
+                    return Err((exit, Failed::Guard));
+                }
+            }
+            Effect::Read {
+                address,
+                result,
+                bytes,
+                exclusive,
+                exit,
+            } => {
+                let at = values[address as usize] as u64;
+                match side.load(memory, at, bytes, exclusive) {
+                    Ok(value) => values[result as usize] = value,
+                    Err(fault) => return Err((exit, Failed::Access(fault, at, false))),
+                }
+            }
+            Effect::Write {
+                address,
+                value,
+                bytes,
+                exclusive,
+                exit,
+            } => {
+                let at = values[address as usize] as u64;
+                let value = values[value as usize] & bits_mask(bytes);
+                if !single && side.is_code(at, bytes) {
+                    return Err((exit, Failed::Retry));
+                }
+                match exclusive {
+                    None => side
+                        .store(memory, at, bytes, value)
+                        .map_err(|fault| (exit, Failed::Access(fault, at, true)))?,
+                    Some(result) => {
+                        let (_, succeeded) = side
+                            .store_exclusive(memory, at, bytes, value)
+                            .map_err(|fault| (exit, Failed::Access(fault, at, true)))?;
+                        values[result as usize] = u128::from(!succeeded);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the effects of the block, each after the pure code before it.
+    /// `Ok`: the count of `code` entries that have run. `Err`: the block
+    /// left before its end.
+    #[inline(never)]
+    fn effects<M: Memory>(
+        &mut self,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+    ) -> Result<usize, (u32, Halt)> {
+        // A block of one instruction makes its stores also into a page of
+        // translated code, and the loop drops the blocks after it.
+        let single = self.instructions == 1;
+        let mut done = 0usize;
+        for index in 0..self.effects.len() {
+            let (before, effect) = self.effects[index];
+            let before = before as usize;
+            Self::pure(&self.code[done..before], &mut self.values).map_err(|halt| (0, halt))?;
+            done = before;
+            if let Err((exit, failed)) = self.effect(effect, state, memory, side, single) {
+                let leave = self.leave(state, exit);
+                let pc = state.pc();
+                let halt = match failed {
+                    Failed::Retry => Halt::Retry,
+                    // The guards of this card are alignment checks, and
+                    // their exit holds the address.
+                    Failed::Guard => Halt::Stop(Stop::Alignment {
+                        pc,
+                        address: leave
+                            .address
+                            .map_or(0, |slot| self.values[slot as usize] as u64),
+                    }),
+                    Failed::Access(Fault::Memory, address, write) => {
+                        Halt::Stop(Stop::DataAbort { pc, address, write })
+                    }
+                    Failed::Access(Fault::Unaligned, address, _) => {
+                        Halt::Stop(Stop::Alignment { pc, address })
+                    }
+                    Failed::Access(Fault::Host(message), ..) => Halt::Stop(Stop::Host(message)),
+                };
+                return Err((leave.completed, halt));
+            }
+        }
+        Ok(done)
+    }
+
+    /// Run the block. The count of instructions that completed, and why the
+    /// block left before its end when it did.
+    #[inline]
+    fn run<M: Memory>(
+        &mut self,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+    ) -> (u32, Option<Halt>) {
+        for (scratch, register) in &self.inputs {
+            self.values[*scratch as usize] = state.slots[*register as usize];
+        }
+        // A block without memory events is its pure code and nothing else.
+        let done = if self.effects.is_empty() {
+            0
         } else {
-            run_with_calls(&self.code, &self.calls, values, state)?;
+            match self.effects(state, memory, side) {
+                Ok(done) => done,
+                Err((completed, halt)) => return (completed, Some(halt)),
+            }
+        };
+        if let Err(halt) = Self::pure(&self.code[done..], &mut self.values) {
+            return (0, Some(halt));
         }
         for (register, scratch) in &self.outputs {
-            state.slots[*register as usize] = values[*scratch as usize];
+            state.slots[*register as usize] = self.values[*scratch as usize];
         }
         // The loop runs the last instruction with the PC at it.
         if let Some((pc, _)) = self.terminal {
             state.set_pc(pc);
         }
-        Ok(())
+        (self.instructions, None)
     }
 }
 
@@ -440,6 +1017,7 @@ pub struct Cpu<M> {
     singles: Cache,
     /// The write generation of the memory that the caches were filled under.
     generation: u64,
+    side: Side,
 }
 
 /// The most entries of `Cpu::unknown`. A guest that walks an encoding space
@@ -464,7 +1042,29 @@ impl<M: Memory> Cpu<M> {
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
+            side: Side::new(),
         }
+    }
+
+    /// Keep the loads and stores of the CPU from now on, or stop keeping
+    /// them. `take_accesses` empties the list.
+    pub fn log_accesses(&mut self, on: bool) {
+        self.side.log = on.then(Vec::new);
+    }
+
+    /// The loads and stores since the last call, in their order.
+    pub fn take_accesses(&mut self) -> Vec<Access> {
+        self.side
+            .log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// End the exclusive reservation of the CPU, as `CLREX` and an exception
+    /// return do.
+    pub fn clear_exclusive(&mut self) {
+        self.side.exclusive = None;
     }
 
     /// What the system registers read that is not in the state.
@@ -617,7 +1217,12 @@ impl<M: Memory> Cpu<M> {
             Trap::Eret if el0 => Err(Exception::Undefined),
             Trap::Eret => {
                 exception::exception_return(&mut self.state);
+                self.clear_exclusive();
                 return Ok(());
+            }
+            Trap::ClearExclusive => {
+                self.clear_exclusive();
+                Ok(())
             }
             Trap::Wfi if el0 && sctlr & sctlr::NTWI == 0 => Err(Exception::WaitTrap(false)),
             Trap::Wfi => {
@@ -704,7 +1309,10 @@ impl<M: Memory> Cpu<M> {
                     }));
                 }
                 // The block ends before the instruction.
-                Lifted::Unsupported => break,
+                Lifted::Unsupported => {
+                    builder.unbegin();
+                    break;
+                }
             }
             // A block stays inside one page, so that the page of its code
             // names it for a later invalidation.
@@ -713,7 +1321,14 @@ impl<M: Memory> Cpu<M> {
             }
         }
         self.translations += 1;
+        self.side.mark_code(pc);
         compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)
+    }
+
+    fn drop_blocks(&mut self) {
+        self.blocks.clear();
+        self.singles.clear();
+        self.side.code_pages.fill(0);
     }
 
     /// Drop every block when a write has reached the memory since the
@@ -723,9 +1338,31 @@ impl<M: Memory> Cpu<M> {
         let generation = self.memory.generation();
         if generation != self.generation {
             self.generation = generation;
-            self.blocks.clear();
-            self.singles.clear();
+            self.drop_blocks();
         }
+    }
+
+    /// Account for the stores of this CPU since the last check. They moved
+    /// the write generation of the memory. The blocks stay when no store
+    /// went into a page of translated code and the generation moved by our
+    /// stores alone. A memory whose generation does not count writes one by
+    /// one drops the blocks here, which is slow and correct.
+    ///
+    /// A write of another CPU to our code is seen here and at the start of
+    /// `run` and `step`, not between two blocks of one `run`. Card C8 closes
+    /// that with the code stamps.
+    fn settle(&mut self) {
+        if self.side.own_writes == 0 {
+            return;
+        }
+        let expected = self.generation.wrapping_add(self.side.own_writes);
+        let generation = self.memory.generation();
+        if self.side.code_written || generation != expected {
+            self.drop_blocks();
+        }
+        self.generation = generation;
+        self.side.own_writes = 0;
+        self.side.code_written = false;
     }
 
     /// Take what does not wait for an instruction: an interrupt whose line
@@ -744,13 +1381,13 @@ impl<M: Memory> Cpu<M> {
         false
     }
 
-    /// Run one block, or take what comes before it. The count of
-    /// instructions that it used of a budget, which is one for an exception
-    /// without an instruction, so that a guest with a broken vector does not
-    /// hold the loop for ever.
-    fn run_block(&mut self, single: bool) -> Result<u32, Stop> {
+    /// Run the block at the PC: one instruction when `single`, else a whole
+    /// block, with the last instruction that the loop runs itself. An
+    /// interrupt, the illegal state and a fetch that fails come before the
+    /// block. `Err`: no block could be made.
+    fn run_block(&mut self, single: bool) -> Result<(u32, Option<Halt>), Stop> {
         if (self.irq || self.fiq || self.state.il) && self.asynchronous() {
-            return Ok(1);
+            return Ok((0, Some(Halt::Taken)));
         }
         let pc = self.state.pc();
         let context = self.state.context;
@@ -768,7 +1405,7 @@ impl<M: Memory> Cpu<M> {
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
                     self.raise(exception, pc);
-                    return Ok(1);
+                    return Ok((0, Some(Halt::Taken)));
                 }
             };
             let cache = if single {
@@ -786,13 +1423,17 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        block.run(&mut self.state)?;
-        let (count, terminal) = (block.instructions, block.terminal);
-        self.instructions += u64::from(count);
-        if let Some((pc, trap)) = terminal {
-            self.trap(pc, trap)?;
+        let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+        let terminal = block.terminal;
+        Ok((count, self.finish(halt, terminal)))
+    }
+
+    /// Run the last instruction of a block that ran to its end.
+    fn finish(&mut self, halt: Option<Halt>, terminal: Option<(u64, Trap)>) -> Option<Halt> {
+        match (halt, terminal) {
+            (None, Some((pc, trap))) => self.trap(pc, trap).err().map(Halt::Stop),
+            (halt, _) => halt,
         }
-        Ok(count)
     }
 
     /// Run exactly one instruction, or take the interrupt or the exception
@@ -800,52 +1441,88 @@ impl<M: Memory> Cpu<M> {
     pub fn step(&mut self) -> Result<(), Stop> {
         self.taken = None;
         self.check_generation();
-        self.run_block(true).map(|_| ())
+        let result = self.run_block(true);
+        self.settle();
+        let (count, halt) = result?;
+        self.instructions += u64::from(count);
+        match halt {
+            None | Some(Halt::Taken) => Ok(()),
+            Some(Halt::Stop(stop)) => Err(stop),
+            Some(Halt::Retry) => Err(host("a block of one instruction asked to run alone")),
+        }
     }
 
     /// Run up to `budget` instructions and say why the loop stopped.
     pub fn run(&mut self, budget: u64) -> Stop {
         self.check_generation();
+        let stop = self.run_inner(budget);
+        self.settle();
+        stop
+    }
+
+    fn run_inner(&mut self, budget: u64) -> Stop {
         let mut left = budget;
         while left > 0 {
             let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
             // The common case: the block is translated and fits the budget.
-            if quiet
+            let outcome = if quiet
                 && let Some(block) = self.blocks.entries[Cache::index(pc)].as_mut()
                 && block.pc == pc
                 && block.context == context
                 && u64::from(block.instructions) <= left
             {
-                if let Err(stop) = block.run(&mut self.state) {
-                    return stop;
-                }
-                let count = u64::from(block.instructions);
+                let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
                 let terminal = block.terminal;
-                self.instructions += count;
-                left -= count;
-                if let Some((pc, trap)) = terminal
-                    && let Err(stop) = self.trap(pc, trap)
-                {
-                    return stop;
+                (count, self.finish(halt, terminal))
+            } else {
+                // A whole block where the budget allows one, else one
+                // instruction. A block that is not translated yet can be as
+                // long as `BLOCK_INSTRUCTIONS`.
+                let cached = self.blocks.entries[Cache::index(pc)]
+                    .as_ref()
+                    .filter(|block| block.pc == pc && block.context == context)
+                    .map(|block| u64::from(block.instructions));
+                let single = match cached {
+                    Some(length) => length > left,
+                    None => left < u64::from(BLOCK_INSTRUCTIONS),
+                };
+                match self.run_block(single) {
+                    Ok(outcome) => outcome,
+                    Err(stop) => return stop,
                 }
-                continue;
-            }
-            // A whole block where the budget allows one, else one
-            // instruction. A block that is not translated yet can be as long
-            // as `BLOCK_INSTRUCTIONS`.
-            let cached = self.blocks.entries[Cache::index(pc)]
-                .as_ref()
-                .filter(|block| block.pc == pc && block.context == context)
-                .map(|block| u64::from(block.instructions));
-            let single = match cached {
-                Some(length) => length > left,
-                None => left < u64::from(BLOCK_INSTRUCTIONS),
             };
-            match self.run_block(single) {
-                Ok(count) => left = left.saturating_sub(u64::from(count)),
-                Err(stop) => return stop,
+            let (count, halt) = outcome;
+            self.instructions += u64::from(count);
+            left = left.saturating_sub(u64::from(count));
+            match halt {
+                None => {}
+                Some(Halt::Taken) => left = left.saturating_sub(1),
+                Some(Halt::Stop(stop)) => return stop,
+                Some(Halt::Retry) => {
+                    // The store goes into a page of translated code. The
+                    // registers are those before its instruction: run it
+                    // alone, and then drop the blocks.
+                    if left == 0 {
+                        break;
+                    }
+                    match self.run_block(true) {
+                        Ok((count, halt)) => {
+                            self.instructions += u64::from(count);
+                            left = left.saturating_sub(u64::from(count));
+                            match halt {
+                                Some(Halt::Stop(stop)) => return stop,
+                                Some(Halt::Taken) => left = left.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        Err(stop) => return stop,
+                    }
+                }
+            }
+            if self.side.code_written {
+                self.settle();
             }
         }
         Stop::Budget
@@ -1458,6 +2135,7 @@ mod tests {
                 writes: vec![(slot::X0 + 2, first)],
             },
             next: A64Next::Pc(next),
+            completed: 1,
         });
         block.events.push(Event::Exit(exit));
         let context = State::reset(0).context;
@@ -1465,7 +2143,9 @@ mod tests {
         let mut state = State::reset(0x4000_0000);
         state.set_x(0, 5);
         state.set_x(1, 7);
-        compiled.run(&mut state).unwrap();
+        let mut memory = FlatMemory::new(0x4000_0000, vec![0; 16]);
+        let (count, halt) = compiled.run(&mut state, &mut memory, &mut Side::new());
+        assert!(count == 1 && halt.is_none());
         assert_eq!(state.x(2), 19);
         assert_eq!(state.pc(), 0x4000_0004);
         // Both calls ran: the masks were flipped twice.
@@ -1483,6 +2163,7 @@ mod tests {
         let exit = block.exit(A64Exit {
             writeback: Writeback::default(),
             next: A64Next::Pc(next),
+            completed: 1,
         });
         block.events.push(Event::Exit(exit));
         assert!(matches!(compile(0, context, 1, block), Err(Stop::Host(_))));

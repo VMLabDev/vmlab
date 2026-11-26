@@ -306,6 +306,34 @@ impl Leader {
         self.rsp.core()
     }
 
+    /// Whether the instruction records carry the vector registers.
+    pub fn has_vectors(&self) -> bool {
+        self.vectors
+    }
+
+    /// Run `words` on QEMU alone, from `address`, to set system state that
+    /// the gdbstub cannot write. A zero word after them ends the run at the
+    /// breakpoint on the exception vector. The words stay in QEMU's memory:
+    /// take the mirror of the RAM after this.
+    pub fn prelude(&mut self, address: u64, words: &[u32]) -> io::Result<()> {
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes.extend([0u8; 4]);
+        self.load(address, &bytes)?;
+        let mut core = self.core()?;
+        core.pc = address;
+        self.set_core(&core)?;
+        self.resume()?;
+        self.stop(false)?;
+        let stopped = self.core()?;
+        if stopped.pc != VECTOR {
+            return Err(other(format!(
+                "the prelude stopped at {:#x}, not at the exception vector",
+                stopped.pc
+            )));
+        }
+        Ok(())
+    }
+
     pub fn resume(&mut self) -> io::Result<()> {
         self.rsp.resume()?;
         self.running = true;
@@ -363,15 +391,36 @@ impl Leader {
         }
     }
 
-    /// Wait until QEMU has stopped, and drop the records that it wrote
-    /// until then. With `interrupt` it is asked to stop first. Without, it
+    /// Parse what `pending` holds whole, and keep the memory writes.
+    fn drain(&mut self, ahead: &mut Ahead) -> io::Result<()> {
+        while let Some((trace, len)) =
+            parse(&self.pending[self.parsed..], self.vectors).map_err(other)?
+        {
+            self.parsed += len;
+            match trace {
+                Trace::Instruction { .. } => ahead.instructions += 1,
+                Trace::Write {
+                    address,
+                    size,
+                    low,
+                    high,
+                } => ahead.writes.push((address, size, low, high)),
+                Trace::Discontinuity { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait until QEMU has stopped, and say what it did that nobody
+    /// followed. With `interrupt` it is asked to stop first. Without, it
     /// is expected to stop at the breakpoint on the exception vector.
     ///
     /// QEMU blocks when the FIFO is full, so the FIFO is drained while the
     /// stop reply is awaited.
-    pub fn stop(&mut self, interrupt: bool) -> io::Result<()> {
+    pub fn stop(&mut self, interrupt: bool) -> io::Result<Ahead> {
+        let mut ahead = Ahead::default();
         if !self.running {
-            return Ok(());
+            return Ok(ahead);
         }
         if interrupt {
             self.rsp.interrupt()?;
@@ -379,8 +428,7 @@ impl Leader {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             while self.fill()? {
-                self.pending.clear();
-                self.parsed = 0;
+                self.drain(&mut ahead)?;
             }
             if let Some(reply) = self.rsp.receive(Duration::from_millis(1))? {
                 if !reply.starts_with(b"T") && !reply.starts_with(b"S") {
@@ -396,12 +444,29 @@ impl Leader {
             }
         }
         // Every record is in the FIFO before the stop reply is sent.
-        while self.fill()? {}
+        while self.fill()? {
+            self.drain(&mut ahead)?;
+        }
+        self.drain(&mut ahead)?;
+        if self.parsed != self.pending.len() {
+            return Err(other("QEMU stopped in the middle of a record"));
+        }
         self.pending.clear();
         self.parsed = 0;
         self.running = false;
-        Ok(())
+        Ok(ahead)
     }
+}
+
+/// What QEMU did between the last record that the follower read and its
+/// stop: it runs ahead of the follower by what the FIFO holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ahead {
+    /// Instruction records that nobody followed.
+    pub instructions: u64,
+    /// The memory writes among them: address, size, and the value as two
+    /// halves.
+    pub writes: Vec<(u64, u32, u64, u64)>,
 }
 
 fn kill(mut child: Child) {

@@ -88,9 +88,12 @@ pub fn no_operands(_b: &mut Builder, _record: Record) -> Lifted {
 
 /// `CLREX`, `DSB`, `DMB` and `ISB`. The interpreter runs one instruction
 /// after the other and has no cache, so the barriers do nothing. `CLREX`
-/// clears the reservation of the exclusives, which card C3 brings.
-pub fn barrier(_b: &mut Builder, _record: Record, _f: &CRmSystemI) -> Lifted {
-    Lifted::Next
+/// ends the exclusive mark of the CPU, which the loop holds.
+pub fn barrier(b: &mut Builder, record: Record, _f: &CRmSystemI) -> Lifted {
+    match record {
+        Record::CLREX => trap(b, Trap::ClearExclusive),
+        _ => Lifted::Next,
+    }
 }
 
 /// `MRS`. NZCV, FPCR and FPSR are register slots and stay in the graph.
