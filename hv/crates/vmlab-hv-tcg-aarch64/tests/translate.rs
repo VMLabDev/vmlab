@@ -115,7 +115,7 @@ impl Machine {
         }
     }
 
-    fn to_el0(&mut self) {
+    fn enter_el0(&mut self) {
         assert!(self.cpu.state.set_cpsr(0x3c0));
     }
 }
@@ -233,7 +233,7 @@ fn each_fault_of_an_access_has_its_syndrome() {
             machine.map(VA, DATA | leaf | NO_EXECUTE);
             machine.cpu.state.set_x(0, VA + 0x40);
             if user {
-                machine.to_el0();
+                machine.enter_el0();
             }
             machine.cpu.step().unwrap();
             let expected = expected.map(|esr| {
@@ -345,7 +345,7 @@ fn execution_needs_the_permission_of_its_level() {
         machine.cpu.memory.write(DATA, &HVC.to_le_bytes()).unwrap();
         machine.cpu.state.set_x(0, VA);
         if user {
-            machine.to_el0();
+            machine.enter_el0();
         }
         machine.cpu.step().unwrap();
         machine.cpu.step().unwrap_or_default();
@@ -424,7 +424,7 @@ fn dc_zva_zeroes_its_block_and_faults_as_a_store() {
     let mut machine = Machine::new(&[asm::sys(op::DC_ZVA, 0), HVC]);
     machine.map(VA, DATA | AF | USER | NO_EXECUTE);
     machine.cpu.state.set_x(0, VA);
-    machine.to_el0();
+    machine.enter_el0();
     machine.cpu.step().unwrap();
     assert_eq!(
         machine.cpu.taken.map(|taken| taken.cause),
@@ -440,7 +440,7 @@ fn dc_zva_zeroes_its_block_and_faults_as_a_store() {
         0x6212_dc08
     );
     machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::DZE;
-    machine.to_el0();
+    machine.enter_el0();
     machine.cpu.state.set_pc(CODE);
     machine.cpu.step().unwrap();
     assert_eq!(machine.cpu.taken, None);
@@ -470,7 +470,7 @@ fn an_address_translation_instruction_fills_par() {
     assert_eq!(par, vec![0xff00_0000_0000_0b80 | DATA, 0x81f, 0x81f, 0x80f]);
     // At EL0 the instruction is undefined.
     let mut machine = Machine::new(&[asm::sys(op::AT_S1E1R, 0), HVC]);
-    machine.to_el0();
+    machine.enter_el0();
     machine.cpu.step().unwrap();
     assert_eq!(
         machine.cpu.taken.map(|taken| taken.cause),
@@ -551,7 +551,7 @@ fn a_changed_descriptor_holds_after_its_tlbi() {
     ] {
         let mut machine = Machine::new(&[word, HVC]);
         if user {
-            machine.to_el0();
+            machine.enter_el0();
         }
         machine.cpu.step().unwrap();
         assert_eq!(
@@ -572,7 +572,7 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
         // No translation and no fault: the caches hold nothing.
         assert_eq!(machine.cpu.taken, None);
         machine.cpu.state.set_pc(CODE);
-        machine.to_el0();
+        machine.enter_el0();
         machine.cpu.step().unwrap();
         assert_eq!(
             machine.cpu.taken.map(|taken| taken.cause),
@@ -584,7 +584,7 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
         );
         machine.cpu.state.system.regs[sysreg::reg::SCTLR_EL1] |= sysreg::sctlr::UCI;
         machine.cpu.state.set_pc(CODE);
-        machine.to_el0();
+        machine.enter_el0();
         machine.cpu.step().unwrap();
         assert_eq!(machine.cpu.taken, None);
     }
@@ -594,7 +594,7 @@ fn the_cache_operations_do_nothing_and_el0_runs_some_with_uci() {
         machine.cpu.step().unwrap();
         assert_eq!(machine.cpu.taken, None);
         machine.cpu.state.set_pc(CODE);
-        machine.to_el0();
+        machine.enter_el0();
         machine.cpu.step().unwrap();
         assert_eq!(
             machine.cpu.taken.map(|taken| taken.cause),
