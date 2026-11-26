@@ -240,8 +240,7 @@ impl Controls {
         };
         Half {
             upper,
-            // QEMU takes a size outside 16 to 39 as the nearest of the two.
-            tsz: ((fields & 0x3f) as u32).clamp(16, 39),
+            tsz: (fields & 0x3f) as u32,
             granule: self.supported(granule),
             disabled: fields & (1 << 7) != 0,
             table: self.ttbr[usize::from(upper)],
@@ -335,6 +334,11 @@ pub fn walk(
         });
     }
     let half = controls.half(va);
+    // A size of a half outside 16 to 39 names no address space of Armv8.0:
+    // QEMU translates nothing through such a half.
+    if !(16..=39).contains(&half.tsz) {
+        return Err(fault(FaultKind::Translation, 0));
+    }
     let input = 64 - half.tsz;
     // Every bit above the input size is the bit that selects the half.
     let above = va >> input;
