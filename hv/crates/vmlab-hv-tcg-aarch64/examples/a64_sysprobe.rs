@@ -200,6 +200,16 @@ fn mask_denied(name: &str) -> bool {
         || name.contains('/')
 }
 
+/// What a read of the register gives is no property of the CPU: the count
+/// of that moment, or what the probe itself left in an exception register.
+fn unstable(name: &str) -> Option<&'static str> {
+    match name {
+        "CNTPCT_EL0" | "CNTVCT_EL0" | "CNTP_TVAL_EL0" | "CNTV_TVAL_EL0" => Some("time"),
+        "SPSR_EL1" | "ELR_EL1" | "ESR_EL1" | "VBAR_EL1" => Some("probe"),
+        _ => None,
+    }
+}
+
 fn read(outcome: Outcome, register: usize) -> String {
     match outcome {
         Outcome::Ran(core) => format!("{:x}", core.x[register]),
@@ -300,24 +310,30 @@ fn main() -> Result<(), Failure> {
          # write of that value (or of zero where no read works) runs. u: the Undefined Instruction\n\
          # exception (ESR 0x02000000). t<esr>: another exception. fp: el1r with CPACR_EL1.FPEN\n\
          # set, where it differs. ones and zeros: the value read back after a write of all ones\n\
-         # and of zero at EL1. An encoding that is not listed is u in all four.\n\
+         # and of zero at EL1. An encoding that is not listed is u in all four. time: a\n\
+         # count, which is another one at every read. probe: an exception register that\n\
+         # the probe itself had written by then.\n\
          # Made by `just tcg-a64-sysprobe` (examples/a64_sysprobe.rs).\n",
     );
     for (index, encoding) in encodings.iter().enumerate() {
+        let name = name(*encoding);
+        let stable = |text: String| match (unstable(&name), text.as_str()) {
+            (Some(why), text) if text != "u" && !text.starts_with('t') => why.to_string(),
+            _ => text,
+        };
         let columns = [
-            read(el1_read[&index], 0),
+            stable(read(el1_read[&index], 0)),
             wrote(el1_write[&(2 * index + 1)]),
             read(el0_read[&index], 0),
             wrote(el0_write[&(2 * index + 1)]),
         ];
-        let fp = read(fp_read[&index], 0);
+        let fp = stable(read(fp_read[&index], 0));
         let fp_wrote = wrote(fp_write[&(2 * index + 1)]);
         if columns.iter().all(|column| column == "u") && fp == "u" && fp_wrote == "u" {
             continue;
         }
         let mut line = format!(
-            "{encoding:04x} {} el1r={} el1w={} el0r={} el0w={}",
-            name(*encoding),
+            "{encoding:04x} {name} el1r={} el1w={} el0r={} el0w={}",
             columns[0],
             columns[1],
             columns[2],

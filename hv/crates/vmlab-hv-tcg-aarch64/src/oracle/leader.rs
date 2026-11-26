@@ -217,6 +217,25 @@ impl Leader {
         Ok(())
     }
 
+    /// Reset the machine of QEMU, as its monitor command `system_reset`
+    /// does. QEMU stays stopped, at EL1 with SP_EL1, and every system
+    /// register has its reset value. The RAM keeps its content, but the
+    /// device tree at its start.
+    pub fn reset(&mut self) -> io::Result<()> {
+        if self.running {
+            return Err(other("QEMU must be stopped for a reset"));
+        }
+        self.rsp.monitor("system_reset")?;
+        let core = self.rsp.core()?;
+        if core.cpsr & 0xf != 5 {
+            return Err(other(format!(
+                "QEMU is at CPSR {:#x} after a reset, not at EL1 with SP_EL1",
+                core.cpsr
+            )));
+        }
+        Ok(())
+    }
+
     pub fn set_vectors(&mut self, vectors: &Vectors) -> io::Result<()> {
         self.rsp.set_vectors(vectors)
     }

@@ -1,0 +1,184 @@
+# What QEMU's cortex-a53 on virt answers to MRS and MSR of each register encoding after
+# its reset: el1r and el0r are the value read at EL1 and EL0, el1w and el0w whether a
+# write of that value (or of zero where no read works) runs. u: the Undefined Instruction
+# exception (ESR 0x02000000). t<esr>: another exception. fp: el1r with CPACR_EL1.FPEN
+# set, where it differs. ones and zeros: the value read back after a write of all ones
+# and of zero at EL1. An encoding that is not listed is u in all four. time: a
+# count, which is another one at every read. probe: an exception register that
+# the probe itself had written by then.
+# Made by `just tcg-a64-sysprobe` (examples/a64_sysprobe.rs).
+8002 OSDTRRX_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+8004 DBGBVR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8005 DBGBCR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8006 DBGWVR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=fffffffffffffffc zeros=0
+8007 DBGWCR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+800c DBGBVR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+800d DBGBCR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+800e DBGWVR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=fffffffffffffffc zeros=0
+800f DBGWCR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8010 MDCCINT_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+8012 MDSCR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8014 DBGBVR2_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8015 DBGBCR2_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8016 DBGWVR2_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=fffffffffffffffc zeros=0
+8017 DBGWCR2_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+801a OSDTRTX_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+801c DBGBVR3_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+801d DBGBCR3_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+801e DBGWVR3_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=fffffffffffffffc zeros=0
+801f DBGWCR3_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8024 DBGBVR4_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8025 DBGBCR4_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+802c DBGBVR5_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+802d DBGBCR5_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+8032 OSECCR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+8080 MDRAR_EL1 el1r=0 el1w=u el0r=u el0w=u
+8084 OSLAR_EL1 el1r=u el1w=ok el0r=u el0w=u
+808c OSLSR_EL1 el1r=a el1w=u el0r=u el0w=u
+809c OSDLR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=1 zeros=0
+83c6 DBGCLAIMSET_EL1 el1r=ff el1w=ok el0r=u el0w=u ones=ff zeros=ff
+83ce DBGCLAIMCLR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+9808 MDCCSR_EL0 el1r=0 el1w=u el0r=0 el0w=u
+9820 DBGDTR_EL0 el1r=0 el1w=ok el0r=0 el0w=ok
+9828 DBGDTRRX_EL0/DBGDTRTX_EL0 el1r=0 el1w=ok el0r=0 el0w=ok
+c000 MIDR_EL1 el1r=410fd034 el1w=u el0r=u el0w=u
+c005 MPIDR_EL1 el1r=80000000 el1w=u el0r=u el0w=u
+c006 REVIDR_EL1 el1r=100 el1w=u el0r=u el0w=u
+c008 ID_PFR0_EL1 el1r=131 el1w=u el0r=u el0w=u
+c009 ID_PFR1_EL1 el1r=10001 el1w=u el0r=u el0w=u
+c00a ID_DFR0_EL1 el1r=3000006 el1w=u el0r=u el0w=u
+c00b ID_AFR0_EL1 el1r=0 el1w=u el0r=u el0w=u
+c00c ID_MMFR0_EL1 el1r=10101105 el1w=u el0r=u el0w=u
+c00d ID_MMFR1_EL1 el1r=40000000 el1w=u el0r=u el0w=u
+c00e ID_MMFR2_EL1 el1r=1260000 el1w=u el0r=u el0w=u
+c00f ID_MMFR3_EL1 el1r=2102211 el1w=u el0r=u el0w=u
+c010 ID_ISAR0_EL1 el1r=2101110 el1w=u el0r=u el0w=u
+c011 ID_ISAR1_EL1 el1r=13112111 el1w=u el0r=u el0w=u
+c012 ID_ISAR2_EL1 el1r=21232042 el1w=u el0r=u el0w=u
+c013 ID_ISAR3_EL1 el1r=1112131 el1w=u el0r=u el0w=u
+c014 ID_ISAR4_EL1 el1r=11142 el1w=u el0r=u el0w=u
+c015 ID_ISAR5_EL1 el1r=11121 el1w=u el0r=u el0w=u
+c016 ID_MMFR4_EL1 el1r=0 el1w=u el0r=u el0w=u
+c017 ID_ISAR6_EL1 el1r=0 el1w=u el0r=u el0w=u
+c018 MVFR0_EL1 el1r=10110222 el1w=u el0r=u el0w=u
+c019 MVFR1_EL1 el1r=12111111 el1w=u el0r=u el0w=u
+c01a MVFR2_EL1 el1r=43 el1w=u el0r=u el0w=u
+c01b S3_0_C0_C3_3 el1r=0 el1w=u el0r=u el0w=u
+c01c ID_PFR2_EL1 el1r=0 el1w=u el0r=u el0w=u
+c01d ID_DFR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c01e ID_MMFR5_EL1 el1r=0 el1w=u el0r=u el0w=u
+c01f S3_0_C0_C3_7 el1r=0 el1w=u el0r=u el0w=u
+c020 ID_AA64PFR0_EL1 el1r=22 el1w=u el0r=u el0w=u
+c021 ID_AA64PFR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c022 ID_AA64PFR2_EL1 el1r=0 el1w=u el0r=u el0w=u
+c023 S3_0_C0_C4_3 el1r=0 el1w=u el0r=u el0w=u
+c024 ID_AA64ZFR0_EL1 el1r=0 el1w=u el0r=u el0w=u
+c025 ID_AA64SMFR0_EL1 el1r=0 el1w=u el0r=u el0w=u
+c026 S3_0_C0_C4_6 el1r=0 el1w=u el0r=u el0w=u
+c027 ID_AA64FPFR0_EL1 el1r=0 el1w=u el0r=u el0w=u
+c028 ID_AA64DFR0_EL1 el1r=10305106 el1w=u el0r=u el0w=u
+c029 ID_AA64DFR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c02a ID_AA64DFR2_EL1 el1r=0 el1w=u el0r=u el0w=u
+c02b S3_0_C0_C5_3 el1r=0 el1w=u el0r=u el0w=u
+c02c ID_AA64AFR0_EL1 el1r=0 el1w=u el0r=u el0w=u
+c02d ID_AA64AFR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c02e S3_0_C0_C5_6 el1r=0 el1w=u el0r=u el0w=u
+c02f S3_0_C0_C5_7 el1r=0 el1w=u el0r=u el0w=u
+c030 ID_AA64ISAR0_EL1 el1r=11120 el1w=u el0r=u el0w=u
+c031 ID_AA64ISAR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c032 ID_AA64ISAR2_EL1 el1r=0 el1w=u el0r=u el0w=u
+c033 ID_AA64ISAR3_EL1 el1r=0 el1w=u el0r=u el0w=u
+c034 S3_0_C0_C6_4 el1r=0 el1w=u el0r=u el0w=u
+c035 S3_0_C0_C6_5 el1r=0 el1w=u el0r=u el0w=u
+c036 S3_0_C0_C6_6 el1r=0 el1w=u el0r=u el0w=u
+c037 S3_0_C0_C6_7 el1r=0 el1w=u el0r=u el0w=u
+c038 ID_AA64MMFR0_EL1 el1r=1122 el1w=u el0r=u el0w=u
+c039 ID_AA64MMFR1_EL1 el1r=0 el1w=u el0r=u el0w=u
+c03a ID_AA64MMFR2_EL1 el1r=0 el1w=u el0r=u el0w=u
+c03b ID_AA64MMFR3_EL1 el1r=0 el1w=u el0r=u el0w=u
+c03c ID_AA64MMFR4_EL1 el1r=0 el1w=u el0r=u el0w=u
+c03d S3_0_C0_C7_5 el1r=0 el1w=u el0r=u el0w=u
+c03e S3_0_C0_C7_6 el1r=0 el1w=u el0r=u el0w=u
+c03f S3_0_C0_C7_7 el1r=0 el1w=u el0r=u el0w=u
+c080 SCTLR_EL1 el1r=c50838 el1w=ok el0r=u el0w=u ones=f3fff01ffffffffe zeros=0
+c081 ACTLR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+c082 CPACR_EL1 el1r=0 el1w=ok el0r=u el0w=u fp=300000 fpw=ok ones=ffffffffffffffff zeros=0
+c100 TTBR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c101 TTBR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c102 TCR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c200 SPSR_EL1 el1r=probe el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c201 ELR_EL1 el1r=probe el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c208 SP_EL0 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c210 SPSel el1r=1 el1w=ok el0r=u el0w=u ones=1 zeros=0
+c212 CurrentEL el1r=4 el1w=u el0r=u el0w=u
+c288 AFSR0_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+c289 AFSR1_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+c290 ESR_EL1 el1r=probe el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c300 FAR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c3a0 PAR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c4f1 PMINTENSET_EL1 el1r=0 el1w=ok el0r=u el0w=u
+c4f2 PMINTENCLR_EL1 el1r=0 el1w=ok el0r=u el0w=u
+c510 MAIR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c518 AMAIR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=0 zeros=0
+c600 VBAR_EL1 el1r=probe el1w=ok el0r=u el0w=u ones=ffffffffffffffe0 zeros=0
+c601 RVBAR_EL1 el1r=0 el1w=u el0r=u el0w=u
+c602 RMR_EL1 el1r=1 el1w=ok el0r=u el0w=u
+c608 ISR_EL1 el1r=0 el1w=u el0r=u el0w=u
+c681 CONTEXTIDR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c684 TPIDR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c708 CNTKCTL_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=ffffffffffffffff zeros=0
+c800 CCSIDR_EL1 el1r=700fe01a el1w=u el0r=u el0w=u
+c801 CLIDR_EL1 el1r=a200023 el1w=u el0r=u el0w=u
+c807 AIDR_EL1 el1r=0 el1w=u el0r=u el0w=u
+cd82 S3_1_C11_C0_2 el1r=0 el1w=ok el0r=u el0w=u
+cd83 S3_1_C11_C0_3 el1r=0 el1w=ok el0r=u el0w=u
+cf80 S3_1_C15_C0_0 el1r=0 el1w=ok el0r=u el0w=u
+cf90 S3_1_C15_C2_0 el1r=0 el1w=ok el0r=u el0w=u
+cf91 S3_1_C15_C2_1 el1r=0 el1w=ok el0r=u el0w=u
+cf92 S3_1_C15_C2_2 el1r=0 el1w=ok el0r=u el0w=u
+cf93 S3_1_C15_C2_3 el1r=0 el1w=ok el0r=u el0w=u
+cf98 S3_1_C15_C3_0 el1r=8000000 el1w=u el0r=u el0w=u
+d000 CSSELR_EL1 el1r=0 el1w=ok el0r=u el0w=u ones=f zeros=0
+d801 CTR_EL0 el1r=84448004 el1w=u el0r=t6232c001 el0w=u
+d807 DCZID_EL0 el1r=4 el1w=u el0r=14 el0w=u
+da10 NZCV el1r=0 el1w=ok el0r=0 el0w=ok ones=f0000000 zeros=0
+da11 DAIF el1r=3c0 el1w=ok el0r=t6232d005 el0w=t6232d004 ones=3c0 zeros=0
+da20 FPCR el1r=t1fe00000 el1w=t1fe00000 el0r=t1fe00000 el0w=t1fe00000 fp=0 fpw=ok ones=7f70000 zeros=0
+da21 FPSR el1r=t1fe00000 el1w=t1fe00000 el0r=t1fe00000 el0w=t1fe00000 fp=0 fpw=ok ones=f800009f zeros=0
+dce0 PMCR_EL0 el1r=41033000 el1w=ok el0r=t6230e419 el0w=t6230e418
+dce1 PMCNTENSET_EL0 el1r=0 el1w=ok el0r=t6232e419 el0w=t6232e418
+dce2 PMCNTENCLR_EL0 el1r=0 el1w=ok el0r=t6234e419 el0w=t6234e418
+dce3 PMOVSCLR_EL0 el1r=0 el1w=ok el0r=t6236e419 el0w=t6236e418
+dce4 PMSWINC_EL0 el1r=u el1w=ok el0r=u el0w=t6238e418
+dce5 PMSELR_EL0 el1r=0 el1w=ok el0r=t623ae419 el0w=t623ae418
+dce6 PMCEID0_EL0 el1r=20001 el1w=u el0r=t623ce419 el0w=u
+dce7 PMCEID1_EL0 el1r=0 el1w=u el0r=t623ee419 el0w=u
+dce8 PMCCNTR_EL0 el1r=0 el1w=ok el0r=t6230e41b el0w=t6230e41a
+dce9 PMXEVTYPER_EL0 el1r=0 el1w=ok el0r=t6232e41b el0w=t6232e41a
+dcea PMXEVCNTR_EL0 el1r=0 el1w=ok el0r=t6234e41b el0w=t6234e41a
+dcf0 PMUSERENR_EL0 el1r=0 el1w=ok el0r=0 el0w=u
+dcf3 PMOVSSET_EL0 el1r=0 el1w=ok el0r=t6236e41d el0w=t6236e41c
+de82 TPIDR_EL0 el1r=0 el1w=ok el0r=0 el0w=ok ones=ffffffffffffffff zeros=0
+de83 TPIDRRO_EL0 el1r=0 el1w=ok el0r=0 el0w=u ones=ffffffffffffffff zeros=0
+df00 CNTFRQ_EL0 el1r=3b9aca0 el1w=ok el0r=t6230f801 el0w=u ones=ffffffffffffffff zeros=0
+df01 CNTPCT_EL0 el1r=time el1w=u el0r=t6232f801 el0w=u
+df02 CNTVCT_EL0 el1r=time el1w=u el0r=t6234f801 el0w=u
+df10 CNTP_TVAL_EL0 el1r=time el1w=ok el0r=t6230f805 el0w=t6230f804
+df11 CNTP_CTL_EL0 el1r=0 el1w=ok el0r=t6232f805 el0w=t6232f804 ones=7 zeros=0
+df12 CNTP_CVAL_EL0 el1r=0 el1w=ok el0r=t6234f805 el0w=t6234f804 ones=ffffffffffffffff zeros=0
+df18 CNTV_TVAL_EL0 el1r=time el1w=ok el0r=t6230f807 el0w=t6230f806
+df19 CNTV_CTL_EL0 el1r=0 el1w=ok el0r=t6232f807 el0w=t6232f806 ones=7 zeros=0
+df1a CNTV_CVAL_EL0 el1r=0 el1w=ok el0r=t6234f807 el0w=t6234f806 ones=ffffffffffffffff zeros=0
+df40 PMEVCNTR0_EL0 el1r=0 el1w=ok el0r=t6230f811 el0w=t6230f810
+df41 PMEVCNTR1_EL0 el1r=0 el1w=ok el0r=t6232f811 el0w=t6232f810
+df42 PMEVCNTR2_EL0 el1r=0 el1w=ok el0r=t6234f811 el0w=t6234f810
+df43 PMEVCNTR3_EL0 el1r=0 el1w=ok el0r=t6236f811 el0w=t6236f810
+df44 PMEVCNTR4_EL0 el1r=0 el1w=ok el0r=t6238f811 el0w=t6238f810
+df45 PMEVCNTR5_EL0 el1r=0 el1w=ok el0r=t623af811 el0w=t623af810
+df60 PMEVTYPER0_EL0 el1r=0 el1w=ok el0r=t6230f819 el0w=t6230f818
+df61 PMEVTYPER1_EL0 el1r=0 el1w=ok el0r=t6232f819 el0w=t6232f818
+df62 PMEVTYPER2_EL0 el1r=0 el1w=ok el0r=t6234f819 el0w=t6234f818
+df63 PMEVTYPER3_EL0 el1r=0 el1w=ok el0r=t6236f819 el0w=t6236f818
+df64 PMEVTYPER4_EL0 el1r=0 el1w=ok el0r=t6238f819 el0w=t6238f818
+df65 PMEVTYPER5_EL0 el1r=0 el1w=ok el0r=t623af819 el0w=t623af818
+df7f PMCCFILTR_EL0 el1r=0 el1w=ok el0r=t623ef81f el0w=t623ef81e

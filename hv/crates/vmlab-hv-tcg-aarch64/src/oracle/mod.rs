@@ -17,9 +17,11 @@ pub mod follow;
 pub mod leader;
 pub mod rsp;
 pub mod stream;
+pub mod system;
 pub mod testfloat;
 
-use crate::state::State;
+use crate::state::{State, slot};
+use crate::sysreg;
 
 /// CPSR of the state that every round starts from, without the flags: EL1
 /// with SP_EL1, and D, A, I and F set. QEMU's `virt` resets to it.
@@ -48,19 +50,25 @@ impl Core {
         }
     }
 
-    /// Our state with these registers. The level, the stack pointer choice
-    /// and the interrupt masks must be those of `CPSR_EL1H`.
+    /// Our state after a reset as the CPU of the lockstep, with these
+    /// registers. `None`: CPSR names no state of the CPU (AArch32, EL2 or
+    /// EL3, a reserved mode).
     pub fn state(&self) -> Option<State> {
-        if self.cpsr & 0x0fff_ffff != CPSR_EL1H {
-            return None;
+        let mut state = State::reset_as(self.pc, &sysreg::QEMU_CORTEX_A53);
+        self.apply(&mut state).then_some(state)
+    }
+
+    /// Put these registers into `state`. `false`: CPSR names no state.
+    pub fn apply(&self, state: &mut State) -> bool {
+        if !state.set_cpsr(self.cpsr) {
+            return false;
         }
-        let mut state = State::reset(self.pc);
         for (n, value) in self.x.iter().enumerate() {
             state.set_x(n, *value);
         }
         state.set_sp(self.sp);
-        state.set_nzcv((self.cpsr >> 28) as u8);
-        Some(state)
+        state.set_pc(self.pc);
+        true
     }
 
     /// The names of the registers that differ, with both values.
@@ -156,6 +164,100 @@ impl std::fmt::Display for Vectors {
         }
         Ok(())
     }
+}
+
+/// A system register that the lockstep compares before every instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compared {
+    /// The name of QEMU's plugin API.
+    pub qemu: &'static str,
+    /// The row of our table, or `None` for SP_EL1, which is a register slot.
+    pub row: Option<usize>,
+}
+
+/// The system registers that a system round compares: every stored row
+/// that a write changes, the registers of an exception, the timers, and the
+/// stack pointer that is not in use.
+pub fn compared() -> Vec<Compared> {
+    let mut list = Vec::new();
+    for (at, row) in sysreg::ROWS.iter().enumerate() {
+        let stored = row.kind == sysreg::Kind::Stored
+            && row.el1 == sysreg::Rw::Rw
+            && row.mask != 0
+            && !row.name.starts_with("DBGDTR");
+        let special = matches!(
+            row.kind,
+            sysreg::Kind::Special(
+                sysreg::Special::TimerCompare(_)
+                    | sysreg::Special::TimerControl(_)
+                    | sysreg::Special::SpEl0
+            )
+        );
+        if stored || special || row.name == "OSLSR_EL1" {
+            let qemu = match row.name {
+                "CSSELR_EL1" => "CSSELR",
+                name => name,
+            };
+            list.push(Compared {
+                qemu,
+                row: Some(at),
+            });
+        }
+    }
+    list.push(Compared {
+        qemu: "SP_EL1",
+        row: None,
+    });
+    list
+}
+
+/// Our values of the compared registers.
+pub fn system_of(state: &State, compared: &[Compared]) -> Vec<u64> {
+    compared
+        .iter()
+        .map(|register| match register.row {
+            Some(row) => sysreg::peek(state, row),
+            None => state.slots[slot::SP_EL1] as u64,
+        })
+        .collect()
+}
+
+/// Put values of the compared registers into our state.
+pub fn apply_system(state: &mut State, compared: &[Compared], values: &[u64]) {
+    for (register, value) in compared.iter().zip(values) {
+        match register.row {
+            Some(row) => sysreg::poke(state, row, *value),
+            None => state.slots[slot::SP_EL1] = (*value).into(),
+        }
+    }
+    state.refresh();
+}
+
+/// Bring QEMU's values of the compared registers into the form of ours.
+/// QEMU keeps the stack pointer that is in use in its register 31, and its
+/// SP_EL0 or SP_EL1 is then the value of the last switch: it becomes `sp`.
+/// A timer control register of QEMU carries the last ISTATUS, which we
+/// compute at a read: only ENABLE and IMASK are compared.
+pub fn normalise(values: &mut [u64], compared: &[Compared], core: &Core) {
+    let el1_sp = core.cpsr & 1 != 0;
+    for (register, value) in compared.iter().zip(values) {
+        match register.qemu {
+            "SP_EL1" if el1_sp => *value = core.sp,
+            "SP_EL0" if !el1_sp => *value = core.sp,
+            "CNTV_CTL_EL0" | "CNTP_CTL_EL0" => *value &= 3,
+            _ => {}
+        }
+    }
+}
+
+/// The compared registers that differ, as `name: ours / qemu`.
+pub fn system_difference(compared: &[Compared], ours: &[u64], qemu: &[u64]) -> Vec<String> {
+    compared
+        .iter()
+        .zip(ours.iter().zip(qemu))
+        .filter(|(_, (ours, qemu))| ours != qemu)
+        .map(|(register, (ours, qemu))| format!("{}: {ours:#x} / {qemu:#x}", register.qemu))
+        .collect()
 }
 
 /// One record of the plugin stream. Nearly every record is an instruction,
@@ -393,6 +495,58 @@ mod tests {
     }
 
     #[test]
+    fn the_compared_registers_go_to_a_state_and_back() {
+        let compared = compared();
+        let names: Vec<&str> = compared.iter().map(|register| register.qemu).collect();
+        for name in [
+            "ESR_EL1", "FAR_EL1", "ELR_EL1", "SPSR_EL1", "VBAR_EL1", "SCTLR_EL1", "CPACR_EL1",
+            "CSSELR", "CNTV_CTL_EL0", "CNTP_CVAL_EL0", "SP_EL0", "SP_EL1", "OSLSR_EL1",
+            "TPIDR_EL0", "DBGWCR3_EL1",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+        // No ID register, and nothing that a write does not change.
+        assert!(!names.contains(&"MIDR_EL1") && !names.contains(&"ACTLR_EL1"));
+        assert!(names.len() < 96, "the plugin takes 96 registers");
+        let mut state = State::reset(0);
+        let values: Vec<u64> = (0..compared.len() as u64).map(|n| 0x1000 + n * 4).collect();
+        apply_system(&mut state, &compared, &values);
+        let mut back = system_of(&state, &compared);
+        // The control of a timer keeps its two bits.
+        for (register, (back, value)) in compared.iter().zip(back.iter_mut().zip(&values)) {
+            if register.qemu.contains("_CTL_") {
+                assert_eq!(*back, value & 3);
+                *back = *value;
+            }
+        }
+        assert_eq!(back, values);
+        // QEMU's copy of the stack pointer in use is stale: `sp` replaces it.
+        let core = Core {
+            x: [0; 31],
+            sp: 0x7777,
+            pc: 0,
+            cpsr: 0x3c5,
+        };
+        let mut qemu = values.clone();
+        normalise(&mut qemu, &compared, &core);
+        let at = |name: &str| names.iter().position(|other| *other == name).unwrap();
+        assert_eq!(qemu[at("SP_EL1")], 0x7777);
+        assert_eq!(qemu[at("SP_EL0")], values[at("SP_EL0")]);
+        assert_eq!(qemu[at("CNTV_CTL_EL0")], values[at("CNTV_CTL_EL0")] & 3);
+        let user = Core { cpsr: 0x3c0, ..core };
+        let mut qemu = values.clone();
+        normalise(&mut qemu, &compared, &user);
+        assert_eq!(qemu[at("SP_EL0")], 0x7777);
+        assert_eq!(qemu[at("SP_EL1")], values[at("SP_EL1")]);
+        let mut other = values.clone();
+        other[at("ESR_EL1")] = 1;
+        assert_eq!(
+            system_difference(&compared, &values, &other),
+            vec![format!("ESR_EL1: {:#x} / 0x1", values[at("ESR_EL1")])]
+        );
+    }
+
+    #[test]
     fn a_core_goes_to_a_state_and_back() {
         let mut core = Core {
             x: [0; 31],
@@ -404,9 +558,14 @@ mod tests {
         let state = core.state().unwrap();
         assert_eq!(Core::of(&state), core);
         assert_eq!(state.nzcv(), 0b1001);
-        // Another level is not a state that the harness can start from.
+        // EL0 has its own stack pointer, and EL2 is no state of the CPU.
         core.cpsr = 0x3c0;
+        let state = core.state().unwrap();
+        assert_eq!(Core::of(&state), core);
+        assert_eq!(state.slots[slot::SP_EL0], 0x8000);
+        core.cpsr = 0x3c9;
         assert!(core.state().is_none());
+        core.cpsr = 0x3c0;
         let other = Core { pc: 0, ..core };
         assert_eq!(
             core.difference(&other),

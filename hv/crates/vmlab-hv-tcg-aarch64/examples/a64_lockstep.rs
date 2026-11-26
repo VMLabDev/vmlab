@@ -14,6 +14,12 @@
 //! template boots (`measure/a64trace.c` of the design card). The first
 //! difference stops the run with exit code 1.
 //!
+//! The group `system` (card C6) runs streams of system instructions with a
+//! vector table: both sides take the exceptions, change the level and
+//! return. Each of its rounds starts from a reset of both sides, and also
+//! compares the system registers of `oracle::compared` before every
+//! instruction, among them ESR_EL1, FAR_EL1, ELR_EL1 and SPSR_EL1.
+//!
 //! The group `fp` (card C4) also loads and compares V0 to V31, FPSR and
 //! FPCR. Its rounds are short, because FPSR only collects: after a few
 //! instructions most of its bits are set, and an instruction that sets one
@@ -28,9 +34,11 @@ use vmlab_hv_tcg_aarch64::lift::{
 };
 use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
-use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, RAM_BASE};
+use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, Options, RAM_BASE};
 use vmlab_hv_tcg_aarch64::oracle::stream::{Generator, Rng, executed_encodings, records_of};
-use vmlab_hv_tcg_aarch64::oracle::{CPSR_EL1H, Core};
+use vmlab_hv_tcg_aarch64::oracle::system::{STREAM_FORMATS, TABLE_BYTES, vector_table};
+use vmlab_hv_tcg_aarch64::oracle::{CPSR_EL1H, Compared, Core, asm, compared};
+use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, FormatClass, Record, State, decode};
 
 type Failure = Box<dyn std::error::Error>;
@@ -43,6 +51,10 @@ const IMAGE_BASE: u64 = RAM_BASE + 32 * 1024 * 1024;
 const IMAGE_WORDS: usize = 1024;
 /// The same for a group that compares FPSR.
 const FP_IMAGE_WORDS: usize = 12;
+/// Instructions in the stream of a system round, and the most that a round
+/// follows: the handlers run many more than the stream holds.
+const SYSTEM_IMAGE_WORDS: usize = 400;
+const SYSTEM_BUDGET: u64 = 3000;
 /// Corpus entries kept per record.
 const SAMPLES: usize = 3;
 
@@ -53,10 +65,11 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "c1" => [IMMEDIATE_FORMATS.as_slice(), BRANCH_FORMATS.as_slice()].concat(),
         "dp-register" | "c2" => REGISTER_FORMATS.to_vec(),
         "fp" => FP_FORMATS.to_vec(),
+        "system" | "c6" => STREAM_FORMATS.to_vec(),
         "all" => LIFTED_FORMATS.to_vec(),
         other => {
             return Err(format!(
-                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all"
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, system, c6, all"
             )
             .into());
         }
@@ -70,11 +83,27 @@ struct Counts {
     /// The distinct encodings among the verified instructions.
     distinct: BTreeMap<Record, std::collections::HashSet<u32>>,
     ends: BTreeMap<String, u64>,
-    samples: BTreeMap<Record, Vec<Entry>>,
+    /// By the record, and for `MRS` and `MSR` of a register with a row by
+    /// the register too.
+    samples: BTreeMap<(Record, u16), Vec<Entry>>,
+    /// Instructions that were verified and cannot be replayed without QEMU:
+    /// counter reads and host calls.
+    led: u64,
+}
+
+/// The key of the samples of an instruction, and how many are kept.
+fn sample_key(record: Record, encoding: u32) -> ((Record, u16), usize) {
+    if matches!(record, Record::MRS | Record::MSR) {
+        let register = (encoding >> 5) as u16;
+        if sysreg::find(register).is_some() {
+            return ((record, register), 1);
+        }
+    }
+    ((record, 0), SAMPLES)
 }
 
 impl Counts {
-    fn add(&mut self, rng: &mut Rng, verified: &[Verified]) {
+    fn add(&mut self, rng: &mut Rng, verified: &[Verified], compared: &[Compared]) {
         for item in verified {
             self.distinct
                 .entry(item.record)
@@ -84,19 +113,18 @@ impl Counts {
             *count += 1;
             // Reservoir sampling: each instruction of a record has the same
             // chance to be one of its samples.
-            let entry = Entry {
-                encoding: item.encoding,
-                before: item.before,
-                after: item.after,
-                vectors: item.vectors,
-            };
-            let samples = self.samples.entry(item.record).or_default();
-            if samples.len() < SAMPLES {
-                samples.push(entry);
+            if !item.replayable {
+                self.led += 1;
+                continue;
+            }
+            let (key, keep) = sample_key(item.record, item.encoding);
+            let samples = self.samples.entry(key).or_default();
+            if samples.len() < keep {
+                samples.push(Entry::of(item, compared));
             } else {
                 let slot = rng.below(*count) as usize;
-                if slot < SAMPLES {
-                    samples[slot] = entry;
+                if slot < keep {
+                    samples[slot] = Entry::of(item, compared);
                 }
             }
         }
@@ -116,6 +144,7 @@ impl Counts {
             End::Undefined => "undefined on both sides".to_string(),
             End::FetchAbort => "fetch abort on both sides".to_string(),
             End::PcAlignment => "pc alignment on both sides".to_string(),
+            End::Exception => "another exception on both sides, to a vector outside the RAM".to_string(),
             End::OutsideMemory => {
                 "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
             }
@@ -138,7 +167,8 @@ impl Run {
     fn round(&mut self, round: &Round) -> Result<(End, usize), Failure> {
         match self.follower.run(round)? {
             Outcome::Agreed { end, verified } => {
-                self.counts.add(&mut self.rng, &verified);
+                let compared = self.follower.compared.clone();
+                self.counts.add(&mut self.rng, &verified, &compared);
                 self.counts.end(end);
                 Ok((end, verified.len()))
             }
@@ -146,10 +176,11 @@ impl Run {
                 difference,
                 verified,
             } => {
-                self.counts.add(&mut self.rng, &verified);
+                let compared = self.follower.compared.clone();
+                self.counts.add(&mut self.rng, &verified, &compared);
                 eprint!("{difference}");
-                if let (Some((encoding, before)), Some(after)) =
-                    (difference.instruction, difference.qemu)
+                if let (Some((encoding, before)), Some(after), true) =
+                    (difference.instruction, difference.qemu, compared.is_empty())
                 {
                     let vectors = difference
                         .vectors_before
@@ -161,6 +192,7 @@ impl Run {
                             before,
                             after,
                             vectors,
+                            system: None,
                         }
                         .line()
                     );
@@ -210,15 +242,26 @@ fn main() -> Result<(), Failure> {
     let formats = group(&group_name)?;
     let started = Instant::now();
     // A group of FP instructions compares the vector and FP registers.
-    let vectors = formats.iter().any(|format| FP_FORMATS.contains(format));
+    // A group of system instructions also compares the system registers, and
+    // its streams hold FP instructions too.
+    let system = formats == STREAM_FORMATS;
+    let vectors = system || formats.iter().any(|format| FP_FORMATS.contains(format));
     let image_words = if vectors { FP_IMAGE_WORDS } else { IMAGE_WORDS };
+    let compared = if system { compared() } else { Vec::new() };
+    let options = Options {
+        vectors,
+        system: compared.iter().map(|register| register.qemu.to_string()).collect(),
+        names: None,
+    };
 
-    let mut leader = Leader::start_with(&qemu, &plugin, &directory, RAM_MIB, vectors)?;
+    let mut leader = Leader::start_options(&qemu, &plugin, &directory, RAM_MIB, &options)?;
     // Our memory starts as a copy of the RAM of QEMU.
     let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
     let memory = FlatMemory::new(RAM_BASE, ram);
+    let mut follower = Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE)));
+    follower.compared = compared;
     let mut run = Run {
-        follower: Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE))),
+        follower,
         counts: Counts::default(),
         rng: Rng(seed ^ 0x5eed),
     };
@@ -234,6 +277,31 @@ fn main() -> Result<(), Failure> {
             .collect();
         if short.is_empty() {
             break;
+        }
+        if system {
+            let words = generator.system_image(IMAGE_BASE, SYSTEM_IMAGE_WORDS);
+            let round = Round {
+                memory: vec![(IMAGE_BASE, bytes(&words))],
+                start: start(&mut generator, IMAGE_BASE + TABLE_BYTES),
+                vectors: Some(generator.vectors()),
+                budget: SYSTEM_BUDGET,
+                visits: 8,
+                reset: true,
+            };
+            run.round(&round)?;
+            if run.counts.rounds.is_multiple_of(200) {
+                let least = formats
+                    .iter()
+                    .map(|format| run.counts.of_format(*format))
+                    .min()
+                    .unwrap_or(0);
+                eprintln!(
+                    "random phase: {} rounds, the class with the fewest has {least} of {per_class}, {:.0} s",
+                    run.counts.rounds,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            continue;
         }
         // Three words in four are of a class that is still short of its
         // count. The others keep every class of the group in every image.
@@ -257,6 +325,7 @@ fn main() -> Result<(), Failure> {
             vectors: vectors.then(|| generator.vectors()),
             budget: image_words as u64 * if vectors { 1 } else { 2 },
             visits: 2,
+            reset: false,
         };
         run.round(&round)?;
         if run.counts.rounds.is_multiple_of(5000) {
@@ -288,9 +357,58 @@ fn main() -> Result<(), Failure> {
     let is_branch = |word: &u32| {
         decode(*word).is_some_and(|decoded| BRANCH_FORMATS.contains(&decoded.record.info().format))
     };
-    let (branches, straight): (Vec<u32>, Vec<u32>) =
-        executed.iter().copied().partition(|word| is_branch(word));
+    let (branches, straight): (Vec<u32>, Vec<u32>) = if system {
+        (Vec::new(), Vec::new())
+    } else {
+        executed.iter().copied().partition(|word| is_branch(word))
+    };
     let mut executed_verified = 0usize;
+    // A system instruction runs alone, after a reset, with the vector table
+    // of the streams and every register zero: an `MSR` then writes zero,
+    // which turns nothing on. WFI is left out: it would stop QEMU.
+    let mut waits = 0;
+    if system {
+        let mut missed = Vec::new();
+        for word in &executed {
+            if *word == 0xd503_207f {
+                waits += 1;
+                continue;
+            }
+            let mut words = vector_table(0x3c5);
+            words.extend(asm::load(16, IMAGE_BASE));
+            words.push(asm::msr(asm::reg::VBAR_EL1, 16));
+            words.push(asm::movz(16, 0, 0));
+            words.extend([*word, asm::NOP, asm::b(0)]);
+            let round = Round {
+                memory: vec![(IMAGE_BASE, bytes(&words))],
+                start: Core {
+                    x: [0; 31],
+                    sp: 0,
+                    pc: IMAGE_BASE + TABLE_BYTES,
+                    cpsr: CPSR_EL1H,
+                },
+                vectors: Some(Default::default()),
+                budget: 7,
+                visits: 2,
+                reset: true,
+            };
+            run.round(&round)?;
+            let verified = run.counts.distinct.values().any(|set| set.contains(word));
+            if verified {
+                executed_verified += 1;
+            } else {
+                missed.push(*word);
+            }
+        }
+        if !missed.is_empty() {
+            return Err(format!(
+                "{} executed encodings were not verified, the first {:08x?}",
+                missed.len(),
+                &missed[..missed.len().min(8)]
+            )
+            .into());
+        }
+    }
     // Instructions that do not branch run many to a round. A zero word ends
     // the image, and both sides stop there.
     for chunk in straight.chunks(image_words - 1) {
@@ -302,6 +420,7 @@ fn main() -> Result<(), Failure> {
             vectors: vectors.then(|| generator.vectors()),
             budget: chunk.len() as u64,
             visits: 1,
+            reset: false,
         };
         let (_, verified) = run.round(&round)?;
         if verified != chunk.len() {
@@ -322,6 +441,7 @@ fn main() -> Result<(), Failure> {
             vectors: vectors.then(|| generator.vectors()),
             budget: 1,
             visits: 1,
+            reset: false,
         };
         let (_, verified) = run.round(&round)?;
         if verified != 1 {
@@ -369,6 +489,12 @@ fn main() -> Result<(), Failure> {
     println!("rounds ended by:");
     for (end, count) in &run.counts.ends {
         println!("  {count:>9} {end}");
+    }
+    if system {
+        println!(
+            "{waits} WFI encodings left out, {} verified instructions that QEMU leads in (counter reads, host calls)",
+            run.counts.led
+        );
     }
     let total: u64 = run.counts.verified.values().sum();
     println!(

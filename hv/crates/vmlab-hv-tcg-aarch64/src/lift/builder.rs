@@ -5,17 +5,44 @@
 //! the two's complement identities, and the lockstep against QEMU (S6)
 //! checks them.
 
+use crate::exception::Exception;
 use crate::fields::Condition;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
 use vmlab_hv_tcg_ir::native::{Binary, Helper, ScalarId, ScalarType, Unary};
 
-/// The class of an exception that ends a block. The exception cards (C6)
-/// add the classes and their syndromes.
+/// A PSTATE field that `MSR` writes with an immediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExceptionClass {
-    Undefined,
+pub enum PstateField {
+    SpSel,
+    DaifSet,
+    DaifClr,
+}
+
+/// What the last instruction of a block does outside the graph (DESIGN.md
+/// G3d): the loop runs it in Rust after the registers of the block are
+/// written back, with the PC at the instruction. An instruction that can
+/// take an exception, change the level or write a system register ends its
+/// block this way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trap {
+    /// The instruction takes this exception.
+    Exception(Exception),
+    /// A word that no selected record matches: the Undefined Instruction
+    /// exception, and a line in the log of the CPU (G3f). A machine can
+    /// claim the word first (A5).
+    Unknown(u32),
+    Hvc(u16),
+    Smc(u16),
+    Eret,
+    Wfi,
+    Wfe,
+    /// `MRS Xt, <register>`, the register by its encoding.
+    Mrs { encoding: u16, rt: u8 },
+    /// `MSR <register>, Xt`.
+    Msr { encoding: u16, rt: u8 },
+    MsrPstate { field: PstateField, immediate: u8 },
 }
 
 /// Where a block goes when it ends.
@@ -23,11 +50,9 @@ pub enum ExceptionClass {
 pub enum A64Next {
     /// The next PC.
     Pc(ScalarId),
-    /// An exception, with the scalars of its syndrome.
-    Exception {
-        class: ExceptionClass,
-        syndrome: Vec<ScalarId>,
-    },
+    /// The instruction at `pc` is the last of the block, and the loop runs
+    /// it.
+    Trap { pc: u64, trap: Trap },
 }
 
 /// The exit payload of an aarch64 block (R8): the register slots that the
@@ -43,7 +68,7 @@ impl ExitScalars for A64Exit {
         self.writeback.for_each_scalar(visit);
         match &mut self.next {
             A64Next::Pc(scalar) => visit(scalar),
-            A64Next::Exception { syndrome, .. } => syndrome.iter_mut().for_each(visit),
+            A64Next::Trap { .. } => {}
         }
     }
 }
@@ -67,6 +92,8 @@ pub struct Builder {
     pc: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// What the last instruction does outside the graph.
+    trap: Option<Trap>,
 }
 
 fn total(value: Option<ScalarId>) -> ScalarId {
@@ -82,6 +109,7 @@ impl Builder {
             context,
             pc,
             branch: None,
+            trap: None,
         }
     }
 
@@ -93,6 +121,12 @@ impl Builder {
     /// The address of the instruction that is being lifted.
     pub fn pc(&self) -> u64 {
         self.pc
+    }
+
+    /// The level, the stack pointer choice and the FP enable that the block
+    /// is lifted for.
+    pub fn context(&self) -> Context {
+        self.context
     }
 
     // --- slots -----------------------------------------------------------
@@ -512,11 +546,18 @@ impl Builder {
         self.branch = Some(target);
     }
 
+    /// The instruction that is being lifted is the last of the block, and
+    /// the loop runs `trap` for it.
+    pub fn trap(&mut self, trap: Trap) {
+        self.trap = Some(trap);
+    }
+
     /// End the block. `fallthrough` is the next PC when no instruction set one.
     pub fn finish(mut self, fallthrough: u64) -> BlockOf<A64Exit> {
-        let next = match self.branch {
-            Some(target) => target,
-            None => self.imm(64, fallthrough),
+        let next = match (self.trap, self.branch) {
+            (Some(trap), _) => A64Next::Trap { pc: self.pc, trap },
+            (None, Some(target)) => A64Next::Pc(target),
+            (None, None) => A64Next::Pc(self.imm(64, fallthrough)),
         };
         let mut writes = Vec::new();
         for slot in 0..slot::COUNT {
@@ -534,7 +575,7 @@ impl Builder {
         }
         let exit = self.block.exit(A64Exit {
             writeback: Writeback { writes },
-            next: A64Next::Pc(next),
+            next,
         });
         self.block.events.push(Event::Exit(exit));
         self.block

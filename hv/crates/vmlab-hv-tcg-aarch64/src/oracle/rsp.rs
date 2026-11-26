@@ -284,6 +284,28 @@ impl Rsp {
         self.expect_ok(format!("z1,{address:x},4").as_bytes(), "z1")
     }
 
+    /// A command for QEMU's monitor (`qRcmd`). What the monitor prints
+    /// comes as `O` packets before the `OK`, and is dropped.
+    pub fn monitor(&mut self, command: &str) -> io::Result<()> {
+        let mut packet = b"qRcmd,".to_vec();
+        packet.extend(hex(command.as_bytes()));
+        self.send(&packet)?;
+        loop {
+            let answer = self
+                .receive(Duration::from_secs(10))?
+                .ok_or_else(|| other("the gdbstub did not answer a monitor command"))?;
+            if answer == b"OK" {
+                return Ok(());
+            }
+            if !answer.starts_with(b"O") || answer.starts_with(b"OK") {
+                return Err(other(format!(
+                    "the gdbstub answered {:?} to the monitor command {command}",
+                    String::from_utf8_lossy(&answer)
+                )));
+            }
+        }
+    }
+
     /// Let the CPU run. The stop reply comes later, through `receive`.
     pub fn resume(&mut self) -> io::Result<()> {
         self.send(b"c")
@@ -386,6 +408,7 @@ mod tests {
             (&b"P42=1f000000"[..], b"OK".to_vec()),
             (&b"z1,200,4"[..], b"OK".to_vec()),
             (&b"p43"[..], b"E14".to_vec()),
+            (&b"qRcmd,73797374656d5f7265736574"[..], b"OK".to_vec()),
         ]);
         assert_eq!(rsp.core().unwrap(), core);
         rsp.set_core(&core).unwrap();
@@ -402,6 +425,7 @@ mod tests {
         rsp.set_register(66, &0x1fu32.to_le_bytes()).unwrap();
         rsp.clear_break(0x200).unwrap();
         assert!(rsp.register(67).is_err());
+        rsp.monitor("system_reset").unwrap();
         server.join().unwrap();
     }
 }
