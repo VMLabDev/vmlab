@@ -2,8 +2,9 @@
 //! a vector table and a run of instructions that take exceptions, change the
 //! exception level and return, and read and write the system registers.
 //!
-//! The stream leaves out what the lockstep cannot follow: `WFI`, which
-//! stops QEMU for ever without an interrupt, and the values of a few
+//! The stream leaves out what the lockstep cannot follow: `WFI` and `WFE`,
+//! which stop QEMU for ever without an interrupt or an event (`directed`
+//! runs both at EL0, where SCTLR_EL1 traps them), and the values of a few
 //! registers that would turn on what later cards bring (the MMU and tagged
 //! addresses, card C8) or what phase 3d does not have (debug exceptions,
 //! V3). `safe_value` holds those limits.
@@ -250,10 +251,11 @@ impl Generator {
                 let field = [0xd500_40bfu32, 0xd503_40df, 0xd503_40ff][self.rng.below(3) as usize];
                 words.push(field | (self.rng.below(16) as u32) << 8);
             }
-            // The hint space but WFI, and the hints with their own record.
+            // The hint space but WFE and WFI, and the hints with their own
+            // record.
             71..=76 => {
                 let hint = match self.rng.below(127) as u32 {
-                    3 => 0,
+                    2 | 3 => 0,
                     other => other,
                 };
                 words.push(0xd503_201f | hint << 5);
@@ -334,6 +336,26 @@ impl Generator {
         words.push(asm::b(0));
         words
     }
+}
+
+/// Rounds that the random streams cannot hold, as the words after the
+/// prelude of `system_image` and the words that the round must verify.
+pub fn directed() -> Vec<(Vec<u32>, Vec<u32>)> {
+    const WFE: u32 = 0xd503_205f;
+    const WFI: u32 = 0xd503_207f;
+    // SCTLR_EL1 after the reset without nTWI and nTWE, then EL0 with SP_EL0:
+    // both waits trap to EL1, and the handler skips them.
+    let mut waits = Vec::new();
+    waits.extend(asm::load(16, 0x00c0_0838));
+    waits.push(asm::msr(reg::SCTLR_EL1, 16));
+    waits.extend(asm::load(16, 0x3c0));
+    waits.push(asm::msr(reg::SPSR_EL1, 16));
+    // adr x16, .+12
+    waits.push(0x1000_0070);
+    waits.push(asm::msr(reg::ELR_EL1, 16));
+    waits.push(asm::ERET);
+    waits.extend([WFI, asm::NOP, WFE, asm::NOP, asm::svc(EXIT_CALL), asm::NOP]);
+    vec![(waits, vec![WFI, WFE])]
 }
 
 /// Whether the special register has no value that a round can be replayed
@@ -446,6 +468,30 @@ mod tests {
         assert!(writable(sysreg::index("OSLAR_EL1")) && !writable(sysreg::index("MIDR_EL1")));
     }
 
+    #[test]
+    fn the_directed_round_traps_both_waits_at_el0() {
+        let (body, must) = directed().remove(0);
+        let mut words = vector_table(0x3c5);
+        words.extend(asm::load(16, BASE));
+        words.push(asm::msr(reg::VBAR_EL1, 16));
+        words.extend(&body);
+        let mut data = vec![0u8; 0x2000];
+        data[..words.len() * 4].copy_from_slice(&asm::bytes(&words));
+        let state = State::reset_as(BASE + TABLE_BYTES, &sysreg::QEMU_CORTEX_A53);
+        let mut cpu = Cpu::new(FlatMemory::new(BASE, data), state);
+        let mut syndromes = Vec::new();
+        for _ in 0..60 {
+            cpu.step().unwrap();
+            if cpu.taken.is_some() {
+                syndromes.push(cpu.state.system.regs[sysreg::reg::ESR_EL1]);
+            }
+        }
+        // WFI, WFE, and the call that brings the round back to EL1.
+        assert_eq!(syndromes, vec![0x07e0_0000, 0x07e0_0001, 0x5600_00e1]);
+        assert_eq!(cpu.state.context.el, 1);
+        assert_eq!(must, vec![0xd503_207f, 0xd503_205f]);
+    }
+
     /// Run streams on our interpreter alone. A call leaves the core, and the
     /// test refuses it, as QEMU's machine does for a call that is no PSCI
     /// function.
@@ -461,8 +507,8 @@ mod tests {
                 if let Some(decoded) = decode(*word) {
                     classes.insert(decoded.record.info().format);
                 }
-                // No WFI: it would stop the leader.
-                assert_ne!(*word, 0xd503_207f);
+                // No WFI and no WFE: they would stop the leader.
+                assert!(*word != 0xd503_207f && *word != 0xd503_205f);
             }
             let mut data = vec![0u8; 0x8000];
             data[..words.len() * 4].copy_from_slice(&asm::bytes(&words));

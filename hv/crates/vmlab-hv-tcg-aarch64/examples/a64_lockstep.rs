@@ -36,7 +36,9 @@ use vmlab_hv_tcg_aarch64::oracle::corpus::Entry;
 use vmlab_hv_tcg_aarch64::oracle::follow::{End, Follower, Outcome, Round, Verified};
 use vmlab_hv_tcg_aarch64::oracle::leader::{Leader, Options, RAM_BASE};
 use vmlab_hv_tcg_aarch64::oracle::stream::{Generator, Rng, executed_encodings, records_of};
-use vmlab_hv_tcg_aarch64::oracle::system::{STREAM_FORMATS, TABLE_BYTES, vector_table};
+use vmlab_hv_tcg_aarch64::oracle::system::{
+    STREAM_FORMATS, TABLE_BYTES, directed, vector_table,
+};
 use vmlab_hv_tcg_aarch64::oracle::{CPSR_EL1H, Compared, Core, asm, compared};
 use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, FormatClass, Record, State, decode};
@@ -369,6 +371,33 @@ fn main() -> Result<(), Failure> {
     let mut waits = 0;
     if system {
         let mut missed = Vec::new();
+        // The rounds that the random streams cannot hold.
+        for (body, must) in directed() {
+            let mut words = vector_table(0x3c5);
+            words.extend(asm::load(16, IMAGE_BASE));
+            words.push(asm::msr(asm::reg::VBAR_EL1, 16));
+            words.extend(&body);
+            words.push(asm::b(0));
+            let round = Round {
+                memory: vec![(IMAGE_BASE, bytes(&words))],
+                start: Core {
+                    x: [0; 31],
+                    sp: 0,
+                    pc: IMAGE_BASE + TABLE_BYTES,
+                    cpsr: CPSR_EL1H,
+                },
+                vectors: Some(Default::default()),
+                budget: 200,
+                visits: 2,
+                reset: true,
+            };
+            run.round(&round)?;
+            for word in must {
+                if !run.counts.distinct.values().any(|set| set.contains(&word)) {
+                    return Err(format!("a directed round did not verify {word:08x}").into());
+                }
+            }
+        }
         for word in &executed {
             if *word == 0xd503_207f {
                 waits += 1;
