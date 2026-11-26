@@ -470,9 +470,10 @@ pub fn walk(
 /// PAR_EL1 after an address translation instruction that succeeded.
 pub fn par_of(translation: &Translation) -> u64 {
     // QEMU reports Device memory and memory that is not cached as outer
-    // shareable.
+    // shareable. The byte 0x40 is no memory type of Armv8.0, and QEMU
+    // takes it as not cached too.
     let attributes = translation.attributes;
-    let shareability = if attributes & 0xf0 == 0 || attributes == 0x44 {
+    let shareability = if attributes & 0xf0 == 0 || attributes == 0x44 || attributes == 0x40 {
         2
     } else {
         u64::from(translation.shareability)
