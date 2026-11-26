@@ -280,7 +280,10 @@ fn a_mounted_btrfs_filesystem_is_refused_without_force() {
                  36 35 0:45 / /mnt/stick rw,relatime shared:1 - btrfs /dev/sdb1 rw,space_cache\n";
 
     let e = plan_mounted(sys.path(), "port:1-9", table, false).unwrap_err();
-    assert!(e.contains("carries a filesystem the host has mounted"), "{e}");
+    assert!(
+        e.contains("carries a filesystem the host has mounted"),
+        "{e}"
+    );
     assert!(e.contains("sdb1 at /mnt/stick"), "{e}");
     assert!(e.contains("--force"), "{e}");
     // Forced it attaches, and the other drive is not refused for it.
@@ -534,10 +537,16 @@ fn device_strings_reach_no_terminal_raw() {
     }]);
     let table = crate::cli::usb::render_list(&raw);
     assert_eq!(table.lines().count(), 2, "{table:?}");
-    assert!(!table.contains(|c: char| c.is_control() && c != '\n'), "{table:?}");
+    assert!(
+        !table.contains(|c: char| c.is_control() && c != '\n'),
+        "{table:?}"
+    );
     let decoded: Vec<Listed> = serde_json::from_value(raw).unwrap();
     assert_eq!(decoded[0].device.serial, None);
-    assert_eq!(decoded[0].device.product.as_deref(), Some("X [2J fake 1-1 row"));
+    assert_eq!(
+        decoded[0].device.product.as_deref(),
+        Some("X [2J fake 1-1 row")
+    );
 
     // A string that is not UTF-8 does not hide the device.
     std::fs::write(sys.path().join("1-1/product"), b"Disk\xff\n").unwrap();
