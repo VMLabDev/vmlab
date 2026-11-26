@@ -419,8 +419,8 @@ mod tests {
             assert_eq!(value("VBAR_EL1", &mut rng) & !0x1f, BASE);
             assert_eq!(value("MDSCR_EL1", &mut rng) & 0xa001, 0);
             let compare = value("CNTV_CVAL_EL0", &mut rng);
-            assert!(compare < 1 << 16 || compare >= 1 << 63);
-            assert!(compare < ROUND_COUNT / 2 || compare > ROUND_COUNT * 2);
+            assert!(!(1 << 16..1 << 63).contains(&compare));
+            assert!(!(ROUND_COUNT / 2..=ROUND_COUNT * 2).contains(&compare));
         }
         assert_eq!(
             safe_value(sysreg::index("CNTV_TVAL_EL0"), &mut rng, BASE, image),

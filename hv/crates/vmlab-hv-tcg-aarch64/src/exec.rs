@@ -97,17 +97,22 @@ impl std::fmt::Display for Unknown {
     }
 }
 
+/// The hook for a register without a row. `write`: the value of an `MSR`.
+/// `Some`: the machine has the register, and the value is what an `MRS`
+/// reads.
+pub type RegisterHook = fn(state: &mut State, encoding: u16, write: Option<u64>) -> Option<u64>;
+
+/// The hook for a word that no selected record matches. `true`: the machine
+/// ran it, and the CPU goes on at the next instruction.
+pub type InstructionHook = fn(state: &mut State, word: u32) -> bool;
+
 /// What a machine adds to the core (DESIGN.md G3e, A5): registers of the
 /// IMPLEMENTATION DEFINED space and instructions of its own. Each hook is
 /// asked before the Undefined Instruction exception is taken.
 #[derive(Clone, Copy, Default)]
 pub struct Hooks {
-    /// A register without a row. `write`: the value of an `MSR`. `Some`:
-    /// the machine has the register, and the value is what an `MRS` reads.
-    pub register: Option<fn(state: &mut State, encoding: u16, write: Option<u64>) -> Option<u64>>,
-    /// A word that no selected record matches. `true`: the machine ran it,
-    /// and the CPU goes on at the next instruction.
-    pub instruction: Option<fn(state: &mut State, word: u32) -> bool>,
+    pub register: Option<RegisterHook>,
+    pub instruction: Option<InstructionHook>,
 }
 
 /// Why no block starts at the PC.

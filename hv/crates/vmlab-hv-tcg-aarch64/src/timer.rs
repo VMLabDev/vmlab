@@ -132,8 +132,10 @@ mod tests {
 
     #[test]
     fn a_timer_fires_at_its_compare_value_and_the_mask_holds_the_line() {
-        let mut timer = Timer::default();
-        timer.compare = 100;
+        let mut timer = Timer {
+            control: 0,
+            compare: 100,
+        };
         // Disabled: no status and no line, whatever the count.
         assert_eq!(timer.control(500), 0);
         assert!(!timer.line(500));
