@@ -143,9 +143,21 @@ fn aavmf() -> Option<(PathBuf, PathBuf)> {
     (code.is_file() && vars.is_file()).then_some((code, vars))
 }
 
+/// The keys that take this AAVMF from its boot manager to its shell: each
+/// is sent when the serial log holds the text, after the keys before it.
+/// Without a disk the firmware says that it found nothing to boot and waits
+/// for a key (QEMU shows the same). The key opens the boot menu, whose
+/// second entry is the shell, and the last key ends the wait for
+/// `startup.nsh`.
+const TO_THE_SHELL: [(&str, &[u8]); 4] = [
+    ("Press any key to enter the Boot Manager Menu", b"x"),
+    ("EFI Internal Shell", b"\x1b[B"),
+    ("EFI Internal Shell", b"\r"),
+    ("any other key to continue", b"\r"),
+];
+
 /// AAVMF, unchanged, from the reset vector to the prompt of its UEFI shell
-/// (the proof of card C10). The machine has no disk, so the boot manager
-/// falls through to the shell.
+/// (the proof of card C10), with the keys of `TO_THE_SHELL` on the PL011.
 fn aavmf_reaches_the_shell(vcpus: u32) {
     let Some((code, pristine)) = aavmf() else {
         eprintln!(
@@ -156,15 +168,19 @@ fn aavmf_reaches_the_shell(vcpus: u32) {
     let dir = tempfile::Builder::new().prefix("hv-virt-").tempdir().unwrap();
     let vars = dir.path().join("AAVMF_VARS.fd");
     std::fs::copy(pristine, &vars).unwrap();
-    let mut machine = Machine::start(
+    let console = dir.path().join("console.sock");
+    let mut description = description(
         dir.path(),
-        &description(
-            dir.path(),
-            vcpus,
-            1024,
-            serde_json::json!({"kind": "firmware", "firmware": "aavmf", "code": code, "vars": vars}),
-        ),
+        vcpus,
+        1024,
+        serde_json::json!({"kind": "firmware", "firmware": "aavmf", "code": code, "vars": vars}),
     );
+    description["ports"] =
+        serde_json::json!([{"transport": "com1", "name": "console", "socket": console}]);
+    let mut machine = Machine::start(dir.path(), &description);
+    let mut keys = std::os::unix::net::UnixStream::connect(&console).unwrap();
+    let mut step = 0;
+    let mut sent = Instant::now();
     assert!(matches!(
         machine.client.call(Control::Resume).unwrap(),
         Outcome::Ok { .. }
@@ -177,6 +193,17 @@ fn aavmf_reaches_the_shell(vcpus: u32) {
     let deadline = start + Duration::from_secs(timeout);
     let mut resets = 0;
     while !machine.serial().contains("Shell>") {
+        // A key goes out when its text is there and the menu had half a
+        // second to draw what the key before it changed.
+        if let Some((text, bytes)) = TO_THE_SHELL.get(step)
+            && machine.serial().contains(text)
+            && sent.elapsed() > Duration::from_millis(500)
+        {
+            use std::io::Write;
+            keys.write_all(bytes).unwrap();
+            step += 1;
+            sent = Instant::now();
+        }
         assert!(
             machine.process.try_wait().unwrap().is_none(),
             "vmlab-hv ended before the UEFI shell: {}",

@@ -28,7 +28,7 @@ use vmlab_hv_devices::gic::{self, Gic, V2m};
 use vmlab_hv_devices::pflash::cfi::{self, CfiFlash};
 use vmlab_hv_devices::pl011::{self, Pl011};
 use vmlab_hv_devices::pl031::{self, Pl031};
-use vmlab_hv_devices::serial::SerialOut;
+use vmlab_hv_devices::serial::{HostSocket, SerialOut};
 use vmlab_hv_devices::{BusDevice, IrqLine, MsiSink, PciSnapshot, Resettable, ged};
 use vmlab_hv_firmware::fw_cfg::{self, FwCfgMmio};
 use vmlab_hv_proto::control::ShutdownReason;
@@ -150,6 +150,34 @@ impl pl031::Clock for MachineClock {
     }
 }
 
+/// Every byte to each of the writers: the serial log, and the socket of
+/// the console.
+struct Tee(Vec<Box<dyn std::io::Write + Send>>);
+
+impl std::io::Write for Tee {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut result = Ok(bytes.len());
+        for (index, writer) in self.0.iter_mut().enumerate() {
+            // The log is the first writer and its error is the error. A
+            // client that does not read its socket loses output and stops
+            // nothing.
+            if let Err(error) = writer.write_all(bytes)
+                && index == 0
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        for writer in &mut self.0 {
+            writer.flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// An interrupt line whose far end is made after its near end: the GIC is
 /// on the bus before the CPUs exist.
 #[derive(Default)]
@@ -243,6 +271,8 @@ pub struct Virt {
     ged: Arc<Mutex<ged::Ged>>,
     rtc: Arc<Mutex<Pl031>>,
     uart: Arc<Mutex<Pl011>>,
+    /// The host end of the PL011 as a socket, when the machine has one.
+    console: Option<HostSocket>,
     fw_cfg: Arc<Mutex<FwCfgMmio>>,
     /// The bank of the firmware variables.
     flash: Option<Arc<Mutex<CfiFlash>>>,
@@ -321,8 +351,17 @@ pub fn validate(desc: &MachineDescription) -> Result<(), VmmError> {
             ));
         }
     }
-    if desc.ports.iter().any(|port| !port.transport.is_virtio()) {
-        return Err(invalid("a virt port is a virtio-serial port"));
+    // One port may be the PL011 itself: `com1` names the first serial port
+    // of a machine.
+    let mut uarts = desc.ports.iter().filter(|port| !port.transport.is_virtio());
+    if uarts
+        .next()
+        .is_some_and(|port| port.transport.com_port().is_none_or(|com| !com.is_com1()))
+        || uarts.next().is_some()
+    {
+        return Err(invalid(
+            "a virt port is a virtio-serial port, or one `com1` port for the PL011",
+        ));
     }
     let image = match &desc.boot {
         Boot::Kernel { kernel, initrd, .. } => {
@@ -554,9 +593,21 @@ pub fn assemble(
             device: "pl011",
             reason: format!("cannot open serial log {}: {e}", desc.serial_log.display()),
         })?;
+    // The PL011 writes the serial log. A `com1` port is its host end as a
+    // socket too: the client reads what the log gets, and what it sends
+    // the guest receives.
+    let mut outputs: Vec<Box<dyn std::io::Write + Send>> = vec![Box::new(log)];
+    let mut console = None;
+    if let Some(port) = desc.ports.iter().find(|port| !port.transport.is_virtio()) {
+        let socket = HostSocket::bind(&port.socket).map_err(|e| {
+            VmmError::Other(format!("serial socket {}: {e}", port.socket.display()))
+        })?;
+        outputs.push(Box::new(socket.output()));
+        console = Some(socket);
+    }
     let uart = Arc::new(Mutex::new(Pl011::new(
         "pl011",
-        SerialOut::new(Box::new(log)),
+        SerialOut::new(Box::new(Tee(outputs))),
         spi(map::UART_SPI),
     )));
     on_bus(map::UART_BASE, pl011::SIZE, uart.clone())?;
@@ -674,10 +725,16 @@ pub fn assemble(
             image: built.disk,
         });
     }
-    if !desc.ports.is_empty() {
+    let virtio_ports: Vec<_> = desc
+        .ports
+        .iter()
+        .filter(|port| port.transport.is_virtio())
+        .cloned()
+        .collect();
+    if !virtio_ports.is_empty() {
         let (slot, function, wiring) = place(desc.console_pci, 2)?;
         let built = factory
-            .virtio_console(&desc.ports, &ram.device_mem, wiring)
+            .virtio_console(&virtio_ports, &ram.device_mem, wiring)
             .map_err(unavailable("virtio-console ports".into()))?;
         pci_root
             .lock()
@@ -764,6 +821,7 @@ pub fn assemble(
         ged,
         rtc,
         uart,
+        console,
         fw_cfg,
         flash,
         functions,
@@ -862,6 +920,15 @@ impl Virt {
     /// What the events thread of the machine does each millisecond.
     pub(crate) fn poll(&self) -> Result<(), String> {
         self.rtc.lock().tick();
+        if let Some(console) = &self.console {
+            // What the receive FIFO has room for. The rest waits in the
+            // socket.
+            let mut uart = self.uart.lock();
+            let mut bytes = [0u8; 32];
+            let room = uart.can_receive().min(bytes.len());
+            let count = console.read(&mut bytes[..room]);
+            uart.receive(&bytes[..count]);
+        }
         if let Some(flash) = &self.flash {
             flash
                 .lock()
