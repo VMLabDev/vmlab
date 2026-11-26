@@ -233,7 +233,7 @@ fn counter_read(encoding: u32) -> Adopt {
 fn end_of(cause: Cause) -> End {
     match cause {
         Cause::Exception(Exception::Undefined) => End::Undefined,
-        Cause::Exception(Exception::InstructionAbort) => End::FetchAbort,
+        Cause::Exception(Exception::InstructionAbort(_)) => End::FetchAbort,
         Cause::Exception(Exception::PcAlignment) => End::PcAlignment,
         _ => End::Exception,
     }

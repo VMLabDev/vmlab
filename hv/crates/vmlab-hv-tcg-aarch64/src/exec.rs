@@ -658,7 +658,13 @@ impl<M: Memory> Cpu<M> {
             match self.memory.read(at, &mut bytes) {
                 Ok(()) => {}
                 Err(Error::Memory(_)) if count == 0 => {
-                    return Err(Refused::Exception(Exception::InstructionAbort));
+                    // Translation is card C8: the PC is a physical address.
+                    let status = if pc >> self.state.physical_address_bits() != 0 {
+                        exception::ADDRESS_SIZE
+                    } else {
+                        exception::EXTERNAL
+                    };
+                    return Err(Refused::Exception(Exception::InstructionAbort(status)));
                 }
                 // The block ends before the instruction. It is looked at
                 // again as the first of the next block.
@@ -921,11 +927,20 @@ mod tests {
         cpu.step().unwrap();
         assert_eq!(
             cpu.taken,
-            sync(Exception::InstructionAbort, 0x1000, VECTORS + 0x200)
+            sync(
+                Exception::InstructionAbort(exception::EXTERNAL),
+                0x1000,
+                VECTORS + 0x200
+            )
         );
         assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x8600_0010);
         assert_eq!(cpu.state.system.regs[reg::FAR_EL1], 0x1000);
         assert_eq!(cpu.state.system.regs[reg::ELR_EL1], 0x1000);
+        // A PC above the 40 bits of a physical address: an address size fault.
+        cpu.state.set_pc(1 << 40);
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.system.regs[reg::ESR_EL1], 0x8600_0000);
+        assert_eq!(cpu.state.system.regs[reg::FAR_EL1], 1 << 40);
         // Not a multiple of four.
         cpu.state.set_pc(BASE + 2);
         cpu.step().unwrap();
@@ -1419,7 +1434,7 @@ mod tests {
         assert_eq!(
             cpu.taken.map(|taken| (taken.cause, taken.from)),
             Some((
-                Cause::Exception(Exception::InstructionAbort),
+                Cause::Exception(Exception::InstructionAbort(exception::EXTERNAL)),
                 BASE + 0x2000
             ))
         );

@@ -32,14 +32,22 @@ pub enum Exception {
     SupervisorCall(u16),
     /// A system instruction that a control bit traps to EL1, with its ISS.
     SystemTrap(u32),
-    /// The memory holds nothing at the PC. The fault status code is the one
-    /// of a synchronous external abort.
-    InstructionAbort,
+    /// No instruction can be fetched at the PC, with the fault status code:
+    /// `ADDRESS_SIZE` or `EXTERNAL`.
+    InstructionAbort(u8),
     /// The PC is not a multiple of four.
     PcAlignment,
     /// `BRK` with its immediate.
     Breakpoint(u16),
 }
+
+/// The fault status code of an address that is wider than the physical
+/// addresses of the CPU, at level 0. With the MMU off QEMU reports it for a
+/// PC above its 40 bits (the lockstep of card C6, ESR_EL1 0x86000000).
+pub const ADDRESS_SIZE: u8 = 0x00;
+/// The fault status code of a synchronous external abort: the memory of the
+/// machine holds nothing at the address.
+pub const EXTERNAL: u8 = 0x10;
 
 /// The instruction length bit of a syndrome: every A64 instruction is 32
 /// bits long.
@@ -58,7 +66,7 @@ impl Exception {
             Self::SupervisorCall(immediate) => (0x15, u32::from(immediate)),
             Self::SystemTrap(iss) => (0x18, iss),
             // 0x20 from a lower level, 0x21 from the same one.
-            Self::InstructionAbort => (0x21 - lower, 0x10),
+            Self::InstructionAbort(status) => (0x21 - lower, u32::from(status)),
             Self::PcAlignment => (0x22, 0),
             Self::Breakpoint(immediate) => (0x3c, u32::from(immediate)),
         };
@@ -67,7 +75,7 @@ impl Exception {
 
     /// Whether the exception writes FAR_EL1 with the PC.
     fn sets_far(self) -> bool {
-        matches!(self, Self::InstructionAbort | Self::PcAlignment)
+        matches!(self, Self::InstructionAbort(_) | Self::PcAlignment)
     }
 
     /// The address that ELR_EL1 gets for an exception at `pc`: the next
@@ -214,8 +222,9 @@ mod tests {
         assert_eq!(Exception::SupervisorCall(0xe1).syndrome(0), 0x5600_00e1);
         // MRS X0, CTR_EL0 at EL0, as QEMU reports it.
         assert_eq!(Exception::SystemTrap(0x0032_c001).syndrome(0), 0x6232_c001);
-        assert_eq!(Exception::InstructionAbort.syndrome(0), 0x8200_0010);
-        assert_eq!(Exception::InstructionAbort.syndrome(1), 0x8600_0010);
+        assert_eq!(Exception::InstructionAbort(EXTERNAL).syndrome(0), 0x8200_0010);
+        assert_eq!(Exception::InstructionAbort(EXTERNAL).syndrome(1), 0x8600_0010);
+        assert_eq!(Exception::InstructionAbort(ADDRESS_SIZE).syndrome(1), 0x8600_0000);
         assert_eq!(Exception::PcAlignment.syndrome(1), 0x8a00_0000);
         assert_eq!(Exception::Breakpoint(0x3e8).syndrome(1), 0xf200_03e8);
     }
