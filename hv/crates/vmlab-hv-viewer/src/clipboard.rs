@@ -98,6 +98,7 @@ impl LabClipboard {
 pub struct Bridge {
     focused: bool,
     last_host: Option<String>,
+    last_guest: Option<String>,
     last_poll: Option<Instant>,
     retry_at: Option<Instant>,
     retry_delay: Duration,
@@ -109,6 +110,7 @@ impl Bridge {
     pub fn focus(&mut self, focused: bool) {
         if focused && !self.focused {
             self.last_host = None;
+            self.last_guest = None;
             self.last_poll = None;
         }
         self.focused = focused;
@@ -161,28 +163,39 @@ impl Bridge {
     ) -> anyhow::Result<()> {
         // Host changes win if both selections changed between polls. Remember remote
         // writes too, so the next host read does not echo the same text to the guest.
-        match host.get() {
-            Ok(text) if self.last_host.as_ref() != Some(&text) => {
-                lab.set(&text)?;
-                self.last_host = Some(text);
+        let host_has_text = match host.get() {
+            Ok(text) => {
+                if self.last_host.as_ref() != Some(&text) {
+                    lab.set(&text)?;
+                    self.last_host = Some(text);
+                }
+                true
             }
-            Ok(_) => {}
             Err(error)
                 if matches!(
                     error.downcast_ref::<arboard::Error>(),
                     Some(arboard::Error::ContentNotAvailable)
-                ) => {}
+                ) => {
+                if self.last_host.take().is_some() {
+                    self.last_guest = None;
+                }
+                false
+            }
             Err(error) => return Err(error),
-        }
+        };
         if self
             .last_poll
             .is_none_or(|when| now.saturating_duration_since(when) >= Duration::from_secs(1))
         {
             let text = lab.get()?;
-            if self.last_host.as_ref() != Some(&text) {
+            // With no host text, establish a guest baseline before allowing
+            // a later guest copy to replace the host selection.
+            let guest_changed = self.last_guest.as_ref().is_some_and(|last| last != &text);
+            if (host_has_text || guest_changed) && self.last_host.as_ref() != Some(&text) {
                 host.set(text.clone())?;
-                self.last_host = Some(text);
+                self.last_host = Some(text.clone());
             }
+            self.last_guest = Some(text);
             self.last_poll = Some(now);
         }
         Ok(())

@@ -401,12 +401,12 @@ pub async fn start_build(
         // The build VM, while the machine verbs can reach it: kept on the op
         // for `template.status` and announced as `template.op.console`.
         let inspectable: crate::template::build::Inspectable = Arc::new(move |machine| {
-            let machine = machine.map(crate::template::build::BuildMachine::reference);
+            let reference = machine.map(crate::template::build::BuildMachine::reference);
             ready_sup.template_ops.set_machine(
                 &ready_lab,
                 &ready_arch,
                 &ready_template,
-                machine.clone(),
+                reference.clone(),
             );
             ready_sup.emit(Event::new(
                 "template.op.console",
@@ -415,7 +415,9 @@ pub async fn start_build(
                     "template": ready_template,
                     "arch": ready_arch,
                     "kind": "build",
-                    "machine": machine,
+                    "machine": reference,
+                    "hypervisor": machine.map(|machine| machine.hypervisor),
+                    "gui": machine.is_some_and(|machine| machine.gui),
                 }),
             ));
         });

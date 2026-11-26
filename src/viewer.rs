@@ -6,19 +6,15 @@
 //! window. Decoupling the window from the VM means closing it only
 //! disconnects — the VM keeps running and `vmlab console` can reattach.
 //!
-//! The viewer is chosen by [`detect`]: an explicit `viewer` in host config
-//! wins; otherwise we look for a known client on `PATH`. `remote-viewer`
-//! (virt-viewer) speaks the VNC unix socket directly and is preferred —
-//! it needs no bridge, so it also works for the `gui = true` auto-open on
-//! `up` (where the CLI exits right after). `gvncviewer`/`vncviewer` are
-//! TCP-only, so the caller bridges the socket to a localhost display port.
+//! For VNC, an explicit `viewer` in host config connects to the unix socket.
+//! Otherwise `remote-viewer`, `gvncviewer` and `vncviewer` are discovered
+//! on `PATH` in that order and connect through a detached TCP bridge.
 //!
 //! vmlab-hv machines prefer the native viewer via [`detect_for`]. It connects
 //! to `display.sock` and uses the lab control socket for clipboard requests.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -73,9 +69,7 @@ const NATIVE_VIEWER_MISSING: &str = "vmlab-hv-viewer not found; install it from 
 /// Select a machine's viewer. `tcp` explicitly requests the VNC bridge.
 pub fn detect_for(hypervisor: HypervisorKind, tcp: bool) -> ConsoleViewer {
     let host = HostConfig::load_default_or_warn();
-    let viewer = select_for(hypervisor, tcp, &host, &find_binary, || {
-        detect_vnc(&host, &on_path)
-    });
+    let viewer = select_for(hypervisor, tcp, &host, &find_binary, &on_path);
     if hypervisor == HypervisorKind::Vmlab && !tcp && matches!(viewer, ConsoleViewer::Vnc(_)) {
         eprintln!("{NATIVE_VIEWER_MISSING}");
     }
@@ -87,7 +81,7 @@ fn select_for(
     tcp: bool,
     host: &HostConfig,
     find: &impl Fn(&Path) -> Option<PathBuf>,
-    vnc: impl FnOnce() -> Option<Viewer>,
+    on_path: &impl Fn(&str) -> bool,
 ) -> ConsoleViewer {
     if hypervisor == HypervisorKind::Vmlab && !tcp {
         let binary = match &host.vmlab_hv_viewer {
@@ -106,7 +100,7 @@ fn select_for(
             });
         }
     }
-    ConsoleViewer::Vnc(vnc())
+    ConsoleViewer::Vnc(detect_vnc(host, on_path))
 }
 
 /// Resolve a bare binary on PATH, or check a configured path directly.
@@ -151,7 +145,7 @@ fn on_path(bin: &str) -> bool {
 }
 
 /// Resolve a viewer: host config first, then known clients on `PATH`.
-/// `remote-viewer` is preferred because it dials the unix socket directly.
+/// Known clients connect through the TCP bridge.
 pub fn detect() -> Option<Viewer> {
     let host = HostConfig::load_default_or_warn();
     detect_vnc(&host, &on_path)
@@ -338,7 +332,7 @@ pub fn spawn_detached_bridge(lab: &str, vm: &str) -> Result<String> {
 /// Open a viewer for a lab VM, using its reported hypervisor for `gui = true`.
 /// The native viewer waits for its display socket. A VNC unix-socket viewer
 /// is launched directly; a TCP-only viewer runs in a detached bridge so it
-/// survives `up` exiting. Prints how to attach when no viewer is found.
+/// survives the CLI exiting. Prints how to attach when no viewer is found.
 pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
     let viewer = match detect_for(hypervisor, false) {
         ConsoleViewer::Native(viewer) => return viewer.launch(lab, vm),
@@ -359,42 +353,11 @@ pub fn open_for(lab: &str, vm: &str, hypervisor: HypervisorKind) -> Result<()> {
         None => {
             println!(
                 "gui: no VNC viewer found — install virt-viewer (remote-viewer), or run \
-                 `vmlab console {vm}`"
+                 `vmlab console {lab}/{vm}`"
             );
             Ok(())
         }
     }
-}
-
-/// Spawn a background task that waits for a VM's VNC socket to appear (the
-/// VM is still booting) and then opens a viewer. For `vmlab template
-/// build`, whose `up()` blocks until provisioning finishes. Like
-/// [`open_for`], only a unix-socket viewer is launched. Must be called from
-/// within a tokio runtime.
-pub fn open_when_ready(sock: PathBuf) {
-    let host = HostConfig::load_default_or_warn();
-    match select_build_viewer(&host, &on_path) {
-        Some(v) => {
-            tokio::spawn(async move {
-                // ~60s for QEMU to create the socket; the build runs longer.
-                for _ in 0..600 {
-                    if sock.exists() {
-                        let _ = launch(&v, &sock.display().to_string());
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            });
-        }
-        _ => println!(
-            "gui: no unix-socket viewer for the build — install virt-viewer (remote-viewer) \
-             to watch builds"
-        ),
-    }
-}
-
-fn select_build_viewer(host: &HostConfig, on_path: &impl Fn(&str) -> bool) -> Option<Viewer> {
-    detect_vnc(host, on_path).filter(|viewer| viewer.transport == Transport::Unix)
 }
 
 #[cfg(test)]
@@ -404,8 +367,13 @@ mod tests {
 
     #[test]
     fn a_build_gui_finds_a_viewer_when_remote_viewer_is_installed() {
-        let viewer = select_build_viewer(&HostConfig::default(), &|bin| bin == "remote-viewer")
-            .expect("the build should launch the installed remote-viewer");
+        let host = HostConfig::default();
+        let find = available(&["remote-viewer"]);
+        let ConsoleViewer::Vnc(Some(viewer)) =
+            select_available(HypervisorKind::Vmlab, false, &host, &find)
+        else {
+            panic!("the build should launch the installed remote-viewer");
+        };
         assert_eq!(viewer.cmd, "remote-viewer vnc://{}");
         assert_eq!(viewer.transport, Transport::Tcp);
     }
@@ -474,8 +442,8 @@ mod tests {
         host: &HostConfig,
         find: &impl Fn(&Path) -> Option<PathBuf>,
     ) -> ConsoleViewer {
-        select_for(hypervisor, tcp, host, find, || {
-            detect_vnc(host, &|bin| find(Path::new(bin)).is_some())
+        select_for(hypervisor, tcp, host, find, &|bin| {
+            find(Path::new(bin)).is_some()
         })
     }
 

@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 
 use super::meta::TemplateMeta;
 use super::store::{ResolvedTemplate, TemplateStore};
+use crate::config::hypervisor::HypervisorKind;
 use crate::config::model::{
     ArtefactSource, Firmware, TemplateDef, TemplateRef, TemplateSource, TemplateVariantDef,
 };
@@ -51,6 +52,8 @@ pub(crate) async fn shutdown_for_seal(vm: &VmInstance) -> Result<()> {
 pub struct BuildMachine {
     pub lab: String,
     pub vm: String,
+    pub hypervisor: HypervisorKind,
+    pub gui: bool,
 }
 
 impl BuildMachine {
@@ -619,10 +622,8 @@ async fn build_variant(
 
     log_build_gpu(&spec, &def.arch, vm.hypervisor(), log);
     log(format!("booting variant build VM ({})\n", v.name));
-    if def.gui {
-        crate::viewer::open_when_ready(vm.dirs.vnc_sock());
-    }
-    let inspection = Inspection::open(&runtime, &vm, control.inspectable.clone(), log).await?;
+    let inspection =
+        Inspection::open(&runtime, &vm, def.gui, control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = control.cancel.cancelled() => None,
@@ -898,12 +899,15 @@ impl Inspection {
     async fn open(
         runtime: &Arc<crate::labd::lab::LabRuntime>,
         vm: &crate::labd::vm::VmInstance,
+        gui: bool,
         inspectable: Option<Inspectable>,
         log: &OutputSink,
     ) -> Result<Self> {
         let machine = BuildMachine {
             lab: runtime.config().lab.name.clone(),
             vm: vm.name().to_string(),
+            hypervisor: vm.hypervisor(),
+            gui,
         };
         let server = crate::labd::build_lab::serve(runtime).await?;
         let announced = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1351,12 +1355,8 @@ async fn run_build(
     // Boot + run build provision scripts (PRD §6.1, §10.4).
     log_build_gpu(&BuildSpec::base(def), &def.arch, vm.hypervisor(), log);
     log("booting build VM\n".to_string());
-    // `gui = true` builds get a viewer once QEMU creates the VNC socket;
-    // up() below blocks through provisioning, so this watches concurrently.
-    if def.gui {
-        crate::viewer::open_when_ready(vm.dirs.vnc_sock());
-    }
-    let inspection = Inspection::open(&runtime, &vm, run.control.inspectable.clone(), log).await?;
+    let inspection =
+        Inspection::open(&runtime, &vm, def.gui, run.control.inspectable.clone(), log).await?;
     let up_result = tokio::select! {
         result = runtime.up(&[], log.clone()) => Some(result),
         () = run.control.cancel.cancelled() => None,
@@ -1444,7 +1444,7 @@ async fn run_build(
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let vm2 = runtime2.vm(build_vm)?;
         let _inspection =
-            Inspection::open(&runtime2, &vm2, run.control.inspectable.clone(), log).await?;
+            Inspection::open(&runtime2, &vm2, false, run.control.inspectable.clone(), log).await?;
         let verified = async {
             let up = tokio::select! {
                 result = runtime2.up(&[], log.clone()) => Some(result),
@@ -2666,6 +2666,8 @@ template "t" { arch = "x86_64" version = "1" disk = 16MiB source "scratch" {} }"
         let m = super::BuildMachine {
             lab: "build-x86_64-alpine".into(),
             vm: "build".into(),
+            hypervisor: super::HypervisorKind::Vmlab,
+            gui: true,
         };
         assert_eq!(m.reference(), "build-x86_64-alpine/build");
         let line = m.announcement();
