@@ -417,9 +417,9 @@ impl Side {
         Ok(spot)
     }
 
-    /// Whether an access of `bytes` bytes at `va` that is not aligned to its
-    /// size takes an alignment fault: with SCTLR_EL1.A, and in Device
-    /// memory. The order of the faults is what the lockstep found on QEMU:
+    /// Whether an access at `va` that is not aligned to its size takes an
+    /// alignment fault: with SCTLR_EL1.A, and in Device memory. The order
+    /// of the faults is what the lockstep found on QEMU:
     ///
     /// - While the MMU is off all memory is Device memory, and the fault
     ///   comes before every other one, also for an address that is wider
@@ -427,38 +427,20 @@ impl Side {
     /// - In Device memory it comes after the faults of the walk for the
     ///   page (translation, address size, access flag) and before the
     ///   permission fault of the page.
-    /// - An access that crosses into a second page looks at the first page
-    ///   whole, then at the second.
+    /// - The page of the first byte decides. An access that crosses from
+    ///   Normal memory into Device memory does not fault.
     ///
     /// `false` where another fault comes first: the access itself reports
     /// that one.
     #[cold]
-    fn unaligned_faults<M: Memory>(
-        &mut self,
-        memory: &mut M,
-        va: u64,
-        bytes: u8,
-        kind: Kind,
-        user: bool,
-    ) -> bool {
+    fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64, kind: Kind) -> bool {
         let controls = *self.mmu.controls();
         if !controls.enabled || controls.strict_alignment {
             return true;
         }
-        let last = va.wrapping_add(u64::from(bytes).saturating_sub(1));
-        let pages = if last >> 12 == va >> 12 { 1 } else { 2 };
-        for address in [va, last].into_iter().take(pages) {
-            let Ok(page) = self.mmu.page(memory, address, kind) else {
-                return false;
-            };
-            if page.flags & mmu::flag::DEVICE != 0 {
-                return true;
-            }
-            if page.flags & mmu::needed(kind, user) == 0 {
-                return false;
-            }
-        }
-        false
+        self.mmu
+            .page(memory, va, kind)
+            .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
     }
 
     fn read_at<M: Memory>(
@@ -1241,19 +1223,12 @@ impl Compiled {
         side: &mut Side,
     ) -> Result<(), (u32, Failed)> {
         let leave = &leaves[exit as usize];
-        let ExceptionClass::Alignment {
-            write,
-            always,
-            bytes,
-            unprivileged,
-        } = leave.class
-        else {
+        let ExceptionClass::Alignment { write, always, .. } = leave.class else {
             return Err((exit, Failed::Guard));
         };
         let address = leave.address.map_or(0, |slot| frame[usize::from(slot)]);
         let kind = if write { Kind::Write } else { Kind::Read };
-        let user = side.user || unprivileged;
-        if always || side.unaligned_faults(memory, address, bytes, kind, user) {
+        if always || side.unaligned_faults(memory, address, kind) {
             let fault = Fault::Abort(mmu::Fault::ALIGNMENT, address);
             return Err((exit, Failed::Access(fault, write)));
         }

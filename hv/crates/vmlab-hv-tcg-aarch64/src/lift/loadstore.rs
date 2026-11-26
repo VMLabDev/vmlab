@@ -504,7 +504,7 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     };
     let address = b.x_or_sp(rn, 64);
     // On every memory, not only where the memory asks for it.
-    b.require_aligned(address, bytes, bytes, !access.load, true);
+    b.require_aligned(address, bytes, !access.load, true);
     transfer(b, access, rt, address);
     Lifted::Next
 }

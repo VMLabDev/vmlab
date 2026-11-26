@@ -80,9 +80,6 @@ pub enum ExceptionClass {
         write: bool,
         always: bool,
         unprivileged: bool,
-        /// The bytes of the whole access, which can reach into a second
-        /// page with another kind of memory.
-        bytes: u8,
     },
 }
 
@@ -771,7 +768,7 @@ impl Builder {
     /// As `load`, for an access of several elements of `align` bytes each:
     /// the address must be a multiple of `align`.
     pub fn load_aligned(&mut self, address: ScalarId, bytes: u8, align: u8) -> ScalarId {
-        self.require_aligned(address, align, bytes, false, false);
+        self.require_aligned(address, align, false, false);
         self.read_event(address, bytes, false)
     }
 
@@ -782,14 +779,14 @@ impl Builder {
 
     /// As `store`, for an access of several elements of `align` bytes each.
     pub fn store_aligned(&mut self, address: ScalarId, bytes: u8, value: ScalarId, align: u8) {
-        self.require_aligned(address, align, bytes, true, false);
+        self.require_aligned(address, align, true, false);
         self.write_event(address, bytes, value, false);
     }
 
     /// A load that also marks the address for exclusive access. The address
     /// must be a multiple of `bytes` on every memory.
     pub fn load_exclusive(&mut self, address: ScalarId, bytes: u8) -> ScalarId {
-        self.require_aligned(address, bytes, bytes, false, true);
+        self.require_aligned(address, bytes, false, true);
         self.read_event(address, bytes, true)
     }
 
@@ -804,20 +801,12 @@ impl Builder {
     }
 
     /// Leave the block with an alignment fault before this instruction,
-    /// unless `address` is a multiple of `bytes`, a power of two. `total`:
-    /// the bytes of the whole access. `always`: the instruction asks for
-    /// the alignment. Otherwise the fault is taken only where the memory
-    /// of the access asks for it: Device memory, which is all memory while
-    /// the MMU is off, or any memory with SCTLR_EL1.A set. The loop decides
-    /// that when the guard fails.
-    pub fn require_aligned(
-        &mut self,
-        address: ScalarId,
-        bytes: u8,
-        total: u8,
-        write: bool,
-        always: bool,
-    ) {
+    /// unless `address` is a multiple of `bytes`, a power of two. `always`:
+    /// the instruction asks for the alignment. Otherwise the fault is taken
+    /// only where the memory at the address asks for it: Device memory,
+    /// which is all memory while the MMU is off, or any memory with
+    /// SCTLR_EL1.A set. The loop decides that when the guard fails.
+    pub fn require_aligned(&mut self, address: ScalarId, bytes: u8, write: bool, always: bool) {
         if bytes == 1
             || self
                 .aligned
@@ -837,7 +826,6 @@ impl Builder {
             write,
             always,
             unprivileged: self.unprivileged,
-            bytes: total,
         };
         let exit = self.exit_before(class, vec![address]);
         self.block.events.push(Event::Guard {
