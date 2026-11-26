@@ -18,6 +18,7 @@ regression check (D2). TCG baseline method and first numbers:
 | `just bench-run-kvm backend='qemu' guest='ubuntu-26.04' repeats='3'` | run the x86_64 KVM suite (guest `ubuntu-26.04` or `windows-10`; vcpus defaults to the template's) |
 | `just bench-run-g2g backend='qemu'` | the x86_64 guest-to-guest net pair (two VMs at once) |
 | `just bench-run qemu riscv64 1 3 flat-rv64gc` | run the flat-image QEMU TCG baseline for the two warm interpreter workloads |
+| `just bench-run interpreter aarch64 1 3` and `just bench-run qemu aarch64 1 3 flat-a64` | run the flat aarch64 images on the aarch64 interpreter and on QEMU TCG |
 | `just bench-report` | print the per-workload trend, and hv-vs-qemu against the phase's bar |
 | `just bench-check` | fail (exit 1) if the latest run of a backend regressed beyond measured noise |
 | `just bench-test` | the suite's own unit tests |
@@ -216,6 +217,41 @@ lines share workload keys, binaries, stop condition and unit, and
 `bench-report` prints the D1 ratio directly. QEMU TCG translates as it
 executes; its numbers cannot exclude a training phase the way the warm
 interpreter numbers do, and the records say so (`warmup_excluded: false`).
+
+### The aarch64 interpreter on flat images
+
+`just bench-run interpreter aarch64 1 3` and
+`just bench-run qemu aarch64 1 3 flat-a64` run the two flat aarch64 images of
+`bench/a64` (`bench/micro_a64.py`): on the interpreter loop of
+`vmlab-hv-tcg-aarch64` (its example `a64_bench`), and on QEMU TCG
+(`-machine virt -cpu cortex-a53`, the image as an ELF at EL1). They hold the
+gate of phase 3d, DESIGN.md M6: the interpreter runs the CoreMark mix at 100
+MIPS or more.
+
+- **scalar_loop_300000000**: `bench/a64/loop.S`, the loop of three
+  instructions of `just tcg-a64-mips`, 100,000,000 times. The run asserts the
+  count of 3 N + 14 instructions.
+- **coremark_algorithms_1000**: the unchanged upstream `iterate()` and the
+  three algorithms, 1,000 iterations on 2,000 bytes with the seeds of a
+  performance run. The image leaves its three checksums in X2 to X4, and the
+  run compares them with CoreMark's own values (`0xe714`, `0x1fd7`, `0x8e3a`).
+  It is a checked instruction mix and not a reportable CoreMark score.
+
+An image has no MMU, no device and no system register, uses no FP or vector
+register (`-mgeneral-regs-only`) and only aligned accesses (`-mstrict-align`),
+and is linked without relaxation, which would put a `nop` in it. It ends with
+the semihosting call `SYS_EXIT` (`hlt #0xf000`). On the interpreter `HLT`
+takes the Undefined Instruction exception, and `a64_bench` stops the run
+there. QEMU ends with the exit code of the call,
+so a wrong checksum fails the run on both sides.
+
+A history line of these workloads holds seconds as `samples`, as every line
+does, and the MIPS of each sample as `mips_samples` with `mips_median`. The
+interpreter's time is inside the process and holds the translation of the
+blocks. A QEMU sample is the wall time of the process less the median of
+fifteen runs of the loop image with one iteration, and its MIPS divide the
+instruction count of the interpreter on the same image by that time. QEMU is
+the yardstick only: no product path starts it.
 
 - **Pinning**: the VM process tree runs under `taskset -c` on a fixed window
   of logical CPUs in the top half of the topology (smp1 → e.g. `16-19`, smp4 →
