@@ -324,14 +324,19 @@ impl Follower {
     /// multiple of 16.
     pub fn sync_monitor(&mut self, pc: u64, data: u64) -> io::Result<()> {
         let build = |record: Record, fields: &[(&str, u32)]| {
-            fields.iter().fold(record.info().value, |word, (name, value)| {
-                crate::with_field(record, name, word, *value).unwrap_or(word)
-            })
+            fields
+                .iter()
+                .fold(record.info().value, |word, (name, value)| {
+                    crate::with_field(record, name, word, *value).unwrap_or(word)
+                })
         };
         let words = [
             // ldxp x1, x3, [x2] ; stxp w4, x1, x3, [x2]
             build(Record::LDXPX, &[("rt", 1), ("rt2", 3), ("rn", 2)]),
-            build(Record::STXPX, &[("ws", 4), ("rt", 1), ("rt2", 3), ("rn", 2)]),
+            build(
+                Record::STXPX,
+                &[("ws", 4), ("rt", 1), ("rt2", 3), ("rn", 2)],
+            ),
             0,
         ];
         let mut start = Core {
@@ -342,16 +347,20 @@ impl Follower {
         };
         start.x[2] = data;
         let round = Round {
-            memory: vec![(pc, words.iter().flat_map(|word| word.to_le_bytes()).collect())],
+            memory: vec![(
+                pc,
+                words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            )],
             start,
             budget: 3,
             visits: 1,
         };
         match self.run(&round)? {
             Outcome::Agreed { verified, .. }
-                if verified.len() == 2
-                    && verified[1].after.x[4] == 0
-                    && !self.monitor_stale => Ok(()),
+                if verified.len() == 2 && verified[1].after.x[4] == 0 && !self.monitor_stale =>
+            {
+                Ok(())
+            }
             Outcome::Agreed { end, verified } => Err(io::Error::other(format!(
                 "the round that makes the exclusive monitors the same ended with {end:?} after {} instructions",
                 verified.len()
