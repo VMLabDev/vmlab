@@ -19,7 +19,9 @@
 #
 # Usage: build/run.sh [-t] command [args...]
 #   -t  allocate a terminal (interactive shell)
-# Env: VMLAB_BUILD_IMAGE (default vmlab-build)
+# Env: VMLAB_BUILD_IMAGE (default vmlab-build): a tag, or an image id
+#      (sha256:...). scripts/release-local.sh gives the id, so that each of its
+#      containers is the same image whatever the tag names by then.
 #      VMLAB_BUILD_VOLUMES (default vmlab-build): the prefix of every named
 #      volume. Code that a build runs can write to its volumes, so a build that
 #      must not inherit from another one gets a prefix of its own:
@@ -46,6 +48,11 @@ fi
 }
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  # An id names one image: there is nothing to build under that name.
+  [[ "$IMAGE" != sha256:* ]] || {
+    echo "build/run.sh: the image $IMAGE is gone from this docker host" >&2
+    exit 1
+  }
   DOCKER_BUILDKIT=1 docker build -f "$ROOT/build/Dockerfile" -t "$IMAGE" "$ROOT"
 fi
 
