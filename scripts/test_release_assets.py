@@ -53,6 +53,7 @@ class ReleaseDryRun(unittest.TestCase):
         self.tool('curl', '''#!/bin/sh
 set -eu
 name="${4##*/}"
+[ "${TIMEOUT_DOWNLOAD:-}" != "$name" ] || exit 28
 [ "${FAIL_DOWNLOAD:-}" != "$name" ] || exit 22
 cat "$FIXTURES/$name" > "$3"
 ''')
@@ -109,9 +110,9 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         script.write_text(text)
         return script
 
-    def install(self, *args, script=None):
+    def install(self, *args, script=None, checks=False):
         return subprocess.run(['sh', str(script or INSTALL), '--version', '1.2.3',
-                               '--no-fastpath', '--skip-checks', *args],
+                               '--no-fastpath', *([] if checks else ['--skip-checks']), *args],
                               env=self.env, capture_output=True, text=True)
 
     def refused(self, result):
@@ -452,6 +453,25 @@ esac
         self.assertIn('old helper', (installed / 'vmlab-fastpath').read_text())
         self.assertFalse((self.root / 'executed').exists())
 
+    def test_failed_helper_download_preserves_the_old_install(self):
+        installed = self.old_install()
+        before = {path: path.read_bytes() for path in installed.iterdir()}
+        self.env['TIMEOUT_DOWNLOAD'] = self.helper
+        result = self.install('--no-guest')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'download failed: https://fixture.invalid/v1.2.3/{self.helper}', result.stderr)
+        self.assertEqual({path: path.read_bytes() for path in installed.iterdir()}, before)
+
+    def test_runtime_report_gives_x86_hypervisor_requirements(self):
+        self.restricted_path()
+        result = self.install('--no-guest', checks=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('vmlab-hv', result.stdout)
+        self.assertIn('--fetch vmlab-hv-1.2.3-linux-x86_64.tar.gz', result.stdout)
+        self.assertIn('require /dev/kvm', result.stdout)
+        self.assertNotIn('qemu-system-x86_64', result.stdout)
+        self.assertNotIn('guests will run under emulation', result.stdout)
+
     def test_bad_signature_never_executes(self):
         self.env['BAD_SIGNATURE'] = '1'
         self.refused(self.install('--no-guest'))
@@ -721,6 +741,15 @@ fi
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.verified_with(), ['--key'])
         self.assertTrue((self.root / 'executed').exists())
+
+    def test_failed_key_signature_download_reports_the_transfer_error(self):
+        self.key_signed()
+        self.env['TIMEOUT_DOWNLOAD'] = 'SHA256SUMS.key.bundle'
+        result = self.install('--no-guest', script=self.installer_with_key())
+        self.refused(result)
+        self.assertIn('download failed: https://fixture.invalid/v1.2.3/SHA256SUMS.key.bundle',
+                      result.stderr)
+        self.assertNotIn('--insecure-skip-signature', result.stderr)
 
     def test_bad_key_signature_never_executes(self):
         self.key_signed()
