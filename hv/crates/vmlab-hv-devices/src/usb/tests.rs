@@ -1551,3 +1551,53 @@ fn a_td_one_whole_poll_cannot_walk_is_refused() {
     assert_eq!(u32::from_le(state) & 7, 2, "the endpoint is halted");
     assert_eq!(d.read(0x44) & 0x1001, 0, "the controller still runs");
 }
+
+/// Configure Endpoint for one bulk IN endpoint (endpoint 2 IN, DCI 5) with
+/// the given dwords 0 and 1 of its context. Returns the completion code.
+fn configure_bulk_in(d: &mut Driver, dword0: u32, dword1: u32) -> u32 {
+    d.mem32(0x6000, 0);
+    d.mem32(0x6004, 0x21); // slot context + DCI 5
+    d.mem32(0x6020, (3 << 20) | (5 << 27));
+    d.mem32(0x60c0, dword0);
+    d.mem32(0x60c4, dword1);
+    d.mem64(0x60c8, 0xb001);
+    d.command(12, 0x6000, d.slot << 24).status >> 24
+}
+
+/// Review usb-2.md F16: Max Burst Size is bits 8 to 15 of dword 1 of an
+/// endpoint context. A guest writes `bMaxBurst` of a SuperSpeed endpoint
+/// there, up to 15, and the endpoint is configured.
+#[test]
+fn a_superspeed_burst_endpoint_is_configured() {
+    for burst in [0u32, 3, 4, 15] {
+        let mut d = Driver::new();
+        d.enumerate();
+        d.configure();
+        assert_eq!(
+            configure_bulk_in(&mut d, 0, (6 << 3) | (burst << 8) | (1024 << 16)),
+            1,
+            "Max Burst Size {burst}"
+        );
+        let state = d.mem.read_obj::<u32>(GuestAddress(0x5000 + 5 * 32)).unwrap();
+        assert_eq!(u32::from_le(state) & 7, 1, "the endpoint is running");
+    }
+}
+
+/// Review usb-2.md F16: MaxPStreams is bits 10 to 14 of dword 0. The
+/// controller advertises no streams, so an endpoint that asks for them is
+/// refused, and its stream context array is never walked as a ring.
+#[test]
+fn a_streams_endpoint_is_refused() {
+    for streams in [1u32, 4, 31] {
+        let mut d = Driver::new();
+        d.enumerate();
+        d.configure();
+        assert_eq!(
+            configure_bulk_in(&mut d, streams << 10, (6 << 3) | (1024 << 16)),
+            5,
+            "MaxPStreams {streams}"
+        );
+        let state = d.mem.read_obj::<u32>(GuestAddress(0x5000 + 5 * 32)).unwrap();
+        assert_eq!(u32::from_le(state) & 7, 0, "the endpoint stays disabled");
+    }
+}

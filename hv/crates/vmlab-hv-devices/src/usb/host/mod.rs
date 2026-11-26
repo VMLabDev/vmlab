@@ -1503,6 +1503,27 @@ mod tests {
         );
     }
 
+    /// Review usb-2.md F18: one isochronous TD of xHCI is the data of one
+    /// service interval, and one usbdevfs packet descriptor is one service
+    /// interval. A high-bandwidth endpoint sends three packets of 1024 bytes
+    /// in it, so the TD of 3072 bytes is one descriptor, not three.
+    #[test]
+    fn one_isochronous_td_is_one_usbdevfs_packet() {
+        let fake = FakeUsbFs::with_high_bandwidth_iso();
+        let mut host = HostUsbDevice::new("usbhost-1-2", Box::new(fake.clone())).expect("device");
+        assert_eq!(host.transfer_iso(0x83, &[], 3072, 1024), UsbTransfer::Nak);
+        assert_eq!(fake.submitted_iso_packets(), [(0x83, vec![3072])]);
+
+        // The three packets of the interval come back as one payload.
+        let payload: Vec<u8> = (0..3072u32).map(|n| n as u8).collect();
+        fake.complete_with(Completion::Data(payload.clone()));
+        fake.run_irq();
+        assert_eq!(
+            host.transfer_iso(0x83, &[], 3072, 1024),
+            UsbTransfer::Ack(payload)
+        );
+    }
+
     #[test]
     fn stalled_completion_halts() {
         let (mut host, fake) = device();
