@@ -111,3 +111,49 @@ impl Input for HvDisplay {
         self.send(vec![Message::Buttons { mask }]).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    /// Review F11 (docs/reviews/display-2.md): scripted input waits for the
+    /// Hello of its connection under the machine's input lock. A hypervisor
+    /// that takes the connection and never answers must cost one call, not
+    /// the lock: the call gives up, and the next one can take the mutex. No
+    /// clock is asserted on: without the handshake's deadline the first
+    /// call does not end.
+    #[tokio::test]
+    async fn input_to_a_silent_hypervisor_gives_the_lock_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("display.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (heard, hello) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let Message::Hello { .. } = vmlab_hv_display::receive(&stream).unwrap().message else {
+                panic!("the client opens with a Hello");
+            };
+            heard.send(()).unwrap();
+            // Nothing is answered; this ends when the client closes.
+            while vmlab_hv_display::receive(&stream).is_ok() {}
+        });
+        let display = HvDisplay {
+            input: Arc::new(Mutex::new(InputConn::with_patience(
+                path.clone(),
+                Duration::from_millis(50),
+            ))),
+            path,
+            buttons: Arc::default(),
+        };
+        let refused = display.pointer_to(1, 2, 4, 4).await;
+        assert!(refused.is_err(), "a silent hypervisor took the input");
+        hello.recv().expect("the server read the Hello");
+        assert!(
+            display.input.try_lock().is_ok(),
+            "the call that gave up still holds the input lock"
+        );
+        server.join().unwrap();
+    }
+}

@@ -367,6 +367,16 @@ async fn follow_op(
                             println!("{line}");
                         }
                     }
+                    "template.op.console" if ev.data["gui"] == true => {
+                        if let Some((build_lab, vm)) = ev.data["machine"].as_str()
+                            .and_then(|reference| reference.split_once('/'))
+                            && let Ok(hypervisor) =
+                                serde_json::from_value(ev.data["hypervisor"].clone())
+                            && let Err(error) = crate::viewer::open_for(build_lab, vm, hypervisor)
+                        {
+                            eprintln!("gui: could not open the viewer for {build_lab}/{vm}: {error:#}");
+                        }
+                    }
                     "template.op.done" => return Ok(OpOutcome::Done),
                     "template.op.cancelled" => return Ok(OpOutcome::Cancelled),
                     "template.op.error" => {
