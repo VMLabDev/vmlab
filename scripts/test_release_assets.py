@@ -183,6 +183,75 @@ printf '%s\\n' "$2" >> "$COSIGN_LOG"
         self.assertTrue((guest / '.vmlab-guest').is_file())
         self.assertTrue((guest / 'agent/new').is_file())
 
+    def mv_stub(self, body):
+        """An mv that runs `body` with $last (its last argument) and $real (the real mv) set."""
+        real = shutil.which('mv')
+        self.assertIsNotNone(real)
+        self.tool('mv', '#!/bin/sh\nset -eu\nreal=' + real
+                  + '\nfor last; do :; done\n' + body)
+
+    def old_guest_with_work(self):
+        self.guest_bundle()
+        guest = self.root / 'guest'
+        self.old_guest(guest)
+        (guest / 'work').write_text('old')
+        return guest
+
+    def staging(self):
+        return sorted(self.root.glob('.vmlab-guest.*'))
+
+    def saved_guest(self, result):
+        """The directory that the installer says it kept the old guest directory in."""
+        named = re.search(r'saved at (\S+)', result.stderr)
+        self.assertIsNotNone(named, result.stdout + result.stderr)
+        return Path(named.group(1))
+
+    def test_failed_guest_swap_keeps_the_old_directory(self):
+        # install-release-2 F15: both the swap and the put-back fail.
+        guest = self.old_guest_with_work()
+        self.mv_stub('[ "$last" != "$VMLAB_GUEST_DIR" ] || exit 1\nexec "$real" "$@"\n')
+        result = self.install()
+        self.assertIn('cannot move the new guest assets', result.stderr, result.stdout)
+        self.assertFalse(guest.exists())
+        saved = self.saved_guest(result)
+        self.assertEqual((saved / 'work').read_text(), 'old')
+        self.assertEqual((saved / 'x86_64/vmlinuz').read_text(), 'old kernel')
+        # Only the old directory is kept: the download and the new tree are gone.
+        self.assertEqual(self.staging(), [saved.parent])
+        self.assertEqual(list(saved.parent.iterdir()), [saved])
+
+    def test_failed_guest_swap_puts_the_old_directory_back(self):
+        # The swap fails and the put-back works: nothing is left in staging.
+        guest = self.old_guest_with_work()
+        self.mv_stub('case "$*" in *"/new $VMLAB_GUEST_DIR") exit 1 ;; esac\nexec "$real" "$@"\n')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('cannot move the new guest assets', result.stderr)
+        self.assertEqual((guest / 'work').read_text(), 'old')
+        self.assertFalse((guest / 'agent/new').exists())
+        self.assertEqual(self.staging(), [])
+
+    def test_signal_between_guest_renames_puts_the_old_directory_back(self):
+        # install-release-2 F15: TERM arrives after the old directory moved aside.
+        guest = self.old_guest_with_work()
+        self.mv_stub('"$real" "$@"\ncase "$last" in */old) kill -TERM "$PPID" ;; esac\n')
+        result = self.install()
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual((guest / 'work').read_text(), 'old')
+        self.assertEqual((guest / 'x86_64/vmlinuz').read_text(), 'old kernel')
+        self.assertFalse((guest / 'agent/new').exists())
+        self.assertEqual(self.staging(), [])
+
+    def test_guest_directory_made_again_during_the_swap_is_not_nested_into(self):
+        # install-release-2 F15: without -T the new tree lands in guest/new.
+        guest = self.old_guest_with_work()
+        self.mv_stub('"$real" "$@"\ncase "$last" in */old)\n'
+                     '  mkdir "$VMLAB_GUEST_DIR"; : > "$VMLAB_GUEST_DIR/other" ;;\nesac\n')
+        result = self.install()
+        self.assertIn('cannot move the new guest assets', result.stderr, result.stdout)
+        self.assertEqual(sorted(path.name for path in guest.iterdir()), ['other'])
+        self.assertEqual((self.saved_guest(result) / 'work').read_text(), 'old')
+
     def old_guest(self, guest):
         (guest / 'agent/linux-x86_64').mkdir(parents=True)
         (guest / 'agent/linux-x86_64/vmlab-agent').write_text('old agent')
