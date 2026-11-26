@@ -2,9 +2,20 @@
 //!
 //! A round loads memory and registers into QEMU and into our CPU, lets QEMU
 //! run, and steps our interpreter beside the records of the plugin. Before
-//! each instruction the registers of both sides must be the same. A round
-//! ends at the first exception, at its instruction budget, or at the first
-//! difference.
+//! each instruction the registers of both sides must be the same: X0 to
+//! X30, SP, PC and CPSR, and V0 to V31, FPSR and FPCR when the plugin gives
+//! them. The memory writes of each instruction must be the same too. A
+//! round ends at the first exception, at its instruction budget, or at the
+//! first difference.
+//!
+//! Our memory mirrors the RAM of QEMU from one round to the next, and the
+//! vector registers are not set by a round, so both must stay the same on
+//! the two sides also where QEMU runs on after our side stopped following.
+//! QEMU runs ahead of the records that our side has read, by what the FIFO
+//! of the plugin holds. When a round ends without an exception of QEMU, the
+//! follower takes the memory writes that QEMU made since, reads its vector
+//! registers before the next round, and says that the exclusive monitors
+//! may differ (`monitor_stale`).
 
 use super::leader::{Ahead, Leader};
 use super::{Core, Trace, Vectors};
@@ -70,6 +81,11 @@ pub enum End {
     /// Our side has no memory at the address of a load or a store, and QEMU
     /// has flash or a device there and ran on. Nothing to compare.
     Device,
+    /// A store of the round went into its own code, and QEMU ran the word
+    /// that was there before, from the block that it had translated. Our
+    /// side runs the new word. Both are what a CPU with caches may do until
+    /// the guest synchronizes them, so nothing is compared (DESIGN.md U3).
+    StaleCode,
     /// QEMU took an exception at a record that we decode and have no lifter
     /// for. Nothing to compare: the exception cards (C6) decide these.
     UnliftedException(Record),
@@ -382,6 +398,8 @@ impl Follower {
         let mut qemu_writes: Vec<QemuWrite> = Vec::new();
         // The accesses of an instruction of ours that ended in a data abort.
         let mut partial: Vec<Access> = Vec::new();
+        // Every store of our side in this round: address and size.
+        let mut stored: Vec<(u64, u8)> = Vec::new();
         let mut expect = Expect::Instruction;
         let mut followed = 0u64;
         let mut visits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
@@ -460,6 +478,16 @@ impl Follower {
                         self.interrupt(&[])?;
                         break Ok(End::OutsideMemory);
                     };
+                    if core.pc & 3 == 0
+                        && word != encoding
+                        && stored.iter().any(|(address, bytes)| {
+                            core.pc.wrapping_sub(*address) < u64::from(*bytes)
+                                || address.wrapping_sub(core.pc) < 4
+                        })
+                    {
+                        self.interrupt(&[])?;
+                        break Ok(End::StaleCode);
+                    }
                     if core.pc & 3 == 0 && word != encoding {
                         break Err(differed(
                             format!(
@@ -483,6 +511,12 @@ impl Follower {
                     followed += 1;
                     let stepped = self.cpu.step();
                     let accesses = self.cpu.take_accesses();
+                    stored.extend(
+                        accesses
+                            .iter()
+                            .filter(|access| access.write)
+                            .map(|access| (access.address, access.bytes)),
+                    );
                     match stepped {
                         Ok(()) => {
                             if let Some(decoded) = decode(encoding) {

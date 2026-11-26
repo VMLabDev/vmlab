@@ -8,6 +8,11 @@
 //! `corpus` keeps instructions with the states that QEMU gave, so that
 //! `just ci::check` replays them without QEMU.
 //!
+//! What a round compares: the core registers before every instruction, the
+//! memory writes of every instruction, and the vector registers, FPSR and
+//! FPCR where the plugin runs with `vectors=on`. The exception registers
+//! come with card C6.
+//!
 //! QEMU is a black box here: its register values, its exceptions and its
 //! gdbstub answers (S6). Nothing in this module is part of a product path.
 

@@ -219,6 +219,10 @@ impl Counts {
             End::OutsideMemory => {
                 "a branch out of the mirrored RAM into QEMU's flash or devices".to_string()
             }
+            End::StaleCode => {
+                "a store into the code of the round, where QEMU runs the old word (not compared)"
+                    .to_string()
+            }
             End::DataAbort => "a load or store outside the memory on both sides".to_string(),
             End::Alignment => "an access that is not aligned to its size on both sides".to_string(),
             End::Device => {
