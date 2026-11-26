@@ -346,8 +346,9 @@ pub fn walk(
     let (start, first_bits, stride) = geometry(granule, input);
     let output = controls.output_bits();
     // The bits of TTBR below the size of the first table are not address
-    // bits.
-    let mut table = half.table & ADDRESS & !((8u64 << first_bits) - 1);
+    // bits. A first table that is smaller than 4K has address bits below
+    // bit 12.
+    let mut table = half.table & 0x0000_ffff_ffff_ffff & !((8u64 << first_bits) - 1);
     if table >> output != 0 {
         return Err(fault(FaultKind::AddressSize, 0));
     }
