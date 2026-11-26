@@ -190,6 +190,9 @@ def capture(qemu: str, name: str, output: Path) -> dict:
                 size = int.from_bytes(entry[:4], "big")
                 select = int.from_bytes(entry[4:6], "big")
                 file_name = entry[8:].split(b"\0", 1)[0].decode("ascii")
+                if os.environ.get("VIRT_FWCFG_TRACE"):
+                    print(f"{name}: {file_name} select={select:#x} size={size}",
+                          file=sys.stderr, flush=True)
                 data = qtest.item(select, size)
                 path = blobs / file_name
                 if not path.resolve().is_relative_to(blobs.resolve()):
