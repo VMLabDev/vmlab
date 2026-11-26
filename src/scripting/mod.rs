@@ -1054,6 +1054,7 @@ pub fn lab_module() -> Module {
                     .as_array()
                     .map(|a| {
                         a.iter()
+                            .filter(|s| s["pending"].as_bool() != Some(true))
                             .filter_map(|s| s["name"].as_str().map(String::from))
                             .collect()
                     })
