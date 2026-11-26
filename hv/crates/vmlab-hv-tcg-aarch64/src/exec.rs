@@ -127,9 +127,6 @@ struct Side {
     /// The accesses since the caller last took them, when it asked for them.
     log: Option<Vec<Access>>,
     code_pages: Vec<u64>,
-    /// The block that runs is one instruction: a store into a code page is
-    /// made, and the caches are dropped after it.
-    single: bool,
     /// Stores of this CPU since the caches were last checked.
     own_writes: u64,
     /// One of them went into a page that holds translated code.
@@ -144,7 +141,6 @@ impl Side {
             exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
-            single: false,
             own_writes: 0,
             code_written: false,
         }
@@ -631,6 +627,7 @@ impl Compiled {
         effect: Effect,
         memory: &mut M,
         side: &mut Side,
+        single: bool,
     ) -> Result<(), (u32, Failed)> {
         let values = &mut self.values;
         match effect {
@@ -665,7 +662,7 @@ impl Compiled {
             } => {
                 let at = values[address as usize] as u64;
                 let value = values[value as usize] & bits_mask(bytes);
-                if !side.single && side.is_code(at, bytes) {
+                if !single && side.is_code(at, bytes) {
                     return Err((exit, Failed::Retry));
                 }
                 match exclusive {
@@ -694,13 +691,16 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> Result<usize, (u32, Halt)> {
+        // A block of one instruction makes its stores also into a page of
+        // translated code, and the loop drops the blocks after it.
+        let single = self.instructions == 1;
         let mut done = 0usize;
         for index in 0..self.effects.len() {
             let (before, effect) = self.effects[index];
             let before = before as usize;
             Self::pure(&self.code[done..before], &mut self.values).map_err(|halt| (0, halt))?;
             done = before;
-            if let Err((exit, failed)) = self.effect(effect, memory, side) {
+            if let Err((exit, failed)) = self.effect(effect, memory, side, single) {
                 let leave = self.leave(state, exit);
                 let pc = state.pc();
                 let halt = match failed {
@@ -963,8 +963,6 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        // A block of one instruction makes its stores also into a code page.
-        self.side.single = single || block.instructions == 1;
         Ok(block.run(&mut self.state, &mut self.memory, &mut self.side))
     }
 
@@ -1002,7 +1000,6 @@ impl<M: Memory> Cpu<M> {
                 && block.context == context
                 && u64::from(block.instructions) <= left
             {
-                self.side.single = block.instructions == 1;
                 block.run(&mut self.state, &mut self.memory, &mut self.side)
             } else {
                 // A whole block where the budget allows one, else one
