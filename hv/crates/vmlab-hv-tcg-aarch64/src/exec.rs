@@ -1685,7 +1685,9 @@ impl<M: Memory> Cpu<M> {
                     Err(Miss::Fault(fault)) if fault.kind == mmu::FaultKind::ExternalOnWalk => {
                         return Ok(Err(Exception::DataAbort {
                             status: fault.status(),
-                            write: false,
+                            // The abort of an address translation
+                            // instruction says "write", also for a read.
+                            write: true,
                             cache: true,
                             address: value,
                         }));
