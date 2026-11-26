@@ -36,7 +36,8 @@
 //! keys on its serial port: each `--key` is sent when the serial log of the
 //! leader holds its text, after the keys before it (`\e` is escape, `\r`
 //! return). Without `--key` the keys are those that lead to the shell
-//! (`TO_THE_SHELL`). Our machine gets no key of its own: it reads the PL011
+//! (`TO_THE_SHELL`), and the last key is sent again from time to time until
+//! the run ends. Our machine gets no key of its own: it reads the PL011
 //! of the leader, as it reads every device.
 //!
 //! The run ends when our serial log holds `--until` (default `Shell>`), at
@@ -106,6 +107,11 @@ const TO_THE_SHELL: [(&str, &str); 4] = [
 ];
 /// The instructions between two keys: the menu draws what a key changed.
 const KEY_GAP: u64 = 1 << 21;
+/// The last key is sent again after this many instructions, for as long as
+/// the run goes on. The shell empties its input when it starts its wait
+/// for a key, so a key that came a moment early is lost, and the wait is
+/// five seconds of the instruction clock: five billion instructions.
+const KEY_REPEAT: u64 = 1 << 24;
 
 /// The instructions that the follower keeps for the report of a difference.
 const KEPT: usize = 4096;
@@ -785,6 +791,13 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
                     arguments.keys.len()
                 );
                 key += 1;
+                key_at = instructions;
+            } else if key == arguments.keys.len()
+                && instructions >= key_at + KEY_REPEAT
+                && let Some((_, bytes)) = arguments.keys.last()
+            {
+                use std::io::Write;
+                keyboard.write_all(bytes)?;
                 key_at = instructions;
             }
             let log = std::fs::read(&description.serial_log).unwrap_or_default();
