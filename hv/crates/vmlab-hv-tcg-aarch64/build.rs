@@ -6,9 +6,14 @@
 //! header in front of every source file gives each SoftFloat name another
 //! assembler name (`#pragma redefine_extname`). A macro would not do:
 //! SoftFloat's headers test `#ifndef softfloat_...` to see which primitives
-//! are inline. The names come from SoftFloat's own headers, so a new upstream
-//! function is renamed without a list here, and the archive is checked after
-//! the build: every symbol that it defines has the prefix.
+//! exist. The pragma acts on a declaration, and the file of a primitive
+//! defines it without one, so the header also includes `primitives.h`. For
+//! that the primitives are functions and not inline (`INLINE_LEVEL` is not
+//! set): a header cannot hold both the prototype and a static definition.
+//!
+//! The names come from SoftFloat's own headers, so a new upstream function is
+//! renamed without a list here, and the archive is checked after the build:
+//! every symbol that it defines has the prefix.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -191,6 +196,10 @@ fn main() {
     for name in names(&headers) {
         writeln!(prefix, "#pragma redefine_extname {name} {PREFIX}{name}").unwrap();
     }
+    prefix.push_str(
+        "#include <stdbool.h>\n#include <stdint.h>\n#include \"platform.h\"\n\
+         #include \"primitiveTypes.h\"\n#include \"primitives.h\"\n",
+    );
     let prefix_header = out.join("a64sf_prefix.h");
     std::fs::write(&prefix_header, prefix).unwrap();
 
@@ -207,7 +216,6 @@ fn main() {
     ] {
         build.define(name, None);
     }
-    build.define("INLINE_LEVEL", "5");
     // The rounding mode and the exception flags are per-thread, so vCPUs on
     // separate host threads need no lock around a SoftFloat call.
     build.define("THREAD_LOCAL", "__thread");
