@@ -28,19 +28,20 @@
 //! case per record: the size, the vector bit and the operation. The tests
 //! of this file check that reading against the name of every record.
 //!
-//! Every address here is a physical address: translation and permissions
-//! come with card C8, and an unprivileged load or store (`LDTR`, `STTR`) is
-//! an ordinary one until then. An access that the memory does not hold
-//! leaves the block before its instruction, and so does an access to an
-//! address that is not a multiple of its size. No register of the
-//! instruction has changed then. The size is that of one register, or of
-//! one element for `LD1` to `LD4` and `ST1` to `ST4`.
+//! Every address here is a virtual address: the loop translates it and
+//! checks the permissions (`mmu.rs`, card C8). An unprivileged load or store
+//! (`LDTR`, `STTR`) is made as EL0. An access that cannot be made leaves the
+//! block before its instruction, as a data abort of the guest, and so does
+//! an access to an address that is not a multiple of its size where the
+//! memory asks for that. No register of the instruction has changed then.
+//! The size is that of one register, or of one element for `LD1` to `LD4`
+//! and `ST1` to `ST4`.
 //!
 //! The alignment rule is what the lockstep found (S6): with the MMU off,
 //! QEMU takes an alignment fault for every such access, with
-//! `SCTLR_EL1.A` set or clear. `Builder::load` and `Builder::store` hold
-//! the rule. The stack pointer alignment check (`SCTLR_EL1.SA`) is another
-//! thing and comes with card C6.
+//! `SCTLR_EL1.A` set or clear, because all memory is Device memory then.
+//! `Builder::require_aligned` and the loop hold the rule. The stack pointer
+//! alignment check (`SCTLR_EL1.SA`) is another thing and is not built.
 
 use super::{Builder, Lifted};
 use crate::fields::sign_extend;
@@ -460,7 +461,7 @@ pub fn ordered(b: &mut Builder, record: Record, rn: u32, rt: u32) -> Lifted {
     };
     let address = b.x_or_sp(rn, 64);
     // On every memory, not only where the memory asks for it.
-    b.require_aligned(address, bytes);
+    b.require_aligned(address, bytes, !access.load, true);
     transfer(b, access, rt, address);
     Lifted::Next
 }

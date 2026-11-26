@@ -430,6 +430,11 @@ pub const fn index(name: &str) -> usize {
 pub mod reg {
     use super::index;
     pub const SCTLR_EL1: usize = index("SCTLR_EL1");
+    pub const TTBR0_EL1: usize = index("TTBR0_EL1");
+    pub const TTBR1_EL1: usize = index("TTBR1_EL1");
+    pub const TCR_EL1: usize = index("TCR_EL1");
+    pub const MAIR_EL1: usize = index("MAIR_EL1");
+    pub const PAR_EL1: usize = index("PAR_EL1");
     pub const CPACR_EL1: usize = index("CPACR_EL1");
     pub const SPSR_EL1: usize = index("SPSR_EL1");
     pub const ELR_EL1: usize = index("ELR_EL1");
@@ -447,9 +452,15 @@ pub mod reg {
 
 /// Bits of SCTLR_EL1 that the core acts on.
 pub mod sctlr {
+    pub const M: u64 = 1;
+    pub const A: u64 = 1 << 1;
+    pub const WXN: u64 = 1 << 19;
+    /// The bits that a translation depends on.
+    pub const TRANSLATION: u64 = M | A | WXN;
     pub const UMA: u64 = 1 << 9;
     pub const DZE: u64 = 1 << 14;
     pub const UCT: u64 = 1 << 15;
+    pub const UCI: u64 = 1 << 26;
     pub const NTWI: u64 = 1 << 16;
     pub const NTWE: u64 = 1 << 18;
 }

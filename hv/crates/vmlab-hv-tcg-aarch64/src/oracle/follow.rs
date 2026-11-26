@@ -261,6 +261,10 @@ enum Plain {
     Stop(Stop),
     Undefined(u64),
     PcAlignment(u64),
+    /// A load or a store that is not aligned to its size, at this PC.
+    Alignment(u64),
+    /// A load or a store that cannot be made, at this PC.
+    DataAbort(u64),
     /// Another exception of the guest, at this PC.
     Exception(u64),
 }
@@ -473,6 +477,10 @@ impl Follower {
         Err(match taken.cause {
             Cause::Exception(Exception::Undefined) => Plain::Undefined(taken.from),
             Cause::Exception(Exception::PcAlignment) => Plain::PcAlignment(taken.from),
+            Cause::Exception(Exception::DataAbort { status: 0x21, .. }) => {
+                Plain::Alignment(taken.from)
+            }
+            Cause::Exception(Exception::DataAbort { .. }) => Plain::DataAbort(taken.from),
             _ => Plain::Exception(taken.from),
         })
     }
@@ -757,10 +765,8 @@ impl Follower {
                             expect = Expect::Exception(pc, End::PcAlignment)
                         }
                         Err(Plain::Exception(pc)) => expect = Expect::Exception(pc, End::Exception),
-                        Err(Plain::Stop(Stop::Alignment { pc, .. })) => {
-                            expect = Expect::Exception(pc, End::Alignment)
-                        }
-                        Err(Plain::Stop(Stop::DataAbort { pc, .. })) => {
+                        Err(Plain::Alignment(pc)) => expect = Expect::Exception(pc, End::Alignment),
+                        Err(Plain::DataAbort(pc)) => {
                             partial = accesses;
                             expect = Expect::Abort(pc);
                         }
