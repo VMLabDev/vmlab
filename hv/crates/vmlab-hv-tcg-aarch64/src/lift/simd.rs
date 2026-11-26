@@ -1404,18 +1404,39 @@ mod tests {
 
     #[test]
     fn the_fixed_bits_of_a_record_say_what_its_name_says() {
-        let mut checked = 0;
+        // The classes without a plan move lanes or are immediates.
+        let unplanned = |format: FormatClass| {
+            let name = format.name();
+            ["SIMDDup", "SIMDIns", "SIMDSMov", "SIMDUMov", "SIMDModifiedImm"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                || [
+                    "BaseSIMDScalarDUP",
+                    "BaseSIMDBitwiseExtract",
+                    "BaseSIMDTableLookup",
+                    "BaseSIMDTableLookupTied",
+                ]
+                .contains(&name)
+                || name.starts_with("BaseSIMDModifiedImm")
+        };
+        let (mut checked, mut classes) = (0, 0);
         for format in SIMD_FORMATS {
+            if unplanned(format) {
+                continue;
+            }
+            classes += 1;
             for record in records_of(format) {
-                let Some(planned) = planned_mnemonic(record) else {
-                    continue;
-                };
-                assert_eq!(planned, mnemonic_of(record.name()), "{}", record.name());
+                let planned = planned_mnemonic(record);
+                assert_eq!(
+                    planned,
+                    Some(mnemonic_of(record.name())),
+                    "{}",
+                    record.name()
+                );
                 checked += 1;
             }
         }
-        // Every class with a plan: the others move lanes or are immediates.
-        assert_eq!(checked, 1341);
+        assert_eq!((classes, checked), (26, 1323));
     }
 
     #[test]
