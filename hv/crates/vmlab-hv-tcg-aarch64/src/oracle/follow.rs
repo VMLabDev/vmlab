@@ -1661,6 +1661,13 @@ impl Follower {
                 Stepped::End(end) => break Ok(end),
                 Stepped::Differ(mut what) => {
                     let ours = Core::of(&self.cpu.state);
+                    if self.translated {
+                        let (descriptors, phys) = self.cpu.walk_trace(ours.pc);
+                        what.push_str(&format!(
+                            "; our walk for the PC {:#x} reads {descriptors:x?} and gives {phys:x?}",
+                            ours.pc
+                        ));
+                    }
                     // What QEMU's exception registers say, when it took an
                     // exception that we did not: they are in its next record.
                     if compare_system {
