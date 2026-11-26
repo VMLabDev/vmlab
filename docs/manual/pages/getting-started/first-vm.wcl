@@ -137,7 +137,8 @@ SRC
     You see the Alpine login prompt on the virtual screen. With no viewer
     installed, or on WSL 2 where the viewer lives on the Windows side, ask
     for a TCP bridge instead. vmlab forwards the display to a localhost port
-    and prints the address for you to point any VNC client at.
+    and prints the address for you to point any VNC client at, and the
+    password that the client must give.
   DOC
 
   code sh { source = "vmlab console --tcp alp" }
