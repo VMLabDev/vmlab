@@ -452,6 +452,7 @@ cat > ./vmlab-fastpath
 got=$(sha256sum ./vmlab-fastpath | cut -d" " -f1)
 [ "$got" = "$want" ] || exit 3
 # chown drops file capabilities, so it comes before setcap.
+[ -n "$owner" ] || exit 5
 chown "$owner" ./vmlab-fastpath
 # Owner only: file capabilities go to whoever executes the file (F2).
 chmod 700 ./vmlab-fastpath
