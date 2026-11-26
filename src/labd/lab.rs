@@ -6393,6 +6393,74 @@ fn main(lab: Lab) {
         assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
     }
 
+    /// The instruction budget is there to end a script that spins without
+    /// the host. A script that keeps calling the host is alive and can be
+    /// cancelled, so a long one must reach its end
+    /// (docs/reviews/wscript-2.md F17, card #1086). The loop is bounded: the
+    /// test ends in both cases.
+    #[tokio::test]
+    async fn a_long_script_that_calls_the_host_is_not_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let result = crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    let i = 0
+    while i < 3000000 {
+        if i % 1000 == 0 { let n = lab.name() }
+        i = i + 1
+    }
+    lab.log("done")
+}
+"#
+            .into(),
+            "long.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| {
+                let _ = output.send(line);
+            }),
+        )
+        .await;
+        result.expect("a script that calls the host ran out of budget");
+        assert_eq!(lines.try_recv().unwrap().trim(), "done");
+    }
+
+    /// A script that spins without a host call still ends, and the fault
+    /// says what the limit is, how large it is and whose it is (F17, the
+    /// third point: `fuel exhausted` said none of these). A builtin
+    /// (`s.len()`) is the script's own work and not a host call.
+    #[tokio::test]
+    async fn a_script_that_spins_without_the_host_ends_and_names_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let result = crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    let s = "ab"
+    let i = 0
+    while i < 20000000 { i = i + s.len() - 1 }
+    lab.log("done")
+}
+"#
+            .into(),
+            "spin.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_| {}),
+        )
+        .await;
+        let error = format!("{:#}", result.expect_err("a spinning script completed"));
+        assert!(error.contains("10,000,000 instructions"), "{error}");
+        assert!(error.contains("host call"), "{error}");
+        assert!(!error.contains("fuel"), "{error}");
+    }
+
     const REBOOT_SCRIPT: &str = r#"use vmlab
 
 fn main(lab: Lab) {

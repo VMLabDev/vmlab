@@ -15,10 +15,18 @@ use super::{EventData, LabHandle, ScriptEntry, SegmentHandle};
 use crate::labd::lab::LabRuntime;
 use crate::labd::record::RunId;
 
-// Bound bytecode execution for every entry point, including scripts that
-// never hand control back to the host. Time spent waiting on a host call
-// does not count against this budget.
+/// The instructions a script may run without a host call. It ends a script
+/// that spins and never hands control back to the host, where a cancelled
+/// run stops. The count starts again when a host call returns
+/// ([`super::cancel::alive`]), so it is no limit on the work of a script that
+/// keeps reaching the host (docs/reviews/wscript-2.md F17).
 const SCRIPT_FUEL: u64 = 10_000_000;
+
+/// The bytes of values one script run may hold at one time. The instruction
+/// budget does not limit memory: one instruction can allocate any amount, and
+/// a failed allocation ends the lab daemon (docs/reviews/wscript-2.md F13).
+/// `exec` returns up to 64 MiB, so a script can keep several outputs.
+const SCRIPT_MEMORY: u64 = 1024 * 1024 * 1024;
 
 /// Where script log output goes (lab log + live CLI stream, PRD §10.1).
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -262,10 +270,12 @@ fn execute(
             }
             output(chunk);
         }),
+        fuel: Some(SCRIPT_FUEL),
+        refuel: Some(Box::new(super::cancel::alive)),
+        memory: Some(SCRIPT_MEMORY),
         ..VmConfig::default()
     };
     let mut vm = Vm::with_config(&ctx, config);
-    vm.set_fuel(Some(SCRIPT_FUEL));
     vm.call_unit::<_, ()>(&unit, entry.name(), args)
         .map_err(|e| anyhow!("{name}: {}", run_error(e)))
 }
@@ -302,7 +312,7 @@ fn run_error(e: wscript::Error) -> String {
         wscript::Error::Runtime(r) => {
             // A fault can end in a payload's own newline (an `expect` on an
             // `Err` carrying a command's stderr); the trace stays on its line.
-            let mut s = r.message.trim_end().to_string();
+            let mut s = limit_fault(&r.message).unwrap_or_else(|| r.message.trim_end().to_string());
             if !r.trace.is_empty() {
                 const TRACE_FRAMES: usize = 12;
                 let mut chain = r
@@ -321,6 +331,40 @@ fn run_error(e: wscript::Error) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// The VM's fault for one of vmlab's two limits on a script run, in words
+/// that say what the limit is, how large it is and that it is vmlab's. The
+/// VM's own (`fuel exhausted`) name neither.
+fn limit_fault(message: &str) -> Option<String> {
+    if message == "fuel exhausted" {
+        return Some(format!(
+            "the script ran {} instructions without a host call, which is vmlab's limit \
+             for a script that does not end (the count starts again at each host call)",
+            grouped(SCRIPT_FUEL)
+        ));
+    }
+    if message.starts_with("memory limit of ") {
+        return Some(format!(
+            "memory limit exceeded: the script holds more than {} MiB of values, which is \
+             vmlab's limit for one script run",
+            SCRIPT_MEMORY / (1024 * 1024)
+        ));
+    }
+    None
+}
+
+/// `n` with a comma between each three digits.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Runtime mutation of a segment's L3 rules and forwards (PRD §9.9), bridged
@@ -616,6 +660,371 @@ fn main() {
             "the script run ended its process: {}\n{}",
             child.status,
             String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    /// Set in the child process of
+    /// `a_script_that_allocates_without_end_faults`.
+    const GROWING_VALUE_CHILD_ENV: &str = "VMLAB_TEST_GROWING_VALUE_CHILD";
+
+    /// A script that doubles a string in a loop asks for 1 TiB in about 400
+    /// instructions, far inside the instruction budget, and a failed
+    /// allocation is an abort of the lab daemon
+    /// (docs/reviews/wscript-2.md F13, card #1086). The run has to end with
+    /// a fault that names the memory limit. It runs in a child process so
+    /// that an abort is an exit status, and under a 4 GiB limit on the
+    /// address space so that a run without the fix cannot take the memory
+    /// of the host.
+    #[test]
+    fn a_script_that_allocates_without_end_faults() {
+        const SCRIPT: &str = r#"
+fn main() {
+    let s = "x"
+    let i = 0
+    while i < 40 {
+        s = s + s
+        i = i + 1
+    }
+}
+"#;
+        if std::env::var_os(GROWING_VALUE_CHILD_ENV).is_some() {
+            let limit = 4 * 1024 * 1024 * 1024;
+            rustix::process::setrlimit(
+                rustix::process::Resource::As,
+                rustix::process::Rlimit {
+                    current: Some(limit),
+                    maximum: Some(limit),
+                },
+            )
+            .unwrap();
+            let result = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(|| execute(SCRIPT, "grow.ws", ScriptEntry::Main, (), Arc::new(|_| {})))
+                .unwrap()
+                .join()
+                .unwrap();
+            let error = format!("{:#}", result.expect_err("the script ran to its end"));
+            assert!(error.contains("memory limit"), "{error}");
+            return;
+        }
+        // libtest names a test without the crate.
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::a_script_that_allocates_without_end_faults"),
+                "--nocapture",
+            ])
+            .env(GROWING_VALUE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "the script run ended its process, or without the fault: {}\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    // -------------------------------------------------------- memory limit
+    //
+    // The memory limit of the vendored VM (`vendor/wscript-vm/src/mem.rs`,
+    // card #1086). That crate's own tests need the compiler as a
+    // dev-dependency, which a crate outside the workspace cannot have, so
+    // the limit is tested here. The limits are small so that no test holds
+    // much.
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Run `main() -> int` of `src` under a memory limit of `limit` bytes
+    /// (none for `None`): its result, or the VM's fault message.
+    fn run_limited(src: &str, limit: Option<u64>) -> Result<i64, String> {
+        let ctx = super::super::context();
+        let unit = ctx
+            .compile(src)
+            .unwrap_or_else(|e| panic!("{}", compile_error(e)));
+        let config = VmConfig {
+            memory: limit,
+            ..VmConfig::default()
+        };
+        let mut vm = Vm::with_config(&ctx, config);
+        vm.call_unit::<_, i64>(&unit, "main", ())
+            .map_err(|e| match e {
+                wscript::Error::Runtime(r) => r.message,
+                other => other.to_string(),
+            })
+    }
+
+    /// `src` must be stopped by a limit of 1 MiB.
+    fn stopped_at_one_mib(src: &str) {
+        let fault = run_limited(src, Some(MIB)).expect_err("the script ran to its end");
+        assert_eq!(fault, format!("memory limit of {MIB} bytes exceeded"));
+    }
+
+    /// Doubling a string asks for any amount in a few instructions. The
+    /// concatenation that does not fit is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_a_doubling_string() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let s = "x"
+    let i = 0
+    while i < 40 {
+        s = s + s
+        i = i + 1
+    }
+    i
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// Without a limit the VM counts nothing: the string doubles to 1 MiB and
+    /// the run ends.
+    #[test]
+    fn memory_none_is_no_limit() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let s = "x"
+    let i = 0
+    while i < 20 {
+        s = s + s
+        i = i + 1
+    }
+    s.bytes_len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, None), Ok(1048576));
+    }
+
+    /// A list that grows one element at a time is stopped too: each `push` is
+    /// small, the list is not.
+    #[test]
+    fn memory_limit_stops_a_growing_list() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let l = [0]
+    while true { l.push(1) }
+    0
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// A list of fresh strings is stopped by what the strings take, not by the
+    /// size of the list alone.
+    #[test]
+    fn memory_limit_counts_what_a_list_holds() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [""]
+    while true { l.push(big + "x") }
+    0
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// The limit is on what the script holds, not on what it has allocated in
+    /// total: 4000 strings of 16 KiB, each dropped at the next pass, are 64 MiB
+    /// of allocation under a limit of 1 MiB.
+    #[test]
+    fn memory_limit_does_not_count_dropped_values() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let n = 0
+    let i = 0
+    while i < 4000 {
+        let t = big + "x"
+        n = n + t.bytes_len()
+        i = i + 1
+    }
+    n
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(65540000));
+    }
+
+    /// The same value in many places is counted once: 10,000 references to one
+    /// string of 16 KiB are a list of 10,000 slots, not 160 MiB.
+    #[test]
+    fn memory_limit_counts_a_shared_value_once() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 0
+    while i < 10000 {
+        l.push(big)
+        i = i + 1
+    }
+    l.len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(10001));
+    }
+
+    /// What `map` collects from its callback is in no register until `map`
+    /// returns. It is counted while `map` runs.
+    #[test]
+    fn memory_limit_counts_what_map_collects() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [0]
+    let i = 0
+    while i < 1000 {
+        l.push(i)
+        i = i + 1
+    }
+    let all = l.map(|x| big + "x")
+    all.len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `fold` keeps one value, however many its callback returned: joining 2000
+    /// lines into 128 KiB returns 128 MiB of strings in total and holds one.
+    #[test]
+    fn memory_limit_does_not_count_what_fold_dropped() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let line = "0123456789abcdef".repeat(4)
+    let l = [line]
+    let i = 1
+    while i < 2000 {
+        l.push(line)
+        i = i + 1
+    }
+    let all = l.fold("", |acc, x| acc + x)
+    all.bytes_len()
+}
+"#;
+        assert_eq!(run_limited(SCRIPT, Some(MIB)), Ok(128000));
+    }
+
+    /// A pad to a width the script names is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_a_pad_to_any_width() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    "x".pad_left(1000000000000, " ").bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// A list of 1000 references to one string of 16 KiB is counted as the list
+    /// and the string once. Its `join` is 16 MiB, built inside one builtin: each
+    /// piece has to fit before it is appended (review of card #1086, F1).
+    #[test]
+    fn memory_limit_stops_a_join_of_one_string_many_times() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 1
+    while i < 1000 {
+        l.push(big)
+        i = i + 1
+    }
+    l.join("").bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `replace` makes each match as long as its replacement: 16 KiB of matches
+    /// times 16 KiB is 256 MiB in one call. It is refused before it allocates
+    /// (review of card #1086, F1).
+    #[test]
+    fn memory_limit_stops_a_replace_that_multiplies() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "x".repeat(16384)
+    big.replace("x", "y".repeat(16384)).bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `str` of the same list writes the string 1000 times, like `join`.
+    #[test]
+    fn memory_limit_stops_a_rendering_of_one_string_many_times() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(1024)
+    let l = [big]
+    let i = 1
+    while i < 1000 {
+        l.push(big)
+        i = i + 1
+    }
+    str(l).bytes_len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// `chars` makes a list slot for each byte of an ASCII string: 128 KiB
+    /// become some MiB. It is refused before it allocates.
+    #[test]
+    fn memory_limit_stops_chars_of_a_long_string() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let big = "0123456789abcdef".repeat(8192)
+    big.chars().len()
+}
+"#;
+        stopped_at_one_mib(SCRIPT);
+    }
+
+    /// The builtins that ask the limit first are not stopped when the result
+    /// fits: a join, a replace and a rendering of 64 KiB each under 1 MiB.
+    #[test]
+    fn memory_limit_lets_a_result_that_fits_through() {
+        const SCRIPT: &str = r#"
+fn main() -> int {
+    let line = "0123456789abcdef".repeat(4)
+    let l = [line]
+    let i = 1
+    while i < 1000 {
+        l.push(line)
+        i = i + 1
+    }
+    let joined = l.join("")
+    let replaced = joined.replace("0", "zero")
+    joined.bytes_len() + replaced.bytes_len() + str(l).bytes_len()
+}
+"#;
+        // 64,000 joined. 4000 matches of "0" grow by 3 bytes each. The
+        // rendering is 1000 strings in quotes and 999 of ", " in brackets.
+        assert_eq!(
+            run_limited(SCRIPT, Some(MIB)),
+            Ok(64000 + 76000 + 66000 + 1998 + 2)
+        );
+    }
+
+    /// A chain of structs nested to any depth is walked without recursion,
+    /// and is stopped when it is too long.
+    #[test]
+    fn memory_limit_walks_a_deep_value() {
+        const SCRIPT: &str = r#"
+struct Node { next: Option[Node] }
+
+fn main() -> int {
+    let cur = Node { next: None }
+    while true { cur = Node { next: Some(cur) } }
+    0
+}
+"#;
+        let fault = run_limited(SCRIPT, Some(64 * MIB)).expect_err("the script ran to its end");
+        assert_eq!(
+            fault,
+            format!("memory limit of {} bytes exceeded", 64 * MIB)
         );
     }
 }

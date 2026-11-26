@@ -5,9 +5,9 @@
 //! doing work. [`block_on`] and [`sleep`] also check while waiting, dropping
 //! the pending work on cancellation. Cancellation unwinds the script thread
 //! with [`Cancelled`], which the runner turns back into [`ScriptCancelled`].
-//! The runner also checks for
-//! cancellation before and after execution and limits each VM's bytecode
-//! budget so a script that never calls the host still terminates.
+//! The runner checks for cancellation before and after execution. When a
+//! host call returns, the VM asks [`alive`] whether to renew the instruction
+//! budget. The budget also ends scripts that never call the host.
 //!
 //! The token rides a thread-local, set for the length of one script run by
 //! [`enter`], so the host functions need no extra argument.
@@ -89,6 +89,19 @@ fn current() -> Option<RunCancellation> {
 pub(crate) fn check() {
     if current().is_some_and(|token| token.is_cancelled()) {
         stop();
+    }
+}
+
+/// The VM asks this each time a host call has returned: whether the script
+/// may have its instruction budget again. It may when the run has a token,
+/// because then this is a point where a cancelled run stops, and it stops
+/// here. A run without a token cannot be stopped from outside, so its budget
+/// stays one for the whole run.
+pub(crate) fn alive() -> bool {
+    match current() {
+        Some(token) if token.is_cancelled() => stop(),
+        Some(_) => true,
+        None => false,
     }
 }
 
