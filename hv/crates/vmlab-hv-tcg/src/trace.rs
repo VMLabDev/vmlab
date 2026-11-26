@@ -279,6 +279,9 @@ impl Evaluation<'_> {
             Operation::Effect(_) => {
                 return Err(Error::Type("native effect used before execution".into()));
             }
+            Operation::Call { .. } => {
+                return Err(Error::Type("a helper call in a Sail trace".into()));
+            }
             Operation::Unary(op, value) => evaluate_unary(op, self.scalar(value)?)
                 .ok_or_else(|| Error::Type("native unary domain".into()))?,
             Operation::Binary(op, a, b) => {
@@ -1614,6 +1617,11 @@ impl Trace {
                     return evaluation.resume(interpreter, id).map(|value| {
                         Outcome::Resumed(value, self.recorded.block.exits[id].completed_steps + 1)
                     });
+                }
+                // The Sail recorder makes no helper call: its helpers are
+                // intrinsics of the model.
+                Event::Call { .. } => {
+                    return Err(Error::Type("a helper call in a Sail trace".into()));
                 }
             }
         }

@@ -179,7 +179,8 @@ pub fn lower(graph: &Graph, id: ScalarId) -> Option<Instruction> {
         Operation::Refine(value) => Instruction::Copy(value),
         Operation::Constant(value) => Instruction::Constant(value),
         Operation::Input(input) => Instruction::Input(input, scalar.ty),
-        Operation::Effect(_) => return None,
+        // A helper call has no linear form: the executor of a frontend runs it.
+        Operation::Effect(_) | Operation::Call { .. } => return None,
         Operation::Unary(operation, value) => Instruction::Unary(operation, value, bits),
         Operation::Binary(operation, a, b) => match scalar.ty {
             ScalarType::Bits(width)

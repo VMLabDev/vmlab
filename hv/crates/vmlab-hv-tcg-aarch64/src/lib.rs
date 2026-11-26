@@ -3,7 +3,8 @@
 //! The decoder comes from the LLVM AArch64 TableGen tables (`generated`).
 //! The semantics are our own code: lifters that append to a block of the
 //! typed IR of `vmlab-hv-tcg-ir` (`lift`), run by a small interpreter loop
-//! (`exec`). `oracle` is the test harness that follows a running QEMU
+//! (`exec`). `helpers` holds what a lifter calls and does not express in the
+//! graph: floating point on Berkeley SoftFloat. `oracle` is the test harness that follows a running QEMU
 //! instruction by instruction. QEMU is the test oracle only: nothing in this
 //! crate starts it outside that harness.
 //!
@@ -14,6 +15,7 @@
 pub mod exec;
 pub mod fields;
 pub mod generated;
+pub mod helpers;
 pub mod lift;
 pub mod oracle;
 pub mod state;

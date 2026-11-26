@@ -24,6 +24,7 @@ fn live(graph: &Graph, mut roots: Vec<ScalarId>) -> Vec<bool> {
                 when_true,
                 when_false,
             } => roots.extend([condition, when_true, when_false]),
+            Operation::Call { ref args, .. } => roots.extend(args.iter().copied()),
             _ => {}
         }
     }
@@ -50,6 +51,15 @@ pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
             } => {
                 roots.extend([address, value]);
                 roots.extend(result);
+            }
+            // An ordered call stays, with its arguments and its results.
+            Event::Call {
+                ref args,
+                ref results,
+                ..
+            } => {
+                roots.extend(args.iter().copied());
+                roots.extend(results.iter().copied());
             }
             Event::Checkpoint(_) | Event::Exit(_) => {}
         }
@@ -78,6 +88,11 @@ pub fn prune_scalars<X: ExitScalars>(block: &mut BlockOf<X>) {
                 *value = map[*value];
                 if let Some(result) = result {
                     *result = map[*result];
+                }
+            }
+            Event::Call { args, results, .. } => {
+                for scalar in args.iter_mut().chain(results.iter_mut()) {
+                    *scalar = map[*scalar];
                 }
             }
             Event::Checkpoint(_) | Event::Exit(_) => {}
@@ -368,5 +383,101 @@ mod tests {
         assert!(matches!(block.values[0], Recipe::Constant(0)));
         assert_eq!(block.context_guards[0].expected, 1);
         assert_eq!(prune(&mut block), vec![0, 1]);
+    }
+
+    fn sum(args: &[u128]) -> u128 {
+        args.iter().sum()
+    }
+
+    fn poke(context: &mut dyn std::any::Any, args: &[u128], results: &mut [u128]) {
+        if let Some(count) = context.downcast_mut::<u32>() {
+            *count += 1;
+        }
+        results[0] = args[0] + 1;
+    }
+
+    static SUM: crate::native::Helper = crate::native::Helper {
+        name: "sum",
+        args: 2,
+        results: 1,
+        effects: crate::native::Effects::NONE,
+        function: crate::native::HelperFn::Pure(sum),
+    };
+
+    static POKE: crate::native::Helper = crate::native::Helper {
+        name: "poke",
+        args: 1,
+        results: 1,
+        effects: crate::native::Effects::WRITES_STATE,
+        function: crate::native::HelperFn::Ordered(poke),
+    };
+
+    #[test]
+    fn a_pure_call_is_one_scalar_and_dies_unused_and_an_ordered_call_stays() {
+        use crate::native::regfile::Writeback;
+        use crate::native::{HelperRef, Operation};
+        let ty = ScalarType::Bits(64);
+        let mut block: BlockOf<Writeback> = BlockOf::default();
+        let a = block.graph.input(0, ty, None);
+        let b = block.graph.input(1, ty, None);
+        let first = block.graph.call(ty, &SUM, &[a, b]).unwrap();
+        // The same helper on the same arguments is the same scalar.
+        assert_eq!(block.graph.call(ty, &SUM, &[a, b]), Some(first));
+        let other = block.graph.call(ty, &SUM, &[b, a]).unwrap();
+        assert_ne!(other, first);
+        // The count of arguments is checked, and an ordered helper is no scalar.
+        assert_eq!(block.graph.call(ty, &SUM, &[a]), None);
+        assert_eq!(block.graph.call(ty, &POKE, &[a]), None);
+        let poked = block.graph.effect(0, ty);
+        block.events.push(Event::Call {
+            helper: HelperRef(&POKE),
+            args: vec![b],
+            results: vec![poked],
+        });
+        let exit = block.exit(Writeback {
+            writes: vec![(0, first)],
+        });
+        block.events.push(Event::Exit(exit));
+        prune_scalars(&mut block);
+        // `other` is gone. The ordered call keeps its argument and its result,
+        // though no exit names the result.
+        let calls: Vec<_> = block
+            .graph
+            .scalars
+            .iter()
+            .filter(|scalar| matches!(scalar.operation, Operation::Call { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let Operation::Call { helper, args } = &calls[0].operation else {
+            unreachable!();
+        };
+        assert_eq!(*helper, HelperRef(&SUM));
+        assert_eq!(args.len(), 2);
+        let Event::Call { args, results, .. } = &block.events[0] else {
+            panic!("the ordered call is the first event");
+        };
+        assert!(matches!(
+            block.graph.scalars[args[0]].operation,
+            Operation::Input(1)
+        ));
+        assert!(matches!(
+            block.graph.scalars[results[0]].operation,
+            Operation::Effect(0)
+        ));
+        // The stage of the call computes nothing: its argument is an input.
+        let stages = crate::native::schedule::schedule(&block);
+        assert_eq!(stages.len(), 2);
+        assert!(!stages[0].contains(&results[0]));
+        // Both functions run through their pointers.
+        let crate::native::HelperFn::Pure(function) = SUM.function else {
+            unreachable!();
+        };
+        assert_eq!(function(&[2, 3]), 5);
+        let crate::native::HelperFn::Ordered(function) = POKE.function else {
+            unreachable!();
+        };
+        let (mut count, mut results) = (0u32, [0u128]);
+        function(&mut count, &[41], &mut results);
+        assert_eq!((count, results[0]), (1, 42));
     }
 }

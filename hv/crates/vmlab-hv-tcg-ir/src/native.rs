@@ -107,6 +107,83 @@ pub enum Binary {
     RemainderUnsigned,
 }
 
+/// State that an ordered helper touches beyond its arguments and results
+/// (R10 of the phase 3d design), as a bit set. A backend may not move an
+/// ordered call across an event that touches the same state, and may not
+/// drop it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Effects(pub u8);
+
+impl Effects {
+    pub const NONE: Self = Self(0);
+    /// It reads state of the guest that is not in a register slot.
+    pub const READS_STATE: Self = Self(1);
+    /// It writes state of the guest that is not in a register slot.
+    pub const WRITES_STATE: Self = Self(2);
+    /// It reads guest memory.
+    pub const READS_MEMORY: Self = Self(4);
+    /// It writes guest memory.
+    pub const WRITES_MEMORY: Self = Self(8);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// The function of a helper. An interpreter calls it, and a JIT emits a call
+/// to the same function.
+#[derive(Clone, Copy)]
+pub enum HelperFn {
+    /// A function of its arguments alone. A helper that depends on a control
+    /// register takes the register as an argument, and one that sets status
+    /// flags returns them as bits of its result.
+    Pure(fn(&[u128]) -> u128),
+    /// A function that also touches the state that the frontend gives as
+    /// `context`. It fills `results`.
+    Ordered(fn(context: &mut dyn std::any::Any, args: &[u128], results: &mut [u128])),
+}
+
+/// A helper call (R10): work that a frontend does not express in scalar
+/// operations, such as a floating-point operation. A helper is a static, and
+/// two helpers are the same when they are the same static.
+pub struct Helper {
+    pub name: &'static str,
+    /// The count of arguments.
+    pub args: u8,
+    /// The count of results: 1 for a pure helper.
+    pub results: u8,
+    pub effects: Effects,
+    pub function: HelperFn,
+}
+
+/// A reference to a helper that compares and hashes by identity.
+#[derive(Clone, Copy)]
+pub struct HelperRef(pub &'static Helper);
+
+impl PartialEq for HelperRef {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for HelperRef {}
+
+impl std::hash::Hash for HelperRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.0, state);
+    }
+}
+
+impl std::fmt::Debug for HelperRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "helper {}", self.0.name)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Operation {
     Constant(u128),
@@ -133,6 +210,13 @@ pub enum Operation {
         condition: ScalarId,
         when_true: ScalarId,
         when_false: ScalarId,
+    },
+    /// The result of a pure helper (R10): a function of `args` alone. Two
+    /// calls of one helper with the same arguments are one scalar, and a call
+    /// whose result nothing uses is dropped.
+    Call {
+        helper: HelperRef,
+        args: Vec<ScalarId>,
     },
 }
 
@@ -221,6 +305,11 @@ impl Graph {
                         *condition = mapping[*condition];
                         *when_true = mapping[*when_true];
                         *when_false = mapping[*when_false];
+                    }
+                    Operation::Call { args, .. } => {
+                        for arg in args {
+                            *arg = mapping[*arg];
+                        }
                     }
                     _ => {}
                 }
@@ -812,6 +901,35 @@ impl Graph {
                 condition,
                 when_true,
                 when_false,
+            },
+        ))
+    }
+}
+
+impl Graph {
+    /// The result of the pure helper `helper` on `args` (R10), of the type
+    /// `ty`. `None` when the helper is not pure or takes another count of
+    /// arguments. A call on literals is not folded: a helper runs when the
+    /// block runs.
+    pub fn call(
+        &mut self,
+        ty: ScalarType,
+        helper: &'static Helper,
+        args: &[ScalarId],
+    ) -> Option<ScalarId> {
+        if !matches!(helper.function, HelperFn::Pure(_))
+            || usize::from(helper.args) != args.len()
+            || helper.results != 1
+        {
+            return None;
+        }
+        let args = args.iter().map(|arg| self.resolve(*arg)).collect();
+        Some(self.insert(
+            ty,
+            type_range(ty),
+            Operation::Call {
+                helper: HelperRef(helper),
+                args,
             },
         ))
     }
