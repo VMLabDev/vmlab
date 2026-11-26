@@ -151,9 +151,14 @@ fn entry(item: &Verified, few_vectors: bool) -> Entry {
         return entry;
     }
     let has_field = |name: &str| vmlab_hv_tcg_aarch64::field(item.record, name, 0).is_some();
-    let vector_data = has_field("vt") || item.encoding & (1 << 26) != 0;
+    let format = item.record.info().format;
+    // An AdvSIMD or crypto instruction names Rd, Rn, Rm and, for a table,
+    // the three registers after Rn.
+    let lanes = SIMD_FORMATS.contains(&format) || CRYPTO_FORMATS.contains(&format);
+    let vector_data = lanes || has_field("vt") || item.encoding & (1 << 26) != 0;
     let first = item.encoding & 31;
     let second = (item.encoding >> 10) & 31;
+    let (rn, rm) = ((item.encoding >> 5) & 31, (item.encoding >> 16) & 31);
     let mut kept = (
         Vectors {
             v: [0; 32],
@@ -166,7 +171,10 @@ fn entry(item: &Verified, few_vectors: bool) -> Entry {
     );
     let mut any = before.fpsr != 0 || before.fpcr != 0 || after.fpsr != 0 || after.fpcr != 0;
     for n in 0..32usize {
-        let named = vector_data && ((n as u32).wrapping_sub(first) & 31 < 4 || n as u32 == second);
+        let named = vector_data
+            && ((n as u32).wrapping_sub(first) & 31 < 4
+                || n as u32 == second
+                || (lanes && ((n as u32).wrapping_sub(rn) & 31 < 4 || n as u32 == rm)));
         if before.v[n] != after.v[n] || (named && before.v[n] != 0) {
             kept.0.v[n] = before.v[n];
             kept.1.v[n] = after.v[n];
@@ -404,7 +412,7 @@ fn main() -> Result<(), Failure> {
         follower: Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE))),
         counts: Counts {
             keep: samples,
-            few_vectors: memory_group,
+            few_vectors: memory_group || lanes,
             ..Counts::default()
         },
         rng: Rng(seed ^ 0x5eed),
