@@ -71,6 +71,8 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
 struct Counts {
     rounds: u64,
     verified: BTreeMap<Record, u64>,
+    /// The distinct encodings among the verified instructions.
+    distinct: BTreeMap<Record, std::collections::HashSet<u32>>,
     ends: BTreeMap<String, u64>,
     samples: BTreeMap<Record, Vec<Entry>>,
 }
@@ -78,6 +80,10 @@ struct Counts {
 impl Counts {
     fn add(&mut self, rng: &mut Rng, verified: &[Verified]) {
         for item in verified {
+            self.distinct
+                .entry(item.record)
+                .or_default()
+                .insert(item.encoding);
             let count = self.verified.entry(item.record).or_default();
             *count += 1;
             // Reservoir sampling: each instruction of a record has the same
@@ -109,6 +115,7 @@ impl Counts {
     fn end(&mut self, end: End) {
         let name = match end {
             End::Budget => "budget".to_string(),
+            End::Loop => "a loop of the stream".to_string(),
             End::Undefined => "undefined on both sides".to_string(),
             End::FetchAbort => "fetch abort on both sides".to_string(),
             End::PcAlignment => "pc alignment on both sides".to_string(),
@@ -237,6 +244,7 @@ fn main() -> Result<(), Failure> {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, pc),
             budget: 2 * IMAGE_WORDS as u64,
+            visits: 2,
         };
         run.round(&round)?;
         if run.counts.rounds.is_multiple_of(5000) {
@@ -292,6 +300,7 @@ fn main() -> Result<(), Failure> {
             memory: vec![(IMAGE_BASE, bytes(&words))],
             start: start(&mut generator, IMAGE_BASE),
             budget: chunk.len() as u64,
+            visits: 1,
         };
         let (_, verified) = run.round(&round)?;
         if verified != chunk.len() {
@@ -310,6 +319,7 @@ fn main() -> Result<(), Failure> {
             memory: vec![(IMAGE_BASE, bytes(&[*word, 0]))],
             start: start(&mut generator, IMAGE_BASE),
             budget: 1,
+            visits: 1,
         };
         let (_, verified) = run.round(&round)?;
         if verified != 1 {
@@ -340,9 +350,10 @@ fn main() -> Result<(), Failure> {
         );
         for record in records_of(*format) {
             println!(
-                "    {:<26} {:>9}",
+                "    {:<26} {:>9}, {:>9} distinct encodings",
                 record.name(),
-                run.counts.verified.get(&record).copied().unwrap_or(0)
+                run.counts.verified.get(&record).copied().unwrap_or(0),
+                run.counts.distinct.get(&record).map_or(0, |set| set.len())
             );
         }
     }

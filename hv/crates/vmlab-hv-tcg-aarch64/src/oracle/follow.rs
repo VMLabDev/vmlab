@@ -22,6 +22,9 @@ pub struct Round {
     pub start: Core,
     /// The most instructions to follow.
     pub budget: u64,
+    /// The round ends when one PC is about to run more often than this. It
+    /// keeps a loop of the stream from filling the round with repeats.
+    pub visits: u32,
 }
 
 /// One instruction that both sides ran from the same registers, with the
@@ -39,6 +42,8 @@ pub struct Verified {
 pub enum End {
     /// The budget of the round was used up.
     Budget,
+    /// A PC came up more often than the round allows: a loop.
+    Loop,
     /// Both sides took the Undefined Instruction exception at an encoding
     /// that no selected record matches.
     Undefined,
@@ -155,6 +160,7 @@ impl Follower {
         let mut last: Option<(u32, Record, Core)> = None;
         let mut expect = Expect::Instruction;
         let mut followed = 0u64;
+        let mut visits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         let differed =
             |what: String, last: &Option<(u32, Record, Core)>, ours: Core, qemu: Option<Core>| {
                 Box::new(Difference {
@@ -215,6 +221,12 @@ impl Follower {
                     if followed >= round.budget {
                         self.leader.stop(true)?;
                         break Ok(End::Budget);
+                    }
+                    let seen = visits.entry(core.pc).or_default();
+                    *seen += 1;
+                    if *seen > round.visits {
+                        self.leader.stop(true)?;
+                        break Ok(End::Loop);
                     }
                     followed += 1;
                     match self.cpu.step() {
