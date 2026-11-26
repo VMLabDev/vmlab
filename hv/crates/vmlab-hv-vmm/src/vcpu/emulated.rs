@@ -30,7 +30,7 @@ use crate::vm::ExitReason;
 /// The instructions of one slice. A kick, and an interrupt that another
 /// thread raised, wait for the end of a slice.
 const SLICE: u64 = 1 << 16;
-/// The slice while the debug log is on.
+/// The slice while the trace log is on.
 const DEBUG_SLICE: u64 = 64;
 
 /// The longest sleep of a halted vCPU whose timer has no deadline. A wake
@@ -236,11 +236,13 @@ impl VcpuBackend for EmulatedVcpu {
         self.drive_timer();
         self.cpu.irq = self.lines.irq.level.load(Ordering::SeqCst);
         self.cpu.fiq = self.lines.fiq.level.load(Ordering::SeqCst);
-        // With the debug log on, the slices are short, so that the log
-        // names nearly every exception that the guest takes.
+        // The debug log names the last exception of each slice. With the
+        // trace log on, the slices are short, so that it names nearly
+        // every one.
         let debug = log::log_enabled!(log::Level::Debug);
+        let short = log::log_enabled!(log::Level::Trace);
         let before = self.cpu.exceptions;
-        let stop = self.cpu.run(if debug { DEBUG_SLICE } else { SLICE });
+        let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
         if debug
             && self.cpu.exceptions != before
             && let Some(taken) = self.cpu.taken
