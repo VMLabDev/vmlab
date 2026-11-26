@@ -78,7 +78,9 @@ fn handshake(
     patience: Duration,
     path: &Path,
 ) -> Result<Client> {
-    let socket = stream.try_clone().context("a second handle on the socket")?;
+    let socket = stream
+        .try_clone()
+        .context("a second handle on the socket")?;
     let (done, wait) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::Builder::new()
         .name("vmlab-hv-hello".into())
