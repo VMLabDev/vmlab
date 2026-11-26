@@ -18,8 +18,10 @@ Fedora 42) cannot move off QEMU.
 
 ## Solution
 
-A CPU emulator generated from the formal Sail models, faster than QEMU's TCG
-(D1). The pipeline:
+A CPU emulator faster than QEMU's TCG (D1). For riscv64 it is generated from
+the formal Sail model. For aarch64 it is decoded from the LLVM tables with our
+own semantics (D15); its design is `../phase-3d-aarch64/DESIGN.md`, which wins
+over this document for 3d. The riscv64 pipeline:
 
 1. A pinned Sail plus isla-sail toolchain in a container emits textual Jib
    (D3).
@@ -29,7 +31,8 @@ A CPU emulator generated from the formal Sail models, faster than QEMU's TCG
    inlined softmmu TLB (D5).
 
 Correctness is held by lockstep comparison against the Sail C++ model per
-instruction and against QEMU per boot (D6). Performance is held by a
+instruction and against QEMU per boot (D6). For aarch64, QEMU is the oracle
+at both levels (D16). Performance is held by a
 continuous benchmark suite against QEMU TCG on this host (D2). Each `virt`
 machine reproduces what QEMU presents, apart from approved differences (D7,
 D8, D9).
@@ -41,7 +44,7 @@ The work is done in sub-phases (D12):
 | 3a | Toolchain, emitter, riscv64 interpreter, lockstep and benchmarks |
 | 3b | riscv64 `virt` machine |
 | 3c | JIT |
-| 3d | aarch64 interpreter and `virt` machine, after the owner's licence check |
+| 3d | aarch64 decoder from the LLVM tables, our own semantics, the interpreter, the TCG vCPU path of the VMM and the `virt` machine (D15 to D18). It does not wait for 3b or 3c |
 | 3e | aarch64 JIT |
 
 ## User stories
@@ -64,6 +67,8 @@ The work is done in sub-phases (D12):
 | `vmlab-hv-tcg-emit` | Jib AST to IR, run by `just tcg-generate` against the pinned toolchain. Its output is committed generated Rust in `vmlab-hv-tcg-riscv64` (later `-aarch64`): decoder accessors and the instruction tag list, with Sail notices. The runtime specialises the IR per instruction. |
 | `vmlab-hv-tcg` | The runtime: CPU state, the softmmu (TLB, page walks driven by the generated semantics, MMIO dispatch to the VMM's buses), exceptions and interrupts, the reference interpreter, the block/trace cache with self-modifying-code invalidation, and later the Cranelift JIT. It is driven per vCPU thread by `vmlab-hv-vmm` in place of `KVM_RUN` when the machine's accel is `tcg`. |
 | `vmlab-hv-lockstep` | The per-instruction oracle: the Sail-generated C++ model built in the toolchain container and linked through FFI, exposing step, state get/set and memory hooks. Plus a harness that runs our interpreter or JIT and the oracle side by side, reporting the first differing architectural state. |
+| `vmlab-hv-tcg-a64gen` | Build-time tool: the JSON dump of `llvm-tblgen` on the pinned LLVM AArch64 tables to the committed decoder and system register tables (D15). Run by `just tcg-a64-generate`, checked by `just tcg-a64-generate-check`. |
+| `vmlab-hv-tcg-aarch64` | The generated decode and system register tables with the LLVM notice, and our own semantics: one lifter per format class into the typed IR, helpers, the system register behaviour table, exceptions, the stage-1 walk (D15, D17). |
 | `bench/` | The suite, its recipes and the result history (D2). |
 
 ### Toolchain (D3, D4)
@@ -116,7 +121,9 @@ instruction group.
 
 **aarch64 `virt` (3d)** matches notes/02's capture:
 - GICv2 + GICv2m (D8), PL011, the architectural timer
-- PSCI over SMC and HVC
+- EL0 and EL1 only: AAVMF starts at EL1, as on QEMU (D17)
+- PSCI served by the machine over HVC (the conduit the templates use) and SMC
+- the CPU core apart from the machine, for a later Apple M1 machine (D17)
 - AAVMF pflash, ACPI tables matched through the normalised diff (D9)
 - PCIe ECAM and the same virtio devices
 
@@ -151,10 +158,11 @@ Profiling hooks:
 - **Lockstep (D6):**
   - A per-instruction corpus: riscv-tests and riscv-arch-test, plus random instruction streams, run against the in-process Sail model with the first divergence reported.
   - Boot-level comparison against QEMU on the templates under deterministic replay (from 3b).
+  - aarch64 (D16): random instruction streams from our decode tables and the encodings the templates execute, compared per instruction with a QEMU process through a TCG plugin, and a boot in which our machine follows QEMU's stream.
 - **S1:** real templates boot to agent ready under the memory cap (3b, 3d).
 - **e2e:** `arch.emulated` and the arch-relevant VM features on `--hypervisor vmlab` (S4).
 - **Benchmarks:** the D2 suite. D1's bar gates flipping a TCG default.
-- **Merge bar:** `just ci::check`, plus `just tcg-generate-check`.
+- **Merge bar:** `just ci::check`, plus `just tcg-generate-check`, and `just tcg-a64-generate-check` for a change of the aarch64 tables.
 - **Safety:** every VM-booting test runs under a memory cap with at most two VMs at once.
 
 ## Out of scope
@@ -162,9 +170,11 @@ Profiling hooks:
 - x86 guest emulation (HV-D3).
 - Cross-arch containers.
 - QEMU `-cpu max` extensions beyond those we implement (D7).
+- The Apple M1 machine, SVE, SME, AArch32 and EL3.
 
 ## Open questions
 
 - Whether Sail's unbounded integers survive specialisation anywhere hot enough to need a bignum fast path (notes/01 Q4); 3a answers it.
 - The exact riscv64 extension list (D7), fixed in 3a.
-- Arm's licence position on sail-arm-derived code: an owner task before 3d.
+- ~~Arm's licence position on sail-arm-derived code: an owner task before 3d.~~ Gone with D15: aarch64 uses no sail-arm.
+- The aarch64 CPU presented to the guest, when the QEMU code is removed, and when vmlab selects vmlab-hv for aarch64 (MAP Q16 to Q18).
