@@ -45,7 +45,7 @@ QEMU's `target/arm` is GPL-2.0 and vmlab is MIT. The rule for every 3d card:
 | Code | Text | Licence | Use |
 |---|---|---|---|
 | S1 | LLVM `llvm/lib/Target/AArch64/*.td`, and the files beside them (`MCTargetDesc/AArch64AddressingModes.h`, `Disassembler/`) | Apache-2.0 WITH LLVM-exception | Encodings, fields, operand classes, the names, encodings and access of system registers, feature predicates. Code that we port by hand carries the notice. |
-| S2 | gem5 `src/arch/arm` (the `.isa` files, `miscregs`, `faults`, `table_walker`, `pauth_helpers`) | BSD-3-Clause, copyright of Arm Limited and others | The readable reference for instruction and system semantics: exception levels, system registers, translation, faults. The gem5 licence has no patent grant (checked in its `LICENSE`). |
+| S2 | gem5 `src/arch/arm` (the `.isa` files, `miscregs`, `faults`, `table_walker`, `pauth_helpers`) | BSD-3-Clause, copyright of Arm Limited and others | The readable reference for instruction and system semantics: exception levels, system registers, translation, faults. The gem5 licence has no patent grant (checked in its `LICENSE`). The card that first reads a file checks the header of that file. |
 | S3 | dynarmic `src/dynarmic/frontend/A64` | 0BSD | A second readable reference for user-mode A64, FP and AdvSIMD. It emulates no privilege level above user mode. |
 | S4 | VIXL's AArch64 simulator | BSD-3-Clause (the card that first reads it checks the `LICENCE` file) | A third reference for user-mode instructions. Its README says that exclusive accesses and some FP rounding modes are not exact. |
 | S5 | Berkeley SoftFloat 3e and TestFloat | BSD-3-Clause | Floating point. SoftFloat is already vendored. |
