@@ -130,6 +130,19 @@ impl FwCfg {
         Ok(device)
     }
 
+    /// Register the firmware inputs of an aarch64 `virt` machine. The files
+    /// get the selectors that QEMU gives them: directory order from 0x20.
+    pub fn for_virt(memory: GuestMemory, platform: &crate::virt::Platform) -> Result<Self, String> {
+        let mut device = Self::new(memory);
+        for (key, data) in crate::virt::numeric_items(platform)? {
+            device.add_numeric(key, data)?;
+        }
+        for (name, data) in crate::virt::files(platform)? {
+            device.add_file(&name, data, false)?;
+        }
+        Ok(device)
+    }
+
     fn insert(&mut self, key: u16, data: Vec<u8>, writable: bool, name: Option<String>) {
         self.state.entries.insert(
             key,
