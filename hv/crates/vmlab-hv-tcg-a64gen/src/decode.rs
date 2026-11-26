@@ -502,6 +502,23 @@ pub fn generate(json: &Value, config: &Config, sha256: &str) -> Result<Output> {
         config.features.len(),
         config.features
     );
+    let mut attributes = Vec::new();
+    for feature in &config.features {
+        let record = &json[format!("Feature{feature}")];
+        attributes.push(
+            record["Name"]
+                .as_str()
+                .with_context(|| format!("sets.toml: LLVM has no Feature{feature}"))?
+                .to_string(),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "/// The same features as `-mattr` of the LLVM tools spells them.\n\
+         pub const FEATURE_ATTRIBUTES: [&str; {}] = {:?};\n",
+        attributes.len(),
+        attributes
+    );
 
     out.push_str(
         "/// One part of a field: `len` bits of the word from `word_lsb` are the\n\

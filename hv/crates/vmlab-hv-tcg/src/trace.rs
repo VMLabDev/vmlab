@@ -300,6 +300,17 @@ impl Evaluation<'_> {
                     .unwrap_or(0)
                     | self.scalar(low)?
             }
+            Operation::Select {
+                condition,
+                when_true,
+                when_false,
+            } => {
+                if self.scalar(condition)? != 0 {
+                    self.scalar(when_true)?
+                } else {
+                    self.scalar(when_false)?
+                }
+            }
         };
         let value = if let ScalarType::Bits(width) = node.ty {
             value & mask(width)

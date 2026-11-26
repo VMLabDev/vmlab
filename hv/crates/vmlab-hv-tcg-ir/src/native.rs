@@ -7,6 +7,7 @@ pub mod linear;
 pub mod liveness;
 mod modular;
 pub mod packed;
+pub mod regfile;
 pub mod schedule;
 use std::collections::HashMap;
 
@@ -75,6 +76,12 @@ pub enum Unary {
     SignExtend(u16),
     LeadingZeros(u16),
     TrailingZeros(u16),
+    /// The low `width` bits in the opposite order.
+    ReverseBits(u16),
+    /// The low `width` bits, a whole number of bytes, in the opposite byte order.
+    ReverseBytes(u16),
+    /// The count of set bits among the low `width` bits.
+    PopCount(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -119,6 +126,13 @@ pub enum Operation {
         high: ScalarId,
         low: ScalarId,
         low_width: u16,
+    },
+    /// `when_true` where the Bool `condition` holds, else `when_false`.
+    /// Both values have the type of the result.
+    Select {
+        condition: ScalarId,
+        when_true: ScalarId,
+        when_false: ScalarId,
     },
 }
 
@@ -198,6 +212,15 @@ impl Graph {
                     } => {
                         *a = mapping[*a];
                         *b = mapping[*b];
+                    }
+                    Operation::Select {
+                        condition,
+                        when_true,
+                        when_false,
+                    } => {
+                        *condition = mapping[*condition];
+                        *when_true = mapping[*when_true];
+                        *when_false = mapping[*when_false];
                     }
                     _ => {}
                 }
@@ -749,6 +772,51 @@ impl Graph {
     }
 }
 
+impl Graph {
+    /// A conditional value (R9). `condition` is a Bool. `when_true` and
+    /// `when_false` must have the type `ty`. `None` when they do not.
+    pub fn select(
+        &mut self,
+        ty: ScalarType,
+        condition: ScalarId,
+        when_true: ScalarId,
+        when_false: ScalarId,
+    ) -> Option<ScalarId> {
+        let condition = self.resolve(condition);
+        let when_true = self.resolve(when_true);
+        let when_false = self.resolve(when_false);
+        if self.scalars[condition].ty != ScalarType::Bool
+            || self.scalars[when_true].ty != ty
+            || self.scalars[when_false].ty != ty
+        {
+            return None;
+        }
+        if let Some(value) = self.literal(condition) {
+            return Some(if value != 0 { when_true } else { when_false });
+        }
+        if when_true == when_false {
+            return Some(when_true);
+        }
+        let range = self.scalars[when_true]
+            .range
+            .zip(self.scalars[when_false].range)
+            .map(|(a, b)| Range {
+                min: a.min.min(b.min),
+                max: a.max.max(b.max),
+            })
+            .or_else(|| type_range(ty));
+        Some(self.insert(
+            ty,
+            range,
+            Operation::Select {
+                condition,
+                when_true,
+                when_false,
+            },
+        ))
+    }
+}
+
 pub fn evaluate_unary(operation: Unary, value: u128) -> Option<u128> {
     Some(match operation {
         Unary::BoolNot => u128::from(value == 0),
@@ -763,6 +831,15 @@ pub fn evaluate_unary(operation: Unary, value: u128) -> Option<u128> {
         Unary::TrailingZeros(width) => {
             u128::from((value & mask(width)).trailing_zeros().min(width.into()))
         }
+        Unary::ReverseBits(0) | Unary::ReverseBytes(0) => 0,
+        Unary::ReverseBits(width) if width <= 128 => {
+            (value & mask(width)).reverse_bits() >> (128 - width)
+        }
+        Unary::ReverseBytes(width) if width <= 128 && width.is_multiple_of(8) => {
+            (value & mask(width)).swap_bytes() >> (128 - width)
+        }
+        Unary::ReverseBits(_) | Unary::ReverseBytes(_) => return None,
+        Unary::PopCount(width) => u128::from((value & mask(width)).count_ones()),
     })
 }
 
@@ -992,6 +1069,62 @@ mod tests {
             evaluate_binary(Binary::Add, ScalarType::Integer, i128::MAX as u128, 1),
             None
         );
+    }
+
+    #[test]
+    fn select_folds_a_known_condition_and_equal_arms() {
+        let mut graph = Graph::default();
+        let ty = ScalarType::Bits(64);
+        let a = graph.input(0, ty, None);
+        let b = graph.input(1, ty, None);
+        let condition = graph.input(2, ScalarType::Bool, None);
+        let truth = graph.constant(ScalarType::Bool, 1);
+        let falsehood = graph.constant(ScalarType::Bool, 0);
+        assert_eq!(graph.select(ty, truth, a, b), Some(a));
+        assert_eq!(graph.select(ty, falsehood, a, b), Some(b));
+        assert_eq!(graph.select(ty, condition, a, a), Some(a));
+        let chosen = graph.select(ty, condition, a, b).unwrap();
+        assert!(matches!(
+            graph.scalars[chosen].operation,
+            Operation::Select { .. }
+        ));
+        assert_eq!(graph.select(ty, condition, a, b), Some(chosen));
+        // The arms must have the type of the result, and the condition is a Bool.
+        let narrow = graph.input(3, ScalarType::Bits(32), None);
+        assert_eq!(graph.select(ty, condition, a, narrow), None);
+        assert_eq!(graph.select(ty, a, a, b), None);
+        // The range of a select is the union of the ranges of its arms.
+        let small = graph.constant(ty, 3);
+        let large = graph.constant(ty, 9);
+        let either = graph.select(ty, condition, small, large).unwrap();
+        assert_eq!(graph.scalars[either].range, Some(Range { min: 3, max: 9 }));
+    }
+
+    #[test]
+    fn bit_reversal_byte_reversal_and_population_count() {
+        assert_eq!(evaluate_unary(Unary::ReverseBits(8), 0b0000_0110), Some(0b0110_0000));
+        assert_eq!(evaluate_unary(Unary::ReverseBits(32), 1), Some(1 << 31));
+        assert_eq!(evaluate_unary(Unary::ReverseBits(64), 1 << 63), Some(1));
+        assert_eq!(evaluate_unary(Unary::ReverseBits(128), 1), Some(1 << 127));
+        assert_eq!(evaluate_unary(Unary::ReverseBits(0), u128::MAX), Some(0));
+        assert_eq!(evaluate_unary(Unary::ReverseBytes(16), 0x1234), Some(0x3412));
+        assert_eq!(
+            evaluate_unary(Unary::ReverseBytes(32), 0xffff_ffff_1122_3344),
+            Some(0x4433_2211)
+        );
+        assert_eq!(
+            evaluate_unary(Unary::ReverseBytes(64), 0x0102_0304_0506_0708),
+            Some(0x0807_0605_0403_0201)
+        );
+        assert_eq!(evaluate_unary(Unary::ReverseBytes(12), 1), None);
+        assert_eq!(evaluate_unary(Unary::PopCount(8), 0x1ff), Some(8));
+        assert_eq!(evaluate_unary(Unary::PopCount(64), u128::MAX), Some(64));
+        let mut graph = Graph::default();
+        let input = graph.constant(ScalarType::Bits(32), 0x0000_00f0);
+        let reversed = graph
+            .unary(ScalarType::Bits(32), Unary::ReverseBits(32), input)
+            .unwrap();
+        assert_eq!(graph.literal(reversed), Some(0x0f00_0000));
     }
 
     #[test]

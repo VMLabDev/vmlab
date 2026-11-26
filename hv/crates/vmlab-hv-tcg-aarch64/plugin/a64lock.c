@@ -16,6 +16,7 @@
  * The stream, little-endian:
  *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 0
  *   instruction   u32 1, u32 encoding, u64 x[31], u64 sp, u64 pc, u64 cpsr
+ *                 (pc is the address of the instruction, not the PC register)
  *                 with vectors: u8 v[32][16], u64 fpsr, u64 fpcr
  *   memory write  u32 2, u32 size in bytes, u64 vaddr, u64 low, u64 high
  *   discontinuity u32 3, u32 type (1 interrupt, 2 exception, 4 host call),
@@ -41,10 +42,14 @@ enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3 };
 
 static int out_fd = -1;
 static int vectors;
-static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_pc, *reg_cpsr;
+static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr;
 static struct qemu_plugin_register *reg_v[32], *reg_fpsr, *reg_fpcr;
 static GByteArray *scratch;
 static int ready;
+/* The address of the translation block that runs now. QEMU does not keep the
+ * PC register current inside a block, so the PC of an instruction is this
+ * plus its offset in the block. */
+static uint64_t tb_base;
 
 static void emit(const void *data, size_t len)
 {
@@ -77,7 +82,10 @@ static void put_reg(GByteArray *rec, struct qemu_plugin_register *reg, guint wan
 static void insn_exec(unsigned int vcpu, void *udata)
 {
     static GByteArray *rec;
-    uint32_t head[2] = { REC_INSN, (uint32_t)(uintptr_t)udata };
+    /* udata: the encoding in the low half, the offset in the block above. */
+    uint64_t packed = (uint64_t)(uintptr_t)udata;
+    uint32_t head[2] = { REC_INSN, (uint32_t)packed };
+    uint64_t pc = tb_base + (packed >> 32);
     if (!ready || vcpu != 0) {
         return;
     }
@@ -90,7 +98,7 @@ static void insn_exec(unsigned int vcpu, void *udata)
         put_reg(rec, reg_x[i], 8);
     }
     put_reg(rec, reg_sp, 8);
-    put_reg(rec, reg_pc, 8);
+    g_byte_array_append(rec, (const uint8_t *)&pc, 8);
     put_reg(rec, reg_cpsr, 8);
     if (vectors) {
         for (int i = 0; i < 32; i++) {
@@ -146,21 +154,32 @@ static void discon(unsigned int vcpu, enum qemu_plugin_discon_type type,
     emit(&rec, sizeof(rec));
 }
 
-static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+static void tb_exec(unsigned int vcpu, void *udata)
+{
+    if (vcpu == 0) {
+        tb_base = (uint64_t)(uintptr_t)udata;
+    }
+}
+
+static void tb_trans(struct qemu_plugin_tb *tb, void *udata)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
+    uint64_t base = qemu_plugin_tb_vaddr(tb);
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, tb_exec, QEMU_PLUGIN_CB_NO_REGS,
+                                         (void *)(uintptr_t)base);
     for (size_t i = 0; i < n; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint32_t encoding = 0;
+        uint64_t offset = qemu_plugin_insn_vaddr(insn) - base;
         qemu_plugin_insn_data(insn, &encoding, sizeof(encoding));
         qemu_plugin_register_vcpu_insn_exec_cb(insn, insn_exec, QEMU_PLUGIN_CB_R_REGS,
-                                               (void *)(uintptr_t)encoding);
+                                               (void *)(uintptr_t)(encoding | offset << 32));
         qemu_plugin_register_vcpu_mem_cb(insn, mem_write, QEMU_PLUGIN_CB_NO_REGS,
                                          QEMU_PLUGIN_MEM_W, NULL);
     }
 }
 
-static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
+static void vcpu_init(unsigned int vcpu, void *udata)
 {
     GArray *regs;
     int missing = 0;
@@ -174,8 +193,6 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
         char *end;
         if (!strcmp(n, "sp")) {
             reg_sp = r->handle;
-        } else if (!strcmp(n, "pc")) {
-            reg_pc = r->handle;
         } else if (!strcmp(n, "cpsr")) {
             reg_cpsr = r->handle;
         } else if (!strcmp(n, "fpsr")) {
@@ -194,7 +211,7 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu)
     for (int i = 0; i < 31; i++) {
         missing += !reg_x[i];
     }
-    missing += !reg_sp + !reg_pc + !reg_cpsr;
+    missing += !reg_sp + !reg_cpsr;
     if (vectors) {
         for (int i = 0; i < 32; i++) {
             missing += !reg_v[i];
@@ -238,8 +255,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
     scratch = g_byte_array_new();
     header.flags = vectors;
     emit(&header, sizeof(header));
-    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
-    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans);
+    qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);
+    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans, NULL);
     qemu_plugin_register_vcpu_discon_cb(id, QEMU_PLUGIN_DISCON_ALL, discon, NULL);
     return 0;
 }

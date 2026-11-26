@@ -26,6 +26,97 @@ tcg-generate $ir='target/tcg/riscv64.ir': tcg-ir-generate
 tcg-generate-check $ir='target/tcg/riscv64.ir': tcg-ir-generate
 	cargo run --release -p vmlab-hv-tcg-emit -- "$ir" crates/vmlab-hv-tcg-riscv64/src --check
 
+# Tag of the LLVM tools container image (toolchain/llvm/pins.env pins its inputs)
+a64_image := "vmlab-hv-llvm-toolchain:23.1.4"
+a64_crate := "crates/vmlab-hv-tcg-aarch64"
+
+# Build the pinned LLVM tools container image from toolchain/llvm/pins.env
+[private]
+tcg-a64-image-build:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd toolchain/llvm
+	args=()
+	while IFS='=' read -r key value; do
+		case "$key" in ''|'#'*|LLVM_AARCH64_JSON_SHA256) continue ;; esac
+		args+=(--build-arg "$key=$value")
+	done < pins.env
+	docker build --memory 16g --memory-swap 16g -f Containerfile "${args[@]}" -t {{a64_image}} .
+
+# Dump the AArch64 TableGen records of the pinned LLVM as JSON into target/tcg/; llvm=container builds the pinned tools, llvm=host uses llvm-tblgen from PATH on the pinned sources
+[group('tcg')]
+tcg-a64-dump llvm='container':
+	#!/usr/bin/env bash
+	set -euo pipefail
+	mkdir -p target/tcg
+	case "{{llvm}}" in
+	container)
+		just tcg-a64-image-build
+		docker run --rm --network none --memory 8g --memory-swap 8g --user "$(id -u):$(id -g)" \
+			-v "$PWD/target/tcg":/out {{a64_image}} /opt/scripts/dump.sh /out ;;
+	host)
+		toolchain/llvm/scripts/fetch-src.sh "$PWD/target/tcg/llvm-src"
+		LLVM_SRC="$PWD/target/tcg/llvm-src" TD_SHA256="$PWD/toolchain/llvm/td.sha256" \
+			toolchain/llvm/scripts/dump.sh "$PWD/target/tcg" ;;
+	*) echo "llvm is container or host" >&2; exit 2 ;;
+	esac
+	want=$(sed -n 's/^LLVM_AARCH64_JSON_SHA256=//p' toolchain/llvm/pins.env)
+	echo "$want  target/tcg/aarch64.json" | sha256sum -c -
+
+# Write toolchain/llvm/td.sha256 from the .td files that the dump reads (after a change of the LLVM pin)
+[group('tcg')]
+tcg-a64-pin:
+	toolchain/llvm/scripts/fetch-src.sh "$PWD/target/tcg/llvm-src"
+	mkdir -p target/tcg
+	PIN=1 LLVM_SRC="$PWD/target/tcg/llvm-src" TD_SHA256="$PWD/toolchain/llvm/td.sha256" toolchain/llvm/scripts/dump.sh "$PWD/target/tcg"
+	@echo "now set LLVM_AARCH64_JSON_SHA256 in toolchain/llvm/pins.env to:" && cut -d' ' -f1 target/tcg/aarch64.json.sha256
+
+# The llvm-mc that the decoder recipes start: the one of the container image, or the one on PATH
+[private]
+tcg-a64-llvm-mc llvm:
+	@case "{{llvm}}" in container) echo "$PWD/toolchain/llvm/scripts/llvm-mc-container.sh" ;; host) command -v llvm-mc ;; *) echo "llvm is container or host" >&2; exit 2 ;; esac
+
+# Generate the committed aarch64 decoder, system register tables and decoder vectors from the pinned LLVM tables
+[group('tcg')]
+tcg-a64-generate llvm='container': (tcg-a64-dump llvm)
+	cargo run --release -p vmlab-hv-tcg-a64gen -- target/tcg/aarch64.json {{a64_crate}}
+	A64_LLVM_IMAGE={{a64_image}} cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_mc -- --llvm-mc "$(just tcg-a64-llvm-mc {{llvm}})" --vectors-out {{a64_crate}}/tests/vectors.txt
+
+# Regenerate in memory and compare the three committed aarch64 decoder artifacts
+[group('tcg')]
+tcg-a64-generate-check llvm='container': (tcg-a64-dump llvm)
+	cargo run --release -p vmlab-hv-tcg-a64gen -- target/tcg/aarch64.json {{a64_crate}} --check
+	A64_LLVM_IMAGE={{a64_image}} cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_mc -- --llvm-mc "$(just tcg-a64-llvm-mc {{llvm}})" --vectors-check {{a64_crate}}/tests/vectors.txt
+
+# Compare the aarch64 decoder with `llvm-mc --show-inst` on random words of the selected sets
+[group('tcg')]
+tcg-a64-decode-check count='10000000' seed='1' llvm='container' jobs='8':
+	if [ "{{llvm}}" = container ]; then just tcg-a64-image-build; fi
+	A64_LLVM_IMAGE={{a64_image}} cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_mc -- --llvm-mc "$(just tcg-a64-llvm-mc {{llvm}})" --count {{count}} --seed {{seed}} --jobs {{jobs}}
+
+# Build the QEMU plugin of the aarch64 lockstep into target/tcg/ (needs gcc, glib and qemu-plugin.h)
+[private]
+tcg-a64-plugin-build:
+	@mkdir -p target/tcg
+	gcc -O2 -Wall -Werror -shared -fPIC $(pkg-config --cflags glib-2.0) -o target/tcg/a64lock.so {{a64_crate}}/plugin/a64lock.c
+
+# Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3); traces are files of the measure plugin with the executed encodings, separated by spaces
+[group('tcg')]
+tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='': tcg-a64-plugin-build
+	#!/usr/bin/env bash
+	set -euo pipefail
+	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64lock.XXXXXX")
+	trap '[ -n "$dir" ] && [ -d "$dir" ] && rm -rf -- "$dir"' EXIT
+	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --group "{{group}}" --per-class "{{per_class}}" --seed "{{seed}}")
+	for trace in {{traces}}; do args+=(--encodings "$trace"); done
+	if [ -n "{{corpus}}" ]; then args+=(--corpus-out "{{corpus}}"); fi
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_lockstep -- "${args[@]}"
+
+# Measure the aarch64 interpreter loop on the branch-and-add image (DESIGN.md M6)
+[group('tcg')]
+tcg-a64-mips iterations='100000000' repeats='3':
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_mips -- {{iterations}} {{repeats}}
+
 # Build the pinned legacy and EFI virtio-net option ROMs
 [group('dev')]
 firmware-ipxe-build:

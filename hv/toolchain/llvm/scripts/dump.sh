@@ -11,6 +11,7 @@ case "$src" in ""|/) echo "dump.sh: LLVM_SRC is not set" >&2; exit 2;; esac
 list=${TD_SHA256:-/opt/td.sha256}
 tblgen=${LLVM_TBLGEN:-llvm-tblgen}
 mkdir -p "$out"
+[ -n "$out" ] && [ -d "$out" ] || exit 1
 target=llvm/lib/Target/AArch64
 ( cd "$src" && "$tblgen" --dump-json -I llvm/include -I "$target" \
     "$target/AArch64.td" -d "$out/aarch64.d" -o "$out/aarch64.json" )
