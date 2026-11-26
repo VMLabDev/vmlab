@@ -111,8 +111,8 @@ struct Tally {
     /// Our constraint refuses what LLVM names, by record.
     constrained: BTreeMap<&'static str, u64>,
     different: u64,
-    /// The first differences, for the report.
-    examples: Vec<String>,
+    /// The differences by the two names, with a count and one word each.
+    pairs: BTreeMap<(&'static str, String), (u64, u32)>,
 }
 
 impl Tally {
@@ -131,13 +131,11 @@ impl Tally {
                     return;
                 }
                 self.different += 1;
-                if self.examples.len() < 40 {
-                    self.examples.push(format!(
-                        "{word:08x}: ours {} / llvm-mc {}",
-                        ours.unwrap_or("(undefined)"),
-                        llvm.unwrap_or("(undefined)")
-                    ));
-                }
+                let pair = (
+                    ours.unwrap_or("(undefined)"),
+                    llvm.unwrap_or("(undefined)").to_string(),
+                );
+                self.pairs.entry(pair).or_insert((0, word)).0 += 1;
             }
         }
     }
@@ -150,10 +148,8 @@ impl Tally {
         for (record, count) in other.constrained {
             *self.constrained.entry(record).or_default() += count;
         }
-        for example in other.examples {
-            if self.examples.len() < 40 {
-                self.examples.push(example);
-            }
+        for (pair, (count, word)) in other.pairs {
+            self.pairs.entry(pair).or_insert((0, word)).0 += count;
         }
     }
 
@@ -169,8 +165,10 @@ impl Tally {
         for (record, count) in &self.constrained {
             println!("  constraint refuses {record}: {count} words that llvm-mc names");
         }
-        for example in &self.examples {
-            println!("  different {example}");
+        for ((ours, llvm), (count, word)) in &self.pairs {
+            println!(
+                "  different: ours {ours} / llvm-mc {llvm}: {count} words, for example {word:08x}"
+            );
         }
     }
 }
