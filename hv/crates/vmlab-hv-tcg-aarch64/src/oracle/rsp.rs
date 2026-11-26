@@ -344,10 +344,7 @@ mod tests {
             (&b"Z1,200,4"[..], b"OK".to_vec()),
             (&b"M0,1:00"[..], b"E14".to_vec()),
             (&b"p23"[..], b"0102030405060708090a0b0c0d0e0f10".to_vec()),
-            (
-                &b"P41=100f0e0d0c0b0a090807060504030201"[..],
-                b"OK".to_vec(),
-            ),
+            (&b"P41=100f0e0d0c0b0a090807060504030201"[..], b"OK".to_vec()),
         ]);
         assert_eq!(rsp.core().unwrap(), core);
         rsp.set_core(&core).unwrap();
@@ -359,7 +356,10 @@ mod tests {
         );
         rsp.break_at(0x200).unwrap();
         assert!(rsp.write_memory(0, &[0]).is_err());
-        assert_eq!(rsp.vector(1).unwrap(), 0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201);
+        assert_eq!(
+            rsp.vector(1).unwrap(),
+            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201
+        );
         rsp.set_vector(31, 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)
             .unwrap();
         server.join().unwrap();

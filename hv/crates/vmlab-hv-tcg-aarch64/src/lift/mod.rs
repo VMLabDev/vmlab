@@ -43,7 +43,9 @@ pub fn lift(builder: &mut Builder, decoded: &Decoded) -> Lifted {
         Fields::BaseCmpBranch(fields) => branch::compare(builder, record, fields),
         Fields::BaseTestBranch(fields) => branch::test(builder, record, fields),
         Fields::BranchReg(fields) => branch::register(builder, record, fields),
-        Fields::BaseLoadStoreUI(f) => loadstore::unsigned_offset(builder, record, f.offset, f.rn, f.rt),
+        Fields::BaseLoadStoreUI(f) => {
+            loadstore::unsigned_offset(builder, record, f.offset, f.rn, f.rt)
+        }
         Fields::BaseLoadStoreUnscale(f) => {
             loadstore::signed_offset(builder, record, Index::Offset, f.offset, f.rn, f.rt)
         }

@@ -162,7 +162,10 @@ type QemuWrite = (u64, u32, u64, u64);
 fn qemu_bytes(write: &QemuWrite) -> (u64, Vec<u8>) {
     let (address, size, low, high) = *write;
     let value = u128::from(low) | u128::from(high) << 64;
-    (address, value.to_le_bytes()[..(size as usize).min(16)].to_vec())
+    (
+        address,
+        value.to_le_bytes()[..(size as usize).min(16)].to_vec(),
+    )
 }
 
 /// The bytes that a list of writes leaves, by address.
@@ -177,17 +180,12 @@ fn written(writes: impl Iterator<Item = (u64, Vec<u8>)>) -> BTreeMap<u64, u8> {
 }
 
 fn our_writes(accesses: &[Access]) -> BTreeMap<u64, u8> {
-    written(
-        accesses
-            .iter()
-            .filter(|access| access.write)
-            .map(|access| {
-                (
-                    access.address,
-                    access.value.to_le_bytes()[..usize::from(access.bytes)].to_vec(),
-                )
-            }),
-    )
+    written(accesses.iter().filter(|access| access.write).map(|access| {
+        (
+            access.address,
+            access.value.to_le_bytes()[..usize::from(access.bytes)].to_vec(),
+        )
+    }))
 }
 
 fn describe(bytes: &BTreeMap<u64, u8>) -> String {

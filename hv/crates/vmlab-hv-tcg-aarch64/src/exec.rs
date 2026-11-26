@@ -430,7 +430,9 @@ fn compile(
         }
         if let Event::Exit(_) = event {
             let A64Next::Pc(next) = payload.next else {
-                return Err(host("a block that ends in an exception has no executor yet"));
+                return Err(host(
+                    "a block that ends in an exception has no executor yet",
+                ));
             };
             outputs.push((slot::PC as u32, narrow(slots[next])?));
             compiled.outputs = outputs;
@@ -503,7 +505,9 @@ fn compile(
             },
             Event::Exit(_) | Event::Checkpoint(_) => continue,
         };
-        compiled.effects.push((narrow(compiled.code.len())?, effect));
+        compiled
+            .effects
+            .push((narrow(compiled.code.len())?, effect));
     }
     if !ended {
         return Err(host("a block without an exit"));
@@ -719,7 +723,11 @@ impl<M: Memory> Cpu<M> {
 
     /// The loads and stores since the last call, in their order.
     pub fn take_accesses(&mut self) -> Vec<Access> {
-        self.side.log.as_mut().map(std::mem::take).unwrap_or_default()
+        self.side
+            .log
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// End the exclusive reservation of the CPU, as `CLREX` and an exception

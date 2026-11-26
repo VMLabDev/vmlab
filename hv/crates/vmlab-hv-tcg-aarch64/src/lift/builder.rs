@@ -603,7 +603,13 @@ impl Builder {
     }
 
     /// `high` above `low`. `low` has `low_width` bits and the result `width`.
-    pub fn concat(&mut self, high: ScalarId, low: ScalarId, low_width: u16, width: u16) -> ScalarId {
+    pub fn concat(
+        &mut self,
+        high: ScalarId,
+        low: ScalarId,
+        low_width: u16,
+        width: u16,
+    ) -> ScalarId {
         debug_assert_eq!(
             self.block.graph.scalars[low].ty,
             ScalarType::Bits(low_width)

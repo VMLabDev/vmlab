@@ -171,7 +171,10 @@ fn a_store_writes_the_low_bytes_of_its_register_and_nothing_beside_them() {
     let bytes = read(&mut cpu, DATA + 0x400, 64);
     assert_eq!(bytes[..4], [0xaa, 0x88, 0xaa, 0xaa]);
     assert_eq!(bytes[8..12], [0x88, 0x77, 0xaa, 0xaa]);
-    assert_eq!(bytes[16..24], [0x88, 0x77, 0x66, 0x55, 0xaa, 0xaa, 0xaa, 0xaa]);
+    assert_eq!(
+        bytes[16..24],
+        [0x88, 0x77, 0x66, 0x55, 0xaa, 0xaa, 0xaa, 0xaa]
+    );
     assert_eq!(bytes[32..40], 0x1122_3344_5566_7788u64.to_le_bytes());
     assert_eq!(bytes[48..56], [0; 8]);
     assert_eq!(cpu.state.x(0), DATA + 0x3f8);
@@ -281,7 +284,10 @@ fn a_vector_register_moves_its_low_bytes_and_a_load_clears_the_rest() {
     assert_eq!(v(&cpu, 4), 0x3322_1100);
     assert_eq!(v(&cpu, 5), 0x7766_5544_3322_1100);
     assert_eq!(v(&cpu, 6), value);
-    assert_eq!(v(&cpu, 7), u128::from_le_bytes(core::array::from_fn(|n| n as u8)));
+    assert_eq!(
+        v(&cpu, 7),
+        u128::from_le_bytes(core::array::from_fn(|n| n as u8))
+    );
     assert_eq!(v(&cpu, 8), value);
 }
 
@@ -289,26 +295,17 @@ fn a_vector_register_moves_its_low_bytes_and_a_load_clears_the_rest() {
 fn whole_register_structures_lie_in_memory_in_turn_or_one_register_after_the_other() {
     let mut cpu = cpu(&[
         // ld2 {v30.4s, v31.4s}, [x0], #32
-        word(
-            Record::LD2Twov4s_POST,
-            &[("vt", 30), ("rn", 0), ("xm", 31)],
-        ),
+        word(Record::LD2Twov4s_POST, &[("vt", 30), ("rn", 0), ("xm", 31)]),
         // ld4 {v31.8b, v0.8b, v1.8b, v2.8b}, [x1]: the list wraps to V0.
         word(Record::LD4Fourv8b, &[("vt", 31), ("rn", 1)]),
         // ld1 {v3.2d, v4.2d, v5.2d}, [x1], x9
-        word(
-            Record::LD1Threev2d_POST,
-            &[("vt", 3), ("rn", 1), ("xm", 9)],
-        ),
+        word(Record::LD1Threev2d_POST, &[("vt", 3), ("rn", 1), ("xm", 9)]),
         // ld3 {v6.8h, v7.8h, v8.8h}, [x2]
         word(Record::LD3Threev8h, &[("vt", 6), ("rn", 2)]),
         // st2 {v6.8h, v7.8h}, [x3]
         word(Record::ST2Twov8h, &[("vt", 6), ("rn", 3)]),
         // st1 {v8.1d}, [x4], #8
-        word(
-            Record::ST1Onev1d_POST,
-            &[("vt", 8), ("rn", 4), ("xm", 31)],
-        ),
+        word(Record::ST1Onev1d_POST, &[("vt", 8), ("rn", 4), ("xm", 31)]),
         // st4 {v3.2s, v4.2s, v5.2s, v6.2s}, [x5]
         word(Record::ST4Fourv2s, &[("vt", 3), ("rn", 5)]),
     ]);
@@ -326,9 +323,12 @@ fn whole_register_structures_lie_in_memory_in_turn_or_one_register_after_the_oth
     assert_eq!(cpu.instructions, 7);
     // LD2 of 32-bit elements: the even words to the first register.
     let words = |offsets: [u64; 4]| {
-        offsets.iter().enumerate().fold(0u128, |value, (n, offset)| {
-            value | u128::from(pattern(*offset, 4)) << (32 * n)
-        })
+        offsets
+            .iter()
+            .enumerate()
+            .fold(0u128, |value, (n, offset)| {
+                value | u128::from(pattern(*offset, 4)) << (32 * n)
+            })
     };
     assert_eq!(v(&cpu, 30), words([0, 8, 16, 24]));
     assert_eq!(cpu.state.x(0), DATA + 32);
@@ -376,7 +376,10 @@ fn whole_register_structures_lie_in_memory_in_turn_or_one_register_after_the_oth
         read(&mut cpu, DATA + 0x1040, 16)[..8],
         (thirds(4) as u64).to_le_bytes()
     );
-    assert_eq!(read(&mut cpu, DATA + 0x1048, 8), pattern(0x1048, 8).to_le_bytes());
+    assert_eq!(
+        read(&mut cpu, DATA + 0x1048, 8),
+        pattern(0x1048, 8).to_le_bytes()
+    );
     assert_eq!(cpu.state.x(4), DATA + 0x1048);
     // ST4 of two 32-bit elements each: e0 of V3, V4, V5, V6, then e1.
     let stored = read(&mut cpu, DATA + 0x1080, 32);
@@ -419,10 +422,7 @@ fn a_single_lane_keeps_the_other_lanes_and_a_replicated_one_fills_them() {
         // ld1r {v20.8b}, [x6]
         word(Record::LD1Rv8b, &[("vt", 20), ("rn", 6)]),
         // ld2r {v21.4s, v22.4s}, [x6], #8
-        word(
-            Record::LD2Rv4s_POST,
-            &[("vt", 21), ("rn", 6), ("xm", 31)],
-        ),
+        word(Record::LD2Rv4s_POST, &[("vt", 21), ("rn", 6), ("xm", 31)]),
         // ld3r {v23.2d, v24.2d, v25.2d}, [x7]
         word(Record::LD3Rv2d, &[("vt", 23), ("rn", 7)]),
         // ld1r {v26.1d}, [x7]
@@ -466,19 +466,43 @@ fn a_single_lane_keeps_the_other_lanes_and_a_replicated_one_fills_them() {
     assert_eq!(v(&cpu, 0), lane(e, 16, 7, pattern(0x42, 2)));
     let stored = read(&mut cpu, DATA + 0x1000, 0x30);
     assert_eq!(stored[..2], [0x03, 0xaa]);
-    assert_eq!(stored[8..16], [0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17]);
-    assert_eq!(stored[0x10..0x18], [0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
-    assert_eq!(stored[0x18..0x20], [0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f]);
-    assert_eq!(stored[0x20..0x28], [0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f]);
+    assert_eq!(
+        stored[8..16],
+        [0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17]
+    );
+    assert_eq!(
+        stored[0x10..0x18],
+        [0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]
+    );
+    assert_eq!(
+        stored[0x18..0x20],
+        [0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f]
+    );
+    assert_eq!(
+        stored[0x20..0x28],
+        [0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f]
+    );
     assert_eq!(stored[0x28..0x30], [0xaa; 8]);
     assert_eq!(cpu.state.x(5), DATA + 0x1028);
     // A replicated element fills 64 or 128 bits. 64 bits leave the rest zero.
     assert_eq!(v(&cpu, 20), 0x6060_6060_6060_6060);
-    assert_eq!(v(&cpu, 21), u128::from(pattern(0x60, 4)) * 0x1_0000_0001_0000_0001_0000_0001);
-    assert_eq!(v(&cpu, 22), u128::from(pattern(0x64, 4)) * 0x1_0000_0001_0000_0001_0000_0001);
+    assert_eq!(
+        v(&cpu, 21),
+        u128::from(pattern(0x60, 4)) * 0x1_0000_0001_0000_0001_0000_0001
+    );
+    assert_eq!(
+        v(&cpu, 22),
+        u128::from(pattern(0x64, 4)) * 0x1_0000_0001_0000_0001_0000_0001
+    );
     assert_eq!(cpu.state.x(6), DATA + 0x68);
-    assert_eq!(v(&cpu, 23), u128::from(pattern(0x80, 8)) * 0x1_0000_0000_0000_0001);
-    assert_eq!(v(&cpu, 25), u128::from(pattern(0x90, 8)) * 0x1_0000_0000_0000_0001);
+    assert_eq!(
+        v(&cpu, 23),
+        u128::from(pattern(0x80, 8)) * 0x1_0000_0000_0000_0001
+    );
+    assert_eq!(
+        v(&cpu, 25),
+        u128::from(pattern(0x90, 8)) * 0x1_0000_0000_0000_0001
+    );
     assert_eq!(v(&cpu, 26), u128::from(pattern(0x80, 8)));
 }
 
@@ -536,12 +560,10 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
     }
     // A pair whose second half is outside the memory: the first half is
     // written, and no register has moved.
-    let mut cpu = cpu(&[
-        word(
-            Record::STPXpost,
-            &[("rt", 1), ("rt2", 2), ("rn", 0), ("offset", 2)],
-        ),
-    ]);
+    let mut cpu = cpu(&[word(
+        Record::STPXpost,
+        &[("rt", 1), ("rt2", 2), ("rn", 0), ("offset", 2)],
+    )]);
     let end = BASE + SIZE as u64;
     cpu.state.set_x(0, end - 8);
     cpu.state.set_x(1, 0x0102_0304_0506_0708);
@@ -559,12 +581,10 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
         0x0102_0304_0506_0708u64.to_le_bytes()
     );
     // A load of two registers that fails at the second leaves the first.
-    let mut cpu = self::cpu(&[
-        word(
-            Record::LDPXi,
-            &[("rt", 1), ("rt2", 2), ("rn", 0), ("offset", 0)],
-        ),
-    ]);
+    let mut cpu = self::cpu(&[word(
+        Record::LDPXi,
+        &[("rt", 1), ("rt2", 2), ("rn", 0), ("offset", 0)],
+    )]);
     cpu.state.set_x(0, end - 8);
     cpu.state.set_x(1, 5);
     assert!(matches!(cpu.run(100), Stop::DataAbort { write: false, .. }));
@@ -664,7 +684,10 @@ fn an_exclusive_store_writes_once_after_an_exclusive_load_of_the_same_place() {
     }
     cpu.step().unwrap();
     assert_eq!(cpu.state.x(9), 1);
-    assert_eq!(read(&mut cpu, DATA + 0x100, 8), pattern(0x100, 8).to_le_bytes());
+    assert_eq!(
+        read(&mut cpu, DATA + 0x100, 8),
+        pattern(0x100, 8).to_le_bytes()
+    );
     assert!(matches!(cpu.run(100), Stop::Unimplemented { .. }));
     assert_eq!(cpu.instructions, 9);
     assert_eq!(cpu.state.x(2), 0x1234_5678_9abc_def0);
@@ -803,7 +826,12 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
     let accesses = cpu.take_accesses();
     assert_eq!(accesses.len(), 2);
     assert_eq!(
-        (accesses[0].address, accesses[0].bytes, accesses[0].value, accesses[0].write),
+        (
+            accesses[0].address,
+            accesses[0].bytes,
+            accesses[0].value,
+            accesses[0].write
+        ),
         (DATA, 8, 0x11, true)
     );
     assert_eq!((accesses[1].address, accesses[1].value), (DATA + 8, 0x22));
@@ -811,7 +839,12 @@ fn the_accesses_of_an_instruction_are_kept_for_a_harness_that_asks() {
     let accesses = cpu.take_accesses();
     assert_eq!(accesses.len(), 1);
     assert_eq!(
-        (accesses[0].address, accesses[0].bytes, accesses[0].value, accesses[0].write),
+        (
+            accesses[0].address,
+            accesses[0].bytes,
+            accesses[0].value,
+            accesses[0].write
+        ),
         (DATA, 1, 0x11, false)
     );
 }
@@ -850,7 +883,10 @@ fn shared(words: &[u32]) -> (Cpu<SharedMemory>, Cpu<SharedMemory>) {
 #[test]
 fn a_write_of_another_cpu_between_the_load_and_the_store_fails_the_store() {
     let (mut first, mut second) = shared(&counter_loop());
-    second.memory.write(DATA + 0x1000, &0u64.to_le_bytes()).unwrap();
+    second
+        .memory
+        .write(DATA + 0x1000, &0u64.to_le_bytes())
+        .unwrap();
     first.state.set_x(3, 1);
     second.state.set_x(3, 1);
     // Both load 0 and reserve.
@@ -872,7 +908,10 @@ fn a_write_of_another_cpu_between_the_load_and_the_store_fails_the_store() {
 fn two_threads_count_with_exclusives_and_lose_no_increment() {
     const TURNS: u64 = 20_000;
     let (mut first, mut second) = shared(&counter_loop());
-    first.memory.write(DATA + 0x1000, &0u64.to_le_bytes()).unwrap();
+    first
+        .memory
+        .write(DATA + 0x1000, &0u64.to_le_bytes())
+        .unwrap();
     let start = std::sync::Arc::new(std::sync::Barrier::new(2));
     let threads: Vec<_> = [&mut first, &mut second]
         .into_iter()
@@ -890,7 +929,10 @@ fn two_threads_count_with_exclusives_and_lose_no_increment() {
     let mut instructions = 0;
     for thread in threads {
         let (stop, left, count) = thread.join().unwrap();
-        assert!(matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 24), "{stop:?}");
+        assert!(
+            matches!(stop, Stop::Unimplemented { pc, .. } if pc == BASE + 24),
+            "{stop:?}"
+        );
         assert_eq!(left, 0);
         instructions += count;
     }

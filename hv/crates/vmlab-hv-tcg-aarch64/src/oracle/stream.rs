@@ -557,7 +557,10 @@ mod tests {
             Record::STXPW,
             &[("ws", 5), ("rt", 3), ("rt2", 4), ("rn", 0)]
         )));
-        assert!(!unpredictable(&word(Record::ADDXri, &[("rd", 1), ("rn", 1)])));
+        assert!(!unpredictable(&word(
+            Record::ADDXri,
+            &[("rd", 1), ("rn", 1)]
+        )));
     }
 
     #[test]

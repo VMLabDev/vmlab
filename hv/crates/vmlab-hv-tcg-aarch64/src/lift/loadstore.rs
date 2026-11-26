@@ -734,10 +734,7 @@ mod tests {
             .iter()
             .find(|suffix| rest.ends_with(**suffix))
             .unwrap_or_else(|| panic!("{name} has no known addressing mode"));
-        (
-            &name[..prefix.len()],
-            &rest[..rest.len() - suffix.len()],
-        )
+        (&name[..prefix.len()], &rest[..rest.len() - suffix.len()])
     }
 
     #[test]
@@ -793,7 +790,10 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 23 + 23 + 13 + 14 + 9 + 14 + 9 + 12 + 12 + 10 + 8 + 4);
+        assert_eq!(
+            checked,
+            23 + 23 + 13 + 14 + 9 + 14 + 9 + 12 + 12 + 10 + 8 + 4
+        );
     }
 
     #[test]
@@ -825,8 +825,11 @@ mod tests {
             for record in records_of(class) {
                 let info = record.info();
                 assert_eq!(info.mask & 0xc440_0000, 0xc440_0000, "{}", info.name);
-                let (mnemonic, letters) =
-                    strip(info.name, &["LDNP", "STNP", "LDP", "STP"], &["post", "pre", "i"]);
+                let (mnemonic, letters) = strip(
+                    info.name,
+                    &["LDNP", "STNP", "LDP", "STP"],
+                    &["post", "pre", "i"],
+                );
                 assert_eq!(
                     pair_access(record),
                     Some(Access {
@@ -902,7 +905,9 @@ mod tests {
                 // LD1Twov16b: the mnemonic, the count of registers, the lanes.
                 let (count, word) = [("One", 1), ("Two", 2), ("Three", 3), ("Four", 4)]
                     .iter()
-                    .find_map(|(word, count)| name[3..].starts_with(word).then_some((*count, *word)))
+                    .find_map(|(word, count)| {
+                        name[3..].starts_with(word).then_some((*count, *word))
+                    })
                     .unwrap_or_else(|| panic!("{name}"));
                 let (lane_count, lane_bytes) = lanes(&name[3 + word.len() + 1..]);
                 assert_eq!(

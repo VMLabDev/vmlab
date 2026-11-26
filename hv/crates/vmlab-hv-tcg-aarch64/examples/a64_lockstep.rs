@@ -582,7 +582,8 @@ fn memory_rounds(
     let data = generator.memory_bytes(WINDOW, WINDOW.1 as usize);
     run.follower.load_memory(WINDOW.0, &data)?;
     for n in 0..32 {
-        let value = u128::from(generator.rng.next_u64()) << 64 | u128::from(generator.rng.next_u64());
+        let value =
+            u128::from(generator.rng.next_u64()) << 64 | u128::from(generator.rng.next_u64());
         run.follower.set_vector(n, value)?;
     }
     let core = |(x, sp, nzcv): ([u64; 31], u64, u8)| Core {
