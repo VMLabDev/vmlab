@@ -21,6 +21,12 @@
 //!   no probe maps them or the code for writing.
 //! - **Little-endian**, and SCTLR_EL1.SA and SA0 clear: the stack pointer
 //!   alignment check is not built.
+//! - **The value of a control register is the one that the stream made.**
+//!   A write of a table base that is another one leaves the instructions
+//!   before its TLBI to the TLB, where the two sides differ. So no return
+//!   of the stream is to a state that does not exist: the exception of
+//!   each instruction after it would run between the instructions that
+//!   load such a value.
 //! - **Code runs at one address.** QEMU keeps a translated block under its
 //!   physical address and runs it at every virtual address that maps there,
 //!   and the plugin then names the address of the first one. So one probe
@@ -33,7 +39,7 @@
 
 use super::asm::{self, op, reg};
 use super::stream::{Generator, records_of, unpredictable};
-use super::system::{EXIT_CALL, spsr};
+use super::system::EXIT_CALL;
 use crate::generated::decode::{FormatClass, decode};
 use crate::lift::{IMMEDIATE_FORMATS, LOAD_STORE_FORMATS, REGISTER_FORMATS};
 use crate::mmu::geometry;
@@ -872,9 +878,15 @@ impl Builder<'_> {
                 }
                 words.push(asm::ISB);
             }
-            // To EL0 or to EL1, with a saved state that the stream makes.
+            // To EL0 or to EL1, with a saved state that the stream makes. It
+            // is a state that exists: after a return to one that does not,
+            // every instruction takes an exception, also those that load
+            // the value of a control register, and the handler leaves
+            // other bits in that register. The streams of card C6 make
+            // those returns.
             74..=78 => {
-                let saved = spsr(&mut self.generator.rng);
+                let flags = self.below(16) << 28 | self.below(16) << 6;
+                let saved = flags | [0b00000, 0b00000, 0b00000, 0b00101, 0b00100][self.below(5) as usize];
                 words.extend(asm::load(16, saved));
                 words.push(asm::msr(reg::SPSR_EL1, 16));
                 let here = at + 4 * 5;
