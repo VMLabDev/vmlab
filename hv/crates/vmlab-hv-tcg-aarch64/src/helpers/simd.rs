@@ -125,7 +125,8 @@ impl Op {
         }
     }
 
-    fn is_fp(self) -> bool {
+    /// Whether the lanes are floating point: the operation reads FPCR.
+    pub fn is_fp(self) -> bool {
         use Op::*;
         matches!(
             self,
