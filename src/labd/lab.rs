@@ -5758,22 +5758,26 @@ mod tests {
         LabRuntime::with_machines(config, machines).expect("runtime")
     }
 
-    #[tokio::test]
-    async fn failed_lab_capture_rolls_back_prior_machines_and_keeps_pending_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        let sh = shared(dir.path());
-        let first = FakeMachine::new("a", MachineKind::Vm, &sh);
-        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, &sh)).unwrap();
+    fn lab_with_failing_capture(sh: &Shared) -> Arc<LabRuntime> {
+        let first = FakeMachine::new("a", MachineKind::Vm, sh);
+        let mut last = Arc::into_inner(FakeMachine::new("b", MachineKind::Vm, sh)).unwrap();
         last.snapshot_failure = true;
-        let lab = lab_of(
-            dir.path(),
+        lab_of(
+            &sh.dir,
             r#"import <vmlab.wcl>
 lab "t" {
  vm "a" { template = "x86_64/t" }
  vm "b" { template = "x86_64/t" }
 }"#,
             vec![first, Arc::new(last)],
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_lab_capture_rolls_back_prior_machines_and_keeps_pending_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = shared(dir.path());
+        let lab = lab_with_failing_capture(&sh);
         let error = lab.snapshot_all("capture").await.unwrap_err();
         assert!(format!("{error:#}").contains("rolled back"));
         let state = lab.state.lock().await;
@@ -5788,6 +5792,34 @@ lab "t" {
             log.iter()
                 .any(|line| line.contains("delete_snapshot:capture"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_script_does_not_list_a_pending_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_with_failing_capture(&shared(dir.path()));
+        lab.snapshot_all("capture").await.unwrap_err();
+        assert_eq!(lab.snapshots("b").await.unwrap()[0]["pending"], true);
+
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    for n in lab.vm("b").expect("b").snapshots().expect("list") {
+        lab.log(n)
+    }
+}"#
+            .into(),
+            "snapshots.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| output.send(line).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lines.try_recv().ok(), None);
     }
 
     #[tokio::test]
@@ -6323,6 +6355,40 @@ fn main(lab: Lab) {
         assert!(lines.try_recv().is_err(), "cancelled script emitted output");
         let err = result.expect_err("cancelled script completed");
         assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_script_logs_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = lab_of(dir.path(), "import <vmlab.wcl>\nlab \"t\" {}", vec![]);
+        let token = tokio_util::sync::CancellationToken::new();
+        let owner = crate::scripting::ScriptOwner::provision("box").cancelled_by(token.clone());
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let err = crate::scripting::run_script_source(
+            lab,
+            r#"use vmlab
+fn main(lab: Lab) {
+    lab.log("first")
+    lab.log("second")
+}
+"#
+            .into(),
+            "cancel.ws",
+            dir.path().to_path_buf(),
+            Some(owner),
+            None,
+            Arc::new(move |line| {
+                if line.trim() == "first" {
+                    token.cancel();
+                }
+                output.send(line).unwrap();
+            }),
+        )
+        .await
+        .expect_err("cancelled script completed");
+        assert!(err.is::<crate::scripting::ScriptCancelled>(), "{err:#}");
+        assert_eq!(lines.try_recv().unwrap().trim(), "first");
+        assert_eq!(lines.try_recv().ok(), None);
     }
 
     #[tokio::test]
@@ -9046,6 +9112,42 @@ lab "t" {
         }
     }
 
+    #[tokio::test]
+    async fn a_script_run_that_cannot_start_a_recording_leaves_none() {
+        use crate::proto::server::{Handler, Streamer};
+        use crate::proto::{ErrorCode, LabRequest};
+        use crate::record::RecordRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some((lab, _sh, _rfb)) = record_lab(dir.path()).await else {
+            return;
+        };
+        let handler = super::super::LabdHandler {
+            lab: lab.clone(),
+            tasks: Arc::new(crate::lifecycle::TaskGroup::new()),
+        };
+        let (stream, _messages) = Streamer::test_channel();
+        let error = handler
+            .handle(
+                LabRequest::Run {
+                    script: "unused.ws".into(),
+                    record: ["a", "web"]
+                        .map(|machine| RecordRequest {
+                            machine: machine.into(),
+                            options: small(),
+                            ..Default::default()
+                        })
+                        .to_vec(),
+                },
+                &stream,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported);
+        assert_eq!(error.message, "machine `web` has no display");
+        assert!(lab.recordings.live_machines().await.is_empty());
+    }
+
     /// `m.record` from a script: a relative path lands under the lab root, the
     /// handle's `stop` finalises, and a recording left open is finalised when
     /// the run ends.
@@ -9961,6 +10063,41 @@ lab "t" {
         assert_eq!(rebuilt.state().await, PowerState::Running);
         assert_eq!(web.state().await, PowerState::Stopped);
         assert!(lab.status().await.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_script_handle_follows_a_rebuilt_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (lab, _sh) = reload_lab(dir.path());
+        lab.start_machine("web").await.unwrap();
+        let web = lab.machine("web").unwrap();
+        let new = RELOAD_BASE.replace("\"web:1\"", "\"web:2\"");
+        lab.reload_with(edited(dir.path(), &new)).await.unwrap();
+
+        let (output, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        crate::scripting::run_script_source(
+            lab.clone(),
+            r#"use vmlab
+fn main(lab: Lab) {
+    let m = lab.machine("web").expect("web")
+    let r = m.restart()
+    lab.log(m.state())
+}
+"#
+            .into(),
+            "restart.ws",
+            dir.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(move |line| output.send(line).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let rebuilt = lab.machine("web").unwrap();
+        assert!(!same(&rebuilt, &web), "web was not rebuilt");
+        assert_eq!(rebuilt.state().await, PowerState::Running);
+        assert_eq!(lines.try_recv().unwrap().trim(), "running");
     }
 
     /// A pending machine that stops by any route — here a guest shutdown,
