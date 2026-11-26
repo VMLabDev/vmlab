@@ -165,7 +165,7 @@ pub enum Outcome {
 }
 
 /// How long QEMU may take to write the next record.
-const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
+const RECORD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The count of the system counter that our side starts a round with. The
 /// streams keep the compare value of a timer far below it or far above it,
@@ -457,7 +457,18 @@ impl Follower {
             })
         };
         let result = loop {
-            let stepped = match self.leader.next_record(RECORD_TIMEOUT)? {
+            let record = match self.leader.next_record(RECORD_TIMEOUT) {
+                Ok(record) => record,
+                // QEMU stands still, for example in a WFI: the round names
+                // the instruction that it ran last.
+                Err(error) => {
+                    let ours = Core::of(&self.cpu.state);
+                    let mut difference = differed(error.to_string(), &last, ours, None);
+                    difference.taken = self.cpu.taken;
+                    break Err(difference);
+                }
+            };
+            let stepped = match record {
                 Trace::Instruction {
                     encoding,
                     core,
