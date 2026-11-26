@@ -297,6 +297,18 @@ const fn fault(kind: FaultKind, level: u8) -> Fault {
 /// The bits 47 to 12 of a descriptor or of a table base.
 const ADDRESS: u64 = 0x0000_ffff_ffff_f000;
 
+/// The shape of a walk for a granule of `1 << granule` bytes and an input
+/// address of `input` bits: the first level, the count of address bits that
+/// the first level resolves, and the count that every later level resolves.
+/// A table holds 8-byte descriptors, so a level resolves `granule - 3` bits,
+/// and the table of the first level holds as many entries as the input size
+/// leaves for it.
+pub fn geometry(granule: u32, input: u32) -> (u32, u32, u32) {
+    let stride = granule - 3;
+    let levels = (input - granule).div_ceil(stride);
+    (4 - levels, input - granule - stride * (levels - 1), stride)
+}
+
 /// Translate `va`, which is untagged already. `read` gives the eight bytes
 /// of a descriptor at a physical address, or `None` where the memory holds
 /// nothing. The permissions of the result are not checked against an access.
@@ -331,13 +343,10 @@ pub fn walk(
         return Err(fault(FaultKind::Translation, 0));
     }
     let granule = half.granule;
-    let stride = granule - 3;
-    let levels = (input - granule).div_ceil(stride);
-    let start = 4 - levels;
+    let (start, first_bits, stride) = geometry(granule, input);
     let output = controls.output_bits();
-    // The table of the first level holds as many entries as the input size
-    // leaves for it. The bits of TTBR below its size are not address bits.
-    let first_bits = input - granule - stride * (levels - 1);
+    // The bits of TTBR below the size of the first table are not address
+    // bits.
     let mut table = half.table & ADDRESS & !((8u64 << first_bits) - 1);
     if table >> output != 0 {
         return Err(fault(FaultKind::AddressSize, 0));

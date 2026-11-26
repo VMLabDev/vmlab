@@ -24,6 +24,11 @@
 //! first. `w`: bytes that the instruction writes. Memory that is not named
 //! is zero.
 //!
+//! An instruction that ran with the MMU on (card C8) names its memory by
+//! physical address, `p=address:bytes`: the word of the instruction, the
+//! translation table descriptors of its walks, and the data that it reads.
+//! Its `w=` addresses are virtual, as the instruction gives them.
+//!
 //! An entry of a group that compares system registers (card C6) has
 //! `sys=` before the arrow: the compared registers that do not hold their
 //! reset value, as `NAME:value` (or `-` for none). After the arrow `dsys=`
@@ -59,6 +64,11 @@ pub struct Entry {
     pub reads: Vec<(u64, Vec<u8>)>,
     /// What the instruction writes: address and bytes.
     pub writes: Vec<(u64, Vec<u8>)>,
+    /// Memory before the instruction by physical address, for an
+    /// instruction that ran with the MMU on: its own word, the descriptors
+    /// of its walks and its data. Empty for every other entry, whose word
+    /// is at its PC and whose `reads` are at their addresses.
+    pub physical: Vec<(u64, Vec<u8>)>,
     /// The compared system registers that do not hold their reset value
     /// before the instruction, and those that it changed.
     pub system: Option<(Named, Named)>,
@@ -283,21 +293,34 @@ impl Entry {
             vectors: None,
             reads: Vec::new(),
             writes: Vec::new(),
+            physical: Vec::new(),
             system: None,
         }
     }
 
     /// The entry of an instruction that the lockstep verified in a round
-    /// of system instructions, which holds no load and no store.
+    /// of system instructions. Such a round holds a load or a store only
+    /// with the MMU on, and then the entry names its memory by physical
+    /// address.
     pub fn of(verified: &super::follow::Verified, compared: &[Compared]) -> Self {
         let reset = reset_system(compared);
+        let writes = verified
+            .accesses
+            .iter()
+            .filter(|access| access.write)
+            .map(|access| {
+                let bytes = access.value.to_le_bytes()[..usize::from(access.bytes)].to_vec();
+                (access.address, bytes)
+            })
+            .collect();
         Self {
             encoding: verified.encoding,
             before: verified.before,
             after: verified.after,
             vectors: verified.vectors,
             reads: Vec::new(),
-            writes: Vec::new(),
+            writes,
+            physical: verified.physical.clone(),
             system: verified.system.as_ref().map(|(before, after)| {
                 (
                     named(compared, &reset, before),
@@ -340,10 +363,13 @@ impl Entry {
 
     pub fn line(&self) -> String {
         let mut line = self.registers_line();
-        if self.reads.is_empty() && self.writes.is_empty() {
+        if self.reads.is_empty() && self.writes.is_empty() && self.physical.is_empty() {
             return line;
         }
         line.push_str(" |");
+        for (address, bytes) in &self.physical {
+            line.push_str(&format!(" p={address:x}:{}", hex(bytes)));
+        }
         for (address, bytes) in &self.reads {
             line.push_str(&format!(" r={address:x}:{}", hex(bytes)));
         }
@@ -358,14 +384,15 @@ impl Entry {
             Some((line, memory)) => (line, memory),
             None => (line, ""),
         };
-        let (mut reads, mut writes) = (Vec::new(), Vec::new());
+        let (mut reads, mut writes, mut physical) = (Vec::new(), Vec::new(), Vec::new());
         for part in memory.split_whitespace() {
             match part.split_once('=') {
                 Some(("r", value)) => reads.push(parse_memory(value)?),
                 Some(("w", value)) => writes.push(parse_memory(value)?),
+                Some(("p", value)) => physical.push(parse_memory(value)?),
                 _ => {
                     return Err(format!(
-                        "`{part}` is not r=address:bytes or w=address:bytes"
+                        "`{part}` is not r=, w= or p= with address:bytes"
                     ));
                 }
             }
@@ -396,6 +423,7 @@ impl Entry {
             vectors: parse_vectors(before_vectors, after_vectors)?,
             reads,
             writes,
+            physical,
             system,
         })
     }
@@ -431,12 +459,23 @@ impl Entry {
         if self.before.pc & 0xfff > 0xffc {
             return Err("the instruction crosses a page".into());
         }
-        let page = self.before.pc & !0xfff;
+        // With physical memory the entry names every byte that it needs,
+        // and its other addresses are virtual.
+        let translated = !self.physical.is_empty();
+        let page = match self.physical.first() {
+            Some((address, _)) => address & !0xfff,
+            None => self.before.pc & !0xfff,
+        };
         let mut low = page;
         let mut high = page
             .checked_add(0x1000)
             .ok_or("an instruction at the end of the address space")?;
-        for (address, bytes) in self.reads.iter().chain(&self.writes) {
+        let named: Vec<&(u64, Vec<u8>)> = if translated {
+            self.physical.iter().collect()
+        } else {
+            self.reads.iter().chain(&self.writes).collect()
+        };
+        for (address, bytes) in named {
             low = low.min(*address & !0xfff);
             let end = address
                 .checked_add(bytes.len() as u64 + 0xfff)
@@ -451,12 +490,15 @@ impl Entry {
             ));
         }
         let mut data = vec![0u8; (high - low) as usize];
-        for (address, bytes) in &self.reads {
+        let before = if translated { &self.physical } else { &self.reads };
+        for (address, bytes) in before {
             let at = (address - low) as usize;
             data[at..at + bytes.len()].copy_from_slice(bytes);
         }
-        let at = (self.before.pc - low) as usize;
-        data[at..at + 4].copy_from_slice(&self.encoding.to_le_bytes());
+        if !translated {
+            let at = (self.before.pc - low) as usize;
+            data[at..at + 4].copy_from_slice(&self.encoding.to_le_bytes());
+        }
         let mut cpu = Cpu::new(FlatMemory::new(low, data), state);
         cpu.clock = Clock::Manual(ROUND_COUNT);
         cpu.log_accesses(true);
@@ -659,6 +701,7 @@ mod tests {
             vectors: None,
             reads: Vec::new(),
             writes: Vec::new(),
+            physical: Vec::new(),
             system: Some((
                 vec![
                     ("VBAR_EL1".to_string(), 0x4208_0000),

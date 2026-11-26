@@ -1110,5 +1110,21 @@ pub static QEMU_CORTEX_A53: CpuModel = CpuModel {
     ccsidr: CCSIDR,
 };
 
+/// The CPU of the walk test against QEMU's `-cpu max` (card C8): QEMU's
+/// `cortex-a53` with the 16K granule and 48 bits of physical address. It
+/// is no CPU of a machine: the streams of that test stay inside what an
+/// Armv8.0 walk and the walk of `max` agree on.
+pub static QEMU_MAX_WALK: CpuModel = CpuModel {
+    name: "qemu-max-walk",
+    resets: &[
+        ("MIDR_EL1", 0x410f_d034),
+        ("ID_AA64PFR0_EL1", 0x22),
+        // PARange 48 bits, 16 bits of ASID, and the 4K, 16K and 64K
+        // granules.
+        ("ID_AA64MMFR0_EL1", 0x0010_1125),
+    ],
+    ccsidr: CCSIDR,
+};
+
 #[cfg(test)]
 mod tests;

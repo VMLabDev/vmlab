@@ -34,6 +34,9 @@ pub struct Options {
     pub system: Vec<String>,
     /// Write the name of every register of the plugin API to this file.
     pub names: Option<PathBuf>,
+    /// The CPU model of QEMU. `None`: `cortex-a53`, the CPU of the lockstep.
+    /// The walk test of the 16K granule asks for `max` (card C8).
+    pub cpu: Option<String>,
 }
 
 pub struct Leader {
@@ -116,7 +119,9 @@ impl Leader {
             .custom_flags(O_NONBLOCK)
             .open(&fifo)?;
         let child = Command::new(qemu)
-            .args(["-machine", "virt", "-cpu", "cortex-a53", "-accel", "tcg"])
+            .args(["-machine", "virt", "-cpu"])
+            .arg(options.cpu.as_deref().unwrap_or("cortex-a53"))
+            .args(["-accel", "tcg"])
             .args(["-smp", "1", "-m", &ram_mib.to_string()])
             .args([
                 "-display", "none", "-monitor", "none", "-serial", "none", "-S",

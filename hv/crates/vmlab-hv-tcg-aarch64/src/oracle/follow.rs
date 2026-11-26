@@ -24,6 +24,12 @@
 //! `Follower::compared`. QEMU leads there for what is not a function of the
 //! CPU state (DESIGN.md O4): the value of a counter read and the answer of a
 //! host call are taken from its next record.
+//!
+//! A round with the MMU on (card C8, `Follower::translated`) is a round of
+//! system instructions that also holds loads and stores: the memory writes
+//! of each instruction are compared, by their virtual addresses. Such a
+//! round loads every byte that its translation tables map, so our memory
+//! takes nothing of what QEMU did after our side stopped following.
 
 use super::leader::{Ahead, Leader, VECTOR};
 use super::{Compared, Core, Trace, Vectors, normalise, system_difference, system_of};
@@ -86,6 +92,10 @@ pub struct Verified {
     /// The result is a function of the registers before: the instruction
     /// can be replayed without QEMU. A counter read and a host call are not.
     pub replayable: bool,
+    /// In a round with the MMU on: the physical memory that the
+    /// instruction needs, as address and bytes. The word of the instruction,
+    /// the translation table descriptors of its walks, and its data.
+    pub physical: Vec<(u64, Vec<u8>)>,
 }
 
 /// How a round ended when the two sides agreed all the way.
@@ -230,6 +240,18 @@ pub struct Follower {
     /// The exceptions that both sides took in the rounds of system
     /// instructions, by their kind.
     pub exceptions: BTreeMap<&'static str, u64>,
+    /// The rounds have the MMU on (card C8): a system round follows loads
+    /// and stores and compares their memory writes, and the addresses of
+    /// the plugin are virtual.
+    pub translated: bool,
+    /// The memory writes of QEMU since its last instruction record, in a
+    /// round with the MMU on.
+    qemu_writes: Vec<QemuWrite>,
+    /// The CPU that our side runs as.
+    pub model: &'static crate::sysreg::CpuModel,
+    /// The bits of PSTATE that are compared, in CPSR and in SPSR_EL1. A
+    /// later CPU than ours has bits that ours does not (the walk test).
+    pub pstate_mask: u32,
 }
 
 /// What our side expects from QEMU next, after it stopped at an instruction.
@@ -279,6 +301,12 @@ struct SystemLast {
     system: Option<Vec<u64>>,
     /// What our side takes from the next record of QEMU.
     adopt: Adopt,
+    /// The loads and stores that our side made.
+    accesses: Vec<Access>,
+    /// Our side took an exception at the instruction.
+    faulted: bool,
+    /// The physical memory that the instruction needs.
+    physical: Vec<(u64, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -419,6 +447,10 @@ impl Follower {
             partial_stores: 0,
             compared: Vec::new(),
             exceptions: BTreeMap::new(),
+            translated: false,
+            qemu_writes: Vec::new(),
+            model: &QEMU_CORTEX_A53,
+            pstate_mask: u32::MAX,
         }
     }
 
@@ -450,7 +482,7 @@ impl Follower {
             return Err(io::Error::other("a round must start at EL1 with SP_EL1"));
         }
         // Our CPU after a reset, as the CPU of the lockstep.
-        let mut state = State::reset_as(round.start.pc, &QEMU_CORTEX_A53);
+        let mut state = State::reset_as(round.start.pc, self.model);
         round.start.apply(&mut state);
         if !round.reset && self.leader.has_vectors() {
             // The leader enabled FP once, and no round of this kind writes
@@ -501,11 +533,119 @@ impl Follower {
         })
     }
 
-    /// The word at the PC of our CPU, when the memory holds one there.
+    /// The word at the virtual address `pc` of our CPU, when the address
+    /// has a translation and the memory holds a word there.
     fn word(&mut self, pc: u64) -> Option<u32> {
+        let phys = self.cpu.physical_address(pc)?;
         let mut bytes = [0u8; 4];
-        self.cpu.memory.read(pc, &mut bytes).ok()?;
+        self.cpu.memory.read(phys, &mut bytes).ok()?;
         Some(u32::from_le_bytes(bytes))
+    }
+
+    /// Add what a walk for `va` reads to `physical`: its descriptors.
+    fn trace(&mut self, va: u64, physical: &mut Vec<(u64, Vec<u8>)>) -> Option<u64> {
+        let (descriptors, phys) = self.cpu.walk_trace(va);
+        for (address, value) in descriptors {
+            physical.push((address, value.to_le_bytes().to_vec()));
+        }
+        phys
+    }
+
+    /// `physical` as runs of bytes in the order of their addresses. Where
+    /// two items name one byte, the first one holds it: that is the value
+    /// before the instruction.
+    fn runs(physical: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
+        let mut bytes = BTreeMap::new();
+        for (address, data) in physical {
+            for (index, byte) in data.into_iter().enumerate() {
+                bytes.entry(address + index as u64).or_insert(byte);
+            }
+        }
+        let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (address, byte) in bytes {
+            match runs.last_mut() {
+                Some((start, run)) if *start + run.len() as u64 == address => run.push(byte),
+                _ => runs.push((address, vec![byte])),
+            }
+        }
+        runs
+    }
+
+    /// The physical memory that the instruction `encoding` needs, which our
+    /// side just ran from the registers `x` with these accesses: its word,
+    /// the descriptors of the walks for its PC, for each access, for the
+    /// address of its fault and for the address that a system operation
+    /// names, and the bytes that it read.
+    fn physical_of(
+        &mut self,
+        encoding: u32,
+        x: &[u64; 31],
+        accesses: &[Access],
+        mut physical: Vec<(u64, Vec<u8>)>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        for access in accesses {
+            let bytes = access.value.to_le_bytes();
+            for (index, byte) in bytes[..usize::from(access.bytes)].iter().enumerate() {
+                let va = access.address.wrapping_add(index as u64);
+                // The descriptors of each page once, at its first byte.
+                let phys = if index == 0 || va & 0xfff == 0 {
+                    self.trace(va, &mut physical)
+                } else {
+                    self.cpu.physical_address(va)
+                };
+                if let Some(phys) = phys
+                    && !access.write
+                {
+                    physical.push((phys, vec![*byte]));
+                }
+            }
+        }
+        if let Some(Taken {
+            cause: Cause::Exception(Exception::DataAbort { address, .. }),
+            ..
+        }) = self.cpu.taken
+        {
+            self.trace(address, &mut physical);
+        }
+        // `SYS`: the address in Xt.
+        if encoding & 0xfff8_0000 == 0xd508_0000 && encoding & 31 != 31 {
+            let va = x[(encoding & 31) as usize];
+            self.trace(va, &mut physical);
+        }
+        Self::runs(physical)
+    }
+
+    /// The memory writes of the last instruction of a round with the MMU
+    /// on, ours against QEMU's, as `writes_differ` compares them. The
+    /// addresses are virtual. QEMU's `DC ZVA` writes without a word to the
+    /// plugin: what it zeroed shows in the loads after it.
+    fn translated_writes_differ(
+        &mut self,
+        last: &SystemLast,
+        qemu: &[QemuWrite],
+    ) -> Option<String> {
+        let ours = our_writes(&last.accesses);
+        let theirs = written(qemu.iter().map(qemu_bytes));
+        let system = last.encoding & 0xffd8_0000 == 0xd508_0000;
+        if system && theirs.is_empty() {
+            return None;
+        }
+        let mut same = ours.keys().all(|address| theirs.contains_key(address));
+        for (address, byte) in &theirs {
+            let mut now = [0u8; 1];
+            same &= self
+                .cpu
+                .physical_address(*address)
+                .is_some_and(|phys| self.cpu.memory.read(phys, &mut now).is_ok())
+                && now[0] == *byte;
+        }
+        (!same).then(|| {
+            format!(
+                "the memory writes of an instruction: ours{}, QEMU's{}",
+                describe(&ours),
+                describe(&theirs)
+            )
+        })
     }
 
     /// The memory writes of the last instruction, ours against QEMU's:
@@ -533,8 +673,14 @@ impl Follower {
         })
     }
 
-    /// Take into our memory what QEMU wrote and our side did not.
+    /// Take into our memory what QEMU wrote and our side did not. A round
+    /// with the MMU on loads all that it maps, and the addresses of these
+    /// writes are virtual under tables that QEMU may have changed since:
+    /// nothing is taken.
     fn mirror(&mut self, writes: &[QemuWrite]) {
+        if self.translated {
+            return;
+        }
         for write in writes {
             let (address, bytes) = qemu_bytes(write);
             // A write to a device of QEMU has no place in our memory.
@@ -677,7 +823,6 @@ impl Follower {
                     if let Some(what) = self.writes_differ(&last, &qemu_writes) {
                         break Err(differed(what, &last, ours, Some(core)));
                     }
-                    qemu_writes.clear();
                     if core != ours {
                         break Err(differed(
                             "the registers before an instruction".into(),
@@ -716,6 +861,7 @@ impl Follower {
                             accesses: last.accesses,
                             system: None,
                             replayable: true,
+                            physical: Vec::new(),
                         });
                     }
                     // QEMU has memory that the round does not mirror: flash
@@ -941,6 +1087,7 @@ impl Follower {
                             accesses: last.accesses,
                             system: None,
                             replayable: true,
+                            physical: Vec::new(),
                         });
                     }
                     break Ok(end);
@@ -1018,22 +1165,32 @@ impl Follower {
     ) -> io::Result<Result<(u32, u64), String>> {
         let (kind, from, to) = match seen {
             Some(seen) => seen,
-            None => match self.leader.next_record(RECORD_TIMEOUT)? {
-                Trace::Discontinuity {
-                    kind,
-                    from_pc,
-                    to_pc,
-                } => (kind, from_pc, to_pc),
-                Trace::Instruction { core, .. } => {
-                    return Ok(Err(format!(
-                        "we leave the stream at {pc:#x} and QEMU runs on at {:#x}",
-                        core.pc
-                    )));
-                }
-                Trace::Write { address, .. } => {
-                    return Ok(Err(format!(
-                        "we leave the stream at {pc:#x} and QEMU writes memory at {address:#x}"
-                    )));
+            None => loop {
+                match self.leader.next_record(RECORD_TIMEOUT)? {
+                    Trace::Discontinuity {
+                        kind,
+                        from_pc,
+                        to_pc,
+                    } => break (kind, from_pc, to_pc),
+                    Trace::Instruction { core, .. } => {
+                        return Ok(Err(format!(
+                            "we leave the stream at {pc:#x} and QEMU runs on at {:#x}",
+                            core.pc
+                        )));
+                    }
+                    // The parts of a store that QEMU made before the part
+                    // that faulted.
+                    Trace::Write {
+                        address,
+                        size,
+                        low,
+                        high,
+                    } if self.translated => self.qemu_writes.push((address, size, low, high)),
+                    Trace::Write { address, .. } => {
+                        return Ok(Err(format!(
+                            "we leave the stream at {pc:#x} and QEMU writes memory at {address:#x}"
+                        )));
+                    }
                 }
             },
         };
@@ -1064,8 +1221,22 @@ impl Follower {
                     ))),
                 },
                 Some(taken) => {
+                    // Our memory is the RAM only. Where QEMU has flash or a
+                    // device, our side takes an external abort and QEMU
+                    // runs on: nothing to compare.
+                    let external = matches!(
+                        taken.cause,
+                        Cause::Exception(
+                            Exception::DataAbort { status, .. }
+                                | Exception::InstructionAbort(status)
+                        ) if status & 0x38 == 0x10
+                    );
                     let (kind, to) = match self.expect(taken.from, seen)? {
                         Ok(found) => found,
+                        Err(_) if external && self.translated => {
+                            self.interrupt(&[])?;
+                            return Ok(Stepped::End(End::Device));
+                        }
                         Err(what) => return Ok(Stepped::Differ(what)),
                     };
                     if kind != 2 || to != taken.to {
@@ -1141,6 +1312,7 @@ impl Follower {
         let compare_vectors = round.vectors.is_some();
         let compare_system = !self.compared.is_empty();
         let mut followed = 0u64;
+        self.qemu_writes.clear();
         let mut visits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         let differed = |what: String, last: &Option<SystemLast>, ours: Core, qemu: Option<Core>| {
             Box::new(Difference {
@@ -1169,10 +1341,17 @@ impl Follower {
             let stepped = match record {
                 Trace::Instruction {
                     encoding,
-                    core,
+                    mut core,
                     vectors,
                     mut system,
                 } => {
+                    // The bits of PSTATE that our CPU does not have.
+                    core.cpsr &= self.pstate_mask;
+                    for (register, value) in self.compared.iter().zip(system.iter_mut()) {
+                        if register.qemu == "SPSR_EL1" {
+                            *value &= u64::from(self.pstate_mask) | !0xffff_ffff;
+                        }
+                    }
                     // What QEMU leads in: a counter, the answer of a call.
                     match last.as_ref().map_or(Adopt::Nothing, |last| last.adopt) {
                         Adopt::Nothing => {}
@@ -1217,8 +1396,15 @@ impl Follower {
                             break Err(difference);
                         }
                     }
-                    let ours_system =
-                        compare_system.then(|| system_of(&self.cpu.state, &self.compared));
+                    let ours_system = compare_system.then(|| {
+                        let mut ours = system_of(&self.cpu.state, &self.compared);
+                        for (register, value) in self.compared.iter().zip(ours.iter_mut()) {
+                            if register.qemu == "SPSR_EL1" {
+                                *value &= u64::from(self.pstate_mask) | !0xffff_ffff;
+                            }
+                        }
+                        ours
+                    });
                     if let Some(ours_system) = &ours_system {
                         normalise(&mut system, &self.compared, &core);
                         if system != *ours_system {
@@ -1234,6 +1420,24 @@ impl Follower {
                             break Err(difference);
                         }
                     }
+                    // The memory writes of the last instruction. One that
+                    // faulted in the middle of a store of several parts may
+                    // have written another count of parts on the two sides:
+                    // a CPU may do either, and the round ends.
+                    let qemu_writes = std::mem::take(&mut self.qemu_writes);
+                    if let Some(previous) = &last
+                        && let Some(what) = self.translated_writes_differ(previous, &qemu_writes)
+                    {
+                        if previous.faulted {
+                            self.partial_stores += 1;
+                            self.interrupt(&[])?;
+                            break Ok(End::Unfollowed(
+                                "a store of several parts that faulted after another count of parts",
+                            ));
+                        }
+                        break Err(differed(what, &last, ours, Some(core)));
+                    }
+                    qemu_writes.clear();
                     // The registers agree, so the last instruction did the same on both sides.
                     if let Some(last) = last.take()
                         && let Some(record) = last.record
@@ -1246,7 +1450,8 @@ impl Follower {
                             vectors: last.vectors.zip(ours_vectors),
                             system: last.system.zip(ours_system.clone()),
                             replayable: last.adopt == Adopt::Nothing,
-                            accesses: Vec::new(),
+                            accesses: last.accesses,
+                            physical: last.physical,
                         });
                     }
                     // QEMU has memory that the round does not mirror: flash
@@ -1279,16 +1484,34 @@ impl Follower {
                         break Ok(End::Loop);
                     }
                     if compare_system
-                        && let Some(why) =
-                            super::system::unfollowed(encoding, &core.x, &self.cpu.state)
+                        && let Some(why) = super::system::unfollowed(
+                            encoding,
+                            &core.x,
+                            &self.cpu.state,
+                            self.translated,
+                        )
                     {
                         self.interrupt(&[])?;
                         break Ok(End::Unfollowed(why));
                     }
                     followed += 1;
+                    // The word of the instruction and the walk for its PC,
+                    // before the instruction changes anything.
+                    let mut physical = Vec::new();
+                    if self.translated
+                        && let Some(phys) = self.trace(core.pc, &mut physical)
+                    {
+                        physical.insert(0, (phys, encoding.to_le_bytes().to_vec()));
+                    }
                     let stepped = self.cpu.step();
-                    // A system round holds no load and no store.
-                    self.cpu.take_accesses();
+                    // Only a round with the MMU on holds loads and stores.
+                    let accesses = self.cpu.take_accesses();
+                    let faulted = self.cpu.taken.is_some();
+                    let physical = if self.translated {
+                        self.physical_of(encoding, &core.x, &accesses, physical)
+                    } else {
+                        physical
+                    };
                     let reaction = self.react(stepped, Some(encoding), None)?;
                     if let Stepped::On(adopt) = reaction {
                         last = Some(SystemLast {
@@ -1298,6 +1521,9 @@ impl Follower {
                             vectors: ours_vectors,
                             system: ours_system,
                             adopt,
+                            accesses,
+                            faulted,
+                            physical,
                         });
                     } else {
                         last = Some(SystemLast {
@@ -1307,6 +1533,9 @@ impl Follower {
                             vectors: ours_vectors,
                             system: None,
                             adopt: Adopt::Nothing,
+                            accesses,
+                            faulted,
+                            physical: Vec::new(),
                         });
                     }
                     reaction
@@ -1341,15 +1570,29 @@ impl Follower {
                         vectors: None,
                         system: None,
                         adopt: Adopt::Nothing,
+                        accesses: Vec::new(),
+                        faulted: true,
+                        physical: Vec::new(),
                     });
+                    self.qemu_writes.clear();
                     let stepped = self.cpu.step();
+                    self.cpu.take_accesses();
                     self.react(stepped, None, Some((kind, from_pc, to_pc)))?
+                }
+                Trace::Write {
+                    address,
+                    size,
+                    low,
+                    high,
+                } if self.translated => {
+                    self.qemu_writes.push((address, size, low, high));
+                    Stepped::On(Adopt::Nothing)
                 }
                 Trace::Write { address, size, .. } => {
                     let ours = Core::of(&self.cpu.state);
                     break Err(differed(
                         format!(
-                            "QEMU wrote {size} bytes at {address:#x} and no lifter of ours writes memory yet"
+                            "QEMU wrote {size} bytes at {address:#x} in a round that holds no store"
                         ),
                         &last,
                         ours,

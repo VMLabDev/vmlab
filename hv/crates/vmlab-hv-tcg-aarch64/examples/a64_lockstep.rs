@@ -37,6 +37,15 @@
 //! hold, or at the zero word behind the image. The memory writes and the
 //! vector registers are compared after every instruction.
 //!
+//! The group `mmu` (card C8) runs streams with the MMU on, over random
+//! translation tables for the 4K and the 64K granule (`oracle/translate.rs`):
+//! loads, stores and calls at addresses that the tables map, do not map or
+//! map without the permission, address translation instructions, `DC ZVA`,
+//! cache and TLB operations. It follows as `system` does, and also compares
+//! the memory writes. The group `walk` runs the same streams for the 16K and
+//! the 64K granule against QEMU's `-cpu max`, inside what an Armv8.0 walk
+//! and the walk of that CPU agree on.
+//!
 //! `--probe` runs each given word alone, as the executed phase of the group
 //! does, and prints how its round ended. Words joined by `+` run one after
 //! the other in one round, with the registers made for the first of them.
@@ -59,6 +68,7 @@ use vmlab_hv_tcg_aarch64::oracle::stream::{Generator, Rng, executed_encodings, r
 use vmlab_hv_tcg_aarch64::oracle::system::{
     STREAM_FORMATS, TABLE_BYTES, agreed, directed, vector_table,
 };
+use vmlab_hv_tcg_aarch64::oracle::translate::{self, Layout, Profile};
 use vmlab_hv_tcg_aarch64::oracle::{CPSR_EL1H, Compared, Core, Vectors, asm, compared};
 use vmlab_hv_tcg_aarch64::sysreg;
 use vmlab_hv_tcg_aarch64::{Cpu, FormatClass, Record, State, decode};
@@ -100,6 +110,10 @@ const FP_IMAGE_WORDS: usize = 12;
 /// follows: the handlers run many more than the stream holds.
 const SYSTEM_IMAGE_WORDS: usize = 400;
 const SYSTEM_BUDGET: u64 = 3000;
+/// Items in the stream of a round with the MMU on, and the most
+/// instructions that a round follows.
+const TRANSLATED_ITEMS: usize = 260;
+const TRANSLATED_BUDGET: u64 = 6000;
 
 fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
     Ok(match name {
@@ -111,6 +125,7 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         "all" => LIFTED_FORMATS.to_vec(),
         "loadstore" => LOAD_STORE_FORMATS.to_vec(),
         "system" | "c6" => STREAM_FORMATS.to_vec(),
+        "mmu" | "c8" | "walk" => vec![FormatClass::SystemXtI],
         "simd" => SIMD_FORMATS.to_vec(),
         "crypto" => CRYPTO_FORMATS.to_vec(),
         "c7" => [SIMD_FORMATS.as_slice(), CRYPTO_FORMATS.as_slice()].concat(),
@@ -131,7 +146,7 @@ fn group(name: &str) -> Result<Vec<FormatClass>, Failure> {
         }
         other => {
             return Err(format!(
-                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, system, c6, simd, crypto, c7, or one format class of c7 by its name"
+                "the group {other} is not known: dp-immediate, branch, c1, dp-register, c2, fp, all, loadstore, system, c6, mmu, c8, walk, simd, crypto, c7, or one format class of c7 by its name"
             )
             .into());
         }
@@ -163,12 +178,22 @@ struct Counts {
     /// name or that it changed, and zero for the others. Without this it
     /// holds all of them.
     few_vectors: bool,
+    /// How many instructions each key of `samples` has seen, where a key is
+    /// not a record.
+    sample_counts: BTreeMap<(Record, u16), u64>,
     /// Exclusive stores that wrote, and that did not.
     exclusive_wrote: u64,
     exclusive_failed: u64,
     /// Verified instructions that wrote memory, and the bytes.
     stores: u64,
     stored_bytes: u64,
+    /// The rounds have the MMU on: the first address of the vector table
+    /// and the place of ESR_EL1 among the compared registers. A sample is
+    /// then kept for each format class and each kind of exception.
+    translated: Option<(u64, usize)>,
+    /// Verified instructions that took an exception, by ESR_EL1 without the
+    /// bits of the instruction: the class and the low byte.
+    syndromes: BTreeMap<u64, u64>,
 }
 
 /// The key of the samples of an instruction, and how many are kept of the
@@ -289,12 +314,39 @@ impl Counts {
             };
             // Reservoir sampling: each instruction of a record has the same
             // chance to be one of its samples.
-            let (key, keep) = sample_key(item.record, item.encoding, self.keep);
+            let (key, keep) = match self.translated {
+                None => sample_key(item.record, item.encoding, self.keep),
+                Some((table, esr)) => {
+                    // An exception leaves the stream for an entry of the
+                    // vector table.
+                    let to = item.after.pc;
+                    let taken = (table..table + translate::VECTORS_BYTES).contains(&to)
+                        && to & 0x7f == 0
+                        && item.before.pc.wrapping_add(4) != to;
+                    let outcome = match (&item.system, taken) {
+                        (Some((_, after)), true) => {
+                            let syndrome = after[esr] & 0xfc00_00ff;
+                            *self.syndromes.entry(syndrome).or_default() += 1;
+                            (syndrome >> 18) as u16 | syndrome as u16 & 0xff
+                        }
+                        _ => 0,
+                    };
+                    let first = records_of(item.record.info().format)[0];
+                    ((first, outcome), 1)
+                }
+            };
+            let seen = if self.translated.is_some() {
+                let seen = self.sample_counts.entry(key).or_default();
+                *seen += 1;
+                *seen
+            } else {
+                *count
+            };
             let samples = self.samples.entry(key).or_default();
             if samples.len() < keep {
                 samples.push(make(item));
             } else {
-                let slot = rng.below(*count) as usize;
+                let slot = rng.below(seen) as usize;
                 if slot < keep {
                     samples[slot] = make(item);
                 }
@@ -473,10 +525,26 @@ fn main() -> Result<(), Failure> {
     // The group of the loads and stores compares them too, and its rounds
     // work on memory.
     let memory_group = group_name == "loadstore";
+    // A group with the MMU on runs as a group of system instructions, with
+    // its own streams. The walk test runs against another CPU of QEMU.
+    let walk = group_name == "walk";
+    let translated = walk || matches!(group_name.as_str(), "mmu" | "c8");
     // A group of system instructions also compares the system registers, and
     // its streams hold FP instructions too.
-    let system = formats == STREAM_FORMATS;
-    let compared = if system { compared() } else { Vec::new() };
+    let system = formats == STREAM_FORMATS || translated;
+    let mut compared = if system { compared() } else { Vec::new() };
+    if walk {
+        // QEMU's `max` is a later CPU than ours: its control registers hold
+        // other bits. The registers of a fault and of a translation are
+        // what the walk test is about.
+        compared.retain(|register| {
+            matches!(
+                register.qemu,
+                "ESR_EL1" | "FAR_EL1" | "ELR_EL1" | "SPSR_EL1" | "PAR_EL1" | "TTBR0_EL1"
+                    | "TTBR1_EL1" | "MAIR_EL1" | "VBAR_EL1" | "SP_EL0" | "SP_EL1"
+            )
+        });
+    }
     let mut leader = if system {
         let options = Options {
             vectors: true,
@@ -485,6 +553,7 @@ fn main() -> Result<(), Failure> {
                 .map(|register| register.qemu.to_string())
                 .collect(),
             names: None,
+            cpu: walk.then(|| "max".to_string()),
         };
         let mut leader = Leader::start_options(&qemu, &plugin, &directory, RAM_MIB, &options)?;
         // The streams have their own vector table.
@@ -501,14 +570,30 @@ fn main() -> Result<(), Failure> {
     let memory = FlatMemory::new(RAM_BASE, ram);
     let mut follower = Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE)));
     follower.compared = compared.clone();
+    follower.translated = translated;
+    if walk {
+        follower.model = &sysreg::QEMU_MAX_WALK;
+        // N, Z, C and V, IL, D, A, I and F, the level and the stack
+        // pointer: the bits of PSTATE that an Armv8.0 CPU has.
+        follower.pstate_mask = 0xf010_03cf;
+    }
+    let esr = compared
+        .iter()
+        .position(|register| register.qemu == "ESR_EL1")
+        .unwrap_or(0);
     let mut run = Run {
         memory: memory_group,
         follower,
         counts: Counts {
             keep: samples,
             few_vectors: memory_group || lanes,
-            sampled: if system { formats.clone() } else { Vec::new() },
+            sampled: if system && !translated {
+                formats.clone()
+            } else {
+                Vec::new()
+            },
             compared,
+            translated: translated.then_some((IMAGE_BASE, esr)),
             ..Counts::default()
         },
         rng: Rng(seed ^ 0x5eed),
@@ -516,6 +601,27 @@ fn main() -> Result<(), Failure> {
     let mut generator = Generator::new(seed);
     if !probe.is_empty() {
         return probe_rounds(&mut run, &mut generator, &probe, probe_offset, memory_group);
+    }
+    if translated {
+        let profile = if walk {
+            translate::MAX_WALK
+        } else {
+            translate::CORTEX_A53
+        };
+        return translated_rounds(
+            &mut run,
+            &mut generator,
+            profile,
+            per_class,
+            // A corpus entry replays as QEMU's `cortex-a53`.
+            corpus_out.as_deref().filter(|_| !walk),
+            &Header {
+                group: &group_name,
+                seed,
+                qemu: &qemu,
+                started,
+            },
+        );
     }
     if memory_group {
         return memory_rounds(
@@ -877,7 +983,11 @@ fn finish(
                 // An entry must replay alone, which is how `just ci::check`
                 // runs it.
                 if let Err(error) = entry.replay() {
-                    eprintln!("not in the corpus: {error}");
+                    // An instruction with the MMU on that changes its own
+                    // translation names memory that a replay cannot hold.
+                    if counts.translated.is_none() {
+                        eprintln!("not in the corpus: {error}");
+                    }
                     refused += 1;
                     continue;
                 }
@@ -890,11 +1000,87 @@ fn finish(
         }
         std::fs::write(path, text)?;
         println!("wrote the corpus samples to {path}, {refused} did not replay alone");
-        if refused != 0 {
+        if refused != 0 && counts.translated.is_none() {
             return Err("verified instructions that do not replay alone".into());
         }
     }
     Ok(())
+}
+
+/// The rounds of a group with the MMU on (card C8): streams over random
+/// translation tables, until `per_class` cache, TLB and address translation
+/// operations are verified.
+fn translated_rounds(
+    run: &mut Run,
+    generator: &mut Generator,
+    profile: Profile,
+    per_class: u64,
+    corpus_out: Option<&str>,
+    header: &Header<'_>,
+) -> Result<(), Failure> {
+    let layout = Layout { base: IMAGE_BASE };
+    let mut granules: BTreeMap<u32, u64> = BTreeMap::new();
+    while run.counts.of_format(FormatClass::SystemXtI) < per_class {
+        let image = generator.translated_image(layout, profile, TRANSLATED_ITEMS);
+        for granule in image.granules {
+            *granules.entry(granule).or_default() += 1;
+        }
+        let (x, sp, nzcv) = generator.registers((image.start, 0x1000));
+        let round = Round {
+            memory: image.memory,
+            start: Core {
+                x,
+                sp,
+                pc: image.start,
+                cpsr: CPSR_EL1H | u32::from(nzcv) << 28,
+            },
+            vectors: Some(Default::default()),
+            budget: TRANSLATED_BUDGET,
+            visits: 4,
+            reset: true,
+            exempt: (layout.base, layout.base + translate::VECTORS_BYTES),
+        };
+        run.round(&round)?;
+        if run.counts.rounds.is_multiple_of(100) {
+            eprintln!(
+                "{} rounds, {} of {per_class} system operations, {:.0} s",
+                run.counts.rounds,
+                run.counts.of_format(FormatClass::SystemXtI),
+                header.started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    header.print(run.counts.rounds, 0);
+    for (granule, halves) in &granules {
+        println!("  {halves:>9} halves of an address space with the {}K granule", (1u32 << granule) / 1024);
+    }
+    print_formats(&run.counts, &[FormatClass::SystemXtI, FormatClass::SystemLXtI]);
+    let loads_and_stores: u64 = LOAD_STORE_FORMATS
+        .iter()
+        .map(|format| run.counts.of_format(*format))
+        .sum();
+    let total: u64 = run.counts.verified.values().sum();
+    println!(
+        "{loads_and_stores} loads and stores verified, and {} other instructions",
+        total - loads_and_stores - run.counts.of_format(FormatClass::SystemXtI)
+    );
+    println!(
+        "memory: {} verified instructions wrote {} bytes, every byte compared",
+        run.counts.stores, run.counts.stored_bytes
+    );
+    println!(
+        "stores of several parts that faulted after a different count of parts on the two sides: {}",
+        run.follower.partial_stores
+    );
+    println!("exceptions that both sides took, with the same registers after them:");
+    for (kind, count) in &run.follower.exceptions {
+        println!("  {count:>9} {kind}");
+    }
+    println!("the syndromes of the verified instructions that took an exception (class and low byte):");
+    for (syndrome, count) in &run.counts.syndromes {
+        println!("  {count:>9} {syndrome:#010x}");
+    }
+    finish(&run.counts, &[], corpus_out, header)
 }
 
 /// Move the base register of `word`, or the stack pointer when that is its
