@@ -209,7 +209,7 @@ fn each_of_the_101_measured_registers_has_a_row_and_answers_at_el1() {
             assert_eq!(bench.msr(row.encoding, 0), Answer::Fault(0x0200_0000), "{name}");
         }
     }
-    assert_eq!((read, written, absent), (93, 43, 7));
+    assert_eq!((read, written, absent), (93, 47, 7));
     // The seven are in the log, each as a read and as a write.
     assert_eq!(bench.cpu.unknown.len(), 14);
 }

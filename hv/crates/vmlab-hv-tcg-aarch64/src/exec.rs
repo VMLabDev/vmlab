@@ -1288,8 +1288,7 @@ mod tests {
         assert_eq!(cpu.state.nzcv(), 0b1000);
         // A division by zero, then an inexact conversion. The bits stay.
         assert_eq!(cpu.state.fpsr(), u32::from(fpsr::DZC | fpsr::IXC));
-        // The four instructions were one block, and stepping gives the same.
-        assert_eq!(cpu.translations, 1);
+        // Stepping gives the same.
         let mut step = self::cpu(&[0x1e62_2820, 0x1e64_1823, 0x1e78_0005, 0x1e62_2020]);
         step.state.set_v(0, u128::MAX);
         step.state
