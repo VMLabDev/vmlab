@@ -38,6 +38,10 @@ import time
 REPOSITORY = "https://gitlab.com/kvm-unit-tests/kvm-unit-tests.git"
 # The commit that the results of card C10 were taken at.
 REVISION = "master"
+# What the tests read as their environment, as an initial RAM disk. The
+# erratum is a defect of old KVM hosts that makes PSCI CPU_ON unsafe to test
+# there. No KVM is in play here, so the test runs.
+ENVIRONMENT = "ERRATA_6c7a5dce22b3=y\n"
 # The tests of card C10: selftest, gic (the GICv2 of `virt`), timer, psci.
 SELECTED = re.compile(r"^(selftest-.*|gicv2-.*|timer|psci)$")
 MAX_SMP = 4
@@ -137,9 +141,12 @@ class Test:
         # `$(($MAX_SMP>4?4:$MAX_SMP))` and its kin: the largest count here.
         numbers = [int(number) for number in re.findall(r"\d+", smp)]
         self.smp = min(max(numbers or [1]), MAX_SMP)
-        extra = shlex.split(section.get("extra_params", "").replace("$MAX_SMP", str(MAX_SMP)))
+        # The arguments of QEMU were `extra_params`, and are `qemu_params`
+        # with the arguments of the test in `test_args`.
+        params = section.get("qemu_params", "") + " " + section.get("extra_params", "")
+        extra = shlex.split(params.replace("$MAX_SMP", str(MAX_SMP)))
         self.memory = 256
-        self.append = ""
+        self.append = " ".join(shlex.split(section.get("test_args", "")))
         self.machine = ""
         self.cpu = ""
         at = 0
@@ -183,13 +190,14 @@ def results(output: str) -> list[str]:
     return lines
 
 
-def on_qemu(qemu: str, source: Path, test: Test, timeout: int) -> str:
+def on_qemu(qemu: str, source: Path, test: Test, timeout: int, environment: Path) -> str:
     machine = "virt" + (f",{test.machine}" if test.machine else "")
     argv = [
         qemu, "-nodefaults", "-machine", machine, "-cpu", "cortex-a53", "-accel", "tcg",
         "-display", "none", "-monitor", "none", "-serial", "stdio",
         "-smp", str(test.smp), "-m", str(test.memory),
         "-kernel", str(source / "arm" / test.file), "-append", test.append,
+        "-initrd", str(environment),
     ]  # fmt: skip
     try:
         done = subprocess.run(argv, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
@@ -198,7 +206,9 @@ def on_qemu(qemu: str, source: Path, test: Test, timeout: int) -> str:
         return (expired.stdout or b"").decode("latin1") + "\nEXIT: STATUS=timeout\n"
 
 
-def on_vmlab_hv(binary: Path, source: Path, test: Test, timeout: int, scratch: Path) -> str:
+def on_vmlab_hv(
+    binary: Path, source: Path, test: Test, timeout: int, scratch: Path, environment: Path
+) -> str:
     scratch = checked_dir(scratch)
     if scratch.exists():
         shutil.rmtree(scratch)
@@ -209,7 +219,7 @@ def on_vmlab_hv(binary: Path, source: Path, test: Test, timeout: int, scratch: P
         "vcpus": test.smp, "memory_mib": test.memory,
         "boot": {
             "kind": "kernel", "kernel": str(source / "arm" / test.file),
-            "initrd": None, "cmdline": test.append,
+            "initrd": str(environment), "cmdline": test.append,
         },
         "disks": [], "nics": [], "ports": [], "serial_log": str(serial),
     }  # fmt: skip
@@ -256,13 +266,17 @@ def main() -> int:
     selected = tests(source, arguments.only)
     if not selected:
         raise SystemExit("no test selected")
+    environment = work / "environment"
+    environment.write_text(ENVIRONMENT)
     different = 0
     for test in selected:
         timeout = max(arguments.timeout, test.timeout)
         started = time.time()
-        qemu = results(on_qemu(arguments.qemu, source, test, timeout))
+        qemu = results(on_qemu(arguments.qemu, source, test, timeout, environment))
         between = time.time()
-        ours_output = on_vmlab_hv(arguments.vmlab_hv, source, test, timeout, work / "run")
+        ours_output = on_vmlab_hv(
+            arguments.vmlab_hv, source, test, timeout, work / "run", environment
+        )
         ours = results(ours_output)
         same = qemu == ours and bool(qemu)
         different += not same
