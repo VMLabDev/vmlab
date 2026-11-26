@@ -12,6 +12,16 @@ hv/crates/vmlab-hv-tcg/vendor/softfloat/
   Berkeley SoftFloat 3e, ucb-bar/berkeley-softfloat-3
   0a5ad290c6b287f6605bb99a35ad0842c1e61aa5. BSD-3-Clause.
   Source files retain their original headers. No QEMU source is included.
+  The generic sources are built two times: with the RISCV specialisation by
+  hv/crates/vmlab-hv-tcg, and with the ARM-VFPv2 specialisation, under the
+  symbol prefix a64sf_, by hv/crates/vmlab-hv-tcg-aarch64.
+
+hv/crates/vmlab-hv-tcg-aarch64/tests/testfloat.txt
+  Test cases written by testfloat_gen of Berkeley TestFloat 3e,
+  ucb-bar/berkeley-testfloat-3 a9c849f1b0eb0264b626d9686ffae167d996e3be,
+  with the results of the SoftFloat above. BSD-3-Clause, with the licence
+  text of SoftFloat below and the copyright years 2011 to 2018. No source
+  file of TestFloat is included: hv/toolchain/testfloat/ fetches it.
 
 Sail RISC-V model licence:
 

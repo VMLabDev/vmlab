@@ -4307,6 +4307,7 @@ dependencies = [
 name = "vmlab-hv-tcg-aarch64"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "vmlab-hv-tcg",
  "vmlab-hv-tcg-ir",
 ]

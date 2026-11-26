@@ -9,7 +9,7 @@ use crate::fields::Condition;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
-use vmlab_hv_tcg_ir::native::{Binary, ScalarId, ScalarType, Unary};
+use vmlab_hv_tcg_ir::native::{Binary, Helper, ScalarId, ScalarType, Unary};
 
 /// The class of an exception that ends a block. The exception cards (C6)
 /// add the classes and their syndromes.
@@ -343,6 +343,57 @@ impl Builder {
         debug_assert_eq!(self.block.graph.scalars[value].ty, ScalarType::Bits(width));
         let value = self.zero_extend(value, 64);
         self.write(self.context.sp_slot(), value);
+    }
+
+    // --- FP and vector registers -------------------------------------------
+
+    /// `high` above the `low_width` bits of `low`, as `width` bits.
+    pub fn concat(
+        &mut self,
+        high: ScalarId,
+        low: ScalarId,
+        low_width: u16,
+        width: u16,
+    ) -> ScalarId {
+        self.block.graph.concat(high, low, low_width, width)
+    }
+
+    /// The low `width` bits of the register V`n`: 32 for S`n`, 64 for D`n`,
+    /// 128 for the whole register.
+    pub fn v(&mut self, n: u32, width: u16) -> ScalarId {
+        let value = self.read(slot::V0 + n as usize);
+        self.low(value, width)
+    }
+
+    /// Write the low `width` bits of V`n`. The bits above them become zero,
+    /// as every scalar write of an FP register does.
+    pub fn set_v(&mut self, n: u32, width: u16, value: ScalarId) {
+        debug_assert_eq!(self.block.graph.scalars[value].ty, ScalarType::Bits(width));
+        let value = self.zero_extend(value, 128);
+        self.write(slot::V0 + n as usize, value);
+    }
+
+    /// The result of the pure helper `helper` on `args`, as `width` bits
+    /// (R10). The lifter gives the count of arguments that the helper names.
+    pub fn call(&mut self, width: u16, helper: &'static Helper, args: &[ScalarId]) -> ScalarId {
+        self.block
+            .graph
+            .call(ScalarType::Bits(width), helper, args)
+            .expect("a pure helper with its count of arguments")
+    }
+
+    /// FPCR now.
+    pub fn fpcr(&mut self) -> ScalarId {
+        self.read(slot::FPCR)
+    }
+
+    /// Set the cumulative exception bits `bits` in FPSR. `bits` has eight
+    /// bits, in the positions of FPSR.
+    pub fn raise(&mut self, bits: ScalarId) {
+        let bits = self.zero_extend(bits, 32);
+        let old = self.read(slot::FPSR);
+        let new = self.binary(32, Binary::Or, old, bits);
+        self.write(slot::FPSR, new);
     }
 
     // --- flags -----------------------------------------------------------

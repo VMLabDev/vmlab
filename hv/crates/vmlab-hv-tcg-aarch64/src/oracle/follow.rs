@@ -7,7 +7,7 @@
 //! difference.
 
 use super::leader::Leader;
-use super::{Core, Trace};
+use super::{Core, Trace, Vectors};
 use crate::exec::{Cpu, Stop};
 use crate::generated::decode::{Record, decode};
 use std::io;
@@ -20,6 +20,10 @@ pub struct Round {
     /// Memory to load on both sides, as address and bytes.
     pub memory: Vec<(u64, Vec<u8>)>,
     pub start: Core,
+    /// V0 to V31, FPSR and FPCR at the start. `Some`: they are loaded on both
+    /// sides and compared before every instruction, and the leader must have
+    /// been started with vectors. `None`: they are left alone and not compared.
+    pub vectors: Option<Vectors>,
     /// The most instructions to follow.
     pub budget: u64,
     /// The round ends when one PC is about to run more often than this. It
@@ -35,6 +39,9 @@ pub struct Verified {
     pub record: Record,
     pub before: Core,
     pub after: Core,
+    /// The vector and FP registers before and after, in a round that
+    /// compares them.
+    pub vectors: Option<(Vectors, Vectors)>,
 }
 
 /// How a round ended when the two sides agreed all the way.
@@ -73,6 +80,11 @@ pub struct Difference {
     pub instruction: Option<(u32, Core)>,
     pub ours: Core,
     pub qemu: Option<Core>,
+    /// The vector and FP registers of both sides, ours first, in a round
+    /// that compares them.
+    pub vectors: Option<(Vectors, Vectors)>,
+    /// The vector and FP registers before the instruction.
+    pub vectors_before: Option<Vectors>,
 }
 
 impl std::fmt::Display for Difference {
@@ -87,6 +99,14 @@ impl std::fmt::Display for Difference {
         if let Some(qemu) = &self.qemu {
             writeln!(f, "  qemu   {qemu}")?;
             for line in self.ours.difference(qemu) {
+                writeln!(f, "  ours / qemu  {line}")?;
+            }
+        }
+        if let Some(before) = &self.vectors_before {
+            writeln!(f, "  before {before}")?;
+        }
+        if let Some((ours, qemu)) = &self.vectors {
+            for line in ours.difference(qemu) {
                 writeln!(f, "  ours / qemu  {line}")?;
             }
         }
@@ -142,6 +162,10 @@ impl Follower {
             .ok_or_else(|| io::Error::other("a round must start at EL1 with SP_EL1"))?;
         self.leader.set_core(&round.start)?;
         self.cpu.state = state;
+        if let Some(vectors) = &round.vectors {
+            self.leader.set_vectors(vectors)?;
+            vectors.apply(&mut self.cpu.state);
+        }
         Ok(())
     }
 
@@ -158,6 +182,9 @@ impl Follower {
         let mut verified = Vec::new();
         // The last instruction that our side ran, with the registers before it.
         let mut last: Option<(u32, Record, Core)> = None;
+        // The vector and FP registers before that instruction.
+        let mut last_vectors: Option<Vectors> = None;
+        let compare_vectors = round.vectors.is_some();
         let mut expect = Expect::Instruction;
         let mut followed = 0u64;
         let mut visits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
@@ -170,12 +197,18 @@ impl Follower {
                         .map(|(encoding, _, before)| (*encoding, *before)),
                     ours,
                     qemu,
+                    vectors: None,
+                    vectors_before: None,
                 })
             };
         let result = loop {
             let ours = Core::of(&self.cpu.state);
             match self.leader.next_record(RECORD_TIMEOUT)? {
-                Trace::Instruction { encoding, core } => {
+                Trace::Instruction {
+                    encoding,
+                    core,
+                    vectors,
+                } => {
                     if let Expect::Exception(pc, _) = expect {
                         break Err(differed(
                             format!("we stop with an exception at {pc:#x} and QEMU runs on"),
@@ -192,6 +225,25 @@ impl Follower {
                             Some(core),
                         ));
                     }
+                    let ours_vectors = compare_vectors.then(|| Vectors::of(&self.cpu.state));
+                    if let Some(ours_vectors) = ours_vectors {
+                        let Some(theirs) = vectors else {
+                            return Err(io::Error::other(
+                                "a round compares the vector registers and the leader does not send them",
+                            ));
+                        };
+                        if theirs != ours_vectors {
+                            let mut difference = differed(
+                                "the vector and FP registers before an instruction".into(),
+                                &last,
+                                ours,
+                                Some(core),
+                            );
+                            difference.vectors = Some((ours_vectors, theirs));
+                            difference.vectors_before = last_vectors;
+                            break Err(difference);
+                        }
+                    }
                     // The registers agree, so the last instruction did the same on both sides.
                     if let Some((word, record, before)) = last.take() {
                         verified.push(Verified {
@@ -199,8 +251,10 @@ impl Follower {
                             record,
                             before,
                             after: core,
+                            vectors: last_vectors.zip(ours_vectors),
                         });
                     }
+                    last_vectors = ours_vectors;
                     // QEMU has memory that the round does not mirror: flash
                     // at 0 and devices. A branch that lands there is verified
                     // by the registers above, and the round ends.
@@ -336,12 +390,29 @@ impl Follower {
                             Some(after),
                         ));
                     }
+                    // An exception changes no vector register either.
+                    let ours_vectors = compare_vectors.then(|| Vectors::of(&self.cpu.state));
+                    if let Some(ours_vectors) = ours_vectors {
+                        let theirs = self.leader.vectors()?;
+                        if theirs != ours_vectors {
+                            let mut difference = differed(
+                                "the vector and FP registers at an exception".into(),
+                                &last,
+                                ours,
+                                Some(after),
+                            );
+                            difference.vectors = Some((ours_vectors, theirs));
+                            difference.vectors_before = last_vectors;
+                            break Err(difference);
+                        }
+                    }
                     if let Some((word, record, before)) = last.take() {
                         verified.push(Verified {
                             encoding: word,
                             record,
                             before,
                             after: ours,
+                            vectors: last_vectors.zip(ours_vectors),
                         });
                     }
                     break Ok(end);

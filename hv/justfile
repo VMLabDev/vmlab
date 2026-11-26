@@ -100,7 +100,7 @@ tcg-a64-plugin-build:
 	@mkdir -p target/tcg
 	gcc -O2 -Wall -Werror -shared -fPIC $(pkg-config --cflags glib-2.0) -o target/tcg/a64lock.so {{a64_crate}}/plugin/a64lock.c
 
-# Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3); traces are files of the measure plugin with the executed encodings, separated by spaces
+# Run the aarch64 instruction lockstep against QEMU for a group (DESIGN.md O3: c1, dp-immediate, branch, or fp, which also compares V0 to V31, FPSR and FPCR); traces are files of the measure plugin with the executed encodings, separated by spaces
 [group('tcg')]
 tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='': tcg-a64-plugin-build
 	#!/usr/bin/env bash
@@ -111,6 +111,16 @@ tcg-a64-lockstep group='c1' per_class='100000' seed='1' traces='' corpus='': tcg
 	for trace in {{traces}}; do args+=(--encodings "$trace"); done
 	if [ -n "{{corpus}}" ]; then args+=(--corpus-out "{{corpus}}"); fi
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_lockstep -- "${args[@]}"
+
+# Run Berkeley TestFloat against the FP helpers of the aarch64 emulator (DESIGN.md O5); it fetches and builds the pinned generator of toolchain/testfloat/pins.env, and sample is a file that takes test cases for tests/testfloat.rs
+[group('tcg')]
+tcg-a64-testfloat level='1' sample='':
+	#!/usr/bin/env bash
+	set -euo pipefail
+	gen=$(toolchain/testfloat/build.sh "$PWD/target/tcg/testfloat")
+	args=(--gen "$gen" --level "{{level}}")
+	if [ -n "{{sample}}" ]; then args+=(--sample-out "{{sample}}"); fi
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_testfloat -- "${args[@]}"
 
 # Measure the aarch64 interpreter loop on the branch-and-add image (DESIGN.md M6)
 [group('tcg')]
