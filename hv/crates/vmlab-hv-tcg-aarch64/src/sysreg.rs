@@ -388,6 +388,9 @@ pub const ROWS: &[Row] = &[
 /// The count of rows, which is the count of stored words.
 pub const COUNT: usize = ROWS.len();
 
+// `find` holds a row number in a byte.
+const _: () = assert!(COUNT < 255);
+
 const fn same(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {

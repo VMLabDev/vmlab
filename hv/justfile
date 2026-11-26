@@ -118,7 +118,7 @@ tcg-a64-sysprobe out='crates/vmlab-hv-tcg-aarch64/tests/qemu-cortex-a53-sysregs.
 	#!/usr/bin/env bash
 	set -euo pipefail
 	dir=$(mktemp -d "${TMPDIR:-/tmp}/a64probe.XXXXXX")
-	trap 'rm -rf -- "$dir"' EXIT
+	trap '[ -n "$dir" ] && [ -d "$dir" ] && rm -rf -- "$dir"' EXIT
 	args=(--plugin "$PWD/target/tcg/a64lock.so" --dir "$dir" --out "{{out}}")
 	if [ -n "{{names}}" ]; then args+=(--names-out "{{names}}"); fi
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_sysprobe -- "${args[@]}"

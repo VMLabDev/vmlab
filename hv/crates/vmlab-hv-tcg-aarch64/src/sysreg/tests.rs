@@ -164,7 +164,6 @@ fn every_row_has_the_name_and_the_encoding_of_the_llvm_tables() {
         // A stored word that nothing can write and nothing resets is zero.
         assert!(row.mask != 0 || row.kind != Kind::Stored || row.el1 != Rw::Wo);
     }
-    const { assert!(COUNT < 255, "the lookup table holds a row number in a byte") };
     assert_eq!(position("NO_SUCH_REGISTER"), COUNT);
     assert_eq!(encoding(3, 3, 14, 0, 2), 0xdf02);
     assert_eq!(name(0xdf02), "CNTVCT_EL0");

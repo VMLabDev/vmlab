@@ -384,8 +384,8 @@ impl Generator {
             let at = base + 4 * words.len() as u64;
             self.system_item(&mut words, at, base, image);
         }
-        // The stream ends in a call that both sides refuse or serve alike,
-        // and a branch to itself: a round that gets here ends as a loop.
+        // The stream ends in a branch to itself: a round that gets here
+        // ends as a loop.
         words.push(asm::NOP);
         words.push(asm::b(0));
         words
