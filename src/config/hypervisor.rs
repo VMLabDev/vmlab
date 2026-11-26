@@ -343,6 +343,12 @@ fn hardware_refusals(
     }
     let pc = legacy_pc(&h.machine);
     if pc {
+        if h.usb {
+            why.push(format!(
+                "vm \"{name}\": `usb = true` requires the q35 xHCI on vmlab-hv (PRD §5.2.1); \
+                 set `usb = false` on the pc machine"
+            ));
+        }
         if !delivered.machine_core {
             why.push(phase(
                 name,
