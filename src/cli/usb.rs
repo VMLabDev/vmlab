@@ -87,7 +87,7 @@ fn cmd_list(json: bool) -> Result<()> {
     })
 }
 
-fn render_list(listed: &Value) -> String {
+pub(crate) fn render_list(listed: &Value) -> String {
     let rows: Vec<Listed> = serde_json::from_value(listed.clone()).unwrap_or_default();
     if rows.is_empty() {
         return "no USB devices on this host\n".into();

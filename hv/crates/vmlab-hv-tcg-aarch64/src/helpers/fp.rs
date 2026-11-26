@@ -1094,5 +1094,7 @@ pub fn expand_immediate(format: Format, immediate: u32) -> u64 {
     format.zero(sign) | exponent << format.fraction_bits() | fraction
 }
 
+pub mod vector;
+
 #[cfg(test)]
 mod tests;
