@@ -308,6 +308,36 @@ machine, and a `terminal` whose shell exited says so and quotes the tail of
 its output.
 DOC
 
+  h2 "The limits on a script run"
+
+  p <<'DOC'
+vmlab sets two limits on every script run: a provision, a first-boot script, a
+handler and `vmlab script`. Neither is a limit on time, and neither can be
+changed. Each ends the run with a runtime error like any other.
+DOC
+
+  p <<'DOC'
+A script may run 10,000,000 instructions without a host call. The limit ends a
+script that does not end by itself, such as a loop with a wrong end condition.
+The count starts again each time a host call returns: any function of the
+`vmlab` module, and any method of `Lab`, `Machine`, `Segment` or `Term`. A
+host call is also where a cancelled run stops. So a script that keeps reaching the host may run as long as it needs,
+and only a script that spins by itself is ended, with "the script ran
+10,000,000 instructions without a host call". A method of a string, a list or
+a map is the script's own work and not a host call. A loop that walks a very
+large text without a host call reaches the limit after one to two million
+passes; call `vmlab::sleep_ms(0)` every few thousand passes there.
+DOC
+
+  p <<'DOC'
+A script may hold 1024 MiB of values at one time. What counts is what the
+script still holds, not what it has made and dropped, so a long script that
+reads many command outputs one after the other stays inside the limit. vmlab
+counts at intervals, so a run can hold up to about half as much again before
+it is stopped with "memory limit exceeded". The limit protects the lab daemon,
+which runs the script and manages every machine of the lab.
+DOC
+
   p <<'DOC'
 Idempotence is the script author's job. Every `vmlab up` runs the provision
 steps of each machine it brings into scope, whether that machine was just

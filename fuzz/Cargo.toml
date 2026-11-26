@@ -26,6 +26,7 @@ members = ["."]
 [patch."https://github.com/Configweave/wscript.git"]
 wscript-core = { path = "../vendor/wscript-core" }
 wscript-compiler = { path = "../vendor/wscript-compiler" }
+wscript-vm = { path = "../vendor/wscript-vm" }
 
 [[bin]]
 name = "qcow2"
