@@ -582,7 +582,8 @@ fn a_prefetch_touches_nothing_also_at_an_address_that_holds_no_memory() {
     let mut before = cpu.state.clone();
     assert!(run_to_end(&mut cpu, 100));
     assert_eq!(cpu.instructions, 5);
-    before.set_pc(BASE + 20);
+    // After the five prefetches and the call that ends the program.
+    before.set_pc(BASE + 24);
     assert_eq!(cpu.state, before);
 }
 
@@ -688,20 +689,29 @@ fn a_store_into_data_keeps_the_translated_blocks() {
     cpu.state.set_x(1, 100);
     assert!(run_to_end(&mut cpu, u64::MAX));
     assert_eq!(cpu.instructions, 300);
-    assert_eq!(cpu.translations, 1);
+    // The loop, and the call that ends the program.
+    assert_eq!(cpu.translations, 2);
     assert_eq!(read(&mut cpu, DATA + 99 * 8, 8), 1u64.to_le_bytes());
-    // A second run finds the block again: our own stores are accounted for.
+    // A second run finds the blocks again: our own stores are accounted for.
     cpu.state.set_pc(BASE);
     cpu.state.set_x(0, DATA);
     cpu.state.set_x(1, 10);
     assert!(run_to_end(&mut cpu, u64::MAX));
-    assert_eq!(cpu.translations, 1);
-    // A write from outside drops it.
+    assert_eq!(cpu.translations, 2);
+    // A write from outside into a data page keeps them too: the code stamp
+    // of their page still holds.
     cpu.memory.write(DATA, &[1]).unwrap();
     cpu.state.set_pc(BASE);
     cpu.state.set_x(1, 1);
     assert!(run_to_end(&mut cpu, u64::MAX));
     assert_eq!(cpu.translations, 2);
+    // A write from outside into their page drops both, also when it changes
+    // none of their bytes.
+    cpu.memory.write(BASE + 0x800, &END.to_le_bytes()).unwrap();
+    cpu.state.set_pc(BASE);
+    cpu.state.set_x(1, 1);
+    assert!(run_to_end(&mut cpu, u64::MAX));
+    assert_eq!(cpu.translations, 4);
 }
 
 fn ldxr(rt: u32, rn: u32) -> u32 {
@@ -981,7 +991,10 @@ fn stop_at(word: u32, offset: u64) -> Option<(u64, u64, bool, u8)> {
 fn on_the_flat_memory_every_access_is_aligned_to_its_size_or_stops() {
     let aligned = |word: u32, offset: u64| stop_at(word, offset).is_none();
     let refused = |word: u32, offset: u64| {
-        stop_at(word, offset) == Some((BASE, DATA + offset, word & (1 << 22) == 0, ALIGNMENT))
+        matches!(
+            stop_at(word, offset),
+            Some((BASE, _, write, ALIGNMENT)) if write == (word & (1 << 22) == 0)
+        )
     };
     // A register of 8 bytes: a multiple of 8, also with a write back.
     let ldr = word(Record::LDRXpost, &[("rt", 2), ("rn", 0), ("offset", 8)]);
