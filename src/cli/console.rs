@@ -1,9 +1,9 @@
 //! `vmlab console` attaches a native or VNC viewer to a VM (PRD §11).
 //!
 //! Every VM serves VNC on a unix socket. We pick a viewer with
-//! [`crate::viewer::detect`] and launch it: a unix-socket viewer
-//! (remote-viewer) dials the socket directly; a TCP-only viewer
-//! (gvncviewer/vncviewer) gets a localhost display the bridge proxies to.
+//! [`crate::viewer::detect_for`]. A configured unix-socket VNC viewer dials
+//! the socket directly. Detected VNC viewers connect through a localhost
+//! display bridge.
 //! With `--tcp` or no viewer at all we just bridge and print the address —
 //! the WSL2 path, where the viewer lives on the Windows side.
 //!
