@@ -417,27 +417,44 @@ impl Side {
         Ok(spot)
     }
 
-    /// Whether an access to `va` that is not aligned to its size faults:
-    /// with SCTLR_EL1.A, and in Device memory, which is all memory while the
-    /// MMU is off. An address without a translation does not fault here:
-    /// the access itself reports that.
+    /// Whether an access of `bytes` bytes at `va` that is not aligned to its
+    /// size takes an alignment fault: with SCTLR_EL1.A, and in Device
+    /// memory. What the lockstep found on QEMU:
+    ///
+    /// - While the MMU is off all memory is Device memory, and the fault
+    ///   comes before every other one, also for an address that is wider
+    ///   than a physical address.
+    /// - While it is on, a translation, access flag or permission fault of
+    ///   the access comes first. `false` then: the access itself reports
+    ///   that fault.
+    /// - An access that crosses into a second page faults when either page
+    ///   is Device memory.
     #[cold]
-    fn unaligned_faults<M: Memory>(&mut self, memory: &mut M, va: u64, bytes: u8) -> bool {
-        // While the MMU is off the fault comes before every other one, also
-        // for an address that is wider than a physical address.
-        let controls = self.mmu.controls();
-        if controls.strict_alignment || !controls.enabled {
+    fn unaligned_faults<M: Memory>(
+        &mut self,
+        memory: &mut M,
+        va: u64,
+        bytes: u8,
+        kind: Kind,
+        user: bool,
+    ) -> bool {
+        let controls = *self.mmu.controls();
+        if !controls.enabled {
             return true;
         }
-        // An access that crosses into a second page faults when either
-        // page is Device memory.
-        let mut device = |va: u64| {
-            self.mmu
-                .page(memory, va, Kind::Read)
-                .is_ok_and(|page| page.flags & mmu::flag::DEVICE != 0)
+        let Ok((_, first)) = self.mmu.translate(memory, va, kind, user) else {
+            return false;
         };
         let last = va.wrapping_add(u64::from(bytes).saturating_sub(1));
-        device(va) || (last >> 12 != va >> 12 && device(last))
+        let second = if last >> 12 == va >> 12 {
+            0
+        } else {
+            match self.mmu.translate(memory, last, kind, user) {
+                Ok((_, flags)) => flags,
+                Err(_) => return false,
+            }
+        };
+        controls.strict_alignment || (first | second) & mmu::flag::DEVICE != 0
     }
 
     fn read_at<M: Memory>(
@@ -1224,13 +1241,15 @@ impl Compiled {
             write,
             always,
             bytes,
-            ..
+            unprivileged,
         } = leave.class
         else {
             return Err((exit, Failed::Guard));
         };
         let address = leave.address.map_or(0, |slot| frame[usize::from(slot)]);
-        if always || side.unaligned_faults(memory, address, bytes) {
+        let kind = if write { Kind::Write } else { Kind::Read };
+        let user = side.user || unprivileged;
+        if always || side.unaligned_faults(memory, address, bytes, kind, user) {
             let fault = Fault::Abort(mmu::Fault::ALIGNMENT, address);
             return Err((exit, Failed::Access(fault, write)));
         }
