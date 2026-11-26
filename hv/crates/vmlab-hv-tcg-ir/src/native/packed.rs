@@ -65,8 +65,14 @@ enum Opcode {
     SignExtend,
     LeadingZeros,
     TrailingZeros,
+    ReverseBits,
+    ReverseBytes,
+    PopCount,
     Slice,
     Concat,
+    /// `left` where the condition holds, else `right`. The slot of the
+    /// condition is `width | extra << 8`.
+    Select,
     Guard(Binary),
     GuardEqual64,
     GuardNotEqual64,
@@ -127,6 +133,9 @@ impl Packed {
         if self.left as usize >= values {
             return false;
         }
+        if matches!(self.opcode, Opcode::Select) {
+            return (self.right as usize) < values && self.condition_slot() < values;
+        }
         if self.extra == u8::MAX && !matches!(self.opcode, Opcode::Concat) {
             return true;
         }
@@ -139,10 +148,17 @@ impl Packed {
             | Opcode::SignExtend
             | Opcode::LeadingZeros
             | Opcode::TrailingZeros
+            | Opcode::ReverseBits
+            | Opcode::ReverseBytes
+            | Opcode::PopCount
             | Opcode::Slice
             | Opcode::BoolGuard => true,
             _ => (self.right as usize) < values,
         }
+    }
+
+    fn condition_slot(&self) -> usize {
+        usize::from(self.width) | usize::from(self.extra) << 8
     }
 
     pub fn right_slot(&self) -> Option<usize> {
@@ -439,6 +455,9 @@ impl Packed {
                     Unary::SignExtend(width) => (Opcode::SignExtend, width),
                     Unary::LeadingZeros(width) => (Opcode::LeadingZeros, width),
                     Unary::TrailingZeros(width) => (Opcode::TrailingZeros, width),
+                    Unary::ReverseBits(width) => (Opcode::ReverseBits, width),
+                    Unary::ReverseBytes(width) => (Opcode::ReverseBytes, width),
+                    Unary::PopCount(width) => (Opcode::PopCount, width),
                 };
                 packed.extra = extra.try_into().ok()?;
                 (opcode, value, 0)
@@ -464,6 +483,15 @@ impl Packed {
                 packed.width = mask_width(bits)?;
                 packed.extra = width.try_into().ok()?;
                 (Opcode::Concat, high, low)
+            }
+            Instruction::Select(condition, when_true, when_false) => {
+                // The condition slot takes the two bytes that other
+                // operations use for a width. A block with more slots than
+                // that is not packed.
+                let condition = u16::try_from(condition).ok()?;
+                packed.width = condition as u8;
+                packed.extra = (condition >> 8) as u8;
+                (Opcode::Select, when_true, when_false)
             }
             Instruction::Constant(_) | Instruction::Input(..) => return None,
         };
@@ -632,6 +660,17 @@ impl Packed {
             Opcode::SignExtend => evaluate_unary(Unary::SignExtend(extra), left)?,
             Opcode::LeadingZeros => evaluate_unary(Unary::LeadingZeros(extra), left)?,
             Opcode::TrailingZeros => evaluate_unary(Unary::TrailingZeros(extra), left)?,
+            Opcode::ReverseBits => evaluate_unary(Unary::ReverseBits(extra), left)?,
+            Opcode::ReverseBytes => evaluate_unary(Unary::ReverseBytes(extra), left)?,
+            Opcode::PopCount => evaluate_unary(Unary::PopCount(extra), left)?,
+            Opcode::Select => {
+                let condition = self.condition_slot() as u32;
+                return Some(if read_word::<CHECKED>(values, condition) != 0 {
+                    left
+                } else {
+                    right()
+                });
+            }
             Opcode::Slice => left.checked_shr(extra.into()).unwrap_or(0),
             Opcode::Concat => left.checked_shl(extra.into()).unwrap_or(0) | right(),
             Opcode::Guard(_)
@@ -696,6 +735,55 @@ mod tests {
         );
         assert_eq!(values, [10, 9]);
         assert_eq!(stamps, [1, 1]);
+    }
+
+    #[test]
+    fn select_reads_its_condition_from_a_slot_of_its_own() {
+        // Slots: 0 and 1 are the arms, 300 is the condition, 2 the output.
+        let packed = Packed::new(2, Instruction::Select(300, 0, 1)).unwrap();
+        assert!(packed.valid_slots(301, 301));
+        assert!(!packed.valid_slots(300, 300));
+        assert!(packed.right_slot().is_none());
+        assert!(packed.with_immediate(1).is_none());
+        let mut values = vec![0u128; 301];
+        values[0] = 7;
+        values[1] = 9;
+        assert_eq!(packed.evaluate(&values), Some(9));
+        values[300] = 1;
+        assert_eq!(packed.evaluate(&values), Some(7));
+        let mut stamps = vec![0u64; 301];
+        assert_eq!(
+            packed.execute(&mut values, &mut stamps, 5),
+            Control::Continue
+        );
+        assert_eq!(values[2], 7);
+        assert_eq!(stamps[2], 5);
+        // A condition slot past 16 bits does not fit the instruction.
+        assert!(Packed::new(2, Instruction::Select(70_000, 0, 1)).is_none());
+        // A full-width value passes through unmasked.
+        values[0] = u128::MAX;
+        assert_eq!(packed.evaluate(&values), Some(u128::MAX));
+    }
+
+    #[test]
+    fn the_new_unary_operations_match_the_scalar_evaluator() {
+        for width in [8u16, 16, 32, 64, 128] {
+            for value in [0, 1, 0x0123_4567_89ab_cdef, u64::MAX as u128, u128::MAX] {
+                for op in [
+                    Unary::ReverseBits(width),
+                    Unary::ReverseBytes(width),
+                    Unary::PopCount(width),
+                ] {
+                    let packed = Packed::new(1, Instruction::Unary(op, 0, mask(width))).unwrap();
+                    assert_eq!(
+                        packed.evaluate(&[value]),
+                        evaluate_unary(op, value).map(|result| result & mask(width)),
+                        "{op:?} {value:#x}"
+                    );
+                    compare_execution(packed, value, 0);
+                }
+            }
+        }
     }
 
     #[test]
