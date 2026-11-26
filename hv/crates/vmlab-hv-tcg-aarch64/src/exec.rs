@@ -1680,6 +1680,16 @@ impl<M: Memory> Cpu<M> {
                         kind: mmu::FaultKind::Permission,
                         level: page.level,
                     }),
+                    // A descriptor that the memory does not hold is an
+                    // exception and no result: QEMU takes the abort.
+                    Err(Miss::Fault(fault)) if fault.kind == mmu::FaultKind::ExternalOnWalk => {
+                        return Ok(Err(Exception::DataAbort {
+                            status: fault.status(),
+                            write: false,
+                            cache: true,
+                            address: value,
+                        }));
+                    }
                     Err(Miss::Fault(fault)) => mmu::par_fault(fault),
                     Err(Miss::Host(message)) => return Err(Stop::Host(message)),
                 };
