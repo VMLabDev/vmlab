@@ -66,9 +66,8 @@ fn add_with_carry(width: u32, a: u64, b: u64, carry: u64) -> (u64, u8) {
     let (a, b) = (a & mask, b & mask);
     let unsigned = u128::from(a) + u128::from(b) + u128::from(carry);
     let result = unsigned as u64 & mask;
-    let signed = i128::from(sign_extend(a, width))
-        + i128::from(sign_extend(b, width))
-        + i128::from(carry);
+    let signed =
+        i128::from(sign_extend(a, width)) + i128::from(sign_extend(b, width)) + i128::from(carry);
     let n = (result >> (width - 1)) & 1 != 0;
     let z = result == 0;
     let c = unsigned >> width != 0;

@@ -200,11 +200,7 @@ pub fn add_sub_carry(b: &mut Builder, record: Record, f: &BaseAddSubCarry) -> Li
 }
 
 /// `ADCS` and `SBCS`.
-pub fn add_sub_carry_flags(
-    b: &mut Builder,
-    record: Record,
-    f: &BaseAddSubCarrySetFlags,
-) -> Lifted {
+pub fn add_sub_carry_flags(b: &mut Builder, record: Record, f: &BaseAddSubCarrySetFlags) -> Lifted {
     let kind = match record {
         Record::ADCSWr => (32, false, true),
         Record::ADCSXr => (64, false, true),

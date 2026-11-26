@@ -264,8 +264,7 @@ fn main() -> Result<(), Failure> {
         decode(*word).is_some_and(|decoded| formats.contains(&decoded.record.info().format))
     });
     let is_branch = |word: &u32| {
-        decode(*word)
-            .is_some_and(|decoded| BRANCH_FORMATS.contains(&decoded.record.info().format))
+        decode(*word).is_some_and(|decoded| BRANCH_FORMATS.contains(&decoded.record.info().format))
     };
     let (branches, straight): (Vec<u32>, Vec<u32>) =
         executed.iter().copied().partition(|word| is_branch(word));
