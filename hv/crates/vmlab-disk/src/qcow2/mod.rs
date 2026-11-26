@@ -2272,6 +2272,37 @@ mod tests {
 }
 
 #[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    /// Review vmlab-disk-2 F15: the L1 entry count wrapped in a cast to
+    /// `u32`, so a resize to 2 EiB or more passed the limit of card #555.
+    #[test]
+    fn a_resize_past_the_l1_limit_is_refused_for_every_size() {
+        let (_dir, mut img) = testsupport::blank(1 << 20);
+        let l1_size = img.l1_size;
+        for shift in [60, 61, 62] {
+            let new_size = 1u64 << shift;
+            assert!(
+                img.resize_grow(new_size).is_err(),
+                "a resize to 1 << {shift} must be refused"
+            );
+            assert_eq!(img.size(), 1 << 20, "size after 1 << {shift}");
+            assert_eq!(img.l1_size, l1_size, "L1 size after 1 << {shift}");
+        }
+    }
+
+    /// Review vmlab-disk-2 F18: a size is a whole number of sectors.
+    #[test]
+    fn create_rounds_a_size_up_to_a_whole_sector() {
+        for (asked, made) in [(0, 0), (1, 512), (1000, 1024), (1024, 1024)] {
+            let (_dir, img) = testsupport::blank(asked);
+            assert_eq!(img.size(), made, "create of {asked} bytes");
+        }
+    }
+}
+
+#[cfg(test)]
 mod testsupport {
     use super::*;
 
