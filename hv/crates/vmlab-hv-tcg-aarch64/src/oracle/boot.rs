@@ -186,6 +186,160 @@ pub fn dump_device_tree(options: &Options) -> io::Result<Vec<u8>> {
     std::fs::read(&path)
 }
 
+/// fw_cfg of `virt`: the data register, and the selector register after it
+/// (QEMU's interface document `docs/specs/fw_cfg.rst`, S7).
+const FW_CFG_DATA: u64 = 0x0902_0000;
+const FW_CFG_SELECTOR: u64 = FW_CFG_DATA + 8;
+/// The item that holds the directory of the files.
+const FW_CFG_DIRECTORY: u16 = 0x19;
+
+/// A QEMU of the machine of the leader that runs no guest: its devices
+/// answer over the qtest protocol.
+struct Qtest {
+    child: Child,
+    reader: io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl Qtest {
+    fn start(options: &Options) -> io::Result<Self> {
+        let socket = options.directory.join("qtest.sock");
+        match std::fs::remove_file(&socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // The same machine without a CPU that runs: no accelerator and no
+        // instruction clock.
+        let mut argv = Vec::new();
+        let mut machine = options.machine().into_iter();
+        while let Some(word) = machine.next() {
+            match word.as_str() {
+                "-accel" | "-icount" => {
+                    machine.next();
+                }
+                _ => argv.push(word),
+            }
+        }
+        argv.extend([
+            "-accel".into(),
+            "qtest".into(),
+            "-qtest".into(),
+            format!("unix:{},server=on,wait=off", socket.display()),
+            "-qtest-log".into(),
+            "/dev/null".into(),
+        ]);
+        let mut child = Command::new(&options.qemu)
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stream = loop {
+            match std::os::unix::net::UnixStream::connect(&socket) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() > deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        Ok(Self {
+            child,
+            reader: io::BufReader::new(stream),
+        })
+    }
+
+    /// Send the commands, and give the value of each answer.
+    fn answers(&mut self, commands: &[String]) -> io::Result<Vec<u64>> {
+        use std::io::{BufRead, Write};
+        let mut text = String::new();
+        for command in commands {
+            text.push_str(command);
+            text.push('\n');
+        }
+        self.reader.get_mut().write_all(text.as_bytes())?;
+        let mut values = Vec::with_capacity(commands.len());
+        while values.len() < commands.len() {
+            let mut line = String::new();
+            if self.reader.read_line(&mut line)? == 0 {
+                return Err(other("QEMU closed its qtest socket"));
+            }
+            let mut words = line.split_whitespace();
+            match words.next() {
+                Some("OK") => values.push(match words.next() {
+                    Some(value) => u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| other(format!("qtest answered {line:?}")))?,
+                    None => 0,
+                }),
+                // A line that QEMU sends by itself, such as an interrupt.
+                Some("IRQ") | None => {}
+                Some(_) => return Err(other(format!("qtest answered {line:?}"))),
+            }
+        }
+        Ok(values)
+    }
+
+    /// The first `length` bytes of the fw_cfg item `selector`.
+    fn item(&mut self, selector: u16, length: usize) -> io::Result<Vec<u8>> {
+        // The selector register is big-endian, and qtest writes the word
+        // in the byte order of the guest.
+        self.answers(&[format!(
+            "writew {FW_CFG_SELECTOR:#x} {:#x}",
+            selector.swap_bytes()
+        )])?;
+        let mut data = Vec::with_capacity(length);
+        while data.len() < length {
+            let count = (length - data.len()).min(256);
+            let commands = vec![format!("readb {FW_CFG_DATA:#x}"); count];
+            data.extend(self.answers(&commands)?.into_iter().map(|byte| byte as u8));
+        }
+        Ok(data)
+    }
+}
+
+impl Drop for Qtest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The names and the sizes of the files of a fw_cfg directory, with the
+/// selector of each: 64 bytes for a file, after a count.
+pub fn directory_entries(directory: &[u8]) -> Vec<(String, u16, usize)> {
+    directory
+        .chunks_exact(64)
+        .map(|entry| {
+            let size = u32::from_be_bytes(entry[..4].try_into().unwrap()) as usize;
+            let selector = u16::from_be_bytes(entry[4..6].try_into().unwrap());
+            let name = entry[8..].split(|byte| *byte == 0).next().unwrap_or(&[]);
+            (String::from_utf8_lossy(name).into_owned(), selector, size)
+        })
+        .collect()
+}
+
+/// The fw_cfg files that the leader gives its firmware, in directory order.
+/// The follower gets the same files: what the firmware reads through DMA
+/// lands in memory without a device read that the follower could take from
+/// the leader.
+pub fn capture_fw_cfg(options: &Options) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let mut qtest = Qtest::start(options)?;
+    let count = qtest.item(FW_CFG_DIRECTORY, 4)?;
+    let count = u32::from_be_bytes(count.try_into().unwrap()) as usize;
+    if count > 4096 {
+        return Err(other(format!("a fw_cfg directory of {count} files")));
+    }
+    let directory = qtest.item(FW_CFG_DIRECTORY, 4 + 64 * count)?;
+    let mut files = Vec::with_capacity(count);
+    for (name, selector, size) in directory_entries(&directory[4..]) {
+        files.push((name, qtest.item(selector, size)?));
+    }
+    Ok(files)
+}
+
 /// A running leader and its stream.
 pub struct Leader {
     child: Child,
@@ -427,6 +581,26 @@ mod tests {
                 }),
                 24
             )))
+        );
+    }
+
+    #[test]
+    fn a_fw_cfg_directory_names_its_files() {
+        let mut directory = Vec::new();
+        for (name, selector, size) in [("bootorder", 0x21u16, 0u32), ("etc/acpi/rsdp", 0x22, 36)] {
+            directory.extend(size.to_be_bytes());
+            directory.extend(selector.to_be_bytes());
+            directory.extend([0; 2]);
+            let mut field = [0u8; 56];
+            field[..name.len()].copy_from_slice(name.as_bytes());
+            directory.extend(field);
+        }
+        assert_eq!(
+            directory_entries(&directory),
+            [
+                ("bootorder".to_string(), 0x21, 0),
+                ("etc/acpi/rsdp".to_string(), 0x22, 36)
+            ]
         );
     }
 

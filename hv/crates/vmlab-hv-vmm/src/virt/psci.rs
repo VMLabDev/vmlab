@@ -5,7 +5,10 @@
 //! Sources read (phase 3d DESIGN.md, "Sources"): S7, the Arm Power State
 //! Coordination Interface specification (DEN 0022, the function identifiers,
 //! the arguments and the return codes) and the SMC Calling Convention
-//! (DEN 0028). No QEMU source was read.
+//! (DEN 0028), and S6: the boot lockstep, where the leader answers
+//! `SMCCC_VERSION` with NOT_SUPPORTED. This machine answers the same, which
+//! tells a guest that the calling convention is SMCCC 1.0. No QEMU source
+//! was read.
 
 pub const VERSION: u32 = 0x8400_0000;
 pub const CPU_SUSPEND: u32 = 0x8400_0001;
@@ -27,9 +30,6 @@ pub const SMCCC_VERSION: u32 = 0x8000_0000;
 
 /// PSCI 1.1.
 const PSCI_1_1: u64 = 0x0001_0001;
-/// SMCCC 1.1.
-const SMCCC_1_1: u64 = 0x0001_0001;
-
 pub const SUCCESS: u64 = 0;
 pub const NOT_SUPPORTED: u64 = -1i64 as u64;
 pub const INVALID_PARAMETERS: u64 = -2i64 as u64;
@@ -81,7 +81,6 @@ fn known(function: u32) -> bool {
             | SYSTEM_OFF
             | SYSTEM_RESET
             | FEATURES
-            | SMCCC_VERSION
     )
 }
 
@@ -99,7 +98,6 @@ pub fn decide(function: u32, arguments: [u64; 3], powered: &[bool]) -> Action {
     };
     match function {
         VERSION => Action::Return(PSCI_1_1),
-        SMCCC_VERSION => Action::Return(SMCCC_1_1),
         CPU_SUSPEND | CPU_SUSPEND64 => {
             // A standby state may return at once. A power-down state is one
             // that this machine does not have.
@@ -147,15 +145,15 @@ mod tests {
     fn version_and_features() {
         let on = [true, false];
         assert_eq!(decide(VERSION, [0; 3], &on), Action::Return(0x1_0001));
-        assert_eq!(decide(SMCCC_VERSION, [0; 3], &on), Action::Return(0x1_0001));
-        for function in [CPU_ON64, CPU_OFF, SYSTEM_RESET, SMCCC_VERSION, FEATURES] {
+        for function in [CPU_ON64, CPU_OFF, SYSTEM_RESET, FEATURES] {
             assert_eq!(
                 decide(FEATURES, [u64::from(function), 0, 0], &on),
                 Action::Return(SUCCESS)
             );
         }
-        // MIGRATE is in the device tree and is not served.
-        for function in [MIGRATE, MIGRATE64, 0x8400_000c, 0x8000_0001] {
+        // MIGRATE is in the device tree and is not served. The leader of
+        // the boot lockstep does not answer SMCCC_VERSION either.
+        for function in [MIGRATE, MIGRATE64, 0x8400_000c, SMCCC_VERSION, 0x8000_0001] {
             assert_eq!(
                 decide(FEATURES, [u64::from(function), 0, 0], &on),
                 Action::Return(NOT_SUPPORTED)

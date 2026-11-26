@@ -216,6 +216,65 @@ impl BusDevice for EmptyTransports {
     fn write(&mut self, _offset: u64, _data: &[u8]) {}
 }
 
+/// The function 00:00.0 of the PCI host: a host bridge without a BAR. Its
+/// identity and what a guest can write of it are what QEMU's `virt` shows
+/// over qtest: the command bits 0x507, the cache line size and the
+/// interrupt line.
+struct HostBridge {
+    registers: [u32; 16],
+}
+
+impl HostBridge {
+    /// For each register that a guest can write, the bits that it can.
+    const WRITABLE: [(usize, u32); 3] = [(1, 0x507), (3, 0xff), (15, 0xff)];
+
+    fn new() -> Self {
+        let mut registers = [0; 16];
+        // Red Hat's generic PCIe host bridge, class 06 00.
+        registers[0] = 0x0008_1b36;
+        registers[2] = 0x0600_0000;
+        registers[11] = 0x1100_1af4;
+        Self { registers }
+    }
+}
+
+impl vmlab_hv_devices::PciDevice for HostBridge {
+    fn config_read(&mut self, reg: usize) -> u32 {
+        self.registers.get(reg).copied().unwrap_or(0)
+    }
+
+    fn config_write(&mut self, reg: usize, offset: u64, data: &[u8]) {
+        let Some((_, writable)) = Self::WRITABLE.iter().find(|(index, _)| *index == reg) else {
+            return;
+        };
+        let mut bytes = self.registers[reg].to_le_bytes();
+        for (index, byte) in data.iter().enumerate() {
+            if let Some(slot) = bytes.get_mut(offset as usize + index) {
+                *slot = *byte;
+            }
+        }
+        let value = u32::from_le_bytes(bytes);
+        self.registers[reg] = (self.registers[reg] & !writable) | (value & writable);
+    }
+
+    fn bars(&self) -> Vec<vmlab_hv_devices::BarInfo> {
+        Vec::new()
+    }
+
+    fn bar_read(&mut self, _bar: u8, _offset: u64, data: &mut [u8]) {
+        data.fill(0xff);
+    }
+
+    fn bar_write(&mut self, _bar: u8, _offset: u64, _data: &[u8]) {}
+}
+
+impl Resettable for HostBridge {
+    fn reset(&mut self) -> Result<(), vmlab_hv_devices::DeviceError> {
+        *self = Self::new();
+        Ok(())
+    }
+}
+
 /// What the machine puts into RAM at power-on and at each reset.
 struct Images {
     /// (address, bytes): the device tree, and the kernel and the initial
@@ -241,6 +300,9 @@ pub struct Options {
     /// The interrupt of a PMU in the ACPI tables, for a leader that has
     /// one. The product has none (DESIGN.md V5).
     pub performance_interrupt: Option<u32>,
+    /// The fw_cfg files, in directory order, in place of the generated
+    /// ones.
+    pub fw_cfg_files: Option<Vec<(String, Vec<u8>)>>,
 }
 
 pub type HostWrapper = Box<dyn FnOnce(Arc<dyn VcpuHost>) -> Arc<dyn VcpuHost>>;
@@ -280,6 +342,7 @@ pub struct Virt {
     fw_cfg: Arc<Mutex<FwCfgMmio>>,
     /// The bank of the firmware variables.
     flash: Option<Arc<Mutex<CfiFlash>>>,
+    bridge: Arc<Mutex<HostBridge>>,
     functions: Vec<Arc<Mutex<dyn PciSnapshot>>>,
     /// The BARs of the PCI root at power-on.
     bars: Vec<(u8, Vec<(u64, bool)>)>,
@@ -639,8 +702,13 @@ pub fn assemble(
         Arc::new(Mutex::new(EmptyTransports)),
     )?;
 
-    let mut firmware = vmlab_hv_firmware::FwCfg::for_virt(ram.device_mem.clone(), &platform)
-        .map_err(VmmError::InvalidMachine)?;
+    let mut firmware = match options.fw_cfg_files {
+        Some(files) => {
+            vmlab_hv_firmware::FwCfg::for_virt_files(ram.device_mem.clone(), &platform, files)
+        }
+        None => vmlab_hv_firmware::FwCfg::for_virt(ram.device_mem.clone(), &platform),
+    }
+    .map_err(VmmError::InvalidMachine)?;
     crate::builder::add_fw_cfg_files(&mut firmware, desc)?;
     let fw_cfg = Arc::new(Mutex::new(FwCfgMmio(firmware)));
     on_bus(map::FW_CFG_BASE, fw_cfg::MMIO_SIZE, fw_cfg.clone())?;
@@ -680,6 +748,11 @@ pub fn assemble(
         map::ECAM_SIZE,
         Arc::new(Mutex::new(PciEcam::new(pci_root.clone()))),
     )?;
+    let bridge = Arc::new(Mutex::new(HostBridge::new()));
+    pci_root
+        .lock()
+        .add_device_at(0, 0, bridge.clone())
+        .map_err(VmmError::Other)?;
     let mut next_slot = 1u8;
     let mut functions: Vec<Arc<Mutex<dyn PciSnapshot>>> = Vec::new();
     let mut place = |address: Option<vmlab_hv_proto::machine::PciAddress>,
@@ -836,6 +909,7 @@ pub fn assemble(
         console,
         fw_cfg,
         flash,
+        bridge,
         functions,
         bars,
         images,
@@ -914,6 +988,7 @@ impl Virt {
         if let Some(flash) = &self.flash {
             flash.lock().reset().map_err(device)?;
         }
+        self.bridge.lock().reset().map_err(device)?;
         for function in &self.functions {
             function.lock().reset().map_err(device)?;
         }

@@ -11,7 +11,9 @@
 //! QEMU boots the firmware at `-smp 1` with the plugin, and our whole `virt`
 //! machine follows its stream from the reset. Both start from the same
 //! firmware and the same variables (each side gets its own copy), the device
-//! tree that the leader writes, and the same memory map. Before every
+//! tree and the fw_cfg files of the leader, and the same memory map. The
+//! files are read from a second QEMU of the same machine over qtest, before
+//! the leader starts: its ACPI tables name the PCI functions that it has. Before every
 //! instruction the follower compares X0 to X30, SP, PC, PSTATE, V0 to V31,
 //! FPSR, FPCR and system registers, and after it the memory writes. The
 //! system registers are those of an exception and of the translation
@@ -368,6 +370,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             .collect(),
     };
     let dtb = boot::dump_device_tree(&options)?;
+    let fw_cfg_files = boot::capture_fw_cfg(&options)?;
 
     let description: MachineDescription = serde_json::from_value(serde_json::json!({
         "name": "lockstep", "arch": "aarch64", "accel": "tcg", "machine": "virt",
@@ -400,6 +403,8 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             // The CPU of the leader, with its PMU in the ACPI tables.
             model: Some(&sysreg::QEMU_CORTEX_A53),
             performance_interrupt: Some(virt::map::QEMU_PMU_GSIV),
+            // The firmware reads these through DMA, into memory.
+            fw_cfg_files: Some(fw_cfg_files),
         },
     )?;
     let host = host.lock().clone().expect("the machine wrapped its host");
