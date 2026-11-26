@@ -347,11 +347,6 @@ impl Builder {
 
     // --- FP and vector registers -------------------------------------------
 
-    /// `width` bits of `value` from the bit `offset`.
-    pub fn slice(&mut self, value: ScalarId, offset: u16, width: u16) -> ScalarId {
-        self.block.graph.slice(value, offset, width)
-    }
-
     /// `high` above the `low_width` bits of `low`, as `width` bits.
     pub fn concat(
         &mut self,
