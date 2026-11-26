@@ -268,6 +268,72 @@ fn plan_attach_refuses_a_mounted_storage_device_without_force() {
     assert!(plan_mounted(sys.path(), "port:1-9", &mount_table(&[]), false).is_ok());
 }
 
+/// Review `docs/reviews/usb-2.md` F14: btrfs mounts under an anonymous
+/// device number, so the mount table names the disk only as the mount
+/// source, after the ` - ` mark.
+#[test]
+fn a_mounted_btrfs_filesystem_is_refused_without_force() {
+    let sys = fake_sysfs();
+    storage(sys.path(), "1-9", ("sdb", "8:16"), ("sdb1", "8:17"));
+    storage(sys.path(), "1-10", ("sdc", "8:32"), ("sdc1", "8:33"));
+    let table = "29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n\
+                 36 35 0:45 / /mnt/stick rw,relatime shared:1 - btrfs /dev/sdb1 rw,space_cache\n";
+
+    let e = plan_mounted(sys.path(), "port:1-9", table, false).unwrap_err();
+    assert!(e.contains("carries a filesystem the host has mounted"), "{e}");
+    assert!(e.contains("sdb1 at /mnt/stick"), "{e}");
+    assert!(e.contains("--force"), "{e}");
+    // Forced it attaches, and the other drive is not refused for it.
+    assert!(plan_mounted(sys.path(), "port:1-9", table, true).is_ok());
+    assert!(plan_mounted(sys.path(), "port:1-10", table, false).is_ok());
+}
+
+/// The mount source finds a mapping by its `/dev/mapper` name, one member of
+/// a multi-device source, and a line with no optional field; a source that
+/// only starts like the disk's name, or is no device path, matches nothing.
+#[test]
+fn the_mount_source_names_the_block_device() {
+    let sys = fake_sysfs();
+    let part = storage(sys.path(), "1-9", ("sdb", "8:16"), ("sdb1", "8:17"));
+    let dm = sys.path().join("virtual-block-dm-0");
+    std::fs::create_dir_all(dm.join("dm")).unwrap();
+    std::fs::write(dm.join("dev"), "254:0\n").unwrap();
+    std::fs::write(dm.join("dm/name"), "backup\n").unwrap();
+    std::fs::create_dir_all(part.join("holders")).unwrap();
+    std::os::unix::fs::symlink(&dm, part.join("holders/dm-0")).unwrap();
+    let devs = scan(sys.path()).unwrap();
+    let dev = resolve(&Selector::parse("port:1-9").unwrap(), &devs).unwrap();
+    let mounts = |line: &str| -> Vec<(String, String)> {
+        host_mounts(sys.path(), dev, line)
+            .into_iter()
+            .map(|m| (m.block, m.mount_point))
+            .collect()
+    };
+    let at = |block: &str, point: &str| vec![(block.to_string(), point.to_string())];
+
+    assert_eq!(
+        mounts("40 35 0:50 / /mnt/a rw shared:1 - btrfs /dev/mapper/backup rw"),
+        at("dm-0", "/mnt/a")
+    );
+    assert_eq!(
+        mounts("41 35 0:51 / /mnt/b rw - bcachefs /dev/sda1:/dev/sdb1 rw"),
+        at("sdb1", "/mnt/b")
+    );
+    assert_eq!(
+        mounts("42 35 0:52 /@home /mnt/c rw shared:1 master:2 - btrfs /dev/sdb rw"),
+        at("sdb", "/mnt/c")
+    );
+    for other in [
+        "43 35 0:53 / /mnt/d rw shared:1 - btrfs /dev/sdb10 rw",
+        "44 35 0:54 / /mnt/e rw shared:1 - btrfs /dev/mapper/backup2 rw",
+        "45 35 0:55 / /mnt/f rw shared:1 - tmpfs sdb1 rw",
+        "46 35 0:56 / /mnt/g rw shared:1 - zfs tank/sdb1 rw",
+        "47 35 0:57 / /mnt/h rw shared:1",
+    ] {
+        assert_eq!(mounts(other), Vec::new(), "{other}");
+    }
+}
+
 #[test]
 fn every_mount_of_the_device_is_named() {
     let sys = fake_sysfs();
@@ -420,4 +486,62 @@ fn departed_attachments_are_the_unplugged_and_the_replugged() {
         e.contains("matches 2 USB devices attached to \"dc01\""),
         "{e}"
     );
+}
+
+/// Review `docs/reviews/usb-2.md` F20: the string descriptors are chosen by
+/// whoever made the device, and they reach the operator's terminal.
+#[test]
+fn device_strings_reach_no_terminal_raw() {
+    let sys = fake_sysfs();
+    device(
+        sys.path(),
+        "1-1",
+        &[
+            ("busnum", "1"),
+            ("devnum", "20"),
+            ("idVendor", "dead"),
+            ("idProduct", "beef"),
+            ("bDeviceClass", "00"),
+            ("manufacturer", "Evil\u{9b}2J\u{202e}Corp"),
+            ("product", "X\u{1b}[2J\nfake 1-1 row"),
+            ("serial", "S\r\u{7}N\u{200b}1"),
+            ("speed", "480"),
+        ],
+        &[(8, 6, 0x50)],
+    );
+    let devs = scan(sys.path()).unwrap();
+    let dev = devs.iter().find(|d| d.port == "1-1").unwrap();
+    assert_eq!(dev.manufacturer.as_deref(), Some("Evil 2J Corp"));
+    assert_eq!(dev.product.as_deref(), Some("X [2J fake 1-1 row"));
+    assert_eq!(dev.serial.as_deref(), Some("S  N 1"));
+    let described = dev.describe();
+    assert!(
+        !described.contains(|c: char| c.is_control()),
+        "{described:?}"
+    );
+
+    let only = listing(vec![dev.clone()], &[]);
+    let table = crate::cli::usb::render_list(&serde_json::to_value(&only).unwrap());
+    assert_eq!(table.lines().count(), 2, "a header and one row: {table:?}");
+    assert!(!table.contains('\u{1b}'), "{table:?}");
+
+    // A listing or an attachment that comes back from a daemon is cleaned as
+    // it is decoded: the CLI does not rely on the daemon having done it.
+    let raw = serde_json::json!([{
+        "port": "1-1", "bus": 1, "devnum": 20, "vendor_id": "dead", "product_id": "beef",
+        "manufacturer": "\u{1b}]0;title\u{7}", "product": "X\u{1b}[2J\nfake 1-1 row",
+        "serial": "\n", "speed": "480", "class": 0,
+    }]);
+    let table = crate::cli::usb::render_list(&raw);
+    assert_eq!(table.lines().count(), 2, "{table:?}");
+    assert!(!table.contains(|c: char| c.is_control() && c != '\n'), "{table:?}");
+    let decoded: Vec<Listed> = serde_json::from_value(raw).unwrap();
+    assert_eq!(decoded[0].device.serial, None);
+    assert_eq!(decoded[0].device.product.as_deref(), Some("X [2J fake 1-1 row"));
+
+    // A string that is not UTF-8 does not hide the device.
+    std::fs::write(sys.path().join("1-1/product"), b"Disk\xff\n").unwrap();
+    let devs = scan(sys.path()).unwrap();
+    let dev = devs.iter().find(|d| d.port == "1-1").unwrap();
+    assert_eq!(dev.product.as_deref(), Some("Disk\u{fffd}"));
 }
