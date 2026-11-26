@@ -46,7 +46,7 @@ tap-test: require-cargo
 
 [group('ci')]
 wscript-test: require-cargo
-	{{host_target_env}}python3 scripts/ci_test.py wscript -p wscript-core -p wscript-compiler
+	{{host_target_env}}python3 scripts/ci_test.py wscript -p wscript-core -p wscript-compiler -p wscript-vm
 
 # Refuse tracked paths that Windows cannot check out (: * ? " < > | \, trailing dot or space)
 [group('ci')]

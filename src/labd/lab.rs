@@ -6397,7 +6397,8 @@ fn main(lab: Lab) {
 
     /// A script that spins without a host call still ends, and the fault
     /// says what the limit is, how large it is and whose it is (F17, the
-    /// third point: `fuel exhausted` said none of these).
+    /// third point: `fuel exhausted` said none of these). A builtin
+    /// (`s.len()`) is the script's own work and not a host call.
     #[tokio::test]
     async fn a_script_that_spins_without_the_host_ends_and_names_the_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -6406,8 +6407,9 @@ fn main(lab: Lab) {
             lab,
             r#"use vmlab
 fn main(lab: Lab) {
+    let s = "ab"
     let i = 0
-    while i < 20000000 { i = i + 1 }
+    while i < 20000000 { i = i + s.len() - 1 }
     lab.log("done")
 }
 "#

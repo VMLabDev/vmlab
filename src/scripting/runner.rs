@@ -15,10 +15,18 @@ use super::{EventData, LabHandle, ScriptEntry, SegmentHandle};
 use crate::labd::lab::LabRuntime;
 use crate::labd::record::RunId;
 
-// Bound bytecode execution for every entry point, including scripts that
-// never hand control back to the host. Time spent waiting on a host call
-// does not count against this budget.
+/// The instructions a script may run without a host call. It ends a script
+/// that spins and never hands control back to the host, where a cancelled
+/// run stops. The count starts again when a host call returns
+/// ([`super::cancel::alive`]), so it is no limit on the work of a script that
+/// keeps reaching the host (docs/reviews/wscript-2.md F17).
 const SCRIPT_FUEL: u64 = 10_000_000;
+
+/// The bytes of values one script run may hold at one time. The instruction
+/// budget does not limit memory: one instruction can allocate any amount, and
+/// a failed allocation ends the lab daemon (docs/reviews/wscript-2.md F13).
+/// `exec` returns up to 64 MiB, so a script can keep several outputs.
+const SCRIPT_MEMORY: u64 = 1024 * 1024 * 1024;
 
 /// Where script log output goes (lab log + live CLI stream, PRD §10.1).
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -261,10 +269,12 @@ fn execute(
             }
             output(chunk);
         }),
+        fuel: Some(SCRIPT_FUEL),
+        refuel: Some(Box::new(super::cancel::alive)),
+        memory: Some(SCRIPT_MEMORY),
         ..VmConfig::default()
     };
     let mut vm = Vm::with_config(&ctx, config);
-    vm.set_fuel(Some(SCRIPT_FUEL));
     vm.call_unit::<_, ()>(&unit, entry.name(), args)
         .map_err(|e| anyhow!("{name}: {}", run_error(e)))
 }
@@ -301,7 +311,8 @@ fn run_error(e: wscript::Error) -> String {
         wscript::Error::Runtime(r) => {
             // A fault can end in a payload's own newline (an `expect` on an
             // `Err` carrying a command's stderr); the trace stays on its line.
-            let mut s = r.message.trim_end().to_string();
+            let mut s = limit_fault(&r.message)
+                .unwrap_or_else(|| r.message.trim_end().to_string());
             if !r.trace.is_empty() {
                 const TRACE_FRAMES: usize = 12;
                 let mut chain = r
@@ -320,6 +331,40 @@ fn run_error(e: wscript::Error) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// The VM's fault for one of vmlab's two limits on a script run, in words
+/// that say what the limit is, how large it is and that it is vmlab's. The
+/// VM's own (`fuel exhausted`) name neither.
+fn limit_fault(message: &str) -> Option<String> {
+    if message == "fuel exhausted" {
+        return Some(format!(
+            "the script ran {} instructions without a host call, which is vmlab's limit \
+             for a script that does not end (the count starts again at each host call)",
+            grouped(SCRIPT_FUEL)
+        ));
+    }
+    if message.starts_with("memory limit of ") {
+        return Some(format!(
+            "memory limit exceeded: the script holds more than {} MiB of values, which is \
+             vmlab's limit for one script run",
+            SCRIPT_MEMORY / (1024 * 1024)
+        ));
+    }
+    None
+}
+
+/// `n` with a comma between each three digits.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Runtime mutation of a segment's L3 rules and forwards (PRD §9.9), bridged

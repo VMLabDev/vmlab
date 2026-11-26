@@ -11,7 +11,24 @@ queue (`release`) instead of by recursion, so dropping a value nested to any
 depth does not overflow the native stack. Keep it until upstream frees values
 without recursion.
 
-The remaining wscript crates come from the Git revision `Cargo.toml` pins,
-`faf09e6e4c7e8ed28611993aa8dc71633a67c028`, which leaves these two crates as
-they were at `ddb6d9f`. Remove these patches when the pinned upstream revision
-exposes the same alias primitive.
+`wscript-vm` is vendored from the revision `Cargo.toml` pins,
+`faf09e6e4c7e8ed28611993aa8dc71633a67c028`, with two deltas (card #1086,
+`docs/reviews/wscript-2.md` F13 and F17). Both are off unless `VmConfig` asks
+for them:
+
+- `VmConfig::memory` is a limit on the bytes of values a script holds at one
+  time (`src/mem.rs`). Fuel counts instructions and one instruction can
+  allocate any amount, so fuel never limited memory. The VM counts by walking
+  the values reachable from the register stack each time enough new ones were
+  made, and a string concatenation and a pad are refused before they allocate.
+- `VmConfig::refuel` is a hook the VM asks after every host function returns.
+  On `true` the tank goes back to the amount it was set to, so the fuel bounds
+  the instructions between two host calls.
+
+Keep it until upstream has a memory limit and a way for a host function to
+fill the tank.
+
+The remaining wscript crates come from the same Git revision, which leaves
+`wscript-core` and `wscript-compiler` as they were at `ddb6d9f`. Remove those
+two patches when the pinned upstream revision exposes the same alias
+primitive.
