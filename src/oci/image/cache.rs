@@ -13,6 +13,7 @@
 //!     manifest.json                       the raw platform manifest
 //!     config.json                         the raw image config blob
 //!     rootfs.sqfs                         the flattened root filesystem
+//! indexes/sha256/<index-hex>/<arch>        platform manifest digest for an index
 //! refs/<host>/<urlencoded-repo>/<tag>     last-resolved manifest digest for
 //!                                         a tag (the offline fallback)
 //! ```
@@ -94,7 +95,16 @@ impl ImageCache {
 
     /// The manifest digest a tag last resolved to, if recorded.
     pub fn resolved_ref(&self, host: &str, repository: &str, tag: &str) -> Option<String> {
-        let text = fs::read_to_string(self.ref_path(host, repository, tag)).ok()?;
+        Self::read_resolution(&self.ref_path(host, repository, tag))
+    }
+
+    /// The installed platform manifest previously selected from this index.
+    pub(super) fn resolved_index(&self, index: &str, arch: &str) -> Option<String> {
+        Self::read_resolution(&self.index_path(index, arch).ok()?)
+    }
+
+    fn read_resolution(path: &Path) -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
         let digest = text.trim();
         (!digest.is_empty()).then(|| digest.to_string())
     }
@@ -192,8 +202,15 @@ impl ImageCache {
         tag: &str,
         manifest_digest: &str,
     ) -> Result<()> {
-        let path = self.ref_path(host, repository, tag);
-        let parent = path.parent().expect("ref path always has a parent");
+        self.write_resolution(&self.ref_path(host, repository, tag), manifest_digest)
+    }
+
+    pub(super) fn record_index(&self, index: &str, arch: &str, manifest: &str) -> Result<()> {
+        self.write_resolution(&self.index_path(index, arch)?, manifest)
+    }
+
+    fn write_resolution(&self, path: &Path, manifest_digest: &str) -> Result<()> {
+        let parent = path.parent().expect("resolution path always has a parent");
         let _lock = self.lock()?;
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -201,8 +218,8 @@ impl ImageCache {
         let tmp = parent.join(format!("{STAGING_PREFIX}{:08x}", rand::random::<u32>()));
         fs::write(&tmp, manifest_digest)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("cannot record tag ref {}", path.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("cannot record image resolution {}", path.display()))?;
         Ok(())
     }
 
@@ -218,6 +235,14 @@ impl ImageCache {
             .join(host)
             .join(encode_repo(repository))
             .join(tag)
+    }
+
+    fn index_path(&self, index: &str, arch: &str) -> Result<PathBuf> {
+        Ok(self
+            .root
+            .join("indexes/sha256")
+            .join(digest_hex(index)?)
+            .join(arch))
     }
 
     /// Exclusive advisory lock on the cache (same discipline as the

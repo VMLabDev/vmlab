@@ -312,16 +312,27 @@ pub(super) fn build_container(
         // The `image =` line changed — drop the stale pin.
         c_state.image_digest = None;
     }
-    let reference = match &c_state.image_digest {
-        // `name:tag@digest` is valid and the digest wins; a
-        // reference already carrying a digest equals its pin.
-        Some(d) if !c_cfg.image.reference.contains('@') => {
-            format!("{}@{}", c_cfg.image.reference, d)
+    let declared = c_cfg.image.reference.as_str();
+    let declared_index_or_manifest = declared.split_once('@');
+    let mut reference = match &c_state.image_digest {
+        Some(pin) => {
+            let name = declared_index_or_manifest.map_or(declared, |(name, _)| name);
+            format!("{name}@{pin}")
         }
-        _ => c_cfg.image.reference.clone(),
+        None => declared.to_owned(),
     };
-    let image = crate::oci::image::cached_container_image(&reference, &cache)
-        .with_context(|| format!("container \"{}\": image {}", c_cfg.name, c_cfg.image))?;
+    let cached = |reference: &str| {
+        crate::oci::image::cached_container_image(reference, arch, &cache)
+            .with_context(|| format!("container \"{}\": image {}", c_cfg.name, c_cfg.image))
+    };
+    // A lab pinned before index resolutions were cached may already have
+    // the platform manifest installed. On a miss, keep the declared index
+    // for the pull so it can resolve and record the mapping again.
+    let mut image = cached(&reference)?;
+    if image.is_none() && declared_index_or_manifest.is_some() && reference != declared {
+        reference = declared.to_owned();
+        image = cached(&reference)?;
+    }
     if let Some(image) = &image {
         c_state.image_digest = Some(image.manifest_digest.clone());
         c_state.image_ref = Some(c_cfg.image.reference.clone());

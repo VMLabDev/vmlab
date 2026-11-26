@@ -99,6 +99,29 @@ class ReleaseVersionTest(unittest.TestCase):
             do_release="true", version="0.45.2", prerelease="false",
             bump="patch", last_tag="v0.45.1")
 
+    def test_newest_release_tag_on_main_is_used_from_release_branch(self):
+        tmp, repo = build([("chore: init", None, "v0.1.0-alpha")])
+        self.addCleanup(tmp.cleanup)
+        git(repo, "switch", "-c", "release")
+        git(repo, "commit", "--allow-empty", "-m", "feat: prior release")
+        git(repo, "switch", "-C", "main", "v0.1.0-alpha")
+        git(repo, "merge", "--no-ff", "-m", "Merge prior release", "release")
+        git(repo, "tag", "v0.2.0-alpha")
+        git(repo, "switch", "release")
+        git(repo, "commit", "--allow-empty", "-m", "fix: next release")
+        for args, version in [
+            (["--release"], "0.2.0"),
+            (["--pre-release"], "0.2.1-alpha"),
+        ]:
+            with self.subTest(args=args):
+                got = calc(repo, args=args)
+                self.assertEqual(got["version"], version)
+                self.assertEqual(got["last_tag"], "v0.2.0-alpha")
+        git(repo, "tag", "v0.2.0", "main")
+        got = calc(repo, args=["--release"])
+        self.assertEqual(got["version"], "0.2.1")
+        self.assertEqual(got["last_tag"], "v0.2.0")
+
     def test_breaking_change_in_0x_bumps_minor(self):
         self.check(
             [("chore: init", None, "v0.45.1"),

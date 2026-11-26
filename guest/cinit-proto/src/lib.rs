@@ -90,7 +90,7 @@ pub struct HealthSpec {
     /// Consecutive failures before the container is reported unhealthy.
     #[serde(default = "default_health_retries")]
     pub retries: u32,
-    /// Grace period after start before checks begin.
+    /// Grace period after start in which failed checks do not count until a pass.
     #[serde(default)]
     pub start_period_secs: u64,
 }

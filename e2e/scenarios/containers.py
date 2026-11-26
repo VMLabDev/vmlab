@@ -133,8 +133,10 @@ def run(h):
         idle_line = h.machine_line(lab, "idle")
         ps = sh(h, lab, "idle", "ps -o comm", check=False, container=True)
         procs = [l.strip() for l in ps.out.splitlines()]
-        h.ok("container.idle", "ready=yes" in idle_line and "nc" not in procs and ps.code == 0,
-             f"{idle_line.strip()}; no workload among {len(procs) - 1} processes")
+        dhcp = h.vmlab("exec", "idle", "--", "/.vmlab/busybox", "pidof", "udhcpc", cwd=lab, check=False)
+        h.ok("container.idle",
+             "ready=yes" in idle_line and "nc" not in procs and ps.code == 0 and dhcp.code == 0,
+             f"{idle_line.strip()}; no workload among {len(procs) - 1} processes; udhcpc exit={dhcp.code}")
 
         # -- container.shell under a pty ------------------------------------
         # The session should end, and the CLI return, when the guest shell exits.

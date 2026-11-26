@@ -8,7 +8,9 @@
 //! and keeps a small state cache (last DHCP IP, started, exited) so callers
 //! can await milestones without replaying the event stream. EOF — QEMU gone —
 //! closes the channel gracefully: the reader exits and pending waiters get a
-//! "channel closed" error.
+//! "channel closed" error. The reader owns every sender, the broadcast one
+//! too, so a subscriber sees the end of the stream even while it holds a
+//! [`CtlHandle`] of its own.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -42,7 +44,12 @@ pub struct CtlHandle {
 
 struct CtlInner {
     writer: Mutex<CtlWriter>,
-    events: broadcast::Sender<CtlEvent>,
+    /// The event stream, for [`CtlHandle::subscribe`]. Weak on purpose: the
+    /// reader task holds the one sender, so the stream closes when the
+    /// reader ends. A sender here would be kept alive by every handle, and a
+    /// subscriber that holds a handle would wait for ever on the stream it
+    /// keeps open itself (review containers-2 G1).
+    events: broadcast::WeakSender<CtlEvent>,
     /// Guest's boot protocol version. A mismatch terminates the reader.
     boot: watch::Receiver<Option<u32>>,
     /// Last `net_up` IP reported by the guest.
@@ -82,7 +89,7 @@ impl CtlHandle {
                 half: write_half,
                 cut_short: false,
             }),
-            events: events.clone(),
+            events: events.downgrade(),
             boot: boot_rx,
             last_ip: RwLock::new(None),
             started: started_rx,
@@ -135,10 +142,14 @@ impl CtlHandle {
                     }
                     CtlEvent::Health { .. } => {}
                 }
-                let _ = reader_inner.events.send(ev);
+                let _ = events.send(ev);
             }
-            // EOF: dropping started_tx/exited_tx here closes the watch
-            // channels, which is how waiters learn the guest is gone.
+            // EOF: dropping the senders here closes the channels, which is
+            // how waiters and subscribers learn the guest is gone. The event
+            // stream closes first, so whoever is woken by a closed watch
+            // finds the stream closed already.
+            drop(events);
+            drop((boot_tx, started_tx, exited_tx));
         });
 
         Ok(CtlHandle { inner })
@@ -208,9 +219,15 @@ impl CtlHandle {
         }
     }
 
-    /// Subscribe to the raw event stream (from now on — no replay).
+    /// Subscribe to the raw event stream (from now on — no replay). The
+    /// stream reports `Closed` once the reader has ended, to a subscriber
+    /// that came before the end and to one that comes after it.
     pub fn subscribe(&self) -> broadcast::Receiver<CtlEvent> {
-        self.inner.events.subscribe()
+        match self.inner.events.upgrade() {
+            Some(events) => events.subscribe(),
+            // The reader is gone: a receiver whose only sender is dropped.
+            None => broadcast::channel(1).1,
+        }
     }
 
     /// Last IP the guest reported via `net_up`, if any yet.
@@ -629,6 +646,50 @@ mod tests {
         assert!(err.to_string().contains("closed"), "{err}");
         let err = ctl.wait_started(LONG).await.unwrap_err();
         assert!(err.to_string().contains("closed"), "{err}");
+    }
+
+    /// Review containers-2 G1: the ctl watcher subscribes and keeps a handle
+    /// for its answers to `boot`. The stream it waits on must close when the
+    /// reader ends, or the watcher, its handle and the socket outlive the
+    /// run. The clock is paused, so the test has no wall-clock limit: it
+    /// waits on the reader's end, which closes the `exited` watch.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscriber_that_holds_the_handle_sees_the_channel_close() {
+        let (_dir, path) = spawn_mock(|mut stream| async move {
+            write_line(
+                &mut stream,
+                &CtlEvent::Boot {
+                    proto_version: PROTO_VERSION,
+                },
+            )
+            .await;
+            // QEMU dies: the socket closes.
+        })
+        .await;
+
+        // As the watcher does: a subscription, and the handle kept alive.
+        let handle = CtlHandle::connect(&path).await.unwrap();
+        let mut rx = handle.subscribe();
+
+        let err = handle.wait_exited(LONG).await.unwrap_err();
+        assert!(err.to_string().contains("ctl channel closed"), "{err}");
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(CtlEvent::Boot {
+                proto_version: PROTO_VERSION,
+            })
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed),
+            "the stream is closed while the subscriber still holds the handle"
+        );
+        // A subscriber that comes after the end is told the same.
+        assert_eq!(
+            handle.subscribe().try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        );
     }
 
     #[tokio::test]

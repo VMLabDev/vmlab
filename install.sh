@@ -61,9 +61,9 @@
 # so the helper is installed mode 0700, and it refuses a caller that is not
 # the owner of its file.
 #
-# vmlab drives QEMU/KVM, so the prebuilt binary is Linux x86_64 only (run it on
-# Linux, or on Windows via WSL 2). It needs /dev/kvm plus QEMU and the
-# usual guest tooling at runtime — see https://vmlab.io for the full list.
+# The prebuilt binary runs on Linux x86_64, including Windows via WSL 2.
+# x86 guests and lab containers require vmlab-hv and /dev/kvm. QEMU runs
+# aarch64 and riscv64 guests. The installer reports missing runtime tools.
 
 set -eu
 
@@ -162,13 +162,29 @@ case "$INSECURE_SKIP_SIGNATURE" in
 esac
 
 # ── HTTP helper (curl or wget) ──────────────────────────────────────────────
+# download_file returns 44 for HTTP 404, and 1 for other failures.
 if command -v curl >/dev/null 2>&1; then
   http_get()      { curl -fsSL "$1"; }
-  download_file() { curl -fsSL -o "$2" "$1"; }
+  download_file() (
+    if status="$(curl -fsSL -o "$2" "$1" -w '%{http_code}')"; then
+      exit 0
+    elif [ "$?" -eq 22 ] && [ "$status" = 404 ]; then
+      exit 44
+    fi
+    exit 1
+  )
   latest_url() { curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest"; }
 elif command -v wget >/dev/null 2>&1; then
   http_get()      { wget -qO- "$1"; }
-  download_file() { wget -qO "$2" "$1"; }
+  download_file() (
+    if response="$(LC_ALL=C wget --no-verbose --server-response -O "$2" "$1" 2>&1)"; then
+      exit 0
+    elif [ "$?" -eq 8 ]; then
+      status="$(printf '%s\n' "$response" | awk '$1 ~ /^HTTP\// {status=$2} END {print status}')"
+      if [ "$status" = 404 ]; then exit 44; fi
+    fi
+    exit 1
+  )
   latest_url() {
     wget --server-response -O /dev/null "https://github.com/$REPO/releases/latest" 2>&1 |
       sed -n 's/^[[:space:]]*[Ll]ocation: \([^[:space:]]*\).*/\1/p' | tail -n1
@@ -192,7 +208,7 @@ case "$os" in
   $SOURCE_BUILD"
     suffix="linux-x86_64" ;;
   Darwin)
-    err "no macOS build — vmlab drives QEMU/KVM and runs on Linux (or Windows via WSL 2)." ;;
+    err "no macOS build — vmlab runs on Linux (or Windows via WSL 2)." ;;
   *)
     err "unsupported platform: $os/$arch — vmlab runs on Linux (or Windows via WSL 2)." ;;
 esac
@@ -272,10 +288,16 @@ verify_signature() {
       --insecure-ignore-tlog=true "$verify_dir/SHA256SUMS" \
       || err "release signature verification failed"
     return 0
+  elif [ "$?" -ne 44 ]; then
+    err "download failed: $BASE_URL/$tag/SHA256SUMS.key.bundle"
   fi
   [ -z "$RELEASE_KEY_FILE" ] || err "release has no key signature (SHA256SUMS.key.bundle) for --release-key"
-  download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" \
-    || err "release has no signature bundle. An unsigned release installs only with --insecure-skip-signature"
+  download_file "$BASE_URL/$tag/SHA256SUMS.bundle" "$verify_dir/SHA256SUMS.bundle" || {
+    if [ "$?" -eq 44 ]; then
+      err "release has no signature bundle. An unsigned release installs only with --insecure-skip-signature"
+    fi
+    err "download failed: $BASE_URL/$tag/SHA256SUMS.bundle"
+  }
   cosign verify-blob --bundle "$verify_dir/SHA256SUMS.bundle" \
     --certificate-identity 'https://github.com/VMLabDev/vmlab/.github/workflows/ci.yml@refs/heads/main' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
@@ -324,7 +346,9 @@ helper_asset="vmlab-fastpath-${ver}-${suffix}"
 helper_tmp="$verify_dir/$helper_asset"
 HELPER=""
 HELPER_SHA=""
-if download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" 2>/dev/null; then
+if awk -v name="$helper_asset" '$2 == name {found=1} END {exit !found}' "$verify_dir/SHA256SUMS"; then
+  download_file "$BASE_URL/$tag/$helper_asset" "$helper_tmp" \
+    || err "download failed: $BASE_URL/$tag/$helper_asset"
   verify_asset "$helper_asset" "$helper_tmp"
   HELPER_SHA="$want"
   HELPER="$BIN_DIR/vmlab-fastpath"
@@ -568,9 +592,30 @@ install_guest() {
     || { guest_fallback "cannot create a staging directory in $gparent"; return 0; }
   [ -n "$gtmp" ] && [ -d "$gtmp" ] && [ "$gtmp" != / ] \
     || { guest_fallback "the staging directory in $gparent is missing"; return 0; }
+  # The old guest directory while it is moved aside, else empty. It may be a
+  # long source build (`just guest-install`), so no exit deletes it: it goes
+  # back to $GUEST_DIR, or it stays in the staging directory under a name the
+  # warning gives.
+  gold=""
+  gkept=0
+  restore_guest() {
+    [ -n "$gold" ] || return 0
+    [ "$gkept" -eq 0 ] || return 1
+    # -T: a $GUEST_DIR that something made again is not moved into.
+    if { [ -e "$gold" ] || [ -L "$gold" ]; } && ! mv -T -- "$gold" "$GUEST_DIR"; then
+      gkept=1
+      warn "cannot put the previous guest directory back at $GUEST_DIR. It is saved at $gold"
+      return 1
+    fi
+    gold=""
+  }
   cleanup_guest() {
     [ -n "$gtmp" ] && [ "$gtmp" != / ] || return 1
-    rm -rf "$gtmp"
+    if restore_guest; then
+      rm -rf -- "$gtmp"
+    else
+      rm -rf -- "$gtmp/new" "$gtmp/$gname"
+    fi
     cleanup_release
   }
   trap cleanup_guest EXIT
@@ -591,16 +636,20 @@ install_guest() {
 
   # Swap: the old directory moves aside whole (nothing from an older version
   # survives in the new one), the new one renames into its place, and the old
-  # one is removed. Put the old one back if the second rename fails.
+  # one is removed. `gold` is set before the first rename and cleared after
+  # the second, so a failure or a signal anywhere between them reaches
+  # restore_guest, here or in the exit trap.
   if [ -e "$GUEST_DIR" ] || [ -L "$GUEST_DIR" ]; then
-    mv "$GUEST_DIR" "$gtmp/old" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
+    gold="$gtmp/old"
+    mv -T -- "$GUEST_DIR" "$gold" || { guest_fallback "cannot move the old $GUEST_DIR aside."; return 0; }
   fi
-  if ! mv "$gtmp/new" "$GUEST_DIR"; then
-    [ -e "$gtmp/old" ] && mv "$gtmp/old" "$GUEST_DIR"
+  if ! mv -T -- "$gtmp/new" "$GUEST_DIR"; then
+    restore_guest || true
     guest_fallback "cannot move the new guest assets into $GUEST_DIR."
     return 0
   fi
-  rm -rf "$gtmp"
+  gold=""
+  rm -rf -- "$gtmp"
   trap cleanup_release EXIT
 
   printf 'Installed guest assets: %s\n' "$(ls "$GUEST_DIR" | tr '\n' ' ')"
@@ -627,10 +676,15 @@ install_guest() {
 # error — most of them matter only to the features that use them.
 [ "$SKIP_CHECKS" -eq 1 ] && exit 0
 
+if ! have vmlab-hv; then
+  printf '\nx86 guests and lab containers require /dev/kvm and vmlab-hv on PATH.\n'
+  printf 'Download the matching vmlab-hv bundle with this installer, then unpack it and add its bin directory to PATH:\n'
+  printf '  curl -fsSL https://vmlab.io/install.sh | sh -s -- --version %s --fetch vmlab-hv-%s-%s.tar.gz\n' "$ver" "$ver" "$suffix"
+fi
+
 # Package name per manager, for the one-line install hint below.
 pkg_for() {
   case "$1" in
-    qemu-system-x86_64) apt=qemu-system-x86; dnf=qemu-system-x86;   pac=qemu-system-x86 ;;
     qemu-img)           apt=qemu-utils;      dnf=qemu-img;          pac=qemu-img ;;
     xorriso)            apt=xorriso;         dnf=xorriso;           pac=libisoburn ;;
     mcopy)              apt=mtools;          dnf=mtools;            pac=mtools ;;
@@ -654,10 +708,8 @@ want() {     # want <cmd> <purpose> [alternative-cmd...]
 "
 }
 
-# Running a guest at all.
-want qemu-system-x86_64 "run x86_64 guests (install qemu-system-arm / -misc for other arches)"
-want qemu-img           "clone disks, snapshot, and build templates"
 # Per feature. Each is only needed by the labs that use it.
+want qemu-img           "optional disk tool fallback (VMLAB_IMAGE_TOOL=qemu-img)"
 want xorriso            "build ISO media and the bootstrap ISO every template build attaches" genisoimage mkisofs
 want mcopy              "build floppy media (mtools)" mformat
 want mkfs.vfat          "format floppy images"
@@ -729,7 +781,7 @@ if [ -n "$virtiofsd_old" ]; then
 fi
 
 if [ ! -e /dev/kvm ]; then
-  printf '\n/dev/kvm is missing: guests will run under emulation, which is very slow.\n'
+  printf '\n/dev/kvm is missing. KVM is required for x86 guests and lab containers.\n'
   printf 'Enable virtualisation in the BIOS, or load kvm_intel / kvm_amd.\n'
 elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
   printf '\n/dev/kvm exists but this user cannot use it. Add yourself to the kvm group:\n'
