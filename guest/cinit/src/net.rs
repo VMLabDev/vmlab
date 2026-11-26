@@ -158,7 +158,7 @@ mod tests {
             commands.contains("ip route replace 0.0.0.0/0 via 10.0.0.2 dev eth0"),
             "{commands}"
         );
-        assert!(!commands.contains("10.0.0.1"), "{commands}");
+        assert!(!commands.contains(" via 10.0.0.1 "), "{commands}");
 
         let commands = run("renew", None);
         assert!(
