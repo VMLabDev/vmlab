@@ -69,7 +69,7 @@ DEVICES = [
     "-device", "usb-tablet",
 ]
 
-# name: (cpu, smp, memory in MiB, extra machine properties).
+# name: (cpu, smp, memory in MiB, and optionally more arguments).
 # `max` is what vmlab's QEMU path presents today. `cortex-a53,pmu=off` is the
 # QEMU answer for a CPU without a PMU: it pins the difference V5 exactly.
 CONFIGS = {
@@ -83,6 +83,13 @@ CONFIGS = {
     "a53-nopmu-smp2-2g": ("cortex-a53,pmu=off", 2, 2048),
     "a53-nopmu-smp4-2g": ("cortex-a53,pmu=off", 4, 2048),
     "a53-smp2-2g": ("cortex-a53", 2, 2048),
+    # Memory sizes that change the encoding of an SMBIOS field, and a UUID.
+    "smp2-512m": ("max", 2, 512),
+    "smp2-1536m": ("max", 2, 1536),
+    "smp2-16g": ("max", 2, 16384),
+    "smp2-32g": ("max", 2, 32768),
+    "smp2-64g": ("max", 2, 65536),
+    "smp2-2g-uuid": ("max", 2, 2048, ["-uuid", "00112233-4455-6677-8899-aabbccddeeff"]),
 }
 
 
@@ -152,7 +159,8 @@ class Qtest:
 
 
 def capture(qemu: str, name: str, output: Path) -> dict:
-    cpu, smp, memory = CONFIGS[name]
+    cpu, smp, memory, *more = CONFIGS[name]
+    more = more[0] if more else []
     code, variables = firmware()
     target = output / name
     if target.exists():
@@ -170,7 +178,7 @@ def capture(qemu: str, name: str, output: Path) -> dict:
             "-m", f"{memory}M", "-display", "none", "-monitor", "none", "-serial", "none",
             "-drive", "if=pflash,format=raw,readonly=on,file=AAVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=AAVMF_VARS.fd",
-            *DEVICES,
+            *DEVICES, *more,
         ]
         argv = [qemu if word == "qemu-system-aarch64" else word for word in logical]
         argv = [word.replace("file=AAVMF_CODE.fd", f"file={run}/code.fd")
@@ -207,6 +215,21 @@ def capture(qemu: str, name: str, output: Path) -> dict:
             said = (run / "qemu.log").read_text(errors="replace").strip()
             if sys.exc_info()[0] is not None and said:
                 print(f"QEMU said: {said}", file=sys.stderr)
+    tables = (blobs / "etc/acpi/tables").read_bytes()
+    split = target / "acpi"
+    split.mkdir()
+    offset = 0
+    acpi = []
+    while tables[offset:offset + 4].strip(b"\0"):
+        signature = tables[offset:offset + 4].decode("ascii")
+        length = int.from_bytes(tables[offset + 4:offset + 8], "little")
+        if not signature.isalnum() or length < 36 or offset + length > len(tables):
+            raise RuntimeError(f"{name}: no ACPI table at offset {offset:#x}")
+        (split / signature).write_bytes(tables[offset:offset + length])
+        acpi.append({"signature": signature, "offset": offset, "length": length})
+        offset += length
+    if any(tables[offset:]):
+        raise RuntimeError(f"{name}: bytes after the last ACPI table")
     record = {
         "configuration": name,
         "cpu": cpu,
@@ -218,6 +241,7 @@ def capture(qemu: str, name: str, output: Path) -> dict:
                             for path in (code, variables)},
         "numeric": numeric,
         "files": files,
+        "acpi_tables": acpi,
     }
     if said:
         record["qemu_said"] = said
@@ -233,8 +257,8 @@ def main() -> int:
     parser.add_argument("only", nargs="*", help="the configurations to capture (default: all)")
     args = parser.parse_args()
     if args.list:
-        for name, (cpu, smp, memory) in CONFIGS.items():
-            print(f"{name}: -cpu {cpu} -smp {smp} -m {memory}M")
+        for name, (cpu, smp, memory, *more) in CONFIGS.items():
+            print(" ".join([f"{name}: -cpu {cpu} -smp {smp} -m {memory}M", *(more[0] if more else [])]))
         return 0
     if args.output is None or str(args.output) in ("", "/"):
         parser.error("--output names the directory of the captures")
