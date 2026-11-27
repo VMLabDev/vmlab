@@ -3722,8 +3722,9 @@ pub struct JitCounts {
     /// Runs that K3 checked (`VMLAB_HV_JIT_CHECK`), and their instructions.
     pub checked_runs: u64,
     pub checked_instructions: u64,
-    /// Blocks compiled and refused, the bytes of code, the resets of the
-    /// region and the host time of the compiles.
+    /// Blocks compiled and refused, the bytes of code, the drops of the
+    /// part of a full region written longest ago (`jit::region::PARTS`) and
+    /// the host time of the compiles.
     pub compiled: u64,
     pub refused: u64,
     pub bytes: u64,

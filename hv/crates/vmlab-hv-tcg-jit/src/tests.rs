@@ -1736,6 +1736,45 @@ fn a_linked_jump_chains_until_the_budget_and_unlinks_to_its_stub() {
 }
 
 #[test]
+fn a_full_region_drops_the_part_written_longest_ago_and_the_links_into_it() {
+    // X goes into the first part, A and B into the second. A is linked to
+    // X and B to A. The drop of the first part sets the jump of A back to
+    // its stub and keeps B linked to A (H13c, card J11).
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut x = Looping::new();
+    let mut a = Looping::new();
+    let mut b = Looping::new();
+    let mut filler = Looping::new();
+    let relative = NextPc::Relative(word(4));
+    let to_x = x.compile(&mut jit, relative, 9);
+    let mut probe = to_x;
+    while probe.generation == to_x.generation {
+        probe = filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    let to_a = a.compile(&mut jit, relative, 9);
+    let to_b = b.compile(&mut jit, relative, 9);
+    assert_eq!(to_a.generation, to_b.generation);
+    assert!(jit.link(&to_a, 0, &to_x));
+    assert!(jit.link(&to_b, 0, &to_a));
+    let mut slots = [0u128, 0x4000_0100, 0];
+    // A runs and jumps to X, whose head finds the budget spent.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 1);
+    assert_eq!((code, context.chained), (BUDGET, 1));
+    assert_eq!(jit.stats.resets, 0);
+    while jit.stats.resets == 0 {
+        filler.compile(&mut jit, NextPc::Absolute(word(5)), 9);
+    }
+    assert!(!jit.current(&to_x));
+    assert!(jit.current(&to_a) && jit.current(&to_b));
+    assert_eq!(jit.linked(), 1);
+    // A leaves at its stub, and B still goes on to A.
+    let (code, context) = a.run(&jit, &to_a, &mut slots, 10);
+    assert_eq!((code, context.budget), (CHAIN, 9));
+    let (code, context) = b.run(&jit, &to_b, &mut slots, 10);
+    assert_eq!((code, context.budget, context.chained), (CHAIN, 8, 2));
+}
+
+#[test]
 fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
     let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
     let mut block = Looping::new();
