@@ -147,6 +147,14 @@ impl EmulatedVcpu {
         // (3e DESIGN.md J1).
         if let Some(error) = &cpu.jit_error {
             log::warn!("vcpu {id}: VMLAB_HV_JIT asks for the JIT, which does not start: {error}");
+        } else if cpu.jit_check_enabled() {
+            let runs = match cpu.jit_check_runs() {
+                u32::MAX => "every run".to_string(),
+                runs => format!("the first {runs} runs"),
+            };
+            log::info!(
+                "vcpu {id}: the JIT is on, and VMLAB_HV_JIT_CHECK checks {runs} of each compiled block against the interpreter (K3)"
+            );
         } else if cpu.jit_enabled() {
             log::info!("vcpu {id}: the JIT is on");
         }
@@ -265,7 +273,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -274,7 +282,15 @@ impl EmulatedVcpu {
             jit.refused,
             jit.bytes,
             jit.resets,
-            jit.compile_ns / 1_000_000
+            jit.compile_ns / 1_000_000,
+            jit.refused_runs,
+            jit.exits_budget,
+            jit.exits_end,
+            jit.exits_exception,
+            jit.exits_retry,
+            jit.exits_stop,
+            jit.checked_runs,
+            jit.checked_instructions,
         );
     }
 

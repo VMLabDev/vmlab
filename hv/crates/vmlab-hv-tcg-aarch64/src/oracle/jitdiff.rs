@@ -14,11 +14,15 @@
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
 //!
+//! `Options` turn K3 on for the compiled side, which then checks each of
+//! its blocks against the interpreter as it runs, and put a defect into the
+//! emitter, which both proofs must catch (3e DESIGN.md J2).
+//!
 //! Sources read: none. This file holds no instruction semantics.
 
 use super::stream::Generator;
 use crate::FormatClass;
-use crate::exec::Cpu;
+use crate::exec::{Cpu, JitDefect};
 use crate::lift::{
     BRANCH_FORMATS, FP_FORMATS, IMMEDIATE_FORMATS, LOAD_STORE_FORMATS, REGISTER_FORMATS,
     SIMD_FORMATS,
@@ -49,6 +53,8 @@ pub struct Report {
     pub interpreted: u64,
     pub compiled_blocks: u64,
     pub refused_blocks: u64,
+    /// Runs of blocks that K3 checked.
+    pub checked_blocks: u64,
 }
 
 /// The first round where the two sides differ.
@@ -90,15 +96,63 @@ fn formats() -> Vec<FormatClass> {
     .concat()
 }
 
-fn cpu(memory: FlatMemory, state: State, jit: bool) -> Result<Cpu<FlatMemory>, String> {
+/// The ways a CPU runs its blocks, for the tests that must hold on each
+/// (3e DESIGN.md K6): the interpreter, the JIT, and the JIT with K3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runner {
+    Interpreter,
+    Jit,
+    Checked,
+}
+
+impl Runner {
+    pub const ALL: [Runner; 3] = [Runner::Interpreter, Runner::Jit, Runner::Checked];
+
+    /// Make `cpu` run its blocks this way. Its translated blocks are
+    /// dropped when K3 turns on.
+    pub fn apply<M: vmlab_hv_tcg::Memory>(self, cpu: &mut Cpu<M>) {
+        let started = match self {
+            Runner::Interpreter => cpu.set_jit_check(false).and_then(|()| cpu.set_jit(false)),
+            Runner::Jit => cpu.set_jit_check(false).and_then(|()| cpu.set_jit(true)),
+            Runner::Checked => cpu.set_jit_check(true),
+        };
+        if let Err(error) = started {
+            panic!("the JIT does not start: {error}");
+        }
+        assert_eq!(cpu.jit_enabled(), self != Runner::Interpreter);
+    }
+}
+
+/// How the compiled side runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// K3 checks every compiled block.
+    pub check: bool,
+    /// A defect in the emitter.
+    pub defect: JitDefect,
+}
+
+fn cpu(memory: FlatMemory, state: State, jit: Option<Options>) -> Result<Cpu<FlatMemory>, String> {
     let mut cpu = Cpu::new(memory, state);
-    cpu.set_jit(jit)
-        .map_err(|error| format!("the JIT does not start: {error}"))?;
+    let started = match jit {
+        Some(options) if options.check => cpu.set_jit_check(true),
+        Some(_) => cpu.set_jit(true),
+        None => cpu.set_jit(false).and_then(|()| cpu.set_jit_check(false)),
+    };
+    started.map_err(|error| format!("the JIT does not start: {error}"))?;
+    if let Some(options) = jit {
+        cpu.seed_jit_defect(options.defect);
+    }
     Ok(cpu)
 }
 
 /// Run `rounds` rounds from `seed`.
 pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
+    run_with(seed, rounds, Options::default())
+}
+
+/// Run `rounds` rounds from `seed`, the compiled side as `options` say.
+pub fn run_with(seed: u64, rounds: u64, options: Options) -> Result<Report, Difference> {
     let mut generator = Generator::new(seed);
     let formats = formats();
     let mut report = Report::default();
@@ -153,11 +207,11 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         let mut reference = cpu(
             FlatMemory::new(RAM_BASE, bytes.clone()),
             state.clone(),
-            false,
+            None,
         )
         .map_err(difference)?;
         let mut compiled =
-            cpu(FlatMemory::new(RAM_BASE, bytes), state, true).map_err(difference)?;
+            cpu(FlatMemory::new(RAM_BASE, bytes), state, Some(options)).map_err(difference)?;
         let expected = reference.run(BUDGET);
         let got = compiled.run(BUDGET);
         if format!("{got:?}") != format!("{expected:?}") {
@@ -193,6 +247,7 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         report.interpreted += jit.interpreted_instructions;
         report.compiled_blocks += jit.compiled;
         report.refused_blocks += jit.refused;
+        report.checked_blocks += jit.checked_runs;
     }
     Ok(report)
 }
