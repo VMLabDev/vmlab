@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vmlab_hv_devices::IrqLine;
-use vmlab_hv_tcg_aarch64::exec::{Lines, Unknown};
+use vmlab_hv_tcg_aarch64::exec::{Lines, Unknown, machine_jit_from_environment};
 use vmlab_hv_tcg_aarch64::timer::Clock;
 use vmlab_hv_tcg_aarch64::{Cpu, State, Stop};
 
@@ -151,10 +151,19 @@ impl EmulatedVcpu {
             fiq: line(true),
         };
         let mut cpu = Cpu::new(memory, state);
-        // `VMLAB_HV_JIT=1` compiles the blocks of the guest to host code
-        // (3e DESIGN.md J1).
+        // The CPU of a machine compiles the blocks of the guest to host code
+        // unless `VMLAB_HV_JIT=0` (3e DESIGN.md T1, Q2, card J8).
+        if cpu.jit_error.is_none()
+            && !cpu.jit_enabled()
+            && machine_jit_from_environment()
+            && let Err(error) = cpu.set_jit(true)
+        {
+            cpu.jit_error = Some(error.to_string());
+        }
         if let Some(error) = &cpu.jit_error {
-            log::warn!("vcpu {id}: VMLAB_HV_JIT asks for the JIT, which does not start: {error}");
+            log::warn!(
+                "vcpu {id}: the JIT does not start, and the CPU runs the interpreter: {error}"
+            );
         } else if cpu.jit_check_enabled() {
             let runs = match cpu.jit_check_runs() {
                 u32::MAX => "every run".to_string(),
@@ -165,6 +174,10 @@ impl EmulatedVcpu {
             );
         } else if cpu.jit_enabled() {
             log::info!("vcpu {id}: the JIT is on");
+        } else {
+            log::info!(
+                "vcpu {id}: VMLAB_HV_JIT turns the JIT off, and the CPU runs the interpreter"
+            );
         }
         cpu.clock = clock;
         cpu.lines = Some(shared);

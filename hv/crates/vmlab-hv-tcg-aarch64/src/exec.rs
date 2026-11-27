@@ -3853,10 +3853,23 @@ fn switch(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1" | "on" | "true"))
 }
 
-/// Whether `VMLAB_HV_JIT` turns the JIT on. It is off by default (3e
-/// DESIGN.md J1, H2e). `VMLAB_HV_JIT_CHECK` turns it on too.
+/// Whether `VMLAB_HV_JIT` asks for the JIT by name: `1`, `on` or `true`.
+/// `VMLAB_HV_JIT_CHECK` asks for it too. A bare `Cpu::new`, as the tests and
+/// the tools of this crate build one, starts the JIT only when asked, so
+/// that a test of the interpreter stays one (3e DESIGN.md H2a).
 pub fn jit_from_environment() -> bool {
     switch("VMLAB_HV_JIT") || jit_check_from_environment()
+}
+
+/// Whether the CPU of a machine runs the JIT (3e DESIGN.md T1, Q2, card
+/// J8): on by default, and off only when `VMLAB_HV_JIT` is `0`, `off` or
+/// `false` (H2e). `VMLAB_HV_JIT_CHECK` turns it on whatever
+/// `VMLAB_HV_JIT` says.
+pub fn machine_jit_from_environment() -> bool {
+    !matches!(
+        std::env::var("VMLAB_HV_JIT").as_deref(),
+        Ok("0" | "off" | "false")
+    ) || jit_check_from_environment()
 }
 
 /// Whether `VMLAB_HV_JIT_CHECK` turns K3 on: every compiled block is

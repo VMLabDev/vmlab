@@ -861,6 +861,27 @@ def latest_baseline(records, arch, guest, vcpus, workload):
 NOISE_FLOOR = 0.05
 
 
+def jit_mode(record):
+    """How the CPU of an aarch64 vmlab-hv record ran, for bench-check (3e
+    DESIGN.md card J8): `jit`, `interpreter`, or `jit-check` for a run of K3,
+    which measures the check and no speed. A record that names no JIT ran
+    the interpreter, its default before J8. Other records have no mode."""
+    if record.get("backend") != "vmlab-hv" or record.get("arch") != "aarch64":
+        return ""
+    env = record.get("env") or {}
+    if env.get("jit_check"):
+        return "jit-check"
+    return "jit" if env.get("jit") else "interpreter"
+
+
+def interpreted_blocks(record):
+    """The most blocks that a JIT row ran in the interpreter for a missing
+    form (3e DESIGN.md H2b) in one of its repeats, or None without reports."""
+    reports = [r for r in (record.get("env") or {}).get("jit_reports") or [] if r]
+    counts = [r["refused_blocks"] for r in reports if "refused_blocks" in r]
+    return max(counts) if counts else None
+
+
 def regression_verdict(previous, latest):
     """('ok' | 'better' | 'worse', allowed) for latest vs previous.
 
@@ -886,10 +907,13 @@ def regression_verdict(previous, latest):
 
 
 def jit_enabled(environ=None):
-    """Whether VMLAB_HV_JIT turns the JIT of the aarch64 core on (3e
-    DESIGN.md J1): the values that `exec::jit_from_environment` reads."""
+    """Whether the aarch64 machine runs the JIT (3e DESIGN.md T1, card J8):
+    on unless VMLAB_HV_JIT is 0, off or false, the values that
+    `exec::machine_jit_from_environment` reads. VMLAB_HV_JIT_CHECK turns it
+    on whatever VMLAB_HV_JIT says."""
     environ = os.environ if environ is None else environ
-    return environ.get("VMLAB_HV_JIT") in ("1", "on", "true") or jit_check_enabled(environ)
+    off = environ.get("VMLAB_HV_JIT") in ("0", "off", "false")
+    return not off or jit_check_enabled(environ)
 
 
 def jit_check_enabled(environ=None):

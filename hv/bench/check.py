@@ -8,6 +8,13 @@ the previous median. Rate workloads (iops, MiB/s, Mbit/s) regress downward;
 seconds and percentages regress upward. Comparisons are within one backend;
 the phase bars (D1 TCG, D28 x86_64) are reported by `just bench-report`,
 not gated here.
+
+The aarch64 rows of vmlab-hv are compared within their JIT mode (3e
+DESIGN.md card J8): a JIT row with the JIT row before it, an interpreter
+row (`VMLAB_HV_JIT=0`, and every row from before the JIT) with the
+interpreter row before it. A row of K3 (`VMLAB_HV_JIT_CHECK`) measures the
+check and is not gated. A JIT row also fails when more of its blocks ran in
+the interpreter for a missing form (H2b) than in the JIT row before it.
 """
 
 import argparse
@@ -37,31 +44,37 @@ def compare(arch, args):
         records = [r for r in records if r["guest"] == args.guest]
     grouped = {}
     for rec in records:
+        mode = lib.jit_mode(rec)
+        if mode == "jit-check":
+            continue
         grouped.setdefault(
-            (rec["backend"], rec["guest"], rec["vcpus"], rec["workload"]), []
+            (rec["backend"], rec["guest"], rec["vcpus"], rec["workload"], mode), []
         ).append(rec)
 
     regressions, notes = [], []
     for key in sorted(grouped):
         entries = grouped[key]
+        name = f"{arch} {key[0]}{f' ({key[4]})' if key[4] else ''} {key[1]} vcpus={key[2]} {key[3]}"
         if len(entries) < 2:
-            notes.append(
-                f"{arch} {key[0]} {key[1]} vcpus={key[2]} {key[3]}: "
-                f"only {len(entries)} entry, nothing to compare"
-            )
+            notes.append(f"{name}: only {len(entries)} entry, nothing to compare")
             continue
         previous, latest = entries[-2], entries[-1]
         verdict, allowed = lib.regression_verdict(previous, latest)
         unit = latest.get("unit", "s")
         line = (
-            f"{arch} {key[0]} {key[1]} vcpus={key[2]} {key[3]}: "
-            f"{previous['median']} -> {latest['median']} {unit} "
+            f"{name}: {previous['median']} -> {latest['median']} {unit} "
             f"(noise <= {allowed}) {verdict}"
         )
         if verdict == "worse":
             regressions.append(line)
         else:
             notes.append(line)
+        if key[4] == "jit":
+            before, after = lib.interpreted_blocks(previous), lib.interpreted_blocks(latest)
+            if before is not None and after is not None and after > before:
+                regressions.append(
+                    f"{name}: {before} -> {after} blocks in the interpreter for a missing form (H2b)"
+                )
     return regressions, notes
 
 
