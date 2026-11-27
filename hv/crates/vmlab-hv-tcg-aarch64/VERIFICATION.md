@@ -2046,3 +2046,60 @@ card's pause counters; since the merge with card #1142 the bench takes
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn.
+
+## Card J3, #1154 (2026-11-27)
+
+The inlined softmmu of the JIT (3e DESIGN.md H7): the fast TLB of
+`vmlab-hv-tcg-jit::tlb` in the `Mmu`, its fill in the Rust load and store
+paths of card S3 (#1147, merged into the branch first, because the fast
+TLB copies the host address of its TLB entries), the flushes of H7b, the
+write table rule of H11a, and the inlined loads and stores of 1, 2, 4 and
+8 bytes with their miss stub. The measured rows and H7e are in G2 of the
+design.
+
+### Equal behaviour
+
+- K1, the O3 lockstep with the JIT on (`VMLAB_HV_JIT=1 just
+  tcg-a64-lockstep <group> 100000 1`, seed 1, 100,000 a class): at
+  `4e079406`, `mmu` 4,403,165 instructions in 1,155 rounds and `walk`
+  4,454,798 in 1,099 rounds, no difference. `loadstore` stopped once, after
+  896 s, on a difference of the low byte of V7 at the start of a round
+  (ours 0x00, QEMU 0xff). It did not repeat: at `073314f6` (the same code
+  with a switch for the fills, which was then removed) two full runs gave
+  5,228,140 and 5,227,849 instructions and runs with only read fills and
+  only write fills 5,227,893 and 5,227,817, all with no difference. The
+  lockstep is not deterministic (the round counts of those runs differ).
+  At `55866877`, before J3, `loadstore` with the JIT on gave 5,227,868,
+  no difference, in one run.
+- K2 (`just tcg-a64-jit-diff 300000 3e0001`) at `41f4fc16`, with the
+  accesses of every other round kept and compared: 300,000 rounds,
+  2,792,656 instructions, no difference.
+- K6 with the JIT on: `VMLAB_HV_JIT=1 cargo test -p vmlab-hv-tcg-aarch64`
+  (every test of the crate, among them the stores into translated code of
+  `tests/loadstore.rs` and `tests/translate.rs`) and `VMLAB_HV_JIT=1 cargo
+  test -p vmlab-hv-vmm --lib vcpu::`: all pass.
+
+### Tests
+
+- `tests/fasttlb.rs`: the fill of each table and level (H7a), nothing for
+  an unprivileged access, a read-only page, or a memory without host
+  pages, the write entries of a page that gets translated code (H11a), the
+  exclusive mark, every flush of H7b (TLBI by address, of every entry and by
+  ASID, a new TTBR0, SCTLR and TCR, a new state), the watch word after an
+  inlined store, and K6 with the JIT on.
+- `vmlab-hv-tcg-jit`: `tlb::tests` (the lookup, the flushes), the inlined
+  forms against the interpreter of the block form on random blocks with
+  misses, hits, faults and a watched page, `Memory::Logged`, and the new
+  encodings against `llvm-mc`.
+- `tests/jit.rs`: K2 asks for hits and misses of the fast TLB.
+
+### Sources read for this card
+
+- The state of `vmlab-hv-tcg-jit`, of this crate, of vmlab-hv-vmm's guest bus
+  and emulated vCPU, and of the bench. The Intel 64 and IA-32 Architectures
+  Software Developer's Manual, volume 2, for `MOVZX`, `TEST` and the sized
+  forms of `MOV`.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.

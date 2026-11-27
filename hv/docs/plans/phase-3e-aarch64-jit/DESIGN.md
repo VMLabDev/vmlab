@@ -705,6 +705,52 @@ the flat images, `vmlab-hv` with `env.jit` for the boot).
   through the thunk, which puts the words that it reads into the frame and
   saves the caller-saved registers that hold values. J3 inlines them.
 
+### G2, measured by card J3
+
+Helios, 2026-11-27, one vCPU, *measured*, the JIT on for both columns.
+"Before" is J1 with card S3 (#1147, RAM straight from the TLB entry)
+merged in, commit `55866877`, because J3 builds on the host address of the
+S3 entry (H7 below). "After" is J3 on top of it, commit `4e079406`. Other
+cards ran boots and builds at the same time (load average 4 to 9 of 32
+threads). The rows are in `bench/history/aarch64.jsonl`.
+
+| Workload | Before (J1 and S3) | After (J3) | Gain |
+|---|---|---|---|
+| CoreMark mix, flat, MIPS (median of 3, cores 28 to 31) | 196.1 | 228.9 | 1.17 times |
+| Scalar loop, flat, MIPS (no load or store in its loop) | 175.2 | 167.8 | none: noise |
+| Debian 13 boot to agent ready, s (median of 3, cores 28 to 31) | 180.3 | 152.3 | 1.18 times |
+| The same, boot MIPS of the bench | 99.6 | 118.5 | 1.19 times |
+
+- **J3a. The hit rate.** CoreMark: 67,145,095 inlined loads and stores in
+  the blocks that ran to their end, 6 misses. The boot, at 17.0e9
+  instructions: 3,448,872,419 inlined accesses and 70,434,658 misses, a
+  hit rate of 98.0 %. In both, no block and no instruction of the flat
+  images ran in the interpreter (H2b). The boot ran 44.8 million of 17.0e9
+  instructions (0.26 %) in the interpreter, in 358 refused blocks, as in
+  J1a.
+- **J3b. One fast path.** The fast TLB is not a second softmmu: its entries
+  are copies of the entries of the architectural TLB with the host address
+  that card S3 put there, filled where the Rust paths of S3 reach RAM
+  through that address and under the same rules (H7a, H11a), and flushed
+  with them (H7b). The Rust paths are those of S3, unchanged.
+- **J3c. H7e settled.** `mark_dirty` of `WriteDiscard` does two things.
+  It moves the write generations (the stamps of code and of reservations),
+  which a store needs only for a page with a watch word that is odd or
+  with code of this CPU, and such a page has no write entry or tells the
+  memory after its write (`WATCHED`), as the straight store of S3 does. And
+  it drops the private pages of a region that `arm` armed (the PAM banks of
+  q35), and a memory with such a region hands out no host pages at all
+  (`GuestBus::direct`), so it has no fast entries. Nothing else reads it.
+- **J3d. Exact for one vCPU and the same as S3 for more.** A store through
+  the fast TLB reads the watch word after its write, as the straight store
+  of S3 does, so the argument of S3 for a page that another vCPU starts to
+  translate (`membarrier`) holds for it. H11c, which drops the write
+  entries of every vCPU before the code is read, is J7.
+- **J3e. The lockstep.** The lockstep keeps every access of the CPU, so its
+  blocks are compiled with every hit kept (`jit::Memory::Logged`), with the
+  same lookup as in a run without the log. K2 keeps the accesses of every
+  other round and compares the two lists.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same

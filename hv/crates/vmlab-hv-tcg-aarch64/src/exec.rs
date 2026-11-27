@@ -413,18 +413,6 @@ impl Side {
         if self.mmu.fast().is_none() || entry.host == 0 {
             return;
         }
-        // TEMPORARY bisect switch, to be removed.
-        static SKIP: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-        let (skip_reads, skip_writes) = *SKIP.get_or_init(|| {
-            match std::env::var("VMLAB_HV_JIT_TLB_BISECT").as_deref() {
-                Ok("reads") => (false, true),
-                Ok("writes") => (true, false),
-                _ => (false, false),
-            }
-        });
-        if (write && skip_writes) || (!write && skip_reads) {
-            return;
-        }
         if write
             && (self.exclusive.is_some()
                 || entry_watch(entry).is_none_or(|watch| watch.load(Ordering::Relaxed) & 1 != 0)
