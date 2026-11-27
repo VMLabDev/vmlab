@@ -1,0 +1,22 @@
+# The back-end spike of the phase 3e design (section 3). Not a member of the
+# hv workspace and not built by `just ci::check`: run it by hand,
+# `cargo run --release` in this directory.
+[package]
+name = "jitspike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cranelift-codegen = "0.123"
+cranelift-frontend = "0.123"
+cranelift-jit = "0.123"
+cranelift-module = "0.123"
+cranelift-native = "0.123"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+debug = false
