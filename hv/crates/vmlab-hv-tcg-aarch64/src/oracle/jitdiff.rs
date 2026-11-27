@@ -11,6 +11,12 @@
 //! the emitter, its spills and guards, and the thunk with its loads,
 //! stores, accesses of 16 bytes, generic operations and helper calls.
 //!
+//! The rounds of `run_flags` are for the flags (card J5, H8): only the
+//! integer and branch classes, which hold every instruction that sets or
+//! reads the flags, on registers at the edges of the orders of 32 and 64
+//! bits, many of them equal or one apart, so that every condition of a
+//! compare flips inside a round (U4).
+//!
 //! `ci::check` runs a bounded number of rounds with a fixed seed (the test
 //! `tests/jit.rs`); `just tcg-a64-jit-diff` runs as many as it is asked.
 //!
@@ -49,6 +55,9 @@ pub struct Report {
     pub interpreted: u64,
     pub compiled_blocks: u64,
     pub refused_blocks: u64,
+    /// Comparisons compiled as host flags, and lazy conditions inline.
+    pub fused: u64,
+    pub lazy: u64,
 }
 
 /// The first round where the two sides differ.
@@ -97,10 +106,62 @@ fn cpu(memory: FlatMemory, state: State, jit: bool) -> Result<Cpu<FlatMemory>, S
     Ok(cpu)
 }
 
+fn flag_formats() -> Vec<FormatClass> {
+    [
+        IMMEDIATE_FORMATS.as_slice(),
+        REGISTER_FORMATS.as_slice(),
+        BRANCH_FORMATS.as_slice(),
+    ]
+    .concat()
+}
+
+/// Registers at the edges of the orders: each one an edge, a neighbour of
+/// one, or a register before it, so that a compare of two registers is
+/// often of equal values or of values one apart.
+fn edge_registers(generator: &mut Generator) -> ([u64; 31], u64, u8) {
+    const EDGES: [u64; 10] = [
+        0,
+        1,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+        0x1_0000_0000,
+        0x7fff_ffff_ffff_ffff,
+        0x8000_0000_0000_0000,
+        0xffff_ffff_8000_0000,
+        u64::MAX,
+    ];
+    let rng = &mut generator.rng;
+    let mut x = [0u64; 31];
+    for n in 0..31 {
+        x[n] = match rng.below(8) {
+            0 | 1 if n > 0 => x[rng.below(n as u64) as usize],
+            2 | 3 => EDGES[rng.below(EDGES.len() as u64) as usize]
+                .wrapping_add(rng.below(3))
+                .wrapping_sub(1),
+            4 => rng.below(17),
+            _ => EDGES[rng.below(EDGES.len() as u64) as usize],
+        };
+    }
+    let sp = x[rng.below(31) as usize];
+    let nzcv = rng.below(16) as u8;
+    (x, sp, nzcv)
+}
+
 /// Run `rounds` rounds from `seed`.
 pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
+    run_rounds(seed, rounds, false)
+}
+
+/// Run `rounds` rounds of the flags from `seed`: the integer and branch
+/// classes on registers at the edges.
+pub fn run_flags(seed: u64, rounds: u64) -> Result<Report, Difference> {
+    run_rounds(seed, rounds, true)
+}
+
+fn run_rounds(seed: u64, rounds: u64, flags: bool) -> Result<Report, Difference> {
     let mut generator = Generator::new(seed);
-    let formats = formats();
+    let formats = if flags { flag_formats() } else { formats() };
     let mut report = Report::default();
     for round in 0..rounds {
         let count = 1 + generator.rng.below(64) as usize;
@@ -125,7 +186,9 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         for (n, word) in words.iter().enumerate() {
             bytes[image + 4 * n..image + 4 * n + 4].copy_from_slice(&word.to_le_bytes());
         }
-        let (x, sp, nzcv) = if generator.rng.chance(1, 2) {
+        let (x, sp, nzcv) = if flags {
+            edge_registers(&mut generator)
+        } else if generator.rng.chance(1, 2) {
             generator.memory_registers(WINDOW)
         } else {
             generator.registers((IMAGE, 4 * count as u64))
@@ -193,6 +256,8 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
         report.interpreted += jit.interpreted_instructions;
         report.compiled_blocks += jit.compiled;
         report.refused_blocks += jit.refused;
+        report.fused += jit.fused;
+        report.lazy += jit.lazy;
     }
     Ok(report)
 }

@@ -886,6 +886,9 @@ const CALL_ARGUMENTS: usize = 8;
 /// its `Code::Call`.
 struct Call {
     function: HelperFn,
+    /// The call is `flags::CONDITION`, which the JIT can make inline (3e
+    /// DESIGN.md H8c).
+    condition: bool,
     /// The words of the arguments.
     args: Vec<Place>,
     /// The words of each result, with the mask of its type.
@@ -958,6 +961,7 @@ impl Parts {
                     }
                     let call = Call {
                         function: helper.0.function,
+                        condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
                         args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                         results: vec![(lowering.place(id), result_mask(graph, id))],
                     };
@@ -1005,6 +1009,7 @@ impl Parts {
                     } else {
                         let call = Call {
                             function: helper.0.function,
+                        condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
                             args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                             results: vec![(lowering.place(id), result_mask(graph, id))],
                         };
@@ -1229,6 +1234,7 @@ fn compile(
                 }
                 let call = Call {
                     function: helper.0.function,
+                    condition: false,
                     args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
@@ -2196,6 +2202,7 @@ impl Compiled {
                     reads: vec![address],
                     writes: place_words(result).collect(),
                     leave: Some(exit),
+                    condition: None,
                 },
                 Access16::Write {
                     address,
@@ -2207,6 +2214,7 @@ impl Compiled {
                     reads: std::iter::once(address).chain(place_words(value)).collect(),
                     writes: exclusive.into_iter().collect(),
                     leave: Some(exit),
+                    condition: None,
                 },
             })
             .collect();
@@ -2221,6 +2229,7 @@ impl Compiled {
                     .flat_map(|(place, _)| place_words(*place))
                     .collect(),
                 leave: None,
+                condition: self.lazy_condition(call),
             })
             .collect();
         // The compiled code writes the next PC with the outputs, as it is
@@ -2247,6 +2256,33 @@ impl Compiled {
                 self.refused = true;
             }
         }
+    }
+
+    /// The inline forms of a call of `flags::CONDITION`: its arguments are
+    /// the kind, the two operands and the condition of the record, each one
+    /// word. The JIT takes the forms only where the word of the condition
+    /// is the constant that it holds now.
+    fn lazy_condition(&self, call: &Call) -> Option<jit::LazyCondition> {
+        let [kind, a, b, code] = call.args.as_slice() else {
+            return None;
+        };
+        let [(result, _)] = call.results.as_slice() else {
+            return None;
+        };
+        if !call.condition || [kind, a, b, code, result].iter().any(|place| place.wide) {
+            return None;
+        }
+        let code_value = *self.frame.get(usize::from(code.slot))?;
+        let condition = u8::try_from(code_value).ok().filter(|code| *code < 16)?;
+        Some(jit::LazyCondition {
+            kind: kind.slot,
+            a: a.slot,
+            b: b.slot,
+            code: code.slot,
+            code_value,
+            result: result.slot,
+            cases: crate::flags::host_forms(condition),
+        })
     }
 
     /// Run the compiled code of the block. `None`: the budget did not hold
@@ -2341,6 +2377,10 @@ pub struct JitCounts {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// Comparisons compiled as the host flags that the next operation
+    /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
+    pub fused: u64,
+    pub lazy: u64,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -2613,6 +2653,8 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+            counts.fused = jit.stats.fused;
+            counts.lazy = jit.stats.lazy;
         }
         counts
     }

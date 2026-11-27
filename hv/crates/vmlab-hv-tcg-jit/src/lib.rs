@@ -7,7 +7,8 @@
 //! - `region`: the code memory, one `memfd` mapped twice (H13d, Q3).
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
 //!   the operations of one word, the guards and their stubs (H9), and the
-//!   thunk through which every effect runs.
+//!   thunk through which every effect runs, and the flags of H8: a
+//!   comparison as host flags, and the inline forms of a lazy condition.
 //! - The trampoline here (H4): `enter` saves the registers that the System V
 //!   ABI keeps, loads the context, and jumps to a block. A block leaves by a
 //!   jump to the common exit, which restores them and returns the exit code.
@@ -26,7 +27,9 @@ pub mod emit;
 pub mod region;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
-pub use emit::{Effect, Refused, Shape};
+pub use emit::{
+    Effect, FlagOperation, FlagTest, LazyCondition, Refused, Shape, add_flags, sub_flags,
+};
 use region::Region;
 use std::ffi::c_void;
 
@@ -88,6 +91,10 @@ pub struct Stats {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// Comparisons compiled as host flags that the next operation reads
+    /// (H8a), and lazy conditions compiled inline (H8c).
+    pub fused: u64,
+    pub lazy: u64,
 }
 
 /// The default size of the code region of one CPU (H13b).
@@ -186,7 +193,7 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let asm = emit::emit(shape, self.exit, self.features)?;
+        let (asm, fused, lazy) = emit::emit(shape, self.exit, self.features)?;
         let len = asm.len();
         let base = match self.region.next(len) {
             Some(base) => base,
@@ -198,6 +205,8 @@ impl Jit {
         };
         let code = asm.finish(base).ok_or(Refused::Size)?;
         self.region.put(base, &code);
+        self.stats.fused += fused;
+        self.stats.lazy += lazy;
         Ok(Entry {
             address: base,
             generation: self.region.generation(),

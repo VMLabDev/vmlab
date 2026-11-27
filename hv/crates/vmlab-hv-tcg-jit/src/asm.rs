@@ -59,6 +59,9 @@ pub enum Shift {
 /// A condition code, as the low nibble of `Jcc`, `SETcc` and `CMOVcc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cond {
+    /// Overflow: OF set.
+    O = 0,
+    No = 1,
     /// Below: CF set.
     B = 2,
     /// Above or equal: CF clear.
@@ -71,6 +74,73 @@ pub enum Cond {
     A = 7,
     /// Sign: SF set.
     S = 8,
+    Ns = 9,
+    /// Less, signed: SF and OF differ.
+    L = 0xc,
+    Ge = 0xd,
+    /// Less or equal, signed: ZF set, or SF and OF differ.
+    Le = 0xe,
+    G = 0xf,
+}
+
+impl Cond {
+    /// The condition that holds where this one does not.
+    pub fn inverse(self) -> Self {
+        match self {
+            Cond::O => Cond::No,
+            Cond::No => Cond::O,
+            Cond::B => Cond::Ae,
+            Cond::Ae => Cond::B,
+            Cond::E => Cond::Ne,
+            Cond::Ne => Cond::E,
+            Cond::Be => Cond::A,
+            Cond::A => Cond::Be,
+            Cond::S => Cond::Ns,
+            Cond::Ns => Cond::S,
+            Cond::L => Cond::Ge,
+            Cond::Ge => Cond::L,
+            Cond::Le => Cond::G,
+            Cond::G => Cond::Le,
+        }
+    }
+
+    /// The condition of a comparison of `b` with `a` that holds where this
+    /// one holds for `a` with `b`. `None`: a condition that is no order.
+    pub fn swapped(self) -> Option<Self> {
+        Some(match self {
+            Cond::E | Cond::Ne => self,
+            Cond::B => Cond::A,
+            Cond::A => Cond::B,
+            Cond::Ae => Cond::Be,
+            Cond::Be => Cond::Ae,
+            Cond::L => Cond::G,
+            Cond::G => Cond::L,
+            Cond::Ge => Cond::Le,
+            Cond::Le => Cond::Ge,
+            Cond::O | Cond::No | Cond::S | Cond::Ns => return None,
+        })
+    }
+
+    /// Whether the condition holds for the flags CF, ZF, SF and OF, as
+    /// volume 1 of the Intel manual defines each (appendix B).
+    pub fn holds(self, cf: bool, zf: bool, sf: bool, of: bool) -> bool {
+        match self {
+            Cond::O => of,
+            Cond::No => !of,
+            Cond::B => cf,
+            Cond::Ae => !cf,
+            Cond::E => zf,
+            Cond::Ne => !zf,
+            Cond::Be => cf || zf,
+            Cond::A => !cf && !zf,
+            Cond::S => sf,
+            Cond::Ns => !sf,
+            Cond::L => sf != of,
+            Cond::Ge => sf == of,
+            Cond::Le => zf || sf != of,
+            Cond::G => !zf && sf == of,
+        }
+    }
 }
 
 /// A place in the code that a jump can name before it is bound.
@@ -294,6 +364,31 @@ impl Asm {
         self.op(None, true, &[opcode], dst.0, src);
     }
 
+    /// `<alu> dst32, src32`.
+    pub fn alu32(&mut self, alu: Alu, dst: Reg, src: Rm) {
+        let opcode = match alu {
+            Alu::Add => 0x03,
+            Alu::Or => 0x0b,
+            Alu::And => 0x23,
+            Alu::Sub => 0x2b,
+            Alu::Xor => 0x33,
+            Alu::Cmp => 0x3b,
+        };
+        self.op(None, false, &[opcode], dst.0, src);
+    }
+
+    /// `<alu> dst32, value`: the 32-bit form, whose immediate is the whole
+    /// operand.
+    pub fn alu_imm32(&mut self, alu: Alu, dst: Rm, value: u32) {
+        if fits_i8(i64::from(value as i32)) {
+            self.op(None, false, &[0x83], alu as u8, dst);
+            self.byte(value as u8);
+        } else {
+            self.op(None, false, &[0x81], alu as u8, dst);
+            self.bytes(&value.to_le_bytes());
+        }
+    }
+
     /// `<alu> dst, value`, the value sign-extended from 32 or 8 bits.
     pub fn alu_imm(&mut self, alu: Alu, dst: Rm, value: i32) {
         if fits_i8(value.into()) {
@@ -308,6 +403,11 @@ impl Asm {
     /// `test a, b`.
     pub fn test(&mut self, a: Reg, b: Reg) {
         self.op(None, true, &[0x85], b.0, Rm::Reg(a));
+    }
+
+    /// `test a32, b32`.
+    pub fn test32(&mut self, a: Reg, b: Reg) {
+        self.op(None, false, &[0x85], b.0, Rm::Reg(a));
     }
 
     /// `imul dst, src`: the low 64 bits of the product.
@@ -515,6 +615,14 @@ mod tests {
                 add(format!("xor {}, {}", NAMES32[d], NAMES32[s]), &|a| {
                     a.xor32(dst, src)
                 });
+                for (alu, text) in alus {
+                    add(format!("{text} {}, {}", NAMES32[d], NAMES32[s]), &|a| {
+                        a.alu32(alu, dst, Rm::Reg(src))
+                    });
+                }
+                add(format!("test {}, {}", NAMES32[s], NAMES32[d]), &|a| {
+                    a.test32(src, dst)
+                });
             }
             for mem in &mems {
                 let text = rm_text(*mem);
@@ -529,6 +637,13 @@ mod tests {
                 add(format!("imul {name}, {text}"), &|a| a.imul(dst, *mem));
                 add(format!("cmovb {name}, {text}"), &|a| {
                     a.cmov(Cond::B, dst, *mem)
+                });
+                let text32 = text.replace("qword", "dword");
+                add(format!("cmp {}, {text32}", NAMES32[d]), &|a| {
+                    a.alu32(Alu::Cmp, dst, *mem)
+                });
+                add(format!("add {}, {text32}", NAMES32[d]), &|a| {
+                    a.alu32(Alu::Add, dst, *mem)
                 });
             }
             for value in [
@@ -554,6 +669,11 @@ mod tests {
                         a.alu_imm(alu, Rm::Reg(dst), value)
                     });
                 }
+            }
+            for value in [1u32, 0x7f, 0x80, 0xffff_ff80, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+                add(format!("cmp {}, {value}", NAMES32[d]), &|a| {
+                    a.alu_imm32(Alu::Cmp, Rm::Reg(dst), value)
+                });
             }
             for (shift, text) in [
                 (Shift::Shl, "shl"),
@@ -588,6 +708,16 @@ mod tests {
                 a.alu_imm(Alu::Add, *mem, 1000)
             });
             add(format!("cmp {text}, 0"), &|a| a.alu_imm(Alu::Cmp, *mem, 0));
+            let text32 = text.replace("qword", "dword");
+            add(format!("cmp {text32}, 3"), &|a| {
+                a.alu_imm32(Alu::Cmp, *mem, 3)
+            });
+            add(format!("cmp {text32}, 4294967295"), &|a| {
+                a.alu_imm32(Alu::Cmp, *mem, u32::MAX)
+            });
+            add(format!("cmp {text32}, 2147483648"), &|a| {
+                a.alu_imm32(Alu::Cmp, *mem, 0x8000_0000)
+            });
             add(format!("call {text}"), &|a| a.call_indirect(*mem));
         }
         for (cond, text) in [
@@ -598,7 +728,17 @@ mod tests {
             (Cond::Be, "be"),
             (Cond::A, "a"),
             (Cond::S, "s"),
+            (Cond::O, "o"),
+            (Cond::No, "no"),
+            (Cond::Ns, "ns"),
+            (Cond::L, "l"),
+            (Cond::Ge, "ge"),
+            (Cond::Le, "le"),
+            (Cond::G, "g"),
         ] {
+            add(format!("cmov{text} rax, rbx"), &|a| {
+                a.cmov(cond, RAX, Rm::Reg(RBX))
+            });
             add(format!("set{text} al"), &|a| a.setcc_al(cond));
             add(format!("j{text} 0x2000"), &|a| a.jcc_absolute(cond, 0x2000));
         }
@@ -711,6 +851,73 @@ mod tests {
             wrong.len(),
             cases.len()
         );
+    }
+
+    const CONDS: [Cond; 14] = [
+        Cond::O,
+        Cond::No,
+        Cond::B,
+        Cond::Ae,
+        Cond::E,
+        Cond::Ne,
+        Cond::Be,
+        Cond::A,
+        Cond::S,
+        Cond::Ns,
+        Cond::L,
+        Cond::Ge,
+        Cond::Le,
+        Cond::G,
+    ];
+
+    /// The flags of `cmp a, b` in 64 bits, from the definitions of `sub`.
+    fn compare(a: u64, b: u64) -> (bool, bool, bool, bool) {
+        let result = a.wrapping_sub(b);
+        let signed = i128::from(a as i64) - i128::from(b as i64);
+        (
+            a < b,
+            result == 0,
+            (result as i64) < 0,
+            signed != i128::from(result as i64),
+        )
+    }
+
+    #[test]
+    fn an_inverse_holds_where_its_condition_does_not_and_a_swap_reverses_the_order() {
+        for bits in 0..16u8 {
+            let flags = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            for cond in CONDS {
+                let (cf, zf, sf, of) = flags;
+                assert_eq!(cond.inverse().holds(cf, zf, sf, of), !cond.holds(cf, zf, sf, of));
+                assert_eq!(cond.inverse().inverse(), cond);
+            }
+        }
+        let values = [0, 1, 2, 0x7fff_ffff_ffff_ffff, 1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX];
+        for a in values {
+            for b in values {
+                for cond in CONDS {
+                    let Some(swapped) = cond.swapped() else {
+                        continue;
+                    };
+                    let (cf, zf, sf, of) = compare(a, b);
+                    let (cf2, zf2, sf2, of2) = compare(b, a);
+                    assert_eq!(
+                        swapped.holds(cf2, zf2, sf2, of2),
+                        cond.holds(cf, zf, sf, of),
+                        "{cond:?} {a:#x} {b:#x}"
+                    );
+                }
+            }
+        }
+        // The signed and unsigned orders, as the conditions after `cmp`.
+        for a in values {
+            for b in values {
+                let (cf, zf, sf, of) = compare(a, b);
+                assert_eq!(Cond::B.holds(cf, zf, sf, of), a < b);
+                assert_eq!(Cond::L.holds(cf, zf, sf, of), (a as i64) < (b as i64));
+                assert_eq!(Cond::Le.holds(cf, zf, sf, of), (a as i64) <= (b as i64));
+            }
+        }
     }
 
     #[test]

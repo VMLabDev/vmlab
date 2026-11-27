@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          \"translations\": {}, \"exit_code\": {code}, \
          \"jit\": {}, \"interpreted_blocks\": {}, \"interpreted_instructions\": {}, \
          \"compiled_blocks\": {}, \"refused_blocks\": {}, \"code_bytes\": {}, \
-         \"compile_ns\": {}, \
+         \"compile_ns\": {}, \"fused\": {}, \"lazy\": {}, \
          \"x2\": {}, \"x3\": {}, \"x4\": {}, \"x5\": {}}}",
         instructions,
         cpu.translations,
@@ -112,6 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jit.refused,
         jit.bytes,
         jit.compile_ns,
+        jit.fused,
+        jit.lazy,
         cpu.state.x(2),
         cpu.state.x(3),
         cpu.state.x(4),
