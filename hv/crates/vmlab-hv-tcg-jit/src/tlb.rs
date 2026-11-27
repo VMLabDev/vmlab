@@ -288,7 +288,10 @@ impl FastTlb {
         match &self.filled {
             // A write table is an odd one.
             Some(filled) => {
-                for &at in filled.iter().filter(|&&at| (at as usize / ENTRIES) & 1 == 1) {
+                for &at in filled
+                    .iter()
+                    .filter(|&&at| (at as usize / ENTRIES) & 1 == 1)
+                {
                     let at = at as usize;
                     clear(&mut self.lines[at / 2].0[at % 2]);
                 }
