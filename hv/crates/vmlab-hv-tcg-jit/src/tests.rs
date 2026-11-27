@@ -398,8 +398,13 @@ fn random_block(random: &mut Random, count: usize) -> Block {
                 let code = if conjunction {
                     Code::IsZero
                 } else {
-                    [Code::Equal, Code::NotEqual, Code::Less, Code::LessEqual, Code::IsZero]
-                        [random.below(5) as usize]
+                    [
+                        Code::Equal,
+                        Code::NotEqual,
+                        Code::Less,
+                        Code::LessEqual,
+                        Code::IsZero,
+                    ][random.below(5) as usize]
                 };
                 let condition = frame.len() as Slot;
                 frame.push(0);
@@ -617,7 +622,11 @@ fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
                                 dst: 6,
                                 a: left,
                                 b: right,
-                                imm: if flip == 2 { u64::MAX } else { u64::from(u32::MAX) },
+                                imm: if flip == 2 {
+                                    u64::MAX
+                                } else {
+                                    u64::from(u32::MAX)
+                                },
                             });
                             // Word 0 is the constant zero.
                             (a, b) = (6, 0);
@@ -702,7 +711,11 @@ fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
             }
         }
     }
-    assert!(jit.stats.fused >= rounds, "{} of {rounds} fused", jit.stats.fused);
+    assert!(
+        jit.stats.fused >= rounds,
+        "{} of {rounds} fused",
+        jit.stats.fused
+    );
 }
 
 /// H8c: a lazy condition runs its form for a kind that has one and calls

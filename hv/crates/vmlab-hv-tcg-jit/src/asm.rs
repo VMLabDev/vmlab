@@ -650,7 +650,9 @@ mod tests {
                 add(format!("add {}, {text32}", NAMES32[d]), &|a| {
                     a.alu32(Alu::Add, dst, *mem)
                 });
-                add(format!("test {text}, {name}"), &|a| a.test_rm(*mem, dst, true));
+                add(format!("test {text}, {name}"), &|a| {
+                    a.test_rm(*mem, dst, true)
+                });
                 add(format!("test {text32}, {}", NAMES32[d]), &|a| {
                     a.test_rm(*mem, dst, false)
                 });
@@ -679,7 +681,15 @@ mod tests {
                     });
                 }
             }
-            for value in [1u32, 0x7f, 0x80, 0xffff_ff80, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+            for value in [
+                1u32,
+                0x7f,
+                0x80,
+                0xffff_ff80,
+                0x7fff_ffff,
+                0x8000_0000,
+                u32::MAX,
+            ] {
                 // llvm-mc prints the immediate of eight bits signed and the
                 // one of 32 bits unsigned.
                 let text = if fits_i8(i64::from(value as i32)) {
@@ -904,11 +914,23 @@ mod tests {
             let flags = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
             for cond in CONDS {
                 let (cf, zf, sf, of) = flags;
-                assert_eq!(cond.inverse().holds(cf, zf, sf, of), !cond.holds(cf, zf, sf, of));
+                assert_eq!(
+                    cond.inverse().holds(cf, zf, sf, of),
+                    !cond.holds(cf, zf, sf, of)
+                );
                 assert_eq!(cond.inverse().inverse(), cond);
             }
         }
-        let values = [0, 1, 2, 0x7fff_ffff_ffff_ffff, 1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX];
+        let values = [
+            0,
+            1,
+            2,
+            0x7fff_ffff_ffff_ffff,
+            1 << 63,
+            (1 << 63) + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
         for a in values {
             for b in values {
                 for cond in CONDS {

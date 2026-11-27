@@ -168,8 +168,14 @@ pub fn host_forms(condition: u8) -> Vec<(u64, FlagTest)> {
     forms.push((u64::from(kind(LOGICAL, 32)), narrow(logical)));
     forms.push((u64::from(EXPLICIT), FlagTest::Table(table)));
     if let Some(cond) = sum {
-        forms.push((u64::from(kind(ADD, 64)), host(FlagOperation::Add, true, cond)));
-        forms.push((u64::from(kind(ADD, 32)), host(FlagOperation::Add, false, cond)));
+        forms.push((
+            u64::from(kind(ADD, 64)),
+            host(FlagOperation::Add, true, cond),
+        ));
+        forms.push((
+            u64::from(kind(ADD, 32)),
+            host(FlagOperation::Add, false, cond),
+        ));
     } else if compare.is_none() {
         forms.push((u64::from(kind(ADD, 64)), FlagTest::Always(true)));
         forms.push((u64::from(kind(ADD, 32)), FlagTest::Always(true)));
@@ -290,7 +296,12 @@ mod tests {
     #[test]
     fn every_host_form_is_the_condition_of_its_kind() {
         let mut values = VALUES.to_vec();
-        values.extend([0x8000_0001, 0xffff_fffe, 0x8000_0000_0000_0001, 0x1_7fff_ffff]);
+        values.extend([
+            0x8000_0001,
+            0xffff_fffe,
+            0x8000_0000_0000_0001,
+            0x1_7fff_ffff,
+        ]);
         let mut forms = 0;
         for condition in 0..16u8 {
             let cases = host_forms(condition);
@@ -303,7 +314,11 @@ mod tests {
                 for &a in &values {
                     for &b in &values {
                         // The explicit kind: every value of the four bits.
-                        let a = if kind == u64::from(EXPLICIT) { a & 31 } else { a };
+                        let a = if kind == u64::from(EXPLICIT) {
+                            a & 31
+                        } else {
+                            a
+                        };
                         assert_eq!(
                             test.evaluate(a, b),
                             holds(condition, nzcv(kind as u8, a, b)),

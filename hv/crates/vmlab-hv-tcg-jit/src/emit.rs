@@ -338,10 +338,12 @@ struct Fusion {
 
 impl Fusion {
     fn words(&self) -> impl Iterator<Item = Slot> {
-        [self.left, self.right].into_iter().filter_map(|operand| match operand {
-            Operand::Word(word) => Some(word),
-            Operand::Imm(_) => None,
-        })
+        [self.left, self.right]
+            .into_iter()
+            .filter_map(|operand| match operand {
+                Operand::Word(word) => Some(word),
+                Operand::Imm(_) => None,
+            })
     }
 }
 
@@ -484,7 +486,9 @@ fn signed(
     };
     // A flip of the operations before `i`: the value and its width.
     let flip = |word: Slot| -> Option<(Slot, bool, usize)> {
-        let at = (i.saturating_sub(2)..i).rev().find(|at| ops[*at].dst == word)?;
+        let at = (i.saturating_sub(2)..i)
+            .rev()
+            .find(|at| ops[*at].dst == word)?;
         let def = ops[at];
         if def.code != Code::Xor || uses[usize::from(word)] != [i as u32] {
             return None;
@@ -520,7 +524,9 @@ fn signed(
     let right = operand(op.b, y)?;
     let flips: Vec<usize> = [x, y].into_iter().flatten().map(|(_, _, at)| at).collect();
     // A value read later than its place must not be written in between.
-    let written: Vec<Slot> = (flips.iter().copied().min()?..=i).map(|at| ops[at].dst).collect();
+    let written: Vec<Slot> = (flips.iter().copied().min()?..=i)
+        .map(|at| ops[at].dst)
+        .collect();
     for operand in [left, right] {
         if let Operand::Word(word) = operand
             && written.contains(&word)
