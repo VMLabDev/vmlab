@@ -65,6 +65,7 @@
 //!   that is not the leader's is written there (a fetch adoption): code that
 //!   a device of the leader read from the disk, such as a program run from
 //!   the page cache.
+//!
 //! The stores of every instruction are still compared, so our RAM differs
 //! from the leader's only where a device of the leader wrote, and an
 //! adoption cannot hide a store of ours that was wrong. A load of ours from
