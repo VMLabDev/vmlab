@@ -45,7 +45,7 @@ The work is done in sub-phases (D12):
 | 3b | riscv64 `virt` machine |
 | 3c | JIT |
 | 3d | aarch64 decoder from the LLVM tables, our own semantics, the interpreter, the TCG vCPU path of the VMM and the `virt` machine (D15 to D18). It does not wait for 3b or 3c |
-| 3e | aarch64 JIT |
+| 3e | aarch64 JIT. Its design is `../phase-3e-aarch64-jit/DESIGN.md`, which wins over this document for 3e. Its first bar is T1 of that design, and D1 is its last |
 
 ## User stories
 
@@ -68,6 +68,7 @@ The work is done in sub-phases (D12):
 | `vmlab-hv-tcg` | The runtime: CPU state, the softmmu (TLB, page walks driven by the generated semantics, MMIO dispatch to the VMM's buses), exceptions and interrupts, the reference interpreter, the block/trace cache with self-modifying-code invalidation, and later the Cranelift JIT. It is driven per vCPU thread by `vmlab-hv-vmm` in place of `KVM_RUN` when the machine's accel is `tcg`. |
 | `vmlab-hv-lockstep` | The per-instruction oracle: the Sail-generated C++ model built in the toolchain container and linked through FFI, exposing step, state get/set and memory hooks. Plus a harness that runs our interpreter or JIT and the oracle side by side, reporting the first differing architectural state. |
 | `vmlab-hv-tcg-a64gen` | Build-time tool: the JSON dump of `llvm-tblgen` on the pinned LLVM AArch64 tables to the committed decoder and system register tables (D15). Run by `just tcg-a64-generate`, checked by `just tcg-a64-generate-check`. |
+| `vmlab-hv-tcg-jit` | Proposed by the design of 3e (D19): the x86-64 emitter over the pre-decoded block form, the code cache, chaining, the jump cache and the inlined softmmu lookup. It knows no guest architecture, so riscv64 (3c) uses it too. |
 | `vmlab-hv-tcg-aarch64` | The generated decode and system register tables with the LLVM notice, and our own semantics: one lifter per format class into the typed IR, helpers, the system register behaviour table, exceptions, the stage-1 walk (D15, D17). |
 | `bench/` | The suite, its recipes and the result history (D2). |
 
@@ -99,6 +100,14 @@ instruction group.
   Self-modifying code is detected through page-protection or generation
   counters on code pages. Interrupts are checked at trace exits and on
   backward branches.
+- **JIT (3e, aarch64).** The design of 3e (`../phase-3e-aarch64-jit/DESIGN.md`)
+  proposes another shape, which the operator decides (D19, MAP Q19): every
+  pre-decoded block is compiled when it is translated, by an x86-64 emitter of
+  our own, with no traces and no tiering at first. Blocks are chained, the TLB
+  lookup is inlined, guest registers live in host registers within a block,
+  a page of translated code has no entry for writes in the inlined TLB, and
+  the budget check at each block head is the interrupt check. If the operator
+  takes it, 3c uses the same crate.
 - **Multi-vCPU (D10).** One host thread per vCPU, with per-vCPU exclusive
   monitors and LR/SC reservations. Memory ordering is mapped explicitly for
   aarch64 and riscv atomics on the x86 TSO host.
@@ -161,7 +170,8 @@ Profiling hooks:
   - aarch64 (D16): random instruction streams from our decode tables and the encodings the templates execute, compared per instruction with a QEMU process through a TCG plugin, and a boot in which our machine follows QEMU's stream.
 - **S1:** real templates boot to agent ready under the memory cap (3b, 3d).
 - **e2e:** `arch.emulated` and the arch-relevant VM features on `--hypervisor vmlab` (S4).
-- **Benchmarks:** the D2 suite. D1's bar gates flipping a TCG default.
+- **Benchmarks:** the D2 suite. D1's bar gates flipping a TCG default. For the aarch64 JIT the design of 3e proposes its bar T1 for the default (MAP Q20).
+- **JIT (3e):** the instruction lockstep and the boot lockstep with the JIT on, a differential of compiled blocks against the interpreter inside `just ci::check`, and a replay check of every block of a real boot (`../phase-3e-aarch64-jit/DESIGN.md`, K1 to K7).
 - **Merge bar:** `just ci::check`, plus `just tcg-generate-check`, and `just tcg-a64-generate-check` for a change of the aarch64 tables.
 - **Safety:** every VM-booting test runs under a memory cap with at most two VMs at once.
 
@@ -178,3 +188,4 @@ Profiling hooks:
 - The exact riscv64 extension list (D7), fixed in 3a.
 - ~~Arm's licence position on sail-arm-derived code: an owner task before 3d.~~ Gone with D15: aarch64 uses no sail-arm.
 - The aarch64 CPU presented to the guest, when the QEMU code is removed, and when vmlab selects vmlab-hv for aarch64 (MAP Q16 to Q18).
+- The back end of the JIT, when it is on by default, and the memory rights of compiled code (MAP Q19 to Q21).

@@ -10,11 +10,11 @@ publish = false
 [workspace]
 
 [dependencies]
-cranelift-codegen = "0.123"
-cranelift-frontend = "0.123"
-cranelift-jit = "0.123"
-cranelift-module = "0.123"
-cranelift-native = "0.123"
+cranelift-codegen = "=0.123.23"
+cranelift-frontend = "=0.123.23"
+cranelift-jit = "=0.123.23"
+cranelift-module = "=0.123.23"
+cranelift-native = "=0.123.23"
 libc = "0.2"
 
 [profile.release]
