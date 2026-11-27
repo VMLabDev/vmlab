@@ -22,6 +22,10 @@
  *   reads=io     add a record for each memory read that a device answers,
  *                with the value that it gave (the boot lockstep, DESIGN.md
  *                O4: the follower takes its device reads from the leader).
+ *   reads=all    as reads=io, and a record for each load from RAM too, with
+ *                its physical address and value (K4 of 3e, card #1187: the
+ *                follower of a Debian boot takes what the devices of the
+ *                leader wrote into RAM from these).
  *
  * The stream, little-endian:
  *   header        "A64LOCK1", u32 flags (bit 0: vectors), u32 count of sysregs
@@ -38,6 +42,8 @@
  *                 u64 from_pc, u64 to_pc
  *   device read   u32 4, u32 size in bytes, u64 physical address, u64 low,
  *                 u64 high (with reads=io only; bit 2 of the header flags)
+ *   RAM load      u32 5, u32 size in bytes, u64 physical address, u64 low,
+ *                 u64 high (with reads=all only; bits 2 and 3 of the flags)
  *
  * Each record is one write(2) of less than PIPE_BUF bytes, so a reader of
  * the FIFO never sees a part of one, and a record is in the FIFO before the
@@ -56,10 +62,11 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3, REC_READ = 4 };
+enum { REC_INSN = 1, REC_MEM = 2, REC_DISCON = 3, REC_READ = 4, REC_LOAD = 5 };
 
 static int out_fd = -1;
 static int vectors;
+/* 1: the device reads (reads=io). 2: those and the loads from RAM (reads=all). */
 static int io_reads;
 static int pipe_bytes;
 static struct qemu_plugin_register *reg_x[31], *reg_sp, *reg_cpsr, *reg_pc;
@@ -149,12 +156,19 @@ static void mem_write(unsigned int vcpu, qemu_plugin_meminfo_t info, uint64_t va
         return;
     }
     if (!qemu_plugin_mem_is_store(info)) {
-        /* A load: only one that a device answers is of interest. */
+        /* A load: one that a device answers, and with reads=all one from
+         * RAM too. */
         struct qemu_plugin_hwaddr *hw = qemu_plugin_get_hwaddr(info, vaddr);
-        if (!hw || !qemu_plugin_hwaddr_is_io(hw)) {
+        if (!hw) {
             return;
         }
-        rec.tag = REC_READ;
+        if (qemu_plugin_hwaddr_is_io(hw)) {
+            rec.tag = REC_READ;
+        } else if (io_reads == 2) {
+            rec.tag = REC_LOAD;
+        } else {
+            return;
+        }
         rec.vaddr = qemu_plugin_hwaddr_phys_addr(hw);
     }
     switch (value.type) {
@@ -312,6 +326,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
             vectors = 1;
         } else if (!strcmp(argv[i], "reads=io")) {
             io_reads = 1;
+        } else if (!strcmp(argv[i], "reads=all")) {
+            io_reads = 2;
         } else if (g_str_has_prefix(argv[i], "pipe=")) {
             pipe_bytes = atoi(argv[i] + 5);
         } else if (g_str_has_prefix(argv[i], "names=")) {
@@ -344,7 +360,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_
         fprintf(stderr, "a64lock: FIFO of %d bytes: %s\n", pipe_bytes, strerror(errno));
     }
     scratch = g_byte_array_new();
-    header.flags = vectors | (sys_count ? 2 : 0) | (io_reads ? 4 : 0);
+    header.flags = vectors | (sys_count ? 2 : 0) | (io_reads ? 4 : 0) | (io_reads == 2 ? 8 : 0);
     header.zero = sys_count;
     emit(&header, sizeof(header));
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);

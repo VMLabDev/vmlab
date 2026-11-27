@@ -7,6 +7,7 @@
 //!       [--qemu <binary>] [--ram-mib N] [--until <text>]
 //!       [--max-instructions N] [--resync N] [--ignore <register>]...
 //!       [--system core|all] [--key <text>=<bytes>]...
+//!       [--disk <template disk.qcow2>]
 //!
 //! QEMU boots the firmware at `-smp 1` with the plugin, and our whole `virt`
 //! machine follows its stream from the reset. Both start from the same
@@ -51,6 +52,27 @@
 //! `VMLAB_HV_JIT=0` (3e DESIGN.md K4): each instruction is a compiled block
 //! of one. The report says how many ran compiled.
 //!
+//! With `--disk` (K4 of 3e, card #1187) the run is a guest boot to agent
+//! ready. The leader boots an overlay over the template on virtio-blk, with
+//! the agent port `vmlab.agent.0` on virtio-serial, and gets no keys unless
+//! `--key` gives them. Our machine has none of those devices: what they
+//! answer is a device read that our CPU takes from the leader, and what they
+//! write into RAM (DMA) the follower takes from the stream too, which then
+//! holds every load from RAM:
+//! - before an instruction, each load of the leader from RAM whose bytes are
+//!   not those of our RAM writes them into our RAM (a RAM adoption);
+//! - before an instruction, an encoding at the physical address of the PC
+//!   that is not the leader's is written there (a fetch adoption): code that
+//!   a device of the leader read from the disk, such as a program run from
+//!   the page cache.
+//! The stores of every instruction are still compared, so our RAM differs
+//! from the leader's only where a device of the leader wrote, and an
+//! adoption cannot hide a store of ours that was wrong. A load of ours from
+//! another address than the leader's still reads our bytes there, and that
+//! is a CPU difference. The harness sends the agent's `hello` on the agent
+//! socket of the leader, and the run ends when the agent answers it: agent
+//! ready. `--until` is then not used unless it is given.
+//!
 //! QEMU is the test oracle only (S6). Nothing here is a product path.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -68,7 +90,8 @@ use vmlab_hv_tcg_aarch64::oracle::{
     Core, Trace, Vectors, apply_system, compared, normalise, system_difference, system_of,
 };
 use vmlab_hv_tcg_aarch64::timer::Clock;
-use vmlab_hv_tcg_aarch64::{Stop, decode, sysreg};
+use vmlab_hv_tcg::Memory;
+use vmlab_hv_tcg_aarch64::{Cpu, Stop, decode, sysreg};
 use vmlab_hv_vmm::NoDevices;
 use vmlab_hv_vmm::vcpu::{Conduit, Hypercall, HypercallOutcome, Kick, VcpuHost};
 use vmlab_hv_vmm::virt;
@@ -252,6 +275,8 @@ struct Arguments {
     /// Read the stream of the leader and run nothing: how fast it is.
     leader_only: bool,
     keys: Vec<(String, Vec<u8>)>,
+    /// The template disk of a K4 run (`--disk`).
+    disk: Option<PathBuf>,
 }
 
 /// The bytes of a key argument: `\e` is escape and `\r` return.
@@ -276,8 +301,10 @@ fn arguments() -> Result<Arguments, Error> {
         all: false,
         leader_only: false,
         keys: Vec::new(),
+        disk: None,
     };
     let mut keys_given = false;
+    let mut until_given = false;
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
         let value = args.next().ok_or_else(|| format!("{name} needs a value"))?;
@@ -288,7 +315,11 @@ fn arguments() -> Result<Arguments, Error> {
             "--code" => parsed.code = value.into(),
             "--vars" => parsed.vars = value.into(),
             "--ram-mib" => parsed.ram_mib = value.parse()?,
-            "--until" => parsed.until = value,
+            "--until" => {
+                until_given = true;
+                parsed.until = value;
+            }
+            "--disk" => parsed.disk = Some(value.into()),
             "--max-instructions" => parsed.max_instructions = value.parse()?,
             "--resync" => parsed.resync = value.parse()?,
             "--ignore" => parsed.ignore.push(value),
@@ -304,7 +335,10 @@ fn arguments() -> Result<Arguments, Error> {
             _ => return Err(format!("unknown argument {name}").into()),
         }
     }
-    if !keys_given {
+    if parsed.disk.is_some() && !until_given {
+        parsed.until = String::new();
+    }
+    if !keys_given && parsed.disk.is_none() {
         parsed.keys = TO_THE_SHELL
             .iter()
             .map(|(text, bytes)| (text.to_string(), key_bytes(bytes)))
@@ -341,6 +375,157 @@ fn name_of(encoding: u32) -> String {
     )
 }
 
+/// What the follower took into its RAM from the loads and the fetches of
+/// the leader (`--disk`): memory that a device of the leader wrote.
+#[derive(Default)]
+struct RamAdoptions {
+    loads: u64,
+    bytes: u64,
+    fetches: u64,
+    /// The adoptions by page of 4 KiB.
+    pages: BTreeMap<u64, u64>,
+}
+
+/// The physical page of the PC, kept while the virtual page and the
+/// translation registers of the records stay the same, and dropped at a
+/// `TLBI`: a TLB of one entry, for the fetch adoption.
+#[derive(Default)]
+struct FetchPage {
+    entry: Option<(u64, u64, u64)>,
+}
+
+/// A value that changes with the translation registers of a record and the
+/// exception level.
+fn translation_key(before: &Before) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    before.system.hash(&mut hasher);
+    (before.core.cpsr & 0xc).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `TLBI` of any kind: `SYS` with CRn 8.
+fn is_tlbi(word: u32) -> bool {
+    word & 0xfff8_f000 == 0xd508_8000
+}
+
+/// The RAM of our machine.
+fn in_ram(address: u64, size: u64, ram_bytes: u64) -> bool {
+    address >= virt::map::RAM_BASE
+        && address
+            .checked_add(size)
+            .is_some_and(|end| end <= virt::map::RAM_BASE + ram_bytes)
+}
+
+/// Write the bytes of each RAM load of the leader into our RAM where ours
+/// are other bytes.
+fn adopt_loads<M: Memory>(
+    cpu: &mut Cpu<M>,
+    loads: &[DeviceRead],
+    ram_bytes: u64,
+    adopted: &mut RamAdoptions,
+) {
+    for load in loads {
+        let size = (load.size as usize).min(16);
+        if size == 0 || !in_ram(load.address, size as u64, ram_bytes) {
+            continue;
+        }
+        let theirs = &load.value.to_le_bytes()[..size];
+        let mut ours = [0u8; 16];
+        if cpu.memory.read(load.address, &mut ours[..size]).is_err() || ours[..size] == *theirs {
+            continue;
+        }
+        if cpu.memory.write(load.address, theirs).is_ok() {
+            adopted.loads += 1;
+            adopted.bytes += size as u64;
+            *adopted.pages.entry(load.address >> 12).or_default() += 1;
+        }
+    }
+}
+
+/// Write the encoding of the leader at the physical address of the PC when
+/// ours is another one.
+fn adopt_fetch<M: Memory>(
+    cpu: &mut Cpu<M>,
+    before: &Before,
+    page: &mut FetchPage,
+    ram_bytes: u64,
+    adopted: &mut RamAdoptions,
+) {
+    let pc = before.core.pc;
+    let key = translation_key(before);
+    let physical = match page.entry {
+        Some((virtual_page, entry_key, physical_page))
+            if virtual_page == pc >> 12 && entry_key == key =>
+        {
+            physical_page << 12 | (pc & 0xfff)
+        }
+        _ => {
+            page.entry = None;
+            let Some(physical) = cpu.physical_address(pc) else {
+                return;
+            };
+            page.entry = Some((pc >> 12, key, physical >> 12));
+            physical
+        }
+    };
+    if !in_ram(physical, 4, ram_bytes) {
+        return;
+    }
+    let mut ours = [0u8; 4];
+    if cpu.memory.read(physical, &mut ours).is_err() || u32::from_le_bytes(ours) == before.encoding
+    {
+        return;
+    }
+    if cpu
+        .memory
+        .write(physical, &before.encoding.to_le_bytes())
+        .is_ok()
+    {
+        adopted.fetches += 1;
+        *adopted.pages.entry(physical >> 12).or_default() += 1;
+    }
+}
+
+/// A frame of the guest agent protocol (guest/agent-proto, v2): the magic,
+/// the length of the payload, the kind, the channel and the payload.
+fn agent_frame(kind: u8, channel: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = b"VMLB".to_vec();
+    frame.extend((payload.len() as u32).to_le_bytes());
+    frame.push(kind);
+    frame.extend(channel.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The first whole frame of the agent in `bytes`: its kind, channel and
+/// payload.
+fn first_agent_frame(bytes: &[u8]) -> Option<(u8, u32, &[u8])> {
+    let start = bytes.windows(4).position(|window| window == b"VMLB")?;
+    let frame = &bytes[start..];
+    if frame.len() < 13 {
+        return None;
+    }
+    let length = u32::from_le_bytes(frame[4..8].try_into().unwrap()) as usize;
+    let channel = u32::from_le_bytes(frame[9..13].try_into().unwrap());
+    let payload = frame.get(13..13 + length)?;
+    Some((frame[8], channel, payload))
+}
+
+/// The `hello` of the host, which the agent answers when it is ready.
+fn agent_hello() -> Vec<u8> {
+    agent_frame(
+        0,
+        0,
+        br#"{"cmd":"hello","proto_version":2,"token":"vmlab-k4"}"#,
+    )
+}
+
+/// How often the hello goes again while the agent has not answered: the
+/// agent can open its port after the first one was read by an earlier
+/// opener, or start again.
+const HELLO_REPEAT: u64 = 1 << 30;
+
 fn main() -> Result<(), Error> {
     let arguments = arguments()?;
     match run(&arguments) {
@@ -360,6 +545,24 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     std::fs::copy(&arguments.vars, &our_vars)?;
     let serial = directory.join("follower-serial.log");
     let _ = std::fs::remove_file(&serial);
+    // The leader writes an overlay over the template, never the template.
+    let guest = match &arguments.disk {
+        Some(template) => {
+            let overlay = directory.join("leader-disk.qcow2");
+            let _ = std::fs::remove_file(&overlay);
+            let status = std::process::Command::new("qemu-img")
+                .args(["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b"])
+                .arg(template)
+                .arg(&overlay)
+                .status()?;
+            if !status.success() {
+                return Err(format!("qemu-img create failed: {status}").into());
+            }
+            Some(boot::GuestDisk { disk: overlay })
+        }
+        None => None,
+    };
+    let ram_bytes = u64::from(arguments.ram_mib) << 20;
 
     let compared: Vec<_> = compared()
         .into_iter()
@@ -379,6 +582,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             .map(|register| register.qemu.to_string())
             .collect(),
         window: None,
+        guest: guest.clone(),
     };
     let dtb = boot::dump_device_tree(&options)?;
     let fw_cfg_files = boot::capture_fw_cfg(&options)?;
@@ -451,6 +655,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut key_at = 0u64;
     let next_instruction = |leader: &mut Leader,
                             reads: &mut Vec<DeviceRead>,
+                            loads: &mut Vec<DeviceRead>,
                             writes: &mut Vec<(u64, u128, usize)>,
                             discontinuities: &mut Vec<(u32, u64, u64)>|
      -> Result<Option<Before>, Error> {
@@ -458,6 +663,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             match leader.next(SILENCE)? {
                 None => return Ok(None),
                 Some(Record::Read(read)) => reads.push(read),
+                Some(Record::Load(load)) => loads.push(load),
                 Some(Record::Trace(Trace::Write {
                     address,
                     size,
@@ -490,9 +696,36 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         }
     };
 
-    let (mut reads, mut writes, mut discontinuities) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut reads, mut loads, mut writes, mut discontinuities) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut adopted = RamAdoptions::default();
+    let mut fetch_page = FetchPage::default();
+    // The agent port of the leader (`--disk`): the hello goes out at once
+    // and waits in the socket until the agent opens its port.
+    let mut agent = match &guest {
+        Some(_) => {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut stream = loop {
+                match std::os::unix::net::UnixStream::connect(options.agent_socket()) {
+                    Ok(stream) => break stream,
+                    Err(error) if Instant::now() > deadline => return Err(error.into()),
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            {
+                use std::io::Write;
+                stream.write_all(&agent_hello())?;
+            }
+            stream.set_nonblocking(true)?;
+            Some(stream)
+        }
+        None => None,
+    };
+    let mut agent_bytes: Vec<u8> = Vec::new();
+    let mut hello_at = 0u64;
+    let mut agent_answer: Option<String> = None;
     let Some(mut current) =
-        next_instruction(&mut leader, &mut reads, &mut writes, &mut discontinuities)?
+        next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?
     else {
         return Err("the leader wrote no instruction".into());
     };
@@ -501,11 +734,12 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut instructions = 0u64;
     if arguments.leader_only {
         while instructions < arguments.max_instructions
-            && next_instruction(&mut leader, &mut reads, &mut writes, &mut discontinuities)?
+            && next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?
                 .is_some()
         {
             instructions += 1;
             reads.clear();
+            loads.clear();
             writes.clear();
             discontinuities.clear();
         }
@@ -587,11 +821,20 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
 
         // What the leader did in this instruction, up to its next one.
         reads.clear();
+        loads.clear();
         writes.clear();
         discontinuities.clear();
-        let next = next_instruction(&mut leader, &mut reads, &mut writes, &mut discontinuities)?;
+        let next = next_instruction(&mut leader, &mut reads, &mut loads, &mut writes, &mut discontinuities)?;
         if !reads.is_empty() {
             *host.reads.lock() = reads.iter().copied().collect();
+        }
+
+        // What a device of the leader wrote into RAM, as far as this
+        // instruction reads it.
+        if guest.is_some() {
+            let cpu = vcpu.cpu();
+            adopt_fetch(cpu, &current, &mut fetch_page, ram_bytes, &mut adopted);
+            adopt_loads(cpu, &loads, ram_bytes, &mut adopted);
         }
 
         // Our instruction.
@@ -633,6 +876,9 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         }
         if cpu.taken.is_some() {
             exceptions += 1;
+        }
+        if is_tlbi(current.encoding) {
+            fetch_page.entry = None;
         }
         instructions += 1;
         let left = if reads.is_empty() {
@@ -813,8 +1059,32 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
                 keyboard.write_all(bytes)?;
                 key_at = instructions;
             }
+            if let Some(stream) = agent.as_mut() {
+                use std::io::{Read, Write};
+                let mut buffer = [0u8; 4096];
+                while let Ok(count) = stream.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    agent_bytes.extend_from_slice(&buffer[..count]);
+                }
+                if let Some((0, 0, payload)) = first_agent_frame(&agent_bytes) {
+                    agent_answer = Some(String::from_utf8_lossy(payload).into_owned());
+                    reached = true;
+                    ended = "the agent answered its hello: agent ready";
+                    break 'run;
+                }
+                if instructions >= hello_at + HELLO_REPEAT {
+                    if hello_at > 0 {
+                        stream.set_nonblocking(false)?;
+                        stream.write_all(&agent_hello())?;
+                        stream.set_nonblocking(true)?;
+                    }
+                    hello_at = instructions;
+                }
+            }
             let log = std::fs::read(&description.serial_log).unwrap_or_default();
-            if String::from_utf8_lossy(&log).contains(&arguments.until) {
+            if !arguments.until.is_empty() && String::from_utf8_lossy(&log).contains(&arguments.until) {
                 reached = true;
                 ended = "our serial log holds the text";
                 break 'run;
@@ -861,6 +1131,19 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     println!(
         "Adopted from the leader: {counters} counter reads, {timed} timer and interrupt status reads that differed."
     );
+    if guest.is_some() {
+        println!(
+            "RAM adopted from the leader (what its devices wrote): {} loads ({} bytes) and {} fetches, in {} pages.",
+            adopted.loads,
+            adopted.bytes,
+            adopted.fetches,
+            adopted.pages.len()
+        );
+        match &agent_answer {
+            Some(answer) => println!("The agent answered: {answer}"),
+            None => println!("The agent did not answer."),
+        }
+    }
     println!("ID registers that differ from the leader (the allow-list):");
     for (encoding, (ours, theirs, count)) in &identity {
         println!(
@@ -893,7 +1176,11 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
         &text[text.ceil_char_boundary(tail)..]
     );
     if !reached && arguments.max_instructions == u64::MAX && differences == 0 {
-        println!("the run did not reach {:?}", arguments.until);
+        if guest.is_some() {
+            println!("the run did not reach agent ready");
+        } else {
+            println!("the run did not reach {:?}", arguments.until);
+        }
         return Ok(false);
     }
     Ok(differences == 0)
