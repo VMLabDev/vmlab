@@ -63,6 +63,17 @@ pub struct Shape<'a> {
     pub instructions: u32,
 }
 
+/// A defect that the emitter puts into its code on purpose, for the tests
+/// that show that K2 and K3 catch a wrong form (3e DESIGN.md J2). Only a
+/// test turns one on: `Jit::seed_defect`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Defect {
+    #[default]
+    None,
+    /// `Code::Add` subtracts.
+    AddSubtracts,
+}
+
 /// Why the emitter made no code for a block. The block runs in the
 /// interpreter (H2b).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +201,7 @@ struct Emitter<'a> {
     pinned: u16,
     exit: u64,
     features: Features,
+    defect: Defect,
     shape: &'a Shape<'a>,
 }
 
@@ -517,6 +529,7 @@ impl Emitter<'_> {
                 let b = self.value(op.b, at);
                 self.load(RAX, a);
                 let alu = match op.code {
+                    Code::Add if self.defect == Defect::AddSubtracts => Alu::Sub,
                     Code::Add => Alu::Add,
                     Code::Sub => Alu::Sub,
                     Code::And => Alu::And,
@@ -807,9 +820,23 @@ impl Emitter<'_> {
     }
 }
 
-/// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline.
-pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused> {
+/// The words of the frame of `shape` that its code writes: the results of
+/// its operations and its inputs. Every other word is a constant, which no
+/// run changes. K3 fills the written words with a pattern before a replay,
+/// so that a word that the code reads before it writes it shows.
+pub fn written(shape: &Shape) -> Result<Vec<bool>, Refused> {
+    Ok(analyse(shape)?.written)
+}
+
+/// What `emit` knows of a block before its pass.
+struct Analysis {
+    uses: Vec<Vec<u32>>,
+    written: Vec<bool>,
+    effects: Vec<(Vec<Slot>, Vec<Slot>)>,
+    homes: Vec<Home>,
+}
+
+fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
     let words = shape.frame.len();
     if words > i32::MAX as usize / 8 {
         return Err(Refused::Size);
@@ -871,6 +898,24 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
             *home = Home::Const(shape.frame[slot]);
         }
     }
+    Ok(Analysis {
+        uses,
+        written,
+        effects,
+        homes,
+    })
+}
+
+/// Emit the code of `shape`. `exit` is the address of the common exit of
+/// the trampoline.
+pub fn emit(shape: &Shape, exit: u64, features: Features, defect: Defect) -> Result<Asm, Refused> {
+    let Analysis {
+        uses,
+        effects,
+        homes,
+        ..
+    } = analyse(shape)?;
+    let words = shape.frame.len();
     let mut emitter = Emitter {
         asm: Asm::new(),
         words: homes
@@ -887,6 +932,7 @@ pub fn emit(shape: &Shape, exit: u64, features: Features) -> Result<Asm, Refused
         pinned: 0,
         exit,
         features,
+        defect,
         shape,
     };
     // H10: the head of the block takes its instructions from the budget,

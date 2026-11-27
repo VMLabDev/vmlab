@@ -64,6 +64,8 @@ use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
 use vmlab_hv_tcg_jit as jit;
+/// A defect that a test puts into the JIT (`Cpu::seed_jit_defect`).
+pub use vmlab_hv_tcg_jit::Defect as JitDefect;
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -236,6 +238,7 @@ struct Reservation {
 }
 
 /// Why an access did not complete.
+#[derive(Clone)]
 enum Fault {
     /// A fault of the guest, with the address for FAR_EL1.
     Abort(mmu::Fault, u64),
@@ -298,6 +301,10 @@ struct Side {
     exclusive_high: u64,
     /// The accesses since the caller last took them, when it asked for them.
     log: Option<Vec<Access>>,
+    /// While K3 checks a block (3e DESIGN.md): what each exclusive store of
+    /// a block did, whether it wrote and whether it reports success, which
+    /// the log of accesses alone does not say.
+    outcomes: Option<Vec<(bool, bool)>>,
     /// A filter in front of `code_set`: a bit for the low bits of each
     /// physical page that holds translated code.
     code_pages: Vec<u64>,
@@ -320,6 +327,7 @@ impl Side {
             exclusive_value: 0,
             exclusive_high: 0,
             log: None,
+            outcomes: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
             code_set: FastSet::default(),
             own_writes: 0,
@@ -746,6 +754,7 @@ struct Leave {
 }
 
 /// Why an effect did not complete.
+#[derive(Clone)]
 enum Failed {
     /// The condition of a guard did not hold, and the guard names no
     /// exception.
@@ -818,6 +827,9 @@ struct Compiled {
     /// The emitter has no form for an operation of the block on this host:
     /// it runs in the interpreter (H2b).
     refused: bool,
+    /// While K3 checks the blocks: the words of the frame that the code
+    /// writes (`jit::emit::written`). Empty otherwise.
+    written: Vec<bool>,
 }
 
 /// The most arguments of a helper.
@@ -1235,6 +1247,7 @@ fn compile(
         terminal,
         code: None,
         refused: false,
+        written: Vec::new(),
     })
 }
 
@@ -1344,6 +1357,7 @@ impl Compiled {
                 .sum::<usize>()
             + self.inputs.capacity() * size_of::<(Place, u32)>()
             + self.outputs.capacity() * size_of::<(u32, Place)>()
+            + self.written.capacity()
     }
 
     /// Make one effect. The error: the exit to leave through, and why.
@@ -1482,9 +1496,12 @@ impl Compiled {
                         .store(memory, at, bytes, value, user, single)
                         .map_err(|refused| (exit, Failed::store(refused)))?,
                     Some(result) => {
-                        let (_, succeeded) = side
+                        let (wrote, succeeded) = side
                             .store_exclusive(memory, at, bytes, value, user, single)
                             .map_err(|refused| (exit, Failed::store(refused)))?;
+                        if let Some(outcomes) = &mut side.outcomes {
+                            outcomes.push((wrote, succeeded));
+                        }
                         frame[usize::from(result)] = u64::from(!succeeded);
                     }
                 }
@@ -1527,6 +1544,47 @@ impl Compiled {
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
         let entry = state.pc();
+        let ended = self.run_ops(state, memory, side);
+        self.end_run(state, entry, ended)
+    }
+
+    /// What `run` gives for how `run_ops` ended, from the PC at the entry.
+    #[inline(always)]
+    fn end_run(
+        &self,
+        state: &mut State,
+        entry: u64,
+        ended: Result<(), Option<(u32, Failed)>>,
+    ) -> (u32, Option<Halt>) {
+        match ended {
+            Ok(()) => {
+                for (register, place) in &self.outputs {
+                    state.slots[*register as usize] = place.read(&self.frame);
+                }
+                // The loop runs the last instruction with the PC at it.
+                if let Some((distance, _)) = self.terminal {
+                    state.set_pc(entry.wrapping_add(distance));
+                }
+                (self.instructions, None)
+            }
+            Err(Some((exit, failed))) => self.leave(state, exit, failed),
+            Err(None) => (
+                0,
+                Some(Halt::Stop(host("an arithmetic operation outside its domain"))),
+            ),
+        }
+    }
+
+    /// The operations of the block in the interpreter. The error: the exit
+    /// that an effect left through and why, or none for an arithmetic
+    /// operation outside its domain.
+    #[inline(always)]
+    fn run_ops<M: Memory>(
+        &mut self,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+    ) -> Result<(), Option<(u32, Failed)>> {
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1540,16 +1598,11 @@ impl Compiled {
                 // frame and the generic operations of the block, and
                 // neither changes size after it.
                 if !unsafe { block::step_unchecked(op, &mut self.frame, &self.generics) } {
-                    return (
-                        0,
-                        Some(Halt::Stop(host(
-                            "an arithmetic operation outside its domain",
-                        ))),
-                    );
+                    return Err(None);
                 }
                 continue;
             }
-            let done = Self::effect(
+            Self::effect(
                 op,
                 &mut self.frame,
                 &self.accesses,
@@ -1559,19 +1612,10 @@ impl Compiled {
                 memory,
                 side,
                 single,
-            );
-            if let Err((exit, failed)) = done {
-                return self.leave(state, exit, failed);
-            }
+            )
+            .map_err(Some)?;
         }
-        for (register, place) in &self.outputs {
-            state.slots[*register as usize] = place.read(&self.frame);
-        }
-        // The loop runs the last instruction with the PC at it.
-        if let Some((distance, _)) = self.terminal {
-            state.set_pc(entry.wrapping_add(distance));
-        }
-        (self.instructions, None)
+        Ok(())
     }
 }
 
@@ -1592,6 +1636,9 @@ struct Env<'a, M> {
     /// Why the block left, when an effect did not complete.
     failed: Option<(u32, Failed)>,
     stop: Option<Stop>,
+    /// The replay of K3, when the block is checked: its loads and stores
+    /// are served from it and not made.
+    replay: Option<&'a mut Replay>,
 }
 
 /// What the thunk returns when the block leaves.
@@ -1622,6 +1669,21 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
         env.stop = Some(host("an arithmetic operation outside its domain"));
         return THUNK_LEFT;
     }
+    if let Some(replay) = env.replay.as_deref_mut()
+        && let Some(done) = replay.access(op, frame, env.accesses)
+    {
+        return match done {
+            Ok(()) => 0,
+            Err(Some(failed)) => {
+                env.failed = Some(failed);
+                THUNK_LEFT
+            }
+            Err(None) => {
+                env.stop = Some(host("K3: the compiled block differs in its accesses"));
+                THUNK_LEFT
+            }
+        };
+    }
     // SAFETY: the state of the CPU, which compiled code does not touch
     // while it calls.
     let state = unsafe { &mut *env.state };
@@ -1644,14 +1706,190 @@ unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u6
     }
 }
 
+/// The replay of K3 (3e DESIGN.md): the accesses that the interpreter made
+/// in a block, which the compiled block of the same entry state must make
+/// again in the same order. A load gets the value of the log, and a store
+/// is compared with the log and not made. When the log is spent at an
+/// access, the interpreter's block left there: the access fails as it did.
+struct Replay {
+    log: Vec<Access>,
+    next: usize,
+    /// What each exclusive store did: wrote, reports success.
+    outcomes: Vec<(bool, bool)>,
+    next_outcome: usize,
+    /// How an access of the interpreter's block failed, when one did.
+    ended: Option<(u32, Failed)>,
+    /// The exit that the compiled block left through at the end of the log.
+    left: Option<u32>,
+    /// The first difference.
+    difference: Option<String>,
+}
+
+impl Replay {
+    fn differ(&mut self, what: String) {
+        if self.difference.is_none() {
+            self.difference = Some(what);
+        }
+    }
+
+    /// The log is spent at an access that leaves through `exit`.
+    fn end(&mut self, exit: u32, what: &str) -> Result<u128, Option<(u32, Failed)>> {
+        match self.ended.take() {
+            Some((_, failed)) => {
+                self.left = Some(exit);
+                Err(Some((exit, failed)))
+            }
+            None => {
+                self.differ(format!(
+                    "{what}, which the interpreter did not make: its log ends after {} accesses",
+                    self.log.len()
+                ));
+                Err(None)
+            }
+        }
+    }
+
+    fn load(&mut self, exit: u32, address: u64, bytes: u8) -> Result<u128, Option<(u32, Failed)>> {
+        match self.log.get(self.next).copied() {
+            Some(access) if !access.write && access.address == address && access.bytes == bytes => {
+                self.next += 1;
+                Ok(access.value)
+            }
+            Some(access) => {
+                self.differ(format!(
+                    "access {}: a load of {bytes} bytes at {address:#x}, the interpreter {access:x?}",
+                    self.next
+                ));
+                Err(None)
+            }
+            None => self.end(exit, &format!("a load of {bytes} bytes at {address:#x}")),
+        }
+    }
+
+    fn store(
+        &mut self,
+        exit: u32,
+        address: u64,
+        bytes: u8,
+        value: u128,
+    ) -> Result<(), Option<(u32, Failed)>> {
+        let value = value & bits_mask(bytes);
+        let made = Access {
+            address,
+            bytes,
+            value,
+            write: true,
+        };
+        match self.log.get(self.next).copied() {
+            Some(access) if access == made => {
+                self.next += 1;
+                Ok(())
+            }
+            Some(access) => {
+                self.differ(format!(
+                    "access {}: {made:x?}, the interpreter {access:x?}",
+                    self.next
+                ));
+                Err(None)
+            }
+            None => self
+                .end(exit, &format!("{made:x?}"))
+                .map(|_| ()),
+        }
+    }
+
+    /// The access of `op` from the log: `None` for an operation that is no
+    /// access. The error: the exit and why, or none for a difference.
+    fn access(
+        &mut self,
+        op: &Op,
+        frame: &mut [u64],
+        accesses: &[Access16],
+    ) -> Option<Result<(), Option<(u32, Failed)>>> {
+        let exit = op.imm as u32;
+        let bytes = |code: Code| match code {
+            Code::Load1 | Code::Store1 => 1,
+            Code::Load2 | Code::Store2 => 2,
+            Code::Load4 | Code::Store4 => 4,
+            _ => 8,
+        };
+        Some(match op.code {
+            Code::Load1 | Code::Load2 | Code::Load4 | Code::Load8 => self
+                .load(exit, frame[usize::from(op.a)], bytes(op.code))
+                .map(|value| frame[usize::from(op.dst)] = value as u64),
+            Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 => {
+                self.store(exit, frame[usize::from(op.a)], bytes(op.code), frame[usize::from(op.b)].into())
+            }
+            Code::Access => match accesses[op.imm as usize] {
+                Access16::Read {
+                    address,
+                    result,
+                    bytes,
+                    exit,
+                    ..
+                } => self
+                    .load(exit, frame[usize::from(address)], bytes)
+                    .map(|value| result.write(frame, value)),
+                Access16::Write {
+                    address,
+                    value,
+                    bytes,
+                    exclusive,
+                    exit,
+                    ..
+                } => {
+                    let (at, value) = (frame[usize::from(address)], value.read(frame));
+                    match exclusive {
+                        None => self.store(exit, at, bytes, value),
+                        Some(result) => match self.outcomes.get(self.next_outcome).copied() {
+                            Some((wrote, succeeded)) => {
+                                self.next_outcome += 1;
+                                let stored = if wrote {
+                                    self.store(exit, at, bytes, value)
+                                } else {
+                                    Ok(())
+                                };
+                                stored.map(|()| frame[usize::from(result)] = u64::from(!succeeded))
+                            }
+                            None => self
+                                .end(exit, &format!("an exclusive store of {bytes} bytes at {at:#x}"))
+                                .map(|_| ()),
+                        },
+                    }
+                }
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// How a run of a block ended, as a line of a K3 report and for the
+/// comparison of the two runs.
+fn halt_text(done: &(u32, Option<Halt>)) -> String {
+    let halt = match &done.1 {
+        None => "the end of the block".to_string(),
+        Some(Halt::Stop(stop)) => format!("{stop:?}"),
+        Some(Halt::Taken) => "an exception taken".to_string(),
+        Some(Halt::Raise(exception)) => format!("{exception:x?}"),
+        Some(Halt::Retry) => "a store into translated code".to_string(),
+    };
+    format!("{} instructions, then {halt}", done.0)
+}
+
 /// The words of a place.
 fn place_words(place: Place) -> impl Iterator<Item = Slot> {
     std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
 }
 
+/// What K3 writes into the written words of the frame before a replay: a
+/// word that the compiled code reads before it writes it shows.
+const POISON: u64 = 0x6b33_dead_6b33_dead;
+
 impl Compiled {
-    /// Compile the block, or mark it as one that the emitter refuses.
-    fn compile_code(&mut self, jit: &mut jit::Jit) {
+    /// Compile the block, or mark it as one that the emitter refuses. `pc`
+    /// is the address that it is entered at now, for the perf map. With
+    /// `check`, the block keeps what K3 needs.
+    fn compile_code(&mut self, jit: &mut jit::Jit, pc: u64, check: bool) {
         let leaves: Vec<Vec<Slot>> = self
             .leaves
             .iter()
@@ -1716,7 +1954,21 @@ impl Compiled {
             instructions: self.instructions,
         };
         match jit.compile(&shape) {
-            Ok(entry) => self.code = Some(entry),
+            Ok(entry) => {
+                self.code = Some(entry);
+                if check {
+                    self.written = jit::emit::written(&shape).unwrap_or_default();
+                }
+                if jit.perf_map() {
+                    let label = format!(
+                        "a64 {pc:#x} pa {:#x} el{} {} insns",
+                        self.phys, self.context.el, self.instructions
+                    );
+                    // A map that cannot be written is turned off: the
+                    // blocks run the same without it.
+                    let _ = jit.name(&entry, &label);
+                }
+            }
             Err(_) => {
                 self.code = None;
                 self.refused = true;
@@ -1725,7 +1977,9 @@ impl Compiled {
     }
 
     /// Run the compiled code of the block. `None`: the budget did not hold
-    /// the block, and nothing ran.
+    /// the block, and nothing ran. With `replay`, the loads and stores are
+    /// served from it (K3).
+    #[allow(clippy::too_many_arguments)]
     fn run_code<M: Memory>(
         &mut self,
         entry: &jit::Entry,
@@ -1734,6 +1988,7 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
         budget: u64,
+        replay: Option<&mut Replay>,
     ) -> Option<(u32, Option<Halt>)> {
         let pc = state.pc();
         side.user = self.context.el == 0;
@@ -1753,6 +2008,7 @@ impl Compiled {
             single: self.instructions == 1,
             failed: None,
             stop: None,
+            replay,
         };
         let mut context = jit::Context {
             budget: budget.min(i64::MAX as u64) as i64,
@@ -1793,6 +2049,164 @@ impl Compiled {
             }),
         }
     }
+
+    /// K3 (3e DESIGN.md): run the block in the interpreter with the log of
+    /// accesses on, then its compiled code from the same entry state, with
+    /// every load and store served from that log. The registers, the state
+    /// and the way the block left must be the same. What the interpreter
+    /// did is what the CPU keeps. A difference stops the CPU with the
+    /// block, both states and the log.
+    fn check<M: Memory>(
+        &mut self,
+        entry: &jit::Entry,
+        jit: &jit::Jit,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+    ) -> (u32, Option<Halt>) {
+        let before = state.clone();
+        let pc = state.pc();
+        let outer = side.log.replace(Vec::new());
+        side.outcomes = Some(Vec::new());
+        side.user = self.context.el == 0;
+        let ended = self.run_ops(state, memory, side);
+        let failed = match &ended {
+            Err(Some((exit, failed))) => Some((*exit, failed.clone())),
+            _ => None,
+        };
+        let expected = self.end_run(state, pc, ended);
+        let log = side.log.take().unwrap_or_default();
+        let outcomes = side.outcomes.take().unwrap_or_default();
+        // A caller that keeps the accesses gets those of the interpreter.
+        side.log = outer.map(|mut outer| {
+            outer.extend_from_slice(&log);
+            outer
+        });
+        let interpreted_frame = self.frame.clone();
+        for (word, written) in self.frame.iter_mut().zip(&self.written) {
+            if *written {
+                *word = POISON;
+            }
+        }
+        let exit = failed.as_ref().map(|(exit, _)| *exit);
+        let mut replay = Replay {
+            log,
+            next: 0,
+            outcomes,
+            next_outcome: 0,
+            ended: failed,
+            left: None,
+            difference: None,
+        };
+        let mut shadow = before.clone();
+        let got = self.run_code(
+            entry,
+            jit,
+            &mut shadow,
+            memory,
+            side,
+            u64::MAX,
+            Some(&mut replay),
+        );
+        let got = got.unwrap_or((0, Some(Halt::Stop(host("the budget of the replay")))));
+        let mut differences = Vec::new();
+        if let Some(difference) = replay.difference.take() {
+            differences.push(difference);
+        }
+        if replay.next != replay.log.len() {
+            differences.push(format!(
+                "the compiled block made {} of the {} accesses of the interpreter",
+                replay.next,
+                replay.log.len()
+            ));
+        }
+        if replay.next_outcome != replay.outcomes.len() {
+            differences.push(format!(
+                "the compiled block made {} of the {} exclusive stores of the interpreter",
+                replay.next_outcome,
+                replay.outcomes.len()
+            ));
+        }
+        if replay.left.is_some() && replay.left != exit {
+            differences.push(format!(
+                "the compiled block left through the exit {:?}, the interpreter through {exit:?}",
+                replay.left
+            ));
+        }
+        let (ours, theirs) = (halt_text(&got), halt_text(&expected));
+        if ours != theirs {
+            differences.push(format!("the compiled block ran {ours}, the interpreter {theirs}"));
+        }
+        if shadow != *state {
+            differences.push("the states differ".to_string());
+        }
+        if differences.is_empty() {
+            return expected;
+        }
+        let report = self.report(&before, state, &shadow, &replay, &differences, &interpreted_frame);
+        (expected.0, Some(Halt::Stop(Stop::Host(report))))
+    }
+
+    /// The report of a difference that K3 found.
+    #[cold]
+    fn report(
+        &self,
+        before: &State,
+        interpreted: &State,
+        compiled: &State,
+        replay: &Replay,
+        differences: &[String],
+        frame: &[u64],
+    ) -> String {
+        use std::fmt::Write;
+        let mut text = format!(
+            "K3: the compiled block at pc {:#x} (pa {:#x}, el{}, {} instructions, {} operations) differs from the interpreter: {}",
+            before.pc(),
+            self.phys,
+            self.context.el,
+            self.instructions,
+            self.ops.len(),
+            differences.join("; ")
+        );
+        let _ = write!(text, "\nslots (entry, interpreter, compiled):");
+        for (index, ((entry, ours), theirs)) in before
+            .slots
+            .iter()
+            .zip(&interpreted.slots)
+            .zip(&compiled.slots)
+            .enumerate()
+        {
+            if ours != theirs || entry != ours {
+                let marker = if ours != theirs { " <-" } else { "" };
+                let _ = write!(
+                    text,
+                    "\n  {index:3}: {entry:#x} {ours:#x} {theirs:#x}{marker}"
+                );
+            }
+        }
+        if interpreted.nzcv() != compiled.nzcv() {
+            let _ = write!(
+                text,
+                "\nnzcv: the interpreter {:#x}, compiled {:#x}",
+                interpreted.nzcv(),
+                compiled.nzcv()
+            );
+        }
+        if interpreted.system != compiled.system {
+            let _ = write!(text, "\nthe system registers differ");
+        }
+        let _ = write!(text, "\naccesses of the interpreter:");
+        for (index, access) in replay.log.iter().enumerate() {
+            let _ = write!(text, "\n  {index}: {access:x?}");
+        }
+        let _ = write!(text, "\nexclusive stores: {:?}", replay.outcomes);
+        let _ = write!(text, "\noperations (word: value of the interpreter):");
+        for (index, op) in self.ops.iter().enumerate() {
+            let value = frame.get(usize::from(op.dst)).copied().unwrap_or(0);
+            let _ = write!(text, "\n  {index}: {op:?} = {value:#x}");
+        }
+        text
+    }
 }
 
 /// What the JIT of a CPU did, for the bench rows and the debug log.
@@ -1806,6 +2220,21 @@ pub struct JitCounts {
     /// the budget did not hold at their head.
     pub interpreted_runs: u64,
     pub interpreted_instructions: u64,
+    /// The runs of `interpreted_runs` whose block the emitter refused. The
+    /// others are those that the budget did not hold.
+    pub refused_runs: u64,
+    /// How the runs of compiled blocks ended: at the end of the block, at
+    /// the head because of the budget (and then in the interpreter), with
+    /// an exception of an instruction, with a store into translated code,
+    /// and with a stop of the CPU.
+    pub exits_end: u64,
+    pub exits_budget: u64,
+    pub exits_exception: u64,
+    pub exits_retry: u64,
+    pub exits_stop: u64,
+    /// Runs that K3 checked (`VMLAB_HV_JIT_CHECK`), and their instructions.
+    pub checked_runs: u64,
+    pub checked_instructions: u64,
     /// Blocks compiled and refused, the bytes of code, the resets of the
     /// region and the host time of the compiles.
     pub compiled: u64,
@@ -1815,6 +2244,26 @@ pub struct JitCounts {
     pub compile_ns: u64,
 }
 
+impl JitCounts {
+    /// Count how a run of compiled code ended.
+    fn exit(&mut self, halt: &Option<Halt>) {
+        match halt {
+            None => self.exits_end += 1,
+            Some(Halt::Raise(_) | Halt::Taken) => self.exits_exception += 1,
+            Some(Halt::Retry) => self.exits_retry += 1,
+            Some(Halt::Stop(_)) => self.exits_stop += 1,
+        }
+    }
+}
+
+/// The JIT of a CPU, and how it runs.
+struct JitRun<'a> {
+    jit: &'a mut Option<jit::Jit>,
+    counts: &'a mut JitCounts,
+    /// K3 checks every compiled block.
+    check: bool,
+}
+
 /// Run `block` on its compiled code when the JIT is on and takes it, else
 /// in the interpreter.
 fn execute<M: Memory>(
@@ -1822,22 +2271,33 @@ fn execute<M: Memory>(
     state: &mut State,
     memory: &mut M,
     side: &mut Side,
-    jit: &mut Option<jit::Jit>,
-    counts: &mut JitCounts,
+    run: JitRun,
     budget: u64,
 ) -> (u32, Option<Halt>) {
+    let JitRun { jit, counts, check } = run;
     let Some(jit) = jit.as_mut() else {
         return block.run(state, memory, side);
     };
     if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
-        block.compile_code(jit);
+        block.compile_code(jit, state.pc(), check);
     }
-    if let Some(entry) = block.code
-        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget)
-    {
-        counts.compiled_runs += 1;
-        counts.compiled_instructions += u64::from(done.0);
-        return done;
+    if let Some(entry) = block.code {
+        if check {
+            let done = block.check(&entry, jit, state, memory, side);
+            counts.checked_runs += 1;
+            counts.checked_instructions += u64::from(done.0);
+            counts.exit(&done.1);
+            return done;
+        }
+        if let Some(done) = block.run_code(&entry, jit, state, memory, side, budget, None) {
+            counts.compiled_runs += 1;
+            counts.compiled_instructions += u64::from(done.0);
+            counts.exit(&done.1);
+            return done;
+        }
+        counts.exits_budget += 1;
+    } else {
+        counts.refused_runs += 1;
     }
     let done = block.run(state, memory, side);
     counts.interpreted_runs += 1;
@@ -1845,13 +2305,28 @@ fn execute<M: Memory>(
     done
 }
 
-/// Whether `VMLAB_HV_JIT` turns the JIT on: `1`, `on` or `true`. It is off
-/// by default (3e DESIGN.md J1, H2e).
+/// Whether the switch `name` of the environment is on: `1`, `on` or
+/// `true`.
+fn switch(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("1" | "on" | "true"))
+}
+
+/// Whether `VMLAB_HV_JIT` turns the JIT on. It is off by default (3e
+/// DESIGN.md J1, H2e). `VMLAB_HV_JIT_CHECK` turns it on too.
 pub fn jit_from_environment() -> bool {
-    matches!(
-        std::env::var("VMLAB_HV_JIT").as_deref(),
-        Ok("1" | "on" | "true")
-    )
+    switch("VMLAB_HV_JIT") || jit_check_from_environment()
+}
+
+/// Whether `VMLAB_HV_JIT_CHECK` turns K3 on: every compiled block is
+/// checked against the interpreter as it runs (3e DESIGN.md K3).
+pub fn jit_check_from_environment() -> bool {
+    switch("VMLAB_HV_JIT_CHECK")
+}
+
+/// Whether `VMLAB_HV_JIT_PERF_MAP` asks for the perf map of the compiled
+/// blocks, `/tmp/perf-<pid>.map` (3e DESIGN.md H13e).
+pub fn jit_perf_map_from_environment() -> bool {
+    switch("VMLAB_HV_JIT_PERF_MAP")
 }
 
 /// The translated blocks of a CPU: an entry for each code address, picked
@@ -2008,6 +2483,10 @@ pub struct Cpu<M> {
     /// The JIT, when it is on (3e DESIGN.md J1).
     jit: Option<jit::Jit>,
     jit_counts: JitCounts,
+    /// K3 checks every compiled block (`set_jit_check`).
+    jit_check: bool,
+    /// The JIT names its blocks in the perf map.
+    jit_perf_map: bool,
     /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
     /// of the CPU writes it to its log.
     pub jit_error: Option<String>,
@@ -2048,11 +2527,18 @@ impl<M: Memory> Cpu<M> {
             side,
             jit: None,
             jit_counts: JitCounts::default(),
+            jit_check: false,
+            jit_perf_map: jit_perf_map_from_environment(),
             jit_error: None,
         };
-        if jit_from_environment()
-            && let Err(error) = cpu.set_jit(true)
-        {
+        let started = if jit_check_from_environment() {
+            cpu.set_jit_check(true)
+        } else if jit_from_environment() {
+            cpu.set_jit(true)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = started {
             cpu.jit_error = Some(error.to_string());
         }
         cpu
@@ -2064,12 +2550,49 @@ impl<M: Memory> Cpu<M> {
         if on == self.jit.is_some() {
             return Ok(());
         }
-        self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        self.jit = if on {
+            let mut jit = jit::Jit::new()?;
+            jit.set_perf_map(self.jit_perf_map)?;
+            Some(jit)
+        } else {
+            None
+        };
         Ok(())
     }
 
     pub fn jit_enabled(&self) -> bool {
         self.jit.is_some()
+    }
+
+    /// Turn K3 on or off (3e DESIGN.md K3). On: the JIT is on, and every
+    /// block that it compiled runs in the interpreter first and then as
+    /// compiled code from the same state, with the accesses of the
+    /// interpreter served to it. A difference stops the CPU with
+    /// `Stop::Host` and a report that begins with `K3:`. Blocks compiled
+    /// before are compiled again, so that each knows what K3 needs.
+    pub fn set_jit_check(&mut self, on: bool) -> std::io::Result<()> {
+        if on {
+            if self.jit.is_none() {
+                self.set_jit(true)?;
+            }
+            self.blocks = Cache::new();
+            self.singles = Cache::new();
+        }
+        self.jit_check = on;
+        Ok(())
+    }
+
+    /// Whether K3 checks the blocks.
+    pub fn jit_check_enabled(&self) -> bool {
+        self.jit_check
+    }
+
+    /// Put a defect into every block that the JIT compiles from now on, to
+    /// show that K2 and K3 catch it (3e DESIGN.md J2). For tests only.
+    pub fn seed_jit_defect(&mut self, defect: JitDefect) {
+        if let Some(jit) = &mut self.jit {
+            jit.seed_defect(defect);
+        }
     }
 
     /// What the JIT did since the CPU was made.
@@ -2794,8 +3317,11 @@ impl<M: Memory> Cpu<M> {
             &mut self.state,
             &mut self.memory,
             &mut self.side,
-            &mut self.jit,
-            &mut self.jit_counts,
+            JitRun {
+                jit: &mut self.jit,
+                counts: &mut self.jit_counts,
+                check: self.jit_check,
+            },
             u64::MAX,
         );
         // The loop runs the last instruction at the PC that the block left.
@@ -2895,8 +3421,11 @@ impl<M: Memory> Cpu<M> {
                     &mut self.state,
                     &mut self.memory,
                     &mut self.side,
-                    &mut self.jit,
-                    &mut self.jit_counts,
+                    JitRun {
+                        jit: &mut self.jit,
+                        counts: &mut self.jit_counts,
+                        check: self.jit_check,
+                    },
                     left,
                 );
                 let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
@@ -3543,16 +4072,20 @@ mod tests {
 
     #[test]
     fn a_write_to_the_memory_drops_the_translated_blocks() {
-        let mut cpu = cpu(&[0x9100_0400, 0x1400_0000]);
-        assert_eq!(cpu.run(1), Stop::Budget);
-        assert_eq!(cpu.state.x(0), 1);
-        // add x0, x0, #2 in place of add x0, x0, #1.
-        cpu.memory
-            .write(BASE, &0x9100_0800u32.to_le_bytes())
-            .unwrap();
-        cpu.state.set_pc(BASE);
-        assert_eq!(cpu.run(1), Stop::Budget);
-        assert_eq!(cpu.state.x(0), 3);
+        // K6 of 3e DESIGN.md: on every runner.
+        for runner in crate::oracle::jitdiff::Runner::ALL {
+            let mut cpu = cpu(&[0x9100_0400, 0x1400_0000]);
+            runner.apply(&mut cpu);
+            assert_eq!(cpu.run(1), Stop::Budget);
+            assert_eq!(cpu.state.x(0), 1);
+            // add x0, x0, #2 in place of add x0, x0, #1.
+            cpu.memory
+                .write(BASE, &0x9100_0800u32.to_le_bytes())
+                .unwrap();
+            cpu.state.set_pc(BASE);
+            assert_eq!(cpu.run(1), Stop::Budget);
+            assert_eq!(cpu.state.x(0), 3, "{runner:?}");
+        }
     }
 
     #[test]

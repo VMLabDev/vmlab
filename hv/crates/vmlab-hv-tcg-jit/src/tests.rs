@@ -544,3 +544,115 @@ fn a_full_region_starts_a_new_generation() {
     }
     panic!("the region never filled");
 }
+
+#[test]
+fn the_perf_map_names_the_trampoline_and_each_block() {
+    assert_eq!(crate::perf::line(0x7f00_1000, 0x40, "a\nb"), "7f001000 40 a b\n");
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let mut random = Random(5);
+    let block = random_block(&mut random, 20);
+    let shape = Shape {
+        ops: &block.ops,
+        generics: &[],
+        frame: &block.frame,
+        accesses: &[],
+        calls: &block.calls,
+        leaves: &block.leaves,
+        inputs: &block.inputs,
+        outputs: &block.outputs,
+        instructions: 1,
+    };
+    // Off: nothing is written.
+    let entry = jit.compile(&shape).expect("a block");
+    jit.name(&entry, "not named").expect("no map, no write");
+    jit.set_perf_map(true).expect("the perf map opens");
+    let entry = jit.compile(&shape).expect("a block");
+    jit.name(&entry, "a64 0x1000 test block").expect("a line of the map");
+    let map = std::fs::read_to_string(crate::perf::path()).expect("the perf map");
+    let line = format!("{:x} {:x} a64 0x1000 test block", entry.address, entry.bytes);
+    assert!(map.lines().any(|l| l == line), "{map}");
+    assert!(map.lines().any(|l| l.ends_with(" vmlab-hv-jit enter")), "{map}");
+    assert!(!map.contains("not named"));
+    let _ = std::fs::remove_file(crate::perf::path());
+}
+
+#[test]
+fn written_words_are_the_results_and_the_inputs_and_the_rest_are_constants() {
+    let mut random = Random(9);
+    for _ in 0..50 {
+        let block = random_block(&mut random, 30);
+        let shape = Shape {
+            ops: &block.ops,
+            generics: &[],
+            frame: &block.frame,
+            accesses: &[],
+            calls: &block.calls,
+            leaves: &block.leaves,
+            inputs: &block.inputs,
+            outputs: &block.outputs,
+            instructions: 1,
+        };
+        let written = crate::emit::written(&shape).expect("a block");
+        assert_eq!(written.len(), block.frame.len());
+        for op in &block.ops {
+            if (op.code as u8) < vmlab_hv_tcg_ir::block::FIRST_EFFECT && op.code != Code::Generic {
+                assert!(written[usize::from(op.dst)], "{op:?}");
+            }
+        }
+        for (place, _) in &block.inputs {
+            assert!(written[usize::from(place.slot)]);
+        }
+    }
+}
+
+#[test]
+fn a_seeded_defect_makes_an_add_subtract() {
+    // add, of the inputs, to the output: 5 + 3 is 2 with the defect.
+    let frame = vec![0u64; 3];
+    let ops = [Op {
+        code: Code::Add,
+        aux: 64,
+        dst: 2,
+        a: 0,
+        b: 1,
+        imm: u64::MAX,
+    }];
+    let inputs = [(Place { slot: 0, wide: false }, 0), (Place { slot: 1, wide: false }, 1)];
+    let outputs = [(2, Place { slot: 2, wide: false })];
+    let shape = Shape {
+        ops: &ops,
+        generics: &[],
+        frame: &frame,
+        accesses: &[],
+        calls: &[],
+        leaves: &[],
+        inputs: &inputs,
+        outputs: &outputs,
+        instructions: 1,
+    };
+    for (defect, expected) in [(crate::Defect::None, 8), (crate::Defect::AddSubtracts, 2)] {
+        let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+        jit.seed_defect(defect);
+        let entry = jit.compile(&shape).expect("a block");
+        let mut slots = [5u128, 3, 0];
+        let mut run_frame = frame.clone();
+        let mut env = Env {
+            ops: ops.to_vec(),
+            frame: run_frame.as_mut_ptr(),
+            words: run_frame.len(),
+            calls: Vec::new(),
+            thunk_calls: 0,
+            left_at: None,
+        };
+        let mut context = Context {
+            budget: 10,
+            thunk,
+            env: (&raw mut env).cast(),
+        };
+        // SAFETY: the entry was just compiled from this block, and the
+        // slots and the frame are as large as it names.
+        let code =
+            unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), run_frame.as_mut_ptr()) };
+        assert_eq!((code, slots[2]), (DONE, expected), "{defect:?}");
+    }
+}

@@ -7,6 +7,7 @@
 
 use vmlab_hv_tcg::{FlatMemory, Memory, SharedMemory};
 use vmlab_hv_tcg_aarch64::exception::{Cause, Exception};
+use vmlab_hv_tcg_aarch64::oracle::jitdiff::Runner;
 use vmlab_hv_tcg_aarch64::state::slot;
 use vmlab_hv_tcg_aarch64::sysreg::reg;
 use vmlab_hv_tcg_aarch64::{Cpu, Record, State, Stop, decode, with_field};
@@ -649,69 +650,112 @@ fn a_failed_access_stops_before_its_instruction_with_every_register_as_it_was() 
 
 #[test]
 fn a_store_into_translated_code_runs_the_new_code() {
+    // K6 of 3e DESIGN.md: on every runner.
+    for runner in Runner::ALL {
+        a_store_into_translated_code_runs_the_new_code_on(runner);
+    }
+}
+
+fn a_store_into_translated_code_runs_the_new_code_on(runner: Runner) {
     // The store replaces the third instruction of its own block.
-    let mut cpu = cpu(&[
+    let program = [
         // str w1, [x0]
         word(Record::STRWui, &[("rt", 1), ("rn", 0)]),
         // add x2, x2, #1
         0x9100_0442,
         // add x3, x3, #1, to be replaced by add x3, x3, #2.
         0x9100_0463,
-    ]);
+    ];
+    let mut cpu = cpu(&program);
+    runner.apply(&mut cpu);
     cpu.state.set_x(0, BASE + 8);
     cpu.state.set_x(1, 0x9100_0863);
-    assert!(run_to_end(&mut cpu, 100));
-    assert_eq!(cpu.instructions, 3);
-    assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 2));
+    assert!(run_to_end(&mut cpu, 100), "{runner:?}");
+    assert_eq!(cpu.instructions, 3, "{runner:?}");
+    assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 2), "{runner:?}");
     // The same through single steps.
-    let mut cpu = self::cpu(&[
-        word(Record::STRWui, &[("rt", 1), ("rn", 0)]),
-        0x9100_0442,
-        0x9100_0463,
-    ]);
+    let mut cpu = self::cpu(&program);
+    runner.apply(&mut cpu);
     cpu.state.set_x(0, BASE + 8);
     cpu.state.set_x(1, 0x9100_0863);
     for _ in 0..3 {
         cpu.step().unwrap();
     }
-    assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 2));
+    assert_eq!((cpu.state.x(2), cpu.state.x(3)), (1, 2), "{runner:?}");
 }
 
 #[test]
 fn a_store_into_data_keeps_the_translated_blocks() {
+    for runner in Runner::ALL {
+        a_store_into_data_keeps_the_translated_blocks_on(runner);
+    }
+}
+
+fn a_store_into_data_keeps_the_translated_blocks_on(runner: Runner) {
     // str x1, [x0], #8 ; subs x1, x1, #1 ; b.ne -8
     let mut cpu = cpu(&[
         word(Record::STRXpost, &[("rt", 1), ("rn", 0), ("offset", 8)]),
         0xf100_0421,
         0x54ff_ffc1,
     ]);
+    runner.apply(&mut cpu);
     cpu.state.set_x(0, DATA);
     cpu.state.set_x(1, 100);
-    assert!(run_to_end(&mut cpu, u64::MAX));
-    assert_eq!(cpu.instructions, 300);
+    assert!(run_to_end(&mut cpu, u64::MAX), "{runner:?}");
+    assert_eq!(cpu.instructions, 300, "{runner:?}");
     // The loop, and the call that ends the program.
-    assert_eq!(cpu.translations, 2);
+    assert_eq!(cpu.translations, 2, "{runner:?}");
     assert_eq!(read(&mut cpu, DATA + 99 * 8, 8), 1u64.to_le_bytes());
     // A second run finds the blocks again: our own stores are accounted for.
     cpu.state.set_pc(BASE);
     cpu.state.set_x(0, DATA);
     cpu.state.set_x(1, 10);
-    assert!(run_to_end(&mut cpu, u64::MAX));
-    assert_eq!(cpu.translations, 2);
+    assert!(run_to_end(&mut cpu, u64::MAX), "{runner:?}");
+    assert_eq!(cpu.translations, 2, "{runner:?}");
     // A write from outside into a data page keeps them too: the code stamp
     // of their page still holds.
     cpu.memory.write(DATA, &[1]).unwrap();
     cpu.state.set_pc(BASE);
     cpu.state.set_x(1, 1);
-    assert!(run_to_end(&mut cpu, u64::MAX));
-    assert_eq!(cpu.translations, 2);
+    assert!(run_to_end(&mut cpu, u64::MAX), "{runner:?}");
+    assert_eq!(cpu.translations, 2, "{runner:?}");
     // A write from outside into their page drops both, also when it changes
     // none of their bytes.
     cpu.memory.write(BASE + 0x800, &END.to_le_bytes()).unwrap();
     cpu.state.set_pc(BASE);
     cpu.state.set_x(1, 1);
-    assert!(run_to_end(&mut cpu, u64::MAX));
-    assert_eq!(cpu.translations, 4);
+    assert!(run_to_end(&mut cpu, u64::MAX), "{runner:?}");
+    assert_eq!(cpu.translations, 4, "{runner:?}");
+}
+
+#[test]
+fn a_store_of_another_cpu_into_code_that_ran_runs_the_new_code() {
+    // K6 of 3e DESIGN.md: the first CPU calls a function and translates it,
+    // the second CPU stores a new instruction into it, and the first calls
+    // it again. blr x2 ; end. The function: add x1, x1, #1 ; ret, of which
+    // the second CPU makes add x1, x1, #2. Its program: str w3, [x4] ; end.
+    const FUNCTION: u64 = BASE + 0x100;
+    const STORER: u64 = BASE + 0x200;
+    let mut program = vec![END; 0x84];
+    program[0] = 0xd63f_0040;
+    program[0x40] = 0x9100_0421;
+    program[0x41] = 0xd65f_03c0;
+    program[0x80] = word(Record::STRWui, &[("rt", 3), ("rn", 4)]);
+    for runner in Runner::ALL {
+        let (mut first, mut second) = shared(&program);
+        runner.apply(&mut first);
+        runner.apply(&mut second);
+        first.state.set_x(2, FUNCTION);
+        assert!(run_to_end(&mut first, 100), "{runner:?}");
+        assert_eq!(first.state.x(1), 1, "{runner:?}");
+        second.state.set_pc(STORER);
+        second.state.set_x(3, 0x9100_0821);
+        second.state.set_x(4, FUNCTION);
+        assert!(run_to_end(&mut second, 100), "{runner:?}");
+        first.state.set_pc(BASE);
+        assert!(run_to_end(&mut first, 100), "{runner:?}");
+        assert_eq!(first.state.x(1), 3, "{runner:?}");
+    }
 }
 
 fn ldxr(rt: u32, rn: u32) -> u32 {
