@@ -141,6 +141,18 @@ def one_repeat(args, arch, smp, pin, version, index):
 
         if args.suite == "boot":
             result["samples"] = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
+            # Boot MIPS: the instructions to agent ready of an emulated
+            # guest over the time (phase 3d speed cards).
+            if args.backend == "vmlab-hv" and arch == "aarch64":
+                counters = backend.boot_counters(smp)
+                if counters is None:
+                    log("warning: no instruction counts in the vmlab-hv log")
+                else:
+                    result["boot_counters"] = counters
+                    result["samples"]["boot_mips"] = round(
+                        counters["instructions"] / result["boot_to_agent_ready"] / 1e6, 2)
+                    log(f"boot counters: {counters}, "
+                        f"{result['samples']['boot_mips']} MIPS")
             return result, backend, session, agent, None
 
         def timed(name, argv, timeout):
@@ -252,6 +264,9 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         env["backend_version"] = backend.backend_version()
         for w in workloads:
             all_samples[w].append(result["samples"][w])
+        if "boot_mips" in result["samples"]:
+            all_samples.setdefault("boot_mips", []).append(result["samples"]["boot_mips"])
+            env.setdefault("boot_counters", []).append(result["boot_counters"])
         if digest is not None:
             digests.add(digest)
         log(f"repeat {i}: {result['samples']}")

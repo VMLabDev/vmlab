@@ -523,6 +523,28 @@ class HvMachineTests(unittest.TestCase):
         self.assertEqual(desc["vcpus"], 2)
 
 
+class BootCountersTests(unittest.TestCase):
+    def test_the_last_paused_line_of_each_vcpu_is_summed_between_pause_and_resume(self):
+        import backends
+
+        log = (
+            "vcpu 0: paused after 5 instructions, 1 translated blocks in 0 ms\n"
+            "vcpu 0: paused after 100 instructions, 7 translated blocks in 3 ms\n"
+            "vcpu 1: paused after 50 instructions, 2 translated blocks in 1 ms\n"
+        )
+        backend = backends.HvBackend.__new__(backends.HvBackend)
+        backend.control = mock.Mock()
+        backend.session = mock.Mock()
+        backend.session.stderr_text.return_value = log
+        counters = backend.boot_counters(2)
+        self.assertEqual(
+            counters, {"instructions": 150, "translations": 9, "translation_ms": 4})
+        self.assertEqual(
+            [c.args[0] for c in backend.control.request.call_args_list], ["pause", "resume"])
+        self.assertEqual(lib.UNIT["boot_mips"], "MIPS")
+        self.assertEqual(lib.DIRECTION["boot_mips"], "higher")
+
+
 class NoiseControlTests(unittest.TestCase):
     def test_g2g_samples_are_named_for_the_sender_and_receiver(self):
         import run

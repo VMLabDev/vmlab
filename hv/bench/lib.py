@@ -172,6 +172,7 @@ G2G_SUITES = {
 
 UNIT = {
     "boot_to_agent_ready": "s",
+    "boot_mips": "MIPS",
     "sha256_256M": "s",
     "xz_9_32M": "s",
     "blk_seq_read_mbps": "MiB/s",
