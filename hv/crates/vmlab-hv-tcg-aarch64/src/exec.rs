@@ -2043,7 +2043,7 @@ impl Compiled {
     /// What `run` gives for how `run_ops` ended.
     #[inline(always)]
     fn end_run(
-        &self,
+        &mut self,
         state: &mut State,
         ended: Result<(), Option<(u32, Failed)>>,
     ) -> (u32, Option<Halt>) {
