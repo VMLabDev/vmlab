@@ -345,7 +345,7 @@ pub fn literal(b: &mut Builder, record: Record, label: u32, rt: u32) -> Lifted {
         return Lifted::Unsupported;
     };
     let offset = sign_extend(u64::from(label & 0x7_ffff), 19) << 2;
-    let address = b.imm(64, b.pc().wrapping_add(offset as u64));
+    let address = b.pc_plus(offset as u64);
     transfer(b, access, rt, address);
     Lifted::Next
 }

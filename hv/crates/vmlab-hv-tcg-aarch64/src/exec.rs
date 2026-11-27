@@ -53,11 +53,13 @@ use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
+use crate::shootdown::Invalidation;
 use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
+use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
@@ -65,8 +67,16 @@ use vmlab_hv_tcg_ir::native::{
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
 
+/// A machine CPU whose timer is armed reads the clock after this many
+/// blocks, to leave its loop when the timer is due (`Cpu::run`).
+const CLOCK_BLOCKS: u32 = 64;
+
 /// The block cache is direct-mapped by the PC.
-const CACHE_ENTRIES: usize = 1 << 12;
+const CACHE_ENTRIES: usize = 1 << 16;
+/// The heap bytes of the young generation of the store of a cache: the
+/// blocks that a block of another PC took the entry of (`Cache`). The old
+/// generation holds as much again at most.
+const SPARE_BYTES: usize = 256 << 20;
 
 /// The pages that hold translated code are a bit set over the low bits of
 /// the page number. Two pages with the same low bits share a bit, which
@@ -291,7 +301,7 @@ struct Side {
     /// physical page that holds translated code.
     code_pages: Vec<u64>,
     /// The physical pages that hold translated code.
-    code_set: std::collections::HashSet<u64>,
+    code_set: FastSet<u64>,
     /// Writes of this CPU to the memory since the caches were last checked.
     own_writes: u64,
     /// One of them went into a page that holds translated code.
@@ -310,7 +320,7 @@ impl Side {
             exclusive_high: 0,
             log: None,
             code_pages: vec![0; CODE_PAGE_BITS / 64],
-            code_set: std::collections::HashSet::new(),
+            code_set: FastSet::default(),
             own_writes: 0,
             code_written: false,
             mmu: Mmu::new(state),
@@ -774,8 +784,9 @@ enum Halt {
 
 /// A block as the loop runs it: the pre-decoded form of `block`.
 struct Compiled {
-    pc: u64,
-    /// The physical address of the first instruction.
+    /// The physical address of the first instruction. No block holds its
+    /// virtual address: it computes its addresses from the PC at its entry
+    /// (`Builder::code_address`).
     phys: u64,
     context: Context,
     /// The stamp of the memory for the bytes of the code, and the epoch of
@@ -797,8 +808,8 @@ struct Compiled {
     inputs: Vec<(Place, u32)>,
     /// Register slot, words of the frame: copied out after it.
     outputs: Vec<(u32, Place)>,
-    /// The last instruction, when the loop runs it: its address and what
-    /// it does.
+    /// The last instruction, when the loop runs it: its distance in bytes
+    /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
 }
 
@@ -903,7 +914,7 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
 }
 
 fn compile(
-    pc: u64,
+    phys: u64,
     context: Context,
     instructions: u32,
     mut block: BlockOf<A64Exit>,
@@ -1095,9 +1106,20 @@ fn compile(
     let Some(outputs) = block_outputs else {
         return Err(host("a block without an exit"));
     };
+    // The loop reads the words of an operation without a check.
+    let words = lowering.frame.len();
+    let generics = lowering.generics.len();
+    if !lowering
+        .ops
+        .iter()
+        .all(|op| block::op_in_frame(op, words, generics))
+    {
+        return Err(host(
+            "an operation of a block names a word outside its frame",
+        ));
+    }
     Ok(Compiled {
-        pc,
-        phys: pc,
+        phys,
         context,
         stamp: None,
         epoch: 0,
@@ -1130,7 +1152,8 @@ fn load<M: Memory, const N: usize>(
     memory: &mut M,
     side: &mut Side,
 ) -> Result<(), (u32, Failed)> {
-    let at = frame[usize::from(op.a)];
+    // SAFETY: `compile` checked the words of every operation.
+    let at = unsafe { block::word(frame, usize::from(op.a)) };
     let user = side.user || op.aux & UNPRIVILEGED != 0;
     // The common case: the TLB holds the page with the permission, nothing
     // keeps the accesses, and the memory holds the address. A read that
@@ -1141,7 +1164,8 @@ fn load<M: Memory, const N: usize>(
     {
         let mut bytes = [0u8; 8];
         if memory.read(phys, &mut bytes[..N]).is_ok() {
-            frame[usize::from(op.dst)] = u64::from_le_bytes(bytes);
+            // SAFETY: as above.
+            unsafe { block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(bytes)) };
             return Ok(());
         }
     }
@@ -1163,8 +1187,13 @@ fn store<M: Memory, const N: usize>(
     side: &mut Side,
     single: bool,
 ) -> Result<(), (u32, Failed)> {
-    let at = frame[usize::from(op.a)];
-    let value = frame[usize::from(op.b)];
+    // SAFETY: `compile` checked the words of every operation.
+    let (at, value) = unsafe {
+        (
+            block::word(frame, usize::from(op.a)),
+            block::word(frame, usize::from(op.b)),
+        )
+    };
     let exit = op.imm as u32;
     let user = side.user || op.aux & UNPRIVILEGED != 0;
     // The common case: the TLB holds the page with the permission, the page
@@ -1186,6 +1215,35 @@ fn store<M: Memory, const N: usize>(
 }
 
 impl Compiled {
+    /// The bytes that the block holds, itself and on the heap, for the bound
+    /// of the store of its cache.
+    fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Self>()
+            + self.ops.capacity() * size_of::<Op>()
+            + self.generics.capacity() * size_of::<Generic>()
+            + self.accesses.capacity() * size_of::<Access16>()
+            + self
+                .leaves
+                .iter()
+                .map(|leave| {
+                    size_of::<Leave>() + leave.outputs.capacity() * size_of::<(u32, Place)>()
+                })
+                .sum::<usize>()
+            + self.frame.capacity() * size_of::<u64>()
+            + self
+                .calls
+                .iter()
+                .map(|call| {
+                    size_of::<Call>()
+                        + call.args.capacity() * size_of::<Place>()
+                        + call.results.capacity() * size_of::<(Place, u128)>()
+                })
+                .sum::<usize>()
+            + self.inputs.capacity() * size_of::<(Place, u32)>()
+            + self.outputs.capacity() * size_of::<(u32, Place)>()
+    }
+
     /// Make one effect. The error: the exit to leave through, and why.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -1202,7 +1260,8 @@ impl Compiled {
     ) -> Result<(), (u32, Failed)> {
         match op.code {
             Code::Guard => {
-                if (frame[usize::from(op.a)] != 0) != (op.aux != 0) {
+                // SAFETY: `compile` checked the words of every operation.
+                if (unsafe { block::word(frame, usize::from(op.a)) } != 0) != (op.aux != 0) {
                     return Self::guard(op.imm as u32, frame, leaves, memory, side);
                 }
                 Ok(())
@@ -1365,6 +1424,7 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
+        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1374,7 +1434,10 @@ impl Compiled {
         side.user = self.context.el == 0;
         for op in &self.ops {
             if (op.code as u8) < FIRST_EFFECT {
-                if !block::step(op, &mut self.frame, &self.generics) {
+                // SAFETY: `compile` checked every operation against the
+                // frame and the generic operations of the block, and
+                // neither changes size after it.
+                if !unsafe { block::step_unchecked(op, &mut self.frame, &self.generics) } {
                     return (
                         0,
                         Some(Halt::Stop(host(
@@ -1403,27 +1466,114 @@ impl Compiled {
             state.slots[*register as usize] = place.read(&self.frame);
         }
         // The loop runs the last instruction with the PC at it.
-        if let Some((pc, _)) = self.terminal {
-            state.set_pc(pc);
+        if let Some((distance, _)) = self.terminal {
+            state.set_pc(entry.wrapping_add(distance));
         }
         (self.instructions, None)
     }
 }
 
+/// The translated blocks of a CPU: an entry for each code address, picked
+/// by the low bits of the physical address, and a store of the blocks that
+/// lost their entry to other code. A kernel and its programs run more code than the entries
+/// cover, so without the store the same blocks were translated again and
+/// again (card C13).
+///
+/// The store has two generations. A block that loses its entry goes into
+/// the young one. When the young one holds `SPARE_BYTES` it becomes the old
+/// one, and the old one is dropped. A block that is taken back from either
+/// returns to its entry. So the blocks that were used since the last turn
+/// stay, and those that were not go: emptying the whole store when it was
+/// full threw away the code of the running programs with the rest, and a
+/// boot of Debian translated three times out of four what it had
+/// translated before.
 struct Cache {
     entries: Vec<Option<Box<Compiled>>>,
+    young: FastMap<BlockKey, Box<Compiled>>,
+    old: FastMap<BlockKey, Box<Compiled>>,
+    /// The heap bytes of the blocks in `young`.
+    young_bytes: usize,
 }
+
+/// A block of the store: the physical address of its code and the context
+/// it was lifted for. A block computes every address from the PC at its
+/// entry (`Builder::code_address`), so it serves its code at any virtual
+/// address: a library that two programs map at two places is translated
+/// once.
+type BlockKey = (u64, Context);
 
 impl Cache {
     fn new() -> Self {
         let mut entries = Vec::new();
         entries.resize_with(CACHE_ENTRIES, || None);
-        Self { entries }
+        Self {
+            entries,
+            young: FastMap::default(),
+            old: FastMap::default(),
+            young_bytes: 0,
+        }
     }
 
-    fn index(pc: u64) -> usize {
-        (pc >> 2) as usize & (CACHE_ENTRIES - 1)
+    /// The entry of the code at the physical address `phys`. One block
+    /// serves the code at every virtual address that maps it, so the entry
+    /// is picked by where the code is, not by the PC. The bits above the
+    /// low ones fold in, so that code at the same offsets of distant pages
+    /// meets less.
+    #[inline(always)]
+    fn index(phys: u64) -> usize {
+        ((phys >> 2) ^ (phys >> 22) ^ (phys >> 44)) as usize & (CACHE_ENTRIES - 1)
     }
+
+    /// Put `block` in the entry at `index`, and keep the block that was
+    /// there in the store.
+    fn put(&mut self, index: usize, block: Box<Compiled>) {
+        if let Some(old) = self.entries[index].replace(block) {
+            self.keep(old);
+        }
+    }
+
+    fn keep(&mut self, block: Box<Compiled>) {
+        let bytes = block.heap_bytes();
+        if self.young_bytes + bytes > SPARE_BYTES {
+            self.old = std::mem::take(&mut self.young);
+            self.young_bytes = 0;
+        }
+        self.young_bytes += bytes;
+        let key = (block.phys, block.context);
+        if let Some(replaced) = self.young.insert(key, block) {
+            self.young_bytes = self.young_bytes.saturating_sub(replaced.heap_bytes());
+        }
+    }
+
+    /// Bring the block of the code at `phys` in `context` back from the
+    /// store into the entry at `index`, when the store has it. Whether it
+    /// still holds the code of the memory is for the caller to check.
+    fn revive(&mut self, index: usize, phys: u64, context: Context) -> bool {
+        let key = (phys, context);
+        let block = match self.young.remove(&key) {
+            Some(block) => {
+                self.young_bytes = self.young_bytes.saturating_sub(block.heap_bytes());
+                block
+            }
+            None => match self.old.remove(&key) {
+                Some(block) => block,
+                None => return false,
+            },
+        };
+        self.put(index, block);
+        true
+    }
+}
+
+/// The interrupt lines of a CPU as levels that other threads set: the
+/// interrupt controller of a machine, from the thread of a device or from
+/// an access of this CPU to the controller. A CPU that has them reads them
+/// before every block, so that a line that falls (the guest acknowledged
+/// the interrupt) is not taken again.
+#[derive(Debug, Default)]
+pub struct Lines {
+    pub irq: std::sync::atomic::AtomicBool,
+    pub fiq: std::sync::atomic::AtomicBool,
 }
 
 /// One CPU on a memory.
@@ -1434,6 +1584,13 @@ pub struct Cpu<M> {
     /// drives them from its interrupt controller. They are levels.
     pub irq: bool,
     pub fiq: bool,
+    /// The lines of a machine, which `irq` and `fiq` follow before every
+    /// block. With them, `run` also returns after a block that wrote a
+    /// register of a timer, so that the machine moves the output lines of
+    /// the timers at once.
+    pub lines: Option<std::sync::Arc<Lines>>,
+    /// A register of a timer was written in the block that ran last.
+    timer_written: bool,
     /// Where the system counter comes from.
     pub clock: Clock,
     pub hooks: Hooks,
@@ -1447,9 +1604,15 @@ pub struct Cpu<M> {
     pub instructions: u64,
     /// Blocks translated since the CPU was made.
     pub translations: u64,
+    /// The host time that the translations took, in nanoseconds.
+    pub translation_ns: u64,
     /// What the guest asked for that the CPU does not have, each once. The
     /// owner of the CPU writes it to its log.
     pub unknown: std::collections::BTreeSet<Unknown>,
+    /// The mailboxes of the machine's CPUs and the index of this one: a
+    /// TLB maintenance operation of the Inner Shareable domain reaches the
+    /// others through them. `None`: the CPU is alone.
+    pub shootdown: Option<(std::sync::Arc<crate::shootdown::Shootdown>, usize)>,
     blocks: Cache,
     /// Blocks of one instruction, for `step` and for the end of a budget.
     singles: Cache,
@@ -1477,13 +1640,17 @@ impl<M: Memory> Cpu<M> {
             memory,
             irq: false,
             fiq: false,
+            lines: None,
+            timer_written: false,
             clock: Clock::Manual(0),
             hooks: Hooks::default(),
             taken: None,
             exceptions: 0,
             instructions: 0,
             translations: 0,
+            translation_ns: 0,
             unknown: std::collections::BTreeSet::new(),
+            shootdown: None,
             blocks: Cache::new(),
             singles: Cache::new(),
             generation,
@@ -1634,6 +1801,16 @@ impl<M: Memory> Cpu<M> {
         }
         let environment = self.environment();
         if write {
+            if matches!(
+                sysreg::ROWS[row].kind,
+                sysreg::Kind::Special(
+                    sysreg::Special::TimerControl(_)
+                        | sysreg::Special::TimerCompare(_)
+                        | sysreg::Special::TimerValue(_)
+                )
+            ) {
+                self.timer_written = true;
+            }
             sysreg::write(row, &mut self.state, &environment, value);
             self.state.refresh();
             self.side.mmu.sync(&self.state);
@@ -1755,20 +1932,31 @@ impl<M: Memory> Cpu<M> {
                 self.state.system.regs[reg::PAR_EL1] = par;
                 Some(Ok(()))
             }
-            // TLBI of the EL1&0 regime, on this CPU or on all of them: a
-            // machine with more CPUs hands the second kind on.
-            (0, 8, 3 | 7, op2) if !el0 => {
+            // TLBI of the EL1&0 regime, on this CPU (CRm 7) or on all of
+            // them (CRm 3, the Inner Shareable domain): the second kind goes
+            // to the other CPUs of the machine too.
+            (0, 8, crm @ (3 | 7), op2) if !el0 => {
                 let asid = (value >> 48) as u16;
-                match op2 {
+                let invalidation = match op2 {
                     // VMALLE1.
-                    0 => self.side.mmu.flush(),
+                    0 => Invalidation::All,
                     // VAE1 and VALE1: one address of one ASID.
-                    1 | 5 => self.side.mmu.flush_page(Regime::El10, value, Some(asid)),
+                    1 | 5 => Invalidation::Page {
+                        argument: value,
+                        asid: Some(asid),
+                    },
                     // ASIDE1.
-                    2 => self.side.mmu.flush_asid(Regime::El10, asid),
+                    2 => Invalidation::Asid(asid),
                     // VAAE1 and VAALE1: one address of every ASID.
-                    3 | 7 => self.side.mmu.flush_page(Regime::El10, value, None),
+                    3 | 7 => Invalidation::Page {
+                        argument: value,
+                        asid: None,
+                    },
                     _ => return self.unknown_operation(encoding, read),
+                };
+                self.invalidate(invalidation);
+                if crm == 3 {
+                    self.broadcast(invalidation);
                 }
                 Some(Ok(()))
             }
@@ -1777,6 +1965,56 @@ impl<M: Memory> Cpu<M> {
         match done {
             Some(done) => Ok(done),
             None => self.unknown_operation(encoding, read),
+        }
+    }
+
+    fn invalidate(&mut self, invalidation: Invalidation) {
+        match invalidation {
+            Invalidation::All => self.side.mmu.flush(),
+            Invalidation::Page { argument, asid } => {
+                self.side.mmu.flush_page(Regime::El10, argument, asid)
+            }
+            Invalidation::Asid(asid) => self.side.mmu.flush_asid(Regime::El10, asid),
+        }
+    }
+
+    /// Hand `invalidation` to the other CPUs, and return when every one of
+    /// them that runs has applied it (`shootdown.rs`).
+    fn broadcast(&mut self, invalidation: Invalidation) {
+        let Some((shootdown, id)) = self.shootdown.clone() else {
+            return;
+        };
+        shootdown.post(id, invalidation);
+        let mut spins = 0u32;
+        while shootdown.outstanding(id) {
+            // Mail of a CPU that waits on this one is taken here.
+            self.take_mail();
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(64) {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn read_lines(&mut self) {
+        if let Some(lines) = &self.lines {
+            use std::sync::atomic::Ordering;
+            self.irq = lines.irq.load(Ordering::Acquire);
+            self.fiq = lines.fiq.load(Ordering::Acquire);
+        }
+    }
+
+    /// Apply what the other CPUs invalidated.
+    fn take_mail(&mut self) {
+        let mail = match &self.shootdown {
+            Some((shootdown, id)) => shootdown.take(*id),
+            None => return,
+        };
+        for invalidation in mail.into_iter().flatten() {
+            self.invalidate(invalidation);
         }
     }
 
@@ -1968,8 +2206,7 @@ impl<M: Memory> Cpu<M> {
         self.translations += 1;
         self.side.mark_code(phys);
         let mut compiled =
-            compile(pc, context, count, builder.finish(at)).map_err(Refused::Stop)?;
-        compiled.phys = phys;
+            compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
         compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
         compiled.epoch = self.epoch;
         Ok(compiled)
@@ -2002,10 +2239,10 @@ impl<M: Memory> Cpu<M> {
         self.side.code_written = false;
     }
 
-    /// Whether the block of the cache at `index` is the one for `pc` at
+    /// Whether the block of the cache at `index` is the one for the code at
     /// `phys` in `context`, and holds the code that the memory holds.
     #[inline(always)]
-    fn usable(&mut self, single: bool, index: usize, pc: u64, phys: u64, context: Context) -> bool {
+    fn usable(&mut self, single: bool, index: usize, phys: u64, context: Context) -> bool {
         let cache = if single {
             &mut self.singles
         } else {
@@ -2014,7 +2251,7 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return false;
         };
-        if block.pc != pc || block.phys != phys || block.context != context {
+        if block.phys != phys || block.context != context {
             return false;
         }
         if block.epoch == self.epoch {
@@ -2058,7 +2295,6 @@ impl<M: Memory> Cpu<M> {
         }
         let pc = self.state.pc();
         let context = self.state.context;
-        let index = Cache::index(pc);
         let phys = match self.code_address() {
             Ok(phys) => phys,
             Err(Refused::Stop(stop)) => return Err(stop),
@@ -2067,9 +2303,22 @@ impl<M: Memory> Cpu<M> {
                 return Ok((0, Some(Halt::Taken)));
             }
         };
-        if !self.usable(single, index, pc, phys, context) {
+        let index = Cache::index(phys);
+        let mut ready = self.usable(single, index, phys, context);
+        if !ready {
+            let cache = if single {
+                &mut self.singles
+            } else {
+                &mut self.blocks
+            };
+            ready = cache.revive(index, phys, context) && self.usable(single, index, phys, context);
+        }
+        if !ready {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
-            let compiled = match self.translate(phys, limit) {
+            let started = std::time::Instant::now();
+            let translated = self.translate(phys, limit);
+            self.translation_ns += started.elapsed().as_nanos() as u64;
+            let compiled = match translated {
                 Ok(compiled) => Box::new(compiled),
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
@@ -2082,7 +2331,7 @@ impl<M: Memory> Cpu<M> {
             } else {
                 &mut self.blocks
             };
-            cache.entries[index] = Some(compiled);
+            cache.put(index, compiled);
         }
         let cache = if single {
             &mut self.singles
@@ -2093,7 +2342,8 @@ impl<M: Memory> Cpu<M> {
             return Err(host("the block cache lost a block"));
         };
         let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
-        let terminal = block.terminal;
+        // The loop runs the last instruction at the PC that the block left.
+        let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
         Ok((count, self.finish(halt, terminal)))
     }
 
@@ -2114,6 +2364,8 @@ impl<M: Memory> Cpu<M> {
     /// that comes before it. `taken` says which.
     pub fn step(&mut self) -> Result<(), Stop> {
         self.taken = None;
+        self.take_mail();
+        self.read_lines();
         self.check_generation();
         let result = self.run_block(true);
         self.settle();
@@ -2130,29 +2382,60 @@ impl<M: Memory> Cpu<M> {
 
     /// Run up to `budget` instructions and say why the loop stopped.
     pub fn run(&mut self, budget: u64) -> Stop {
+        if let Some((shootdown, id)) = &self.shootdown {
+            shootdown.set_running(*id, true);
+        }
         self.check_generation();
         let stop = self.run_inner(budget);
         self.settle();
+        if let Some((shootdown, id)) = &self.shootdown {
+            shootdown.set_running(*id, false);
+        }
+        // Mail posted after this is taken before the next block.
         stop
     }
 
     fn run_inner(&mut self, budget: u64) -> Stop {
         let mut left = budget;
+        // A machine CPU leaves the loop when a timer line is due to rise,
+        // so that its owner raises the interrupt then and not at the end of
+        // the budget: a guest that spins until the interrupt comes waited
+        // a whole budget for each (kvm-unit-tests `timer`, card C13). The
+        // clock is read every `CLOCK_BLOCKS` blocks, not before each.
+        let deadline = if self.lines.is_some() {
+            self.timer_deadline()
+        } else {
+            None
+        };
+        let mut blocks = 0u32;
         while left > 0 {
-            let pc = self.state.pc();
+            if let Some(deadline) = deadline {
+                blocks += 1;
+                if blocks.is_multiple_of(CLOCK_BLOCKS) && self.clock.count() >= deadline {
+                    break;
+                }
+            }
+            // Another CPU invalidated translations: no block starts before
+            // this CPU has dropped them too.
+            self.take_mail();
+            self.read_lines();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
-            let index = Cache::index(pc);
+            let fetched = if quiet {
+                self.code_address().ok()
+            } else {
+                None
+            };
+            let index = fetched.map_or(0, Cache::index);
             // The common case: the TLB holds the page of the code, and the
             // block is translated and fits the budget.
-            let outcome = if quiet
-                && let Ok(phys) = self.code_address()
-                && self.usable(false, index, pc, phys, context)
+            let outcome = if let Some(phys) = fetched
+                && self.usable(false, index, phys, context)
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
                 let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
-                let terminal = block.terminal;
+                let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
                 (count, self.finish(halt, terminal))
             } else {
                 // A whole block where the budget allows one, else one
@@ -2160,7 +2443,7 @@ impl<M: Memory> Cpu<M> {
                 // long as `BLOCK_INSTRUCTIONS`.
                 let cached = self.blocks.entries[index]
                     .as_ref()
-                    .filter(|block| block.pc == pc && block.context == context)
+                    .filter(|block| Some(block.phys) == fetched && block.context == context)
                     .map(|block| u64::from(block.instructions));
                 let single = match cached {
                     Some(length) => length > left,
@@ -2206,6 +2489,12 @@ impl<M: Memory> Cpu<M> {
             if self.side.code_written {
                 self.settle();
             }
+            if self.timer_written {
+                self.timer_written = false;
+                if self.lines.is_some() {
+                    break;
+                }
+            }
         }
         Stop::Budget
     }
@@ -2244,6 +2533,32 @@ mod tests {
         assert_eq!(cpu.instructions, 3000);
         // One block of three instructions, translated once.
         assert_eq!(cpu.translations, 1);
+    }
+
+    #[test]
+    fn a_machine_cpu_leaves_its_loop_when_its_timer_is_due() {
+        // The virtual timer is due 20 us from now on a 1 GHz clock, and the
+        // budget takes some milliseconds. A machine CPU leaves its loop
+        // within `CLOCK_BLOCKS` blocks of the deadline, so that its owner
+        // raises the line. A CPU without lines runs its budget.
+        let budget = 3_000_000;
+        for machine in [true, false] {
+            let mut cpu = cpu(&LOOP);
+            cpu.state.set_x(1, budget);
+            cpu.clock = Clock::host(0, 1_000_000_000);
+            let timer = &mut cpu.state.system.timers[1];
+            timer.compare = cpu.clock.count() + 20_000;
+            timer.set_control(1);
+            if machine {
+                cpu.lines = Some(std::sync::Arc::new(Lines::default()));
+            }
+            assert_eq!(cpu.run(budget), Stop::Budget);
+            if machine {
+                assert!(cpu.instructions < budget / 10, "{}", cpu.instructions);
+            } else {
+                assert_eq!(cpu.instructions, budget);
+            }
+        }
     }
 
     #[test]

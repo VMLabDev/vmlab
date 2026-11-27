@@ -100,7 +100,8 @@ pub enum A64Next {
         class: ExceptionClass,
         syndrome: Vec<ScalarId>,
     },
-    /// The instruction at `pc` is the last of the block, and the loop runs
+    /// The instruction at `pc` bytes from the entry of the block is the last
+    /// of the block, and the loop runs
     /// it.
     Trap { pc: u64, trap: Trap },
 }
@@ -176,6 +177,8 @@ pub struct Builder {
     context: Context,
     /// The address of the instruction that is being lifted.
     pc: u64,
+    /// The address of the first instruction of the block.
+    entry: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
     /// What the last instruction does outside the graph.
@@ -220,6 +223,7 @@ impl Builder {
             written: [false; slot::COUNT],
             context,
             pc,
+            entry: pc,
             branch: None,
             trap: None,
             completed: 0,
@@ -277,6 +281,35 @@ impl Builder {
     /// The address of the instruction that is being lifted.
     pub fn pc(&self) -> u64 {
         self.pc
+    }
+
+    /// The address `va` of the code of the block, as the block computes
+    /// it: the PC at its entry plus the distance. No block holds its own
+    /// virtual address, so that one translation serves the same code at
+    /// another address, the code of a library that two programs map at two
+    /// places (card C13).
+    pub fn code_address(&mut self, va: u64) -> ScalarId {
+        let entry = REGISTER_FILE.read(&mut self.block.graph, slot::PC);
+        let distance = va.wrapping_sub(self.entry);
+        if distance == 0 {
+            return entry;
+        }
+        let distance = self.imm(64, distance);
+        self.binary(64, Binary::Add, entry, distance)
+    }
+
+    /// The address `delta` bytes from the instruction that is being lifted,
+    /// as `code_address` computes it.
+    pub fn pc_plus(&mut self, delta: u64) -> ScalarId {
+        self.code_address(self.pc.wrapping_add(delta))
+    }
+
+    /// The address of the 4 KB page of the instruction that is being
+    /// lifted. A block stays inside one page, so it is that of its entry.
+    pub fn pc_page(&mut self) -> ScalarId {
+        let entry = REGISTER_FILE.read(&mut self.block.graph, slot::PC);
+        let mask = self.imm(64, !0xfff);
+        self.binary(64, Binary::And, entry, mask)
     }
 
     /// The level, the stack pointer choice and the FP enable that the block
@@ -1043,7 +1076,7 @@ impl Builder {
     /// PC.
     fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
         let mut writes = self.writes(self.before, self.before_written);
-        let pc = self.imm(64, self.pc);
+        let pc = self.pc_plus(0);
         writes.push((slot::PC, pc));
         self.block.exit(A64Exit {
             writeback: Writeback { writes },
@@ -1233,9 +1266,12 @@ impl Builder {
     /// End the block. `fallthrough` is the next PC when no instruction set one.
     pub fn finish(mut self, fallthrough: u64) -> BlockOf<A64Exit> {
         let next = match (self.trap, self.branch) {
-            (Some(trap), _) => A64Next::Trap { pc: self.pc, trap },
+            (Some(trap), _) => A64Next::Trap {
+                pc: self.pc.wrapping_sub(self.entry),
+                trap,
+            },
             (None, Some(target)) => A64Next::Pc(target),
-            (None, None) => A64Next::Pc(self.imm(64, fallthrough)),
+            (None, None) => A64Next::Pc(self.code_address(fallthrough)),
         };
         let writes = self.writes(self.current, self.written);
         let completed = self.completed + u32::from(self.started);

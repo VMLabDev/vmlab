@@ -99,6 +99,20 @@ pub fn init_logging() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the stderr filter writes a record of `level` from `target`. The
+/// recorder keeps every record, so `log::log_enabled!` is always true under
+/// it: a choice that costs time only while someone reads the log asks here.
+/// Without the recorder (a test), it is what the `log` facade says.
+pub(crate) fn stderr_enabled(level: log::Level, target: &str) -> bool {
+    match LOGGER.get() {
+        Some(logger) => logger
+            .filter
+            .read()
+            .enabled(&Metadata::builder().level(level).target(target).build()),
+        None => log::log_enabled!(target: target, level),
+    }
+}
+
 pub(crate) fn set_log_filter(filter: &str) -> Result<(), String> {
     let parsed = parse_filter(filter)?;
     let logger = LOGGER.get().ok_or("logging is not initialized")?;

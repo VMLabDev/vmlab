@@ -3,13 +3,14 @@ mod assume;
 mod bitfield;
 pub mod block;
 pub mod dce;
+pub mod fasthash;
 pub mod linear;
 pub mod liveness;
 mod modular;
 pub mod packed;
 pub mod regfile;
 pub mod schedule;
-use std::collections::HashMap;
+use fasthash::FastMap as HashMap;
 
 pub type ScalarId = usize;
 pub type InputId = usize;

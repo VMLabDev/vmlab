@@ -511,6 +511,16 @@ class HvMachineTests(unittest.TestCase):
         self.assertEqual(self.desc["ports"][0]["name"], "vmlab.agent.0")
         self.assertEqual(self.desc["disks"][0]["format"], "qcow2")
         self.assertFalse(self.desc["disks"][0]["read_only"])
+        self.assertNotIn("machine", self.desc)
+
+    def test_aarch64_runs_on_virt_with_aavmf(self):
+        desc = hv_machine_description(
+            "/run", "aarch64", 2, "/run/ov.qcow2", "/fw/AAVMF_CODE.fd", "/run/vars.fd"
+        )
+        self.assertTrue(set(desc) <= MACHINE_FIELDS, set(desc) - MACHINE_FIELDS)
+        self.assertEqual(desc["machine"], "virt")
+        self.assertEqual(desc["boot"]["firmware"], "aavmf")
+        self.assertEqual(desc["vcpus"], 2)
 
 
 class BootMipsTests(unittest.TestCase):
