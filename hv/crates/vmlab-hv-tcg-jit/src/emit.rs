@@ -60,10 +60,12 @@ pub struct Chain {
     pub key: u64,
     /// The offset of its first instruction in its 4 KiB page.
     pub page_offset: u32,
-    /// Whether its exits look for the code of the next block: linked jumps
-    /// to a target in the same page, and the jump cache for the rest.
-    /// Without, it leaves with `DONE`.
-    pub link: bool,
+    /// Whether its exits look for the code of the next block: `sites`,
+    /// linked jumps to a target in the same page, and `jumps`, the jump
+    /// cache for the rest. Without either, the block leaves with `DONE`, and
+    /// without one, its exits leave with `DONE` where it would serve them.
+    pub sites: bool,
+    pub jumps: bool,
 }
 
 /// What the block makes of the PC of the state at its end.
@@ -863,7 +865,11 @@ impl Emitter<'_> {
         self.asm.store(slot, RAX);
         self.asm.store_imm(Rm::Mem(R15, pc + 8), 0);
         let chain = match self.shape.chain {
-            Some(chain) if chain.link && !matches!(next.kind, NextPc::Fixed(_)) => chain,
+            Some(chain)
+                if (chain.sites || chain.jumps) && !matches!(next.kind, NextPc::Fixed(_)) =>
+            {
+                chain
+            }
             _ => {
                 self.asm.xor32(RAX, RAX);
                 self.asm.jmp_absolute(self.exit);
@@ -873,7 +879,9 @@ impl Emitter<'_> {
         // H5: a constant distance to a target in the page of the block is a
         // jump that its owner links. RCX holds the distance.
         let mut sites = Vec::new();
-        if let NextPc::Relative(place) = next.kind {
+        if let NextPc::Relative(place) = next.kind
+            && chain.sites
+        {
             for distance in self.candidates(place.slot) {
                 let target = i64::from(chain.page_offset) + distance as i64;
                 if !(0..4096).contains(&target) || sites.len() == SITES {
@@ -898,6 +906,11 @@ impl Emitter<'_> {
                 self.asm.cold(false);
                 sites.push((jump, stub));
             }
+        }
+        if !chain.jumps {
+            self.asm.xor32(RAX, RAX);
+            self.asm.jmp_absolute(self.exit);
+            return sites;
         }
         // H6: the jump cache, by the PC in RAX.
         let miss = self.asm.label();

@@ -2035,9 +2035,9 @@ fn place_words(place: Place) -> impl Iterator<Item = Slot> {
 
 impl Compiled {
     /// Compile the block, or mark it as one that the emitter refuses. With
-    /// `link`, its exits look for the code of the next block (3e DESIGN.md
-    /// H5, H6).
-    fn compile_code(&mut self, jit: &mut jit::Jit, link: bool) {
+    /// `sites` and `jumps`, its exits look for the code of the next block
+    /// (3e DESIGN.md H5, H6).
+    fn compile_code(&mut self, jit: &mut jit::Jit, sites: bool, jumps: bool) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
         // those operations compute first is in the list too, which costs a
@@ -2129,7 +2129,8 @@ impl Compiled {
             tag: tag as u64,
             key: context_key(self.context),
             page_offset: (self.phys & 0xfff) as u32,
-            link,
+            sites,
+            jumps,
         };
         let shape = jit::Shape {
             ops: &self.ops,
@@ -2187,7 +2188,9 @@ enum Pending {
 /// The chaining of a CPU: whether it is on, the link that the next block
 /// makes, and what it must agree with to make it.
 struct Chaining {
-    on: bool,
+    /// Linked jumps (H5) and the jump cache (H6).
+    sites: bool,
+    jumps: bool,
     pending: Option<Pending>,
     /// The epoch and the count of changes of the MMU at the exit that left
     /// `pending`. A link is made in the same of both.
@@ -2453,7 +2456,11 @@ unsafe fn execute<M: Memory>(
         // SAFETY: the caller's promise.
         let compiled = unsafe { &mut *block };
         if !compiled.refused && !compiled.code.is_some_and(|entry| jit.current(&entry)) {
-            compiled.compile_code(jit, chaining.on && !single);
+            compiled.compile_code(
+                jit,
+                chaining.sites && !single,
+                chaining.jumps && !single,
+            );
         }
         if let Some(pending) = pending
             && !single
@@ -2488,13 +2495,17 @@ unsafe fn execute<M: Memory>(
     }
 }
 
-/// Whether `VMLAB_HV_JIT_CHAIN` leaves chaining on: anything but `0`,
-/// `off` and `false` (3e DESIGN.md J4, R3: the switch for a bisect).
-pub fn chaining_from_environment() -> bool {
-    !matches!(
-        std::env::var("VMLAB_HV_JIT_CHAIN").as_deref(),
-        Ok("0" | "off" | "false")
-    )
+/// What `VMLAB_HV_JIT_CHAIN` leaves on of chaining (3e DESIGN.md J4, R3:
+/// the switch for a bisect): linked jumps and the jump cache. `0`, `off`
+/// and `false` turn both off, `sites` leaves only the linked jumps, `jumps`
+/// only the jump cache, and anything else, or nothing, both.
+pub fn chaining_from_environment() -> (bool, bool) {
+    match std::env::var("VMLAB_HV_JIT_CHAIN").as_deref() {
+        Ok("0" | "off" | "false") => (false, false),
+        Ok("sites") => (true, false),
+        Ok("jumps") => (false, true),
+        _ => (true, true),
+    }
 }
 
 /// Whether `VMLAB_HV_JIT` turns the JIT on: `1`, `on` or `true`. It is off
@@ -2715,7 +2726,8 @@ impl<M: Memory> Cpu<M> {
             jit_counts: JitCounts::default(),
             jit_error: None,
             chaining: Chaining {
-                on: chaining_from_environment(),
+                sites: chaining_from_environment().0,
+                jumps: chaining_from_environment().1,
                 pending: None,
                 epoch: 0,
                 mmu: 0,
@@ -2749,10 +2761,11 @@ impl<M: Memory> Cpu<M> {
     /// switch for a bisect). The code compiled so far is dropped, so that
     /// every block is compiled again with its exits as the switch says.
     pub fn set_chaining(&mut self, on: bool) -> std::io::Result<()> {
-        if on == self.chaining.on {
+        if (on, on) == (self.chaining.sites, self.chaining.jumps) {
             return Ok(());
         }
-        self.chaining.on = on;
+        self.chaining.sites = on;
+        self.chaining.jumps = on;
         self.chaining.pending = None;
         if self.jit.is_some() {
             self.jit = Some(jit::Jit::new()?);
@@ -2761,7 +2774,7 @@ impl<M: Memory> Cpu<M> {
     }
 
     pub fn chaining_enabled(&self) -> bool {
-        self.chaining.on
+        self.chaining.sites || self.chaining.jumps
     }
 
     /// The jumps of compiled code that are linked now, for the tests.

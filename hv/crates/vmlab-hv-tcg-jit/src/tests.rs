@@ -606,7 +606,8 @@ impl Looping {
                 tag: 0x7a6,
                 key,
                 page_offset: 0x100,
-                link: true,
+                sites: true,
+                jumps: true,
             }),
             next: Some(Next { pc: 1, kind }),
         };
