@@ -5505,7 +5505,9 @@ mod tests {
                         continue;
                     }
                     let lanes = (if q { 128 } else { 64 }) / (8u32 << size);
-                    let word = base | u32::from(q) << 30 | size << 22 | 2 << 16 | 1 << 5;
+                    // The forms of two registers have no Rm.
+                    let rm = if reads_m { 2 << 16 } else { 0 };
+                    let word = base | u32::from(q) << 30 | size << 22 | rm | 1 << 5;
                     let code = Lanes::new(op, size as u8, lanes as u8).imm(container);
                     cases.push((word, code, reads_m, zero));
                 }
