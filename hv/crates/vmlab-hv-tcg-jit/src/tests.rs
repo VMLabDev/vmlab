@@ -547,7 +547,10 @@ fn a_full_region_starts_a_new_generation() {
 
 #[test]
 fn the_perf_map_names_the_trampoline_and_each_block() {
-    assert_eq!(crate::perf::line(0x7f00_1000, 0x40, "a\nb"), "7f001000 40 a b\n");
+    assert_eq!(
+        crate::perf::line(0x7f00_1000, 0x40, "a\nb"),
+        "7f001000 40 a b\n"
+    );
     let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
     let mut random = Random(5);
     let block = random_block(&mut random, 20);
@@ -567,11 +570,18 @@ fn the_perf_map_names_the_trampoline_and_each_block() {
     jit.name(&entry, "not named").expect("no map, no write");
     jit.set_perf_map(true).expect("the perf map opens");
     let entry = jit.compile(&shape).expect("a block");
-    jit.name(&entry, "a64 0x1000 test block").expect("a line of the map");
+    jit.name(&entry, "a64 0x1000 test block")
+        .expect("a line of the map");
     let map = std::fs::read_to_string(crate::perf::path()).expect("the perf map");
-    let line = format!("{:x} {:x} a64 0x1000 test block", entry.address, entry.bytes);
+    let line = format!(
+        "{:x} {:x} a64 0x1000 test block",
+        entry.address, entry.bytes
+    );
     assert!(map.lines().any(|l| l == line), "{map}");
-    assert!(map.lines().any(|l| l.ends_with(" vmlab-hv-jit enter")), "{map}");
+    assert!(
+        map.lines().any(|l| l.ends_with(" vmlab-hv-jit enter")),
+        "{map}"
+    );
     assert!(!map.contains("not named"));
     let _ = std::fs::remove_file(crate::perf::path());
 }
@@ -617,8 +627,29 @@ fn a_seeded_defect_makes_an_add_subtract() {
         b: 1,
         imm: u64::MAX,
     }];
-    let inputs = [(Place { slot: 0, wide: false }, 0), (Place { slot: 1, wide: false }, 1)];
-    let outputs = [(2, Place { slot: 2, wide: false })];
+    let inputs = [
+        (
+            Place {
+                slot: 0,
+                wide: false,
+            },
+            0,
+        ),
+        (
+            Place {
+                slot: 1,
+                wide: false,
+            },
+            1,
+        ),
+    ];
+    let outputs = [(
+        2,
+        Place {
+            slot: 2,
+            wide: false,
+        },
+    )];
     let shape = Shape {
         ops: &ops,
         generics: &[],
@@ -651,8 +682,14 @@ fn a_seeded_defect_makes_an_add_subtract() {
         };
         // SAFETY: the entry was just compiled from this block, and the
         // slots and the frame are as large as it names.
-        let code =
-            unsafe { jit.enter(&entry, &mut context, slots.as_mut_ptr(), run_frame.as_mut_ptr()) };
+        let code = unsafe {
+            jit.enter(
+                &entry,
+                &mut context,
+                slots.as_mut_ptr(),
+                run_frame.as_mut_ptr(),
+            )
+        };
         assert_eq!((code, slots[2]), (DONE, expected), "{defect:?}");
     }
 }

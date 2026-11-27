@@ -41,8 +41,8 @@ fn the_differential_catches_a_seeded_defect() {
         defect: JitDefect::AddSubtracts,
         ..Options::default()
     };
-    let difference = jitdiff::run_with(SEED, 1_000, options)
-        .expect_err("K2 does not see an ADD that subtracts");
+    let difference =
+        jitdiff::run_with(SEED, 1_000, options).expect_err("K2 does not see an ADD that subtracts");
     eprintln!("K2 with the defect: {difference}");
 }
 
@@ -52,8 +52,8 @@ fn the_replay_check_catches_a_seeded_defect() {
         check: true,
         defect: JitDefect::AddSubtracts,
     };
-    let difference = jitdiff::run_with(SEED, 1_000, options)
-        .expect_err("K3 does not see an ADD that subtracts");
+    let difference =
+        jitdiff::run_with(SEED, 1_000, options).expect_err("K3 does not see an ADD that subtracts");
     // The compiled side stopped with the report of K3; what it kept is what
     // the interpreter did.
     assert!(

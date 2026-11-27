@@ -1570,7 +1570,9 @@ impl Compiled {
             Err(Some((exit, failed))) => self.leave(state, exit, failed),
             Err(None) => (
                 0,
-                Some(Halt::Stop(host("an arithmetic operation outside its domain"))),
+                Some(Halt::Stop(host(
+                    "an arithmetic operation outside its domain",
+                ))),
             ),
         }
     }
@@ -1792,9 +1794,7 @@ impl Replay {
                 ));
                 Err(None)
             }
-            None => self
-                .end(exit, &format!("{made:x?}"))
-                .map(|_| ()),
+            None => self.end(exit, &format!("{made:x?}")).map(|_| ()),
         }
     }
 
@@ -1817,9 +1817,12 @@ impl Replay {
             Code::Load1 | Code::Load2 | Code::Load4 | Code::Load8 => self
                 .load(exit, frame[usize::from(op.a)], bytes(op.code))
                 .map(|value| frame[usize::from(op.dst)] = value as u64),
-            Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 => {
-                self.store(exit, frame[usize::from(op.a)], bytes(op.code), frame[usize::from(op.b)].into())
-            }
+            Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 => self.store(
+                exit,
+                frame[usize::from(op.a)],
+                bytes(op.code),
+                frame[usize::from(op.b)].into(),
+            ),
             Code::Access => match accesses[op.imm as usize] {
                 Access16::Read {
                     address,
@@ -1852,7 +1855,10 @@ impl Replay {
                                 stored.map(|()| frame[usize::from(result)] = u64::from(!succeeded))
                             }
                             None => self
-                                .end(exit, &format!("an exclusive store of {bytes} bytes at {at:#x}"))
+                                .end(
+                                    exit,
+                                    &format!("an exclusive store of {bytes} bytes at {at:#x}"),
+                                )
                                 .map(|_| ()),
                         },
                     }
@@ -2135,7 +2141,9 @@ impl Compiled {
         }
         let (ours, theirs) = (halt_text(&got), halt_text(&expected));
         if ours != theirs {
-            differences.push(format!("the compiled block ran {ours}, the interpreter {theirs}"));
+            differences.push(format!(
+                "the compiled block ran {ours}, the interpreter {theirs}"
+            ));
         }
         if shadow != *state {
             differences.push("the states differ".to_string());
@@ -2143,7 +2151,14 @@ impl Compiled {
         if differences.is_empty() {
             return expected;
         }
-        let report = self.report(&before, state, &shadow, &replay, &differences, &interpreted_frame);
+        let report = self.report(
+            &before,
+            state,
+            &shadow,
+            &replay,
+            &differences,
+            &interpreted_frame,
+        );
         (expected.0, Some(Halt::Stop(Stop::Host(report))))
     }
 

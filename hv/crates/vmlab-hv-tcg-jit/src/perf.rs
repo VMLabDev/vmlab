@@ -34,7 +34,9 @@ pub fn line(address: u64, bytes: u64, name: &str) -> String {
 
 /// Name `bytes` bytes of code at `address`.
 pub fn name(address: u64, bytes: u64, name: &str) -> io::Result<()> {
-    let mut map = MAP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = MAP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if map.is_none() {
         *map = Some(
             std::fs::OpenOptions::new()

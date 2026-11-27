@@ -132,11 +132,7 @@ pub struct Options {
     pub defect: JitDefect,
 }
 
-fn cpu(
-    memory: FlatMemory,
-    state: State,
-    jit: Option<Options>,
-) -> Result<Cpu<FlatMemory>, String> {
+fn cpu(memory: FlatMemory, state: State, jit: Option<Options>) -> Result<Cpu<FlatMemory>, String> {
     let mut cpu = Cpu::new(memory, state);
     let started = match jit {
         Some(options) if options.check => cpu.set_jit_check(true),
