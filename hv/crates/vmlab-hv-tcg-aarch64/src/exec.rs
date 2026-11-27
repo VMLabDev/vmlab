@@ -1429,6 +1429,17 @@ impl Cache {
     }
 }
 
+/// The interrupt lines of a CPU as levels that other threads set: the
+/// interrupt controller of a machine, from the thread of a device or from
+/// an access of this CPU to the controller. A CPU that has them reads them
+/// before every block, so that a line that falls (the guest acknowledged
+/// the interrupt) is not taken again.
+#[derive(Debug, Default)]
+pub struct Lines {
+    pub irq: std::sync::atomic::AtomicBool,
+    pub fiq: std::sync::atomic::AtomicBool,
+}
+
 /// One CPU on a memory.
 pub struct Cpu<M> {
     pub state: State,
@@ -1437,6 +1448,13 @@ pub struct Cpu<M> {
     /// drives them from its interrupt controller. They are levels.
     pub irq: bool,
     pub fiq: bool,
+    /// The lines of a machine, which `irq` and `fiq` follow before every
+    /// block. With them, `run` also returns after a block that wrote a
+    /// register of a timer, so that the machine moves the output lines of
+    /// the timers at once.
+    pub lines: Option<std::sync::Arc<Lines>>,
+    /// A register of a timer was written in the block that ran last.
+    timer_written: bool,
     /// Where the system counter comes from.
     pub clock: Clock,
     pub hooks: Hooks,
@@ -1484,6 +1502,8 @@ impl<M: Memory> Cpu<M> {
             memory,
             irq: false,
             fiq: false,
+            lines: None,
+            timer_written: false,
             clock: Clock::Manual(0),
             hooks: Hooks::default(),
             taken: None,
@@ -1622,6 +1642,16 @@ impl<M: Memory> Cpu<M> {
         }
         let environment = self.environment();
         if write {
+            if matches!(
+                sysreg::ROWS[row].kind,
+                sysreg::Kind::Special(
+                    sysreg::Special::TimerControl(_)
+                        | sysreg::Special::TimerCompare(_)
+                        | sysreg::Special::TimerValue(_)
+                )
+            ) {
+                self.timer_written = true;
+            }
             sysreg::write(row, &mut self.state, &environment, value);
             self.state.refresh();
             self.side.mmu.sync(&self.state);
@@ -1806,6 +1836,15 @@ impl<M: Memory> Cpu<M> {
             } else {
                 std::hint::spin_loop();
             }
+        }
+    }
+
+    #[inline(always)]
+    fn read_lines(&mut self) {
+        if let Some(lines) = &self.lines {
+            use std::sync::atomic::Ordering;
+            self.irq = lines.irq.load(Ordering::Acquire);
+            self.fiq = lines.fiq.load(Ordering::Acquire);
         }
     }
 
@@ -2155,6 +2194,7 @@ impl<M: Memory> Cpu<M> {
     pub fn step(&mut self) -> Result<(), Stop> {
         self.taken = None;
         self.take_mail();
+        self.read_lines();
         self.check_generation();
         let result = self.run_block(true);
         self.settle();
@@ -2190,6 +2230,7 @@ impl<M: Memory> Cpu<M> {
             // Another CPU invalidated translations: no block starts before
             // this CPU has dropped them too.
             self.take_mail();
+            self.read_lines();
             let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
@@ -2256,6 +2297,12 @@ impl<M: Memory> Cpu<M> {
             }
             if self.side.code_written {
                 self.settle();
+            }
+            if self.timer_written {
+                self.timer_written = false;
+                if self.lines.is_some() {
+                    break;
+                }
             }
         }
         Stop::Budget
