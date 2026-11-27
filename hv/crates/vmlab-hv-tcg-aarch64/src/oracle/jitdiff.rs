@@ -170,7 +170,7 @@ pub fn run(seed: u64, rounds: u64) -> Result<Report, Difference> {
             )));
         }
         let (ours, theirs) = (compiled.memory.bytes(), reference.memory.bytes());
-        if let Some(at) = ours.iter().zip(&theirs).position(|(a, b)| a != b) {
+        if let Some(at) = ours.iter().zip(theirs).position(|(a, b)| a != b) {
             return Err(difference(format!(
                 "the memory differs first at {:#x}: {:#04x}, the interpreter {:#04x}",
                 RAM_BASE + at as u64,
