@@ -2310,7 +2310,7 @@ unsafe fn run_code<M: Memory>(
             pending: Some(Pending::Verify {
                 pc,
                 key,
-                code: jit.jump_entry(pc).code,
+                code: jit.jump_target(pc, key).unwrap_or(0),
             }),
         },
         jit::LOOKUP => {
@@ -2394,6 +2394,8 @@ pub struct JitCounts {
     pub links: u64,
     pub unlinks: u64,
     pub fills: u64,
+    /// Times the jump cache was emptied.
+    pub clears: u64,
 }
 
 /// Make the link that the run before left for `block`, whose code is
@@ -2858,6 +2860,7 @@ impl<M: Memory> Cpu<M> {
             counts.links = jit.stats.links;
             counts.unlinks = jit.stats.unlinks;
             counts.fills = jit.stats.fills;
+            counts.clears = jit.stats.clears;
         }
         counts
     }

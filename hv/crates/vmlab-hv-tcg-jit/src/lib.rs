@@ -81,6 +81,9 @@ pub struct Context {
     /// cache. Compiled code counts them.
     pub chained: u64,
     pub hits: u64,
+    /// The generation of the jump cache, which every key of an entry holds
+    /// added to it: `clear_jumps` moves it, and every entry is then a miss.
+    pub jump_generation: u64,
 }
 
 pub(crate) const CONTEXT_BUDGET: i32 = 0;
@@ -90,9 +93,11 @@ pub(crate) const CONTEXT_BLOCK: i32 = 24;
 pub(crate) const CONTEXT_JUMP: i32 = 32;
 pub(crate) const CONTEXT_CHAINED: i32 = 40;
 pub(crate) const CONTEXT_HITS: i32 = 48;
+pub(crate) const CONTEXT_JUMP_GENERATION: i32 = 56;
 
-/// One entry of the jump cache (H6). An empty entry has the key 0, which no
-/// context has.
+/// One entry of the jump cache (H6): the key is that of the context plus
+/// the generation of the cache when it was filled. An empty entry has the
+/// key 0, which no context has.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JumpEntry {
@@ -110,6 +115,12 @@ impl JumpEntry {
         pad: 0,
     };
 }
+
+/// A step of the generation of the jump cache. A key of a context uses the
+/// bits below 32 and the bit 63, so a generation never meets them.
+const JUMP_GENERATION_STEP: u64 = 1 << 32;
+/// The generation after which the cache is emptied and starts again.
+const JUMP_GENERATION_LAST: u64 = (1 << 62) - JUMP_GENERATION_STEP;
 
 /// The entries of the jump cache, a power of two.
 pub const JUMP_ENTRIES: usize = 4096;
@@ -172,6 +183,8 @@ pub struct Stats {
     pub links: u64,
     pub unlinks: u64,
     pub fills: u64,
+    /// Times the jump cache was emptied.
+    pub clears: u64,
 }
 
 /// The default size of the code region of one CPU (H13b).
@@ -189,6 +202,7 @@ pub struct Jit {
     /// The linked jumps to each block, by the address of its code.
     incoming: HashMap<u64, Vec<Site>>,
     jump: Box<[JumpEntry]>,
+    jump_generation: u64,
     pub stats: Stats,
 }
 
@@ -244,6 +258,7 @@ impl Jit {
             features,
             incoming: HashMap::new(),
             jump: vec![JumpEntry::EMPTY; JUMP_ENTRIES].into_boxed_slice(),
+            jump_generation: JUMP_GENERATION_STEP,
             stats: Stats::default(),
         })
     }
@@ -258,6 +273,7 @@ impl Jit {
             jump: self.jump.as_ptr(),
             chained: 0,
             hits: 0,
+            jump_generation: self.jump_generation,
         }
     }
 
@@ -327,8 +343,17 @@ impl Jit {
     }
 
     /// Empty the jump cache: the translation of virtual addresses changed.
+    /// A new generation, so that it costs no write of its entries: it runs
+    /// at every write of a table base, twice for each system call of a
+    /// kernel without hardware PAN.
     pub fn clear_jumps(&mut self) {
-        self.jump.fill(JumpEntry::EMPTY);
+        if self.jump_generation >= JUMP_GENERATION_LAST {
+            self.jump.fill(JumpEntry::EMPTY);
+            self.jump_generation = JUMP_GENERATION_STEP;
+        } else {
+            self.jump_generation += JUMP_GENERATION_STEP;
+        }
+        self.stats.clears += 1;
     }
 
     /// Put the code `to` into the jump cache for the virtual PC `pc` in the
@@ -340,16 +365,18 @@ impl Jit {
         }
         self.jump[jump_index(pc)] = JumpEntry {
             pc,
-            key,
+            key: key + self.jump_generation,
             code: to.address,
             pad: 0,
         };
         self.stats.fills += 1;
     }
 
-    /// The entry of the jump cache for `pc`, for the tests.
-    pub fn jump_entry(&self, pc: u64) -> JumpEntry {
-        self.jump[jump_index(pc)]
+    /// The code that the jump cache gives for `pc` in the context of `key`.
+    pub fn jump_target(&self, pc: u64, key: u64) -> Option<u64> {
+        let entry = self.jump[jump_index(pc)];
+        (entry.pc == pc && entry.key == key.wrapping_add(self.jump_generation))
+            .then_some(entry.code)
     }
 
     /// Whether the code of `entry` is still in the region.

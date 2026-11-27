@@ -34,7 +34,7 @@ use crate::asm::{
 };
 use crate::{
     BUDGET, CHAIN, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV, CONTEXT_HITS,
-    CONTEXT_JUMP, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES, VERIFY,
+    CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES, VERIFY,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
 
@@ -927,6 +927,8 @@ impl Emitter<'_> {
         self.asm.alu(Alu::Cmp, RAX, Rm::Mem(RDX, 0));
         self.asm.jcc(Cond::Ne, miss);
         self.asm.mov_imm(RCX, chain.key);
+        self.asm
+            .alu(Alu::Add, RCX, Rm::Mem(R13, CONTEXT_JUMP_GENERATION));
         self.asm.alu(Alu::Cmp, RCX, Rm::Mem(RDX, 8));
         self.asm.jcc(Cond::Ne, miss);
         self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_HITS), 1);

@@ -900,7 +900,8 @@ JIT_REPORT = re.compile(
     # The exits of card J4 (chaining and the jump cache), when the line has them.
     r"(?:; exits: (?P<chained>\d+) chained, (?P<jump_hits>\d+) jump cache hits, "
     r"(?P<unlinked>\d+) unlinked, (?P<lookups>\d+) jump cache misses, (?P<entered>\d+) runs "
-    r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills)?")
+    r"entered; (?P<links>\d+) links, (?P<unlinks>\d+) unlinks, (?P<fills>\d+) fills"
+    r"(?:, (?P<clears>\d+) clears of the jump cache)?)?")
 
 
 def last_jit_report(run_dir):

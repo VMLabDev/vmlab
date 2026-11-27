@@ -685,7 +685,7 @@ fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
     let (code, _) = block.run(&jit, &entry, &mut slots, 100);
     assert_eq!(code, LOOKUP);
     jit.fill(pc, 9, &entry);
-    assert_eq!(jit.jump_entry(pc).code, entry.address);
+    assert_eq!(jit.jump_target(pc, 9), Some(entry.address));
     let (code, context) = block.run(&jit, &entry, &mut slots, 20);
     assert_eq!((code, context.hits), (BUDGET, 20));
     assert_eq!(slots[0], 21);
@@ -693,6 +693,12 @@ fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
     jit.fill(pc, 8, &entry);
     let (code, context) = block.run(&jit, &entry, &mut slots, 20);
     assert_eq!((code, context.hits), (LOOKUP, 0));
+    // An entry from before the cache was emptied is a miss.
+    jit.fill(pc, 9, &entry);
+    jit.clear_jumps();
+    assert_eq!(jit.jump_target(pc, 9), None);
+    let (code, _) = block.run(&jit, &entry, &mut slots, 20);
+    assert_eq!(code, LOOKUP);
     // Another PC is a miss.
     jit.fill(pc, 9, &entry);
     slots[2] = u128::from(pc + 4);
@@ -704,7 +710,7 @@ fn the_jump_cache_serves_its_pc_and_its_key_and_is_dropped_with_the_region() {
     while jit.stats.resets == resets {
         other.compile(&mut jit, NextPc::Absolute(word(5)), 9);
     }
-    assert_eq!(jit.jump_entry(pc).key, 0);
+    assert_eq!(jit.jump_target(pc, 9), None);
     assert!(!jit.current(&entry));
 }
 
