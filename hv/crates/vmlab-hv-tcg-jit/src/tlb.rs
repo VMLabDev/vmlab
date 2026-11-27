@@ -32,11 +32,11 @@
 //! (card J12: a sweep of the whole tables each time took 2.9 s of a boot at
 //! 4,096 entries and 55 s at 65,536).
 
-/// The entries of one table: 4 MiB of guest pages. From the curve of card
-/// J12 (3e DESIGN.md J12a): at 1,024 a boot misses 2.6 % of its inlined
-/// accesses and 256 entries 3.1 %, and 4,096 to 65,536 entries take a
-/// tenth of what is left at most. The four tables are 128 KiB.
-pub const ENTRIES: usize = 1024;
+/// The entries of one table: 1 MiB of guest pages, the four tables 32 KiB.
+/// From the curve of card J12 (3e DESIGN.md J12a, J12d): more entries miss
+/// less in a boot (2.6 % of its inlined accesses at 1,024 against 3.1 %)
+/// but not in `xz`, which ran 1 to 3 % slower at 1,024.
+pub const ENTRIES: usize = 256;
 /// Log2 of the bytes of one entry.
 pub const ENTRY_BITS: u32 = 5;
 /// The tag of an empty entry. A masked address has at most its three low

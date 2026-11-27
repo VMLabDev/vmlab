@@ -396,7 +396,7 @@ Today a load is: `Mmu::hit` (the architectural TLB with ASID and permissions),
 then `Memory::read` through `GuestBus` (16 % to 21 % of the time, W1c).
 
 The JIT adds a **fast TLB** per vCPU beside the architectural one: two tables
-(reads and writes) for each of EL0 and EL1, 256 or more entries, direct-mapped
+(reads and writes) for each of EL0 and EL1, 256 entries (J12a, J12d), direct-mapped
 by the 4 KiB page of the virtual address. An entry is (tag, addend): the tag
 is the page address, and host address is virtual address plus addend. The
 inlined lookup masks the address so that an access that is not aligned to its
@@ -408,7 +408,10 @@ size, or crosses its page, misses.
   `STTR`), an exclusive access and 16-byte accesses call the existing Rust
   path (`Side::load`, `Side::store`), which also fills the fast TLB.
 - **H7b.** Every flush of the architectural TLB flushes the fast TLB the same
-  way: TLBI, a write of `TTBR`, `TCR` or `SCTLR`, a change of ASID.
+  way: TLBI, a write of `TTBR`, `TCR` or `SCTLR`, a change of ASID. A
+  flush clears the places filled since the last flush, while they are at
+  most a quarter of a table, and sweeps the four tables only past that
+  (J12c).
 - **H7c.** A miss is a call that keeps the host registers, in a cold stub
   after the block. It can come back with a fault. Then the block leaves
   through the exit of that instruction (H9).
@@ -1269,7 +1272,7 @@ D2 suite. Each estimate is *est.*, with its basis.
 |---|---|---|---|---|
 | N1 | Fewer and cheaper round trips to the Rust loop | 37.5 % of a boot (J9a1) | A boot 1.3 to 1.5 times. Basis: half the round trips (the jump cache kept across a write of TTBR0 and TTBR1 when the ASID tells the spaces apart, and a miss served from the stub without the loop), each at half its cost. | Card J10 |
 | N2 | Cheaper translation and compile | 10.5 % of a boot, and up to 8.7 % more in libc (J9a2) | A boot 1.1 to 1.2 times. Basis: no heap call per block in the lifter and the emitter, and fewer recompiles after a drop of the region. | Card J11 |
-| N3 | The reach of the fast TLB | 62.4 % of `xz` (J9a4) | `xz` 1.4 to 1.8 times. A boot: little, its miss rate is 3 %. | Card J12 |
+| N3 | The reach of the fast TLB | 62.4 % of `xz` (J9a4) | `xz` 1.4 to 1.8 times. A boot: little, its miss rate is 3 %. | Card J12. It measured that the misses of `xz` are accesses not aligned to their size, and not a lack of reach (J12b): N10. |
 | N4 | Host-FPU fast paths and inlined AdvSIMD, with the crypto helpers | 69.5 % of `sha256` (J9a3), 3.2 % of a boot | `sha256` 2 to 3 times. Basis: the SHA-256 operations as direct helpers of their own, without the generic lane evaluator and the marshalling of the pure call. FP: no row of D2 has FP work, so the FP half of D11 waits for a workload that has it. | Card J13 (AdvSIMD and crypto only) |
 | N5 | Superblocks: several blocks as one unit, with registers kept across the joins (H1) | 99.9 % of CoreMark in compiled code, 2.56 instructions a block run (J9a5) | CoreMark 1.2 to 1.4 times, which is 2,400 to 2,800 MIPS against QEMU's 2,566. A boot: at most its 18.9 % in compiled code. | Card J14 |
 | N6 | A return stack for `RET` | The jump cache serves 11 % of the block runs of a boot, inline | At most 1 to 2 % of a boot. Basis: a hit is an index, two compares and a jump (H6). | Not now. N1 measures it again. |
@@ -1282,6 +1285,142 @@ D2 suite. Each estimate is *est.*, with its basis.
 to 57 % of QEMU. Basis: the gains of the table multiplied, each on the
 measured rows of J9b. So R1 holds: the next cards do not reach D1 on the
 boot or on the D2 workloads, and they do not show what would.
+
+### J12, measured by card J12
+
+Helios, 2026-11-28, *measured*. Debian 13 through the bench, one run of
+each binary for the curve and three for the rows, cores 12 to 15. Other
+cards ran builds and boots at the same time, with a load average of 4 to
+78 of 32 threads, so the times of one run moved by up to a factor of two
+(a boot of 65 to 155 s) and the curve gives no times but the counters. The
+counters of the fast TLB are those of the JIT line of the log (one every
+1e9 instructions of a vCPU). The window of `xz` is the JIT lines whose
+`unix_ns` falls inside the time of `xz` in the bench log, so it holds 4e9
+or 5e9 of its instructions. Sources read: none outside this repository. No
+QEMU source was read (X1 to X3).
+
+**J12a. The curve.** Each size is a build of the card branch with only
+`tlb::ENTRIES` changed, and the flush of J12c.
+
+| Entries | Four tables per vCPU | Boot: misses of the inlined accesses | Full suite: misses | `xz` window: misses | `xz`, s (one run) |
+|---|---|---|---|---|---|
+| 256 | 32 KiB | 3.11 % (136.8 M of 4.40e9) | 10.22 % (697.3 M of 6.82e9) | 32.0 % (500.4 M of 1.56e9) | 9.13 |
+| 1,024 | 128 KiB | 2.58 % (114.3 M of 4.44e9) | 9.77 % (666.0 M of 6.82e9) | 32.1 % (400.4 M of 1.25e9) | 9.17 |
+| 4,096 | 512 KiB | 2.52 % (111.4 M of 4.43e9) | 9.72 % (661.1 M of 6.80e9) | 32.0 % (399.9 M of 1.25e9) | 9.31 |
+| 16,384 | 2 MiB | 2.47 % (107.5 M of 4.35e9) | 9.71 % (663.0 M of 6.83e9) | 32.0 % (499.7 M of 1.56e9) | 9.03 |
+| 65,536 | 8 MiB | 2.49 % (109.7 M of 4.41e9) | 9.69 % (661.6 M of 6.83e9) | 31.7 % (495.1 M of 1.56e9) | 9.45 |
+
+The size moves the miss rate of a boot from 3.1 % to 2.5 %, and 1,024
+entries take 85 % of that step. It does not move the miss rate of `xz`.
+No time of a boot moved beyond the noise, and `xz` ran 1 to 3 % slower at
+1,024 than at 256 in an A/B of the same code (J12d3). `tlb::ENTRIES` stays
+256.
+
+**J12b. Why `xz` misses.** A build that counted each miss by its cause
+in the thunk (commit `f149cabd`, 256 entries): not aligned to its size (a
+pair: not aligned to 8 or in the last 8 bytes of its page), an empty entry,
+or an entry of another page.
+
+| Run | Misses | Not aligned | Empty | Another page |
+|---|---|---|---|---|
+| Full suite, 27.0e9 instructions | 725.2 M | 550.5 M (76 %) | 110.2 M (15 %) | 49.7 M (7 %) |
+| `xz` window, 4e9 instructions | 402.5 M | 399.0 M (99.1 %) | 0.8 M | 2.7 M |
+| `xz` window at 1,024 entries (`ae03e611`), 5e9 instructions | 500.4 M | 498.6 M (99.6 %) | 1.0 M | 0.8 M |
+| Boot to agent ready at 1,024 entries (`ae03e611`), 18.0e9 instructions | 114.5 M | 26.2 M (23 %) | 76.5 M (67 %) | 4.4 M (4 %) |
+
+So J9a4 named the wrong cause: `xz` hits the architectural TLB and has
+the page in the fast TLB, and misses because the inlined lookup of H7
+masks the bits below the size of the access, so that an access that is
+not aligned to its size misses even inside its page. A third of the
+inlined accesses of `xz` are such. A boot misses mostly on empty entries:
+the places that the million flushes of J12c emptied. The count does not
+say what the other 6 % of the misses of a boot are. The basis of an
+explanation, not measured: aligned accesses whose Device alignment
+(`Op::aux`, card S4) the inlined compare keeps. The count cost `xz` about 6 % (500
+million calls of the thunk in 9 s, rows of J12d), so it is not in the
+card's last commit.
+
+**J12c. The cost of a flush.** A boot flushes the fast TLB about a million
+times (0.83 to 0.98 million at one vCPU, 1.2 million in the full suite):
+every write of `TTBR0` and `TTBR1` (a context switch) flushes it (H7b). A
+flush that sweeps the four tables costs their size each time. The card
+makes a flush clear the places filled since the last one, while they are at
+most `ENTRIES / 4`, and sweep only past that; the search of the write
+entries of a page that gets code (`drop_writes`, 7,200 to 8,700 a run) does
+the same. Time in the flushes and those searches, a boot at one vCPU:
+
+| Entries | The sweep of the tables (`next`) | The places filled (the card) |
+|---|---|---|
+| 256 | 244 ms | 70 ms |
+| 1,024 | | 57 ms |
+| 4,096 | 2,915 ms | 60 ms |
+| 16,384 | | 79 ms |
+| 65,536 | 54,760 ms | 92 ms |
+
+**J12d. The rows, before and after.** Two pairs, each `next` (`2f8a7dc4`)
+and the card side by side on cores 12 to 15, the flat rows on cores 28 to
+31, the median of 3 with the range. Both after columns ran at 1,024
+entries: the first pair's (`ae03e611`) with the count of J12b in its miss
+path, the second's (`c54692c5`) without. The card's last code is that of
+the second at 256 entries, which is the 256 column of the A/B (J12d3). The rows are in `bench/history/aarch64.jsonl` with the notes "card
+J12". Three boots of the two pairs (two of `next`, one of `ae03e611`) did
+not reach agent ready: the guest went idle in its apparmor profiles after
+17e9 to 19e9 instructions and ran 1e9 instructions in the next 570 s,
+while systemd restarted `systemd-udevd` and `systemd-journald`. They were
+killed and run again, and are not in the rows (their logs are in the card's
+folder on helios, `j12/hang*`). Both binaries did it, at a load average of
+4 to 78.
+
+| Workload | vCPUs | `next`, second pair | 1,024 entries, second pair | `next`, first pair | 1,024 entries with the count, first pair |
+|---|---|---|---|---|---|
+| Boot to agent ready, boot suite, s | 1 | 93.82 (61.87 to 97.55) | 60.52 (60.23 to 73.60) | 70.46 (68.46 to 76.87) | 81.02 (72.36 to 97.30) |
+| Its misses of the fast TLB | 1 | 3.13 % | 2.40 % | 2.96 % | 2.49 % |
+| Boot to agent ready, full suite, s | 1 | 70.04 (64.34 to 100.73) | 72.38 (60.33 to 73.39) | 72.39 (70.19 to 96.69) | 59.12 (59.07 to 68.41) |
+| `sha256_256M`, s | 1 | 8.28 (7.92 to 8.54) | 9.04 (8.91 to 11.91) | 9.60 (8.45 to 9.71) | 7.78 (7.44 to 8.85) |
+| `xz_9_32M`, s | 1 | 8.87 (8.86 to 9.90) | 9.39 (8.93 to 10.79) | 8.82 (8.79 to 9.18) | 9.34 (9.23 to 9.70) |
+| Boot to agent ready, full suite, s | 4 | 56.52 (44.50 to 73.26) | 46.16 (44.31 to 52.27) | 48.27 (46.04 to 48.86) | 49.92 (48.32 to 50.14) |
+| `sha256_256M`, s | 4 | 7.74 (7.18 to 7.79) | 7.58 (7.27 to 8.11) | 7.48 (7.36 to 7.62) | 8.03 (7.67 to 8.10) |
+| `xz_9_32M`, s | 4 | 9.23 (8.70 to 16.46) | 9.43 (8.95 to 10.67) | 9.07 (8.97 to 9.12) | 9.94 (9.44 to 10.01) |
+| CoreMark mix, flat, MIPS | 1 | 1,976.5 (1,945.9 to 2,016.6) | 1,971.8 (1,812.4 to 2,016.2) | 1,952.5 (1,933.2 to 1,956.9) | 1,920.4 (1,912.7 to 1,939.7) |
+| Scalar loop, flat, MIPS | 1 | 2,009.7 (2,006.2 to 2,011.9) | 2,022.6 (2,021.9 to 2,022.7) | 2,000.8 (1,997.2 to 2,006.8) | 1,970.0 (1,955.6 to 1,970.4) |
+
+- **J12d1. The interpreter share (H2b)** is zero for a missing form in
+  every row. At the budget (H2c): 23 to 85 blocks a run at one vCPU and
+  1,063 to 1,435 at four, on both sides. No instruction of the flat images
+  ran in the interpreter.
+- **J12d2. The boots are noise.** The same binary gave 44 to 101 s within
+  one column. The miss rate of a boot fell from 3.0 to 3.1 % to 2.4 to
+  2.5 % in both pairs, as in J12a.
+- **J12d3. `xz` is not faster, and its medians are 2 to 10 % slower** in
+  both pairs. In the first pair the count of J12b explains it: 500 million
+  more calls of `miss_kind` in 9 s. In the second the ranges overlap.
+  An A/B of the same code (`0cd87127`, the card's last code, with
+  `ENTRIES` 256 and 1,024), one vCPU, full suite, interleaved, three
+  repeats each:
+
+  | Round | `xz` at 256, s | `xz` at 1,024, s | Misses of the run at 256 | At 1,024 |
+  |---|---|---|---|---|
+  | 1 | 8.89 (8.83 to 8.93) | 9.04 (9.01 to 9.17) | 10.26 % | 9.78 % |
+  | 2 | 9.12 (9.11 to 18.31) | 9.18 (9.04 to 9.51) | 10.07 % | 9.77 % |
+
+  The basis of an explanation, not measured: the pages that `xz` touches
+  fill more of the larger tables, so its hits read more cache lines. So the
+  size stays 256, and the card keeps the tables on the heap, the counters
+  and the flush of J12c, which takes a boot's flushes from 244 ms to 88 to
+  110 ms at 256 entries.
+- **J12d4. The share of D1 (O1)**, over the QEMU rows of J9b. The card's
+  code (the 256 column of the A/B, one vCPU): the boot of the full suite
+  37 to 42 %, `xz` 30 to 31 %, `sha256` 24 to 26 %. At four vCPUs (1,024
+  entries, second pair): the boot 44 %, `xz` 29 %, `sha256` 27 %. The
+  flat rows, which miss the fast TLB 6 times a run: CoreMark 77 %, the loop
+  65 %. Beyond the noise of J12d2, the card moves no row toward T3.
+
+**J12e. What comes next.**
+
+| Code | Step | Measured share it attacks | Gain, est. | Decision |
+|---|---|---|---|---|
+| N10 | Unaligned accesses through the fast TLB: the inlined lookup compares the page of the last byte of the access (`va + size - 1`) with the tag and keeps only the bits that `Op::aux` asks (Device memory, card S4), so an access that is not aligned and stays in its page hits. A pair the same. | 32 % of the inlined accesses of `xz` miss, 99.5 % of them not aligned (J12b), and the miss path is 62.4 % of `xz` (J9a4). 23 % of the misses of a boot. | `xz` 1.5 to 2.2 times. Basis: most of the 62.4 % goes, and what stays is the inlined hit. | A card in place of N3, before or beside J13. K1 for the load and store group, K2 with unaligned addresses, K3 on a Debian boot. |
+| N11 | The fast TLB kept across a context switch: entries tagged with the ASID, or a table set per recent ASID, so that a write of `TTBR0` with a known ASID does not empty it (H7b) | 67 % of the misses of a boot are empty entries after about a million flushes (J12b, J12c); the misses are 2.6 % of its inlined accesses | A boot: a few per cent at most. Basis: the memory class of J9a is 7.9 % of a boot, and the misses are a part of it. | Not now. With the ASID work of J10 (the jump cache across a write of `TTBR`), which meets the same question. |
 
 ## 8. The cards
 
@@ -1410,6 +1549,21 @@ cp /tmp/perf-<pid>.map perf.map
 python3 measure/ipclass.py <binary> raw.txt@perf.map --top 40 --window <from> <to>   # unix seconds of the bench log
 # CoreMark: a long image (micro_a64.build_coremark(30000)) under a64_bench with
 # VMLAB_HV_JIT=1 VMLAB_HV_JIT_PERF_MAP=1, sampled the same way, one map per run
+```
+
+J12, the same checkout and firmware:
+
+```sh
+# J12a: one vmlab-hv per size, each through the full suite and the boot suite
+sed -i 's/^pub const ENTRIES: usize = [0-9]*;/pub const ENTRIES: usize = 4096;/' \
+  hv/crates/vmlab-hv-tcg-jit/src/tlb.rs
+cargo build --release -p vmlab-hv && cp <target>/release/vmlab-hv vmlab-hv-4096
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite full --cpus 12-15 --hv-bin vmlab-hv-4096        # then --suite boot
+# the counters: the last "fast TLB:" of bench/run/<run>/stderr.log; for xz, the JIT
+# lines whose unix_ns is inside the end time and the length of xz_9_32M in the bench log
+# J12b: the same on a build of commit f149cabd (the misses by cause)
+# J12d: as J9b, with --hv-bin of next and of the card, side by side, without QEMU
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
