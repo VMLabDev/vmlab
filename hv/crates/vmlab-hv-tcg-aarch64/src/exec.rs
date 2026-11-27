@@ -3432,9 +3432,11 @@ mod tests {
         assert_eq!(counts.blocks, 1);
         assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
         assert_eq!(counts.alignment_operations, 6);
-        // The discarded add restores X4. The fault PC of an access is no
-        // operation: the exit carries its distance from the entry (#1143).
-        assert_eq!(counts.exit_writeback_operations, 1);
+        // The discarded add restores X4, on the cold path of the exits
+        // only: no operation of the block serves an exit (card S4). The
+        // fault PC of an access is no operation: the exit carries its
+        // distance from the entry (#1143).
+        assert_eq!(counts.exit_writeback_operations, 0);
     }
 
     #[test]
