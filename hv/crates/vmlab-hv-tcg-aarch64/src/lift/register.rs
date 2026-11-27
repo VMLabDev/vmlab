@@ -24,7 +24,6 @@ use crate::generated::decode::{
     BaseDiv, BaseLogicalSReg, BaseMulAccum, BaseOneOperandData, BaseShift, MulHi, OneWRegData,
     OneXRegData, Record, WideMulAccum,
 };
-use crate::state::slot;
 use vmlab_hv_tcg_ir::native::{Binary, ScalarId, Unary};
 
 // --- operands -----------------------------------------------------------------
