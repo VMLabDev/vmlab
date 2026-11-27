@@ -549,8 +549,11 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
             }
         };
         let dst = frame.len() as Slot;
-        match random.below(if memory == Memory::Thunk { 14 } else { 18 }) {
-            14..=17 => {
+        // The comparisons that a select or a guard reads (12 and 13) are in
+        // the blocks of the thunk, the loads and stores (12 to 15) in the
+        // others.
+        match random.below(if memory == Memory::Thunk { 14 } else { 16 }) {
+            12..=15 if memory != Memory::Thunk => {
                 // A load or a store at an address of a constant word, with
                 // a leave like a guard's.
                 let bytes = [1u8, 2, 4, 8][random.below(4) as usize];
