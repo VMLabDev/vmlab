@@ -1720,7 +1720,8 @@ fn load_pair<M: Memory>(
     // from `dst` for this one.
     let at = unsafe { block::word(frame, usize::from(op.a)) };
     let exit = op.imm as u32;
-    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    let privileged = op.aux & UNPRIVILEGED == 0;
+    let user = side.user || !privileged;
     if side.log.is_none()
         && let Some((phys, flags)) = side.mmu.hit(at, 16, mmu::needed(Kind::Read, user))
         && (flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0)
@@ -1737,6 +1738,10 @@ fn load_pair<M: Memory>(
                 block::set_word(frame, usize::from(op.dst), u64::from_le_bytes(low));
                 block::set_word(frame, usize::from(op.dst) + 1, u64::from_le_bytes(high));
             }
+            // Compiled code makes the pair inline from now on (3e J6).
+            if privileged && side.mmu.fast().is_some() {
+                side.fill_fast_after(at, 16, Kind::Read);
+            }
             return Ok(());
         }
     }
@@ -1745,6 +1750,9 @@ fn load_pair<M: Memory>(
         Ok(value) => {
             frame[usize::from(op.dst)] = value as u64;
             frame[usize::from(op.dst) + 1] = (value >> 64) as u64;
+            if privileged && side.mmu.fast().is_some() {
+                side.fill_fast_after(at, 16, Kind::Read);
+            }
             Ok(())
         }
         Err(fault) => Err((exit, Failed::Access(fault, false))),
@@ -1770,7 +1778,8 @@ fn store_pair<M: Memory>(
         )
     };
     let exit = op.imm as u32;
-    let user = side.user || op.aux & UNPRIVILEGED != 0;
+    let privileged = op.aux & UNPRIVILEGED == 0;
+    let user = side.user || !privileged;
     if side.exclusive.is_none()
         && side.log.is_none()
         && let Some((phys, flags)) = side.mmu.hit(at, 16, mmu::needed(Kind::Write, user))
@@ -1785,12 +1794,20 @@ fn store_pair<M: Memory>(
             .write(phys + 8, &high.to_le_bytes())
             .map_err(|error| (exit, Failed::Access(Fault::memory(error, at), true)))?;
         side.own_writes += 1;
+        // Compiled code makes the pair inline from now on (3e J6).
+        if privileged && side.mmu.fast().is_some() {
+            side.fill_fast_after(at, 16, Kind::Write);
+        }
         return Ok(());
     }
     device_faults(side, memory, at, op.aux, Kind::Write).map_err(|failed| (exit, failed))?;
     let value = u128::from(low) | u128::from(high) << 64;
     side.store(memory, at, 16, value, user, single)
-        .map_err(|refused| (exit, Failed::store(refused)))
+        .map_err(|refused| (exit, Failed::store(refused)))?;
+    if privileged && side.mmu.fast().is_some() {
+        side.fill_fast_after(at, 16, Kind::Write);
+    }
+    Ok(())
 }
 
 /// A store of the low `N` bytes, 1 to 8, of one word.
@@ -2208,7 +2225,10 @@ impl Compiled {
 
 /// What the thunk of compiled code reaches: the CPU around the blocks that
 /// run. The block of an operation is the one that its head named in the
-/// context (3e DESIGN.md H5): a chained run passes through many.
+/// context (3e DESIGN.md H5): a chained run passes through many. Its
+/// layout is that of C with the state first, so that `ordered_call`, which
+/// is not generic over the memory, reads the state (H12).
+#[repr(C)]
 struct Env<'a, M> {
     state: *mut State,
     memory: &'a mut M,
@@ -2262,6 +2282,7 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
         Code::Load1 | Code::Store1 => 1u8,
         Code::Load2 | Code::Store2 => 2,
         Code::Load4 | Code::Store4 => 4,
+        Code::LoadPair | Code::StorePair => 16,
         _ => 8,
     };
     match request {
@@ -2273,11 +2294,12 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
             let at = frame[usize::from(op.a)];
             let bytes = bytes();
             let level = usize::from(!env.side.user);
+            // A pair hits as an access of 8 bytes in one page.
             if let Some(phys) = env
                 .side
                 .mmu
                 .fast()
-                .and_then(|fast| fast.lookup(level, true, at, bytes))
+                .and_then(|fast| fast.lookup(level, true, at, bytes.min(8)))
                 .map(|entry| entry.phys)
             {
                 env.memory
@@ -2291,14 +2313,26 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
             let bytes = bytes();
             let write = matches!(
                 op.code,
-                Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8
+                Code::Store1 | Code::Store2 | Code::Store4 | Code::Store8 | Code::StorePair
             );
-            let value = frame[usize::from(if write { op.b } else { op.dst })];
+            // A pair is one access of 16 bytes in the log, as `load_pair`
+            // and `store_pair` make it there.
+            let value = match op.code {
+                Code::StorePair => {
+                    u128::from(frame[usize::from(op.b)])
+                        | u128::from(frame[usize::from(op.dst)]) << 64
+                }
+                Code::LoadPair => {
+                    u128::from(frame[usize::from(op.dst)])
+                        | u128::from(frame[usize::from(op.dst) + 1]) << 64
+                }
+                _ => u128::from(frame[usize::from(if write { op.b } else { op.dst })]),
+            };
             if let Some(log) = &mut env.side.log {
                 log.push(Access {
                     address: frame[usize::from(op.a)],
                     bytes,
-                    value: u128::from(value) & bits_mask(bytes),
+                    value: value & bits_mask(bytes),
                     write,
                 });
             }
@@ -2360,6 +2394,58 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
             THUNK_LEFT
         }
     }
+}
+
+/// A pure helper call of compiled code, called by the code itself in place
+/// of the thunk (3e DESIGN.md H12): `index` is the call in the block.
+///
+/// # Safety
+/// As for `thunk`: `env` is the `Env` of the run, `tag` the `Compiled` whose
+/// code runs, and `index` one of its calls.
+unsafe extern "sysv64" fn pure_call(
+    env: *mut std::ffi::c_void,
+    index: u64,
+    tag: *mut std::ffi::c_void,
+) -> u64 {
+    // SAFETY: the caller's promise: the block is alive while its code runs.
+    let compiled = unsafe { &mut *tag.cast::<Compiled>() };
+    let call = &compiled.calls[index as usize];
+    let frame = compiled.frame.as_mut_slice();
+    let HelperFn::Pure(function) = call.function else {
+        // SAFETY: the caller's promise, which is that of `ordered_call`.
+        return unsafe { ordered_call(env, index, tag) };
+    };
+    let mut args = [0u128; CALL_ARGUMENTS];
+    for (arg, place) in args.iter_mut().zip(&call.args) {
+        *arg = place.read(frame);
+    }
+    let (place, mask) = call.results[0];
+    place.write(frame, function(&args[..call.args.len()]) & mask);
+    0
+}
+
+/// An ordered helper call of compiled code, as `pure_call`. The helper
+/// sees the state as the thunk shows it (`Compiled::call`).
+///
+/// # Safety
+/// As for `pure_call`, and `env` is an `Env` of the run, whose first field
+/// is the state.
+unsafe extern "sysv64" fn ordered_call(
+    env: *mut std::ffi::c_void,
+    index: u64,
+    tag: *mut std::ffi::c_void,
+) -> u64 {
+    // SAFETY: the caller's promise: `Env` is `repr(C)` with the state
+    // first, and compiled code does not touch the state while it calls.
+    let state = unsafe { &mut **env.cast::<*mut State>() };
+    // SAFETY: as for `pure_call`.
+    let compiled = unsafe { &mut *tag.cast::<Compiled>() };
+    Compiled::call(
+        &compiled.calls[index as usize],
+        compiled.frame.as_mut_slice(),
+        state,
+    );
+    0
 }
 
 /// The thunk of a replay of K3: the loads and stores of the block are
@@ -2676,6 +2762,7 @@ impl Compiled {
                     reads: vec![address],
                     writes: place_words(result).collect(),
                     leave: Some(exit),
+                    direct: None,
                 },
                 Access16::Write {
                     address,
@@ -2687,13 +2774,15 @@ impl Compiled {
                     reads: std::iter::once(address).chain(place_words(value)).collect(),
                     writes: exclusive.into_iter().collect(),
                     leave: Some(exit),
+                    direct: None,
                 },
             })
             .collect();
         let calls: Vec<jit::Effect> = self
             .calls
             .iter()
-            .map(|call| jit::Effect {
+            .enumerate()
+            .map(|(index, call)| jit::Effect {
                 reads: call.args.iter().copied().flat_map(place_words).collect(),
                 writes: call
                     .results
@@ -2701,6 +2790,14 @@ impl Compiled {
                     .flat_map(|(place, _)| place_words(*place))
                     .collect(),
                 leave: None,
+                // H12: compiled code calls the helper of its kind itself.
+                direct: Some((
+                    match call.function {
+                        HelperFn::Pure(_) => pure_call as usize as u64,
+                        HelperFn::Ordered(_) => ordered_call as usize as u64,
+                    },
+                    index as u64,
+                )),
             })
             .collect();
         // The compiled code sets the PC (3e DESIGN.md H5): the last

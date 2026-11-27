@@ -49,7 +49,8 @@ use crate::{
     CONTEXT_WRITES, Features, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
     WATCHED,
 };
-use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
+use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
+use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
 
 /// What an effect that the caller describes reads and writes: an access of
 /// `Code::Access` or a call of `Code::Call`, by the index in its `imm`.
@@ -59,6 +60,14 @@ pub struct Effect {
     pub writes: Vec<Slot>,
     /// The leave of the block that the effect can leave through.
     pub leave: Option<u32>,
+    /// A function that runs the effect in place of the thunk (DESIGN.md
+    /// H12), and its second argument: compiled code calls it with the
+    /// System V convention as it calls the thunk, `(env, argument, block)`,
+    /// with the words that it reads in the frame, and reads what it writes
+    /// from there. 0: go on. Anything else: the block leaves with that value.
+    /// The address is that of an `extern "sysv64"` function of the type
+    /// `crate::Thunk`.
+    pub direct: Option<(u64, u64)>,
 }
 
 /// How the loads and stores of 1 to 8 bytes of a block reach memory.
@@ -541,6 +550,12 @@ impl Emitter<'_> {
     /// Call the thunk for the operation `index`, keeping `saved`. RAX holds
     /// what it returns.
     fn call_thunk(asm: &mut Asm, index: u64, saved: &[Reg]) {
+        Self::call_function(asm, None, index, saved);
+    }
+
+    /// Call `function`, or the thunk of the context, with `argument`,
+    /// keeping `saved`. RAX holds what it returns.
+    fn call_function(asm: &mut Asm, function: Option<u64>, argument: u64, saved: &[Reg]) {
         for reg in saved {
             asm.push(*reg);
         }
@@ -550,9 +565,15 @@ impl Emitter<'_> {
             asm.alu_imm(Alu::Sub, Rm::Reg(RSP), 8);
         }
         asm.mov(RDI, Rm::Mem(R13, CONTEXT_ENV));
-        asm.mov_imm(RSI, index);
+        asm.mov_imm(RSI, argument);
         asm.mov(RDX, Rm::Mem(R13, CONTEXT_BLOCK));
-        asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK));
+        match function {
+            Some(function) => {
+                asm.mov_imm(RAX, function);
+                asm.call_indirect(Rm::Reg(RAX));
+            }
+            None => asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK)),
+        }
         if pad {
             asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
         }
@@ -561,8 +582,18 @@ impl Emitter<'_> {
         }
     }
 
-    /// An operation that runs through the thunk.
+    /// An operation that runs through the thunk, or through the function
+    /// that its `Effect` names.
     fn effect(&mut self, index: usize, reads: &[Slot], writes: &[Slot]) {
+        let op = self.shape.ops[index];
+        let direct = if op.code == Code::Call {
+            self.shape
+                .calls
+                .get(op.imm as usize)
+                .and_then(|call| call.direct)
+        } else {
+            None
+        };
         let at = index as u32;
         for word in reads {
             self.materialize(*word);
@@ -573,7 +604,12 @@ impl Emitter<'_> {
             self.words[usize::from(*word)].home = Home::Frame;
         }
         let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index as u64, &saved);
+        match direct {
+            Some((function, argument)) => {
+                Self::call_function(&mut self.asm, Some(function), argument, &saved);
+            }
+            None => Self::call_thunk(&mut self.asm, index as u64, &saved),
+        }
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
     }
@@ -644,12 +680,18 @@ impl Emitter<'_> {
 
     /// A load or a store of `bytes` bytes over the fast TLB (H7). The
     /// address is the word `a`, the value of a store the word `b`, the
-    /// result of a load the word `dst`, and the leave `imm`.
+    /// result of a load the word `dst`, and the leave `imm`. An access of 16
+    /// bytes is a pair of words (`LoadPair`, `StorePair`): the result in
+    /// `dst` and the word after it, the value in `b` (low) and `dst` (high).
+    /// It hits where its address is a multiple of 8 and its 16 bytes are in
+    /// one page, and it is two accesses of 8 bytes of the host.
     fn access(&mut self, index: usize, op: &Op, reads: &[Slot], bytes: u8, store: bool) {
         let at = index as u32;
+        let pair = bytes == 16;
         let logged = self.shape.memory == Memory::Logged;
         let address = self.value(op.a, at);
         let value = store.then(|| self.value(op.b, at));
+        let high = (store && pair).then(|| self.value(op.dst, at));
         let miss = self.asm.label();
         let join = self.asm.label();
         // RCX: the entry of the page in the table of the block.
@@ -662,24 +704,38 @@ impl Emitter<'_> {
         self.asm.alu(Alu::Add, RCX, Rm::Mem(R13, table));
         // The address in its page and below its size, against the tag.
         self.asm.mov(RDX, Rm::Reg(RAX));
-        let low = (i32::from(bytes) - 1) | i32::from(op.aux & ALIGNMENT);
+        let low = (i32::from(bytes.min(8)) - 1) | i32::from(op.aux & ALIGNMENT);
         self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | low);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
         self.asm.jcc(Cond::Ne, miss);
+        if pair {
+            // The last 8 bytes of a page: the second word is in the next.
+            self.asm.mov(RDX, Rm::Reg(RAX));
+            self.asm.alu_imm(Alu::And, Rm::Reg(RDX), 0xff8);
+            self.asm.alu_imm(Alu::Cmp, Rm::Reg(RDX), 0xff8);
+            self.asm.jcc(Cond::E, miss);
+        }
         self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
         if let Some(value) = value {
-            let source = match value {
-                Val::Reg(reg) => reg,
-                Val::Mem(memory) => {
-                    self.asm.mov(RDX, memory);
-                    RDX
-                }
-                Val::Imm(value) => {
-                    self.asm.mov_imm(RDX, value);
-                    RDX
-                }
+            let parts = match high {
+                Some(high) => vec![(0, value), (8, high)],
+                None => vec![(0, value)],
             };
-            self.asm.store_sized(Rm::Mem(RAX, 0), source, bytes);
+            for (offset, part) in parts {
+                let source = match part {
+                    Val::Reg(reg) => reg,
+                    Val::Mem(memory) => {
+                        self.asm.mov(RDX, memory);
+                        RDX
+                    }
+                    Val::Imm(value) => {
+                        self.asm.mov_imm(RDX, value);
+                        RDX
+                    }
+                };
+                self.asm
+                    .store_sized(Rm::Mem(RAX, offset), source, bytes.min(8));
+            }
             // The watch word of the page: odd while a CPU holds code of it.
             let watched = self.asm.label();
             let back = self.asm.label();
@@ -688,7 +744,11 @@ impl Emitter<'_> {
             self.asm.jcc(Cond::Ne, watched);
             self.asm.bind(back);
             if logged {
-                self.home_all(&[op.a, op.b]);
+                if pair {
+                    self.home_all(&[op.a, op.b, op.dst]);
+                } else {
+                    self.home_all(&[op.a, op.b]);
+                }
                 self.thunk(index, LOGGED, false);
             }
             self.asm.cold(true);
@@ -697,6 +757,17 @@ impl Emitter<'_> {
             self.thunk(index, WATCHED, false);
             self.asm.jmp(back);
             self.asm.cold(false);
+        } else if pair {
+            self.asm.mov(RCX, Rm::Mem(RAX, 8));
+            self.asm.mov(RAX, Rm::Mem(RAX, 0));
+            if logged {
+                self.asm.store(Self::frame(op.dst), RAX);
+                self.asm.store(Self::frame(op.dst + 1), RCX);
+                self.home_all(&[op.a]);
+                self.thunk(index, LOGGED, false);
+                self.asm.mov(RAX, Self::frame(op.dst));
+                self.asm.mov(RCX, Self::frame(op.dst + 1));
+            }
         } else {
             self.asm.load_sized(RAX, Rm::Mem(RAX, 0), bytes);
             if logged {
@@ -715,11 +786,23 @@ impl Emitter<'_> {
         self.thunk(index, MISS, true);
         if !store {
             self.asm.mov(RAX, Self::frame(op.dst));
+            if pair {
+                self.asm.mov(RCX, Self::frame(op.dst + 1));
+            }
         }
         self.asm.jmp(join);
         self.asm.cold(false);
         if store {
             self.release(reads, at);
+        } else if pair {
+            self.define_two(
+                Place {
+                    slot: op.dst,
+                    wide: true,
+                },
+                reads,
+                at,
+            );
         } else {
             self.define(op.dst, reads, at);
         }
@@ -859,7 +942,11 @@ impl Emitter<'_> {
                 self.asm.shift_imm(Shift::Sar, RAX, 64 - width);
                 self.mask(op.imm);
             }
-            Code::LeadingZeros | Code::TrailingZeros | Code::PopCount | Code::ReverseBytes => {
+            Code::LeadingZeros
+            | Code::TrailingZeros
+            | Code::PopCount
+            | Code::ReverseBytes
+            | Code::ReverseBits => {
                 if width == 0 || width > 64 {
                     return Err(Refused::Malformed);
                 }
@@ -891,6 +978,26 @@ impl Emitter<'_> {
                         self.asm.cmov(Cond::A, RAX, Rm::Reg(RDX));
                     }
                     Code::PopCount => self.asm.popcnt(RAX, RAX),
+                    Code::ReverseBits => {
+                        // The bits of each byte in the opposite order, by
+                        // swapping halves of 1, 2 and 4 bits, then the
+                        // bytes in the opposite order.
+                        for (count, mask) in [
+                            (1u8, 0x5555_5555_5555_5555u64),
+                            (2, 0x3333_3333_3333_3333),
+                            (4, 0x0f0f_0f0f_0f0f_0f0f),
+                        ] {
+                            self.asm.mov(RCX, Rm::Reg(RAX));
+                            self.asm.shift_imm(Shift::Shr, RCX, count);
+                            self.asm.mov_imm(RDX, mask);
+                            self.asm.alu(Alu::And, RCX, Rm::Reg(RDX));
+                            self.asm.alu(Alu::And, RAX, Rm::Reg(RDX));
+                            self.asm.shift_imm(Shift::Shl, RAX, count);
+                            self.asm.alu(Alu::Or, RAX, Rm::Reg(RCX));
+                        }
+                        self.asm.bswap(RAX);
+                        self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
+                    }
                     _ => {
                         self.asm.bswap(RAX);
                         self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
@@ -954,11 +1061,284 @@ impl Emitter<'_> {
                 }
                 return Ok(());
             }
-            Code::ReverseBits => return Err(Refused::Form(op.code)),
             _ => return Err(Refused::Malformed),
         }
         self.define(op.dst, reads, at);
         Ok(())
+    }
+
+    /// The half `high` of the operand `place` of the operation at `at`: the
+    /// high half of an operand of one word is zero.
+    fn half(&mut self, place: Place, high: bool, at: u32) -> Val {
+        if high && !place.wide {
+            return Val::Imm(0);
+        }
+        self.value(place.slot + Slot::from(high), at)
+    }
+
+    /// `<alu> dst, value` for RAX or RCX, through RDX where it must.
+    fn alu_on(&mut self, alu: Alu, dst: Reg, value: Val) {
+        match value {
+            Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
+                self.asm.alu_imm(alu, Rm::Reg(dst), value as i32);
+            }
+            other => {
+                let rm = self.rm(other, RDX);
+                self.asm.alu(alu, dst, rm);
+            }
+        }
+    }
+
+    /// `reg &= mask`, in its shortest form, through RDX where it must.
+    fn mask_on(&mut self, reg: Reg, mask: u64) {
+        if mask == u64::MAX {
+        } else if mask == 0 {
+            self.asm.xor32(reg, reg);
+        } else if mask == u64::from(u32::MAX) {
+            self.asm.mov32(reg, reg);
+        } else if i32::try_from(mask as i64).is_ok() {
+            self.asm.alu_imm(Alu::And, Rm::Reg(reg), mask as i32);
+        } else {
+            self.asm.mov_imm(RDX, mask);
+            self.asm.alu(Alu::And, reg, Rm::Reg(RDX));
+        }
+    }
+
+    /// The result of a generic operation, its low word in RAX and its high
+    /// one in RCX, into the words of `dst`.
+    fn define_two(&mut self, dst: Place, reads: &[Slot], at: u32) {
+        self.release(reads, at);
+        let mut halves = vec![(dst.slot, RAX)];
+        if dst.wide {
+            halves.push((dst.slot + 1, RCX));
+        }
+        for (word, source) in halves {
+            self.unbind(word);
+            self.words[usize::from(word)].home = Home::Frame;
+            if self.next_use(word, at).is_none() {
+                // The frame is its home, and nothing reads it there.
+                continue;
+            }
+            let reg = self.allocate(at);
+            self.asm.mov(reg, Rm::Reg(source));
+            self.bind(word, reg, true);
+        }
+    }
+
+    /// A generic operation (the values of two words, DESIGN.md H3), inline
+    /// where the emitter has a form for its kind. `false`: it has none, and
+    /// nothing was emitted.
+    fn generic(&mut self, index: usize, op: &Op, reads: &[Slot]) -> bool {
+        let at = index as u32;
+        let Some(generic) = self.shape.generics.get(op.imm as usize).copied() else {
+            return false;
+        };
+        let [a, b, c] = generic.args();
+        let dst = generic.dst();
+        let ty = generic.ty();
+        let is_big = |value: Val| matches!(value, Val::Imm(value) if i32::try_from(value as i64).is_err());
+        let form = match generic.kind() {
+            GenericKind::Binary(
+                Binary::And | Binary::Or | Binary::Xor | Binary::Equal | Binary::NotEqual,
+            )
+            | GenericKind::Slice { .. }
+            | GenericKind::Concat { .. }
+            | GenericKind::Unary(Unary::BitNot | Unary::Truncate(_)) => true,
+            GenericKind::Binary(Binary::Add | Binary::Sub) => matches!(ty, ScalarType::Bits(_)),
+            GenericKind::Select => !a.wide,
+            _ => false,
+        };
+        if !form {
+            return false;
+        }
+        if dst.slot == 0 || (dst.wide && dst.slot == Slot::MAX) {
+            return false;
+        }
+        if self.next_use(dst.slot, at).is_none()
+            && (!dst.wide || self.next_use(dst.slot + 1, at).is_none())
+        {
+            // Nothing reads the result.
+            self.release(reads, at);
+            for word in [dst.slot, dst.slot + 1].into_iter().take(1 + usize::from(dst.wide)) {
+                self.unbind(word);
+                self.words[usize::from(word)].home = Home::Frame;
+            }
+            return true;
+        }
+        let type_mask = match ty {
+            ScalarType::Bits(width) if width < 128 => (1u128 << width) - 1,
+            _ => u128::MAX,
+        };
+        let mask = match generic.kind() {
+            GenericKind::Binary(_) => type_mask,
+            GenericKind::Select => u128::MAX,
+            GenericKind::Unary(Unary::Truncate(width)) if width < 128 => {
+                generic.mask() & ((1u128 << width) - 1)
+            }
+            _ => generic.mask(),
+        };
+        match generic.kind() {
+            GenericKind::Binary(operation @ (Binary::And | Binary::Or | Binary::Xor)) => {
+                let alu = match operation {
+                    Binary::And => Alu::And,
+                    Binary::Or => Alu::Or,
+                    _ => Alu::Xor,
+                };
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                self.load(RAX, al);
+                self.alu_on(alu, RAX, bl);
+                if dst.wide {
+                    self.load(RCX, ah);
+                    self.alu_on(alu, RCX, bh);
+                }
+            }
+            GenericKind::Binary(operation @ (Binary::Add | Binary::Sub)) => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                // The carry goes from the low word to the high one: nothing
+                // between them may write the flags or need RDX.
+                if is_big(bl) || is_big(bh) {
+                    self.pinned = 0;
+                    return false;
+                }
+                let (low, high) = if operation == Binary::Add {
+                    (Alu::Add, Alu::Adc)
+                } else {
+                    (Alu::Sub, Alu::Sbb)
+                };
+                self.load(RAX, al);
+                if dst.wide {
+                    self.load(RCX, ah);
+                }
+                self.alu_on(low, RAX, bl);
+                if dst.wide {
+                    self.alu_on(high, RCX, bh);
+                }
+            }
+            GenericKind::Binary(operation) => {
+                // Equal and NotEqual: the two halves of `a ^ b` are zero.
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                self.load(RAX, al);
+                self.alu_on(Alu::Xor, RAX, bl);
+                if a.wide || b.wide {
+                    self.load(RCX, ah);
+                    self.alu_on(Alu::Xor, RCX, bh);
+                    self.asm.alu(Alu::Or, RAX, Rm::Reg(RCX));
+                }
+                self.asm.mov(RCX, Rm::Reg(RAX));
+                self.asm.xor32(RAX, RAX);
+                self.asm.test(RCX, RCX);
+                self.asm.setcc_al(if operation == Binary::Equal {
+                    Cond::E
+                } else {
+                    Cond::Ne
+                });
+                self.asm.xor32(RCX, RCX);
+            }
+            GenericKind::Unary(operation) => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                self.load(RAX, al);
+                self.load(RCX, ah);
+                if operation == Unary::BitNot {
+                    self.asm.not(RAX);
+                    self.asm.not(RCX);
+                }
+            }
+            GenericKind::Slice { offset } => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                match offset {
+                    128.. => {
+                        self.asm.xor32(RAX, RAX);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    64.. => {
+                        self.load(RAX, ah);
+                        self.asm.shift_imm(Shift::Shr, RAX, (offset - 64) as u8);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    0 => {
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                    }
+                    _ => {
+                        let offset = offset as u8;
+                        self.load(RAX, al);
+                        self.asm.shift_imm(Shift::Shr, RAX, offset);
+                        self.load(RCX, ah);
+                        self.asm.mov(RDX, Rm::Reg(RCX));
+                        self.asm.shift_imm(Shift::Shl, RDX, 64 - offset);
+                        self.asm.alu(Alu::Or, RAX, Rm::Reg(RDX));
+                        self.asm.shift_imm(Shift::Shr, RCX, offset);
+                    }
+                }
+            }
+            GenericKind::Concat { low_width } => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                match low_width {
+                    128.. => {
+                        self.asm.xor32(RAX, RAX);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    64.. => {
+                        self.load(RCX, al);
+                        self.asm.shift_imm(Shift::Shl, RCX, (low_width - 64) as u8);
+                        self.asm.xor32(RAX, RAX);
+                    }
+                    0 => {
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                    }
+                    _ => {
+                        let width = low_width as u8;
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                        self.asm.shift_imm(Shift::Shl, RCX, width);
+                        self.asm.mov(RDX, Rm::Reg(RAX));
+                        self.asm.shift_imm(Shift::Shr, RDX, 64 - width);
+                        self.asm.alu(Alu::Or, RCX, Rm::Reg(RDX));
+                        self.asm.shift_imm(Shift::Shl, RAX, width);
+                    }
+                }
+                self.alu_on(Alu::Or, RAX, bl);
+                self.alu_on(Alu::Or, RCX, bh);
+            }
+            GenericKind::Select => {
+                // `b` where the word of `a` is not zero, else `c`. Every
+                // move comes before its test: a move of zero is an `xor`.
+                let condition = self.value(a.slot, at);
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                let (cl, ch) = (self.half(c, false, at), self.half(c, true, at));
+                for (target, taken, other) in [(RAX, bl, cl), (RCX, bh, ch)] {
+                    if target == RCX && !dst.wide {
+                        break;
+                    }
+                    match condition {
+                        Val::Imm(value) => self.load(target, if value != 0 { taken } else { other }),
+                        Val::Reg(reg) => {
+                            let rm = self.rm(taken, RDX);
+                            self.load(target, other);
+                            self.asm.test(reg, reg);
+                            self.asm.cmov(Cond::Ne, target, rm);
+                        }
+                        Val::Mem(memory) => {
+                            let rm = self.rm(taken, RDX);
+                            self.load(target, other);
+                            self.asm.alu_imm(Alu::Cmp, memory, 0);
+                            self.asm.cmov(Cond::Ne, target, rm);
+                        }
+                    }
+                }
+            }
+        }
+        self.mask_on(RAX, mask as u64);
+        if dst.wide {
+            self.mask_on(RCX, (mask >> 64) as u64);
+        }
+        self.define_two(dst, reads, at);
+        true
     }
 
     /// Write `value` to `target`, through RAX where it must.
@@ -1197,6 +1577,8 @@ fn inline_access(op: &Op, memory: Memory) -> Option<(u8, bool)> {
         Code::Store2 => (2, true),
         Code::Store4 => (4, true),
         Code::Store8 => (8, true),
+        Code::LoadPair => (16, false),
+        Code::StorePair => (16, true),
         _ => return None,
     };
     Some((bytes, store))
@@ -1374,9 +1756,11 @@ pub fn emit(
         let (reads, writes) = &effects[index];
         if let Some((bytes, store)) = inline_access(op, shape.memory) {
             emitter.access(index, op, reads, bytes, store);
-        } else if op.code == Code::Generic
-            || (op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard)
-        {
+        } else if op.code == Code::Generic {
+            if !emitter.generic(index, op, reads) {
+                emitter.effect(index, reads, writes);
+            }
+        } else if op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard {
             emitter.effect(index, reads, writes);
         } else if op.code == Code::Guard {
             emitter.guard(index, op, reads);
