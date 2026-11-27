@@ -233,6 +233,8 @@ pub struct Graph {
     pub scalars: Vec<Scalar>,
     interned: HashMap<(ScalarType, Option<Range>, Operation), ScalarId>,
     aliases: HashMap<ScalarId, ScalarId>,
+    /// How deep `modular` is in its own recursion (`modular::MOST_DEPTH`).
+    modular_depth: u32,
 }
 
 impl Graph {
