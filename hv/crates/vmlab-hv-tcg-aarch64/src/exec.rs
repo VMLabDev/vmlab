@@ -1604,11 +1604,6 @@ pub struct Cpu<M> {
     pub instructions: u64,
     /// Blocks translated since the CPU was made.
     pub translations: u64,
-    /// WIP diagnostics: translations of a (phys, context) seen before, at the same PC and at another; blocks whose stamp failed.
-    pub again_same: u64,
-    pub again_other: u64,
-    pub stale: u64,
-    seen: FastMap<(u64, Context), u64>,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
     /// What the guest asked for that the CPU does not have, each once. The
@@ -1653,10 +1648,6 @@ impl<M: Memory> Cpu<M> {
             exceptions: 0,
             instructions: 0,
             translations: 0,
-            again_same: 0,
-            again_other: 0,
-            stale: 0,
-            seen: FastMap::default(),
             translation_ns: 0,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
@@ -2213,11 +2204,6 @@ impl<M: Memory> Cpu<M> {
             }
         }
         self.translations += 1;
-        match self.seen.insert((phys, context), pc) {
-            Some(old) if old == pc => self.again_same += 1,
-            Some(_) => self.again_other += 1,
-            None => {}
-        }
         self.side.mark_code(phys);
         let mut compiled =
             compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
@@ -2279,7 +2265,6 @@ impl<M: Memory> Cpu<M> {
             block.epoch = self.epoch;
             true
         } else {
-            self.stale += 1;
             false
         }
     }
