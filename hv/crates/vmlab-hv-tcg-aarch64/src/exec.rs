@@ -291,6 +291,15 @@ struct Spot {
     second: u64,
 }
 
+/// The log of accesses, the outcomes of the exclusive stores and the
+/// frame of the interpreter's run, which K3 keeps for a block.
+#[derive(Default)]
+struct CheckBuffers {
+    log: Vec<Access>,
+    outcomes: Vec<(bool, bool)>,
+    frame: Vec<u64>,
+}
+
 /// What a block needs beside the registers and the memory.
 struct Side {
     exclusive: Option<Reservation>,
@@ -305,6 +314,8 @@ struct Side {
     /// a block did, whether it wrote and whether it reports success, which
     /// the log of accesses alone does not say.
     outcomes: Option<Vec<(bool, bool)>>,
+    /// The buffers that K3 uses again from block to block.
+    check: CheckBuffers,
     /// A filter in front of `code_set`: a bit for the low bits of each
     /// physical page that holds translated code.
     code_pages: Vec<u64>,
@@ -328,6 +339,7 @@ impl Side {
             exclusive_high: 0,
             log: None,
             outcomes: None,
+            check: CheckBuffers::default(),
             code_pages: vec![0; CODE_PAGE_BITS / 64],
             code_set: FastSet::default(),
             own_writes: 0,
@@ -2062,6 +2074,11 @@ impl Compiled {
     /// and the way the block left must be the same. What the interpreter
     /// did is what the CPU keeps. A difference stops the CPU with the
     /// block, both states and the log.
+    ///
+    /// A block without an ordered helper call changes nothing of the state
+    /// but its register slots, so only those are saved and compared, on
+    /// the state of the CPU itself. A block with one runs its compiled code
+    /// on a copy of the whole entry state.
     fn check<M: Memory>(
         &mut self,
         entry: &jit::Entry,
@@ -2070,10 +2087,18 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        let before = state.clone();
+        let ordered = self
+            .calls
+            .iter()
+            .any(|call| matches!(call.function, HelperFn::Ordered(_)));
+        let entry_slots = state.slots;
+        let mut whole = ordered.then(|| state.clone());
         let pc = state.pc();
-        let outer = side.log.replace(Vec::new());
-        side.outcomes = Some(Vec::new());
+        let mut buffers = std::mem::take(&mut side.check);
+        buffers.log.clear();
+        buffers.outcomes.clear();
+        let outer = side.log.replace(std::mem::take(&mut buffers.log));
+        side.outcomes = Some(std::mem::take(&mut buffers.outcomes));
         side.user = self.context.el == 0;
         let ended = self.run_ops(state, memory, side);
         let failed = match &ended {
@@ -2088,7 +2113,8 @@ impl Compiled {
             outer.extend_from_slice(&log);
             outer
         });
-        let interpreted_frame = self.frame.clone();
+        buffers.frame.clear();
+        buffers.frame.extend_from_slice(&self.frame);
         for (word, written) in self.frame.iter_mut().zip(&self.written) {
             if *written {
                 *word = POISON;
@@ -2104,17 +2130,20 @@ impl Compiled {
             left: None,
             difference: None,
         };
-        let mut shadow = before.clone();
-        let got = self.run_code(
-            entry,
-            jit,
-            &mut shadow,
-            memory,
-            side,
-            u64::MAX,
-            Some(&mut replay),
-        );
+        let interpreted_slots = state.slots;
+        let got = match &mut whole {
+            Some(shadow) => self.run_code(entry, jit, shadow, memory, side, u64::MAX, Some(&mut replay)),
+            None => {
+                state.slots = entry_slots;
+                self.run_code(entry, jit, state, memory, side, u64::MAX, Some(&mut replay))
+            }
+        };
         let got = got.unwrap_or((0, Some(Halt::Stop(host("the budget of the replay")))));
+        // The state of the CPU is the interpreter's from here on.
+        let compiled_slots = match &whole {
+            Some(shadow) => shadow.slots,
+            None => std::mem::replace(&mut state.slots, interpreted_slots),
+        };
         let mut differences = Vec::new();
         if let Some(difference) = replay.difference.take() {
             differences.push(difference);
@@ -2145,19 +2174,51 @@ impl Compiled {
                 "the compiled block ran {ours}, the interpreter {theirs}"
             ));
         }
-        if shadow != *state {
+        let agree = match &whole {
+            Some(shadow) => *shadow == *state,
+            None => {
+                let flags = slot::FLAGS_KIND..=slot::FLAGS_B;
+                let same = compiled_slots
+                    .iter()
+                    .zip(&interpreted_slots)
+                    .enumerate()
+                    .all(|(index, (a, b))| flags.contains(&index) || a == b);
+                // NZCV as each lazy record gives it.
+                let nzcv = |slots: &[u128; slot::COUNT]| {
+                    crate::flags::nzcv(
+                        slots[slot::FLAGS_KIND] as u8,
+                        slots[slot::FLAGS_A] as u64,
+                        slots[slot::FLAGS_B] as u64,
+                    )
+                };
+                same && nzcv(&compiled_slots) == nzcv(&interpreted_slots)
+            }
+        };
+        if !agree {
             differences.push("the states differ".to_string());
         }
         if differences.is_empty() {
+            side.check = CheckBuffers {
+                log: replay.log,
+                outcomes: replay.outcomes,
+                frame: buffers.frame,
+            };
             return expected;
         }
+        let mut before = whole.clone().unwrap_or_else(|| state.clone());
+        before.slots = entry_slots;
+        let compiled = whole.unwrap_or_else(|| {
+            let mut compiled = state.clone();
+            compiled.slots = compiled_slots;
+            compiled
+        });
         let report = self.report(
             &before,
             state,
-            &shadow,
+            &compiled,
             &replay,
             &differences,
-            &interpreted_frame,
+            &buffers.frame,
         );
         (expected.0, Some(Halt::Stop(Stop::Host(report))))
     }
