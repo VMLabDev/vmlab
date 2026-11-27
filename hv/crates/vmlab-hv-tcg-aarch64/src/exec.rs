@@ -2382,6 +2382,82 @@ struct Env<'a, M> {
     /// The replay of K3, when the block is checked: its loads and stores
     /// are served from it and not made.
     replay: Option<&'a mut Replay>,
+    /// What a miss of the jump cache looks in (`jit::JUMP`, card J10), when
+    /// the run serves them.
+    lookup: Option<JumpLookup>,
+    /// The misses that it served with code.
+    served: u64,
+}
+
+/// What a run of compiled code serves a miss of the jump cache from (card
+/// J10): the blocks of the CPU, the epoch and the count of changes of the
+/// MMU of when the run started, the JIT that runs the code, and the runs of
+/// each block that K3 checks.
+#[derive(Clone, Copy)]
+struct JumpLookup {
+    blocks: *mut Cache,
+    jit: *const jit::Jit,
+    epoch: u64,
+    changes: u64,
+    check: u32,
+}
+
+/// Serve a miss of the jump cache from the thunk (`jit::JUMP`, card J10):
+/// the code of the block at the PC of the state, when the loop would run
+/// that block's code next without a step of its own. That is: the TLB
+/// holds the page of the PC for an instruction fetch, the block is in its
+/// entry of the cache for the same context as the block that left, it was
+/// seen in this epoch, its code is current, and K3 has no check of it left.
+/// Nothing moved since the run started: no store into translated code, no
+/// change of the MMU. The entry of the jump cache is filled as `make_link`
+/// fills it. 0: the block leaves with `LOOKUP`, and the loop does it all.
+///
+/// The loop also reads the interrupt lines, the mail and the timer before a
+/// block; a hit of the jump cache does not, and neither does this: a kick
+/// ends the run at the next block head for those (H10c).
+///
+/// # Safety
+/// As for `thunk`, and `tag` is the block that left. The blocks of the
+/// lookup and the JIT live while the code runs, and nothing holds a
+/// reference into them.
+unsafe fn serve_jump<M: Memory>(env: &mut Env<M>, tag: *mut std::ffi::c_void) -> u64 {
+    let Some(lookup) = env.lookup else {
+        return 0;
+    };
+    if env.side.code_written || env.side.mmu.changes() != lookup.changes {
+        return 0;
+    }
+    // SAFETY: the caller's promise.
+    let (from, state) = unsafe { (&*tag.cast::<Compiled>(), &*env.state) };
+    let pc = state.pc();
+    let context = state.context;
+    let key = context_key(context);
+    if key != context_key(from.context) || pc & 3 != 0 || !mmu::canonical(pc) {
+        return 0;
+    }
+    let need = mmu::needed(Kind::Execute, context.el == 0);
+    let Some((phys, _)) = env.side.mmu.hit(pc, 4, need) else {
+        return 0;
+    };
+    // SAFETY: the caller's promise. Only the entry is read.
+    let (cache, jit) = unsafe { (&*lookup.blocks, &*lookup.jit) };
+    let Some(block) = cache.entries[Cache::index(phys)].as_deref() else {
+        return 0;
+    };
+    if block.phys != phys
+        || block.context != context
+        || block.epoch != lookup.epoch
+        || block.checks < lookup.check
+    {
+        return 0;
+    }
+    match block.code {
+        Some(code) if jit.fill_shared(pc, key, &code) => {
+            env.served += 1;
+            code.address
+        }
+        _ => 0,
+    }
 }
 
 /// What the thunk returns when the block leaves.
@@ -2404,6 +2480,10 @@ unsafe extern "sysv64" fn thunk<M: Memory>(
     // SAFETY: the caller's promise. Compiled code holds no reference into
     // the environment or the block while it calls.
     let env = unsafe { &mut *env.cast::<Env<M>>() };
+    if index == jit::JUMP {
+        // SAFETY: as above.
+        return unsafe { serve_jump(env, tag) };
+    }
     // SAFETY: as above: the block is alive while its code runs.
     let compiled = unsafe { &mut *tag.cast::<Compiled>() };
     let request = index & !u64::from(u32::MAX);
@@ -2604,6 +2684,10 @@ unsafe extern "sysv64" fn replay_thunk<M: Memory>(
     index: u64,
     tag: *mut std::ffi::c_void,
 ) -> u64 {
+    // A replay checks one block, and serves no miss of the jump cache.
+    if index == jit::JUMP {
+        return 0;
+    }
     // SAFETY: the caller's promise. The references end before `thunk`
     // makes its own.
     let done = unsafe {
@@ -2847,7 +2931,9 @@ impl Compiled {
     /// Compile the block, or mark it as one that the emitter refuses. `pc`
     /// is the address that it is entered at now, for the perf map. With
     /// `check`, the block keeps what K3 needs. With `sites` and `jumps`, its
-    /// exits look for the code of the next block (3e DESIGN.md H5, H6).
+    /// exits look for the code of the next block (3e DESIGN.md H5, H6), and
+    /// with `serve` a miss of the jump cache asks the thunk first (J10).
+    #[allow(clippy::too_many_arguments)]
     fn compile_code(
         &mut self,
         jit: &mut jit::Jit,
@@ -2856,6 +2942,7 @@ impl Compiled {
         sites: bool,
         jumps: bool,
         verify: bool,
+        serve: bool,
     ) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
@@ -2965,6 +3052,7 @@ impl Compiled {
             sites,
             jumps,
             verify,
+            serve,
         };
         let shape = jit::Shape {
             ops: &self.ops,
@@ -3047,6 +3135,9 @@ struct Chaining {
     /// Hits of the jump cache come back to the loop, which compares them
     /// with its own lookup (`VMLAB_HV_JIT_CHAIN=verify`).
     verify: bool,
+    /// A miss of the jump cache is served from the thunk where it can be
+    /// (card J10), unless `VMLAB_HV_JIT_SERVE` is `0`, `off` or `false`.
+    serve: bool,
     /// Hits that named other code than the lookup found.
     mismatches: u64,
     pending: Option<Pending>,
@@ -3055,7 +3146,7 @@ struct Chaining {
     epoch: u64,
     mmu: u64,
     /// The count of changes of the MMU that the jump cache holds entries
-    /// of.
+    /// of (`Mmu::jump_changes`).
     seen: u64,
 }
 
@@ -3090,6 +3181,7 @@ unsafe fn run_chained<M: Memory>(
     counts: &mut JitCounts,
     replay: Option<&mut Replay>,
     seat: Option<&jit::seat::Seat>,
+    lookup: Option<JumpLookup>,
 ) -> Option<Ran> {
     // SAFETY: the caller's promise.
     let context_el = unsafe { (*first).context.el };
@@ -3107,6 +3199,8 @@ unsafe fn run_chained<M: Memory>(
         failed: None,
         stop: None,
         replay,
+        lookup,
+        served: 0,
     };
     let thunk: jit::Thunk = if env.replay.is_some() {
         replay_thunk::<M>
@@ -3155,6 +3249,9 @@ unsafe fn run_chained<M: Memory>(
     };
     let failed = env.failed.take();
     let stop = env.stop.take();
+    counts.jump_served += env.served;
+    // SAFETY: as above.
+    let kicked = unsafe { jit::seat::kicked(context) };
     // SAFETY: as above.
     let left = unsafe { jit::seat::left(context) };
     // SAFETY: as above. Only the budget is shared.
@@ -3180,21 +3277,37 @@ unsafe fn run_chained<M: Memory>(
     let key = context_key(last.context);
     let pc = state.pc();
     let ran = match code {
-        jit::DONE => Ran {
-            count: taken,
-            halt: None,
-            terminal: last.terminal.map(|(_, trap)| trap),
-            pending: None,
-        },
+        jit::DONE => {
+            // The exit of a block that the loop ends itself (H5c), else of
+            // one whose next PC is a constant distance or that has no link.
+            if last.terminal.is_some() {
+                counts.returns_terminal += 1;
+            } else {
+                counts.returns_done += 1;
+            }
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: last.terminal.map(|(_, trap)| trap),
+                pending: None,
+            }
+        }
         jit::BUDGET if taken == 0 => return None,
         // The run stopped at the head of `last`, which did not run: the PC
         // is its entry.
-        jit::BUDGET => Ran {
-            count: taken,
-            halt: None,
-            terminal: None,
-            pending: None,
-        },
+        jit::BUDGET => {
+            if kicked {
+                counts.returns_kicked += 1;
+            } else {
+                counts.returns_budget += 1;
+            }
+            Ran {
+                count: taken,
+                halt: None,
+                terminal: None,
+                pending: None,
+            }
+        }
         jit::VERIFY => Ran {
             count: taken,
             halt: None,
@@ -3311,6 +3424,7 @@ impl Compiled {
                 budget,
                 &mut counts,
                 replay,
+                None,
                 None,
             )
         };
@@ -3599,6 +3713,21 @@ pub struct JitCounts {
     pub jump_hits: u64,
     pub unlinked: u64,
     pub lookups: u64,
+    /// Misses of the jump cache that the thunk served with code, so that
+    /// the run went on (card J10). They are not in `lookups`.
+    pub jump_served: u64,
+    /// The other returns to the loop after the end of a block (card J10):
+    /// a block that the loop ends itself (H5c: a system instruction, an
+    /// exception return, a call of the machine), a block that leaves with
+    /// nothing to chain to, and a run that stopped at a block head with
+    /// its budget spent, or kicked by another thread (H10c).
+    pub returns_terminal: u64,
+    pub returns_done: u64,
+    pub returns_budget: u64,
+    pub returns_kicked: u64,
+    /// Changes of the translation that kept the jump cache, because a new
+    /// ASID came with the new table base (`Mmu::jump_changes`).
+    pub jump_spaces: u64,
     /// Jumps linked and set back to their stubs, and entries of the jump
     /// cache filled.
     pub links: u64,
@@ -3690,6 +3819,8 @@ struct JitRun<'a> {
     chaining: &'a mut Chaining,
     /// Where the context of the run is, for a kick from another thread.
     seat: &'a jit::seat::Seat,
+    /// The blocks that a miss of the jump cache is served from (J10).
+    blocks: *mut Cache,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -3717,6 +3848,7 @@ unsafe fn execute<M: Memory>(
         check,
         chaining,
         seat,
+        blocks,
     } = run;
     let Some(jit) = jit.as_mut() else {
         // SAFETY: the caller's promise.
@@ -3730,12 +3862,16 @@ unsafe fn execute<M: Memory>(
             pending: None,
         };
     };
-    // The jump cache holds the translations of the MMU as they were.
-    let mmu = side.mmu.changes();
-    if chaining.seen != mmu {
+    // The jump cache holds the translations of the MMU as they were, in
+    // the address space of each entry: a new table base with a new ASID
+    // keeps it (card J10).
+    let jumps = side.mmu.jump_changes();
+    if chaining.seen != jumps {
         jit.clear_jumps();
-        chaining.seen = mmu;
+        chaining.seen = jumps;
     }
+    jit.set_jump_space(side.mmu.asid());
+    let mmu = side.mmu.changes();
     // Inline over the fast TLB, and with every hit kept while the CPU keeps
     // its accesses (H7, K1). A change drops the code of the region.
     jit.set_memory(if side.mmu.fast().is_none() {
@@ -3756,6 +3892,7 @@ unsafe fn execute<M: Memory>(
                 chaining.sites && !single,
                 chaining.jumps && !single,
                 chaining.verify,
+                chaining.serve,
             );
         }
         if let Some(pending) = pending
@@ -3808,6 +3945,13 @@ unsafe fn execute<M: Memory>(
                 counts,
                 None,
                 Some(seat),
+                (chaining.serve && !chaining.verify && !single).then_some(JumpLookup {
+                    blocks,
+                    jit: &raw const *jit,
+                    epoch,
+                    changes: mmu,
+                    check,
+                }),
             )
         } {
             counts.exit(&ran.halt);
@@ -4155,6 +4299,10 @@ impl<M: Memory> Cpu<M> {
                 sites: chaining_from_environment().0,
                 jumps: chaining_from_environment().1,
                 verify: matches!(std::env::var("VMLAB_HV_JIT_CHAIN").as_deref(), Ok("verify")),
+                serve: !matches!(
+                    std::env::var("VMLAB_HV_JIT_SERVE").as_deref(),
+                    Ok("0" | "off" | "false")
+                ),
                 mismatches: 0,
                 pending: None,
                 epoch: 0,
@@ -4307,6 +4455,7 @@ impl<M: Memory> Cpu<M> {
             counts.fills = jit.stats.fills;
             counts.clears = jit.stats.clears;
         }
+        counts.jump_spaces = self.side.mmu.spaces();
         if let Some(fast) = self.side.mmu.fast() {
             counts.tlb_fills = fast.fills;
             counts.tlb_flushes = fast.flushes;
@@ -4376,7 +4525,7 @@ impl<M: Memory> Cpu<M> {
         self.side.mmu.set_fast(self.jit.is_some());
         // Compiled code chains to the blocks that go now (3e DESIGN.md K7).
         self.unlink_all();
-        self.chaining.seen = self.side.mmu.changes();
+        self.chaining.seen = self.side.mmu.jump_changes();
         if let Some(jit) = &mut self.jit {
             jit.clear_jumps();
         }
@@ -5096,6 +5245,7 @@ impl<M: Memory> Cpu<M> {
                         Some(lines) => &lines.seat,
                         None => &self.seat,
                     },
+                    blocks: &raw mut self.blocks,
                 },
                 pending,
                 self.epoch,
@@ -5273,6 +5423,7 @@ impl<M: Memory> Cpu<M> {
                                 Some(lines) => &lines.seat,
                                 None => &self.seat,
                             },
+                            blocks: &raw mut self.blocks,
                         },
                         pending,
                         self.epoch,
@@ -5421,6 +5572,61 @@ mod tests {
         };
         let quiet = runs(false);
         assert_eq!(runs(true), quiet + 1, "the run after the TLBI");
+    }
+
+    /// Card J10: two blocks 16 KiB apart take the same entry of the jump
+    /// cache, so that each exit misses it. The thunk serves the miss with
+    /// the code of the other block, and the run does not come back to the
+    /// loop for it. The registers are those of the interpreter, and of a
+    /// run that comes back for every miss.
+    #[test]
+    fn a_miss_of_the_jump_cache_is_served_without_a_return_to_the_loop() {
+        const OTHER: u64 = BASE + 0x4000;
+        assert_eq!(jit::jump_index(BASE), jit::jump_index(OTHER));
+        let make = |jit: bool, serve: bool| {
+            let mut data = vec![0u8; 0x8000];
+            // add x0, x0, #1 ; br x2 / add x1, x1, #1 ; br x3
+            for (at, words) in [(0usize, [0x9100_0400u32, 0xd61f_0040]), (0x4000, [0x9100_0421, 0xd61f_0060])] {
+                for (n, word) in words.iter().enumerate() {
+                    data[at + n * 4..at + n * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            let mut cpu = Cpu::new(FlatMemory::new(BASE, data), State::reset(BASE));
+            cpu.state.set_x(2, OTHER);
+            cpu.state.set_x(3, BASE);
+            if jit {
+                cpu.set_jit(true).unwrap();
+                cpu.set_chaining(true).unwrap();
+                cpu.chaining.serve = serve;
+            }
+            cpu
+        };
+        let mut interpreted = make(false, false);
+        let mut served = make(true, true);
+        let mut returned = make(true, false);
+        for cpu in [&mut interpreted, &mut served, &mut returned] {
+            assert_eq!(cpu.run(4000), Stop::Budget);
+        }
+        for cpu in [&served, &returned] {
+            assert_eq!(
+                (cpu.state.x(0), cpu.state.x(1), cpu.state.pc(), cpu.instructions),
+                (
+                    interpreted.state.x(0),
+                    interpreted.state.x(1),
+                    interpreted.state.pc(),
+                    interpreted.instructions
+                )
+            );
+        }
+        assert_eq!(interpreted.state.x(0) + interpreted.state.x(1), 2000);
+        let (served, returned) = (served.jit_counts(), returned.jit_counts());
+        // Without the thunk every exit after the first ones misses and
+        // comes back; with it only the first ones do.
+        assert_eq!(returned.jump_served, 0);
+        assert!(returned.lookups > 1900, "{returned:?}");
+        assert!(served.lookups <= 4, "{served:?}");
+        assert!(served.jump_served > 1900, "{served:?}");
+        assert!(served.compiled_runs <= 8, "{served:?}");
     }
 
     #[test]

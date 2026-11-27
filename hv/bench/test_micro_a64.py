@@ -139,6 +139,24 @@ class JitReportTests(unittest.TestCase):
                           report["code_mails"], report["code_pages"], report["wait_ms"]),
                          (40, 38, 5, 7, 2))
 
+    def test_a_report_with_the_returns_to_the_loop_by_reason(self):
+        line = ('{"level":"INFO","message":"vcpu 0: JIT: 1000 instructions, 7 of them in the '
+                'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
+                '0 resets of the region, 3 ms of compiling; fast TLB: 900 accesses, 12 misses; '
+                'machine: 40 exclusive loads, 38 exclusive stores, 5 code mails, 7 code pages, '
+                '2 ms waiting; returns: 50 jump cache misses served in code, 11 at a block '
+                'that the loop ends, 3 with nothing to chain to, 9 at the budget, 2 kicked; '
+                '17 changes of the address space kept the jump cache"}\n')
+        with tempfile.TemporaryDirectory() as run_dir:
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line)
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual((report["jump_served"], report["returns_terminal"],
+                          report["returns_done"], report["returns_budget"],
+                          report["returns_kicked"], report["jump_spaces"]),
+                         (50, 11, 3, 9, 2, 17))
+        self.assertEqual(report["wait_ms"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

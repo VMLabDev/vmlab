@@ -33,7 +33,14 @@
 //! `unlink_to` and `unlink_all` set them back to their stubs. Every other
 //! exit looks its target up in the jump cache of the CPU (H6): an entry is
 //! the virtual PC, the key of the context and the code, direct-mapped by the
-//! PC. A miss leaves with `LOOKUP`, and the owner fills the entry (`fill`).
+//! PC. A miss of a block whose `Chain::serve` is set first calls the thunk
+//! with `JUMP`: an owner that has the code of the target compiled returns
+//! its address, fills the entry (`fill_shared`), and the run goes on without
+//! leaving compiled code (card J10). Otherwise the miss leaves with
+//! `LOOKUP`, and the owner fills the entry (`fill`). The key of an entry
+//! holds the address space (`set_jump_space`, the ASID), so that an owner
+//! can keep the cache across a change of the translation tables that the
+//! ASID tells apart.
 //! When the region is full, its code is dropped whole (H13c), and with it
 //! every link and every entry of the jump cache.
 //!
@@ -54,6 +61,7 @@ pub use emit::{
     Shape, add_flags, sub_flags,
 };
 use region::Region;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -92,6 +100,11 @@ pub const WATCHED: u64 = 2 << 32;
 /// are in the frame, and the value of a load is in its result word. The
 /// owner keeps the access. The block goes on.
 pub const LOGGED: u64 = 4 << 32;
+/// A miss of the jump cache, in a block whose `Chain::serve` is set: the PC
+/// of the state is the target, and every output of the block is written.
+/// The low 32 bits are 0, not an operation. The thunk returns the address
+/// of the code to go on to, or 0, and the block then leaves with `LOOKUP`.
+pub const JUMP: u64 = 8 << 32;
 
 /// What compiled code reads through R13.
 #[repr(C)]
@@ -109,8 +122,10 @@ pub struct Context {
     /// cache. Compiled code counts them.
     pub chained: u64,
     pub hits: u64,
-    /// The generation of the jump cache, which every key of an entry holds
-    /// added to it: `clear_jumps` moves it, and every entry is then a miss.
+    /// The generation of the jump cache and its address space, which every
+    /// key of an entry holds added to it: `clear_jumps` moves the
+    /// generation, and every entry is then a miss, and `set_jump_space`
+    /// the space, whose entries are then misses until it comes back.
     pub jump_generation: u64,
     /// The read and the write table of the fast TLB for the level of the
     /// blocks that run (`tlb::FastTlb::table`), or `tlb::EMPTY_TABLE`, which
@@ -145,8 +160,8 @@ const _: () = {
 };
 
 /// One entry of the jump cache (H6): the key is that of the context plus
-/// the generation of the cache when it was filled. An empty entry has the
-/// key 0, which no context has.
+/// the generation of the cache and the address space when it was filled.
+/// An empty entry has the key 0, which no context has.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JumpEntry {
@@ -166,8 +181,11 @@ impl JumpEntry {
 }
 
 /// A step of the generation of the jump cache. A key of a context uses the
-/// bits below 32 and the bit 63, so a generation never meets them.
-const JUMP_GENERATION_STEP: u64 = 1 << 32;
+/// bits below 32 and the bit 63, and the address space the bits 32 to 47,
+/// so a generation never meets them.
+const JUMP_GENERATION_STEP: u64 = 1 << 48;
+/// Where the address space sits in the key of an entry.
+const JUMP_SPACE_SHIFT: u32 = 32;
 /// The generation after which the cache is emptied and starts again.
 const JUMP_GENERATION_LAST: u64 = (1 << 62) - JUMP_GENERATION_STEP;
 
@@ -234,6 +252,8 @@ pub struct Stats {
     pub fills: u64,
     /// Times the jump cache was emptied.
     pub clears: u64,
+    /// Changes of the address space of the jump cache (`set_jump_space`).
+    pub spaces: u64,
     /// Comparisons compiled as host flags that the next operation reads
     /// (H8a), and lazy conditions compiled inline (H8c).
     pub fused: u64,
@@ -254,8 +274,13 @@ pub struct Jit {
     features: Features,
     /// The linked jumps to each block, by the address of its code.
     incoming: HashMap<u64, Vec<Site>>,
-    jump: Box<[JumpEntry]>,
+    /// The jump cache. Compiled code reads it, and the thunk of a run fills
+    /// it while the run holds the JIT shared (`fill_shared`).
+    jump: Box<[Cell<JumpEntry>]>,
     jump_generation: u64,
+    /// The address space of the entries that are filled and hit from now
+    /// on, in its place in the key.
+    jump_space: u64,
     defect: Defect,
     /// The address and the length of the trampoline.
     trampoline: (u64, u64),
@@ -321,8 +346,11 @@ impl Jit {
             exit: base + exit_offset as u64,
             features,
             incoming: HashMap::new(),
-            jump: vec![JumpEntry::EMPTY; JUMP_ENTRIES].into_boxed_slice(),
+            jump: (0..JUMP_ENTRIES)
+                .map(|_| Cell::new(JumpEntry::EMPTY))
+                .collect(),
             jump_generation: JUMP_GENERATION_STEP,
+            jump_space: 0,
             defect: Defect::None,
             trampoline: (base, len as u64),
             perf_map: false,
@@ -351,16 +379,18 @@ impl Jit {
     }
 
     /// A context for code of this JIT, with nothing counted yet.
+    #[inline]
     pub fn context(&self, budget: i64, thunk: Thunk, env: *mut c_void) -> Context {
         Context {
             budget,
             thunk,
             env,
             block: std::ptr::null_mut(),
-            jump: self.jump.as_ptr(),
+            // `Cell<JumpEntry>` has the layout of `JumpEntry`.
+            jump: self.jump.as_ptr().cast(),
             chained: 0,
             hits: 0,
-            jump_generation: self.jump_generation,
+            jump_generation: self.jump_tag(),
             reads: tlb::EMPTY_TABLE.as_ptr(),
             writes: tlb::EMPTY_TABLE.as_ptr(),
             accesses: 0,
@@ -408,9 +438,9 @@ impl Jit {
                 self.stats.unlinks += 1;
             }
         }
-        for entry in self.jump.iter_mut() {
-            if entry.code == address {
-                *entry = JumpEntry::EMPTY;
+        for entry in self.jump.iter() {
+            if entry.get().code == address {
+                entry.set(JumpEntry::EMPTY);
             }
         }
     }
@@ -438,7 +468,9 @@ impl Jit {
     /// kernel without hardware PAN.
     pub fn clear_jumps(&mut self) {
         if self.jump_generation >= JUMP_GENERATION_LAST {
-            self.jump.fill(JumpEntry::EMPTY);
+            for entry in self.jump.iter() {
+                entry.set(JumpEntry::EMPTY);
+            }
             self.jump_generation = JUMP_GENERATION_STEP;
         } else {
             self.jump_generation += JUMP_GENERATION_STEP;
@@ -446,27 +478,57 @@ impl Jit {
         self.stats.clears += 1;
     }
 
+    /// The address space of the jump cache from now on (card J10): an
+    /// entry hits only in the space that it was filled in. The owner names
+    /// the ASID here and keeps the cache across a change of the tables that
+    /// comes with a new ASID, as its TLB keeps its entries, instead of
+    /// emptying it. A space is at most 16 bits. The context of a run takes
+    /// the space of when it was made (`context`).
+    #[inline]
+    pub fn set_jump_space(&mut self, space: u16) {
+        let space = u64::from(space) << JUMP_SPACE_SHIFT;
+        if space != self.jump_space {
+            self.jump_space = space;
+            self.stats.spaces += 1;
+        }
+    }
+
+    /// The generation and the space that a key of an entry holds now.
+    #[inline]
+    fn jump_tag(&self) -> u64 {
+        self.jump_generation + self.jump_space
+    }
+
     /// Put the code `to` into the jump cache for the virtual PC `pc` in the
     /// context of `key` (H6). The caller checked that `to` holds the block
     /// of `pc` in that context now.
     pub fn fill(&mut self, pc: u64, key: u64, to: &Entry) {
-        if key == 0 || !self.current(to) {
-            return;
+        if self.fill_shared(pc, key, to) {
+            self.stats.fills += 1;
         }
-        self.jump[jump_index(pc)] = JumpEntry {
+    }
+
+    /// `fill` while a run of compiled code holds the JIT, from its thunk
+    /// (`JUMP`). `false`: nothing was filled. The caller counts it.
+    #[inline]
+    pub fn fill_shared(&self, pc: u64, key: u64, to: &Entry) -> bool {
+        if key == 0 || !self.current(to) {
+            return false;
+        }
+        self.jump[jump_index(pc)].set(JumpEntry {
             pc,
-            key: key + self.jump_generation,
+            key: key + self.jump_tag(),
             code: to.address,
             pad: 0,
-        };
-        self.stats.fills += 1;
+        });
+        true
     }
 
     /// The code that the jump cache gives for `pc` in the context of `key`.
+    #[inline]
     pub fn jump_target(&self, pc: u64, key: u64) -> Option<u64> {
-        let entry = self.jump[jump_index(pc)];
-        (entry.pc == pc && entry.key == key.wrapping_add(self.jump_generation))
-            .then_some(entry.code)
+        let entry = self.jump[jump_index(pc)].get();
+        (entry.pc == pc && entry.key == key.wrapping_add(self.jump_tag())).then_some(entry.code)
     }
 
     /// Put `defect` into every block compiled from now on. For the tests
@@ -506,11 +568,13 @@ impl Jit {
     }
 
     /// Whether the code of `entry` is still in the region.
+    #[inline]
     pub fn current(&self, entry: &Entry) -> bool {
         entry.generation == self.region.generation() && self.region.contains(entry.address)
     }
 
     /// The generation of the code in the region.
+    #[inline]
     pub fn generation(&self) -> u64 {
         self.region.generation()
     }
@@ -584,6 +648,7 @@ impl Jit {
     /// it runs but the thunk of `context`, which `context.env` serves. The
     /// same holds for every block that a linked jump or the jump cache
     /// reaches from it: the frame and the tag of its `Chain` are alive.
+    #[inline]
     pub unsafe fn enter(
         &self,
         entry: &Entry,

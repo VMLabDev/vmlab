@@ -943,7 +943,13 @@ JIT_REPORT = re.compile(
     # What the CPUs of a machine told each other (card J7), when the line has it.
     r"(?:; machine: (?P<exclusive_loads>\d+) exclusive loads, (?P<exclusive_stores>\d+) "
     r"exclusive stores, (?P<code_mails>\d+) code mails, (?P<code_pages>\d+) code pages, "
-    r"(?P<wait_ms>\d+) ms waiting)?")
+    r"(?P<wait_ms>\d+) ms waiting)?"
+    # The returns to the loop by reason, and the jump cache kept across a new
+    # address space (card J10), when the line has them.
+    r"(?:; returns: (?P<jump_served>\d+) jump cache misses served in code, "
+    r"(?P<returns_terminal>\d+) at a block that the loop ends, (?P<returns_done>\d+) with "
+    r"nothing to chain to, (?P<returns_budget>\d+) at the budget, (?P<returns_kicked>\d+) "
+    r"kicked; (?P<jump_spaces>\d+) changes of the address space kept the jump cache)?")
 
 
 def last_jit_report(run_dir):

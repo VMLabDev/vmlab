@@ -537,6 +537,10 @@ pub struct Mmu {
     /// every new control. What keeps a translation beside the TLB (the jump
     /// cache of the JIT, 3e DESIGN.md H6) is dropped when this moves.
     changes: u64,
+    /// The changes of `changes` that were a new table base with a new
+    /// ASID and nothing else (card J10): an entry of the jump cache is
+    /// tagged with its ASID, as an entry of the TLB is, and stays.
+    spaces: u64,
     /// What the memory named its host pages when the entries took theirs
     /// (`Memory::host_mapping`).
     mapping: Option<(u64, u64)>,
@@ -552,6 +556,7 @@ impl Mmu {
             controls,
             asid: controls.asid(),
             changes: 0,
+            spaces: 0,
             mapping: None,
             fast: None,
         }
@@ -588,8 +593,31 @@ impl Mmu {
     }
 
     /// The count of changes of the translation (`changes`).
+    #[inline]
     pub fn changes(&self) -> u64 {
         self.changes
+    }
+
+    /// The count of changes of the translation that the jump cache of the
+    /// JIT must be emptied for (3e DESIGN.md H6, card J10): every change but
+    /// a new table base that comes with a new ASID. The jump cache tags its
+    /// entries with the ASID (`asid`), so that a change of the address space
+    /// keeps the entries of the others, as the TLB keeps its own. A new base
+    /// under the same ASID cannot be told apart and empties it.
+    #[inline]
+    pub fn jump_changes(&self) -> u64 {
+        self.changes - self.spaces
+    }
+
+    /// The changes that kept the jump cache (`jump_changes`).
+    pub fn spaces(&self) -> u64 {
+        self.spaces
+    }
+
+    /// The ASID that the entries of the TLB are made with now.
+    #[inline]
+    pub fn asid(&self) -> u16 {
+        self.asid
     }
 
     pub fn controls(&self) -> &Controls {
@@ -620,6 +648,9 @@ impl Mmu {
             ttbr: new.ttbr,
             ..self.controls
         } == new;
+        if tables_only && new.asid() != self.asid {
+            self.spaces += 1;
+        }
         self.controls = new;
         self.asid = new.asid();
         if !tables_only {
@@ -1419,6 +1450,44 @@ mod tests {
                 level: 0
             }))
         );
+    }
+
+    /// Card J10: the jump cache of the JIT is kept across a new table base
+    /// that comes with a new ASID, and emptied by every other change.
+    #[test]
+    fn a_new_table_base_with_a_new_asid_keeps_the_jump_cache() {
+        let va = 0x7f_0000_3000u64;
+        let (_, mut state, _) = mapped(va, 0x4008_0000 | TABLE | AF | NOT_GLOBAL);
+        let mut mmu = Mmu::new(&state);
+        assert_eq!(mmu.asid(), 7);
+        let ttbr0 = state.system.regs[reg::TTBR0_EL1] & 0xffff_ffff_ffff;
+        let mut switch = |mmu: &mut Mmu, base: u64, asid: u64| {
+            state.system.regs[reg::TTBR0_EL1] = base | asid << 48;
+            mmu.sync(&state);
+            (mmu.changes(), mmu.jump_changes())
+        };
+        // Another base and another ASID: a change, which keeps the cache.
+        let (changes, jumps) = (mmu.changes(), mmu.jump_changes());
+        assert_eq!(switch(&mut mmu, ttbr0 + 0x1000, 8), (changes + 1, jumps));
+        assert_eq!(mmu.asid(), 8);
+        // Back to the first space.
+        assert_eq!(switch(&mut mmu, ttbr0, 7), (changes + 2, jumps));
+        // The same ASID with another base cannot be told apart.
+        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 7), (changes + 3, jumps + 1));
+        // The same ASID with the same base is no change.
+        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 7), (changes + 3, jumps + 1));
+        // A new ASID under the same base keeps it too.
+        assert_eq!(switch(&mut mmu, ttbr0 + 0x2000, 9), (changes + 4, jumps + 1));
+        assert_eq!(mmu.spaces(), 3);
+        // Every TLBI empties it, and so does a change of a control.
+        mmu.flush_page(Regime::El10, va >> 12 | 9 << 48, Some(9));
+        assert_eq!(mmu.jump_changes(), jumps + 2);
+        mmu.flush_asid(Regime::El10, 9);
+        assert_eq!(mmu.jump_changes(), jumps + 3);
+        state.system.regs[reg::MAIR_EL1] = 0x44;
+        state.system.regs[reg::TTBR0_EL1] = ttbr0 | 3 << 48;
+        mmu.sync(&state);
+        assert_eq!(mmu.jump_changes(), jumps + 5);
     }
 
     #[test]

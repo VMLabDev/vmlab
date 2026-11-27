@@ -107,6 +107,7 @@ impl Region {
     }
 
     /// The generation of the code in the region.
+    #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -180,6 +181,7 @@ impl Region {
     }
 
     /// Whether `address` is inside the executable view.
+    #[inline]
     pub fn contains(&self, address: u64) -> bool {
         let start = self.exec as u64;
         (start..start + self.len as u64).contains(&address)
