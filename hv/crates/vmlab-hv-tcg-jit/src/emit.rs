@@ -67,7 +67,7 @@ use crate::tlb::{ADDEND, ENTRIES, ENTRY_BITS, TAG, WATCH};
 use crate::{
     BUDGET, CHAIN, CONTEXT_ACCESSES, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV,
     CONTEXT_HITS, CONTEXT_JUMP, CONTEXT_JUMP_GENERATION, CONTEXT_READS, CONTEXT_THUNK,
-    CONTEXT_WRITES, Features, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
+    CONTEXT_WRITES, Features, JUMP, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
     WATCHED,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
@@ -254,6 +254,10 @@ pub struct Chain {
     /// that the owner can compare the entry with its own lookup (a check
     /// for a bisect).
     pub verify: bool,
+    /// A miss of the jump cache calls the thunk with `JUMP` before it
+    /// leaves (card J10): the owner can give the code of the target, and
+    /// the run goes on. Not with `verify`.
+    pub serve: bool,
 }
 
 /// What the block makes of the PC of the state at its end.
@@ -2204,6 +2208,17 @@ impl Emitter<'_> {
         }
         self.asm.cold(true);
         self.asm.bind(miss);
+        if chain.serve && !chain.verify {
+            // Card J10: the owner looks the target up without leaving. Every
+            // output is written, and no host register but those of the
+            // context holds anything, so the call keeps none.
+            let leave = self.asm.label();
+            Self::call_thunk(&mut self.asm, JUMP, &[]);
+            self.asm.test(RAX, RAX);
+            self.asm.jcc(Cond::E, leave);
+            self.asm.jmp_reg(RAX);
+            self.asm.bind(leave);
+        }
         self.asm.mov_imm(RAX, LOOKUP);
         self.asm.jmp_absolute(self.exit);
         self.asm.cold(false);

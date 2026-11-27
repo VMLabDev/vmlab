@@ -17,6 +17,16 @@
 //! atomic operations on both sides of Rust, and compiled code subtracts
 //! from it in place.
 //!
+//! `prepare` writes the budget with a release store, a plain `mov` on the
+//! host, and not a sequentially consistent one, an `xchg` (card J10). The
+//! protocol asks nothing more of it. A kick that lands before the store is
+//! lost whatever the order of the store, and the owner reads its mail and
+//! its lines before `prepare` and nothing that a kicker writes after it, so
+//! no later load of the owner has to wait for the store. What a lost kick
+//! costs is the wait of a kicker until it kicks again (J7a). The seat has
+//! cache lines of its own, so that the stores of `prepare` do not share a
+//! line with what other threads write.
+//!
 //! Sources: none beyond the design. No code of another JIT was read.
 
 use crate::Context;
@@ -35,6 +45,7 @@ pub const MOST: u64 = 1 << 38;
 ///
 /// # Safety
 /// `context` points at a live `Context`.
+#[inline(always)]
 unsafe fn budget<'a>(context: *mut Context) -> &'a AtomicI64 {
     // SAFETY: the caller's promise. The budget is an aligned `i64`, which
     // every side reaches with atomic operations or from compiled code.
@@ -59,6 +70,7 @@ pub unsafe fn kick(context: *mut Context) {
 ///
 /// # Safety
 /// `context` points at a live `Context`.
+#[inline]
 pub unsafe fn left(context: *mut Context) -> i64 {
     // SAFETY: the caller's promise.
     let raw = unsafe { budget(context) }.load(Ordering::SeqCst);
@@ -69,6 +81,7 @@ pub unsafe fn left(context: *mut Context) -> i64 {
 ///
 /// # Safety
 /// `context` points at a live `Context`.
+#[inline]
 pub unsafe fn kicked(context: *mut Context) -> bool {
     // SAFETY: the caller's promise.
     unsafe { budget(context) }.load(Ordering::SeqCst) < 0
@@ -79,7 +92,8 @@ unsafe extern "sysv64" fn idle(_: *mut c_void, _: u64, _: *mut c_void) -> u64 {
     crate::BUDGET
 }
 
-/// The context of one CPU at a fixed address.
+/// The context of one CPU at a fixed address, on cache lines of its own.
+#[repr(align(128))]
 pub struct Seat {
     context: UnsafeCell<Context>,
 }
@@ -122,6 +136,7 @@ impl Seat {
     }
 
     /// The context, for the run of the owner.
+    #[inline]
     pub fn context(&self) -> *mut Context {
         self.context.get()
     }
@@ -129,6 +144,7 @@ impl Seat {
     /// Put `fresh` into the seat for a run. Only the owner calls it, on
     /// its own thread, while no code runs on the seat. A kick that lands
     /// before the budget is written is lost.
+    #[inline]
     pub fn prepare(&self, fresh: Context) {
         let context = self.context.get();
         // SAFETY: the owner's fields are written by the owner alone, and
@@ -158,7 +174,7 @@ impl Seat {
             addr_of_mut!((*context).reads).write(reads);
             addr_of_mut!((*context).writes).write(writes);
             addr_of_mut!((*context).accesses).write(accesses);
-            budget(context).store(fresh_budget, Ordering::SeqCst);
+            budget(context).store(fresh_budget, Ordering::Release);
         }
     }
 
@@ -198,6 +214,52 @@ mod tests {
             budget(context).store(MOST as i64, Ordering::SeqCst);
             seat.kick();
             assert_eq!(left(context), MOST as i64);
+        }
+    }
+
+    #[test]
+    fn a_seat_is_on_lines_of_its_own_and_a_kick_after_prepare_holds() {
+        assert_eq!(std::mem::align_of::<Seat>(), 128);
+        let seat = std::sync::Arc::new(Seat::new());
+        assert_eq!(seat.context() as usize % 128, 0);
+        let mut fresh = seat_context(500);
+        fresh.chained = 7;
+        seat.prepare(fresh);
+        // A kick from another thread after the store of `prepare` is seen.
+        std::thread::spawn({
+            let seat = seat.clone();
+            move || seat.kick()
+        })
+        .join()
+        .unwrap();
+        // SAFETY: the seat lives.
+        unsafe {
+            assert!(kicked(seat.context()));
+            assert_eq!(left(seat.context()), 500);
+            assert_eq!((*seat.context()).chained, 7);
+        }
+        // The next `prepare` sets the budget again.
+        seat.prepare(seat_context(40));
+        // SAFETY: as above.
+        unsafe {
+            assert!(!kicked(seat.context()));
+            assert_eq!(left(seat.context()), 40);
+        }
+    }
+
+    fn seat_context(budget: i64) -> Context {
+        Context {
+            budget,
+            thunk: idle,
+            env: std::ptr::null_mut(),
+            block: std::ptr::null_mut(),
+            jump: std::ptr::null(),
+            chained: 0,
+            hits: 0,
+            jump_generation: 0,
+            reads: crate::tlb::EMPTY_TABLE.as_ptr(),
+            writes: crate::tlb::EMPTY_TABLE.as_ptr(),
+            accesses: 0,
         }
     }
 }
