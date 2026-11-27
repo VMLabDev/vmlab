@@ -521,10 +521,13 @@ fn agent_hello() -> Vec<u8> {
     )
 }
 
-/// How often the hello goes again while the agent has not answered: the
-/// agent can open its port after the first one was read by an earlier
-/// opener, or start again.
-const HELLO_REPEAT: u64 = 1 << 30;
+/// How often the hello goes again while the agent has not answered. The
+/// agent does not answer a hello that reached the port before it opened it
+/// (a plain QEMU boot of debian-13, card #1187: no answer to the first, an
+/// answer to the one sent again on the same connection), so the run ends
+/// up to this many instructions after the agent is ready: about a quarter of
+/// a guest second.
+const HELLO_REPEAT: u64 = 1 << 28;
 
 fn main() -> Result<(), Error> {
     let arguments = arguments()?;
@@ -1092,11 +1095,9 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
                     break 'run;
                 }
                 if instructions >= hello_at + HELLO_REPEAT {
-                    if hello_at > 0 {
-                        stream.set_nonblocking(false)?;
-                        stream.write_all(&agent_hello())?;
-                        stream.set_nonblocking(true)?;
-                    }
+                    stream.set_nonblocking(false)?;
+                    stream.write_all(&agent_hello())?;
+                    stream.set_nonblocking(true)?;
                     hello_at = instructions;
                 }
             }

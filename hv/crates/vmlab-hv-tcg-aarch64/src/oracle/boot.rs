@@ -128,6 +128,17 @@ impl Options {
     fn machine_with(&self, leader: bool) -> Vec<String> {
         // A window starts the CPU at EL2, so that its prelude can write every
         // register of EL1 and leave with `ERET` (`oracle::window`).
+        // A guest boot waits for its disk, which QEMU serves in host time.
+        // With `sleep=off` the clock of an idle CPU jumps to its next timer
+        // at once, so every wait for the disk ends a timeout of the guest
+        // (systemd killed journald after 6,000 guest seconds, card #1187).
+        // With `sleep=on` an idle CPU waits in host time, and a guest second
+        // is still 1e9 instructions while it runs.
+        let icount = if self.guest.is_some() {
+            "shift=0,sleep=on"
+        } else {
+            "shift=0,sleep=off"
+        };
         let machine = if self.window.is_some() {
             "virt,dtb-randomness=off,virtualization=on"
         } else {
@@ -166,7 +177,7 @@ impl Options {
             "-m",
             &self.ram_mib.to_string(),
             "-icount",
-            "shift=0,sleep=off",
+            icount,
             "-rtc",
             "base=2020-01-01T00:00:00,clock=vm",
             "-nodefaults",
@@ -727,6 +738,7 @@ mod tests {
             }),
         };
         let argv = options.argv().join(" ");
+        assert!(argv.contains("-icount shift=0,sleep=on"));
         assert!(argv.contains(
             "-blockdev driver=qcow2,node-name=disk0,file.driver=file,file.filename=/d/disk.qcow2 \
              -device virtio-blk-pci,drive=disk0 \
