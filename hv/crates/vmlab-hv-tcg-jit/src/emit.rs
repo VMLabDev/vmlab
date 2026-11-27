@@ -27,11 +27,11 @@
 //! AMD64 ABI for the call of the thunk. The operations are those of
 //! `vmlab_hv_tcg_ir::block`.
 
+use crate::asm::Label;
 use crate::asm::{
     Alu, Asm, Cond, R8, R9, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
     Reg, Rm, Shift,
 };
-use crate::asm::Label;
 use crate::{
     BUDGET, CHAIN, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV, CONTEXT_HITS,
     CONTEXT_JUMP, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES,

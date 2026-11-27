@@ -2377,7 +2377,15 @@ pub struct JitCounts {
 /// Make the link that the run before left for `block`, whose code is
 /// current: when the block is the one that its exit reached, in the same
 /// context, the same epoch and the same translation (3e DESIGN.md H5, H6).
-fn make_link(jit: &mut jit::Jit, chaining: &Chaining, pending: Pending, block: &Compiled, pc: u64, epoch: u64, mmu: u64) {
+fn make_link(
+    jit: &mut jit::Jit,
+    chaining: &Chaining,
+    pending: Pending,
+    block: &Compiled,
+    pc: u64,
+    epoch: u64,
+    mmu: u64,
+) {
     let Some(to) = block.code else {
         return;
     };
