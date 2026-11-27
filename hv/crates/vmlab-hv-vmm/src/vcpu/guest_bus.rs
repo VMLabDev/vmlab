@@ -207,7 +207,7 @@ impl GuestBus {
                 len: region.len(),
                 stamps,
                 host: region.as_ptr() as usize,
-                bitmap: region.bitmap() as *const _,
+                bitmap: region.get_mmap().bitmap() as *const _,
             });
         }
         Ok(Self(Arc::new(Shared {
