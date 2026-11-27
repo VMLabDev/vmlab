@@ -14,6 +14,7 @@ The QEMU argv below is vmlab's own argv for a linux-modern profile VM on the
 import itertools
 import json
 import os
+import re
 import select
 import shutil
 import socket
@@ -866,3 +867,32 @@ def regression_verdict(previous, latest):
     if delta < -allowed:
         return "better", round(allowed, 3)
     return "ok", round(allowed, 3)
+
+
+def jit_enabled(environ=None):
+    """Whether VMLAB_HV_JIT turns the JIT of the aarch64 core on (3e
+    DESIGN.md J1): the values that `exec::jit_from_environment` reads."""
+    environ = os.environ if environ is None else environ
+    return environ.get("VMLAB_HV_JIT") in ("1", "on", "true")
+
+
+JIT_REPORT = re.compile(
+    r"JIT: (?P<instructions>\d+) instructions, (?P<interpreted_instructions>\d+) of them in the "
+    r"interpreter in (?P<interpreted_blocks>\d+) blocks; (?P<compiled_blocks>\d+) blocks compiled, "
+    r"(?P<refused_blocks>\d+) refused, (?P<code_bytes>\d+) bytes of code, (?P<resets>\d+) resets "
+    r"of the region, (?P<compile_ms>\d+) ms of compiling")
+
+
+def last_jit_report(run_dir):
+    """The counts of the last JIT line that vmlab-hv wrote to the stderr log
+    of a run (one every 1e9 instructions of a vCPU), or None."""
+    last = None
+    try:
+        with open(os.path.join(run_dir, "stderr.log"), errors="replace") as log_file:
+            for line in log_file:
+                match = JIT_REPORT.search(line)
+                if match:
+                    last = {key: int(value) for key, value in match.groupdict().items()}
+    except OSError:
+        return None
+    return last

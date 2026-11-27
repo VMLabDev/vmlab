@@ -243,6 +243,10 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         "template": version,
         "host_cpus": os.cpu_count(),
     }
+    if args.backend == "vmlab-hv" and arch == "aarch64":
+        # The JIT of 3e (DESIGN.md J1) is off unless VMLAB_HV_JIT turns it on.
+        env["jit"] = lib.jit_enabled()
+        env["jit_reports"] = []
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} {arch} smp={smp} {args.guest} repeat {i}/{args.repeats}")
         result, backend, session, agent, digest = one_repeat(
@@ -250,6 +254,8 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         )
         env["loadavg_end"] = lib.read_loadavg()
         env["backend_version"] = backend.backend_version()
+        if "jit_reports" in env:
+            env["jit_reports"].append(lib.last_jit_report(result["run"]))
         for w in workloads:
             all_samples[w].append(result["samples"][w])
         if digest is not None:

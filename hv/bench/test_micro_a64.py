@@ -82,5 +82,25 @@ class MicroA64Tests(unittest.TestCase):
                          ("aarch64", "flat-a64", "s", 3))
 
 
+class JitReportTests(unittest.TestCase):
+    def test_the_switch_and_the_last_report_of_a_run(self):
+        self.assertTrue(lib.jit_enabled({"VMLAB_HV_JIT": "1"}))
+        self.assertFalse(lib.jit_enabled({"VMLAB_HV_JIT": "0"}))
+        self.assertFalse(lib.jit_enabled({}))
+        line = ('{"level":"INFO","message":"vcpu 0: JIT: {n} instructions, 7 of them in the '
+                'interpreter in 2 blocks; 30 blocks compiled, 1 refused, 900 bytes of code, '
+                '0 resets of the region, 3 ms of compiling"}\n')
+        with tempfile.TemporaryDirectory() as run_dir:
+            self.assertIsNone(lib.last_jit_report(run_dir))
+            with open(Path(run_dir) / "stderr.log", "w") as log:
+                log.write(line.replace("{n}", "1000"))
+                log.write("other\n")
+                log.write(line.replace("{n}", "2000"))
+            report = lib.last_jit_report(run_dir)
+        self.assertEqual(report["instructions"], 2000)
+        self.assertEqual(report["interpreted_instructions"], 7)
+        self.assertEqual(report["compile_ms"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
