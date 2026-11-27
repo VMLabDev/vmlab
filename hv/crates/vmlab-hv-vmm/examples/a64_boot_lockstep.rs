@@ -47,6 +47,10 @@
 //! more than the first defect. The last instructions before a difference go
 //! to `last-instructions.txt` in the scratch directory.
 //!
+//! The CPU runs the JIT, as the CPU of every machine does unless
+//! `VMLAB_HV_JIT=0` (3e DESIGN.md K4): each instruction is a compiled block
+//! of one. The report says how many ran compiled.
+//!
 //! QEMU is the test oracle only (S6). Nothing here is a product path.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -421,6 +425,13 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     let mut vcpu = cell.lock();
     vcpu.cpu().clock = Clock::Manual(0);
     vcpu.cpu().log_accesses(true);
+    // The leader leads the interrupts: our CPU takes one only where the
+    // stream says, through `irq` and `fiq`. A CPU of a machine reads the
+    // lines of its machine before every block (card C13), which took an
+    // interrupt that our controller had pending where the leader took none
+    // (K4 of 3e, card J8: at an `ISB` after `MSR DAIFClr`). The lines still
+    // tell the GIC's level to the checks below.
+    vcpu.cpu().lines = None;
 
     let mut leader = Leader::start(&options)?;
     // The serial port of the leader, for its keys.
@@ -724,6 +735,7 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
             parts.reset().map_err(|e| format!("reset: {e}"))?;
             vcpu = cell.lock();
             vcpu.cpu().clock = Clock::Manual(0);
+            vcpu.cpu().lines = None;
         }
 
         let Some(next) = next else {
@@ -831,6 +843,20 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     for (record, count) in &by_record {
         println!("  differences after {record}: {count}");
     }
+    // K4 of 3e DESIGN.md: the CPU of the machine runs the JIT unless
+    // `VMLAB_HV_JIT=0`, so every instruction ran as a compiled block of one.
+    let jit = vcpu.cpu().jit_counts();
+    println!(
+        "JIT: {}. {} runs of compiled code ({} instructions), {} runs in the interpreter.",
+        if vcpu.cpu().jit_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        jit.compiled_runs,
+        jit.compiled_instructions,
+        jit.interpreted_runs
+    );
     println!(
         "Adopted from the leader: {counters} counter reads, {timed} timer and interrupt status reads that differed."
     );
