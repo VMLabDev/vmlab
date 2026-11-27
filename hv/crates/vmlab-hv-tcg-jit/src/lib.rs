@@ -8,8 +8,9 @@
 //! - `emit`: the one-pass allocator with its spill (H3), the inline forms of
 //!   the operations of one word and of the common ones of two words, the
 //!   guards and their stubs (H9), the inlined loads and stores of 1 to 16
-//!   bytes over the fast TLB (H7), the direct calls of helpers (H12), and
-//!   the thunk through which every other effect runs.
+//!   bytes over the fast TLB (H7), the flags of H8 (a comparison as host
+//!   flags, and the inline forms of a lazy condition), the direct calls of
+//!   helpers (H12), and the thunk through which every other effect runs.
 //! - `tlb`: the layout of the fast TLB and its fill and flush (H7).
 //! - `perf`: the perf map (H13e), which names each block for `perf`.
 //! - The trampoline here (H4): `enter` saves the registers that the System V
@@ -45,7 +46,10 @@ pub mod region;
 pub mod tlb;
 
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
-pub use emit::{Chain, Defect, Effect, Memory, Next, NextPc, Refused, Shape};
+pub use emit::{
+    Chain, Defect, Effect, FlagOperation, FlagTest, LazyCondition, Memory, Next, NextPc, Refused,
+    Shape, add_flags, sub_flags,
+};
 use region::Region;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -227,6 +231,10 @@ pub struct Stats {
     pub fills: u64,
     /// Times the jump cache was emptied.
     pub clears: u64,
+    /// Comparisons compiled as host flags that the next operation reads
+    /// (H8a), and lazy conditions compiled inline (H8c).
+    pub fused: u64,
+    pub lazy: u64,
 }
 
 /// The default size of the code region of one CPU (H13b).
@@ -252,6 +260,10 @@ pub struct Jit {
     perf_map: bool,
     /// How the code in the region reaches memory (H7, `set_memory`).
     memory: Memory,
+    /// Compile comparisons as host flags and lazy conditions inline (H8).
+    /// Off: every comparison is a `setcc`, and every lazy condition a call,
+    /// as card J1 made them. For measurements before and after.
+    pub host_flags: bool,
     pub stats: Stats,
 }
 
@@ -312,6 +324,7 @@ impl Jit {
             trampoline: (base, len as u64),
             perf_map: false,
             memory: Memory::Thunk,
+            host_flags: true,
             stats: Stats::default(),
         })
     }
@@ -516,7 +529,13 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let (asm, labels) = emit::emit(shape, self.exit, self.features, self.defect)?;
+        let (asm, labels, fused, lazy) = emit::emit(
+            shape,
+            self.exit,
+            self.features,
+            self.defect,
+            self.host_flags,
+        )?;
         let mut sites = [(0, 0); SITES];
         for (n, (jump, stub)) in labels.iter().enumerate() {
             let position = |label| {
@@ -542,6 +561,8 @@ impl Jit {
         };
         let code = asm.finish(base).ok_or(Refused::Size)?;
         self.region.put(base, &code);
+        self.stats.fused += fused;
+        self.stats.lazy += lazy;
         Ok(Entry {
             address: base,
             generation: self.region.generation(),

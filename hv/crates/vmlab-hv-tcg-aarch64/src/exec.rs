@@ -973,6 +973,9 @@ const CALL_ARGUMENTS: usize = 8;
 /// its `Code::Call`.
 struct Call {
     function: HelperFn,
+    /// The call is `flags::CONDITION`, which the JIT can make inline (3e
+    /// DESIGN.md H8c).
+    condition: bool,
     /// The words of the arguments.
     args: Vec<Place>,
     /// The words of each result, with the mask of its type.
@@ -1045,6 +1048,7 @@ impl Parts {
                     }
                     let call = Call {
                         function: helper.0.function,
+                        condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
                         args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                         results: vec![(lowering.place(id), result_mask(graph, id))],
                     };
@@ -1092,6 +1096,7 @@ impl Parts {
                     } else {
                         let call = Call {
                             function: helper.0.function,
+                            condition: std::ptr::eq(helper.0, &crate::flags::CONDITION),
                             args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                             results: vec![(lowering.place(id), result_mask(graph, id))],
                         };
@@ -1316,6 +1321,7 @@ fn compile(
                 }
                 let call = Call {
                     function: helper.0.function,
+                    condition: false,
                     args: args.iter().map(|arg| lowering.place(*arg)).collect(),
                     results: results
                         .iter()
@@ -2763,6 +2769,7 @@ impl Compiled {
                     writes: place_words(result).collect(),
                     leave: Some(exit),
                     direct: None,
+                    condition: None,
                 },
                 Access16::Write {
                     address,
@@ -2775,6 +2782,7 @@ impl Compiled {
                     writes: exclusive.into_iter().collect(),
                     leave: Some(exit),
                     direct: None,
+                    condition: None,
                 },
             })
             .collect();
@@ -2798,6 +2806,7 @@ impl Compiled {
                     },
                     index as u64,
                 )),
+                condition: self.lazy_condition(call),
             })
             .collect();
         // The compiled code sets the PC (3e DESIGN.md H5): the last
@@ -3086,6 +3095,33 @@ unsafe fn run_chained<M: Memory>(
 }
 
 impl Compiled {
+    /// The inline forms of a call of `flags::CONDITION`: its arguments are
+    /// the kind, the two operands and the condition of the record, each one
+    /// word. The JIT takes the forms only where the word of the condition
+    /// is the constant that it holds now.
+    fn lazy_condition(&self, call: &Call) -> Option<jit::LazyCondition> {
+        let [kind, a, b, code] = call.args.as_slice() else {
+            return None;
+        };
+        let [(result, _)] = call.results.as_slice() else {
+            return None;
+        };
+        if !call.condition || [kind, a, b, code, result].iter().any(|place| place.wide) {
+            return None;
+        }
+        let code_value = *self.frame.get(usize::from(code.slot))?;
+        let condition = u8::try_from(code_value).ok().filter(|code| *code < 16)?;
+        Some(jit::LazyCondition {
+            kind: kind.slot,
+            a: a.slot,
+            b: b.slot,
+            code: code.slot,
+            code_value,
+            result: result.slot,
+            cases: crate::flags::host_forms(condition),
+        })
+    }
+
     /// Run the compiled code of this block and of no other: the replay of
     /// K3 checks one block. Its head takes the whole budget, so the head of
     /// any block that its exit reaches leaves at once. `None`: the budget did
@@ -3390,6 +3426,10 @@ pub struct JitCounts {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// Comparisons compiled as the host flags that the next operation
+    /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
+    pub fused: u64,
+    pub lazy: u64,
     /// The exits of compiled blocks to the next block (H5, H6): through a
     /// linked jump (`chained`), through a hit of the jump cache
     /// (`jump_hits`), and to the loop through a jump that is not linked
@@ -3668,6 +3708,17 @@ pub fn jit_perf_map_from_environment() -> bool {
     switch("VMLAB_HV_JIT_PERF_MAP")
 }
 
+/// Whether the JIT keeps the flags in host flags (3e DESIGN.md H8, card J5):
+/// on unless `VMLAB_HV_JIT_FLAGS` is `0`, `off` or `false`. Off, it compiles
+/// every comparison and lazy condition as card J1 did, for a measurement
+/// before and after.
+pub fn host_flags_from_environment() -> bool {
+    !matches!(
+        std::env::var("VMLAB_HV_JIT_FLAGS").as_deref(),
+        Ok("0" | "off" | "false")
+    )
+}
+
 /// The translated blocks of a CPU: an entry for each code address, picked
 /// by the low bits of the physical address, and a store of the blocks that
 /// lost their entry to other code. A kernel and its programs run more code than the entries
@@ -3921,6 +3972,7 @@ impl<M: Memory> Cpu<M> {
         }
         self.jit = if on {
             let mut jit = jit::Jit::new()?;
+            jit.host_flags = host_flags_from_environment();
             jit.set_perf_map(self.jit_perf_map)?;
             Some(jit)
         } else {
@@ -4037,6 +4089,8 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+            counts.fused = jit.stats.fused;
+            counts.lazy = jit.stats.lazy;
             counts.links = jit.stats.links;
             counts.unlinks = jit.stats.unlinks;
             counts.fills = jit.stats.fills;

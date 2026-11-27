@@ -164,10 +164,10 @@ tcg-a64-testfloat level='1' sample='':
 tcg-a64-mips iterations='100000000' repeats='3':
 	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_mips -- {{iterations}} {{repeats}}
 
-# Run the block differential of the aarch64 JIT (3e DESIGN.md K2): interpreter against compiled code
+# Run the block differential of the aarch64 JIT (3e DESIGN.md K2): interpreter against compiled code; mode `flags` for edge operands
 [group('tcg')]
-tcg-a64-jit-diff rounds='1000000' seed='3e0001':
-	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_jitdiff -- {{rounds}} {{seed}}
+tcg-a64-jit-diff rounds='1000000' seed='3e0001' mode='all':
+	cargo run --release -p vmlab-hv-tcg-aarch64 --example a64_jitdiff -- {{rounds}} {{seed}} {{mode}}
 
 # Build the pinned legacy and EFI virtio-net option ROMs
 [group('dev')]
