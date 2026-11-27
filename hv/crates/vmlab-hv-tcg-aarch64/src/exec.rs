@@ -1091,6 +1091,24 @@ struct Compiled {
     written: Vec<bool>,
     /// The runs of the compiled code that K3 checked.
     checks: u32,
+    /// Why the block was translated, for the count of the compiles by
+    /// cause (3e DESIGN.md J11).
+    origin: Origin,
+}
+
+/// Why a block was translated (3e DESIGN.md J11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Origin {
+    /// The CPU never translated the code at its physical address in its
+    /// context before.
+    #[default]
+    First,
+    /// The CPU had a block for it whose code stamp no longer held: a write
+    /// into its page, or an epoch whose check failed.
+    Invalidated,
+    /// The CPU had translated it before, and the store of the cache dropped
+    /// that block, or a reset of the state dropped every block.
+    Evicted,
 }
 
 /// The most arguments of a helper.
@@ -1687,6 +1705,7 @@ fn compile(
         refused: false,
         written: Vec::new(),
         checks: 0,
+        origin: Origin::First,
     })
 }
 
@@ -3585,6 +3604,22 @@ pub struct JitCounts {
     pub bytes: u64,
     pub resets: u64,
     pub compile_ns: u64,
+    /// The compiles by cause (3e DESIGN.md J11): a block translated for the
+    /// first time, a block whose code went with a drop of the region (H13c)
+    /// or a change of how the code reaches memory, a block translated again
+    /// after its code stamp failed (a write into its page, an epoch), and a
+    /// block translated again after the store of the cache dropped it.
+    pub compiles_first: u64,
+    pub compiles_region: u64,
+    pub compiles_invalidated: u64,
+    pub compiles_evicted: u64,
+    /// Drops of the region for a change of how the code reaches memory
+    /// (`resets` counts those of a full region).
+    pub memory_resets: u64,
+    /// Blocks translated and the host time of the translations, as
+    /// `Cpu::translations` and `Cpu::translation_ns`.
+    pub translations: u64,
+    pub translation_ns: u64,
     /// Comparisons compiled as the host flags that the next operation
     /// reads, and lazy conditions compiled inline (3e DESIGN.md H8).
     pub fused: u64,
@@ -3749,6 +3784,15 @@ unsafe fn execute<M: Memory>(
         // SAFETY: the caller's promise.
         let compiled = unsafe { &mut *block };
         if !compiled.refused && !compiled.code.is_some_and(|entry| jit.current(&entry)) {
+            if compiled.code.is_some() {
+                counts.compiles_region += 1;
+            } else {
+                match compiled.origin {
+                    Origin::First => counts.compiles_first += 1,
+                    Origin::Invalidated => counts.compiles_invalidated += 1,
+                    Origin::Evicted => counts.compiles_evicted += 1,
+                }
+            }
             compiled.compile_code(
                 jit,
                 state.pc(),
@@ -4065,6 +4109,11 @@ pub struct Cpu<M> {
     pub translations: u64,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
+    /// The blocks that the CPU translated, by the physical address and the
+    /// key of the context, with 1 << 32 for a block of one instruction: a
+    /// block that is translated again is told from a first one (3e
+    /// DESIGN.md J11).
+    translated: FastSet<(u64, u64)>,
     /// Enabled by the owner for an instrumented boot.
     pub block_counts: Option<BlockCounts>,
     /// What the guest asked for that the CPU does not have, each once. The
@@ -4135,6 +4184,7 @@ impl<M: Memory> Cpu<M> {
             instructions: 0,
             translations: 0,
             translation_ns: 0,
+            translated: FastSet::default(),
             block_counts: None,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
@@ -4300,6 +4350,7 @@ impl<M: Memory> Cpu<M> {
             counts.bytes = jit.stats.bytes;
             counts.resets = jit.stats.resets;
             counts.compile_ns = jit.stats.compile_ns;
+            counts.memory_resets = jit.stats.memory_resets;
             counts.fused = jit.stats.fused;
             counts.lazy = jit.stats.lazy;
             counts.links = jit.stats.links;
@@ -4312,6 +4363,8 @@ impl<M: Memory> Cpu<M> {
             counts.tlb_flushes = fast.flushes;
         }
         counts.machine = self.side.machine;
+        counts.translations = self.translations;
+        counts.translation_ns = self.translation_ns;
         counts
     }
 
@@ -5036,13 +5089,20 @@ impl<M: Memory> Cpu<M> {
         };
         let index = Cache::index(phys);
         let mut ready = self.usable(single, index, phys, context);
+        // The cache held a block of the code whose stamp failed.
+        let mut stale = false;
         if !ready {
             let cache = if single {
                 &mut self.singles
             } else {
                 &mut self.blocks
             };
-            ready = cache.revive(index, phys, context) && self.usable(single, index, phys, context);
+            stale = cache.entries[index]
+                .as_ref()
+                .is_some_and(|block| block.phys == phys && block.context == context);
+            let revived = cache.revive(index, phys, context);
+            ready = revived && self.usable(single, index, phys, context);
+            stale |= revived && !ready;
         }
         if !ready {
             let limit = if single { 1 } else { BLOCK_INSTRUCTIONS };
@@ -5050,7 +5110,17 @@ impl<M: Memory> Cpu<M> {
             let translated = self.translate(phys, limit);
             self.translation_ns += started.elapsed().as_nanos() as u64;
             let compiled = match translated {
-                Ok(compiled) => Box::new(compiled),
+                Ok(mut compiled) => {
+                    let key = (phys, context_key(context) | u64::from(single) << 32);
+                    compiled.origin = if stale {
+                        Origin::Invalidated
+                    } else if self.translated.insert(key) {
+                        Origin::First
+                    } else {
+                        Origin::Evicted
+                    };
+                    Box::new(compiled)
+                }
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
                     self.raise(exception, pc);

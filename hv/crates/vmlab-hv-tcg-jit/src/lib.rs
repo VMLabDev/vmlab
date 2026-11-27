@@ -226,6 +226,8 @@ pub struct Stats {
     pub refused: u64,
     pub bytes: u64,
     pub resets: u64,
+    /// Drops of the region for a change of `Memory` (`set_memory`).
+    pub memory_resets: u64,
     pub compile_ns: u64,
     /// Jumps linked, jumps set back to their stubs, and entries of the
     /// jump cache filled.
@@ -342,6 +344,7 @@ impl Jit {
             self.incoming.clear();
             self.clear_jumps();
             self.memory = memory;
+            self.stats.memory_resets += 1;
         }
     }
 
