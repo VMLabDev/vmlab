@@ -24,9 +24,19 @@
 //! below the size of the access, and compares that with the tag. So an
 //! access that is not aligned to its size misses, and such an access is
 //! the only one that can cross its page.
+//!
+//! A flush, and the search of the write entries of a page that gets code,
+//! visit the places filled since the last flush while there are at most
+//! `TRACKED`, and sweep the tables only past that: their cost follows what
+//! the TLB holds and not its size. A boot flushes about a million times
+//! (card J12: a sweep of the whole tables each time took 2.9 s of a boot at
+//! 4,096 entries and 55 s at 65,536).
 
-/// The entries of one table.
-pub const ENTRIES: usize = 256;
+/// The entries of one table: 4 MiB of guest pages. From the curve of card
+/// J12 (3e DESIGN.md J12a): at 1,024 a boot misses 2.6 % of its inlined
+/// accesses and 256 entries 3.1 %, and 4,096 to 65,536 entries take a
+/// tenth of what is left at most. The four tables are 128 KiB.
+pub const ENTRIES: usize = 1024;
 /// Log2 of the bytes of one entry.
 pub const ENTRY_BITS: u32 = 5;
 /// The tag of an empty entry. A masked address has at most its three low
@@ -340,7 +350,8 @@ mod tests {
         // The other level, the other kind, and another page with its place.
         assert!(tlb.lookup(0, false, 0x1234_5000, 8).is_none());
         assert!(tlb.lookup(1, true, 0x1234_5000, 8).is_none());
-        assert!(tlb.lookup(1, false, 0x1244_5000, 8).is_none());
+        let rival = 0x1234_5000 + ((ENTRIES as u64) << 12);
+        assert!(tlb.lookup(1, false, rival, 8).is_none());
         assert_eq!(tlb.len(), 1);
     }
 
