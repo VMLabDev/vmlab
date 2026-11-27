@@ -2188,13 +2188,6 @@ impl<M: Memory> Cpu<M> {
             // Another CPU invalidated translations: no block starts before
             // this CPU has dropped them too.
             self.take_mail();
-            // Another writer (a device, another CPU, a DMA of fw_cfg that an
-            // instruction of this CPU started) moved the memory: the blocks
-            // are checked against it before the next one runs, not at the
-            // end of the budget.
-            if self.memory.generation() != self.generation.wrapping_add(self.side.own_writes) {
-                self.settle();
-            }
             let pc = self.state.pc();
             let context = self.state.context;
             let quiet = !(self.irq || self.fiq || self.state.il);
