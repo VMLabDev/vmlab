@@ -1221,6 +1221,12 @@ be a wrong base for the next speed card to compare with.
   ready in 148 to 169 s on a host at a load of 2 to 10. So Fedora at one
   vCPU reaches agent ready with no margin on a loaded host: the remaining
   speed is the three costs of C13b-P1.
+- **C13b-S1a. Decision of the leader (2026-11-27): the card lands with this
+  cell open.** Guest timeouts stay as they are (decision of the operator),
+  so the fix is speed. J10 (entry and exit, 31.5 % of C13b-P1), J11
+  (translation and the code cache, about 14 %) and J12 (the fast TLB, about
+  12 %) work on the three costs, and a follow-up card measures Fedora 44 at
+  one vCPU again, three repeats on S1's terms, after all three of them.
 - **C13b-S2.** No serial log of the other 21 boots of the matrix has a line
   of emergency mode, a failed dependency, a timed-out job, an oops or a
   segfault, and each of them reached agent ready inside 600 s (the longest

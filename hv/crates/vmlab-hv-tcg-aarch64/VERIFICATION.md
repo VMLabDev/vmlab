@@ -2486,6 +2486,13 @@ hours, and kvm-unit-tests at 4 vCPUs. The numbers are in 3e DESIGN.md,
   not prove.
 - Any change of speed. The three largest costs of the profile are named in
   C13b-P1 of the 3e design.
+- S1 for Fedora 44 at one vCPU. Of seven boots on a host at a load of 7 to
+  12, four reached agent ready in 149.6 to 172.5 s and three went to
+  emergency mode on systemd's 90 s device timeout, the vCPU at 37 to 130
+  MIPS in the late phase (3e DESIGN.md, C13b-S1). Every other cell of the
+  matrix passed its three repeats. The leader landed the card with this
+  cell open (C13b-S1a): a follow-up card measures it again after J10, J11
+  and J12.
 
 ### Sources read for this card
 
