@@ -1435,6 +1435,123 @@ adoption rules of the boot lockstep.
   were not read to write this code. Its `unittests.cfg` is parsed by the
   script that runs it.
 
+## Card S3 (2026-11-27)
+
+Guest RAM straight from the TLB entry, and stores without stamps on pages
+that hold no translated code (the five model views of card #1145, F2 and F3
+of each).
+
+### What changed
+
+- **The TLB entry keeps the host address of its page** (`tlb::Entry::host`)
+  and the address of the page's watch word (`Entry::watch`), from
+  `Memory::host_page` when the entry is filled. A load whose page the TLB
+  holds that way is a probe, an add and one host access; a store is the same
+  plus two relaxed loads of the watch word. Neither calls the memory. The
+  CPU drops its entries when the memory names another mapping
+  (`Memory::host_mapping`, checked at every `run` and `step`). `FlatMemory`
+  and `GuestBus` hand out host pages; every other memory keeps the call.
+- **The TLB has 2,048 entries and a folded index** (the page number XOR the
+  page number shifted by the index width), so pages 4 MiB apart no longer
+  take one place. An invalidation by address looks at one place when no
+  entry of a mapping larger than a page covers the address. It looks at
+  every entry when one does, and while more than 64 such mappings are kept.
+- **A store into a page without translated code moves no stamp.** The
+  page's watch word is odd while a CPU holds code it translated there.
+  `GuestBus` stores straight when it is even: no stamp, no `SeqCst`
+  operation, no lock. The argument for the race between a translator and a
+  straight store is the module comment of `vmlab-hv-vmm/src/vcpu/guest_bus.rs`:
+  the translator makes the word odd under a mutex and then runs
+  `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, takes the stamp before it
+  reads the code (the old code read first and stamped after, which let a
+  write between the two go unseen), and checks the word after. A stamped
+  write makes the word even before it moves the stamps. A device write is
+  always stamped. A host without the barrier or without `cmpxchg16b` runs
+  more than one CPU with every write stamped, as before.
+- **The exclusive store is one host compare and exchange** against the value
+  of its load (`Memory::compare_and_store`), under the transaction lock and
+  after the generation check. A store of another CPU that changed the value
+  fails it; one that wrote the same value back is taken as one before the
+  load, which is what QEMU does. The 16-byte form is `lock cmpxchg16b`.
+- **The code-page filter bits are cleared again**: each bit has a count of
+  the pages of `code_set` that have it, and the bit goes when the count
+  reaches zero.
+- A memory that counts the stamps of its own writes (`own_generation`)
+  tells `settle` how far they moved the generation, so a straight store does
+  not start a new epoch.
+
+### Speed
+
+On helios, pinned to cores 28-31, 3 repeats each, with `bench/run.py`
+(`just bench-run interpreter aarch64 1 3` for the flat images, and
+`--backend vmlab-hv --arch aarch64 --guest debian-13 --suite boot` at 1 and 2
+vCPUs for the boot MIPS row). Before is `next` at `8f98e8f4`, which holds
+the lazy flags of card S1 and its boot MIPS row. After is `57ad9140`, a
+merge of that `next` and this branch on helios: the branch merges into it
+without a conflict. The two ran one after the other, before first, while
+other cards booted VMs on other cores. The rows are in
+`hv/bench/history/aarch64.jsonl` with a `note`.
+
+| | Before (median) | After (median) | Change |
+|---|---|---|---|
+| CoreMark mix, MIPS | 132.85, 138.38, 141.39 (**138.38**) | 151.74, 150.99, 150.47 (**150.99**) | +9 % |
+| Scalar loop, MIPS | 154.54, 148.81, 157.83 (**154.54**) | 158.70, 158.97, 155.81 (**158.70**) | +3 % |
+| Debian boot, 1 vCPU, MIPS | 82.55, 84.74, 81.33 (**82.55**) | 91.26, 96.64, 96.86 (**96.64**) | +17 % |
+| Debian to agent ready, 1 vCPU, s | 220.46, 212.27, 220.67 (**220.46**) | 196.47, 184.97, 184.38 (**184.97**) | -16 % |
+| Debian boot, 2 vCPUs, MIPS | 104.65, 101.45, 107.58 (**104.65**) | 127.41, 124.60, 110.32 (**124.60**) | +19 % |
+| Debian to agent ready, 2 vCPUs, s | 173.53, 180.35, 169.32 (**173.53**) | 142.14, 145.14, 167.13 (**145.14**) | -16 % |
+
+The scalar loop has no load and no store, so its change is within the
+noise. The five views estimated 25 to 40 % at 1 vCPU and 50 to 70 % at 2
+for the whole of their W1; what is left of the gap at 2 vCPUs is the block
+loop and the operations, which card S0 profiled.
+
+### Equal behaviour
+
+- O3 lockstep on `ef5a139c` (the code of this card): `just tcg-a64-lockstep
+  loadstore` verified 5,227,768 instructions in 2,980,769 rounds, `mmu`
+  4,403,165 in 1,155 rounds and `walk` 4,454,798 in 1,099 rounds (seed 1,
+  100,000 per class), no difference in any. Those groups run on
+  `FlatMemory`, which hands out host pages, so they run the new paths.
+- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) on `57ad9140`: 11 tests,
+  9 with the same results as QEMU 11.1.3, 2 (`gicv2-mmio`, `gicv2-mmio-3p`)
+  pass the two `ITARGETSR` subtests that fail on QEMU, as in card C13, and
+  none differs otherwise.
+
+### Tests
+
+- `vmlab-hv-vmm/src/vcpu/emulated_tests.rs`: a store moves the stamps only
+  where a CPU holds code, a translator sees a write that raced it
+  (`watch_holds`), a device write is always stamped; the exclusive store is
+  a compare and exchange at 1, 2, 4, 8 and 16 bytes; and two CPUs on two
+  threads, 200,000 rounds each, take a spinlock with `LDAXR`/`STXR`, count
+  under it with plain loads and stores, give it back with a straight `STLR`,
+  count a second word with `LDXR`/`STXR` alone and store beside both in the
+  same page: both counts end at 400,000.
+- `vmlab-hv-tcg/src/tlb.rs`: the folded index, an invalidation by address
+  with and without a larger mapping, and past 64 of them.
+- `exec.rs`: a new memory under the CPU drops the host pages of the old one.
+
+### What this card does not do
+
+- The JIT of phase 3e can take the entry as it is (host address and watch
+  word); no code of it is here.
+- An invalidation by ASID still looks at every entry.
+- Code on pages that a CPU also writes as data (mixed pages) is stamped and
+  translated again as before: each stamped write makes the watch even, and
+  the next translation makes it odd, with a barrier at 2 or more CPUs.
+
+### Sources read for this card
+
+- The state of this crate, of `vmlab-hv-tcg` and of
+  `vmlab-hv-vmm/src/vcpu/guest_bus.rs`; the Linux man page of `membarrier`
+  for its two commands, and the x86 `cmpxchg16b` instruction from general
+  knowledge of the instruction set.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
+
 ## Card C14 (2026-11-27)
 
 Snapshots, reset and the debug port of an emulated machine (DESIGN.md F6,
@@ -1801,3 +1918,266 @@ subtests that QEMU failed in both `gicv2-mmio` and `gicv2-mmio-3p`.
 
 No instruction semantics sources were consulted for S0. QEMU was used as
 a running oracle for lockstep and kvm-unit-tests.
+
+## Card S2, #1143 (2026-11-27)
+
+Translated blocks that do not depend on their virtual address (DESIGN.md
+M6). The PC-relative blocks and the cache indexed by physical address were
+made on card C13 (`73333030`, `b5117069`, after its F6); this card takes
+that branch, measures it, finds what it costs and takes part of the cost
+back.
+
+### What a block is keyed by
+
+A block is kept and found under the physical address of its first
+instruction and its `Context`: the exception level, `PSTATE.SP`, the FP
+enable of `CPACR_EL1.FPEN`, and `TCR.TBI0`/`TBI1` of the regime for an
+instruction address. The level, the stack pointer and the FP enable change
+what the lifter makes, and TBI changes the graph of a branch to a register.
+Nothing else is needed in the key:
+
+- A block never crosses a 4 KB page (`translate` ends it at a page
+  boundary), so its virtual and physical addresses have the same low 12
+  bits for every granule, and `ADRP` takes the page of the entry PC.
+- The execute permission, the level's view of it, the ASID and the
+  translation regime are checked by the TLB lookup of the PC before every
+  block (`code_address`), not by the key: a mapping without execute
+  permission takes its abort before any block is looked up.
+- Every value that depends on the PC is computed from the PC at the entry:
+  `ADR`, `ADRP`, `LDR` (literal), the link of `BL`/`BLR`, the PC of an
+  exception that leaves the block, the PC of the last instruction that the
+  loop runs (`Trap`), and the next PC.
+- The code bytes are checked as before, by the code stamp of the memory for
+  the physical pages of the block and the epoch. A store through any virtual
+  address reaches the same physical page, so invalidation stays exact: the
+  block is made again only when its own bytes may have changed.
+
+### What it cost, and what changed here
+
+On the flat images, whose translations do not matter, the PC-relative
+blocks ran slower: the next PC of every direct branch and the PC of every
+exception exit had become an `Add` of the entry PC in the operations of the
+block, and the exit PC of a load or a store is computed before the access.
+Now:
+
+- A direct branch and the fall through carry their next PC as a distance
+  from the entry (`A64Next::Relative`). A conditional branch is a `Select`
+  of two constants, as before the change. The loop adds the entry PC.
+- An exception exit carries the distance of its instruction (`at` of
+  `A64Next::Exception`) and no PC write: the loop sets the PC when the block
+  leaves there.
+- The next PC is not one of the register outputs any more: the block sets
+  it from its own words after them, and reads the entry PC after its
+  operations, not across them.
+
+What is still slower than the blocks at fixed addresses: `BL`, `ADR`,
+`ADRP` and `LDR` (literal) read the PC and add, and the index of the cache
+needs the physical address, which waits for the TLB lookup, where the
+virtual index did not.
+
+### Measurements
+
+helios, pinned to four cores (`--cpus 28-31`), 1 vCPU, Debian 13 template,
+2 GiB, `bench/run.py --backend vmlab-hv --arch aarch64 --suite boot`. The
+host ran other cards' boots and builds throughout (load average 4 to 28),
+so the wall times are noisy; the translation counts are not. Before is
+`f91d8899`, this branch at `567c0829` with `b5117069` and `73333030`
+reverted (C13's two-generation store and everything else kept); after is
+`567c0829`; final is `b94d2d67`, the code of this card (a commit of a
+scratch copy on helios with the tree of `40c0ffa4` of this branch;
+`f91d8899` exists only there too). The instruction and
+translation counts come from the line each emulated vCPU logs when the
+bench pauses the machine at agent ready (`boot_counters`).
+
+| Build | Translations to agent ready | Translation time | Instructions | Agent ready | Boot MIPS |
+|---|---|---|---|---|---|
+| before | 1,605,469; 1,591,822; 1,595,640; 1,586,935 | 12.8 s; 13.5 s; 12.6 s; 14.9 s | 18.02e9 to 18.31e9 | 228 s, 249 s, 250 s, 289 s; one run in emergency mode | 79.2, 72.6, 72.1, 63.4 |
+| after | 490,571; 488,811; 491,088; 482,317; 491,783; 492,190; 492,717 | 3.7 s to 4.4 s | 17.92e9 to 18.22e9 | 249 s, 264 s, 269 s, 254 s, 226 s, 222 s, 221 s | 72.2, 68.5, 67.0, 71.7, 79.4, 80.9, 81.1 |
+| final | 490,335; 491,570; 495,805; 495,209; 492,465 | 3.6 s to 4.0 s | 17.98e9 to 18.27e9 | 269 s, 243 s, 243 s, 220 s, 271 s; one run in emergency mode | 67.9, 74.6, 75.3, 81.9, 66.4 |
+
+The same physical code is translated once: 3.3 times fewer translations,
+and the translation time of a boot falls from about 13 s to about 4 s. The
+boot time does not show it beyond the noise of the host.
+
+The flat aarch64 images (`--backend interpreter`), 12 samples of each
+build, interleaved: before, final and before again, three repeats a run:
+
+| Build | CoreMark mix | Scalar loop |
+|---|---|---|
+| before | 133.1 MIPS (131.0 to 137.5) | 127.7 MIPS (111.0 to 130.1) |
+| after (an earlier interleaving) | 112.9 MIPS against 131.5 before | 112.9 MIPS against 125.5 before |
+| final | 123.3 MIPS (119.2 to 126.3) | 121.1 MIPS (119.6 to 123.6) |
+
+The flat mix runs 7 % slower than with blocks at fixed addresses, and the
+scalar loop 5 %, from 14 % and 10 % after the change of C13.
+
+`hv/bench/history/aarch64.jsonl` holds the rows of the three builds:
+`coremark_algorithms_1000` and `scalar_loop_300000000` of the interpreter,
+and `boot_to_agent_ready` and `boot_mips` of vmlab-hv, whose `env` keeps
+the counts of each repeat (`boot_counters`). These rows were taken with this
+card's pause counters; since the merge with card #1142 the bench takes
+`boot_mips` from #1142's instruction counts, and the pause line of a vCPU
+(`parking`) remains for the translation counts.
+
+### Equal behaviour
+
+- O3 lockstep (`just tcg-a64-lockstep <group>`, seed 1, 100,000 a class) at
+  `b94d2d67`, the tree of `40c0ffa4`: `c1` 1,439,552 instructions, `loadstore` 5,227,727, `system`
+  14,143,370 (with the exceptions), `mmu` 4,403,165; no difference in any.
+- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) at `b94d2d67`: 11 tests, 9
+  give the same results as QEMU, and `gicv2-mmio` and `gicv2-mmio-3p` pass
+  the two `ITARGETSR` subtests that fail on QEMU, as in cards C10 and C13.
+
+### Tests
+
+- `a_shared_block_computes_its_page_and_its_link_from_the_pc_it_runs_at`
+  (`tests/translate.rs`): one page of code with `ADRP`, `BL` and a return
+  at two addresses in two pages, run as blocks and stepped.
+- `a_write_to_shared_code_reaches_it_at_every_address`: the block of the
+  first address serves the second until a store through a third address
+  changes its code, and the second address runs the new code.
+- `one_translation_serves_code_at_two_addresses` (card C13).
+- bench: `BootCountersTests` reads the pause lines of the vCPUs.
+
+### Sources read for this card
+
+- The state of this crate, of vmlab-hv-vmm's emulated vCPU and of the bench.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
+
+## Card S4 (2026-11-27)
+
+The alignment checks and the writeback of the exits off the path on which
+every access succeeds, and the pairs of X registers on the fast path of the
+loop (the five model views of card #1145, the parts that four of them name).
+
+### What changed
+
+- **Alignment.** The context of a block has a bit more, `strict`: the MMU is
+  off or SCTLR_EL1.A is set (`state::strict_alignment`). `State::refresh`
+  sets it, and so does the start of `run` and `step`, for an owner that
+  wrote SCTLR_EL1 itself. A block lifted with it checks every alignment
+  before the access, as before. A block lifted without it compiles no `And`,
+  `IsZero` and `Guard` for an alignment that only Device memory asks for:
+  the exit of the access carries that alignment
+  (`ExceptionClass::DataAbort::device`), each load and store holds it in its
+  `aux`, and the access checks it on its slow path, which a page of Device
+  memory takes (`exec::device_faults`). The check is the one the guard made
+  (`Side::unaligned_faults`): after the faults of the walk for the page and
+  before its permissions, the page of the first byte deciding. An exclusive
+  access and `LDAR`/`STLR` keep their guard in every context, since they ask
+  for the alignment on every memory.
+- **Exit writeback.** `compile` no longer computes the writeback of an exit
+  before the event that leaves through it. Each exit gets its own list of
+  operations (`Leave::ops`) with what its writeback needs and the block has
+  not computed at that point, and the inputs that only that list reads.
+  `Compiled::leave` runs the list, then copies the writeback out. The end of
+  the block computes its writeback on the way as before.
+- **Pairs.** A load or a store of 16 bytes that is not exclusive is
+  `Code::LoadPair` or `Code::StorePair`: one TLB hit and two accesses of 8
+  bytes where the bytes are in one page, the two words of the frame read and
+  written directly. A store whose value joins two words (`STP` of X
+  registers) stores the two words and computes no join. A slice of 64 bits
+  at the offset 0 or 64 of a value of 128 bits shares the words of the value
+  (`block::word_of`), so the two halves of an `LDP` cost no operation.
+  Anything else (a crossing into another page, a Device page without the
+  alignment, a page of code, an exclusive mark, the access log) takes the
+  slow path of before, which makes the one access of 16 bytes. Where the
+  memory refuses the second half after taking the first, the fault is the
+  one that access of 16 bytes reported, and the memory has seen the same
+  (it splits an access of 16 bytes to a device into two of 8 bytes too).
+- **SUB and CMP** of registers and of immediates are one `Sub`:
+  `Builder::sub_with_carry` computes `a - b` as one operation when the carry
+  is the literal 1, and `a + NOT b + carry` otherwise. Its flags stay the
+  lazy flags of card S1, from the same operands.
+- **W registers.** `Add`, `Sub`, `Mul`, `And`, `Or`, `Xor` and the shifted
+  value of `ShiftLeft` read a truncated operand of one word whole
+  (`exec::skip_truncations`): the block form masks the result to its type,
+  so the `Slice` of a W register read from its X slot is no operation of
+  its own unless another operation needs it.
+
+### Tests
+
+- `an_access_late_in_a_block_leaves_with_the_registers_before_it`
+  (`tests/translate.rs`): a block of four instructions whose load faults in
+  Device memory and with SCTLR_EL1.A and not in Normal memory, run as one
+  block, with the three instructions before it written back.
+- `a_pair_of_x_registers_is_one_access`: `STP` and `LDP` aligned and not, a
+  pair that crosses into a page without a translation (the fault names the
+  first byte of that page, no register written), and Device memory, which
+  asks a pair for the alignment of one register.
+
+### Measurements
+
+On helios, `c90a1e7b` (next, before) against `b3ecf70d` (the code of this
+card), each from its own clone, 1 vCPU, pinned to CPUs 28-31. Other cards
+ran boots, lockstep and builds on the host at the same time (load average 3
+to 17), and one of them was pinned to CPUs 16-17, inside the default window
+of the bench. Both clones count as dirty because the build rewrites
+`Cargo.lock` (the missing `flate2` entry of `vmlab-hv-vmm`). The lines are in
+`hv/bench/history/aarch64.jsonl`.
+
+| Workload | Before | After |
+|---|---|---|
+| `coremark_algorithms_1000`, MIPS, two alternating runs of 3 | 114.4, 103.4 | 119.7, 118.2 |
+| `scalar_loop_300000000`, MIPS, the same runs | 113.8, 109.8 | 115.8, 109.2 |
+| Debian 13 to agent ready, s, alternating, `--repeats 1` each | 237.5, 236.4, 230.6 (median 236.4) | 194.5, 247.0, 233.2 (median 233.2) |
+| the same boots, guest time at `Run /init`, s | 17.8, 17.9, 17.5 | 14.7, 17.4, 16.4 |
+| the same boots, guest time at the start of systemd, s | 47.2, 47.4, 47.2 | 38.7, 45.4, 42.9 |
+
+- The flat images run with the MMU off: their blocks are strict and keep
+  the alignment guards, so the CoreMark mix gains from the exits, the pairs,
+  `Sub` and the W registers only, 4 to 14 %. The loop of three instructions
+  has no access and no exit inside a block, and does not move.
+- The boot gains about 9 % to the start of systemd on the boots of the
+  quietest host (42.9 s against 47.2 s), and 1 % to agent ready by the
+  median, inside the spread of the runs (6.9 s before, 52.5 s after). From systemd on the boot waits on
+  devices and timers in real time as much as it computes.
+- The boot MIPS row (card S0) is not on `next` yet, so the boots are
+  recorded as time to agent ready. Each boot is its own line with one
+  sample: a run of three repeats writes no line when one repeat fails, and
+  two of the boots fell into emergency mode (one of each side, under load:
+  the device of `/boot/efi` did not appear inside its 90 s, as in card C13).
+  A first run of the baseline gave 312.4 s and 266.4 s before its third
+  repeat did that, and wrote no line.
+
+### Equal behaviour
+
+The instruction lockstep against QEMU 11.1.3 `-cpu cortex-a53` at
+`b3ecf70d`, no difference in any run:
+
+| Run | Instructions verified | Rounds |
+|---|---|---|
+| `just tcg-a64-lockstep mmu 100000 1` | 4,403,165 | 1,155 |
+| `just tcg-a64-lockstep mmu 100000 2` | 4,457,567 | 1,164 |
+| `just tcg-a64-lockstep mmu 100000 3` | 4,454,408 | 1,168 |
+| `just tcg-a64-lockstep walk 100000 1` | 4,454,798 | 1,099 |
+| `just tcg-a64-lockstep system 100000 1` | 14,143,984 | 15,388 |
+| `just tcg-a64-lockstep loadstore 100000 5` | 5,226,330 | 2,977,680 |
+| `just tcg-a64-lockstep all 100000 3` | 3,347,191 | 73,159 |
+
+The mmu runs give the same counts as in card C8, with their alignment, Device
+and permission faults in the same order on both sides. The lockstep runs one
+instruction a block, so the tests above hold the exits inside a longer
+block. `just tcg-a64-kvm-unit-tests`: 11 tests, 9 give the same result lines
+as QEMU, 2 (`gicv2-mmio`, `gicv2-mmio-3p`) pass the two `ITARGETSR`
+subtests that fail on QEMU, as in card C13.
+
+### What this card does not do
+
+- The boot MIPS row, which card S0 adds, and a profile of where the boot
+  time goes now.
+- The x86-64 back end, lazy flags, block chaining and the RAM store path
+  (the other cards of the five views).
+
+### Sources read for this card
+
+- The state of this crate, `vmlab-hv-tcg-ir` (the graph, the scheduler, the
+  pruning) and the RAM path of `vmlab-hv-vmm` (`guest_bus.rs`), and the five
+  model views of card #1145.
+- The two's complement identities for the flags of a subtraction.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the black box of the lockstep and of
+  kvm-unit-tests only.

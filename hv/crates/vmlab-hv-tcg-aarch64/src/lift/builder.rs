@@ -71,9 +71,14 @@ pub enum Trap {
 pub enum ExceptionClass {
     Undefined,
     /// A load or a store that cannot be made. `unprivileged`: the accesses
-    /// of the instruction are made as EL0 (`LDTR`, `STTR`).
+    /// of the instruction are made as EL0 (`LDTR`, `STTR`). `device`: the
+    /// alignment in bytes that Device memory asks of the access, which the
+    /// access checks itself where its page is Device memory (1: none). Only
+    /// a block lifted without `Context::strict` has one above 1: a strict
+    /// block checks every alignment before the access (card S4).
     DataAbort {
         unprivileged: bool,
+        device: u8,
     },
     /// An access to an address that is not a multiple of its size. The
     /// syndrome is the address. `always`: the instruction asks for the
@@ -94,11 +99,17 @@ pub enum ExceptionClass {
 pub enum A64Next {
     /// The next PC.
     Pc(ScalarId),
+    /// The next PC as its distance in bytes from the entry of the block: a
+    /// direct branch, or the fall through. The loop adds the PC at the
+    /// entry, so that the block reads no PC for it.
+    Relative(ScalarId),
     /// An exception that leaves the block before one of its instructions,
-    /// with the scalars of its syndrome.
+    /// with the scalars of its syndrome. The PC is that instruction, `at`
+    /// bytes from the entry of the block: the loop sets it.
     Exception {
         class: ExceptionClass,
         syndrome: Vec<ScalarId>,
+        at: u64,
     },
     /// The instruction at `pc` bytes from the entry of the block is the last
     /// of the block, and the loop runs
@@ -120,7 +131,7 @@ impl ExitScalars for A64Exit {
     fn for_each_scalar(&mut self, visit: &mut dyn FnMut(&mut ScalarId)) {
         self.writeback.for_each_scalar(visit);
         match &mut self.next {
-            A64Next::Pc(scalar) => visit(scalar),
+            A64Next::Pc(scalar) | A64Next::Relative(scalar) => visit(scalar),
             A64Next::Exception { syndrome, .. } => syndrome.iter_mut().for_each(visit),
             A64Next::Trap { .. } => {}
         }
@@ -181,6 +192,8 @@ pub struct Builder {
     entry: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// `branch` is a distance from the entry of the block.
+    relative: bool,
     /// What the last instruction does outside the graph.
     trap: Option<Trap>,
     /// The instructions before the one that is being lifted.
@@ -190,8 +203,12 @@ pub struct Builder {
     /// what an exit inside the instruction writes back.
     before: [Option<ScalarId>; slot::COUNT],
     before_written: [bool; slot::COUNT],
-    /// The exit of a failed memory access of this instruction, once made.
-    abort: Option<ExitId>,
+    /// The exit of a failed memory access of this instruction, once made,
+    /// with the Device alignment it asks for.
+    abort: Option<(ExitId, u8)>,
+    /// The Device alignment that the next access of this instruction asks
+    /// for, in a block lifted without `Context::strict` (1: none).
+    device: u8,
     /// The memory effects of the block so far. Each has its own number.
     effects: usize,
     /// The addresses of this instruction that an alignment guard covers,
@@ -225,12 +242,14 @@ impl Builder {
             pc,
             entry: pc,
             branch: None,
+            relative: false,
             trap: None,
             completed: 0,
             started: false,
             before: [None; slot::COUNT],
             before_written: [false; slot::COUNT],
             abort: None,
+            device: 1,
             effects: 0,
             aligned: Vec::new(),
             unprivileged: false,
@@ -248,6 +267,7 @@ impl Builder {
         self.before = self.current;
         self.before_written = self.written;
         self.abort = None;
+        self.device = 1;
         self.aligned.clear();
         self.unprivileged = false;
     }
@@ -302,6 +322,14 @@ impl Builder {
     /// as `code_address` computes it.
     pub fn pc_plus(&mut self, delta: u64) -> ScalarId {
         self.code_address(self.pc.wrapping_add(delta))
+    }
+
+    /// The distance from the entry of the block to the address `delta`
+    /// bytes from the instruction that is being lifted, as a constant: the
+    /// next PC of a direct branch (`branch_relative`).
+    pub fn pc_distance(&mut self, delta: u64) -> ScalarId {
+        let distance = self.pc.wrapping_add(delta).wrapping_sub(self.entry);
+        self.imm(64, distance)
     }
 
     /// The address of the 4 KB page of the instruction that is being
@@ -674,8 +702,13 @@ impl Builder {
         b: ScalarId,
         carry: ScalarId,
     ) -> (ScalarId, Flags) {
-        let inverted = self.not(width, b);
-        let (result, _) = self.add_with_carry(width, a, inverted, carry);
+        // With the carry set it is one subtraction (card S4).
+        let result = if self.block.graph.literal(carry) == Some(1) {
+            self.binary(width, Binary::Sub, a, b)
+        } else {
+            let inverted = self.not(width, b);
+            self.add_with_carry(width, a, inverted, carry).0
+        };
         let sum = Sum {
             width,
             a,
@@ -1073,27 +1106,36 @@ impl Builder {
 
     /// An exit that leaves the block before the instruction that is being
     /// lifted: the registers as they were before it, and its address as the
-    /// PC.
+    /// PC, which the loop sets from the entry PC.
     fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
-        let mut writes = self.writes(self.before, self.before_written);
-        let pc = self.pc_plus(0);
-        writes.push((slot::PC, pc));
+        let writes = self.writes(self.before, self.before_written);
+        let at = self.pc.wrapping_sub(self.entry);
         self.block.exit(A64Exit {
             writeback: Writeback { writes },
-            next: A64Next::Exception { class, syndrome },
+            next: A64Next::Exception {
+                class,
+                syndrome,
+                at,
+            },
             completed: self.completed,
         })
     }
 
+    /// The exit of a failed access of this instruction, which asks for the
+    /// Device alignment that `require_aligned` left for it.
     fn abort_exit(&mut self) -> ExitId {
-        if let Some(exit) = self.abort {
+        let device = std::mem::replace(&mut self.device, 1);
+        if let Some((exit, asked)) = self.abort
+            && asked == device
+        {
             return exit;
         }
         let class = ExceptionClass::DataAbort {
             unprivileged: self.unprivileged,
+            device,
         };
         let exit = self.exit_before(class, Vec::new());
-        self.abort = Some(exit);
+        self.abort = Some((exit, device));
         exit
     }
 
@@ -1208,6 +1250,12 @@ impl Builder {
     /// only where something asks for it: SCTLR_EL1.A or the MMU being off,
     /// which ask for `bytes`, or Device memory at the address, which asks
     /// for `device` bytes. The loop decides that when the guard fails.
+    ///
+    /// A block lifted without `Context::strict` has no guard for what only
+    /// Device memory asks: the next access of the instruction checks
+    /// `device` itself, after the walk of its page and before its
+    /// permissions, where the guard and the loop put that fault (card S4).
+    /// Call it right before the access that it covers.
     pub fn require_aligned(
         &mut self,
         address: ScalarId,
@@ -1222,6 +1270,10 @@ impl Builder {
                 .iter()
                 .any(|(checked, size)| *checked == address && *size >= bytes)
         {
+            return;
+        }
+        if !always && !self.context.strict {
+            self.device = device;
             return;
         }
         self.aligned.push((address, bytes));
@@ -1255,6 +1307,14 @@ impl Builder {
             "a branch target is 64 bits"
         );
         self.branch = Some(target);
+        self.relative = false;
+    }
+
+    /// Set the next PC as its distance from the entry of the block
+    /// (`pc_distance`). The instruction that calls this ends the block.
+    pub fn branch_relative(&mut self, distance: ScalarId) {
+        self.branch(distance);
+        self.relative = true;
     }
 
     /// The instruction that is being lifted is the last of the block, and
@@ -1270,8 +1330,12 @@ impl Builder {
                 pc: self.pc.wrapping_sub(self.entry),
                 trap,
             },
+            (None, Some(target)) if self.relative => A64Next::Relative(target),
             (None, Some(target)) => A64Next::Pc(target),
-            (None, None) => A64Next::Pc(self.code_address(fallthrough)),
+            (None, None) => {
+                let distance = self.imm(64, fallthrough.wrapping_sub(self.entry));
+                A64Next::Relative(distance)
+            }
         };
         let writes = self.writes(self.current, self.written);
         let completed = self.completed + u32::from(self.started);
