@@ -34,7 +34,7 @@ use crate::asm::{
 };
 use crate::{
     BUDGET, CHAIN, CONTEXT_BLOCK, CONTEXT_BUDGET, CONTEXT_CHAINED, CONTEXT_ENV, CONTEXT_HITS,
-    CONTEXT_JUMP, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES,
+    CONTEXT_JUMP, CONTEXT_THUNK, Features, JUMP_ENTRIES, JUMP_SHIFT, LOOKUP, SITES, VERIFY,
 };
 use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
 
@@ -66,6 +66,10 @@ pub struct Chain {
     /// without one, its exits leave with `DONE` where it would serve them.
     pub sites: bool,
     pub jumps: bool,
+    /// A hit of the jump cache leaves with `VERIFY` instead of jumping, so
+    /// that the owner can compare the entry with its own lookup (a check
+    /// for a bisect).
+    pub verify: bool,
 }
 
 /// What the block makes of the PC of the state at its end.
@@ -926,7 +930,12 @@ impl Emitter<'_> {
         self.asm.alu(Alu::Cmp, RCX, Rm::Mem(RDX, 8));
         self.asm.jcc(Cond::Ne, miss);
         self.asm.alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_HITS), 1);
-        self.asm.jmp_indirect(Rm::Mem(RDX, 16));
+        if chain.verify {
+            self.asm.mov_imm(RAX, VERIFY);
+            self.asm.jmp_absolute(self.exit);
+        } else {
+            self.asm.jmp_indirect(Rm::Mem(RDX, 16));
+        }
         self.asm.cold(true);
         self.asm.bind(miss);
         self.asm.mov_imm(RAX, LOOKUP);

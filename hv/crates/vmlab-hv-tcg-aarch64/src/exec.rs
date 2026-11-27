@@ -2037,7 +2037,7 @@ impl Compiled {
     /// Compile the block, or mark it as one that the emitter refuses. With
     /// `sites` and `jumps`, its exits look for the code of the next block
     /// (3e DESIGN.md H5, H6).
-    fn compile_code(&mut self, jit: &mut jit::Jit, sites: bool, jumps: bool) {
+    fn compile_code(&mut self, jit: &mut jit::Jit, sites: bool, jumps: bool, verify: bool) {
         // What a leave reads from the frame: its outputs, its address, and
         // every word that its own operations read (card S4). A word that
         // those operations compute first is in the list too, which costs a
@@ -2131,6 +2131,7 @@ impl Compiled {
             page_offset: (self.phys & 0xfff) as u32,
             sites,
             jumps,
+            verify,
         };
         let shape = jit::Shape {
             ops: &self.ops,
@@ -2183,6 +2184,9 @@ enum Pending {
     },
     /// The jump cache had no entry for `pc` in the context of `key`.
     Lookup { pc: u64, key: u64 },
+    /// The jump cache had an entry for `pc` in the context of `key`, with
+    /// the code `code`, and did not take it (`Chain::verify`).
+    Verify { pc: u64, key: u64, code: u64 },
 }
 
 /// The chaining of a CPU: whether it is on, the link that the next block
@@ -2191,6 +2195,11 @@ struct Chaining {
     /// Linked jumps (H5) and the jump cache (H6).
     sites: bool,
     jumps: bool,
+    /// Hits of the jump cache come back to the loop, which compares them
+    /// with its own lookup (`VMLAB_HV_JIT_CHAIN=verify`).
+    verify: bool,
+    /// Hits that named other code than the lookup found.
+    mismatches: u64,
     pending: Option<Pending>,
     /// The epoch and the count of changes of the MMU at the exit that left
     /// `pending`. A link is made in the same of both.
@@ -2294,6 +2303,16 @@ unsafe fn run_code<M: Memory>(
             terminal: None,
             pending: None,
         },
+        jit::VERIFY => Ran {
+            count: taken,
+            halt: None,
+            terminal: None,
+            pending: Some(Pending::Verify {
+                pc,
+                key,
+                code: jit.jump_entry(pc).code,
+            }),
+        },
         jit::LOOKUP => {
             counts.lookups += 1;
             Ran {
@@ -2382,7 +2401,7 @@ pub struct JitCounts {
 /// context, the same epoch and the same translation (3e DESIGN.md H5, H6).
 fn make_link(
     jit: &mut jit::Jit,
-    chaining: &Chaining,
+    chaining: &mut Chaining,
     pending: Pending,
     block: &Compiled,
     pc: u64,
@@ -2409,6 +2428,21 @@ fn make_link(
             pc: target,
             key: from_key,
         } if target == pc && from_key == key => jit.fill(pc, key, &to),
+        Pending::Verify {
+            pc: target,
+            key: from_key,
+            code,
+        } => {
+            if target != pc || from_key != key || code != to.address {
+                chaining.mismatches += 1;
+                if chaining.mismatches <= 50 {
+                    eprintln!(
+                        "jit verify: the jump cache named {code:#x} for pc {target:#x} key {from_key:#x}; the loop runs {:#x} at pc {pc:#x} key {key:#x}, phys {:#x}, epoch {epoch}/{}, mmu {mmu}/{}/{}",
+                        to.address, block.phys, chaining.epoch, chaining.mmu, chaining.seen
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2460,6 +2494,7 @@ unsafe fn execute<M: Memory>(
                 jit,
                 chaining.sites && !single,
                 chaining.jumps && !single,
+                chaining.verify,
             );
         }
         if let Some(pending) = pending
@@ -2467,6 +2502,14 @@ unsafe fn execute<M: Memory>(
             && compiled.code.is_some_and(|entry| jit.current(&entry))
         {
             make_link(jit, chaining, pending, compiled, state.pc(), epoch, mmu);
+        } else if !single && let Some(Pending::Verify { pc, key, code }) = pending {
+            chaining.mismatches += 1;
+            if chaining.mismatches <= 50 {
+                eprintln!(
+                    "jit verify: the jump cache named {code:#x} for pc {pc:#x} key {key:#x}; the loop runs a block without code at pc {:#x}, single {single}",
+                    state.pc()
+                );
+            }
         }
     }
     // SAFETY: as above.
@@ -2728,6 +2771,8 @@ impl<M: Memory> Cpu<M> {
             chaining: Chaining {
                 sites: chaining_from_environment().0,
                 jumps: chaining_from_environment().1,
+                verify: matches!(std::env::var("VMLAB_HV_JIT_CHAIN").as_deref(), Ok("verify")),
+                mismatches: 0,
                 pending: None,
                 epoch: 0,
                 mmu: 0,

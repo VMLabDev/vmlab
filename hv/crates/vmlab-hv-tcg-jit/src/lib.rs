@@ -53,6 +53,9 @@ pub const BUDGET: u64 = 1;
 pub const CHAIN: u64 = 0x10;
 /// The block ran to its end, and the jump cache had no entry for the PC.
 pub const LOOKUP: u64 = 0x20;
+/// The block ran to its end and the jump cache had an entry for the PC,
+/// which it did not take (`Chain::verify`).
+pub const VERIFY: u64 = 0x30;
 /// The most exits of a block that can be linked.
 pub const SITES: usize = 2;
 

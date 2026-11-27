@@ -608,6 +608,7 @@ impl Looping {
                 page_offset: 0x100,
                 sites: true,
                 jumps: true,
+                verify: false,
             }),
             next: Some(Next { pc: 1, kind }),
         };
