@@ -67,6 +67,10 @@ use vmlab_hv_tcg_ir::native::{
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
 
+/// A machine CPU whose timer is armed reads the clock after this many
+/// blocks, to leave its loop when the timer is due (`Cpu::run`).
+const CLOCK_BLOCKS: u32 = 64;
+
 /// The block cache is direct-mapped by the PC.
 const CACHE_ENTRIES: usize = 1 << 14;
 /// The heap bytes of the young generation of the store of a cache: the
@@ -2385,7 +2389,24 @@ impl<M: Memory> Cpu<M> {
 
     fn run_inner(&mut self, budget: u64) -> Stop {
         let mut left = budget;
+        // A machine CPU leaves the loop when a timer line is due to rise,
+        // so that its owner raises the interrupt then and not at the end of
+        // the budget: a guest that spins until the interrupt comes waited
+        // a whole budget for each (kvm-unit-tests `timer`, card C13). The
+        // clock is read every `CLOCK_BLOCKS` blocks, not before each.
+        let deadline = if self.lines.is_some() {
+            self.timer_deadline()
+        } else {
+            None
+        };
+        let mut blocks = 0u32;
         while left > 0 {
+            if let Some(deadline) = deadline {
+                blocks += 1;
+                if blocks % CLOCK_BLOCKS == 0 && self.clock.count() >= deadline {
+                    break;
+                }
+            }
             // Another CPU invalidated translations: no block starts before
             // this CPU has dropped them too.
             self.take_mail();
