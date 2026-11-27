@@ -310,6 +310,11 @@ struct Side {
     mmu: Mmu,
     /// The block that runs is at EL0.
     user: bool,
+    /// WIP: operations and blocks run.
+    pub ops_run: u64,
+    pub blocks_run: u64,
+    pub generic_run: u64,
+    pub inputs_run: u64,
 }
 
 impl Side {
@@ -325,6 +330,10 @@ impl Side {
             code_written: false,
             mmu: Mmu::new(state),
             user: false,
+            ops_run: 0,
+            blocks_run: 0,
+            generic_run: 0,
+            inputs_run: 0,
         }
     }
 
@@ -1432,6 +1441,10 @@ impl Compiled {
         // translated code, and the loop starts a new epoch after it.
         let single = self.instructions == 1;
         side.user = self.context.el == 0;
+        side.ops_run += self.ops.len() as u64;
+        side.blocks_run += 1;
+        side.generic_run += self.generics.len() as u64;
+        side.inputs_run += (self.inputs.len() + self.outputs.len()) as u64;
         for op in &self.ops {
             if (op.code as u8) < FIRST_EFFECT {
                 // SAFETY: `compile` checked every operation against the
@@ -1691,6 +1704,11 @@ impl<M: Memory> Cpu<M> {
     }
 
     /// The count of translations that the TLB of the CPU holds.
+    /// WIP: operations, blocks, generic operations and register copies run.
+    pub fn run_counts(&self) -> (u64, u64, u64, u64) {
+        (self.side.ops_run, self.side.blocks_run, self.side.generic_run, self.side.inputs_run)
+    }
+
     pub fn tlb_entries(&self) -> usize {
         self.side.mmu.entries()
     }
