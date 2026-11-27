@@ -883,7 +883,13 @@ What card J7 built:
   A kick of the VMM (a pause, a snapshot, a change of the run state), which
   also sets `Lines::leave`, so that `run` ends at the next block and not at
   the end of its slice. Every post to a mailbox. The thunk kicks its own
-  run, as before, after a store into translated code.
+  run, as before, after a store into translated code, and after a wait of
+  J7c in which the CPU took code mail or an invalidation of its TLB: the
+  rest of the run would follow links and a jump cache of translations
+  that are gone. A line and a kick of the VMM kick once. When the head of a
+  block overwrites that kick, the interrupt or the pause waits for the end
+  of the run, as before J7 (`CHAIN_SLICE`); only a waiter of a mailbox
+  kicks again.
 - **J7c. Code mail (H11a with several vCPUs).** A store that ended
   translated code of some CPU made the watch word of its page even. The
   memory counts these writes for each handle (`Memory::ended_code`). The
