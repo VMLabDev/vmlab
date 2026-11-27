@@ -570,24 +570,27 @@ fn two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing() {
     let memory = ram();
     let bus = GuestBus::new(memory.clone(), host_with_latch(), 2).unwrap();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    assert!(bus.writes_straight(), "the host has membarrier and cmpxchg16b");
+    assert!(
+        bus.writes_straight(),
+        "the host has membarrier and cmpxchg16b"
+    );
     let program = [
-        ldaxr32(5, 1),     // 0 lock: w5 = [x1]
-        cbnz32(5, -1),     // 1 held: again
-        stxr32(6, 7, 1),   // 2 [x1] = 1
-        cbnz32(6, -3),     // 3 lost: again
-        ldr32(8, 3, 0),    // 4 w8 = [x3]
-        add32(8, 8, 1),    // 5
-        str32(8, 3, 0),    // 6 [x3] = w8
-        stlr32(31, 1),     // 7 [x1] = 0
-        ldxr32(11, 10),    // 8 w11 = [x10]
-        add32(11, 11, 1),  // 9
+        ldaxr32(5, 1),      // 0 lock: w5 = [x1]
+        cbnz32(5, -1),      // 1 held: again
+        stxr32(6, 7, 1),    // 2 [x1] = 1
+        cbnz32(6, -3),      // 3 lost: again
+        ldr32(8, 3, 0),     // 4 w8 = [x3]
+        add32(8, 8, 1),     // 5
+        str32(8, 3, 0),     // 6 [x3] = w8
+        stlr32(31, 1),      // 7 [x1] = 0
+        ldxr32(11, 10),     // 8 w11 = [x10]
+        add32(11, 11, 1),   // 9
         stxr32(12, 11, 10), // 10
-        cbnz32(12, -3),    // 11 lost: again from 8
-        str32(2, 9, 0),    // 12 [x9] = w2, beside the counters
-        sub64(2, 2, 1),    // 13
-        asm::cbnz(2, -14), // 14
-        asm::hvc(0),       // 15
+        cbnz32(12, -3),     // 11 lost: again from 8
+        str32(2, 9, 0),     // 12 [x9] = w2, beside the counters
+        sub64(2, 2, 1),     // 13
+        asm::cbnz(2, -14),  // 14
+        asm::hvc(0),        // 15
     ];
     memory
         .write_slice(&asm::bytes(&program), GuestAddress(CODE))

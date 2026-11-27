@@ -57,8 +57,8 @@ use crate::shootdown::Invalidation;
 use crate::state::{Context, State, slot};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
-use vmlab_hv_tcg::{CodeStamp, Error, Memory};
 use std::sync::atomic::{AtomicU32, Ordering, compiler_fence};
+use vmlab_hv_tcg::{CodeStamp, Error, Memory};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
@@ -2330,7 +2330,8 @@ impl<M: Memory> Cpu<M> {
             compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
         // A write that made the page unwatched while the code was read: the
         // block holds no stamp, and runs until the next epoch.
-        compiled.stamp = stamp.filter(|_| watch.is_none_or(|word| self.memory.watch_holds(phys, word)));
+        compiled.stamp =
+            stamp.filter(|_| watch.is_none_or(|word| self.memory.watch_holds(phys, word)));
         compiled.epoch = self.epoch;
         Ok(compiled)
     }
@@ -3365,7 +3366,9 @@ mod tests {
         // ldr x1, [x0] ; str x1, [x0, #8] ; hvc #0
         let mut cpu = cpu(&[0xf940_0001, 0xf900_0401, HVC_0]);
         cpu.state.set_x(0, BASE + 0x1800);
-        cpu.memory.write(BASE + 0x1800, &7u64.to_le_bytes()).unwrap();
+        cpu.memory
+            .write(BASE + 0x1800, &7u64.to_le_bytes())
+            .unwrap();
         assert!(matches!(cpu.run(10), Stop::Hypercall { .. }));
         assert_eq!(cpu.state.x(1), 7);
         // The store went straight into the page: the bytes are there, and no
