@@ -291,7 +291,7 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         "host_cpus": os.cpu_count(),
     }
     if args.backend == "vmlab-hv" and arch == "aarch64":
-        # The JIT of 3e (DESIGN.md J1) is off unless VMLAB_HV_JIT turns it on.
+        # The JIT of 3e is on unless VMLAB_HV_JIT=0 turns it off (DESIGN.md T1, J8).
         env["jit"] = lib.jit_enabled()
         # K3 (J2) checks every compiled block: a boot that measures no speed.
         env["jit_check"] = lib.jit_check_enabled()

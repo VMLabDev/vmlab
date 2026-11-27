@@ -47,6 +47,10 @@
 //! more than the first defect. The last instructions before a difference go
 //! to `last-instructions.txt` in the scratch directory.
 //!
+//! The CPU runs the JIT, as the CPU of every machine does unless
+//! `VMLAB_HV_JIT=0` (3e DESIGN.md K4): each instruction is a compiled block
+//! of one. The report says how many ran compiled.
+//!
 //! QEMU is the test oracle only (S6). Nothing here is a product path.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -831,6 +835,20 @@ fn run(arguments: &Arguments) -> Result<bool, Error> {
     for (record, count) in &by_record {
         println!("  differences after {record}: {count}");
     }
+    // K4 of 3e DESIGN.md: the CPU of the machine runs the JIT unless
+    // `VMLAB_HV_JIT=0`, so every instruction ran as a compiled block of one.
+    let jit = vcpu.cpu().jit_counts();
+    println!(
+        "JIT: {}. {} runs of compiled code ({} instructions), {} runs in the interpreter.",
+        if vcpu.cpu().jit_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        jit.compiled_runs,
+        jit.compiled_instructions,
+        jit.interpreted_runs
+    );
     println!(
         "Adopted from the leader: {counters} counter reads, {timed} timer and interrupt status reads that differed."
     );
