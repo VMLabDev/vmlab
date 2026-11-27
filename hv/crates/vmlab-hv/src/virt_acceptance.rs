@@ -387,6 +387,7 @@ fn snapshots_of_an_emulated_aarch64_machine_online_and_offline() {
         panic!("no aarch64 registers")
     };
     assert_eq!(registers.x[1], COUNTER);
+    assert!(registers.instructions > 0, "the vCPU counts what it runs");
     // It runs on from the save.
     assert!(machine.run_a_while() > at_save);
 

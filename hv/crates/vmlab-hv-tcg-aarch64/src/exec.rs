@@ -2503,6 +2503,7 @@ impl<M: Memory> Cpu<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
@@ -3208,5 +3209,132 @@ mod tests {
                 BASE + 0x2000
             ))
         );
+    }
+
+    /// The flags of `a + b + carry` in `width` bits, from the definitions of
+    /// N, Z, C and V, as the bits 3 to 0.
+    fn sum_flags(width: u32, a: u64, b: u64, carry: bool) -> u8 {
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let (a, b) = (a & mask, b & mask);
+        let result = a.wrapping_add(b).wrapping_add(u64::from(carry)) & mask;
+        let sign = |value: u64| -> i128 {
+            if width == 64 {
+                i128::from(value as i64)
+            } else {
+                i128::from(value as u32 as i32)
+            }
+        };
+        let n = result >> (width - 1) & 1 == 1;
+        let c = u128::from(a) + u128::from(b) + u128::from(carry) != u128::from(result);
+        let v = sign(a) + sign(b) + i128::from(carry) != sign(result);
+        u8::from(n) << 3 | u8::from(result == 0) << 2 | u8::from(c) << 1 | u8::from(v)
+    }
+
+    #[test]
+    fn every_condition_reads_the_lazy_flags_inside_and_after_their_block() {
+        // msr nzcv, x12 ; <setter> ; csinc x2, xzr, xzr, cond ; b +4 ;
+        // csinc x3, xzr, xzr, cond ; b . The first csinc reads the flags of the
+        // block, the second the flag slots.
+        const VALUES: [u64; 8] = [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        let ccmp =
+            |sf: u32, cond: u32, nzcv: u32| sf << 31 | 0x7a40_0000 | 1 << 16 | cond << 12 | nzcv;
+        let mut case = 0u32;
+        for width in [32u32, 64] {
+            let sf = u32::from(width == 64);
+            // (encoding with rd 9, rn 0 and rm 1, its flags).
+            type Setter = (u32, fn(u32, u64, u64, u8) -> u8);
+            let setters: [Setter; 6] = [
+                (sf << 31 | 0x6b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, !b, true)
+                }),
+                (sf << 31 | 0x2b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, b, false)
+                }),
+                (sf << 31 | 0x6a00_0009 | 1 << 16, |w, a, b, _| {
+                    let mask = if w == 64 {
+                        u64::MAX
+                    } else {
+                        u64::from(u32::MAX)
+                    };
+                    let result = a & b & mask;
+                    u8::from(result >> (w - 1) & 1 == 1) << 3 | u8::from(result == 0) << 2
+                }),
+                (sf << 31 | 0x3a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, b, before & 2 != 0)
+                }),
+                (sf << 31 | 0x7a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, !b, before & 2 != 0)
+                }),
+                (0, |_, _, _, _| 0),
+            ];
+            for (index, (encoding, flags)) in setters.iter().enumerate() {
+                for &a in &VALUES {
+                    for &b in &VALUES {
+                        for cond in 0..16u32 {
+                            case += 1;
+                            let before = (case % 16) as u8;
+                            // The last setter is a ccmp on a condition of
+                            // the flags before it.
+                            let (encoding, expected) = if index == 5 {
+                                let on = case / 16 % 16;
+                                let given = case / 7 % 16;
+                                let expected = if flags::holds(on as u8, before) {
+                                    sum_flags(width, a, !b, true)
+                                } else {
+                                    given as u8
+                                };
+                                (ccmp(sf, on, given), expected)
+                            } else {
+                                (*encoding, flags(width, a, b, before))
+                            };
+                            let csinc = |rd: u32| 0x9a9f_07e0 | cond << 12 | rd;
+                            let mut cpu = cpu(&[
+                                0xd51b_420c,
+                                encoding,
+                                csinc(2),
+                                0x1400_0001,
+                                csinc(3),
+                                0x1400_0000,
+                            ]);
+                            cpu.state.set_x(0, a);
+                            cpu.state.set_x(1, b);
+                            cpu.state.set_x(12, u64::from(before) << 28);
+                            assert_eq!(cpu.run(6), Stop::Budget);
+                            let what = format!(
+                                "{encoding:#010x} {a:#x} {b:#x} cond {cond} flags {before:04b}"
+                            );
+                            assert_eq!(cpu.state.nzcv(), expected, "{what}");
+                            let holds = u64::from(!flags::holds(cond as u8, expected));
+                            assert_eq!(cpu.state.x(2), holds, "in the block: {what}");
+                            assert_eq!(cpu.state.x(3), holds, "after the block: {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mrs_nzcv_reads_the_lazy_flags() {
+        // subs x9, x0, x1 ; mrs x2, nzcv ; b +4 ; mrs x3, nzcv
+        let mut cpu = cpu(&[0xeb01_0009, 0xd53b_4202, 0x1400_0001, 0xd53b_4203]);
+        cpu.state.set_x(0, 1);
+        cpu.state.set_x(1, 2);
+        assert_eq!(cpu.run(4), Stop::Budget);
+        assert_eq!(cpu.state.x(2), 0x8000_0000);
+        assert_eq!(cpu.state.x(3), 0x8000_0000);
     }
 }
