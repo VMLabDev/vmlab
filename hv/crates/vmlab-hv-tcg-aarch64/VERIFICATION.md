@@ -1706,9 +1706,9 @@ of the bench. Both clones count as dirty because the build rewrites
   the alignment guards, so the CoreMark mix gains from the exits, the pairs,
   `Sub` and the W registers only, 4 to 14 %. The loop of three instructions
   has no access and no exit inside a block, and does not move.
-- The boot gains 8 to 10 % to the start of systemd on the boots of the
-  quietest host, and 1 % to agent ready by the median, inside the spread of
-  the runs (16 s before, 53 s after). From systemd on the boot waits on
+- The boot gains about 9 % to the start of systemd on the boots of the
+  quietest host (42.9 s against 47.2 s), and 1 % to agent ready by the
+  median, inside the spread of the runs (6.9 s before, 52.5 s after). From systemd on the boot waits on
   devices and timers in real time as much as it computes.
 - The boot MIPS row (card S0) is not on `next` yet, so the boots are
   recorded as time to agent ready. Each boot is its own line with one
