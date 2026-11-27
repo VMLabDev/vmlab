@@ -2088,9 +2088,10 @@ impl Emitter<'_> {
     }
 
     /// The end of the block: the outputs to the state, the PC, then the
-    /// exit. The exits that chain are returned: the label of each jump and
-    /// of its stub.
+    /// exit. The exits that chain go into `sites`: the label of each jump
+    /// and of its stub. `slots` and `spans` are the words of each operation.
     fn outputs(&mut self, slots: &[Slot], spans: &[Span]) {
+        self.sites.clear();
         // The word of the next PC goes into RCX before an output can write
         // over the slot that it is still in.
         let next = self.shape.next;
@@ -2142,7 +2143,6 @@ impl Emitter<'_> {
         };
         // H5: a constant distance to a target in the page of the block is a
         // jump that its owner links. RCX holds the distance.
-        self.sites.clear();
         if let NextPc::Relative(place) = next.kind
             && chain.sites
         {
