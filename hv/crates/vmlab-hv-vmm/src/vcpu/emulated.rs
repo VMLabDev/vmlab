@@ -107,6 +107,9 @@ impl Drop for EmulatedVcpu {
         if self.report_boot_instructions {
             eprintln!("boot instructions: {} {}", self.id, self.cpu.instructions);
         }
+        if let Some(counts) = &self.cpu.block_counts {
+            eprintln!("boot block counts: {} {counts:?}", self.id);
+        }
     }
 }
 
@@ -133,6 +136,9 @@ impl EmulatedVcpu {
         let mut cpu = Cpu::new(memory, state);
         cpu.clock = clock;
         cpu.lines = Some(shared);
+        if std::env::var_os("VMLAB_HV_BOOT_BLOCK_COUNTS").is_some() {
+            cpu.block_counts = Some(Default::default());
+        }
         Self {
             id,
             cpu,
