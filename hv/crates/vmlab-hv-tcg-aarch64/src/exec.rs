@@ -1512,6 +1512,8 @@ pub struct Cpu<M> {
     pub instructions: u64,
     /// Blocks translated since the CPU was made.
     pub translations: u64,
+    /// The host time that the translations took, in nanoseconds.
+    pub translation_ns: u64,
     /// What the guest asked for that the CPU does not have, each once. The
     /// owner of the CPU writes it to its log.
     pub unknown: std::collections::BTreeSet<Unknown>,
@@ -1554,6 +1556,7 @@ impl<M: Memory> Cpu<M> {
             exceptions: 0,
             instructions: 0,
             translations: 0,
+            translation_ns: 0,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
             blocks: Cache::new(),
@@ -2202,7 +2205,10 @@ impl<M: Memory> Cpu<M> {
         }
         if !ready {
             let limit = if single { 1 } else { BLOCK_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
-            let compiled = match self.translate(phys, limit) {
+            let started = std::time::Instant::now();
+            let translated = self.translate(phys, limit);
+            self.translation_ns += started.elapsed().as_nanos() as u64;
+            let compiled = match translated {
                 Ok(compiled) => Box::new(compiled),
                 Err(Refused::Stop(stop)) => return Err(stop),
                 Err(Refused::Exception(exception)) => {
