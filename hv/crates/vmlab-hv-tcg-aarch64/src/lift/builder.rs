@@ -94,11 +94,17 @@ pub enum ExceptionClass {
 pub enum A64Next {
     /// The next PC.
     Pc(ScalarId),
+    /// The next PC as its distance in bytes from the entry of the block: a
+    /// direct branch, or the fall through. The loop adds the PC at the
+    /// entry, so that the block reads no PC for it.
+    Relative(ScalarId),
     /// An exception that leaves the block before one of its instructions,
-    /// with the scalars of its syndrome.
+    /// with the scalars of its syndrome. The PC is that instruction, `at`
+    /// bytes from the entry of the block: the loop sets it.
     Exception {
         class: ExceptionClass,
         syndrome: Vec<ScalarId>,
+        at: u64,
     },
     /// The instruction at `pc` bytes from the entry of the block is the last
     /// of the block, and the loop runs
@@ -120,7 +126,7 @@ impl ExitScalars for A64Exit {
     fn for_each_scalar(&mut self, visit: &mut dyn FnMut(&mut ScalarId)) {
         self.writeback.for_each_scalar(visit);
         match &mut self.next {
-            A64Next::Pc(scalar) => visit(scalar),
+            A64Next::Pc(scalar) | A64Next::Relative(scalar) => visit(scalar),
             A64Next::Exception { syndrome, .. } => syndrome.iter_mut().for_each(visit),
             A64Next::Trap { .. } => {}
         }
@@ -181,6 +187,8 @@ pub struct Builder {
     entry: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// `branch` is a distance from the entry of the block.
+    relative: bool,
     /// What the last instruction does outside the graph.
     trap: Option<Trap>,
     /// The instructions before the one that is being lifted.
@@ -225,6 +233,7 @@ impl Builder {
             pc,
             entry: pc,
             branch: None,
+            relative: false,
             trap: None,
             completed: 0,
             started: false,
@@ -302,6 +311,14 @@ impl Builder {
     /// as `code_address` computes it.
     pub fn pc_plus(&mut self, delta: u64) -> ScalarId {
         self.code_address(self.pc.wrapping_add(delta))
+    }
+
+    /// The distance from the entry of the block to the address `delta`
+    /// bytes from the instruction that is being lifted, as a constant: the
+    /// next PC of a direct branch (`branch_relative`).
+    pub fn pc_distance(&mut self, delta: u64) -> ScalarId {
+        let distance = self.pc.wrapping_add(delta).wrapping_sub(self.entry);
+        self.imm(64, distance)
     }
 
     /// The address of the 4 KB page of the instruction that is being
@@ -1073,14 +1090,17 @@ impl Builder {
 
     /// An exit that leaves the block before the instruction that is being
     /// lifted: the registers as they were before it, and its address as the
-    /// PC.
+    /// PC, which the loop sets from the entry PC.
     fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
-        let mut writes = self.writes(self.before, self.before_written);
-        let pc = self.pc_plus(0);
-        writes.push((slot::PC, pc));
+        let writes = self.writes(self.before, self.before_written);
+        let at = self.pc.wrapping_sub(self.entry);
         self.block.exit(A64Exit {
             writeback: Writeback { writes },
-            next: A64Next::Exception { class, syndrome },
+            next: A64Next::Exception {
+                class,
+                syndrome,
+                at,
+            },
             completed: self.completed,
         })
     }
@@ -1255,6 +1275,14 @@ impl Builder {
             "a branch target is 64 bits"
         );
         self.branch = Some(target);
+        self.relative = false;
+    }
+
+    /// Set the next PC as its distance from the entry of the block
+    /// (`pc_distance`). The instruction that calls this ends the block.
+    pub fn branch_relative(&mut self, distance: ScalarId) {
+        self.branch(distance);
+        self.relative = true;
     }
 
     /// The instruction that is being lifted is the last of the block, and
@@ -1270,8 +1298,12 @@ impl Builder {
                 pc: self.pc.wrapping_sub(self.entry),
                 trap,
             },
+            (None, Some(target)) if self.relative => A64Next::Relative(target),
             (None, Some(target)) => A64Next::Pc(target),
-            (None, None) => A64Next::Pc(self.code_address(fallthrough)),
+            (None, None) => {
+                let distance = self.imm(64, fallthrough.wrapping_sub(self.entry));
+                A64Next::Relative(distance)
+            }
         };
         let writes = self.writes(self.current, self.written);
         let completed = self.completed + u32::from(self.started);

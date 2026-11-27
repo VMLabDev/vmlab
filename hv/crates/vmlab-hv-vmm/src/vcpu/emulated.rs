@@ -97,6 +97,8 @@ pub struct EmulatedVcpu {
     hypercall: Option<u64>,
     /// What the guest asked for and the CPU does not have, as logged.
     logged: usize,
+    /// The instruction count that the last pause logged.
+    paused_at: u64,
     /// The system counter of the machine and its frequency. The counter of
     /// the CPU is set from it before each slice, so that it stands still
     /// while the machine is paused.
@@ -162,6 +164,7 @@ impl EmulatedVcpu {
             timer_levels: [None; 2],
             hypercall: None,
             logged: 0,
+            paused_at: 0,
             counter: None,
             jit_report: JIT_REPORT,
         }
@@ -402,6 +405,23 @@ impl VcpuBackend for EmulatedVcpu {
             )),
             Stop::Host(error) => self.fail(error),
         }
+    }
+
+    /// Say what the CPU ran up to the pause, once for each pause after
+    /// instructions ran: the boot bench pauses the machine at agent ready
+    /// and divides the instructions by the time (`hv/bench`, boot MIPS).
+    fn parking(&mut self) {
+        if self.cpu.instructions == self.paused_at {
+            return;
+        }
+        self.paused_at = self.cpu.instructions;
+        log::info!(
+            "vcpu {}: paused after {} instructions, {} translated blocks in {} ms",
+            self.id,
+            self.cpu.instructions,
+            self.cpu.translations,
+            self.cpu.translation_ns / 1_000_000
+        );
     }
 
     fn finish_hypercall(&mut self, outcome: HypercallOutcome) {

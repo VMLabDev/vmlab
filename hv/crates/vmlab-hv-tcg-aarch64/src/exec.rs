@@ -53,7 +53,7 @@ use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
 use crate::shootdown::Invalidation;
-use crate::state::{Context, State, slot};
+use crate::state::{Context, State};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
@@ -736,8 +736,11 @@ const UNPRIVILEGED: u8 = 0x80;
 #[derive(Clone, Debug)]
 struct Leave {
     /// Register slot, words of the frame: copied out when the block leaves
-    /// here. The PC is one of them.
+    /// here.
     outputs: Vec<(u32, Place)>,
+    /// The distance in bytes from the entry of the block to the instruction
+    /// that did not complete: the PC when the block leaves here.
+    at: u64,
     /// The instructions of the block that are complete here.
     completed: u32,
     /// The word of the address of an alignment fault.
@@ -812,6 +815,10 @@ struct Compiled {
     /// The last instruction, when the loop runs it: its distance in bytes
     /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
+    /// The words of the next PC, and whether they hold its distance from
+    /// the PC at the entry (`A64Next::Relative`). The loop sets the PC from
+    /// them after the outputs.
+    next: Option<(Place, bool)>,
     /// The compiled code of the block, when the JIT is on (3e DESIGN.md
     /// J1). Code of an older generation of the region is none.
     code: Option<jit::Entry>,
@@ -918,7 +925,7 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
         .map(|(_, scalar)| *scalar)
         .collect();
     match &exit.next {
-        A64Next::Pc(next) => roots.push(*next),
+        A64Next::Pc(next) | A64Next::Relative(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
         A64Next::Trap { .. } => {}
     }
@@ -1023,6 +1030,7 @@ fn compile(
     };
     let mut block_outputs = None;
     let mut terminal = None;
+    let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
     for event in &block.events {
@@ -1080,7 +1088,8 @@ fn compile(
         }
         if let Event::Exit(_) = event {
             match payload.next {
-                A64Next::Pc(next) => outputs.push((slot::PC as u32, lowering.place(next))),
+                A64Next::Pc(next) => next_pc = Some((lowering.place(next), false)),
+                A64Next::Relative(next) => next_pc = Some((lowering.place(next), true)),
                 // The loop runs the last instruction, with the PC at it.
                 A64Next::Trap { pc, trap } => terminal = Some((pc, trap)),
                 A64Next::Exception { .. } => {
@@ -1093,12 +1102,18 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { class, syndrome } = &payload.next else {
+                let A64Next::Exception {
+                    class,
+                    syndrome,
+                    at,
+                } = &payload.next
+                else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
                 parts.leaves.push(Leave {
                     outputs,
+                    at: *at,
                     completed: payload.completed,
                     address: syndrome.first().map(|scalar| lowering.word(*scalar)),
                     class: *class,
@@ -1233,6 +1248,7 @@ fn compile(
         inputs: parts.inputs,
         outputs,
         terminal,
+        next: next_pc,
         code: None,
         refused: false,
     })
@@ -1497,10 +1513,13 @@ impl Compiled {
     /// were before the instruction that could not complete.
     #[cold]
     fn leave(&self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+        // No operation of a block writes the PC: it is the entry still.
+        let entry = state.pc();
         let leave = &self.leaves[exit as usize];
         for (register, place) in &leave.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
         }
+        state.set_pc(entry.wrapping_add(leave.at));
         let halt = match failed {
             Failed::Retry => Halt::Retry,
             Failed::Guard => Halt::Stop(host("a guard that names no exception")),
@@ -1526,7 +1545,6 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1564,8 +1582,20 @@ impl Compiled {
                 return self.leave(state, exit, failed);
             }
         }
+        // No operation of a block writes the PC: it is the entry still. It
+        // is read here and not before the operations, which keeps a
+        // register free in their loop.
+        let entry = state.pc();
         for (register, place) in &self.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
+        }
+        if let Some((place, relative)) = &self.next {
+            let value = place.read(&self.frame) as u64;
+            state.set_pc(if *relative {
+                entry.wrapping_add(value)
+            } else {
+                value
+            });
         }
         // The loop runs the last instruction with the PC at it.
         if let Some((distance, _)) = self.terminal {
@@ -1704,6 +1734,12 @@ impl Compiled {
                 leave: None,
             })
             .collect();
+        // The compiled code writes the next PC with the outputs, as it is
+        // in the frame: a distance from the entry is added after it runs.
+        let mut outputs = self.outputs.clone();
+        if let Some((place, _)) = self.next {
+            outputs.push((crate::state::slot::PC as u32, place));
+        }
         let shape = jit::Shape {
             ops: &self.ops,
             generics: &self.generics,
@@ -1712,7 +1748,7 @@ impl Compiled {
             calls: &calls,
             leaves: &leaves,
             inputs: &self.inputs,
-            outputs: &self.outputs,
+            outputs: &outputs,
             instructions: self.instructions,
         };
         match jit.compile(&shape) {
@@ -1775,6 +1811,9 @@ impl Compiled {
         let stop = env.stop.take();
         match code {
             jit::DONE => {
+                if let Some((_, true)) = self.next {
+                    state.set_pc(pc.wrapping_add(state.pc()));
+                }
                 // The loop runs the last instruction with the PC at it.
                 if let Some((distance, _)) = self.terminal {
                     state.set_pc(pc.wrapping_add(distance));
@@ -2968,6 +3007,7 @@ impl<M: Memory> Cpu<M> {
 mod tests {
     use super::*;
     use crate::flags;
+    use crate::state::slot;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
@@ -3029,8 +3069,9 @@ mod tests {
         assert_eq!(counts.blocks, 1);
         assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
         assert_eq!(counts.alignment_operations, 6);
-        // The discarded add restores X4. Each access also has its own fault PC.
-        assert_eq!(counts.exit_writeback_operations, 3);
+        // The discarded add restores X4. The fault PC of an access is no
+        // operation: the exit carries its distance from the entry (#1143).
+        assert_eq!(counts.exit_writeback_operations, 1);
     }
 
     #[test]

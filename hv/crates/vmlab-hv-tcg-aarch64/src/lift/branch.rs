@@ -18,17 +18,20 @@ use crate::generated::decode::{
 use crate::state::slot;
 use vmlab_hv_tcg_ir::native::{Binary, ScalarId};
 
-/// The address that a PC-relative field of `bits` bits names: the field
-/// counts instructions from the branch.
+/// The address that a PC-relative field of `bits` bits names, as its
+/// distance from the entry of the block: the field counts instructions from
+/// the branch.
 fn target(b: &mut Builder, field: u32, bits: u32) -> ScalarId {
-    b.pc_plus((sign_extend(field.into(), bits) << 2) as u64)
+    b.pc_distance((sign_extend(field.into(), bits) << 2) as u64)
 }
 
-/// The next PC of a conditional branch: `target` where `taken` holds.
+/// The next PC of a conditional branch: `target` where `taken` holds. Both
+/// are distances from the entry of the block, so the select is all that
+/// runs.
 fn conditional_branch(b: &mut Builder, taken: ScalarId, target: ScalarId) {
-    let next = b.pc_plus(4);
-    let pc = b.select(64, taken, target, next);
-    b.branch(pc);
+    let next = b.pc_distance(4);
+    let distance = b.select(64, taken, target, next);
+    b.branch_relative(distance);
 }
 
 fn link(b: &mut Builder) {
@@ -42,7 +45,7 @@ pub fn branch(b: &mut Builder, record: Record, f: &BranchImm) -> Lifted {
         return Lifted::Unsupported;
     }
     let target = target(b, f.addr, 26);
-    b.branch(target);
+    b.branch_relative(target);
     Lifted::Branch
 }
 
@@ -53,7 +56,7 @@ pub fn call(b: &mut Builder, record: Record, f: &CallImm) -> Lifted {
     }
     let target = target(b, f.addr, 26);
     link(b);
-    b.branch(target);
+    b.branch_relative(target);
     Lifted::Branch
 }
 

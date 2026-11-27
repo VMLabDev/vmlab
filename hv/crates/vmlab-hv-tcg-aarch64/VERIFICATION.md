@@ -1801,3 +1801,131 @@ subtests that QEMU failed in both `gicv2-mmio` and `gicv2-mmio-3p`.
 
 No instruction semantics sources were consulted for S0. QEMU was used as
 a running oracle for lockstep and kvm-unit-tests.
+
+## Card S2, #1143 (2026-11-27)
+
+Translated blocks that do not depend on their virtual address (DESIGN.md
+M6). The PC-relative blocks and the cache indexed by physical address were
+made on card C13 (`73333030`, `b5117069`, after its F6); this card takes
+that branch, measures it, finds what it costs and takes part of the cost
+back.
+
+### What a block is keyed by
+
+A block is kept and found under the physical address of its first
+instruction and its `Context`: the exception level, `PSTATE.SP`, the FP
+enable of `CPACR_EL1.FPEN`, and `TCR.TBI0`/`TBI1` of the regime for an
+instruction address. The level, the stack pointer and the FP enable change
+what the lifter makes, and TBI changes the graph of a branch to a register.
+Nothing else is needed in the key:
+
+- A block never crosses a 4 KB page (`translate` ends it at a page
+  boundary), so its virtual and physical addresses have the same low 12
+  bits for every granule, and `ADRP` takes the page of the entry PC.
+- The execute permission, the level's view of it, the ASID and the
+  translation regime are checked by the TLB lookup of the PC before every
+  block (`code_address`), not by the key: a mapping without execute
+  permission takes its abort before any block is looked up.
+- Every value that depends on the PC is computed from the PC at the entry:
+  `ADR`, `ADRP`, `LDR` (literal), the link of `BL`/`BLR`, the PC of an
+  exception that leaves the block, the PC of the last instruction that the
+  loop runs (`Trap`), and the next PC.
+- The code bytes are checked as before, by the code stamp of the memory for
+  the physical pages of the block and the epoch. A store through any virtual
+  address reaches the same physical page, so invalidation stays exact: the
+  block is made again only when its own bytes may have changed.
+
+### What it cost, and what changed here
+
+On the flat images, whose translations do not matter, the PC-relative
+blocks ran slower: the next PC of every direct branch and the PC of every
+exception exit had become an `Add` of the entry PC in the operations of the
+block, and the exit PC of a load or a store is computed before the access.
+Now:
+
+- A direct branch and the fall through carry their next PC as a distance
+  from the entry (`A64Next::Relative`). A conditional branch is a `Select`
+  of two constants, as before the change. The loop adds the entry PC.
+- An exception exit carries the distance of its instruction (`at` of
+  `A64Next::Exception`) and no PC write: the loop sets the PC when the block
+  leaves there.
+- The next PC is not one of the register outputs any more: the block sets
+  it from its own words after them, and reads the entry PC after its
+  operations, not across them.
+
+What is still slower than the blocks at fixed addresses: `BL`, `ADR`,
+`ADRP` and `LDR` (literal) read the PC and add, and the index of the cache
+needs the physical address, which waits for the TLB lookup, where the
+virtual index did not.
+
+### Measurements
+
+helios, pinned to four cores (`--cpus 28-31`), 1 vCPU, Debian 13 template,
+2 GiB, `bench/run.py --backend vmlab-hv --arch aarch64 --suite boot`. The
+host ran other cards' boots and builds throughout (load average 4 to 28),
+so the wall times are noisy; the translation counts are not. Before is
+`f91d8899`, this branch at `567c0829` with `b5117069` and `73333030`
+reverted (C13's two-generation store and everything else kept); after is
+`567c0829`; final is `b94d2d67`, the code of this card (a commit of a
+scratch copy on helios with the tree of `40c0ffa4` of this branch;
+`f91d8899` exists only there too). The instruction and
+translation counts come from the line each emulated vCPU logs when the
+bench pauses the machine at agent ready (`boot_counters`).
+
+| Build | Translations to agent ready | Translation time | Instructions | Agent ready | Boot MIPS |
+|---|---|---|---|---|---|
+| before | 1,605,469; 1,591,822; 1,595,640; 1,586,935 | 12.8 s; 13.5 s; 12.6 s; 14.9 s | 18.02e9 to 18.31e9 | 228 s, 249 s, 250 s, 289 s; one run in emergency mode | 79.2, 72.6, 72.1, 63.4 |
+| after | 490,571; 488,811; 491,088; 482,317; 491,783; 492,190; 492,717 | 3.7 s to 4.4 s | 17.92e9 to 18.22e9 | 249 s, 264 s, 269 s, 254 s, 226 s, 222 s, 221 s | 72.2, 68.5, 67.0, 71.7, 79.4, 80.9, 81.1 |
+| final | 490,335; 491,570; 495,805; 495,209; 492,465 | 3.6 s to 4.0 s | 17.98e9 to 18.27e9 | 269 s, 243 s, 243 s, 220 s, 271 s; one run in emergency mode | 67.9, 74.6, 75.3, 81.9, 66.4 |
+
+The same physical code is translated once: 3.3 times fewer translations,
+and the translation time of a boot falls from about 13 s to about 4 s. The
+boot time does not show it beyond the noise of the host.
+
+The flat aarch64 images (`--backend interpreter`), 12 samples of each
+build, interleaved: before, final and before again, three repeats a run:
+
+| Build | CoreMark mix | Scalar loop |
+|---|---|---|
+| before | 133.1 MIPS (131.0 to 137.5) | 127.7 MIPS (111.0 to 130.1) |
+| after (an earlier interleaving) | 112.9 MIPS against 131.5 before | 112.9 MIPS against 125.5 before |
+| final | 123.3 MIPS (119.2 to 126.3) | 121.1 MIPS (119.6 to 123.6) |
+
+The flat mix runs 7 % slower than with blocks at fixed addresses, and the
+scalar loop 5 %, from 14 % and 10 % after the change of C13.
+
+`hv/bench/history/aarch64.jsonl` holds the rows of the three builds:
+`coremark_algorithms_1000` and `scalar_loop_300000000` of the interpreter,
+and `boot_to_agent_ready` and `boot_mips` of vmlab-hv, whose `env` keeps
+the counts of each repeat (`boot_counters`). These rows were taken with this
+card's pause counters; since the merge with card #1142 the bench takes
+`boot_mips` from #1142's instruction counts, and the pause line of a vCPU
+(`parking`) remains for the translation counts.
+
+### Equal behaviour
+
+- O3 lockstep (`just tcg-a64-lockstep <group>`, seed 1, 100,000 a class) at
+  `b94d2d67`, the tree of `40c0ffa4`: `c1` 1,439,552 instructions, `loadstore` 5,227,727, `system`
+  14,143,370 (with the exceptions), `mmu` 4,403,165; no difference in any.
+- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) at `b94d2d67`: 11 tests, 9
+  give the same results as QEMU, and `gicv2-mmio` and `gicv2-mmio-3p` pass
+  the two `ITARGETSR` subtests that fail on QEMU, as in cards C10 and C13.
+
+### Tests
+
+- `a_shared_block_computes_its_page_and_its_link_from_the_pc_it_runs_at`
+  (`tests/translate.rs`): one page of code with `ADRP`, `BL` and a return
+  at two addresses in two pages, run as blocks and stepped.
+- `a_write_to_shared_code_reaches_it_at_every_address`: the block of the
+  first address serves the second until a store through a third address
+  changes its code, and the second address runs the new code.
+- `one_translation_serves_code_at_two_addresses` (card C13).
+- bench: `BootCountersTests` reads the pause lines of the vCPUs.
+
+### Sources read for this card
+
+- The state of this crate, of vmlab-hv-vmm's emulated vCPU and of the bench.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
