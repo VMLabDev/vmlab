@@ -3100,7 +3100,6 @@ impl Compiled {
     }
 }
 
-
 /// What the JIT of a CPU did, for the bench rows and the debug log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JitCounts {

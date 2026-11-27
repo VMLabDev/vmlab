@@ -228,7 +228,14 @@ fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u
     let mut context = jit.context(budget, thunk, (&raw mut env).cast());
     // SAFETY: the entry was just compiled from this block, and the slots
     // and the frame are as large as it names.
-    let code = unsafe { jit.enter(&entry, &raw mut context, slots.as_mut_ptr(), frame.as_mut_ptr()) };
+    let code = unsafe {
+        jit.enter(
+            &entry,
+            &raw mut context,
+            slots.as_mut_ptr(),
+            frame.as_mut_ptr(),
+        )
+    };
     let mut words = Vec::new();
     if code == LEFT {
         let op = block.ops[env.left_at.expect("the guard that failed")];
