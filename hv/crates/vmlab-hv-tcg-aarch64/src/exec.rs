@@ -2132,7 +2132,15 @@ impl Compiled {
         };
         let interpreted_slots = state.slots;
         let got = match &mut whole {
-            Some(shadow) => self.run_code(entry, jit, shadow, memory, side, u64::MAX, Some(&mut replay)),
+            Some(shadow) => self.run_code(
+                entry,
+                jit,
+                shadow,
+                memory,
+                side,
+                u64::MAX,
+                Some(&mut replay),
+            ),
             None => {
                 state.slots = entry_slots;
                 self.run_code(entry, jit, state, memory, side, u64::MAX, Some(&mut replay))
