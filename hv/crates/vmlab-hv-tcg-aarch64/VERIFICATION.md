@@ -1435,6 +1435,123 @@ adoption rules of the boot lockstep.
   were not read to write this code. Its `unittests.cfg` is parsed by the
   script that runs it.
 
+## Card S3 (2026-11-27)
+
+Guest RAM straight from the TLB entry, and stores without stamps on pages
+that hold no translated code (the five model views of card #1145, F2 and F3
+of each).
+
+### What changed
+
+- **The TLB entry keeps the host address of its page** (`tlb::Entry::host`)
+  and the address of the page's watch word (`Entry::watch`), from
+  `Memory::host_page` when the entry is filled. A load whose page the TLB
+  holds that way is a probe, an add and one host access; a store is the same
+  plus two relaxed loads of the watch word. Neither calls the memory. The
+  CPU drops its entries when the memory names another mapping
+  (`Memory::host_mapping`, checked at every `run` and `step`). `FlatMemory`
+  and `GuestBus` hand out host pages; every other memory keeps the call.
+- **The TLB has 2,048 entries and a folded index** (the page number XOR the
+  page number shifted by the index width), so pages 4 MiB apart no longer
+  take one place. An invalidation by address looks at one place when no
+  entry of a mapping larger than a page covers the address. It looks at
+  every entry when one does, and while more than 64 such mappings are kept.
+- **A store into a page without translated code moves no stamp.** The
+  page's watch word is odd while a CPU holds code it translated there.
+  `GuestBus` stores straight when it is even: no stamp, no `SeqCst`
+  operation, no lock. The argument for the race between a translator and a
+  straight store is the module comment of `vmlab-hv-vmm/src/vcpu/guest_bus.rs`:
+  the translator makes the word odd under a mutex and then runs
+  `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, takes the stamp before it
+  reads the code (the old code read first and stamped after, which let a
+  write between the two go unseen), and checks the word after. A stamped
+  write makes the word even before it moves the stamps. A device write is
+  always stamped. A host without the barrier or without `cmpxchg16b` runs
+  more than one CPU with every write stamped, as before.
+- **The exclusive store is one host compare and exchange** against the value
+  of its load (`Memory::compare_and_store`), under the transaction lock and
+  after the generation check. A store of another CPU that changed the value
+  fails it; one that wrote the same value back is taken as one before the
+  load, which is what QEMU does. The 16-byte form is `lock cmpxchg16b`.
+- **The code-page filter bits are cleared again**: each bit has a count of
+  the pages of `code_set` that have it, and the bit goes when the count
+  reaches zero.
+- A memory that counts the stamps of its own writes (`own_generation`)
+  tells `settle` how far they moved the generation, so a straight store does
+  not start a new epoch.
+
+### Speed
+
+On helios, pinned to cores 28-31, 3 repeats each, with `bench/run.py`
+(`just bench-run interpreter aarch64 1 3` for the flat images, and
+`--backend vmlab-hv --arch aarch64 --guest debian-13 --suite boot` at 1 and 2
+vCPUs for the boot MIPS row). Before is `next` at `8f98e8f4`, which holds
+the lazy flags of card S1 and its boot MIPS row. After is `57ad9140`, a
+merge of that `next` and this branch on helios: the branch merges into it
+without a conflict. The two ran one after the other, before first, while
+other cards booted VMs on other cores. The rows are in
+`hv/bench/history/aarch64.jsonl` with a `note`.
+
+| | Before (median) | After (median) | Change |
+|---|---|---|---|
+| CoreMark mix, MIPS | 132.85, 138.38, 141.39 (**138.38**) | 151.74, 150.99, 150.47 (**150.99**) | +9 % |
+| Scalar loop, MIPS | 154.54, 148.81, 157.83 (**154.54**) | 158.70, 158.97, 155.81 (**158.70**) | +3 % |
+| Debian boot, 1 vCPU, MIPS | 82.55, 84.74, 81.33 (**82.55**) | 91.26, 96.64, 96.86 (**96.64**) | +17 % |
+| Debian to agent ready, 1 vCPU, s | 220.46, 212.27, 220.67 (**220.46**) | 196.47, 184.97, 184.38 (**184.97**) | -16 % |
+| Debian boot, 2 vCPUs, MIPS | 104.65, 101.45, 107.58 (**104.65**) | 127.41, 124.60, 110.32 (**124.60**) | +19 % |
+| Debian to agent ready, 2 vCPUs, s | 173.53, 180.35, 169.32 (**173.53**) | 142.14, 145.14, 167.13 (**145.14**) | -16 % |
+
+The scalar loop has no load and no store, so its change is within the
+noise. The five views estimated 25 to 40 % at 1 vCPU and 50 to 70 % at 2
+for the whole of their W1; what is left of the gap at 2 vCPUs is the block
+loop and the operations, which card S0 profiled.
+
+### Equal behaviour
+
+- O3 lockstep on `ef5a139c` (the code of this card): `just tcg-a64-lockstep
+  loadstore` verified 5,227,768 instructions in 2,980,769 rounds, `mmu`
+  4,403,165 in 1,155 rounds and `walk` 4,454,798 in 1,099 rounds (seed 1,
+  100,000 per class), no difference in any. Those groups run on
+  `FlatMemory`, which hands out host pages, so they run the new paths.
+- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) on `57ad9140`: 11 tests,
+  9 with the same results as QEMU 11.1.3, 2 (`gicv2-mmio`, `gicv2-mmio-3p`)
+  pass the two `ITARGETSR` subtests that fail on QEMU, as in card C13, and
+  none differs otherwise.
+
+### Tests
+
+- `vmlab-hv-vmm/src/vcpu/emulated_tests.rs`: a store moves the stamps only
+  where a CPU holds code, a translator sees a write that raced it
+  (`watch_holds`), a device write is always stamped; the exclusive store is
+  a compare and exchange at 1, 2, 4, 8 and 16 bytes; and two CPUs on two
+  threads, 200,000 rounds each, take a spinlock with `LDAXR`/`STXR`, count
+  under it with plain loads and stores, give it back with a straight `STLR`,
+  count a second word with `LDXR`/`STXR` alone and store beside both in the
+  same page: both counts end at 400,000.
+- `vmlab-hv-tcg/src/tlb.rs`: the folded index, an invalidation by address
+  with and without a larger mapping, and past 64 of them.
+- `exec.rs`: a new memory under the CPU drops the host pages of the old one.
+
+### What this card does not do
+
+- The JIT of phase 3e can take the entry as it is (host address and watch
+  word); no code of it is here.
+- An invalidation by ASID still looks at every entry.
+- Code on pages that a CPU also writes as data (mixed pages) is stamped and
+  translated again as before: each stamped write makes the watch even, and
+  the next translation makes it odd, with a barrier at 2 or more CPUs.
+
+### Sources read for this card
+
+- The state of this crate, of `vmlab-hv-tcg` and of
+  `vmlab-hv-vmm/src/vcpu/guest_bus.rs`; the Linux man page of `membarrier`
+  for its two commands, and the x86 `cmpxchg16b` instruction from general
+  knowledge of the instruction set.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
+
 ## Card C14 (2026-11-27)
 
 Snapshots, reset and the debug port of an emulated machine (DESIGN.md F6,
@@ -1617,123 +1734,6 @@ same results. `timer` gives the same results after the deadline exit above.
 - The multiply-and-rotate hash from its description (the hasher of Firefox
   and rustc); no code of it was read or copied.
 - The serial logs of the guests, and kvm-unit-tests as a running program.
-- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
-  Reference Manual was opened.
-- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
-  no Unicorn.
-
-## Card S3 (2026-11-27)
-
-Guest RAM straight from the TLB entry, and stores without stamps on pages
-that hold no translated code (the five model views of card #1145, F2 and F3
-of each).
-
-### What changed
-
-- **The TLB entry keeps the host address of its page** (`tlb::Entry::host`)
-  and the address of the page's watch word (`Entry::watch`), from
-  `Memory::host_page` when the entry is filled. A load whose page the TLB
-  holds that way is a probe, an add and one host access; a store is the same
-  plus two relaxed loads of the watch word. Neither calls the memory. The
-  CPU drops its entries when the memory names another mapping
-  (`Memory::host_mapping`, checked at every `run` and `step`). `FlatMemory`
-  and `GuestBus` hand out host pages; every other memory keeps the call.
-- **The TLB has 2,048 entries and a folded index** (the page number XOR the
-  page number shifted by the index width), so pages 4 MiB apart no longer
-  take one place. An invalidation by address looks at one place when no
-  entry of a mapping larger than a page covers the address. It looks at
-  every entry when one does, and while more than 64 such mappings are kept.
-- **A store into a page without translated code moves no stamp.** The
-  page's watch word is odd while a CPU holds code it translated there.
-  `GuestBus` stores straight when it is even: no stamp, no `SeqCst`
-  operation, no lock. The argument for the race between a translator and a
-  straight store is the module comment of `vmlab-hv-vmm/src/vcpu/guest_bus.rs`:
-  the translator makes the word odd under a mutex and then runs
-  `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`, takes the stamp before it
-  reads the code (the old code read first and stamped after, which let a
-  write between the two go unseen), and checks the word after. A stamped
-  write makes the word even before it moves the stamps. A device write is
-  always stamped. A host without the barrier or without `cmpxchg16b` runs
-  more than one CPU with every write stamped, as before.
-- **The exclusive store is one host compare and exchange** against the value
-  of its load (`Memory::compare_and_store`), under the transaction lock and
-  after the generation check. A store of another CPU that changed the value
-  fails it; one that wrote the same value back is taken as one before the
-  load, which is what QEMU does. The 16-byte form is `lock cmpxchg16b`.
-- **The code-page filter bits are cleared again**: each bit has a count of
-  the pages of `code_set` that have it, and the bit goes when the count
-  reaches zero.
-- A memory that counts the stamps of its own writes (`own_generation`)
-  tells `settle` how far they moved the generation, so a straight store does
-  not start a new epoch.
-
-### Speed
-
-On helios, pinned to cores 28-31, 3 repeats each, with `bench/run.py`
-(`just bench-run interpreter aarch64 1 3` for the flat images, and
-`--backend vmlab-hv --arch aarch64 --guest debian-13 --suite boot` at 1 and 2
-vCPUs for the boot MIPS row). Before is `next` at `8f98e8f4`, which holds
-the lazy flags of card S1 and its boot MIPS row. After is `57ad9140`, a
-merge of that `next` and this branch on helios: the branch merges into it
-without a conflict. The two ran one after the other, before first, while
-other cards booted VMs on other cores. The rows are in
-`hv/bench/history/aarch64.jsonl` with a `note`.
-
-| | Before (median) | After (median) | Change |
-|---|---|---|---|
-| CoreMark mix, MIPS | 132.85, 138.38, 141.39 (**138.38**) | 151.74, 150.99, 150.47 (**150.99**) | +9 % |
-| Scalar loop, MIPS | 154.54, 148.81, 157.83 (**154.54**) | 158.70, 158.97, 155.81 (**158.70**) | +3 % |
-| Debian boot, 1 vCPU, MIPS | 82.55, 84.74, 81.33 (**82.55**) | 91.26, 96.64, 96.86 (**96.64**) | +17 % |
-| Debian to agent ready, 1 vCPU, s | 220.46, 212.27, 220.67 (**220.46**) | 196.47, 184.97, 184.38 (**184.97**) | -16 % |
-| Debian boot, 2 vCPUs, MIPS | 104.65, 101.45, 107.58 (**104.65**) | 127.41, 124.60, 110.32 (**124.60**) | +19 % |
-| Debian to agent ready, 2 vCPUs, s | 173.53, 180.35, 169.32 (**173.53**) | 142.14, 145.14, 167.13 (**145.14**) | -16 % |
-
-The scalar loop has no load and no store, so its change is within the
-noise. The five views estimated 25 to 40 % at 1 vCPU and 50 to 70 % at 2
-for the whole of their W1; what is left of the gap at 2 vCPUs is the block
-loop and the operations, which card S0 profiled.
-
-### Equal behaviour
-
-- O3 lockstep on `ef5a139c` (the code of this card): `just tcg-a64-lockstep
-  loadstore` verified 5,227,768 instructions in 2,980,769 rounds, `mmu`
-  4,403,165 in 1,155 rounds and `walk` 4,454,798 in 1,099 rounds (seed 1,
-  100,000 per class), no difference in any. Those groups run on
-  `FlatMemory`, which hands out host pages, so they run the new paths.
-- kvm-unit-tests (`just tcg-a64-kvm-unit-tests`) on `57ad9140`: 11 tests,
-  9 with the same results as QEMU 11.1.3, 2 (`gicv2-mmio`, `gicv2-mmio-3p`)
-  pass the two `ITARGETSR` subtests that fail on QEMU, as in card C13, and
-  none differs otherwise.
-
-### Tests
-
-- `vmlab-hv-vmm/src/vcpu/emulated_tests.rs`: a store moves the stamps only
-  where a CPU holds code, a translator sees a write that raced it
-  (`watch_holds`), a device write is always stamped; the exclusive store is
-  a compare and exchange at 1, 2, 4, 8 and 16 bytes; and two CPUs on two
-  threads, 200,000 rounds each, take a spinlock with `LDAXR`/`STXR`, count
-  under it with plain loads and stores, give it back with a straight `STLR`,
-  count a second word with `LDXR`/`STXR` alone and store beside both in the
-  same page: both counts end at 400,000.
-- `vmlab-hv-tcg/src/tlb.rs`: the folded index, an invalidation by address
-  with and without a larger mapping, and past 64 of them.
-- `exec.rs`: a new memory under the CPU drops the host pages of the old one.
-
-### What this card does not do
-
-- The JIT of phase 3e can take the entry as it is (host address and watch
-  word); no code of it is here.
-- An invalidation by ASID still looks at every entry.
-- Code on pages that a CPU also writes as data (mixed pages) is stamped and
-  translated again as before: each stamped write makes the watch even, and
-  the next translation makes it odd, with a barrier at 2 or more CPUs.
-
-### Sources read for this card
-
-- The state of this crate, of `vmlab-hv-tcg` and of
-  `vmlab-hv-vmm/src/vcpu/guest_bus.rs`; the Linux man page of `membarrier`
-  for its two commands, and the x86 `cmpxchg16b` instruction from general
-  knowledge of the instruction set.
 - S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
