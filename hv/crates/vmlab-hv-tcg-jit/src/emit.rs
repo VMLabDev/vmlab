@@ -1092,7 +1092,7 @@ impl Emitter<'_> {
         }
         let saved = self.live_caller_saved();
         if let Some(registers) = registers {
-            Self::call_registers(&mut self.asm, registers, &saved);
+            Self::call_registers(&mut self.asm, registers, saved.as_slice());
             return;
         }
         match direct {

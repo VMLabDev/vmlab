@@ -5967,6 +5967,8 @@ mod tests {
                 }
             }
         }
+    }
+
     /// Card J10: two blocks 16 KiB apart take the same entry of the jump
     /// cache, so that each exit misses it. The thunk serves the miss with
     /// the code of the other block, and the run does not come back to the
