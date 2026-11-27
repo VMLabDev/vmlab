@@ -48,7 +48,7 @@
 //! lockstep of the cards C6 and C8 and the probe of the system registers).
 //! This file holds no other instruction semantics.
 
-use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
+use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
