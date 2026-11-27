@@ -115,6 +115,11 @@ impl EmulatedVcpu {
         }
     }
 
+    /// The instructions that the CPU has run.
+    pub fn instructions(&self) -> u64 {
+        self.cpu.instructions
+    }
+
     /// The vCPU `id` in the reset state `state`, on `memory`, with the
     /// system counter of `clock`.
     pub fn new(id: u8, memory: GuestBus, state: State, clock: Clock) -> Self {

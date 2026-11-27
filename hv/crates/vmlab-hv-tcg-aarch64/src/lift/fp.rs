@@ -182,12 +182,7 @@ pub fn three_operand(b: &mut Builder, record: Record, f: &BaseThreeOperandFPData
 
 /// N, Z, C and V of a compare helper result.
 fn compare_flags(b: &mut Builder, packed: ScalarId) -> Flags {
-    Flags {
-        n: b.bit(packed, 3),
-        z: b.bit(packed, 2),
-        c: b.bit(packed, 1),
-        v: b.bit(packed, 0),
-    }
+    Flags::Explicit(b.slice(packed, 0, 4))
 }
 
 fn compare(b: &mut Builder, format: Format, signalling: bool, n: ScalarId, m: ScalarId) {
@@ -256,16 +251,7 @@ pub fn conditional_compare(b: &mut Builder, record: Record, f: &BaseFPCondCompar
         &[n, m],
     );
     let compared = compare_flags(b, packed);
-    let mut pick = |compared: ScalarId, bit: u32| {
-        let immediate = b.imm(1, u64::from((f.nzcv >> bit) & 1));
-        b.select(1, holds, compared, immediate)
-    };
-    let flags = Flags {
-        n: pick(compared.n, 3),
-        z: pick(compared.z, 2),
-        c: pick(compared.c, 1),
-        v: pick(compared.v, 0),
-    };
+    let flags = b.chosen_flags(holds, compared, (f.nzcv & 15) as u8);
     b.set_flags(flags);
     let raised = b.slice(packed, 64, 8);
     let none = b.imm(8, 0);

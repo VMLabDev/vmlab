@@ -53,14 +53,14 @@ pub fn add_sub_immediate(b: &mut Builder, record: Record, f: &AddSubImmShift) ->
     }
     let immediate = u64::from(f.imm & 0xfff) << (12 * shift);
     let operand = b.x_or_sp(f.rn, width);
-    let (addend, carry) = if subtract {
-        (!immediate & ones(width.into()), 1)
+    let addend = b.imm(width, immediate);
+    let (result, flags) = if subtract {
+        let carry = b.imm(1, 1);
+        b.sub_with_carry(width, operand, addend, carry)
     } else {
-        (immediate, 0)
+        let carry = b.imm(1, 0);
+        b.add_with_carry(width, operand, addend, carry)
     };
-    let addend = b.imm(width, addend);
-    let carry = b.imm(1, carry);
-    let (result, flags) = b.add_with_carry(width, operand, addend, carry);
     if set_flags {
         b.set_flags(flags);
         b.set_x(f.rd, width, result);

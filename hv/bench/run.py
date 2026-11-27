@@ -159,9 +159,16 @@ def one_repeat(args, arch, smp, pin, version, index):
             k: hello.get(k) for k in ("agent_version", "os", "features")
         }
         log(f"agent ready after {result['boot_to_agent_ready']}s")
+        boot = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
+        if counts_instructions(args, arch) and not boot_mips:
+            instructions = backend.instructions(smp)
+            result["boot_instructions"] = instructions
+            boot["boot_mips"] = round(
+                instructions / result["boot_to_agent_ready"] / 1e6, 2
+            )
+            log(f"{instructions} instructions to agent ready: {boot['boot_mips']} MIPS")
 
         if args.suite == "boot":
-            result["samples"] = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
             if boot_mips:
                 # Quit at the handshake so the final vCPU counts exclude guest shutdown.
                 backend.quit()
@@ -171,7 +178,8 @@ def one_repeat(args, arch, smp, pin, version, index):
                 if session.wait_exit(30) != 0:
                     raise lib.BenchError("VM failed to exit cleanly at agent ready")
                 result["boot_instructions"] = boot_instructions(session.stderr_text(), smp)
-                result["samples"]["boot_mips"] = result["boot_instructions"] / ready_seconds / 1e6
+                boot["boot_mips"] = result["boot_instructions"] / ready_seconds / 1e6
+            result["samples"] = boot
             return result, backend, session, agent, None
 
         def timed(name, argv, timeout):
@@ -216,7 +224,7 @@ def one_repeat(args, arch, smp, pin, version, index):
         result["sha256_digest"] = digest
 
         result["samples"] = {
-            "boot_to_agent_ready": result["boot_to_agent_ready"],
+            **boot,
             "sha256_256M": round(sha_secs, 2),
             "xz_9_32M": round(xz_secs, 2),
         }
@@ -261,11 +269,17 @@ def one_repeat(args, arch, smp, pin, version, index):
             json.dump(result, f, indent=1)
 
 
+def counts_instructions(args, arch):
+    """Whether a run reads the instruction count of its boot: vmlab-hv on
+    an emulated aarch64 machine, whose vCPUs count what they run."""
+    return args.backend == "vmlab-hv" and arch == "aarch64"
+
+
 def run_config(args, arch, smp, pin, version, commit, dirty, host):
     """N repeats of one configuration → one history line per workload."""
     workloads = ("boot_to_agent_ready",) if args.suite == "boot" else lib.TCG_WORKLOADS
-    if measures_boot_mips(args, arch):
-        workloads += ("boot_mips",)
+    if counts_instructions(args, arch):
+        workloads = (*workloads, "boot_mips")
     all_samples = {w: [] for w in workloads}
     digests = set()
     env = {
@@ -329,7 +343,7 @@ def finish_config(args, arch, smp, all_samples, env, commit, dirty, host):
             "qemu_baseline": None,
             "env": env,
         }
-        if args.backend == "vmlab-hv":
+        if args.backend == "vmlab-hv" and w != "boot_mips":
             record["qemu_baseline"] = lib.latest_baseline(
                 existing, arch, args.guest, smp, w
             )
