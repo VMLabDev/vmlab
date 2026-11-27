@@ -2372,7 +2372,13 @@ measured rows are in J8 of the design.
   the control socket runs twice, with `VMLAB_HV_JIT=1` and `=0`, in the same
   process and in a new one on the same disk, and reads in the log of the
   machine which of the two its vCPU ran.
-- K4: see J8 of the design for the run and what it found.
+- K4 (`just tcg-a64-boot-lockstep`, AAVMF from the reset, the JIT on):
+  the first run found a CPU difference after 318,699,178 instructions, an
+  interrupt that our CPU took at an `ISB` where the leader took none, from
+  the lockstep reading the lines of the machine (above). After the fix, no
+  CPU difference in 351,352,701 compiled instructions, where the leader
+  stops by itself (it stops at the same point with no follower). J8f and
+  J8g of the design. K4 for Debian to agent ready was not built.
 - K1: no emitter form changed, so no group had to run. K2 ran in `ci::check`
   (`tests/jit.rs`).
 
@@ -2386,6 +2392,16 @@ measured rows are in J8 of the design.
 - `bench`: `test_jit_rows_compare_with_jit_rows_only`,
   `test_a_slower_jit_row_fails`, `test_a_row_of_the_check_is_not_gated`,
   `test_more_refused_blocks_fail_a_jit_row`, and the switch with no value.
+
+### What this card does not do
+
+- K4 for Debian from the reset to agent ready, and its nightly run: the boot
+  lockstep has no disk, no virtio devices whose completions the leader
+  leads, and no agent, and the leader runs at 0.53 million instructions a
+  second, about 9.4 hours for the 18e9 instructions of the boot.
+- Why QEMU, with the plugin, stops its stream after 351,352,700
+  instructions of this AAVMF, before its boot menu. The run of card C10
+  reached the shell.
 
 ### Sources read for this card
 

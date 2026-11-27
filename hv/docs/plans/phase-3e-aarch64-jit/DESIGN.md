@@ -1104,6 +1104,31 @@ to 27, the two columns side by side.
 - **J8e. K7.** The snapshot, debug port and reset tests of card C14 run with
   the JIT and on the interpreter, in `vmlab-hv-vmm` and at S1 over the
   control socket (VERIFICATION.md, card J8).
+- **J8f. K4, the first difference and its fix.** `just
+  tcg-a64-boot-lockstep` (AAVMF 2026.08+ds-2 of `guest/fetch-firmware.sh`,
+  QEMU 11.1.3, cores 28 to 31) with the JIT on, as every machine CPU runs
+  now: every instruction ran as a compiled block of one (the report counts
+  the runs of compiled code). The first run stopped at a CPU difference
+  after 318,699,178 instructions: at an `ISB` after `MSR DAIFClr` our CPU
+  took an interrupt that the leader did not take there. It was the harness,
+  not the JIT: since card C13 a CPU of a machine reads the lines of its
+  machine before every block, so the follower took an interrupt that its
+  GIC had pending, where the lockstep means the leader to lead every
+  interrupt. The interpreter reads them the same way, and no O4 run had
+  passed that point since C13. The lockstep now runs its CPU without those
+  lines. The second run had no CPU difference in 351,352,701 instructions,
+  all of them compiled, with 4 interrupts taken where the leader took them,
+  each pending in our GIC, 2 host calls and 1,266 device reads with no
+  device finding. There the leader stopped writing its stream, before the
+  boot menu: QEMU with the plugin and no follower (`--leader-only 1`)
+  stops at the same instruction, 351,352,700, so the end of that run is
+  the leader's and not ours. Why QEMU stops there is not known.
+- **J8g. Not done: K4 for Debian to agent ready.** The boot lockstep boots
+  the firmware with no disk. A Debian boot needs the disk and the virtio
+  devices on both sides, with the leader leading their completions, and an
+  agent at its end. The leader runs at 0.53 million instructions a second
+  with the plugin, so the 18e9 instructions of a Debian boot are about 9.4
+  hours. Neither the follower for that boot nor its nightly run was built.
 
 ## 8. The cards
 
