@@ -42,7 +42,9 @@ description.
   3,000 MIPS on CoreMark after cards J1 to J7. The first useful bar (T1, about
   150 MIPS on a boot) is inside that. D1 on a boot (the boot time of QEMU) is
   not certain: after the JIT, most of the time is in what the JIT does not
-  remove (R1).
+  remove (R1). *Measured* by card J9 after J1 to J8: 279 MIPS on a Debian
+  boot (42 % of QEMU's speed) and 2,025 MIPS on CoreMark (79 % of QEMU's).
+  Only 19 % of the boot is in compiled code (J9a).
 - **The first card** (J1) compiles the integer operations, guards and exits,
   calls the existing Rust paths for memory and helpers, and records CoreMark
   and boot MIPS.
@@ -134,6 +136,7 @@ In MIPS that is 470 to 690 on a boot average and 2,300 to 2,700 on CoreMark:
 9 to 13 times today's boot and 17 to 20 times today's CoreMark. Section 7 says
 which part of that is measured and which is estimated. Open question Q15 of
 the MAP (how D1 is treated) stays open until card J9 has measured numbers.
+Card J9 measured them (J9b) and proposes an answer (Q4).
 
 ## 2. Where the time goes today
 
@@ -506,11 +509,16 @@ a `memcpy` loop of glibc) before a card is written.
   The default is one region of 64 MiB per vCPU, reserved at once and touched
   as it fills. It is inside the memory cap of the VM process, beside the 256
   MiB young generation of the block store.
-- **H13c. Eviction.** When the region is full, the whole cache of that vCPU
-  is dropped: the bump pointer is reset, every block loses its code address,
-  the chains and the jump cache are cleared. The pre-decoded blocks stay in
-  the block store, so a block is compiled again in about a microsecond when
-  it runs next. A partial eviction is not built.
+- **H13c. Eviction.** The region is cut into four parts, written one after
+  another. When the part that the JIT writes into is full, it goes on to
+  the next one, the part written longest ago, and drops only the code in
+  it: the blocks of that part lose their code address, the jumps of the
+  other parts that are linked into it go back to their stubs, and the jump
+  cache is cleared. The code of the other three parts stays. The
+  pre-decoded blocks stay in the block store, so a block is compiled again
+  in about a microsecond when it runs next. Until card J11 the whole region
+  was dropped, and the recompiles after a drop were 56 % of the compiles of
+  a Debian boot (J11a).
 - **H13d. W^X.** The region is a `memfd` mapped twice: one view readable and
   writable, where the emitter writes, and one view readable and executable,
   where the vCPU runs. No page is writable and executable in one mapping.
@@ -673,7 +681,7 @@ in J4 as a count). The eager write-back of H3 is only an option.
 | | | A boot: 1.5 to 2 times more. Basis: W1b and W1f are 25 % of today's time, which is most of what is left after G1 and G2. | est. |
 | G4 | Flags as host flags (J5) | 1.2 to 1.7 times on a block that ends in a compare and a branch | measured on the spike |
 | | | In the interpreter alone, card #1142 reports 13 % on CoreMark. | reported by that card |
-| G5 | All of J1 to J7 | A boot: 250 to 450 MIPS. CoreMark: 1,500 to 3,000 MIPS. Basis: the spike's chained blocks run at 3,600 to 7,000 MIPS. A real workload has guards, helper calls, jump cache misses and TLB misses, and the 7 % of R1 stays. | est. |
+| G5 | All of J1 to J8 | A Debian boot at 1 vCPU: 279.2 MIPS, 64.4 s to agent ready. CoreMark: 2,024.8 MIPS. The scalar loop: 2,040.4 MIPS. The estimate was 250 to 450 and 1,500 to 3,000 MIPS. | measured by card J9 (J9b) |
 | G6 | Translation cost added by the emitter | 0.2 to 1.1 µs per block on top of 8 to 17 µs | measured |
 
 Each J card replaces the estimate of its row by a measured bench row.
@@ -1256,6 +1264,256 @@ minutes, inside the two hours of the card.
   devices and DMA, the instructions between the windows, and a defect of
   ours earlier in the boot that left a state that is consistent.
 
+### G5 and D1, measured by card J9
+
+Helios, 2026-11-28, *measured*, at commit `4af3439a` (`next` with J1 to J8,
+the JIT on by default). Other cards ran builds and boots at the same time
+(load average 3 to 9 of 32 threads), and the host-wide VM cap of the bench
+made some runs wait for a slot. The rows are in
+`bench/history/aarch64.jsonl` with the commit `4af3439a`. The rows of the
+profiling runs below are not in the history: they ran a binary with frame
+pointers and line tables.
+
+The bench runs QEMU with `-cpu max` and vmlab-hv with its own set, the ID
+registers of a `cortex-a53` (3d) with AES, SHA-1, SHA-256 and CRC32 and
+without LSE. So the guest can choose other code on the two sides (the
+atomics of the kernel, the string functions of glibc). The same Debian
+image and the same commands run on both.
+
+**J9a. W1 again, on the JIT.** The sampler of W1 with three changes
+(`measure/ipraw.c`): it samples only the vCPU threads (`IPCOMM=vcpu-`), it
+writes a sample in no mapped object as compiled code, and it writes the
+first return address in the binary of each sample's call chain, so that a
+sample in libc is classed by its caller where the frame pointers allow.
+`measure/ipclass.py` names compiled code by the perf map of the run
+(`VMLAB_HV_JIT_PERF_MAP=1`) and has three new classes for the Rust side of
+the JIT. Sources read for the sampler: the `perf_event_open(2)` manual
+page (the layout of a sample with a call chain). No QEMU source was read
+(X1 to X3). Debian 13 at one vCPU through the bench's full suite, cores 16 to
+19, one run, samples cut at agent ready and at the ends of the two
+workloads by the times of the bench log. CoreMark: three runs of a flat
+image of 30,000 iterations (4.30e9 instructions each), cores 16 to 19.
+
+| Class | Boot to agent ready | `sha256` | `xz` | CoreMark, flat |
+|---|---|---|---|---|
+| Samples | 70,379 | 7,994 | 6,997 | 4,172 |
+| Compiled code: the blocks, the trampoline, and code the perf map does not name | 18.9 % | 4.4 % | 25.4 % | 99.9 % |
+| Entering and leaving compiled code in the Rust loop (`Seat::prepare`, `execute`, `run_chained`, `Jit::current`, `Jit::link`) | 24.9 % | 4.3 % | 5.6 % | 0 % |
+| Block lookup and the checks of the loop, with the libc calls made from it | 12.6 % | 1.8 % | 0.7 % | 0 % |
+| Translation and compile (lift, lowering, emit, assembler), with the libc calls made from them | 10.5 % | 3.2 % | 0.2 % | 0 % |
+| libc with no caller in the binary (by the offsets: `malloc`, `free`, `realloc`) | 8.7 % | 2.6 % | 0.2 % | 0 % |
+| Memory: RAM behind a hit, the softmmu paths, page walks | 7.9 % | 3.9 % | 44.7 % | 0 % |
+| The thunk and the pure calls | 3.8 % | 11.9 % | 20.1 % | 0 % |
+| Helpers: FP, AdvSIMD, crypto | 3.2 % | 57.6 % | 0 % | 0 % |
+| Register copies, the operation loop of the interpreter, system, devices, other | 9.4 % | 10.3 % | 3.1 % | 0.1 % |
+
+- **J9a1. The boot is not in compiled code.** 18.9 % of the vCPU's time is
+  in compiled blocks. The round trip to the Rust loop (the two rows after
+  them) is 37.5 %. `Seat::prepare`, which stores the context and the budget
+  before every entry, is 10.1 % alone. The counters of the boot row (17.0e9
+  instructions): 2,878.6 million block runs (5.9 instructions a run), of
+  which 2,362.7 million came through a linked jump (82 %), 318.9 million
+  through the jump cache (11 %) and 197.0 million from the Rust loop
+  (6.8 %). Of these 197.0 million, 90.5 million are misses of the jump
+  cache and 22.5 million made a new link. The jump cache was emptied 1.10
+  million times and 22.4 million links were unlinked. *Est.*: 37.5 % of the
+  64.4 s of the boot row over 197.0 million round trips is about 120 ns a
+  round trip. The basis of an explanation for `Seat::prepare`, not
+  measured: its store of the budget is sequentially consistent (an
+  `xchg`), on a cache line that the threads which raise the interrupt
+  lines also write.
+- **J9a2. Translation is a tenth of the boot.** 947,061 compiles in the
+  boot (453 MB of code, 5.9 s in the compiler by its own counter, 6 drops
+  of the 64 MiB region), as in J6d. With the heap calls that the call
+  chains give to it, translation and compile are 10.5 %. libc with no
+  caller in the binary is another 8.7 %: `malloc` and `free` without frame
+  pointers hide their caller, so how much of it is translation is not
+  known.
+- **J9a3. `sha256` runs in the helpers.** The guest's `sha256sum` uses the
+  SHA-256 instructions, which vmlab-hv's ID registers offer.
+  `helpers::crypto` and the generic AdvSIMD evaluator (`simd::run`,
+  `eval`, `same`, `lane`) are 57.6 %, and the pure calls that reach them
+  another 11.9 %.
+- **J9a4. `xz` runs in the miss path of the fast TLB.** `-9` searches a
+  dictionary larger than the 1 MiB that 256 entries of 4 KiB reach
+  (`tlb::ENTRIES`). The miss path (the thunk, `load`, `FastTlb::fill`,
+  `fill_fast`, the lookup of the architectural TLB: the softmmu class and
+  the thunk) is 62.4 %, page walks 0.3 %: the architectural TLB hits and
+  the fast TLB does not. The counters:
+  the boot alone missed 3.0 % of 4.18e9 inlined accesses, and a run of
+  the full suite (26.0e9 instructions) 10.2 % of 6.83e9. The part after
+  agent ready (the preparation, `sha256`, `xz` and the check) is then
+  about 21.6 % (571.6 million of 2.64e9), from the difference of the two
+  runs.
+- **J9a5. CoreMark is all compiled code**: 99.9 % of the samples, none in
+  the Rust loop, the thunk or translation. 1.68e9 block runs for 4.30e9
+  instructions, 2.56 instructions a run, and its hottest blocks have 2 to
+  5 instructions. What is left there is the code of each block: the budget
+  check at its head and the registers that it reads and writes at its
+  ends (H3, H10).
+- **J9a6. Small for every workload:** exceptions, system registers, the
+  timer and the interrupts (0.9 % of the boot), page walks (1.2 %), FP
+  helpers (none visible: the helper samples are AdvSIMD and crypto), the
+  exclusives (`load_reserved` 0.50 % and `compare_and_store` 0.42 % of the
+  first boot profile at one vCPU, whole run).
+
+**J9b. The rows against QEMU.** The flat images: cores 28 to 31, the median
+of 3 with the range. The D2 suite on Debian 13: vmlab-hv on cores 20 to 23,
+QEMU on cores 24 to 27, the median of 3 with the range. QEMU at one vCPU
+ran beside vmlab-hv at one vCPU, QEMU at four vCPUs after the vmlab-hv
+runs. The boot row of the boot suite ran alone after the full suite. "Of
+QEMU" is QEMU's time over ours, or our MIPS over QEMU's.
+
+| Workload | vCPUs | vmlab-hv, JIT | QEMU 11.1.3 TCG | Of QEMU |
+|---|---|---|---|---|
+| CoreMark mix, flat, MIPS | 1 | 2,024.8 (2,023.3 to 2,038.7) | 2,565.6 (2,522.0 to 2,591.5) | 79 % |
+| Scalar loop, flat, MIPS | 1 | 2,040.4 (2,026.9 to 2,046.9) | 3,130.4 (3,118.9 to 3,176.9) | 65 % |
+| Boot to agent ready, boot suite, s | 1 | 64.4 (64.2 to 73.0), 279.2 MIPS | 26.9 (26.7 to 28.4), full suite | 42 % |
+| Boot to agent ready, full suite, s | 1 | 80.2 (70.9 to 81.6), 225.1 MIPS | 26.9 (26.7 to 28.4) | 34 % |
+| `sha256_256M`, s | 1 | 9.76 (9.61 to 9.92) | 2.13 (2.05 to 2.16) | 22 % |
+| `xz_9_32M`, s | 1 | 8.86 (8.61 to 9.02) | 2.78 (2.74 to 2.79) | 31 % |
+| Boot to agent ready, full suite, s | 4 | 56.3 (55.0 to 61.7), 345.9 MIPS over the four vCPUs | 20.1 (20.1 to 20.7) | 36 % |
+| `sha256_256M`, s | 4 | 7.43 (6.88 to 7.68) | 2.02 (2.02 to 2.04) | 27 % |
+| `xz_9_32M`, s | 4 | 8.43 (8.39 to 9.16) | 2.72 (2.71 to 2.75) | 32 % |
+
+- **J9b1. The interpreter share (H2b)** is zero for a missing form in every
+  row: no block refused. At the budget (H2c): 53 blocks and 257
+  instructions in the boot row at one vCPU, 1,398 blocks and 7,891
+  instructions in the run at four vCPUs at its last report. No instruction
+  of the flat images ran in the interpreter.
+- **J9b2. The two boot rows at one vCPU differ by 16 s.** The full suite ran
+  beside QEMU's runs and the boot suite alone. Both are in the history.
+- **J9b3. Four vCPUs** make our boot 1.42 times faster than one vCPU (the
+  full suite rows) and QEMU's 1.34 times. `sha256` and `xz` are one thread
+  each, and run 1.3 and 1.05 times faster on our side with four vCPUs. The
+  basis of an explanation, not measured: at one vCPU the same vCPU also
+  serves the interrupts and the reads of the page cache. The waits of J7c
+  and J7d took 1.6 s of CPU time in the four vCPU run (the counters at its
+  last report).
+- **J9b4. D1 is met by no row.** The nearest are CoreMark (79 %) and the
+  boot at one vCPU (42 %).
+
+**J9c. What comes next, from J9a.** The order is the expected gain on the
+D2 suite. Each estimate is *est.*, with its basis.
+
+| Code | Step | Measured share it attacks | Gain, est. | Decision |
+|---|---|---|---|---|
+| N1 | Fewer and cheaper round trips to the Rust loop | 37.5 % of a boot (J9a1) | A boot 1.3 to 1.5 times. Basis: half the round trips (the jump cache kept across a write of TTBR0 and TTBR1 when the ASID tells the spaces apart, and a miss served from the stub without the loop), each at half its cost. | Card J10 |
+| N2 | Cheaper translation and compile | 10.5 % of a boot, and up to 8.7 % more in libc (J9a2) | A boot 1.1 to 1.2 times. Basis: no heap call per block in the lifter and the emitter, and fewer recompiles after a drop of the region. | Card J11 |
+| N3 | The reach of the fast TLB | 62.4 % of `xz` (J9a4) | `xz` 1.4 to 1.8 times. A boot: little, its miss rate is 3 %. | Card J12 |
+| N4 | Host-FPU fast paths and inlined AdvSIMD, with the crypto helpers | 69.5 % of `sha256` (J9a3), 3.2 % of a boot | `sha256` 2 to 3 times. Basis: the SHA-256 operations as direct helpers of their own, without the generic lane evaluator and the marshalling of the pure call. FP: no row of D2 has FP work, so the FP half of D11 waits for a workload that has it. | Card J13 (AdvSIMD and crypto only) |
+| N5 | Superblocks: several blocks as one unit, with registers kept across the joins (H1) | 99.9 % of CoreMark in compiled code, 2.56 instructions a block run (J9a5) | CoreMark 1.2 to 1.4 times, which is 2,400 to 2,800 MIPS against QEMU's 2,566. A boot: at most its 18.9 % in compiled code. | Card J14 |
+| N6 | A return stack for `RET` | The jump cache serves 11 % of the block runs of a boot, inline | At most 1 to 2 % of a boot. Basis: a hit is an index, two compares and a jump (H6). | Not now. N1 measures it again. |
+| N7 | LSE (3d:G2) with host atomics | The exclusives: about 1 % of a boot at one vCPU (J9a6), 0.14 to 0.42 % of the instructions (J7g) | Small at one vCPU. At four vCPUs the spins of J7g. | Not now. A profile at four vCPUs after N1 decides it. |
+| N8 | Cheaper exception entry | 0.9 % of a boot (J9a6) | Under 1 %. | Not a card. |
+| N9 | A Cranelift tier for hot regions (Q1) | Compiled code: 18.9 % of a boot, 4.4 % of `sha256`, 25.4 % of `xz` | A boot at most 1.1 times even if that code were twice as fast. CoreMark: B1 measured 8 to 53 % on a block alone. | Not now. After J14, if CoreMark is still under QEMU. |
+
+*Est.* after J10 to J14 together: a Debian boot at one vCPU of 36 to 45 s
+(60 to 75 % of QEMU), CoreMark near QEMU, `sha256` 44 to 65 % and `xz` 44
+to 57 % of QEMU. Basis: the gains of the table multiplied, each on the
+measured rows of J9b. So R1 holds: the next cards do not reach D1 on the
+boot or on the D2 workloads, and they do not show what would.
+
+### J11, measured by card J11
+
+Helios, 2026-11-28, *measured*. Before: `f0d5a25e`, which is `next`
+(`2f8a7dc4`) with only the counters of this card. After: `33c67ec8`. The
+merge bar ran on `85f8afcb`, which differs from it only in rustfmt and
+clippy changes. Each side was built from a tree exported from its commit.
+The boots ran on cores 20 to 23 and the flat images on cores 28 to 31.
+Other cards ran builds and boots at the same time: the load average was
+4.6 to 15.2 of 32 threads at the starts and the ends of the runs. The merge
+bar of this card ran during the first after boots and the second before
+boots. The last pair of boots ran side by side, before on cores 20 to 23
+and after on cores 24 to 27, at a load average of 4.6 to 12.9.
+The rows are in `bench/history/aarch64.jsonl` with the note "card J11".
+No QEMU source was read (X1 to X3). No other source was read.
+
+**J11a. The compiles of a boot by cause.** The new counters of the debug
+log (`compiles: ... first, ... after a drop of the region, ... after an
+invalidation, ... after an eviction`) are read at the last counter line
+before agent ready. Each repeat of Debian 13 at one vCPU:
+
+| At the line of | Before | After |
+|---|---|---|
+| 18.0e9 instructions (before: 6 boots, after: 4) | 1.088 to 1.100 million compiles: 457,165 to 472,073 the first time, 608,000 to 616,680 after a drop of the region, 13,870 to 14,015 after an invalidation or an epoch, none after an eviction. 7 drops of the region of 64 MiB | 0.923 to 0.966 million: 457,193 to 475,070 the first time, 443,863 to 477,752 after a drop of a part, 13,931 to 14,139 after an invalidation, none after an eviction. 23 or 24 drops of a part of 16 MiB |
+| The same, compile time | 7.99 to 8.52 s (7.3 to 7.8 µs a compile) | 1.53 to 1.60 s (1.58 to 1.73 µs) |
+| The same, translation time | 2.50 to 2.67 s for 471,035 to 486,088 blocks (5.1 to 5.5 µs a block) | 1.86 to 2.09 s for 471,332 to 489,031 blocks (3.8 to 4.4 µs) |
+| 17.0e9 instructions, the side-by-side pair (before: 2 boots, after: 2) | 947,480 and 951,378 compiles, 501,467 and 503,317 after a drop; 5.73 and 5.76 s compiling (6.0 µs); 2.04 s translating (4.6 µs a block) | 802,212 and 793,286 compiles, 353,329 and 345,398 after a drop; 1.26 and 1.23 s compiling (1.6 µs); 1.59 s translating (3.5 µs) |
+
+At four vCPUs (three boots each side, the four vCPUs summed at their last
+lines): before 9.89 to 14.22 s compiling, 7.7 to 9.5 µs a compile; after
+2.08 to 2.23 s, 1.7 to 1.9 µs.
+
+- **J11a1. Most compiles were recompiles.** Before, 56 % of the compiles
+  of a boot came after a drop of the region: 7 drops, each followed by
+  about 87,000 compiles of blocks that the boot had compiled before.
+  Blocks dropped from the block store and compiled again: none.
+- **J11a2. The region drops a quarter now (H13c).** The recompiles after
+  a drop fall by 21 to 28 % at 18.0e9 instructions, to 48 to 50 % of the
+  compiles. The basis of an explanation, not measured: the code that a
+  boot runs again is larger than three quarters of the region, so a part
+  that is dropped still holds code that runs again.
+- **J11a3. The size of the region stays 64 MiB.** After the change, a
+  recompile costs 1.6 µs, so the 0.35 to 0.48 million recompiles after a
+  drop cost 0.6 to 0.8 s of a boot of 58 to 86 s. Code that the boot
+  compiles the first time is 0.22 GB at one vCPU (457,000 to 475,000
+  blocks of 479 bytes), so a region that kept it all is 256 MiB, and the
+  memfd keeps each page that it wrote: up to 256 MiB of host memory for
+  each vCPU. *Est.*: that region would save at most the 0.6 to 0.8 s, 1 to
+  1.4 % of a boot.
+
+**J11b. The heap calls of a block** (`tests/alloc.rs` of
+`vmlab-hv-tcg-aarch64`: 603 blocks translated, and compiled with the JIT,
+on a CPU whose buffers grew on 603 blocks before; the heap calls of the
+thread counted):
+
+| | Before | After |
+|---|---|---|
+| A compile (the shape of the block, the emitter, the assembler, the code) | 117.6 a block | 0 |
+| A translation (the lifter, the pruning, the lowering, the block) | 71.2 a block | 13.5 a block |
+
+- **J11b1. What stays** is the lists that the pre-decoded block keeps (its
+  operations, its frame, its leaves with their operations and outputs, its
+  calls) and its box, each allocated once at its own size. The lifter
+  fills the block of the translation before, the exits take their lists
+  from those of the block before, the lowering, the pruning and the lists
+  of `compile` are kept by the CPU (`Translator`), and the emitter and the
+  assembler by the JIT (`emit::Scratch`). The forms of a lazy condition are
+  a table made once (`flags::host_forms_of`).
+- **J11b2. The test fails** when a compile makes a heap call, or when a
+  translation of that program makes 16 or more a block.
+
+**J11c. The rows.**
+
+| Workload | Before | After |
+|---|---|---|
+| Debian 13 boot to agent ready, 1 vCPU, s, the side-by-side pair (median of 3) | 68.66 (62.53 to 80.27), 261.7 MIPS | 58.38 (57.25 to 64.23), 305.2 MIPS |
+| The same, the runs one after the other | 88.37 (72.39 to 96.40), and 94.80 (90.56 to 119.10) beside the merge bar | 85.51 (76.24 to 86.47), beside the merge bar |
+| Debian 13 boot to agent ready, 4 vCPUs, s | 60.40 (60.28 to 66.40), and 90.39 (88.55 to 133.10) beside the merge bar | 60.37 (58.83 to 70.17) |
+| CoreMark mix, flat, MIPS (median of 3, two runs a side) | 1,839.7, 1,951.4 | 2,023.1, 1,989.0 |
+| Scalar loop, flat, MIPS | 1,577.6 (1,362.0 to 1,748.0), 1,954.5 | 2,008.9, 1,982.6 |
+| Instructions in the interpreter at the last counter line of each boot (H2b, H2c) | none for a missing form; at the budget 102 to 328 at 1 vCPU, 5,300 to 7,404 at 4 | none for a missing form; at the budget 136 to 225 at 1 vCPU, 5,650 to 6,770 at 4 |
+| K3 on Debian 13 at 1 vCPU (`VMLAB_HV_JIT_CHECK=1`, `VMLAB_HV_JIT_CHECK_RUNS=1000`) | | Agent ready after 132.3 s, no difference, 121.2 million checked runs (581.7 million instructions) up to the counter line at 18.0e9 instructions |
+
+- **J11c1. The boot at one vCPU is 1.18 times faster** in the pair that ran
+  side by side, inside the estimate of N2 (1.1 to 1.2 times). The runs one
+  after the other differ by less than the spread of the before side (24.0
+  and 28.5 s), with the load of the host changing between them. The basis of an explanation: the
+  pair saves 4.5 s of compiling and 0.5 s of translating of the 17.0e9
+  instructions, and the 0.15 million fewer compiles also make fewer links
+  and fewer misses of the jump cache.
+- **J11c2. The flat images** compile a few blocks, and they run the same
+  within their noise, as they should.
+- **J11c3. K2** (`tests/jit.rs` of `vmlab-hv-tcg-aarch64`, the random blocks
+  and the flag operands against the interpreter) passes on the after side.
+  The JIT tests add one for the drop of a part: a jump into the dropped
+  part goes back to its stub, and a jump between two parts that stay stays
+  linked.
+- **J11c4. Not done:** a profile of the boot as in J9a, so the share of
+  translation and compile in the samples after the change, and how much of
+  the 8.7 % of libc of J9a2 went with it, are not measured.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -1281,6 +1539,11 @@ time. Every card:
 | J7 | More than one vCPU | H11c, the kick through the budget from another thread (H10c), the TLBI broadcast with the fast TLB and the jump cache. The share of exclusives in the profile at 2 and 4 vCPUs. | A stress test: two threads, one stores into code that the other runs in a chained loop, 10 million rounds, no stale execution. The exclusives stress test of 3d card C3 with the JIT on. kvm-unit-tests at 4 vCPUs. The boot rows at 2 and 4 vCPUs. | J3, J4 | J5, J6 |
 | J8 | Bar T1, and the JIT on by default | K7: the snapshot, reset and debug port tests of card C14 with the JIT on. K4 for Debian from reset to agent ready, started as the nightly run. The S1 matrix. `VMLAB_HV_JIT` on by default for aarch64. `bench-check` gates the JIT rows. VERIFICATION.md. | T1: the four templates at 1 and 2 vCPUs, three runs each, agent ready, no emergency mode, boot MIPS of Debian at least 150. The S1 snapshot tests. K4 without a CPU difference, or its first difference fixed. | J5, J6, J7 | none |
 | J9 | Measure against D1 and plan the rest | The profile of W1 again on the JIT (boot and CoreMark, with the perf map), the D2 suite (`sha256`, `xz`) at 1 and 4 vCPUs against QEMU, and a design update with measured rows in place of G5: which of superblocks, a return stack, host-FPU fast paths, inlined AdvSIMD, LSE, cheaper exception entry, and a Cranelift tier for hot regions come next, as cards. | The numbers in the history and in this document. The answer to Q15 of the MAP proposed to the operator. | J8 | none |
+| J10 | Fewer and cheaper round trips to the Rust loop (N1) | Count the returns to the Rust loop by reason (a jump cache miss, a first link, an exit that H5c does not link, the budget, an exception) and measure the cost of one round trip and of `Seat::prepare`. Then: the jump cache kept across a write of TTBR0 and TTBR1 where the ASID tells the address spaces apart (H6 clears it today), a miss of the jump cache served by a call from the stub that returns the host address without leaving compiled code, and `Seat::prepare` without a sequentially consistent store where the kick protocol of J7a allows it. | The returns per boot by reason, before and after. K2, K3 on a Debian boot, K6, the stress tests of J7. The rows. | J9 | J12, J13 |
+| J11 | Cheaper translation and compile (N2) | Count the compiles of a boot by cause (the first time, after a drop of the region, after an invalidation or an epoch). No heap allocation per block in the lifter, the lowering and the emitter (buffers kept by the CPU). The size of the region from that count, or a drop of only the older part (H13c). | The compiles and the compile time per boot, before and after. K2, K3 on a Debian boot. The rows. | J9 | J12, J13 |
+| J12 | The reach of the fast TLB (N3) | `tlb::ENTRIES` from a measured curve of the miss rate of `xz` and of a boot against the size, with the cost of a flush (H7b) at each size. | The miss rates and the `xz` rows at 1 and 4 vCPUs, before and after. The unit tests of H7a and H7b at the new size. K2. | J9 | J10, J11, J13 |
+| J13 | AdvSIMD and crypto without the generic evaluator (N4) | The SHA-256 operations (`SHA256H`, `SHA256H2`, `SHA256SU0`, `SHA256SU1`) and the AdvSIMD forms that the profile of a boot and of `sha256` names, as direct helpers or inline forms, called without the marshalling of the pure call. | K1 for the AdvSIMD and crypto groups with the JIT on. K2, K3 on a Debian boot. The `sha256` rows at 1 and 4 vCPUs. | J9 | J10, J11, J12 |
+| J14 | Superblocks (N5) | Several blocks compiled as one unit with registers kept across the joins, for the targets that a block reaches through a linked jump inside its page, with the exits and the precise state of H9 at each join. | CoreMark and the loop against QEMU. K2 with blocks that join. K1 for the branch groups. K3 on a Debian boot. The rows. | J10 | none |
 
 J1 is small enough to prove the path: one crate, the emitter forms for the
 operations that are 80 % of what a block holds, no softmmu, no chaining, and
@@ -1311,6 +1574,28 @@ texts on the card quote the first spike run (Cranelift 0.123.23: 25 to 160 µs,
   readable and executable for the vCPU (H13d). The option not taken: one
   mapping with read, write and execute.
 
+Proposed by card J9, open (Q15 of the MAP):
+
+- **Q4. How D1 is treated.** Measured (J9b): CoreMark at 79 % of QEMU's
+  speed, the Debian boot at 34 to 42 % at one vCPU and 36 % at four,
+  `sha256` at 22 and 27 %, `xz` at 31 and 32 %. *Est.* after J10 to J14
+  (J9c): the boot at 60 to 75 %, CoreMark near 100 %, `sha256` and `xz` at
+  44 to 65 %. No card in view reaches D1 on the boot or on the D2
+  workloads.
+  - **O1 (recommended).** D1 stays the tracked target: `bench-report`
+    gives each row as a percentage of QEMU, at 1 and 4 vCPUs, and the
+    design records it at every card. It is not a gate of 3e. 3e closes at
+    a measured bar T3 after J10 to J14: CoreMark at least 100 % of QEMU,
+    and every row of the D2 suite (the boot, `sha256`, `xz`) at least 50 %
+    of QEMU at 1 and 4 vCPUs. The estimates of J9c put the boot above
+    that bar, and CoreMark, `sha256` and `xz` about at it. D1 is decided
+    again with the rows of T3.
+  - **O2.** D1 as written: phase 3 is not finished until every row is at
+    least 100 %. Cards after J14 (N6 to N9 and others) without an
+    estimate that they reach it.
+  - **O3.** D1 for CPU work only (CoreMark, `sha256`, `xz`), and a boot
+    bar of its own (for example at most twice QEMU's time).
+
 ## How to measure again
 
 On helios, in a card folder, as the account `vmlab`:
@@ -1334,6 +1619,37 @@ python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 \
   --guest debian-13 --suite boot --keep --cpus 12-15 --hv-bin <binary> &
 IPRAW=raw-<t>.txt ipraw <pid of vmlab-hv> 10        # every 15 s of the boot
 python3 measure/ipclass.py <binary> raw-*.txt --top 30
+```
+
+J9, on a checkout of the commit with the firmware of
+`guest/fetch-firmware.sh aarch64` in `VMLAB_HV_FIRMWARE_DIR_AARCH64`:
+
+```sh
+# J9b: the D2 suite and the boot row, both sides, and the flat rows
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1,4 --repeats 3 --guest debian-13 --suite full --cpus 20-23
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 1,4 --repeats 3 --guest debian-13 --suite full --cpus 24-27
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 3 --guest debian-13 --suite boot --cpus 20-23
+python3 bench/run.py --backend jit --arch aarch64 --vcpus 1 --repeats 3 --cpus 28-31
+python3 bench/run.py --backend qemu --arch aarch64 --vcpus 1 --repeats 3 --guest flat-a64 --cpus 28-31
+
+# J9a: the profiling build of W1, the sampler of this directory, the perf map
+cc -O2 -o ipraw measure/ipraw.c
+VMLAB_HV_JIT_PERF_MAP=1 python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 \
+  --guest debian-13 --suite full --keep --cpus 16-19 --hv-bin <binary> &
+IPCOMM=vcpu- IPRAW=raw.txt ipraw <pid of vmlab-hv> 3600     # the whole run, until the VM ends
+cp /tmp/perf-<pid>.map perf.map
+python3 measure/ipclass.py <binary> raw.txt@perf.map --top 40 --window <from> <to>   # unix seconds of the bench log
+# CoreMark: a long image (micro_a64.build_coremark(30000)) under a64_bench with
+# VMLAB_HV_JIT=1 VMLAB_HV_JIT_PERF_MAP=1, sampled the same way, one map per run
+
+# J11: the heap calls of a translation and of a compile, then the compiles by
+# cause, read from the last JIT line of each kept run (stderr.log of bench/run)
+cargo test --release -p vmlab-hv-tcg-aarch64 --test alloc -- --nocapture
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1,4 --repeats 3 --guest debian-13 --suite boot --keep --cpus 20-23
+grep -o "compiles: .*" bench/run/*/stderr.log
+# K3 on a boot
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
+  --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --cpus 20-23 --timeout-scale 4
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the

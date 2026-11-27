@@ -34,8 +34,9 @@
 //! exit looks its target up in the jump cache of the CPU (H6): an entry is
 //! the virtual PC, the key of the context and the code, direct-mapped by the
 //! PC. A miss leaves with `LOOKUP`, and the owner fills the entry (`fill`).
-//! When the region is full, its code is dropped whole (H13c), and with it
-//! every link and every entry of the jump cache.
+//! When the region is full, the code of the part of it written longest ago
+//! is dropped (H13c, card J11), with every link to it and from it, and every
+//! entry of the jump cache.
 //!
 //! Sources read: the Intel 64 and IA-32 Architectures Software Developer's
 //! Manual, volume 2, the System V AMD64 ABI, and the Linux man pages of the
@@ -225,7 +226,11 @@ pub struct Stats {
     pub compiled: u64,
     pub refused: u64,
     pub bytes: u64,
+    /// Drops of the code of the part of a full region written longest ago
+    /// (H13c).
     pub resets: u64,
+    /// Drops of the region for a change of `Memory` (`set_memory`).
+    pub memory_resets: u64,
     pub compile_ns: u64,
     /// Jumps linked, jumps set back to their stubs, and entries of the
     /// jump cache filled.
@@ -268,6 +273,9 @@ pub struct Jit {
     /// as card J1 made them. For measurements before and after.
     pub host_flags: bool,
     pub stats: Stats,
+    /// The buffers of the emitter, kept from one block to the next (3e
+    /// DESIGN.md J11).
+    scratch: emit::Scratch,
 }
 
 impl Jit {
@@ -329,6 +337,7 @@ impl Jit {
             memory: Memory::Thunk,
             host_flags: true,
             stats: Stats::default(),
+            scratch: emit::Scratch::default(),
         })
     }
 
@@ -342,6 +351,7 @@ impl Jit {
             self.incoming.clear();
             self.clear_jumps();
             self.memory = memory;
+            self.stats.memory_resets += 1;
         }
     }
 
@@ -396,6 +406,31 @@ impl Jit {
         let displacement = target.wrapping_sub(jump + 5) as i64;
         let displacement = i32::try_from(displacement).expect("a jump inside the region");
         region.patch(jump + 1, &displacement.to_le_bytes());
+    }
+
+    /// Forget the code from `start` to `end`, which the region dropped: a
+    /// jump of the code that stays and that is linked into it goes back to
+    /// its stub, a jump inside it is no code any more, and the jump cache is
+    /// emptied.
+    fn drop_code(&mut self, start: u64, end: u64) {
+        let dropped = start..end;
+        let region = &mut self.region;
+        let stats = &mut self.stats;
+        self.incoming.retain(|target, sites| {
+            if dropped.contains(target) {
+                for site in sites.iter() {
+                    if !dropped.contains(&site.jump) {
+                        Self::point(region, site.jump, site.stub);
+                        stats.unlinks += 1;
+                    }
+                }
+                false
+            } else {
+                sites.retain(|site| !dropped.contains(&site.jump));
+                !sites.is_empty()
+            }
+        });
+        self.clear_jumps();
     }
 
     /// Set every jump that was linked to the code at `address` back to its
@@ -507,16 +542,12 @@ impl Jit {
 
     /// Whether the code of `entry` is still in the region.
     pub fn current(&self, entry: &Entry) -> bool {
-        entry.generation == self.region.generation() && self.region.contains(entry.address)
+        self.region.generation_of(entry.address) == Some(entry.generation)
     }
 
-    /// The generation of the code in the region.
-    pub fn generation(&self) -> u64 {
-        self.region.generation()
-    }
-
-    /// Compile `shape`. A full region is dropped and starts again (H13c):
-    /// every earlier entry is then of an older generation.
+    /// Compile `shape`. A full region drops the code of its part written
+    /// longest ago (H13c): every entry of that part is then of an older
+    /// generation.
     pub fn compile(&mut self, shape: &Shape) -> Result<Entry, Refused> {
         let started = std::time::Instant::now();
         let result = self.compile_inner(shape);
@@ -532,13 +563,27 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, shape: &Shape) -> Result<Entry, Refused> {
-        let (asm, labels, fused, lazy) = emit::emit(
+        // The buffers of the emitter go back to the JIT also when it
+        // refuses the block.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = self.place(shape, &mut scratch);
+        self.scratch = scratch;
+        result
+    }
+
+    /// Emit `shape` with the buffers of `scratch` and put its code into the
+    /// region.
+    fn place(&mut self, shape: &Shape, scratch: &mut emit::Scratch) -> Result<Entry, Refused> {
+        let (fused, lazy) = emit::emit(
             shape,
             self.exit,
             self.features,
             self.defect,
             self.host_flags,
+            scratch,
         )?;
+        let asm = &scratch.asm;
+        let labels = &scratch.sites;
         let mut sites = [(0, 0); SITES];
         for (n, (jump, stub)) in labels.iter().enumerate() {
             let position = |label| {
@@ -552,18 +597,18 @@ impl Jit {
         let base = match self.region.next(len) {
             Some(base) => base,
             None => {
-                // H13c: the whole code of the region goes, and with it every
-                // linked jump and every entry of the jump cache. The jumps
-                // are not set back: their bytes are no code any more.
-                self.region.reset();
-                self.incoming.clear();
-                self.clear_jumps();
-                self.stats.resets += 1;
+                // H13c: the code of the next part goes.
+                if let Some((start, end)) = self.region.advance() {
+                    self.drop_code(start, end);
+                    self.stats.resets += 1;
+                }
                 self.region.next(len).ok_or(Refused::Size)?
             }
         };
-        let code = asm.finish(base).ok_or(Refused::Size)?;
-        self.region.put(base, &code);
+        asm.finish_into(base, &mut scratch.code)
+            .ok_or(Refused::Size)?;
+        let code = &scratch.code;
+        self.region.put(base, code);
         self.stats.fused += fused;
         self.stats.lazy += lazy;
         Ok(Entry {
