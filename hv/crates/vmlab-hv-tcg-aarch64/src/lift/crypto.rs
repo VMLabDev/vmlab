@@ -1,7 +1,8 @@
 //! The crypto instructions of the 3d set (card C7): the seven format classes
 //! of the `AES` and `SHA2` records that are not `PMULL` (14 records). Each
-//! is one call of the pure helper `helpers::crypto::CRYPTO` on the registers
-//! of the instruction (DESIGN.md G3d).
+//! is one call of the pure helper of its operation in
+//! `helpers::crypto::HELPERS` on the registers of the instruction (DESIGN.md
+//! G3d, 3e DESIGN.md J13).
 //!
 //! Sources read (DESIGN.md "Sources"): S1, the generated tables of the LLVM
 //! AArch64 records. S6, the lockstep against QEMU, which checks which
@@ -10,7 +11,7 @@
 
 use super::{Builder, Lifted};
 use crate::generated::decode::Record;
-use crate::helpers::crypto::{CRYPTO, Crypto};
+use crate::helpers::crypto::{Crypto, helper_of};
 
 /// The operation of a record, and whether it reads `Rd` and `Rm`.
 pub fn plan(record: Record) -> Option<(Crypto, bool, bool)> {
@@ -40,11 +41,10 @@ pub fn lift(b: &mut Builder, record: Record, word: u32) -> Lifted {
         return Lifted::Unsupported;
     };
     let (rd, rn, rm) = (word & 31, (word >> 5) & 31, (word >> 16) & 31);
-    let code = b.imm(32, operation as u64);
     let d = if reads_d { b.v(rd, 128) } else { b.imm(128, 0) };
     let n = b.v(rn, 128);
     let m = if reads_m { b.v(rm, 128) } else { b.imm(128, 0) };
-    let result = b.call(128, &CRYPTO, &[code, d, n, m]);
+    let result = b.call(128, helper_of(operation), &[d, n, m]);
     b.set_v(rd, 128, result);
     Lifted::Next
 }

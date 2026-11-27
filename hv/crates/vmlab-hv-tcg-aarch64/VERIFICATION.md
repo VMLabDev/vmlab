@@ -2509,3 +2509,89 @@ hours, and kvm-unit-tests at 4 vCPUs. The numbers are in 3e DESIGN.md,
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
   no Unicorn. QEMU ran as the oracle of O3, K4 and the windows, through its
   command line and the plugin API that `a64lock.c` already used.
+
+## Card J13, #1185 (2026-11-28)
+
+AdvSIMD and crypto without the generic evaluator (3e DESIGN.md J13, N4).
+The measured rows are in J13 of the design.
+
+### What changed
+
+- `helpers::crypto::HELPERS`: one pure helper for each of the fourteen
+  crypto operations of the 3d set, on `(d, n, m)`, in place of the one
+  helper `CRYPTO` that took the operation as a fourth argument. The lifter
+  of `lift::crypto` calls the helper of its operation.
+- `jit::Effect::registers` (`jit::Registers`): a pure helper call whose
+  words go to its function in RDI, RSI, RDX, RCX, R8 and R9 and come back
+  in RAX and RDX, with the registers of the pool that a call does not keep
+  saved around it. The function has the type `jit::RegisterFn`, which
+  gives `jit::Words`. A call whose words do not fit the effect (more than
+  six, more than two results, or results that are not its writes) goes
+  through `direct` or the thunk as before. `exec` gives the crypto helpers
+  this form when their arguments and their result are values of 128 bits
+  (`helpers::in_registers_of`, `register_call`).
+- `lift::simd`: the integer `ADD`, `SUB`, `CMEQ` (register and zero),
+  `CMTST` and `REV16`, `REV32`, `REV64` of a whole vector of 64 or 128
+  bits, and `ADD` and `SUB` of D registers, are operations of the graph on
+  words of 64 bits (`inline_lanes`): the lanes without their top bits
+  added or subtracted, the top bits put back with an exclusive or; a
+  compare as the top bit of each lane spread over the lane; a reversal as
+  `bswap` and swaps of neighbouring blocks. The emitter has inline forms
+  for every operation they use. Every other lane operation still calls
+  `simd::eval`.
+- Shared interfaces changed: `vmlab_hv_tcg_jit::Effect` has the field
+  `registers`, and the crate exports `Registers`, `RegisterFn` and
+  `Words`. `helpers::crypto::CRYPTO` is gone.
+
+### Equal behaviour
+
+- K1, the O3 lockstep with the JIT on (`VMLAB_HV_JIT=1 just
+  tcg-a64-lockstep <group> 100000 1`, seed 1) at `d28d07cc`: `simd`
+  4,702,716 instructions in 391,893 rounds and `crypto` 700,320 in 58,360
+  rounds, no difference, every instruction compiled, no block refused.
+- K2 (`just tcg-a64-jit-diff 300000 3e0001`, and `3e0005 flags`) at
+  `cb021b6b`: 300,000 rounds each, no difference. `all`: 2,792,656
+  instructions, 665,512 blocks compiled, none refused. `flags`: 45,827,006
+  instructions, 1,300,303 blocks compiled, none refused.
+- K3 on a Debian 13 boot at `d28d07cc` (`VMLAB_HV_JIT_CHECK=1`,
+  `VMLAB_HV_JIT_CHECK_RUNS=1000`, the bench, cores 24 to 27): agent ready
+  after 156.7 s with no difference; 128.7 million checked runs (616.9
+  million instructions) up to the last counter line, at 18.0e9
+  instructions; no block refused. A first K3 boot fell into emergency mode
+  on the device timeout of `/boot/efi` under a load average of 44, with no
+  difference up to there (J13f of the design).
+- The fallback count (H2b) of every boot of the rows is zero.
+- `just ci::check` at `cb021b6b` (the code of this card, before these
+  notes): exit 0.
+
+### Tests
+
+- `exec::tests::inline_lanes_and_register_helpers_give_what_the_helpers_give`:
+  every arrangement of the inline forms, 64 rounds each of operands that
+  are random, all ones, top bits only and zero, with lanes equal between
+  the two operands, in the interpreter and in compiled code, against
+  `simd::eval`; the fourteen crypto instructions against
+  `helpers::crypto::crypto`, both ways, with their records checked
+  against the plan of `lift::crypto`.
+- `vmlab-hv-tcg-jit`: `a_register_call_takes_its_words_in_registers` (six
+  words in, two out, with six other words live across the call, and the
+  fallback to `direct` when the results are not the writes); a sixth of
+  the calls of `random_blocks_spill_call_and_leave_as_the_interpreter_does`
+  take their words in registers.
+- `tests/jit.rs` (K2, K3 on the streams) runs over the new forms.
+
+### Sources read for this card
+
+- The state of `vmlab-hv-tcg-jit`, of `vmlab-hv-tcg-ir`, of this crate and
+  of the bench. The System V AMD64 ABI for the argument registers and the
+  return of a structure of two words in RAX and RDX. The lane tricks
+  (an addition that keeps the top bits of the lanes apart, the spread of a
+  top bit over its lane) are written from the author's knowledge of
+  integer arithmetic, and checked by the test above against `simd::eval`
+  and by K1 against QEMU.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened. The encodings of the test are from the
+  author's knowledge of the A64 encoding, and the test checks each against
+  the record that the decoder gives.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn. QEMU ran as the oracle of K1 and in the J9 rows only.
