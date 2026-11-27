@@ -1,6 +1,6 @@
 //! The emitter: one pass over the operations of a block, values in host
 //! registers (DESIGN.md H3), guards and exits with their stubs (H9), and
-//! every effect through the thunk.
+//! the effects that it has no inline form for through the thunk.
 //!
 //! The frame of the block is the home of every word. A word lives in a
 //! host register from its definition, or from its first use when it is
@@ -10,15 +10,26 @@
 //! register is read from the state at its first use, and written to the
 //! state at the exit of the block.
 //!
-//! The thunk runs what the emitter has no inline form for: the accesses of
-//! 16 bytes and the exclusive ones, the generic operations, the helper
-//! calls, a guard that fails, and a load or a store of 1 to 8 bytes that
-//! misses the fast TLB (H7) or that its block may not inline.
+//! Inline forms (card J6 brought the last ones that a boot needs): every
+//! operation of one word, `RBIT` among them on every x86-64 host; the
+//! generic operations of two words that a block makes most (`And`, `Or`,
+//! `Xor`, `Add` and `Sub` of a bitvector, `Equal`, `NotEqual`, `Slice`,
+//! `Concat`, `BitNot`, `Truncate`, `Select`), each value as two words in two
+//! registers; and the loads and stores of 1 to 16 bytes over the fast TLB.
+//!
+//! The thunk runs the rest: the exclusive accesses and those of `Access`,
+//! the other generic operations, a guard that fails, and a load or a store
+//! that misses the fast TLB (H7) or that its block may not inline. A helper
+//! call whose `Effect` names a function of its own is a System V call of
+//! that function (H12), with the same arguments as the thunk's, so that it
+//! needs no dispatch on the operation; the others go through the thunk.
 //!
 //! A load or a store of 1 to 8 bytes looks up the fast TLB inline (H7, the
 //! layout in `tlb`): the index from the page bits of the address, the tag
 //! compared with the address masked to its page and to the bits below its
-//! size, the addend, and the access of the host. A store then reads the
+//! size, the addend, and the access of the host. A pair of 16 bytes is
+//! masked as an access of 8 and misses at the last 8 bytes of its page, so
+//! that both of its words are in one page: two accesses of 8 bytes. A store then reads the
 //! watch word of its page and asks the thunk to tell the memory when it is
 //! odd (card S3). A miss is a stub after the block (H7c) that puts the words
 //! of the access and of its leave into the frame and runs the access in the
