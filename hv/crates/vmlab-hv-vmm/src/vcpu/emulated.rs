@@ -294,7 +294,7 @@ impl EmulatedVcpu {
         self.jit_report = self.cpu.instructions + JIT_REPORT;
         let jit = self.cpu.jit_counts();
         log::info!(
-            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting",
+            "vcpu {}: JIT: {} instructions, {} of them in the interpreter in {} blocks; {} blocks compiled, {} refused, {} bytes of code, {} resets of the region, {} ms of compiling; fallbacks: {} runs of refused blocks, {} at the budget; exits: {} at the end, {} exceptions, {} stores into code, {} stops; K3: {} blocks checked, {} instructions; chaining: {} chained, {} jump cache hits, {} unlinked, {} jump cache misses, {} runs entered; {} links, {} unlinks, {} fills, {} clears of the jump cache; fast TLB: {} accesses, {} misses, {} flushes, {} scans, {} ms flushing; machine: {} exclusive loads, {} exclusive stores, {} code mails, {} code pages, {} ms waiting",
             self.id,
             self.cpu.instructions,
             jit.interpreted_instructions,
@@ -323,6 +323,9 @@ impl EmulatedVcpu {
             jit.clears,
             jit.tlb_accesses,
             jit.tlb_misses,
+            jit.tlb_flushes,
+            jit.tlb_scans,
+            jit.tlb_flush_ns / 1_000_000,
             jit.machine.exclusive_loads,
             jit.machine.exclusive_stores,
             jit.machine.code_mails,
