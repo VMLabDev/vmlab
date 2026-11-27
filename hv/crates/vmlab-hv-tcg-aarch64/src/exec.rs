@@ -2793,8 +2793,8 @@ impl Compiled {
                 // H12: compiled code calls the helper of its kind itself.
                 direct: Some((
                     match call.function {
-                        HelperFn::Pure(_) => pure_call as usize as u64,
-                        HelperFn::Ordered(_) => ordered_call as usize as u64,
+                        HelperFn::Pure(_) => pure_call as jit::Thunk as usize as u64,
+                        HelperFn::Ordered(_) => ordered_call as jit::Thunk as usize as u64,
                     },
                     index as u64,
                 )),

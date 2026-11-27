@@ -808,7 +808,7 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                 });
                 // Half of the calls go to their own function (H12).
                 let direct = (random.below(2) == 0)
-                    .then_some((direct as usize as u64, calls.len() as u64));
+                    .then_some((direct as Thunk as usize as u64, calls.len() as u64));
                 calls.push(Effect {
                     reads,
                     writes,
@@ -1727,7 +1727,7 @@ fn a_direct_call_runs_its_function_and_not_the_thunk() {
         reads: vec![1, 2],
         writes: vec![3, 4],
         leave: None,
-        direct: Some((direct as usize as u64, 0)),
+        direct: Some((direct as Thunk as usize as u64, 0)),
     };
     let block = Block {
         ops: vec![Op {
