@@ -651,9 +651,11 @@ mod tests {
     /// Review containers-2 G1: the ctl watcher subscribes and keeps a handle
     /// for its answers to `boot`. The stream it waits on must close when the
     /// reader ends, or the watcher, its handle and the socket outlive the
-    /// run. The clock is paused, so the test has no wall-clock limit: it
-    /// waits on the reader's end, which closes the `exited` watch.
-    #[tokio::test(start_paused = true)]
+    /// run. It waits on the reader's end, which closes the `exited` watch.
+    /// The clock runs: a paused one jumps to the next timer whenever the
+    /// runtime waits on the socket, so `LONG` could expire before the mock's
+    /// close is read.
+    #[tokio::test]
     async fn a_subscriber_that_holds_the_handle_sees_the_channel_close() {
         let (_dir, path) = spawn_mock(|mut stream| async move {
             write_line(
