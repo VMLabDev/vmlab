@@ -1624,6 +1624,10 @@ same results. `timer` gives the same results after the deadline exit above.
 
 ## S0: Debian boot profile (#1146)
 
+S1 lazy flags landed in `ab1dc54d` via PR #1031 and is included in this
+branch. The S0 function samples, block counts and ceilings below describe
+the **pre-S1 interpreter**. The S0 measurement binary was `2251fc8b`.
+
 The `boot_mips` row belongs to the aarch64 Debian 13 `vmlab-hv` boot
 suite. A run starts a fresh overlay, waits for the guest agent handshake,
 then issues `quit`. The VM emits the instruction count of every vCPU
@@ -1639,9 +1643,23 @@ python3 hv/bench/run.py --backend vmlab-hv --arch aarch64 --guest debian-13 \
 
 ### Repeat measurements
 
-[Aarch64 history](../../bench/history/aarch64.jsonl) records the regular
-boot rows and keeps the measurements with block counting enabled alongside
-them. The measurement binary was `2251fc8b`. At two vCPUs the median was
+[Aarch64 history](../../bench/history/aarch64.jsonl) keeps the pre-S1 S0
+rows before the S1 comparison. Use the **87.92 MIPS** one-vCPU row
+(`ca5825bb`) as the post-S1 baseline. S1 measured **76.68 to 87.92 MIPS**
+(+14.7%) at one vCPU, using pin 16–19 and the debug-port count
+(`54317232` before S1). There is no post-S1 two-vCPU row. Measure that
+configuration on the relevant base commit before comparing future changes.
+
+S0's 62.87 MIPS and S1's 76.68 MIPS before row both predate lazy flags.
+They used different pins (16–17 and 16–19 respectively), and S0 measured
+under higher host load. S0's successful one-vCPU repeats started at
+one-minute load averages of 12.50–13.24, while the S1 before batch
+started at 10.19 and ended at 4.39. S0 counted at VM exit just after
+the handshake, while S1 read the paused vCPUs through the debug port.
+These differences confound the comparison, and the samples cannot
+isolate how much each contributed.
+
+At two vCPUs on the pre-S1 S0 build, the median was
 80.12 MIPS with block counting disabled and 74.89 MIPS with it enabled,
 with three boots per setting. One instrumented run took 350.74 s
 compared with 224.99 s for another, so the median difference does not
@@ -1734,9 +1752,11 @@ single-instruction blocks. About 31% of the static operations are alignment
 or exit-writeback work. The profile gives no execution frequency for those
 operations.
 
-### Work removable by later cards
+### Pre-S1 ceilings for remaining cards
 
-The ceilings below include all of the indicated measured functions, even
+The ceilings below come from the pre-S1 profile. Lazy flags changed
+interpreter work, so current shares and relative gains require a new profile.
+The ceilings include all of the indicated measured functions, even
 where the planned change can remove only part of the work. They express
 shares of sampled boot CPU work under the measured guest workload. The
 two-vCPU wall-clock effect also depends on which vCPU delays agent readiness,
@@ -1750,7 +1770,6 @@ a full second at fixed guest work. It is a sizing estimate.
 
 | Card | Work included in the ceiling | 1 vCPU CPU share | 2 vCPU CPU share | 2 vCPU wall budget |
 |---|---|---:|---:|---:|
-| S1 lazy flags | All operation execution and dispatch. Function samples cannot isolate the part that computes flags. | 38.33% | 32.25% | 46% |
 | S3 TLB RAM access and unwatched stores | RAM load, RAM store, dirty stamps, TLB/page walks and the entire possible lock share. The W1 ceiling includes other VMM work. | 32.48% | 28.55% | 41% |
 | S4 alignment, exit writeback and pair accesses | All operations, wide access dispatch, RAM load/store paths and TLB work. The W1 ceiling uses its combined RAM/VMM class. Most of these paths survive S4. | 71.09% | 43.86% | 62% |
 | S5 cheaper block entry and chaining | The block loop, cache, register copies and all helper/system work. The W1 helper subtotal includes exceptions. | 24.99% | 34.16% | 49% |
@@ -1762,11 +1781,11 @@ function profile does not distinguish those operations from other
 uses of the same opcodes. The effect of the pair fast path also depends
 on the proportion of X pairs that hit one page.
 
-Prioritize S3 because the dirty callback and direct lock activity alone use
-16.21% of the two-vCPU samples. S4 can proceed alongside it, with the
-in-page pair path checked against the S3 TLB changes when they meet.
-Land S1 after S4 because they edit the same lifter paths. Keep S5 on hold
-while the JIT's block chaining card (J4) is on schedule.
+The pre-S1 samples suggest investigating S3 first because the dirty callback
+and direct lock activity accounted for 16.21% of two-vCPU work. S4 can
+proceed alongside it, with the in-page pair path checked against the S3 TLB
+changes when they meet. Keep S5 on hold while the JIT's block chaining
+card (J4) is on schedule.
 
 ### Behaviour checks
 
