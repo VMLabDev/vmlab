@@ -863,6 +863,78 @@ fn one_translation_serves_code_at_two_addresses() {
 }
 
 #[test]
+fn a_shared_block_computes_its_page_and_its_link_from_the_pc_it_runs_at() {
+    // One page of code at two addresses in two pages, called at each:
+    // ADRP, BL and the PC of the return all come from the PC at the entry
+    // of the one block.
+    const FIRST: u64 = VA + 0x2000;
+    const SECOND: u64 = VA + 0x5000;
+    // adrp x7, . ; mov x9, x30 ; bl +8 ; hvc ; mov x10, x30 ; ret x9
+    const CALLED: [u32; 6] = [
+        0x9000_0007,
+        0xaa1e_03e9,
+        0x9400_0002,
+        HVC,
+        0xaa1e_03ea,
+        0xd65f_0120,
+    ];
+    // blr x2 ; mov x11, x7 ; mov x12, x10 ; blr x6 ; hvc
+    let program = [asm::blr(2), 0xaa07_03eb, 0xaa0a_03ec, asm::blr(6), HVC];
+    for step in [false, true] {
+        let mut machine = Machine::new(&program);
+        machine.map(FIRST, DATA | AF | READ_ONLY);
+        machine.map(SECOND, DATA | AF | READ_ONLY);
+        machine
+            .cpu
+            .memory
+            .write(DATA, &asm::bytes(&CALLED))
+            .unwrap();
+        machine.cpu.state.set_x(2, FIRST);
+        machine.cpu.state.set_x(6, SECOND);
+        if step {
+            for _ in 0..14 {
+                machine.cpu.step().unwrap();
+            }
+        } else {
+            assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+        }
+        assert_eq!(machine.cpu.taken, None);
+        let x = |n| machine.cpu.state.x(n);
+        assert_eq!((x(11), x(12)), (FIRST, FIRST + 12), "stepped: {step}");
+        assert_eq!((x(7), x(10)), (SECOND, SECOND + 12), "stepped: {step}");
+    }
+}
+
+#[test]
+fn a_write_to_shared_code_reaches_it_at_every_address() {
+    // The page of the data runs at two addresses and is written at a third.
+    // The block of the first call serves the second address too, until the
+    // store changes its code: the second call runs the new code.
+    const ADD_1: u32 = 0x9100_0421;
+    const ADD_2: u32 = 0x9100_0821;
+    const FIRST: u64 = VA + 0x2000;
+    const SECOND: u64 = VA + 0x5000;
+    // blr x2 ; str w3, [x0] ; blr x6 ; hvc
+    let mut machine = Machine::new(&[asm::blr(2), 0xb900_0003, asm::blr(6), HVC]);
+    machine.map(VA, DATA | AF | NO_EXECUTE);
+    machine.map(FIRST, DATA | AF | READ_ONLY);
+    machine.map(SECOND, DATA | AF | READ_ONLY);
+    machine
+        .cpu
+        .memory
+        .write(DATA, &asm::bytes(&[ADD_1, asm::RET]))
+        .unwrap();
+    machine.cpu.state.set_x(0, VA);
+    machine.cpu.state.set_x(2, FIRST);
+    machine.cpu.state.set_x(3, u64::from(ADD_2));
+    machine.cpu.state.set_x(6, SECOND);
+    assert!(matches!(machine.cpu.run(100), Stop::Hypercall { .. }));
+    assert_eq!(machine.cpu.taken, None);
+    // One from the first call, two from the second.
+    assert_eq!(machine.cpu.state.x(1), 3);
+}
+
+#[test]
 fn the_guest_takes_the_abort_and_returns_to_the_access() {
     // The handler makes the descriptor valid and returns: the store runs
     // again. str x1, [x0] ; hvc. The handler: str x3, [x2] ; eret.

@@ -140,6 +140,9 @@ pub trait VcpuBackend {
         false
     }
 
+    /// The machine stops this vCPU: its thread parks after this.
+    fn parking(&mut self) {}
+
     /// The bytes that the bus gave for the last [`Exit::MmioRead`].
     fn finish_mmio_read(&mut self, _data: &[u8]) {}
 
@@ -267,6 +270,10 @@ impl<B: VcpuBackend> VcpuBackend for Arc<Mutex<B>> {
         self.lock().pending()
     }
 
+    fn parking(&mut self) {
+        self.lock().parking();
+    }
+
     fn finish_mmio_read(&mut self, data: &[u8]) {
         self.lock().finish_mmio_read(data);
     }
@@ -375,6 +382,7 @@ fn run_loop(id: u8, vcpu: &mut dyn VcpuBackend, host: &dyn VcpuHost) {
             if host.exited() {
                 return;
             }
+            vcpu.parking();
             host.park(id);
             continue;
         }

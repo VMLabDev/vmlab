@@ -56,21 +56,22 @@
 //! lockstep of the cards C6 and C8 and the probe of the system registers).
 //! This file holds no other instruction semantics.
 
-use crate::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use crate::exception::{self, Cause, Exception};
 use crate::generated::decode::{Record, decode};
 use crate::lift::{A64Exit, A64Next, Builder, ExceptionClass, Lifted, PstateField, Trap, lift};
 use crate::mmu::{self, Kind, Miss, Mmu, Regime};
 use crate::shootdown::Invalidation;
-use crate::state::{Context, State, slot};
+use crate::state::{Context, State};
 use crate::sysreg::{self, Denied, Environment, reg, sctlr};
 use crate::timer::{self, Clock};
 use vmlab_hv_tcg::{CodeStamp, Error, Memory};
+use vmlab_hv_tcg_ir::block::{self, Code, FIRST_EFFECT, Generic, Lowering, Op, Place, Slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event};
 use vmlab_hv_tcg_ir::native::fasthash::{FastMap, FastSet};
 use vmlab_hv_tcg_ir::native::{
     Graph, HelperFn, Operation, ScalarId, ScalarType, dce, mask, schedule,
 };
+use vmlab_hv_tcg_jit as jit;
 
 /// The most instructions in one block.
 pub const BLOCK_INSTRUCTIONS: u32 = 64;
@@ -758,8 +759,11 @@ struct Leave {
     /// copied in from the state, which a block changes only at its end.
     inputs: Vec<(Place, u32)>,
     /// Register slot, words of the frame: copied out when the block leaves
-    /// here. The PC is one of them.
+    /// here.
     outputs: Vec<(u32, Place)>,
+    /// The distance in bytes from the entry of the block to the instruction
+    /// that did not complete: the PC when the block leaves here.
+    at: u64,
     /// The instructions of the block that are complete here.
     completed: u32,
     /// The word of the address of an alignment fault.
@@ -834,6 +838,16 @@ struct Compiled {
     /// The last instruction, when the loop runs it: its distance in bytes
     /// from the first, and what it does.
     terminal: Option<(u64, Trap)>,
+    /// The words of the next PC, and whether they hold its distance from
+    /// the PC at the entry (`A64Next::Relative`). The loop sets the PC from
+    /// them after the outputs.
+    next: Option<(Place, bool)>,
+    /// The compiled code of the block, when the JIT is on (3e DESIGN.md
+    /// J1). Code of an older generation of the region is none.
+    code: Option<jit::Entry>,
+    /// The emitter has no form for an operation of the block on this host:
+    /// it runs in the interpreter (H2b).
+    refused: bool,
 }
 
 /// The most arguments of a helper.
@@ -877,6 +891,7 @@ struct Parts {
     leaves: Vec<Leave>,
     calls: Vec<Call>,
     inputs: Vec<(Place, u32)>,
+    op_counts: Option<Vec<usize>>,
 }
 
 impl Parts {
@@ -899,6 +914,7 @@ impl Parts {
         roots: &[ScalarId],
     ) -> Result<(), Stop> {
         for id in schedule::scalars(graph, roots, seen) {
+            let before = lowering.ops.len();
             match &graph.scalars[id].operation {
                 Operation::Constant(value) => lowering.constant(id, *value),
                 Operation::Input(register) => {
@@ -919,6 +935,9 @@ impl Parts {
                     self.call(lowering, call)?;
                 }
                 _ => lowering.scalar(graph, id),
+            }
+            if let Some(counts) = &mut self.op_counts {
+                counts[id] = lowering.ops.len() - before;
             }
         }
         Ok(())
@@ -1038,11 +1057,92 @@ fn exit_roots(exit: &A64Exit) -> Vec<ScalarId> {
         .map(|(_, scalar)| *scalar)
         .collect();
     match &exit.next {
-        A64Next::Pc(next) => roots.push(*next),
+        A64Next::Pc(next) | A64Next::Relative(next) => roots.push(*next),
         A64Next::Exception { syndrome, .. } => roots.extend(syndrome),
         A64Next::Trap { .. } => {}
     }
     roots
+}
+
+/// Static operation counts summed over translations, including retranslations.
+#[derive(Debug, Default)]
+pub struct BlockCounts {
+    pub blocks: u64,
+    pub operations: u64,
+    pub alignment_operations: u64,
+    pub exit_writeback_operations: u64,
+    pub ldp_x: u64,
+    pub stp_x: u64,
+}
+
+impl BlockCounts {
+    fn translated(&mut self, block: &BlockOf<A64Exit>, counts: &[usize], operations: usize) {
+        let graph = &block.graph;
+        let mut normal = vec![false; counts.len()];
+        let mut alignment = Vec::new();
+        let mut writeback = Vec::new();
+        for event in &block.events {
+            let (exit, roots) = match event {
+                Event::Guard {
+                    condition, exit, ..
+                } if matches!(
+                    block.exits[*exit].next,
+                    A64Next::Exception {
+                        class: ExceptionClass::Alignment { .. },
+                        ..
+                    }
+                ) =>
+                {
+                    alignment.push(*condition);
+                    self.alignment_operations += 1;
+                    (Some(*exit), Vec::new())
+                }
+                Event::Guard {
+                    condition, exit, ..
+                } => (Some(*exit), vec![*condition]),
+                Event::ReadMemory { address, error, .. } => (Some(*error), vec![*address]),
+                Event::WriteMemory {
+                    address,
+                    value,
+                    error,
+                    ..
+                } => (Some(*error), vec![*address, *value]),
+                Event::Call { args, .. } => (None, args.clone()),
+                Event::Exit(exit) => (None, exit_roots(&block.exits[*exit])),
+                Event::Checkpoint(_) => continue,
+            };
+            schedule::scalars(graph, &roots, &mut normal);
+            if let Some(exit) = exit {
+                let payload = &block.exits[exit];
+                writeback.extend(payload.writeback.writes.iter().map(|&(_, id)| id));
+                if let A64Next::Exception { syndrome, .. } = &payload.next {
+                    schedule::scalars(graph, syndrome, &mut normal);
+                }
+            }
+        }
+        // Shared dependencies belong to neither exclusive category.
+        let alignment_only = schedule::scalars(graph, &alignment, &mut normal.clone());
+        let writeback_only = schedule::scalars(graph, &writeback, &mut normal);
+        let mut shared = vec![false; counts.len()];
+        for &id in &writeback_only {
+            shared[id] = true;
+        }
+        self.alignment_operations += alignment_only
+            .iter()
+            .filter(|&&id| !shared[id])
+            .map(|&id| counts[id] as u64)
+            .sum::<u64>();
+        for id in alignment_only {
+            shared[id] = false;
+        }
+        self.exit_writeback_operations += writeback_only
+            .into_iter()
+            .filter(|&id| shared[id])
+            .map(|id| counts[id] as u64)
+            .sum::<u64>();
+        self.blocks += 1;
+        self.operations += operations as u64;
+    }
 }
 
 fn compile(
@@ -1050,15 +1150,20 @@ fn compile(
     context: Context,
     instructions: u32,
     mut block: BlockOf<A64Exit>,
+    counts: Option<&mut BlockCounts>,
 ) -> Result<Compiled, Stop> {
     skip_truncations(&mut block.graph);
     dce::prune_scalars(&mut block);
     let graph = &block.graph;
     let mut lowering = Lowering::new(graph).ok_or_else(|| host("a block with too many slots"))?;
     let mut seen = vec![false; graph.scalars.len()];
-    let mut parts = Parts::default();
+    let mut parts = Parts {
+        op_counts: counts.as_ref().map(|_| vec![0; graph.scalars.len()]),
+        ..Parts::default()
+    };
     let mut block_outputs = None;
     let mut terminal = None;
+    let mut next_pc = None;
     // The exits that events leave through, by their number in the block.
     let mut leave_of = vec![None; block.exits.len()];
     for event in &block.events {
@@ -1143,7 +1248,8 @@ fn compile(
         }
         if is_end {
             match payload.next {
-                A64Next::Pc(next) => outputs.push((slot::PC as u32, lowering.place(next))),
+                A64Next::Pc(next) => next_pc = Some((lowering.place(next), false)),
+                A64Next::Relative(next) => next_pc = Some((lowering.place(next), true)),
                 // The loop runs the last instruction, with the PC at it.
                 A64Next::Trap { pc, trap } => terminal = Some((pc, trap)),
                 A64Next::Exception { .. } => {
@@ -1156,7 +1262,12 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { class, syndrome } = &payload.next else {
+                let A64Next::Exception {
+                    class,
+                    syndrome,
+                    at,
+                } = &payload.next
+                else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
@@ -1166,6 +1277,7 @@ fn compile(
                     ops,
                     inputs,
                     outputs,
+                    at: *at,
                     completed: payload.completed,
                     address: syndrome.first().map(|scalar| lowering.word(*scalar)),
                     class: *class,
@@ -1289,6 +1401,9 @@ fn compile(
     let Some(outputs) = block_outputs else {
         return Err(host("a block without an exit"));
     };
+    if let (Some(counts), Some(op_counts)) = (counts, &parts.op_counts) {
+        counts.translated(&block, op_counts, lowering.ops.len());
+    }
     // The loop reads the words of an operation without a check.
     let words = lowering.frame.len();
     let generics = lowering.generics.len();
@@ -1318,6 +1433,9 @@ fn compile(
         inputs: parts.inputs,
         outputs,
         terminal,
+        next: next_pc,
+        code: None,
+        refused: false,
     })
 }
 
@@ -1707,6 +1825,8 @@ impl Compiled {
     /// were before the instruction that could not complete.
     #[cold]
     fn leave(&mut self, state: &mut State, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+        // No operation of a block writes the PC: it is the entry still.
+        let entry = state.pc();
         let leave = &self.leaves[exit as usize];
         let frame = &mut self.frame;
         for (place, register) in &leave.inputs {
@@ -1729,6 +1849,7 @@ impl Compiled {
         for (register, place) in &leave.outputs {
             state.slots[*register as usize] = place.read(frame);
         }
+        state.set_pc(entry.wrapping_add(leave.at));
         let halt = match failed {
             Failed::Retry => Halt::Retry,
             Failed::Guard => Halt::Stop(host("a guard that names no exception")),
@@ -1754,7 +1875,6 @@ impl Compiled {
         memory: &mut M,
         side: &mut Side,
     ) -> (u32, Option<Halt>) {
-        let entry = state.pc();
         for (place, register) in &self.inputs {
             place.write(&mut self.frame, state.slots[*register as usize]);
         }
@@ -1797,8 +1917,20 @@ impl Compiled {
         if let Some((exit, failed)) = failed {
             return self.leave(state, exit, failed);
         }
+        // No operation of a block writes the PC: it is the entry still. It
+        // is read here and not before the operations, which keeps a
+        // register free in their loop.
+        let entry = state.pc();
         for (register, place) in &self.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
+        }
+        if let Some((place, relative)) = &self.next {
+            let value = place.read(&self.frame) as u64;
+            state.set_pc(if *relative {
+                entry.wrapping_add(value)
+            } else {
+                value
+            });
         }
         // The loop runs the last instruction with the PC at it.
         if let Some((distance, _)) = self.terminal {
@@ -1806,6 +1938,319 @@ impl Compiled {
         }
         (self.instructions, None)
     }
+}
+
+/// What the thunk of compiled code reaches: the parts of the block that it
+/// runs an effect with, and the CPU around it.
+struct Env<'a, M> {
+    ops: &'a [Op],
+    generics: &'a [Generic],
+    accesses: &'a [Access16],
+    calls: &'a [Call],
+    leaves: &'a [Leave],
+    frame: *mut u64,
+    words: usize,
+    state: *mut State,
+    memory: &'a mut M,
+    side: &'a mut Side,
+    single: bool,
+    /// Why the block left, when an effect did not complete.
+    failed: Option<(u32, Failed)>,
+    stop: Option<Stop>,
+}
+
+/// What the thunk returns when the block leaves.
+const THUNK_LEFT: u64 = 2;
+
+/// The thunk of compiled code (3e DESIGN.md J1): it runs the operation
+/// `index` of the block as the interpreter does. The emitter put every word
+/// that the operation reads into the frame, and reads what it writes from
+/// there.
+///
+/// # Safety
+/// `env` is the `Env<M>` of the block that runs, and `index` one of its
+/// operations, which `compile` checked against the frame.
+unsafe extern "sysv64" fn thunk<M: Memory>(env: *mut std::ffi::c_void, index: u64) -> u64 {
+    // SAFETY: the caller's promise. Compiled code holds no reference into
+    // the environment while it calls.
+    let env = unsafe { &mut *env.cast::<Env<M>>() };
+    let op = &env.ops[index as usize];
+    // SAFETY: the frame of the block, which nothing else touches while the
+    // thunk runs.
+    let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    if (op.code as u8) < FIRST_EFFECT {
+        // SAFETY: `compile` checked every operation against the frame and
+        // the generic operations of the block.
+        if unsafe { block::step_unchecked(op, frame, env.generics) } {
+            return 0;
+        }
+        env.stop = Some(host("an arithmetic operation outside its domain"));
+        return THUNK_LEFT;
+    }
+    // SAFETY: the state of the CPU, which compiled code does not touch
+    // while it calls.
+    let state = unsafe { &mut *env.state };
+    match Compiled::effect(
+        op,
+        frame,
+        env.accesses,
+        env.calls,
+        env.leaves,
+        state,
+        env.memory,
+        env.side,
+        env.single,
+    ) {
+        Ok(()) => 0,
+        Err(failed) => {
+            env.failed = Some(failed);
+            THUNK_LEFT
+        }
+    }
+}
+
+/// The words of a place.
+fn place_words(place: Place) -> impl Iterator<Item = Slot> {
+    std::iter::once(place.slot).chain(place.wide.then_some(place.slot + 1))
+}
+
+impl Compiled {
+    /// Compile the block, or mark it as one that the emitter refuses.
+    fn compile_code(&mut self, jit: &mut jit::Jit) {
+        // What a leave reads from the frame: its outputs, its address, and
+        // every word that its own operations read (card S4). A word that
+        // those operations compute first is in the list too, which costs a
+        // store of a stale value that they then overwrite.
+        let generics = &self.generics;
+        let calls_of = &self.calls;
+        let leaves: Vec<Vec<Slot>> = self
+            .leaves
+            .iter()
+            .map(|leave| {
+                let cold = leave.ops.iter().flat_map(|op| {
+                    let words: Vec<Slot> = match op.code {
+                        Code::Generic => generics[op.imm as usize]
+                            .args()
+                            .into_iter()
+                            .flat_map(place_words)
+                            .collect(),
+                        Code::Call => calls_of[op.imm as usize]
+                            .args
+                            .iter()
+                            .copied()
+                            .flat_map(place_words)
+                            .collect(),
+                        Code::Select => vec![op.a, op.b, op.imm as Slot],
+                        _ => vec![op.a, op.b],
+                    };
+                    words
+                });
+                leave
+                    .outputs
+                    .iter()
+                    .flat_map(|(_, place)| place_words(*place))
+                    .chain(leave.address)
+                    .chain(cold)
+                    .collect()
+            })
+            .collect();
+        let accesses: Vec<jit::Effect> = self
+            .accesses
+            .iter()
+            .map(|access| match *access {
+                Access16::Read {
+                    address,
+                    result,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: vec![address],
+                    writes: place_words(result).collect(),
+                    leave: Some(exit),
+                },
+                Access16::Write {
+                    address,
+                    value,
+                    exclusive,
+                    exit,
+                    ..
+                } => jit::Effect {
+                    reads: std::iter::once(address).chain(place_words(value)).collect(),
+                    writes: exclusive.into_iter().collect(),
+                    leave: Some(exit),
+                },
+            })
+            .collect();
+        let calls: Vec<jit::Effect> = self
+            .calls
+            .iter()
+            .map(|call| jit::Effect {
+                reads: call.args.iter().copied().flat_map(place_words).collect(),
+                writes: call
+                    .results
+                    .iter()
+                    .flat_map(|(place, _)| place_words(*place))
+                    .collect(),
+                leave: None,
+            })
+            .collect();
+        // The compiled code writes the next PC with the outputs, as it is
+        // in the frame: a distance from the entry is added after it runs.
+        let mut outputs = self.outputs.clone();
+        if let Some((place, _)) = self.next {
+            outputs.push((crate::state::slot::PC as u32, place));
+        }
+        let shape = jit::Shape {
+            ops: &self.ops,
+            generics: &self.generics,
+            frame: &self.frame,
+            accesses: &accesses,
+            calls: &calls,
+            leaves: &leaves,
+            inputs: &self.inputs,
+            outputs: &outputs,
+            instructions: self.instructions,
+        };
+        match jit.compile(&shape) {
+            Ok(entry) => self.code = Some(entry),
+            Err(_) => {
+                self.code = None;
+                self.refused = true;
+            }
+        }
+    }
+
+    /// Run the compiled code of the block. `None`: the budget did not hold
+    /// the block, and nothing ran.
+    fn run_code<M: Memory>(
+        &mut self,
+        entry: &jit::Entry,
+        jit: &jit::Jit,
+        state: &mut State,
+        memory: &mut M,
+        side: &mut Side,
+        budget: u64,
+    ) -> Option<(u32, Option<Halt>)> {
+        let pc = state.pc();
+        side.user = self.context.el == 0;
+        let state_pointer: *mut State = state;
+        let frame = self.frame.as_mut_ptr();
+        let mut env = Env {
+            ops: &self.ops,
+            generics: &self.generics,
+            accesses: &self.accesses,
+            calls: &self.calls,
+            leaves: &self.leaves,
+            frame,
+            words: self.frame.len(),
+            state: state_pointer,
+            memory,
+            side,
+            single: self.instructions == 1,
+            failed: None,
+            stop: None,
+        };
+        let mut context = jit::Context {
+            budget: budget.min(i64::MAX as u64) as i64,
+            thunk: thunk::<M>,
+            env: (&raw mut env).cast(),
+        };
+        // SAFETY: `entry` is current and was compiled from this block, whose
+        // frame and register slots are as large as its shape names. While
+        // the code runs, only it and the thunk touch the frame and the
+        // state, and the thunk reaches them through `env` alone.
+        let code = unsafe {
+            jit.enter(
+                entry,
+                &mut context,
+                (&raw mut (*state_pointer).slots).cast(),
+                frame,
+            )
+        };
+        let failed = env.failed.take();
+        let stop = env.stop.take();
+        match code {
+            jit::DONE => {
+                if let Some((_, true)) = self.next {
+                    state.set_pc(pc.wrapping_add(state.pc()));
+                }
+                // The loop runs the last instruction with the PC at it.
+                if let Some((distance, _)) = self.terminal {
+                    state.set_pc(pc.wrapping_add(distance));
+                }
+                Some((self.instructions, None))
+            }
+            jit::BUDGET => None,
+            _ => Some(match (failed, stop) {
+                (Some((exit, failed)), _) => self.leave(state, exit, failed),
+                (None, stop) => (
+                    0,
+                    Some(Halt::Stop(stop.unwrap_or_else(|| {
+                        host("compiled code left the block without a reason")
+                    }))),
+                ),
+            }),
+        }
+    }
+}
+
+/// What the JIT of a CPU did, for the bench rows and the debug log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitCounts {
+    /// Runs of compiled blocks, and their instructions.
+    pub compiled_runs: u64,
+    pub compiled_instructions: u64,
+    /// Runs of blocks in the interpreter while the JIT is on, and their
+    /// instructions: blocks that the emitter refused (H2b), and blocks that
+    /// the budget did not hold at their head.
+    pub interpreted_runs: u64,
+    pub interpreted_instructions: u64,
+    /// Blocks compiled and refused, the bytes of code, the resets of the
+    /// region and the host time of the compiles.
+    pub compiled: u64,
+    pub refused: u64,
+    pub bytes: u64,
+    pub resets: u64,
+    pub compile_ns: u64,
+}
+
+/// Run `block` on its compiled code when the JIT is on and takes it, else
+/// in the interpreter.
+fn execute<M: Memory>(
+    block: &mut Compiled,
+    state: &mut State,
+    memory: &mut M,
+    side: &mut Side,
+    jit: &mut Option<jit::Jit>,
+    counts: &mut JitCounts,
+    budget: u64,
+) -> (u32, Option<Halt>) {
+    let Some(jit) = jit.as_mut() else {
+        return block.run(state, memory, side);
+    };
+    if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
+        block.compile_code(jit);
+    }
+    if let Some(entry) = block.code
+        && let Some(done) = block.run_code(&entry, jit, state, memory, side, budget)
+    {
+        counts.compiled_runs += 1;
+        counts.compiled_instructions += u64::from(done.0);
+        return done;
+    }
+    let done = block.run(state, memory, side);
+    counts.interpreted_runs += 1;
+    counts.interpreted_instructions += u64::from(done.0);
+    done
+}
+
+/// Whether `VMLAB_HV_JIT` turns the JIT on: `1`, `on` or `true`. It is off
+/// by default (3e DESIGN.md J1, H2e).
+pub fn jit_from_environment() -> bool {
+    matches!(
+        std::env::var("VMLAB_HV_JIT").as_deref(),
+        Ok("1" | "on" | "true")
+    )
 }
 
 /// The translated blocks of a CPU: an entry for each code address, picked
@@ -1941,6 +2386,8 @@ pub struct Cpu<M> {
     pub translations: u64,
     /// The host time that the translations took, in nanoseconds.
     pub translation_ns: u64,
+    /// Enabled by the owner for an instrumented boot.
+    pub block_counts: Option<BlockCounts>,
     /// What the guest asked for that the CPU does not have, each once. The
     /// owner of the CPU writes it to its log.
     pub unknown: std::collections::BTreeSet<Unknown>,
@@ -1957,6 +2404,12 @@ pub struct Cpu<M> {
     /// memory holds.
     epoch: u64,
     side: Side,
+    /// The JIT, when it is on (3e DESIGN.md J1).
+    jit: Option<jit::Jit>,
+    jit_counts: JitCounts,
+    /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
+    /// of the CPU writes it to its log.
+    pub jit_error: Option<String>,
 }
 
 /// The bytes that `DC ZVA` zeroes: DCZID_EL0.BS is 4, which is 16 words.
@@ -1970,7 +2423,7 @@ impl<M: Memory> Cpu<M> {
     pub fn new(memory: M, state: State) -> Self {
         let generation = memory.generation();
         let side = Side::new(&state);
-        Self {
+        let mut cpu = Self {
             state,
             memory,
             irq: false,
@@ -1984,6 +2437,7 @@ impl<M: Memory> Cpu<M> {
             instructions: 0,
             translations: 0,
             translation_ns: 0,
+            block_counts: None,
             unknown: std::collections::BTreeSet::new(),
             shootdown: None,
             blocks: Cache::new(),
@@ -1991,7 +2445,43 @@ impl<M: Memory> Cpu<M> {
             generation,
             epoch: 1,
             side,
+            jit: None,
+            jit_counts: JitCounts::default(),
+            jit_error: None,
+        };
+        if jit_from_environment()
+            && let Err(error) = cpu.set_jit(true)
+        {
+            cpu.jit_error = Some(error.to_string());
         }
+        cpu
+    }
+
+    /// Turn the JIT on or off. On: every block runs as compiled code where
+    /// the emitter takes it. Off: the code region is dropped.
+    pub fn set_jit(&mut self, on: bool) -> std::io::Result<()> {
+        if on == self.jit.is_some() {
+            return Ok(());
+        }
+        self.jit = if on { Some(jit::Jit::new()?) } else { None };
+        Ok(())
+    }
+
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// What the JIT did since the CPU was made.
+    pub fn jit_counts(&self) -> JitCounts {
+        let mut counts = self.jit_counts;
+        if let Some(jit) = &self.jit {
+            counts.compiled = jit.stats.compiled;
+            counts.refused = jit.stats.refused;
+            counts.bytes = jit.stats.bytes;
+            counts.resets = jit.stats.resets;
+            counts.compile_ns = jit.stats.compile_ns;
+        }
+        counts
     }
 
     /// The physical address of the virtual address `va`, when it has one,
@@ -2475,6 +2965,8 @@ impl<M: Memory> Cpu<M> {
         let mut builder = Builder::new(context, pc);
         let mut at = pc;
         let mut count = 0;
+        let mut ldp_x = 0;
+        let mut stp_x = 0;
         loop {
             let mut bytes = [0u8; 4];
             // A block stays inside one page, so one translation serves it.
@@ -2497,7 +2989,17 @@ impl<M: Memory> Cpu<M> {
             let word = u32::from_le_bytes(bytes);
             builder.begin(at);
             let lifted = match decode(word) {
-                Some(decoded) => lift(&mut builder, &decoded),
+                Some(decoded) => {
+                    let lifted = lift(&mut builder, &decoded);
+                    if self.block_counts.is_some() && !matches!(lifted, Lifted::Unsupported) {
+                        match decoded.record {
+                            Record::LDPXi | Record::LDPXpost | Record::LDPXpre => ldp_x += 1,
+                            Record::STPXi | Record::STPXpost | Record::STPXpre => stp_x += 1,
+                            _ => {}
+                        }
+                    }
+                    lifted
+                }
                 // `SMC` needs EL3 in the LLVM tables, so no selected record
                 // matches it. The machine serves it as it serves `HVC`.
                 None if word & 0xffe0_001f == 0xd400_0003 => {
@@ -2540,8 +3042,18 @@ impl<M: Memory> Cpu<M> {
         }
         self.translations += 1;
         self.side.mark_code(phys);
-        let mut compiled =
-            compile(phys, context, count, builder.finish(at)).map_err(Refused::Stop)?;
+        let mut compiled = compile(
+            phys,
+            context,
+            count,
+            builder.finish(at),
+            self.block_counts.as_mut(),
+        )
+        .map_err(Refused::Stop)?;
+        if let Some(counts) = &mut self.block_counts {
+            counts.ldp_x += ldp_x;
+            counts.stp_x += stp_x;
+        }
         compiled.stamp = self.memory.code_stamp(phys, count.max(1) as usize * 4);
         compiled.epoch = self.epoch;
         Ok(compiled)
@@ -2679,7 +3191,15 @@ impl<M: Memory> Cpu<M> {
         let Some(block) = cache.entries[index].as_mut() else {
             return Err(host("the block cache lost a block"));
         };
-        let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+        let (count, halt) = execute(
+            block,
+            &mut self.state,
+            &mut self.memory,
+            &mut self.side,
+            &mut self.jit,
+            &mut self.jit_counts,
+            u64::MAX,
+        );
         // The loop runs the last instruction at the PC that the block left.
         let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
         Ok((count, self.finish(halt, terminal)))
@@ -2772,7 +3292,15 @@ impl<M: Memory> Cpu<M> {
                 && let Some(block) = self.blocks.entries[index].as_mut()
                 && u64::from(block.instructions) <= left
             {
-                let (count, halt) = block.run(&mut self.state, &mut self.memory, &mut self.side);
+                let (count, halt) = execute(
+                    block,
+                    &mut self.state,
+                    &mut self.memory,
+                    &mut self.side,
+                    &mut self.jit,
+                    &mut self.jit_counts,
+                    left,
+                );
                 let terminal = block.terminal.map(|(_, trap)| (self.state.pc(), trap));
                 (count, self.finish(halt, terminal))
             } else {
@@ -2841,6 +3369,8 @@ impl<M: Memory> Cpu<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flags;
+    use crate::state::slot;
     use vmlab_hv_tcg::FlatMemory;
 
     const BASE: u64 = 0x4000_0000;
@@ -2870,6 +3400,41 @@ mod tests {
         assert_eq!(cpu.instructions, 3000);
         // One block of three instructions, translated once.
         assert_eq!(cpu.translations, 1);
+    }
+
+    #[test]
+    fn block_counts_measure_rollback_work_and_pairs_without_changing_execution() {
+        // add x4, x4, #1 ; ldp x0, x1, [x2] ; stp x0, x1, [x3] ;
+        // movz x4, #0 ; b .
+        let words = [
+            0x9100_0484,
+            0xa940_0440,
+            0xa900_0460,
+            0xd280_0004,
+            0x1400_0000,
+        ];
+        let mut plain = cpu(&words);
+        let mut counted = cpu(&words);
+        counted.block_counts = Some(BlockCounts::default());
+        for cpu in [&mut plain, &mut counted] {
+            cpu.state.set_x(2, BASE + 0x1000);
+            cpu.state.set_x(3, BASE + 0x1010);
+            cpu.memory.write(BASE + 0x1000, &[0x5a; 16]).unwrap();
+            let (completed, halt) = cpu.run_block(false).unwrap();
+            assert_eq!(completed, 5);
+            assert!(halt.is_none());
+            let mut copied = [0; 16];
+            cpu.memory.read(BASE + 0x1010, &mut copied).unwrap();
+            assert_eq!(copied, [0x5a; 16]);
+        }
+        assert_eq!(counted.state.slots, plain.state.slots);
+        let counts = counted.block_counts.unwrap();
+        assert_eq!(counts.blocks, 1);
+        assert_eq!((counts.ldp_x, counts.stp_x), (1, 1));
+        assert_eq!(counts.alignment_operations, 6);
+        // The discarded add restores X4. The fault PC of an access is no
+        // operation: the exit carries its distance from the entry (#1143).
+        assert_eq!(counts.exit_writeback_operations, 1);
     }
 
     #[test]
@@ -3497,7 +4062,7 @@ mod tests {
         });
         block.events.push(Event::Exit(exit));
         let context = State::reset(0).context;
-        let mut compiled = compile(0x4000_0000, context, 1, block).unwrap();
+        let mut compiled = compile(0x4000_0000, context, 1, block, None).unwrap();
         let mut state = State::reset(0x4000_0000);
         state.set_x(0, 5);
         state.set_x(1, 7);
@@ -3525,7 +4090,10 @@ mod tests {
             completed: 1,
         });
         block.events.push(Event::Exit(exit));
-        assert!(matches!(compile(0, context, 1, block), Err(Stop::Host(_))));
+        assert!(matches!(
+            compile(0, context, 1, block, None),
+            Err(Stop::Host(_))
+        ));
     }
 
     #[test]
@@ -3546,5 +4114,132 @@ mod tests {
                 BASE + 0x2000
             ))
         );
+    }
+
+    /// The flags of `a + b + carry` in `width` bits, from the definitions of
+    /// N, Z, C and V, as the bits 3 to 0.
+    fn sum_flags(width: u32, a: u64, b: u64, carry: bool) -> u8 {
+        let mask = if width == 64 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let (a, b) = (a & mask, b & mask);
+        let result = a.wrapping_add(b).wrapping_add(u64::from(carry)) & mask;
+        let sign = |value: u64| -> i128 {
+            if width == 64 {
+                i128::from(value as i64)
+            } else {
+                i128::from(value as u32 as i32)
+            }
+        };
+        let n = result >> (width - 1) & 1 == 1;
+        let c = u128::from(a) + u128::from(b) + u128::from(carry) != u128::from(result);
+        let v = sign(a) + sign(b) + i128::from(carry) != sign(result);
+        u8::from(n) << 3 | u8::from(result == 0) << 2 | u8::from(c) << 1 | u8::from(v)
+    }
+
+    #[test]
+    fn every_condition_reads_the_lazy_flags_inside_and_after_their_block() {
+        // msr nzcv, x12 ; <setter> ; csinc x2, xzr, xzr, cond ; b +4 ;
+        // csinc x3, xzr, xzr, cond ; b . The first csinc reads the flags of the
+        // block, the second the flag slots.
+        const VALUES: [u64; 8] = [
+            0,
+            1,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        let ccmp =
+            |sf: u32, cond: u32, nzcv: u32| sf << 31 | 0x7a40_0000 | 1 << 16 | cond << 12 | nzcv;
+        let mut case = 0u32;
+        for width in [32u32, 64] {
+            let sf = u32::from(width == 64);
+            // (encoding with rd 9, rn 0 and rm 1, its flags).
+            type Setter = (u32, fn(u32, u64, u64, u8) -> u8);
+            let setters: [Setter; 6] = [
+                (sf << 31 | 0x6b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, !b, true)
+                }),
+                (sf << 31 | 0x2b00_0009 | 1 << 16, |w, a, b, _| {
+                    sum_flags(w, a, b, false)
+                }),
+                (sf << 31 | 0x6a00_0009 | 1 << 16, |w, a, b, _| {
+                    let mask = if w == 64 {
+                        u64::MAX
+                    } else {
+                        u64::from(u32::MAX)
+                    };
+                    let result = a & b & mask;
+                    u8::from(result >> (w - 1) & 1 == 1) << 3 | u8::from(result == 0) << 2
+                }),
+                (sf << 31 | 0x3a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, b, before & 2 != 0)
+                }),
+                (sf << 31 | 0x7a00_0009 | 1 << 16, |w, a, b, before| {
+                    sum_flags(w, a, !b, before & 2 != 0)
+                }),
+                (0, |_, _, _, _| 0),
+            ];
+            for (index, (encoding, flags)) in setters.iter().enumerate() {
+                for &a in &VALUES {
+                    for &b in &VALUES {
+                        for cond in 0..16u32 {
+                            case += 1;
+                            let before = (case % 16) as u8;
+                            // The last setter is a ccmp on a condition of
+                            // the flags before it.
+                            let (encoding, expected) = if index == 5 {
+                                let on = case / 16 % 16;
+                                let given = case / 7 % 16;
+                                let expected = if flags::holds(on as u8, before) {
+                                    sum_flags(width, a, !b, true)
+                                } else {
+                                    given as u8
+                                };
+                                (ccmp(sf, on, given), expected)
+                            } else {
+                                (*encoding, flags(width, a, b, before))
+                            };
+                            let csinc = |rd: u32| 0x9a9f_07e0 | cond << 12 | rd;
+                            let mut cpu = cpu(&[
+                                0xd51b_420c,
+                                encoding,
+                                csinc(2),
+                                0x1400_0001,
+                                csinc(3),
+                                0x1400_0000,
+                            ]);
+                            cpu.state.set_x(0, a);
+                            cpu.state.set_x(1, b);
+                            cpu.state.set_x(12, u64::from(before) << 28);
+                            assert_eq!(cpu.run(6), Stop::Budget);
+                            let what = format!(
+                                "{encoding:#010x} {a:#x} {b:#x} cond {cond} flags {before:04b}"
+                            );
+                            assert_eq!(cpu.state.nzcv(), expected, "{what}");
+                            let holds = u64::from(!flags::holds(cond as u8, expected));
+                            assert_eq!(cpu.state.x(2), holds, "in the block: {what}");
+                            assert_eq!(cpu.state.x(3), holds, "after the block: {what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mrs_nzcv_reads_the_lazy_flags() {
+        // subs x9, x0, x1 ; mrs x2, nzcv ; b +4 ; mrs x3, nzcv
+        let mut cpu = cpu(&[0xeb01_0009, 0xd53b_4202, 0x1400_0001, 0xd53b_4203]);
+        cpu.state.set_x(0, 1);
+        cpu.state.set_x(1, 2);
+        assert_eq!(cpu.run(4), Stop::Budget);
+        assert_eq!(cpu.state.x(2), 0x8000_0000);
+        assert_eq!(cpu.state.x(3), 0x8000_0000);
     }
 }

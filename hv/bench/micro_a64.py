@@ -8,6 +8,11 @@ ends with the semihosting call SYS_EXIT. Our interpreter
 its `hlt` takes, and QEMU ends with the exit code of the call, so both run the same bytes to
 the same instruction.
 
+The `jit` backend runs the same binary with `VMLAB_HV_JIT=1` (3e DESIGN.md
+J1): every block that the emitter takes runs as x86-64 code. Its rows, and
+the interpreter's, carry the count of blocks and instructions that ran in the
+interpreter while the JIT was on (H2b), in `env`.
+
 The `interpreter` backend records the time of the run inside the process,
 with the translation of the blocks in it. The `qemu` backend (guest
 `flat-a64`) records the wall time of a QEMU process less the median of a
@@ -217,12 +222,17 @@ def run_qemu(args, commit, dirty, host, log, pin):
     return 0
 
 
+BACKEND_VERSIONS = {"interpreter": "packed block interpreter",
+                    "jit": "packed block interpreter with the x86-64 JIT (J1)"}
+
+
 def run_interpreter_backend(args, commit, dirty, host, log, pin):
     binary = interpreter_binary()
     workloads = build_workloads()
     environment = dict(os.environ)
+    environment["VMLAB_HV_JIT"] = "1" if args.backend == "jit" else "0"
     for name, (_, image, expected) in workloads.items():
-        noise = noise_record(pin, lib.MEMORY_MAX, "packed block interpreter")
+        noise = noise_record(pin, lib.MEMORY_MAX, BACKEND_VERSIONS[args.backend])
         samples, mips, raw = [], [], []
         for repeat in range(args.repeats):
             result = run_interpreter(binary, image, pin, environment)
@@ -237,8 +247,12 @@ def run_interpreter_backend(args, commit, dirty, host, log, pin):
         if len({r["instructions"] for r in raw}) != 1:
             raise lib.BenchError(f"nondeterministic instruction count: {name}")
         noise["instruction_count"] = raw[0]["instructions"]
+        # What ran in the interpreter while the JIT was on (H2b).
+        noise["jit"] = bool(raw[0].get("jit"))
+        noise["interpreted_blocks"] = raw[0].get("interpreted_blocks", 0)
+        noise["interpreted_instructions"] = raw[0].get("interpreted_instructions", 0)
         noise["loadavg_end"] = lib.read_loadavg()
-        rec = record("interpreter", name, commit, dirty, host, samples, mips, noise, raw)
+        rec = record(args.backend, name, commit, dirty, host, samples, mips, noise, raw)
         rec["qemu_baseline"] = lib.latest_baseline(lib.read_history("aarch64"), "aarch64",
                                                    GUEST, 1, name)
         lib.append_history("aarch64", rec)

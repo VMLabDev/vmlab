@@ -1,12 +1,13 @@
 //! The builder that the lifters share (DESIGN.md G3b): the registers of one
 //! block as scalars of a `native::Graph`, the flags, and the exit.
 //!
-//! Sources read: none. The carry and overflow rules of `add_with_carry` and
-//! `subtract_with_flags` are the two's complement identities, and the lockstep against QEMU (S6)
+//! Sources read: none. The carry and overflow rules of `add_with_carry` are
+//! the two's complement identities, and the lockstep against QEMU (S6)
 //! checks them.
 
 use crate::exception::Exception;
 use crate::fields::Condition;
+use crate::flags;
 use crate::state::{Context, REGISTER_FILE, slot};
 use vmlab_hv_tcg_ir::native::block::{BlockOf, Event, ExitId, ExitScalars};
 use vmlab_hv_tcg_ir::native::regfile::Writeback;
@@ -98,11 +99,17 @@ pub enum ExceptionClass {
 pub enum A64Next {
     /// The next PC.
     Pc(ScalarId),
+    /// The next PC as its distance in bytes from the entry of the block: a
+    /// direct branch, or the fall through. The loop adds the PC at the
+    /// entry, so that the block reads no PC for it.
+    Relative(ScalarId),
     /// An exception that leaves the block before one of its instructions,
-    /// with the scalars of its syndrome.
+    /// with the scalars of its syndrome. The PC is that instruction, `at`
+    /// bytes from the entry of the block: the loop sets it.
     Exception {
         class: ExceptionClass,
         syndrome: Vec<ScalarId>,
+        at: u64,
     },
     /// The instruction at `pc` bytes from the entry of the block is the last
     /// of the block, and the loop runs
@@ -124,7 +131,7 @@ impl ExitScalars for A64Exit {
     fn for_each_scalar(&mut self, visit: &mut dyn FnMut(&mut ScalarId)) {
         self.writeback.for_each_scalar(visit);
         match &mut self.next {
-            A64Next::Pc(scalar) => visit(scalar),
+            A64Next::Pc(scalar) | A64Next::Relative(scalar) => visit(scalar),
             A64Next::Exception { syndrome, .. } => syndrome.iter_mut().for_each(visit),
             A64Next::Trap { .. } => {}
         }
@@ -133,11 +140,44 @@ impl ExitScalars for A64Exit {
 
 /// N, Z, C and V, each a scalar of one bit.
 #[derive(Clone, Copy, Debug)]
-pub struct Flags {
-    pub n: ScalarId,
-    pub z: ScalarId,
-    pub c: ScalarId,
-    pub v: ScalarId,
+struct FlagBits {
+    n: ScalarId,
+    z: ScalarId,
+    c: ScalarId,
+    v: ScalarId,
+}
+
+/// `a + b + carry` of `width` bits, or `a + NOT(b) + carry` when
+/// `subtract`, and its `result`: what the flags of a sum follow from.
+#[derive(Clone, Copy, Debug)]
+pub struct Sum {
+    width: u16,
+    a: ScalarId,
+    b: ScalarId,
+    carry: ScalarId,
+    subtract: bool,
+    result: ScalarId,
+}
+
+/// The flags that an instruction sets, as what they follow from (card
+/// #1142). They are computed only where a condition, `MRS NZCV` or the
+/// Rust side reads them.
+#[derive(Clone, Copy, Debug)]
+pub enum Flags {
+    Sum(Sum),
+    /// N and Z of `result`, C and V clear.
+    Logical {
+        width: u16,
+        result: ScalarId,
+    },
+    /// NZCV as four bits, N the highest.
+    Explicit(ScalarId),
+    /// The flags of `sum` where the Bool `holds`, else `otherwise` (NZCV).
+    Chosen {
+        holds: ScalarId,
+        sum: Sum,
+        otherwise: u8,
+    },
 }
 
 pub struct Builder {
@@ -152,6 +192,8 @@ pub struct Builder {
     entry: u64,
     /// The next PC, when an instruction of the block has set one.
     branch: Option<ScalarId>,
+    /// `branch` is a distance from the entry of the block.
+    relative: bool,
     /// What the last instruction does outside the graph.
     trap: Option<Trap>,
     /// The instructions before the one that is being lifted.
@@ -174,6 +216,9 @@ pub struct Builder {
     aligned: Vec<(ScalarId, u8)>,
     /// The accesses of this instruction are made as EL0.
     unprivileged: bool,
+    /// The flags as the block set them last. `None`: the block has not set
+    /// them, and they are in the flag slots.
+    flags: Option<Flags>,
 }
 
 /// The alignment that Device memory asks of a load or a store of a register
@@ -197,6 +242,7 @@ impl Builder {
             pc,
             entry: pc,
             branch: None,
+            relative: false,
             trap: None,
             completed: 0,
             started: false,
@@ -207,6 +253,7 @@ impl Builder {
             effects: 0,
             aligned: Vec::new(),
             unprivileged: false,
+            flags: None,
         }
     }
 
@@ -275,6 +322,14 @@ impl Builder {
     /// as `code_address` computes it.
     pub fn pc_plus(&mut self, delta: u64) -> ScalarId {
         self.code_address(self.pc.wrapping_add(delta))
+    }
+
+    /// The distance from the entry of the block to the address `delta`
+    /// bytes from the instruction that is being lifted, as a constant: the
+    /// next PC of a direct branch (`branch_relative`).
+    pub fn pc_distance(&mut self, delta: u64) -> ScalarId {
+        let distance = self.pc.wrapping_add(delta).wrapping_sub(self.entry);
+        self.imm(64, distance)
     }
 
     /// The address of the 4 KB page of the instruction that is being
@@ -614,9 +669,9 @@ impl Builder {
     // --- flags -----------------------------------------------------------
 
     /// `a + b + carry` in `width` bits, with the flags of the sum. `carry`
-    /// is one bit. A subtraction is `a + NOT(b) + 1`. This and
-    /// `subtract_with_flags`, which gives the same as it for a carry of 1,
-    /// are the sources of N, Z, C and V for every add, subtract and compare.
+    /// is one bit. This and `sub_with_carry` are the one source of N, Z, C
+    /// and V for every add, subtract and compare. The flags are lazy: they
+    /// are computed only where something reads them (card #1142).
     pub fn add_with_carry(
         &mut self,
         width: u16,
@@ -627,6 +682,187 @@ impl Builder {
         let partial = self.binary(width, Binary::Add, a, b);
         let carry_wide = self.zero_extend(carry, width);
         let result = self.binary(width, Binary::Add, partial, carry_wide);
+        let sum = Sum {
+            width,
+            a,
+            b,
+            carry,
+            subtract: false,
+            result,
+        };
+        (result, Flags::Sum(sum))
+    }
+
+    /// `a + NOT(b) + carry` in `width` bits, with its flags: `a - b` when
+    /// the carry is set.
+    pub fn sub_with_carry(
+        &mut self,
+        width: u16,
+        a: ScalarId,
+        b: ScalarId,
+        carry: ScalarId,
+    ) -> (ScalarId, Flags) {
+        // With the carry set it is one subtraction (card S4).
+        let result = if self.block.graph.literal(carry) == Some(1) {
+            self.binary(width, Binary::Sub, a, b)
+        } else {
+            let inverted = self.not(width, b);
+            self.add_with_carry(width, a, inverted, carry).0
+        };
+        let sum = Sum {
+            width,
+            a,
+            b,
+            carry,
+            subtract: true,
+            result,
+        };
+        (result, Flags::Sum(sum))
+    }
+
+    /// The flags of a logical result: N and Z from it, C and V clear.
+    pub fn logical_flags(&mut self, width: u16, result: ScalarId) -> Flags {
+        Flags::Logical { width, result }
+    }
+
+    /// `compared` where the Bool `holds`, else the flags `otherwise` (NZCV
+    /// as the bits 3 to 0).
+    pub fn chosen_flags(&mut self, holds: ScalarId, compared: Flags, otherwise: u8) -> Flags {
+        match compared {
+            Flags::Sum(sum) => Flags::Chosen {
+                holds,
+                sum,
+                otherwise,
+            },
+            compared => {
+                let bits = self.nzcv_of(Some(compared));
+                let otherwise = self.imm(4, otherwise.into());
+                Flags::Explicit(self.select(4, holds, bits, otherwise))
+            }
+        }
+    }
+
+    /// Set the flags: their kind and operands go into the flag slots, and
+    /// the conditions of the rest of the block are lifted from them.
+    pub fn set_flags(&mut self, flags: Flags) {
+        match flags {
+            Flags::Sum(sum) => {
+                let (kind, a, b) = self.sum_slots(sum);
+                self.write(slot::FLAGS_KIND, kind);
+                self.write(slot::FLAGS_A, a);
+                self.write(slot::FLAGS_B, b);
+            }
+            Flags::Logical { width, result } => {
+                let kind = self.imm(4, flags::kind(flags::LOGICAL, width).into());
+                let a = self.zero_extend(result, 64);
+                self.write(slot::FLAGS_KIND, kind);
+                self.write(slot::FLAGS_A, a);
+            }
+            Flags::Explicit(bits) => {
+                let kind = self.imm(4, flags::EXPLICIT.into());
+                let a = self.zero_extend(bits, 64);
+                self.write(slot::FLAGS_KIND, kind);
+                self.write(slot::FLAGS_A, a);
+            }
+            Flags::Chosen {
+                holds,
+                sum,
+                otherwise,
+            } => {
+                let (kind, a, b) = self.sum_slots(sum);
+                let explicit = self.imm(4, flags::EXPLICIT.into());
+                let kind = self.select(4, holds, kind, explicit);
+                let otherwise = self.imm(64, otherwise.into());
+                let a = self.select(64, holds, a, otherwise);
+                self.write(slot::FLAGS_KIND, kind);
+                self.write(slot::FLAGS_A, a);
+                self.write(slot::FLAGS_B, b);
+            }
+        }
+        self.flags = Some(flags);
+    }
+
+    /// The flag slots of a sum: its kind and its two operands.
+    fn sum_slots(&mut self, sum: Sum) -> (ScalarId, ScalarId, ScalarId) {
+        let operation = if sum.subtract { flags::SUB } else { flags::ADD };
+        let base = flags::kind(operation, sum.width);
+        let kind = match self.block.graph.literal(sum.carry) {
+            Some(carry) => self.imm(
+                4,
+                u64::from(base | if carry != 0 { flags::CARRY } else { 0 }),
+            ),
+            None => {
+                let base = self.imm(4, base.into());
+                let carry = self.zero_extend(sum.carry, 4);
+                let carry = self.shl(4, carry, 3);
+                self.binary(4, Binary::Or, base, carry)
+            }
+        };
+        let a = self.zero_extend(sum.a, 64);
+        let b = self.zero_extend(sum.b, 64);
+        (kind, a, b)
+    }
+
+    /// The flags now as NZCV in four bits.
+    pub fn nzcv(&mut self) -> ScalarId {
+        self.nzcv_of(self.flags)
+    }
+
+    /// The flags as four bits: of `flags`, or of the flag slots when the
+    /// block has not set them.
+    fn nzcv_of(&mut self, flags: Option<Flags>) -> ScalarId {
+        match flags {
+            None => {
+                let kind = self.read(slot::FLAGS_KIND);
+                let a = self.read(slot::FLAGS_A);
+                let b = self.read(slot::FLAGS_B);
+                self.call(4, &flags::NZCV, &[kind, a, b])
+            }
+            Some(Flags::Explicit(bits)) => bits,
+            Some(Flags::Logical { width, result }) => {
+                let n = self.bit(result, width - 1);
+                let zero = self.is_zero(width, result);
+                let z = self.to_bit(zero);
+                let clear = self.imm(2, 0);
+                let nz = self.concat(n, z, 1, 2);
+                self.concat(nz, clear, 2, 4)
+            }
+            Some(Flags::Sum(sum)) => {
+                let bits = self.sum_bits(sum);
+                self.pack(bits)
+            }
+            Some(Flags::Chosen {
+                holds,
+                sum,
+                otherwise,
+            }) => {
+                let bits = self.sum_bits(sum);
+                let bits = self.pack(bits);
+                let otherwise = self.imm(4, otherwise.into());
+                self.select(4, holds, bits, otherwise)
+            }
+        }
+    }
+
+    /// N, Z, C and V as four bits, N the highest.
+    fn pack(&mut self, bits: FlagBits) -> ScalarId {
+        let nz = self.concat(bits.n, bits.z, 1, 2);
+        let cv = self.concat(bits.c, bits.v, 1, 2);
+        self.concat(nz, cv, 2, 4)
+    }
+
+    /// The four flags of a sum, each one bit.
+    fn sum_bits(&mut self, sum: Sum) -> FlagBits {
+        let Sum {
+            width,
+            a,
+            b,
+            carry,
+            subtract,
+            result,
+        } = sum;
+        let b = if subtract { self.not(width, b) } else { b };
+        let partial = self.binary(width, Binary::Add, a, b);
         // The carry out of an unsigned sum shows as a sum below an operand.
         let carry_out = match self.block.graph.literal(carry) {
             Some(0) => self.compare(Binary::LessUnsigned, result, a),
@@ -642,87 +878,188 @@ impl Builder {
         let from_b = self.binary(width, Binary::Xor, b, result);
         let both = self.binary(width, Binary::And, from_a, from_b);
         let zero = self.is_zero(width, result);
-        let flags = Flags {
+        FlagBits {
             n: self.bit(result, width - 1),
             z: self.to_bit(zero),
             c: self.to_bit(carry_out),
             v: self.bit(both, width - 1),
-        };
-        (result, flags)
-    }
-
-    /// `a - b` in `width` bits, with the flags of the difference: what
-    /// `add_with_carry(a, NOT b, 1)` gives, as one subtraction (card S4).
-    /// The carry is "no borrow", `a` at least `b` unsigned, and the signed
-    /// overflow is the operands differing in sign and the result differing
-    /// from `a`.
-    pub fn subtract_with_flags(
-        &mut self,
-        width: u16,
-        a: ScalarId,
-        b: ScalarId,
-    ) -> (ScalarId, Flags) {
-        let result = self.binary(width, Binary::Sub, a, b);
-        let carry_out = self.compare(Binary::LessEqualUnsigned, b, a);
-        let operands = self.binary(width, Binary::Xor, a, b);
-        let from_a = self.binary(width, Binary::Xor, a, result);
-        let both = self.binary(width, Binary::And, operands, from_a);
-        let zero = self.is_zero(width, result);
-        let flags = Flags {
-            n: self.bit(result, width - 1),
-            z: self.to_bit(zero),
-            c: self.to_bit(carry_out),
-            v: self.bit(both, width - 1),
-        };
-        (result, flags)
-    }
-
-    /// The flags of a logical result: N and Z from it, C and V clear.
-    pub fn logical_flags(&mut self, width: u16, result: ScalarId) -> Flags {
-        let zero = self.is_zero(width, result);
-        Flags {
-            n: self.bit(result, width - 1),
-            z: self.to_bit(zero),
-            c: self.imm(1, 0),
-            v: self.imm(1, 0),
         }
-    }
-
-    pub fn set_flags(&mut self, flags: Flags) {
-        self.write(slot::N, flags.n);
-        self.write(slot::Z, flags.z);
-        self.write(slot::C, flags.c);
-        self.write(slot::V, flags.v);
     }
 
     /// Whether `condition` holds for the flags now. A Bool.
     pub fn condition(&mut self, condition: Condition) -> ScalarId {
-        let flag = |builder: &mut Self, slot: usize| {
-            let bit = builder.read(slot);
-            builder.to_bool(bit)
+        if matches!(condition, Condition::Al | Condition::Nv) {
+            return self.block.graph.constant(ScalarType::Bool, 1);
+        }
+        match self.flags {
+            None => {
+                let kind = self.read(slot::FLAGS_KIND);
+                let a = self.read(slot::FLAGS_A);
+                let b = self.read(slot::FLAGS_B);
+                let code = self.imm(4, condition as u64);
+                self.block
+                    .graph
+                    .call(ScalarType::Bool, &flags::CONDITION, &[kind, a, b, code])
+                    .expect("a pure helper with its count of arguments")
+            }
+            Some(Flags::Explicit(bits)) => {
+                let flags = FlagBits {
+                    n: self.bit(bits, 3),
+                    z: self.bit(bits, 2),
+                    c: self.bit(bits, 1),
+                    v: self.bit(bits, 0),
+                };
+                self.condition_of_bits(condition, flags)
+            }
+            Some(Flags::Logical { width, result }) => {
+                self.condition_of_logical(condition, width, result)
+            }
+            Some(Flags::Sum(sum)) => self.condition_of_sum(condition, sum),
+            Some(Flags::Chosen {
+                holds,
+                sum,
+                otherwise,
+            }) => {
+                let compared = self.condition_of_sum(condition, sum);
+                if flags::holds(condition as u8, otherwise) {
+                    let not_holds = self.bool_not(holds);
+                    self.bool_binary(Binary::Or, not_holds, compared)
+                } else {
+                    self.bool_binary(Binary::And, holds, compared)
+                }
+            }
+        }
+    }
+
+    /// `value` with its sign bit flipped: an unsigned order of two flipped
+    /// values is the signed order of the values.
+    fn flip_sign(&mut self, width: u16, value: ScalarId) -> ScalarId {
+        let sign = self.imm(width, 1 << (width - 1));
+        self.binary(width, Binary::Xor, value, sign)
+    }
+
+    /// `a < b` (or `a <= b`) for signed values of `width` bits. A Bool.
+    fn signed_less(&mut self, width: u16, a: ScalarId, b: ScalarId, or_equal: bool) -> ScalarId {
+        let a = self.flip_sign(width, a);
+        let b = self.flip_sign(width, b);
+        let operation = if or_equal {
+            Binary::LessEqualUnsigned
+        } else {
+            Binary::LessUnsigned
         };
+        self.compare(operation, a, b)
+    }
+
+    /// Whether `value` is negative as `width` bits. A Bool.
+    fn negative(&mut self, width: u16, value: ScalarId) -> ScalarId {
+        let sign = self.imm(width, 1 << (width - 1));
+        self.compare(Binary::LessEqualUnsigned, sign, value)
+    }
+
+    fn condition_of_logical(
+        &mut self,
+        condition: Condition,
+        width: u16,
+        result: ScalarId,
+    ) -> ScalarId {
+        let constant = |builder: &mut Self, value: bool| {
+            builder
+                .block
+                .graph
+                .constant(ScalarType::Bool, u128::from(value))
+        };
+        let zero = self.imm(width, 0);
+        match condition {
+            Condition::Eq => self.compare(Binary::Equal, result, zero),
+            Condition::Ne => self.compare(Binary::NotEqual, result, zero),
+            // N == V with V clear: not negative.
+            Condition::Mi | Condition::Lt => self.negative(width, result),
+            Condition::Pl | Condition::Ge => {
+                let sign = self.imm(width, 1 << (width - 1));
+                self.compare(Binary::LessUnsigned, result, sign)
+            }
+            Condition::Gt => self.signed_less(width, zero, result, false),
+            Condition::Le => self.signed_less(width, result, zero, true),
+            // C and V are clear.
+            Condition::Cs | Condition::Vs | Condition::Hi => constant(self, false),
+            Condition::Cc | Condition::Vc | Condition::Ls | Condition::Al | Condition::Nv => {
+                constant(self, true)
+            }
+        }
+    }
+
+    fn condition_of_sum(&mut self, condition: Condition, sum: Sum) -> ScalarId {
+        let Sum {
+            width,
+            a,
+            b,
+            carry,
+            subtract,
+            result,
+        } = sum;
+        let carry = self.block.graph.literal(carry);
+        // A compare: `a - b`, where every condition but V is an order of
+        // the two operands.
+        if subtract && carry == Some(1) {
+            let direct = match condition {
+                Condition::Eq => Some(self.compare(Binary::Equal, a, b)),
+                Condition::Ne => Some(self.compare(Binary::NotEqual, a, b)),
+                Condition::Cs => Some(self.compare(Binary::LessEqualUnsigned, b, a)),
+                Condition::Cc => Some(self.compare(Binary::LessUnsigned, a, b)),
+                Condition::Hi => Some(self.compare(Binary::LessUnsigned, b, a)),
+                Condition::Ls => Some(self.compare(Binary::LessEqualUnsigned, a, b)),
+                Condition::Ge => Some(self.signed_less(width, b, a, true)),
+                Condition::Lt => Some(self.signed_less(width, a, b, false)),
+                Condition::Gt => Some(self.signed_less(width, b, a, false)),
+                Condition::Le => Some(self.signed_less(width, a, b, true)),
+                _ => None,
+            };
+            if let Some(direct) = direct {
+                return direct;
+            }
+        }
+        let zero = self.imm(width, 0);
+        match condition {
+            Condition::Eq => return self.compare(Binary::Equal, result, zero),
+            Condition::Ne => return self.compare(Binary::NotEqual, result, zero),
+            Condition::Mi => return self.negative(width, result),
+            Condition::Pl => {
+                let sign = self.imm(width, 1 << (width - 1));
+                return self.compare(Binary::LessUnsigned, result, sign);
+            }
+            // An add without a carry in carries out where the sum is below
+            // an operand.
+            Condition::Cs if !subtract && carry == Some(0) => {
+                return self.compare(Binary::LessUnsigned, result, a);
+            }
+            Condition::Cc if !subtract && carry == Some(0) => {
+                return self.compare(Binary::LessEqualUnsigned, a, result);
+            }
+            _ => {}
+        }
+        let bits = self.sum_bits(sum);
+        self.condition_of_bits(condition, bits)
+    }
+
+    /// Whether `condition` holds for four flags of one bit each.
+    fn condition_of_bits(&mut self, condition: Condition, flags: FlagBits) -> ScalarId {
+        let flag = |builder: &mut Self, bit: ScalarId| builder.to_bool(bit);
         // Each pair is a base condition and its inverse.
         let base = match condition {
-            Condition::Eq | Condition::Ne => flag(self, slot::Z),
-            Condition::Cs | Condition::Cc => flag(self, slot::C),
-            Condition::Mi | Condition::Pl => flag(self, slot::N),
-            Condition::Vs | Condition::Vc => flag(self, slot::V),
+            Condition::Eq | Condition::Ne => flag(self, flags.z),
+            Condition::Cs | Condition::Cc => flag(self, flags.c),
+            Condition::Mi | Condition::Pl => flag(self, flags.n),
+            Condition::Vs | Condition::Vc => flag(self, flags.v),
             Condition::Hi | Condition::Ls => {
-                let c = flag(self, slot::C);
-                let z = flag(self, slot::Z);
+                let c = flag(self, flags.c);
+                let z = flag(self, flags.z);
                 let not_z = self.bool_not(z);
                 self.bool_binary(Binary::And, c, not_z)
             }
-            Condition::Ge | Condition::Lt => {
-                let n = self.read(slot::N);
-                let v = self.read(slot::V);
-                self.compare(Binary::Equal, n, v)
-            }
+            Condition::Ge | Condition::Lt => self.compare(Binary::Equal, flags.n, flags.v),
             Condition::Gt | Condition::Le => {
-                let n = self.read(slot::N);
-                let v = self.read(slot::V);
-                let same = self.compare(Binary::Equal, n, v);
-                let z = flag(self, slot::Z);
+                let same = self.compare(Binary::Equal, flags.n, flags.v);
+                let z = flag(self, flags.z);
                 let not_z = self.bool_not(z);
                 self.bool_binary(Binary::And, not_z, same)
             }
@@ -769,14 +1106,17 @@ impl Builder {
 
     /// An exit that leaves the block before the instruction that is being
     /// lifted: the registers as they were before it, and its address as the
-    /// PC.
+    /// PC, which the loop sets from the entry PC.
     fn exit_before(&mut self, class: ExceptionClass, syndrome: Vec<ScalarId>) -> ExitId {
-        let mut writes = self.writes(self.before, self.before_written);
-        let pc = self.pc_plus(0);
-        writes.push((slot::PC, pc));
+        let writes = self.writes(self.before, self.before_written);
+        let at = self.pc.wrapping_sub(self.entry);
         self.block.exit(A64Exit {
             writeback: Writeback { writes },
-            next: A64Next::Exception { class, syndrome },
+            next: A64Next::Exception {
+                class,
+                syndrome,
+                at,
+            },
             completed: self.completed,
         })
     }
@@ -967,6 +1307,14 @@ impl Builder {
             "a branch target is 64 bits"
         );
         self.branch = Some(target);
+        self.relative = false;
+    }
+
+    /// Set the next PC as its distance from the entry of the block
+    /// (`pc_distance`). The instruction that calls this ends the block.
+    pub fn branch_relative(&mut self, distance: ScalarId) {
+        self.branch(distance);
+        self.relative = true;
     }
 
     /// The instruction that is being lifted is the last of the block, and
@@ -982,8 +1330,12 @@ impl Builder {
                 pc: self.pc.wrapping_sub(self.entry),
                 trap,
             },
+            (None, Some(target)) if self.relative => A64Next::Relative(target),
             (None, Some(target)) => A64Next::Pc(target),
-            (None, None) => A64Next::Pc(self.code_address(fallthrough)),
+            (None, None) => {
+                let distance = self.imm(64, fallthrough.wrapping_sub(self.entry));
+                A64Next::Relative(distance)
+            }
         };
         let writes = self.writes(self.current, self.written);
         let completed = self.completed + u32::from(self.started);

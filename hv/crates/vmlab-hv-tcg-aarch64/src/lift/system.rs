@@ -19,7 +19,7 @@
 //!   source was not read (X1).
 
 use super::Lifted;
-use super::builder::{Builder, PstateField, Trap};
+use super::builder::{Builder, Flags, PstateField, Trap};
 use crate::exception::Exception;
 use crate::generated::decode::{
     CRmSystemI, ExceptionGeneration, HintI, MRSI, MSRI, MSRpstateImm0_15, Record, UDFType,
@@ -101,13 +101,9 @@ pub fn mrs(b: &mut Builder, _record: Record, f: &MRSI) -> Lifted {
     let fp = b.context().fp;
     match f.systemreg {
         NZCV => {
-            let mut value = b.imm(64, 0);
-            for (flag, bit) in [(slot::N, 31), (slot::Z, 30), (slot::C, 29), (slot::V, 28)] {
-                let flag = b.read(flag);
-                let flag = b.zero_extend(flag, 64);
-                let flag = b.shl(64, flag, bit);
-                value = b.binary(64, Binary::Or, value, flag);
-            }
+            let flags = b.nzcv();
+            let flags = b.zero_extend(flags, 64);
+            let value = b.shl(64, flags, 28);
             b.set_x(f.rt, 64, value);
             Lifted::Next
         }
@@ -151,10 +147,8 @@ pub fn msr(b: &mut Builder, _record: Record, f: &MSRI) -> Lifted {
     match f.systemreg {
         NZCV => {
             let value = b.x(f.rt, 64);
-            for (flag, bit) in [(slot::N, 31), (slot::Z, 30), (slot::C, 29), (slot::V, 28)] {
-                let bit = b.bit(value, bit);
-                b.write(flag, bit);
-            }
+            let flags = b.slice(value, 28, 4);
+            b.set_flags(Flags::Explicit(flags));
             Lifted::Next
         }
         FPCR | FPSR if !fp => trap(b, Trap::Exception(Exception::FpAccess)),

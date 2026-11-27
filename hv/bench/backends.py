@@ -13,6 +13,7 @@ error text as the reason, and the runner records it instead of results.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -27,7 +28,7 @@ class VmSession:
     scope, so a group kill reaps the whole tree and nothing outlives a run.
     """
 
-    def __init__(self, vm_argv, run_dir, log):
+    def __init__(self, vm_argv, run_dir, log, env=None):
         lib.require_vm_slots()
         self.run_dir = run_dir
         self.log = log
@@ -40,6 +41,7 @@ class VmSession:
             argv,
             stdout=subprocess.DEVNULL,
             stderr=self.stderr_file,
+            env=env,
             start_new_session=True,
         )
 
@@ -273,6 +275,13 @@ def hv_machine_description(run_dir, arch, smp, overlay, code_fd, vars_fd):
     return desc
 
 
+# The line an emulated vCPU logs when the machine pauses it
+# (vmlab-hv-vmm vcpu/emulated.rs, `parking`). The last one of each vCPU holds.
+PAUSED_LINE = re.compile(
+    r"vcpu (\d+): paused after (\d+) instructions, (\d+) translated blocks in (\d+) ms"
+)
+
+
 class HvBackend:
     name = "vmlab-hv"
 
@@ -300,8 +309,9 @@ class HvBackend:
             "--paused",
         ]
 
-    def launch(self):
-        self.session = VmSession(self.vm_argv, self.run_dir, self.log)
+    def launch(self, boot_mips=False):
+        env = dict(os.environ, VMLAB_HV_BOOT_INSTRUCTIONS="1") if boot_mips else None
+        self.session = VmSession(self.vm_argv, self.run_dir, self.log, env=env)
         return self.session
 
     def release_cpus(self):
@@ -322,8 +332,46 @@ class HvBackend:
     def agent_socket(self):
         return os.path.join(self.run_dir, "agent.sock")
 
+    def instructions(self, smp):
+        """The instructions that the emulated vCPUs have run (an aarch64
+        machine on the interpreter): pause, read each vCPU, resume."""
+        self.control.debug("pause")
+        try:
+            total = 0
+            for vcpu in range(smp):
+                response = self.control.debug("read_registers", vcpu=vcpu)
+                total += response["registers"]["instructions"]
+            return total
+        finally:
+            self.control.debug("detach", resume=True)
+
     def backend_version(self):
         return getattr(self, "hv_version_seen", "vmlab-hv (unlaunched)")
+
+    def boot_counters(self, vcpus, timeout=30):
+        """Pause the machine and read what each emulated vCPU ran up to the
+        pause from the stderr log (`vcpu N: paused after I instructions, T
+        translated blocks in M ms`), then resume it. The sums, or None for a
+        vCPU that is not emulated (KVM logs no such line)."""
+        self.control.request("pause")
+        try:
+            end = time.monotonic() + timeout
+            while True:
+                seen = {}
+                for m in PAUSED_LINE.finditer(self.session.stderr_text()):
+                    seen[int(m.group(1))] = tuple(int(g) for g in m.group(2, 3, 4))
+                if len(seen) >= vcpus:
+                    break
+                if time.monotonic() > end:
+                    return None
+                time.sleep(0.2)
+        finally:
+            self.control.request("resume")
+        return {
+            "instructions": sum(v[0] for v in seen.values()),
+            "translations": sum(v[1] for v in seen.values()),
+            "translation_ms": sum(v[2] for v in seen.values()),
+        }
 
     def quit(self):
         ctl = getattr(self, "control", None)

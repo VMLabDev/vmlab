@@ -266,13 +266,17 @@ timer.rs         the generic timer as a value with output lines
   block. 168 format classes cover the 2,332 records, because the tables
   already factor the variants (width, sign, opcode) into fields.
 - **G3b. Shared helpers keep it small.** `b.x(n)`, `b.sp()`, `b.add_with_carry`
-  (the source of N, Z, C, V for ADD, CCMP and the rest, and with
-  `b.subtract_with_flags`, which gives the same flags as one subtraction, for
-  SUB and CMP),
+  (the one source of N, Z, C, V for ADD, SUB, CMP, CCMP and the rest),
   `b.shift`, `b.extend`, `b.bitmask_immediate`, `b.address(mode)` for every
   addressing mode with writeback, `b.load` and `b.store`, `b.cond(cc)`.
-- **G3c. Flags are four one-bit slots.** A block that sets flags twice keeps
-  only the last write after `dce`, which is what a lazy-flags scheme buys.
+- **G3c. Flags are lazy (card #1142).** A flag-setting instruction writes
+  three slots: a kind (sum, difference, logical result or the four bits
+  themselves, with the width and the carry in) and two operands
+  (`flags.rs`). A condition in the block that set the flags is lifted from
+  the operands (`cmp` and `b.lt` are one signed comparison); a block that
+  reads flags it did not set calls a pure helper, and Rust reads them
+  through `State::nzcv`. A snapshot saves the four bits, in the layout of
+  four one-bit slots that it had before.
 - **G3d. Two tiers.** Integer data processing, branches, loads and stores are
   pure IR, so that the 3e JIT can optimise the more than 80 % of executed
   instructions that they are. FP, AdvSIMD, crypto and system instructions are

@@ -599,7 +599,14 @@ fn main() -> Result<(), Failure> {
     // Our memory starts as a copy of the RAM of QEMU.
     let ram = leader.memory(RAM_BASE, RAM_MIB as usize * 1024 * 1024)?;
     let memory = FlatMemory::new(RAM_BASE, ram);
-    let mut follower = Follower::new(leader, Cpu::new(memory, State::reset(RAM_BASE)));
+    let cpu = Cpu::new(memory, State::reset(RAM_BASE));
+    // K1 of 3e DESIGN.md: with `VMLAB_HV_JIT=1` every instruction runs as
+    // a compiled block of one instruction.
+    if let Some(error) = &cpu.jit_error {
+        return Err(format!("VMLAB_HV_JIT: {error}").into());
+    }
+    println!("JIT: {}", if cpu.jit_enabled() { "on" } else { "off" });
+    let mut follower = Follower::new(leader, cpu);
     follower.compared = compared.clone();
     follower.translated = translated;
     if walk {
@@ -932,6 +939,13 @@ fn main() -> Result<(), Failure> {
         println!(
             "{waits} WFI encodings left out, {left_out} encodings of registers that the 3d CPU leaves out (the PMU), {} verified instructions that QEMU leads in (counter reads, host calls)",
             run.counts.led
+        );
+    }
+    if run.follower.cpu.jit_enabled() {
+        let jit = run.follower.cpu.jit_counts();
+        println!(
+            "JIT: {} blocks compiled, {} refused, {} instructions compiled, {} in the interpreter",
+            jit.compiled, jit.refused, jit.compiled_instructions, jit.interpreted_instructions
         );
     }
     finish(&run.counts, &formats, corpus_out.as_deref(), &header)

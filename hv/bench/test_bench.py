@@ -523,6 +523,65 @@ class HvMachineTests(unittest.TestCase):
         self.assertEqual(desc["vcpus"], 2)
 
 
+class BootCountersTests(unittest.TestCase):
+    def test_the_last_paused_line_of_each_vcpu_is_summed_between_pause_and_resume(self):
+        import backends
+
+        log = (
+            "vcpu 0: paused after 5 instructions, 1 translated blocks in 0 ms\n"
+            "vcpu 0: paused after 100 instructions, 7 translated blocks in 3 ms\n"
+            "vcpu 1: paused after 50 instructions, 2 translated blocks in 1 ms\n"
+        )
+        backend = backends.HvBackend.__new__(backends.HvBackend)
+        backend.control = mock.Mock()
+        backend.session = mock.Mock()
+        backend.session.stderr_text.return_value = log
+        counters = backend.boot_counters(2)
+        self.assertEqual(
+            counters, {"instructions": 150, "translations": 9, "translation_ms": 4})
+        self.assertEqual(
+            [c.args[0] for c in backend.control.request.call_args_list], ["pause", "resume"])
+        self.assertEqual(lib.UNIT["boot_mips"], "MIPS")
+        self.assertEqual(lib.DIRECTION["boot_mips"], "higher")
+
+
+class BootMipsTests(unittest.TestCase):
+    """The boot MIPS row (card #1142): the instructions of an emulated
+    aarch64 boot, read over the debug port of the control socket."""
+
+    def test_the_backend_sums_the_vcpus_and_resumes(self):
+        import backends
+
+        calls = []
+
+        class Control:
+            def debug(self, operation, **kwargs):
+                calls.append((operation, kwargs))
+                if operation == "read_registers":
+                    count = 1000 * (kwargs["vcpu"] + 1)
+                    return {"result": "aarch64_registers", "registers": {"instructions": count}}
+                return {"result": "done"}
+
+        backend = backends.HvBackend.__new__(backends.HvBackend)
+        backend.control = Control()
+        self.assertEqual(backend.instructions(2), 3000)
+        self.assertEqual(
+            [operation for operation, _ in calls],
+            ["pause", "read_registers", "read_registers", "detach"],
+        )
+        self.assertEqual(calls[-1][1], {"resume": True})
+
+    def test_only_vmlab_hv_on_aarch64_counts(self):
+        import run
+
+        hv = argparse.Namespace(backend="vmlab-hv")
+        self.assertTrue(run.counts_instructions(hv, "aarch64"))
+        self.assertFalse(run.counts_instructions(hv, "riscv64"))
+        self.assertFalse(run.counts_instructions(argparse.Namespace(backend="qemu"), "aarch64"))
+        self.assertEqual(lib.UNIT["boot_mips"], "MIPS")
+        self.assertEqual(lib.DIRECTION["boot_mips"], "higher")
+
+
 class NoiseControlTests(unittest.TestCase):
     def test_g2g_samples_are_named_for_the_sender_and_receiver(self):
         import run

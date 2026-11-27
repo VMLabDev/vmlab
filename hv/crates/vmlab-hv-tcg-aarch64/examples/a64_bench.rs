@@ -52,6 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     memory.write(LOAD, &image)?;
     memory.write(SYNCHRONOUS, &HVC.to_le_bytes())?;
     let mut cpu = Cpu::new(memory, State::reset(LOAD));
+    if let Some(error) = &cpu.jit_error {
+        return Err(format!("VMLAB_HV_JIT: {error}").into());
+    }
     cpu.state.system.regs[reg::VBAR_EL1] = VECTORS;
     let start = Instant::now();
     let stop = cpu.run(limit);
@@ -90,12 +93,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("the exit reason is {reason:#x}").into());
     }
     let mips = instructions as f64 / seconds / 1e6;
+    // With `VMLAB_HV_JIT=1` (3e DESIGN.md J1): the blocks and instructions
+    // that ran in the interpreter (H2b), and what the emitter made.
+    let jit = cpu.jit_counts();
     println!(
         "{{\"instructions\": {}, \"seconds\": {seconds:.9}, \"mips\": {mips:.6}, \
          \"translations\": {}, \"exit_code\": {code}, \
+         \"jit\": {}, \"interpreted_blocks\": {}, \"interpreted_instructions\": {}, \
+         \"compiled_blocks\": {}, \"refused_blocks\": {}, \"code_bytes\": {}, \
+         \"compile_ns\": {}, \
          \"x2\": {}, \"x3\": {}, \"x4\": {}, \"x5\": {}}}",
         instructions,
         cpu.translations,
+        cpu.jit_enabled(),
+        jit.interpreted_runs,
+        jit.interpreted_instructions,
+        jit.compiled,
+        jit.refused,
+        jit.bytes,
+        jit.compile_ns,
         cpu.state.x(2),
         cpu.state.x(3),
         cpu.state.x(4),

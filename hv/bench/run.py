@@ -56,7 +56,7 @@ IDLE_WINDOW = 60.0       # idle host CPU sampling window
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--backend", choices=("qemu", "vmlab-hv", "interpreter", "interpreter-reference", "interpreter-specialized"), default="qemu")
+    p.add_argument("--backend", choices=("qemu", "vmlab-hv", "interpreter", "interpreter-reference", "interpreter-specialized", "jit"), default="qemu")
     p.add_argument("--arch", default="all", help="all, or x86_64,aarch64,riscv64")
     p.add_argument("--vcpus", default=None,
                    help="comma-separated vCPU counts (default: 1,4 TCG, "
@@ -111,6 +111,24 @@ def make_backend(args, run_dir, arch, smp, pin, overlay, code_fd, vars_fd):
     )
 
 
+def measures_boot_mips(args, arch):
+    return (args.backend == "vmlab-hv" and arch == "aarch64"
+            and args.guest == "debian-13" and args.suite == "boot")
+
+
+def boot_instructions(stderr, vcpus):
+    counts = {}
+    for line in stderr.splitlines():
+        if line.startswith("boot instructions: "):
+            cpu, count = map(int, line.removeprefix("boot instructions: ").split())
+            if cpu in counts or count < 0:
+                raise lib.BenchError(f"invalid boot instruction count for vCPU {cpu}")
+            counts[cpu] = count
+    if counts.keys() != set(range(vcpus)) or not sum(counts.values()):
+        raise lib.BenchError(f"missing boot instruction counts for {vcpus} vCPUs: {counts}")
+    return sum(counts.values())
+
+
 def one_repeat(args, arch, smp, pin, version, index):
     """One VM: launch → ready → workloads → clean shutdown. Returns samples."""
     run_dir = os.path.join(
@@ -122,8 +140,10 @@ def one_repeat(args, arch, smp, pin, version, index):
     backend = make_backend(args, run_dir, arch, smp, pin, overlay, code_fd, vars_fd)
 
     result = {"run": run_dir, "arch": arch, "vcpus": smp, "backend": args.backend}
-    session = backend.launch()
+    boot_mips = measures_boot_mips(args, arch)
+    session = backend.launch(boot_mips=True) if boot_mips else backend.launch()
     agent = None
+    stopped_at_ready = False
     try:
         backend.release_cpus()
         result["t_release"] = round(session.elapsed(), 2)
@@ -133,14 +153,33 @@ def one_repeat(args, arch, smp, pin, version, index):
         agent, hello = lib.wait_for_agent(
             backend.agent_socket(), deadline, vm_exited=session.exit_code
         )
-        result["boot_to_agent_ready"] = round(session.elapsed(), 2)
+        ready_seconds = session.elapsed()
+        result["boot_to_agent_ready"] = round(ready_seconds, 2)
         result["agent_hello"] = {
             k: hello.get(k) for k in ("agent_version", "os", "features")
         }
         log(f"agent ready after {result['boot_to_agent_ready']}s")
+        boot = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
+        if counts_instructions(args, arch) and not boot_mips:
+            instructions = backend.instructions(smp)
+            result["boot_instructions"] = instructions
+            boot["boot_mips"] = round(
+                instructions / result["boot_to_agent_ready"] / 1e6, 2
+            )
+            log(f"{instructions} instructions to agent ready: {boot['boot_mips']} MIPS")
 
         if args.suite == "boot":
-            result["samples"] = {"boot_to_agent_ready": result["boot_to_agent_ready"]}
+            if boot_mips:
+                # Quit at the handshake so the final vCPU counts exclude guest shutdown.
+                backend.quit()
+                stopped_at_ready = True
+                agent.close()
+                agent = None
+                if session.wait_exit(30) != 0:
+                    raise lib.BenchError("VM failed to exit cleanly at agent ready")
+                result["boot_instructions"] = boot_instructions(session.stderr_text(), smp)
+                boot["boot_mips"] = result["boot_instructions"] / ready_seconds / 1e6
+            result["samples"] = boot
             return result, backend, session, agent, None
 
         def timed(name, argv, timeout):
@@ -185,7 +224,7 @@ def one_repeat(args, arch, smp, pin, version, index):
         result["sha256_digest"] = digest
 
         result["samples"] = {
-            "boot_to_agent_ready": result["boot_to_agent_ready"],
+            **boot,
             "sha256_256M": round(sha_secs, 2),
             "xz_9_32M": round(xz_secs, 2),
         }
@@ -210,7 +249,7 @@ def one_repeat(args, arch, smp, pin, version, index):
                         agent.shutdown()
                 finally:
                     agent.close()
-            if args.backend == "vmlab-hv":
+            if args.backend == "vmlab-hv" and not stopped_at_ready:
                 backend.quit()
             if agent is not None and session.wait_exit(SHUTDOWN_TIMEOUT) is None:
                 log(f"VM did not exit after powerdown within {SHUTDOWN_TIMEOUT}s")
@@ -230,9 +269,17 @@ def one_repeat(args, arch, smp, pin, version, index):
             json.dump(result, f, indent=1)
 
 
+def counts_instructions(args, arch):
+    """Whether a run reads the instruction count of its boot: vmlab-hv on
+    an emulated aarch64 machine, whose vCPUs count what they run."""
+    return args.backend == "vmlab-hv" and arch == "aarch64"
+
+
 def run_config(args, arch, smp, pin, version, commit, dirty, host):
     """N repeats of one configuration → one history line per workload."""
     workloads = ("boot_to_agent_ready",) if args.suite == "boot" else lib.TCG_WORKLOADS
+    if counts_instructions(args, arch):
+        workloads = (*workloads, "boot_mips")
     all_samples = {w: [] for w in workloads}
     digests = set()
     env = {
@@ -243,6 +290,13 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         "template": version,
         "host_cpus": os.cpu_count(),
     }
+    if args.backend == "vmlab-hv" and arch == "aarch64":
+        # The JIT of 3e (DESIGN.md J1) is off unless VMLAB_HV_JIT turns it on.
+        env["jit"] = lib.jit_enabled()
+        env["jit_reports"] = []
+    if "boot_mips" in workloads:
+        env["boot_instruction_counts"] = []
+        env["boot_block_counts_enabled"] = "VMLAB_HV_BOOT_BLOCK_COUNTS" in os.environ
     for i in range(1, args.repeats + 1):
         log(f"=== {args.backend} {arch} smp={smp} {args.guest} repeat {i}/{args.repeats}")
         result, backend, session, agent, digest = one_repeat(
@@ -250,6 +304,10 @@ def run_config(args, arch, smp, pin, version, commit, dirty, host):
         )
         env["loadavg_end"] = lib.read_loadavg()
         env["backend_version"] = backend.backend_version()
+        if "jit_reports" in env:
+            env["jit_reports"].append(lib.last_jit_report(result["run"]))
+        if "boot_instructions" in result:
+            env["boot_instruction_counts"].append(result["boot_instructions"])
         for w in workloads:
             all_samples[w].append(result["samples"][w])
         if digest is not None:
@@ -291,7 +349,7 @@ def finish_config(args, arch, smp, all_samples, env, commit, dirty, host):
             "qemu_baseline": None,
             "env": env,
         }
-        if args.backend == "vmlab-hv":
+        if args.backend == "vmlab-hv" and w != "boot_mips":
             record["qemu_baseline"] = lib.latest_baseline(
                 existing, arch, args.guest, smp, w
             )
@@ -1162,9 +1220,10 @@ def sweep_stale_vms():
 
 def main(argv=None):
     args = parse_args(argv)
-    if (args.backend == "interpreter" and args.arch == "aarch64") or (
+    if (args.backend in ("interpreter", "jit") and args.arch == "aarch64") or (
             args.backend == "qemu" and args.guest == "flat-a64"):
-        # The flat aarch64 images on our interpreter loop and on QEMU TCG.
+        # The flat aarch64 images on our interpreter loop, on its JIT (3e
+        # DESIGN.md J1) and on QEMU TCG.
         if args.arch not in ("all", "aarch64"):
             raise lib.BenchError("the guest flat-a64 is an aarch64 image")
         if args.suite == "boot":
@@ -1172,6 +1231,8 @@ def main(argv=None):
         import micro_a64
         commit, dirty = git_commit()
         return micro_a64.run(args, commit, dirty, os.uname().nodename, log)
+    if args.backend == "jit":
+        raise lib.BenchError("the jit backend runs the flat aarch64 images: --arch aarch64")
     if args.backend in ("interpreter", "interpreter-reference", "interpreter-specialized") or (
             args.backend == "qemu" and args.guest == "flat-rv64gc"):
         if args.suite == "boot":
@@ -1240,8 +1301,8 @@ def main(argv=None):
             try:
                 records = run_config(args, arch, smp, pin, version, commit, dirty, host)
                 for r in records:
-                    log(f"history: {r['workload']} median={r['median']}s "
-                        f"spread={r['spread']}s")
+                    log(f"history: {r['workload']} median={r['median']}{r['unit']} "
+                        f"spread={r['spread']}{r['unit']}")
             except lib.BackendUnsupported as skip:
                 log(f"SKIP {skip.backend} {arch} smp={smp}: {skip.reason}")
                 log("(no history recorded for this configuration)")

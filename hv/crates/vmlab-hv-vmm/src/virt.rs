@@ -979,6 +979,15 @@ pub fn assemble(
 }
 
 impl Virt {
+    pub(crate) fn report_boot_counts(&self) {
+        let instructions = std::env::var_os("VMLAB_HV_BOOT_INSTRUCTIONS").is_some();
+        if instructions || std::env::var_os("VMLAB_HV_BOOT_BLOCK_COUNTS").is_some() {
+            for vcpu in &self.vcpus {
+                vcpu.lock().report_boot_counts(instructions);
+            }
+        }
+    }
+
     pub(crate) fn vcpus(&self) -> usize {
         self.vcpus.len()
     }
