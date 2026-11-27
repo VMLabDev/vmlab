@@ -107,6 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          \"compile_ns\": {}, \"chaining\": {}, \"chained\": {}, \"jump_hits\": {}, \
          \"unlinked\": {}, \"lookups\": {}, \"entered\": {}, \"links\": {}, \
          \"unlinks\": {}, \"fills\": {}, \"clears\": {}, \"tlb_accesses\": {}, \"tlb_misses\": {}, \
+         \"fused\": {}, \"lazy\": {}, \
          \"x2\": {}, \"x3\": {}, \"x4\": {}, \"x5\": {}}}",
         instructions,
         cpu.translations,
@@ -129,6 +130,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         jit.clears,
         jit.tlb_accesses,
         jit.tlb_misses,
+        jit.fused,
+        jit.lazy,
         cpu.state.x(2),
         cpu.state.x(3),
         cpu.state.x(4),

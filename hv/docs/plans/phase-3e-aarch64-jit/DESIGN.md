@@ -961,6 +961,102 @@ of the two.
   core (four vCPU threads and the threads of the devices share four
   cores) takes its mail only when it runs again.
 
+### G4, measured by card J5
+
+Helios, 2026-11-27, one vCPU, cores 28 to 31, three repeats, *measured*.
+Both sides are one binary: `VMLAB_HV_JIT_FLAGS=0` turns the forms of H8 off
+and leaves the forms of J1. Other cards ran builds and boots at the same time
+(load average 5 to 25). The rows are in `bench/history/aarch64.jsonl` with
+the note "card J5".
+
+| Workload | J1 forms | Host flags (J5) |
+|---|---|---|
+| CoreMark mix, flat, MIPS (median) | 164.4 | 169.6 |
+| Scalar loop, flat, MIPS (median) | 158.3 | 154.4 |
+| Debian 13 boot MIPS to agent ready (median, two sets) | 132.7 and 109.0 | 127.0 |
+
+- **J5a.** What is built. H8a: a comparison (`Equal`, `NotEqual`, `Less`,
+  `LessEqual`, `IsZero`) whose one reader is the next operation, a `Select`
+  or a `Guard`, is a `cmp` and a `cmov` or a `jcc`. A signed order, which the
+  lifter writes as an unsigned order of two values with flipped sign bits,
+  is a `cmp` at 32 or 64 bits with a signed condition, and an `And` compared
+  with zero is a `test`. H8b needed no change: the lifter of #1142 writes the
+  record (the kind and two operands) as outputs of the block, a store each.
+  H8c: a call of `a64_condition` is inline for seven kinds of record (a
+  compare at 64 and 32 bits, a logical result at both, the explicit flags as
+  a mask of 16 bits, a sum without a carry in at both), from the map
+  `flags::host_forms`, and a call for the rest. HI and LS after a sum have
+  no host condition and call.
+- **J5b.** The gain is below G4 (1.2 to 1.7 times): CoreMark gains 3 %, and
+  the loop and the boot move by less than the noise. CoreMark has 545 fused
+  comparisons in 337 blocks and no lazy condition. The basis of an
+  explanation, not measured: a fused comparison saves a `setcc`, a `test`
+  and a register, about two host instructions of the 40 to 60 of a block,
+  and every block still leaves to the Rust loop. The spike measured G4 on
+  chained blocks, which J4 brings.
+- **J5c.** Not fused: the `And` and `Or` of comparisons that `CCMP` leaves,
+  a lazy condition whose reader is a `Select` (it is a `setcc` and a
+  `test`), and a comparison that is not just before its reader. In the
+  blocks of `CMP` with `B.cond`, `CSEL` and `CSET`, `TST` with `B.cond` and
+  `CMN` with `CSET`, the reader is always next.
+- **J5d.** One boot of the twelve went to emergency mode, with the host
+  flags on: `systemd-udevd` took more than 90 s to start, `/boot/efi` timed
+  out, and the vCPU ran 1e9 instructions in 66 s, so the guest was mostly
+  waiting. That set of three has no row. The other five boots with the host
+  flags on and all six without them reached agent ready. No serial log of
+  the twelve has a segfault, a trap or an oops. K1 and K2 found no
+  difference. This card does not show whether the JIT caused it. It is a
+  risk for T1 (J8).
+
+### J6, measured by card J6
+
+Helios, 2026-11-27, one vCPU, *measured*, the JIT on for both columns.
+Before: `6242195c` (`next` before J5 was merged). After: `078143df`, the
+same base with this card. Both sides lack J5 (G4). The two boots of
+each pair ran side by side, on cores 12 to 15 and 16 to 19. Other cards ran
+builds and boots at the same time, and the merge bar of this card ran
+during the third pair of Debian boots (load average 6 to 15 of 32 threads).
+The rows are in `bench/history/aarch64.jsonl`.
+
+| Workload | Before | After | Gain |
+|---|---|---|---|
+| CoreMark mix, flat, MIPS (median of 3, cores 28 to 31) | 1,562.9 | 1,854.2 | 1.19 times |
+| Scalar loop, flat, MIPS | 1,967.9 | 1,983.0 | none: noise |
+| Debian 13 boot to agent ready, s (median of 3) | 88.3 (82.7 to 112.3) | 84.4 (81.4 to 118.6) | 1.05 times |
+| The same, boot MIPS | 203.1 | 212.3 | 1.05 times |
+| Blocks refused by the emitter in the Debian boot (H2b), each repeat | 357, 347, 354 | 0, 0, 0 | |
+| Instructions in the interpreter in the Debian boot, each repeat | 44.0, 43.7, 46.9 million in 5.60, 5.57, 5.98 million runs of refused blocks | 15, 9, 0, in 2, 1, 0 runs at the budget (H2c) | |
+| Fedora 44, the same counts at 29e9 to 31e9 instructions (J6f) | 757 blocks refused, 283.3 million instructions in 21.4 million runs | 0 refused, 30 and 34 instructions in 3 runs at the budget, in two runs | |
+| K3 on Debian 13 (`VMLAB_HV_JIT_CHECK_RUNS=1000`), agent ready, s | | 144.2, no difference, 137.3 million runs checked | |
+
+- **J6a. The fallback count is zero.** No block of the Debian or the Fedora
+  boot runs in the interpreter for a missing form. What runs there is H2c:
+  a block that the budget does not hold whole runs one instruction at a time
+  (0 to 15 instructions a boot). No instruction of the flat images runs in
+  the interpreter, before or after.
+- **J6b. What the boots refused** was `RBIT`, as J1a found: with its form
+  no block is refused, and on a host with `lzcnt`, `bmi1` and `popcnt`
+  (helios) the emitter has no other refusal of a form.
+- **J6c. The other forms** replace calls of the thunk, which were no
+  fallback. The gain on CoreMark is theirs: no block of the flat images was
+  refused before either. Which of them gives it is not measured. The basis
+  of an explanation: its functions save and restore registers in pairs,
+  and an `LDP` or an `STP` is now inline over the fast TLB.
+- **J6d. Code.** The Debian boot compiled 0.95 million blocks to 455 MB of
+  code (479 bytes a block) and dropped the region 6 times, against 0.88
+  million, 368 MB (418 bytes a block) and 5 drops before, and every drop
+  compiles the working set again. Compile time 6.8 s against 5.7 s. The
+  basis of an explanation, not measured: a pair and a generic of two words
+  are longer inline than a call of the thunk.
+- **J6e. Not done:** the eager write-back of H3, which the card left
+  optional: neither built nor measured.
+- **J6f. Fedora at one vCPU** reached emergency mode in both runs of this
+  card and in the run of `next` beside the first, on a 90 s device timeout
+  (`boot-efi.mount`, `boot.mount`), as card #1048 found. Its counts in the
+  table are those of the counter line at 29e9 to 31e9 instructions, into
+  systemd, of the 30.7e9 of a whole boot (3d:M2). T1 (J8) still asks for
+  Fedora at agent ready.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same

@@ -1,6 +1,6 @@
 //! The emitter: one pass over the operations of a block, values in host
 //! registers (DESIGN.md H3), guards and exits with their stubs (H9), and
-//! every effect through the thunk.
+//! the effects that it has no inline form for through the thunk.
 //!
 //! The frame of the block is the home of every word. A word lives in a
 //! host register from its definition, or from its first use when it is
@@ -10,15 +10,26 @@
 //! register is read from the state at its first use, and written to the
 //! state at the exit of the block.
 //!
-//! The thunk runs what the emitter has no inline form for: the accesses of
-//! 16 bytes and the exclusive ones, the generic operations, the helper
-//! calls, a guard that fails, and a load or a store of 1 to 8 bytes that
-//! misses the fast TLB (H7) or that its block may not inline.
+//! Inline forms (card J6 brought the last ones that a boot needs): every
+//! operation of one word, `RBIT` among them on every x86-64 host; the
+//! generic operations of two words that a block makes most (`And`, `Or`,
+//! `Xor`, `Add` and `Sub` of a bitvector, `Equal`, `NotEqual`, `Slice`,
+//! `Concat`, `BitNot`, `Truncate`, `Select`), each value as two words in two
+//! registers; and the loads and stores of 1 to 16 bytes over the fast TLB.
+//!
+//! The thunk runs the rest: the exclusive accesses and those of `Access`,
+//! the other generic operations, a guard that fails, and a load or a store
+//! that misses the fast TLB (H7) or that its block may not inline. A helper
+//! call whose `Effect` names a function of its own is a System V call of
+//! that function (H12), with the same arguments as the thunk's, so that it
+//! needs no dispatch on the operation; the others go through the thunk.
 //!
 //! A load or a store of 1 to 8 bytes looks up the fast TLB inline (H7, the
 //! layout in `tlb`): the index from the page bits of the address, the tag
 //! compared with the address masked to its page and to the bits below its
-//! size, the addend, and the access of the host. A store then reads the
+//! size, the addend, and the access of the host. A pair of 16 bytes is
+//! masked as an access of 8 and misses at the last 8 bytes of its page, so
+//! that both of its words are in one page: two accesses of 8 bytes. A store then reads the
 //! watch word of its page and asks the thunk to tell the memory when it is
 //! odd (card S3). A miss is a stub after the block (H7c) that puts the words
 //! of the access and of its leave into the frame and runs the access in the
@@ -27,6 +38,16 @@
 //! wrote are read from the frame. The words that a leave of the block names
 //! are in the frame before every effect that can leave through it, so the
 //! frame is what the interpreter would have at that point.
+//!
+//! Flags (DESIGN.md H8): a comparison that the next operation reads, as the
+//! condition of a `Select` or of a `Guard`, and nothing else reads, is a
+//! `cmp` whose host flags that operation reads: a `cmov` or a `jcc`, with
+//! no `setcc` and no `test` between them (H8a). A signed order, which the
+//! block form spells as an unsigned order of two values whose sign bits are
+//! flipped, is a `cmp` of the values at their width, with a signed
+//! condition. A helper call that computes a condition from a lazy flag
+//! record of the guest (`LazyCondition`) is inline for the kinds of record
+//! that its caller names, and a call for the rest (H8c).
 //!
 //! Registers: R13 holds the context of the entry, R14 the frame, R15 the
 //! register slots of the state. RAX, RCX and RDX are scratch. The others,
@@ -49,7 +70,8 @@ use crate::{
     CONTEXT_WRITES, Features, JUMP_ENTRIES, JUMP_SHIFT, LOGGED, LOOKUP, MISS, SITES, VERIFY,
     WATCHED,
 };
-use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Op, Place, Slot};
+use vmlab_hv_tcg_ir::block::{Code, FIRST_EFFECT, Generic, Kind as GenericKind, Op, Place, Slot};
+use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
 
 /// What an effect that the caller describes reads and writes: an access of
 /// `Code::Access` or a call of `Code::Call`, by the index in its `imm`.
@@ -59,6 +81,128 @@ pub struct Effect {
     pub writes: Vec<Slot>,
     /// The leave of the block that the effect can leave through.
     pub leave: Option<u32>,
+    /// A function that runs the effect in place of the thunk (DESIGN.md
+    /// H12), and its second argument: compiled code calls it with the
+    /// System V convention as it calls the thunk, `(env, argument, block)`,
+    /// with the words that it reads in the frame, and reads what it writes
+    /// from there. 0: go on. Anything else: the block leaves with that value.
+    /// The address is that of an `extern "sysv64"` function of the type
+    /// `crate::Thunk`.
+    pub direct: Option<(u64, u64)>,
+    /// A helper call that is a condition of a lazy flag record, with the
+    /// inline forms of its kinds (H8c).
+    pub condition: Option<LazyCondition>,
+}
+
+/// A helper call whose result is whether a condition holds for a lazy flag
+/// record of the guest: a kind and two operands (DESIGN.md H8c). The caller
+/// knows the guest. It names each kind of record that has an inline form,
+/// and the form. The call runs for a record of any other kind. The forms
+/// are used only where the word `code` is the constant `code_value`: they
+/// are the forms of that one condition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LazyCondition {
+    pub kind: Slot,
+    pub a: Slot,
+    pub b: Slot,
+    pub code: Slot,
+    pub code_value: u64,
+    /// The word of the result: 0 or 1.
+    pub result: Slot,
+    /// Each kind of record with its form, tried in order.
+    pub cases: Vec<(u64, FlagTest)>,
+}
+
+/// The host operation whose flags a `FlagTest::Host` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagOperation {
+    /// `cmp a, b`: the flags of `a - b`.
+    Sub,
+    /// `add a, b`: the flags of `a + b`.
+    Add,
+    /// `test a, a`: the flags of `a`, with CF and OF clear.
+    Test,
+}
+
+/// How a condition follows from the operands of one kind of record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagTest {
+    /// It holds, or does not, whatever the operands are.
+    Always(bool),
+    /// The host condition `cond` after `operation` on the low 32 bits of
+    /// the operands, or on all 64 when `wide`.
+    Host {
+        operation: FlagOperation,
+        wide: bool,
+        cond: Cond,
+    },
+    /// The bit `a & 15` of the mask: a record that holds the flags
+    /// themselves in the low four bits of `a`.
+    Table(u16),
+}
+
+/// The flags CF, ZF, SF and OF of `cmp a, b` in 64 bits, or in 32 when not
+/// `wide`, from the definition of `sub` in volume 2 of the Intel manual.
+pub fn sub_flags(a: u64, b: u64, wide: bool) -> (bool, bool, bool, bool) {
+    let (width, mask) = if wide {
+        (64, u64::MAX)
+    } else {
+        (32, u64::from(u32::MAX))
+    };
+    let (a, b) = (a & mask, b & mask);
+    let result = a.wrapping_sub(b) & mask;
+    let sign = |value: u64| value >> (width - 1) & 1 == 1;
+    (
+        a < b,
+        result == 0,
+        sign(result),
+        sign(a) != sign(b) && sign(result) != sign(a),
+    )
+}
+
+/// The flags of `add a, b`, as `sub_flags` gives those of `cmp`.
+pub fn add_flags(a: u64, b: u64, wide: bool) -> (bool, bool, bool, bool) {
+    let (width, mask) = if wide {
+        (64, u64::MAX)
+    } else {
+        (32, u64::from(u32::MAX))
+    };
+    let (a, b) = (a & mask, b & mask);
+    let sum = u128::from(a) + u128::from(b);
+    let result = sum as u64 & mask;
+    let sign = |value: u64| value >> (width - 1) & 1 == 1;
+    (
+        sum >> width != 0,
+        result == 0,
+        sign(result),
+        sign(a) == sign(b) && sign(result) != sign(a),
+    )
+}
+
+impl FlagTest {
+    /// Whether the test holds for the operands, by the definitions of the
+    /// host instructions: what the compiled form must give.
+    pub fn evaluate(self, a: u64, b: u64) -> bool {
+        match self {
+            FlagTest::Always(holds) => holds,
+            FlagTest::Table(mask) => mask >> (a & 15) & 1 == 1,
+            FlagTest::Host {
+                operation,
+                wide,
+                cond,
+            } => {
+                let (cf, zf, sf, of) = match operation {
+                    FlagOperation::Sub => sub_flags(a, b, wide),
+                    FlagOperation::Add => add_flags(a, b, wide),
+                    FlagOperation::Test => {
+                        let (_, zf, sf, _) = sub_flags(a, 0, wide);
+                        (false, zf, sf, false)
+                    }
+                };
+                cond.holds(cf, zf, sf, of)
+            }
+        }
+    }
 }
 
 /// How the loads and stores of 1 to 8 bytes of a block reach memory.
@@ -298,6 +442,228 @@ fn uses_of(op: &Op, generics: &[Generic], shape: &Shape) -> Option<(Vec<Slot>, V
     })
 }
 
+/// An operand of a comparison that becomes host flags: a word, or a
+/// constant that no word holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operand {
+    Word(Slot),
+    Imm(u64),
+}
+
+/// A comparison that the operation after it reads as host flags (H8a):
+/// `cmp left, right` in 64 bits, or in 32 when not `wide`, then `cond`.
+/// With `test`, a comparison of `left AND right` with zero: `test left,
+/// right`.
+#[derive(Clone, Copy, Debug)]
+struct Fusion {
+    left: Operand,
+    right: Operand,
+    cond: Cond,
+    wide: bool,
+    test: bool,
+}
+
+impl Fusion {
+    fn words(&self) -> impl Iterator<Item = Slot> {
+        [self.left, self.right]
+            .into_iter()
+            .filter_map(|operand| match operand {
+                Operand::Word(word) => Some(word),
+                Operand::Imm(_) => None,
+            })
+    }
+}
+
+/// The comparisons of the block that become host flags (H8a): for each
+/// operation, the comparison that it reads as flags, and whether the
+/// emitter skips it because the operation after it reads it so. The uses of
+/// the operands move to the operation that reads the flags.
+fn fusions(
+    ops: &[Op],
+    leaves: &[Vec<Slot>],
+    homes: &[Home],
+    uses: &mut [Vec<u32>],
+) -> (Vec<Option<Fusion>>, Vec<bool>) {
+    let mut fused = vec![None; ops.len()];
+    let mut skip = vec![false; ops.len()];
+    for i in 0..ops.len().saturating_sub(1) {
+        let op = ops[i];
+        let cond = match op.code {
+            Code::Equal | Code::IsZero => Cond::E,
+            Code::NotEqual => Cond::Ne,
+            Code::Less => Cond::B,
+            Code::LessEqual => Cond::Be,
+            _ => continue,
+        };
+        let j = i + 1;
+        let consumer = ops[j];
+        let reads_flags = match consumer.code {
+            Code::Select => {
+                consumer.imm == u64::from(op.dst) && consumer.a != op.dst && consumer.b != op.dst
+            }
+            Code::Guard => {
+                consumer.a == op.dst
+                    && leaves
+                        .get(consumer.imm as usize)
+                        .is_some_and(|leave| !leave.contains(&op.dst))
+            }
+            _ => false,
+        };
+        let right = if op.code == Code::IsZero {
+            Operand::Imm(0)
+        } else {
+            Operand::Word(op.b)
+        };
+        if !reads_flags
+            || uses[usize::from(op.dst)] != [j as u32]
+            || op.a == op.dst
+            || right == Operand::Word(op.dst)
+        {
+            continue;
+        }
+        let mut fusion = Fusion {
+            left: Operand::Word(op.a),
+            right,
+            cond,
+            wide: true,
+            test: false,
+        };
+        let mut group = vec![i];
+        let with_zero = match op.code {
+            Code::IsZero => true,
+            Code::Equal | Code::NotEqual => homes[usize::from(op.b)] == Home::Const(0),
+            _ => false,
+        };
+        if with_zero && let Some((x, y, wide, at)) = conjunction(ops, i, uses) {
+            fusion = Fusion {
+                left: Operand::Word(x),
+                right: Operand::Word(y),
+                cond,
+                wide,
+                test: true,
+            };
+            group.push(at);
+        } else if matches!(op.code, Code::Less | Code::LessEqual)
+            && let Some((x, y, wide, flips)) = signed(ops, i, homes, uses)
+        {
+            fusion = Fusion {
+                left: x,
+                right: y,
+                cond: if op.code == Code::Less {
+                    Cond::L
+                } else {
+                    Cond::Le
+                },
+                wide,
+                test: false,
+            };
+            group.extend(flips);
+        }
+        for word in fusion.words() {
+            let list = &mut uses[usize::from(word)];
+            list.retain(|at| !group.contains(&(*at as usize)));
+            let at = list.partition_point(|at| *at < j as u32);
+            if list.get(at) != Some(&(j as u32)) {
+                list.insert(at, j as u32);
+            }
+        }
+        for at in group {
+            skip[at] = true;
+            uses[usize::from(ops[at].dst)].clear();
+        }
+        fused[j] = Some(fusion);
+    }
+    (fused, skip)
+}
+
+/// A comparison with zero at `i` of the result of an `And` just before it
+/// that nothing else reads, of 64 bits or of 32: the operands of the `And`,
+/// whether it is of 64 bits, and its place.
+fn conjunction(ops: &[Op], i: usize, uses: &[Vec<u32>]) -> Option<(Slot, Slot, bool, usize)> {
+    let at = i.checked_sub(1)?;
+    let def = ops[at];
+    if def.code != Code::And || def.dst != ops[i].a || uses[usize::from(def.dst)] != [i as u32] {
+        return None;
+    }
+    let wide = match def.imm {
+        u64::MAX => true,
+        0xffff_ffff => false,
+        _ => return None,
+    };
+    if [def.a, def.b].contains(&ops[i].dst) {
+        return None;
+    }
+    Some((def.a, def.b, wide, at))
+}
+
+/// A signed order at `i`: an unsigned order of two values whose sign bits
+/// are flipped, each by an operation just before it that nothing else
+/// reads, or as a constant. The values, whether their width is 64 bits
+/// (else 32), and the operations that flip them.
+fn signed(
+    ops: &[Op],
+    i: usize,
+    homes: &[Home],
+    uses: &[Vec<u32>],
+) -> Option<(Operand, Operand, bool, Vec<usize>)> {
+    let op = ops[i];
+    let constant = |word: Slot| match homes[usize::from(word)] {
+        Home::Const(value) => Some(value),
+        _ => None,
+    };
+    // A flip of the operations before `i`: the value and its width.
+    let flip = |word: Slot| -> Option<(Slot, bool, usize)> {
+        let at = (i.saturating_sub(2)..i)
+            .rev()
+            .find(|at| ops[*at].dst == word)?;
+        let def = ops[at];
+        if def.code != Code::Xor || uses[usize::from(word)] != [i as u32] {
+            return None;
+        }
+        let (value, sign) = match (constant(def.a), constant(def.b)) {
+            (_, Some(sign)) => (def.a, sign),
+            (Some(sign), None) => (def.b, sign),
+            (None, None) => return None,
+        };
+        let wide = match (sign, def.imm) {
+            (0x8000_0000_0000_0000, u64::MAX) => true,
+            (0x8000_0000, 0xffff_ffff) => false,
+            _ => return None,
+        };
+        Some((value, wide, at))
+    };
+    let x = flip(op.a);
+    let y = flip(op.b);
+    let wide = match (x, y) {
+        (Some((_, a, at_a)), Some((_, b, at_b))) if a == b && at_a != at_b => a,
+        (Some((_, wide, _)), None) | (None, Some((_, wide, _))) => wide,
+        _ => return None,
+    };
+    let sign = if wide { 1u64 << 63 } else { 1 << 31 };
+    // The other operand is a constant with its sign bit flipped already.
+    let operand = |word: Slot, flipped: Option<(Slot, bool, usize)>| match flipped {
+        Some((value, _, _)) => Some(Operand::Word(value)),
+        None => constant(word)
+            .filter(|value| wide || *value <= u64::from(u32::MAX))
+            .map(|value| Operand::Imm(value ^ sign)),
+    };
+    let left = operand(op.a, x)?;
+    let right = operand(op.b, y)?;
+    let flips: Vec<usize> = [x, y].into_iter().flatten().map(|(_, _, at)| at).collect();
+    // A value read later than its place must not be written in between.
+    let written: Vec<Slot> = (flips.iter().copied().min()?..=i)
+        .map(|at| ops[at].dst)
+        .collect();
+    for operand in [left, right] {
+        if let Operand::Word(word) = operand
+            && written.contains(&word)
+        {
+            return None;
+        }
+    }
+    Some((left, right, wide, flips))
+}
+
 struct Emitter<'a> {
     asm: Asm,
     /// Where each word is at the head of the block.
@@ -312,6 +678,8 @@ struct Emitter<'a> {
     features: Features,
     defect: Defect,
     shape: &'a Shape<'a>,
+    /// The lazy conditions emitted inline.
+    lazy: u64,
 }
 
 impl Emitter<'_> {
@@ -541,6 +909,12 @@ impl Emitter<'_> {
     /// Call the thunk for the operation `index`, keeping `saved`. RAX holds
     /// what it returns.
     fn call_thunk(asm: &mut Asm, index: u64, saved: &[Reg]) {
+        Self::call_function(asm, None, index, saved);
+    }
+
+    /// Call `function`, or the thunk of the context, with `argument`,
+    /// keeping `saved`. RAX holds what it returns.
+    fn call_function(asm: &mut Asm, function: Option<u64>, argument: u64, saved: &[Reg]) {
         for reg in saved {
             asm.push(*reg);
         }
@@ -550,9 +924,15 @@ impl Emitter<'_> {
             asm.alu_imm(Alu::Sub, Rm::Reg(RSP), 8);
         }
         asm.mov(RDI, Rm::Mem(R13, CONTEXT_ENV));
-        asm.mov_imm(RSI, index);
+        asm.mov_imm(RSI, argument);
         asm.mov(RDX, Rm::Mem(R13, CONTEXT_BLOCK));
-        asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK));
+        match function {
+            Some(function) => {
+                asm.mov_imm(RAX, function);
+                asm.call_indirect(Rm::Reg(RAX));
+            }
+            None => asm.call_indirect(Rm::Mem(R13, CONTEXT_THUNK)),
+        }
         if pad {
             asm.alu_imm(Alu::Add, Rm::Reg(RSP), 8);
         }
@@ -561,8 +941,18 @@ impl Emitter<'_> {
         }
     }
 
-    /// An operation that runs through the thunk.
+    /// An operation that runs through the thunk, or through the function
+    /// that its `Effect` names.
     fn effect(&mut self, index: usize, reads: &[Slot], writes: &[Slot]) {
+        let op = self.shape.ops[index];
+        let direct = if op.code == Code::Call {
+            self.shape
+                .calls
+                .get(op.imm as usize)
+                .and_then(|call| call.direct)
+        } else {
+            None
+        };
         let at = index as u32;
         for word in reads {
             self.materialize(*word);
@@ -573,22 +963,205 @@ impl Emitter<'_> {
             self.words[usize::from(*word)].home = Home::Frame;
         }
         let saved = self.live_caller_saved();
+        match direct {
+            Some((function, argument)) => {
+                Self::call_function(&mut self.asm, Some(function), argument, &saved);
+            }
+            None => Self::call_thunk(&mut self.asm, index as u64, &saved),
+        }
+        self.asm.test(RAX, RAX);
+        self.asm.jcc_absolute(Cond::Ne, self.exit);
+    }
+
+    /// Whether `lazy` describes the call at `index` as the block holds it:
+    /// its words are those that the call reads and writes, and the word of
+    /// its condition is the constant that its forms are for.
+    fn lazy_fits(&self, lazy: &LazyCondition, reads: &[Slot], writes: &[Slot]) -> bool {
+        let words = self.words.len();
+        [lazy.kind, lazy.a, lazy.b, lazy.code, lazy.result]
+            .iter()
+            .all(|word| usize::from(*word) < words)
+            && [lazy.kind, lazy.a, lazy.b, lazy.code]
+                .iter()
+                .all(|word| reads.contains(word))
+            && writes == [lazy.result]
+            && self.words[usize::from(lazy.code)].home == Home::Const(lazy.code_value)
+    }
+
+    /// The form of a test of the record whose operands are `a` and `b`: 0
+    /// or 1 in RAX. It uses RCX and RDX.
+    fn flag_test(&mut self, test: FlagTest, a: Val, b: Val) {
+        let setcc = |asm: &mut Asm, cond: Cond| asm.setcc_al(cond);
+        match test {
+            FlagTest::Always(holds) => self.asm.mov_imm(RAX, u64::from(holds)),
+            FlagTest::Table(mask) => {
+                self.load(RCX, a);
+                self.asm.alu_imm(Alu::And, Rm::Reg(RCX), 15);
+                self.asm.mov_imm(RAX, u64::from(mask));
+                self.asm.shift_cl(Shift::Shr, RAX);
+                self.asm.alu_imm(Alu::And, Rm::Reg(RAX), 1);
+            }
+            FlagTest::Host {
+                operation,
+                wide,
+                cond,
+            } => {
+                // The moves first, then the `xor` that clears RAX, then the
+                // operation whose flags the `setcc` reads.
+                match operation {
+                    FlagOperation::Sub => {
+                        let left = self.reg(a, RDX);
+                        let right = self.rm(b, RCX);
+                        self.asm.xor32(RAX, RAX);
+                        if wide {
+                            self.asm.alu(Alu::Cmp, left, right);
+                        } else {
+                            self.asm.alu32(Alu::Cmp, left, right);
+                        }
+                    }
+                    FlagOperation::Add => {
+                        self.load(RDX, a);
+                        let right = self.rm(b, RCX);
+                        self.asm.xor32(RAX, RAX);
+                        if wide {
+                            self.asm.alu(Alu::Add, RDX, right);
+                        } else {
+                            self.asm.alu32(Alu::Add, RDX, right);
+                        }
+                    }
+                    FlagOperation::Test => {
+                        let left = self.reg(a, RDX);
+                        self.asm.xor32(RAX, RAX);
+                        if wide {
+                            self.asm.test(left, left);
+                        } else {
+                            self.asm.test32(left, left);
+                        }
+                    }
+                }
+                setcc(&mut self.asm, cond);
+            }
+        }
+    }
+
+    /// A helper call that is a condition of a lazy flag record (H8c): the
+    /// kind is compared with each kind that has a form, whose form then
+    /// runs inline. Any other kind goes to a stub that calls the thunk, as
+    /// `effect` does, and reads the result from the frame.
+    fn lazy_condition(&mut self, index: usize, lazy: &LazyCondition, reads: &[Slot]) {
+        let at = index as u32;
+        if self.next_use(lazy.result, at).is_none() {
+            // A pure call that nothing reads.
+            self.release(reads, at);
+            self.unbind(lazy.result);
+            self.words[usize::from(lazy.result)].home = Home::Frame;
+            return;
+        }
+        self.lazy += 1;
+        let kind = self.value(lazy.kind, at);
+        let a = self.value(lazy.a, at);
+        let b = self.value(lazy.b, at);
+        let done = self.asm.label();
+        let stub = self.asm.label();
+        match kind {
+            Val::Imm(kind) => match lazy.cases.iter().find(|(k, _)| *k == kind) {
+                Some((_, test)) => self.flag_test(*test, a, b),
+                None => self.asm.jmp(stub),
+            },
+            kind => {
+                let kind = self.rm(kind, RCX);
+                for (value, test) in &lazy.cases {
+                    let next = self.asm.label();
+                    match i32::try_from(*value as i64) {
+                        Ok(value) => self.asm.alu_imm(Alu::Cmp, kind, value),
+                        Err(_) => {
+                            self.asm.mov_imm(RDX, *value);
+                            match kind {
+                                Rm::Reg(reg) => self.asm.alu(Alu::Cmp, reg, Rm::Reg(RDX)),
+                                memory => self.asm.alu(Alu::Cmp, RDX, memory),
+                            }
+                        }
+                    }
+                    self.asm.jcc(Cond::Ne, next);
+                    self.flag_test(*test, a, b);
+                    self.asm.jmp(done);
+                    self.asm.bind(next);
+                }
+                self.asm.jmp(stub);
+            }
+        }
+        self.asm.bind(done);
+        self.asm.cold(true);
+        self.asm.bind(stub);
+        for word in reads {
+            let w = self.words[usize::from(*word)];
+            Self::home_code(&mut self.asm, *word, w);
+        }
+        let saved = self.live_caller_saved();
         Self::call_thunk(&mut self.asm, index as u64, &saved);
         self.asm.test(RAX, RAX);
         self.asm.jcc_absolute(Cond::Ne, self.exit);
+        self.asm.mov(RAX, Self::frame(lazy.result));
+        self.asm.jmp(done);
+        self.asm.cold(false);
+        self.define(lazy.result, reads, at);
     }
 
     /// A guard: on the inline path nothing happens. When its condition does
     /// not hold, a stub puts the words of its leave into the frame and asks
     /// the thunk, which leaves the block or lets it go on.
-    fn guard(&mut self, index: usize, op: &Op, reads: &[Slot]) {
+    fn guard(&mut self, index: usize, op: &Op, reads: &[Slot], fusion: Option<Fusion>) {
         let at = index as u32;
-        let condition = self.value(op.a, at);
         let stub = self.asm.label();
         let back = self.asm.label();
-        // The guard fails where the condition is zero and it expects a
-        // value that is not, or the other way.
-        let fail = if op.aux != 0 { Cond::E } else { Cond::Ne };
+        let mut all = reads.to_vec();
+        if let Some(fusion) = fusion {
+            // The guard reads the flags of the comparison before it (H8a).
+            all.extend(fusion.words());
+            let left = self.operand(fusion.left, at);
+            let right = self.operand(fusion.right, at);
+            match self.compare(fusion, left, right) {
+                Ok(cond) => {
+                    let fail = if op.aux != 0 { cond.inverse() } else { cond };
+                    self.asm.jcc(fail, stub);
+                }
+                Err(holds) => {
+                    if holds != (op.aux != 0) {
+                        self.asm.jmp(stub);
+                    }
+                }
+            }
+        } else {
+            let condition = self.value(op.a, at);
+            // The guard fails where the condition is zero and it expects a
+            // value that is not, or the other way.
+            let fail = if op.aux != 0 { Cond::E } else { Cond::Ne };
+            self.guard_test(condition, fail, op, stub);
+        }
+        self.asm.bind(back);
+        // The stub, with the places of the words as they are here.
+        self.asm.cold(true);
+        self.asm.bind(stub);
+        for word in reads {
+            let w = self.words[usize::from(*word)];
+            Self::home_code(&mut self.asm, *word, w);
+        }
+        if fusion.is_some() {
+            // The thunk reads the condition: the value that fails.
+            self.asm
+                .store_imm(Self::frame(op.a), i32::from(op.aux == 0));
+        }
+        let saved = self.live_caller_saved();
+        Self::call_thunk(&mut self.asm, index as u64, &saved);
+        self.asm.test(RAX, RAX);
+        self.asm.jcc_absolute(Cond::Ne, self.exit);
+        self.asm.jmp(back);
+        self.asm.cold(false);
+        self.release(&all, at);
+    }
+
+    /// The test of a guard on the word of its condition.
+    fn guard_test(&mut self, condition: Val, fail: Cond, op: &Op, stub: crate::asm::Label) {
         match condition {
             Val::Imm(value) => {
                 if (value != 0) != (op.aux != 0) {
@@ -604,21 +1177,142 @@ impl Emitter<'_> {
                 self.asm.jcc(fail, stub);
             }
         }
-        self.asm.bind(back);
-        // The stub, with the places of the words as they are here.
-        self.asm.cold(true);
-        self.asm.bind(stub);
-        for word in reads {
-            let w = self.words[usize::from(*word)];
-            Self::home_code(&mut self.asm, *word, w);
+    }
+
+    /// The value of an operand of a fused comparison at `at`.
+    fn operand(&mut self, operand: Operand, at: u32) -> Val {
+        match operand {
+            Operand::Word(word) => self.value(word, at),
+            Operand::Imm(value) => Val::Imm(value),
         }
-        let saved = self.live_caller_saved();
-        Self::call_thunk(&mut self.asm, index as u64, &saved);
-        self.asm.test(RAX, RAX);
-        self.asm.jcc_absolute(Cond::Ne, self.exit);
-        self.asm.jmp(back);
-        self.asm.cold(false);
-        self.release(reads, at);
+    }
+
+    /// Set the host flags of the comparison `fusion` of `left` and `right`,
+    /// and give the condition that holds where the comparison does. With
+    /// two constants it emits nothing and gives whether it holds. It uses
+    /// RCX as its scratch, and no other.
+    fn compare(&mut self, fusion: Fusion, left: Val, right: Val) -> Result<Cond, bool> {
+        let wide = fusion.wide;
+        let cond = fusion.cond;
+        if fusion.test {
+            return self.test_flags(fusion, left, right);
+        }
+        let fits = |value: u64| !wide || i32::try_from(value as i64).is_ok();
+        let cmp = |asm: &mut Asm, left: Reg, right: Rm| {
+            if wide {
+                asm.alu(Alu::Cmp, left, right);
+            } else {
+                asm.alu32(Alu::Cmp, left, right);
+            }
+        };
+        match (left, right) {
+            (Val::Imm(a), Val::Imm(b)) => {
+                let (cf, zf, sf, of) = sub_flags(a, b, wide);
+                Err(cond.holds(cf, zf, sf, of))
+            }
+            (left, Val::Imm(value)) if fits(value) => {
+                let left = self.reg(left, RCX);
+                if value == 0 {
+                    // The flags of `test` are those of `cmp` with zero.
+                    if wide {
+                        self.asm.test(left, left);
+                    } else {
+                        self.asm.test32(left, left);
+                    }
+                } else if wide {
+                    self.asm.alu_imm(Alu::Cmp, Rm::Reg(left), value as i32);
+                } else {
+                    self.asm.alu_imm32(Alu::Cmp, Rm::Reg(left), value as u32);
+                }
+                Ok(cond)
+            }
+            (Val::Imm(value), right) if fits(value) => {
+                let swapped = Fusion {
+                    cond: cond.swapped().expect("an order"),
+                    ..fusion
+                };
+                self.compare(swapped, right, Val::Imm(value))
+            }
+            (left, Val::Imm(value)) => {
+                // A constant that is no immediate, against a register or
+                // memory.
+                self.asm.mov_imm(RCX, value);
+                match left {
+                    Val::Reg(reg) => {
+                        cmp(&mut self.asm, reg, Rm::Reg(RCX));
+                        Ok(cond)
+                    }
+                    other => {
+                        let memory = self.rm(other, RCX);
+                        cmp(&mut self.asm, RCX, memory);
+                        Ok(cond.swapped().expect("an order"))
+                    }
+                }
+            }
+            (left, right) => {
+                let left = self.reg(left, RCX);
+                let right = self.rm(right, RCX);
+                cmp(&mut self.asm, left, right);
+                Ok(cond)
+            }
+        }
+    }
+
+    /// The flags of `test left, right` for a fused comparison of a
+    /// conjunction with zero. It uses RCX as its scratch, and no other.
+    fn test_flags(&mut self, fusion: Fusion, left: Val, right: Val) -> Result<Cond, bool> {
+        let wide = fusion.wide;
+        let test = |asm: &mut Asm, a: Rm, b: Reg| asm.test_rm(a, b, wide);
+        match (left, right) {
+            (Val::Imm(a), Val::Imm(b)) => {
+                let (_, zf, sf, _) = sub_flags(a & b, 0, wide);
+                Err(fusion.cond.holds(false, zf, sf, false))
+            }
+            (Val::Imm(value), other) | (other, Val::Imm(value)) => {
+                self.asm.mov_imm(RCX, value);
+                let other = self.rm(other, RCX);
+                test(&mut self.asm, other, RCX);
+                Ok(fusion.cond)
+            }
+            (left, right) => {
+                let left = self.reg(left, RCX);
+                let right = self.rm(right, RCX);
+                test(&mut self.asm, right, left);
+                Ok(fusion.cond)
+            }
+        }
+    }
+
+    /// A `Select` that reads the flags of the comparison before it: the
+    /// moves, then `cmp` and `cmov` (H8a).
+    fn fused_select(&mut self, index: usize, op: &Op, reads: &[Slot], fusion: Fusion) {
+        let at = index as u32;
+        let mut all = reads.to_vec();
+        all.extend(fusion.words());
+        if self.next_use(op.dst, at).is_none() {
+            self.release(&all, at);
+            self.unbind(op.dst);
+            self.words[usize::from(op.dst)].home = Home::Frame;
+            return;
+        }
+        let a = self.value(op.a, at);
+        let b = self.value(op.b, at);
+        let left = self.operand(fusion.left, at);
+        let right = self.operand(fusion.right, at);
+        if let (Val::Imm(x), Val::Imm(y)) = (left, right) {
+            let holds = self.compare(fusion, Val::Imm(x), Val::Imm(y)) == Err(true);
+            self.load(RAX, if holds { a } else { b });
+        } else {
+            // Every move comes before the comparison: a move of zero is an
+            // `xor`, which writes the flags.
+            let rm = self.rm(a, RDX);
+            self.load(RAX, b);
+            match self.compare(fusion, left, right) {
+                Ok(cond) => self.asm.cmov(cond, RAX, rm),
+                Err(_) => unreachable!("two constants are handled above"),
+            }
+        }
+        self.define(op.dst, &all, at);
     }
 
     /// The words that a stub puts into the frame: those of `reads`, from
@@ -644,12 +1338,18 @@ impl Emitter<'_> {
 
     /// A load or a store of `bytes` bytes over the fast TLB (H7). The
     /// address is the word `a`, the value of a store the word `b`, the
-    /// result of a load the word `dst`, and the leave `imm`.
+    /// result of a load the word `dst`, and the leave `imm`. An access of 16
+    /// bytes is a pair of words (`LoadPair`, `StorePair`): the result in
+    /// `dst` and the word after it, the value in `b` (low) and `dst` (high).
+    /// It hits where its address is a multiple of 8 and its 16 bytes are in
+    /// one page, and it is two accesses of 8 bytes of the host.
     fn access(&mut self, index: usize, op: &Op, reads: &[Slot], bytes: u8, store: bool) {
         let at = index as u32;
+        let pair = bytes == 16;
         let logged = self.shape.memory == Memory::Logged;
         let address = self.value(op.a, at);
         let value = store.then(|| self.value(op.b, at));
+        let high = (store && pair).then(|| self.value(op.dst, at));
         let miss = self.asm.label();
         let join = self.asm.label();
         // RCX: the entry of the page in the table of the block.
@@ -662,24 +1362,38 @@ impl Emitter<'_> {
         self.asm.alu(Alu::Add, RCX, Rm::Mem(R13, table));
         // The address in its page and below its size, against the tag.
         self.asm.mov(RDX, Rm::Reg(RAX));
-        let low = (i32::from(bytes) - 1) | i32::from(op.aux & ALIGNMENT);
+        let low = (i32::from(bytes.min(8)) - 1) | i32::from(op.aux & ALIGNMENT);
         self.asm.alu_imm(Alu::And, Rm::Reg(RDX), !0xfff | low);
         self.asm.alu(Alu::Cmp, RDX, Rm::Mem(RCX, TAG));
         self.asm.jcc(Cond::Ne, miss);
+        if pair {
+            // The last 8 bytes of a page: the second word is in the next.
+            self.asm.mov(RDX, Rm::Reg(RAX));
+            self.asm.alu_imm(Alu::And, Rm::Reg(RDX), 0xff8);
+            self.asm.alu_imm(Alu::Cmp, Rm::Reg(RDX), 0xff8);
+            self.asm.jcc(Cond::E, miss);
+        }
         self.asm.alu(Alu::Add, RAX, Rm::Mem(RCX, ADDEND));
         if let Some(value) = value {
-            let source = match value {
-                Val::Reg(reg) => reg,
-                Val::Mem(memory) => {
-                    self.asm.mov(RDX, memory);
-                    RDX
-                }
-                Val::Imm(value) => {
-                    self.asm.mov_imm(RDX, value);
-                    RDX
-                }
+            let parts = match high {
+                Some(high) => vec![(0, value), (8, high)],
+                None => vec![(0, value)],
             };
-            self.asm.store_sized(Rm::Mem(RAX, 0), source, bytes);
+            for (offset, part) in parts {
+                let source = match part {
+                    Val::Reg(reg) => reg,
+                    Val::Mem(memory) => {
+                        self.asm.mov(RDX, memory);
+                        RDX
+                    }
+                    Val::Imm(value) => {
+                        self.asm.mov_imm(RDX, value);
+                        RDX
+                    }
+                };
+                self.asm
+                    .store_sized(Rm::Mem(RAX, offset), source, bytes.min(8));
+            }
             // The watch word of the page: odd while a CPU holds code of it.
             let watched = self.asm.label();
             let back = self.asm.label();
@@ -688,7 +1402,11 @@ impl Emitter<'_> {
             self.asm.jcc(Cond::Ne, watched);
             self.asm.bind(back);
             if logged {
-                self.home_all(&[op.a, op.b]);
+                if pair {
+                    self.home_all(&[op.a, op.b, op.dst]);
+                } else {
+                    self.home_all(&[op.a, op.b]);
+                }
                 self.thunk(index, LOGGED, false);
             }
             self.asm.cold(true);
@@ -697,6 +1415,17 @@ impl Emitter<'_> {
             self.thunk(index, WATCHED, false);
             self.asm.jmp(back);
             self.asm.cold(false);
+        } else if pair {
+            self.asm.mov(RCX, Rm::Mem(RAX, 8));
+            self.asm.mov(RAX, Rm::Mem(RAX, 0));
+            if logged {
+                self.asm.store(Self::frame(op.dst), RAX);
+                self.asm.store(Self::frame(op.dst + 1), RCX);
+                self.home_all(&[op.a]);
+                self.thunk(index, LOGGED, false);
+                self.asm.mov(RAX, Self::frame(op.dst));
+                self.asm.mov(RCX, Self::frame(op.dst + 1));
+            }
         } else {
             self.asm.load_sized(RAX, Rm::Mem(RAX, 0), bytes);
             if logged {
@@ -715,11 +1444,23 @@ impl Emitter<'_> {
         self.thunk(index, MISS, true);
         if !store {
             self.asm.mov(RAX, Self::frame(op.dst));
+            if pair {
+                self.asm.mov(RCX, Self::frame(op.dst + 1));
+            }
         }
         self.asm.jmp(join);
         self.asm.cold(false);
         if store {
             self.release(reads, at);
+        } else if pair {
+            self.define_two(
+                Place {
+                    slot: op.dst,
+                    wide: true,
+                },
+                reads,
+                at,
+            );
         } else {
             self.define(op.dst, reads, at);
         }
@@ -859,7 +1600,11 @@ impl Emitter<'_> {
                 self.asm.shift_imm(Shift::Sar, RAX, 64 - width);
                 self.mask(op.imm);
             }
-            Code::LeadingZeros | Code::TrailingZeros | Code::PopCount | Code::ReverseBytes => {
+            Code::LeadingZeros
+            | Code::TrailingZeros
+            | Code::PopCount
+            | Code::ReverseBytes
+            | Code::ReverseBits => {
                 if width == 0 || width > 64 {
                     return Err(Refused::Malformed);
                 }
@@ -891,6 +1636,26 @@ impl Emitter<'_> {
                         self.asm.cmov(Cond::A, RAX, Rm::Reg(RDX));
                     }
                     Code::PopCount => self.asm.popcnt(RAX, RAX),
+                    Code::ReverseBits => {
+                        // The bits of each byte in the opposite order, by
+                        // swapping halves of 1, 2 and 4 bits, then the
+                        // bytes in the opposite order.
+                        for (count, mask) in [
+                            (1u8, 0x5555_5555_5555_5555u64),
+                            (2, 0x3333_3333_3333_3333),
+                            (4, 0x0f0f_0f0f_0f0f_0f0f),
+                        ] {
+                            self.asm.mov(RCX, Rm::Reg(RAX));
+                            self.asm.shift_imm(Shift::Shr, RCX, count);
+                            self.asm.mov_imm(RDX, mask);
+                            self.asm.alu(Alu::And, RCX, Rm::Reg(RDX));
+                            self.asm.alu(Alu::And, RAX, Rm::Reg(RDX));
+                            self.asm.shift_imm(Shift::Shl, RAX, count);
+                            self.asm.alu(Alu::Or, RAX, Rm::Reg(RCX));
+                        }
+                        self.asm.bswap(RAX);
+                        self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
+                    }
                     _ => {
                         self.asm.bswap(RAX);
                         self.asm.shift_imm(Shift::Shr, RAX, 64 - width);
@@ -954,11 +1719,290 @@ impl Emitter<'_> {
                 }
                 return Ok(());
             }
-            Code::ReverseBits => return Err(Refused::Form(op.code)),
             _ => return Err(Refused::Malformed),
         }
         self.define(op.dst, reads, at);
         Ok(())
+    }
+
+    /// The half `high` of the operand `place` of the operation at `at`: the
+    /// high half of an operand of one word is zero.
+    fn half(&mut self, place: Place, high: bool, at: u32) -> Val {
+        if high && !place.wide {
+            return Val::Imm(0);
+        }
+        self.value(place.slot + Slot::from(high), at)
+    }
+
+    /// `<alu> dst, value` for RAX or RCX, through RDX where it must.
+    fn alu_on(&mut self, alu: Alu, dst: Reg, value: Val) {
+        match value {
+            Val::Imm(value) if i32::try_from(value as i64).is_ok() => {
+                self.asm.alu_imm(alu, Rm::Reg(dst), value as i32);
+            }
+            other => {
+                let rm = self.rm(other, RDX);
+                self.asm.alu(alu, dst, rm);
+            }
+        }
+    }
+
+    /// `reg &= mask`, in its shortest form, through RDX where it must.
+    fn mask_on(&mut self, reg: Reg, mask: u64) {
+        if mask == u64::MAX {
+        } else if mask == 0 {
+            self.asm.xor32(reg, reg);
+        } else if mask == u64::from(u32::MAX) {
+            self.asm.mov32(reg, reg);
+        } else if i32::try_from(mask as i64).is_ok() {
+            self.asm.alu_imm(Alu::And, Rm::Reg(reg), mask as i32);
+        } else {
+            self.asm.mov_imm(RDX, mask);
+            self.asm.alu(Alu::And, reg, Rm::Reg(RDX));
+        }
+    }
+
+    /// The result of a generic operation, its low word in RAX and its high
+    /// one in RCX, into the words of `dst`.
+    fn define_two(&mut self, dst: Place, reads: &[Slot], at: u32) {
+        self.release(reads, at);
+        let mut halves = vec![(dst.slot, RAX)];
+        if dst.wide {
+            halves.push((dst.slot + 1, RCX));
+        }
+        for (word, source) in halves {
+            self.unbind(word);
+            self.words[usize::from(word)].home = Home::Frame;
+            if self.next_use(word, at).is_none() {
+                // The frame is its home, and nothing reads it there.
+                continue;
+            }
+            let reg = self.allocate(at);
+            self.asm.mov(reg, Rm::Reg(source));
+            self.bind(word, reg, true);
+        }
+    }
+
+    /// A generic operation (the values of two words, DESIGN.md H3), inline
+    /// where the emitter has a form for its kind. `false`: it has none, and
+    /// nothing was emitted.
+    fn generic(&mut self, index: usize, op: &Op, reads: &[Slot]) -> bool {
+        let at = index as u32;
+        let Some(generic) = self.shape.generics.get(op.imm as usize).copied() else {
+            return false;
+        };
+        let [a, b, c] = generic.args();
+        let dst = generic.dst();
+        let ty = generic.ty();
+        let is_big =
+            |value: Val| matches!(value, Val::Imm(value) if i32::try_from(value as i64).is_err());
+        let form = match generic.kind() {
+            GenericKind::Binary(
+                Binary::And | Binary::Or | Binary::Xor | Binary::Equal | Binary::NotEqual,
+            )
+            | GenericKind::Slice { .. }
+            | GenericKind::Concat { .. }
+            | GenericKind::Unary(Unary::BitNot | Unary::Truncate(_)) => true,
+            GenericKind::Binary(Binary::Add | Binary::Sub) => matches!(ty, ScalarType::Bits(_)),
+            GenericKind::Select => !a.wide,
+            _ => false,
+        };
+        if !form {
+            return false;
+        }
+        if dst.slot == 0 || (dst.wide && dst.slot == Slot::MAX) {
+            return false;
+        }
+        if self.next_use(dst.slot, at).is_none()
+            && (!dst.wide || self.next_use(dst.slot + 1, at).is_none())
+        {
+            // Nothing reads the result.
+            self.release(reads, at);
+            for word in [dst.slot, dst.slot + 1]
+                .into_iter()
+                .take(1 + usize::from(dst.wide))
+            {
+                self.unbind(word);
+                self.words[usize::from(word)].home = Home::Frame;
+            }
+            return true;
+        }
+        let type_mask = match ty {
+            ScalarType::Bits(width) if width < 128 => (1u128 << width) - 1,
+            _ => u128::MAX,
+        };
+        let mask = match generic.kind() {
+            GenericKind::Binary(_) => type_mask,
+            GenericKind::Select => u128::MAX,
+            GenericKind::Unary(Unary::Truncate(width)) if width < 128 => {
+                generic.mask() & ((1u128 << width) - 1)
+            }
+            _ => generic.mask(),
+        };
+        match generic.kind() {
+            GenericKind::Binary(operation @ (Binary::And | Binary::Or | Binary::Xor)) => {
+                let alu = match operation {
+                    Binary::And => Alu::And,
+                    Binary::Or => Alu::Or,
+                    _ => Alu::Xor,
+                };
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                self.load(RAX, al);
+                self.alu_on(alu, RAX, bl);
+                if dst.wide {
+                    self.load(RCX, ah);
+                    self.alu_on(alu, RCX, bh);
+                }
+            }
+            GenericKind::Binary(operation @ (Binary::Add | Binary::Sub)) => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                // The carry goes from the low word to the high one: nothing
+                // between them may write the flags or need RDX.
+                if is_big(bl) || is_big(bh) {
+                    self.pinned = 0;
+                    return false;
+                }
+                let (low, high) = if operation == Binary::Add {
+                    (Alu::Add, Alu::Adc)
+                } else {
+                    (Alu::Sub, Alu::Sbb)
+                };
+                self.load(RAX, al);
+                if dst.wide {
+                    self.load(RCX, ah);
+                }
+                self.alu_on(low, RAX, bl);
+                if dst.wide {
+                    self.alu_on(high, RCX, bh);
+                }
+            }
+            GenericKind::Binary(operation) => {
+                // Equal and NotEqual: the two halves of `a ^ b` are zero.
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                self.load(RAX, al);
+                self.alu_on(Alu::Xor, RAX, bl);
+                if a.wide || b.wide {
+                    self.load(RCX, ah);
+                    self.alu_on(Alu::Xor, RCX, bh);
+                    self.asm.alu(Alu::Or, RAX, Rm::Reg(RCX));
+                }
+                self.asm.mov(RCX, Rm::Reg(RAX));
+                self.asm.xor32(RAX, RAX);
+                self.asm.test(RCX, RCX);
+                self.asm.setcc_al(if operation == Binary::Equal {
+                    Cond::E
+                } else {
+                    Cond::Ne
+                });
+                self.asm.xor32(RCX, RCX);
+            }
+            GenericKind::Unary(operation) => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                self.load(RAX, al);
+                self.load(RCX, ah);
+                if operation == Unary::BitNot {
+                    self.asm.not(RAX);
+                    self.asm.not(RCX);
+                }
+            }
+            GenericKind::Slice { offset } => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                match offset {
+                    128.. => {
+                        self.asm.xor32(RAX, RAX);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    64.. => {
+                        self.load(RAX, ah);
+                        self.asm.shift_imm(Shift::Shr, RAX, (offset - 64) as u8);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    0 => {
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                    }
+                    _ => {
+                        let offset = offset as u8;
+                        self.load(RAX, al);
+                        self.asm.shift_imm(Shift::Shr, RAX, offset);
+                        self.load(RCX, ah);
+                        self.asm.mov(RDX, Rm::Reg(RCX));
+                        self.asm.shift_imm(Shift::Shl, RDX, 64 - offset);
+                        self.asm.alu(Alu::Or, RAX, Rm::Reg(RDX));
+                        self.asm.shift_imm(Shift::Shr, RCX, offset);
+                    }
+                }
+            }
+            GenericKind::Concat { low_width } => {
+                let (al, ah) = (self.half(a, false, at), self.half(a, true, at));
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                match low_width {
+                    128.. => {
+                        self.asm.xor32(RAX, RAX);
+                        self.asm.xor32(RCX, RCX);
+                    }
+                    64.. => {
+                        self.load(RCX, al);
+                        self.asm.shift_imm(Shift::Shl, RCX, (low_width - 64) as u8);
+                        self.asm.xor32(RAX, RAX);
+                    }
+                    0 => {
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                    }
+                    _ => {
+                        let width = low_width as u8;
+                        self.load(RAX, al);
+                        self.load(RCX, ah);
+                        self.asm.shift_imm(Shift::Shl, RCX, width);
+                        self.asm.mov(RDX, Rm::Reg(RAX));
+                        self.asm.shift_imm(Shift::Shr, RDX, 64 - width);
+                        self.asm.alu(Alu::Or, RCX, Rm::Reg(RDX));
+                        self.asm.shift_imm(Shift::Shl, RAX, width);
+                    }
+                }
+                self.alu_on(Alu::Or, RAX, bl);
+                self.alu_on(Alu::Or, RCX, bh);
+            }
+            GenericKind::Select => {
+                // `b` where the word of `a` is not zero, else `c`. Every
+                // move comes before its test: a move of zero is an `xor`.
+                let condition = self.value(a.slot, at);
+                let (bl, bh) = (self.half(b, false, at), self.half(b, true, at));
+                let (cl, ch) = (self.half(c, false, at), self.half(c, true, at));
+                for (target, taken, other) in [(RAX, bl, cl), (RCX, bh, ch)] {
+                    if target == RCX && !dst.wide {
+                        break;
+                    }
+                    match condition {
+                        Val::Imm(value) => {
+                            self.load(target, if value != 0 { taken } else { other })
+                        }
+                        Val::Reg(reg) => {
+                            let rm = self.rm(taken, RDX);
+                            self.load(target, other);
+                            self.asm.test(reg, reg);
+                            self.asm.cmov(Cond::Ne, target, rm);
+                        }
+                        Val::Mem(memory) => {
+                            let rm = self.rm(taken, RDX);
+                            self.load(target, other);
+                            self.asm.alu_imm(Alu::Cmp, memory, 0);
+                            self.asm.cmov(Cond::Ne, target, rm);
+                        }
+                    }
+                }
+            }
+        }
+        self.mask_on(RAX, mask as u64);
+        if dst.wide {
+            self.mask_on(RCX, (mask >> 64) as u64);
+        }
+        self.define_two(dst, reads, at);
+        true
     }
 
     /// Write `value` to `target`, through RAX where it must.
@@ -1197,6 +2241,8 @@ fn inline_access(op: &Op, memory: Memory) -> Option<(u8, bool)> {
         Code::Store2 => (2, true),
         Code::Store4 => (4, true),
         Code::Store8 => (8, true),
+        Code::LoadPair => (16, false),
+        Code::StorePair => (16, true),
         _ => return None,
     };
     Some((bytes, store))
@@ -1299,22 +2345,35 @@ fn analyse(shape: &Shape) -> Result<Analysis, Refused> {
     })
 }
 
+/// The code of a block, the labels of the jumps that chain and of their
+/// stubs, the count of comparisons that became host flags, and the count of
+/// lazy conditions that are inline.
+pub type Emitted = (Asm, Vec<(Label, Label)>, u64, u64);
+
 /// Emit the code of `shape`. `exit` is the address of the common exit of
-/// the trampoline. With the code, the labels of the jumps that chain and of
-/// their stubs, in the order of their exit indices.
+/// the trampoline. `host_flags` turns on the forms of H8. With the code, the
+/// labels of the jumps that chain and of their stubs, in the order of their
+/// exit indices, the count of comparisons that became host flags, and the
+/// count of lazy conditions that are inline.
 pub fn emit(
     shape: &Shape,
     exit: u64,
     features: Features,
     defect: Defect,
-) -> Result<(Asm, Vec<(Label, Label)>), Refused> {
+    host_flags: bool,
+) -> Result<Emitted, Refused> {
     let Analysis {
-        uses,
+        mut uses,
         effects,
         homes,
         ..
     } = analyse(shape)?;
     let words = shape.frame.len();
+    let (fused, skip) = if host_flags {
+        fusions(shape.ops, shape.leaves, &homes, &mut uses)
+    } else {
+        (vec![None; shape.ops.len()], vec![false; shape.ops.len()])
+    };
     let mut emitter = Emitter {
         asm: Asm::new(),
         initial: homes.clone(),
@@ -1334,6 +2393,7 @@ pub fn emit(
         features,
         defect,
         shape,
+        lazy: 0,
     };
     // H5: the head of a block that chains loads its own frame and names
     // itself, because a jump from another block reaches it.
@@ -1371,19 +2431,37 @@ pub fn emit(
             .alu_imm(Alu::Add, Rm::Mem(R13, CONTEXT_ACCESSES), inlined);
     }
     for (index, op) in shape.ops.iter().enumerate() {
+        if skip[index] {
+            continue;
+        }
         let (reads, writes) = &effects[index];
+        let lazy = match op.code {
+            Code::Call => shape
+                .calls
+                .get(op.imm as usize)
+                .and_then(|call| call.condition.as_ref())
+                .filter(|lazy| host_flags && emitter.lazy_fits(lazy, reads, writes)),
+            _ => None,
+        };
         if let Some((bytes, store)) = inline_access(op, shape.memory) {
             emitter.access(index, op, reads, bytes, store);
-        } else if op.code == Code::Generic
-            || (op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard)
-        {
+        } else if let Some(lazy) = lazy {
+            emitter.lazy_condition(index, lazy, reads);
+        } else if op.code == Code::Generic {
+            if !emitter.generic(index, op, reads) {
+                emitter.effect(index, reads, writes);
+            }
+        } else if op.code as u8 >= FIRST_EFFECT && op.code != Code::Guard {
             emitter.effect(index, reads, writes);
         } else if op.code == Code::Guard {
-            emitter.guard(index, op, reads);
+            emitter.guard(index, op, reads, fused[index]);
+        } else if let (Code::Select, Some(fusion)) = (op.code, fused[index]) {
+            emitter.fused_select(index, op, reads, fusion);
         } else {
             emitter.pure(index, op, reads)?;
         }
     }
     let sites = emitter.outputs();
-    Ok((emitter.asm, sites))
+    let fused = fused.iter().filter(|fusion| fusion.is_some()).count() as u64;
+    Ok((emitter.asm, sites, fused, emitter.lazy))
 }

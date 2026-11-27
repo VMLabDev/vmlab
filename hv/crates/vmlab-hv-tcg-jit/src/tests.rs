@@ -4,10 +4,14 @@
 //! operations.
 
 use super::*;
+use crate::asm::Cond;
 use emit::THUNK_ACCESS;
 use std::sync::atomic::AtomicU32;
 use tlb::FastTlb;
-use vmlab_hv_tcg_ir::block::{Code, Op, Place, Slot, op_in_frame, step_unchecked};
+use vmlab_hv_tcg_ir::block::{
+    Code, Generic, Kind as GenericKind, Op, Place, Slot, op_in_frame, step_unchecked,
+};
+use vmlab_hv_tcg_ir::native::{Binary, ScalarType, Unary};
 
 /// The guest memory of the tests: `PAGES` pages at the virtual address
 /// `RAM`. The page `WATCHED_PAGE` has an odd watch word.
@@ -32,6 +36,8 @@ fn access_size(code: Code) -> Option<(u8, bool)> {
         Code::Store2 => (2, true),
         Code::Store4 => (4, true),
         Code::Store8 => (8, true),
+        Code::LoadPair => (16, false),
+        Code::StorePair => (16, true),
         _ => return None,
     })
 }
@@ -44,6 +50,19 @@ fn access(op: &Op, frame: &mut [u64], ram: &mut [u8]) -> bool {
         return false;
     };
     let part = &mut ram[offset..offset + usize::from(bytes)];
+    if bytes == 16 {
+        // A pair: the result in `dst` and the word after it, the value in
+        // `b` (low) and `dst` (high).
+        if store {
+            part[..8].copy_from_slice(&frame[usize::from(op.b)].to_le_bytes());
+            part[8..].copy_from_slice(&frame[usize::from(op.dst)].to_le_bytes());
+        } else {
+            let (low, high) = part.split_at(8);
+            frame[usize::from(op.dst)] = u64::from_le_bytes(low.try_into().expect("8 bytes"));
+            frame[usize::from(op.dst) + 1] = u64::from_le_bytes(high.try_into().expect("8 bytes"));
+        }
+        return true;
+    }
     if store {
         part.copy_from_slice(&frame[usize::from(op.b)].to_le_bytes()[..usize::from(bytes)]);
     } else {
@@ -95,7 +114,7 @@ impl Random {
     }
 }
 
-const PURE: [Code; 24] = [
+const PURE: [Code; 25] = [
     Code::Add,
     Code::Sub,
     Code::Mul,
@@ -116,6 +135,7 @@ const PURE: [Code; 24] = [
     Code::LeadingZeros,
     Code::TrailingZeros,
     Code::ReverseBytes,
+    Code::ReverseBits,
     Code::PopCount,
     Code::Slice,
     Code::Concat,
@@ -131,6 +151,7 @@ fn operation(random: &mut Random, code: Code, dst: Slot, a: Slot, b: Slot, c: Sl
         | Code::SignExtend
         | Code::LeadingZeros
         | Code::TrailingZeros
+        | Code::ReverseBits
         | Code::PopCount => {
             let width = width(random);
             (width, random.mask())
@@ -155,10 +176,13 @@ fn operation(random: &mut Random, code: Code, dst: Slot, a: Slot, b: Slot, c: Sl
 /// memory with its fast TLB.
 struct Env {
     ops: Vec<Op>,
+    generics: Vec<Generic>,
     frame: *mut u64,
     words: usize,
     calls: Vec<Effect>,
     thunk_calls: u64,
+    /// The helper calls that compiled code made itself (`Effect::direct`).
+    direct_calls: u64,
     /// The guard or the access that left the block.
     left_at: Option<usize>,
     ram: *mut u8,
@@ -169,7 +193,7 @@ struct Env {
     misses: u64,
     watched: u64,
     /// The accesses that hits asked to keep: address, size, value, store.
-    logged: Vec<(u64, u8, u64, bool)>,
+    logged: Vec<(u64, u8, u128, bool)>,
 }
 
 impl Env {
@@ -177,10 +201,12 @@ impl Env {
     fn base() -> Self {
         Self {
             ops: Vec::new(),
+            generics: Vec::new(),
             frame: std::ptr::null_mut(),
             words: 0,
             calls: Vec::new(),
             thunk_calls: 0,
+            direct_calls: 0,
             left_at: None,
             ram: std::ptr::null_mut(),
             tlb: FastTlb::new(),
@@ -196,6 +222,14 @@ impl Env {
 /// A helper call of the test: the first word that it writes gets a mix of
 /// the words that it reads.
 fn call(effect: &Effect, frame: &mut [u64]) {
+    // A lazy condition gives what its form gives for a kind with one.
+    if let Some(lazy) = &effect.condition {
+        let word = |slot: Slot| frame[usize::from(slot)];
+        if let Some((_, test)) = lazy.cases.iter().find(|(kind, _)| *kind == word(lazy.kind)) {
+            frame[usize::from(lazy.result)] = u64::from(test.evaluate(word(lazy.a), word(lazy.b)));
+            return;
+        }
+    }
     let mut value = 0x9e37_79b9_7f4a_7c15u64;
     for word in &effect.reads {
         value = value.rotate_left(7) ^ frame[usize::from(*word)];
@@ -231,12 +265,19 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_voi
                 return 0;
             }
             LOGGED => {
-                let value = if store {
-                    frame[usize::from(op.b)]
-                } else {
-                    frame[usize::from(op.dst)]
+                let value = match (bytes, store) {
+                    (16, true) => {
+                        u128::from(frame[usize::from(op.b)])
+                            | u128::from(frame[usize::from(op.dst)]) << 64
+                    }
+                    (16, false) => {
+                        u128::from(frame[usize::from(op.dst)])
+                            | u128::from(frame[usize::from(op.dst) + 1]) << 64
+                    }
+                    (_, true) => u128::from(frame[usize::from(op.b)]),
+                    (_, false) => u128::from(frame[usize::from(op.dst)]),
                 };
-                let mask = u64::MAX >> (64 - 8 * u32::from(bytes));
+                let mask = u128::MAX >> (128 - 8 * u32::from(bytes));
                 env.logged.push((va, bytes, value & mask, store));
                 return 0;
             }
@@ -276,17 +317,33 @@ unsafe extern "sysv64" fn thunk(env: *mut c_void, index: u64, _block: *mut c_voi
             0
         }
         _ => {
-            assert!(op_in_frame(&op, frame.len(), 0));
+            assert!(op_in_frame(&op, frame.len(), env.generics.len()));
             // SAFETY: checked just above.
-            unsafe { step_unchecked(&op, frame, &[]) };
+            assert!(unsafe { step_unchecked(&op, frame, &env.generics) });
             0
         }
     }
 }
 
+/// The function that compiled code calls for a helper call with
+/// `Effect::direct`: the call of the index `argument`, as the thunk runs it.
+///
+/// # Safety
+/// As for `thunk`.
+unsafe extern "sysv64" fn direct(env: *mut c_void, argument: u64, _block: *mut c_void) -> u64 {
+    // SAFETY: the test passes its `Env`.
+    let env = unsafe { &mut *env.cast::<Env>() };
+    env.direct_calls += 1;
+    // SAFETY: the frame of the test, as long as its `words`.
+    let frame = unsafe { std::slice::from_raw_parts_mut(env.frame, env.words) };
+    call(&env.calls[argument as usize], frame);
+    0
+}
+
 /// A block of the test.
 struct Block {
     ops: Vec<Op>,
+    generics: Vec<Generic>,
     frame: Vec<u64>,
     calls: Vec<Effect>,
     leaves: Vec<Vec<Slot>>,
@@ -325,9 +382,9 @@ fn interpret(block: &Block, slots: &mut [u128], ram: &mut [u8]) -> (u64, Vec<u64
             }
             Code::Call => call(&block.calls[op.imm as usize], &mut frame),
             _ => {
-                assert!(op_in_frame(op, frame.len(), 0));
+                assert!(op_in_frame(op, frame.len(), block.generics.len()));
                 // SAFETY: checked just above.
-                unsafe { step_unchecked(op, &mut frame, &[]) };
+                assert!(unsafe { step_unchecked(op, &mut frame, &block.generics) });
             }
         }
     }
@@ -344,7 +401,8 @@ struct Ran {
     thunk_calls: u64,
     misses: u64,
     watched: u64,
-    logged: Vec<(u64, u8, u64, bool)>,
+    logged: Vec<(u64, u8, u128, bool)>,
+    direct_calls: u64,
 }
 
 fn compiled(jit: &mut Jit, block: &Block, slots: &mut [u128], budget: i64) -> (u64, Vec<u64>, u64) {
@@ -365,7 +423,7 @@ fn compiled_on(
 ) -> Ran {
     let shape = Shape {
         ops: &block.ops,
-        generics: &[],
+        generics: &block.generics,
         frame: &block.frame,
         accesses: &[],
         calls: &block.calls,
@@ -382,6 +440,7 @@ fn compiled_on(
     let fill = tlb.is_some();
     let mut env = Env {
         ops: block.ops.clone(),
+        generics: block.generics.clone(),
         frame: frame.as_mut_ptr(),
         words: frame.len(),
         calls: block.calls.clone(),
@@ -423,6 +482,7 @@ fn compiled_on(
         misses: env.misses,
         watched: env.watched,
         logged: env.logged,
+        direct_calls: env.direct_calls,
     }
 }
 
@@ -454,6 +514,7 @@ fn every_inline_form_computes_what_the_interpreter_computes() {
             let op = operation(&mut random, code, 7, a, b, c);
             let block = Block {
                 ops: vec![op],
+                generics: Vec::new(),
                 frame,
                 calls: Vec::new(),
                 leaves: Vec::new(),
@@ -508,12 +569,129 @@ fn random_block(random: &mut Random, count: usize) -> Block {
 /// outside.
 fn address(random: &mut Random, bytes: u8) -> u64 {
     let page = RAM + 4096 * random.below(PAGES as u64);
+    // A pair hits inline at a multiple of 8 in its page, and misses at the
+    // last 8 bytes of it.
+    if bytes == 16 && random.below(3) == 0 {
+        return page + random.below(512) * 8;
+    }
     match random.below(16) {
         0 => page + 4096 - u64::from(bytes) / 2 - 1 + u64::from(bytes == 1),
         1 => page + random.below(4096 - u64::from(bytes)),
         2 => RAM - 4096 + random.below(4096),
         3 => RAM + (PAGES * 4096) as u64 - u64::from(bytes) / 2,
         _ => page + random.below(4096 / u64::from(bytes)) * u64::from(bytes),
+    }
+}
+
+/// The mask of the low `width` bits of a value of two words.
+fn mask128(width: u16) -> u128 {
+    if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+
+/// A random generic operation into the words from `dst` on, over the words
+/// of `defined` and the values of two words from the words of `wides`, as
+/// the lowering makes one: the kinds that the emitter has a form for, and
+/// some that it has none for, which run through the thunk.
+fn random_generic(random: &mut Random, defined: &[Slot], wides: &[Slot], dst: Slot) -> Generic {
+    let pick = |random: &mut Random, list: &[Slot]| list[random.below(list.len() as u64) as usize];
+    let place = |random: &mut Random, wide: bool| {
+        if wide && !wides.is_empty() {
+            Place {
+                slot: pick(random, wides),
+                wide: true,
+            }
+        } else {
+            Place {
+                slot: pick(random, defined),
+                wide: false,
+            }
+        }
+    };
+    // A place of two words where `random.below(n) == 0` is `when`.
+    let place_by = |random: &mut Random, n: u64, when: bool| {
+        let wide = (random.below(n) == 0) == when;
+        place(random, wide)
+    };
+    let width = 1 + random.below(128) as u16;
+    let wide = width > 64;
+    let ty = ScalarType::Bits(width);
+    let out = Place { slot: dst, wide };
+    let none = Place::default();
+    match random.below(12) {
+        0..=3 => {
+            let operation = [
+                Binary::And,
+                Binary::Or,
+                Binary::Xor,
+                Binary::Add,
+                Binary::Sub,
+                Binary::Mul,
+                Binary::ShiftLeft,
+            ][random.below(7) as usize];
+            let (a, b) = (place(random, wide), place(random, wide));
+            Generic::new(GenericKind::Binary(operation), ty, 0, [a, b, none], out)
+        }
+        4 => {
+            let operation = [Binary::Equal, Binary::NotEqual][random.below(2) as usize];
+            let (a, b) = (place_by(random, 2, true), place_by(random, 2, true));
+            let out = Place {
+                slot: dst,
+                wide: false,
+            };
+            Generic::new(
+                GenericKind::Binary(operation),
+                ScalarType::Bool,
+                0,
+                [a, b, none],
+                out,
+            )
+        }
+        5 | 6 => {
+            let offset = random.below(140) as u16;
+            let a = place_by(random, 4, false);
+            Generic::new(
+                GenericKind::Slice { offset },
+                ty,
+                mask128(width),
+                [a, none, none],
+                out,
+            )
+        }
+        7 | 8 => {
+            let low_width = random.below(130) as u16;
+            let (a, b) = (place_by(random, 2, true), place_by(random, 2, true));
+            Generic::new(
+                GenericKind::Concat { low_width },
+                ty,
+                mask128(width),
+                [a, b, none],
+                out,
+            )
+        }
+        9 => {
+            let operation = [
+                Unary::BitNot,
+                Unary::Truncate(1 + random.below(128) as u16),
+                Unary::PopCount(1 + random.below(128) as u16),
+            ][random.below(3) as usize];
+            let a = place_by(random, 2, true);
+            Generic::new(
+                GenericKind::Unary(operation),
+                ty,
+                mask128(width),
+                [a, none, none],
+                out,
+            )
+        }
+        _ => {
+            let condition = place(random, false);
+            let (b, c) = (place(random, wide), place(random, wide));
+            Generic::new(GenericKind::Select, ty, 0, [condition, b, c], out)
+        }
     }
 }
 
@@ -525,9 +703,12 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
         *word = random.value();
     }
     let mut ops = Vec::new();
+    let mut generics = Vec::new();
     let mut calls = Vec::new();
     let mut leaves = Vec::new();
     let mut defined: Vec<Slot> = (1..1 + inputs + constants).collect();
+    // Two words that follow each other are a value of two words.
+    let mut wides: Vec<Slot> = (1..inputs + constants).collect();
     for _ in 0..count {
         let any = |random: &mut Random, defined: &[Slot]| {
             // Mostly a recent value, so that values die and registers come
@@ -540,11 +721,14 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
             }
         };
         let dst = frame.len() as Slot;
-        match random.below(if memory == Memory::Thunk { 12 } else { 16 }) {
-            12..=15 => {
+        // The comparisons that a select or a guard reads (12 and 13) are in
+        // the blocks of the thunk, the loads and stores (12 to 16) in the
+        // others, and the generic operations (14 and 15, 17 and 18) in both.
+        match random.below(if memory == Memory::Thunk { 16 } else { 21 }) {
+            12..=16 if memory != Memory::Thunk => {
                 // A load or a store at an address of a constant word, with
                 // a leave like a guard's.
-                let bytes = [1u8, 2, 4, 8][random.below(4) as usize];
+                let bytes = [1u8, 2, 4, 8, 16][random.below(5) as usize];
                 let store = random.below(2) == 0;
                 let at = frame.len() as Slot;
                 frame.push(address(random, bytes));
@@ -556,16 +740,25 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                     (2, false) => Code::Load2,
                     (4, false) => Code::Load4,
                     (8, false) => Code::Load8,
+                    (16, false) => Code::LoadPair,
                     (1, true) => Code::Store1,
                     (2, true) => Code::Store2,
                     (4, true) => Code::Store4,
-                    _ => Code::Store8,
+                    (8, true) => Code::Store8,
+                    _ => Code::StorePair,
                 };
-                let (dst, b) = if store {
-                    (0, any(random, &defined))
-                } else {
-                    frame.push(0);
-                    (at + 1, 0)
+                let (dst, b) = match (bytes, store) {
+                    // A pair stores `b` (low) and `dst` (high).
+                    (16, true) => (any(random, &defined), any(random, &defined)),
+                    (_, true) => (0, any(random, &defined)),
+                    (16, false) => {
+                        frame.extend([0, 0]);
+                        (at + 1, 0)
+                    }
+                    (_, false) => {
+                        frame.push(0);
+                        (at + 1, 0)
+                    }
                 };
                 ops.push(Op {
                     code,
@@ -578,7 +771,127 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                 leaves.push(leave);
                 if !store {
                     defined.push(dst);
+                    if bytes == 16 {
+                        defined.push(dst + 1);
+                        wides.push(dst);
+                    }
                 }
+            }
+            12 | 13 => {
+                // A comparison, its operands flipped at 32 or 64 bits
+                // sometimes, and the select or the guard that reads it.
+                let mut x = any(random, &defined);
+                let mut y = any(random, &defined);
+                let mut conjunction = false;
+                if random.below(4) == 0 {
+                    let and = frame.len() as Slot;
+                    frame.push(0);
+                    ops.push(Op {
+                        code: Code::And,
+                        aux: 0,
+                        dst: and,
+                        a: x,
+                        b: y,
+                        imm: if random.below(2) == 0 {
+                            u64::MAX
+                        } else {
+                            u64::from(u32::MAX)
+                        },
+                    });
+                    x = and;
+                    conjunction = true;
+                } else if random.below(2) == 0 {
+                    let (sign, mask) = if random.below(2) == 0 {
+                        (1u64 << 63, u64::MAX)
+                    } else {
+                        (1 << 31, u64::from(u32::MAX))
+                    };
+                    let sign_word = frame.len() as Slot;
+                    frame.push(sign);
+                    for operand in [&mut x, &mut y] {
+                        if random.below(4) == 0 {
+                            continue;
+                        }
+                        let flipped = frame.len() as Slot;
+                        frame.push(0);
+                        ops.push(Op {
+                            code: Code::Xor,
+                            aux: 0,
+                            dst: flipped,
+                            a: *operand,
+                            b: sign_word,
+                            imm: mask,
+                        });
+                        *operand = flipped;
+                    }
+                }
+                let code = if conjunction {
+                    Code::IsZero
+                } else {
+                    [
+                        Code::Equal,
+                        Code::NotEqual,
+                        Code::Less,
+                        Code::LessEqual,
+                        Code::IsZero,
+                    ][random.below(5) as usize]
+                };
+                let condition = frame.len() as Slot;
+                frame.push(0);
+                ops.push(Op {
+                    code,
+                    aux: 0,
+                    dst: condition,
+                    a: x,
+                    b: y,
+                    imm: 0,
+                });
+                if random.below(3) == 0 {
+                    let leave: Vec<Slot> = (0..random.below(4))
+                        .map(|_| any(random, &defined))
+                        .collect();
+                    ops.push(Op {
+                        code: Code::Guard,
+                        aux: u8::from(random.below(2) == 0),
+                        dst: 0,
+                        a: condition,
+                        b: 0,
+                        imm: leaves.len() as u64,
+                    });
+                    leaves.push(leave);
+                } else {
+                    let dst = frame.len() as Slot;
+                    frame.push(0);
+                    ops.push(Op {
+                        code: Code::Select,
+                        aux: 0,
+                        dst,
+                        a: any(random, &defined),
+                        b: any(random, &defined),
+                        imm: u64::from(condition),
+                    });
+                    defined.push(dst);
+                }
+            }
+            14..=18 => {
+                let generic = random_generic(random, &defined, &wides, dst);
+                let out = generic.dst();
+                frame.push(0);
+                defined.push(dst);
+                if out.wide {
+                    frame.push(0);
+                    defined.push(dst + 1);
+                    wides.push(dst);
+                }
+                ops.push(Op {
+                    code: Code::Generic,
+                    aux: 0,
+                    dst: 0,
+                    a: 0,
+                    b: 0,
+                    imm: generics.len() as u64,
+                });
+                generics.push(generic);
             }
             0 => {
                 let reads: Vec<Slot> = (0..random.below(4))
@@ -595,10 +908,15 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
                     b: 0,
                     imm: calls.len() as u64,
                 });
+                // Half of the calls go to their own function (H12).
+                let direct = (random.below(2) == 0)
+                    .then_some((direct as Thunk as usize as u64, calls.len() as u64));
                 calls.push(Effect {
                     reads,
                     writes,
                     leave: None,
+                    direct,
+                    condition: None,
                 });
             }
             1 => {
@@ -632,11 +950,23 @@ fn random_block_with(random: &mut Random, count: usize, memory: Memory) -> Block
     }
     let mut outputs = Vec::new();
     for register in 0..(1 + random.below(16) as u32) {
-        let slot = defined[random.below(defined.len() as u64) as usize];
-        outputs.push((register, Place { slot, wide: false }));
+        // Some outputs are values of two words.
+        let place = if random.below(4) == 0 {
+            Place {
+                slot: wides[random.below(wides.len() as u64) as usize],
+                wide: true,
+            }
+        } else {
+            Place {
+                slot: defined[random.below(defined.len() as u64) as usize],
+                wide: false,
+            }
+        };
+        outputs.push((register, place));
     }
     Block {
         ops,
+        generics,
         frame,
         calls,
         leaves,
@@ -687,11 +1017,347 @@ fn random_blocks_spill_call_and_leave_as_the_interpreter_does() {
     assert!(left > 100, "{left} blocks left through a guard");
 }
 
+/// Operands at the edges of the orders of 32 and 64 bits.
+const EDGES: [u64; 14] = [
+    0,
+    1,
+    2,
+    0x7fff_ffff,
+    0x8000_0000,
+    0x8000_0001,
+    0xffff_ffff,
+    0x1_0000_0000,
+    0x7fff_ffff_ffff_ffff,
+    0x8000_0000_0000_0000,
+    0x8000_0000_7fff_ffff,
+    0xffff_ffff_8000_0000,
+    u64::MAX - 1,
+    u64::MAX,
+];
+
+/// H8a: a comparison that a select or a guard reads next is host flags.
+/// Every comparison, unsigned and signed at both widths, with its operands
+/// in registers, in the state and constant, against the interpreter on the
+/// edges of the orders.
+#[test]
+fn comparisons_read_as_host_flags_give_what_the_interpreter_gives() {
+    let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
+    let codes = [
+        Code::Equal,
+        Code::NotEqual,
+        Code::Less,
+        Code::LessEqual,
+        Code::IsZero,
+    ];
+    let mut random = Random(0x0e85_0001);
+    let mut rounds = 0;
+    for code in codes {
+        // 0: unsigned, 32 and 64: the operands flipped at that width, 2
+        // and 3: the conjunction of the operands at 64 and 32 bits compared
+        // with zero.
+        for flip in [0u8, 32, 64, 2, 3] {
+            if flip < 32 && flip != 0 && matches!(code, Code::Less | Code::LessEqual) {
+                continue;
+            }
+            // 0: a select, 1 and 2: a guard that expects zero or not.
+            for consumer in 0..3 {
+                // Which operands are constants.
+                for constants in 0..4u8 {
+                    for _ in 0..40 {
+                        let x = EDGES[random.below(EDGES.len() as u64) as usize];
+                        let y = EDGES[random.below(EDGES.len() as u64) as usize];
+                        // Words 1, 2: inputs x and y. 3, 4: constants x and
+                        // y. 5: the sign. 6, 7: flips. 8: the condition. 9,
+                        // 10: what the select picks from. 11: its result.
+                        let (sign, mask) = match flip {
+                            32 => (1u64 << 31, u64::from(u32::MAX)),
+                            _ => (1 << 63, u64::MAX),
+                        };
+                        let frame = vec![0, 0, 0, x, y, sign, 0, 0, 0, 0, 0, 0];
+                        let left = if constants & 1 != 0 { 3 } else { 1 };
+                        let right = if constants & 2 != 0 { 4 } else { 2 };
+                        let mut ops = Vec::new();
+                        let (mut a, mut b) = (left, right);
+                        if flip == 2 || flip == 3 {
+                            ops.push(Op {
+                                code: Code::And,
+                                aux: 0,
+                                dst: 6,
+                                a: left,
+                                b: right,
+                                imm: if flip == 2 {
+                                    u64::MAX
+                                } else {
+                                    u64::from(u32::MAX)
+                                },
+                            });
+                            // Word 0 is the constant zero.
+                            (a, b) = (6, 0);
+                        } else if flip != 0 {
+                            ops.push(Op {
+                                code: Code::Xor,
+                                aux: 0,
+                                dst: 6,
+                                a: left,
+                                b: 5,
+                                imm: mask,
+                            });
+                            // A constant operand is flipped already.
+                            if constants & 2 == 0 {
+                                ops.push(Op {
+                                    code: Code::Xor,
+                                    aux: 0,
+                                    dst: 7,
+                                    a: right,
+                                    b: 5,
+                                    imm: mask,
+                                });
+                                b = 7;
+                            }
+                            a = 6;
+                        }
+                        ops.push(Op {
+                            code,
+                            aux: 0,
+                            dst: 8,
+                            a,
+                            b,
+                            imm: 0,
+                        });
+                        let mut leaves = Vec::new();
+                        if consumer == 0 {
+                            ops.push(Op {
+                                code: Code::Select,
+                                aux: 0,
+                                dst: 11,
+                                a: 9,
+                                b: 10,
+                                imm: 8,
+                            });
+                        } else {
+                            ops.push(Op {
+                                code: Code::Guard,
+                                aux: consumer - 1,
+                                dst: 0,
+                                a: 8,
+                                b: 0,
+                                imm: 0,
+                            });
+                            leaves.push(vec![1, 2, 9]);
+                        }
+                        let block = Block {
+                            ops,
+                            generics: Vec::new(),
+                            frame,
+                            calls: Vec::new(),
+                            leaves,
+                            inputs: vec![(word(1), 0), (word(2), 1), (word(9), 2), (word(10), 3)],
+                            outputs: vec![(0, word(11)), (1, word(1))],
+                            memory: Memory::Thunk,
+                        };
+                        let mut slots = [
+                            u128::from(x),
+                            u128::from(y),
+                            u128::from(random.value()),
+                            u128::from(random.value()),
+                        ];
+                        let mut expected = slots;
+                        let (code_expected, words) = interpret(&block, &mut expected, &mut []);
+                        let (got_code, got_words, _) = compiled(&mut jit, &block, &mut slots, 100);
+                        let what = format!("{:?}", block.ops);
+                        assert_eq!(got_code, code_expected, "{what} on {x:#x} {y:#x}");
+                        assert_eq!(got_words, words, "{what} on {x:#x} {y:#x}");
+                        if code_expected == DONE {
+                            assert_eq!(slots, expected, "{what} on {x:#x} {y:#x}");
+                        }
+                        rounds += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        jit.stats.fused >= rounds,
+        "{} of {rounds} fused",
+        jit.stats.fused
+    );
+}
+
+/// H8c: a lazy condition runs its form for a kind that has one and calls
+/// the thunk for any other, for every host test on the edges.
+#[test]
+fn lazy_conditions_run_their_forms_inline_and_call_for_other_kinds() {
+    let mut jit = Jit::with_capacity(16 << 20).expect("a code region");
+    let conds = [
+        Cond::O,
+        Cond::No,
+        Cond::B,
+        Cond::Ae,
+        Cond::E,
+        Cond::Ne,
+        Cond::Be,
+        Cond::A,
+        Cond::S,
+        Cond::Ns,
+        Cond::L,
+        Cond::Ge,
+        Cond::Le,
+        Cond::G,
+    ];
+    let mut tests = vec![
+        FlagTest::Always(false),
+        FlagTest::Always(true),
+        FlagTest::Table(0xa5c3),
+        FlagTest::Table(1),
+    ];
+    for operation in [FlagOperation::Sub, FlagOperation::Add, FlagOperation::Test] {
+        for wide in [false, true] {
+            for cond in conds {
+                tests.push(FlagTest::Host {
+                    operation,
+                    wide,
+                    cond,
+                });
+            }
+        }
+    }
+    let mut random = Random(0x0e85_0002);
+    let mut stubs = 0;
+    for test in tests {
+        for constant_kind in [false, true] {
+            for _ in 0..60 {
+                let a = EDGES[random.below(EDGES.len() as u64) as usize];
+                let b = EDGES[random.below(EDGES.len() as u64) as usize];
+                // Kind 9 has the form, 3 an explicit one, 5 none.
+                let kind = [9u64, 3, 5][random.below(3) as usize];
+                // Words 1: the kind, 2, 3: a, b, 4: the condition, 5: the
+                // result, 6: the kind as a constant.
+                let frame = vec![0, 0, 0, 0, 11, 0, kind];
+                let kind_word = if constant_kind { 6 } else { 1 };
+                let lazy = LazyCondition {
+                    kind: kind_word,
+                    a: 2,
+                    b: 3,
+                    code: 4,
+                    code_value: 11,
+                    result: 5,
+                    cases: vec![(9, test), (3, FlagTest::Table(0x0ff0))],
+                };
+                let calls = vec![Effect {
+                    reads: vec![kind_word, 2, 3, 4],
+                    writes: vec![5],
+                    leave: None,
+                    direct: None,
+                    condition: Some(lazy),
+                }];
+                let block = Block {
+                    generics: Vec::new(),
+                    ops: vec![Op {
+                        code: Code::Call,
+                        aux: 0,
+                        dst: 0,
+                        a: 0,
+                        b: 0,
+                        imm: 0,
+                    }],
+                    frame,
+                    calls,
+                    leaves: Vec::new(),
+                    inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
+                    outputs: vec![(0, word(5)), (1, word(2))],
+                    memory: Memory::Thunk,
+                };
+                let mut slots = [u128::from(kind), u128::from(a), u128::from(b)];
+                let mut expected = slots;
+                interpret(&block, &mut expected, &mut []);
+                let (code, _, thunk_calls) = compiled(&mut jit, &block, &mut slots, 100);
+                assert_eq!(code, DONE);
+                assert_eq!(slots, expected, "{test:?} kind {kind} on {a:#x} {b:#x}");
+                assert_eq!(thunk_calls, u64::from(kind == 5), "{test:?} kind {kind}");
+                stubs += thunk_calls;
+            }
+        }
+    }
+    assert!(stubs > 0);
+    assert!(jit.stats.lazy > 0);
+}
+
+/// The forms of a lazy condition are those of its one condition: where the
+/// word of the condition is not the constant they are for, the call runs.
+#[test]
+fn a_lazy_condition_for_another_code_is_a_call() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let lazy = LazyCondition {
+        kind: 1,
+        a: 2,
+        b: 3,
+        code: 4,
+        code_value: 12,
+        result: 5,
+        cases: vec![(1, FlagTest::Always(true))],
+    };
+    let block = Block {
+        ops: vec![Op {
+            code: Code::Call,
+            aux: 0,
+            dst: 0,
+            a: 0,
+            b: 0,
+            imm: 0,
+        }],
+        generics: Vec::new(),
+        frame: vec![0, 0, 0, 0, 11, 0],
+        calls: vec![Effect {
+            reads: vec![1, 2, 3, 4],
+            writes: vec![5],
+            leave: None,
+            direct: None,
+            condition: Some(lazy),
+        }],
+        leaves: Vec::new(),
+        inputs: vec![(word(1), 0), (word(2), 1), (word(3), 2)],
+        outputs: vec![(0, word(5))],
+        memory: Memory::Thunk,
+    };
+    let mut slots = [1u128, 2, 3];
+    let (_, _, thunk_calls) = compiled(&mut jit, &block, &mut slots, 100);
+    assert_eq!((thunk_calls, jit.stats.lazy), (1, 0));
+}
+
+/// The definitions of the host flags that the forms are checked against.
+#[test]
+fn the_host_flags_are_those_of_the_definitions() {
+    for a in EDGES {
+        for b in EDGES {
+            let (cf, zf, sf, of) = sub_flags(a, b, true);
+            assert_eq!(cf, a < b);
+            assert_eq!(zf, a == b);
+            assert_eq!(sf, (a.wrapping_sub(b) as i64) < 0);
+            assert_eq!(of, (a as i64).checked_sub(b as i64).is_none());
+            let (cf, zf, sf, of) = sub_flags(a, b, false);
+            let (a32, b32) = (a as u32, b as u32);
+            assert_eq!(cf, a32 < b32);
+            assert_eq!(zf, a32 == b32);
+            assert_eq!(sf, (a32.wrapping_sub(b32) as i32) < 0);
+            assert_eq!(of, (a32 as i32).checked_sub(b32 as i32).is_none());
+            let (cf, zf, sf, of) = add_flags(a, b, true);
+            assert_eq!(cf, a.checked_add(b).is_none());
+            assert_eq!(zf, a.wrapping_add(b) == 0);
+            assert_eq!(sf, (a.wrapping_add(b) as i64) < 0);
+            assert_eq!(of, (a as i64).checked_add(b as i64).is_none());
+            let (cf, _, _, of) = add_flags(a, b, false);
+            assert_eq!(cf, a32.checked_add(b32).is_none());
+            assert_eq!(of, (a32 as i32).checked_add(b32 as i32).is_none());
+        }
+    }
+}
+
 #[test]
 fn the_head_of_a_block_takes_its_count_from_the_budget() {
     let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
     let block = Block {
         ops: Vec::new(),
+        generics: Vec::new(),
         frame: vec![0, 5],
         calls: Vec::new(),
         leaves: Vec::new(),
@@ -761,7 +1427,8 @@ fn a_form_that_the_host_lacks_is_refused() {
         ops: &[rbit],
         ..shape
     };
-    assert_eq!(jit.compile(&shape), Err(Refused::Form(Code::ReverseBits)));
+    // RBIT needs no extension of the host (3e J6).
+    assert!(jit.compile(&shape).is_ok());
 }
 
 #[test]
@@ -773,7 +1440,7 @@ fn a_full_region_starts_a_new_generation() {
     for _ in 0..2000 {
         let shape = Shape {
             ops: &block.ops,
-            generics: &[],
+            generics: &block.generics,
             frame: &block.frame,
             accesses: &[],
             calls: &block.calls,
@@ -806,7 +1473,7 @@ fn the_perf_map_names_the_trampoline_and_each_block() {
     let block = random_block(&mut random, 20);
     let shape = Shape {
         ops: &block.ops,
-        generics: &[],
+        generics: &block.generics,
         frame: &block.frame,
         accesses: &[],
         calls: &block.calls,
@@ -846,7 +1513,7 @@ fn written_words_are_the_results_and_the_inputs_and_the_rest_are_constants() {
         let block = random_block(&mut random, 30);
         let shape = Shape {
             ops: &block.ops,
-            generics: &[],
+            generics: &block.generics,
             frame: &block.frame,
             accesses: &[],
             calls: &block.calls,
@@ -1206,6 +1873,7 @@ fn access_block(ops: Vec<Op>, frame: Vec<u64>, result: Slot, memory: Memory) -> 
     let leaves = vec![Vec::new(); ops.len()];
     Block {
         ops,
+        generics: Vec::new(),
         frame,
         calls: Vec::new(),
         leaves,
@@ -1429,4 +2097,103 @@ fn a_store_into_a_watched_page_tells_the_thunk_after_its_write() {
         assert_eq!(ran, (DONE, calls, 0, calls), "odd: {odd}");
         assert_eq!(&ram[offset + 4..offset + 8], &0xeeff_1122u32.to_le_bytes());
     }
+}
+
+/// The generic operations of a block of one operation, on random values of
+/// one and two words: the forms of two words (3e J6) leave what the
+/// interpreter leaves, and a kind without a form runs through the thunk.
+#[test]
+fn every_generic_form_computes_what_the_interpreter_computes() {
+    let mut jit = Jit::with_capacity(4 << 20).expect("a code region");
+    let mut random = Random(0x3e_0006);
+    let (mut inline, mut through) = (0u64, 0u64);
+    for round in 0..20_000 {
+        // Words 1 to 6 are inputs, 7 to 12 constants, 13 and 14 the
+        // result.
+        let mut frame = vec![0u64; 15];
+        for word in &mut frame[7..13] {
+            *word = random.value();
+        }
+        let defined: Vec<Slot> = if round % 3 == 0 {
+            (1..13).collect()
+        } else {
+            (1..7).collect()
+        };
+        let wides: Vec<Slot> = defined[..defined.len() - 1].to_vec();
+        let generic = random_generic(&mut random, &defined, &wides, 13);
+        let block = Block {
+            ops: vec![Op {
+                code: Code::Generic,
+                aux: 0,
+                dst: 0,
+                a: 0,
+                b: 0,
+                imm: 0,
+            }],
+            generics: vec![generic],
+            frame,
+            calls: Vec::new(),
+            leaves: Vec::new(),
+            inputs: (1..7).map(|n| (word(n), u32::from(n))).collect(),
+            outputs: vec![(0, generic.dst())],
+            memory: Memory::Thunk,
+        };
+        let mut slots = [0u128; 7];
+        for slot in &mut slots[1..] {
+            *slot = u128::from(random.value());
+        }
+        let mut expected = slots;
+        interpret(&block, &mut expected, &mut []);
+        let mut got = slots;
+        let (_, _, thunk_calls) = compiled(&mut jit, &block, &mut got, 100);
+        assert_eq!(got, expected, "round {round}: {generic:?} on {slots:x?}");
+        if thunk_calls == 0 {
+            inline += 1;
+        } else {
+            through += 1;
+        }
+    }
+    assert!(
+        inline > 10_000 && through > 1000,
+        "{inline} inline, {through} through the thunk"
+    );
+}
+
+/// A helper call with `Effect::direct` is a call of its own function, not
+/// of the thunk (H12), and computes what the thunk computes.
+#[test]
+fn a_direct_call_runs_its_function_and_not_the_thunk() {
+    let mut jit = Jit::with_capacity(1 << 20).expect("a code region");
+    let effect = Effect {
+        reads: vec![1, 2],
+        writes: vec![3, 4],
+        leave: None,
+        direct: Some((direct as Thunk as usize as u64, 0)),
+        condition: None,
+    };
+    let block = Block {
+        ops: vec![Op {
+            code: Code::Call,
+            aux: 0,
+            dst: 0,
+            a: 0,
+            b: 0,
+            imm: 0,
+        }],
+        generics: Vec::new(),
+        frame: vec![0; 5],
+        calls: vec![effect],
+        leaves: Vec::new(),
+        inputs: vec![(word(1), 1), (word(2), 2)],
+        outputs: vec![(0, word(3)), (3, word(4))],
+        memory: Memory::Thunk,
+    };
+    let slots = [0, 0x1234, 0x5678_9abc_def0, 7];
+    let mut expected = slots;
+    interpret(&block, &mut expected, &mut []);
+    let mut got = slots;
+    let mut ram = vec![0u8; PAGES * 4096];
+    let ran = compiled_on(&mut jit, &block, &mut got, 10, &mut ram, None);
+    assert_eq!((ran.code, got), (DONE, expected));
+    assert_eq!((ran.thunk_calls, ran.direct_calls), (0, 1));
 }

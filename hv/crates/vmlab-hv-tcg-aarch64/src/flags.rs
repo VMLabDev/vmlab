@@ -18,11 +18,21 @@
 //! Operands are kept zero-extended to 64 bits. The bits above the width are
 //! ignored.
 //!
-//! Sources read: none. The carry and overflow rules are the two's complement
-//! identities of `Builder::add_with_carry`.
+//! The JIT reads a condition of a record that another block wrote as host
+//! flags (3e DESIGN.md H8c): `host_forms` is the map, for each condition, from
+//! the kinds of record that x86-64 computes in one operation to that
+//! operation and the condition of the host that is the condition of Arm.
+//!
+//! Sources read: none for Arm. The carry and overflow rules are the two's
+//! complement identities of `Builder::add_with_carry`. For the host: the
+//! Intel 64 and IA-32 Architectures Software Developer's Manual, volume 1,
+//! appendix B (the conditions of `Jcc`, `SETcc` and `CMOVcc`), and volume 2
+//! (the flags that `cmp`, `add` and `test` write).
 
 use crate::fields::Condition;
 use vmlab_hv_tcg_ir::native::{Effects, Helper, HelperFn};
+use vmlab_hv_tcg_jit::asm::Cond;
+use vmlab_hv_tcg_jit::{FlagOperation, FlagTest};
 
 pub const EXPLICIT: u8 = 0;
 pub const ADD: u8 = 1;
@@ -75,6 +85,102 @@ pub fn holds(condition: u8, nzcv: u8) -> bool {
         nzcv & 2 != 0,
         nzcv & 1 != 0,
     )
+}
+
+/// The inline forms of the condition `condition` (its four bits), by the
+/// kind of record (3e DESIGN.md H8c), the most common kinds first: a
+/// compare (`SUB` with the carry set), a logical result, the explicit
+/// flags, then a sum without a carry in. Any other kind (a sum or a
+/// difference with a carry that is not the one a compare has) is a call.
+///
+/// - After `cmp a, b` the host flags are N, Z and V of Arm, and the host's
+///   carry is the borrow, the inverse of the carry of Arm: CS is `ae`, HI is
+///   `a` (no borrow and not equal).
+/// - After `add a, b` the host carry is the carry of Arm. HI and LS (C and
+///   Z together) have no host condition after an addition, so they call.
+/// - After `test a, a` CF and OF are clear, as C and V are for a logical
+///   result: a condition on C or V alone is a constant.
+/// - The explicit kind holds NZCV in the low four bits of `a`: the form is
+///   the mask of the sixteen values for which the condition holds.
+pub fn host_forms(condition: u8) -> Vec<(u64, FlagTest)> {
+    let condition = Condition::from_bits(u32::from(condition));
+    let host = |operation, wide, cond| FlagTest::Host {
+        operation,
+        wide,
+        cond,
+    };
+    let compare = match condition {
+        Condition::Eq => Some(Cond::E),
+        Condition::Ne => Some(Cond::Ne),
+        Condition::Cs => Some(Cond::Ae),
+        Condition::Cc => Some(Cond::B),
+        Condition::Mi => Some(Cond::S),
+        Condition::Pl => Some(Cond::Ns),
+        Condition::Vs => Some(Cond::O),
+        Condition::Vc => Some(Cond::No),
+        Condition::Hi => Some(Cond::A),
+        Condition::Ls => Some(Cond::Be),
+        Condition::Ge => Some(Cond::Ge),
+        Condition::Lt => Some(Cond::L),
+        Condition::Gt => Some(Cond::G),
+        Condition::Le => Some(Cond::Le),
+        Condition::Al | Condition::Nv => None,
+    };
+    let sum = match condition {
+        Condition::Cs => Some(Cond::B),
+        Condition::Cc => Some(Cond::Ae),
+        Condition::Hi | Condition::Ls => None,
+        _ => compare,
+    };
+    let logical = match condition {
+        Condition::Cs | Condition::Vs | Condition::Hi => FlagTest::Always(false),
+        Condition::Cc | Condition::Vc | Condition::Ls => FlagTest::Always(true),
+        _ => match compare {
+            Some(cond) => host(FlagOperation::Test, true, cond),
+            None => FlagTest::Always(true),
+        },
+    };
+    let narrow = |test: FlagTest| match test {
+        FlagTest::Host {
+            operation, cond, ..
+        } => host(operation, false, cond),
+        other => other,
+    };
+    let compare_carry = |width| u64::from(kind(SUB, width) | CARRY);
+    let mut table = 0u16;
+    for nzcv in 0..16u8 {
+        if holds(condition as u8, nzcv) {
+            table |= 1 << nzcv;
+        }
+    }
+    let mut forms = Vec::with_capacity(7);
+    match compare {
+        Some(cond) => {
+            forms.push((compare_carry(64), host(FlagOperation::Sub, true, cond)));
+            forms.push((compare_carry(32), host(FlagOperation::Sub, false, cond)));
+        }
+        None => {
+            forms.push((compare_carry(64), FlagTest::Always(true)));
+            forms.push((compare_carry(32), FlagTest::Always(true)));
+        }
+    }
+    forms.push((u64::from(kind(LOGICAL, 64)), logical));
+    forms.push((u64::from(kind(LOGICAL, 32)), narrow(logical)));
+    forms.push((u64::from(EXPLICIT), FlagTest::Table(table)));
+    if let Some(cond) = sum {
+        forms.push((
+            u64::from(kind(ADD, 64)),
+            host(FlagOperation::Add, true, cond),
+        ));
+        forms.push((
+            u64::from(kind(ADD, 32)),
+            host(FlagOperation::Add, false, cond),
+        ));
+    } else if compare.is_none() {
+        forms.push((u64::from(kind(ADD, 64)), FlagTest::Always(true)));
+        forms.push((u64::from(kind(ADD, 32)), FlagTest::Always(true)));
+    }
+    forms
 }
 
 fn helper_nzcv(args: &[u128]) -> u128 {
@@ -181,6 +287,51 @@ mod tests {
         for value in 0..16 {
             assert_eq!(nzcv(EXPLICIT, value, 0), value as u8);
         }
+    }
+
+    /// U4 of 3e DESIGN.md, sampled: every inline form of every condition
+    /// gives, by the definitions of the host flags, what the lazy record
+    /// gives, on the edges of both widths. The JIT's own tests show that
+    /// the compiled forms give what the definitions give.
+    #[test]
+    fn every_host_form_is_the_condition_of_its_kind() {
+        let mut values = VALUES.to_vec();
+        values.extend([
+            0x8000_0001,
+            0xffff_fffe,
+            0x8000_0000_0000_0001,
+            0x1_7fff_ffff,
+        ]);
+        let mut forms = 0;
+        for condition in 0..16u8 {
+            let cases = host_forms(condition);
+            let kinds: Vec<u64> = cases.iter().map(|(kind, _)| *kind).collect();
+            let mut unique = kinds.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), kinds.len(), "one form per kind");
+            for (kind, test) in cases {
+                for &a in &values {
+                    for &b in &values {
+                        // The explicit kind: every value of the four bits.
+                        let a = if kind == u64::from(EXPLICIT) {
+                            a & 31
+                        } else {
+                            a
+                        };
+                        assert_eq!(
+                            test.evaluate(a, b),
+                            holds(condition, nzcv(kind as u8, a, b)),
+                            "condition {condition} kind {kind} {test:?} on {a:#x} {b:#x}"
+                        );
+                    }
+                }
+                forms += 1;
+            }
+        }
+        // Seven kinds for each condition but HI and LS, which have no form
+        // after an addition.
+        assert_eq!(forms, 14 * 7 + 2 * 5);
     }
 
     #[test]
