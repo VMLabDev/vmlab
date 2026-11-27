@@ -505,8 +505,8 @@ fn read_image(path: &std::path::Path, what: &str, limit: u64) -> Result<Vec<u8>,
 /// The Image inside an EFI zboot kernel, which Alpine and Fedora ship for
 /// arm64: a PE file whose header says `zimg` at 4, gives the offset and the
 /// size of the compressed Image at 8 and 12, and names the compression at
-/// 0x18 (Linux, `drivers/firmware/efi/libstub/zboot-header.S` as the
-/// kernel documents it). Firmware runs its stub, which unpacks the Image. A
+/// 0x18, as the bytes of the guest asset's kernel show. Firmware runs its
+/// stub, which unpacks the Image. A
 /// boot without firmware unpacks it here, as a boot loader does. Any other
 /// image is returned as it is.
 fn unpack_zboot(image: Vec<u8>, limit: u64) -> Result<Vec<u8>, VmmError> {

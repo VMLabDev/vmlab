@@ -1473,9 +1473,9 @@ D13).
 
 ### Sources read for this card
 
-- The state of this crate. The Linux kernel's description of the EFI zboot
-  header (`drivers/firmware/efi/libstub/zboot-header.S` as documented by
-  the kernel) for the payload offset, size and compression name.
+- The state of this crate. For the EFI zboot header: the first bytes of
+  the guest asset's kernel (`od`) and what `file` says of it (`MZ`, `zimg`,
+  the payload offset and size, `gzip`). No kernel source was read.
 - S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
