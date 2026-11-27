@@ -24,6 +24,7 @@ pub mod helpers;
 pub mod lift;
 pub mod mmu;
 pub mod oracle;
+pub mod shootdown;
 pub mod state;
 pub mod sysreg;
 pub mod timer;

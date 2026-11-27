@@ -21,11 +21,14 @@ use vmlab_hv_tcg_ir::native::Binary;
 pub fn adr(b: &mut Builder, record: Record, f: &ADRI) -> Lifted {
     let offset = sign_extend(f.label.into(), 21);
     let value = match record {
-        Record::ADR => b.pc().wrapping_add(offset as u64),
-        Record::ADRP => (b.pc() & !0xfff).wrapping_add((offset << 12) as u64),
+        Record::ADR => b.pc_plus(offset as u64),
+        Record::ADRP => {
+            let page = b.pc_page();
+            let offset = b.imm(64, (offset << 12) as u64);
+            b.binary(64, Binary::Add, page, offset)
+        }
         _ => return Lifted::Unsupported,
     };
-    let value = b.imm(64, value);
     b.set_x(f.xd, 64, value);
     Lifted::Next
 }

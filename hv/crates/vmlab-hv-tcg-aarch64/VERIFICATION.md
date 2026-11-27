@@ -1340,6 +1340,31 @@ RAM, and the files come through DMA.
   the DSDT of the capture, whatever functions the machine has: that is a
   finding for card C11, not changed here.
 
+The second matrix, at commit `f7346539` (the head of this card), measures
+the speed of each boot. The same `bench/run.py` command in two lanes of
+four cores (16-19 and 20-23); every 20 s the sampler turns on the debug log
+of `vmlab_hv_vmm::vcpu::emulated` for 1 s and reads the instruction count of
+each vCPU from its exception lines. MIPS is the sum over the vCPUs of the
+last count, divided by the time from the process start to that sample, so
+idle time is inside it, and a boot in emergency mode idles after it fails.
+Other cards ran one or two emulated aarch64 VMs on other cores of helios
+during the first runs (load average 11 to 15); Debian ran again at load 5.
+
+| Template | vCPUs | Result | MIPS | Instructions, over |
+|---|---|---|---|---|
+| alpine-3.23 | 1 | agent ready in 296 s | 50.3 | 14.86e9, 295 s |
+| alpine-3.23 | 2 | agent ready in 298 s | 51.1 | 15.08e9, 295 s |
+| debian-13 | 1 | emergency mode under load; agent ready in 274 s at load 5 | 25.8; 64.2 | 18.23e9, 708 s; 18.94e9, 295 s |
+| debian-13 | 2 | emergency mode under load; agent ready in 204 s at load 5 | 27.2; 89.1 | 19.45e9, 715 s; 18.79e9, 211 s |
+| fedora-44 | 1 | emergency mode | 43.8 | 31.33e9, 715 s |
+| fedora-44 | 2 | emergency mode | 52.2 | 37.35e9, 716 s |
+| ubuntu-24.04 | 1 | emergency mode; the agent answered from it at 522 s | 44.6 | 24.42e9, 547 s |
+| ubuntu-24.04 | 2 | agent ready in 341 s | 68.5 | 24.50e9, 358 s |
+
+An agent that answers from emergency mode does not count as a pass of S1.
+Debian's two results show how near its timeouts it runs: the load of other
+VMs on the host is enough to push it over them.
+
 ### kvm-unit-tests
 
 `just tcg-a64-kvm-unit-tests` builds kvm-unit-tests (commit `32f8ad45`, with
@@ -1476,6 +1501,122 @@ D13).
 - The state of this crate. For the EFI zboot header: the first bytes of
   the guest asset's kernel (`od`) and what `file` says of it (`MZ`, `zimg`,
   the payload offset and size, `gzip`). No kernel source was read.
+- S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
+  Reference Manual was opened.
+- X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
+  no Unicorn.
+
+## Card C13 (2026-11-27)
+
+The four templates to agent ready (DESIGN.md P4, M6). The card lands what
+it found and fixed. Five of the eight boots reach agent ready inside 600 s
+on a quiet host, Debian among them, and the boot lockstep (O4) of Debian did
+not run. What stops the rest is the speed of the interpreter, not an
+instruction or a device that a boot misses. The boots that fail on speed and
+the O4 lockstep of Debian move to card C13b (decision of the overseer,
+2026-11-27): guest time stays real time and no guest timeout is lengthened.
+
+### What the boots missed, and what changed
+
+- The virtio functions of `virt` are transitional (`1af4:1001` and so on),
+  as QEMU presents them: AAVMF bound no driver to a modern-only function.
+  An I/O BAR at port 0 decodes on `virt`, where AAVMF places the first one.
+- An Inner Shareable TLBI reaches every CPU of the machine (`shootdown.rs`).
+- The vmlab-hv binary ran every emulated vCPU in slices of 64 instructions,
+  because the flight recorder makes `log_enabled!(Trace)` always true. The
+  slices follow the stderr filter now. With long slices two faults showed:
+  the core read its interrupt lines once a slice, so AAVMF took an
+  acknowledged interrupt again and again until its stack overflowed, and a
+  timer that came due inside a slice was raised at its end, which failed the
+  busy-loop subtests of kvm-unit-tests `timer`. A machine CPU reads its lines
+  before every block, and leaves its loop within 64 blocks of its timer's
+  deadline.
+- The boots spent their time in three places (stack samples of the vCPU
+  thread of a Debian boot, `eu-stack` through a `PR_SET_PTRACER` wrapper):
+  - about 40 % in the RAM path of `GuestBus`: vm-memory's slice lookup for
+    each load and store. RAM is read and written through its mapping now,
+    with one host access for an aligned access of 2, 4 or 8 bytes, and the
+    bitmap of the region still told of each write;
+  - about 15 % in SipHash, in the interning of the graph of a translation:
+    the tables of a translation hash with a multiply-and-rotate hasher;
+  - translations of code translated before: between 120 s and 240 s of a
+    Debian boot, 4.8 million translations, 3.6 million of them at a PC whose
+    block the cache had dropped (it emptied its store when full), and 1.1
+    million of the same code at another virtual address (a library in two
+    programs). The store keeps two generations bounded by bytes, a block
+    computes its PC-relative values from the PC at its entry, and the cache
+    is indexed by the physical address of the code. To the same point of the
+    boot the translation time fell from 44.8 s to 7 s.
+- The loop reads the words of a block without bounds checks, which every
+  operation passes once when its block is made (`block::op_in_frame`).
+
+### The boots (S1)
+
+`bench/run.py --backend vmlab-hv --arch aarch64 --suite boot` on helios,
+the templates of `~/.local/share/vmlab/templates/aarch64`, AAVMF of
+`guest/fetch-firmware.sh`, 2 GiB, pinned to four cores, under the memory cap
+(`systemd-run --scope -p MemoryMax=24G`). One run each at commit `29189e7f`
+(the code of this card less its tests and lints), Debian at 1 vCPU three
+times.
+
+| Template | 1 vCPU | 2 vCPUs |
+|---|---|---|
+| alpine-3.23 | agent ready in 358 s | agent ready in 356 s |
+| debian-13 | agent ready in 278 s, 285 s and 302 s; one run of an earlier commit of this card in emergency mode | agent ready in 247 s |
+| fedora-44 | emergency mode | emergency mode |
+| ubuntu-24.04 | emergency mode | agent ready in 317 s |
+
+Each boot that fails falls into systemd's emergency mode: a device unit
+(`/boot/efi`, `/dev/ttyAMA0`, the root of the Fedora initrd) does not appear
+inside its 90 s job timeout, because udev's coldplug runs too slowly while
+the rest of early userspace runs beside it. The guests run nothing that the
+CPU does not have: the unknown-is-loud log names nothing, and no boot ends in
+an unimplemented instruction.
+
+The speed it takes: Fedora executes 30.7e9 instructions to agent ready on
+QEMU (M2). The interpreter runs a boot at about 45 to 60 million
+instructions a second, so Fedora needs more than 500 s with no idle time,
+and its device timeouts come first. Dynamic counts on the Debian boot: about
+23 operations a block and 4.2 a guest instruction, 11 register copies a
+block; `Add` is 27 % of the operations, `Slice` 13 %, `And` 10 %, `IsZero`
+9 %, `Xor` 6 %, most of it the NZCV of the flag-setting instructions, which
+every block that ends in a compare writes out. Lazy flags, block chaining or
+the JIT of 3e are what is left for a gain of the size that Fedora needs.
+
+### kvm-unit-tests
+
+`just tcg-a64-kvm-unit-tests` at commit `3353f252`: 11 tests, 9 give the
+same result lines as QEMU and 2 (`gicv2-mmio` and `gicv2-mmio-3p`, 4 vCPUs)
+pass the two `ITARGETSR` subtests that fail on QEMU, as in card C10. The 4
+vCPU tests `selftest-smp`, `gicv2-ipi`, `gicv2-active` and `psci` give the
+same results. `timer` gives the same results after the deadline exit above.
+
+### Tests
+
+- vmlab-hv-tcg-aarch64: `one_translation_serves_code_at_two_addresses`
+  (`tests/translate.rs`) maps one page of code at two addresses, calls an
+  `ADR` at each and counts one translation fewer than for a copy;
+  `a_machine_cpu_leaves_its_loop_when_its_timer_is_due` (`exec.rs`).
+- vmlab-hv-tcg-ir: the hasher spreads near keys over the buckets.
+
+### What this card does not do
+
+- Fedora at 1 and 2 vCPUs and Ubuntu at 1 vCPU do not reach agent ready,
+  and Debian at 1 and 2 vCPUs is near its device timeouts: the speed above.
+  These move to card C13b.
+- O4 for Debian did not run: at the 0.59 million instructions a second of
+  card C10 the 18e9 instructions of the boot take about 8.5 hours. It moves
+  to card C13b.
+- The S1 test of the aarch64 guest asset (`s1_aarch64.rs`, card C14) did
+  not run: helios has no aarch64 guest asset.
+
+### Sources read for this card
+
+- The state of this crate and of vmlab-hv-vmm, and vm-memory's
+  `GuestRegionMmap` interface (`as_ptr`, the bitmap) for the RAM path.
+- The multiply-and-rotate hash from its description (the hasher of Firefox
+  and rustc); no code of it was read or copied.
+- The serial logs of the guests, and kvm-unit-tests as a running program.
 - S1 to S8 for semantics: none opened. No chapter of the Arm Architecture
   Reference Manual was opened.
 - X1 to X3 hold: no QEMU source was opened, no Arm ASL, XML or pseudocode,
