@@ -415,6 +415,8 @@ impl Asm {
         let opcode = match alu {
             Alu::Add => 0x03,
             Alu::Or => 0x0b,
+            Alu::Adc => 0x13,
+            Alu::Sbb => 0x1b,
             Alu::And => 0x23,
             Alu::Sub => 0x2b,
             Alu::Xor => 0x33,
