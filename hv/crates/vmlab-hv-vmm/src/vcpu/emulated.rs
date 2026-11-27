@@ -146,8 +146,12 @@ impl EmulatedVcpu {
         if let Some(error) = &cpu.jit_error {
             log::warn!("vcpu {id}: VMLAB_HV_JIT asks for the JIT, which does not start: {error}");
         } else if cpu.jit_check_enabled() {
+            let runs = match cpu.jit_check_runs() {
+                u32::MAX => "every run".to_string(),
+                runs => format!("the first {runs} runs"),
+            };
             log::info!(
-                "vcpu {id}: the JIT is on, and VMLAB_HV_JIT_CHECK checks every compiled block against the interpreter (K3)"
+                "vcpu {id}: the JIT is on, and VMLAB_HV_JIT_CHECK checks {runs} of each compiled block against the interpreter (K3)"
             );
         } else if cpu.jit_enabled() {
             log::info!("vcpu {id}: the JIT is on");

@@ -842,6 +842,8 @@ struct Compiled {
     /// While K3 checks the blocks: the words of the frame that the code
     /// writes (`jit::emit::written`). Empty otherwise.
     written: Vec<bool>,
+    /// The runs of the compiled code that K3 checked.
+    checks: u32,
 }
 
 /// The most arguments of a helper.
@@ -1260,6 +1262,7 @@ fn compile(
         code: None,
         refused: false,
         written: Vec::new(),
+        checks: 0,
     })
 }
 
@@ -1881,8 +1884,19 @@ impl Replay {
     }
 }
 
-/// How a run of a block ended, as a line of a K3 report and for the
-/// comparison of the two runs.
+/// Whether two runs of a block ended the same way.
+fn same_end(a: &(u32, Option<Halt>), b: &(u32, Option<Halt>)) -> bool {
+    a.0 == b.0
+        && match (&a.1, &b.1) {
+            (None, None) | (Some(Halt::Taken), Some(Halt::Taken)) => true,
+            (Some(Halt::Retry), Some(Halt::Retry)) => true,
+            (Some(Halt::Stop(a)), Some(Halt::Stop(b))) => a == b,
+            (Some(Halt::Raise(a)), Some(Halt::Raise(b))) => a == b,
+            _ => false,
+        }
+}
+
+/// How a run of a block ended, as a line of a K3 report.
 fn halt_text(done: &(u32, Option<Halt>)) -> String {
     let halt = match &done.1 {
         None => "the end of the block".to_string(),
@@ -1974,6 +1988,7 @@ impl Compiled {
         match jit.compile(&shape) {
             Ok(entry) => {
                 self.code = Some(entry);
+                self.checks = 0;
                 if check {
                     self.written = jit::emit::written(&shape).unwrap_or_default();
                 }
@@ -2130,27 +2145,31 @@ impl Compiled {
             left: None,
             difference: None,
         };
-        let interpreted_slots = state.slots;
+        // `slots` holds the entry slots, and then the interpreter's.
+        let mut slots = entry_slots;
         let got = match &mut whole {
-            Some(shadow) => self.run_code(
-                entry,
-                jit,
-                shadow,
-                memory,
-                side,
-                u64::MAX,
-                Some(&mut replay),
-            ),
+            Some(shadow) => {
+                slots = state.slots;
+                self.run_code(
+                    entry,
+                    jit,
+                    shadow,
+                    memory,
+                    side,
+                    u64::MAX,
+                    Some(&mut replay),
+                )
+            }
             None => {
-                state.slots = entry_slots;
+                std::mem::swap(&mut state.slots, &mut slots);
                 self.run_code(entry, jit, state, memory, side, u64::MAX, Some(&mut replay))
             }
         };
+        let interpreted_slots = &slots;
         let got = got.unwrap_or((0, Some(Halt::Stop(host("the budget of the replay")))));
-        // The state of the CPU is the interpreter's from here on.
         let compiled_slots = match &whole {
-            Some(shadow) => shadow.slots,
-            None => std::mem::replace(&mut state.slots, interpreted_slots),
+            Some(shadow) => &shadow.slots,
+            None => &state.slots,
         };
         let mut differences = Vec::new();
         if let Some(difference) = replay.difference.take() {
@@ -2176,21 +2195,19 @@ impl Compiled {
                 replay.left
             ));
         }
-        let (ours, theirs) = (halt_text(&got), halt_text(&expected));
-        if ours != theirs {
+        if !same_end(&got, &expected) {
             differences.push(format!(
-                "the compiled block ran {ours}, the interpreter {theirs}"
+                "the compiled block ran {}, the interpreter {}",
+                halt_text(&got),
+                halt_text(&expected)
             ));
         }
         let agree = match &whole {
             Some(shadow) => *shadow == *state,
             None => {
                 let flags = slot::FLAGS_KIND..=slot::FLAGS_B;
-                let same = compiled_slots
-                    .iter()
-                    .zip(&interpreted_slots)
-                    .enumerate()
-                    .all(|(index, (a, b))| flags.contains(&index) || a == b);
+                let same = compiled_slots[..*flags.start()] == interpreted_slots[..*flags.start()]
+                    && compiled_slots[*flags.end() + 1..] == interpreted_slots[*flags.end() + 1..];
                 // NZCV as each lazy record gives it.
                 let nzcv = |slots: &[u128; slot::COUNT]| {
                     crate::flags::nzcv(
@@ -2199,19 +2216,27 @@ impl Compiled {
                         slots[slot::FLAGS_B] as u64,
                     )
                 };
-                same && nzcv(&compiled_slots) == nzcv(&interpreted_slots)
+                same && nzcv(compiled_slots) == nzcv(interpreted_slots)
             }
         };
         if !agree {
             differences.push("the states differ".to_string());
         }
         if differences.is_empty() {
+            // The state of the CPU is the interpreter's from here on.
+            if whole.is_none() {
+                state.slots = slots;
+            }
             side.check = CheckBuffers {
                 log: replay.log,
                 outcomes: replay.outcomes,
                 frame: buffers.frame,
             };
             return expected;
+        }
+        let compiled_slots = whole.as_ref().map_or(state.slots, |shadow| shadow.slots);
+        if whole.is_none() {
+            state.slots = slots;
         }
         let mut before = whole.clone().unwrap_or_else(|| state.clone());
         before.slots = entry_slots;
@@ -2344,8 +2369,8 @@ impl JitCounts {
 struct JitRun<'a> {
     jit: &'a mut Option<jit::Jit>,
     counts: &'a mut JitCounts,
-    /// K3 checks every compiled block.
-    check: bool,
+    /// K3 checks this many runs of each compiled block, 0 none.
+    check: u32,
 }
 
 /// Run `block` on its compiled code when the JIT is on and takes it, else
@@ -2363,10 +2388,11 @@ fn execute<M: Memory>(
         return block.run(state, memory, side);
     };
     if !block.refused && !block.code.is_some_and(|entry| jit.current(&entry)) {
-        block.compile_code(jit, state.pc(), check);
+        block.compile_code(jit, state.pc(), check > 0);
     }
     if let Some(entry) = block.code {
-        if check {
+        if block.checks < check {
+            block.checks += 1;
             let done = block.check(&entry, jit, state, memory, side);
             counts.checked_runs += 1;
             counts.checked_instructions += u64::from(done.0);
@@ -2405,6 +2431,16 @@ pub fn jit_from_environment() -> bool {
 /// checked against the interpreter as it runs (3e DESIGN.md K3).
 pub fn jit_check_from_environment() -> bool {
     switch("VMLAB_HV_JIT_CHECK")
+}
+
+/// The runs of each compiled block that K3 checks:
+/// `VMLAB_HV_JIT_CHECK_RUNS=<n>`, or every run.
+pub fn jit_check_runs_from_environment() -> u32 {
+    std::env::var("VMLAB_HV_JIT_CHECK_RUNS")
+        .ok()
+        .and_then(|runs| runs.parse::<u32>().ok())
+        .filter(|runs| *runs > 0)
+        .unwrap_or(u32::MAX)
 }
 
 /// Whether `VMLAB_HV_JIT_PERF_MAP` asks for the perf map of the compiled
@@ -2567,8 +2603,10 @@ pub struct Cpu<M> {
     /// The JIT, when it is on (3e DESIGN.md J1).
     jit: Option<jit::Jit>,
     jit_counts: JitCounts,
-    /// K3 checks every compiled block (`set_jit_check`).
+    /// K3 checks the compiled blocks (`set_jit_check`): the first
+    /// `jit_check_runs` runs of each.
     jit_check: bool,
+    jit_check_runs: u32,
     /// The JIT names its blocks in the perf map.
     jit_perf_map: bool,
     /// Why the JIT that `VMLAB_HV_JIT` asked for could not start. The owner
@@ -2612,6 +2650,7 @@ impl<M: Memory> Cpu<M> {
             jit: None,
             jit_counts: JitCounts::default(),
             jit_check: false,
+            jit_check_runs: jit_check_runs_from_environment(),
             jit_perf_map: jit_perf_map_from_environment(),
             jit_error: None,
         };
@@ -2670,6 +2709,21 @@ impl<M: Memory> Cpu<M> {
     pub fn jit_check_enabled(&self) -> bool {
         self.jit_check
     }
+
+    /// K3 checks the first `runs` runs of each compiled block, and every
+    /// later run of it is a plain run of its code. Every block that runs is
+    /// still checked, the first time and as many more as `runs` allows:
+    /// what a boot asks for when a check of every run is too slow for its
+    /// timeouts. `u32::MAX`, the default, checks every run.
+    pub fn set_jit_check_runs(&mut self, runs: u32) {
+        self.jit_check_runs = runs.max(1);
+    }
+
+    /// The runs of each compiled block that K3 checks when it is on.
+    pub fn jit_check_runs(&self) -> u32 {
+        self.jit_check_runs
+    }
+
 
     /// Put a defect into every block that the JIT compiles from now on, to
     /// show that K2 and K3 catch it (3e DESIGN.md J2). For tests only.
@@ -3404,7 +3458,11 @@ impl<M: Memory> Cpu<M> {
             JitRun {
                 jit: &mut self.jit,
                 counts: &mut self.jit_counts,
-                check: self.jit_check,
+                check: if self.jit_check {
+                    self.jit_check_runs
+                } else {
+                    0
+                },
             },
             u64::MAX,
         );
@@ -3508,7 +3566,11 @@ impl<M: Memory> Cpu<M> {
                     JitRun {
                         jit: &mut self.jit,
                         counts: &mut self.jit_counts,
-                        check: self.jit_check,
+                        check: if self.jit_check {
+                    self.jit_check_runs
+                } else {
+                    0
+                },
                     },
                     left,
                 );
