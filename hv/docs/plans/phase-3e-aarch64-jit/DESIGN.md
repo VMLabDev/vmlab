@@ -1288,6 +1288,139 @@ to 57 % of QEMU. Basis: the gains of the table multiplied, each on the
 measured rows of J9b. So R1 holds: the next cards do not reach D1 on the
 boot or on the D2 workloads, and they do not show what would.
 
+### N1, measured by card J10
+
+What card J10 built:
+
+- **J10a. The jump cache keeps its entries across a new address space.**
+  The key of an entry holds the ASID beside the key of the context and the
+  generation (`Jit::set_jump_space`, bits 32 to 47 of the key). A write of
+  TTBR0 or TTBR1 that brings a new ASID and changes nothing else now keeps
+  the cache, as the TLB keeps its tagged entries (`Mmu::jump_changes`). A
+  new base under the same ASID, a TLBI and a change of a control register
+  still empty it. A kernel without hardware PAN writes TTBR0 and the ASID
+  of TTBR1 at every entry and every exit, so this is the change that most
+  misses came from.
+- **J10b. A miss of the jump cache is served without leaving compiled
+  code.** The cold stub of a miss calls the thunk with `jit::JUMP`. The
+  thunk returns the code of the block at the PC when the loop would run that
+  code next without a step of its own: the TLB holds the page of the PC for
+  a fetch, the block is in its entry of the cache for the same context, it
+  was seen in this epoch, its code is current, K3 has no check of it left,
+  and since the run started no store went into translated code and the MMU
+  did not change. It fills the entry as the loop does, and the stub jumps
+  to the code. Anything else returns 0, and the block leaves with `LOOKUP`
+  as before. The interrupt lines, the mail and the timer are not read
+  there, as a hit does not read them: a kick ends the run at the next block
+  head (H10c). `VMLAB_HV_JIT_SERVE=0` turns it off.
+- **J10c. `Seat::prepare` stores the budget with release order**, a `mov`,
+  where it stored it sequentially consistent, an `xchg`. J7a allows it: a
+  kick that lands before the store is lost in either order, and the owner
+  reads its mail and its lines before `prepare` and nothing that a kicker
+  writes after it. The seat is aligned to 128 bytes, on cache lines of its
+  own.
+- **J10d. The small functions of the round trip are inlined across
+  crates** (`Jit::current`, `Jit::context`, `Jit::enter`, `Region::contains`
+  and the reads of the seat). The release profile has no LTO, so they were
+  calls.
+- **J10e. Counts.** The JIT line of the debug log ends with the returns to
+  the loop by reason (the misses served in code, a block that the loop
+  ends itself, a block with nothing to chain to, the budget, a kick) and
+  the changes of the address space that kept the cache. `bench/lib.py`
+  reads them.
+
+Proof, helios, 2026-11-28, *measured*. Before is `next` (`2f8a7dc4`),
+after is `648891e6`. Other cards ran builds and boots at the same time
+(load average 8 to 14 of 32 threads). The rows are in
+`bench/history/aarch64.jsonl` with these two commits. The boot rows of
+both sides are marked dirty: the flat rows of the same checkout were
+written first.
+
+**J10f. The returns to the loop by reason**, Debian 13 to agent ready at
+one vCPU, the counts of the last JIT line of the boot (18.0e9 instructions
+on both sides):
+
+| Reason | Before | After |
+|---|---|---|
+| Returns to the loop (runs of compiled code entered) | 223.3 million | 131.2 million |
+| A miss of the jump cache | 102.2 million | 12.0 million |
+| A miss of the jump cache served in code (J10b) | none | 30.9 million |
+| A first link of a jump (H5) | 27.7 million | 26.1 million |
+| A block that the loop ends itself (H5c: `MSR`, `ERET`, `SVC`, a system instruction) | 93.4 million, with the two rows below (not counted apart before) | 88.3 million |
+| A block with nothing to chain to | | 1.9 million |
+| The budget at a block head, spent or kicked | | 2.9 million, of which 1,205 kicked |
+| An exception or a store into translated code | 83,000 | 83,000 |
+| Emptyings of the jump cache | 1.24 million | 0.30 million, and 0.93 million changes of the address space kept it |
+| Hits of the jump cache inline | 341.8 million | 399.6 million |
+
+The misses of the jump cache, served or not, fell from 102.2 million to
+42.9 million (J10a), and the thunk served 72 % of those that are left
+(J10b). The round trips fell by 41 %. At four vCPUs the last line of a
+boot is that of one vCPU. Two secondary vCPUs at 3.0e9 instructions each:
+62.9 million returns before (21.8 million misses), 51.0 million after
+(8.5 million misses and 4.5 million served).
+
+**J10g. The cost of one round trip**, the flat images with chaining off
+(`VMLAB_HV_JIT_CHAIN=0`), so that every block returns to the loop: the
+time less that of the same image with chaining on, over the runs entered.
+Cores 28 to 31, the median of 5, the three builds in turn. "After with an
+`xchg`" is the after build with the store of `prepare` sequentially
+consistent again, to measure that store alone.
+
+| Image | Before | After | After with an `xchg` |
+|---|---|---|---|
+| Scalar loop, 100.0 million round trips | 34.8 ns | 26.2 ns | 29.5 ns |
+| CoreMark mix, 56.0 million round trips | 35.3 ns | 26.8 ns | 30.4 ns |
+
+A round trip costs a quarter less. The store of `prepare` is 3.3 to 3.6
+ns of it on one thread, the inlining and the alignment the rest. A boot
+pays more for a round trip than this: J9a1 estimated 120 ns from the
+profile. How much of `Seat::prepare` in that profile was the line shared
+with other threads is not measured.
+
+**J10h. The rows.** The boots: Debian 13 to agent ready, the boot suite.
+The two sides ran one after the other repeat by repeat on cores 20 to 23
+(one VM at a time), the median of 3 with the range. A first set ran the
+three repeats of each side in a block, before then after, while the load
+of the host fell.
+
+| Workload | vCPUs | Before | After |
+|---|---|---|---|
+| Boot to agent ready, s, in turn | 1 | 102.4 (86.8 to 107.1), 176.2 MIPS | 84.2 (82.4 to 88.3), 216.1 MIPS |
+| Boot to agent ready, s, in turn | 4 | 105.4 (83.1 to 118.9), 194.6 MIPS | 78.0 (61.0 to 90.0), 259.5 MIPS |
+| Boot to agent ready, s, in a block | 1 | 86.4 (85.0 to 104.2), 209.6 MIPS | 64.2 (60.3 to 64.3), 281.9 MIPS |
+| Boot to agent ready, s, in a block | 4 | 58.8 (54.3 to 60.9), 339.4 MIPS | 50.8 (50.4 to 64.6), 377.1 MIPS |
+| Scalar loop, flat, MIPS, in turn, median of 5 | 1 | 1,970.5 (1,921.4 to 1,995.9) | 1,992.4 (1,916.0 to 2,002.5) |
+| CoreMark mix, flat, MIPS, in turn, median of 5 | 1 | 1,978.7 (1,955.8 to 2,014.9) | 1,937.8 (1,718.2 to 1,981.4) |
+| Scalar loop, flat, MIPS, bench rows | 1 | 1,889.7 | 1,834.3 |
+| CoreMark mix, flat, MIPS, bench rows | 1 | 1,871.0 | 1,810.7 |
+
+- **J10i. N1 holds in part.** The boot at one vCPU is 1.22 times faster in
+  turn and 1.35 times in a block, against the 1.3 to 1.5 of the estimate.
+  At four vCPUs 1.35 and 1.16 times. The round trips fell by 41 %, not by
+  half, and each costs 25 % less on a flat image, not half. The flat rows
+  move by less than the spread of the host: they make almost no round
+  trips (the scalar loop enters compiled code 5 times a run).
+- **J10j. The interpreter share (H2b)** is zero for a missing form in
+  every row: no block refused.
+- **J10k. K3** on a Debian 13 boot at two vCPUs with the after build,
+  `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000`: agent ready
+  after 93.8 s, no difference. 160.8 million checked runs (778.9 million
+  instructions) over both vCPUs at their last lines, with 11.7 million
+  misses served in code between the checked runs.
+- **J10l. K2, K6 and the stress tests of J7** run in `just ci::check`: the
+  block differential, the stores into translated code with the JIT on, the
+  chained pair and the store from a second CPU, and
+  `a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored` at 20,000
+  rounds. The stress test also ran alone at 2,000,000 rounds
+  (`VMLAB_HV_J7_ROUNDS=2000000`), beside the exclusives stress test of
+  card C3: both passed, no stale execution.
+- **J10m. What is left.** 67 % of the returns that are left are blocks
+  that the loop ends itself (H5c), one every 204 instructions of a boot.
+  The `MSR` of a table base and of the ASID at every entry to and exit
+  from the kernel is among them. Serving those in code is a card of its
+  own: each changes the state that the loop reads before the next block.
+
 ### J11, measured by card J11
 
 Helios, 2026-11-28, *measured*. Before: `f0d5a25e`, which is `next`
@@ -1524,6 +1657,22 @@ grep -o "compiles: .*" bench/run/*/stderr.log
 # K3 on a boot
 VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
   --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --cpus 20-23 --timeout-scale 4
+```
+
+J10, the same firmware, one checkout and one release build of each side
+(`CARGO_TARGET_DIR` of its own):
+
+```sh
+# J10h: the boot rows, the two sides in turn, one VM at a time (each side in its checkout)
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1 --repeats 1 --guest debian-13 \
+  --suite boot --keep --hv-bin <side>/release/vmlab-hv --cpus 20-23    # before, after, before, ...
+# J10f: the returns by reason are in the JIT lines of the kept stderr.log, and in env.jit_reports
+# of each row
+# J10g: the cost of a round trip, each image with chaining on and off, the builds in turn
+VMLAB_HV_JIT=1 VMLAB_HV_JIT_CHAIN=0 taskset -c 28-31 <side>/release/examples/a64_bench <image> 4000000000
+# J10k: K3 on a Debian boot at two vCPUs
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv \
+  --arch aarch64 --vcpus 2 --repeats 1 --guest debian-13 --suite boot --timeout-scale 3 --cpus 24-27
 ```
 
 The boot MIPS of E2 are the differences of the instruction counter that the
