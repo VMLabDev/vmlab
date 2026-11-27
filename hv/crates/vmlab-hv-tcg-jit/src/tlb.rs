@@ -114,13 +114,15 @@ impl FastTlb {
         (va >> 12) as usize & (ENTRIES - 1)
     }
 
-    /// The entries of every table, table after table.
-    fn entries(&self) -> &[Entry] {
-        self.lines.as_flattened()
+    /// The entry at `at` of the tables, table after table.
+    #[inline(always)]
+    fn entry(&self, at: usize) -> &Entry {
+        &self.lines[at / 2].0[at % 2]
     }
 
-    fn entries_mut(&mut self) -> &mut [Entry] {
-        self.lines.as_flattened_mut()
+    #[inline(always)]
+    fn entry_mut(&mut self, at: usize) -> &mut Entry {
+        &mut self.lines[at / 2].0[at % 2]
     }
 
     /// The place of the entry `index` of the table of `level` for reads or
@@ -133,13 +135,15 @@ impl FastTlb {
     /// The table of `level` for reads or for writes, as compiled code takes
     /// it.
     pub fn table(&self, level: usize, write: bool) -> *const Entry {
-        self.entries()[Self::place(level, write, 0)..].as_ptr()
+        let lines = self.lines.as_ptr().cast::<Entry>();
+        // In the allocation: a place is less than its length in entries.
+        lines.wrapping_add(Self::place(level, write, 0))
     }
 
     /// The entry that an access of `bytes` bytes at `va` hits, as the
     /// inlined lookup finds it.
     pub fn lookup(&self, level: usize, write: bool, va: u64, bytes: u8) -> Option<&Entry> {
-        let entry = &self.entries()[Self::place(level, write, Self::index(va))];
+        let entry = self.entry(Self::place(level, write, Self::index(va)));
         (va & (!0xfff | (u64::from(bytes.max(1)) - 1)) == entry.tag).then_some(entry)
     }
 
@@ -160,10 +164,10 @@ impl FastTlb {
     ) {
         let tag = va & !0xfff;
         let at = Self::place(level, write, Self::index(va));
-        let place = &mut self.lines.as_flattened_mut()[at];
-        if place.tag == EMPTY {
+        if self.entry(at).tag == EMPTY {
             self.used += 1;
         }
+        let place = self.entry_mut(at);
         *place = Entry {
             tag,
             addend: (host as u64).wrapping_sub(tag),
@@ -216,14 +220,13 @@ impl FastTlb {
             return;
         }
         let index = page as usize & (ENTRIES - 1);
-        let mut dropped = 0;
-        for table in self.entries_mut().chunks_exact_mut(ENTRIES) {
-            if table[index].tag != EMPTY {
-                table[index] = NOTHING;
-                dropped += 1;
+        for table in 0..4 {
+            let entry = self.entry_mut(table * ENTRIES + index);
+            if entry.tag != EMPTY {
+                *entry = NOTHING;
+                self.used -= 1;
             }
         }
-        self.used -= dropped;
     }
 
     /// Drop the write entries of the physical page that holds `phys`: it
@@ -236,11 +239,13 @@ impl FastTlb {
         let page = phys & !0xfff;
         let mut dropped = 0;
         for level in 0..2 {
-            let from = Self::place(level, true, 0);
-            for entry in &mut self.entries_mut()[from..from + ENTRIES] {
-                if entry.tag != EMPTY && entry.phys == page {
-                    *entry = NOTHING;
-                    dropped += 1;
+            let from = Self::place(level, true, 0) / 2;
+            for line in &mut self.lines[from..from + ENTRIES / 2] {
+                for entry in &mut line.0 {
+                    if entry.tag != EMPTY && entry.phys == page {
+                        *entry = NOTHING;
+                        dropped += 1;
+                    }
                 }
             }
         }
