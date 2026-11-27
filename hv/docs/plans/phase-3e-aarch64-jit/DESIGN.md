@@ -32,9 +32,9 @@ description.
   x86-64 with a small emitter of our own, at the moment the block is
   translated. No tiering and no traces in the first cards. The interpreter
   stays as the reference, as the cold path and as the per-block fallback.
-- **Why not Cranelift (D5).** Measured on the same blocks: Cranelift needs 25
+- **Why not Cranelift (D5).** Measured on the same blocks: Cranelift needs 24
   to 160 µs to compile a block, our emitter 0.2 to 1.1 µs. Cranelift's code is
-  6 to 54 % faster on a block alone. Chaining and lazy flags are worth more
+  8 to 53 % faster on a block alone. Chaining and lazy flags are worth more
   than that (1.25 to 2.1 times and 1.2 to 1.7 times) and do not depend on the
   back end. This changes D5, so it is question Q1 for the operator.
 - **What the JIT can reach.** *Est.*: 250 to 450 MIPS on a boot and 1,500 to
@@ -63,8 +63,8 @@ median with the range. MIPS is instructions of the image over the run time.
 
 QEMU is 17.5 times faster than `next` on CoreMark, and 19 times faster than
 the tip of card #1048. The changes of #1048 made a boot faster and a flat
-image 9 % slower: the loop reads the interrupt lines and the timer deadline
-before every block. Card #1142 (S1, lazy flags, not merged) reports 138 to 156
+image 9 % slower. The basis of an explanation, not measured: the loop now
+reads the interrupt lines and the timer deadline before every block. Card #1142 (S1, lazy flags, not merged) reports 138 to 156
 MIPS on CoreMark and 136 to 195 on the loop on its branch.
 
 ### E2. Today's numbers, a boot (measured)
@@ -81,14 +81,22 @@ The instruction counts are the counter of the vCPU.
 | User space (systemd) | 186 to 322 | 4.85e9 | 49, 25, 33 |
 | Whole busy part | 0 to 330 | 17.9e9 | 54 |
 
-This run did not reach agent ready inside 600 s under the sampler. Card #1048
-measured the same commit without one: 278 s, 285 s and 302 s to agent ready,
-and emergency mode on Fedora at 1 and 2 vCPUs and on Ubuntu at 1 vCPU. A boot
-of `next` was not measured again: `next` does not have the fixes of #1048, and
-F3 of that card measured it at 45 MIPS with Debian in emergency mode.
+This run did not reach agent ready inside 600 s under the sampler. A second
+run of the same commit without the sampler and without frame pointers, on
+cores 8 to 11 with the host at a load average of 15, fell into emergency
+mode: a device unit timed out. Card #1048 measured the same commit at 278 s,
+285 s and 302 s to agent ready, with emergency mode on Fedora at 1 and 2
+vCPUs and on Ubuntu at 1 vCPU. So Debian at one vCPU is at the edge today. A
+boot of `next` was not measured again: `next` does not have the fixes of
+#1048, and F3 of that card measured it at 45 MIPS with Debian in emergency
+mode.
 
-The QEMU side, from `bench/history/aarch64.jsonl` (2026-11-26, three repeats,
-median) and the instruction counts of 3d:M2:
+QEMU booted the same template on the same cores a minute later in 33.1 s,
+30.0 s and 30.8 s (median 30.8 s, 585 MIPS average).
+
+The QEMU side for all four templates, from `bench/history/aarch64.jsonl`
+(2026-11-26, a quieter host, three repeats, median) and the instruction
+counts of 3d:M2:
 
 | Template | QEMU, 1 vCPU (s) | 2 vCPUs (s) | 4 vCPUs (s) | Instructions, 1 vCPU | QEMU average MIPS, 1 vCPU |
 |---|---|---|---|---|---|
@@ -101,8 +109,8 @@ The average includes idle time, so QEMU is faster than this while it executes.
 
 ### T1. The first useful bar
 
-All four templates reach agent ready at 1 and 2 vCPUs, three runs of three
-each, with no unit in emergency mode, and the boot MIPS row of Debian at one
+All four templates reach agent ready at 1 and 2 vCPUs in three runs of
+three, with no unit in emergency mode, and the boot MIPS row of Debian at one
 vCPU is at least 150.
 
 The basis: the failures of card #1048 are device units that miss a 90 s
@@ -193,9 +201,8 @@ through the same dispatcher (a table by PC) and must leave the same registers
 and memory as the interpreter.
 
 - **Interpreter**: the loop of `exec` over the operations, without its checks.
-- **Cranelift** 0.123.23, one function per block, at `opt_level` `none` and
-  `speed`. The spike was written against this version. The newest is 0.138.0,
-  where two calls of the API differ. It was not measured.
+- **Cranelift** 0.138.0, the newest, one function per block, at `opt_level`
+  `none` and `speed`. Version 0.123.23 gave the same numbers within 10 %.
 - **Template**: one stencil of machine code per operation, with holes for the
   words of the frame, copied and patched. Every value lives in its word of the
   frame. This is the simplest copy-and-patch form. A stencil library built by
@@ -212,18 +219,18 @@ block of 33 instructions that mixes both. Median of three runs, pinned.
 | Block | Executor | MIPS | Compile time per block | Code bytes |
 |---|---|---|---|---|
 | Integer, 6 instructions, 14 operations | Interpreter | 410 | | |
-| | Cranelift `none` | 3,094 | 25.2 µs | 208 |
-| | Cranelift `speed` | 3,247 | 42.6 µs | 176 |
+| | Cranelift `none` | 3,033 | 23.7 µs | 208 |
+| | Cranelift `speed` | 3,218 | 42.3 µs | 176 |
 | | Template | 1,538 | 0.18 µs | 533 |
 | | Direct | 2,107 | 0.35 µs | 241 |
 | Load and store, 7 instructions, 16 operations | Interpreter | 414 | | |
-| | Cranelift `none` | 2,485 | 46.8 µs | 392 |
-| | Cranelift `speed` | 2,568 | 75.5 µs | 384 |
+| | Cranelift `none` | 2,451 | 42.0 µs | 384 |
+| | Cranelift `speed` | 2,635 | 77.7 µs | 392 |
 | | Template | 1,486 | 0.18 µs | 720 |
 | | Direct | 2,430 | 0.47 µs | 460 |
 | Mixed, 33 instructions, 44 operations | Interpreter | 842 | | |
-| | Cranelift `none` | 6,962 | 88.8 µs | 824 |
-| | Cranelift `speed` | 7,175 | 157.6 µs | 800 |
+| | Cranelift `none` | 7,341 | 85.0 µs | 792 |
+| | Cranelift `speed` | 7,089 | 160.1 µs | 808 |
 | | Template | 3,097 | 0.48 µs | 1,710 |
 | | Direct | 5,562 | 1.09 µs | 1,137 |
 
@@ -257,7 +264,7 @@ What the spike does not show:
 
 | Option | Pulled in | Licences |
 |---|---|---|
-| Cranelift | 39 crates in the build of the spike for this host, 19 of them from the Cranelift and Wasmtime project (`cranelift-*`, `regalloc2`, `target-lexicon`, two `wasmtime-internal-*`). The spike binary is 6.3 MB. | Apache-2.0 WITH LLVM-exception for those 19. The others MIT or Apache-2.0, one of them with Unicode-3.0. All usable as dependencies under `hv/AGENTS.md`. |
+| Cranelift | 34 crates in the build of the spike for this host (38 with version 0.123.23), 19 of them from the Cranelift and Wasmtime project (`cranelift-*`, `regalloc2`, `target-lexicon`, `wasmtime-internal-*`). The spike binary is 7.0 MB. | Apache-2.0 WITH LLVM-exception for those 19. The others MIT or Apache-2.0, one Zlib, one with Unicode-3.0. All usable as dependencies under `hv/AGENTS.md`. |
 | Copy-and-patch from stencils of a C compiler | No run-time crate. At build time: clang (already used by `build.rs` for C helpers) and a reader of relocations. | Our own code. |
 | Template, stencils from our assembler | Nothing. | Our own code. |
 | Direct emission | Nothing. | Our own code. Encodings from the Intel manual, which `hv/AGENTS.md` names as a source. |
@@ -266,11 +273,11 @@ What the spike does not show:
 
 | Code | Option | For | Against |
 |---|---|---|---|
-| O1 | Cranelift (the choice of D5) | A tested register allocator and optimiser. The fastest code on a block alone: 6 to 54 % over the direct emitter in B1. A second host architecture for free. | 25 to 160 µs per block. A boot makes 1.1 to 2.3 million translations (F6 of #1048, with and without the 1.2 million that card #1143 removes), so compiling each is 30 to 360 s of host time. The boot of QEMU is 26 to 62 s. So Cranelift needs tiering: a count per block, a threshold, the interpreter for everything below it. A boot is mostly warm code, not hot code, and the interpreter stays in most of it. The documentation read for the spike shows no direct jump that is patched later (chaining) in its JIT module, so a block would chain through an indirect jump or a tail call. This was not checked further and not measured. The host is x86-64 only (HV-D3), so a second architecture has no use. |
+| O1 | Cranelift (the choice of D5) | A tested register allocator and optimiser. The fastest code on a block alone: 8 to 53 % over the direct emitter in B1. A second host architecture for free. | 24 to 160 µs per block. A boot makes 1.1 to 2.3 million translations (F6 of #1048, with and without the 1.2 million that card #1143 removes), so compiling each is 30 to 360 s of host time. The boot of QEMU is 26 to 62 s. So Cranelift needs tiering: a count per block, a threshold, the interpreter for everything below it. A boot is mostly warm code, not hot code, and the interpreter stays in most of it. The documentation read for the spike shows no direct jump that is patched later (chaining) in its JIT module, so a block would chain through an indirect jump or a tail call. This was not checked further and not measured. The host is x86-64 only (HV-D3), so a second architecture has no use. |
 | O2 | Template JIT | The simplest emitter. The same compile time as O3. | About half the speed of O3 (1,486 to 3,097 against 2,107 to 5,562), because every value passes through memory. Three times the code bytes. |
 | O3 | Direct emission | 0.2 to 1.1 µs per block: under 10 % of the 8 to 17 µs that a translation costs today. So every block is compiled when it is translated, with no tiering, no counters and no second code path for warm code. Code layout is ours: a patchable jump, a cold stub and a precise exit are plain bytes. No dependency. | We own an assembler and a register allocator with a spill. The code is slower than Cranelift's on a block alone. No optimiser across blocks. |
 
-**Recommendation: O3.** The measured difference in code speed (6 to 54 %) is
+**Recommendation: O3.** The measured difference in code speed (8 to 53 %) is
 smaller than each of the two steps that are free of the back end (chaining,
 lazy flags), and the difference in compile time (70 to 160 times) decides
 whether the design needs tiering at all.
@@ -278,7 +285,7 @@ whether the design needs tiering at all.
 **What the plan's choice of Cranelift costs or saves.** It saves writing an
 allocator and gives better code inside a block or a trace. It costs a tiering
 design before the first measured gain, 30 to 360 s of compile time per boot if
-tiering is left out, 39 crates, and an unmeasured way to chain. D5 chose it
+tiering is left out, 34 crates, and an unmeasured way to chain. D5 chose it
 for "cross-block optimisation" in hot traces. That stays possible later as a
 second tier over O3 for the hottest regions, if the numbers of card J9 ask for
 it. It is not needed for T1.

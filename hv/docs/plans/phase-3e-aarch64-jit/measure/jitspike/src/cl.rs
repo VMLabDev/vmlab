@@ -4,7 +4,7 @@ use crate::{Block, Code, OFF_TLB, PC, TLB_ENTRIES, TLB_MASK, slow_load, slow_sto
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::I64;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -37,6 +37,7 @@ impl Jit {
         let mut store_signature = self.module.make_signature();
         store_signature.params.extend([AbiParam::new(I64); 3]);
 
+        let target = self.module.target_config();
         let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.builder);
         let load_signature = b.import_signature(load_signature);
         let store_signature = b.import_signature(store_signature);
@@ -45,7 +46,7 @@ impl Jit {
         b.switch_to_block(entry);
         b.seal_block(entry);
         let state = b.block_params(entry)[0];
-        let flags = MemFlags::trusted();
+        let flags = MemFlagsData::trusted();
 
         let mut values: Vec<Option<Value>> = vec![None; block.slots];
         for (slot, value) in &block.consts {
@@ -136,7 +137,7 @@ impl Jit {
         let next = b.ins().select(values[block.cond as usize].unwrap(), taken, fall);
         b.ins().store(flags, next, state, PC as i32 * 8);
         b.ins().return_(&[]);
-        b.finalize();
+        b.finalize(target);
 
         let id = self.module.declare_anonymous_function(&self.context.func.signature).unwrap();
         self.module.define_function(id, &mut self.context).unwrap();
