@@ -1007,7 +1007,12 @@ fn compile(
         let leave = match leave_of[exit] {
             Some(leave) => leave,
             None => {
-                let A64Next::Exception { class, syndrome, at } = &payload.next else {
+                let A64Next::Exception {
+                    class,
+                    syndrome,
+                    at,
+                } = &payload.next
+                else {
                     return Err(host("an event that leaves a block without an exception"));
                 };
                 let leave = narrow(parts.leaves.len())?;
@@ -1407,7 +1412,13 @@ impl Compiled {
     /// Leave through `exit`, which `failed` asked for: the registers as they
     /// were before the instruction that could not complete.
     #[cold]
-    fn leave(&self, state: &mut State, entry: u64, exit: u32, failed: Failed) -> (u32, Option<Halt>) {
+    fn leave(
+        &self,
+        state: &mut State,
+        entry: u64,
+        exit: u32,
+        failed: Failed,
+    ) -> (u32, Option<Halt>) {
         let leave = &self.leaves[exit as usize];
         for (register, place) in &leave.outputs {
             state.slots[*register as usize] = place.read(&self.frame);
