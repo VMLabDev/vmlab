@@ -865,6 +865,101 @@ J1). After: `f286f9b3`. Other cards ran boots and builds at the same time
   time, the boots of each half and the boots after the change passed, and
   K1 and K2 found no difference.
 
+### J7, more than one vCPU (measured)
+
+What card J7 built:
+
+- **J7a. The seat (H10c).** The context of compiled code is no longer on
+  the stack of a run. It is in a seat (`vmlab-hv-tcg-jit::seat`) at an
+  address that lives as long as the CPU: the seat of its interrupt lines
+  (`exec::Lines`), or a seat of its own. Another thread kicks the run with
+  one atomic subtraction of 2^40 from the budget, and the next block head
+  leaves. The head subtracts with a plain read-modify-write, so a kick that
+  lands inside it is lost. A thread that waits for the CPU kicks again
+  every 64 turns of its wait. The owner reads the budget back as its
+  remainder by 2^40, so the count of instructions is exact after any
+  number of kicks, and a run holds at most 2^38 instructions.
+- **J7b. Who kicks.** An interrupt line that rises (`CpuLine::set_level`).
+  A kick of the VMM (a pause, a snapshot, a change of the run state), which
+  also sets `Lines::leave`, so that `run` ends at the next block and not at
+  the end of its slice. Every post to a mailbox. The thunk kicks its own
+  run, as before, after a store into translated code.
+- **J7c. Code mail (H11a with several vCPUs).** A store that ended
+  translated code of some CPU made the watch word of its page even. The
+  memory counts these writes for each handle (`Memory::ended_code`). The
+  CPU that made the store posts code mail to the others, kicks them and
+  waits until each one that runs has taken it, before the store
+  instruction completes. It waits after it lets go of the lock of an
+  exclusive store. A CPU that takes code mail starts a new epoch: its
+  compiled code leaves at the next block head, every link is unlinked,
+  and each block passes its code stamp again before it runs. Before J7 a
+  CPU learned of such a store at the end of its slice of 65,536
+  instructions, and ran the old code of a chained loop until then.
+- **J7d. H11c.** A CPU that translates code in a page that it holds no
+  code of posts the page (`Invalidation::CodePage`) after it makes the
+  watch word odd and before it reads the code. It waits until every other
+  CPU that runs has dropped its write entries of the page from its fast
+  TLB. A translation whose watch word changed while it read the code
+  (`watch_holds` is false) ends its epoch after its run: a block without a
+  stamp chained and ran until the next epoch before.
+- **J7e. The TLBI broadcast** is that of card C13 with the kick. A CPU
+  applies the mail to its architectural TLB, which flushes the fast TLB the
+  same way (H7b), and the next run empties the jump cache, because the
+  changes of the MMU moved. A broadcaster waited up to `CHAIN_SLICE` (4,096
+  instructions) of each other CPU before J7 and waits one block now.
+- **J7f. Counts.** The JIT line of the debug log ends with what the CPUs
+  of a machine told each other: exclusive loads and stores, code mails,
+  code pages, and the time spent waiting. `bench/lib.py` reads them.
+
+Proof, helios, 2026-11-27, *measured*:
+
+| Proof | Result |
+|---|---|
+| The stress test of J7 (`a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored`, two CPUs on two threads on a `GuestBus`, the JIT and chaining on): the writer stores `MOVZ X1, #round` into a function that the runner calls from a chained loop, then publishes the round; the runner checks the value and acknowledges | 10,000,000 rounds in 43.2 s, no stale execution (`VMLAB_HV_J7_ROUNDS=10000000`). The test of `ci::check` runs 20,000 rounds. A build that told the others after the stores of the Rust paths but not after the store that `Memory::write` serves stopped in its first rounds with the runner on old code: the test sees the defect. |
+| The exclusives stress test of card C3 (`two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing`) | Passes on the interpreter and with the JIT and chaining, both with the mailboxes of two CPUs. |
+| kvm-unit-tests (`just tcg-a64-kvm-unit-tests`, `VMLAB_HV_JIT=1`; `selftest-smp`, `gicv2-ipi`, `gicv2-mmio`, `gicv2-mmio-3p`, `gicv2-active` and `psci` at 4 vCPUs) | 11 tests. vmlab-hv passes every subtest that it passes on the interpreter. QEMU failed `psci: cpu-on` in one of its two runs. |
+
+The rows, before (`6242195c`, `next`) and after (`3b07327b`), side by
+side: cores 20 to 23 and 24 to 27 for the boots, 28 to 31 for the flat
+images, the median of 3, at a load of 3 to 11 of 32 threads. The boot rows
+of both sides are marked dirty: the flat rows of the same checkout were
+written first.
+
+| Workload | Before | After |
+|---|---|---|
+| Scalar loop, flat, JIT, MIPS | 1,876.0 | 1,959.2 |
+| CoreMark mix, flat, JIT, MIPS | 1,479.9 | 1,558.0 |
+| Debian 13 boot to agent ready, 1 vCPU, s | 102.9 | 93.0 |
+| The same, boot MIPS | 174.3 | 191.7 |
+| Debian 13 boot, 2 vCPUs, s | 80.2 | 72.2 |
+| The same, boot MIPS (both vCPUs) | 231.0 | 256.2 |
+| Debian 13 boot, 4 vCPUs, s | 108.8 | 114.3 |
+| The same, boot MIPS (four vCPUs) | 179.0 | 171.8 |
+| Instructions in the interpreter (H2b), 1 vCPU, at the last report | 44.0 million of 17.0e9 in 5.60 million runs | 43.5 million of 17.0e9 in 5.56 million runs |
+
+No instruction of the flat images ran in the interpreter. The 4 vCPU
+boots of both sides slowed from repeat to repeat (76 to 143 s and 72 to
+145 s) while the load of the host rose, so that row holds no difference
+of the two.
+
+- **J7g. The share of exclusives** (after, the sum over the vCPUs at their
+  last report, about 17e9 instructions). It is a share of the instructions
+  that ran, from the counts of J7f, not a sampled profile of the host time.
+
+  | vCPUs | Exclusive loads | Exclusive stores | Share of the instructions | Code mails | Code pages | Waiting |
+  |---|---|---|---|---|---|---|
+  | 1 | 12.0 million | 11.9 million | 0.14 % | 0 | 0 | 0 |
+  | 2 | 27.3 to 30.9 million | 11.3 to 12.9 million | 0.23 to 0.24 % | 2,412 to 2,559 | 11,259 to 11,573 | 114 to 136 ms |
+  | 4 | 44.9 to 64.6 million | 10.6 to 11.2 million | 0.33 to 0.42 % | 2,392 to 2,442 | 16,408 to 17,447 | 2.6 to 8.2 s |
+
+  The stores stay at about 11 million and the loads grow with the vCPUs:
+  the extra loads are spins of a lock (`LDAXR` until the lock is free). At
+  4 vCPUs on 4 host cores the waits of J7c and J7d took 2.6 to 8.2 s of
+  CPU time over a boot of 72 to 145 s, 0.2 to 0.5 ms a wait. The basis of
+  an explanation, not measured: a waited CPU whose thread is not on a
+  core (four vCPU threads and the threads of the devices share four
+  cores) takes its mail only when it runs again.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
