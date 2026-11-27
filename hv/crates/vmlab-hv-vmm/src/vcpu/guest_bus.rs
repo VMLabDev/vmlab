@@ -272,24 +272,35 @@ fn has_cas16() -> bool {
     }
 }
 
-/// Compare and exchange the 16 bytes at `at`.
+/// Compare and exchange the 16 bytes at `at`: `lock cmpxchg16b`, written
+/// out because the intrinsic leaves a call of `__atomic_compare_exchange_16`
+/// in a build without optimisation, which no library serves.
 ///
 /// # Safety
 /// `at` is a live, writable, 16-byte aligned host address, and the host has
 /// `cmpxchg16b` (`has_cas16`).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "cmpxchg16b")]
 unsafe fn cas16(at: usize, expected: u128, new: u128) -> bool {
-    // SAFETY: the caller's promise.
+    let swapped: u8;
+    // SAFETY: the caller's promise. `rbx` belongs to the compiler, so the
+    // low half of the new value goes through another register and `rbx` is
+    // put back.
     unsafe {
-        std::arch::x86_64::cmpxchg16b(
-            at as *mut u128,
-            expected,
-            new,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) == expected
+        std::arch::asm!(
+            "xchg {low}, rbx",
+            "lock cmpxchg16b xmmword ptr [{at}]",
+            "sete {swapped}",
+            "mov rbx, {low}",
+            at = in(reg) at,
+            low = inout(reg) new as u64 => _,
+            swapped = out(reg_byte) swapped,
+            inout("rax") expected as u64 => _,
+            inout("rdx") (expected >> 64) as u64 => _,
+            in("rcx") (new >> 64) as u64,
+            options(nostack),
+        );
     }
+    swapped != 0
 }
 
 /// Compare and exchange `len` bytes, 1 to 16, at `at`: `expected` and `new`
