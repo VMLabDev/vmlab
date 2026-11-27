@@ -1548,7 +1548,8 @@ fn load<M: Memory, const N: usize>(
     let need = mmu::needed(Kind::Read, user);
     // The address has the alignment that Device memory asks for, or the page
     // is not Device memory (card S4).
-    let aligned = |flags: u8| flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0;
+    let aligned =
+        |flags: u8| flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0;
     // The common case: the TLB holds the page with the permission and its
     // host address, and nothing keeps the accesses.
     if side.log.is_none() {
@@ -1718,7 +1719,8 @@ fn store<M: Memory, const N: usize>(
     // The common case: the TLB holds the page with the permission, the page
     // holds no translated code, there is no exclusive mark to carry over
     // the store, and nothing keeps the accesses.
-    let aligned = |flags: u8| flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0;
+    let aligned =
+        |flags: u8| flags & mmu::flag::DEVICE == 0 || at & u64::from(op.aux & DEVICE_MASK) == 0;
     if side.exclusive.is_none() && side.log.is_none() {
         // RAM that the host reaches straight, which no CPU holds code of:
         // the store needs no stamp (card S3).
