@@ -1885,6 +1885,8 @@ fn store_pair<M: Memory>(
             .write(phys + 8, &high.to_le_bytes())
             .map_err(|error| (exit, Failed::Access(Fault::memory(error, at), true)))?;
         side.own_writes += 1;
+        // Translated code of another CPU can be in the page.
+        side.tell_code(memory);
         return Ok(());
     }
     device_faults(side, memory, at, op.aux, Kind::Write).map_err(|failed| (exit, failed))?;
@@ -1953,6 +1955,8 @@ fn store<M: Memory, const N: usize>(
             && memory.write(phys, &value.to_le_bytes()[..N]).is_ok()
         {
             side.own_writes += 1;
+            // Translated code of another CPU can be in the page.
+            side.tell_code(memory);
             return Ok(());
         }
     }

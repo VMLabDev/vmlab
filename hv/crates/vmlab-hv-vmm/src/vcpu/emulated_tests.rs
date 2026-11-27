@@ -742,12 +742,16 @@ fn a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored() {
             .unwrap();
     }
     let shootdown = Arc::new(vmlab_hv_tcg_aarch64::shootdown::Shootdown::new(2));
+    // A CPU that stops ends the other: the writer waits for an
+    // acknowledgement that a runner that stopped does not give.
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let threads: Vec<_> = [WRITER, RUNNER]
         .into_iter()
         .enumerate()
         .map(|(id, start)| {
             let bus = bus.clone();
             let shootdown = shootdown.clone();
+            let stopped = stopped.clone();
             std::thread::spawn(move || {
                 let mut state = State::reset(start);
                 state.set_x(2, FUNCTION);
@@ -760,26 +764,35 @@ fn a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored() {
                 cpu.set_jit(true).unwrap();
                 cpu.set_chaining(true).unwrap();
                 cpu.shootdown = Some((shootdown, id));
-                loop {
+                let stop = loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        break None;
+                    }
                     match cpu.run(1 << 20) {
                         vmlab_hv_tcg_aarch64::Stop::Budget => {}
                         vmlab_hv_tcg_aarch64::Stop::Hypercall { immediate, .. } => {
-                            return (immediate, cpu.state.x(5), cpu.state.x(1), cpu.jit_counts());
+                            break Some(immediate);
                         }
-                        other => panic!("cpu {id}: {other:?}"),
+                        other => {
+                            stopped.store(true, Ordering::SeqCst);
+                            panic!("cpu {id}: {other:?}");
+                        }
                     }
-                }
+                };
+                stopped.store(true, Ordering::SeqCst);
+                (stop, cpu.state.x(5), cpu.state.x(1), cpu.jit_counts())
             })
         })
         .collect();
     let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-    let (immediate, round, value, counts) = &results[1];
+    let (stop, round, value, counts) = &results[1];
     assert_eq!(
-        *immediate, 0,
-        "the runner ran old code in round {round}: x1 {value:#x}"
+        *stop,
+        Some(0),
+        "the runner ran old code in round {round}: x1 {value:#x}, {counts:?}"
     );
     assert_eq!(*round, rounds);
-    assert_eq!(results[0].0, 0);
+    assert_eq!(results[0].0, Some(0));
     // The loops ran as compiled code that chains.
     assert!(counts.chained > rounds, "{counts:?}");
 }
