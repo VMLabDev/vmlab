@@ -2656,7 +2656,13 @@ mod tests {
     fn block_counts_measure_rollback_work_and_pairs_without_changing_execution() {
         // add x4, x4, #1 ; ldp x0, x1, [x2] ; stp x0, x1, [x3] ;
         // movz x4, #0 ; b .
-        let words = [0x9100_0484, 0xa940_0440, 0xa900_0460, 0xd280_0004, 0x1400_0000];
+        let words = [
+            0x9100_0484,
+            0xa940_0440,
+            0xa900_0460,
+            0xd280_0004,
+            0x1400_0000,
+        ];
         let mut plain = cpu(&words);
         let mut counted = cpu(&words);
         counted.block_counts = Some(BlockCounts::default());
