@@ -1768,7 +1768,7 @@ fn compile_with(
         return Err(host("a block without an exit"));
     };
     if let (Some(counts), Some(op_counts)) = (counts, &parts.op_counts) {
-        counts.translated(&block, op_counts, lowering.ops.len());
+        counts.translated(block, op_counts, lowering.ops.len());
     }
     // The loop reads the words of an operation without a check.
     let words = lowering.frame.len();
@@ -1794,9 +1794,9 @@ fn compile_with(
         ops: lowering.ops.clone(),
         generics: lowering.generics.clone(),
         accesses: parts.accesses.clone(),
-        leaves: parts.leaves.drain(..).collect(),
+        leaves: moved(&mut parts.leaves),
         frame: lowering.frame.clone(),
-        calls: parts.calls.drain(..).collect(),
+        calls: moved(&mut parts.calls),
         inputs: parts.inputs.clone(),
         outputs,
         terminal,
@@ -1807,6 +1807,14 @@ fn compile_with(
         checks: 0,
         origin: Origin::First,
     })
+}
+
+/// The items of `list` in a list of their own size: `list` is left empty
+/// with its memory, for the next block.
+fn moved<T>(list: &mut Vec<T>) -> Vec<T> {
+    let mut items = Vec::with_capacity(list.len());
+    items.append(list);
+    items
 }
 
 fn bits_mask(bytes: u8) -> u128 {
