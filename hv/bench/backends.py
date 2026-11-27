@@ -234,12 +234,13 @@ def hv_machine_description(run_dir, arch, smp, overlay, code_fd, vars_fd):
 
     The guest matches the QEMU backend: `virt` hardware, 2 GiB, one qcow2
     overlay on virtio-blk, edk2 firmware pair, the agent port named
-    `vmlab.agent.0`. `accel` is `tcg` — the point of the comparison. The
-    `machine` field stays at its default until phase 3b/3d adds the `virt`
-    machine kind; until then vmlab-hv itself rejects the description, which
-    the backend reports as a skip.
+    `vmlab.agent.0`. `accel` is `tcg` — the point of the comparison. An
+    aarch64 guest runs on the `virt` machine of phase 3d with AAVMF. riscv64
+    keeps the default machine until phase 3b adds its `virt`; until then
+    vmlab-hv itself rejects the description, which the backend reports as a
+    skip.
     """
-    return {
+    desc = {
         "name": f"vmlab:bench/{arch}",
         "arch": arch,
         "accel": "tcg",
@@ -247,7 +248,7 @@ def hv_machine_description(run_dir, arch, smp, overlay, code_fd, vars_fd):
         "memory_mib": 2048,
         "boot": {
             "kind": "firmware",
-            "firmware": "ovmf",
+            "firmware": "aavmf" if arch == "aarch64" else "ovmf",
             "code": code_fd,
             "vars": vars_fd,
             "secure_boot": False,
@@ -267,6 +268,9 @@ def hv_machine_description(run_dir, arch, smp, overlay, code_fd, vars_fd):
             {"name": "vmlab.agent.0", "socket": os.path.join(run_dir, "agent.sock")}
         ],
     }
+    if arch == "aarch64":
+        desc["machine"] = "virt"
+    return desc
 
 
 class HvBackend:
