@@ -385,6 +385,11 @@ pub struct Block {
     queue_sizes: Vec<u16>,
     /// Queue states restored before activation, applied by `activate`.
     pending_queues: Option<Vec<virtio_queue::QueueState>>,
+    /// What `VIRTIO_BLK_T_GET_ID` answers, NUL-padded to the 20 bytes the
+    /// request carries. Set by the machine at build time and never
+    /// snapshotted: it is a property of where the disk sits, not of its
+    /// state.
+    serial: [u8; SERIAL_LEN],
     /// Reused scratch for buffered requests; never snapshotted.
     io_buffer: Vec<u8>,
     /// Coalesced guest ranges for reads, rebuilt without retaining guest pointers.
@@ -430,9 +435,21 @@ impl Block {
             queues: Vec::new(),
             queue_sizes: vec![QUEUE_MAX_SIZE],
             pending_queues: None,
+            // No serial, as QEMU's virtio-blk without `serial=`.
+            serial: [0; SERIAL_LEN],
             io_buffer: Vec::new(),
             read_ranges: Vec::new(),
         }
+    }
+
+    /// The serial `VIRTIO_BLK_T_GET_ID` reports. VIRTIO 1.2 §5.2.6 gives it
+    /// 20 bytes, NUL-terminated only when shorter, so a longer one is cut.
+    pub fn with_serial(mut self, serial: &str) -> Self {
+        let bytes = serial.as_bytes();
+        let len = bytes.len().min(SERIAL_LEN);
+        self.serial = [0; SERIAL_LEN];
+        self.serial[..len].copy_from_slice(&bytes[..len]);
+        self
     }
 
     /// Configure the request queues before transport construction.
@@ -555,13 +572,10 @@ impl Block {
                 Ok(()) => S_OK,
                 Err(_) => S_IOERR,
             },
-            T_GET_ID => {
-                let serial: [u8; SERIAL_LEN] = *b"vmlab-hv-blk-0000000";
-                match writer.write_all(&serial) {
-                    Ok(()) => S_OK,
-                    Err(_) => S_IOERR,
-                }
-            }
+            T_GET_ID => match writer.write_all(&self.serial) {
+                Ok(()) => S_OK,
+                Err(_) => S_IOERR,
+            },
             T_DISCARD => self.discard(&mut reader),
             _ => S_UNSUPP,
         };
@@ -1014,9 +1028,12 @@ mod tests {
 
     impl Fixture {
         fn new(disk: Box<dyn vmlab_disk::DiskImage>) -> Self {
+            Self::with_block(Block::new("virtio-blk@test", disk))
+        }
+
+        fn with_block(mut block: Block) -> Self {
             let mem = GuestMemory::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
             let interrupt = Arc::new(RecInterrupt::default());
-            let mut block = Block::new("virtio-blk@test", disk);
             block.ack_features(block.features());
             let mut q = Queue::new(QUEUE_MAX_SIZE).unwrap();
             q.set_size(16);
@@ -1576,9 +1593,53 @@ mod tests {
         assert_eq!(f.used_slot(0), (1, 0, 1));
     }
 
+    /// Answer one `GET_ID` on `f` and give the 20 serial bytes.
+    fn get_id(f: &mut Fixture) -> [u8; 20] {
+        f.put_header(T_GET_ID, 0);
+        f.write_desc(0, desc(f.headers, 16, NEXT, 1));
+        f.write_desc(1, desc(f.buf, 20, NEXT | WRITE, 2));
+        f.write_desc(2, desc(f.buf + 0x800, 1, WRITE, 0));
+        f.submit(0);
+        assert_eq!(f.status(), S_OK);
+        let mut serial = [0u8; 20];
+        f.mem.read_slice(&mut serial, GuestAddress(f.buf)).unwrap();
+        serial
+    }
+
+    #[test]
+    fn get_id_reports_no_serial_unless_given_one() {
+        let mut f = Fixture::new(Box::new(MemDisk::new(64 * 1024)));
+        assert_eq!(get_id(&mut f), [0u8; 20]);
+    }
+
+    /// Two disks given two serials report two serials (GitHub #1026: every
+    /// disk used to report the one constant).
+    #[test]
+    fn get_id_reports_the_serial_of_each_disk() {
+        let mut serials = Vec::new();
+        for given in ["0000000000000002", "0000000000000003"] {
+            let block = Block::new("disk", Box::new(MemDisk::new(64 * 1024)));
+            let mut f = Fixture::with_block(block.with_serial(given));
+            let serial = get_id(&mut f);
+            let mut want = [0u8; 20];
+            want[..given.len()].copy_from_slice(given.as_bytes());
+            assert_eq!(serial, want);
+            serials.push(serial);
+        }
+        assert_ne!(serials[0], serials[1]);
+    }
+
+    #[test]
+    fn get_id_cuts_a_serial_at_twenty_bytes() {
+        let block = Block::new("disk", Box::new(MemDisk::new(64 * 1024)));
+        let mut f = Fixture::with_block(block.with_serial("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(&get_id(&mut f), b"abcdefghijklmnopqrst");
+    }
+
     #[test]
     fn get_id_returns_the_device_serial() {
-        let mut f = Fixture::new(Box::new(MemDisk::new(64 * 1024)));
+        let block = Block::new("disk", Box::new(MemDisk::new(64 * 1024)));
+        let mut f = Fixture::with_block(block.with_serial("vmlab-serial"));
         f.put_header(T_GET_ID, 0);
         // Header -> 20 writable serial bytes -> status.
         f.write_desc(0, desc(f.headers, 16, NEXT, 1));
@@ -1588,7 +1649,7 @@ mod tests {
         assert_eq!(f.status(), S_OK);
         let mut serial = [0u8; 20];
         f.mem.read_slice(&mut serial, GuestAddress(f.buf)).unwrap();
-        assert_eq!(&serial, b"vmlab-hv-blk-0000000");
+        assert_eq!(&serial, b"vmlab-serial\0\0\0\0\0\0\0\0");
         assert_eq!(f.used_slot(0), (1, 0, 21));
     }
 
