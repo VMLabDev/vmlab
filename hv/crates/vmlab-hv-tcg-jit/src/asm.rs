@@ -42,6 +42,10 @@ pub enum Rm {
 pub enum Alu {
     Add = 0,
     Or = 1,
+    /// Add with the carry, and subtract with the borrow: the high words of
+    /// a value of two words.
+    Adc = 2,
+    Sbb = 3,
     And = 4,
     Sub = 5,
     Xor = 6,
@@ -396,6 +400,8 @@ impl Asm {
         let opcode = match alu {
             Alu::Add => 0x03,
             Alu::Or => 0x0b,
+            Alu::Adc => 0x13,
+            Alu::Sbb => 0x1b,
             Alu::And => 0x23,
             Alu::Sub => 0x2b,
             Alu::Xor => 0x33,
@@ -409,6 +415,8 @@ impl Asm {
         let opcode = match alu {
             Alu::Add => 0x03,
             Alu::Or => 0x0b,
+            Alu::Adc => 0x13,
+            Alu::Sbb => 0x1b,
             Alu::And => 0x23,
             Alu::Sub => 0x2b,
             Alu::Xor => 0x33,
@@ -631,6 +639,8 @@ mod tests {
         let alus = [
             (Alu::Add, "add"),
             (Alu::Or, "or"),
+            (Alu::Adc, "adc"),
+            (Alu::Sbb, "sbb"),
             (Alu::And, "and"),
             (Alu::Sub, "sub"),
             (Alu::Xor, "xor"),
