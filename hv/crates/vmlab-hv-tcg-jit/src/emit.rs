@@ -1127,7 +1127,7 @@ impl Emitter<'_> {
             },
             kind => {
                 let kind = self.rm(kind, RCX);
-                for (value, test) in &lazy.cases {
+                for (value, test) in lazy.cases.iter() {
                     let next = self.asm.label();
                     match i32::try_from(*value as i64) {
                         Ok(value) => self.asm.alu_imm(Alu::Cmp, kind, value),
