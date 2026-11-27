@@ -246,7 +246,12 @@ impl VcpuBackend for EmulatedVcpu {
         // trace log on, the slices are short, so that it names nearly
         // every one.
         let debug = log::log_enabled!(log::Level::Debug);
-        let short = log::log_enabled!(log::Level::Trace);
+        // Short slices cost most of the speed of the CPU, so they follow
+        // what the stderr log writes, not what the recorder keeps.
+        let short = crate::diagnostics::report::stderr_enabled(
+            log::Level::Trace,
+            module_path!(),
+        );
         let before = self.cpu.exceptions;
         let stop = self.cpu.run(if short { DEBUG_SLICE } else { SLICE });
         if debug
