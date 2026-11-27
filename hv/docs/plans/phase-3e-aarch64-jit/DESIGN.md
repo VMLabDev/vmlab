@@ -509,11 +509,16 @@ a `memcpy` loop of glibc) before a card is written.
   The default is one region of 64 MiB per vCPU, reserved at once and touched
   as it fills. It is inside the memory cap of the VM process, beside the 256
   MiB young generation of the block store.
-- **H13c. Eviction.** When the region is full, the whole cache of that vCPU
-  is dropped: the bump pointer is reset, every block loses its code address,
-  the chains and the jump cache are cleared. The pre-decoded blocks stay in
-  the block store, so a block is compiled again in about a microsecond when
-  it runs next. A partial eviction is not built.
+- **H13c. Eviction.** The region is cut into four parts, written one after
+  another. When the part that the JIT writes into is full, it goes on to
+  the next one, the part written longest ago, and drops only the code in
+  it: the blocks of that part lose their code address, the jumps of the
+  other parts that are linked into it go back to their stubs, and the jump
+  cache is cleared. The code of the other three parts stays. The
+  pre-decoded blocks stay in the block store, so a block is compiled again
+  in about a microsecond when it runs next. Until card J11 the whole region
+  was dropped, and the recompiles after a drop were 56 % of the compiles of
+  a Debian boot (J11a).
 - **H13d. W^X.** The region is a `memfd` mapped twice: one view readable and
   writable, where the emitter writes, and one view readable and executable,
   where the vCPU runs. No page is writable and executable in one mapping.
@@ -1416,6 +1421,106 @@ of the host fell.
   from the kernel is among them. Serving those in code is a card of its
   own: each changes the state that the loop reads before the next block.
 
+### J11, measured by card J11
+
+Helios, 2026-11-28, *measured*. Before: `f0d5a25e`, which is `next`
+(`2f8a7dc4`) with only the counters of this card. After: `33c67ec8`. The
+merge bar ran on `85f8afcb`, which differs from it only in rustfmt and
+clippy changes. Each side was built from a tree exported from its commit.
+The boots ran on cores 20 to 23 and the flat images on cores 28 to 31.
+Other cards ran builds and boots at the same time: the load average was
+4.6 to 15.2 of 32 threads at the starts and the ends of the runs. The merge
+bar of this card ran during the first after boots and the second before
+boots. The last pair of boots ran side by side, before on cores 20 to 23
+and after on cores 24 to 27, at a load average of 4.6 to 12.9.
+The rows are in `bench/history/aarch64.jsonl` with the note "card J11".
+No QEMU source was read (X1 to X3). No other source was read.
+
+**J11a. The compiles of a boot by cause.** The new counters of the debug
+log (`compiles: ... first, ... after a drop of the region, ... after an
+invalidation, ... after an eviction`) are read at the last counter line
+before agent ready. Each repeat of Debian 13 at one vCPU:
+
+| At the line of | Before | After |
+|---|---|---|
+| 18.0e9 instructions (before: 6 boots, after: 4) | 1.088 to 1.100 million compiles: 457,165 to 472,073 the first time, 608,000 to 616,680 after a drop of the region, 13,870 to 14,015 after an invalidation or an epoch, none after an eviction. 7 drops of the region of 64 MiB | 0.923 to 0.966 million: 457,193 to 475,070 the first time, 443,863 to 477,752 after a drop of a part, 13,931 to 14,139 after an invalidation, none after an eviction. 23 or 24 drops of a part of 16 MiB |
+| The same, compile time | 7.99 to 8.52 s (7.3 to 7.8 µs a compile) | 1.53 to 1.60 s (1.58 to 1.73 µs) |
+| The same, translation time | 2.50 to 2.67 s for 471,035 to 486,088 blocks (5.1 to 5.5 µs a block) | 1.86 to 2.09 s for 471,332 to 489,031 blocks (3.8 to 4.4 µs) |
+| 17.0e9 instructions, the side-by-side pair (before: 2 boots, after: 2) | 947,480 and 951,378 compiles, 501,467 and 503,317 after a drop; 5.73 and 5.76 s compiling (6.0 µs); 2.04 s translating (4.6 µs a block) | 802,212 and 793,286 compiles, 353,329 and 345,398 after a drop; 1.26 and 1.23 s compiling (1.6 µs); 1.59 s translating (3.5 µs) |
+
+At four vCPUs (three boots each side, the four vCPUs summed at their last
+lines): before 9.89 to 14.22 s compiling, 7.7 to 9.5 µs a compile; after
+2.08 to 2.23 s, 1.7 to 1.9 µs.
+
+- **J11a1. Most compiles were recompiles.** Before, 56 % of the compiles
+  of a boot came after a drop of the region: 7 drops, each followed by
+  about 87,000 compiles of blocks that the boot had compiled before.
+  Blocks dropped from the block store and compiled again: none.
+- **J11a2. The region drops a quarter now (H13c).** The recompiles after
+  a drop fall by 21 to 28 % at 18.0e9 instructions, to 48 to 50 % of the
+  compiles. The basis of an explanation, not measured: the code that a
+  boot runs again is larger than three quarters of the region, so a part
+  that is dropped still holds code that runs again.
+- **J11a3. The size of the region stays 64 MiB.** After the change, a
+  recompile costs 1.6 µs, so the 0.35 to 0.48 million recompiles after a
+  drop cost 0.6 to 0.8 s of a boot of 58 to 86 s. Code that the boot
+  compiles the first time is 0.22 GB at one vCPU (457,000 to 475,000
+  blocks of 479 bytes), so a region that kept it all is 256 MiB, and the
+  memfd keeps each page that it wrote: up to 256 MiB of host memory for
+  each vCPU. *Est.*: that region would save at most the 0.6 to 0.8 s, 1 to
+  1.4 % of a boot.
+
+**J11b. The heap calls of a block** (`tests/alloc.rs` of
+`vmlab-hv-tcg-aarch64`: 603 blocks translated, and compiled with the JIT,
+on a CPU whose buffers grew on 603 blocks before; the heap calls of the
+thread counted):
+
+| | Before | After |
+|---|---|---|
+| A compile (the shape of the block, the emitter, the assembler, the code) | 117.6 a block | 0 |
+| A translation (the lifter, the pruning, the lowering, the block) | 71.2 a block | 13.5 a block |
+
+- **J11b1. What stays** is the lists that the pre-decoded block keeps (its
+  operations, its frame, its leaves with their operations and outputs, its
+  calls) and its box, each allocated once at its own size. The lifter
+  fills the block of the translation before, the exits take their lists
+  from those of the block before, the lowering, the pruning and the lists
+  of `compile` are kept by the CPU (`Translator`), and the emitter and the
+  assembler by the JIT (`emit::Scratch`). The forms of a lazy condition are
+  a table made once (`flags::host_forms_of`).
+- **J11b2. The test fails** when a compile makes a heap call, or when a
+  translation of that program makes 16 or more a block.
+
+**J11c. The rows.**
+
+| Workload | Before | After |
+|---|---|---|
+| Debian 13 boot to agent ready, 1 vCPU, s, the side-by-side pair (median of 3) | 68.66 (62.53 to 80.27), 261.7 MIPS | 58.38 (57.25 to 64.23), 305.2 MIPS |
+| The same, the runs one after the other | 88.37 (72.39 to 96.40), and 94.80 (90.56 to 119.10) beside the merge bar | 85.51 (76.24 to 86.47), beside the merge bar |
+| Debian 13 boot to agent ready, 4 vCPUs, s | 60.40 (60.28 to 66.40), and 90.39 (88.55 to 133.10) beside the merge bar | 60.37 (58.83 to 70.17) |
+| CoreMark mix, flat, MIPS (median of 3, two runs a side) | 1,839.7, 1,951.4 | 2,023.1, 1,989.0 |
+| Scalar loop, flat, MIPS | 1,577.6 (1,362.0 to 1,748.0), 1,954.5 | 2,008.9, 1,982.6 |
+| Instructions in the interpreter at the last counter line of each boot (H2b, H2c) | none for a missing form; at the budget 102 to 328 at 1 vCPU, 5,300 to 7,404 at 4 | none for a missing form; at the budget 136 to 225 at 1 vCPU, 5,650 to 6,770 at 4 |
+| K3 on Debian 13 at 1 vCPU (`VMLAB_HV_JIT_CHECK=1`, `VMLAB_HV_JIT_CHECK_RUNS=1000`) | | Agent ready after 132.3 s, no difference, 121.2 million checked runs (581.7 million instructions) up to the counter line at 18.0e9 instructions |
+
+- **J11c1. The boot at one vCPU is 1.18 times faster** in the pair that ran
+  side by side, inside the estimate of N2 (1.1 to 1.2 times). The runs one
+  after the other differ by less than the spread of the before side (24.0
+  and 28.5 s), with the load of the host changing between them. The basis of an explanation: the
+  pair saves 4.5 s of compiling and 0.5 s of translating of the 17.0e9
+  instructions, and the 0.15 million fewer compiles also make fewer links
+  and fewer misses of the jump cache.
+- **J11c2. The flat images** compile a few blocks, and they run the same
+  within their noise, as they should.
+- **J11c3. K2** (`tests/jit.rs` of `vmlab-hv-tcg-aarch64`, the random blocks
+  and the flag operands against the interpreter) passes on the after side.
+  The JIT tests add one for the drop of a part: a jump into the dropped
+  part goes back to its stub, and a jump between two parts that stay stays
+  linked.
+- **J11c4. Not done:** a profile of the boot as in J9a, so the share of
+  translation and compile in the samples after the change, and how much of
+  the 8.7 % of libc of J9a2 went with it, are not measured.
+
 ## 8. The cards
 
 The order is the number. "With" names the cards that can run at the same
@@ -1543,6 +1648,15 @@ cp /tmp/perf-<pid>.map perf.map
 python3 measure/ipclass.py <binary> raw.txt@perf.map --top 40 --window <from> <to>   # unix seconds of the bench log
 # CoreMark: a long image (micro_a64.build_coremark(30000)) under a64_bench with
 # VMLAB_HV_JIT=1 VMLAB_HV_JIT_PERF_MAP=1, sampled the same way, one map per run
+
+# J11: the heap calls of a translation and of a compile, then the compiles by
+# cause, read from the last JIT line of each kept run (stderr.log of bench/run)
+cargo test --release -p vmlab-hv-tcg-aarch64 --test alloc -- --nocapture
+python3 bench/run.py --backend vmlab-hv --arch aarch64 --vcpus 1,4 --repeats 3 --guest debian-13 --suite boot --keep --cpus 20-23
+grep -o "compiles: .*" bench/run/*/stderr.log
+# K3 on a boot
+VMLAB_HV_JIT_CHECK=1 VMLAB_HV_JIT_CHECK_RUNS=1000 python3 bench/run.py --backend vmlab-hv --arch aarch64 \
+  --vcpus 1 --repeats 1 --guest debian-13 --suite boot --keep --cpus 20-23 --timeout-scale 4
 ```
 
 J10, the same firmware, one checkout and one release build of each side

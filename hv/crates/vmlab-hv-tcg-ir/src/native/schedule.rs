@@ -42,10 +42,20 @@ fn visit(graph: &Graph, id: ScalarId, seen: &mut [bool], output: &mut Vec<Scalar
 /// after what it depends on. `seen` has one entry per scalar of the graph.
 pub fn scalars(graph: &Graph, roots: &[ScalarId], seen: &mut [bool]) -> Vec<ScalarId> {
     let mut output = Vec::new();
-    for root in roots {
-        visit(graph, *root, seen, &mut output);
-    }
+    scalars_into(graph, roots, seen, &mut output);
     output
+}
+
+/// `scalars`, appended to `output`.
+pub fn scalars_into(
+    graph: &Graph,
+    roots: &[ScalarId],
+    seen: &mut [bool],
+    output: &mut Vec<ScalarId>,
+) {
+    for root in roots {
+        visit(graph, *root, seen, output);
+    }
 }
 
 pub fn schedule<X>(block: &BlockOf<X>) -> Vec<Vec<ScalarId>> {

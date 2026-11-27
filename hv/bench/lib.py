@@ -944,6 +944,11 @@ JIT_REPORT = re.compile(
     r"(?:; machine: (?P<exclusive_loads>\d+) exclusive loads, (?P<exclusive_stores>\d+) "
     r"exclusive stores, (?P<code_mails>\d+) code mails, (?P<code_pages>\d+) code pages, "
     r"(?P<wait_ms>\d+) ms waiting)?"
+    # The compiles by cause and the translations (card J11), when the line has them.
+    r"(?:; compiles: (?P<compiles_first>\d+) first, (?P<compiles_region>\d+) after a drop of "
+    r"the region, (?P<compiles_invalidated>\d+) after an invalidation, (?P<compiles_evicted>\d+) "
+    r"after an eviction, (?P<memory_resets>\d+) drops for the memory; translations: "
+    r"(?P<translations>\d+) blocks, (?P<translation_ms>\d+) ms)?"
     # The returns to the loop by reason, and the jump cache kept across a new
     # address space (card J10), when the line has them.
     r"(?:; returns: (?P<jump_served>\d+) jump cache misses served in code, "

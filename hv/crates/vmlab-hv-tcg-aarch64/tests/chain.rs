@@ -69,6 +69,49 @@ fn a_chained_pair_is_unlinked_by_a_store_into_the_target() {
 }
 
 #[test]
+fn the_compiles_are_counted_by_cause() {
+    // The program of the test above: B is translated again after the store
+    // into it (3e DESIGN.md J11).
+    const ADD_X6: u32 = 0x9100_04c6;
+    let program = [
+        0x9100_0400,
+        0x1400_0003,
+        0xd503_201f,
+        0xd503_201f,
+        0xf100_0421,
+        0x54ff_ff61,
+        0xb500_0087,
+        0xd280_0027,
+        0xb900_0083,
+        0x17ff_fff7,
+        HVC,
+    ];
+    let mut cpu = flat(&program, true);
+    cpu.state.set_x(1, 1000);
+    cpu.state.set_x(3, u64::from(ADD_X6));
+    cpu.state.set_x(4, BASE + 0x10);
+    assert!(matches!(cpu.run(100_000), Stop::Hypercall { .. }));
+    let counts = cpu.jit_counts();
+    assert!(counts.compiles_first >= 3, "{counts:?}");
+    assert!(counts.compiles_invalidated >= 1, "{counts:?}");
+    assert_eq!(
+        (
+            counts.compiles_region,
+            counts.compiles_evicted,
+            counts.resets
+        ),
+        (0, 0, 0),
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.compiles_first + counts.compiles_invalidated,
+        counts.compiled + counts.refused,
+        "{counts:?}"
+    );
+    assert!(counts.translations >= counts.compiled, "{counts:?}");
+}
+
+#[test]
 fn the_switch_turns_chaining_off_and_the_result_stays() {
     // add x0, x0, #1 ; subs x1, x1, #1 ; b.ne -8 ; hvc
     let program = [0x9100_0400, 0xf100_0421, 0x54ff_ffc1, HVC];

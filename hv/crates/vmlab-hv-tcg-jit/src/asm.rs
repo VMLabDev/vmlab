@@ -242,10 +242,27 @@ impl Asm {
     /// The finished code, placed at `base`: the hot section, then the cold
     /// one, with every jump resolved. `None`: a label that was never bound,
     /// or a target out of the reach of a 32-bit displacement.
-    pub fn finish(mut self, base: u64) -> Option<Vec<u8>> {
+    pub fn finish(self, base: u64) -> Option<Vec<u8>> {
+        let mut code = Vec::new();
+        self.finish_into(base, &mut code)?;
+        Some(code)
+    }
+
+    /// Start a new unit, keeping the memory of the buffers.
+    pub fn clear(&mut self) {
+        self.hot.clear();
+        self.cold.clear();
+        self.in_cold = false;
+        self.labels.clear();
+        self.fixups.clear();
+    }
+
+    /// `finish` into `code`, which is cleared first and keeps its memory.
+    pub fn finish_into(&self, base: u64, code: &mut Vec<u8>) -> Option<()> {
         let hot = self.hot.len();
-        let mut code = std::mem::take(&mut self.hot);
-        code.append(&mut self.cold);
+        code.clear();
+        code.extend_from_slice(&self.hot);
+        code.extend_from_slice(&self.cold);
         for fixup in &self.fixups {
             let at = fixup.at + if fixup.cold { hot } else { 0 };
             let target = match fixup.target {
@@ -259,7 +276,7 @@ impl Asm {
             let displacement = i32::try_from(target.wrapping_sub(next) as i64).ok()?;
             code[at..at + 4].copy_from_slice(&displacement.to_le_bytes());
         }
-        Some(code)
+        Some(())
     }
 
     /// A REX prefix where one is needed: `w` for a 64-bit operand, or an
