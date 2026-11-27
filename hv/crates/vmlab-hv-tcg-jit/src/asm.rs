@@ -542,7 +542,8 @@ mod tests {
             }
             for (shift, text) in [(Shift::Shl, "shl"), (Shift::Shr, "shr"), (Shift::Sar, "sar")] {
                 add(format!("{text} {name}, cl"), &|a| a.shift_cl(shift, dst));
-                for count in [1u8, 7, 63] {
+                // A count of 1 prints as the form without a count (D1).
+                for count in [2u8, 7, 63] {
                     add(format!("{text} {name}, {count}"), &|a| {
                         a.shift_imm(shift, dst, count)
                     });
