@@ -69,9 +69,7 @@ fn add_or_subtract(
     right: ScalarId,
 ) -> (ScalarId, Flags) {
     if subtract {
-        let inverted = b.not(width, right);
-        let carry = b.imm(1, 1);
-        b.add_with_carry(width, left, inverted, carry)
+        b.subtract_with_flags(width, left, right)
     } else {
         let carry = b.imm(1, 0);
         b.add_with_carry(width, left, right, carry)
