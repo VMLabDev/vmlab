@@ -917,6 +917,7 @@ Proof, helios, 2026-11-27, *measured*:
 |---|---|
 | The stress test of J7 (`a_cpu_in_chained_code_runs_the_code_that_another_cpu_stored`, two CPUs on two threads on a `GuestBus`, the JIT and chaining on): the writer stores `MOVZ X1, #round` into a function that the runner calls from a chained loop, then publishes the round; the runner checks the value and acknowledges | 10,000,000 rounds in 43.2 s, no stale execution (`VMLAB_HV_J7_ROUNDS=10000000`). The test of `ci::check` runs 20,000 rounds. A build that told the others after the stores of the Rust paths but not after the store that `Memory::write` serves stopped in its first rounds with the runner on old code: the test sees the defect. |
 | The exclusives stress test of card C3 (`two_cpus_count_under_a_spinlock_and_with_exclusives_and_lose_nothing`) | Passes on the interpreter and with the JIT and chaining, both with the mailboxes of two CPUs. |
+| K3 on a Debian 13 boot at 2 vCPUs, `VMLAB_HV_JIT_CHECK=1` and `VMLAB_HV_JIT_CHECK_RUNS=1000` | Agent ready after 93.7 s, no difference. 150.1 million checked runs (722.7 million instructions) over both vCPUs up to their last counter lines, at 18.0e9 instructions. |
 | kvm-unit-tests (`just tcg-a64-kvm-unit-tests`, `VMLAB_HV_JIT=1`; `selftest-smp`, `gicv2-ipi`, `gicv2-mmio`, `gicv2-mmio-3p`, `gicv2-active` and `psci` at 4 vCPUs) | 11 tests. vmlab-hv passes every subtest that it passes on the interpreter. QEMU failed `psci: cpu-on` in one of its two runs. |
 
 The rows, before (`6242195c`, `next`) and after (`3b07327b`), side by
