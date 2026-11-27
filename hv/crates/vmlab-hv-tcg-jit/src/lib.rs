@@ -51,7 +51,7 @@ pub mod tlb;
 use asm::{Asm, R12, R13, R14, R15, RBP, RBX, RCX, RDI, RDX, RSI, RSP, Rm};
 pub use emit::{
     Chain, Defect, Effect, FlagOperation, FlagTest, LazyCondition, Memory, Next, NextPc, Refused,
-    Shape, add_flags, sub_flags,
+    Registers, Shape, add_flags, sub_flags,
 };
 use region::Region;
 use std::collections::HashMap;
@@ -79,6 +79,19 @@ pub const SITES: usize = 2;
 /// in `Context::block`. 0: go on. Anything else: the block leaves with that
 /// value.
 pub type Thunk = unsafe extern "sysv64" fn(env: *mut c_void, index: u64, block: *mut c_void) -> u64;
+
+/// The function of a helper call with `Effect::registers` (3e DESIGN.md
+/// J13): the words of its arguments in the six argument registers, and
+/// the words of its results in RAX and RDX.
+pub type RegisterFn = extern "sysv64" fn(u64, u64, u64, u64, u64, u64) -> Words;
+
+/// The two words that a `RegisterFn` gives: `low` in RAX, `high` in RDX.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Words {
+    pub low: u64,
+    pub high: u64,
+}
 
 /// An inlined load or store missed the fast TLB: run it as the operation,
 /// which fills the TLB where H7a lets it.
